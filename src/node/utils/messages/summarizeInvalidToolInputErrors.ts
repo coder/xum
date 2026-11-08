@@ -3,9 +3,12 @@ import {
   type ModelMessage,
   type StreamTextTransform,
   type TextStreamPart,
+  type ToolResultPart,
   type ToolSet,
 } from "ai";
+import { z } from "zod";
 import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   formatToolInputIssues,
   isToolInputIssueArray,
@@ -75,23 +78,16 @@ export function summarizeInvalidToolInputErrors<
   };
 }
 
-function isInvalidToolInputOutput(
-  output: { type: string; value?: unknown },
-  toolName: string
-): boolean {
-  const prefix = invalidToolInputPrefix(toolName);
+const FailedToolResultSchema = z.object({ success: z.literal(false), error: z.string() });
+
+/** The error text of a tool-result as replayed: same-turn SDK error output or a persisted result. */
+function replayedErrorText(output: ToolResultPart["output"]): string | undefined {
   if (output.type === "error-json" || output.type === "error-text") {
-    return typeof output.value === "string" && output.value.startsWith(prefix);
+    return typeof output.value === "string" ? output.value : undefined;
   }
-  if (output.type !== "json") return false;
-  const value = output.value;
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as { success?: unknown }).success === false &&
-    typeof (value as { error?: unknown }).error === "string" &&
-    (value as { error: string }).error.startsWith(prefix)
-  );
+  if (output.type !== "json") return undefined;
+  const failed = FailedToolResultSchema.safeParse(output.value);
+  return failed.success ? failed.data.error : undefined;
 }
 
 function collectRejectedToolCallIds(messages: readonly ModelMessage[]): Set<string> {
@@ -99,21 +95,15 @@ function collectRejectedToolCallIds(messages: readonly ModelMessage[]): Set<stri
   for (const message of messages) {
     if (message.role !== "tool") continue;
     for (const part of message.content) {
-      if (part.type === "tool-result" && isInvalidToolInputOutput(part.output, part.toolName)) {
+      if (
+        part.type === "tool-result" &&
+        replayedErrorText(part.output)?.startsWith(invalidToolInputPrefix(part.toolName)) === true
+      ) {
         rejected.add(part.toolCallId);
       }
     }
   }
   return rejected;
-}
-
-function isEmptyObject(value: unknown): boolean {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    !Array.isArray(value) &&
-    Object.keys(value).length === 0
-  );
 }
 
 /**
@@ -127,24 +117,25 @@ function isEmptyObject(value: unknown): boolean {
 export function blankInvalidToolCallInputs(messages: ModelMessage[]): ModelMessage[] {
   const rejected = collectRejectedToolCallIds(messages);
   if (rejected.size === 0) return messages;
-  let changed = false;
-  const result = messages.map((message): ModelMessage => {
-    if (message.role !== "assistant" || typeof message.content === "string") return message;
-    let messageChanged = false;
-    const content = message.content.map((part) => {
-      if (
-        part.type !== "tool-call" ||
-        !rejected.has(part.toolCallId) ||
-        isEmptyObject(part.input)
-      ) {
-        return part;
-      }
-      messageChanged = true;
-      return { ...part, input: {} };
-    });
-    if (!messageChanged) return message;
-    changed = true;
-    return { ...message, content };
-  });
-  return changed ? result : messages;
+  const result = messages.map((message) => blankRejectedToolCalls(message, rejected));
+  return result.some((message, index) => message !== messages[index]) ? result : messages;
+}
+
+function blankRejectedToolCalls(
+  message: ModelMessage,
+  rejected: ReadonlySet<string>
+): ModelMessage {
+  if (message.role !== "assistant" || typeof message.content === "string") return message;
+  const content = message.content.map((part) =>
+    part.type === "tool-call" && rejected.has(part.toolCallId) && !isEmptyRecord(part.input)
+      ? { ...part, input: {} }
+      : part
+  );
+  return content.some((part, index) => part !== message.content[index])
+    ? { ...message, content }
+    : message;
+}
+
+function isEmptyRecord(value: unknown): boolean {
+  return isPlainObject(value) && Object.keys(value).length === 0;
 }
