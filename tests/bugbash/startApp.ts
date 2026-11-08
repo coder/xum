@@ -440,6 +440,10 @@ async function seed(
   fs.writeFileSync(guide, GUIDE_ARTIFACT_HTML);
   const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
   fs.utimesSync(guide, anHourAgo, anHourAgo);
+  // A hash-router page (repros/artifactsHashRouter.e2e.ts), dated back like the guide.
+  const hashRouter = path.join(artifactsDir, "hash-router.html");
+  fs.writeFileSync(hashRouter, HASH_ROUTER_ARTIFACT_HTML);
+  fs.utimesSync(hashRouter, anHourAgo, anHourAgo);
   // Artifacts that send a message to the agent: an HTML page that sends on a click (at once) and
   // from a timer after a click (the confirm strip asks), and a canvas whose button sends at once.
   // Dated back like the guide, so the default artifact stays the same.
@@ -497,6 +501,40 @@ const GUIDE_ARTIFACT_HTML = `<!doctype html>
       addEventListener("scroll", function () {
         document.getElementById("status").textContent = scrollY > 0 ? "Scrolled" : "At the top";
       });
+    </script>
+  </body>
+</html>
+`;
+
+/**
+ * A hash router: it renders the route from location.hash on every hashchange, and has a link, a
+ * location.hash button and a history.replaceState button for each way an app moves between routes.
+ */
+const HASH_ROUTER_ARTIFACT_HTML = `<!doctype html>
+<html>
+  <body>
+    <nav>
+      <a href="#/">Home</a>
+      <a href="#/s/alpha">Alpha</a>
+      <a href="#/s/beta">Beta</a>
+      <button id="set-hash" type="button">Gamma by hash</button>
+      <button id="replace" type="button">Delta by replaceState</button>
+    </nav>
+    <p id="route"></p>
+    <script>
+      function render() {
+        document.getElementById("route").textContent =
+          "Route is " + (location.hash.replace(/^#/, "") || "/") + ".";
+      }
+      addEventListener("hashchange", render);
+      document.getElementById("set-hash").addEventListener("click", function () {
+        location.hash = "#/s/gamma";
+      });
+      document.getElementById("replace").addEventListener("click", function () {
+        history.replaceState(null, "", "#/s/delta");
+        render();
+      });
+      render();
     </script>
   </body>
 </html>
