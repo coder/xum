@@ -9,7 +9,16 @@
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally:
 // bun test ./scripts/ci/cachePaths.test.ts
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { parse } from "yaml";
 
@@ -22,6 +31,8 @@ interface CacheStep {
   /** actions/cache, actions/cache/restore or actions/cache/save. */
   action: string;
   paths: string[];
+  /** The key as written. A save step has its restore step's key: it names it by output. */
+  key: string;
   /** The key with runner.os and runner.arch filled in, cut at the first other expression. */
   keyPrefix: string;
   /** The same for each restore-keys line. */
@@ -74,15 +85,18 @@ function resolvePath(raw: string, fileText: string): string {
   return path.posix.normalize(raw.startsWith("~") ? HOME + raw.slice(1) : raw);
 }
 
-function workflowFiles(): string[] {
-  return [
-    ...readdirSync(path.join(ROOT, ".github/workflows"))
-      .filter((name) => name.endsWith(".yml"))
-      .map((name) => `.github/workflows/${name}`),
-    ...readdirSync(path.join(ROOT, ".github/actions")).map(
-      (dir) => `.github/actions/${dir}/action.yml`
-    ),
-  ];
+// Every workflow and composite action under `root`: GitHub runs .yml and .yaml alike.
+function workflowFiles(root: string = ROOT): string[] {
+  const isYaml = (name: string) => /\.ya?ml$/.test(name);
+  const workflows = readdirSync(path.join(root, ".github/workflows"))
+    .filter(isYaml)
+    .map((name) => `.github/workflows/${name}`);
+  const actions = readdirSync(path.join(root, ".github/actions")).flatMap((dir) =>
+    ["action.yml", "action.yaml"]
+      .filter((name) => existsSync(path.join(root, ".github/actions", dir, name)))
+      .map((name) => `.github/actions/${dir}/${name}`)
+  );
+  return [...workflows, ...actions];
 }
 
 // A save step names its key by the restore step's output: `steps.<id>.outputs.cache-primary-key`.
@@ -116,6 +130,7 @@ function cacheStepsOf(file: string): CacheStep[] {
         file,
         action: String(step.uses).split("@")[0],
         paths: lines(step.with?.path).map((raw) => resolvePath(raw, text)),
+        key: keyOf(step, steps),
         keyPrefix: literalPrefix(keyOf(step, steps)),
         restoreKeyPrefixes: lines(step.with?.["restore-keys"]).map(literalPrefix),
       }))
@@ -171,11 +186,25 @@ const guardedSteps = allSteps.filter((step) =>
   GUARDED.some((prefix) => step.keyPrefix.startsWith(prefix))
 );
 
+// The restore step and the save step of one guarded cache.
+const stepsOf = (prefix: string) =>
+  guardedSteps.filter((step) => step.keyPrefix.startsWith(prefix));
+
+// The file whose content makes each guarded cache's key: the pins, or the checksums, that the
+// cached files are checked against. A key without it keeps an entry after its pins change.
+const KEYED_BY: Record<string, string> = {
+  "release-assets-shfmt-hadolint-": "scripts/ci/install-release-tools.sh",
+  "release-assets-static-curl-": "scripts/ci/install-release-tools.sh",
+  "tree-sitter-grammars-v": "scripts/ci/download_tree_sitter_grammars.py",
+  "xum-electron-zip-": "node_modules/electron/checksums.json",
+};
+
 describe("the isolation check", () => {
   const cache = (over: Partial<CacheStep>): CacheStep => ({
     file: "x.yml",
     action: "actions/cache",
     paths: [`${HOME}/.cache/mine`],
+    key: "mine-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('x') }}",
     keyPrefix: "mine-Linux-X64-",
     restoreKeyPrefixes: [],
     ...over,
@@ -224,6 +253,39 @@ describe("the isolation check", () => {
   });
 });
 
+describe("the workflow files that the check reads", () => {
+  test("are every .yml and .yaml workflow and every action.yml and action.yaml", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cache-paths-"));
+    try {
+      const files = [
+        ".github/workflows/a.yml",
+        ".github/workflows/b.yaml",
+        ".github/workflows/notes.md",
+        ".github/actions/c/action.yml",
+        ".github/actions/d/action.yaml",
+        ".github/actions/e/README.md",
+      ];
+      for (const file of files) {
+        mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+        writeFileSync(path.join(root, file), "");
+      }
+      expect(workflowFiles(root).sort()).toEqual([
+        ".github/actions/c/action.yml",
+        ".github/actions/d/action.yaml",
+        ".github/workflows/a.yml",
+        ".github/workflows/b.yaml",
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("include the real ones", () => {
+    expect(workflowFiles()).toContain(".github/workflows/pr.yml");
+    expect(workflowFiles()).toContain(".github/actions/setup-xum/action.yml");
+  });
+});
+
 describe("the download caches of the CI tools", () => {
   test("each of the four has one restore step and one save step", () => {
     for (const prefix of GUARDED) {
@@ -231,6 +293,22 @@ describe("the download caches of the CI tools", () => {
         .filter((step) => step.keyPrefix.startsWith(prefix))
         .map((step) => step.action);
       expect(actions.toSorted()).toEqual(["actions/cache/restore", "actions/cache/save"]);
+    }
+  });
+
+  test("each saves the path that it restores, under the key that it looked up", () => {
+    for (const prefix of GUARDED) {
+      const restore = stepsOf(prefix).find((step) => step.action === "actions/cache/restore");
+      const save = stepsOf(prefix).find((step) => step.action === "actions/cache/save");
+      expect(restore).toBeDefined();
+      expect(save?.paths).toEqual(restore?.paths);
+      expect(save?.key).toBe(restore?.key);
+    }
+  });
+
+  test.each(Object.entries(KEYED_BY))("the key of %s hashes %s", (prefix, file) => {
+    for (const step of stepsOf(prefix)) {
+      expect(step.key).toContain(`hashFiles('${file}')`);
     }
   });
 
@@ -253,8 +331,11 @@ describe("the download caches of the CI tools", () => {
     expect(root).toBe(".cache/xum-release-assets");
     for (const set of ["shfmt-hadolint", "static-curl"]) {
       expect(script).toContain(`assets=$assets_root/${set}`);
-      const step = guardedSteps.find((s) => s.keyPrefix.startsWith(`release-assets-${set}-`));
-      expect(step?.paths).toEqual([`${HOME}/${root}/${set}`]);
+      const steps = stepsOf(`release-assets-${set}-`);
+      expect(steps).toHaveLength(2);
+      for (const step of steps) {
+        expect(step.paths).toEqual([`${HOME}/${root}/${set}`]);
+      }
     }
   });
 
@@ -267,8 +348,11 @@ describe("the download caches of the CI tools", () => {
     );
     const stage = text(download?.env?.GRAMMAR_STAGE_DIR);
     expect(stage).not.toBe("");
-    const step = guardedSteps.find((s) => s.keyPrefix.startsWith("tree-sitter-grammars-v"));
-    expect(step?.paths).toEqual([resolvePath(stage, "")]);
-    expect(step?.paths[0].startsWith(`${RUNNER_TEMP}/`)).toBe(true);
+    const steps = stepsOf("tree-sitter-grammars-v");
+    expect(steps).toHaveLength(2);
+    for (const step of steps) {
+      expect(step.paths).toEqual([resolvePath(stage, "")]);
+      expect(step.paths[0].startsWith(`${RUNNER_TEMP}/`)).toBe(true);
+    }
   });
 });

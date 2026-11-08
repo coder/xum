@@ -212,6 +212,20 @@ describe.skipIf(Bun.which("python3") === null)("download_tree_sitter_grammars.py
     expect(await stageListing()).toEqual(STAGE_FILES);
   });
 
+  test("a verified stage that also holds extra files: only the two pinned files reach the pack's directory", async () => {
+    await download();
+    await mkdir(path.join(dirs.stage, "libs"), { recursive: true });
+    await writeFile(path.join(dirs.stage, "libs", "libtree_sitter_evil.so"), "planted bytes");
+    await writeFile(path.join(dirs.stage, "evil.so"), "planted bytes");
+    // A network attempt would fail: the extras must not make the stage a miss, and must not
+    // be copied either.
+    const result = await download({ error: releaseError(504) });
+    expect(result.exitCode).toBe(0);
+    expect(await packCalls()).toEqual([`network:${LANGUAGES}`, `offline:${LANGUAGES}`]);
+    expect(existsSync(path.join(dirs.packRoot, "libs", "libtree_sitter_evil.so"))).toBe(false);
+    expect(existsSync(path.join(dirs.packRoot, "evil.so"))).toBe(false);
+  });
+
   test("files that another cache planted in the pack's directory are deleted, never loaded", async () => {
     await download();
     const libs = path.join(dirs.packRoot, "libs");
