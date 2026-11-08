@@ -100,7 +100,7 @@ To let commands write or read more paths, edit `~/.xum/config.json`:
 }
 ```
 
-A path can start with `~/`. A project can have its own `agentSandbox` with the same fields, in its entry in `projects`. Each field that the project sets replaces the global field. For example, a project `extraReadPaths` replaces the global `extraReadPaths`, it does not add to it. A repository cannot set the sandbox. The agent's config tool cannot change `agentSandbox`, and while the sandbox is on, it cannot add a workspace or change the id, path, projects or runtime of one.
+A path can start with `~/`. A project can have its own `agentSandbox` with the same fields, in its entry in `projects`. Each field that the project sets replaces the global field. For example, a project `extraReadPaths` replaces the global `extraReadPaths`, it does not add to it. A repository cannot set the sandbox. The agent's config tool cannot change `agentSandbox`, and while the sandbox is on, it cannot add or remove a project, add a workspace, or change the id, path, projects or runtime of one.
 
 Xum ignores a field that is not valid and keeps the valid fields, so a broken field next to `"enabled": true` does not turn the sandbox off. An `agentSandbox` value that is not an object is ignored as a whole. Xum shows no message for this, and the next save from Settings writes the value without the broken fields.
 

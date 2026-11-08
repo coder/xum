@@ -413,11 +413,22 @@ describe("mux_config_write", () => {
         operations: [{ op: "set", path: ["taskSettings", "maxParallelAgentTasks"], value: 8 }],
         refused: false,
       },
+      // A new parent folder would make /test/proj its sub-project, under the parent's setting.
       {
-        name: "allows adding a project without an override",
-        operations: [
-          { op: "set", path: ["projects", 1], value: ["/test/other", { workspaces: [] }] },
-        ],
+        name: "refuses adding a project while the sandbox is on",
+        operations: [{ op: "set", path: ["projects", 1], value: ["/test", { workspaces: [] }] }],
+        refused: true,
+      },
+      {
+        name: "refuses removing a project while the sandbox is on",
+        config: projectOnlyConfig,
+        operations: [{ op: "set", path: ["projects"], value: [projectOnlyConfig.projects[0]] }],
+        refused: true,
+      },
+      {
+        name: "allows adding a project while no sandbox is on",
+        config: { projects: [["/test/proj", { workspaces: [] }]] },
+        operations: [{ op: "set", path: ["projects", 1], value: ["/test", { workspaces: [] }] }],
         refused: false,
       },
       {

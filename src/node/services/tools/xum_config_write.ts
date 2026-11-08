@@ -101,7 +101,8 @@ function agentSandboxOnIn(document: unknown): boolean {
 
 /**
  * Whether `next` changes agentSandbox by value, globally or in any project (added, edited or
- * removed), or, while it is on anywhere, adds a workspace row or changes a row's bindings.
+ * removed), or, while it is on anywhere, adds or removes a project, adds a workspace row or
+ * changes a row's bindings.
  */
 function changesAgentSandbox(current: unknown, next: unknown): boolean {
   if (!isDeepStrictEqual(agentSandboxOf(current), agentSandboxOf(next))) return true;
@@ -111,6 +112,9 @@ function changesAgentSandbox(current: unknown, next: unknown): boolean {
     if (!isDeepStrictEqual(before.get(key) ?? [], after.get(key) ?? [])) return true;
   }
   if (!agentSandboxOnIn(current)) return false;
+  // Which project a workspace or sub-project falls under (Config derives parentage from the
+  // registered paths) picks its setting, so the set of projects stays fixed too.
+  if (!isDeepStrictEqual(new Set(before.keys()), new Set(after.keys()))) return true;
   const known = workspaceBindings(current);
   return workspaceBindings(next).some(
     (row) => !known.some((candidate) => isDeepStrictEqual(row, candidate))
@@ -147,8 +151,8 @@ async function rewriteConfigDocument(
     return {
       success: false,
       error:
-        "Refusing to change agentSandbox, or while it is on, to add a workspace or change " +
-        "a workspace's id, path, projects or runtime. Only the user can change them.",
+        "Refusing to change agentSandbox, or while it is on, to add or remove a project, add a " +
+        "workspace or change a workspace's id, path, projects or runtime. Only the user can change them.",
     };
   }
 
