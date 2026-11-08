@@ -14,6 +14,16 @@ const { Dialog, DialogOverlay } = require("./Dialog?real=1") as typeof DialogMod
 
 let cleanupDom: (() => void) | null = null;
 
+beforeEach(() => {
+  cleanupDom = installDom();
+});
+
+afterEach(() => {
+  cleanup();
+  cleanupDom?.();
+  cleanupDom = null;
+});
+
 /**
  * isDialogOpen() against the REAL shared Dialog primitives. Radix puts no aria-modal on dialog
  * content, so the guard must recognise an open modal by its overlay; the Radix Portal does not
@@ -21,16 +31,6 @@ let cleanupDom: (() => void) | null = null;
  * covered by the Dialog and Popover story plays.
  */
 describe("isDialogOpen with the shared Dialog primitives", () => {
-  beforeEach(() => {
-    cleanupDom = installDom();
-  });
-
-  afterEach(() => {
-    cleanup();
-    cleanupDom?.();
-    cleanupDom = null;
-  });
-
   test("detects an open modal dialog whose content carries no aria-modal", () => {
     const view = render(
       <Dialog open>
@@ -120,16 +120,6 @@ describe("isDialogOpen with the shared Dialog primitives", () => {
  * the patch leaves moves within a tap slop alone.
  */
 describe("touch moves inside an open modal dialog", () => {
-  beforeEach(() => {
-    cleanupDom = installDom();
-  });
-
-  afterEach(() => {
-    cleanup();
-    cleanupDom?.();
-    cleanupDom = null;
-  });
-
   function touchOn(target: Element, type: string, x: number, y: number): TouchEvent {
     const point = new window.Touch({ identifier: 1, target, clientX: x, clientY: y });
     const event = new window.TouchEvent(type, {
