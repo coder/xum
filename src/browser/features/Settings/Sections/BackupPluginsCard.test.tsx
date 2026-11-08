@@ -255,6 +255,24 @@ describe("BackupPluginsCard", () => {
     expect(reviews).toEqual([]);
   });
 
+  test("offers no review of a plugin from an ssh source, and says to add it by hand", () => {
+    const view = renderCard(
+      reportOf([
+        row("alpha", "missing"),
+        row("beta", "missing", { url: "ssh://git@attacker.example/beta.git" }),
+        row("gamma", "missing", { url: "git@attacker.example:gamma.git" }),
+        row("delta", "installed", { url: "git@github.com:example/delta.git" }),
+      ])
+    );
+
+    expect(view.getByRole("button", { name: /Review and install \(1\)/ })).toBeTruthy();
+    const badges = view
+      .getAllByRole("listitem")
+      .map((item) => item.querySelectorAll("span")[1]?.textContent);
+    expect(badges).toEqual(["Not installed", "Add it yourself", "Add it yourself", "Installed"]);
+    expect(view.getByText(/add its repository yourself/)).toBeTruthy();
+  });
+
   test("explains a name in use only when a plugin has one", () => {
     const withConflict = renderCard(reportOf([row("gamma", "conflict")]));
     expect(withConflict.getByText(/is not offered/)).toBeTruthy();
@@ -286,6 +304,39 @@ describe("reviewBackedUpPlugins", () => {
     expect(entries.map((entry) => entry.name)).toEqual(["alpha", "delta"]);
     expect(entries.some((entry) => "status" in entry)).toBe(false);
     expect(opened).toBe(1);
+  });
+
+  test("hands over no plugin from an ssh or scp source", () => {
+    let opened = 0;
+
+    reviewBackedUpPlugins({
+      report: reportOf([
+        row("alpha", "missing"),
+        row("beta", "missing", { url: "ssh://git@attacker.example/beta.git" }),
+        row("gamma", "missing", { url: "git@attacker.example:gamma.git" }),
+        row("delta", "missing", { url: "http://attacker.example/delta.git" }),
+      ]),
+      enabled: true,
+      openPlugins: () => opened++,
+    });
+
+    const intent = consumePendingPluginsSectionIntent();
+    const entries = intent?.type === "install-from-backup" ? intent.entries : [];
+    expect(entries.map((entry) => entry.name)).toEqual(["alpha"]);
+    expect(opened).toBe(1);
+  });
+
+  test("opens nothing when every missing plugin comes from an ssh source", () => {
+    let opened = 0;
+
+    reviewBackedUpPlugins({
+      report: reportOf([row("beta", "missing", { url: "git@attacker.example:beta.git" })]),
+      enabled: true,
+      openPlugins: () => opened++,
+    });
+
+    expect(consumePendingPluginsSectionIntent()).toBeNull();
+    expect(opened).toBe(0);
   });
 
   test("does nothing while a backup action runs", () => {
