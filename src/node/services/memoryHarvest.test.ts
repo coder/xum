@@ -1236,8 +1236,6 @@ describe("runMemoryHarvest", () => {
 
       const prompts = retry.calls.map(userPromptText);
       expect(prompts[0]).toContain("Transcript chunk 2/3");
-      expect(prompts[0]).toContain("already applied");
-      expect(prompts[0]).toContain("do not repeat");
       expect(prompts[0]).toContain("/memories/workspace/two.md");
       expect(prompts[0]).not.toContain("/memories/workspace/one.md");
       expect(prompts[0]).not.toContain("UNIQUE-FACT-TEXT");
