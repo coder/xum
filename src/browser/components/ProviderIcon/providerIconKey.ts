@@ -29,6 +29,21 @@ const RUNTIME_DEFAULT_PORTS = new Map<string, LocalRuntimeIconKey>([
 
 const LOCAL_HOST_SUFFIXES = [".localhost", ".local", ".lan", ".internal", ".home.arpa", ".ts.net"];
 
+// [first octet, second octet min, second octet max]; 100.64/10 is CGNAT, which Tailscale uses.
+const PRIVATE_IPV4_RANGES: ReadonlyArray<readonly [number, number, number]> = [
+  [0, 0, 255],
+  [10, 0, 255],
+  [127, 0, 255],
+  [100, 64, 127],
+  [169, 254, 254],
+  [172, 16, 31],
+  [192, 168, 168],
+];
+
+function isInIPv4Range(a: number, b: number, range: readonly [number, number, number]): boolean {
+  return a === range[0] && b >= range[1] && b <= range[2];
+}
+
 function isPrivateIPv4(hostname: string): boolean {
   const match = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(hostname);
   if (match == null) {
@@ -36,15 +51,7 @@ function isPrivateIPv4(hostname: string): boolean {
   }
   const a = Number(match[1]);
   const b = Number(match[2]);
-  return (
-    a === 127 ||
-    a === 10 ||
-    hostname === "0.0.0.0" ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 169 && b === 254) ||
-    (a === 100 && b >= 64 && b <= 127)
-  );
+  return PRIVATE_IPV4_RANGES.some((range) => isInIPv4Range(a, b, range));
 }
 
 function isLocalNetworkHost(rawHostname: string): boolean {
@@ -89,22 +96,21 @@ export function resolveProviderIconKey(
   const url = parseBaseUrl(config);
   const names = [provider, config?.displayName].filter(Boolean).join(" ").toLowerCase();
   const haystack = [names, url?.hostname.toLowerCase()].filter(Boolean).join(" ");
+  return matchRuntimeName(haystack) ?? classifyEndpoint(url, names);
+}
 
-  for (const [pattern, key] of RUNTIME_NAME_PATTERNS) {
-    if (pattern.test(haystack)) {
-      return key;
-    }
-  }
+function matchRuntimeName(haystack: string): LocalRuntimeIconKey | undefined {
+  return RUNTIME_NAME_PATTERNS.find(([pattern]) => pattern.test(haystack))?.[1];
+}
 
+/** Fallback once no runtime name matched: a runtime's unique default port, then local vs custom. */
+function classifyEndpoint(url: URL | null, names: string): ProviderIconKey {
   const portKey = url != null ? RUNTIME_DEFAULT_PORTS.get(url.port) : undefined;
   if (portKey != null) {
     return portKey;
   }
-
-  if ((url != null && isLocalNetworkHost(url.hostname)) || names.includes("local")) {
-    return "local";
-  }
-  return "custom";
+  const isLocalHost = url != null && isLocalNetworkHost(url.hostname);
+  return isLocalHost || names.includes("local") ? "local" : "custom";
 }
 
 export function isBrandIconKey(key: ProviderIconKey): key is BrandIconKey {
