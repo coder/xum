@@ -1750,7 +1750,12 @@ describe("runMemoryHarvest", () => {
       // tool error instead of ending the stream, and the model's next step retries the command.
       const { model, calls } = scriptedModel([
         [
-          { type: "tool-call", toolCallId: "call-cut", toolName: "memory", input: '{"command":"cre' },
+          {
+            type: "tool-call",
+            toolCallId: "call-cut",
+            toolName: "memory",
+            input: '{"command":"cre',
+          },
           lengthFinishChunk(1),
         ],
         [

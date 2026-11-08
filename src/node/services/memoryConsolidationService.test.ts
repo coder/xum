@@ -2944,8 +2944,12 @@ describe("MemoryConsolidationService", () => {
       // stream was billed.
       await fsPromises.mkdir(path.join(fixture.xumHome, "memory-consolidation.json"));
 
-      await expect(fixture.service.maybeRun("ws-dream", "manual")).rejects.toThrow();
+      const failure = await fixture.service.maybeRun("ws-dream", "manual").then(
+        () => undefined,
+        (error: unknown) => error
+      );
 
+      expect(failure).toBeInstanceOf(Error);
       expect(recorded).toEqual(["ws-dream"]);
     });
 
