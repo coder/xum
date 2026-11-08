@@ -8,9 +8,7 @@ function syncViewportHeight(): void {
   // opens or closes. A height read from innerHeight on a resize while it was up stuck, and left a
   // blank band under the shell after it closed. Height times scale ignores pinch zoom.
   const height =
-    viewport != null && viewport.height > 0
-      ? Math.round(viewport.height * viewport.scale)
-      : window.innerHeight;
+    viewport != null ? Math.round(viewport.height * viewport.scale) : window.innerHeight;
   document.documentElement.style.setProperty(APP_VIEWPORT_HEIGHT_PROPERTY, `${height}px`);
   // To reveal the focused field over the keyboard iOS scrolls the window, which moved the whole
   // shell up and hid the header. The shell now fits above the keyboard, so undo that scroll
@@ -18,6 +16,37 @@ function syncViewportHeight(): void {
   if (window.scrollY !== 0 && (viewport == null || viewport.scale === 1)) {
     window.scrollTo(0, 0);
   }
+}
+
+/**
+ * iOS reports a visual viewport height of -33554432 after the iPhone Duo folds, until the app
+ * restarts, and Floating UI sizes every popper's collision viewport from it, so poppers open pinned
+ * to the top of the screen.
+ */
+function installVisualViewportHeightFix(): () => void {
+  const viewport = window.visualViewport;
+  if (viewport == null) return () => undefined;
+  const nativeHeight = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(viewport) as object,
+    "height"
+  )?.get;
+  if (nativeHeight == null) return () => undefined;
+  try {
+    Object.defineProperty(viewport, "height", {
+      configurable: true,
+      get: () => {
+        const height = nativeHeight.call(viewport) as number;
+        return height > 0 ? height : window.innerHeight;
+      },
+    });
+  } catch (error) {
+    // main.tsx calls this before React mounts, and startup must never fail on it.
+    console.error("Viewport height sync: could not correct the visual viewport height", error);
+    return () => undefined;
+  }
+  return () => {
+    Reflect.deleteProperty(viewport, "height");
+  };
 }
 
 /**
@@ -31,6 +60,7 @@ export function installViewportHeightSync(): () => void {
     return () => undefined;
   }
 
+  const removeVisualViewportHeightFix = installVisualViewportHeightFix();
   syncViewportHeight();
   window.addEventListener("resize", syncViewportHeight);
   window.visualViewport?.addEventListener("resize", syncViewportHeight);
@@ -67,6 +97,7 @@ export function installViewportHeightSync(): () => void {
     observer?.disconnect();
     viewportBox.remove();
     document.documentElement.style.removeProperty(APP_VIEWPORT_HEIGHT_PROPERTY);
+    removeVisualViewportHeightFix();
   };
 }
 
