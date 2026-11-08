@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,16 @@ reads.write_text('x' * count)
 if str(count) == os.environ.get('WATCH_DATE_FAILS_AT'):
     sys.exit('date: clock unavailable')
 print(pathlib.Path(os.environ['WATCH_CLOCK']).read_text())
+"""
+# A jq that runs the real one, except for the classify call (the one with --arg mode) when
+# WATCH_JQ_FAKE_STDERR is set: that call prints the fake text and exits 5, as jq does for an error.
+JQ = """
+import os, sys
+fake = os.environ.get('WATCH_JQ_FAKE_STDERR')
+if fake and '--arg' in sys.argv and 'mode' in sys.argv:
+    print(fake, file=sys.stderr)
+    sys.exit(5)
+os.execv(os.environ['WATCH_REAL_JQ'], ['jq'] + sys.argv[1:])
 """
 
 
@@ -449,6 +460,21 @@ class WatchPrStateTest(unittest.TestCase):
                 self.assertIn("Could not classify the GitHub response", result.stderr)
                 self.assertNotIn("jq: error", result.stderr)
                 self.assert_no_hostile_text(result)
+
+    def test_only_messages_that_start_with_the_scripts_prefix_survive_the_jq_filter(self):
+        stub = self.directory / "jq"
+        stub.write_text(f"#!{sys.executable}\n{JQ}")
+        stub.chmod(0o755)
+        env = {"WATCH_REAL_JQ": shutil.which("jq")}
+        # Older jq quotes up to about 26 characters of a value, so a quoted value could carry
+        # the prefix. It must not pass the filter when it is not at the start of the message.
+        quoted = f'jq: error (at <stdin>:1): Cannot iterate over string ("watch_pr_state: {HOSTILE}...")'
+        result = self.assert_watch(2, [reply(checked(101, [check()]))], "101", WATCH_JQ_FAKE_STDERR=quoted, **env)
+        self.assert_no_hostile_text(result)
+        self.assertIn("Could not classify the GitHub response", result.stderr)
+        own = "jq: error (at <stdin>:1): watch_pr_state: PR #101: unknown state DRAFTED"
+        result = self.assert_watch(2, [reply(checked(101, [check()]))], "101", WATCH_JQ_FAKE_STDERR=own, **env)
+        self.assertIn(own, result.stderr)
 
     def test_deadline_ends_the_watch_before_the_next_poll_would_pass_it(self):
         self.assert_watch(3, [reply(queued(101, "QUEUED"))] * 4, "101", "--queue", "--deadline-mins", "3")
