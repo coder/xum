@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useState } from "react";
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
+import { MermaidPendingFrame } from "@/browser/features/Messages/MermaidPendingFrame";
 import { PAINT_CHECK_WAIT_EVENT } from "@/constants/mermaid";
 import { lightweightMeta, PIXEL_DISABLED } from "./meta.js";
 
@@ -10,10 +11,12 @@ import { lightweightMeta, PIXEL_DISABLED } from "./meta.js";
  * them, and it requires each one to fail with its expected message (or to pass). Without them,
  * deleting a guard from the runner would leave every real paint-check story green.
  *
- * Not covered: the runner's count of drawn diagrams against frames (a frame that never draws and
- * shows no error marker). A story for it would wait the runner's whole render timeout on every CI
- * run. The runner also never checks a diagram that mounts after its wait has returned, so no
+ * Not covered: a diagram that mounts after the runner's wait has returned is not checked, so no
  * fixture mounts one that late.
+ *
+ * The fixture run sets a short render timeout for the runner (PAINT_CHECK_RENDER_TIMEOUT_ENV in
+ * src/constants/mermaid.ts), so the story whose frame never draws does not wait the runner's whole
+ * default.
  *
  * - "!test" keeps them out of the default `make test-storybook` run.
  * - The paint-fixture tag lets `--includeTags` pick them, and the WebKit step excludes it.
@@ -67,6 +70,24 @@ function MountWhenRunnerWaits(props: { children: React.ReactNode }) {
  */
 export const BrokenChartNextToGoodChart: Story = {
   render: () => <Page content={[GOOD_CHART, BROKEN_CHART, TEXT_AFTER].join("\n\n")} />,
+};
+
+/**
+ * MUST FAIL with "must show a rendered Mermaid diagram". One diagram draws. The other frame is the
+ * pending placeholder that Mermaid shows before it draws, and it never draws or shows an error
+ * marker, as when a render never finishes. The runner waits until every frame has a drawing, so
+ * only its count of drawn diagrams against frames can fail this story: a wait that stopped at the
+ * first drawing would pass it.
+ */
+export const DiagramNextToAFrameThatNeverDraws: Story = {
+  render: () => (
+    <div className="bg-background min-h-screen p-4">
+      <div style={{ width: 600 }}>
+        <MarkdownRenderer content={[GOOD_CHART, TEXT_AFTER].join("\n\n")} />
+        <MermaidPendingFrame />
+      </div>
+    </div>
+  ),
 };
 
 /**

@@ -14,6 +14,7 @@ import {
   MERMAID_ERROR_SELECTOR,
   MERMAID_PAGE_DIAGRAM_SELECTOR,
   MERMAID_PAGE_FRAME_SELECTOR,
+  PAINT_CHECK_RENDER_TIMEOUT_ENV,
   PAINT_CHECK_WAIT_EVENT,
 } from "../src/constants/mermaid";
 
@@ -774,7 +775,12 @@ async function assertLiveLineClearsTheComposer(page: StoryPage) {
 // its new text in scripts/check-paint-check-fixtures.ts.
 const PAINT_CHECK_TAG = "paint-check";
 const NO_DIAGRAM_MESSAGE = `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`;
-const DIAGRAM_RENDER_TIMEOUT_MS = 15_000;
+const DEFAULT_DIAGRAM_RENDER_TIMEOUT_MS = 15_000;
+// The fixture run shortens this (scripts/check-paint-check-fixtures.ts), so the fixture with a frame
+// that never draws fails without the default wait. A real run leaves the variable unset.
+const requestedRenderTimeoutMs = Number(process.env[PAINT_CHECK_RENDER_TIMEOUT_ENV]);
+const DIAGRAM_RENDER_TIMEOUT_MS =
+  requestedRenderTimeoutMs > 0 ? requestedRenderTimeoutMs : DEFAULT_DIAGRAM_RENDER_TIMEOUT_MS;
 
 interface Box {
   left: number;

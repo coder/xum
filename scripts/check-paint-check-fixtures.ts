@@ -16,9 +16,14 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { PAINT_CHECK_RENDER_TIMEOUT_ENV } from "../src/constants/mermaid";
 
 const FIXTURE_TAG = "paint-fixture";
 const FIXTURE_FILE = "src/browser/stories/PaintCheckFixtures.stories.tsx";
+
+// The fixture with a frame that never draws waits this long for it. The other fixtures render in
+// well under a second, so the margin is wide, and a real run waits the runner's default instead.
+const FIXTURE_RENDER_TIMEOUT_MS = 5_000;
 
 // The runner's viewport check fails a diagram that is off screen, hidden, covered or clipped.
 const VIEWPORT_CHECK_MESSAGE = "must change pixels inside its box";
@@ -30,6 +35,7 @@ const VIEWPORT_CHECK_MESSAGE = "must change pixels inside its box";
  */
 export const FIXTURES: ReadonlyMap<string, string | null> = new Map([
   ["BrokenChartNextToGoodChart", "must show a rendered Mermaid diagram"],
+  ["DiagramNextToAFrameThatNeverDraws", "must show a rendered Mermaid diagram"],
   ["DiagramOutsideTheViewport", VIEWPORT_CHECK_MESSAGE],
   ["DiagramInHiddenParent", VIEWPORT_CHECK_MESSAGE],
   ["DiagramUnderAnOverlay", VIEWPORT_CHECK_MESSAGE],
@@ -113,6 +119,26 @@ export function fixtureProblems(report: unknown): string[] {
   return problems;
 }
 
+/** What spawnSync returns. A process that never started has no output: Node leaves it null or unset. */
+export interface RunResult {
+  status: number | null;
+  signal: string | null;
+  error?: Error;
+  stdout?: string | null;
+  stderr?: string | null;
+}
+
+const outputOf = (run: RunResult) => `${run.stdout ?? ""}${run.stderr ?? ""}`;
+
+/** Why a run left no report. A run that never started has no exit status, only an error. */
+export function noReportMessage(run: RunResult): string {
+  const ending: string[] = [];
+  if (run.error) ending.push(`error: ${run.error.message}`);
+  if (run.signal) ending.push(`signal ${run.signal}`);
+  if (run.status !== null) ending.push(`exit ${run.status}`);
+  return `test-storybook wrote no readable report (${ending.join(", ") || "no exit status"}):\n${outputOf(run)}`;
+}
+
 function main(): number {
   // From the environment, not a flag: Make passes it on without a shell reading its characters.
   const url = process.env.STORYBOOK_URL || "http://127.0.0.1:6006";
@@ -139,19 +165,25 @@ function main(): number {
         ],
         ...["--json", "--outputFile", reportFile, FIXTURE_FILE],
       ],
-      { encoding: "utf8", timeout: 5 * 60_000 }
+      {
+        encoding: "utf8",
+        timeout: 5 * 60_000,
+        env: {
+          ...process.env,
+          [PAINT_CHECK_RENDER_TIMEOUT_ENV]: String(FIXTURE_RENDER_TIMEOUT_MS),
+        },
+      }
     );
-    const log = `${run.stdout}${run.stderr}`;
     let report: unknown;
     try {
       report = JSON.parse(readFileSync(reportFile, "utf8"));
     } catch {
-      console.error(`test-storybook wrote no readable report (exit ${run.status}):\n${log}`);
+      console.error(noReportMessage(run));
       return 1;
     }
     const problems = fixtureProblems(report);
     if (problems.length > 0) {
-      console.error(`${problems.join("\n\n")}\n\nThe runner's output:\n${log}`);
+      console.error(`${problems.join("\n\n")}\n\nThe runner's output:\n${outputOf(run)}`);
       return 1;
     }
     console.log(`Paint-check fixtures: all ${FIXTURES.size} failed or passed as expected.`);
