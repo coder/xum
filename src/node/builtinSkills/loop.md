@@ -62,7 +62,7 @@ Do not use background dispatch to hide an unbounded polling loop — record the 
 When the loop's purpose is to wake only when a condition changes, read `background-monitors` and choose based on the signal source:
 
 - If the condition is a complete line from one long-running shell command (dev server ready, watch-test failure, log panic), use `bash({ run_in_background: true, monitor: ... })`. A monitored process also wakes the owner when it settles (exit, kill, timeout) — unless `wake_on_exit: false`, the monitor was retired by `max_events`, or the task was explicitly cancelled via `task_stop` — so a watcher that dies without matching cannot strand the loop.
-- If the condition requires polling external state with repeated commands/API calls (CI finished, mergeability changed, review arrived, deployment became healthy), use a bounded background task or workflow that performs the polling internally and completes with a report. If a bounded watcher script already prints one line per state change and exits on final states (for example `./scripts/watch_pr_state.sh`), `bash({ run_in_background: true, monitor: ... })` on that script works too, on a checkout you trust.
+- If the condition requires polling external state with repeated commands/API calls (CI finished, mergeability changed, review arrived, deployment became healthy), use a bounded background task or workflow that performs the polling internally and completes with a report.
 
 Use raw `bash(run_in_background=true)` without `monitor` only when you plan to explicitly retrieve output with `task_await`; it will not wake the parent just because it prints output or exits.
 

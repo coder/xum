@@ -17,13 +17,13 @@ Xum wakes the owning workspace (the one that launched the task or process) in th
 
 Use `bash({ run_in_background: true, monitor: { filter: "FAILED|ERROR", max_events: 1 } })` for line-oriented shell output watchers such as dev servers, watch tests, and log tails. The process keeps running; Xum wakes the owner with the matched lines, and the owner should call `task_await` only if it needs surrounding/full output.
 
-State polling that is not naturally a single process output stream (CI checks, mergeability, PR reviews, deployments, queue state) goes to `bash.monitor` only when a bounded watcher script prints its state changes (see the rules for `bash.monitor`). Otherwise use background `task({ run_in_background: true, ... })` or `workflow_run({ run_in_background: true, ... })`.
+Use background `task({ run_in_background: true, ... })` or `workflow_run({ run_in_background: true, ... })` for state polling that is not naturally a single process output stream, such as CI checks, mergeability, PR reviews, deployments, and queue state.
 
 ### Wake timing
 
 A monitored `bash` wake never interrupts a turn. Xum sends it as a new turn only when the owner is idle, so an owner that is still mid-turn gets it after the turn ends, however long ago the line matched. A sub-agent task's report or an `agent_report` update is different: by default it ends a busy owner's turn at the next tool boundary and moves a running foreground `bash` to the background.
 
-A sub-agent that waits on a raw `bash.monitor` cannot sit idle waiting for its wake, because its final message is its terminal report. A wake that arrives after that report restarts the sub-agent with a new turn. A sub-agent waits in the foreground instead: a bounded foreground `bash` that runs the watcher until its final line (set `timeout_secs` at least 300 s above the watcher's own deadline: the foreground default is 60 s, and the watcher can run past its deadline by one last read), or `task_await` on the background process. If Xum moves the foreground watcher to the background (its result starts with "Process sent to background"), keep waiting on it with `task_await` until its final line, and start no second watcher. A sub-agent stops its monitors with `task_stop` before its final report.
+A sub-agent that waits on a raw `bash.monitor` cannot sit idle waiting for its wake, because its final message is its terminal report. A wake that arrives after that report restarts the sub-agent with a new turn. A sub-agent waits in the foreground instead: a bounded foreground `bash` that runs the watcher until its final line (set `timeout_secs` at least 300 s above the watcher's own deadline: the foreground default is 60 s, and the watcher can run past its deadline by one last read), or `task_await` on the background process. If Xum moves the foreground watcher to the background (its result starts with "Process sent to background"), keep waiting on it with `task_await` until its final line, and start no second watcher. Run watcher scripts only on a checkout you trust. A sub-agent stops its monitors with `task_stop` before its final report.
 
 ## Monitor contract
 
@@ -40,7 +40,7 @@ Every monitor must be bounded and idempotent. Before launching one, define:
 
 ### Raw bash output monitor
 
-Use raw background `bash` with `monitor` when the condition is a complete line printed by one long-running shell process: dev servers becoming ready, watch-test failures, compiler errors, log-tail panics, benchmark failures, state-change lines of a bounded watcher script, or other stdout/stderr signals.
+Use raw background `bash` with `monitor` when the condition is a complete line printed by one long-running shell process: dev servers becoming ready, watch-test failures, compiler errors, log-tail panics, benchmark failures, or other stdout/stderr signals.
 
 ```ts
 bash({
@@ -61,7 +61,7 @@ Rules for `bash.monitor`:
 - Keep the regex specific enough to avoid wake storms; use `max_events` for noisy logs.
 - Treat matched lines as a wake signal, not full context; call `task_await({ task_ids: ["bash:<id>"], timeout_secs: 0 })` only when you need surrounding output.
 - A monitored process wakes the owner at settlement (exit, kill, timeout) even if the filter never matched, so a watcher script that dies unexpectedly cannot strand the agent. Pass `wake_on_exit: false` only when the exit itself is genuinely uninteresting. Monitors retired by `max_events` stop watching entirely and do not exit-wake, and explicit cancellation (`task_stop`, terminate without flush, workspace cleanup) deliberately produces no settlement wake — do not stop a task and then wait on its wake.
-- Use `bash.monitor` for GitHub checks, mergeability, review state, queue state, deploy APIs, or any other state that needs repeated polling commands only on a bounded watcher script. The script polls internally, prints one line per state change, and exits on every final state, like `./scripts/watch_pr_state.sh <pr> [--queue]` in the xum repo. Filter on `^RESULT ` and set `wake_on_exit: false`: that script ends with a `RESULT` line that holds only PR numbers and state names, so the wake carries only that line and not the remote check names the script prints before it. Set `timeout_secs` above the script's own deadline by the margin in Wake timing, because a process that is killed first wakes no one. Run watcher scripts only on a checkout you trust. Do not point a monitor at a bare `gh` call or an unbounded loop. For state with no such script, use a background task/workflow monitor.
+- Do not use `bash.monitor` for GitHub checks, mergeability, review state, deploy APIs, or any state that requires polling separate commands. Use a background task/workflow monitor for those.
 
 ### Ad-hoc task monitor
 
