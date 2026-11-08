@@ -6,7 +6,7 @@
 // bun test ./scripts/ci/downloadVerified.test.ts
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { runScript, type RunResult } from "./runScript";
@@ -132,6 +132,29 @@ describe("download-verified.sh", () => {
     expect(requests).toEqual(["/missing"]);
     expect(await destDirEntries()).toEqual([]);
   });
+
+  // Stock macOS has no sha256sum: the script falls back to shasum.
+  const SHELL_TOOLS = ["bash", "env", "dirname", "basename", "mkdir", "mktemp", "mv", "rm"];
+  const TOOLS_WITHOUT_SHA256SUM = [...SHELL_TOOLS, "cut", "curl", "shasum", "sleep"];
+  const hasToolsForNoSha256sum = TOOLS_WITHOUT_SHA256SUM.every((tool) => Bun.which(tool) !== null);
+
+  test.skipIf(!hasToolsForNoSha256sum)(
+    "checks the download with shasum when the host has no sha256sum",
+    async () => {
+      const bin = path.join(work, "bin-without-sha256sum");
+      await mkdir(bin);
+      for (const tool of TOOLS_WITHOUT_SHA256SUM) {
+        await symlink(Bun.which(tool) ?? "", path.join(bin, tool));
+      }
+      const env = { PATH: bin, DOWNLOAD_BACKOFF_SECS: "0", DOWNLOAD_BUDGET_SECS: "30" };
+      const fresh = await runScript([DOWNLOAD, url("/ok"), BODY_SHA256, dest], { cwd: work, env });
+      expect(fresh.exitCode).toBe(0);
+      expect(await readFile(dest, "utf8")).toBe(BODY);
+      const again = await runScript([DOWNLOAD, url("/ok"), BODY_SHA256, dest], { cwd: work, env });
+      expect(again.stdout).toContain("no download");
+      expect(requests).toEqual(["/ok"]);
+    }
+  );
 
   test("refuses a download that does not match and leaves nothing behind", async () => {
     const result = await download("/ok", "0".repeat(64));

@@ -7,9 +7,12 @@
 #   --max-backoff-secs <n>  Double the wait after each failure, up to n seconds. Without
 #                           this option every wait is backoff_secs.
 #   --budget-secs <n>       Give up when the next wait would end more than n seconds after
-#                           the first try started. A fixed count of tries cannot outlast an
-#                           outage: github.com release downloads answered 504 for more than
-#                           7 minutes on 2026-11-08, and `curl --retry 5` waits about 30 s.
+#                           the first try started, and cut a running try off when the budget
+#                           ends (with GNU `timeout`, or `gtimeout`; a host with neither, such
+#                           as stock macOS, lets a try run to its own end). A fixed count of
+#                           tries cannot outlast an outage: github.com release downloads
+#                           answered 504 for more than 7 minutes on 2026-11-08, and
+#                           `curl --retry 5` waits about 30 s.
 #   --fatal-status <n>      Give up at once when the command exits with n (repeatable), for
 #                           a failure that another try cannot change, such as an HTTP 404.
 # Exit status: 0 when the command succeeded, 1 when the retries ended.
@@ -53,6 +56,17 @@ if [[ "$max_attempts" -eq 0 && -z "$budget" ]]; then
   exit 2
 fi
 
+# The command that cuts a try off at the budget, if the host has one.
+cutoff=""
+if [[ -n "$budget" ]]; then
+  for candidate in timeout gtimeout; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      cutoff=$candidate
+      break
+    fi
+  done
+fi
+
 start=$SECONDS
 wait_secs=$backoff_secs
 attempt=0
@@ -63,7 +77,16 @@ while true; do
   else
     echo "::group::Attempt $attempt of $max_attempts"
   fi
-  if "$@"; then
+  run=("$@")
+  if [[ -n "$cutoff" ]]; then
+    remaining=$((budget - (SECONDS - start)))
+    if [[ "$remaining" -lt 1 ]]; then
+      remaining=1
+    fi
+    # -k: a command that ignores the TERM at the budget is killed 5 s later.
+    run=("$cutoff" -k 5 "$remaining" "$@")
+  fi
+  if "${run[@]}"; then
     echo "::endgroup::"
     exit 0
   else

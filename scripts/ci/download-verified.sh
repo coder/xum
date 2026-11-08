@@ -27,8 +27,15 @@ if ! [[ "$sha256" =~ ^[0-9a-f]{64}$ ]]; then
 fi
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# sha256sum is GNU coreutils. Stock macOS has shasum instead, and the tests run there too.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+else
+  sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+fi
+
 matches() {
-  printf '%s  %s\n' "$sha256" "$1" | sha256sum -c --status - 2>/dev/null
+  [[ "$(sha256_of "$1" 2>/dev/null)" == "$sha256" ]]
 }
 
 if [[ -f "$dest" ]] && matches "$dest"; then

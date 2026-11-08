@@ -101,6 +101,19 @@ describe("exponential backoff", () => {
     expect(await lines("sleeps")).toEqual(["2", "4", "8"]);
   });
 
+  // GNU `timeout` cuts the try off; a host without it (stock macOS) lets the try finish.
+  test.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
+    "cuts a running try off when the budget ends",
+    async () => {
+      const started = Date.now();
+      const result = await retry(["--budget-secs", "2", "0", "1", "/bin/sleep", "30"]);
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain("exit 124");
+      expect(result.stdout).toContain("2s budget is spent");
+      expect(Date.now() - started).toBeLessThan(10_000);
+    }
+  );
+
   test("gives up at once on a fatal status", async () => {
     const result = await retry([
       "--fatal-status",
