@@ -11,6 +11,11 @@ import type { Config } from "@/node/config";
 import { TaskHandleStore } from "@/node/services/taskHandleStore";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
+import {
+  isolateHostHome,
+  type IsolatedHostHome,
+} from "@/node/services/hostHomeIsolation.testHarness";
+import { __resetFileSinkForTests } from "@/node/services/log";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -49,13 +54,37 @@ import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks"
  *   beforeEach(async () => { rootDir = await createTaskServiceTestRoot(); });
  *   afterEach(async () => { await removeTaskServiceTestRoot(rootDir); });
  * so no mutable state is shared across files; helpers below take the root as a parameter.
+ *
+ * The root also isolates the runtime user's home (HOME, USERPROFILE, XUM_ROOT and os.homedir())
+ * from creation to removal. Every agent-task reservation resolves its agent definition, which
+ * scans the global plugin roots (<XUM_ROOT>/plugins and ~/.agents/plugins). Without the isolation
+ * these tests read, and wait on, the plugins installed on the machine that runs them. At most one
+ * root is live at a time: a root whose removal was skipped is released when the next one is
+ * created, so the os.homedir() spy never nests.
  */
+let isolatedHome: IsolatedHostHome | undefined;
+
+function releaseIsolatedHome(): void {
+  if (isolatedHome === undefined) return;
+  isolatedHome.restore();
+  isolatedHome = undefined;
+  // The log file sink opens at the first log line, inside the isolated home that restore() just
+  // deleted. Drop it so the next log line reopens under the restored home.
+  __resetFileSinkForTests();
+}
+
 export async function createTaskServiceTestRoot(): Promise<string> {
+  releaseIsolatedHome();
+  isolatedHome = isolateHostHome("task-service-host-home");
   return await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-"));
 }
 
 export async function removeTaskServiceTestRoot(rootDir: string): Promise<void> {
-  await fsPromises.rm(rootDir, { recursive: true, force: true });
+  try {
+    await fsPromises.rm(rootDir, { recursive: true, force: true });
+  } finally {
+    releaseIsolatedHome();
+  }
 }
 
 export async function collectFullHistory(service: HistoryService, workspaceId: string) {
