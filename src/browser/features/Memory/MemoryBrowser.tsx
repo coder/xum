@@ -22,10 +22,12 @@ import type {
   MemoryConsolidationRecordPayload,
   MemoryConsolidationStatusPayload,
   MemoryFileInfo,
+  MemoryHarvestRecordPayload,
 } from "@/common/orpc/schemas/memory";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getErrorMessage } from "@/common/utils/errors";
+import { formatCostWithDollar } from "@/common/utils/tokens/usageAggregator";
 import { MemoryFileEditor } from "./MemoryFileEditor";
 
 const SCOPE_LABELS: Record<MemoryScope, string> = {
@@ -502,10 +504,31 @@ function uniqueConsolidationSummaryLines(
   return lines;
 }
 
+/** What a run's steps cost, as priced from the usage each reported; absent in older records. */
+function formatSpent(spentUsd: number | undefined): string {
+  return spentUsd === undefined ? "" : ` · ${formatCostWithDollar(spentUsd)}`;
+}
+
 function formatConsolidationRecord(record: MemoryConsolidationRecordPayload | null): string {
   if (record === null) return "never";
   const appliedCount = record.ops.filter((op) => op.applied).length;
-  return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}`;
+  // Why the run ended before the model finished (the cost ceiling), so a line that reads like a
+  // finished run does not hide a stopped one.
+  const note = record.note === undefined ? "" : ` · ${record.note}`;
+  return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}${formatSpent(record.spentUsd)}${note}`;
+}
+
+function formatHarvestRecord(record: MemoryHarvestRecordPayload | null): string {
+  if (record === null) return "never";
+  // Records written before the analyzer have no `ops`: their counts are inbox candidates, not edits.
+  const counts =
+    record.ops === undefined
+      ? `${record.acceptedCandidates} accepted / ${record.skippedCandidates} skipped`
+      : `${record.acceptedCandidates} edit${record.acceptedCandidates === 1 ? "" : "s"} / ${record.skippedCandidates} rejected`;
+  // Why a completed run read only part of its epoch (its edit budget ran out, or the cost ceiling
+  // stopped it), so a line that says "completed" does not read as "everything analyzed".
+  const note = record.note === undefined ? "" : ` · ${record.note}`;
+  return `${record.status}: ${counts}${formatSpent(record.spentUsd)}${note}`;
 }
 
 /**
@@ -568,9 +591,7 @@ function ConsolidationFooter(props: {
     status?.projectAvailable === false
       ? "unavailable"
       : formatConsolidationRecord(status?.projectRecord ?? null);
-  const harvestLabel = status?.latestHarvestRecord
-    ? `${status.latestHarvestRecord.status}: ${status.latestHarvestRecord.acceptedCandidates} accepted / ${status.latestHarvestRecord.skippedCandidates} skipped`
-    : "never";
+  const harvestLabel = formatHarvestRecord(status?.latestHarvestRecord ?? null);
   const harvestError =
     status?.latestHarvestRecord?.status === "failed" ? status.latestHarvestRecord.error : undefined;
   // One consolidation pass can cover workspace, project, and global memory at
@@ -594,14 +615,17 @@ function ConsolidationFooter(props: {
       >
         {/* Use the shared, portaled tooltip only: a native title duplicates the UI tooltip and ignores z-index. */}
         <div className="text-muted min-w-0 flex-1 space-y-0.5">
-          <div className="counter-nums truncate">
+          {/* Wrap, never truncate: these lines carry the note that a run stopped at the cost
+              ceiling or read only part of its epoch, and a touch screen cannot open the tooltip
+              that would show the rest. */}
+          <div className="counter-nums break-words">
             Workspace: {formatConsolidationRecord(status?.workspaceRecord ?? null)}
           </div>
-          <div className="counter-nums truncate">Project: {projectLabel}</div>
-          <div className="counter-nums truncate">
+          <div className="counter-nums break-words">Project: {projectLabel}</div>
+          <div className="counter-nums break-words">
             Global: {formatConsolidationRecord(status?.globalRecord ?? null)}
           </div>
-          <div className="counter-nums truncate">Harvest: {harvestLabel}</div>
+          <div className="counter-nums break-words">Harvest: {harvestLabel}</div>
           {harvestError !== undefined && (
             <div role="alert" className="text-error truncate">
               Harvest error: {harvestError}

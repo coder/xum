@@ -3833,7 +3833,9 @@ function computeStrReplaceUpdate(
       `No replacement was performed: old_str matches ${occurrences} locations (lines ${lines.join(", ")}) in ${virtualPath}. Provide a longer, unique old_str.`
     );
   }
-  return content.replace(oldStr, newStr);
+  // A replacer function, not the string: `replace` would read `$&`, `$'`, `` $` `` and `$$` in
+  // newStr as patterns and write something other than what the caller sent.
+  return content.replace(oldStr, () => newStr);
 }
 
 function computeInsertUpdate(
