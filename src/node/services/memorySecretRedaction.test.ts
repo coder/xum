@@ -328,6 +328,11 @@ describe("redactSecretLike", () => {
         "curl -H 'Cookie: [redacted]' https://example.com",
       ],
       [
+        "a header in Markdown inline code",
+        `Send \`Cookie: sid=${SESSION}\` with the request.`,
+        "Send `Cookie: [redacted]",
+      ],
+      [
         "a header as a JSON key",
         jsonOf({ headers: { cookie: `sid=${SESSION}; a=b`, host: "example.com" } }),
         '{"headers":{"cookie":"[redacted]","host":"example.com"}}',
@@ -456,6 +461,7 @@ describe("redactSecretLike", () => {
       `The bus is reached with ${SERVICE_BUS}; the key is in the vault.`,
       "Rotate the shared access key every quarter: SharedAccessKeyName stays the same.",
       "Each SharedAccessKey is scoped to one namespace.",
+      "shared_access_key_name=RootManageSharedAccessKey, shared-access-key-name: RootManageSharedAccessKey",
     ].join("\n");
     expect(redactSecretLike(text)).toBe(text);
   });

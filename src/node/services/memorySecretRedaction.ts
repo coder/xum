@@ -23,7 +23,7 @@ export const REDACTION_LOOKAHEAD_CHARS = 512;
 // `AccountKey` is the Azure storage connection string's secret and `SharedAccessKey` the Service Bus
 // and Event Hubs one (its sibling `SharedAccessKeyName` is the policy's name, so it stays readable,
 // as `AccountName` does); a key named `bearer` holds the token.
-const SECRET_NAME = String.raw`(?:api[_-]?key|account[_-]?key|shared[_-]?access[_-]?key(?!name)|secret|token(?!s\b)|bearer|passw(?:or)?d|authorization|credential)`;
+const SECRET_NAME = String.raw`(?:api[_-]?key|account[_-]?key|shared[_-]?access[_-]?key(?![_-]?name)|secret|token(?!s\b)|bearer|passw(?:or)?d|authorization|credential)`;
 // Longest run after the name (`secret_access_key`, `token_endpoint_auth_method`) and widest gap
 // of spaces around the separator that still count. Past these a pair is not recognized.
 const NAME_SUFFIX_MAX = 48;
@@ -110,9 +110,9 @@ const COOKIE_NAME = "(?:Set-)?Cookie";
 // Behind the name: a line start (the text's, a raw line break, or the escape of one: `\n` ends in a
 // letter), with the indent and the marker of a `curl -v` trace (`> Cookie:`, `< Set-Cookie:`) or a
 // list (`- Cookie:`); a quote, which is a JSON key, a `-H "Cookie: ..."` argument, or JSON text in
-// JSON text (`\"Cookie\"`); an object or argument list (`{ cookie: 'a=b' }`, Node's inspect shape);
+// JSON text (`\"Cookie\"`); a Markdown inline-code backtick (a header quoted in prose or a log); an object or argument list (`{ cookie: 'a=b' }`, Node's inspect shape);
 // or an unquoted `-H` / `--header` argument.
-const COOKIE_CONTEXT = String.raw`(?:(?:^|[\r\n]|\\[nr])[ \t]{0,16}(?:[<>*-][ \t]{0,4})?|["'{,][ \t]{0,8}|(?:-H|--header)[ =])`;
+const COOKIE_CONTEXT = String.raw`(?:(?:^|[\r\n]|\\[nr])[ \t]{0,16}(?:[<>*-][ \t]{0,4})?|["'\x60{,][ \t]{0,8}|(?:-H|--header)[ =])`;
 const COOKIE_KEY_QUOTE = String.raw`(?:\\{0,${ESCAPE_RUN_MAX}}["'])`;
 const COOKIE_HEADER_PATTERN = new RegExp(
   String.raw`(${COOKIE_NAME}(?<=${COOKIE_CONTEXT}${COOKIE_NAME})${COOKIE_KEY_QUOTE}?[ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})` +
