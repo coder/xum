@@ -615,6 +615,58 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(physical(fixture, "tainted.md"), "utf-8")).toBe(tainted);
     });
 
+    it("refuses an edit that removes one credential and assembles another, which keeps their count", async () => {
+      using fixture = await createFixture();
+      await fsPromises.mkdir(path.dirname(physical(fixture, "x")), { recursive: true });
+      const swapped = "password: old-secret\nsk-\nABCDEFGHIJKLMNO\n";
+      await fsPromises.writeFile(physical(fixture, "swapped.md"), swapped);
+
+      const result = await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/swapped.md",
+        "password: old-secret\nsk-\n",
+        "sk-",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+
+      expect(result.success).toBe(false);
+      expect(await fsPromises.readFile(physical(fixture, "swapped.md"), "utf-8")).toBe(swapped);
+    });
+
+    it("makes validateMutation refuse the results the guarded write refuses, and only when asked", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/halves.md",
+        "sk-\nABCDEFGHIJKLMNO\npassword:\n",
+        "agent"
+      );
+      const commands = [
+        { command: "create", path: "/memories/global/new.md", file_text: "password: hunter2pw\n" },
+        {
+          command: "str_replace",
+          path: "/memories/global/halves.md",
+          old_str: "sk-\nA",
+          new_str: "sk-A",
+        },
+        {
+          command: "insert",
+          path: "/memories/global/halves.md",
+          insert_line: 3,
+          insert_text: "hunter2pw",
+        },
+      ] as const;
+
+      for (const command of commands) {
+        const guarded = await fixture.service.validateMutation(fixture.ctx, command, GUARDED);
+        expect(guarded.ok ? "accepted" : guarded.error).toContain("credential");
+        expect(await fixture.service.validateMutation(fixture.ctx, command)).toEqual({ ok: true });
+      }
+    });
+
     it("lets one of two concurrent halves-joining edits land and refuses the other, as one lock orders them", async () => {
       // Each edit alone leaves no credential, so a check made before the lock would pass both and
       // the second would write the whole key. Inside the lock the second one sees the first's result.
