@@ -7678,7 +7678,7 @@ describe("WorkspaceMcpOverridesService", () => {
     await fs.writeFile(other, '{ "enabledServers": ["other"] }');
     const realOpen = fsPromisesModule.open;
     const openSpy = spyOn(fsPromisesModule, "open").mockImplementation((...args) =>
-      args[0] === own ? realOpen(other, ...args.slice(1)) : realOpen(...args)
+      args[0] === own ? realOpen(other, args[1], args[2]) : realOpen(...args)
     );
     try {
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
