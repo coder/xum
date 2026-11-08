@@ -27,10 +27,11 @@ export { MCP_STARTUP_TIMEOUT_MS };
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 /**
- * Real time expireStartupDeadline gives a startup to hang before it fails. With fake timers on,
- * the 5 s test limit did not stop a run that waited without this bound (it stayed stuck for over
- * 120 s), so the bound is the only stop for a startup that never hangs. It is long because a host
- * that stalls the process for 20 s must not fail a startup that was only paused.
+ * Real time expireStartupDeadline gives a startup to hang before it fails. A test that awaits the
+ * call directly and keeps the default 5 s limit is marked failed at 5 s, before this bound. The
+ * bound ends what the limit does not: with it disabled, a test that awaited the call inside
+ * `expect(...).rejects` stayed stuck for over 60 s. It is long because a host that stalls the
+ * process for 20 s must not fail a startup that was only paused.
  */
 const STARTUP_HANG_WAIT_MS = 30_000;
 
@@ -191,9 +192,10 @@ export class FakeMcpServers {
       // Wait for the hang itself, not for a number of event-loop turns: the startup path does real
       // I/O before it hangs, and a loaded host ran out of turns first. An operation that ends
       // without hanging fails here with its cause at once. One that is still running after a
-      // bound in real time fails here too, but a test with the default 5 s limit then reports
-      // "timed out after 5000ms" (after the bound): the limit marks the test only when it ends.
-      // The cause text shows in a test that shortens the bound or raises its limit.
+      // bound in real time fails here too. The cause text shows only when the bound ends before
+      // the test's limit: a test that awaits this method directly and keeps the default 5 s limit
+      // is marked "timed out after 5000ms" at 5 s, before the 30 s bound. Shorten
+      // startupHangWaitMs, or raise the limit, to see the cause.
       const bound = realTimeBound(this.startupHangWaitMs);
       let outcome: "hung" | "settled" | "bound";
       try {

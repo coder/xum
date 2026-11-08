@@ -5550,7 +5550,7 @@ describe("MCPServerManager", () => {
   });
 
   test("the startup deadline fires once a connection hangs, however long real I/O delays the hang", async () => {
-    // This test follows the bounded-wait test below on purpose: that one shortens the harness's
+    // This test follows the bounded-wait test above on purpose: that one shortens the harness's
     // real-time bound to 100 ms, and reset() must put it back, or this 400 ms hang fails.
     // The harness waits for the hang itself. It once gave the hang a fixed number of event-loop
     // turns, which a loaded host used up before the startup's real I/O (here a child process that
