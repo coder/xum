@@ -389,6 +389,35 @@ describe("ArtifactViewer renderers", () => {
     forged.port1.close();
   });
 
+  test("a theme change reaches the document over its port, never the frame's window", async () => {
+    const client = createTestApiClient({});
+    const frameIn = (theme: "dark" | "light") => (
+      <ThemeProvider forcedTheme={theme}>
+        <APIProvider client={client}>
+          <SandboxedArtifactFrame
+            workspaceId={null}
+            path="page.html"
+            kind="html"
+            content="<p>hi</p>"
+          />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    const view = render(frameIn("dark"));
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const windowPosts: unknown[] = [];
+    frame.contentWindow!.postMessage = ((message: unknown) => {
+      windowPosts.push(message);
+    }) as Window["postMessage"];
+    const artifact = bootFrameDocument(frame);
+    view.rerender(frameIn("light"));
+    await deliverFrameMessages();
+    expect(windowPosts).toEqual([]);
+    expect(artifact.received).toContainEqual(
+      expect.objectContaining({ xumArtifact: 1, type: "theme", theme: "light" })
+    );
+  });
+
   test("an open announcement from any other window binds nothing", async () => {
     const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
