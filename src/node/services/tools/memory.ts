@@ -194,6 +194,12 @@ export async function executeMemoryCommand(
      * MemoryService.assertNotPinnedForRemoval. Ignored by other commands.
      */
     rejectPinned?: boolean;
+    /**
+     * The harvest analyzer's credential check on the RESULTING file of a create, str_replace or
+     * insert, enforced by MemoryService INSIDE its mutation lock (see MemoryWriteOptions).
+     * Ignored by other commands.
+     */
+    rejectSecretLike?: boolean;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -219,7 +225,8 @@ export async function executeMemoryCommand(
             input.file_text,
             "agent",
             toolCallId,
-            options?.abortSignal
+            options?.abortSignal,
+            { rejectSecretLike: options?.rejectSecretLike }
           ))
         );
       }
@@ -236,7 +243,8 @@ export async function executeMemoryCommand(
             input.new_str ?? "",
             "agent",
             toolCallId,
-            options?.abortSignal
+            options?.abortSignal,
+            { rejectSecretLike: options?.rejectSecretLike }
           ))
         );
       }
@@ -257,7 +265,8 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.expectedTargetFingerprint,
-            options?.abortSignal
+            options?.abortSignal,
+            { rejectSecretLike: options?.rejectSecretLike }
           ))
         );
       }

@@ -529,6 +529,8 @@ export function createConsolidationMemoryTool(args: {
         expectedTargetFingerprint: args.expectedTargetFingerprints?.get(toolCallId),
         abortSignal: args.abortSignal,
         rejectPinned: true,
+        // The pre-check above sees only the new text; this one sees the file the write would leave.
+        rejectSecretLike: args.rejectSecretLike,
       });
       journal.push({
         ...target,

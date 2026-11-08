@@ -548,6 +548,76 @@ describe("consolidation memory tool rails", () => {
       expect(fixture.getMutationCount()).toBe(0);
     });
 
+    it("rejects a credential that two calls assemble, journals the refusal without a value, and leaves the file as it was", async () => {
+      // The first call adds two halves that are harmless alone; the second adds no text at all,
+      // only removes the newline between them. A check on the new text sees nothing in either.
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const halves = "sk-\nABCDEFGHIJKLMNO\n";
+
+      const created = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/global/halves.md",
+        file_text: halves,
+      });
+      const joined = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/halves.md",
+        old_str: "sk-\nABC",
+        new_str: "sk-ABC",
+      });
+
+      expect(created.success).toBe(true);
+      expect(joined.success).toBe(false);
+      if (!joined.success) expect(joined.error).toContain("credential");
+      expect(fixture.journal.map((op) => op.applied)).toEqual([true, false]);
+      expect(fixture.journal[1]?.note).toContain("credential");
+      expect(JSON.stringify(fixture.journal)).not.toContain("ABCDEFGHIJKLMNO");
+      expect(
+        await fsPromises.readFile(path.join(fixture.globalMemoryDir, "halves.md"), "utf-8")
+      ).toBe(halves);
+    });
+
+    it("leaves the dream pass's default guard free to write that join", async () => {
+      // The organizer merges and rewrites whatever memory holds, so it runs without the check.
+      using fixture = await createFixture();
+      await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/global/halves.md",
+        file_text: "sk-\nABCDEFGHIJKLMNO\n",
+      });
+
+      const joined = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/halves.md",
+        old_str: "sk-\nABC",
+        new_str: "sk-ABC",
+      });
+
+      expect(joined.success).toBe(true);
+    });
+
+    it("still edits a file that already holds a credential-like line or a redacted placeholder", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      await fsPromises.writeFile(
+        path.join(fixture.globalMemoryDir, "legacy.md"),
+        "password: hunter2-correct-horse\nnotes\n"
+      );
+      await fsPromises.writeFile(
+        path.join(fixture.globalMemoryDir, "placeholder.md"),
+        "API_TOKEN: [redacted]\nnotes\n"
+      );
+
+      for (const name of ["legacy.md", "placeholder.md"]) {
+        const edited = await execute(fixture.tool, {
+          command: "str_replace",
+          path: `/memories/global/${name}`,
+          old_str: "notes",
+          new_str: "more notes",
+        });
+        expect(edited.success).toBe(true);
+      }
+    });
+
     it("accepts text that only talks about tokens and passwords", async () => {
       using fixture = await createFixture({ guard: { rejectSecretLike: true } });
 
