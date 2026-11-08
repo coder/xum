@@ -6,8 +6,12 @@
  * no chat history, no UI events) whose only tool is a guarded memory tool.
  *
  * Rails live HERE in code, not in the agent prompt:
- * - scope restriction: consolidates workspace + global, plus project when the
- *   run has a single stable project identity
+ * - scope restriction: by default consolidates workspace + global, plus project
+ *   when the run has a single stable project identity; a caller can narrow it
+ *   (`writableScopes`), as the harvest analyzer does to workspace only
+ * - secret check (opt-in): a create/str_replace/insert whose new text holds a
+ *   credential shape is rejected, so a model that copied tool output cannot
+ *   persist it
  * - pin protection: pinned files may be edited, never deleted or renamed —
  *   including via a delete/rename of an ancestor directory (subtree check)
  * - op budget: at most MEMORY_CONSOLIDATION_OP_BUDGET mutating commands per
@@ -32,16 +36,27 @@ import assert from "@/common/utils/assert";
 import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  type MemoryScope,
 } from "@/common/constants/memory";
 import type { MemoryToolResult } from "@/common/types/tools";
-import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
+import {
+  MemoryConsolidationOpSchema,
+  type MemoryConsolidationOp,
+} from "@/common/orpc/schemas/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
-import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import { createSpendMeter } from "@/node/services/memoryDreamSpend";
+import {
+  memoryLogicalKey,
+  type MemoryMetaEntry,
+  type MemoryMetaService,
+} from "@/node/services/memoryMeta";
+import { containsSecretLike, redactSecretLike } from "@/node/services/memorySecretRedaction";
 import { parseMemoryPath, type MemoryScopeContext } from "@/node/services/memoryService";
 import type { MemoryService } from "@/node/services/memoryService";
 import { executeMemoryCommand, type MemoryCommandInput } from "@/node/services/tools/memory";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
 // Re-exported for journal consumers; defined next to the oRPC schema so the
 // wire shape and the node shape can never drift (z.infer single source).
@@ -54,6 +69,10 @@ export interface MemoryConsolidationResult {
   budgetExhausted: boolean;
   /** Token cost of the run; undefined when the provider reported none. */
   usage?: { inputTokens: number; outputTokens: number };
+  /** USD the run's steps cost, as priced from what each reported. */
+  spentUsd: number;
+  /** Set when the cost ceiling ended the run before the model finished: see SpendMeter. */
+  note?: string;
   /**
    * Fatal stream error (provider failure or abort/timeout). When set, the
    * pass did NOT complete — callers must not treat the memory state as
@@ -61,6 +80,14 @@ export interface MemoryConsolidationResult {
    */
   streamError?: string;
 }
+
+/** Scopes a consolidation run can be allowed to modify; the session scope is never one of them. */
+type WritableMemoryScope = Exclude<MemoryScope, "session">;
+
+const CANCELLED_PASS_ERROR = "Consolidation pass was cancelled";
+const DEFAULT_WRITABLE_SCOPES: readonly WritableMemoryScope[] = ["workspace", "global", "project"];
+const LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
+const MUTATING_COMMANDS = MemoryConsolidationOpSchema.shape.command.options;
 
 interface MutationTarget {
   command: MemoryConsolidationOp["command"];
@@ -85,6 +112,20 @@ function classifyMutation(input: MemoryCommandInput): MutationTarget | null {
   }
 }
 
+/** The text a mutating command would add to memory, or null when it adds none (delete, rename). */
+function newTextOf(input: MemoryCommandInput): string | null {
+  switch (input.command) {
+    case "create":
+      return input.file_text ?? null;
+    case "str_replace":
+      return input.new_str ?? null;
+    case "insert":
+      return input.insert_text ?? null;
+    default:
+      return null;
+  }
+}
+
 /**
  * Run-scoped mutation budget. Check + reservation happen in ONE synchronous
  * call (tryConsume): the AI SDK runs parallel tool calls concurrently, so an
@@ -99,8 +140,13 @@ export interface MutationBudget {
   tryConsume(): boolean;
 }
 
-export function createMutationBudget(limit: number): MutationBudget {
-  let used = 0;
+export function createMutationBudget(limit: number, alreadyUsed = 0): MutationBudget {
+  // `alreadyUsed` lets a retry of the same unit of work (an analyzer epoch) resume the budget the
+  // earlier attempt spent instead of getting a fresh one. Only a whole, non-negative count can be
+  // resumed. A negative one would add to the limit (-100 allowed `limit` + 100 mutations) and NaN
+  // would never reach it, so anything else starts the count over: the run still cannot make more
+  // than `limit` mutations.
+  let used = Number.isInteger(alreadyUsed) && alreadyUsed >= 0 ? alreadyUsed : 0;
   return {
     limit,
     used: () => used,
@@ -188,6 +234,148 @@ async function validateMutationForStaging(
   }
 }
 
+/** What one run may do to memory: the options `createConsolidationMemoryTool` resolves for its guard. */
+interface MutationRails {
+  memoryService: MemoryService;
+  metaService: MemoryMetaService;
+  ctx: MemoryScopeContext;
+  writableScopes: readonly WritableMemoryScope[];
+  /** Project memory stays unavailable without a single stable project identity, even when listed. */
+  projectAvailable: boolean;
+  deniedCommands?: ReadonlyArray<MemoryConsolidationOp["command"]>;
+  rejectSecretLike?: boolean;
+}
+
+/** Whether a run may modify `scope`. */
+function isWritableScope(
+  scope: MemoryScope | null,
+  rails: Pick<MutationRails, "writableScopes" | "projectAvailable">
+): boolean {
+  return (
+    scope !== null &&
+    scope !== "session" &&
+    rails.writableScopes.includes(scope) &&
+    (scope !== "project" || rails.projectAvailable)
+  );
+}
+
+function scopeRejection(
+  virtualPath: string,
+  rails: Pick<MutationRails, "writableScopes" | "projectAvailable">
+): string {
+  const modifiable = rails.writableScopes
+    .filter((scope) => scope !== "project" || rails.projectAvailable)
+    .map((scope) => `/memories/${scope}/...`);
+  const projectNote =
+    rails.writableScopes.includes("project") && !rails.projectAvailable
+      ? "project memory is available only for single-project runs; "
+      : "";
+  return `Consolidation may not modify ${virtualPath}: ${projectNote}this run can modify ${LIST_FORMAT.format(modifiable)}.`;
+}
+
+/**
+ * Why a run that rejects credentials may not write what `input` adds, or null when it may. The
+ * note is journaled into the sidecar record, so it never quotes the rejected text.
+ */
+function secretRejection(target: MutationTarget, input: MemoryCommandInput): string | null {
+  const text = newTextOf(input);
+  if (text !== null && containsSecretLike(text)) {
+    return `${target.path} was not changed: the new text contains a credential-like value (a key, token, password or private key). Memory must never hold secrets; say what the credential is for and where it lives, and leave the value out.`;
+  }
+  // A file name is text too: `sk-ant-....md` stores the key in the directory listing. A delete
+  // names an existing file and adds nothing, so it stays open; a rename adds only its new name.
+  const addedName = target.command === "rename" ? target.newPath : target.path;
+  if (target.command !== "delete" && addedName != null && containsSecretLike(addedName)) {
+    return "The path contains a credential-like value, so it was not used. Name the file for what it holds, not for a key, token or password.";
+  }
+  return null;
+}
+
+/**
+ * The note for a denied command. It names what the run may still use rather than describing the
+ * denial as "adding" or "editing": a run that is denied `insert` still adds, through the others.
+ */
+function deniedCommandRejection(
+  command: MemoryConsolidationOp["command"],
+  denied: ReadonlyArray<MemoryConsolidationOp["command"]>
+): string {
+  const allowed = MUTATING_COMMANDS.filter((candidate) => !denied.includes(candidate));
+  return `This run may not use ${command}; it can change memory only with ${LIST_FORMAT.format(allowed)}.`;
+}
+
+/**
+ * The rails that need no I/O: writable scope, denied command and (opt-in) credential check, in
+ * that order. Throws on an invalid path (parseMemoryPath); the tool surfaces that as a tool error.
+ */
+function staticRejection(
+  rails: MutationRails,
+  target: MutationTarget,
+  input: MemoryCommandInput
+): string | null {
+  // Whitelist, not blacklist, so scopes added later stay out of bounds by default.
+  for (const virtualPath of [target.path, target.newPath]) {
+    if (virtualPath == null) continue;
+    if (!isWritableScope(parseMemoryPath(virtualPath).scope, rails)) {
+      return scopeRejection(virtualPath, rails);
+    }
+  }
+  if (rails.deniedCommands?.includes(target.command) === true) {
+    return deniedCommandRejection(target.command, rails.deniedCommands);
+  }
+  return rails.rejectSecretLike === true ? secretRejection(target, input) : null;
+}
+
+/**
+ * Why a delete/rename of `key` may not run: it is pinned, or a file under it is (`entries` are the
+ * sidecar records by logical key). Deletes/renames may target a directory (MemoryService removes
+ * recursively), so without the subtree check `delete dir/` would silently destroy dir/pinned.md.
+ */
+function pinnedRejection(
+  entries: ReadonlyMap<string, MemoryMetaEntry>,
+  key: string,
+  path: string
+): string | null {
+  const subtreePrefix = `${key}/`;
+  for (const [entryKey, entry] of entries) {
+    if (entry.pinned !== true) continue;
+    if (entryKey === key || entryKey.startsWith(subtreePrefix)) {
+      return `${path} is pinned by the user (directly or via a pinned file inside it); pinned files may be edited but never deleted or renamed.`;
+    }
+  }
+  return null;
+}
+
+/** The note that refuses `target` before it runs, or null when every rail lets it through. */
+async function mutationRejection(
+  rails: MutationRails,
+  target: MutationTarget,
+  input: MemoryCommandInput
+): Promise<string | null> {
+  const rejection = staticRejection(rails, target, input);
+  if (rejection !== null) return rejection;
+  // Pin protection: pinned files are editable but never deleted/renamed. This pre-check gives the
+  // model (and dry-run staging) early feedback; the AUTHORITATIVE check runs inside
+  // MemoryService's mutation lock against the owner the command's store is actually bound to
+  // (`rejectPinned` in the tool): the owner resolved here can differ from the command's when
+  // config.json is transiently unreadable in between.
+  if (target.command !== "delete" && target.command !== "rename") return null;
+  const { scope, relPath } = parseMemoryPath(target.path);
+  assert(
+    scope === "workspace" || scope === "project" || scope === "global",
+    "guard scope check must run first"
+  );
+  const entries = await rails.metaService.getEntries();
+  const key = memoryLogicalKey(scope, relPath, {
+    projectPath: rails.ctx.projectPath,
+    // Sidecar keys follow the shared store's owner (MemoryService.logicalKeyFor).
+    workspaceId:
+      rails.ctx.workspaceId === ""
+        ? ""
+        : rails.memoryService.resolveWorkspaceMemoryOwnerId(rails.ctx.workspaceId),
+  });
+  return pinnedRejection(entries, key, target.path);
+}
+
 /**
  * Build the guarded memory tool for one consolidation run. Exported separately
  * from runMemoryConsolidation so the rails are testable without a model.
@@ -226,59 +414,47 @@ export function createConsolidationMemoryTool(args: {
    * immediately before the first durable write.
    */
   abortSignal?: AbortSignal;
-}): { tool: Tool; getMutationCount: () => number } {
+  /**
+   * Scopes this run may modify (reads are never scope-limited). Default: workspace, global and
+   * project, which the dream pass uses. Project memory stays unavailable without a single stable
+   * project identity even when listed. The harvest analyzer narrows this to `["workspace"]`, so
+   * only the organizer promotes lessons to shared scopes.
+   */
+  writableScopes?: readonly WritableMemoryScope[];
+  /**
+   * Commands this run may not use. Default: none, which the dream pass uses. The harvest analyzer
+   * denies `delete` and `rename` (only the organizer removes) and `insert`: its line offset comes
+   * from an earlier read and goes stale under parallel calls and foreground writers, where
+   * `create` and `str_replace` are anchored to content.
+   */
+  deniedCommands?: ReadonlyArray<MemoryConsolidationOp["command"]>;
+  /**
+   * Reject a create/str_replace/insert whose new text, or a create/rename whose new file name,
+   * holds a credential shape (see `containsSecretLike`). For runs that read tool output and then
+   * write memory.
+   */
+  rejectSecretLike?: boolean;
+  /**
+   * Lead sentence of the tool description. The command reference is always appended. Default
+   * describes the dream pass ("you are consolidating").
+   */
+  description?: string;
+}): { tool: Tool; getMutationCount: () => number; isBudgetExhausted: () => boolean } {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
   const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
-
-  const guard = async (target: MutationTarget): Promise<string | null> => {
-    // Whitelist, not blacklist, so scopes added later stay out of bounds by default.
-    // Project memory is available only when the workspace has one stable project identity.
-    for (const virtualPath of [target.path, target.newPath]) {
-      if (virtualPath == null) continue;
-      const { scope } = parseMemoryPath(virtualPath);
-      if (scope === "workspace" || scope === "global") continue;
-      if (scope === "project" && ctx.projectPath !== "") continue;
-      return `Consolidation may not modify ${virtualPath}: project memory is available only for single-project runs; this run can modify /memories/workspace/... and /memories/global/....`;
-    }
-    // Pin protection: pinned files are editable but never deleted/renamed.
-    // Deletes/renames may target a directory (MemoryService removes
-    // recursively), so reject when the path itself OR anything under it is
-    // pinned — otherwise `delete dir/` would silently destroy dir/pinned.md.
-    // This pre-check gives the model (and dry-run staging) early feedback;
-    // the AUTHORITATIVE check runs inside MemoryService's mutation lock
-    // against the owner the command's store is actually bound to
-    // (`rejectPinned` below): the owner resolved here can differ from the
-    // command's when config.json is transiently unreadable in between.
-    if (target.command === "delete" || target.command === "rename") {
-      const { scope, relPath } = parseMemoryPath(target.path);
-      assert(
-        scope === "workspace" || scope === "project" || scope === "global",
-        "guard scope check must run first"
-      );
-      const entries = await metaService.getEntries();
-      const key = memoryLogicalKey(scope, relPath, {
-        projectPath: ctx.projectPath,
-        // Sidecar keys follow the shared store's owner (MemoryService.logicalKeyFor).
-        workspaceId:
-          ctx.workspaceId === ""
-            ? ""
-            : memoryService.resolveWorkspaceMemoryOwnerId(ctx.workspaceId),
-      });
-      const subtreePrefix = `${key}/`;
-      for (const [entryKey, entry] of entries) {
-        if (entry.pinned !== true) continue;
-        if (entryKey === key || entryKey.startsWith(subtreePrefix)) {
-          return `${target.path} is pinned by the user (directly or via a pinned file inside it); pinned files may be edited but never deleted or renamed.`;
-        }
-      }
-    }
-    return null;
+  const writableScopes = args.writableScopes ?? DEFAULT_WRITABLE_SCOPES;
+  const rails: MutationRails = {
+    memoryService,
+    metaService,
+    ctx,
+    writableScopes,
+    projectAvailable: ctx.projectPath !== "",
+    deniedCommands: args.deniedCommands,
+    rejectSecretLike: args.rejectSecretLike,
   };
 
   const memoryTool = tool({
-    description:
-      "Manage the persistent memory directory you are consolidating. " +
-      TOOL_DEFINITIONS.memory.description,
+    description: `${args.description ?? "Manage the persistent memory directory you are consolidating."} ${TOOL_DEFINITIONS.memory.description}`,
     inputSchema: TOOL_DEFINITIONS.memory.schema,
     // toolCallId is threaded into the r2 refinement journal rows so callers
     // (refine, r11) can correlate this run's edits to their journaled ids.
@@ -287,23 +463,39 @@ export function createConsolidationMemoryTool(args: {
       // pre-commit recheck (below) is what stops executions that were
       // already in flight when the caller was torn down.
       if (args.abortSignal?.aborted === true) {
-        return { success: false, error: "Consolidation pass was cancelled" };
+        return { success: false, error: CANCELLED_PASS_ERROR };
       }
       const target = classifyMutation(input);
       if (target === null) {
-        // Reads (and malformed inputs, which fail validation inside) pass through.
-        return executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId);
+        // Reads (and malformed inputs, which fail validation inside) pass through. A read that
+        // stalls in filesystem I/O has nothing to re-check the signal, and the provider loop
+        // waits for the tool result: race it, so the run's timeout and removal still end the run.
+        const read = await raceWithAbortAndTimeout(
+          executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId),
+          { signal: args.abortSignal }
+        );
+        return read.kind === "ok" ? read.value : { success: false, error: CANCELLED_PASS_ERROR };
       }
 
       let rejection: string | null;
       try {
-        rejection = await guard(target);
+        rejection = await mutationRejection(rails, target, input);
       } catch (error) {
         // parseMemoryPath throws on invalid paths; surface as a tool error.
         return { success: false, error: getErrorMessage(error) };
       }
       if (rejection !== null) {
-        journal.push({ ...target, applied: false, note: rejection });
+        // The journal is persisted, and a rejected path (or the note that quotes it) may itself be
+        // the credential the guard just refused.
+        const persisted = (text: string): string =>
+          args.rejectSecretLike === true ? redactSecretLike(text) : text;
+        journal.push({
+          ...target,
+          path: persisted(target.path),
+          ...(target.newPath !== undefined && { newPath: persisted(target.newPath) }),
+          applied: false,
+          note: persisted(rejection),
+        });
         return { success: false, error: rejection };
       }
 
@@ -346,7 +538,11 @@ export function createConsolidationMemoryTool(args: {
       return result;
     },
   });
-  return { tool: memoryTool, getMutationCount: () => budget.used() };
+  return {
+    tool: memoryTool,
+    getMutationCount: () => budget.used(),
+    isBudgetExhausted: () => budget.used() >= budget.limit,
+  };
 }
 
 /**
@@ -383,10 +579,12 @@ export async function runMemoryConsolidation(args: {
   ) => Promise<void>;
   /** Pricing identity of `model`; its long-context threshold sets each step's tier. */
   pricingModel?: string;
+  /** The run stops once its measured spend reaches this many USD; none when absent. */
+  ceilingUsd?: number;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
   const journal: MemoryConsolidationOp[] = [];
-  const { tool: memoryTool, getMutationCount } = createConsolidationMemoryTool({
+  const { tool: memoryTool, isBudgetExhausted } = createConsolidationMemoryTool({
     memoryService: args.memoryService,
     metaService: args.metaService,
     ctx: args.ctx,
@@ -405,6 +603,7 @@ export async function runMemoryConsolidation(args: {
         ? " This is the FINAL pass for an archived workspace: preserve only cross-project user preferences or environment facts in /memories/global/... before workspace memory is deleted. Project memory is unavailable for this run; do not promote project-specific lessons to global memory."
         : " This is the FINAL pass for an archived workspace: promote durable workspace lessons before workspace memory is deleted. Move repo-specific lessons to /memories/project/... and only cross-project user preferences or environment facts to /memories/global/....";
 
+  const meter = createSpendMeter({ pricingModel: args.pricingModel, ceilingUsd: args.ceilingUsd });
   const stream = streamText({
     model: args.model,
     system: args.agentBody,
@@ -412,7 +611,9 @@ export async function runMemoryConsolidation(args: {
       "Run a memory-consolidation pass now. Survey the memory directories, then apply the highest-value cleanups within budget." +
       finalPassPrompt,
     tools: { memory: memoryTool },
-    stopWhen: stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS),
+    stopWhen: [stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS), meter.stopIfCeilingReached],
+    onStepEnd: meter.recordStep,
+    maxOutputTokens: meter.maxOutputTokens,
     abortSignal: args.abortSignal,
   });
 
@@ -426,6 +627,18 @@ export async function runMemoryConsolidation(args: {
       streamErrors.push(getErrorMessage(error));
     },
   });
+  // An abort ends the stream without an error part, so a pass cut short by its timeout or by
+  // workspace removal would read as clean and be journaled as a success.
+  if (streamErrors.length === 0 && args.abortSignal?.aborted === true) {
+    streamErrors.push("memory consolidation was cut short by its timeout or by workspace removal");
+  }
+  // A step that hit the output limit never ran its tool call, yet the stream ends clean: without
+  // this the pass would be journaled as a success and the debounce would hold off its retry.
+  if (streamErrors.length === 0 && meter.endedAtOutputLimit()) {
+    streamErrors.push(
+      "memory consolidation ended a step at the model's output limit, so its tool call never ran"
+    );
+  }
   const summary =
     streamErrors.length === 0 ? (await stream.text).trim() : `stream error: ${streamErrors[0]}`;
 
@@ -456,8 +669,10 @@ export async function runMemoryConsolidation(args: {
     summary,
     // Derived from accepted mutations, not journal length: journaled guard
     // rejections must not report a budget the run never spent (MEM-RPT-01).
-    budgetExhausted: getMutationCount() >= MEMORY_CONSOLIDATION_OP_BUDGET,
+    budgetExhausted: isBudgetExhausted(),
     usage,
+    spentUsd: meter.spentUsd(),
+    note: meter.note(),
     streamError: streamErrors[0],
   };
 }
