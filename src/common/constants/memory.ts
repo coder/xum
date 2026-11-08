@@ -80,6 +80,14 @@ export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
 /** Generous step ceiling for the consolidation stream (reads + budgeted mutations). */
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
 /**
+ * Memory analyzer (the harvest of one closed compaction epoch): mutating memory
+ * commands for the whole epoch. All of its transcript chunks, and a retry of the
+ * epoch, spend one budget, so a long epoch cannot out-write a short one.
+ */
+export const MEMORY_ANALYZER_OP_BUDGET = 8;
+/** Step ceiling for one analyzer chunk (reads of related memory + budgeted edits). */
+export const MEMORY_ANALYZER_MAX_STEPS = 12;
+/**
  * Memory harvest: transcript chunks one epoch's harvest reads. Each chunk is a model call of at
  * most 40,000 characters of transcript, and the per-part caps leave an epoch's total unbounded
  * (thousands of parallel tool calls, or megabytes of pasted text, make hundreds of chunks). 12 is

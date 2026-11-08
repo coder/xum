@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it, setSystemTime, spyOn } from "bun:test";
 import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
@@ -15,6 +15,7 @@ import type {
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
+  MEMORY_ANALYZER_OP_BUDGET,
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
 } from "@/common/constants/memory";
@@ -32,6 +33,7 @@ import {
   resolveHeadlessAgentDefinition,
 } from "./memoryConsolidationService";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
+import { MEMORY_ANALYZER_SYSTEM_PROMPT } from "./memoryHarvest";
 import { HistoryService } from "./historyService";
 import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
@@ -57,6 +59,29 @@ function userPromptText(options: LanguageModelV3CallOptions): string {
     }
   }
   return parts.join("\n");
+}
+
+/** Stream parts of one analyzer step that writes `text` to a workspace memory file. */
+function harvestWriteChunks(
+  memoryPath = "/memories/workspace/testing.md",
+  text = "The user prefers concise tests.\n"
+): LanguageModelV3StreamPart[] {
+  return [
+    {
+      type: "tool-call",
+      toolCallId: `harvest-write-${memoryPath}`,
+      toolName: "memory",
+      input: JSON.stringify({ command: "create", path: memoryPath, file_text: text }),
+    },
+    {
+      type: "finish",
+      finishReason: { unified: "tool-calls", raw: "tool-calls" },
+      usage: {
+        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: { total: 1, text: 0, reasoning: 0 },
+      },
+    },
+  ];
 }
 
 function scriptedModel(capturePrompt?: (prompt: string) => void): MockLanguageModelV3 {
@@ -92,32 +117,7 @@ function harvestCandidateModel(): MockLanguageModelV3 {
       const isHarvest = prompt.includes("just-compacted transcript epoch");
       const chunks: LanguageModelV3StreamPart[] =
         isHarvest && streamCount === 1
-          ? [
-              {
-                type: "tool-call",
-                toolCallId: "harvest-candidate",
-                toolName: "submit_memory_candidates",
-                input: JSON.stringify({
-                  candidates: [
-                    {
-                      category: "preference",
-                      memoryText: "The user prefers concise tests.",
-                      evidenceMessageIds: ["pref-1"],
-                      confidence: 0.95,
-                      rationale: "Explicit preference in the compacted epoch.",
-                    },
-                  ],
-                }),
-              },
-              {
-                type: "finish",
-                finishReason: { unified: "tool-calls", raw: "tool-calls" },
-                usage: {
-                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
-                  outputTokens: { total: 1, text: 0, reasoning: 0 },
-                },
-              },
-            ]
+          ? harvestWriteChunks()
           : [
               { type: "text-start", id: "t1" },
               { type: "text-delta", id: "t1", delta: "no changes needed" },
@@ -198,6 +198,67 @@ function projectMutationModel(): MockLanguageModelV3 {
             ];
       return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
     },
+  });
+}
+
+function systemPromptText(options: LanguageModelV3CallOptions): string {
+  return options.prompt
+    .flatMap((message) => (message.role === "system" ? [message.content] : []))
+    .join("\n");
+}
+
+function noChangesStream(): ReadableStream<LanguageModelV3StreamPart> {
+  return simulateReadableStream<LanguageModelV3StreamPart>({
+    chunks: [
+      { type: "text-start", id: "t1" },
+      { type: "text-delta", id: "t1", delta: "no changes needed" },
+      { type: "text-end", id: "t1" },
+      {
+        type: "finish",
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+          outputTokens: { total: 1, text: 1, reasoning: 0 },
+        },
+      },
+    ],
+  });
+}
+
+function failingStream(): ReadableStream<LanguageModelV3StreamPart> {
+  return new ReadableStream<LanguageModelV3StreamPart>({
+    pull(controller) {
+      controller.error(new Error("provider exploded"));
+    },
+  });
+}
+
+/** One analyzer step that issues MEMORY_ANALYZER_OP_BUDGET creates: the epoch's whole edit budget. */
+function spendEveryEditStream(): ReadableStream<LanguageModelV3StreamPart> {
+  return simulateReadableStream<LanguageModelV3StreamPart>({
+    chunks: [
+      ...Array.from(
+        { length: MEMORY_ANALYZER_OP_BUDGET },
+        (_, index): LanguageModelV3StreamPart => ({
+          type: "tool-call",
+          toolCallId: `spend-${index}`,
+          toolName: "memory",
+          input: JSON.stringify({
+            command: "create",
+            path: `/memories/workspace/spend-${index}.md`,
+            file_text: `fact ${index}\n`,
+          }),
+        })
+      ),
+      {
+        type: "finish",
+        finishReason: { unified: "tool-calls", raw: "tool-calls" },
+        usage: {
+          inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+          outputTokens: { total: 1, text: 0, reasoning: 0 },
+        },
+      },
+    ],
   });
 }
 
@@ -369,6 +430,62 @@ async function seedCompactionEpoch(
     compactionRequestMessageId: `compact-request${suffix}`,
     ...(previousBoundaryHistorySequence !== undefined ? { previousBoundaryHistorySequence } : {}),
   };
+}
+
+function pathExists(target: string): Promise<boolean> {
+  return fsPromises.access(target).then(
+    () => true,
+    () => false
+  );
+}
+
+/** Rows that make the next epoch's transcript span three analyzer chunks (5 + 5 + 3 rows). */
+async function appendBulkRows(fixture: Fixture, workspaceId = "ws-dream"): Promise<void> {
+  for (let index = 0; index < 12; index++) {
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage(`bulk-${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`)
+    );
+  }
+}
+
+async function harvestRecords(
+  fixture: Fixture,
+  workspaceId = "ws-dream"
+): Promise<Record<string, MemoryHarvestRecordPayload>> {
+  // No sidecar until the first record is saved.
+  const text = await fsPromises
+    .readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
+    .catch(() => "{}");
+  const raw = JSON.parse(text) as {
+    harvestsByWorkspace?: Record<string, Record<string, MemoryHarvestRecordPayload>>;
+  };
+  return raw.harvestsByWorkspace?.[workspaceId] ?? {};
+}
+
+/** Rewrites one stored harvest record on disk, as a record from another run or version would read. */
+async function editHarvestRecord(
+  fixture: Fixture,
+  boundaryKey: string,
+  edit: (record: Record<string, unknown>) => void,
+  workspaceId = "ws-dream"
+): Promise<void> {
+  const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+  const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
+    harvestsByWorkspace: Record<string, Record<string, Record<string, unknown>>>;
+  };
+  edit(sidecar.harvestsByWorkspace[workspaceId][boundaryKey]);
+  await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+}
+
+/** Another backend on the same root holding the dream lock: this process sees its token as live. */
+function holdForeignDreamLock(fixture: Fixture) {
+  return acquireCrossProcessLock({
+    lockPath: dreamStreamLockPath(fixture.xumHome),
+    acquireTimeoutMs: 1_000,
+    staleMs: 60_000,
+    timeoutMessage: "test holder",
+  });
 }
 
 /** A sweep or trigger the 6 h window refused: returned quietly as a skip, not an error to retry. */
@@ -727,7 +844,7 @@ describe("MemoryConsolidationService", () => {
     expect(status.latestHarvestRecord).toBeNull();
   });
 
-  it("harvests a compaction boundary before running the dream sweep", async () => {
+  it("analyzes a compaction boundary into workspace memory before running the dream sweep", async () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     const metadata = await seedCompactionEpoch(fixture);
 
@@ -737,14 +854,20 @@ describe("MemoryConsolidationService", () => {
     expect(fixture.modelCalls).toHaveLength(2);
     const file = await fixture.memoryService.readFileWithSha(
       { runtime: null, checkoutCwd: "", workspaceId: "ws-dream", projectPath: "/projects/demo" },
-      "/memories/workspace/harvest/summary-1.md"
+      "/memories/workspace/testing.md"
     );
     expect(file.success).toBe(true);
     if (file.success) expect(file.data.content).toContain("concise tests");
 
     const status = await fixture.service.getStatus("ws-dream");
     expect(status.workspaceRecord?.trigger).toBe("compaction");
-    expect(status.latestHarvestRecord?.status).toBe("completed");
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "completed",
+      nextChunk: 1,
+      acceptedCandidates: 1,
+      skippedCandidates: 0,
+      ops: [{ command: "create", path: "/memories/workspace/testing.md", applied: true }],
+    });
   });
 
   it("prunes old harvest sidecar records while preserving the newest status", async () => {
@@ -894,32 +1017,7 @@ describe("MemoryConsolidationService", () => {
             const chunks: LanguageModelV3StreamPart[] = prompt.includes(
               "just-compacted transcript epoch"
             )
-              ? [
-                  {
-                    type: "tool-call",
-                    toolCallId: "harvest-candidate",
-                    toolName: "submit_memory_candidates",
-                    input: JSON.stringify({
-                      candidates: [
-                        {
-                          category: "preference",
-                          memoryText: "The user prefers concise tests.",
-                          evidenceMessageIds: ["pref-1"],
-                          confidence: 0.95,
-                          rationale: "Explicit preference in the compacted epoch.",
-                        },
-                      ],
-                    }),
-                  },
-                  {
-                    type: "finish",
-                    finishReason: { unified: "tool-calls", raw: "tool-calls" },
-                    usage: {
-                      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
-                      outputTokens: { total: 1, text: 0, reasoning: 0 },
-                    },
-                  },
-                ]
+              ? harvestWriteChunks()
               : [
                   { type: "text-start", id: "t1" },
                   { type: "text-delta", id: "t1", delta: "second sweep" },
@@ -1039,32 +1137,7 @@ describe("MemoryConsolidationService", () => {
               harvestStreamCount++;
               return Promise.resolve({
                 stream: simulateReadableStream({
-                  chunks: [
-                    {
-                      type: "tool-call",
-                      toolCallId: "harvest-candidate",
-                      toolName: "submit_memory_candidates",
-                      input: JSON.stringify({
-                        candidates: [
-                          {
-                            category: "preference",
-                            memoryText: "The user prefers concise tests.",
-                            evidenceMessageIds: ["pref-1"],
-                            confidence: 0.95,
-                            rationale: "Explicit preference in the compacted epoch.",
-                          },
-                        ],
-                      }),
-                    },
-                    {
-                      type: "finish",
-                      finishReason: { unified: "tool-calls", raw: "tool-calls" },
-                      usage: {
-                        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
-                        outputTokens: { total: 1, text: 0, reasoning: 0 },
-                      },
-                    },
-                  ],
+                  chunks: harvestWriteChunks(),
                 }),
               });
             }
@@ -1121,32 +1194,7 @@ describe("MemoryConsolidationService", () => {
               }
               return Promise.resolve({
                 stream: simulateReadableStream({
-                  chunks: [
-                    {
-                      type: "tool-call",
-                      toolCallId: "harvest-candidate",
-                      toolName: "submit_memory_candidates",
-                      input: JSON.stringify({
-                        candidates: [
-                          {
-                            category: "preference",
-                            memoryText: "The user prefers concise tests.",
-                            evidenceMessageIds: ["pref-1"],
-                            confidence: 0.95,
-                            rationale: "Explicit preference in the compacted epoch.",
-                          },
-                        ],
-                      }),
-                    },
-                    {
-                      type: "finish",
-                      finishReason: { unified: "tool-calls", raw: "tool-calls" },
-                      usage: {
-                        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
-                        outputTokens: { total: 1, text: 0, reasoning: 0 },
-                      },
-                    },
-                  ],
+                  chunks: harvestWriteChunks(),
                 }),
               });
             }
@@ -1184,6 +1232,595 @@ describe("MemoryConsolidationService", () => {
     expect(status.latestHarvestRecord?.status).toBe("completed");
     expect(status.latestHarvestRecord?.attemptCount).toBe(2);
     expect(harvestAttempts).toBe(2);
+  });
+
+  it("resumes a failed analyzer run at the chunk that failed, not at the start", async () => {
+    const chunkLabels: string[] = [];
+    let recordDuringChunkTwo: MemoryHarvestRecordPayload | null = null;
+    let failedOnce = false;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: async (options) => {
+            const prompt = userPromptText(options);
+            const finish = {
+              stream: simulateReadableStream({
+                chunks: [
+                  { type: "text-start", id: "t1" },
+                  { type: "text-delta", id: "t1", delta: "no changes needed" },
+                  { type: "text-end", id: "t1" },
+                  {
+                    type: "finish",
+                    finishReason: { unified: "stop", raw: "stop" },
+                    usage: {
+                      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                      outputTokens: { total: 1, text: 1, reasoning: 0 },
+                    },
+                  },
+                ] satisfies LanguageModelV3StreamPart[],
+              }),
+            };
+            const afterToolResult = options.prompt.some((message) => message.role === "tool");
+            if (!prompt.includes("just-compacted transcript epoch") || afterToolResult) {
+              return finish;
+            }
+            const label = /Transcript chunk (\d+\/\d+)/.exec(prompt)?.[1] ?? "";
+            chunkLabels.push(label);
+            const write = (name: string) => ({
+              stream: simulateReadableStream({
+                chunks: harvestWriteChunks(`/memories/workspace/${name}.md`, `${name}\n`),
+              }),
+            });
+            if (!failedOnce) {
+              if (label.startsWith("1/")) return write("one");
+              recordDuringChunkTwo = (await fixture.service.getStatus("ws-dream"))
+                .latestHarvestRecord;
+              failedOnce = true;
+              return {
+                stream: new ReadableStream<LanguageModelV3StreamPart>({
+                  pull(controller) {
+                    controller.error(new Error("provider exploded"));
+                  },
+                }),
+              };
+            }
+            return label.startsWith("2/") ? write("two") : finish;
+          },
+        }),
+    });
+    await appendBulkRows(fixture);
+    const metadata = await seedCompactionEpoch(fixture);
+    const ctx = {
+      runtime: null,
+      checkoutCwd: "",
+      workspaceId: "ws-dream",
+      projectPath: "/projects/demo",
+    };
+
+    expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+
+    // The cursor reached disk as soon as chunk 1 finished, before chunk 2 failed.
+    expect(recordDuringChunkTwo).toMatchObject({ status: "pending", nextChunk: 1 });
+    let status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "failed",
+      attemptCount: 1,
+      nextChunk: 1,
+      acceptedCandidates: 1,
+      ops: [{ command: "create", path: "/memories/workspace/one.md", applied: true }],
+    });
+
+    expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+    // Chunk 1's model is not called again on the retry.
+    expect(chunkLabels).toEqual(["1/3", "2/3", "2/3", "3/3"]);
+    status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "completed",
+      attemptCount: 2,
+      nextChunk: 3,
+      acceptedCandidates: 2,
+      skippedCandidates: 0,
+    });
+    expect(status.latestHarvestRecord?.ops?.map((op) => op.path)).toEqual([
+      "/memories/workspace/one.md",
+      "/memories/workspace/two.md",
+    ]);
+    for (const name of ["one", "two"]) {
+      expect(
+        await fixture.memoryService.readFileWithSha(ctx, `/memories/workspace/${name}.md`)
+      ).toMatchObject({ success: true });
+    }
+  });
+
+  it("adds the tokens of the chunks a failed attempt finished to the completed record", async () => {
+    let failedOnce = false;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            if (!failedOnce && userPromptText(options).includes("Transcript chunk 2/3")) {
+              failedOnce = true;
+              return Promise.resolve({
+                stream: new ReadableStream<LanguageModelV3StreamPart>({
+                  pull(controller) {
+                    controller.error(new Error("provider exploded"));
+                  },
+                }),
+              });
+            }
+            // Every other call, a harvest chunk or a sweep, is one clean stream of 1 token each way.
+            return Promise.resolve({
+              stream: simulateReadableStream({
+                chunks: [
+                  { type: "text-start", id: "t1" },
+                  { type: "text-delta", id: "t1", delta: "no changes needed" },
+                  { type: "text-end", id: "t1" },
+                  {
+                    type: "finish",
+                    finishReason: { unified: "stop", raw: "stop" },
+                    usage: {
+                      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                      outputTokens: { total: 1, text: 1, reasoning: 0 },
+                    },
+                  },
+                ] satisfies LanguageModelV3StreamPart[],
+              }),
+            });
+          },
+        }),
+    });
+    await appendBulkRows(fixture);
+    const metadata = await seedCompactionEpoch(fixture);
+
+    expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+    let status = await fixture.service.getStatus("ws-dream");
+    // Chunk 1 finished and chunk 2 failed: the failed record keeps what chunk 1 cost.
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "failed",
+      nextChunk: 1,
+      usage: { inputTokens: 1, outputTokens: 1 },
+    });
+
+    expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+    // The retry ran chunks 2 and 3 only; the record counts all three.
+    status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "completed",
+      attemptCount: 2,
+      usage: { inputTokens: 3, outputTokens: 3 },
+    });
+  });
+
+  it("keeps the budget spent and the failed chunk's landed edits in its record, and the retry uses both", async () => {
+    const chunkTwoPrompts: string[] = [];
+    let failedOnce = false;
+    const done = () => ({
+      stream: simulateReadableStream({
+        chunks: [
+          { type: "text-start", id: "t1" },
+          { type: "text-delta", id: "t1", delta: "no changes needed" },
+          { type: "text-end", id: "t1" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+              outputTokens: { total: 1, text: 1, reasoning: 0 },
+            },
+          },
+        ] satisfies LanguageModelV3StreamPart[],
+      }),
+    });
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            const prompt = userPromptText(options);
+            if (!prompt.includes("just-compacted transcript epoch")) return Promise.resolve(done());
+            const afterToolResult = options.prompt.some((message) => message.role === "tool");
+            const label = /Transcript chunk (\d+)\//.exec(prompt)?.[1];
+            if (label === "1" && !afterToolResult) {
+              return Promise.resolve({
+                stream: simulateReadableStream({
+                  chunks: harvestWriteChunks("/memories/workspace/one.md"),
+                }),
+              });
+            }
+            if (label !== "2") return Promise.resolve(done());
+            if (failedOnce) {
+              chunkTwoPrompts.push(prompt);
+              return Promise.resolve(done());
+            }
+            if (!afterToolResult) {
+              // One edit lands and one dispatch fails (both spend budget), then the stream dies.
+              return Promise.resolve({
+                stream: simulateReadableStream({
+                  chunks: [
+                    ...harvestWriteChunks("/memories/workspace/two.md").slice(0, 1),
+                    {
+                      type: "tool-call",
+                      toolCallId: "missing-edit",
+                      toolName: "memory",
+                      input: JSON.stringify({
+                        command: "str_replace",
+                        path: "/memories/workspace/missing.md",
+                        old_str: "a",
+                        new_str: "b",
+                      }),
+                    },
+                    ...harvestWriteChunks("/memories/workspace/two.md").slice(1),
+                  ] satisfies LanguageModelV3StreamPart[],
+                }),
+              });
+            }
+            failedOnce = true;
+            return Promise.resolve({
+              stream: new ReadableStream<LanguageModelV3StreamPart>({
+                pull(controller) {
+                  controller.error(new Error("provider exploded"));
+                },
+              }),
+            });
+          },
+        }),
+    });
+    await appendBulkRows(fixture);
+    const metadata = await seedCompactionEpoch(fixture);
+
+    expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+
+    let status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "failed",
+      nextChunk: 1,
+      // Chunk one's edit, then chunk two's edit and its failed dispatch.
+      budgetUsed: 3,
+      nextChunkOps: 2,
+    });
+
+    expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+    expect(chunkTwoPrompts[0]).toContain("/memories/workspace/two.md");
+    expect(chunkTwoPrompts[0]).not.toContain("/memories/workspace/one.md");
+    status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "completed",
+      nextChunk: 3,
+      budgetUsed: 3,
+      nextChunkOps: 0,
+    });
+  });
+
+  it("skips the chunks left once the epoch's edit budget is spent, and notes it in the record", async () => {
+    const chunkLabels: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            const prompt = userPromptText(options);
+            const afterToolResult = options.prompt.some((message) => message.role === "tool");
+            if (!prompt.includes("just-compacted transcript epoch") || afterToolResult) {
+              return Promise.resolve({ stream: noChangesStream() });
+            }
+            chunkLabels.push(/Transcript chunk (\d+\/\d+)/.exec(prompt)?.[1] ?? "");
+            return Promise.resolve({
+              stream: spendEveryEditStream(),
+            });
+          },
+        }),
+    });
+    await appendBulkRows(fixture);
+    const metadata = await seedCompactionEpoch(fixture);
+
+    expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+
+    // Chunk 1 spent all of the epoch's edits, so chunks 2 and 3 made no model call.
+    expect(chunkLabels).toEqual(["1/3"]);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record).toMatchObject({
+      status: "completed",
+      nextChunk: 3,
+      budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+    });
+    expect(record?.note).toContain("chunks 2-3 of 3");
+  });
+
+  it("resumes at the first chunk nobody read when saving the completed record failed after a budget skip", async () => {
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            const prompt = userPromptText(options);
+            const afterToolResult = options.prompt.some((message) => message.role === "tool");
+            return Promise.resolve({
+              stream:
+                prompt.includes("just-compacted transcript epoch") && !afterToolResult
+                  ? spendEveryEditStream()
+                  : noChangesStream(),
+            });
+          },
+        }),
+    });
+    await appendBulkRows(fixture);
+    const metadata = await seedCompactionEpoch(fixture);
+    const service = fixture.service as unknown as {
+      saveHarvestRecordEffect: (
+        workspaceId: string,
+        boundaryKey: string,
+        record: MemoryHarvestRecordPayload,
+        projectPath: string
+      ) => Effect.Effect<void>;
+    };
+    const save = service.saveHarvestRecordEffect.bind(service);
+    let failedOnce = false;
+    spyOn(service, "saveHarvestRecordEffect").mockImplementation(
+      (workspaceId, boundaryKey, record, projectPath) => {
+        if (record.status !== "completed" || failedOnce) {
+          return save(workspaceId, boundaryKey, record, projectPath);
+        }
+        failedOnce = true;
+        return Effect.promise(() => Promise.reject(new Error("disk full")));
+      }
+    );
+
+    await fixture.service.maybeHarvestThenSweep(metadata);
+    // The failed record resumes at the first chunk nobody read, not past the skipped ones.
+    expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toMatchObject({
+      status: "failed",
+      nextChunk: 1,
+    });
+
+    await fixture.service.maybeHarvestThenSweep(metadata);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record?.status).toBe("completed");
+    // The retry meets the spent budget again and says which chunks it skipped.
+    expect(record?.note).toContain("chunks 2-3 of 3");
+  });
+
+  it("keeps the edits of a chunk that wrote and then failed in the failed record", async () => {
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            const isHarvest = userPromptText(options).includes("just-compacted transcript epoch");
+            const afterToolResult = options.prompt.some((message) => message.role === "tool");
+            if (isHarvest && !afterToolResult) {
+              return Promise.resolve({
+                stream: simulateReadableStream({
+                  chunks: harvestWriteChunks("/memories/workspace/landed.md", "landed\n"),
+                }),
+              });
+            }
+            if (isHarvest) {
+              return Promise.resolve({
+                stream: new ReadableStream<LanguageModelV3StreamPart>({
+                  pull(controller) {
+                    controller.error(new Error("provider exploded"));
+                  },
+                }),
+              });
+            }
+            return Promise.resolve({ stream: noChangesStream() });
+          },
+        }),
+    });
+    const metadata = await seedCompactionEpoch(fixture);
+
+    await fixture.service.maybeHarvestThenSweep(metadata);
+
+    // The write landed in memory, so the record that a retry resumes from must say so.
+    expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+      status: "failed",
+      nextChunk: 0,
+      acceptedCandidates: 1,
+      budgetUsed: 1,
+      nextChunkOps: 1,
+      ops: [{ command: "create", path: "/memories/workspace/landed.md", applied: true }],
+    });
+  });
+
+  describe("a harvest record with a corrupt count", () => {
+    /** Chunk 1 of the first attempt lands one edit; its chunk 2 fails; then every step spends 8. */
+    function failingThenSpendingModels() {
+      let analyzerCalls = 0;
+      const factory = () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            const afterToolResult = options.prompt.some((message) => message.role === "tool");
+            if (systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT || afterToolResult) {
+              return Promise.resolve({ stream: noChangesStream() });
+            }
+            const call = ++analyzerCalls;
+            if (call === 1) {
+              return Promise.resolve({
+                stream: simulateReadableStream({
+                  chunks: harvestWriteChunks("/memories/workspace/landed.md", "landed\n"),
+                }),
+              });
+            }
+            if (call === 2) return Promise.resolve({ stream: failingStream() });
+            // Distinct paths per step, so every create applies unless the budget refuses it.
+            return Promise.resolve({
+              stream: simulateReadableStream({
+                chunks: [
+                  ...Array.from(
+                    { length: MEMORY_ANALYZER_OP_BUDGET },
+                    (_, index): LanguageModelV3StreamPart => ({
+                      type: "tool-call",
+                      toolCallId: `spend-${call}-${index}`,
+                      toolName: "memory",
+                      input: JSON.stringify({
+                        command: "create",
+                        path: `/memories/workspace/call-${call}-${index}.md`,
+                        file_text: "fact\n",
+                      }),
+                    })
+                  ),
+                  {
+                    type: "finish",
+                    finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                    usage: {
+                      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                      outputTokens: { total: 1, text: 0, reasoning: 0 },
+                    },
+                  },
+                ],
+              }),
+            });
+          },
+        });
+      return { factory };
+    }
+
+    it("cannot widen the edit budget: a negative budgetUsed restarts the epoch on a fresh budget of 8", async () => {
+      using fixture = await createFixture({
+        modelFactory: failingThenSpendingModels().factory,
+      });
+      // Chunks bulk-0..4, bulk-5..9 and bulk-10..11.
+      await appendBulkRows(fixture);
+      const metadata = await seedCompactionEpoch(fixture);
+      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+      expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+        status: "failed",
+        nextChunk: 1,
+      });
+      // A budget of -100 used to leave 108 edits: chunks 2 and 3 would each spend 8 more.
+      await editHarvestRecord(fixture, "summary-1", (record) => {
+        record.budgetUsed = -100;
+      });
+
+      expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+      const record = (await harvestRecords(fixture))["summary-1"];
+      expect(record?.status).toBe("completed");
+      expect(record?.ops?.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
+      expect(record?.note).toContain("edit budget spent");
+    });
+
+    it("cannot widen the attempt limit: a negative attemptCount restarts the epoch on the bound every epoch has", async () => {
+      let analyzerCalls = 0;
+      using fixture = await createFixture({
+        modelFactory: () =>
+          new MockLanguageModelV3({
+            doStream: (options) => {
+              if (systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT) {
+                return Promise.resolve({ stream: noChangesStream() });
+              }
+              analyzerCalls++;
+              return Promise.resolve({ stream: failingStream() });
+            },
+          }),
+      });
+      const metadata = await seedCompactionEpoch(fixture);
+      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+      expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+        status: "failed",
+        attemptCount: 1,
+      });
+      // An attemptCount of -100 used to stay under HARVEST_MAX_ATTEMPTS for 100 more attempts.
+      await editHarvestRecord(fixture, "summary-1", (record) => {
+        record.attemptCount = -100;
+      });
+      analyzerCalls = 0;
+
+      for (let run = 0; run < HARVEST_MAX_ATTEMPTS + 3; run++) {
+        await fixture.service.maybeHarvestThenSweep(metadata);
+      }
+
+      expect(analyzerCalls).toBe(HARVEST_MAX_ATTEMPTS);
+      expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+        status: "failed",
+        attemptCount: HARVEST_MAX_ATTEMPTS,
+      });
+    });
+
+    it.each([
+      ["attemptCount", -1],
+      ["attemptCount", 1.5],
+      ["budgetUsed", -100],
+      ["budgetUsed", 1.5],
+      ["nextChunk", -1],
+      ["nextChunkOps", -1],
+    ])("drops a record whose %s is %d on load", async (field, value) => {
+      using fixture = await createFixture();
+      const metadata = await seedCompactionEpoch(fixture);
+      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+      expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).not.toBeNull();
+      await editHarvestRecord(fixture, "summary-1", (record) => {
+        record[field] = value;
+      });
+
+      expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toBeNull();
+    });
+  });
+
+  it("refuses a harvest for a workspace that another backend is removing, before any model call", async () => {
+    using fixture = await createFixture();
+    const metadata = await seedCompactionEpoch(fixture);
+    // History writes refuse once the tombstone exists, so the rows come first.
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-dream");
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: "ws-dream", removedAt: Date.now() })
+    );
+    const harvested = await fixture.service.maybeHarvestThenSweep(metadata);
+    expect(harvested.success).toBe(false);
+    if (!harvested.success) expect(harvested.error).toContain("being removed");
+
+    expect(fixture.modelCalls).toHaveLength(0);
+    expect(await harvestRecords(fixture)).toEqual({});
+  });
+
+  it("records an analyzer write outside workspace memory as rejected and never applies it", async () => {
+    let harvestStep = 0;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            const isHarvest = userPromptText(options).includes("just-compacted transcript epoch");
+            const chunks: LanguageModelV3StreamPart[] =
+              isHarvest && harvestStep++ === 0
+                ? [
+                    harvestWriteChunks("/memories/global/promoted.md", "global\n")[0],
+                    ...harvestWriteChunks("/memories/workspace/kept.md", "kept\n"),
+                  ]
+                : [
+                    { type: "text-start", id: "t1" },
+                    { type: "text-delta", id: "t1", delta: "no changes needed" },
+                    { type: "text-end", id: "t1" },
+                    {
+                      type: "finish",
+                      finishReason: { unified: "stop", raw: "stop" },
+                      usage: {
+                        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                        outputTokens: { total: 1, text: 1, reasoning: 0 },
+                      },
+                    },
+                  ];
+            return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+          },
+        }),
+    });
+    const metadata = await seedCompactionEpoch(fixture);
+
+    expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record).toMatchObject({
+      status: "completed",
+      acceptedCandidates: 1,
+      skippedCandidates: 1,
+    });
+    expect(Object.fromEntries((record?.ops ?? []).map((op) => [op.path, op.applied]))).toEqual({
+      "/memories/workspace/kept.md": true,
+      "/memories/global/promoted.md": false,
+    });
+    expect(await pathExists(path.join(fixture.xumHome, "memory", "global", "promoted.md"))).toBe(
+      false
+    );
   });
 
   it("recovers retryable failed harvest records before a production sweep trigger", async () => {
@@ -1376,6 +2013,424 @@ describe("MemoryConsolidationService", () => {
     expect(fixture.modelCalls).toHaveLength(2);
   });
 
+  describe("analyzer queue", () => {
+    interface Gate {
+      opened: Promise<void>;
+      open: () => void;
+    }
+    function gate(): Gate {
+      let open!: () => void;
+      const opened = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      return { opened, open };
+    }
+
+    /**
+     * Models whose analyzer streams each hold until `release(id)`, numbered in the order they
+     * start, with a log of when each starts and ends. A dream stream is not held, unless
+     * `holdDream`: then the first one holds until `releaseDream()` and logs `dream-start` and
+     * `dream-end` (a later one, such as a sweep, passes). `modelCreated(n)` and `streamStarted(n)`
+     * resolve on the events themselves, so a test waits on what happened, not on how long it took.
+     */
+    function heldAnalyzers(config?: { holdDream?: boolean }) {
+      const events: string[] = [];
+      const dream = { started: gate(), released: gate() };
+      const gates = {
+        created: new Map<number, Gate>(),
+        started: new Map<number, Gate>(),
+        released: new Map<number, Gate>(),
+      };
+      const gateFor = (kind: keyof typeof gates, id: number): Gate => {
+        let found = gates[kind].get(id);
+        if (found === undefined) {
+          found = gate();
+          gates[kind].set(id, found);
+        }
+        return found;
+      };
+      let modelsCreated = 0;
+      let analyzerStreams = 0;
+      const factory = () => {
+        gateFor("created", ++modelsCreated).open();
+        const inner = scriptedModel();
+        return new MockLanguageModelV3({
+          doStream: async (options) => {
+            if (!userPromptText(options).includes("just-compacted transcript epoch")) {
+              if (config?.holdDream !== true) return inner.doStream(options);
+              events.push("dream-start");
+              dream.started.open();
+              await dream.released.opened;
+              events.push("dream-end");
+              return inner.doStream(options);
+            }
+            const id = ++analyzerStreams;
+            events.push(`start-${id}`);
+            gateFor("started", id).open();
+            await gateFor("released", id).opened;
+            events.push(`end-${id}`);
+            return inner.doStream(options);
+          },
+        });
+      };
+      return {
+        events,
+        factory,
+        modelCreated: (id: number) => gateFor("created", id).opened,
+        streamStarted: (id: number) => gateFor("started", id).opened,
+        release: (id: number) => gateFor("released", id).open(),
+        dreamStarted: dream.started.opened,
+        releaseDream: () => dream.released.open(),
+      };
+    }
+
+    /** Lets every reaction already queued on a promise run. Nothing here waits for elapsed time. */
+    async function settle(): Promise<void> {
+      for (let turn = 0; turn < 5; turn++) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+
+    /**
+     * Starts `first`'s analyzer and holds its stream, then starts `second`'s: past its model
+     * creation, the second run has only its turn left to wait for. Returns once both settled.
+     */
+    async function runSecondBehindFirst(
+      fixture: Fixture,
+      held: ReturnType<typeof heldAnalyzers>,
+      first: CompactionCompletionMetadata,
+      second: CompactionCompletionMetadata
+    ): Promise<void> {
+      const firstRun = fixture.service.maybeHarvestThenSweep(first);
+      await held.streamStarted(1);
+      const secondRun = fixture.service.maybeHarvestThenSweep(second);
+      await held.modelCreated(2);
+      await settle();
+      expect(held.events).toEqual(["start-1"]);
+
+      held.release(1);
+      await held.streamStarted(2);
+      expect(held.events).toEqual(["start-1", "end-1", "start-2"]);
+      held.release(2);
+      await Promise.all([firstRun, secondRun]);
+      expect(held.events).toEqual(["start-1", "end-1", "start-2", "end-2"]);
+    }
+
+    it("runs the analyzers of two compaction boundaries of one workspace one after the other", async () => {
+      const held = heldAnalyzers();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      const first = await seedCompactionEpoch(fixture);
+      const second = await seedCompactionEpoch(
+        fixture,
+        "ws-dream",
+        2,
+        first.summaryHistorySequence
+      );
+
+      await runSecondBehindFirst(fixture, held, first, second);
+
+      const records = await harvestRecords(fixture);
+      expect(records["summary-1"]?.status).toBe("completed");
+      expect(records["summary-2"]?.status).toBe("completed");
+    });
+
+    it("runs a sub-agent's analyzer after its owner's, since both write the owner's workspace memory", async () => {
+      const held = heldAnalyzers();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+      const owner = await seedCompactionEpoch(fixture);
+      const child = await seedCompactionEpoch(fixture, "ws-sub");
+
+      await runSecondBehindFirst(fixture, held, owner, child);
+
+      expect((await harvestRecords(fixture, "ws-dream"))["summary-1"]?.status).toBe("completed");
+      expect((await harvestRecords(fixture, "ws-sub"))["summary-1"]?.status).toBe("completed");
+    });
+
+    it("runs the chunks of two unrelated workspaces one after the other, like every memory-writing stream", async () => {
+      // The dream's exclusion is service-wide: its lock file is one for the root, so a chunk of
+      // another owner cannot hold it beside this one. Each owner still has its own job queue.
+      const held = heldAnalyzers();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      await fixture.addWorkspace("ws-other");
+      const first = await seedCompactionEpoch(fixture);
+      const other = await seedCompactionEpoch(fixture, "ws-other");
+
+      await runSecondBehindFirst(fixture, held, first, other);
+
+      expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+      expect((await harvestRecords(fixture, "ws-other"))["summary-1"]?.status).toBe("completed");
+    });
+
+    it("starts the owner's next analyzer while the previous one's usage is still being recorded", async () => {
+      // Recording usage takes the session directory's lock: a stall there must not hold every later
+      // analyzer of the owner, and the usage of both chunks must still be recorded afterwards.
+      const held = heldAnalyzers();
+      using fixture = await createFixture({ modelFactory: held.factory, withSessionUsage: true });
+      const first = await seedCompactionEpoch(fixture);
+      const second = await seedCompactionEpoch(
+        fixture,
+        "ws-dream",
+        2,
+        first.summaryHistorySequence
+      );
+      held.release(1);
+      held.release(2);
+      const usageEntered = gate();
+      const usageStalled = gate();
+      const recordedAnalyzers: string[] = [];
+      spyOn(fixture.sessionUsage!, "recordHeadlessUsage").mockImplementation(
+        async (workspaceId, _model, _usage, _providerMetadata, options) => {
+          if (options?.analyticsSource !== "memory_harvest") return undefined;
+          recordedAnalyzers.push(workspaceId);
+          usageEntered.open();
+          await usageStalled.opened;
+          return undefined;
+        }
+      );
+
+      let giveUp: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const firstRun = fixture.service.maybeHarvestThenSweep(first);
+        await usageEntered.opened;
+        const secondRun = fixture.service.maybeHarvestThenSweep(second);
+        await held.modelCreated(2);
+        // The stream starting is the event waited for. The bound only turns a run stuck behind
+        // the first one's usage into a failed assertion instead of a test timeout.
+        const started = held.streamStarted(2).then(() => true);
+        const gaveUp = new Promise<boolean>((resolve) => {
+          giveUp = setTimeout(() => resolve(false), 2_000);
+        });
+        expect(await Promise.race([started, gaveUp])).toBe(true);
+
+        usageStalled.open();
+        await Promise.all([firstRun, secondRun]);
+        expect(recordedAnalyzers).toEqual(["ws-dream", "ws-dream"]);
+      } finally {
+        clearTimeout(giveUp);
+        usageStalled.open();
+      }
+    });
+
+    it("lets removal cancel an analyzer that is still waiting its turn, without wedging the queue", async () => {
+      const held = heldAnalyzers();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+      const owner = await seedCompactionEpoch(fixture);
+      const child = await seedCompactionEpoch(fixture, "ws-sub");
+
+      const ownerRun = fixture.service.maybeHarvestThenSweep(owner);
+      await held.streamStarted(1);
+      const childRun = fixture.service.maybeHarvestThenSweep(child);
+      await held.modelCreated(2);
+      await settle();
+
+      await fixture.service.cancelInFlightConsolidation("ws-sub");
+      await childRun;
+      // The cancelled run never read a chunk; the owner's stream is untouched.
+      expect(held.events).toEqual(["start-1"]);
+      expect((await harvestRecords(fixture, "ws-sub"))["summary-1"]).toMatchObject({
+        status: "failed",
+        error: expect.stringContaining("before its turn") as string,
+      });
+
+      held.release(1);
+      await ownerRun;
+      const next = await seedCompactionEpoch(fixture, "ws-dream", 2, owner.summaryHistorySequence);
+      const nextRun = fixture.service.maybeHarvestThenSweep(next);
+      await held.streamStarted(2);
+      held.release(2);
+      await nextRun;
+      expect((await harvestRecords(fixture, "ws-dream"))["summary-2"]?.status).toBe("completed");
+    });
+
+    // The analyzer and the dream edit the same /memories/workspace files, and the dream's `insert`
+    // takes a line offset from an earlier read: the two streams must never run at once.
+    describe("with the dream stream's exclusion", () => {
+      it("does not start a chunk while a dream stream of its owner holds the exclusion", async () => {
+        const held = heldAnalyzers({ holdDream: true });
+        using fixture = await createFixture({ modelFactory: held.factory });
+        const epoch = await seedCompactionEpoch(fixture);
+        held.release(1);
+
+        const dreamRun = fixture.service.maybeRun("ws-dream", "manual");
+        await held.dreamStarted;
+        const harvestRun = fixture.service.maybeHarvestThenSweep(epoch);
+        await held.modelCreated(2);
+        await settle();
+        expect(held.events).toEqual(["dream-start"]);
+
+        held.releaseDream();
+        await held.streamStarted(1);
+        expect(held.events.slice(0, 3)).toEqual(["dream-start", "dream-end", "start-1"]);
+        await Promise.all([dreamRun, harvestRun]);
+        expect(held.events).toEqual(["dream-start", "dream-end", "start-1", "end-1"]);
+        expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+      });
+
+      it("does not start a dream stream while a chunk of its owner is streaming", async () => {
+        const held = heldAnalyzers({ holdDream: true });
+        using fixture = await createFixture({ modelFactory: held.factory });
+        const epoch = await seedCompactionEpoch(fixture);
+
+        const harvestRun = fixture.service.maybeHarvestThenSweep(epoch);
+        await held.streamStarted(1);
+        const dreamRun = fixture.service.maybeRun("ws-dream", "manual");
+        await held.modelCreated(2);
+        // A dream with no exclusion to wait for still has disk work (its lock) before its stream,
+        // which no count of loop turns bounds. The stream starting is the event waited for; the
+        // bound only ends the wait of a dream that is held back, as it should be.
+        let giveUp: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const startedEarly = await Promise.race([
+            held.dreamStarted.then(() => true),
+            new Promise<boolean>((resolve) => {
+              giveUp = setTimeout(() => resolve(false), 250);
+            }),
+          ]);
+          expect(startedEarly).toBe(false);
+        } finally {
+          clearTimeout(giveUp);
+        }
+        expect(held.events).toEqual(["start-1"]);
+
+        held.release(1);
+        await held.dreamStarted;
+        expect(held.events.slice(0, 3)).toEqual(["start-1", "end-1", "dream-start"]);
+        held.releaseDream();
+        await Promise.all([harvestRun, dreamRun]);
+      });
+
+      it("starts a chunk's timeout when it gets the exclusion, not while it waits behind a dream stream", async () => {
+        const held = heldAnalyzers({ holdDream: true });
+        const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+        const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+          held.events.push("timeout");
+          return realTimeout(ms);
+        });
+        try {
+          using fixture = await createFixture({ modelFactory: held.factory });
+          const epoch = await seedCompactionEpoch(fixture);
+          held.release(1);
+
+          const dreamRun = fixture.service.maybeRun("ws-dream", "manual");
+          await held.dreamStarted;
+          const harvestRun = fixture.service.maybeHarvestThenSweep(epoch);
+          await held.modelCreated(2);
+          await settle();
+          // The dream's own timeout only: a chunk that waits has none running.
+          expect(held.events).toEqual(["timeout", "dream-start"]);
+
+          held.releaseDream();
+          await held.streamStarted(1);
+          expect(held.events.slice(0, 5)).toEqual([
+            "timeout",
+            "dream-start",
+            "dream-end",
+            "timeout",
+            "start-1",
+          ]);
+          await Promise.all([dreamRun, harvestRun]);
+        } finally {
+          timeoutSpy.mockRestore();
+        }
+      });
+
+      it("waits for a dream stream in another process before starting a chunk", async () => {
+        const held = heldAnalyzers();
+        using fixture = await createFixture({ modelFactory: held.factory });
+        const epoch = await seedCompactionEpoch(fixture);
+        held.release(1);
+        const releaseForeign = await holdForeignDreamLock(fixture);
+        try {
+          const run = fixture.service.maybeHarvestThenSweep(epoch);
+          await held.modelCreated(1);
+          await settle();
+          expect(held.events).toEqual([]);
+
+          await releaseForeign();
+          await held.streamStarted(1);
+          await run;
+          expect(held.events).toEqual(["start-1", "end-1"]);
+          expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+        } finally {
+          await releaseForeign();
+        }
+      });
+
+      it("lets removal cancel a chunk that is waiting for the exclusion, without wedging the queue", async () => {
+        const held = heldAnalyzers();
+        using fixture = await createFixture({ modelFactory: held.factory });
+        await fixture.addWorkspace("ws-other");
+        const epoch = await seedCompactionEpoch(fixture);
+        const other = await seedCompactionEpoch(fixture, "ws-other");
+        held.release(1);
+        held.release(2);
+        const releaseForeign = await holdForeignDreamLock(fixture);
+        try {
+          const run = fixture.service.maybeHarvestThenSweep(epoch);
+          await held.modelCreated(1);
+          await settle();
+
+          await fixture.service.cancelInFlightConsolidation("ws-dream");
+          await run;
+          // No model call was made, and the run ended as a failed stream does: resumable.
+          expect(held.events).toEqual([]);
+          expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+            status: "failed",
+            nextChunk: 0,
+            error: expect.stringContaining("did not start") as string,
+          });
+
+          // The cancelled chunk gave its place in the queue back and never took the lock.
+          await releaseForeign();
+          await fixture.service.maybeHarvestThenSweep(other);
+          expect(held.events).toEqual(["start-1", "end-1"]);
+          expect((await harvestRecords(fixture, "ws-other"))["summary-1"]?.status).toBe(
+            "completed"
+          );
+        } finally {
+          await releaseForeign();
+        }
+      });
+
+      it("fails the job, without a model call, when the exclusion's lock cannot be taken, and a retry runs it", async () => {
+        const held = heldAnalyzers();
+        using fixture = await createFixture({ modelFactory: held.factory });
+        const epoch = await seedCompactionEpoch(fixture);
+        held.release(1);
+        const lockPath = dreamStreamLockPath(fixture.xumHome);
+        const { writeFile } = fsPromises;
+        // The lock's temp file cannot be written: a filesystem error, not contention.
+        const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(async (file, data) => {
+          if (typeof file === "string" && file.startsWith(`${lockPath}.tmp-`)) {
+            throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+          }
+          return writeFile(file, data);
+        });
+        try {
+          await fixture.service.maybeHarvestThenSweep(epoch);
+        } finally {
+          writeSpy.mockRestore();
+        }
+        expect(held.events).toEqual([]);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "failed",
+          attemptCount: 1,
+          nextChunk: 0,
+          error: expect.stringContaining("consolidation lock") as string,
+        });
+
+        await fixture.service.maybeHarvestThenSweep(epoch);
+        expect(held.events).toEqual(["start-1", "end-1"]);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          attemptCount: 2,
+        });
+      });
+    });
+  });
+
   describe("dream stream queue", () => {
     /**
      * Models whose streams each hold until `release(id)`, numbered in the order the runs created
@@ -1499,16 +2554,6 @@ describe("MemoryConsolidationService", () => {
         releaseUsage();
       }
     });
-
-    /** Another backend on the same root holding the dream lock: this process sees its token as live. */
-    function holdForeignDreamLock(fixture: Fixture) {
-      return acquireCrossProcessLock({
-        lockPath: dreamStreamLockPath(fixture.xumHome),
-        acquireTimeoutMs: 1_000,
-        staleMs: 60_000,
-        timeoutMessage: "test holder",
-      });
-    }
 
     it("waits for a dream stream in another process before starting its own", async () => {
       const held = heldStreams();
@@ -1790,6 +2835,90 @@ describe("MemoryConsolidationService", () => {
     const retry = await fixture.service.maybeRun("ws-dream", "compaction");
     expect(retry.success).toBe(true);
     expect(fixture.modelCalls).toHaveLength(2);
+  });
+
+  it("does not treat a run of many chunks as stale while its chunks keep finishing", async () => {
+    // Attempt 3 is the one a stale record would flip to failed on a sidecar read.
+    const start = Date.now();
+    const minute = 60_000;
+    let statusDuringChunkTwo: MemoryHarvestRecordPayload | null = null;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: async (call) => {
+            const label = /Transcript chunk (\d+)\//.exec(userPromptText(call))?.[1];
+            if (label === "1") setSystemTime(new Date(start + 4 * minute));
+            if (label === "2") {
+              setSystemTime(new Date(start + 8 * minute));
+              statusDuringChunkTwo = (await fixture.service.getStatus("ws-dream"))
+                .latestHarvestRecord;
+            }
+            return { stream: noChangesStream() };
+          },
+        }),
+    });
+    await appendBulkRows(fixture);
+    const metadata = await seedCompactionEpoch(fixture);
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-dream": {
+            [metadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: start - 20_000,
+              completedAt: start - 10_000,
+              attemptCount: 2,
+              boundaryKey: metadata.summaryMessageId,
+              compactionEpoch: metadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "provider exploded",
+              completionMetadata: metadata,
+            },
+          },
+        },
+      })
+    );
+    try {
+      setSystemTime(new Date(start));
+      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+    } finally {
+      setSystemTime();
+    }
+
+    // 8 minutes after the attempt began, but 4 after its last finished chunk.
+    expect(statusDuringChunkTwo).toMatchObject({ status: "pending", attemptCount: 3 });
+  });
+
+  it("does not journal a dream that removal cut short as a success", async () => {
+    // A real provider stream ends silently when its request is aborted: no error part reaches
+    // the runner, which used to read the pass as clean.
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => (streamStarted = resolve));
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (call) => {
+            streamStarted();
+            return new Promise((_resolve, reject) => {
+              call.abortSignal?.addEventListener("abort", () =>
+                reject(new Error("stalled provider call aborted"))
+              );
+            });
+          },
+        }),
+    });
+
+    const run = fixture.service.maybeRun("ws-dream", "manual");
+    await started;
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    const result = await run;
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("stream failed");
+    expect(await fixture.service.getRecord("ws-dream")).toBeNull();
   });
 
   it("self-heals a corrupt sidecar instead of failing every later read", async () => {
