@@ -2006,7 +2006,7 @@ export const PluginsSettingsSection: React.FC = () => {
           void checkForUpdates();
           break;
       }
-    });
+    }, initialIntent);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribe on API reconnect only; the listener reads the latest handlers via closure per subscription
   }, [api]);
 
