@@ -592,6 +592,29 @@ describe("MemoryService", () => {
       }
     });
 
+    it("refuses an edit that assembles a new key in a file that already held a credential", async () => {
+      // An old password must not switch the guard off for the rest of the file: joining `sk-` and
+      // its suffix there adds a second credential shape, which the count of shapes sees.
+      using fixture = await createFixture();
+      await fsPromises.mkdir(path.dirname(physical(fixture, "x")), { recursive: true });
+      const tainted = "password: hunter2-correct-horse\nsk-\nABCDEFGHIJKLMNO\n";
+      await fsPromises.writeFile(physical(fixture, "tainted.md"), tainted);
+
+      const joined = await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/tainted.md",
+        "sk-\nABC",
+        "sk-ABC",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+
+      expect(joined.success).toBe(false);
+      expect(await fsPromises.readFile(physical(fixture, "tainted.md"), "utf-8")).toBe(tainted);
+    });
+
     it("lets one of two concurrent halves-joining edits land and refuses the other, as one lock orders them", async () => {
       // Each edit alone leaves no credential, so a check made before the lock would pass both and
       // the second would write the whole key. Inside the lock the second one sees the first's result.

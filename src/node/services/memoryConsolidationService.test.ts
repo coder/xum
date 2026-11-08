@@ -3416,7 +3416,8 @@ describe("MemoryConsolidationService", () => {
         // A record saved before the floor was: it has the cursor and the row its chunks read, no
         // floor. The cursor counts chunks of the rows after the job's floor, so a floor taken from
         // the record's own `readThroughRowId` would leave the retry fewer rows than the cursor
-        // counts, and skip some. With no floor to reuse it reads the rows again from the start.
+        // counts, and skip some. With no floor to reuse it reads the rows again from the start,
+        // its first chunk included: the recomputed floor may differ from the one the cursor counted.
         const { chunkLabels, record } = await retryAfterSecondChunkFailed((fixture) =>
           editHarvestRecord(fixture, "summary-1", (stored) => {
             expect(typeof stored.readThroughRowId).toBe("string");
@@ -3424,7 +3425,7 @@ describe("MemoryConsolidationService", () => {
           })
         );
 
-        expect(chunkLabels).toEqual(["1/3", "2/3", "2/3", "3/3"]);
+        expect(chunkLabels).toEqual(["1/3", "2/3", "1/3", "2/3", "3/3"]);
         expect(record).toMatchObject({ status: "completed", nextChunk: 3 });
       });
 
@@ -5516,6 +5517,25 @@ describe("harvestResumeState", () => {
       usage,
     });
     expect(attemptState.analyzedFloorRowId).toBe("row-3");
+  });
+
+  it("starts a retry whose record has a cursor but no floor at the first chunk", () => {
+    // Its floor is recomputed and may be newer than the one the cursor counted from: resuming at
+    // the old chunk would skip rows no run read.
+    const { progress } = harvestResumeState({
+      status: "failed",
+      startedAt: 1,
+      attemptCount: 1,
+      boundaryKey: "summary-1",
+      compactionEpoch: 1,
+      acceptedCandidates: 1,
+      skippedCandidates: 0,
+      nextChunk: 2,
+      nextChunkOps: 1,
+      budgetUsed: 5,
+    });
+
+    expect(progress).toMatchObject({ nextChunk: 0, nextChunkOps: undefined, budgetUsed: 5 });
   });
 
   it("keeps a null floor (an attempt that found no earlier run) apart from an absent one", () => {

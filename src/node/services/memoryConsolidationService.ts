@@ -476,12 +476,17 @@ export function harvestResumeState(existing: MemoryHarvestRecord | undefined): {
 } {
   // A first attempt has no record: read each field off an empty one rather than check per field.
   const earlier: Partial<MemoryHarvestRecord> = existing ?? {};
+  // The chunk cursor counts chunks of the rows after the floor the first attempt fixed. A record
+  // with a cursor but no floor (older, or hand-edited) gets its floor recomputed, maybe a newer one
+  // that an archive completed meanwhile, and the old cursor would then skip chunks nobody read: start
+  // that retry at the first chunk again (re-reading rows, never skipping them).
+  const cursorHasFloor = earlier.analyzedFloorRowId !== undefined;
   return {
     progress: {
-      nextChunk: earlier.nextChunk ?? 0,
+      nextChunk: cursorHasFloor ? (earlier.nextChunk ?? 0) : 0,
       ops: earlier.ops ?? [],
       budgetUsed: earlier.budgetUsed,
-      nextChunkOps: earlier.nextChunkOps,
+      nextChunkOps: cursorHasFloor ? earlier.nextChunkOps : undefined,
       // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot be
       // loaded): its failure record would otherwise drop what the earlier attempt's chunks read.
       readThroughRowId: earlier.readThroughRowId,

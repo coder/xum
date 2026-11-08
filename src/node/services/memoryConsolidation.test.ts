@@ -1498,6 +1498,45 @@ describe("runMemoryConsolidation", () => {
     expect(await pathExists(path.join(fixture.globalMemoryDir, "cut.md"))).toBe(false);
   });
 
+  it("redacts a credential the model repeats in its closing summary", async () => {
+    // The summary is persisted and shown through status IPC, outside the guarded writes.
+    using fixture = await createFixture();
+    const key = "sk-ABCDEFGHIJKLMNOPQRSTUV";
+    const model = new MockLanguageModelV3({
+      doStream: () =>
+        Promise.resolve({
+          stream: simulateReadableStream<LanguageModelV3StreamPart>({
+            chunks: [
+              { type: "text-start", id: "t" },
+              { type: "text-delta", id: "t", delta: `Removed the stale key ${key}.` },
+              { type: "text-end", id: "t" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 1, text: 1, reasoning: 0 },
+                },
+              },
+            ],
+          }),
+        }),
+    });
+
+    const result = await runMemoryConsolidation({
+      model,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.streamError).toBeUndefined();
+    expect(result.summary).not.toContain(key);
+    expect(result.summary).toContain("Removed the stale key");
+  });
+
   // What the organizer writes can be promoted where other workspaces' models read it, so its guard
   // refuses a credential in code, whatever the prompt said.
   it("refuses a credential the organizer tries to write", async () => {

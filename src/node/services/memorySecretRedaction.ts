@@ -11,7 +11,8 @@
  * leave the tail of a long credential readable.
  */
 
-const REDACTED = "[redacted]";
+/** What a redacted value becomes. */
+export const REDACTED = "[redacted]";
 
 /**
  * Callers cut text at a cap. They scan this much past it, so a secret that starts inside the kept

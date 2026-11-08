@@ -714,8 +714,11 @@ export async function runMemoryConsolidation(args: {
       "memory consolidation ended a step at the model's output limit, so its tool call never ran"
     );
   }
-  const summary =
-    streamErrors.length === 0 ? (await stream.text).trim() : `stream error: ${streamErrors[0]}`;
+  // The summary is persisted in the sidecar and shown through status IPC: a credential the model
+  // repeats from memory in its closing text must not outlive the guarded writes.
+  const summary = redactSecretLike(
+    streamErrors.length === 0 ? (await stream.text).trim() : `stream error: ${streamErrors[0]}`
+  );
 
   // Cost telemetry: headless runs bypass the chat cost pipeline, so the
   // journal record is the only place token usage is visible. Only awaited on
