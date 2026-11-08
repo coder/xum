@@ -65,11 +65,12 @@ function isVersionResponse(response: http.IncomingMessage): Promise<boolean> {
 
 /**
  * Asks the lock's `baseUrl` whether a xum backend runs there. peek() uses it only where the
- * lock's process identity cannot decide: macOS, Windows, and locks that an older build wrote.
+ * lock's process identity cannot decide (judgeByIdentity() in serverLockfile.ts reads
+ * "undecided" and lists the cases).
  *
  * The request carries no header and no token: the lock's `baseUrl` can name any process. A
  * redirect is not followed. The answer is public (`GET /version` needs no token), so a process
- * that copies it still reads as `answers`: on those platforms only the identity check can close
+ * that copies it still reads as `answers`: where identity cannot decide, the probe cannot close
  * that case.
  */
 export function probeXumBackend(

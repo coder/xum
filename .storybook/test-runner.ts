@@ -14,6 +14,7 @@ import {
   MERMAID_ERROR_SELECTOR,
   MERMAID_PAGE_DIAGRAM_SELECTOR,
   MERMAID_PAGE_FRAME_SELECTOR,
+  PAINT_CHECK_WAIT_EVENT,
 } from "../src/constants/mermaid";
 
 // Real :hover for the primary-button contrast stories (#6022). A play runs inside the page and
@@ -767,6 +768,10 @@ async function assertLiveLineClearsTheComposer(page: StoryPage) {
   }
 }
 
+// The diagram wait, the error marker, the viewport check and the paint-outside check below each
+// have a story built to trip them (src/browser/stories/PaintCheckFixtures.stories.tsx), which
+// `make test-storybook-paint-fixtures` runs through this file. A message that changes needs its new
+// text in scripts/check-paint-check-fixtures.ts.
 const PAINT_CHECK_TAG = "paint-check";
 const NO_DIAGRAM_MESSAGE = `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`;
 const DIAGRAM_RENDER_TIMEOUT_MS = 15_000;
@@ -786,19 +791,22 @@ interface Pixels {
 }
 
 async function waitForRenderedDiagrams(page: StoryPage) {
-  const args: [string, string, string, number] = [
+  const args: [string, string, string, number, string] = [
     MERMAID_PAGE_FRAME_SELECTOR,
     MERMAID_PAGE_DIAGRAM_SELECTOR,
     MERMAID_ERROR_SELECTOR,
     DIAGRAM_RENDER_TIMEOUT_MS,
+    PAINT_CHECK_WAIT_EVENT,
   ];
-  const rendered = await page.evaluate(async ([frames, diagrams, errors, timeout]) => {
+  const rendered = await page.evaluate(async ([frames, diagrams, errors, timeout, waitEvent]) => {
     // A diagram that fails replaces its whole frame, so the counts below cannot see it.
     const hasFailed = () => document.querySelector(errors) !== null;
     const isRendered = () => {
       const drawn = document.querySelectorAll(diagrams).length;
       return drawn > 0 && drawn === document.querySelectorAll(frames).length;
     };
+    // The fixture story that mounts its diagram late waits for this, so it cannot mount early.
+    window.dispatchEvent(new Event(waitEvent));
     // Not Date.now(): the preview freezes it (.storybook/preview.tsx).
     const deadline = performance.now() + timeout;
     while (!isRendered() && !hasFailed() && performance.now() < deadline) {
@@ -1181,6 +1189,17 @@ const config: TestRunnerConfig = {
     const initialOrder = await tabs.evaluateAll((elements) => elements.map((el) => el.id));
     try {
       await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+      // A swipe has settled at the first scrollend after its touchEnd (`data-swipe-ended` marks
+      // that point), not at any scrollend: Playwright's scroll-into-view before a click and the
+      // previous swipe's fling also end with one, and a fast runner can have the swipe already
+      // listening by then. Counting that event started the next swipe, and in the end the tap on
+      // the last tab, during a fling. A touch that lands on a fling only stops it and sends no
+      // click, so the tab stayed unselected and the wait for it timed out.
+      await row.evaluate((el) => {
+        el.addEventListener("scrollend", () => {
+          if (el.hasAttribute("data-swipe-ended")) el.setAttribute("data-scroll-settled", "");
+        });
+      });
       for (const width of [1200, 375]) {
         // A visible-sidebar tablet and a phone viewport, both with a narrow overflowing strip.
         await page.setViewportSize({ width, height: 900 });
@@ -1212,10 +1231,8 @@ const config: TestRunnerConfig = {
             throw new Error("No tab label available to swipe");
           });
           await row.evaluate((el) => {
+            el.removeAttribute("data-swipe-ended");
             el.removeAttribute("data-scroll-settled");
-            el.addEventListener("scrollend", () => el.setAttribute("data-scroll-settled", ""), {
-              once: true,
-            });
           });
           await client.send("Input.dispatchTouchEvent", {
             type: "touchStart",
@@ -1230,6 +1247,8 @@ const config: TestRunnerConfig = {
               () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
             );
           }
+          // Arm before the touch ends: a scrollend that comes right as the finger lifts counts.
+          await row.evaluate((el) => el.setAttribute("data-swipe-ended", ""));
           await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
           await row.and(page.locator("[data-scroll-settled]")).waitFor({ timeout: 5000 });
           // The tap below lands 20 px into the last tab's visible part: on a phone, a long title

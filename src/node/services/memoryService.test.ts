@@ -471,6 +471,233 @@ describe("MemoryService", () => {
     });
   });
 
+  // Credential shapes in these tests are synthetic: `sk-` plus 15 letters is the shortest shape the
+  // detector reads as a key, and neither half of it is one alone (it never matches across a newline).
+  describe("rejectSecretLike (the result of a write, checked inside its lock)", () => {
+    const GUARDED = { rejectSecretLike: true };
+    const physical = (fixture: MemoryFixture, name: string) =>
+      path.join(fixture.xumHome, "memory", "global", name);
+
+    it("refuses a str_replace that joins two harmless halves into a credential, and leaves the file as it was", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/halves.md",
+        "sk-\nABCDEFGHIJKLMNO\n",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+
+      const joined = await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/halves.md",
+        "sk-\nABC",
+        "sk-ABC",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+
+      expect(joined.success).toBe(false);
+      if (!joined.success) {
+        expect(joined.error).toContain("credential");
+        expect(joined.error).not.toContain("ABCDEFGHIJKLMNO");
+      }
+      expect(await fsPromises.readFile(physical(fixture, "halves.md"), "utf-8")).toBe(
+        "sk-\nABCDEFGHIJKLMNO\n"
+      );
+    });
+
+    it("writes the same join when the check is not asked for (the organizer's writes)", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/halves.md",
+        "sk-\nABCDEFGHIJKLMNO\n",
+        "agent"
+      );
+
+      const joined = await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/halves.md",
+        "sk-\nABC",
+        "sk-ABC",
+        "agent"
+      );
+
+      expect(joined.success).toBe(true);
+    });
+
+    it("refuses an insert that completes a key name and its value across lines, and a create that is one", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, "/memories/global/env.md", "password:\n", "agent");
+
+      const inserted = await fixture.service.insert(
+        fixture.ctx,
+        "/memories/global/env.md",
+        1,
+        "hunter2-correct-horse",
+        "agent",
+        undefined,
+        undefined,
+        undefined,
+        GUARDED
+      );
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/direct.md",
+        "password: hunter2-correct-horse\n",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+
+      expect(inserted.success).toBe(false);
+      expect(created.success).toBe(false);
+      expect(await fsPromises.readFile(physical(fixture, "env.md"), "utf-8")).toBe("password:\n");
+      expect(await pathExists(physical(fixture, "direct.md"))).toBe(false);
+    });
+
+    it("keeps editing a file that already held credential-like text, and a placeholder the detector skips", async () => {
+      // The refusal is for text a write ADDS. A note the user wrote with a password in it, or one
+      // that says `[redacted]` where a value was, must not freeze the file for the analyzer.
+      using fixture = await createFixture();
+      await fsPromises.mkdir(path.dirname(physical(fixture, "x")), { recursive: true });
+      await fsPromises.writeFile(
+        physical(fixture, "legacy.md"),
+        "password: hunter2-correct-horse\nnotes\n"
+      );
+      await fsPromises.writeFile(
+        physical(fixture, "placeholder.md"),
+        "API_TOKEN: [redacted]\nnotes\n"
+      );
+
+      for (const name of ["legacy.md", "placeholder.md"]) {
+        const edited = await fixture.service.strReplace(
+          fixture.ctx,
+          `/memories/global/${name}`,
+          "notes",
+          "more notes",
+          "agent",
+          undefined,
+          undefined,
+          GUARDED
+        );
+        expect(edited.success).toBe(true);
+        expect(await fsPromises.readFile(physical(fixture, name), "utf-8")).toContain("more notes");
+      }
+    });
+
+    it("refuses an edit that assembles a new key in a file that already held a credential", async () => {
+      // An old password must not switch the guard off for the rest of the file: joining `sk-` and
+      // its suffix there adds a second credential shape, which the count of shapes sees.
+      using fixture = await createFixture();
+      await fsPromises.mkdir(path.dirname(physical(fixture, "x")), { recursive: true });
+      const tainted = "password: hunter2-correct-horse\nsk-\nABCDEFGHIJKLMNO\n";
+      await fsPromises.writeFile(physical(fixture, "tainted.md"), tainted);
+
+      const joined = await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/tainted.md",
+        "sk-\nABC",
+        "sk-ABC",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+
+      expect(joined.success).toBe(false);
+      expect(await fsPromises.readFile(physical(fixture, "tainted.md"), "utf-8")).toBe(tainted);
+    });
+
+    it("refuses an edit that removes one credential and assembles another, which keeps their count", async () => {
+      using fixture = await createFixture();
+      await fsPromises.mkdir(path.dirname(physical(fixture, "x")), { recursive: true });
+      const swapped = "password: old-secret\nsk-\nABCDEFGHIJKLMNO\n";
+      await fsPromises.writeFile(physical(fixture, "swapped.md"), swapped);
+
+      const result = await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/swapped.md",
+        "password: old-secret\nsk-\n",
+        "sk-",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+
+      expect(result.success).toBe(false);
+      expect(await fsPromises.readFile(physical(fixture, "swapped.md"), "utf-8")).toBe(swapped);
+    });
+
+    it("makes validateMutation refuse the results the guarded write refuses, and only when asked", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/halves.md",
+        "sk-\nABCDEFGHIJKLMNO\npassword:\n",
+        "agent"
+      );
+      const commands = [
+        { command: "create", path: "/memories/global/new.md", file_text: "password: hunter2pw\n" },
+        {
+          command: "str_replace",
+          path: "/memories/global/halves.md",
+          old_str: "sk-\nA",
+          new_str: "sk-A",
+        },
+        {
+          command: "insert",
+          path: "/memories/global/halves.md",
+          insert_line: 3,
+          insert_text: "hunter2pw",
+        },
+      ] as const;
+
+      for (const command of commands) {
+        const guarded = await fixture.service.validateMutation(fixture.ctx, command, GUARDED);
+        expect(guarded.ok ? "accepted" : guarded.error).toContain("credential");
+        expect(await fixture.service.validateMutation(fixture.ctx, command)).toEqual({ ok: true });
+      }
+    });
+
+    it("lets one of two concurrent halves-joining edits land and refuses the other, as one lock orders them", async () => {
+      // Each edit alone leaves no credential, so a check made before the lock would pass both and
+      // the second would write the whole key. Inside the lock the second one sees the first's result.
+      using fixture = await createFixture();
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/halves.md",
+        "sk-\nAB\nCDEFGHIJKLMNO\n",
+        "agent"
+      );
+      const join = (oldStr: string, newStr: string) =>
+        fixture.service.strReplace(
+          fixture.ctx,
+          "/memories/global/halves.md",
+          oldStr,
+          newStr,
+          "agent",
+          undefined,
+          undefined,
+          GUARDED
+        );
+
+      const results = await Promise.all([join("sk-\nAB", "sk-AB"), join("B\nC", "BC")]);
+
+      expect(results.filter((result) => result.success)).toHaveLength(1);
+      expect(await fsPromises.readFile(physical(fixture, "halves.md"), "utf-8")).not.toContain(
+        "sk-ABCDEFGHIJKLMNO"
+      );
+    });
+  });
+
   describe("delete + rename", () => {
     it("deletes files and directories recursively", async () => {
       using fixture = await createFixture();

@@ -197,7 +197,8 @@ agent-browser find role button click --name "Open settings" --exact
 - `idle` waits until the page settles: no CSS transition runs, and on a `/workspace/` page the
   `Conversation transcript` log is neither loading nor streaming (`aria-busy="false"`). A click
   while the right sidebar slides open lands where the target was and is lost. `idle` exits 3
-  when the page shows `<name> failed to load.` (see Gotchas).
+  when the page shows `<name> failed to load.` or the boot screen's `Xum could not load` (see
+  Gotchas).
 - `send-ready` waits until the composer's `Send message` button is enabled. Fill the message, run
   `send-ready`, then send. The workspace composer keeps Send disabled until the transcript has
   caught up, and the new-workspace composer until the branch list has loaded and the draft is
@@ -270,9 +271,10 @@ opens a page of the run in Playwright WebKit at a phone viewport:
 touch), waits as `idle` does, and writes `<step>-webkit.png` and `<step>-webkit.txt` under
 `evidence/<feature>/`. `idle`'s test reads a page as settled while it still shows the loading
 screen or a Mermaid diagram that is still rendering, so this command also waits for both to go.
-After 60 s it exits 1 and names what still shows. It exits 3 on `<name> failed to load.`, as
-`idle` does, and 1 when the page shows the startup connection error or the token prompt instead
-of the page. A failed run leaves no `-webkit` files from an earlier run of the same name.
+After 60 s it exits 1 and names what still shows. It exits 3 on `<name> failed to load.` or the boot
+screen's `Xum could not load`, as `idle` does, and 1 when the page shows the startup connection
+error or the token prompt instead of the page. A failed run leaves no `-webkit` files from an
+earlier run of the same name.
 
 The report holds only fixed text and numbers: the URL you gave (without the token), the engine and
 its mode, the viewport, `document.documentElement.scrollWidth <= innerWidth` with both numbers (or
@@ -386,17 +388,17 @@ after their other arguments. Without one they use the newest launch from this ch
   What the page shows depends on the failed modules. A lazily loaded one shows
   `<name> failed to load.` with a `Reload` button, the console logs
   `Failed to fetch dynamically imported module`, and `verify-xum.sh idle` exits 3. A module of the
-  first-load graph shows nothing: the page stays on `Loading Xum` and `idle` exits 1 after 25 s.
-  `React.lazy` keeps a failure and the boot screen has no failure state, so only a reload
+  first-load graph replaces `Loading Xum` with the boot screen's `Xum could not load` and a
+  focused `Reload` button, and `idle` exits 3 too. `React.lazy` keeps a failure, so only a reload
   recovers. Run `agent-browser reload`, then repeat the step, and note the reload in your report.
   Launch warms Vite, so a page load takes a few seconds and the window for such a change is
   short. Under heavy host load a warm load can still take 20 s.
-- A page that stays on `Loading Xum` after `idle` timed out has lost a module request (see the
-  previous item): run `agent-browser reload`. A slow transform is not the usual cause after a
-  launch, because Vite has already transformed every module. Vite transforms a module again after a
-  source edit, and every module again after a dependency re-optimization (the first item above).
-  Then the page can stay on `Loading Xum` for as long as a cold load takes, which is longer than
-  one `idle`: run `idle` again.
+- A page that stays on `Loading Xum` after `idle` timed out is slow or has a request that hangs (a
+  hung request raises no error, so the boot screen shows none). A slow transform is not the usual
+  cause after a launch, because Vite has already transformed every module. Vite transforms a module
+  again after a source edit, and every module again after a dependency re-optimization (the first
+  item above). Then the page can stay on `Loading Xum` for as long as a cold load takes, which is
+  longer than one `idle`: run `idle` again, then `agent-browser reload`.
 - agent-browser's headless Chromium matches `(hover: none)`, so Tailwind's `hover:` and
   `group-hover:` variants never apply. Controls that appear on hover (a sidebar row's archive
   icon) ignore clicks there. Focus them (`agent-browser focus '[aria-label="<name>"]'`) and press

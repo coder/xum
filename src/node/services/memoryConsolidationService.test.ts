@@ -730,6 +730,13 @@ function holdForeignDreamLock(fixture: Fixture) {
   });
 }
 
+/** Another backend's removal of `workspaceId`: its durable tombstone, which no local signal carries. */
+async function publishForeignRemoval(fixture: Fixture, workspaceId: string): Promise<void> {
+  const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, workspaceId);
+  await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+  await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId, removedAt: Date.now() }));
+}
+
 /** A sweep or trigger the 6 h window refused: returned quietly as a skip, not an error to retry. */
 function expectDebounced(result: Result<unknown, string>): void {
   expect(result.success).toBe(false);
@@ -2926,6 +2933,119 @@ describe("MemoryConsolidationService", () => {
       }
     });
 
+    it("records the usage of a stream whose success record could not be saved", async () => {
+      using fixture = await createFixture({ withSessionUsage: true });
+      const recorded: string[] = [];
+      spyOn(fixture.sessionUsage!, "recordHeadlessUsage").mockImplementation((workspaceId) => {
+        recorded.push(workspaceId);
+        return Promise.resolve(undefined);
+      });
+      // A directory where the sidecar file belongs: the save's final rename fails, after the
+      // stream was billed.
+      await fsPromises.mkdir(path.join(fixture.xumHome, "memory-consolidation.json"));
+
+      const failure = await fixture.service.maybeRun("ws-dream", "manual").then(
+        () => undefined,
+        (error: unknown) => error
+      );
+
+      expect(failure).toBeInstanceOf(Error);
+      expect(recorded).toEqual(["ws-dream"]);
+    });
+
+    it("records the usage of a pass that ended at the output limit and journals nothing", async () => {
+      // The pass fails (its tool call never ran), but its stream completed and was billed.
+      using fixture = await createFixture({
+        withSessionUsage: true,
+        modelFactory: () =>
+          new MockLanguageModelV3({
+            doStream: () =>
+              Promise.resolve({
+                stream: simulateReadableStream<LanguageModelV3StreamPart>({
+                  chunks: [
+                    {
+                      type: "finish",
+                      finishReason: { unified: "length", raw: "length" },
+                      usage: {
+                        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                        outputTokens: { total: 0, text: 0, reasoning: 0 },
+                      },
+                    },
+                  ],
+                }),
+              }),
+          }),
+      });
+      const recorded: string[] = [];
+      spyOn(fixture.sessionUsage!, "recordHeadlessUsage").mockImplementation((workspaceId) => {
+        recorded.push(workspaceId);
+        return Promise.resolve(undefined);
+      });
+
+      const result = await fixture.service.maybeRun("ws-dream", "manual");
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("output limit");
+      expect(recorded).toEqual(["ws-dream"]);
+      expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+    });
+
+    it.each([
+      ["the workspace", "ws-dream"],
+      ["the sub-agent it runs for", "ws-sub"],
+    ])(
+      "refuses a run, without a stream or a journal row, when another backend removed %s while it waited",
+      async (_name, removedId) => {
+        let streams = 0;
+        using fixture = await createFixture({
+          modelFactory: () => {
+            const inner = scriptedModel();
+            return new MockLanguageModelV3({
+              doStream: (options) => {
+                streams++;
+                return inner.doStream(options);
+              },
+            });
+          },
+        });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        const releaseForeign = await holdForeignDreamLock(fixture);
+        try {
+          // The sub-agent's run goes to its owner's store, acting for the sub-agent.
+          const run = fixture.service.maybeRun("ws-sub", "manual");
+          await waitingForTurn(fixture, 1);
+          await publishForeignRemoval(fixture, removedId);
+          await releaseForeign();
+
+          const result = await run;
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error).toContain("being removed");
+          expect(streams).toBe(0);
+          expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+        } finally {
+          await releaseForeign();
+        }
+      }
+    );
+
+    it("journals no success for a workspace another backend removed while the stream ran", async () => {
+      const held = heldStreams();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      const run = fixture.service.maybeRun("ws-dream", "manual");
+      await until(() => held.events.includes("start-1"));
+      await publishForeignRemoval(fixture, "ws-dream");
+      held.release(1);
+
+      const result = await run;
+
+      // The stream ended clean, though every memory read and write it made was refused: a success
+      // record would hold off the debounce's retry and advance the launch sweep's coverage.
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("being removed");
+      expect(held.events).toEqual(["start-1", "end-1"]);
+      expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+    });
+
     it("waits for a dream stream in another process before starting its own", async () => {
       const held = heldStreams();
       using fixture = await createFixture({ modelFactory: held.factory });
@@ -3343,7 +3463,14 @@ describe("MemoryConsolidationService", () => {
         expect(closing).not.toContain("We settled on bun");
       });
 
-      it("keeps a retry of the closing compaction on the rows its first attempt read, even if an archive completes meanwhile", async () => {
+      /**
+       * A closing compaction whose epoch spans three chunks and whose first attempt fails on the
+       * second. `betweenAttempts` then changes the sidecar, and the retry runs. Returns the chunks
+       * the model was asked about (the failed one twice) and the compaction's final record.
+       */
+      async function retryAfterSecondChunkFailed(
+        betweenAttempts: (fixture: Fixture) => Promise<void>
+      ) {
         const chunkLabels: string[] = [];
         let failedOnce = false;
         using fixture = await createFixture({
@@ -3374,31 +3501,52 @@ describe("MemoryConsolidationService", () => {
           analyzedFloorRowId: null,
         });
 
-        // An archive pass that read the epoch before it closed finishes after the first attempt:
-        // its row is inside the closed epoch, so it must not move the rows under the saved cursor.
-        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
-        const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
-          harvestsByWorkspace: Record<string, Record<string, unknown>>;
-        };
-        sidecar.harvestsByWorkspace["ws-dream"]["open:bulk-9"] = {
-          status: "completed",
-          startedAt: Date.now(),
-          completedAt: Date.now(),
-          attemptCount: 1,
-          boundaryKey: "open:bulk-9",
-          compactionEpoch: 1,
-          acceptedCandidates: 0,
-          skippedCandidates: 0,
-        };
-        await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+        await betweenAttempts(fixture);
 
         expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+        return { chunkLabels, record: (await harvestRecords(fixture))["summary-1"] };
+      }
+
+      it("keeps a retry of the closing compaction on the rows its first attempt read, even if an archive completes meanwhile", async () => {
+        const { chunkLabels, record } = await retryAfterSecondChunkFailed(async (fixture) => {
+          // An archive pass that read the epoch before it closed finishes after the first attempt:
+          // its row is inside the closed epoch, so it must not move the rows under the saved cursor.
+          const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+          const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
+            harvestsByWorkspace: Record<string, Record<string, unknown>>;
+          };
+          sidecar.harvestsByWorkspace["ws-dream"]["open:bulk-9"] = {
+            status: "completed",
+            startedAt: Date.now(),
+            completedAt: Date.now(),
+            attemptCount: 1,
+            boundaryKey: "open:bulk-9",
+            compactionEpoch: 1,
+            acceptedCandidates: 0,
+            skippedCandidates: 0,
+          };
+          await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+        });
 
         expect(chunkLabels).toEqual(["1/3", "2/3", "2/3", "3/3"]);
-        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
-          status: "completed",
-          nextChunk: 3,
-        });
+        expect(record).toMatchObject({ status: "completed", nextChunk: 3 });
+      });
+
+      it("does not start a retry after what its own record read when that record names no floor", async () => {
+        // A record saved before the floor was: it has the cursor and the row its chunks read, no
+        // floor. The cursor counts chunks of the rows after the job's floor, so a floor taken from
+        // the record's own `readThroughRowId` would leave the retry fewer rows than the cursor
+        // counts, and skip some. Such a record's cursor counts from the epoch's start, so the retry
+        // resumes at its chunk there.
+        const { chunkLabels, record } = await retryAfterSecondChunkFailed((fixture) =>
+          editHarvestRecord(fixture, "summary-1", (stored) => {
+            expect(typeof stored.readThroughRowId).toBe("string");
+            delete stored.analyzedFloorRowId;
+          })
+        );
+
+        expect(chunkLabels).toEqual(["1/3", "2/3", "2/3", "3/3"]);
+        expect(record).toMatchObject({ status: "completed", nextChunk: 3 });
       });
 
       it("makes no analyzer call for a compaction that closes an epoch an archive fully analyzed", async () => {
@@ -5489,6 +5637,26 @@ describe("harvestResumeState", () => {
       usage,
     });
     expect(attemptState.analyzedFloorRowId).toBe("row-3");
+  });
+
+  it("resumes a record from before the floor at its cursor, counted from the epoch's start", () => {
+    // Such a record's analyzer read the whole epoch. A recomputed floor could be newer and skip
+    // chunks; restarting the cursor would replay chunks without the edits they already landed.
+    const { progress, attemptState } = harvestResumeState({
+      status: "failed",
+      startedAt: 1,
+      attemptCount: 1,
+      boundaryKey: "summary-1",
+      compactionEpoch: 1,
+      acceptedCandidates: 1,
+      skippedCandidates: 0,
+      nextChunk: 2,
+      nextChunkOps: 1,
+      budgetUsed: 5,
+    });
+
+    expect(progress).toMatchObject({ nextChunk: 2, nextChunkOps: 1, budgetUsed: 5 });
+    expect(attemptState.analyzedFloorRowId).toBeNull();
   });
 
   it("keeps a null floor (an attempt that found no earlier run) apart from an absent one", () => {

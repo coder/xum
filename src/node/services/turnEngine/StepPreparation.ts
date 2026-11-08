@@ -55,7 +55,10 @@ import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/me
 import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { stripReasoningReplay } from "@/node/utils/messages/reasoningProviderOptions";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
-import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
+import {
+  blankInvalidToolCallInputs,
+  summarizeInvalidToolInputErrors,
+} from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import type { StepMessageTracker } from "@/node/services/turnEngine/types";
 export type { StepMessageTracker } from "@/node/services/turnEngine/types";
 
@@ -63,7 +66,8 @@ export type { StepMessageTracker } from "@/node/services/turnEngine/types";
  * Same-turn message transforms applied before every provider step: strip workflow run records
  * and redact binary-like strings in same-turn tool results (history-level redaction in
  * applyToolOutputRedaction can't see these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
- * (messagePipeline's neutralizer only sees persisted history), then extract supported
+ * (messagePipeline's neutralizer only sees persisted history), blank the inputs of calls the
+ * SDK rejected as invalid (same-turn and history), then extract supported
  * attachments out of tool-result JSON so providers don't treat them as text. Idempotent on an
  * already-transformed prefix. The settled-step budget floor reuses it so it measures exactly the
  * request the next step's preflight will check. Native tool_reference dedupe is NOT part of
@@ -73,7 +77,7 @@ export type { StepMessageTracker } from "@/node/services/turnEngine/types";
 export function transformStepMessages(messages: ModelMessage[]): Promise<ModelMessage[]> {
   return extractToolMediaAsUserMessagesFromModelMessages(
     neutralizeAgentEnvelopeLookalikesInModelToolParts(
-      stripWorkflowRunRecordsFromModelMessages(messages)
+      blankInvalidToolCallInputs(stripWorkflowRunRecordsFromModelMessages(messages))
     )
   );
 }

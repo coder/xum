@@ -331,6 +331,9 @@ export function dreamStreamLockPath(rootDir: string): string {
 const DEBOUNCED_SKIP_REASON =
   "debounced: a recent consolidation run already covered this workspace";
 
+/** The refusal of a run whose workspace, or the sub-agent it runs for, is being removed. */
+const REMOVAL_REFUSED_REASON = "workspace is being removed; consolidation refused";
+
 /** Where a dream stream's turn ended up (see runDreamStreamExclusively). */
 type DreamStreamTurn<T> =
   | { outcome: "ran"; value: T }
@@ -491,8 +494,21 @@ export function harvestResumeState(existing: MemoryHarvestRecord | undefined): {
     },
     // A retry keeps the floor of the first attempt: the chunk cursor counts chunks of the rows
     // after it.
-    attemptState: { analyzedFloorRowId: earlier.analyzedFloorRowId },
+    attemptState: { analyzedFloorRowId: resumedFloor(earlier) },
   };
+}
+
+/**
+ * The floor a retry's cursor counts from. A record written before the floor existed has a cursor
+ * but no floor: the analyzer then read the whole epoch, so its cursor counts from the epoch's start
+ * (null). Recomputing a floor for it could find a newer one (an archive completed meanwhile) and
+ * skip chunks, and restarting its cursor would replay chunks whose landed edits it no longer knows.
+ * A record with no cursor yet has no floor to keep: the attempt takes one from the records.
+ */
+function resumedFloor(earlier: Partial<MemoryHarvestRecord>): string | null | undefined {
+  if (earlier.analyzedFloorRowId !== undefined) return earlier.analyzedFloorRowId;
+  const hasCursor = (earlier.nextChunk ?? 0) > 0 || (earlier.nextChunkOps ?? 0) > 0;
+  return hasCursor ? null : undefined;
 }
 
 /**
@@ -548,10 +564,16 @@ const OPEN_EPOCH_KEY_PREFIX = "open:";
  * skipping any.
  */
 function analyzedEpochRowIds(
-  records: Record<string, MemoryHarvestRecord> | undefined
+  records: Record<string, MemoryHarvestRecord> | undefined,
+  ownBoundaryKey: string
 ): Set<string> {
   const ids = new Set<string>();
   for (const [boundaryKey, record] of Object.entries(records ?? {})) {
+    // The job's own record says how far ITS chunk cursor got, not which rows an earlier run read:
+    // starting a retry after its own `readThroughRowId` would skip rows, since the cursor counts
+    // chunks of the rows after the job's floor (kept in `analyzedFloorRowId`; `resumedFloor` gives
+    // a record from before that field the epoch's start).
+    if (boundaryKey === ownBoundaryKey) continue;
     const isOpenEpochRecord = boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX);
     const readEverythingToKey =
       isOpenEpochRecord && record.status === "completed" && record.readThroughRowId === undefined;
@@ -956,6 +978,23 @@ export class MemoryConsolidationService extends EventEmitter {
   }
 
   /**
+   * The durable teardown gate of one dream run: true once another backend began removing the
+   * workspace the run is keyed to, or the sub-agent it runs for (see isRemovalTombstonedEffect).
+   * One fs probe each, so it can run inside the dream turn.
+   */
+  private async isRunRemovalTombstoned(
+    workspaceId: string,
+    options: MemoryConsolidationRunOptions
+  ): Promise<boolean> {
+    for (const id of [workspaceId, options.actingWorkspaceId]) {
+      if (id !== undefined && (await isWorkspaceRemovalTombstoned(this.config.rootDir, id))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Register one run's removal controller; disposed when the run settles.
    * A run made on a sub-agent's behalf over the OWNER's store (a redirected
    * trigger, the post-harvest sweep) is registered under the acting child's
@@ -1165,7 +1204,7 @@ export class MemoryConsolidationService extends EventEmitter {
       (options.actingWorkspaceId !== undefined &&
         this.removalCancelled.has(options.actingWorkspaceId))
     ) {
-      return Err("workspace is being removed; consolidation refused");
+      return Err(REMOVAL_REFUSED_REASON);
     }
     const ownerWorkspaceId = this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
     if (ownerWorkspaceId !== workspaceId) {
@@ -1323,15 +1362,11 @@ export class MemoryConsolidationService extends EventEmitter {
     const self = this;
     return Effect.gen(function* () {
       // Durable cross-process teardown gate (r61); see isRemovalTombstonedEffect
-      // for why this runs behind the in-flight reservation.
-      if (yield* self.isRemovalTombstonedEffect(workspaceId)) {
-        return Err("workspace is being removed; consolidation refused");
-      }
-      if (
-        options.actingWorkspaceId !== undefined &&
-        (yield* self.isRemovalTombstonedEffect(options.actingWorkspaceId))
-      ) {
-        return Err("workspace is being removed; consolidation refused");
+      // for why this runs behind the in-flight reservation. Like the debounce below, an early
+      // exit and not the gate: another backend can remove the workspace while this run waits for
+      // its turn, so the turn rechecks.
+      if (yield* Effect.promise(() => self.isRunRemovalTombstoned(workspaceId, options))) {
+        return Err(REMOVAL_REFUSED_REASON);
       }
 
       // Cheap early exit, before the model is created and a turn is queued for. It is not the
@@ -1433,6 +1468,11 @@ export class MemoryConsolidationService extends EventEmitter {
       // sidecar's brief in-process lock plus one atomic write. Usage recording is not part of the
       // turn (see `usageRecorder`).
       const runTurn = async (): Promise<Result<MemoryConsolidationRecord, string>> => {
+        // A removal in another backend cannot abort `removalSignal`, so one that came while this
+        // run waited is seen only here: refused before any model call or journal row.
+        if (await self.isRunRemovalTombstoned(workspaceId, options)) {
+          return Err(REMOVAL_REFUSED_REASON);
+        }
         if (await Effect.runPromise(self.isDebouncedEffect(workspaceId, trigger, options))) {
           return Err(DEBOUNCED_SKIP_REASON);
         }
@@ -1443,6 +1483,12 @@ export class MemoryConsolidationService extends EventEmitter {
         // that never happened.
         if (result.streamError !== undefined) {
           return Err(`consolidation stream failed: ${result.streamError}`);
+        }
+        // Removed while the model ran, in another backend: every memory read and write of the
+        // pass was refused, so it covered nothing, and a success record would hold off the
+        // retries of the debounce and advance the launch sweep's global coverage.
+        if (await self.isRunRemovalTombstoned(workspaceId, options)) {
+          return Err(REMOVAL_REFUSED_REASON);
         }
         const record: MemoryConsolidationRecord = {
           lastRunAt: Date.now(),
@@ -1457,12 +1503,19 @@ export class MemoryConsolidationService extends EventEmitter {
         await Effect.runPromise(self.saveRecordEffect(workspaceId, projectPath, record));
         return Ok(record);
       };
-      const turn = yield* Effect.promise(async () =>
-        self.runDreamStreamExclusively(removalSignal, runTurn)
-      );
+      const turn = yield* Effect.promise(async () => {
+        try {
+          return await self.runDreamStreamExclusively(removalSignal, runTurn);
+        } finally {
+          // On every path out of the turn, once it is released: the stream was billed whether
+          // the record's save threw, the pass failed or the run was refused. `flush` never
+          // rejects, so it cannot replace the error that is leaving.
+          await usageRecorder.flush();
+        }
+      });
       // Removal reached this run while it was still queued: no stream started.
       if (turn.outcome === "cancelled") {
-        return Err("workspace is being removed; consolidation refused");
+        return Err(REMOVAL_REFUSED_REASON);
       }
       // No stream started: a stream without the cross-process lock could overlap another
       // backend's. Nothing is journaled, so the next trigger retries.
@@ -1472,8 +1525,6 @@ export class MemoryConsolidationService extends EventEmitter {
       // Debounced behind another run, or the stream failed: nothing was journaled.
       if (!turn.value.success) return turn.value;
       const record = turn.value.data;
-
-      yield* Effect.promise(usageRecorder.flush);
 
       log.debug("[MemoryConsolidation] run complete", {
         workspaceId,
@@ -1534,7 +1585,7 @@ export class MemoryConsolidationService extends EventEmitter {
   ): Promise<Result<MemoryConsolidationRecord, string>> {
     if (!this.enabled()) return Err("memory-consolidation experiment is disabled");
     if (this.removalCancelled.has(workspaceId)) {
-      return Err("workspace is being removed; consolidation refused");
+      return Err(REMOVAL_REFUSED_REASON);
     }
     // Registered in this synchronous frame, before any await, and for the whole call, queueing
     // behind an earlier pass included: the owner's pass must never find a gap to slip through.
@@ -1875,7 +1926,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const floorFrom = (records: Record<string, MemoryHarvestRecord> | undefined) =>
         recordedFloor !== undefined
           ? recordedFloor
-          : analyzedFloorRowId(epoch.data.messages, analyzedEpochRowIds(records));
+          : analyzedFloorRowId(epoch.data.messages, analyzedEpochRowIds(records, boundaryKey));
       // Every row was analyzed before: nothing is left to read, so no model call.
       const nothingLeftAfter = (floor: string | null) =>
         epoch.data.messages.length > 0 && rowsAfterFloor(epoch.data.messages, floor).length === 0;

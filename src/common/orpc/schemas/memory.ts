@@ -157,7 +157,8 @@ export const MemoryHarvestRecordSchema = z.object({
    * The row of this epoch an earlier run (an archive, or the compaction that closed the epoch under
    * an archive's snapshot) had analyzed up to when the first attempt's analyzer turn began (null:
    * none), so the run reads the rows after it. A retry reuses it instead of looking again: a run
-   * that completes later must not move the rows under the saved chunk cursor. Absent before an attempt's turn began, and in older records.
+   * that completes later must not move the rows under the saved chunk cursor. Absent before an
+   * attempt's turn began, and in older records.
    */
   analyzedFloorRowId: z.string().nullish(),
   error: z.string().optional(),

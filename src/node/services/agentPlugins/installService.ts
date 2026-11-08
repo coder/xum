@@ -8,7 +8,6 @@ import * as path from "node:path";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import {
-  AgentPluginInstallEntrySchema,
   AgentPluginComponentConsentSchema,
   AgentPluginImportedComponentsSchema,
   type AgentPluginImportedComponents,
@@ -150,6 +149,7 @@ import type { OpenAIPluginInterface } from "./openaiExtension";
 import {
   acquirePluginMutationLock,
   bumpContainerMutationEpoch,
+  MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
   MUTATION_LOCK_FILE,
   containerHasPendingSignOuts,
   pendingSignOutsRecordState,
@@ -162,7 +162,11 @@ import {
   UNINSTALL_JOURNAL_PREFIX,
   UPDATE_JOURNAL_PREFIX,
 } from "./journals";
-import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
+import {
+  PLUGIN_REGISTRY_FILE_NAME,
+  parseRegistryEntriesLenient,
+  readPluginRegistryDocument,
+} from "./registry";
 import { isPlainObject, type AgentPluginManifest } from "./manifest";
 import {
   hashPluginTree,
@@ -270,9 +274,6 @@ const MARKETPLACE_SCAN_CONCURRENCY = 8;
 
 /** Staging dirs left behind by crashes are reclaimed after this age. */
 const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
-
-/** How long an acquire waits on a live holder before failing (covers a full clone). */
-const MUTATION_LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Bound discovery/settings waits on startup crash-recovery I/O. */
 const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;
@@ -2274,35 +2275,8 @@ export class AgentPluginInstallService {
         seenRawNames.add(rawName);
       }
     }
-    const entries: AgentPluginInstallEntry[] = [];
-    const seenNames = new Set<string>();
-    for (const rawEntry of rawEntries) {
-      const parsed = AgentPluginInstallEntrySchema.safeParse(rawEntry);
-      if (!parsed.success) {
-        log.debug("Skipping unrecognized managed plugin registry entry (preserved on disk)", {
-          entry: rawEntry,
-          error: parsed.error.message,
-        });
-        continue;
-      }
-      // Duplicate names are corrupt identity: entry names map 1:1 to
-      // container directories and instance IDs, and raw rewrites match by
-      // name — a mutation would patch EVERY duplicate from the first entry's
-      // source, silently rewriting the others. Mutations (strict) refuse;
-      // views (lenient) keep the first (matching find()-based lookups).
-      if (seenNames.has(parsed.data.name)) {
-        if (mode === "strict") {
-          throw new Error(
-            `The plugin registry (${shortenHome(this.registryFile)}) contains duplicate entries for '${parsed.data.name}'. Repair the file, then retry.`
-          );
-        }
-        log.warn("Ignoring duplicate managed plugin registry entry", { name: parsed.data.name });
-        continue;
-      }
-      seenNames.add(parsed.data.name);
-      entries.push(parsed.data);
-    }
-    return entries;
+    // Strict mode refused every repeated raw name above, so what is left is the lenient parse.
+    return parseRegistryEntriesLenient(rawEntries);
   }
 
   /**
