@@ -162,6 +162,19 @@ describe("createSpendMeter", () => {
     expect(priced.note()).toBeUndefined();
   });
 
+  it("reports a step that finished at the output limit, and still counts what it cost", () => {
+    const meter = createSpendMeter({ pricingModel: OPENAI_MODEL, ceilingUsd: 100 });
+    for (const finishReason of ["stop", "tool-calls", "content-filter", "error", "other"]) {
+      meter.recordStep({ ...stepOf(250_000), finishReason });
+    }
+    expect(meter.endedAtOutputLimit()).toBe(false);
+
+    meter.recordStep({ ...stepOf(250_000), finishReason: "length" });
+
+    expect(meter.endedAtOutputLimit()).toBe(true);
+    expect(meter.spentUsd()).toBeCloseTo(3, 9);
+  });
+
   it("carries the spend of earlier attempts", () => {
     const meter = createSpendMeter({ pricingModel: OPENAI_MODEL, ceilingUsd: 1, spentUsd: 0.75 });
     expect(meter.stopIfCeilingReached()).toBe(false);

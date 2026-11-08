@@ -614,6 +614,13 @@ export async function runMemoryConsolidation(args: {
   if (streamErrors.length === 0 && args.abortSignal?.aborted === true) {
     streamErrors.push("memory consolidation was cut short by its timeout or by workspace removal");
   }
+  // A step that hit the output limit never ran its tool call, yet the stream ends clean: without
+  // this the pass would be journaled as a success and the debounce would hold off its retry.
+  if (streamErrors.length === 0 && meter.endedAtOutputLimit()) {
+    streamErrors.push(
+      "memory consolidation ended a step at the model's output limit, so its tool call never ran"
+    );
+  }
   const summary =
     streamErrors.length === 0 ? (await stream.text).trim() : `stream error: ${streamErrors[0]}`;
 

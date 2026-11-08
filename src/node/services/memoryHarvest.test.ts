@@ -48,6 +48,18 @@ function toolFinishChunk(inputTokens = 1): LanguageModelV3StreamPart {
   };
 }
 
+/** A step cut off at the model's output limit: its tool call is the half-written command. */
+function lengthFinishChunk(inputTokens = 1): LanguageModelV3StreamPart {
+  return {
+    type: "finish",
+    finishReason: { unified: "length", raw: "length" },
+    usage: {
+      inputTokens: { total: inputTokens, noCache: inputTokens, cacheRead: 0, cacheWrite: 0 },
+      outputTokens: { total: 0, text: 0, reasoning: 0 },
+    },
+  };
+}
+
 function memoryToolCall(
   input: Record<string, unknown>,
   id = "memory-call"
@@ -1439,6 +1451,38 @@ describe("runMemoryHarvest", () => {
 
       expect(result.streamError).toContain("provider exploded");
       expect(result.spentUsd).toBeCloseTo(0.5, 3);
+    });
+
+    it("fails a chunk whose step ended at the output limit, keeping what landed and what it cost", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      // The SDK runs no tool call of a step that finishes with `length`, and the stream ends clean.
+      const { model, calls } = scriptedModel([
+        [
+          memoryToolCall(createFile("/memories/workspace/landed.md", "fact\n"), "call-landed"),
+          toolFinishChunk(HALF_DOLLAR_INPUT_TOKENS),
+        ],
+        [
+          memoryToolCall(createFile("/memories/workspace/cut.md", "half a comm"), "call-cut"),
+          lengthFinishChunk(HALF_DOLLAR_INPUT_TOKENS),
+        ],
+      ]);
+
+      const result = await runHarvest(fixture, model, { ...priced, ceilingUsd: 100 });
+
+      expect(result.streamError).toContain("output limit");
+      // Like any failed stream: the cursor stays on the chunk, and the later chunks are not read.
+      expect(result.nextChunk).toBe(0);
+      expect(result.readChunks).toBe(0);
+      expect(calls).toHaveLength(2);
+      expect(result.ops).toEqual([
+        { command: "create", path: "/memories/workspace/landed.md", applied: true },
+      ]);
+      expect(result.nextChunkOps).toBe(1);
+      expect(result.spentUsd).toBeCloseTo(1, 3);
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/cut.md")
+      ).toMatchObject({ success: false });
     });
 
     it("caps what one step can write, which bounds how far it can overshoot", async () => {

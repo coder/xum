@@ -562,6 +562,14 @@ async function analyzeChunk(args: {
       streamError: `memory analysis of chunk ${args.label} was cut short by its timeout or by workspace removal`,
     };
   }
+  // A step that hit the output limit never ran its tool call, yet the stream ends clean: the
+  // cursor would move past a chunk the model only partly analyzed. The meter is the job's, but a
+  // step like that ends its chunk's stream and the run with it, so the flag is this chunk's.
+  if (args.meter.endedAtOutputLimit()) {
+    return {
+      streamError: `memory analysis of chunk ${args.label} ended a step at the model's output limit, so its tool call never ran`,
+    };
+  }
 
   try {
     // AI SDK 7: top-level `usage` is the all-steps total (old `totalUsage`).

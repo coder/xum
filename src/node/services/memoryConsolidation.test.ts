@@ -1155,7 +1155,72 @@ function listingModel(providerMetadata?: SharedV3ProviderMetadata): {
   return { model, calls };
 }
 
+/** A model whose first step lands a global file and whose second is cut off at the output limit. */
+function outputLimitedModel(): MockLanguageModelV3 {
+  let calls = 0;
+  const step = (name: string, unified: "tool-calls" | "length"): LanguageModelV3StreamPart[] => [
+    {
+      type: "tool-call",
+      toolCallId: name,
+      toolName: "memory",
+      input: JSON.stringify({
+        command: "create",
+        path: `/memories/global/${name}.md`,
+        file_text: "fact\n",
+      }),
+    },
+    {
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: {
+        inputTokens: {
+          total: HALF_DOLLAR_INPUT_TOKENS,
+          noCache: HALF_DOLLAR_INPUT_TOKENS,
+          cacheRead: 0,
+          cacheWrite: 0,
+        },
+        outputTokens: { total: 0, text: 0, reasoning: 0 },
+      },
+    },
+  ];
+  return new MockLanguageModelV3({
+    doStream: () => {
+      calls += 1;
+      const chunks = calls === 1 ? step("landed", "tool-calls") : step("cut", "length");
+      return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+    },
+  });
+}
+
 describe("runMemoryConsolidation", () => {
+  // The SDK runs no tool call of a step that finishes with `length`, and the stream ends without
+  // an error: the pass must not read as a success, or it is journaled and the debounce holds off
+  // the retry.
+  it.each([
+    ["a ceiling caps the step", 100],
+    ["no ceiling is set", undefined],
+  ])("fails a pass whose step ended at the output limit when %s", async (_name, ceilingUsd) => {
+    using fixture = await createFixture();
+
+    const result = await runMemoryConsolidation({
+      model: outputLimitedModel(),
+      pricingModel: PRICED_MODEL,
+      ceilingUsd,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.streamError).toContain("output limit");
+    expect(result.summary).toContain("stream error");
+    // What landed before the cut step stays, and what the steps cost stays counted.
+    expect(result.ops.map((op) => op.path)).toEqual(["/memories/global/landed.md"]);
+    expect(result.spentUsd).toBeCloseTo(1, 9);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "cut.md"))).toBe(false);
+  });
+
   describe("cost ceiling", () => {
     async function run(
       fixture: Fixture,

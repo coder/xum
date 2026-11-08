@@ -20,6 +20,8 @@ import {
 interface PricedStep {
   usage?: AiSdkUsageLike;
   providerMetadata?: Record<string, unknown>;
+  /** Why the step ended, as the SDK's step result reports it (`length`: the output limit). */
+  finishReason?: string;
 }
 
 /**
@@ -55,6 +57,14 @@ export interface SpendMeter {
    * model's own limit.
    */
   maxOutputTokens: number | undefined;
+  /**
+   * True once a step finished with `length`: the model hit its output limit, the cap above or its
+   * own. The SDK runs a step's tool calls only when the step finishes with `stop` or
+   * `tool-calls`, so that step's memory command never ran, and the model never saw a failure to
+   * retry from. The stream still ends without an error, so the caller must read this and treat
+   * the run as incomplete. Such a step is the last of its stream: nothing came back to answer.
+   */
+  endedAtOutputLimit: () => boolean;
   /** Measured USD, with what `spentUsd` of the meter's creation already held. */
   spentUsd: () => number;
   /**
@@ -76,9 +86,11 @@ export function createSpendMeter(args: {
   let spent = args.spentUsd ?? 0;
   let stopped = false;
   let unpriced = false;
+  let outputLimited = false;
   return {
     maxOutputTokens: args.ceilingUsd === undefined ? undefined : MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
     recordStep: (step) => {
+      if (step.finishReason === "length") outputLimited = true;
       const cost = stepCostUsd(step, args.pricingModel);
       if (cost === undefined) unpriced = true;
       else spent += cost;
@@ -88,6 +100,7 @@ export function createSpendMeter(args: {
       stopped = true;
       return true;
     },
+    endedAtOutputLimit: () => outputLimited,
     spentUsd: () => spent,
     note: () => {
       if (stopped) return `stopped at the cost ceiling after $${spent.toFixed(2)}`;

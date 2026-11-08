@@ -92,8 +92,10 @@ export const MEMORY_ANALYZER_MAX_STEPS = 12;
  * Output cap of one model call (one step) of the analyzer and of the organizer. The dream's cost
  * ceiling stops a run only after a step whose measured cost reaches it, so the step in flight
  * can still go past the ceiling. The cap bounds what that step can write, so it applies only to a
- * run that has a ceiling (see SpendMeter.maxOutputTokens). A memory command longer than this is cut
- * off and fails to parse; the model sees the failure and can write it in smaller pieces.
+ * run that has a ceiling (see SpendMeter.maxOutputTokens). A step that hits it finishes with
+ * `length`, and the SDK runs no tool call of such a step, so a memory command longer than this is
+ * lost without the model seeing a failure it could retry from. Both callers treat that as an
+ * incomplete run (see SpendMeter.endedAtOutputLimit).
  */
 export const MEMORY_MAX_OUTPUT_TOKENS_PER_STEP = 4_096;
 /** Smallest dream cost ceiling a user can set, in USD: the cent, the unit a stopped run reports in. */
