@@ -366,22 +366,35 @@ describe("the Electron zip wiring", () => {
   );
 
   // `make dist-*` passes the directory itself (tested below). A step that runs electron-builder
-  // directly must pass it, or electron-builder downloads its own zip.
+  // directly must pass it, or electron-builder downloads its own zip. Bash expands the flag only
+  // when the variable is set. The Windows step runs in PowerShell, which builds the argument first.
+  const BASH_FLAG = '${ELECTRON_ZIP_DIR:+-c.electronDist="$ELECTRON_ZIP_DIR"}';
+  const DIRECT_CALLS: Record<string, string[]> = {
+    "_desktop-release.yml#build-linux": [
+      `bun x electron-builder --linux --publish always ${BASH_FLAG}`,
+    ],
+    "_desktop-release.yml#build-linux-arm64": [
+      `bun x electron-builder --linux --arm64 --publish never ${BASH_FLAG}`,
+    ],
+    "_desktop-release.yml#build-windows": [
+      '$extra = "-c.electronDist=$env:ELECTRON_ZIP_DIR"',
+      "bun x electron-builder --win --publish always @extra",
+    ],
+  };
+
   test("a step that runs electron-builder directly hands it the zip directory", async () => {
-    const direct = [];
+    const direct = new Map<string, string>();
     for (const [key, job] of await jobsWithElectronBuilder()) {
       for (const step of job.steps) {
-        if (/bun x electron-builder/.test(step.run ?? "")) direct.push([key, step.run ?? ""]);
+        if (/bun x electron-builder/.test(step.run ?? "")) direct.set(key, step.run ?? "");
       }
     }
-    expect(direct.map(([key]) => key).sort()).toEqual([
-      "_desktop-release.yml#build-linux",
-      "_desktop-release.yml#build-linux-arm64",
-      "_desktop-release.yml#build-windows",
-    ]);
-    for (const [, run] of direct) {
-      expect(run).toContain("electronDist");
-      expect(run).toContain("ELECTRON_ZIP_DIR");
+    expect([...direct.keys()].sort()).toEqual(Object.keys(DIRECT_CALLS).sort());
+    for (const [key, run] of direct) {
+      const lines = run.split("\n").map((line) => line.trim());
+      for (const expected of DIRECT_CALLS[key]) {
+        expect(lines.some((line) => line.includes(expected))).toBe(true);
+      }
     }
   });
 });
