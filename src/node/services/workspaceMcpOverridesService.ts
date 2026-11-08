@@ -9,6 +9,7 @@ import {
 } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
+import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { configFilePath, type Config, type ProjectsConfig } from "@/node/config";
@@ -4584,6 +4585,9 @@ export class WorkspaceMcpOverridesService {
     opaqueFields: Record<string, unknown>;
   }> {
     const legacyConfig = snapshot.loadLegacyConfig();
+    if (snapshot.lenientRegistry) {
+      await this.assertNoUnretirableLegacySharer(written, writtenPath, legacyConfig, snapshot);
+    }
     const all = await snapshot.loadAllMetadata();
     const carriesLegacy = (m: FrontendWorkspaceMetadata): boolean =>
       this.getLegacyOverridesFromConfig(m.id, legacyConfig) !== undefined;
@@ -4626,6 +4630,43 @@ export class WorkspaceMcpOverridesService {
       mergeOpaqueFields(opaqueFields, fields, sharer.id);
     }
     return { sharerIds: sharers.map((m) => m.id), opaqueFields };
+  }
+
+  /**
+   * Refuses a save under a lenient registry when an id-less config row that carries a legacy
+   * `workspace.mcp` value may share the written checkout. That row's id lives only in its
+   * unreadable metadata.json (the walk lists it under a fallback id), so the id lookups in
+   * planSharersLegacyRetirement cannot reach its value, and nothing retires it: after a clear it
+   * would migrate back over the user's write once the file is readable again.
+   */
+  private async assertNoUnretirableLegacySharer(
+    written: FrontendWorkspaceMetadata,
+    writtenPath: string,
+    legacyConfig: ProjectsConfig,
+    snapshot: ConfigSnapshot
+  ): Promise<void> {
+    const identity = runtimeFilesystemIdentity(written.runtimeConfig);
+    const rows = [...legacyConfig.projects.values()]
+      .flatMap((project) => project.workspaces)
+      .filter((row) => row.id === undefined && row.mcp !== undefined);
+    if (identity === undefined || rows.length === 0) return;
+    const canonicalWritten = await snapshot.canonicalize(identity, writtenPath);
+    for (const row of rows) {
+      const runtimeConfig = row.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
+      if (runtimeFilesystemIdentity(runtimeConfig) !== identity) continue;
+      const rowPath = this.getOverridesFilePaths(row.path, runtimeConfig)[0];
+      const canonicalRow = await snapshot.canonicalize(identity, rowPath);
+      // An unresolvable path may share the checkout too.
+      if (
+        canonicalWritten === undefined ||
+        canonicalRow === undefined ||
+        canonicalRow === canonicalWritten
+      ) {
+        throw new Error(
+          `The workspace registered at ${row.path} may share this checkout and carries legacy MCP settings that Xum cannot retire until config.json holds its id (its metadata.json is unreadable or not migrated yet); the settings were not saved. Repair that file, then try again.`
+        );
+      }
+    }
   }
 
   /**
