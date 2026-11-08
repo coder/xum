@@ -1529,12 +1529,15 @@ function groupMetadataById(
 /**
  * Each host-local workspace's part in a plugin sweep, as one string per id: what the scan's
  * verdict on it rests on. That is its checkout (where its documents live and which workspaces
- * share them), project, parent (what it inherits), runtime and isolation. Fields that change
- * often and decide nothing here, such as its title or task status, are left out.
+ * share them), project, parent (what it inherits), runtime and isolation, and whether its
+ * config.json entry carries a legacy `workspace.mcp` value (`legacyIds`; a value makes it a
+ * candidate). Fields that change often and decide nothing here, such as its title or task
+ * status, are left out.
  */
 function sweepIdentitiesById(
   registry: readonly FrontendWorkspaceMetadata[],
-  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string
+  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string,
+  legacyIds: ReadonlySet<string>
 ): Map<string, string> {
   const identities = new Map<string, string>();
   for (const [id, entries] of groupMetadataById([...registry], /* hostLocalOnly */ true)) {
@@ -1552,7 +1555,7 @@ function sweepIdentitiesById(
       )
       .sort()
       .join("\n");
-    identities.set(id, identity);
+    identities.set(id, `${legacyIds.has(id) ? "legacy" : "-"}\n${identity}`);
   }
   return identities;
 }
@@ -5044,7 +5047,11 @@ export class WorkspaceMcpOverridesService {
         budget.remaining(),
         "workspace enumeration exceeded the plugin-prune budget"
       );
-      const changed = this.changedSinceScan(registry, plan);
+      const changed = this.changedSinceScan(
+        registry,
+        idsWithLegacyOverrides(snapshot.loadLegacyConfig()),
+        plan
+      );
       if (locked === undefined) {
         return changed;
       }
@@ -5124,7 +5131,11 @@ export class WorkspaceMcpOverridesService {
     // An unscanned descendant or alias of a candidate is locked and pruned like the others.
     const unscannedIds = [...unscanned].filter((id) => !locked.has(id));
     const documentedIds = [...scan.documented].filter((id) => !locked.has(id));
-    const scanIdentities = sweepIdentitiesById(registry, (metadata) => this.checkoutOf(metadata));
+    const scanIdentities = sweepIdentitiesById(
+      registry,
+      (metadata) => this.checkoutOf(metadata),
+      legacyIds
+    );
     return { candidateIds, lockedIds: [...locked], unscannedIds, documentedIds, scanIdentities };
   }
 
@@ -5148,9 +5159,14 @@ export class WorkspaceMcpOverridesService {
    */
   private changedSinceScan(
     registry: readonly FrontendWorkspaceMetadata[],
+    legacyIds: ReadonlySet<string>,
     plan: PluginSweepPlan
   ): Array<{ workspaceId: string; error: unknown }> {
-    const current = sweepIdentitiesById(registry, (metadata) => this.checkoutOf(metadata));
+    const current = sweepIdentitiesById(
+      registry,
+      (metadata) => this.checkoutOf(metadata),
+      legacyIds
+    );
     const lockedIds = new Set(plan.lockedIds);
     return [...new Set([...plan.scanIdentities.keys(), ...current.keys()])]
       .filter((id) => !lockedIds.has(id) && plan.scanIdentities.get(id) !== current.get(id))

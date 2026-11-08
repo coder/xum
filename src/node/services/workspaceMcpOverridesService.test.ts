@@ -5609,6 +5609,19 @@ describe("WorkspaceMcpOverridesService", () => {
         },
       },
       {
+        writer: "older build that writes a legacy config.json value",
+        change: async (subject: { workspaceId: string }) => {
+          await config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              for (const entry of project.workspaces) {
+                if (entry.id === subject.workspaceId) entry.mcp = { enabledServers: [staleKey] };
+              }
+            }
+            return cfg;
+          });
+        },
+      },
+      {
         writer: "delete",
         change: async (subject: { workspaceId: string }) => {
           await config.editConfig((cfg) => {
@@ -5658,7 +5671,9 @@ describe("WorkspaceMcpOverridesService", () => {
         }
       );
 
-      expect(failures.map((failure) => failure.workspaceId)).toEqual([fork?.workspaceId]);
+      expect(failures.map((failure) => failure.workspaceId)).toEqual([
+        fork?.workspaceId ?? "the change registered no fork",
+      ]);
     });
 
     it("prunePluginOverrideKeysForWorkspaces waits for a save that passed validation before it, then prunes what the save wrote", async () => {
