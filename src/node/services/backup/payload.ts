@@ -2075,12 +2075,14 @@ export class BackupInvalidPayloadError extends Error {
 }
 
 /**
- * An errno name (`ENOENT`, `EACCES`) or a Node `ERR_*` code. Our own errors carry a `code` too
- * (BackupInvalidPayloadError and BackupServiceError: `INVALID_BACKUP`, `IO_ERROR`, ...), so a bare
- * "has a string code" test would read a repository failure as a disk failure. None of those starts
- * with `E`; a test keeps it so (payload.test.ts).
+ * An errno name (`ENOENT`, `EACCES`), a Node `ERR_*` code, or `UNKNOWN`, the one libuv name that
+ * does not start with `E` (Node on Windows reports a failed fs call it cannot name that way). Our
+ * own errors carry a `code` too (BackupInvalidPayloadError and BackupServiceError:
+ * `INVALID_BACKUP`, `IO_ERROR`, ...), so a bare "has a string code" test would read a repository
+ * failure as a disk failure. None of those starts with `E` or is `UNKNOWN`; a test keeps it so
+ * (payload.test.ts).
  */
-const ERRNO_CODE = /^E[A-Z0-9_]+$/;
+const ERRNO_CODE = /^(?:E[A-Z0-9_]+|UNKNOWN)$/;
 
 /** An fs failure carries an errno code; a validation failure does not. */
 export function isFilesystemError(error: unknown): boolean {

@@ -5740,6 +5740,10 @@ describe("isFilesystemError", () => {
     expect(
       isFilesystemError(Object.assign(new Error("too big"), { code: "ERR_FS_FILE_TOO_LARGE" }))
     ).toBe(true);
+    // Node on Windows names a failed fs call it cannot map this way, and main took every coded error.
+    expect(
+      isFilesystemError(Object.assign(new Error("unknown error, open"), { code: "UNKNOWN" }))
+    ).toBe(true);
     expect(isFilesystemError(new Error("no code"))).toBe(false);
     expect(isFilesystemError({ code: "ENOENT" })).toBe(false);
     expect(isFilesystemError(new BackupInvalidPayloadError(new Error("bad payload")))).toBe(false);
