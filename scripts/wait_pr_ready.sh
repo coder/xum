@@ -124,13 +124,15 @@ export MUX_GH_REPO
 export MUX_SKIP_FETCH_SYNC=1
 
 PR_DATA_FILE=$(mktemp)
+REACTIONS_SCAN_CACHE_FILE="${PR_DATA_FILE}.reactions-scan"
 cleanup() {
-  rm -f "$PR_DATA_FILE"
+  rm -f "$PR_DATA_FILE" "$REACTIONS_SCAN_CACHE_FILE"
 }
 trap cleanup EXIT
 
 # Share the latest PR GraphQL payload across child scripts to avoid duplicate API calls.
 export MUX_PR_DATA_FILE="$PR_DATA_FILE"
+export MUX_REACTIONS_SCAN_CACHE_FILE="$REACTIONS_SCAN_CACHE_FILE"
 
 echo "🚦 Waiting for PR #$PR_NUMBER to become ready (Codex + optional coder-agents-review + non-visual-review CI, fail-fast)..."
 echo ""

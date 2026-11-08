@@ -107,7 +107,7 @@ def connection(nodes, more=False):
     }
 
 
-def snapshot(comments=(), threads=(), reactions=(), more=False, head=None):
+def snapshot(comments=(), threads=(), reactions=(), more=False, head=None, reactions_more=False):
     # The PR head defaults to the head of the first board in the snapshot, so a
     # fixture board describes the current head unless a test says otherwise.
     if head is None:
@@ -121,7 +121,7 @@ def snapshot(comments=(), threads=(), reactions=(), more=False, head=None):
                     "headRefOid": head,
                     "comments": connection(list(comments), more),
                     "reviewThreads": connection(list(threads), more),
-                    "reactions": connection(list(reactions)),
+                    "reactions": connection(list(reactions), reactions_more),
                 }
             }
         }
@@ -1283,6 +1283,19 @@ else:
                     )
                     result = self.assert_gate(expected, data, "wait_pr_codex.sh")
                     self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
+        # With more than 100 reactions the script pages through all of them: the same rule applies.
+        for case, board_comment, expected in (
+            ("paged: the board's code review of the head finished clean", comment(flagged("false")), 0),
+            ("paged: the board names an earlier head", comment(board_for(board, EARLIER_HEAD)), 10),
+        ):
+            with self.subTest(case):
+                data = snapshot(
+                    [request, board_comment],
+                    reactions=[{"user": {"login": BOT}, "createdAt": AFTER}],
+                    head=PR_HEAD,
+                    reactions_more=True,
+                )
+                self.assert_gate(expected, data, "wait_pr_codex.sh")
         with self.subTest("the thumbs-up came before the request"):
             stale = {"user": {"login": BOT}, "createdAt": BEFORE}
             data = snapshot([request, comment(flagged("false"))], reactions=[stale], head=PR_HEAD)
