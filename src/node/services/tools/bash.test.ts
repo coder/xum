@@ -1475,6 +1475,7 @@ describe("bash tool", () => {
       "top | head",
       "view < f",
       "vim 'a' | tee 'b'",
+      'vim "it\'s" | tee "b\'s"',
       "nano f",
       "./top",
       "bin/view notes.md",
