@@ -673,9 +673,11 @@ async function analyzeChunk(args: {
   } catch {
     usage = undefined;
   }
-  // A step that hit the output limit never ran its tool call, yet the stream ends clean: the
-  // cursor would move past a chunk the model only partly analyzed. The meter is the job's, but a
-  // step like that ends its chunk's stream and the run with it, so the flag is this chunk's.
+  // When the stream's last step hit the output limit, the SDK ran none of its tool calls, yet the
+  // stream ends clean: the cursor would move past a chunk the model only partly analyzed. An
+  // earlier cut-off step does not count: its call comes back to the model as a tool error, and a
+  // later step can retry it (the meter keeps only the last step). The meter is the job's, but a
+  // chunk that ends this way fails and ends the run, so the flag is always this chunk's.
   if (args.meter.endedAtOutputLimit()) {
     return {
       streamError: `memory analysis of chunk ${args.label} ended a step at the model's output limit, so its tool call never ran`,

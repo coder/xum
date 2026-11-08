@@ -635,8 +635,10 @@ export async function runMemoryConsolidation(args: {
   }
   // Set apart from `streamErrors`: only a stream that failed or was aborted has unreliable usage.
   const streamCompleted = streamErrors.length === 0;
-  // A step that hit the output limit never ran its tool call, yet the stream ends clean: without
-  // this the pass would be journaled as a success and the debounce would hold off its retry.
+  // When the stream's last step hit the output limit, the SDK ran none of its tool calls, yet the
+  // stream ends clean: without this the pass would be journaled as a success and the debounce
+  // would hold off its retry. An earlier cut-off step does not count: its call comes back to the
+  // model as a tool error, and a later step can retry it (the meter keeps only the last step).
   const streamError =
     streamErrors[0] ??
     (streamCompleted && meter.endedAtOutputLimit()
