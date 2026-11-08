@@ -109,13 +109,15 @@ jobs:
               - 'pixel.jsonc'
               - '.storybook/**'
             # Queue-only jobs (test-e2e, bugbash-sandbox, build-vscode) still run on a PR that
-            # changes their own tests or sources. This workflow holds their steps, the Makefile
-            # their targets, and bun.lock the playwright-core version that keys the sandbox image.
+            # changes their own tests or sources. This workflow and the setup-xum action hold
+            # their steps, the Makefile their targets, and bun.lock the playwright-core version
+            # that keys the sandbox image.
             e2e_tests:
               - 'tests/e2e/**'
               - 'tests/bugbash/**'
               - 'playwright.config.ts'
               - '.github/workflows/pr.yml'
+              - '.github/actions/setup-xum/**'
               - 'Makefile'
               - 'package.json'
               - 'bun.lock'
@@ -169,47 +171,29 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-version.sh
-      # Release binaries pinned by checksum. A version bump needs new checksums for every asset
-      # below. Never copy them from the release page: download each asset yourself, run
-      # `sha256sum` on it, and check that the result equals the digest GitHub computed at upload
-      # (`gh api repos/<owner>/<repo>/releases/tags/<tag> --jq '.assets[] | .name + " " +
-      # .digest'`). hadolint v2.12.0 predates those digests: compare with its .sha256 assets.
+      # shfmt and hadolint: release binaries pinned by checksum in the install script, which
+      # also says how to bump them. The cache holds the verified downloads and is keyed on that
+      # script, so a changed pin starts fresh. A cache hit skips the download, which github.com
+      # answered with 504 for more than 7 minutes on 2026-11-08. A cold cache retries each
+      # download for 15 minutes: this job has no time limit of its own (the default is 6 hours).
+      # The cache is saved right after the install, because the job's post step saves only when
+      # every later step passes, and the steps below download more (the grammars).
+      - name: Restore shfmt and hadolint downloads
+        id: release-assets
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/xum-release-assets
+          key: release-assets-shfmt-hadolint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-release-tools.sh') }}
       - name: Install shfmt and hadolint
-        env:
-          SHFMT_VERSION: v3.14.1
-          SHFMT_SHA256_X86_64: 76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf
-          SHFMT_SHA256_AARCH64: 5f2db09dae91fca848f7adbdd014632e921a383863a2ad7e0450ad3aba0c6489
-          HADOLINT_VERSION: v2.12.0
-          HADOLINT_SHA256_X86_64: 56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010
-          HADOLINT_SHA256_AARCH64: 5798551bf19f33951881f15eb238f90aef023f11e7ec7e9f4c37961cb87c5df6
         run: |
-          set -euo pipefail
-          case "$(uname -m)" in
-            x86_64)
-              shfmt_arch=amd64 shfmt_sha256="$SHFMT_SHA256_X86_64"
-              hadolint_arch=x86_64 hadolint_sha256="$HADOLINT_SHA256_X86_64"
-              ;;
-            aarch64 | arm64)
-              shfmt_arch=arm64 shfmt_sha256="$SHFMT_SHA256_AARCH64"
-              hadolint_arch=arm64 hadolint_sha256="$HADOLINT_SHA256_AARCH64"
-              ;;
-            *)
-              echo "::error::no pinned shfmt or hadolint for $(uname -m); add its assets and checksums"
-              exit 1
-              ;;
-          esac
-          bin="$HOME/.local/bin"
-          mkdir -p "$bin"
-          curl -fsSL --retry 5 --retry-all-errors -o "$bin/shfmt" \
-            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_${shfmt_arch}"
-          curl -fsSL --retry 5 --retry-all-errors -o "$bin/hadolint" \
-            "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-${hadolint_arch}"
-          echo "${shfmt_sha256}  $bin/shfmt" | sha256sum -c -
-          echo "${hadolint_sha256}  $bin/hadolint" | sha256sum -c -
-          chmod +x "$bin/shfmt" "$bin/hadolint"
-          "$bin/shfmt" --version
-          "$bin/hadolint" --version
-          echo "$bin" >> "$GITHUB_PATH"
+          ./scripts/ci/install-release-tools.sh shfmt-hadolint "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Save shfmt and hadolint downloads
+        if: steps.release-assets.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/xum-release-assets
+          key: ${{ steps.release-assets.outputs.cache-primary-key }}
       - name: Install shellcheck
         run: |
           set -euo pipefail
@@ -241,6 +225,37 @@ jobs:
           key: ${{ runner.os }}-lint-fmt-node-${{ steps.node-version.outputs.version }}-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-lint-fmt-node-${{ steps.node-version.outputs.version }}-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-
+      # tree-sitter-language-pack downloads its grammars from a GitHub release on first use
+      # (`make tree-sitter-grammars`, a prerequisite of the script tests in static-check-full).
+      # The pack keeps them in a directory named by its version, so the key is that pin from
+      # pyproject.toml. A language added to the Makefile's list needs a new key prefix here.
+      # The step below downloads them (15 minutes of retries on a cold cache), and the save
+      # follows at once, ahead of the long make run.
+      - name: Read the tree-sitter-language-pack pin
+        id: tslp
+        run: |
+          version=$(sed -n 's/^ *"tree-sitter-language-pack==\([0-9][0-9.]*\)".*/\1/p' pyproject.toml)
+          if [ -z "$version" ]; then
+            echo "::error::pyproject.toml does not pin tree-sitter-language-pack with =="
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Restore tree-sitter grammars
+        id: tree-sitter-grammars
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: tree-sitter-grammars-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.tslp.outputs.version }}
+      - name: Download tree-sitter grammars
+        run: make tree-sitter-grammars
+        env:
+          GRAMMAR_DOWNLOAD_BUDGET_SECS: 900
+      - name: Save tree-sitter grammars
+        if: steps.tree-sitter-grammars.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: ${{ steps.tree-sitter-grammars.outputs.cache-primary-key }}
       - run: make -j static-check-full
         env:
           MUX_ESLINT_CONCURRENCY: 4
@@ -309,39 +324,36 @@ jobs:
       # single-attempt path. Run the real-curl pinning tests once more with a pinned static
       # curl 8.7+ (curl.se lists stunnel/static-curl), so CI also checks the address
       # fallback and its no-retry cases (#6414). The env var fails the file if that curl is
-      # not the one on PATH.
+      # not the one on PATH. The pin and its checksums live in the install script. As for
+      # shfmt above, a cache hit skips the download, and the cache is saved right after it.
+      # A cold cache retries for 8 minutes (DOWNLOAD_BUDGET_SECS), not 15: this job stops at
+      # 20 minutes. The step starts after 7 minutes of build and tests, and the pinning tests,
+      # the cache save and the cleanup take under 1 more (measured on PR 8001), so a full budget
+      # ends the job at about 16 minutes and leaves room for a slow runner.
+      - name: Restore the static curl download
+        id: static-curl-download
+        if: matrix.shard == 1 && github.event.inputs.test_filter == ''
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/xum-release-assets
+          key: release-assets-static-curl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-release-tools.sh') }}
+      - name: Install static curl
+        if: matrix.shard == 1 && github.event.inputs.test_filter == ''
+        env:
+          DOWNLOAD_BUDGET_SECS: 480
+        run: ./scripts/ci/install-release-tools.sh static-curl "$RUNNER_TEMP/static-curl"
+      - name: Save the static curl download
+        if: matrix.shard == 1 && github.event.inputs.test_filter == '' && steps.static-curl-download.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/xum-release-assets
+          key: ${{ steps.static-curl-download.outputs.cache-primary-key }}
       - name: web_fetch pinning tests with curl 8.7+
         if: matrix.shard == 1 && github.event.inputs.test_filter == ''
         env:
-          # A version bump needs new checksums for BOTH assets below (#6492). Never copy them
-          # from the release page: download each curl-linux-<arch>-musl-<version>.tar.xz
-          # yourself, run `sha256sum` on it, and check that the result equals the digest
-          # GitHub computed at upload (`gh api repos/stunnel/static-curl/releases/tags/<version>
-          # --jq '.assets[] | select(.name == "<asset>") | .digest'`). The release has no
-          # build attestations, so those two must agree before the new values land.
-          STATIC_CURL_VERSION: 8.22.0
-          STATIC_CURL_SHA256_X86_64: dfb02460ba2abe513087538f12a3cf79b74b64a5ea3787ce8ac0cdb11251f884
-          STATIC_CURL_SHA256_AARCH64: cf94cbeaae1b3c1944a4a761ef04478f8f0b23e93a324b5ed009b2082eda11f3
           XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK: "1"
         run: |
-          # Pick the asset for this runner's CPU, so a move to arm64 runners keeps the step
-          # (#6492). Any other CPU fails here instead of silently testing nothing.
-          case "$(uname -m)" in
-            x86_64) arch=x86_64 sha256="$STATIC_CURL_SHA256_X86_64" ;;
-            aarch64 | arm64) arch=aarch64 sha256="$STATIC_CURL_SHA256_AARCH64" ;;
-            *)
-              echo "::error::no pinned static curl for $(uname -m); add its asset and checksum"
-              exit 1
-              ;;
-          esac
-          dir="$RUNNER_TEMP/static-curl"
-          mkdir -p "$dir"
-          archive="$dir/curl.tar.xz"
-          curl -fsSL --retry 3 -o "$archive" \
-            "https://github.com/stunnel/static-curl/releases/download/${STATIC_CURL_VERSION}/curl-linux-${arch}-musl-${STATIC_CURL_VERSION}.tar.xz"
-          echo "${sha256}  ${archive}" | sha256sum -c -
-          tar -xJf "$archive" -C "$dir" curl
-          PATH="$dir:$PATH"
+          PATH="$RUNNER_TEMP/static-curl:$PATH"
           curl -q --version
           bun test src/node/services/tools/web_fetch.pinning.test.ts
       # The host trap and the in-memory agent-loop proof run in their own bun process, with
@@ -787,6 +799,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          skip-build-caches: "true"
       - name: Install xvfb
         if: matrix.os == 'linux'
         run: |

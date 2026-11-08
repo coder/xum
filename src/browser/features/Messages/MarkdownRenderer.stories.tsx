@@ -7,6 +7,7 @@ import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { expectNoDiagramInkOutsideBox } from "@/browser/stories/storyPlayHelpers";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 import { SIDE_INSET_VIEWPORT } from "@/constants/layout";
+import { MERMAID_PAGE_DIAGRAM_SELECTOR } from "@/constants/mermaid";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { UserMessageContent } from "./UserMessageContent";
 
@@ -276,10 +277,12 @@ interface DiagramGeometry {
   drawing: { width: number; height: number };
 }
 
-const INLINE_SVG = ".mermaid-container:not(.mermaid-modal) > svg.pele";
 const DIALOG_SVG = ".mermaid-modal > svg.pele";
 
-function measureDiagram(canvasElement: HTMLElement, selector = INLINE_SVG): DiagramGeometry {
+function measureDiagram(
+  canvasElement: HTMLElement,
+  selector = MERMAID_PAGE_DIAGRAM_SELECTOR
+): DiagramGeometry {
   const svg = canvasElement.querySelector<SVGSVGElement>(selector);
   if (!svg) throw new Error("The diagram has not rendered yet");
   const container = svg.parentElement!;
