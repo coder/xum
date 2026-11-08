@@ -26,16 +26,15 @@ function syncViewportHeight(): void {
 function installVisualViewportHeightFix(): () => void {
   const viewport = window.visualViewport;
   if (viewport == null) return () => undefined;
-  const nativeHeight = Object.getOwnPropertyDescriptor(
-    Object.getPrototypeOf(viewport) as object,
-    "height"
-  )?.get;
-  if (nativeHeight == null) return () => undefined;
+  const prototype = Object.getPrototypeOf(viewport) as object;
+  if (typeof Object.getOwnPropertyDescriptor(prototype, "height")?.get !== "function") {
+    return () => undefined;
+  }
   try {
     Object.defineProperty(viewport, "height", {
       configurable: true,
       get: () => {
-        const height = nativeHeight.call(viewport) as number;
+        const height = Reflect.get(prototype, "height", viewport) as number;
         return height > 0 ? height : window.innerHeight;
       },
     });
