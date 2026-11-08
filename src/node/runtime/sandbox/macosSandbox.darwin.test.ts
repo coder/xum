@@ -291,6 +291,36 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(await exists(path.join(workspace, ".mux"))).toBe(false);
     });
 
+    it("keeps the MCP overrides, plugin folders and worktree commondir read-only", async () => {
+      const repo = path.join(root, "repo");
+      const worktree = path.join(root, "wt");
+      await fs.mkdir(repo);
+      git(repo, "init", "-q");
+      git(repo, ...GIT_IDENTITY.split(" "), "commit", "-q", "--allow-empty", "-m", "init");
+      git(repo, "worktree", "add", "-q", worktree);
+      const commondir = path.join(repo, ".git", "worktrees", "wt", "commondir");
+      const before = await fs.readFile(commondir, "utf8");
+      // A checkout with its own .xum folder: Seatbelt refuses to make a missing one.
+      await fs.mkdir(path.join(worktree, ".xum"));
+
+      const result = await runSandboxed(
+        buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: worktree, pathEnv: process.env.PATH }),
+        worktree,
+        [
+          "echo '{}' > .xum/mcp.local.jsonc || echo MCP_DENIED",
+          "mkdir -p .agents/plugins/p || echo PLUGIN_DENIED",
+          `echo ${root} > ${commondir} || echo COMMONDIR_DENIED`,
+        ].join("; ")
+      );
+
+      expect(result.stdout).toContain("MCP_DENIED");
+      expect(result.stdout).toContain("PLUGIN_DENIED");
+      expect(result.stdout).toContain("COMMONDIR_DENIED");
+      expect(await exists(path.join(worktree, ".xum", "mcp.local.jsonc"))).toBe(false);
+      expect(await exists(path.join(worktree, ".agents", "plugins"))).toBe(false);
+      expect(await fs.readFile(commondir, "utf8")).toBe(before);
+    });
+
     // The next command's policy opens their real paths, so a link in their place would open its
     // target. The protected paths under each keep it in place.
     it("keeps the workspace, scratch and extra write folders in place", async () => {

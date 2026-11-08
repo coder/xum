@@ -1171,7 +1171,6 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           wall_duration_ms: 0,
         });
       }
-      const sandboxOptOut = sandboxExecOptions(approval);
 
       if (run_in_background) {
         if (!config.workspaceId || !config.backgroundProcessManager || !config.runtime) {
@@ -1239,13 +1238,15 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           scriptWithEnv,
           {
             cwd: config.cwd,
-            env: { ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets), ...hooksEnv },
+            ...sandboxExecOptions(approval, {
+              ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets),
+              ...hooksEnv,
+            }),
             pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
             monitor: monitorConfig,
             timeoutSecs: backgroundTimeoutSecs(timeout_secs),
-            ...sandboxOptOut,
           }
         );
 
@@ -1333,15 +1334,14 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 ${scriptWithEnv}`;
       const execStream = await config.runtime.exec(scriptWithClosedStdin, {
         cwd: config.cwd,
-        env: {
+        ...sandboxExecOptions(approval, {
           ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets),
           ...hooksEnv,
           ...NON_INTERACTIVE_ENV_VARS,
-        },
+        }),
         pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,
-        ...sandboxOptOut,
       });
 
       let exitCodeResolved = false;

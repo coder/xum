@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import { getXumHome } from "@/common/constants/paths";
 
 /**
@@ -52,8 +53,15 @@ export const PROTECTED_GIT_DIR_PATHS: readonly string[] = [
   "modules",
 ];
 
-/** What git reads from a linked worktree's own folder, <git folder>/worktrees/<name>. */
-export const PROTECTED_LINKED_WORKTREE_PATHS: readonly string[] = ["config.worktree", "modules"];
+/**
+ * What git reads from a linked worktree's own folder, <git folder>/worktrees/<name>. `commondir`
+ * names the git folder whose config and hooks git uses there.
+ */
+export const PROTECTED_LINKED_WORKTREE_PATHS: readonly string[] = [
+  "config.worktree",
+  "modules",
+  "commondir",
+];
 
 /**
  * Read-only under each write root. Xum, git or an editor runs these with full access, so a
@@ -63,15 +71,15 @@ export const PROTECTED_LINKED_WORKTREE_PATHS: readonly string[] = ["config.workt
 export const PROTECTED_WRITE_PATHS: ReadonlyArray<string | { path: string; ifFile: true }> = [
   ...PROTECTED_GIT_DIR_PATHS.map((name) => `.git/${name}`),
   { path: ".git", ifFile: true },
-  // MCP servers start outside the sandbox.
-  ".xum/mcp.jsonc",
-  ".mux/mcp.jsonc",
+  // MCP servers start outside the sandbox, and the workspace overrides
+  // (workspaceMcpOverridesService.ts) choose which of them start.
+  ...["mcp.jsonc", "mcp.local.jsonc", "mcp.local.json"].flatMap(listProjectMetadataRelativePaths),
   // Bash sources it before the script, also for a call the user let run outside the sandbox.
-  ".xum/tool_env",
-  ".mux/tool_env",
-  // Plugin hooks and MCP servers.
+  ...listProjectMetadataRelativePaths("tool_env"),
+  // Plugin hooks and MCP servers: every plugin container (projectPluginContainerPaths).
   ".mcp.json",
-  ".xum/plugins",
+  ...listProjectMetadataRelativePaths("plugins"),
+  ".agents/plugins",
   // The editor and direnv run them.
   ".vscode",
   ".idea",
@@ -90,6 +98,20 @@ const GLOBAL_SKILL_ROOTS: readonly string[] = [
   "~/.mux/skills",
 ];
 const PLUGIN_ROOTS: readonly string[] = [`${XUM_HOME_TOKEN}/plugins`, "~/.agents/plugins"];
+
+/**
+ * Read paths with code that Xum runs in every workspace, also in one without the sandbox, and
+ * plugin MCP servers start outside it. Any of them can be a link into a write root (a dotfiles
+ * setup), where it must stay read-only.
+ */
+export const AUTOMATION_READ_PATHS: readonly string[] = [
+  ...GLOBAL_SKILL_ROOTS,
+  ...PLUGIN_ROOTS,
+  // Xum's own helper scripts (tool_env and the like).
+  `${XUM_HOME_TOKEN}/bin`,
+  // The global tool hooks (hooks.ts): Xum runs them in the sandbox, so it must read them.
+  ...["tool_env", "tool_hook", "tool_pre", "tool_post"].map((name) => `${XUM_HOME_TOKEN}/${name}`),
+];
 
 // Open under ~ for each command, with the workspace, its scratch folder, the main .git of a
 // worktree, all write paths and extraReadPaths.
@@ -110,12 +132,7 @@ export const HOME_READ_PATHS: readonly string[] = [
   "~/.local/share/mise",
   "~/.local/share/uv",
   "~/.sdkman",
-  ...GLOBAL_SKILL_ROOTS,
-  ...PLUGIN_ROOTS,
-  // Xum's own helper scripts (tool_env and the like).
-  `${XUM_HOME_TOKEN}/bin`,
-  // The global tool hooks (hooks.ts): Xum runs them in the sandbox, so it must read them.
-  ...["tool_env", "tool_hook", "tool_pre", "tool_post"].map((name) => `${XUM_HOME_TOKEN}/${name}`),
+  ...AUTOMATION_READ_PATHS,
 ];
 
 // Denied after the allows, so no open folder or extraReadPaths entry exposes them.
@@ -150,7 +167,7 @@ export function expandWriteRoot(entry: string): string {
 }
 
 /** `~/x`, `<xumHome>/x` or an absolute path, without resolving symlinks. */
-function expandSandboxPathSpelling(entry: string): string {
+export function expandSandboxPathSpelling(entry: string): string {
   if (entry === "~") return os.homedir();
   if (entry.startsWith("~/")) return path.join(os.homedir(), entry.slice(2));
   if (entry === XUM_HOME_TOKEN) return getXumHome();

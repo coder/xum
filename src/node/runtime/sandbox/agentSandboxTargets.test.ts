@@ -109,6 +109,8 @@ describe("buildAgentSandboxPolicy", () => {
     for (const target of [
       path.join(linked, "config.worktree"),
       path.join(linked, "modules", "sub", "hooks", "post-checkout"),
+      // Git outside the sandbox reads the config and hooks of the folder it names.
+      path.join(linked, "commondir"),
       path.join(commonDir, "config.worktree"),
       path.join(commonDir, "modules", "sub", "config"),
     ]) {
@@ -169,14 +171,56 @@ describe("buildAgentSandboxPolicy", () => {
     }
   });
 
-  // Bash sources it before the script, also for a call that the user let run outside.
-  test("keeps the project tool_env read-only", () => {
+  // Bash sources tool_env before the script, also for a call that the user let run outside, and
+  // MCP servers (also those of plugins) start outside the sandbox.
+  test("keeps the project files that Xum runs outside the sandbox read-only", () => {
     const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
 
-    for (const dir of [".xum", ".mux"]) {
-      expect(agentSandboxPolicyAllows(policy, path.join(repo, dir, "tool_env"), "write")).toBe(
+    for (const file of [
+      ...[".xum", ".mux"].flatMap((dir) =>
+        ["tool_env", "mcp.local.jsonc", "mcp.local.json", "plugins/p/.mcp.json"].map((name) =>
+          path.join(dir, name)
+        )
+      ),
+      ".agents/plugins/p/.mcp.json",
+    ]) {
+      expect(agentSandboxPolicyAllows(policy, path.join(repo, file), "write")).toBe(false);
+    }
+  });
+
+  // root is in the temp folder, a write root outside the (hidden) home folder.
+  test("keeps a global plugin folder that is a link into a write root read-only", async () => {
+    const home = path.join(root, "home");
+    const plugins = path.join(root, "agent-plugins");
+    await fs.mkdir(plugins);
+    await fs.mkdir(path.join(home, ".agents"), { recursive: true });
+    await fs.symlink(plugins, path.join(home, ".agents", "plugins"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+      expect(agentSandboxPolicyAllows(policy, path.join(plugins, "p", ".mcp.json"), "write")).toBe(
         false
       );
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  test("does not follow a symlink in a write root that extraReadPaths names", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(path.join(home, ".cache"), { recursive: true });
+    await fs.symlink(home, path.join(home, ".cache", "input"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const { allowRead } = buildAgentSandboxPolicy(
+        { ...SETTINGS, extraReadPaths: ["~/.cache/input"] },
+        { cwd: repo }
+      );
+
+      expect(allowRead).not.toContain(home);
+    } finally {
+      homedir.mockRestore();
     }
   });
 
@@ -184,6 +228,16 @@ describe("buildAgentSandboxPolicy", () => {
     process.env.XUM_ROOT = path.join(root, "xum-home");
 
     expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
+  });
+
+  // Xum starts the MCP servers of its global plugins outside the sandbox.
+  test("fails closed when an extraWritePaths entry is in Xum's home folder", () => {
+    expect(() =>
+      buildAgentSandboxPolicy(
+        { ...SETTINGS, extraWritePaths: [path.join(xumRoot, "plugins")] },
+        { cwd: repo }
+      )
+    ).toThrow(AgentSandboxStartError);
   });
 
   test("hides a home folder outside /Users", async () => {

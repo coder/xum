@@ -7,6 +7,7 @@ import type {
 } from "@/common/config/schemas/agentSandbox";
 import { getXumHome } from "@/common/constants/paths";
 import {
+  AUTOMATION_READ_PATHS,
   CACHE_WRITE_PATHS,
   DENY_READ_ROOTS,
   HOME_READ_PATHS,
@@ -16,6 +17,7 @@ import {
   PROTECTED_WRITE_PATHS,
   dedupe,
   expandSandboxPath,
+  expandSandboxPathSpelling,
   expandWriteRoot,
   isPathAtOrUnder,
   realpathOfNearest,
@@ -123,11 +125,18 @@ export function buildAgentSandboxPolicy(
     ...extraWriteRoots,
   ]);
   // Xum runs code from its home folder with full access (the global mcp.jsonc, tool hooks,
-  // skills), so a policy that can write it does not hold.
+  // skills, plugins), so a policy that can write it does not hold. Workspaces and scratch
+  // folders can live in it; an extraWritePaths entry cannot.
   const xumHome = realpathOfNearest(getXumHome());
   if (isUnderAny(xumHome, writeRoots)) {
     throw new AgentSandboxStartError(
       `Xum's home folder ${xumHome} is inside a folder that commands can write`
+    );
+  }
+  const extraRootInXumHome = extraWriteRoots.find((root) => isPathAtOrUnder(root, xumHome));
+  if (extraRootInXumHome !== undefined) {
+    throw new AgentSandboxStartError(
+      `the extra write path ${extraRootInXumHome} is inside Xum's home folder ${xumHome}`
     );
   }
   // A background command starts in a temp folder and gets its checkout in workspaceRoots.
@@ -138,8 +147,11 @@ export function buildAgentSandboxPolicy(
     [
       ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
       ...gitCommonDirs.flatMap(protectedGitDirPaths),
-      // A credential file in a write root (~/.cache/huggingface/token) stays unwritable too.
-      ...nestedDenies.filter((denied) => isUnderAny(denied, writeRoots)),
+      // A credential file in a write root (~/.cache/huggingface/token) stays unwritable too,
+      // and so does a global plugin or skill folder that is a link into one.
+      ...[...nestedDenies, ...AUTOMATION_READ_PATHS.map(expandSandboxPath)].filter((denied) =>
+        isUnderAny(denied, writeRoots)
+      ),
     ].flatMap(withLinkTarget)
   );
   const allowRead = dedupe([
@@ -147,7 +159,13 @@ export function buildAgentSandboxPolicy(
     ...gitCommonDirs,
     ...HOME_READ_PATHS.map(expandSandboxPath),
     ...pathFoldersUnderHome(input.pathEnv, home, writeRoots),
-    ...outsideNestedDenies(settings.extraReadPaths.map(expandSandboxPath), nestedDenies),
+    // A command can replace an entry in a write root with a link, so links there are not followed.
+    ...outsideNestedDenies(
+      settings.extraReadPaths.map((entry) =>
+        realpathOutside(expandSandboxPathSpelling(entry), writeRoots)
+      ),
+      nestedDenies
+    ),
   ]);
   return {
     writeRoots,

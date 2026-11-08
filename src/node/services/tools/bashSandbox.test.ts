@@ -108,6 +108,19 @@ describe("bash outside_sandbox_reason", () => {
     expect(events.at(-1)).toMatchObject({ toolCallId: "call-1", pending: false });
   });
 
+  // The approval card shows only the script; a BASH_ENV file in the workspace can change later.
+  it("does not source BASH_ENV in an approved call", async () => {
+    const startup = path.join(cwd, "startup.sh");
+    await fs.promises.writeFile(startup, "echo sourced\n");
+    const { run } = setup(POLICY, { secrets: { BASH_ENV: startup } });
+
+    const result = run();
+    await waitFor(() => events.length === 1);
+    sandboxApprovalManager.answer("ws-sandbox", "call-1", true);
+
+    expect(await result).toMatchObject({ success: true, output: "ran" });
+  });
+
   it("runs nothing after a denial or a Stop", async () => {
     const { runtime, run } = setup(POLICY);
 

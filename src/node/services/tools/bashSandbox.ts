@@ -21,9 +21,17 @@ function agentSandboxApplies(config: ToolConfiguration): boolean {
 
 export type SandboxApproval = "not-asked" | "approved" | "denied";
 
-/** The exec options of a bash call: an approved call runs outside the sandbox, with full access. */
-export function sandboxExecOptions(approval: SandboxApproval): Pick<ExecOptions, "sandbox"> {
-  return approval === "approved" ? { sandbox: "off" } : {};
+/**
+ * The exec options of a bash call with environment `env`: an approved call runs outside the
+ * sandbox, with full access, and without BASH_ENV. Bash sources the file that BASH_ENV names
+ * before the script, and that file can be in the workspace, where the agent can change it after
+ * the user approved the script.
+ */
+export function sandboxExecOptions(
+  approval: SandboxApproval,
+  env: Record<string, string>
+): Pick<ExecOptions, "sandbox" | "env"> {
+  return approval === "approved" ? { sandbox: "off", env: { ...env, BASH_ENV: "" } } : { env };
 }
 
 /**
