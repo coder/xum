@@ -492,9 +492,12 @@ CHECK_CODEX_STATUS_ONCE() {
     [.[] | select(.createdAt > $request_at and .isMinimized != true and codex_usage_limit($bot))]
     | sort_by(.createdAt) | last // empty | .body // empty')
 
-  # A receipt that names another head outlasts a push and does not approve: its `Reviewed commit`
-  # is a short SHA (10 or more hex characters, as Codex prints it) that must start the PR head. A
-  # receipt that names no commit says nothing about a head, so the gate decides.
+  # The gate above binds the head: it waits while the head's summary board is old or still running,
+  # and fails while a finding is open. The check here only rejects a receipt that names another
+  # head, because such a receipt outlasts a push: its `Reviewed commit` must be a short SHA of at
+  # least 10 hex characters (Codex prints 10) that starts the PR head. A receipt with no
+  # `Reviewed commit` line names no head and is left to the gate. Capture the SHA at any length:
+  # a short SHA must be rejected here, not mistaken for a receipt with no line.
   approval_comment=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" --arg head "$pr_head" '
     [.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex)))
       | select(((.body | capture("[*][*]Reviewed commit:[*][*] `(?<sha>[0-9a-f]+)`")?) // {sha: null}).sha as $sha

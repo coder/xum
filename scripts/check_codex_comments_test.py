@@ -1273,6 +1273,9 @@ else:
 
         running = FIXTURES["review_state_running_summary"]["body"]
         for case, comments, expected in (
+            # As on main: with no board and no finding the gate is clean, so the reaction approves.
+            ("no board", [request], 0),
+            ("a receipt for an earlier head, no board", [request, code_receipt(EARLIER_HEAD[:10])], 0),
             ("the board's code review of the head finished", [request, comment(flagged("false"))], 0),
             # A finished review can report null flags (#7734): its findings are threads and comments.
             ("the board's flag is null", [request, comment(flagged("null"))], 0),
