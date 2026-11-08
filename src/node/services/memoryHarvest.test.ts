@@ -688,6 +688,30 @@ describe("runMemoryHarvest", () => {
       expect(prompt).not.toContain("a1B2a1B2");
     });
 
+    it("never sends a session cookie from a tool's output or input to the harvest model", async () => {
+      using fixture = createFixture();
+      const session = "s%3AopaqueSessionValue.Zm9vYmFy";
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart(
+            "bash",
+            { script: `curl -i -H "Cookie: connect.sid=${session}" https://app.example.com/me` },
+            {
+              success: true,
+              output: `HTTP/1.1 200 OK\r\nSet-Cookie: sessionid=${session}; Path=/; HttpOnly\r\n\r\nlogged in`,
+              headers: { "set-cookie": [`a=${session}`, `b=${session}`], server: "nginx" },
+            }
+          ),
+        ]),
+      ]);
+
+      expect(prompt).not.toContain(session);
+      expect(prompt).toContain("Set-Cookie: [redacted]");
+      expect(prompt).toContain("logged in");
+      expect(prompt).toContain("nginx");
+    });
+
     it("redacts a whole quoted secret that holds an escaped quote, in a structured value", async () => {
       using fixture = createFixture();
 

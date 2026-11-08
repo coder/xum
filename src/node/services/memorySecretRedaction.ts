@@ -86,9 +86,34 @@ const SECRET_KEY_VALUE_PATTERN = new RegExp(
   "gi"
 );
 
+// A session cookie is a bearer credential that has no keyword and no token shape of its own, so the
+// header is the only thing that marks it. The value of a `Cookie` / `Set-Cookie` header goes, and
+// the header name stays. A header's value ends at its line break (raw, or the escape of one in
+// JSON text: `\n`, `\r`) or at the quote that closes it (a JSON string, a `curl -H "..."`), so the
+// body takes everything but those, and a backslash that does not start an escape. The header may
+// also be a JSON key (`"cookie": "a=b"`, its opening quote kept so the quotes stay paired), whose
+// value may be an array (`"set-cookie": ["a=b", "c=d"]`, Node's shape), read to its `]`.
+// A name starts after a non-word character, so `getCookie:` and `X-Cookie:` are not headers; after
+// an escaped line break it starts behind the letter of `\n`. A prose line that begins with
+// `cookie:` is redacted to its end: the name and the colon are all this rule can see.
+// Linear: the body and the array never fail and never backtrack, as `QUOTED_VALUE` is (a run of
+// body characters is one step); the name, the key's quote and the gaps are bounded, and the value
+// is read once, since the match ends it.
+const COOKIE_HEADER_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w-])|(?<=\\[nr]))` +
+    String.raw`((?:Set-)?Cookie(?:\\{0,${ESCAPE_RUN_MAX}}["'])?[ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})` +
+    String.raw`(?:\[[^\]]*\]?|((?:\\{0,${ESCAPE_RUN_MAX}}["'])?)(?:[^\r\n"'\\]+|\\(?![nr"']))*)`,
+  "gi"
+);
+
 /** Replaces common credential shapes with `[redacted]`. */
 export function redactSecretLike(text: string): string {
-  let redacted = text;
+  // First, while the value is still whole: a standalone pattern that redacts the head of a cookie
+  // would end the value there and leave its tail readable.
+  let redacted = text.replace(
+    COOKIE_HEADER_PATTERN,
+    (_match, prefix: string, opener: string | undefined) => `${prefix}${opener ?? ""}${REDACTED}`
+  );
   for (const pattern of STANDALONE_SECRET_PATTERNS) redacted = redacted.replace(pattern, REDACTED);
   return redacted.replace(
     SECRET_KEY_VALUE_PATTERN,
