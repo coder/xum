@@ -730,6 +730,13 @@ function holdForeignDreamLock(fixture: Fixture) {
   });
 }
 
+/** Another backend's removal of `workspaceId`: its durable tombstone, which no local signal carries. */
+async function publishForeignRemoval(fixture: Fixture, workspaceId: string): Promise<void> {
+  const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, workspaceId);
+  await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+  await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId, removedAt: Date.now() }));
+}
+
 /** A sweep or trigger the 6 h window refused: returned quietly as a skip, not an error to retry. */
 function expectDebounced(result: Result<unknown, string>): void {
   expect(result.success).toBe(false);
@@ -2976,6 +2983,62 @@ describe("MemoryConsolidationService", () => {
       expect(result.success).toBe(false);
       if (!result.success) expect(result.error).toContain("output limit");
       expect(recorded).toEqual(["ws-dream"]);
+      expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+    });
+
+    it.each([
+      ["the workspace", "ws-dream"],
+      ["the sub-agent it runs for", "ws-sub"],
+    ])(
+      "refuses a run, without a stream or a journal row, when another backend removed %s while it waited",
+      async (_name, removedId) => {
+        let streams = 0;
+        using fixture = await createFixture({
+          modelFactory: () => {
+            const inner = scriptedModel();
+            return new MockLanguageModelV3({
+              doStream: (options) => {
+                streams++;
+                return inner.doStream(options);
+              },
+            });
+          },
+        });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        const releaseForeign = await holdForeignDreamLock(fixture);
+        try {
+          // The sub-agent's run goes to its owner's store, acting for the sub-agent.
+          const run = fixture.service.maybeRun("ws-sub", "manual");
+          await waitingForTurn(fixture, 1);
+          await publishForeignRemoval(fixture, removedId);
+          await releaseForeign();
+
+          const result = await run;
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error).toContain("being removed");
+          expect(streams).toBe(0);
+          expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+        } finally {
+          await releaseForeign();
+        }
+      }
+    );
+
+    it("journals no success for a workspace another backend removed while the stream ran", async () => {
+      const held = heldStreams();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      const run = fixture.service.maybeRun("ws-dream", "manual");
+      await until(() => held.events.includes("start-1"));
+      await publishForeignRemoval(fixture, "ws-dream");
+      held.release(1);
+
+      const result = await run;
+
+      // The stream ended clean, though every memory read and write it made was refused: a success
+      // record would hold off the debounce's retry and advance the launch sweep's coverage.
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("being removed");
+      expect(held.events).toEqual(["start-1", "end-1"]);
       expect(await fixture.service.getRecord("ws-dream")).toBeNull();
     });
 
