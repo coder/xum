@@ -456,6 +456,14 @@ function persistedTarget(
 }
 
 /**
+ * Journals that recorded the full note. Kept beside the rows, not read from them: a failed
+ * command's note quotes its model-chosen path, so a path ending in the full note would otherwise
+ * drop every later refusal. Keyed by the array, so it holds for every tool that shares one; a
+ * resumed analyzer attempt starts an empty journal (earlier ops stay apart), and so a fresh cap.
+ */
+const fullJournals = new WeakSet<MemoryConsolidationOp[]>();
+
+/**
  * Journal a refusal while the journal has room. The refusal that reaches the last slot carries the
  * note that later ones are dropped, and so does the first one after rows of budgeted commands
  * filled the journal past it: those are pushed directly and always (the budget bounds them), so
@@ -464,9 +472,13 @@ function persistedTarget(
  * analyzer's chunks of a run).
  */
 function journalRefusal(journal: MemoryConsolidationOp[], row: RefusalRow): void {
-  if (journal.some((op) => op.note?.endsWith(JOURNAL_FULL_NOTE) === true)) return;
-  const reachesLastSlot = journal.length >= MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - 1;
-  journal.push(reachesLastSlot ? { ...row, note: `${row.note} ${JOURNAL_FULL_NOTE}` } : row);
+  if (fullJournals.has(journal)) return;
+  if (journal.length < MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - 1) {
+    journal.push(row);
+    return;
+  }
+  fullJournals.add(journal);
+  journal.push({ ...row, note: `${row.note} ${JOURNAL_FULL_NOTE}` });
 }
 
 /**
