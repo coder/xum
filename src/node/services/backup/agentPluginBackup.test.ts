@@ -281,6 +281,30 @@ describe("backup of the managed plugin list", () => {
         "source.url",
       ],
       [
+        "a URL with a query the installer strips",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git?x=1",
+            ref: "main",
+            refType: "branch",
+          },
+        },
+        "source.url",
+      ],
+      [
+        "a URL with a fragment the installer strips",
+        {
+          source: {
+            type: "git",
+            url: "git@github.com:example/mono.git#main",
+            ref: "main",
+            refType: "branch",
+          },
+        },
+        "source.url",
+      ],
+      [
         "a ref git cannot hold",
         {
           source: {
@@ -1057,15 +1081,17 @@ describe("backup of the managed plugin list", () => {
         alpha,
         // The schema reads `ext` as an scp host: the preview would refuse it as a remote helper.
         withUrl("remote-helper", "ext::payload"),
-        // The parser strips a query, so the preview would fetch another URL than the row names.
+        // The parser strips a query and a fragment, so the preview would fetch another URL than
+        // the row names.
         withUrl("with-query", "https://github.com/example/repo.git?x=1"),
+        withUrl("with-fragment", "git@github.com:example/repo.git#main"),
       ];
       await writeSidecar(managed, JSON.stringify({ schemaVersion: 1, plugins: rows }));
 
       const preview = await previewAndValidate(payload, request);
 
       expect(preview.plugins.rows.map((row) => row.name)).toEqual(["alpha"]);
-      expect(preview.plugins.warnings).toHaveLength(2);
+      expect(preview.plugins.warnings).toHaveLength(3);
     });
 
     it("reads only the first rows of an oversized list and caps the warnings", async () => {
