@@ -14,6 +14,7 @@ import {
   MERMAID_ERROR_SELECTOR,
   MERMAID_PAGE_DIAGRAM_SELECTOR,
   MERMAID_PAGE_FRAME_SELECTOR,
+  PAINT_CHECK_WAIT_EVENT,
 } from "../src/constants/mermaid";
 
 // Real :hover for the primary-button contrast stories (#6022). A play runs inside the page and
@@ -767,6 +768,10 @@ async function assertLiveLineClearsTheComposer(page: StoryPage) {
   }
 }
 
+// The diagram wait, the error marker, the viewport check and the paint-outside check below each
+// have a story built to trip them (src/browser/stories/PaintCheckFixtures.stories.tsx), which
+// `make test-storybook-paint-fixtures` runs through this file. A message that changes needs its new
+// text in scripts/check-paint-check-fixtures.ts.
 const PAINT_CHECK_TAG = "paint-check";
 const NO_DIAGRAM_MESSAGE = `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`;
 const DIAGRAM_RENDER_TIMEOUT_MS = 15_000;
@@ -786,19 +791,22 @@ interface Pixels {
 }
 
 async function waitForRenderedDiagrams(page: StoryPage) {
-  const args: [string, string, string, number] = [
+  const args: [string, string, string, number, string] = [
     MERMAID_PAGE_FRAME_SELECTOR,
     MERMAID_PAGE_DIAGRAM_SELECTOR,
     MERMAID_ERROR_SELECTOR,
     DIAGRAM_RENDER_TIMEOUT_MS,
+    PAINT_CHECK_WAIT_EVENT,
   ];
-  const rendered = await page.evaluate(async ([frames, diagrams, errors, timeout]) => {
+  const rendered = await page.evaluate(async ([frames, diagrams, errors, timeout, waitEvent]) => {
     // A diagram that fails replaces its whole frame, so the counts below cannot see it.
     const hasFailed = () => document.querySelector(errors) !== null;
     const isRendered = () => {
       const drawn = document.querySelectorAll(diagrams).length;
       return drawn > 0 && drawn === document.querySelectorAll(frames).length;
     };
+    // The fixture story that mounts its diagram late waits for this, so it cannot mount early.
+    window.dispatchEvent(new Event(waitEvent));
     // Not Date.now(): the preview freezes it (.storybook/preview.tsx).
     const deadline = performance.now() + timeout;
     while (!isRendered() && !hasFailed() && performance.now() < deadline) {
