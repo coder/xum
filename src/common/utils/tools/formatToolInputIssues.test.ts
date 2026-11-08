@@ -70,22 +70,24 @@ describe("formatToolInputIssues", () => {
 
     const message = formatToolInputIssues(issuesFor(schema, input), input);
 
+    // Two missing-field issues, then one listing of the keys that arrived.
     expect(message.split("; ")).toHaveLength(3);
-    expect(message.match(/received keys: /g)).toHaveLength(1);
-    expect(message).toContain("agent_report");
-    expect(message).not.toContain("secret");
+    expect(message.split("agent_report")).toHaveLength(2);
+    expect(message).toContain("k".repeat(40));
     expect(message).not.toContain("k".repeat(41));
-    expect(formatToolInputIssues(issuesFor(schema, {}), {})).toEndWith("; received no keys");
+    expect(message).not.toContain("secret");
+    // An empty object still gets the note, so the model learns it sent nothing.
+    expect(formatToolInputIssues(issuesFor(schema, {}), {}).split("; ")).toHaveLength(3);
   });
 
   test("does not list keys for a present field of the wrong type or another issue", () => {
     const schema = z.object({ script: z.string(), count: z.number().max(1) });
 
-    for (const input of [
-      { script: 5, count: 0 },
-      { script: "ls", count: 2 },
+    for (const { input, unlistedKey } of [
+      { input: { script: 5, count: 0 }, unlistedKey: "count" },
+      { input: { script: "ls", count: 2 }, unlistedKey: "script" },
     ]) {
-      expect(formatToolInputIssues(issuesFor(schema, input), input)).not.toContain("received keys");
+      expect(formatToolInputIssues(issuesFor(schema, input), input)).not.toContain(unlistedKey);
     }
   });
 });

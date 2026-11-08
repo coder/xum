@@ -1464,7 +1464,7 @@ describe("bash tool", () => {
       }
     );
 
-    it.each(["top -l 1", "vim -es -c q file", "vim +q file", "cat f | less", "view < f", "nano f"])(
+    it.each(["top -l 1", "vim -es -c q file", "vim +q file", "top | head", "view < f", "nano f"])(
       "still runs %s",
       async (script) => {
         using testEnv = createSpiedBashTool();
