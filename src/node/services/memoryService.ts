@@ -50,11 +50,7 @@ import {
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
-import {
-  REDACTED,
-  containsSecretLike,
-  redactSecretLike,
-} from "@/node/services/memorySecretRedaction";
+import { addsSecretLike } from "@/node/services/memorySecretRedaction";
 import {
   adoptionTargetPresence,
   adoptionTargetStamp,
@@ -3879,18 +3875,12 @@ export interface MemoryWriteOptions {
   rejectSecretLike?: boolean;
 }
 
-/** How many credential shapes `text` holds: the markers its redaction leaves. */
-function secretShapeCount(text: string): number {
-  return redactSecretLike(text).split(REDACTED).length - 1;
-}
-
 /**
- * Refusal rule of `rejectSecretLike`: the result is credential-like and holds more credential
- * shapes than `previous` did. A file that already held such text (a user's note, a placeholder the
- * detector flags) stays editable where an edit adds none, since that text is the organizer's to
- * clean, not a reason to freeze the file; an edit that assembles a new key there is still refused.
- * The limit: an edit that removes one shape and assembles another keeps the count and passes. The
- * message never quotes the content: the caller journals it.
+ * Refusal rule of `rejectSecretLike`: the result holds a credential value `previous` did not (see
+ * `addsSecretLike`). A file that already held such text (a user's note, a placeholder the detector
+ * flags) stays editable where an edit adds none, since that text is the organizer's to clean, not
+ * a reason to freeze the file; an edit that assembles a new key there, even while it removes an
+ * old one, is still refused. The message never quotes the content: the caller journals it.
  */
 function assertNoNewSecret(
   options: MemoryWriteOptions | undefined,
@@ -3899,8 +3889,7 @@ function assertNoNewSecret(
   virtualPath: string
 ): void {
   if (options?.rejectSecretLike !== true) return;
-  if (!containsSecretLike(updated)) return;
-  if (secretShapeCount(updated) <= secretShapeCount(previous)) return;
+  if (!addsSecretLike(previous, updated)) return;
   throw new MemoryCommandError(
     `${virtualPath} was not changed: the file would contain a credential-like value (a key, token, password or private key) after this edit. Memory must never hold secrets; say what the credential is for and where it lives, and leave the value out.`
   );

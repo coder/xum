@@ -615,6 +615,27 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(physical(fixture, "tainted.md"), "utf-8")).toBe(tainted);
     });
 
+    it("refuses an edit that removes one credential and assembles another, which keeps their count", async () => {
+      using fixture = await createFixture();
+      await fsPromises.mkdir(path.dirname(physical(fixture, "x")), { recursive: true });
+      const swapped = "password: old-secret\nsk-\nABCDEFGHIJKLMNO\n";
+      await fsPromises.writeFile(physical(fixture, "swapped.md"), swapped);
+
+      const result = await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/swapped.md",
+        "password: old-secret\nsk-\n",
+        "sk-",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+
+      expect(result.success).toBe(false);
+      expect(await fsPromises.readFile(physical(fixture, "swapped.md"), "utf-8")).toBe(swapped);
+    });
+
     it("lets one of two concurrent halves-joining edits land and refuses the other, as one lock orders them", async () => {
       // Each edit alone leaves no credential, so a check made before the lock would pass both and
       // the second would write the whole key. Inside the lock the second one sees the first's result.
