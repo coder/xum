@@ -1449,20 +1449,24 @@ describe("bash tool", () => {
       };
     }
 
-    it.each(["view", "  vim notes.md  ", "/usr/bin/top"])(
-      "rejects %p without spawning it",
-      async (script) => {
-        using testEnv = createSpiedBashTool();
+    it.each([
+      "view",
+      "  vim notes.md  ",
+      "/usr/bin/top",
+      "vim 'notes&draft'",
+      'view "report(1).txt"',
+      "vim notes\\;draft",
+    ])("rejects %p without spawning it", async (script) => {
+      using testEnv = createSpiedBashTool();
 
-        const result = (await testEnv.tool.execute!(
-          { script, run_in_background: false, display_name: "test" },
-          mockToolCallOptions
-        )) as BashToolResult;
+      const result = (await testEnv.tool.execute!(
+        { script, run_in_background: false, display_name: "test" },
+        mockToolCallOptions
+      )) as BashToolResult;
 
-        expect(result).toMatchObject({ success: false, exitCode: -1, wall_duration_ms: 0 });
-        expect(testEnv.exec).not.toHaveBeenCalled();
-      }
-    );
+      expect(result).toMatchObject({ success: false, exitCode: -1, wall_duration_ms: 0 });
+      expect(testEnv.exec).not.toHaveBeenCalled();
+    });
 
     it.each([
       "top -l 1",
@@ -1470,6 +1474,7 @@ describe("bash tool", () => {
       "vim +q file",
       "top | head",
       "view < f",
+      "vim 'a' | tee 'b'",
       "nano f",
       "./top",
       "bin/view notes.md",

@@ -559,6 +559,9 @@ const INTERACTIVE_TUI_PROGRAMS = new Set(["vi", "vim", "view", "vimdiff", "nvim"
 const SYSTEM_BIN_DIRS = new Set(["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]);
 // Pipes, redirects, lists, subshells and expansions make the script more than a bare TUI launch.
 const SHELL_COMPOSITION_CHARS = /[|&;<>()$`\n]/;
+// Quoted and backslash-escaped text is literal to bash, so it composes nothing: `vim 'a&b'` still
+// launches Vim. Double quotes keep `$` and backticks live, but those only build an argument.
+const SHELL_LITERAL_TEXT = /\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*"/g;
 
 function isInteractiveTuiProgram(program: string): boolean {
   if (!INTERACTIVE_TUI_PROGRAMS.has(path.posix.basename(program))) return false;
@@ -568,11 +571,11 @@ function isInteractiveTuiProgram(program: string): boolean {
 /**
  * Models that mistake bash for another tool send `view <file>` (Vim) and wait the whole
  * timeout for nothing. Reject only a bare launch: any flag (`top -l 1`, `vim -es`) or `+cmd`
- * argument, or any shell composition, may make the program exit on its own.
+ * argument, or any shell composition outside quotes, may make the program exit on its own.
  */
 function rejectInteractiveTui(script: string): BashToolResult | null {
   const trimmed = script.trim();
-  if (SHELL_COMPOSITION_CHARS.test(trimmed)) return null;
+  if (SHELL_COMPOSITION_CHARS.test(trimmed.replace(SHELL_LITERAL_TEXT, ""))) return null;
   const [program, ...args] = trimmed.split(/\s+/);
   if (!isInteractiveTuiProgram(program)) return null;
   if (args.some((arg) => arg.startsWith("-") || arg.startsWith("+"))) return null;
