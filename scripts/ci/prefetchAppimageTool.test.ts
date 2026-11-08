@@ -7,8 +7,17 @@
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally:
 // bun test ./scripts/ci/prefetchAppimageTool.test.ts
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { path7za } from "7zip-bin";
@@ -20,6 +29,11 @@ const VERSION = "appimage-12.0.1";
 let work: string;
 let cache: string;
 let assets: string;
+
+beforeAll(async () => {
+  // The install may leave the binary without its executable bit, and makeArchive runs it directly.
+  await chmod(path7za, 0o755);
+});
 
 beforeEach(async () => {
   work = await mkdtemp(path.join(tmpdir(), "prefetch-appimage-tool-"));
@@ -186,6 +200,21 @@ describe("--unpack", () => {
     expect(result.exitCode).not.toBe(0);
     expect(await readFile(path.join(dest, "runtime-x64"), "utf8")).toBe("runtime");
     expect(await readdir(path.dirname(dest))).toEqual([VERSION]);
+  });
+
+  test("runs a 7za that the install left without the executable bit", async () => {
+    const sevenzip = path.join(work, "7za-copy");
+    await copyFile(path7za, sevenzip);
+    await chmod(sevenzip, 0o644);
+    const dest = path.join(cache, "appimage", VERSION);
+
+    const result = await runScript([SCRIPT, "--unpack", await makeArchive(), dest], {
+      cwd: work,
+      env: { SEVENZIP: sevenzip },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(await readFile(path.join(dest, "runtime-x64"), "utf8")).toBe("runtime");
   });
 
   test("refuses a wrong command line", async () => {

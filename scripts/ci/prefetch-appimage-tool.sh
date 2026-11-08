@@ -32,7 +32,9 @@ trap '[[ -z "$tmp" ]] || rm -rf "$tmp"' EXIT
 # unpack <archive> <dest>: <dest> appears whole or not at all.
 unpack() {
   local archive=$1 dest=$2 sevenzip
-  sevenzip=$(cd "$here/../.." && node -p 'require("7zip-bin").path7za')
+  # 7zip-bin's binary is not always executable after an install (CI got "Permission denied", 126).
+  sevenzip=${SEVENZIP:-$(cd "$here/../.." && node -p 'require("7zip-bin").path7za')}
+  [[ -x "$sevenzip" ]] || chmod +x "$sevenzip"
   mkdir -p "$(dirname "$dest")"
   tmp=$(mktemp -d "$dest.XXXXXX")
   "$sevenzip" x -y -bd "-o$tmp" "$archive" >/dev/null
