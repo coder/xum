@@ -169,6 +169,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - Never render attacker-controlled data through `dangerouslySetInnerHTML`, `innerHTML`, `outerHTML`, or `insertAdjacentHTML`.
 - Prefer React element trees for highlighting (split + `<mark>` nodes) so React escaping stays in effect.
 - If raw HTML/SVG rendering is unavoidable (e.g., Shiki/Mermaid), require explicit sanitization/hardening and document the trust boundary with a `SECURITY AUDIT` comment at the sink.
+- Checks of repository-controlled plugin rows (backups, marketplaces) must reuse the installer's own rules (source parser, subfolder, ref, `reviewUrlOf`, `pointsAtThisMachine`) instead of a separate grammar. A restore must not make git contact a host that only the backup names, except through a plain https URL that the user reviews.
 
 ## TypeScript Discipline
 

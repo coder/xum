@@ -185,6 +185,12 @@ export function httpsFormOfSshUrl(url: string): string | undefined {
  * URL that other parsers read differently, such as `https://github.com\@attacker.example/x`
  * (WHATWG sees github.com, while git and libcurl connect to attacker.example), would show the user
  * one host and fetch from another. An allowlist cannot be spelled around.
+ *
+ * It reads the URL as written. A host name that DNS points at this machine (for example
+ * `localtest.me` or `ip6-localhost`) still passes, because Xum cannot look the name up before git
+ * does (DNS rebinding): the limit `assertMarketplaceMayName` states for a remote marketplace's
+ * sources. A review of such a row contacts that host over https, with no SSH key and no credential
+ * unless git already stores one for that host name, and nothing installs without the user's consent.
  */
 export const PLAIN_HTTPS_URL =
   /^https:\/\/[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*(?::[0-9]{1,5})?\/[A-Za-z0-9._~/-]+$/;

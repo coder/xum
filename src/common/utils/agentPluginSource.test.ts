@@ -189,6 +189,12 @@ describe("reviewUrlOf", () => {
     ["an IPv6 literal", "https://[::1]/example/repo.git"],
     ["an upper-case scheme", "HTTPS://github.com/example/repo.git"],
     ["no path", "https://github.com"],
+    // An unanchored match would accept this one: its https form ends in an https URL.
+    ["an ssh URL that ends in an https URL", "ssh://git@attacker.example/https://a.example/b"],
+    ["a bare query mark", "https://github.com/o/r?x"],
+    ["an at sign in the path", "https://github.com/o/r@x"],
+    ["a backslash in the host", "https://github.com\\attacker.example/o/r"],
+    ["a port over five digits", "https://github.com:123456/r"],
     ["an ssh source whose https form is on this machine", "git@127.0.0.1:example/repo.git"],
     ["an ssh URL whose https form is localhost", "ssh://git@localhost/example/repo.git"],
     ["an ssh source whose path is not plain", "git@github.com:example/repo.git?x=1"],
