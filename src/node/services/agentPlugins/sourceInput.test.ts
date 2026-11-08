@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { isFullCommitSha, parseAgentPluginSourceInput } from "./sourceInput";
+import { isFullCommitSha, isInstallerSourceUrl, parseAgentPluginSourceInput } from "./sourceInput";
 
 describe("parseAgentPluginSourceInput", () => {
   // Shorthand expansion depends on SSH-agent presence; pin it for determinism.
@@ -157,5 +157,31 @@ describe("isFullCommitSha", () => {
     expect(isFullCommitSha("a".repeat(39))).toBe(false);
     expect(isFullCommitSha("a".repeat(41))).toBe(false);
     expect(isFullCommitSha("main")).toBe(false);
+  });
+});
+
+describe("isInstallerSourceUrl", () => {
+  test.each([
+    "https://github.com/example/repo.git",
+    "ssh://git@github.com/example/repo.git",
+    "git@github.com:example/repo.git",
+    "git://git.example.com/example/repo.git",
+    // The installer takes an scp-style source with a space, and stores it as written.
+    "gitbox:srv/my repos/r.git",
+  ])("reads %j as written", (url) => {
+    expect(isInstallerSourceUrl(url)).toBe(true);
+  });
+
+  test.each([
+    ["a remote-helper transport", "ext::payload"],
+    ["a query the installer strips", "https://github.com/example/repo.git?x=1"],
+    ["a fragment the installer strips", "git@github.com:example/repo.git#main"],
+    ["shorthand it expands", "example/repo"],
+    ["shorthand with a ref", "example/repo@main"],
+    ["a credential", "https://user:secret-pass@example.com/example/repo.git"],
+    ["an empty string", ""],
+    ["whitespace around the URL", " https://github.com/example/repo.git"],
+  ])("does not read %s as written", (_label, url) => {
+    expect(isInstallerSourceUrl(url)).toBe(false);
   });
 });

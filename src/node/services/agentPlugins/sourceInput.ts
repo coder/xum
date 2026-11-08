@@ -150,3 +150,20 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
       : {}),
   };
 }
+
+/**
+ * True when the installer reads `url` as a repository URL and hands git exactly it: it parses
+ * (no remote-helper transport, no credential, no shorthand to expand) and nothing is stripped or
+ * expanded. A stored source passes this by construction, so a settings backup lists only rows
+ * that its preview takes as written. The grammar lives here, in node (the parser expands `~`
+ * and reads the environment for shorthand), so the backup applies it where it reads and writes
+ * the list, not in the common schema.
+ */
+export function isInstallerSourceUrl(url: string): boolean {
+  try {
+    const parsed = parseAgentPluginSourceInput(url);
+    return parsed.url === url && parsed.ref === undefined && parsed.subpath === undefined;
+  } catch {
+    return false;
+  }
+}

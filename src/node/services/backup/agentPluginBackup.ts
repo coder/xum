@@ -2,7 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
 import type { AgentPluginInstallEntry } from "@/common/config/schemas/agentPluginInstalls";
-import type { BackupContents } from "@/common/config/schemas/settingsBackup";
+import { UNSAFE_URL_CHARACTERS, type BackupContents } from "@/common/config/schemas/settingsBackup";
 import {
   BackupPluginEntrySchema,
   MAX_BACKUP_PLUGIN_ENTRIES,
@@ -16,6 +16,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { pointsAtThisMachine } from "@/common/utils/agentPluginSource";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
+import { isInstallerSourceUrl } from "@/node/services/agentPlugins/sourceInput";
 import {
   acquirePluginMutationLock,
   MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
@@ -171,17 +172,43 @@ async function readInstallSnapshot(
 }
 
 /**
+ * A row of the list that the install review can open. The common schema holds the rules it can
+ * check without node (the folder, the ref, the URL's characters and whether it is on this
+ * machine). The URL must also be one the installer's own source parser takes as written
+ * (`isInstallerSourceUrl`): `ext::payload` reads as an scp host to the schema, and the preview
+ * then refuses it. Export and restore read the list through this schema, so both agree with
+ * the installer.
+ */
+const InstallablePluginEntrySchema = BackupPluginEntrySchema.refine(
+  (entry) => isInstallerSourceUrl(entry.source.url),
+  { path: ["source", "url"], message: "The installer does not read this as a repository URL" }
+);
+
+/**
+ * Why a plugin that works here stays out of the list, or undefined when its source can go in.
+ * Another machine cannot use a path or a loopback host on this one, and the list would publish it
+ * (the home folder names the user). The installer also takes an scp-style source with a space in
+ * its path (`gitbox:srv/my repos/r.git`), which the list refuses: whitespace, control and format
+ * characters let a URL read differently from the one git gets. Failing the push for it would
+ * block every backup for a plugin that installs and updates fine.
+ */
+function sourceLeftOutReason(url: string): string | undefined {
+  if (pointsAtThisMachine(url)) return "its source is on this machine";
+  if (UNSAFE_URL_CHARACTERS.test(url)) {
+    return "its source URL has whitespace or a control character that a backup does not carry";
+  }
+  return undefined;
+}
+
+/**
  * The portable entry of one install, or null for a plugin the backup leaves out on purpose (logged
  * by name, and listed in the docs). An install the list cannot hold throws instead.
  */
 function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | null {
-  // Another machine cannot use a path or a loopback host on this one, and the list would publish it
-  // (the home folder names the user). The plugin is logged by name only, so its absence from the
-  // backup is explained.
-  if (pointsAtThisMachine(install.source.url)) {
-    log.info("Leaving a plugin out of the settings backup: its source is on this machine", {
-      plugin: install.name,
-    });
+  // The plugin is logged by name only, so its absence from the backup is explained.
+  const leftOut = sourceLeftOutReason(install.source.url);
+  if (leftOut !== undefined) {
+    log.info(`Leaving a plugin out of the settings backup: ${leftOut}`, { plugin: install.name });
     return null;
   }
   // The registry records the repository a marketplace entry resolved to, and the plugin.json keeps
@@ -197,7 +224,7 @@ function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | n
     return null;
   }
   // Only the fields the schema names: consent, install times and auto-update stay local.
-  const parsed = BackupPluginEntrySchema.safeParse({
+  const parsed = InstallablePluginEntrySchema.safeParse({
     name: install.name,
     source: install.source,
     lockedSha: install.lockedSha,
@@ -380,7 +407,7 @@ function readPluginRows(rows: readonly unknown[]): PluginListRead {
   const problems: string[] = [];
   const names = new Set<string>();
   for (const [index, row] of rows.slice(0, MAX_BACKUP_PLUGIN_ENTRIES).entries()) {
-    const parsed = BackupPluginEntrySchema.safeParse(row);
+    const parsed = InstallablePluginEntrySchema.safeParse(row);
     if (!parsed.success) {
       problems.push(
         `Left out ${rowLabel(row, index)}: ${formatZodIssues(parsed.error.issues.slice(0, 2))}`

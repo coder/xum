@@ -248,18 +248,6 @@ describe("backup of the managed plugin list", () => {
         "source.url",
       ],
       [
-        "whitespace in its URL",
-        {
-          source: {
-            type: "git",
-            url: "https://github.com/example/two words.git",
-            ref: "main",
-            refType: "branch",
-          },
-        },
-        "source.url",
-      ],
-      [
         "a folder the installer refuses",
         {
           source: {
@@ -284,6 +272,13 @@ describe("backup of the managed plugin list", () => {
           },
         },
         "source.subpath",
+      ],
+      [
+        "a URL the installer's source parser refuses (the schema reads ext as an scp host)",
+        {
+          source: { type: "git", url: "ext::payload", ref: "main", refType: "branch" },
+        },
+        "source.url",
       ],
       [
         "a ref git cannot hold",
@@ -369,6 +364,36 @@ describe("backup of the managed plugin list", () => {
         .filter(([message]) => String(message).includes("its source is on this machine"))
         .map(([, fields]) => (fields as { plugin: string }).plugin);
       expect(logged.sort()).toEqual(Object.keys(leftOutUrls).sort());
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin whose URL has whitespace or a control character, and logs it", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      // The installer takes an scp-style source with a space, so that plugin works here: the push
+      // must not fail for it, or no backup could be made.
+      const withUrl = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const spacedUrls = {
+        "scp-with-space": "gitbox:srv/my repos/r.git",
+        "https-with-space": "https://github.com/example/two words.git",
+        "control-character": "https://github.com/example/re\u0007po.git",
+        "right-to-left-mark": "https://github.com/exam\u200Fple/repo.git",
+      };
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        ...Object.entries(spacedUrls).map(([name, url]) =>
+          registryRow(name, { source: withUrl(url) })
+        ),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha"]);
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("whitespace or a control character"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(Object.keys(spacedUrls).sort());
       info.mockRestore();
     });
 
@@ -986,6 +1011,30 @@ describe("backup of the managed plugin list", () => {
       // A row the install review would refuse is never offered for it.
       expect(preview.plugins.rows.map((row) => row.name)).toEqual(["alpha", "kept-folder"]);
       expect(preview.plugins.warnings).toHaveLength(5);
+    });
+
+    it("leaves out a row whose url the installer's source parser refuses or rewrites", async () => {
+      const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
+      const [alpha] = sidecar.plugins;
+      const withUrl = (name: string, url: string) => ({
+        ...alpha,
+        name,
+        source: { type: "git", url, ref: "main", refType: "branch" },
+      });
+      const rows = [
+        alpha,
+        // The schema reads `ext` as an scp host: the preview would refuse it as a remote helper.
+        withUrl("remote-helper", "ext::payload"),
+        // The parser strips a query, so the preview would fetch another URL than the row names.
+        withUrl("with-query", "https://github.com/example/repo.git?x=1"),
+      ];
+      await writeSidecar(managed, JSON.stringify({ schemaVersion: 1, plugins: rows }));
+
+      const preview = await previewAndValidate(payload, request);
+
+      expect(preview.plugins.rows.map((row) => row.name)).toEqual(["alpha"]);
+      expect(preview.plugins.warnings).toHaveLength(2);
     });
 
     it("reads only the first rows of an oversized list and caps the warnings", async () => {
