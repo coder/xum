@@ -2942,6 +2942,43 @@ describe("MemoryConsolidationService", () => {
       expect(recorded).toEqual(["ws-dream"]);
     });
 
+    it("records the usage of a pass that ended at the output limit and journals nothing", async () => {
+      // The pass fails (its tool call never ran), but its stream completed and was billed.
+      using fixture = await createFixture({
+        withSessionUsage: true,
+        modelFactory: () =>
+          new MockLanguageModelV3({
+            doStream: () =>
+              Promise.resolve({
+                stream: simulateReadableStream<LanguageModelV3StreamPart>({
+                  chunks: [
+                    {
+                      type: "finish",
+                      finishReason: { unified: "length", raw: "length" },
+                      usage: {
+                        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                        outputTokens: { total: 0, text: 0, reasoning: 0 },
+                      },
+                    },
+                  ],
+                }),
+              }),
+          }),
+      });
+      const recorded: string[] = [];
+      spyOn(fixture.sessionUsage!, "recordHeadlessUsage").mockImplementation((workspaceId) => {
+        recorded.push(workspaceId);
+        return Promise.resolve(undefined);
+      });
+
+      const result = await fixture.service.maybeRun("ws-dream", "manual");
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("output limit");
+      expect(recorded).toEqual(["ws-dream"]);
+      expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+    });
+
     it("waits for a dream stream in another process before starting its own", async () => {
       const held = heldStreams();
       using fixture = await createFixture({ modelFactory: held.factory });

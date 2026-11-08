@@ -1536,6 +1536,45 @@ describe("runMemoryHarvest", () => {
     expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 15 });
   });
 
+  it("reports the usage of a chunk whose step ended at the output limit, though that fails the chunk", async () => {
+    using fixture = createFixture();
+    const recorded: Array<number | undefined> = [];
+    // The stream ends clean, so the whole of it was billed, the cut-off step included.
+    const { model } = scriptedModel([
+      [
+        memoryToolCall(createFile("/memories/workspace/cut.md", "half a comm"), "call-cut"),
+        lengthFinishChunk(7),
+      ],
+    ]);
+
+    const result = await runHarvest(fixture, model, {
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    expect(result.streamError).toContain("output limit");
+    expect(recorded).toEqual([7]);
+  });
+
+  it("reports no usage for a chunk whose stream failed", async () => {
+    using fixture = createFixture();
+    const recorded: Array<number | undefined> = [];
+    const { model } = scriptedModel([new Error("provider exploded")]);
+
+    const result = await runHarvest(fixture, model, {
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    // After a mid-flight error the SDK's usage promise can stay pending forever: nothing waits on it.
+    expect(result.streamError).toContain("provider exploded");
+    expect(recorded).toEqual([]);
+  });
+
   it("sums the usage of the chunks that reported one and none when no chunk did", async () => {
     using fixture = createFixture();
     fixture.messages = manyChunkMessages();
