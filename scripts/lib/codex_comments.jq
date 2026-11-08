@@ -109,6 +109,19 @@ def codex_board_head_line:
   or test(codex_completed_row)
   or test(codex_running_row);
 
+# Since 2026-11-06 Codex can also fold the board into one <details> block: a <details> line and a
+# summary line with the overall status replace the heading, and a closing tag follows the help
+# text. Unfold exactly that shape into the heading form, so the checks below read both forms alike.
+# Output: {body, running}, where running says the summary line reads Running. Any other shape is
+# left as it is, so it fails those checks and keeps blocking.
+def codex_unfold_board:
+  (first(capture("\\A(?<meta>" + codex_summary_marker + "\n(<!-- [^\n]* -->\n+)*)"
+    + "<details>\n<summary><strong>Codex Review Summary</strong>: (?<label>🔄 Running|✅ Completed)</summary>\n"
+    + "(?<rest>[\\s\\S]*)\n\n</details>\\z")) // null) as $folded
+  | if $folded == null then {body: ., running: false}
+    else {body: ($folded.meta + "## Codex Review Summary\n" + $folded.rest), running: ($folded.label == "🔄 Running")}
+    end;
+
 def codex_advisory_header: capture("^#### Advisory findings \\((?<n>[0-9]+)\\)$").n | tonumber;
 
 # Whether a board line is an advisory bullet with Codex's Resolved marker or a link to one of $ids.
@@ -144,7 +157,8 @@ def codex_cleared_advisory_inventory($ids):
 def codex_summary_status($bot; $head; $resolved; $cleared):
   if .author.login != $bot then null
   else
-    (.body | codex_without_help) as $body
+    (.body | codex_unfold_board) as $board
+    | ($board.body | codex_without_help) as $body
     | if $body | startswith(codex_summary_marker) then
         (try (
           ($body | split("\n") | map(select(length > 0))) as $all
@@ -229,7 +243,8 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
             # A commitless code review counts for the head of the security review beside
             # it, which must be the current head: Codex starts both reviews together on
             # each push or request, so an older push's code review cannot sit next to it.
-            then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
+            # A Running summary line never lets the board read completed.
+            then (if $board.running or $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
                      or ($null_security and $cleared.clean_security_receipt != true)
                      or $security.headSha != $head
                      or ($reviews | any(.status == "running" or (.commit_sha // $head) != $head))
