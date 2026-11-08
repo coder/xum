@@ -19,7 +19,7 @@ describe("snapshotHistoryMethods", () => {
     );
     expect(() => snapshotHistoryMethods({})).toThrow('has no own "pushState"');
     // An inherited method is not the own descriptor the restore redefines.
-    expect(() => snapshotHistoryMethods(Object.create(History.prototype))).toThrow(
+    expect(() => snapshotHistoryMethods(Object.create(History.prototype) as object)).toThrow(
       'has no own "pushState"'
     );
   });
