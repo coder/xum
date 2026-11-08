@@ -38,7 +38,9 @@ export function installViewportHeightSync(): () => void {
 
   // Turning an iPad from landscape to portrait can fire resize while innerHeight still holds the
   // landscape height, and no later resize follows, so the app kept filling only the old height.
-  // A fixed box spanning the viewport resizes once the rotated layout exists; sync again then.
+  // Folding the iPhone Duo does the same once iosCoverColumn.ts has taken the cover display's
+  // column back, and its height arrives about three frames later, so a next-frame re-read misses it.
+  // A fixed box spanning the viewport resizes once the new layout exists; sync again then.
   const viewportBox = document.createElement("div");
   viewportBox.setAttribute("aria-hidden", "true");
   viewportBox.style.cssText =
