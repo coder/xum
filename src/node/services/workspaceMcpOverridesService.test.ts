@@ -5166,6 +5166,36 @@ describe("WorkspaceMcpOverridesService", () => {
       });
     });
 
+    it("prunePluginOverrideKeysForWorkspaces leaves the legacy config.json value of a workspace it does not sweep", async () => {
+      // The prune edits config.json, which holds every workspace's legacy value: it must touch
+      // only the rows of the ids it swept, which are the ones it holds the locks of.
+      const service = new WorkspaceMcpOverridesService(config);
+      const swept = await registerWorkspace("legacy-swept");
+      const other = await registerWorkspace("legacy-not-swept");
+      const legacyIds = new Set([swept.workspaceId, other.workspaceId]);
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const entry of project.workspaces) {
+            if (legacyIds.has(entry.id ?? "")) entry.mcp = { enabledServers: [staleKey, "kept"] };
+          }
+        }
+        return cfg;
+      });
+
+      const failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [swept.workspaceId],
+        prefix
+      );
+
+      expect(failures).toEqual([]);
+      const legacyOf = (workspaceId: string) =>
+        [...config.loadConfigOrDefault().projects.values()]
+          .flatMap((project) => project.workspaces)
+          .find((entry) => entry.id === workspaceId)?.mcp;
+      expect(legacyOf(swept.workspaceId)).toEqual({ enabledServers: ["kept"] });
+      expect(legacyOf(other.workspaceId)).toEqual({ enabledServers: [staleKey, "kept"] });
+    });
+
     it("prunePluginOverrideKeysForWorkspaces waits for a save that passed validation before it, then prunes what the save wrote", async () => {
       // The save validated the key while the plugin was still installed, and it still holds
       // its locks when the uninstall commits. A scan that does not wait for it reads the

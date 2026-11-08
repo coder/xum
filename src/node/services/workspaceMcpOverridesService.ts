@@ -983,6 +983,7 @@ function withLegacyValuesPruned(
     for (const workspace of projectConfig.workspaces) {
       if (workspace.id !== workspaceId || !legacyValueMayNameKey(workspace.mcp, keyPrefix))
         continue;
+      // mutation-equivalent: prunedLegacyValue yields a plain object or undefined, so ?? and || agree
       workspace.mcp = prunedLegacyValue(workspace.mcp, keyPrefix) ?? workspace.mcp;
     }
   }
