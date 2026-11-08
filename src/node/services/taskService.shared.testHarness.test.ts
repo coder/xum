@@ -60,10 +60,15 @@ describe("createTaskServiceTestRoot", () => {
 
   test("a root whose removal was skipped does not nest the next isolation", async () => {
     const skipped = await createTaskServiceTestRoot();
+    // An open log sink makes ending the skipped isolation take a few ticks, so the next root must
+    // wait for it before it isolates.
+    log.info("task service test root: the sink of a root whose removal was skipped");
     const second = await createTaskServiceTestRoot();
+    expect(os.homedir()).not.toBe(hostHomedir);
     await removeTaskServiceTestRoot(second);
     expectHostHome();
     await fsPromises.rm(skipped, { recursive: true, force: true });
+    __resetFileSinkForTests();
   });
 
   test("gives the home back even when deleting the root fails", async () => {
@@ -80,23 +85,31 @@ describe("createTaskServiceTestRoot", () => {
     }
   });
 
-  // The log file sink opens at the first log line, in the home that is current then. A sink that
-  // outlives its home keeps a descriptor on a deleted file, and a later test's log lines never
-  // reach the home that is current for it.
-  test("closes the log sink that the isolated home opened when the root is removed", async () => {
+  // The log file sink opens at the first log line, in the home that is current then. Windows cannot
+  // delete a file that a stream holds open, and a sink that outlives its home would keep writing
+  // to a deleted file instead of the home that is current for a later test.
+  test("closes the log sink that the isolated home opened before it deletes that home", async () => {
     __resetFileSinkForTests();
-    const open = spyOn(fs, "createWriteStream");
     const root = await createTaskServiceTestRoot();
+    const isolated = os.homedir();
+    const open = spyOn(fs, "createWriteStream");
+    const realRmSync = fs.rmSync;
+    let sink: fs.WriteStream | undefined;
+    let closedWhenHomeDeleted: boolean | undefined;
+    const rmSync = spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target) === isolated) closedWhenHomeDeleted = sink?.closed;
+      return realRmSync(target, options);
+    });
     try {
-      const isolated = os.homedir();
       log.info("task service test root: the sink opens inside the isolated home");
       expect(open.mock.calls.length).toBe(1);
       expect(String(open.mock.calls[0][0]).startsWith(isolated)).toBe(true);
-      const sink = open.mock.results[0].value as fs.WriteStream;
-      expect(sink.writableEnded).toBe(false);
+      sink = open.mock.results[0].value as fs.WriteStream;
+      expect(sink.closed).toBe(false);
       await removeTaskServiceTestRoot(root);
-      expect(sink.writableEnded).toBe(true);
+      expect(closedWhenHomeDeleted).toBe(true);
     } finally {
+      rmSync.mockRestore();
       open.mockRestore();
       await removeTaskServiceTestRoot(root);
       __resetFileSinkForTests();

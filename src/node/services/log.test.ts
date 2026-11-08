@@ -13,7 +13,13 @@ import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { __resetFileSinkForTests, clearLogFiles, closeLogFile, log } from "./log";
+import {
+  __closeFileSinkForTests,
+  __resetFileSinkForTests,
+  clearLogFiles,
+  closeLogFile,
+  log,
+} from "./log";
 import { subscribeLogFeed, type LogEntry } from "./logBuffer";
 
 describe("log file sink state machine", () => {
@@ -101,6 +107,29 @@ describe("log file sink state machine", () => {
 
     log.info("line after clear");
     expect(createWriteStreamSpy).toHaveBeenCalledTimes(2);
+  });
+
+  test("__closeFileSinkForTests resolves only after the sink's descriptor is closed", async () => {
+    const originalCreateWriteStream = fs.createWriteStream;
+    const createdStreams: fs.WriteStream[] = [];
+    spyOn(fs, "createWriteStream").mockImplementation((...args) => {
+      const stream = originalCreateWriteStream(...args);
+      createdStreams.push(stream);
+      return stream;
+    });
+
+    log.info("line before the sink is closed");
+    const stream = createdStreams[0];
+    if (!stream) {
+      throw new Error("expected a log stream");
+    }
+    expect(stream.closed).toBe(false);
+
+    await __closeFileSinkForTests();
+    expect(stream.closed).toBe(true);
+
+    // With no sink open there is nothing to wait for.
+    await __closeFileSinkForTests();
   });
 
   test("clearLogFiles rejects when truncate fails", async () => {

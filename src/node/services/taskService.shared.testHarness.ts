@@ -15,7 +15,7 @@ import {
   isolateHostHome,
   type IsolatedHostHome,
 } from "@/node/services/hostHomeIsolation.testHarness";
-import { __resetFileSinkForTests } from "@/node/services/log";
+import { __closeFileSinkForTests, __resetFileSinkForTests } from "@/node/services/log";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -67,18 +67,19 @@ import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks"
  */
 let isolation: { rootDir: string; home: IsolatedHostHome } | undefined;
 
-function releaseIsolation(): void {
+async function releaseIsolation(): Promise<void> {
   if (isolation === undefined) return;
   const { home } = isolation;
   isolation = undefined;
-  // Close the log file sink before its folder is deleted: Windows cannot delete an open file. The
-  // next log line reopens it under the restored home.
-  __resetFileSinkForTests();
+  // The log file sink opens inside the isolated home. Wait until its descriptor is closed before
+  // that folder is deleted, because Windows cannot delete an open file. The next log line
+  // reopens the sink under the restored home.
+  await __closeFileSinkForTests();
   home.restore();
 }
 
 export async function createTaskServiceTestRoot(): Promise<string> {
-  releaseIsolation();
+  await releaseIsolation();
   const rootDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-"));
   isolation = { rootDir, home: isolateHostHome("task-service-host-home") };
   // A log sink that an earlier test opened under the host's home would keep writing there.
@@ -90,7 +91,7 @@ export async function removeTaskServiceTestRoot(rootDir: string): Promise<void> 
   try {
     await fsPromises.rm(rootDir, { recursive: true, force: true });
   } finally {
-    if (isolation?.rootDir === rootDir) releaseIsolation();
+    if (isolation?.rootDir === rootDir) await releaseIsolation();
   }
 }
 

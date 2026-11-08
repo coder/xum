@@ -370,6 +370,18 @@ export function __resetFileSinkForTests(): void {
   sinkLifecycleEpoch = 0;
 }
 
+/**
+ * @internal Test seam: __resetFileSinkForTests, then wait until the open sink's file descriptor
+ * is closed. stream.end() only starts that close. A test that deletes the folder holding the log
+ * file awaits this first, because Windows cannot delete a file that a stream holds open.
+ */
+export async function __closeFileSinkForTests(): Promise<void> {
+  const openStream = fileSinkState.status === "open" ? fileSinkState.stream : null;
+  __resetFileSinkForTests();
+  if (openStream === null || openStream.closed) return;
+  await new Promise<void>((resolve) => openStream.once("close", resolve));
+}
+
 let currentLogLevel: LogLevel = getDefaultLogLevel();
 
 /**
