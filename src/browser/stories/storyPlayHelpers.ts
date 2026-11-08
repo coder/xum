@@ -227,3 +227,35 @@ export async function findChatActivityPanel(): Promise<HTMLElement> {
     return found;
   });
 }
+
+interface PaintHook {
+  __storybookAssertPaint?: () => Promise<void>;
+}
+
+/**
+ * Runs the test runner's pixel check (.storybook/test-runner.ts) now, before a screenshot or
+ * resize repairs a stale WebKit layout.
+ */
+export async function expectNoDiagramInkOutsideBox() {
+  const assertPaint = (window as Window & PaintHook).__storybookAssertPaint;
+  if (assertPaint) await assertPaint();
+  else if (navigator.userAgent.includes("StorybookTestRunner")) {
+    throw new Error("paint hook missing: .storybook/test-runner.ts did not register it");
+  }
+}
+
+/**
+ * Wait until a Mermaid diagram has replaced its "Rendering diagram..." placeholder. Mermaid loads
+ * lazily, so a story tagged `paint-check` that does not wait can reach the runner's check with no
+ * diagram yet.
+ */
+export async function waitForRenderedMermaidDiagram(root: HTMLElement): Promise<void> {
+  await waitFor(
+    () => {
+      if (root.querySelector(".mermaid-container:not(.mermaid-modal) > svg") === null) {
+        throw new Error("No Mermaid diagram has rendered yet");
+      }
+    },
+    { timeout: 15_000 }
+  );
+}

@@ -4442,14 +4442,16 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // Wait for process to exit and exit_code to be written
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
-      // Check exit_code file exists and contains correct value
+      // The wrapper's trap creates exit_code, then writes the code: wait for the content, not a
+      // fixed time or the file's existence (a slow host stretches the gap between the two).
       const exitCodePath = path.join(result.outputDir, "exit_code");
-      const exitCodeContent = await fs.readFile(exitCodePath, "utf-8");
+      let exitCodeContent = "";
+      for (let attempt = 0; attempt < 200 && exitCodeContent.trim() === ""; attempt++) {
+        exitCodeContent = await fs.readFile(exitCodePath, "utf-8").catch(() => "");
+        if (exitCodeContent.trim() === "") await new Promise((resolve) => setTimeout(resolve, 25));
+      }
       expect(exitCodeContent.trim()).toBe("42");
-    });
+    }, 15_000);
   });
 
   describe("hasOrphanedRunningBackgroundProcesses", () => {
