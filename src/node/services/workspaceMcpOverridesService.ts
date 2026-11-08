@@ -895,7 +895,9 @@ function groupByCheckout(
 export function sweepClosure(
   registry: readonly FrontendWorkspaceMetadata[],
   seedIds: Iterable<string>,
-  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string
+  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string,
+  /** Counts the ids the walk queues, seeds left out (tests pin the walk's cost with it). */
+  stats?: { queued: number }
 ): Set<string> {
   const hostLocalEntries = groupMetadataById([...registry], /* hostLocalOnly */ true);
   const graph: SweepClosureGraph = {
@@ -916,7 +918,9 @@ export function sweepClosure(
     if (hostLocalEntries.has(id) || !registeredIds.has(id)) {
       members.add(id);
     }
-    queue.push(...sweepClosureEdges(id, graph));
+    const edges = sweepClosureEdges(id, graph);
+    if (stats !== undefined) stats.queued += edges.length;
+    queue.push(...edges);
   }
   return members;
 }

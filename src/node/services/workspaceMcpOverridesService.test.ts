@@ -5753,14 +5753,12 @@ describe("WorkspaceMcpOverridesService", () => {
         return cfg;
       });
       const registry = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
-      const startedAt = performance.now();
-      const members = sweepClosure(registry, ["ws-alias-0"], () => projectPath);
-      const elapsedMs = performance.now() - startedAt;
+      const stats = { queued: 0 };
+      const members = sweepClosure(registry, ["ws-alias-0"], () => projectPath, stats);
 
       expect(members.size).toBe(5_000);
-      // A few milliseconds once per checkout. The quadratic walk took about 1.2 s, and copying
-      // the growing alias list on each insert about 0.2 s.
-      expect(elapsedMs).toBeLessThan(150);
+      // Each alias queued exactly once. The quadratic walk queued 5,000 per alias (about 1.2 s).
+      expect(stats.queued).toBe(5_000);
     });
 
     it("prunePluginOverrideKeysForWorkspaces locks a document that spells the key inside a longer string", async () => {
