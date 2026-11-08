@@ -132,8 +132,9 @@ def codex_cleared_advisory_inventory($ids):
 
 # Parse the review summary board Codex edits in place. Emit "completed" or
 # "running" only when every line has an observed informational shape; emit null
-# for anything else so unknown content stays blocking. The metadata status tracks
-# the security review alone (observed on coder/mux#4271: "completed" while the
+# for anything else so unknown content stays blocking. With $strict false the board's Markdown
+# lines are not read (see codex_summary_status): every decision comes from its metadata lines.
+# The metadata status tracks the security review alone (observed on coder/mux#4271: "completed" while the
 # Code Review row still read Running), so a Running row also means "running".
 # $head is the PR's current head commit. Codex records the reviewed head in the
 # board's metadata; a Completed board for another head is a review of an older
@@ -141,7 +142,7 @@ def codex_cleared_advisory_inventory($ids):
 # place, so that state is "running" for the current head, never "completed".
 # $resolved is the output of codex_resolved_discussions, and $cleared the
 # output of codex_resolved_finding_commits.
-def codex_summary_status($bot; $head; $resolved; $cleared):
+def codex_board_status($bot; $head; $resolved; $cleared; $strict):
   if .author.login != $bot then null
   else
     (.body | codex_without_help) as $body
@@ -166,15 +167,19 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
           # security finding thread. Any other shape stays unknown.
           | ($security.status == "completed" and $security.headSha == $head
             and $security.mergeGateEnabled == false
-            and ($lines[2:]
+            and (($strict | not) or ($lines[2:]
               | .[(map(codex_board_head_line or test(codex_commitless_code_review_row) | not) | index(true)) // length:]
-              | codex_cleared_advisory_inventory($cleared.security_discussions // [])))
+              | codex_cleared_advisory_inventory($cleared.security_discussions // []))))
             as $null_security_base
           # Runs triggered by a push post no receipt (coder/xum#7731): until a Codex security
           # review request brings one, such a board is pending, so wait budgets cover it.
           | ($state | any(.security_review | .status == "completed"
               and .has_unresolved_findings == null and .has_any_findings == null)) as $null_security
           | if $lines[0] == codex_summary_marker
+            # Without Markdown to read, the board needs exactly one state marker: no marker, or a
+            # second one beside it, leaves nothing to decide from.
+            and ($strict or (($state | length) == 1
+              and ($lines[2:] | all(contains("<!-- codex-review-state:v1 ") | not))))
             # Unknown state fields or statuses could be findings. has_any_findings
             # stays true after findings are resolved, so it is not used.
             and ($state | all(type == "object" and (keys == ["code_review", "security_review"])))
@@ -214,22 +219,22 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
               and (.pullRequestNumber | type == "number")
               and (.repository | test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))
               and (.status == "completed" or .status == "running"))
-            and ($lines[2:] | length >= 5)
-            and ($lines[2:] | all(
-              codex_board_head_line
-              or (test(codex_commitless_code_review_row) and ($state | any(.code_review.commit_sha == null)))
-              # Security advisories stay listed after their review threads are resolved.
-              # Codex's Resolved marker can lag or never appear (coder/xum#5045), so a
-              # resolved linked thread also clears its bullet. A bullet with neither is a
-              # live finding and keeps blocking; other sections stay unknown.
-              or . == "### Security findings"
-              or test("^#### Advisory findings \\([0-9]+\\)$")
-              or codex_cleared_advisory_bullet($resolved)
-            ))
+            and (($strict | not) or (($lines[2:] | length >= 5)
+              and ($lines[2:] | all(
+                codex_board_head_line
+                or (test(codex_commitless_code_review_row) and ($state | any(.code_review.commit_sha == null)))
+                # Security advisories stay listed after their review threads are resolved.
+                # Codex's Resolved marker can lag or never appear (coder/xum#5045), so a
+                # resolved linked thread also clears its bullet. A bullet with neither is a
+                # live finding and keeps blocking; other sections stay unknown.
+                or . == "### Security findings"
+                or test("^#### Advisory findings \\([0-9]+\\)$")
+                or codex_cleared_advisory_bullet($resolved)
+              ))))
             # A commitless code review counts for the head of the security review beside
             # it, which must be the current head: Codex starts both reviews together on
             # each push or request, so an older push's code review cannot sit next to it.
-            then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
+            then (if $security.status == "running" or ($strict and ($lines[2:] | any(test(codex_running_row))))
                      or ($null_security and $cleared.clean_security_receipt != true)
                      or $security.headSha != $head
                      or ($reviews | any(.status == "running" or (.commit_sha // $head) != $head))
@@ -242,6 +247,19 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
       else null
       end
   end;
+
+# Codex changed its board's Markdown on 2026-11-08: an outer <details> replaced the
+# "## Codex Review Summary" heading, and the line parser above reads that as unknown content. The
+# metadata lines are the part meant for machines, so a board that has no such heading is decided by
+# them alone: the same decisions as above (head, status, flags, receipt, threads), without the
+# Markdown allowlist and the advisory inventory it checks. A board with the heading is the shape
+# the line parser knows: unknown content in it still blocks. A board whose state marker is
+# missing or does not parse blocks in both shapes.
+def codex_summary_status($bot; $head; $resolved; $cleared):
+  codex_board_status($bot; $head; $resolved; $cleared; true)
+  // (if (.body | gsub("\r\n"; "\n") | split("\n") | any(. == "## Codex Review Summary"))
+      then null
+      else codex_board_status($bot; $head; $resolved; $cleared; false) end);
 
 # Codex is still reviewing. Callers may wait on this state instead of failing on
 # it, but it never supplies approval: after any wait budget it blocks like before.

@@ -40,6 +40,28 @@ def board_for(body, head):
     return body.replace(board_head(body), head)
 
 
+def details_board(body):
+    """The board in the shape Codex has used since 2026-11-08: an outer <details> replaces the
+    "## Codex Review Summary" heading, and its metadata lines stay as they were."""
+    heading = "## Codex Review Summary\n"
+    assert heading in body, "a board with the old heading"
+    wrapped = body.replace(
+        heading,
+        "<details>\n<summary><strong>Codex Review Summary</strong>: ✅ Completed</summary>\n",
+        1,
+    )
+    return wrapped.rstrip("\n") + "\n\n</details>"
+
+
+# Every decision the gate takes on a board must be the same in both shapes, for the same state.
+SHAPES = (("heading board", lambda body: body), ("details board", details_board))
+
+
+def in_shape(body, shape):
+    """A board in `shape`; any other comment (a receipt, a finding) unchanged."""
+    return shape(body) if body.startswith("<!-- codex-pull-request-review-summary -->") else body
+
+
 def comment(body, author=BOT, created_at=AFTER, minimized=False, association="MEMBER"):
     return {
         "id": "comment",
@@ -309,10 +331,11 @@ else:
             ("after security line", body.replace(state + security, security + state), 1),
             ("two state lines", body.replace(state, state + state), 1),
         ):
-            for cached in (False, True):
-                with self.subTest(case=case, cached=cached):
-                    data = snapshot([comment(changed)], head=head)
-                    self.assert_gate(expected, data, cache=data if cached else None)
+            for shape_name, shape in SHAPES:
+                for cached in (False, True):
+                    with self.subTest(case=case, shape=shape_name, cached=cached):
+                        data = snapshot([comment(shape(changed))], head=head)
+                        self.assert_gate(expected, data, cache=data if cached else None)
 
     def test_null_security_flags_pass_only_with_a_clean_receipt_for_this_head(self):
         # Since 2026-10-28 Codex can finish a security review with null findings flags
@@ -351,10 +374,16 @@ else:
              [], head, 1),
             ("running, null findings", [running, receipt], [], head, 10),
         ):
-            for cached in (False, True):
-                with self.subTest(case=case, cached=cached):
-                    data = snapshot([comment(body) for body in comments], threads, head=pr_head)
-                    self.assert_gate(expected, data, cache=data if cached else None)
+            for shape_name, shape in SHAPES:
+                # The details board's Markdown is not read: a finding list in it is not an input.
+                # The receipt and the open-thread rules decide, as they do for any null flags.
+                want = 0 if (case, shape_name) == ("advisory section", "details board") else expected
+                for cached in (False, True):
+                    with self.subTest(case=case, shape=shape_name, cached=cached):
+                        data = snapshot(
+                            [comment(in_shape(body, shape)) for body in comments], threads, head=pr_head
+                        )
+                        self.assert_gate(want, data, cache=data if cached else None)
         with self.subTest("a minimized receipt does not count"):
             data = snapshot([comment(board), comment(receipt, minimized=True)], head=head)
             self.assert_gate(10, data)
@@ -487,10 +516,13 @@ else:
              [], 1),
             ("running", [null_code.replace(null_flags, null_flags.replace("completed", "running"), 1)], [], 10),
         ):
-            for cached in (False, True):
-                with self.subTest(case=case, cached=cached):
-                    data = snapshot([comment(body) for body in comments], threads, head=head)
-                    self.assert_gate(expected, data, cache=data if cached else None)
+            for shape_name, shape in SHAPES:
+                for cached in (False, True):
+                    with self.subTest(case=case, shape=shape_name, cached=cached):
+                        data = snapshot(
+                            [comment(in_shape(body, shape)) for body in comments], threads, head=head
+                        )
+                        self.assert_gate(expected, data, cache=data if cached else None)
 
     def test_resolved_codex_threads_clear_unresolved_review_state(self):
         # Codex keeps has_unresolved_findings true after its threads are resolved
@@ -531,10 +563,96 @@ else:
             ("thread with both markers", security,
              [thread(security_marker + "[P2] Fixed" + code_marker, resolved=True, commit=head)], 1),
         ):
+            for shape_name, shape in SHAPES:
+                for cached in (False, True):
+                    with self.subTest(case=case, shape=shape_name, cached=cached):
+                        data = snapshot([comment(shape(body))], threads, head=head)
+                        self.assert_gate(expected, data, cache=data if cached else None)
+
+    def test_details_board_is_decided_by_its_metadata_lines(self):
+        # Codex wrapped its board in <details> on 2026-11-08 (observed on #7996). Its Markdown is
+        # not read: head, status and flags come from the state marker, and every decision matches
+        # the heading board's (the other tests run both shapes). What is left to pin here: the
+        # marker itself, and where the two shapes differ.
+        clean = FIXTURES["review_state_summary"]["body"]
+        board = details_board(clean)
+        head = board_head(board)
+        state = re.search(r"<!-- codex-review-state:v1 .* -->\n", board).group(0)
+        for case, body, pr_head, expected in (
+            ("clean on this head", board, head, 0),
+            ("a board recorded for an older head", board, NEWER_HEAD, 10),
+            ("a lane that names an older head", board.replace(head, "c" * 40, 1), head, 10),
+            ("a running lane", board.replace('"status":"completed"}', '"status":"running"}', 1), head, 10),
+            ("unresolved findings", board.replace('"has_unresolved_findings":false', '"has_unresolved_findings":true', 1), head, 1),
+            ("no state marker", board.replace(state, "", 1), head, 1),
+            ("a state marker that is not JSON", board.replace("codex-review-state:v1 {", "codex-review-state:v1 {{", 1), head, 1),
+            ("a state marker without its end", board.replace('}} -->\n', "}}\n", 1), head, 1),
+            ("a state marker without a security marker", board.replace(
+                re.search(r"<!-- codex-security-review:v1 .* -->\n", board).group(0), "", 1), head, 1),
+        ):
             for cached in (False, True):
                 with self.subTest(case=case, cached=cached):
-                    data = snapshot([comment(body)], threads, head=head)
+                    data = snapshot([comment(body)], head=pr_head)
                     self.assert_gate(expected, data, cache=data if cached else None)
+        # The real board of #7996, with null security flags, as Codex posts most of them now.
+        real = FIXTURES["review_state_details_null_security_summary"]["body"]
+        real_head = board_head(real)
+        receipt = re.sub(
+            r"\*\*Reviewed commit:\*\* `[0-9a-f]+`",
+            f"**Reviewed commit:** `{real_head[:10]}`",
+            FIXTURES["receipt_security_no_findings_null_board"]["body"],
+        )
+        open_thread = thread("[P2] Open\n\n<!-- codex-code-review-finding:v1 -->", commit=real_head)
+        for case, comments, threads, expected in (
+            ("beside a clean receipt for the head", [real, receipt], [], 0),
+            ("no receipt yet", [real], [], 10),
+            ("an open Codex thread", [real, receipt], [open_thread], 1),
+        ):
+            with self.subTest(case=case):
+                data = snapshot([comment(body) for body in comments], threads, head=real_head)
+                self.assert_gate(expected, data)
+        # Where the shapes differ: the heading board's Markdown is read, so unknown content in it
+        # blocks. The details board's is not, so the same content is not an input.
+        unknown = "\n\nUnknown section.\n\n\n\n<details>"
+        known = "\n\n\n\n<details>"
+        with self.subTest("unknown Markdown in a heading board blocks"):
+            self.assert_gate(1, snapshot([comment(clean.replace(known, unknown, 1))]))
+        with self.subTest("unknown Markdown in a details board is not read"):
+            self.assert_gate(0, snapshot([comment(board.replace(known, unknown, 1))], head=head))
+
+    def test_details_board_counts_only_for_the_current_head(self):
+        # The same wait as the heading board's: Codex edits the board in place once it reviews
+        # the new head, and the gate waits until then.
+        board = FIXTURES["review_state_summary"]["body"]
+        stale = snapshot([comment(details_board(board))], head=NEWER_HEAD)
+        current = snapshot([comment(details_board(board_for(board, NEWER_HEAD)))])
+        self.assert_gate(10, stale)
+        self.assert_gate(0, [stale, current], wait=60)
+        self.assertEqual(self.comment_rounds, 2)
+
+    def test_commitless_code_review_counts_in_a_details_board(self):
+        # coder/xum#7002 on the details board: the commitless code lane is a state, not a row.
+        board = FIXTURES["commitless_code_review_summary"]["body"]
+        sha = board_head(board)
+        commitless = '"commit_sha":null,"has_any_findings":null,"has_unresolved_findings":null,"status":"completed"'
+        self.assertIn(commitless, board)
+        wrapped = details_board(board)
+        self.assert_gate(0, snapshot([comment(wrapped)]))
+        self.assert_gate(10, snapshot([comment(wrapped)], head=NEWER_HEAD))
+        for name, body in (
+            ("only the code review may lose its commit",
+             board.replace(f'"security_review":{{"commit_sha":"{sha}"', '"security_review":{"commit_sha":null')),
+            ("a commitless review must not report findings",
+             board.replace(commitless, commitless.replace('"has_any_findings":null', '"has_any_findings":true'))),
+            ("a commitless review must not report unresolved findings",
+             board.replace(commitless, commitless.replace('"has_unresolved_findings":null', '"has_unresolved_findings":true'))),
+            ("a commitless review must have completed",
+             board.replace(commitless, commitless.replace('"completed"', '"running"'))),
+        ):
+            with self.subTest(name):
+                self.assertNotEqual(body, board)
+                self.assert_gate(1, snapshot([comment(details_board(body))]))
+        self.assert_gate(1, snapshot([comment(wrapped)], [thread("[P1] Fix authorization")]))
 
     def test_summary_completion_requires_metadata_and_every_review_row(self):
         completed = FIXTURES["summary"]["body"]
