@@ -15,6 +15,14 @@ import { installDom } from "../../../../tests/ui/dom";
 
 const VERIFY_XUM_SCRIPT = path.join(process.cwd(), ".xum/skills/verify-xum/scripts/verify-xum.sh");
 
+// What the app's own screens render once React replaced the static boot screen: the classes of
+// index.html's boot loader, and no id. LoadingScreen.tsx and StartupConnectionError.tsx are the
+// sources of these two.
+const LOADING_SCREEN_HTML =
+  '<div class="boot-loader" role="status" aria-live="polite" aria-busy="true"><div class="boot-loader__inner"><p class="boot-loader__text">Loading<span class="boot-loader__dots"></span></p></div></div>';
+const STARTUP_ERROR_HTML =
+  '<div class="boot-loader" role="alert" aria-live="polite"><div class="boot-loader__inner"><p class="boot-loader__text">No backend</p></div></div>';
+
 let cleanupDom: (() => void) | null = null;
 let indexPage: Document;
 let scriptSource: string;
@@ -43,6 +51,12 @@ function addBootScreen(): void {
   }
 }
 
+function addBootScreenWithoutTemplate(): void {
+  const root = indexPage.getElementById("root");
+  if (!root) throw new Error("index.html has no #root");
+  document.body.append(document.importNode(root, true));
+}
+
 function runBootScript(): void {
   // Like the browser, give the script the page's own window, document and location as globals.
   vm.runInNewContext(scriptSource, { window, document, location: window.location });
@@ -62,6 +76,28 @@ function failedModuleScript(): Event {
   const event = new window.Event("error", { cancelable: true });
   script.dispatchEvent(event);
   return event;
+}
+
+/** The failure template alone: the page around it is up to the test. */
+function addTemplate(): void {
+  const template = indexPage.getElementById("boot-load-failure");
+  if (!template) throw new Error("index.html has no #boot-load-failure");
+  document.body.append(document.importNode(template, true));
+}
+
+/** Errors that the page's handlers raise while `action` runs, as the window reports them. */
+function errorsRaisedBy(action: () => void): unknown[] {
+  const raised: unknown[] = [];
+  const listener = (event: Event) => raised.push((event as ErrorEvent).error ?? event.type);
+  window.addEventListener("error", listener);
+  try {
+    action();
+  } catch (error) {
+    raised.push(error);
+  } finally {
+    window.removeEventListener("error", listener);
+  }
+  return raised;
 }
 
 describe("boot screen load failure", () => {
@@ -112,6 +148,32 @@ describe("boot screen load failure", () => {
     bootPage();
 
     window.dispatchEvent(new window.Event("vite:preloadError", { cancelable: true }));
+
+    expect(within(document.body).getByRole("alert")).toBeTruthy();
+  });
+
+  // Vite's helper rethrows the original error unless a listener cancels vite:preloadError. A
+  // canceled event makes the failed dynamic import resolve, which hides it from lazy boundaries.
+  test("leaves a Vite preload error uncanceled, before and after the app mounts", () => {
+    bootPage();
+    const before = new window.Event("vite:preloadError", { cancelable: true });
+    window.dispatchEvent(before);
+    expect(before.defaultPrevented).toBe(false);
+
+    // React clears the root when it renders, which removes the static boot screen.
+    document.getElementById("root")?.replaceChildren();
+    const after = new window.Event("vite:preloadError", { cancelable: true });
+    window.dispatchEvent(after);
+    expect(after.defaultPrevented).toBe(false);
+  });
+
+  test("shows the prompt for a Vite preload error that came before the body", () => {
+    runBootScript();
+    window.dispatchEvent(new window.Event("vite:preloadError"));
+    expect(within(document.body).queryByRole("alert")).toBeNull();
+
+    addBootScreen();
+    document.dispatchEvent(new window.Event("DOMContentLoaded"));
 
     expect(within(document.body).getByRole("alert")).toBeTruthy();
   });
@@ -170,6 +232,75 @@ describe("boot screen load failure", () => {
       preload.dispatchEvent(new window.Event("error"));
 
       expect(within(document.body).queryByRole("alert")).toBeNull();
+    });
+
+    // A link whose `type` says "module" is not a module script: only a script element is one.
+    test("an element that is not a script but has the type module", () => {
+      bootPage();
+
+      const link = document.createElement("link");
+      link.setAttribute("type", "module");
+      document.head.append(link);
+      link.dispatchEvent(new window.Event("error"));
+
+      expect(within(document.body).queryByRole("alert")).toBeNull();
+    });
+
+    // React's LoadingScreen and StartupConnectionError use the boot loader's classes and no id, so
+    // the script finds the static boot screen by its id and leaves these alone.
+    test.each([
+      ["LoadingScreen", LOADING_SCREEN_HTML],
+      ["StartupConnectionError", STARTUP_ERROR_HTML],
+    ])("the app's %s screen, which has the boot loader's classes and no id", (_name, html) => {
+      runBootScript();
+      addTemplate();
+      const root = document.createElement("div");
+      root.id = "root";
+      root.innerHTML = html;
+      document.body.append(root);
+      const before = root.innerHTML;
+
+      failedModuleScript();
+      window.dispatchEvent(new window.Event("vite:preloadError"));
+
+      expect(root.innerHTML).toBe(before);
+      expect(document.activeElement).toBe(document.body);
+    });
+
+    test("the app's screen that replaced the boot screen while a failure waited for the body", () => {
+      runBootScript();
+      failedModuleScript();
+      addTemplate();
+      const root = document.createElement("div");
+      root.id = "root";
+      root.innerHTML = LOADING_SCREEN_HTML;
+      document.body.append(root);
+      const before = root.innerHTML;
+
+      document.dispatchEvent(new window.Event("DOMContentLoaded"));
+
+      expect(root.innerHTML).toBe(before);
+    });
+
+    test("a boot screen that has lost its loading text or its template, and no error from it", () => {
+      bootPage();
+      document.querySelector(".boot-loader__text")?.remove();
+      expect(errorsRaisedBy(() => failedModuleScript())).toEqual([]);
+      expect(document.querySelector("[data-load-failed]")).toBeNull();
+
+      document.body.innerHTML = "";
+      addBootScreenWithoutTemplate();
+      expect(errorsRaisedBy(() => failedModuleScript())).toEqual([]);
+      expect(document.querySelector("[data-load-failed]")).toBeNull();
+    });
+
+    test("a failure that waited for the body, when no boot screen came", () => {
+      runBootScript();
+      failedModuleScript();
+
+      expect(
+        errorsRaisedBy(() => document.dispatchEvent(new window.Event("DOMContentLoaded")))
+      ).toEqual([]);
     });
 
     test("anything once the app has replaced the boot screen", () => {
