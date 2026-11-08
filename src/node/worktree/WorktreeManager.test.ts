@@ -2703,8 +2703,25 @@ describe("WorktreeManager.deleteWorkspace", () => {
     const fixture = await createWorktreeManagerFixture({
       tempDirPrefix: "worktree-manager-delete-",
     });
+    // The payload names its sentinel by absolute path, and that path becomes part of the branch
+    // name. Git refuses a name with a component that starts with a dot or holds a character such as
+    // `~` or `:`, so on a host whose TMPDIR is under `~/.mux` the create below failed and this test
+    // never reached the deletion it covers. Pick a temp directory whose path git accepts.
+    const sentinelDir = [os.tmpdir(), "/tmp"].find((dir) => {
+      try {
+        execFileSync("git", ["check-ref-format", "--branch", `feature/inject-${dir}`], {
+          stdio: "ignore",
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (sentinelDir === undefined) {
+      throw new Error("Expected a temp directory whose path git accepts in a branch name");
+    }
     const sentinelPath = path.join(
-      os.tmpdir(),
+      sentinelDir,
       `mux_injection_test_${Date.now()}_${Math.random().toString(16).slice(2)}`
     );
     const branchName = `feature/inject-$(touch\${IFS}${sentinelPath})`;
@@ -2712,6 +2729,13 @@ describe("WorktreeManager.deleteWorkspace", () => {
     let execFileAsyncSpy: { mockRestore: () => void } | null = null;
 
     try {
+      // Control: a shell that expands the name creates the sentinel. Without it, an absent sentinel
+      // below could mean that the payload cannot run here (an unwritable directory), not that the
+      // deletion kept it from running.
+      execFileSync("sh", ["-c", `: ${branchName}`]);
+      expect(existsSync(sentinelPath)).toBe(true);
+      await fsPromises.rm(sentinelPath, { force: true });
+
       const { projectPath, manager, initLogger } = fixture;
 
       const createResult = await manager.createWorkspace({
