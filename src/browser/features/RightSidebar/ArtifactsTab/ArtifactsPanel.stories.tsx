@@ -207,7 +207,12 @@ function listingFor(files: Record<string, ArtifactReadResult>): ArtifactListing 
 function renderPanel(
   selectedPath: string,
   files: Record<string, ArtifactReadResult> = FILES,
-  options: { allowCdn?: boolean; workspaceId?: string; sendInteractionError?: string } = {}
+  options: {
+    allowCdn?: boolean;
+    workspaceId?: string;
+    sendInteractionError?: string;
+    onSetState?: (input: { path: string; state: unknown }) => void;
+  } = {}
 ) {
   const workspaceId = options.workspaceId ?? WORKSPACE_ID;
   writeArtifactSelection(workspaceId, { scope: "artifact", path: selectedPath });
@@ -218,6 +223,7 @@ function renderPanel(
           listing: listingFor(files),
           files,
           sendInteractionError: options.sendInteractionError,
+          onSetState: options.onSetState,
         },
         userPreferences: { ui: { artifactsAllowCdnScripts: options.allowCdn ?? true } },
       })}
@@ -855,6 +861,7 @@ const assertNavigatedAway = async (canvasElement: HTMLElement) => {
 };
 
 export const NavigateAwayLocation: Story = {
+  tags: ["webkit"],
   parameters: { pixel: PIXEL_DISABLED },
   render: () =>
     renderPanel("away.html", { "away.html": ok("away.html", navigateAwayHtml("location")) }),
@@ -866,6 +873,82 @@ export const NavigateAwayLink: Story = {
   render: () =>
     renderPanel("away.html", { "away.html": ok("away.html", navigateAwayHtml("link")) }),
   play: ({ canvasElement }) => assertNavigatedAway(canvasElement),
+};
+
+// A hash router (superblink's map nodes set location.hash). WebKit fires the iframe's load event
+// again for that fragment change, and both engines do for history.back() to a pushed entry. The
+// document is still the one Xum built, so the artifact must stay open with its bridge. The play
+// starts the routes once it listens for the frame's loads, and asks for the save after the last.
+const HASH_ROUTER_HTML = `<!doctype html><html><head><script>
+  window.addEventListener("message", function (event) {
+    var test = event.data && event.data.xumRouteTest;
+    if (test === "save") window.xum.setState({ route: location.hash });
+    if (test !== "go") return;
+    window.addEventListener("hashchange", function () {
+      setTimeout(function () {
+        history.pushState(null, "", "about:srcdoc#/p");
+        parent.postMessage({ xumRouteTest: "back" }, "*");
+        // A task later, so the story sees "back" before the traversal's load.
+        setTimeout(function () { history.back(); }, 50);
+      }, 500);
+    }, { once: true });
+    location.hash = "#/s/gamma";
+  });
+  window.addEventListener("load", function () {
+    parent.postMessage({ xumRouteTest: "ready" }, "*");
+  });
+</script></head><body><p>hash router</p></body></html>`;
+
+// Route messages from the artifact and the frame's loads, in arrival order.
+const routeEvents: string[] = [];
+const routeStates: unknown[] = [];
+export const HashRouterStaysOpen: Story = {
+  tags: ["webkit"],
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    routeEvents.length = 0;
+    routeStates.length = 0;
+    const handler = (event: MessageEvent) => {
+      const message = (event.data as { xumRouteTest?: unknown } | null)?.xumRouteTest;
+      if (typeof message === "string") routeEvents.push(message);
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  },
+  render: () =>
+    renderPanel(
+      "router.html",
+      { "router.html": ok("router.html", HASH_ROUTER_HTML) },
+      {
+        workspaceId: `${WORKSPACE_ID}-router`,
+        onSetState: (input) => routeStates.push(input.state),
+      }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("artifact-frame");
+    if (!(frame instanceof HTMLIFrameElement)) throw new Error("Story bug: no artifact iframe");
+    frame.addEventListener("load", () => routeEvents.push("load"));
+    await waitFor(() => expect(routeEvents).toContain("ready"));
+    frame.contentWindow?.postMessage({ xumRouteTest: "go" }, "*");
+    const notice = () => canvas.queryByText(/This artifact navigated away/);
+    // The load that follows history.back(), or the notice that closed the frame before it.
+    await waitFor(
+      () => {
+        const back = routeEvents.indexOf("back");
+        const loadAfterBack = back !== -1 && routeEvents.indexOf("load", back) !== -1;
+        expect(loadAfterBack || notice() != null).toBe(true);
+      },
+      { timeout: 10000 }
+    );
+    frame.contentWindow?.postMessage({ xumRouteTest: "save" }, "*");
+    await waitFor(() => expect(routeStates.length > 0 || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
+    await expect(notice()).toBeNull();
+    await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
+    await expect(routeStates).toEqual([{ route: "#/s/gamma" }]);
+  },
 };
 
 // The frame forwards Escape over the bridge, so Escape pressed inside a fullscreen HTML

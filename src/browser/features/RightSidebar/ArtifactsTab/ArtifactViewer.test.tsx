@@ -13,6 +13,7 @@ import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils"
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ARTIFACT_ASSET_LIMITS } from "./artifactAssets";
+import { bootFrameDocument } from "./frameDocument.testHarness";
 import { buildArtifactCsp } from "./artifactCsp";
 import { DIFF_ARTIFACT_MAX_LINES } from "./DiffArtifact";
 import { ArtifactsPanel } from "./ArtifactsPanel";
@@ -42,11 +43,17 @@ let readInputs: Array<{ path: string; maxBytes?: number | null }> = [];
 let agentBrowserAvailable: boolean | null = null;
 let capabilityRequests = 0;
 let readRequests: string[] = [];
+// States the host persisted for an artifact's window.xum.setState.
+let savedStates: unknown[] = [];
 
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
     artifacts: {
       getState: () => Promise.resolve({ success: true as const, data: { state: null } }),
+      setState: (input: { state: unknown }) => {
+        savedStates.push(input.state);
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       listPinned: () =>
         Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
       listShelf: () =>
@@ -122,6 +129,7 @@ describe("ArtifactViewer renderers", () => {
     agentBrowserAvailable = null;
     capabilityRequests = 0;
     readRequests = [];
+    savedStates = [];
   });
 
   afterEach(() => {
@@ -264,6 +272,25 @@ describe("ArtifactViewer renderers", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Reload" }));
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
+  });
+
+  // WebKit fires the iframe's load event again when the artifact sets location.hash, and both
+  // engines do for history.back() to a pushed entry. The document is still the one Xum built.
+  test("a frame stays open with its bridge across loads of the same document", async () => {
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const document = bootFrameDocument(frame);
+    fireEvent.load(frame);
+    fireEvent.load(frame);
+    fireEvent.load(frame);
+    const shownWithoutNotice = () =>
+      view.queryByText(/This artifact navigated away/) == null &&
+      view.queryByTestId("artifact-frame") === frame;
+    expect(shownWithoutNotice()).toBe(true);
+
+    document.win.xum?.setState({ route: "#/s/gamma" });
+    await waitFor(() => expect(savedStates).toEqual([{ route: "#/s/gamma" }]));
+    expect(shownWithoutNotice()).toBe(true);
   });
 
   test("a styled page's reported canvas color replaces the white backdrop", async () => {
