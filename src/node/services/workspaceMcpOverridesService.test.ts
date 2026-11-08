@@ -7667,6 +7667,29 @@ describe("WorkspaceMcpOverridesService", () => {
     );
   });
 
+  it("the verified document read refuses a handle that is not the checkout's own document", async () => {
+    // A parent segment swapped to a symlink at open time, and back before the guards, leaves the
+    // handle on another file of the same device. Only the inode check can tell.
+    const checkout = path.join(config.srcDir, "nofollow-inode");
+    await fs.mkdir(path.join(checkout, ".xum"), { recursive: true });
+    const own = path.join(checkout, ".xum", "mcp.local.jsonc");
+    await fs.writeFile(own, '{ "enabledServers": ["own"] }');
+    const other = path.join(config.srcDir, "nofollow-inode-other.jsonc");
+    await fs.writeFile(other, '{ "enabledServers": ["other"] }');
+    const realOpen = fsPromisesModule.open;
+    const openSpy = spyOn(fsPromisesModule, "open").mockImplementation((...args) =>
+      args[0] === own ? realOpen(other, ...args.slice(1)) : realOpen(...args)
+    );
+    try {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(readHostOverrideDocumentNoFollow(own, checkout)).rejects.toThrow(
+        /not the checkout's own document/
+      );
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
   it("saves a devcontainer workspace's settings on the host without a running container", async () => {
     // The override files live in the host worktree and DevcontainerRuntime
     // reads/writes them there; only `exec` needs `devcontainer exec` (a

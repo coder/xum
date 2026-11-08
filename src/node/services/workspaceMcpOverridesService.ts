@@ -317,6 +317,7 @@ async function readHandleUpTo(
 ): Promise<string> {
   const buffer = Buffer.alloc(maxBytes + 1);
   let length = 0;
+  // mutation-equivalent: at a full buffer, a further read asks for 0 bytes, gets 0, and ends the loop
   while (length < buffer.length) {
     const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
     if (bytesRead === 0) break;
@@ -357,6 +358,7 @@ export async function readHostOverrideDocumentNoFollow(
   };
   const handle = await fsPromises.open(
     filePath,
+    // mutation-equivalent: O_NOFOLLOW is a nonzero constant wherever Node defines it, so ?? and || agree; only Windows, which lacks it, reads the 0, and these tests run on POSIX
     fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)
   );
   try {
