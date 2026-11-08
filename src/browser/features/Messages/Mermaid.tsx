@@ -11,7 +11,7 @@ import { DESKTOP_TITLEBAR_HEIGHT_PX, isDesktopMode } from "@/browser/hooks/useDe
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
-import { MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
+import { MERMAID_ERROR_ATTRIBUTE, MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
 import {
   diagramPixelSize,
   NARROW_DIAGRAM_WIDTH,
@@ -920,6 +920,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   if (error && !isStreaming) {
     return (
       <pre
+        {...{ [MERMAID_ERROR_ATTRIBUTE]: "" }}
         style={{
           color: "var(--color-syntax-error)",
           background: "hsl(from var(--color-syntax-error) h s l / 0.1)",
