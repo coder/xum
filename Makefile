@@ -1008,13 +1008,13 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 	@bun x test-storybook --testTimeout 30000
 
 # The runner opens the Storybook page once for every story file it is given, so only the files
-# that name the tag are visited.
-WEBKIT_STORY_FILES = $(shell grep -rlF '"webkit"' src/browser --include='*.stories.tsx')
+# that name a tag are visited.
+WEBKIT_STORY_FILES = $(shell grep -rlF -e '"webkit"' -e '"paint-check"' src/browser --include='*.stories.tsx')
 
-test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)
+test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" or "paint-check" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)
 	$(check_node_version)
-	@test -n "$(WEBKIT_STORY_FILES)" || { echo "No story has the webkit tag"; exit 1; }
-	@bun x test-storybook --browsers webkit --includeTags webkit --testTimeout 30000 $(WEBKIT_STORY_FILES)
+	@test -n "$(WEBKIT_STORY_FILES)" || { echo "No story has the webkit or paint-check tag"; exit 1; }
+	@bun x test-storybook --browsers webkit --includeTags webkit paint-check --testTimeout 30000 $(WEBKIT_STORY_FILES)
 
 storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (requires Storybook served; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)

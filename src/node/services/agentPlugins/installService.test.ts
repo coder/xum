@@ -20,7 +20,11 @@ import { acquirePluginMutationLock, MUTATION_LOCK_FILE, readMutationEpochToken }
 import * as treeHash from "./treeHash";
 import * as discoveryModule from "./discovery";
 import { readPluginMcpPolicy } from "./registry";
-import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import {
+  ALL_WORKSPACES_TARGET,
+  WorkspaceMcpOverridesService,
+} from "@/node/services/workspaceMcpOverridesService";
+import { CrossProcessLockTimeoutError } from "@/node/utils/main/crossProcessLock";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -7012,6 +7016,25 @@ describe("AgentPluginInstallService", () => {
         return cfg;
       });
     };
+    // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
+    // Its own runtime config keeps its checkout under this test's root.
+    const registerMalformedLegacyEntry = async () => {
+      const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
+      await fsPromises.mkdir(legacyPath, { recursive: true });
+      const legacyEntry: unknown = {
+        path: legacyPath,
+        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+      };
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "old-branch");
+      await fsPromises.mkdir(sessionDir, { recursive: true });
+      await fsPromises.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
+      await expect(config.getAllWorkspaceMetadata({ throwOnError: true })).rejects.toThrow();
+      return legacyPath;
+    };
     const rejectionMessage = (promise: Promise<unknown>) =>
       promise.then(
         () => "resolved",
@@ -7084,11 +7107,194 @@ describe("AgentPluginInstallService", () => {
       await registerLocalWorkspace("ws-1");
       const preview = await serviceWithOverrides.preview({ input: remoteDir });
 
-      await expect(
+      const refusal = await rejectionMessage(
         serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
-      ).rejects.toThrow(/ws-1/);
+      );
+      expect(refusal).toContain("ws-1");
+      // A cause the service cannot classify is shown as it is.
+      expect(refusal).toContain("EBUSY: resource busy");
       expect(await registry()).toEqual([]);
       expect(await pathExists(installPath())).toBe(false);
+    });
+
+    test("a sweep that drops cached overrides reaches the manager per workspace or for all", async () => {
+      // The sweep evicts one workspace's cache, or every cache when it cannot
+      // tell which are stale; a stale cache would keep serving the old enable.
+      const evicted: string[] = [];
+      const manager = {
+        stopServersWithKeyPrefix: () => Promise.resolve(),
+        forgetAllWorkspaceOverrides: () => void evicted.push("all"),
+        forgetWorkspaceOverrides: (workspaceId: string) => void evicted.push(workspaceId),
+      } as unknown as MCPServerManager;
+      const sweeping: Pick<WorkspaceMcpOverridesService, "prunePluginOverrideKeysForWorkspaces"> = {
+        prunePluginOverrideKeysForWorkspaces: async (_ids, _prefix, options) => {
+          await options?.publish?.(null, ALL_WORKSPACES_TARGET);
+          await options?.publish?.(null, "ws-1");
+          // A failure ends the install early: nothing else touches the manager.
+          return [{ workspaceId: "ws-1", error: new Error("stop here") }];
+        },
+      };
+      const service = new AgentPluginInstallService(config, {
+        mcpServerManager: manager,
+        workspaceMcpOverridesService: sweeping as WorkspaceMcpOverridesService,
+      });
+      await registerLocalWorkspace("ws-1");
+      const preview = await service.preview({ input: remoteDir });
+
+      await rejectionMessage(
+        service.install({ source: preview.source, expectedSha: preview.lockedSha })
+      );
+
+      expect(evicted).toEqual(["all", "ws-1"]);
+    });
+
+    describe("a refusal says why the override cleanup failed", () => {
+      // Retry advice alone left a user stuck on a file that stays too large,
+      // and the reason was only in the log. Each cause gets its own advice.
+      type Gate = "fresh install" | "reinstall gate";
+      const gates: Gate[] = ["fresh install", "reinstall gate"];
+      // Each gate words its refusal in its own way: this tells a test which gate refused.
+      const refusedBy: Record<Gate, RegExp> = {
+        "fresh install": /before installing/,
+        "reinstall gate": /previous uninstall/,
+      };
+      const realOverridesService = () => new WorkspaceMcpOverridesService(config);
+      const serviceWith = (overrides: WorkspaceMcpOverridesService) =>
+        new AgentPluginInstallService(config, { workspaceMcpOverridesService: overrides });
+      const writeOversizedDoc = async (workspaceId: string) => {
+        const docPath = path.join(muxRoot, "checkouts", workspaceId, ".xum", "mcp.local.jsonc");
+        await fsPromises.mkdir(path.dirname(docPath), { recursive: true });
+        await fsPromises.writeFile(docPath, JSON.stringify({ padding: "x".repeat(1024 * 1024) }));
+        return docPath;
+      };
+      /** Holds a workspace's lock, and makes each attempt on it cost a whole waiting budget. */
+      const holdWorkspaceBusy = async (
+        overrides: WorkspaceMcpOverridesService,
+        workspaceId: string
+      ) => {
+        const locksDir = path.join(muxRoot, "mcp-overrides-locks");
+        const before = new Set(await fsPromises.readdir(locksDir).catch(() => [] as string[]));
+        const release = await overrides.acquireWorkspaceLock(workspaceId);
+        const busyLocks = new Set(
+          (await fsPromises.readdir(locksDir))
+            .filter((name) => name.endsWith(".lock") && !before.has(name))
+            .map((name) => path.join(locksDir, name))
+        );
+        expect(busyLocks.size).toBeGreaterThan(0);
+        const realNow = Date.now;
+        const realLink = fsPromises.link;
+        let skewMs = 0;
+        const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skewMs);
+        const linkSpy = spyOn(fsPromises, "link").mockImplementation((existing, target) => {
+          if (busyLocks.has(String(target))) skewMs += 61_000;
+          return realLink(existing, target);
+        });
+        return async () => {
+          nowSpy.mockRestore();
+          linkSpy.mockRestore();
+          await release();
+        };
+      };
+      /** An install that the gate refuses; resolves to the refusal text once called. */
+      const prepareRefusal = async (
+        gate: Gate,
+        service: AgentPluginInstallService,
+        workspaceIds: string[]
+      ) => {
+        if (gate === "reinstall gate") {
+          const prefix = `plugin:${computePluginInstanceId(installPath())}:`;
+          await fsPromises.writeFile(
+            registryFile(),
+            JSON.stringify({ plugins: [], pendingOverridePrunes: [{ prefix, workspaceIds }] })
+          );
+        }
+        const preview = await service.preview({ input: remoteDir });
+        return () =>
+          rejectionMessage(
+            service.install({ source: preview.source, expectedSha: preview.lockedSha })
+          );
+      };
+
+      test.each(gates)(
+        "%s: an override file over the size limit is named and must be shrunk",
+        async (gate) => {
+          const service = serviceWith(realOverridesService());
+          await registerLocalWorkspace("ws-1");
+          const docPath = await writeOversizedDoc("ws-1");
+          const refuse = await prepareRefusal(gate, service, ["ws-1"]);
+
+          const refusal = await refuse();
+
+          expect(refusal).toMatch(refusedBy[gate]);
+          expect(refusal).toContain("1 workspace (ws-1)");
+          expect(refusal).toContain(docPath);
+          expect(refusal).toMatch(/shrink/i);
+          expect(refusal).not.toMatch(/retry/i);
+        }
+      );
+
+      test.each(gates)("%s: a workspace that stays busy is told to retry", async (gate) => {
+        const overrides = realOverridesService();
+        const service = serviceWith(overrides);
+        await registerLocalWorkspace("ws-1");
+        const refuse = await prepareRefusal(gate, service, ["ws-1"]);
+        const releaseBusy = await holdWorkspaceBusy(overrides, "ws-1");
+        let refusal: string;
+        try {
+          refusal = await refuse();
+        } finally {
+          await releaseBusy();
+        }
+
+        expect(refusal).toMatch(refusedBy[gate]);
+        expect(refusal).toContain("1 workspace (ws-1)");
+        expect(refusal).toMatch(/retry/i);
+        expect(refusal).not.toMatch(/shrink/i);
+        // A busy workspace is a known cause, not the catch-all one.
+        expect(refusal).not.toMatch(/another reason/i);
+      });
+
+      test("each failed workspace gets its own cause when the causes differ", async () => {
+        // The first failure must not hide the one a retry cannot fix.
+        const overrides = realOverridesService();
+        const service = serviceWith(overrides);
+        await registerLocalWorkspace("ws-1");
+        await registerLocalWorkspace("ws-2");
+        const docPath = await writeOversizedDoc("ws-2");
+        const refuse = await prepareRefusal("fresh install", service, ["ws-1", "ws-2"]);
+        const releaseBusy = await holdWorkspaceBusy(overrides, "ws-1");
+        let refusal: string;
+        try {
+          refusal = await refuse();
+        } finally {
+          await releaseBusy();
+        }
+
+        expect(refusal).toContain(docPath);
+        expect(refusal).toMatch(/shrink/i);
+        expect(refusal).toMatch(/retry/i);
+      });
+
+      test("a lock timeout that fails the whole check marks every workspace busy", async () => {
+        const wholesale: Pick<
+          WorkspaceMcpOverridesService,
+          "prunePluginOverrideKeysForWorkspaces"
+        > = {
+          prunePluginOverrideKeysForWorkspaces: () =>
+            Promise.reject(new CrossProcessLockTimeoutError("held by pid 1")),
+        };
+        const service = serviceWith(wholesale as WorkspaceMcpOverridesService);
+        await registerLocalWorkspace("ws-1");
+        await registerLocalWorkspace("ws-2");
+        const refuse = await prepareRefusal("fresh install", service, ["ws-1", "ws-2"]);
+
+        const refusal = await refuse();
+
+        expect(refusal).toContain("ws-1");
+        expect(refusal).toContain("ws-2");
+        expect(refusal).toMatch(/retry/i);
+        expect(refusal).not.toMatch(/shrink|another reason/i);
+      });
     });
 
     test("the reinstall gate keeps its tombstone when config.json does not parse", async () => {
@@ -7129,6 +7335,41 @@ describe("AgentPluginInstallService", () => {
       expect(await pathExists(installPath())).toBe(true);
     });
 
+    test("a fresh install sweeps every workspace when an unrelated legacy entry's metadata is malformed", async () => {
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
+      });
+      const staleEnable = buildPluginServerKey(computePluginInstanceId(installPath()), "echo");
+      const overridesFile = (checkout: string) => path.join(checkout, ".xum", "mcp.local.jsonc");
+      await registerLocalWorkspace("ws-1");
+      const checkouts = [
+        path.join(muxRoot, "checkouts", "ws-1"),
+        await registerMalformedLegacyEntry(),
+      ];
+      for (const checkout of checkouts) {
+        await fsPromises.mkdir(path.dirname(overridesFile(checkout)), { recursive: true });
+        await fsPromises.writeFile(
+          overridesFile(checkout),
+          JSON.stringify({ enabledServers: [staleEnable, "other"] })
+        );
+      }
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      expect(await registry()).toHaveLength(1);
+      for (const checkout of checkouts) {
+        const overrides = JSON.parse(
+          await fsPromises.readFile(overridesFile(checkout), "utf8")
+        ) as {
+          enabledServers?: string[];
+        };
+        expect(overrides.enabledServers).toEqual(["other"]);
+      }
+    });
+
     test("an unrelated malformed legacy workspace entry does not abort an uninstall", async () => {
       const serviceWithOverrides = new AgentPluginInstallService(config, {
         workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
@@ -7139,18 +7380,7 @@ describe("AgentPluginInstallService", () => {
         source: preview.source,
         expectedSha: preview.lockedSha,
       });
-      // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
-      const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
-      await fsPromises.mkdir(legacyPath, { recursive: true });
-      const legacyEntry: unknown = { path: legacyPath };
-      await config.editConfig((cfg) => {
-        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
-        return cfg;
-      });
-      const sessionDir = path.join(config.sessionsDir, "old-branch");
-      await fsPromises.mkdir(sessionDir, { recursive: true });
-      await fsPromises.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
-      await expect(config.getAllWorkspaceMetadata({ throwOnError: true })).rejects.toThrow();
+      await registerMalformedLegacyEntry();
       expect(await pathExists(installPath())).toBe(true);
 
       await serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false });
@@ -7890,36 +8120,41 @@ describe("AgentPluginInstallService", () => {
     expect(await registry()).toEqual([]);
   });
 
-  test("a failed install hygiene sweep reports a count and at most 5 workspace IDs", async () => {
-    // A 6,302-workspace config failed this sweep for 800-plus workspaces, and
-    // the error listed every ID. The log keeps one warning per workspace.
-    const ids = ["ws-1", "ws-2", "ws-3", "ws-4", "ws-5", "ws-6", "ws-7"];
-    const serviceWithOverrides = new AgentPluginInstallService(config, {
-      workspaceMcpOverridesService: overridesServiceStub(() =>
-        Promise.reject(new Error("pruning exceeded the plugin-prune budget"))
-      ),
-    });
-    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
-      () =>
-        Promise.resolve(
-          ids.map((id) => ({ id, runtimeConfig: { type: "local" } }))
-        ) as unknown as ReturnType<Config["getAllWorkspaceMetadata"]>
-    );
-    try {
-      const preview = await serviceWithOverrides.preview({ input: remoteDir });
-      const install = serviceWithOverrides.install({
-        source: preview.source,
-        expectedSha: preview.lockedSha,
+  test.each([
+    [5, "5 workspaces (ws-1, ws-2, ws-3, ws-4, ws-5)"],
+    [6, "6 workspaces (ws-1, ws-2, ws-3, ws-4, ws-5, and 1 more)"],
+    [7, "7 workspaces (ws-1, ws-2, ws-3, ws-4, ws-5, and 2 more)"],
+  ])(
+    "a failed install hygiene sweep of %i workspaces reports a count and at most 5 workspace IDs",
+    async (count, listed) => {
+      // A 6,302-workspace config failed this sweep for 800-plus workspaces, and
+      // the error listed every ID. The log keeps one warning per workspace.
+      const ids = Array.from({ length: count }, (_, index) => `ws-${index + 1}`);
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overridesServiceStub(() =>
+          Promise.reject(new Error("pruning exceeded the plugin-prune budget"))
+        ),
       });
-      await expect(install).rejects.toThrow(
-        "7 workspaces (ws-1, ws-2, ws-3, ws-4, ws-5, and 2 more)"
+      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
+        () =>
+          Promise.resolve(
+            ids.map((id) => ({ id, runtimeConfig: { type: "local" } }))
+          ) as unknown as ReturnType<Config["getAllWorkspaceMetadata"]>
       );
-      await expect(install).rejects.not.toThrow(/ws-6/);
-      expect(await registry()).toEqual([]);
-    } finally {
-      metadataSpy.mockRestore();
+      try {
+        const preview = await serviceWithOverrides.preview({ input: remoteDir });
+        const install = serviceWithOverrides.install({
+          source: preview.source,
+          expectedSha: preview.lockedSha,
+        });
+        await expect(install).rejects.toThrow(listed);
+        await expect(install).rejects.not.toThrow(/ws-6/);
+        expect(await registry()).toEqual([]);
+      } finally {
+        metadataSpy.mockRestore();
+      }
     }
-  });
+  );
 
   test("failed per-workspace prunes persist a tombstone that gates reinstall and self-heals", async () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));

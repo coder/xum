@@ -29,6 +29,7 @@ import {
 } from "@/node/services/agentPlugins/mcpConfig";
 import { log } from "@/node/services/log";
 import { getErrorMessage } from "@/common/utils/errors";
+import { rememberLogKey } from "@/node/utils/logDedupe";
 import { resolveCoderSSHHost } from "@/constants/coder";
 
 const MCP_OVERRIDE_FILENAMES = ["mcp.local.jsonc", "mcp.local.json"] as const;
@@ -468,6 +469,10 @@ async function boundedRealpath(target: string): Promise<string | undefined> {
     return undefined;
   }
 }
+/** Strict-walk failures already warned about, per Config (see loadAllMetadataTolerant). */
+const warnedLenientWalks = new WeakMap<Config, Set<string>>();
+export const MAX_WARNED_LENIENT_WALKS = 16;
+
 /**
  * Memoized config reads shared across one resolution/publication — or one
  * batch sweep. Loading config.json is a synchronous full parse (~100 ms on a
@@ -483,6 +488,11 @@ class ConfigSnapshot {
     canonical: Map<string, Promise<string | undefined>>;
     /** In-flight writes started by this operation (see trackSideEffect). */
     sideEffects: Set<Promise<unknown>>;
+    /**
+     * Set when loadAllMetadataTolerant fell back to the lenient walk: the ids of the entries it
+     * built from their config row alone (Config's `fallbackIds`).
+     */
+    fallbackIds?: Set<string>;
   };
   private _cancelled = false;
 
@@ -587,6 +597,62 @@ class ConfigSnapshot {
     }));
   }
 
+  /**
+   * loadAllMetadata for a plugin override sweep or an override read, with checkoutLockKeys'
+   * fallback. The strict walk also fails on an UNRELATED id-less legacy entry whose metadata.json
+   * does not parse, and that must not refuse every plugin install or turn MCP off for every
+   * serve. The lenient walk lists such an entry under its fallback id, so its checkout is still
+   * swept. It is trusted only while config.json itself loads strictly: a config.json failure
+   * degrades it to EMPTY. A requested id that it does not list fails on its own (metadata not
+   * found), and a parent it does not list is unknown, not removed (see loadInheritedOverrides).
+   *
+   * A degraded entry whose config row names no runtime gets the default worktree runtime (its
+   * real one may sit in the unreadable metadata.json), and the sweep prunes the checkout at the
+   * row's persisted path. That is still safe: the sweep removes only this plugin instance's keys,
+   * which are stale consent in any file, and plugin servers never run off-host. Skipping or
+   * failing the entry instead would leave a real stale enable in place, or refuse every install
+   * again. An override read refuses such an entry instead (see assertReadableEntry).
+   */
+  loadAllMetadataTolerant(workspaceIds: readonly string[]): Promise<FrontendWorkspaceMetadata[]> {
+    return (this.store.all = this.loadAllMetadata().catch((error: unknown) => {
+      this.loadLegacyConfig();
+      const fallbackIds = new Set<string>();
+      this.store.fallbackIds = fallbackIds;
+      // A count, not the ids: an install sweep can request thousands.
+      const fields = { workspaceCount: workspaceIds.length, error: getErrorMessage(error) };
+      // Every override read on such a host gets here (the tool-call gate reads on every call):
+      // warn once per distinct failure and Config, then log at debug.
+      let warned = warnedLenientWalks.get(this.config);
+      if (warned === undefined) {
+        warned = new Set();
+        warnedLenientWalks.set(this.config, warned);
+      }
+      const message =
+        "[MCP] Resolving workspace MCP overrides from a lenient registry walk: another entry's metadata is unreadable";
+      if (rememberLogKey(warned, fields.error, MAX_WARNED_LENIENT_WALKS)) log.warn(message, fields);
+      else log.debug(message, fields);
+      return this.config.getAllWorkspaceMetadata({ probeCheckouts: false, fallbackIds });
+    }));
+  }
+
+  /** The registry came from loadAllMetadataTolerant's fallback: a degraded entry's id is unknown. */
+  get lenientRegistry(): boolean {
+    return this.store.fallbackIds !== undefined;
+  }
+
+  /**
+   * Throws for an entry that the lenient walk built from its config row alone: its name and
+   * runtime may live only in its unreadable metadata.json, so the checkout it names may not
+   * hold its override file, and a disable there is unknown, not absent.
+   */
+  assertReadableEntry(workspaceId: string): void {
+    if (this.store.fallbackIds?.has(workspaceId) === true) {
+      throw new Error(
+        `Workspace ${workspaceId} metadata is unreadable; its MCP overrides are unknown`
+      );
+    }
+  }
+
   canonicalize(identity: string, filePath: string): Promise<string | undefined> {
     if (identity !== "host") {
       return Promise.resolve(filePath);
@@ -632,7 +698,7 @@ interface ForkCopyProgress {
 }
 /** Parallel realpath budget for the sharer scan (see publishEffectiveOverrides). */
 const CANONICALIZE_CONCURRENCY = 16;
-/** Budget for acquiring a workspace lock — or a whole batch of them (see withWorkspaceLocks). */
+/** Budget for waiting on busy workspace locks, for one workspace or a batch (see withWorkspaceLocks). */
 const WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS = 60_000;
 const WORKSPACE_LOCK_RETRY_BACKOFF_MS = 150;
 /** Budget for an unlocked reader's legacy migration to take the write locks (see migrateLegacyOverridesFenced). */
@@ -726,7 +792,8 @@ function passBlocker(
     ? undefined
     : { error: new CheckoutKeysChangedError() };
 }
-function isRetryableLockError(error: unknown): boolean {
+/** A busy or moved checkout: waiting and trying again can succeed. */
+export function isRetryableLockError(error: unknown): boolean {
   return (
     error instanceof CheckoutKeysChangedError ||
     // The lock's timeout message appends holder details to ours.
@@ -1183,6 +1250,21 @@ function selectProbedCandidate(
  */
 const MAX_PRUNED_OVERRIDES_BYTES = 1024 * 1024;
 /**
+ * An override file over MAX_PRUNED_OVERRIDES_BYTES. Only the user can fix it,
+ * so a plugin install refusal must say that a retry will not help (it tells
+ * this error apart from a busy lock by type, not by message).
+ */
+export class OverridesFileTooLargeError extends Error {
+  constructor(
+    readonly filePath: string,
+    size: number
+  ) {
+    super(
+      `Workspace MCP overrides file ${filePath} is ${size} bytes, over the ${MAX_PRUNED_OVERRIDES_BYTES} bytes Xum reads to remove plugin keys. Remove or shrink it, then retry.`
+    );
+  }
+}
+/**
  * Whether a candidate override file exists for the plugin-key prune.
  * Strict: "cannot tell" throws, like a file over MAX_PRUNED_OVERRIDES_BYTES,
  * so the caller keeps its tombstone instead of retiring it unread.
@@ -1196,9 +1278,7 @@ async function prunableFileExists(
     throw probe.error;
   }
   if (probe.kind === "file" && probe.size > MAX_PRUNED_OVERRIDES_BYTES) {
-    throw new Error(
-      `Workspace MCP overrides file ${filePath} is ${probe.size} bytes, over the ${MAX_PRUNED_OVERRIDES_BYTES} bytes Xum reads to remove plugin keys. Remove or shrink it, then retry.`
-    );
+    throw new OverridesFileTooLargeError(filePath, probe.size);
   }
   return probe.kind === "file";
 }
@@ -1855,12 +1935,16 @@ export class WorkspaceMcpOverridesService {
   ): Promise<{ overrides: WorkspaceMCPOverrides; revision: string; authoritative: boolean }> {
     const snapshot = new ConfigSnapshot(this.config);
     const mode = options?.mode ?? "lenient";
-    const resolution = (async () =>
-      this.resolveOverridesFor(
+    const resolution = (async () => {
+      // Every request-path read goes through here: one unrelated malformed legacy entry must not
+      // turn MCP off for every workspace (see loadAllMetadataTolerant).
+      await snapshot.loadAllMetadataTolerant([workspaceId]);
+      return this.resolveOverridesFor(
         await this.getWorkspaceMetadata(workspaceId, snapshot),
         mode,
         snapshot
-      ))();
+      );
+    })();
     let resolved: ResolvedOverrides;
     if (options?.timeoutMs === undefined && options?.signal === undefined) {
       resolved = await resolution;
@@ -1961,6 +2045,8 @@ export class WorkspaceMcpOverridesService {
     inheritanceDepth = 0
   ): Promise<ResolvedOverrides> {
     const workspaceId = metadata.id;
+    // Here, not in the callers: the requested workspace and every inherited ancestor alike.
+    snapshot.assertReadableEntry(workspaceId);
     const { runtime, workspacePath, hostFilesystem } = this.resolveWorkspace(metadata, snapshot);
     const filePaths = this.getOverridesFilePaths(workspacePath, metadata.runtimeConfig);
     const canonicalPath = filePaths[0];
@@ -2365,6 +2451,11 @@ export class WorkspaceMcpOverridesService {
       const all = await snapshot.loadAllMetadata();
       const parent = all.find((m) => m.id === parentWorkspaceId);
       if (parent === undefined) {
+        // A lenient registry lists a degraded legacy entry under its fallback id, so a missing
+        // parent can be that entry: its settings (a disable included) are unknown, not absent.
+        if (snapshot.lenientRegistry) {
+          throw new Error(`Parent workspace ${parentWorkspaceId} is missing from a lenient read`);
+        }
         return { overrides: {}, authoritative: true };
       }
       const inherited = await this.resolveOverridesFor(
@@ -3759,8 +3850,9 @@ export class WorkspaceMcpOverridesService {
    * saves responsive during a slow remote rename (the global lock is never
    * held across a checkout move).
    *
-   * LOCK ORDER: workspace locks are acquired in sorted order and ALWAYS
-   * before the global lock (runExclusive), never while holding it.
+   * LOCK ORDER: workspace locks are ALWAYS taken before the global lock
+   * (runExclusive), never while holding it. A batch waits for at most one
+   * of them, holding nothing, and only tries the rest (see withWorkspaceLocks).
    * A crashed holder is reclaimed once provably dead (never on age), like
    * the global lock.
    */
@@ -3852,9 +3944,10 @@ export class WorkspaceMcpOverridesService {
       // metadata.json is unreadable or malformed. Rename and removal take
       // this lock, so that must not brick every healthy workspace until the
       // user repairs persisted state by hand (self-healing rule). The lenient
-      // walk skips such entries; it is trusted only when it still registers
-      // every requested id — a config.json failure degrades it to EMPTY, and
-      // "absent" would then wrongly fall through to the id-only key.
+      // walk lists such an entry under its fallback id instead of failing; it
+      // is trusted only when it still registers every requested id — a
+      // config.json failure degrades it to EMPTY, and "absent" would then
+      // wrongly fall through to the id-only key.
       const lenient = await this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
       const registered = new Set(lenient.map((metadata) => metadata.id));
       if (!workspaceIds.every((id) => registered.has(id))) {
@@ -4705,7 +4798,7 @@ export class WorkspaceMcpOverridesService {
     // fs.access, which blocks indefinitely on a stalled mount.
     const metadataById = groupMetadataById(
       await withDeadline(
-        snapshot.loadAllMetadata(),
+        snapshot.loadAllMetadataTolerant(workspaceIds),
         budget.remaining(),
         "workspace enumeration exceeded the plugin-prune budget"
       ),
@@ -4715,8 +4808,9 @@ export class WorkspaceMcpOverridesService {
     const swept = new Map<string, SweptWorkspace>();
     let anyOwesEpoch = false;
     // Many checkouts at once: thousands of sequential stats outlasted the
-    // sweep budget. One task per ID (first spelling), and IDs whose
-    // checkouts share a lock key run one after another (see groupByCheckout).
+    // sweep budget. One task per ID (first spelling). IDs whose checkouts
+    // share a lock key run one after another (see groupByCheckout), so no
+    // two prunes read or rewrite one checkout's document at once.
     const seen = new Set<string>();
     const uniqueIds = workspaceIds.filter((workspaceId) => {
       const id = workspaceId.trim();
@@ -4780,7 +4874,7 @@ export class WorkspaceMcpOverridesService {
     try {
       afterById = groupMetadataById(
         await withDeadline(
-          after.loadAllMetadata(),
+          after.loadAllMetadataTolerant([...swept.keys()]),
           budget.remaining(),
           "workspace enumeration exceeded the plugin-prune budget"
         ),
@@ -4892,6 +4986,13 @@ export class WorkspaceMcpOverridesService {
     after: ConfigSnapshot,
     budget: PublicationBudget
   ): Promise<Array<{ workspaceId: string; error: unknown }>> {
+    if (after.lenientRegistry) {
+      // Publication resolves inheritance from this registry, which lists a degraded entry under
+      // its fallback id: a child of that entry would publish `{}` for its parent's settings as
+      // disk truth. Evict every cache instead, so the next read goes to disk.
+      await publish(null, ALL_WORKSPACES_TARGET);
+      return [];
+    }
     const failures: Array<{ workspaceId: string; error: unknown }> = [];
     // Publish AFTER every prune landed: an inheriting descendant swept
     // before its parent would otherwise publish the parent's pre-prune

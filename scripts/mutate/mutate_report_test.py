@@ -4,7 +4,10 @@ Run through `make test-mutate-scripts`, which supplies mutator, Crapper and
 pytest. The end-to-end run (real bun processes) is in check.test.ts.
 """
 
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -134,7 +137,6 @@ def test_a_site_whose_test_runs_without_coverage_is_not_skipped_as_uncovered():
 
 
 def test_baselines_get_only_the_time_left_before_the_run_deadline():
-    import time
     from mutate_report import baselines
 
     given = []
@@ -148,6 +150,190 @@ def test_baselines_get_only_the_time_left_before_the_run_deadline():
     timeouts, dropped = baselines(["a"], queue_of("w"), 1, time.monotonic() - 1, runner)
     assert timeouts == {} and [d["path"] for d in dropped] == ["a"]
     assert len(given) == 2  # past the deadline, no baseline starts
+
+
+def fake_bun(tmp_path, monkeypatch, behaviors: dict[str, str]) -> None:
+    """Puts a `bun` on PATH whose `bun test ./<file>` runs the shell snippet chosen by <file>."""
+
+    cases = "\n".join(f"  ./{name}) {body} ;;" for name, body in behaviors.items())
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    script = bin_dir / "bun"
+    script.write_text(f'#!/bin/sh\ncase "$2" in\n{cases}\nesac\n')
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+
+def test_a_slow_baseline_that_keeps_printing_is_not_dropped_but_a_silent_one_is(tmp_path, monkeypatch):
+    # A baseline of installService.test.ts takes 80 to 145 s on a loaded host, over the old 120 s
+    # cap, and the mutants of that file were then silently not run. Slow is not hung: a hang
+    # prints nothing (scripts/test-unit-ci.sh cuts a file after BUN_TEST_STALL_SECS of silence).
+    import mutate_report
+    from mutate_report import baselines
+
+    # Shrunk so the test runs in seconds: the stall limit is 1.5 s, and the slow file runs for 3 s.
+    monkeypatch.setattr(mutate_report, "BASELINE_STALL", 1.5)
+    fake_bun(
+        tmp_path,
+        monkeypatch,
+        {
+            "slow.test.ts": "for i in 1 2 3 4 5 6; do echo \"(pass) $i\"; sleep 0.5; done",
+            "hung.test.ts": "echo started; sleep 30",
+            "broken.test.ts": "echo '(fail) broken'; exit 1",
+        },
+    )
+    worker = tmp_path / "w"
+    worker.mkdir()
+    tests = ["slow.test.ts", "hung.test.ts", "broken.test.ts"]
+
+    timeouts, dropped = baselines(tests, queue_of(worker), 1, time.monotonic() + 60)
+
+    assert sorted(timeouts) == ["slow.test.ts"]
+    assert timeouts["slow.test.ts"] >= 3.0 * 10  # scaled from the measured 3 s, not capped
+    reasons = {d["path"]: d["reason"] for d in dropped}
+    assert sorted(reasons) == ["broken.test.ts", "hung.test.ts"]
+    assert reasons["broken.test.ts"] == "fails without a mutant"
+    assert "printed nothing" in reasons["hung.test.ts"]
+
+
+def test_a_baseline_that_prints_a_lot_keeps_none_of_it(tmp_path, monkeypatch):
+    # The runner needs only to see that output arrives. A baseline that loops printing would fill
+    # the disk if its output were kept in a file until the run's deadline, so stdout must be a pipe
+    # that the runner drains. The fake bun fails unless its stdout is a pipe.
+    from mutate_report import baselines
+
+    fake_bun(
+        tmp_path,
+        monkeypatch,
+        {"loud.test.ts": '[ -p /dev/stdout ] || exit 1; head -c 20000000 /dev/zero | tr "\\0" x; exit 0'},
+    )
+    worker = tmp_path / "w"
+    worker.mkdir()
+
+    timeouts, dropped = baselines(["loud.test.ts"], queue_of(worker), 1, time.monotonic() + 60)
+
+    assert sorted(timeouts) == ["loud.test.ts"] and dropped == []
+
+
+def test_a_baseline_that_prints_only_on_stderr_is_kept_when_slow_and_never_blocks(tmp_path, monkeypatch):
+    # Bun writes its "(pass) <test>" lines to stderr, so stderr is the activity signal. It must be
+    # the same drained pipe as stdout: ignored, the slow file looks hung; a second pipe that nobody
+    # reads, a file that prints a lot blocks on a full pipe.
+    import mutate_report
+    from mutate_report import baselines
+
+    monkeypatch.setattr(mutate_report, "BASELINE_STALL", 1.5)
+    fake_bun(
+        tmp_path,
+        monkeypatch,
+        {
+            "slow.test.ts": 'for i in 1 2 3 4 5 6; do echo "(pass) $i" >&2; sleep 0.5; done',
+            "loud.test.ts": 'head -c 20000000 /dev/zero | tr "\\0" x >&2; exit 0',
+        },
+    )
+    worker = tmp_path / "w"
+    worker.mkdir()
+
+    timeouts, dropped = baselines(["slow.test.ts", "loud.test.ts"], queue_of(worker), 1, time.monotonic() + 60)
+
+    assert sorted(timeouts) == ["loud.test.ts", "slow.test.ts"] and dropped == []
+
+
+def test_the_output_drain_keeps_none_of_what_it_reads():
+    # A baseline that loops printing must not fill memory either. 50 MB go through in 64 KB chunks;
+    # a drain that kept them would peak at 50 MB.
+    import tracemalloc
+    from mutate_report import drain_output
+
+    class Stream:
+        def __init__(self):
+            self.left = 800
+
+        def read1(self, size):
+            self.left -= 1
+            return bytes(size) if self.left >= 0 else b""
+
+    seen = []
+    tracemalloc.start()
+    try:
+        drain_output(Stream(), lambda: seen.append(1))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert len(seen) == 800  # each chunk counted as activity
+    assert peak < 5_000_000
+
+
+def test_a_baseline_is_bounded_only_by_the_time_left_and_by_silence(tmp_path, monkeypatch):
+    # Whatever a cap is called, it would cut a file that is slow but keeps printing. Two views of it:
+    # the runner is given the whole time left, and a baseline that runs 300 s on the module's clock
+    # (a clock that runs 100 times faster) is kept, which no cap under 300 s lets through.
+    import mutate_report
+    from mutate_report import baselines
+
+    given = []
+
+    def runner(_worker, _test, timeout):
+        given.append(timeout)
+        return True, 0.1, False
+
+    baselines(["a"], queue_of("w"), 1, time.monotonic() + 100_000, runner)
+    assert given[0] > 99_000
+
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(mutate_report.time, "monotonic", lambda: real_monotonic() * 100)
+    fake_bun(tmp_path, monkeypatch, {"slow.test.ts": 'for i in 1 2 3 4 5 6 7 8 9 10; do echo "(pass) $i"; sleep 0.3; done'})
+    worker = tmp_path / "w"
+    worker.mkdir()
+
+    timeouts, dropped = baselines(["slow.test.ts"], queue_of(worker), 1, mutate_report.time.monotonic() + 10_000_000)
+
+    assert sorted(timeouts) == ["slow.test.ts"] and dropped == []
+
+
+def test_a_dropped_baseline_leaves_no_process_behind(tmp_path, monkeypatch):
+    # The whole process group goes with a hung file: bun's own children must not outlive it.
+    import mutate_report
+    from mutate_report import baselines
+
+    monkeypatch.setattr(mutate_report, "BASELINE_STALL", 1.0)
+    pidfile = tmp_path / "child.pid"
+    fake_bun(tmp_path, monkeypatch, {"hung.test.ts": f"sleep 30 & echo $! > {pidfile}; echo started; wait"})
+    worker = tmp_path / "w"
+    worker.mkdir()
+
+    timeouts, dropped = baselines(["hung.test.ts"], queue_of(worker), 1, time.monotonic() + 60)
+
+    assert timeouts == {} and "printed nothing" in dropped[0]["reason"]
+    child = int(pidfile.read_text())
+
+    def alive() -> bool:
+        # An orphaned child can stay a zombie for good where PID 1 does not reap (some containers),
+        # and kill(pid, 0) succeeds for a zombie: its state tells it from a running process.
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(child)], capture_output=True, text=True).stdout.strip()
+        return state != "" and not state.startswith("Z")
+
+    for _ in range(100):
+        if not alive():
+            break
+        time.sleep(0.05)
+    assert not alive()
+
+
+def test_a_baseline_stopped_by_the_run_deadline_says_so(tmp_path, monkeypatch):
+    import mutate_report
+    from mutate_report import DEADLINE, baselines
+
+    monkeypatch.setattr(mutate_report, "BASELINE_STALL", 30.0)
+    # Bounded (8 s), so a runner that ignores the deadline fails the assertion instead of hanging.
+    fake_bun(tmp_path, monkeypatch, {"busy.test.ts": "for i in $(seq 1 40); do echo tick; sleep 0.2; done"})
+    worker = tmp_path / "w"
+    worker.mkdir()
+
+    timeouts, dropped = baselines(["busy.test.ts"], queue_of(worker), 1, time.monotonic() + 1.5)
+
+    assert timeouts == {} and dropped == [{"path": "busy.test.ts", "reason": DEADLINE}]
 
 
 def test_a_mutant_past_the_deadline_is_not_run_and_the_file_is_restored(tmp_path):

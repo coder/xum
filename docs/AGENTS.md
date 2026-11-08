@@ -142,6 +142,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - Never let a single malformed line in history brick a workspace—apply defensive filtering in request-building paths so the user can continue working.
 - When streaming crashes, any incomplete state committed to disk should either be repairable on next load or excluded from provider requests to avoid API validation errors.
 - **Startup-time initialization must never crash the app.** Wrap in try-catch, use timeouts, fall back silently.
+- **`server.lock` liveness is decided by process identity** (pid, start time, boot id, PID namespace and platform; `judgeHolder()` in `src/node/utils/concurrency/processLiveness.ts`), except that a lock with this process's own pid is live only if this process wrote it. The `/version` probe (`src/node/services/xumBackendProbe.ts`) covers only what identity cannot decide, for example macOS, Windows, locks from older builds, and identity that is incomplete or unreadable. Do not add more liveness heuristics (timeouts, extra probes, process-state guesses) to `src/node/services/serverLockfile.ts` or the probe. A lock reader never deletes a lock: `acquire()` replaces a stale one, and its owner's `release()` removes it.
 
 ## Command Palette & UI Access
 
@@ -151,7 +152,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 ## Styling
 
 - Never use emoji characters as UI icons or status indicators; emoji rendering varies across platforms and fonts.
-- Never use CSS `zoom`: Safari and Chromium lay a zoomed element out differently, and iPhone Safari painted a Mermaid diagram far outside its frame (`local/no-css-zoom`, `make check-no-css-zoom`). Size the element with explicit pixels computed in code (see `mermaidDiagramBox.ts`). Tag a story `webkit` when its layout must hold in Safari: `make test-storybook-webkit` plays those stories in WebKit (CI runs it in `Test / Storybook`).
+- Never use CSS `zoom`: Safari and Chromium lay a zoomed element out differently, and iPhone Safari painted a Mermaid diagram far outside its frame (`local/no-css-zoom`, `make check-no-css-zoom`). Size the element with explicit pixels computed in code (see `mermaidDiagramBox.ts`). Tag a story `webkit` when its layout must hold in Safari: `make test-storybook-webkit` plays those stories in WebKit (CI runs it in `Test / Storybook`). Tag it `paint-check` instead when it shows a Mermaid diagram: the runner also compares the diagram's paint with its box, and fails a story with no rendered diagram. WebKit repairs a stale layout at the first screenshot, so the at-rest check cannot see the state right after an interaction: a story that changes the diagram (zoom, resize) must call `expectNoDiagramInkOutsideBox()` right after it, as `MarkdownRenderer.stories.tsx` does after "+".
 - Prefer SVG icons (usually from `lucide-react`) or shared icon components under `src/browser/components/icons/`.
 - For tool call headers, use `ToolIcon` from `src/browser/features/Tools/Shared/ToolPrimitives.tsx`.
 - If a tool/agent provides an emoji string (e.g., todo-derived status or `displayStatus`), render via `EmojiIcon` (`src/browser/components/icons/EmojiIcon/EmojiIcon.tsx`) instead of rendering the emoji.

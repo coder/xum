@@ -1,17 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as fsPromisesModule from "node:fs/promises";
+import * as nodeFs from "node:fs";
 import { parse as jsoncParse, type ParseError as JsoncParseError } from "jsonc-parser";
 import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
+import { log } from "@/node/services/log";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import {
+  ALL_WORKSPACES_TARGET,
   boundContainerMutation,
   isPositivelyAbsent,
+  MAX_WARNED_LENIENT_WALKS,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
   readHostOverrideDocumentNoFollow,
   readWorkspaceOverridesEpochToken,
@@ -4177,6 +4181,303 @@ describe("WorkspaceMcpOverridesService", () => {
     await expect(service.acquireWorkspaceLock(healthy.workspaceId)).rejects.toThrow();
   });
 
+  describe("with an unrelated malformed legacy entry", () => {
+    const pluginKey = "plugin:0123456789abcdef:echo";
+    const overridesFile = (workspacePath: string) =>
+      path.join(workspacePath, ".xum", "mcp.local.jsonc");
+    const writeEnable = async (workspacePath: string) => {
+      await fs.mkdir(path.join(workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        overridesFile(workspacePath),
+        JSON.stringify({ enabledServers: [pluginKey, "other"] })
+      );
+    };
+    const enabledServers = async (workspacePath: string) =>
+      (
+        JSON.parse(await fs.readFile(overridesFile(workspacePath), "utf8")) as {
+          enabledServers?: string[];
+        }
+      ).enabledServers;
+    // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
+    // With `id`, a partially migrated row: config.json holds the id, but not the name.
+    // Its own runtime config keeps its checkout under this test's root.
+    const registerMalformedLegacyEntry = async (id?: string) => {
+      const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
+      await fs.mkdir(legacyPath, { recursive: true });
+      const legacyEntry: unknown = {
+        ...(id === undefined ? {} : { id }),
+        path: legacyPath,
+        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+      };
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "old-branch");
+      await fs.mkdir(sessionDir, { recursive: true });
+      await fs.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true })
+      ).rejects.toThrow();
+      return legacyPath;
+    };
+    const sweepOutcome = (service: WorkspaceMcpOverridesService, workspaceIds: string[]) =>
+      service.prunePluginOverrideKeysForWorkspaces(workspaceIds, "plugin:0123456789abcdef:").then(
+        (failures) => failures.map((failure) => failure.workspaceId).sort(),
+        () => "refused" as const
+      );
+    const setParent = (childId: string, parentWorkspaceId: string) =>
+      config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const workspace = project.workspaces.find((w) => w.id === childId);
+          if (workspace) workspace.parentWorkspaceId = parentWorkspaceId;
+        }
+        return cfg;
+      });
+    const served = (
+      service: WorkspaceMcpOverridesService,
+      workspaceId: string,
+      mode?: "lenient" | "strict"
+    ) =>
+      service.getOverridesForWorkspace(workspaceId, { mode }).then(
+        (read) => (read.authoritative ? read.overrides : "not authoritative"),
+        () => "refused"
+      );
+
+    it("prunes every requested workspace, the legacy entry's checkout included", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      const legacyPath = await registerMalformedLegacyEntry();
+      await writeEnable(legacyPath);
+      const legacyId = (await config.getAllWorkspaceMetadata({ probeCheckouts: false }))
+        .map((metadata) => metadata.id)
+        .find((id) => id !== healthy.workspaceId);
+      if (legacyId === undefined) throw new Error("the lenient walk lists the legacy entry");
+
+      // Registry-only under the locks, the lenient walk too: a checkout probe can stall on a mount.
+      // Config probes through fs.promises, which Bun keeps apart from the fs/promises module.
+      const accessSpy = spyOn(nodeFs.promises, "access");
+      try {
+        expect(await sweepOutcome(service, [healthy.workspaceId, legacyId])).toEqual([]);
+        expect(accessSpy.mock.calls.map(([target]) => String(target))).not.toContain(
+          healthy.workspacePath
+        );
+      } finally {
+        accessSpy.mockRestore();
+      }
+      expect(await enabledServers(healthy.workspacePath)).toEqual(["other"]);
+      expect(await enabledServers(legacyPath)).toEqual(["other"]);
+    });
+
+    it("evicts every cache instead of publishing from the degraded registry", async () => {
+      // The child's parent is the legacy entry, whose stable id lives only in its unreadable
+      // metadata.json: resolving the child from the lenient walk would read that parent as gone.
+      const service = new WorkspaceMcpOverridesService(config);
+      const legacyPath = await registerMalformedLegacyEntry();
+      await fs.mkdir(path.join(legacyPath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        overridesFile(legacyPath),
+        JSON.stringify({ enabledServers: ["parent-server"] })
+      );
+      const child = await registerWorkspace("child-of-legacy");
+      await setParent(child.workspaceId, "legacy-stable-id");
+
+      const published: Array<[string, unknown]> = [];
+      const failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [child.workspaceId],
+        "plugin:0123456789abcdef:",
+        {
+          publish: (persisted, workspaceId) => {
+            published.push([workspaceId, persisted]);
+            return Promise.resolve();
+          },
+        }
+      );
+      expect(failures).toEqual([]);
+      expect(published).toEqual([[ALL_WORKSPACES_TARGET, null]]);
+    });
+
+    it("serves a workspace's pruned overrides authoritatively after the sweep", async () => {
+      // MCP serves read the registry too: one malformed legacy entry must not turn every serve off.
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry();
+      expect(await sweepOutcome(service, [healthy.workspaceId])).toEqual([]);
+
+      const read = await service.getOverridesForWorkspace(healthy.workspaceId);
+      expect(read.authoritative).toBe(true);
+      expect(read.overrides.enabledServers).toEqual(["other"]);
+    });
+
+    // Id-less: the child names the stable id that only the unreadable metadata.json holds.
+    // Partially migrated: the walk builds the parent from its config row alone (see below).
+    // Either way the inherited settings (a disable included) are unknown, not absent.
+    for (const { shape, entryId, parentId } of [
+      { shape: "id-less", entryId: undefined, parentId: "legacy-stable-id" },
+      { shape: "partially migrated", entryId: "partial-legacy-id", parentId: "partial-legacy-id" },
+    ]) {
+      it(`does not serve a child of the ${shape} legacy entry authoritatively`, async () => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const legacyPath = await registerMalformedLegacyEntry(entryId);
+        await fs.mkdir(path.join(legacyPath, ".xum"), { recursive: true });
+        await fs.writeFile(
+          overridesFile(legacyPath),
+          JSON.stringify({ disabledServers: ["global-server"] })
+        );
+        const child = await registerWorkspace("child-of-legacy");
+        await setParent(child.workspaceId, parentId);
+
+        expect(await served(service, child.workspaceId)).toBe("not authoritative");
+        // The settings dialog reads strictly: it must report the state unavailable, not show `{}`.
+        expect(await served(service, child.workspaceId, "strict")).toBe("refused");
+      });
+    }
+
+    it("does not serve a partially migrated legacy entry from its config row alone", async () => {
+      // Its id is in config.json, but its name (and on SSH or Docker its runtime) lives only in
+      // the unreadable metadata.json: the checkout the row alone names may not hold its override
+      // file. A healthy workspace beside it is still served.
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry("partial-legacy-id");
+
+      expect(await served(service, "partial-legacy-id")).toBe("refused");
+      expect(await served(service, "partial-legacy-id", "strict")).toBe("refused");
+      const read = await service.getOverridesForWorkspace(healthy.workspaceId);
+      expect(read.authoritative).toBe(true);
+      expect(read.overrides.enabledServers).toEqual([pluginKey, "other"]);
+    });
+
+    it("does not serve overrides while config.json is corrupt", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry();
+      // Parseable but structurally invalid: a lenient load still lists the healthy workspace, so
+      // only the strict config.json load refuses. Unparseable bytes would leave nothing to serve.
+      const configFile = path.join(tempDir, "config.json");
+      const doc = JSON.parse(await fs.readFile(configFile, "utf8")) as { projects: unknown[] };
+      doc.projects.push(["/fake/broken-project", { workspaces: "nope" }]);
+      await fs.writeFile(configFile, JSON.stringify(doc));
+
+      expect(await served(service, healthy.workspaceId)).toBe("refused");
+    });
+
+    it("logs the legacy entry's load failure and the lenient walk once across reads", async () => {
+      // Each override read walks the registry again (the tool-call gate reads on every call).
+      const errorSpy = spyOn(log, "error");
+      const warnSpy = spyOn(log, "warn");
+      try {
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await writeEnable(healthy.workspacePath);
+        await registerMalformedLegacyEntry();
+        for (let read = 0; read < 3; read++) {
+          expect(await served(service, healthy.workspaceId)).not.toBe("refused");
+        }
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        errorSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("warns about the lenient walk again for a new failure, and forgets the oldest past its cap", async () => {
+      const warnSpy = spyOn(log, "warn");
+      try {
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await registerMalformedLegacyEntry();
+        const metadataFile = path.join(config.sessionsDir, "old-branch", "metadata.json");
+        // Each content fails the strict walk with its own message; the workspace count stays 1.
+        const readWith = async (content: string) => {
+          await fs.writeFile(metadataFile, content);
+          expect(await served(service, healthy.workspaceId)).not.toBe("refused");
+        };
+        const lenientWarns = () =>
+          warnSpy.mock.calls.filter(([message]) =>
+            String(message).includes("lenient registry walk")
+          ).length;
+        await readWith("{ not json");
+        await readWith("[");
+        expect(lenientWarns()).toBe(2);
+        for (let failure = 0; failure <= MAX_WARNED_LENIENT_WALKS; failure++) {
+          await readWith(`x${failure}`);
+        }
+        expect(lenientWarns()).toBe(MAX_WARNED_LENIENT_WALKS + 3);
+        await readWith("{ not json");
+        expect(lenientWarns()).toBe(MAX_WARNED_LENIENT_WALKS + 4);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    // Runs `change` once, right before the sweep's own registry read: after the lock derivation,
+    // which reads the same registry first.
+    const beforeSweepRead = (change: () => void) => {
+      const real = config.getAllWorkspaceMetadata.bind(config);
+      let changed = false;
+      return spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
+        (...args: Parameters<Config["getAllWorkspaceMetadata"]>) => {
+          if (!changed && new Error().stack?.includes("sweepPluginOverrideKeys")) {
+            changed = true;
+            change();
+          }
+          return real(...args);
+        }
+      );
+    };
+
+    it.each(["before the sweep", "after the lock derivation"] as const)(
+      "refuses when config.json breaks %s and leaves the overrides as they were",
+      async (when) => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await writeEnable(healthy.workspacePath);
+        await registerMalformedLegacyEntry();
+        const corrupt = () => nodeFs.writeFileSync(path.join(tempDir, "config.json"), "{ not json");
+        if (when === "before the sweep") corrupt();
+        const spy = beforeSweepRead(when === "before the sweep" ? () => undefined : corrupt);
+        try {
+          expect(await sweepOutcome(service, [healthy.workspaceId])).toBe("refused");
+        } finally {
+          spy.mockRestore();
+        }
+        expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
+      }
+    );
+
+    it("fails a requested workspace that the sweep's lenient walk does not list", async () => {
+      // The lock derivation lists the workspace. By the sweep's own read it is gone from
+      // config.json, so only the sweep's own check can fail it.
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry();
+      const configPath = path.join(tempDir, "config.json");
+      const spy = beforeSweepRead(() => {
+        const document = JSON.parse(nodeFs.readFileSync(configPath, "utf8")) as {
+          projects: Array<[string, unknown]>;
+        };
+        document.projects = document.projects.filter(
+          ([projectPath]) => projectPath !== "/fake/healthy-beside-legacy"
+        );
+        nodeFs.writeFileSync(configPath, JSON.stringify(document));
+      });
+      try {
+        expect(await sweepOutcome(service, [healthy.workspaceId])).toEqual([healthy.workspaceId]);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
+    });
+  });
+
   it("aliases sharing one checkout contend for one lock", async () => {
     // An isolation:none child and its parent hold distinct ids for one
     // override document: a rename through one id must fence a save through
@@ -4616,6 +4917,8 @@ describe("WorkspaceMcpOverridesService", () => {
     }
 
     expect(failures.map((failure) => failure.workspaceId)).toEqual([busy.workspaceId]);
+    // The holder's details reach the install error's log line.
+    expect(String(failures[0].error)).toMatch(/\.lock is held by pid/);
     const read = async (workspacePath: string) =>
       (
         jsoncParse(
@@ -4730,6 +5033,303 @@ describe("WorkspaceMcpOverridesService", () => {
     } finally {
       linkSpy.mockRestore();
       await releaseOld();
+    }
+  });
+
+  /** `count` workspaces whose documents each hold a stale enable for the test plugin. */
+  async function workspacesWithStaleEnables(name: string, count: number): Promise<string[]> {
+    const ids: string[] = [];
+    for (let index = 0; index < count; index++) {
+      const workspace = await registerWorkspace(`${name}-${index}`);
+      await fs.mkdir(path.join(workspace.workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(workspace.workspacePath, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+      );
+      ids.push(workspace.workspaceId);
+    }
+    return ids;
+  }
+
+  it("prunePluginOverrideKeysForWorkspaces releases its checkout locks many at a time", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const ids = await workspacesWithStaleEnables("release-many", 40);
+    const realRm = fsPromisesModule.rm;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const rmSpy = spyOn(fsPromisesModule, "rm").mockImplementation(async (target, options) => {
+      const lockFile = String(target);
+      if (
+        !lockFile.includes(`${path.sep}mcp-overrides-locks${path.sep}`) ||
+        !lockFile.endsWith(".lock")
+      ) {
+        return realRm(target, options);
+      }
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return await realRm(target, options);
+      } finally {
+        inFlight--;
+      }
+    });
+    let failures: Array<{ workspaceId: string; error: unknown }>;
+    try {
+      failures = await service.prunePluginOverrideKeysForWorkspaces(
+        ids,
+        "plugin:0123456789abcdef:"
+      );
+    } finally {
+      rmSpy.mockRestore();
+    }
+
+    expect(failures).toEqual([]);
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(maxInFlight).toBeLessThanOrEqual(16);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces prunes many checkouts at a time, at most 16", async () => {
+    // One at a time outlasted the sweep budget at thousands of checkouts;
+    // without a bound, every repository-controlled document is read at once.
+    const service = new WorkspaceMcpOverridesService(config);
+    const ids = await workspacesWithStaleEnables("prune-many", 40);
+    const realLstat = fsPromisesModule.lstat;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const lstatSpy = spyOn(fsPromisesModule, "lstat").mockImplementation((async (
+      target: string,
+      ...rest: unknown[]
+    ) => {
+      if (!String(target).endsWith("mcp.local.jsonc")) {
+        return (realLstat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+      }
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return await realLstat(target);
+      } finally {
+        inFlight--;
+      }
+    }) as typeof fsPromisesModule.lstat);
+    let failures: Array<{ workspaceId: string; error: unknown }>;
+    try {
+      failures = await service.prunePluginOverrideKeysForWorkspaces(
+        ids,
+        "plugin:0123456789abcdef:"
+      );
+    } finally {
+      lstatSpy.mockRestore();
+    }
+
+    expect(failures).toEqual([]);
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(maxInFlight).toBeLessThanOrEqual(16);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces names a workspace listed twice once", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      ["ws-listed-twice", " ws-listed-twice"],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures.map((failure) => failure.workspaceId)).toEqual(["ws-listed-twice"]);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces still bumps the epoch when a workspace fails after a rewrite", async () => {
+    // A corrupted config lists one ID on two checkouts. The first rewrite is
+    // durable even though the second checkout fails, so sibling processes
+    // must learn about it now, not on the retry.
+    const service = new WorkspaceMcpOverridesService(config);
+    const rewritten = await registerWorkspace("epoch-dup-a");
+    const failing = await registerWorkspace("epoch-dup-b");
+    const clean = await registerWorkspace("epoch-clean");
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        for (const workspace of project.workspaces) {
+          if (workspace.id === failing.workspaceId) workspace.id = rewritten.workspaceId;
+        }
+      }
+      return cfg;
+    });
+    const write = async (workspacePath: string, text: string) => {
+      await fs.mkdir(path.join(workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), text);
+    };
+    await write(
+      rewritten.workspacePath,
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo"] })
+    );
+    await write(failing.workspacePath, "x".repeat(1024 * 1024 + 1));
+    const before = await readWorkspaceOverridesEpochToken(config.rootDir);
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [rewritten.workspaceId, clean.workspaceId],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures.map((failure) => failure.workspaceId)).toEqual([rewritten.workspaceId]);
+    const after = jsoncParse(
+      await fs.readFile(path.join(rewritten.workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
+    ) as Record<string, unknown>;
+    expect(after.enabledServers).toEqual([]);
+    expect(await readWorkspaceOverridesEpochToken(config.rootDir)).not.toBe(before);
+  });
+
+  /** Run `sweep` while counting override-document stats in flight at once (each takes 50 ms). */
+  async function maxDocStatsInFlight<T>(sweep: () => Promise<T>): Promise<[T, number]> {
+    const realStat = fsPromisesModule.stat;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const statSpy = spyOn(fsPromisesModule, "stat").mockImplementation((async (
+      target: string,
+      ...rest: unknown[]
+    ) => {
+      if (!String(target).endsWith("mcp.local.jsonc")) {
+        return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+      }
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return await realStat(target);
+      } finally {
+        inFlight--;
+      }
+    }) as typeof fsPromisesModule.stat);
+    try {
+      return [await sweep(), maxInFlight];
+    } finally {
+      statSpy.mockRestore();
+    }
+  }
+
+  async function writeStaleEnable(checkout: string): Promise<string> {
+    const docPath = path.join(checkout, ".xum", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(docPath), { recursive: true });
+    await fs.writeFile(
+      docPath,
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+    );
+    return docPath;
+  }
+
+  it("prunePluginOverrideKeysForWorkspaces groups a symlink-spelled alias with its checkout", async () => {
+    // The link's own spelling is its first lock key; only its realpath key
+    // ties it to the checkout registered at the real path.
+    const service = new WorkspaceMcpOverridesService(config);
+    const realCheckout = path.join(tempDir, "spelled-real");
+    const linkCheckout = path.join(tempDir, "spelled-link");
+    await registerLocalWorkspace(realCheckout, "ws-spelled-real");
+    await fs.symlink(realCheckout, linkCheckout);
+    await registerLocalWorkspace(linkCheckout, "ws-spelled-link");
+    const docPath = await writeStaleEnable(realCheckout);
+
+    const [failures, maxInFlight] = await maxDocStatsInFlight(() =>
+      service.prunePluginOverrideKeysForWorkspaces(
+        ["ws-spelled-real", "ws-spelled-link"],
+        "plugin:0123456789abcdef:"
+      )
+    );
+
+    expect(failures).toEqual([]);
+    expect(maxInFlight).toBe(1);
+    const after = jsoncParse(await fs.readFile(docPath, "utf-8")) as Record<string, unknown>;
+    expect(after.enabledServers).toEqual(["other"]);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces keeps one group when a later ID joins through an earlier member's key", async () => {
+    // A corrupted config registers ws-dup on two checkouts. ws-second (on the
+    // second checkout) joins ws-dup's group; ws-third shares only the first
+    // checkout's key, which ws-second does not have.
+    const service = new WorkspaceMcpOverridesService(config);
+    const firstCheckout = path.join(tempDir, "joined-first");
+    const secondCheckout = path.join(tempDir, "joined-second");
+    await registerLocalWorkspace(firstCheckout, "ws-dup");
+    await registerLocalWorkspace(secondCheckout, "ws-dup");
+    await registerLocalWorkspace(secondCheckout, "ws-second");
+    await registerLocalWorkspace(firstCheckout, "ws-third");
+    const docs = [await writeStaleEnable(firstCheckout), await writeStaleEnable(secondCheckout)];
+
+    const [failures, maxInFlight] = await maxDocStatsInFlight(() =>
+      service.prunePluginOverrideKeysForWorkspaces(
+        ["ws-dup", "ws-second", "ws-third"],
+        "plugin:0123456789abcdef:"
+      )
+    );
+
+    expect(failures).toEqual([]);
+    expect(maxInFlight).toBe(1);
+    for (const docPath of docs) {
+      const after = jsoncParse(await fs.readFile(docPath, "utf-8")) as Record<string, unknown>;
+      expect(after.enabledServers).toEqual(["other"]);
+    }
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces does not hold its locks while a verification outlasts the budget", async () => {
+    // Taking the locks used up the waiting budget, then the registry read
+    // that verifies them stalls. A normal pass gets only what is left of the
+    // budget, so it gives the locks back at once; the last pass then sweeps.
+    const service = new WorkspaceMcpOverridesService(config);
+    const workspaces = [
+      await registerWorkspace("verify-stall-a"),
+      await registerWorkspace("verify-stall-b"),
+    ];
+    const docs = await Promise.all(
+      workspaces.map((workspace) => writeStaleEnable(workspace.workspacePath))
+    );
+    const lockDir = `${path.sep}mcp-overrides-locks${path.sep}`;
+    const realNow = Date.now;
+    const realLink = fsPromisesModule.link;
+    const realGetAll = config.getAllWorkspaceMetadata.bind(config);
+    let skewMs = 0;
+    let stallNextRead = false;
+    let stalledReads = 0;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skewMs);
+    const linkSpy = spyOn(fsPromisesModule, "link").mockImplementation((existing, target) => {
+      if (String(target).includes(lockDir) && skewMs === 0) {
+        skewMs += 61_000;
+        stallNextRead = true;
+      }
+      return realLink(existing, target);
+    });
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(((
+      ...args: Parameters<typeof realGetAll>
+    ) => {
+      if (stallNextRead) {
+        stallNextRead = false;
+        stalledReads++;
+        return new Promise<never>(() => undefined);
+      }
+      return realGetAll(...args);
+    }) as typeof realGetAll);
+    // Without the cut, the stalled read waits out a whole real minute. Stop
+    // waiting after 3 s so that case fails on the assertion, not on a timeout.
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const stalled = new Promise<"stalled">((resolve) => {
+      watchdog = setTimeout(() => resolve("stalled"), 3_000);
+    });
+    let failures: Array<{ workspaceId: string; error: unknown }> | "stalled";
+    try {
+      failures = await Promise.race([
+        service.prunePluginOverrideKeysForWorkspaces(
+          workspaces.map((workspace) => workspace.workspaceId),
+          "plugin:0123456789abcdef:"
+        ),
+        stalled,
+      ]);
+    } finally {
+      clearTimeout(watchdog);
+      nowSpy.mockRestore();
+      linkSpy.mockRestore();
+      metadataSpy.mockRestore();
+    }
+
+    expect(stalledReads).toBe(1);
+    expect(failures).toEqual([]);
+    for (const docPath of docs) {
+      const after = jsoncParse(await fs.readFile(docPath, "utf-8")) as Record<string, unknown>;
+      expect(after.enabledServers).toEqual(["other"]);
     }
   });
 
