@@ -336,6 +336,7 @@ export function sidecarLockPath(rootDir: string): string {
 
 /** Cross-process half of the analyzer queue for one memory owner (see runAnalyzerJobTurn). */
 export function analyzerJobLockPath(rootDir: string, ownerId: string): string {
+  // mutation-equivalent: any fixed slice of the digest names one stable lock per owner
   const digest = createHash("sha256").update(ownerId).digest("hex").slice(0, 32);
   return path.join(rootDir, "locks", `memory-analyzer-${digest}.lock`);
 }
@@ -488,6 +489,7 @@ function isLiveHarvestAttempt(record: MemoryHarvestRecord | undefined): boolean 
 
 /** The number of the attempt after the ones `record` counts. */
 function nextAttemptCount(record: MemoryHarvestRecord | undefined): number {
+  // mutation-equivalent: the count is a number, and || differs from ?? only on 0, which maps to 0
   return (record?.attemptCount ?? 0) + 1;
 }
 

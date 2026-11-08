@@ -3374,6 +3374,72 @@ describe("MemoryConsolidationService", () => {
         });
       });
 
+      it("leaves another backend's live attempt alone when this job fails before its turn", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        const live: MemoryHarvestRecordPayload = {
+          status: "pending",
+          startedAt: Date.now(),
+          progressAt: Date.now(),
+          attemptCount: 1,
+          nextChunk: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+          completionMetadata: metadata,
+        };
+        await fsPromises.writeFile(
+          path.join(fixture.xumHome, "memory-consolidation.json"),
+          JSON.stringify({ harvestsByWorkspace: { "ws-dream": { "summary-1": live } } })
+        );
+        // The job fails before its turn, so without the job lock: its failure must not replace
+        // the record that the other backend's attempt keeps updating.
+        fixture.setModelUnavailable(true);
+        await fixture.service.maybeHarvestThenSweep(metadata);
+
+        expect((await harvestRecords(fixture))["summary-1"]).toEqual(live);
+      });
+
+      it("neither writes the sidecar nor announces a change for a save that changes nothing", async () => {
+        using fixture = await createFixture();
+        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+        const internals = fixture.service as unknown as {
+          saveHarvestRecordEffect: (
+            workspaceId: string,
+            boundaryKey: string,
+            record: MemoryHarvestRecordPayload | (() => undefined),
+            projectPath: string
+          ) => Effect.Effect<void>;
+        };
+        const save = (record: MemoryHarvestRecordPayload | (() => undefined)) =>
+          Effect.runPromise(internals.saveHarvestRecordEffect("ws-dream", "summary-1", record, ""));
+        const changes: MemoryConsolidationStatusChangeEventPayload[] = [];
+        fixture.service.on("statusChange", (event: MemoryConsolidationStatusChangeEventPayload) =>
+          changes.push(event)
+        );
+        const failed = (attemptCount: number): MemoryHarvestRecordPayload => ({
+          status: "failed",
+          startedAt: 1,
+          completedAt: 1,
+          attemptCount,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+        });
+
+        // A writer without the job lock that found a live attempt.
+        await save(() => undefined);
+        expect(await pathExists(sidecarPath)).toBe(false);
+        await save(failed(HARVEST_MAX_ATTEMPTS));
+        const written = await fsPromises.stat(sidecarPath);
+        // A retryable failure never reopens a terminal record.
+        await save(failed(1));
+        expect(changes).toHaveLength(1);
+        expect((await fsPromises.stat(sidecarPath)).ino).toBe(written.ino);
+      });
+
       it("takes over the sidecar and analyzer locks of a backend that died holding them", async () => {
         using fixture = await createFixture();
         const metadata = await seedCompactionEpoch(fixture);
