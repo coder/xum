@@ -96,10 +96,13 @@ const SECRET_KEY_VALUE_PATTERN = new RegExp(
 // body takes everything but those, and a backslash that does not start an escape. The header may
 // also be a JSON key (`"cookie": "a=b"`, its opening quote kept so the quotes stay paired), whose
 // value may be an array (`"set-cookie": ["a=b", "c=d"]`, Node's shape), read to its `]`.
-// The name counts only in header position (`COOKIE_CONTEXT`), so a sentence such as `Session
-// cookie: HttpOnly is set` or `getCookie:` stays readable: the memory-write guard reuses this
-// detector, and a note about cookies must stay writable. A prose line that begins with `cookie:`
-// is still a header to this rule and is redacted to its end.
+// What tells a header from prose is its value, not where it sits: a cookie header's value is
+// `name=value` pairs (or a list of them), while a sentence such as `Session cookie: HttpOnly is set`
+// has words. Positions draw a new case every time a header turns up in a new frame (Markdown
+// emphasis, a numbered list, `Host: x; Cookie: a=b` on one line, Go's `map[Cookie:[a=b]]`), so the
+// name counts after any character that cannot be part of a longer name (`getCookie:` and
+// `X-Cookie-Policy:` stay readable), and `redactCookieValue` leaves a value that is not a cookie
+// pair alone. The memory-write guard reuses this detector, so a note about cookies stays writable.
 // Linear: once the colon matched, the body and the array never fail and never backtrack, as
 // `QUOTED_VALUE` is (a run of body characters, or of backslashes, is one step: a step per backslash
 // cost 50 ms on 100 KB of them); the name, the context, the key's quote and the gaps are bounded,
@@ -107,12 +110,9 @@ const SECRET_KEY_VALUE_PATTERN = new RegExp(
 // name, so the scan pays for it only at the word `cookie`. A value that needs a check the pattern
 // cannot make without backtracking (see `redactCookieValue`) is read whole and judged afterwards.
 const COOKIE_NAME = "(?:Set-)?Cookie";
-// Behind the name: a line start (the text's, a raw line break, or the escape of one: `\n` ends in a
-// letter), with the indent and the marker of a `curl -v` trace (`> Cookie:`, `< Set-Cookie:`) or a
-// list (`- Cookie:`); a quote, which is a JSON key, a `-H "Cookie: ..."` argument, or JSON text in
-// JSON text (`\"Cookie\"`); a Markdown inline-code backtick (a header quoted in prose or a log); an object or argument list (`{ cookie: 'a=b' }`, Node's inspect shape);
-// or an unquoted `-H` / `--header` argument.
-const COOKIE_CONTEXT = String.raw`(?:(?:^|[\r\n]|\\[nr])[ \t]{0,16}(?:[<>*-][ \t]{0,4})?|["'\x60{,][ \t]{0,8}|(?:-H|--header)[ =])`;
+// Behind the name: the start of the text, a character that cannot be part of a longer name, or the
+// escape of a line break in JSON text (`\n` ends in a letter).
+const COOKIE_CONTEXT = String.raw`(?:^|[^\w-]|\\[nr])`;
 const COOKIE_KEY_QUOTE = String.raw`(?:\\{0,${ESCAPE_RUN_MAX}}["'])`;
 const COOKIE_HEADER_PATTERN = new RegExp(
   String.raw`(${COOKIE_NAME}(?<=${COOKIE_CONTEXT}${COOKIE_NAME})${COOKIE_KEY_QUOTE}?[ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})` +
@@ -122,6 +122,8 @@ const COOKIE_HEADER_PATTERN = new RegExp(
 
 /** A value that stays as it is: none (only spaces, or an array with nothing in it), or `[redacted]`. */
 const UNTOUCHED_COOKIE_VALUE = /^\s*(?:$|\[\s*\]?$|\[redacted\])/;
+/** A header value: a `name=value` pair first, or a list (`[...]`, Node's and Go's shapes). */
+const COOKIE_HEADER_VALUE = /^\s*(?:\[|[^\s=;,"'\\[\]]+=)/;
 
 /**
  * What a matched cookie header becomes. The match runs to the end of the header whatever the value
@@ -136,7 +138,7 @@ function redactCookieValue(match: string, prefix: string, opener: string | undef
   // replace with another one, so `??` and `||` agree.
   const quote = opener ?? "";
   const value = match.slice(prefix.length + quote.length);
-  if (UNTOUCHED_COOKIE_VALUE.test(value)) return match;
+  if (UNTOUCHED_COOKIE_VALUE.test(value) || !COOKIE_HEADER_VALUE.test(value)) return match;
   return `${prefix}${quote}${REDACTED}`;
 }
 

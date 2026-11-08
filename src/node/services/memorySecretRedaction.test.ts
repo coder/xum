@@ -408,17 +408,36 @@ describe("redactSecretLike", () => {
     });
 
     // The memory-write guard reuses this detector: a note that explains a cookie must stay writable.
-    // The name is a header only where a header starts, not after any word of a sentence.
+    // What marks a header is its value (`name=value`), so a sentence with words after the colon stays.
     it("leaves a sentence that has `cookie:` in the middle of it readable", () => {
       const text = [
         "Note on the cookie: it expires after an hour.",
         "Session cookie: HttpOnly and Secure flags are set by the login route.",
         "Remember: the Set-Cookie: header only reaches the browser over HTTPS.",
-        `The cookie: a=${SESSION}`,
       ].join("\n");
 
       expect(redactSecretLike(text)).toBe(text);
       expect(containsSecretLike(text)).toBe(false);
+    });
+
+    // A cookie pair is a credential wherever the header sits: the frames a tool or a model wraps it
+    // in (Markdown, a numbered list, one line of several headers, Go's map print) do not matter.
+    it.each([
+      ["Markdown emphasis in a list", `- **Cookie: sid=${SESSION}**`, "- **Cookie: [redacted]"],
+      ["a numbered list", `1. Cookie: sid=${SESSION}`, "1. Cookie: [redacted]"],
+      [
+        "several headers on one line",
+        `Host: x; Cookie: a=${SESSION}`,
+        "Host: x; Cookie: [redacted]",
+      ],
+      [
+        "Go's map print",
+        `map[Accept:[*/*] Cookie:[a=${SESSION}]]`,
+        "map[Accept:[*/*] Cookie:[redacted]]",
+      ],
+      ["a sentence", `The cookie: a=${SESSION}`, "The cookie: [redacted]"],
+    ])("redacts a cookie pair in %s", (_label, text, expected) => {
+      expect(redactSecretLike(text)).toBe(expected);
     });
 
     // A redacted header read back (the model's own notes quote what it read) is not a new credential,
