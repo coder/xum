@@ -1333,10 +1333,8 @@ describe("BackupSection", () => {
       fireEvent.change(canvas.getByLabelText("Repository URL"), { target: { value } });
     }
     await canvas.findByText("Unsaved changes");
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    });
 
+    // A rerun of the reload effect calls both during the commit, so nothing is left to wait for.
     expect(getSettings?.mock.calls.length).toBe(readsBefore);
     expect(onConfigChanged?.mock.calls.length).toBe(streamsBefore);
   });
