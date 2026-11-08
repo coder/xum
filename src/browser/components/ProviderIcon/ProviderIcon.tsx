@@ -102,7 +102,6 @@ export interface ProviderWithIconProps {
 
 /**
  * Renders a provider name with its icon.
- * Custom providers use the neutral fallback icon.
  */
 export function ProviderWithIcon(props: ProviderWithIconProps) {
   const name = props.displayName
