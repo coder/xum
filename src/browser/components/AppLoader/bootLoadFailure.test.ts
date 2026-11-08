@@ -4,6 +4,7 @@ import { cleanup, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import * as vm from "node:vm";
 import { installDom } from "../../../../tests/ui/dom";
 
 // index.html's boot-load-failure script is the only code that can run when the app's module graph
@@ -39,7 +40,8 @@ function addBootScreen(): void {
 }
 
 function runBootScript(): void {
-  new Function("window", "document", "location", scriptSource)(window, document, window.location);
+  // Like the browser, give the script the page's own window, document and location as globals.
+  vm.runInNewContext(scriptSource, { window, document, location: window.location });
 }
 
 function bootPage(): void {
@@ -138,7 +140,8 @@ describe("boot screen load failure", () => {
       expect(event.defaultPrevented).toBe(false);
     });
 
-    // A failed preload is not a failed load: the module script asks for the file again itself.
+    // Only the module script element's own error says a module failed to load: a failed preload
+    // hint is not that, and the script that needs the file then fails on its own.
     test("a script that is not a module, a stylesheet or a preload that fails to load", () => {
       bootPage();
 

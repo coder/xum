@@ -14,7 +14,8 @@
 // token and the replacement of control characters still run over everything this process prints or
 // writes, as a second layer: a container's stdout and stderr land in the Docker daemon's log.
 //
-// Exit codes: 0 captured. 1 failed. 3 the page shows "<name> failed to load." (as `idle`).
+// Exit codes: 0 captured. 1 failed. 3 the page shows "<name> failed to load." or the boot screen's
+// "Xum could not load" (as `idle`).
 // 4 WebKit did not launch here: the caller tries the next mode.
 import { createRequire } from "node:module";
 import * as fs from "node:fs";

@@ -162,7 +162,12 @@
       }
 
       .boot-loader__button:hover {
-        background: var(--color-accent-button-hover, hsl(207 100% 34%));
+        background: var(--color-accent-button-hover, hsl(207 100% 37%));
+      }
+
+      :root[data-theme="light"] .boot-loader__button:hover,
+      :root[data-theme$="-light"] .boot-loader__button:hover {
+        background: var(--color-accent-button-hover, hsl(207 90% 38%));
       }
 
       .boot-loader__button:focus-visible {
@@ -283,11 +288,16 @@
       // of that graph fails to load (a network error, or a 404 for a chunk that a new deploy
       // replaced), the browser runs none of the graph: not React, not the app's components, not
       // its keybinds. So this plain script, which imports nothing, is the only code that can tell
-      // the user. It swaps "Loading Xum" for a reload prompt, and it reports only load failures:
+      // the user. It swaps "Loading Xum" for a reload prompt when the browser reports a module that
+      // did not load:
       //   - a module script element's error event: the entry or one of its static imports
       //     failed to load. A syntax error or a throw while a module runs is an error event on
-      //     the window, not on the element, so a real runtime error never passes as a load failure.
-      //   - Vite's vite:preloadError (production builds): a dynamic import or its preload failed.
+      //     the window, not on the element, so a runtime error in the static graph never passes
+      //     as a load failure. (The dev server answers a module that Vite cannot transform with
+      //     HTTP 500, which the browser reports as a failed load too.)
+      //   - Vite's vite:preloadError (production builds): a dynamic import or its preload was
+      //     rejected. Vite raises it for every rejection of the import, a module that throws as
+      //     it runs included.
       // It never cancels an event, so the browser and the app's handlers still see every error.
       // It does nothing once the app replaced the boot screen: from then on the app's own
       // boundaries show load failures. A slow load raises neither event, so a slow load shows

@@ -6,8 +6,8 @@ import indexHtml from "virtual:index-html";
 // The boot screen when the app's module graph fails to load. Nothing in that graph can run then,
 // React included, so this state is index.html's own markup, style and script, not a component.
 // The story builds it from index.html itself and fails a module script the way a browser does, so
-// it cannot drift from what ships. Pixel skips it (the snapshot budget is deliberate); the screens
-// at phone and desktop width are in the PR that added it.
+// it cannot drift from what ships. Pixel skips it (the snapshot budget is deliberate): the Desktop
+// and Phone stories show the screen at both widths.
 const meta: Meta = {
   ...lightweightMeta,
   title: "Components/AppLoader/BootLoadFailure",
