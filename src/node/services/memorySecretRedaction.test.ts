@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { containsSecretLike, redactSecretLike } from "./memorySecretRedaction";
+import { addsSecretLike, containsSecretLike, redactSecretLike } from "./memorySecretRedaction";
 
 /** CPU time (user + system) that `run` takes: unlike wall-clock time, a busy host cannot inflate it. */
 function cpuMs(run: () => void): number {
@@ -707,5 +707,35 @@ describe("containsSecretLike", () => {
     expect(containsSecretLike(`key sk-${"k3J9".repeat(6)}`)).toBe(true);
     expect(containsSecretLike("The token budget resets each turn; max_tokens: 4096.")).toBe(false);
     expect(containsSecretLike("Auth uses a password manager and a bearer scheme.")).toBe(false);
+  });
+});
+
+describe("addsSecretLike", () => {
+  const KEY = "sk-ABCDEFGHIJKLMNO";
+
+  it("flags an edit that swaps one credential for another, which keeps their count", () => {
+    expect(addsSecretLike(`password: old-secret\nsk-\nABCDEFGHIJKLMNO\n`, `${KEY}\n`)).toBe(true);
+  });
+
+  it("flags a second copy of a credential the file held once", () => {
+    expect(addsSecretLike(`${KEY}\n`, `${KEY}\n${KEY}\n`)).toBe(true);
+  });
+
+  it("flags a changed cookie value, which the cookie pass reads before the others", () => {
+    expect(addsSecretLike("Cookie: session=one\n", "Cookie: session=two\n")).toBe(true);
+  });
+
+  it("passes edits that keep, move or remove the credentials a file held", () => {
+    const held = `notes\n${KEY}\nCookie: session=one\npassword: hunter2-correct-horse\n`;
+    expect(addsSecretLike(held, held.replace("notes", "more notes"))).toBe(false);
+    expect(
+      addsSecretLike(held, `password: hunter2-correct-horse\nCookie: session=one\n${KEY}\n`)
+    ).toBe(false);
+    expect(addsSecretLike(held, "notes\n")).toBe(false);
+    expect(addsSecretLike("", "notes about token budgets\n")).toBe(false);
+  });
+
+  it("flags an edit inside a matched value, the accepted false refusal", () => {
+    expect(addsSecretLike('password: "old words"\n', 'password: "new words"\n')).toBe(true);
   });
 });
