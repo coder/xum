@@ -5,8 +5,12 @@ import * as nodeFs from "node:fs";
 import { parse as jsoncParse, type ParseError as JsoncParseError } from "jsonc-parser";
 import * as os from "os";
 import * as path from "path";
+import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { Config } from "@/node/config";
-import { withProjectRegistrationFileLock } from "@/node/config/projectRegistrationLock";
+import {
+  withProjectRegistrationFileLock,
+  type ProjectRegistrationLockHandle,
+} from "@/node/config/projectRegistrationLock";
 import { log } from "@/node/services/log";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
@@ -1236,6 +1240,8 @@ describe("WorkspaceMcpOverridesService", () => {
       };
       const legacySpy = spyOn(internals, "getLegacyOverridesFromConfig");
       const editSpy = spyOn(cfg, "editConfig");
+      // The legacy clear edits through editConfigIfChanged.
+      const changedEditSpy = spyOn(cfg, "editConfigIfChanged");
       const realpathSpy = spyOn(fsPromisesModule, "realpath");
       try {
         await service.setOverridesForWorkspace("written", overrides, {
@@ -1245,13 +1251,14 @@ describe("WorkspaceMcpOverridesService", () => {
         const unrelatedDirs = unrelated.map((entry) => entry.dir);
         return {
           legacyLookups: legacySpy.mock.calls.length,
-          configEdits: editSpy.mock.calls.length,
+          configEdits: editSpy.mock.calls.length + changedEditSpy.mock.calls.length,
           unrelatedRealpaths: realpathSpy.mock.calls.filter(([target]) =>
             isInside(target, unrelatedDirs)
           ).length,
         };
       } finally {
         realpathSpy.mockRestore();
+        changedEditSpy.mockRestore();
         editSpy.mockRestore();
         legacySpy.mockRestore();
       }
@@ -1587,6 +1594,178 @@ describe("WorkspaceMcpOverridesService", () => {
         .flatMap((project) => project.workspaces)
         .find((w) => w.id === "locked-legacy");
       expect(stored?.mcp).toBeUndefined();
+    });
+
+    const storedLegacy = (workspaceId: string) =>
+      [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((w) => w.id === workspaceId)?.mcp;
+    /**
+     * Wraps the service's legacy clears (config.editConfigIfChanged): `before` runs as the clear
+     * is called, `after` once its edit is done. Calls count from 1.
+     */
+    const spyLegacyClears = (hooks: {
+      before?: (call: number) => void;
+      after?: (call: number) => Promise<void>;
+    }) => {
+      const editIfChanged = config.editConfigIfChanged.bind(config);
+      let calls = 0;
+      return spyOn(config, "editConfigIfChanged").mockImplementation(async (fn) => {
+        const call = ++calls;
+        hooks.before?.(call);
+        await editIfChanged(fn);
+        await hooks.after?.(call);
+      });
+    };
+
+    it("a legacy clear that finds nothing to clear leaves config.json unwritten", async () => {
+      // Every save clears its legacy value. A clear with nothing to clear rewrote the whole
+      // config.json: at 7,550 workspaces each save re-serialized the registry.
+      const changedDir = path.join(tempDir, "changed-legacy");
+      await registerLocalWorkspaces(config, [
+        { dir: path.join(tempDir, "no-legacy-save"), id: "no-legacy-save" },
+        { dir: changedDir, id: "changed-legacy" },
+      ]);
+      const legacy = { enabledServers: ["shots"] };
+      await config.editConfig((cfg) => {
+        const entry = cfg.projects.get(changedDir)?.workspaces[0];
+        if (entry) entry.mcp = legacy;
+        return cfg;
+      });
+      const service = new WorkspaceMcpOverridesService(config);
+      const internals = service as unknown as {
+        clearLegacyOverridesInConfig: (
+          workspaceId: string,
+          options?: { onlyIfEquals?: { enabledServers?: string[] } }
+        ) => Promise<void>;
+      };
+      const saveSpy = spyOn(
+        config as unknown as { saveConfig: (cfg: unknown) => unknown },
+        "saveConfig"
+      );
+      try {
+        await service.setOverridesForWorkspace(
+          "no-legacy-save",
+          { disabledServers: ["shots"] },
+          { publish: () => Promise.resolve(), hasSnapshot: () => false }
+        );
+        // An id the registry does not list, and a value that changed since it was read.
+        await internals.clearLegacyOverridesInConfig("not-registered");
+        await internals.clearLegacyOverridesInConfig("changed-legacy", {
+          onlyIfEquals: { enabledServers: ["other"] },
+        });
+        expect(saveSpy).not.toHaveBeenCalled();
+      } finally {
+        saveSpy.mockRestore();
+      }
+      expect(storedLegacy("changed-legacy")).toEqual(legacy);
+    });
+
+    const saveKinds: Array<{ kind: string; overrides: WorkspaceMCPOverrides }> = [
+      { kind: "write", overrides: { disabledServers: ["shots"] } },
+      { kind: "clear", overrides: {} },
+    ];
+    it.each(saveKinds)(
+      "a settings $kind's legacy clear sees a value another process commits under the config lock",
+      async ({ kind, overrides }) => {
+        // The clear decides under the config lock (see clearLegacyOverridesInConfig). A save
+        // that looked for a legacy value before it took the lock skipped the clear, and a value
+        // that a downgraded Xum committed meanwhile came back over the user's save.
+        const id = `save-locked-legacy-${kind}`;
+        const dir = path.join(tempDir, id);
+        await registerLocalWorkspaces(config, [{ dir, id }]);
+        const service = new WorkspaceMcpOverridesService(config);
+        const clearCalled = Promise.withResolvers<void>();
+        const spy = spyLegacyClears({ before: () => clearCalled.resolve() });
+        try {
+          let saving: Promise<void> | undefined;
+          await withProjectRegistrationFileLock(config.rootDir, async (lock) => {
+            saving = service.setOverridesForWorkspace(id, overrides, {
+              publish: () => Promise.resolve(),
+              hasSnapshot: () => false,
+            });
+            // The save's clear waits for this hold. A save that skips the clear ends instead.
+            await Promise.race([clearCalled.promise, saving]);
+            await config.editConfig(
+              (cfg) => {
+                const entry = cfg.projects.get(dir)?.workspaces[0];
+                if (entry) entry.mcp = { enabledServers: ["shots"] };
+                return cfg;
+              },
+              { withinRegistrationLock: lock }
+            );
+          });
+          await saving;
+        } finally {
+          spy.mockRestore();
+        }
+        expect(storedLegacy(id)).toBeUndefined();
+      }
+    );
+
+    it("a sharer's legacy value that another process sets again during the save is still retired", async () => {
+      // The save retires a sharer's legacy value under the config lock as well. Another process
+      // clears that value after the writer's own clear, and sets a new one before it releases
+      // the lock: a save that looked for the value before it took the lock skipped the sharer.
+      const realDir = path.join(tempDir, "retire-race-real");
+      const aliasDir = path.join(tempDir, "retire-race-alias");
+      await fs.mkdir(realDir, { recursive: true });
+      await fs.symlink(realDir, aliasDir);
+      await registerLocalWorkspaces(config, [
+        { dir: realDir, id: "retire-race-writer" },
+        { dir: aliasDir, id: "retire-race-sharer" },
+      ]);
+      const setSharerLegacy = (
+        value: { enabledServers: string[] } | undefined,
+        lock?: ProjectRegistrationLockHandle
+      ) =>
+        config.editConfig(
+          (cfg) => {
+            const entry = cfg.projects.get(aliasDir)?.workspaces[0];
+            if (entry && value === undefined) delete entry.mcp;
+            else if (entry) entry.mcp = value;
+            return cfg;
+          },
+          lock === undefined ? undefined : { withinRegistrationLock: lock }
+        );
+      await setSharerLegacy({ enabledServers: ["shots"] });
+      const service = new WorkspaceMcpOverridesService(config);
+      const held = Promise.withResolvers<ProjectRegistrationLockHandle>();
+      const release = Promise.withResolvers<void>();
+      const sharerClearCalled = Promise.withResolvers<void>();
+      let holding: Promise<void> | undefined;
+      const spy = spyLegacyClears({
+        before: (call) => {
+          if (call === 2) sharerClearCalled.resolve();
+        },
+        after: async (call) => {
+          if (call !== 1) return;
+          // The writer's own clear is done: the other process takes the lock.
+          holding = withProjectRegistrationFileLock(config.rootDir, async (lock) => {
+            held.resolve(lock);
+            await release.promise;
+          });
+          await setSharerLegacy(undefined, await held.promise);
+        },
+      });
+      try {
+        const saving = service.setOverridesForWorkspace(
+          "retire-race-writer",
+          { disabledServers: ["shots"] },
+          { publish: () => Promise.resolve(), hasSnapshot: () => false }
+        );
+        // The sharer's clear waits for the hold. A save that skips the sharer ends instead.
+        await Promise.race([sharerClearCalled.promise, saving]);
+        await setSharerLegacy({ enabledServers: ["late"] }, await held.promise);
+        release.resolve();
+        await holding;
+        await saving;
+      } finally {
+        release.resolve();
+        await holding;
+        spy.mockRestore();
+      }
+      expect(storedLegacy("retire-race-sharer")).toBeUndefined();
     });
   });
 

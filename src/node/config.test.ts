@@ -6,7 +6,12 @@ import * as fs from "fs";
 import cjsFs from "fs";
 import * as os from "os";
 import { log } from "@/node/services/log";
-import { CONFIG_TREE_FIELDS, Config, MAX_LOGGED_METADATA_LOAD_FAILURES } from "./config";
+import {
+  CONFIG_TREE_FIELDS,
+  CONFIG_UNCHANGED,
+  Config,
+  MAX_LOGGED_METADATA_LOAD_FAILURES,
+} from "./config";
 import {
   projectRegistrationLockFilePath,
   withProjectRegistrationLock,
@@ -3908,6 +3913,35 @@ describe("Config", () => {
       await otherProcess[Symbol.asyncDispose]();
       await waiting;
       expect(calls).toBe(2);
+    });
+
+    it("editConfigIfChanged writes nothing for an unchanged config, with or without waiting for the lock", async () => {
+      // Every MCP settings save clears its legacy config.json value through this. An edit that
+      // changed nothing still rewrote the whole file: at 7,550 workspaces, each save
+      // re-serialized the registry.
+      const saveConfig = spyOn(
+        config as unknown as { saveConfig: (cfg: unknown) => unknown },
+        "saveConfig"
+      );
+      await config.editConfigIfChanged(() => CONFIG_UNCHANGED);
+      expect(saveConfig).not.toHaveBeenCalled();
+
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      const waiting = config.editConfigIfChanged(() => CONFIG_UNCHANGED);
+      // Long enough for the edit to step out of the queue and wait for the lock.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await otherProcess[Symbol.asyncDispose]();
+      await waiting;
+      expect(saveConfig).not.toHaveBeenCalled();
+
+      // A changed config is written as by editConfig.
+      await config.editConfigIfChanged((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
+      expect(saveConfig).toHaveBeenCalledTimes(1);
+      expect(new Config(tempDir).loadConfigOrDefault().heartbeatDefaultIntervalMs).toBe(360_000);
     });
   });
 

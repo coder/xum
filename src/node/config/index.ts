@@ -1818,6 +1818,17 @@ function configFileWatchDirsKey(dirs: ReadonlyMap<string, ReadonlySet<string>>):
   return JSON.stringify(Array.from(dirs, ([dir, names]) => [dir, Array.from(names)]));
 }
 
+/**
+ * Returned by an editConfig transform that changed nothing: the edit then writes nothing. The
+ * transform runs under the edit's lock on the bytes a write would replace, so the decision is
+ * made inside the same hold (a check read before the lock can miss another process's commit).
+ */
+export const CONFIG_UNCHANGED: unique symbol = Symbol("config unchanged");
+/** An editConfig transform (see CONFIG_UNCHANGED). */
+export type ConfigEditTransform = (
+  config: ProjectsConfig
+) => ProjectsConfig | typeof CONFIG_UNCHANGED;
+
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
@@ -3645,6 +3656,14 @@ export class Config {
   }
 
   /**
+   * editConfig for a transform that may find nothing to change: returning CONFIG_UNCHANGED writes
+   * nothing. An edit that changes nothing otherwise still rewrites the whole config.json.
+   */
+  async editConfigIfChanged(fn: ConfigEditTransform): Promise<void> {
+    return this.enqueueGatedConfigEdit(fn);
+  }
+
+  /**
    * The cross-process gate for an edit issued outside any registration window; shared by
    * editConfig and the load-time migration persist (which must not call the public, commonly
    * spied editConfig). Every edit persists the whole config, project map included, from the
@@ -3652,9 +3671,7 @@ export class Config {
    * cross-process lock or a registration another process makes in between is silently
    * dropped by this process's save — even by an edit that never touched the project set.
    */
-  private async enqueueGatedConfigEdit(
-    fn: (config: ProjectsConfig) => ProjectsConfig
-  ): Promise<void> {
+  private async enqueueGatedConfigEdit(fn: ConfigEditTransform): Promise<void> {
     // Straight into the queue, in call order: the edit takes its own hold of the file lock
     // inside its slot, at write time. When the lock is held elsewhere — another process, or
     // a restore, import, or create window in this one — the edit fails the slot before
@@ -3675,7 +3692,7 @@ export class Config {
    * for it, and records the chain's new tail. Called synchronously from the edit's queue
    * slot, so the chain order is the slot order.
    */
-  private joinLockWaiters(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
+  private joinLockWaiters(fn: ConfigEditTransform): Promise<void> {
     const rerun = (this.lockWaiters ?? Promise.resolve()).then(() =>
       withProjectRegistrationFileLock(this.rootDir, (lock) =>
         this.enqueueConfigEdit(fn, { kind: "held", lock })
@@ -4061,7 +4078,7 @@ export class Config {
    * detail rather than a caller-initiated mutation.
    */
   private enqueueConfigEdit(
-    fn: (config: ProjectsConfig) => ProjectsConfig,
+    fn: ConfigEditTransform,
     registrationLock: RegistrationLockState
   ): Promise<void> {
     // Defer the fiber start to a microtask: Effect.runPromise executes fibers
@@ -4086,7 +4103,7 @@ export class Config {
    * fiber cancelled while waiting never runs its edit).
    */
   private enqueueConfigEditEffect(
-    fn: (config: ProjectsConfig) => ProjectsConfig,
+    fn: ConfigEditTransform,
     registrationLock: RegistrationLockState
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
@@ -4100,7 +4117,7 @@ export class Config {
     // bytes this edit did not read (#5929). A rename between this stat and the read only makes
     // the save refuse (fail closed), never overwrite.
     let readStatKey: string | undefined;
-    const transform = (): ProjectsConfig => {
+    const transform = (): ProjectsConfig | typeof CONFIG_UNCHANGED => {
       readStatKey = self.readEditStatKey();
       return fn(self.readConfigOrDefault({ keepSnapshot: true }));
     };
@@ -4147,6 +4164,7 @@ export class Config {
               },
               catch: (error) => error,
             });
+            if (newConfig === CONFIG_UNCHANGED) return;
             return yield* write(newConfig, registrationLock.lock);
           }
           // The gate runs here, before any lock work, so an unreadable config is refused for
@@ -4174,7 +4192,8 @@ export class Config {
               await using lock = await tryProjectRegistrationFileLock(self.rootDir);
               if (lock === null)
                 throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
-              await Effect.runPromise(write(transform(), lock));
+              const newConfig = transform();
+              if (newConfig !== CONFIG_UNCHANGED) await Effect.runPromise(write(newConfig, lock));
             },
             catch: (error) => error,
           });
