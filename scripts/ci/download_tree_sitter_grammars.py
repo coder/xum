@@ -6,18 +6,22 @@ for minutes on 2026-11-08.
 
 The pack loads its grammars as native libraries, so bytes in its cache directory run as
 code. CI cannot trust a restored cache (a crafted entry can put any file in the pack's
-directory), so every run, on a cache hit or miss, does this:
+directory), so a CI run sets GRAMMAR_STAGE_DIR, the directory that CI caches, and every run,
+on a cache hit or miss, does this:
 
 1. Wipe the pack's version directory ("pack root"), which holds whatever any cache or
    earlier run left there.
-2. Copy the pinned manifest and bundle from the stage directory (the directory CI caches)
-   into the pack root, and keep them only if both match the sha256 pins below.
+2. Copy the pinned manifest and bundle from the stage directory into the pack root, and keep
+   them only if both match the sha256 pins below.
 3. Run the pack's download. With a verified manifest and bundle in place it extracts the
    grammars from them with no network. Without them it downloads both.
 4. Check the manifest and bundle in the pack root against the pins again. A mismatch is
    fatal: the release changed, or the pins are wrong, and no retry fixes that.
 5. If the stage held no verified files, rebuild it from the pack root, so the cache save
    stores exactly the two verified files and nothing else.
+
+Without GRAMMAR_STAGE_DIR (a local run) nothing is wiped and nothing is written outside the
+pack's own directory: the script runs the pack's download and does step 4.
 
 To bump tree-sitter-language-pack: change the version in pyproject.toml, then set RELEASE
 and PINS below from the release's parsers.json (the pack's manifest) and its bundles.
@@ -71,9 +75,8 @@ PINS = Pins(
     },
 )
 
-# The directory that CI caches (.github/workflows/pr.yml, "Restore tree-sitter grammars").
-# It holds manifest.json and bundles/<bundle name> and nothing else.
-DEFAULT_STAGE_DIR = "~/.cache/xum-tree-sitter-grammars"
+# The stage directory (GRAMMAR_STAGE_DIR) holds manifest.json and bundles/<bundle name> and
+# nothing else.
 MANIFEST_NAME = "manifest.json"
 BUNDLES_DIR = "bundles"
 
@@ -154,18 +157,25 @@ def pack_root() -> Path:
     return root
 
 
-def run(pins: Pins, platform_name: str, stage: Path) -> int:
-    root = pack_root()
+def restore_from_stage(pins: Pins, platform_name: str, stage: Path, root: Path) -> bool:
+    """Leave `root` holding the stage's copy of the pinned files. True when both match their
+    pins. Otherwise `root` is empty and the caller downloads."""
     reset_dir(root)
     copy_pinned_files(pins, platform_name, stage, root)
-    staged = is_verified(pins, platform_name, root)
-    if not staged:
-        if stage.exists():
-            print(
-                f"::warning::{stage} does not hold the pinned tree-sitter grammars; downloading them",
-                file=sys.stderr,
-            )
-        reset_dir(root)
+    if is_verified(pins, platform_name, root):
+        return True
+    if stage.exists():
+        print(
+            f"::warning::{stage} does not hold the pinned tree-sitter grammars; downloading them",
+            file=sys.stderr,
+        )
+    reset_dir(root)
+    return False
+
+
+def run(pins: Pins, platform_name: str, stage: Path | None) -> int:
+    root = pack_root()
+    staged = stage is not None and restore_from_stage(pins, platform_name, stage, root)
     try:
         download(LANGUAGES)
     except DownloadError as err:
@@ -174,11 +184,12 @@ def run(pins: Pins, platform_name: str, stage: Path) -> int:
     if not is_verified(pins, platform_name, root):
         print(
             f"::error::the tree-sitter-language-pack {pins.release} manifest or bundle for {platform_name} "
-            "does not match the pinned sha256 (see scripts/ci/download_tree_sitter_grammars.py)",
+            f"in {root} is missing or does not match the pinned sha256 (a local run: delete that "
+            "directory and run again; otherwise see scripts/ci/download_tree_sitter_grammars.py)",
             file=sys.stderr,
         )
         return FATAL_EXIT
-    if not staged:
+    if stage is not None and not staged:
         reset_dir(stage)
         copy_pinned_files(pins, platform_name, root, stage)
     return 0
@@ -193,8 +204,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return UNSUPPORTED_EXIT
-    stage = Path(os.environ.get("GRAMMAR_STAGE_DIR") or DEFAULT_STAGE_DIR).expanduser()
-    return run(PINS, platform_name, stage)
+    stage = os.environ.get("GRAMMAR_STAGE_DIR")
+    return run(PINS, platform_name, Path(stage).expanduser() if stage else None)
 
 
 if __name__ == "__main__":

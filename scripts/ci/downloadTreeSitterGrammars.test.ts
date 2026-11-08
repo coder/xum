@@ -66,7 +66,8 @@ import download_tree_sitter_grammars as m
 mode = os.environ["HARNESS_MODE"]
 if mode == "run":
     pins = m.Pins(**json.loads(os.environ["PINS_JSON"]))
-    sys.exit(m.run(pins, os.environ["PLATFORM"], Path(os.environ["STAGE"])))
+    stage = os.environ.get("STAGE")
+    sys.exit(m.run(pins, os.environ["PLATFORM"], Path(stage) if stage else None))
 platform.system = lambda: os.environ["FAKE_SYSTEM"]
 platform.machine = lambda: os.environ["FAKE_MACHINE"]
 if mode == "platform":
@@ -123,6 +124,8 @@ function harness(mode: string, env: Record<string, string>): Promise<RunResult> 
       STUB_RELEASE: path.join(work, "release"),
       STUB_BUNDLE_NAME: BUNDLE_NAME,
       STUB_ERROR: "",
+      // A stage directory only where a test asks for one: CI sets this variable.
+      GRAMMAR_STAGE_DIR: "",
       ...env,
     },
   });
@@ -130,13 +133,13 @@ function harness(mode: string, env: Record<string, string>): Promise<RunResult> 
 
 // run() with pins for the stub's release bytes, unless a test passes other pins.
 function download(
-  options: { error?: string; pins?: { manifest: string; bundle: string } } = {}
+  options: { error?: string; pins?: { manifest: string; bundle: string }; stage?: boolean } = {}
 ): Promise<RunResult> {
   const pins = options.pins ?? { manifest: MANIFEST_BYTES, bundle: BUNDLE_BYTES };
   return harness("run", {
     STUB_ERROR: options.error ?? "",
     PLATFORM,
-    STAGE: dirs.stage,
+    STAGE: options.stage === false ? "" : dirs.stage,
     PINS_JSON: JSON.stringify({
       release: "v1",
       manifest_sha256: sha256(pins.manifest),
@@ -241,6 +244,28 @@ describe.skipIf(Bun.which("python3") === null)("download_tree_sitter_grammars.py
     expect(await readdir(victim)).toEqual([]);
   });
 
+  describe("a local run, with no stage directory", () => {
+    test("downloads and checks the pins, but wipes nothing and writes no stage", async () => {
+      await mkdir(dirs.packRoot, { recursive: true });
+      const planted = path.join(dirs.packRoot, "planted.json");
+      await writeFile(planted, "kept");
+      const result = await download({ stage: false });
+      expect(result.exitCode).toBe(0);
+      expect(await packCalls()).toEqual([`network:${LANGUAGES}`]);
+      expect(await readFile(planted, "utf8")).toBe("kept");
+      expect(existsSync(dirs.stage)).toBe(false);
+    });
+
+    test("still fails closed with 64 on a download that does not match the pins", async () => {
+      const result = await download({
+        stage: false,
+        pins: { manifest: MANIFEST_BYTES, bundle: "other bundle" },
+      });
+      expect(result.exitCode).toBe(64);
+      expect(result.stderr).toContain("does not match the pinned sha256");
+    });
+  });
+
   test("a download that does not match the pins fails closed with 64 and stages nothing", async () => {
     const result = await download({ pins: { manifest: MANIFEST_BYTES, bundle: "other bundle" } });
     expect(result.exitCode).toBe(64);
@@ -309,6 +334,27 @@ describe.skipIf(Bun.which("python3") === null)("download_tree_sitter_grammars.py
         pins: { bundle_sha256: Record<string, string> };
       };
       expect(new Set(Object.keys(pins.bundle_sha256))).toEqual(named);
+    });
+
+    test("main() takes the stage directory from GRAMMAR_STAGE_DIR, and uses none without it", async () => {
+      // The stub fails its download, so the run ends with exit 1 right after the part that
+      // differs: a stage directory makes the script wipe the pack's directory first.
+      const env = {
+        FAKE_SYSTEM: "Linux",
+        FAKE_MACHINE: "x86_64",
+        STUB_ERROR: "Download error: connection reset by peer",
+      };
+      await mkdir(dirs.packRoot, { recursive: true });
+      const planted = path.join(dirs.packRoot, "planted.json");
+      await writeFile(planted, "planted bytes");
+
+      const local = await harness("main", env);
+      expect(local.exitCode).toBe(1);
+      expect(existsSync(planted)).toBe(true);
+
+      const ci = await harness("main", { ...env, GRAMMAR_STAGE_DIR: dirs.stage });
+      expect(ci.exitCode).toBe(1);
+      expect(existsSync(planted)).toBe(false);
     });
 
     test("a platform without a pin exits 2 before the pack is touched", async () => {

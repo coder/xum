@@ -15,6 +15,7 @@ import { parse } from "yaml";
 
 const ROOT = path.resolve(import.meta.dir, "../..");
 const HOME = "/home/runner";
+const RUNNER_TEMP = "/home/runner/work/_temp";
 
 interface CacheStep {
   file: string;
@@ -63,6 +64,9 @@ function resolvePath(raw: string, fileText: string): string {
       throw new Error("electron_config_cache is not set in the file that uses it");
     }
     return resolvePath(line[1].replace("$HOME", "~"), fileText);
+  }
+  if (raw.startsWith("${{ runner.temp }}/")) {
+    return path.posix.normalize(RUNNER_TEMP + raw.slice("${{ runner.temp }}".length));
   }
   if (raw.includes("${{")) {
     throw new Error(`cannot resolve cache path ${raw}`);
@@ -254,14 +258,17 @@ describe("the download caches of the CI tools", () => {
     }
   });
 
-  test("the grammar cache is the stage directory that the download script fills", () => {
-    const script = readFileSync(
-      path.join(ROOT, "scripts/ci/download_tree_sitter_grammars.py"),
-      "utf8"
+  test("the grammar cache is the stage directory that the Download step hands the script, under the runner's temp directory", () => {
+    const workflow = parse(readFileSync(path.join(ROOT, ".github/workflows/pr.yml"), "utf8")) as {
+      jobs: Record<string, { steps: { name?: string; env?: Record<string, unknown> }[] }>;
+    };
+    const download = workflow.jobs["static-check"].steps.find(
+      (step) => step.name === "Download tree-sitter grammars"
     );
-    const stage = /DEFAULT_STAGE_DIR = "([^"]+)"/.exec(script)?.[1];
-    expect(stage).toBe("~/.cache/xum-tree-sitter-grammars");
+    const stage = text(download?.env?.GRAMMAR_STAGE_DIR);
+    expect(stage).not.toBe("");
     const step = guardedSteps.find((s) => s.keyPrefix.startsWith("tree-sitter-grammars-v"));
-    expect(step?.paths).toEqual([resolvePath(stage ?? "", "")]);
+    expect(step?.paths).toEqual([resolvePath(stage, "")]);
+    expect(step?.paths[0].startsWith(`${RUNNER_TEMP}/`)).toBe(true);
   });
 });
