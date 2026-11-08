@@ -1,8 +1,15 @@
 import { z } from "zod";
 import {
+  hasUrlCredentials,
   SettingsBackupInputSchema,
   SettingsBackupSchema,
+  UNSAFE_URL_CHARACTERS,
 } from "@/common/config/schemas/settingsBackup";
+import {
+  AgentPluginGitSourceSchema,
+  AgentPluginInstallEntrySchema,
+} from "@/common/config/schemas/agentPluginInstalls";
+import { pointsAtThisMachine } from "@/common/utils/agentPluginSource";
 import { ResultSchema } from "./result";
 
 /**
@@ -49,6 +56,134 @@ export const BackupProjectImportResultSchema = z.object({
   registered: z.boolean(),
 });
 
+/**
+ * A full commit id in lowercase. `isFullCommitSha` (src/node/services/agentPlugins/sourceInput.ts)
+ * also takes uppercase, but common code cannot import it. The install status and the pinned-commit
+ * check compare ids as exact strings, and git prints lowercase, so a row with an uppercase id is
+ * refused here rather than normalized.
+ */
+const FULL_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+/** Cap on the plugins one backup list names: it is repository-controlled, and a restore shows every row. */
+export const MAX_BACKUP_PLUGIN_ENTRIES = 512;
+
+/** Caps on what one row names, for the same reason: skills and MCP servers, and each name. */
+export const MAX_BACKUP_PLUGIN_COMPONENTS = 512;
+const MAX_BACKUP_PLUGIN_COMPONENT_NAME_CHARS = 256;
+
+const BackupPluginComponentNamesSchema = z
+  .array(z.string().min(1).max(MAX_BACKUP_PLUGIN_COMPONENT_NAME_CHARS))
+  .max(MAX_BACKUP_PLUGIN_COMPONENTS);
+
+/**
+ * A repository URL a restore hands to git. The list is repository-controlled, so the URL must not
+ * read as a git option (a leading dash, or whitespace before it, since the preview trims its
+ * input), or carry whitespace, control or bidi characters or a credential. It must also not point
+ * at this machine: the export leaves out every such source with this same check
+ * (agentPluginBackup.ts), so only a tampered list carries one, and on Windows a path, a `file:`
+ * URL or a UNC or NT-namespace spelling of one can make the preview's fetch open SMB, which can
+ * send the user's credentials before any consent.
+ */
+const BackupPluginUrlSchema = z
+  .string()
+  .min(1)
+  .max(2048)
+  .regex(/^[^\s-]/, { message: "A repository URL must not start with '-' or whitespace" })
+  .refine((url) => !pointsAtThisMachine(url), {
+    message: "A repository URL must not be a path, a file: URL or a host on this machine",
+  })
+  .refine((url) => !UNSAFE_URL_CHARACTERS.test(url), {
+    message: "A repository URL must not contain whitespace or control characters",
+  })
+  .refine((url) => !hasUrlCredentials(url), {
+    message: "A repository URL must not carry a credential",
+  });
+
+/**
+ * One managed Agent Plugin as the backup records it: where it came from and which commit it was
+ * pinned to. Only what is needed to offer the install again. Consent, hook trust, approved copies,
+ * enabled servers and timestamps are local facts and never travel (the parse drops them): another
+ * machine's review is the only thing that can approve a plugin there. The install method does not
+ * travel either, so the repository cannot choose how a restore installs a plugin: a list that
+ * names one still reads, and the parse drops it. Every field has a cap, because the list is
+ * repository-controlled.
+ */
+export const BackupPluginEntrySchema = z.object({
+  name: AgentPluginInstallEntrySchema.shape.name,
+  source: AgentPluginGitSourceSchema.extend({
+    url: BackupPluginUrlSchema,
+    ref: z.string().min(1).max(256),
+    subpath: z.string().min(1).max(1024).optional(),
+  }),
+  /** Full commit id: a restore previews this exact commit, whatever `source.ref` tracks now. */
+  lockedSha: z.string().regex(FULL_COMMIT_SHA_PATTERN, { message: "Not a full commit id" }),
+  importedComponents: z
+    .object({
+      skills: BackupPluginComponentNamesSchema,
+      mcpServers: BackupPluginComponentNamesSchema,
+    })
+    .optional(),
+});
+
+/**
+ * The `agent-plugins/manifest.json` sidecar of a backup. The reader (agentPluginBackup.ts) checks
+ * the envelope and then each row on its own, so one row this build cannot read never hides the
+ * others; there is no schema for the whole file.
+ */
+export interface BackupPluginManifest {
+  schemaVersion: 1;
+  plugins: BackupPluginEntry[];
+}
+
+/**
+ * How a listed plugin compares with this machine's managed installs: `missing` (nothing by that
+ * name), `installed` (that name at the same commit, repository and folder, with its folder),
+ * `folderMissing` (the registry lists that plugin but its folder is gone: not offered, since an
+ * install would collide with the row), `conflict` (that name is taken by another commit, another
+ * repository or folder, or by a folder the installer does not manage).
+ */
+export const BackupPluginStatusSchema = z.enum([
+  "missing",
+  "installed",
+  "folderMissing",
+  "conflict",
+]);
+
+/** A listed plugin with its status. Restoring installs none of these rows. */
+export const BackupPluginRowSchema = BackupPluginEntrySchema.extend({
+  status: BackupPluginStatusSchema,
+});
+
+/** What a preview or restore reports of the backup's plugin list. */
+export const BackupPluginReportSchema = z.object({
+  /** The backup's listed plugins against this machine's installs. */
+  rows: z.array(BackupPluginRowSchema),
+  /** The backup carries a plugin list but `includePlugins` is off, so it is skipped. */
+  skipped: z.boolean(),
+  /** What this build could not read of the list (the list or a row); the rest still shows. */
+  warnings: z.array(z.string()),
+});
+
+export const EMPTY_BACKUP_PLUGIN_REPORT: BackupPluginReport = {
+  rows: [],
+  skipped: false,
+  warnings: [],
+};
+
+/**
+ * What a push removes from the backup's plugin list: the listed plugins this machine's export
+ * leaves out, `wholeList` when the backup has a list and the push writes none, and `unreadable`
+ * when the list has parts this build could not read (a newer Xum's rows), which a push that
+ * writes a list replaces without being able to name them. The push refuses until it carries the
+ * `approval` of exactly this removal: a different removal asks again.
+ */
+export const BackupPluginRemovalSchema = z.object({
+  names: z.array(z.string()),
+  wholeList: z.boolean(),
+  unreadable: z.boolean(),
+  approval: z.string(),
+});
+
 export const BackupOperationErrorSchema = z.object({
   code: z.enum([
     "AUTH_FAILED",
@@ -58,6 +193,7 @@ export const BackupOperationErrorSchema = z.object({
     "SECRET_DETECTED",
     "COMMAND_APPROVAL_REQUIRED",
     "PROJECT_IMPORT_APPROVAL_REQUIRED",
+    "PLUGIN_REMOVAL_APPROVAL_REQUIRED",
     "IO_ERROR",
     "GIT_ERROR",
   ]),
@@ -77,6 +213,11 @@ export const BackupOperationErrorSchema = z.object({
    * the fresh list instead of failing opaquely.
    */
   projectImports: z.array(BackupProjectImportSchema).nullish(),
+  /**
+   * On PLUGIN_REMOVAL_APPROVAL_REQUIRED: what the push would remove from the backup's plugin
+   * list. Echo `approval` back as `approvedPluginRemovalDigest` to push anyway.
+   */
+  pluginRemoval: BackupPluginRemovalSchema.nullish(),
   /**
    * Set when a restore fails after its safety snapshot completed: files may already have
    * been overwritten, and the snapshot is the only recovery path, so a failure report
@@ -128,6 +269,7 @@ export const backup = {
         projectBundleSkipped: z.boolean(),
         /** Artifact shelf files left out of the push or a restore, each with its reason. */
         shelfSkipped: z.array(z.string()).optional(),
+        plugins: BackupPluginReportSchema,
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
@@ -142,6 +284,7 @@ export const backup = {
   push: {
     input: SettingsBackupInputSchema.extend({
       approvedSecretDigest: z.string().nullish(),
+      approvedPluginRemovalDigest: z.string().nullish(),
     }),
     output: BackupResult(
       z.object({
@@ -173,6 +316,7 @@ export const backup = {
         /** The backup carries a project bundle but `includeProjects` is off, so it is skipped. */
         projectBundleSkipped: z.boolean(),
         shelfSkipped: z.array(z.string()).optional(),
+        plugins: BackupPluginReportSchema,
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
@@ -192,3 +336,8 @@ export type BackupCommandApproval = z.infer<typeof BackupCommandApprovalSchema>;
 export type BackupCredentialKind = z.infer<typeof BackupCredentialKindSchema>;
 export type BackupProjectImport = z.infer<typeof BackupProjectImportSchema>;
 export type BackupProjectImportResult = z.infer<typeof BackupProjectImportResultSchema>;
+export type BackupPluginEntry = z.infer<typeof BackupPluginEntrySchema>;
+export type BackupPluginStatus = z.infer<typeof BackupPluginStatusSchema>;
+export type BackupPluginRow = z.infer<typeof BackupPluginRowSchema>;
+export type BackupPluginReport = z.infer<typeof BackupPluginReportSchema>;
+export type BackupPluginRemoval = z.infer<typeof BackupPluginRemovalSchema>;

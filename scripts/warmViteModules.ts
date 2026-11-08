@@ -8,8 +8,8 @@
  * verify-xum run then outlasts agent-browser's 25 s wait and shows "Loading Xum" for as long as
  * the transforms take. During those seconds Chrome also holds dozens of queued module requests,
  * which a host network change (a Docker veth coming up) fails with ERR_NETWORK_CHANGED, and the
- * page then shows "<name> failed to load." or stays on "Loading Xum". A warm Vite serves the
- * same graph in about 2 s.
+ * page then shows "<name> failed to load." (a lazy part) or the boot screen's "Xum could not load"
+ * (a module of the first load). A warm Vite serves the same graph in about 2 s.
  *
  * The walk reads Vite's own output: Vite rewrites every import it serves to an absolute path, so a
  * regex over the served JavaScript finds the static and the `import("...")` edges. A 4xx answer is

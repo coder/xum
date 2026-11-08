@@ -151,7 +151,7 @@ include fmt.mk
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
-.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook test-storybook-webkit storybook-budget
+.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook test-storybook-webkit test-storybook-paint-fixtures storybook-budget
 .PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
@@ -942,8 +942,12 @@ install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Appli
 dist-win: build ## Build Windows distributable
 	@bun x electron-builder --win --publish never
 
+# ELECTRON_ZIP_DIR (CI sets it, from setup-xum's electron-zip input) names the directory of the
+# checksum-checked electron-v<version>-linux-x64.zip. electron-builder then unpacks that zip and
+# downloads nothing: its own download retries nothing, and a github.com 504 failed Build / Linux
+# in five queue runs on 2026-11-08.
 dist-linux: build ## Build Linux distributable
-	@bun x electron-builder --linux --publish never
+	@bun x electron-builder --linux --publish never $(if $(ELECTRON_ZIP_DIR),-c.electronDist=$(ELECTRON_ZIP_DIR))
 
 dist-linux-arm64: build ## Build Linux arm64 distributable
 	@bun x electron-builder --linux --arm64 --publish never
@@ -1019,7 +1023,12 @@ WEBKIT_STORY_FILES = $(shell grep -rlF -e '"webkit"' -e '"paint-check"' src/brow
 test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" or "paint-check" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)
 	$(check_node_version)
 	@test -n "$(WEBKIT_STORY_FILES)" || { echo "No story has the webkit or paint-check tag"; exit 1; }
-	@bun x test-storybook --browsers webkit --includeTags webkit paint-check --testTimeout 30000 $(WEBKIT_STORY_FILES)
+	@# paint-fixture stories are built to fail (one to pass), so only test-storybook-paint-fixtures runs them.
+	@bun x test-storybook --browsers webkit --includeTags webkit paint-check --excludeTags paint-fixture --testTimeout 30000 $(WEBKIT_STORY_FILES)
+
+test-storybook-paint-fixtures: node_modules/.installed ## Prove the runner's diagram wait, error marker, viewport check and paint-outside check still fire, with stories built to trip them (requires Storybook to be running or built; STORYBOOK_URL, default http://127.0.0.1:6006)
+	$(check_node_version)
+	@bun scripts/check-paint-check-fixtures.ts
 
 storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (requires Storybook served; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)
