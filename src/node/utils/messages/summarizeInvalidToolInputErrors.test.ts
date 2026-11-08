@@ -98,6 +98,21 @@ describe("summarizeInvalidToolInputErrors", () => {
     expect(output[2]).toBe(executionFailure);
   });
 
+  test("keeps the execution error of a later call that reuses a rejected call's ID", async () => {
+    const rejected = rejectedCall("call_0", "{not json", new Error("JSON parsing failed"));
+    const executionFailure = {
+      type: "tool-error" as const,
+      toolCallId: "call_0",
+      toolName: "note",
+      input: { text: "ok" },
+      error: new Error("disk full"),
+    };
+
+    const output = await runTransform([rejected.call, rejected.toolError, executionFailure]);
+
+    expect(output[2]).toBe(executionFailure);
+  });
+
   test("falls back to the error message when the cause chain has no issues", async () => {
     const rejected = rejectedCall("unparsable", "{not json", new Error("JSON parsing failed"));
 

@@ -67,6 +67,8 @@ export function summarizeInvalidToolInputErrors<
           );
         } else if (part.type === "tool-error") {
           const summary = summaries.get(part.toolCallId);
+          // Consumed here: a provider may reuse the ID for a later call of this turn that runs.
+          summaries.delete(part.toolCallId);
           if (summary != null) {
             controller.enqueue({ ...part, error: summary });
             return;
