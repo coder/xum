@@ -7,6 +7,7 @@ import { installDom } from "../../../tests/ui/dom";
 import {
   APP_VIEWPORT_HEIGHT_PROPERTY,
   installIosFocusZoomGuard,
+  installIphoneDuoStatusBarStyle,
   installViewportHeightSync,
 } from "./viewportHeight";
 
@@ -37,7 +38,7 @@ function appViewportHeight(): string {
 
 /** Runs requestAnimationFrame callbacks inline, so a test can flush them when it chooses. */
 function withFrames(run: (drain: () => void) => void) {
-  const frames: Array<FrameRequestCallback> = [];
+  const frames: FrameRequestCallback[] = [];
   const original = window.requestAnimationFrame;
   Object.defineProperty(window, "requestAnimationFrame", {
     configurable: true,
@@ -241,5 +242,35 @@ describe("iOS focus-zoom guard", () => {
     installIosFocusZoomGuard();
 
     expect(meta.content).toBe(original);
+  });
+});
+
+describe("iPhone Duo status-bar style", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  function statusBarStyle(width: number, height: number): string | null | undefined {
+    Object.defineProperty(window.screen, "width", { configurable: true, get: () => width });
+    Object.defineProperty(window.screen, "height", { configurable: true, get: () => height });
+    installIphoneDuoStatusBarStyle();
+    return document
+      .querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')
+      ?.getAttribute("content");
+  }
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("goes black-translucent on the Duo, which reports one screen size on both displays", () => {
+    expect(statusBarStyle(466, 678)).toBe("black-translucent");
+  });
+
+  test("leaves an iPhone on the native status-bar layout", () => {
+    expect(statusBarStyle(402, 874)).toBeUndefined();
   });
 });

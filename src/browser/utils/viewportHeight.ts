@@ -66,3 +66,20 @@ export function installIosFocusZoomGuard(): void {
   if (meta == null || /maximum-scale/i.test(meta.content)) return;
   meta.content = `${meta.content}, maximum-scale=1`;
 }
+
+/**
+ * On the unfolded iPhone Duo, iOS 27.2 shrinks a home-screen web app by 82pt (the inner display's
+ * portrait status bar) when it comes back from the background, and only a fold cycle restores it.
+ * A black-translucent web clip keeps the full size there. Its status bar is a side column on the
+ * cover display and the landscape inner display, so the header blur that keeps the style out of
+ * index.html elsewhere (#5656) did not show on either. iOS reads the style once, when the user adds
+ * the page to the Home Screen. The Duo reports a 466x678 screen on both displays.
+ */
+export function installIphoneDuoStatusBarStyle(): void {
+  const { width, height } = window.screen;
+  if (Math.min(width, height) !== 466 || Math.max(width, height) !== 678) return;
+  const meta = document.createElement("meta");
+  meta.name = "apple-mobile-web-app-status-bar-style";
+  meta.content = "black-translucent";
+  document.head.appendChild(meta);
+}
