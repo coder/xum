@@ -104,7 +104,11 @@ export interface AgentSandboxPolicy {
   writeRoots: string[];
   /** The main .git of each worktree among the workspace roots: writable except hooks and config. */
   gitCommonDirs: string[];
-  /** PROTECTED_WRITE_PATHS in each root, and the protected paths of each git folder. */
+  /**
+   * PROTECTED_WRITE_PATHS in each root, the protected paths of each git folder, and the tool
+   * caches that run outside the sandbox. An entry that ends in `*` is a glob (srt passes it to
+   * Seatbelt as one).
+   */
   denyWrite: string[];
   /** DENY_READ_ROOTS, the home folder and NESTED_DENY_READ_PATHS. */
   denyRead: string[];
@@ -198,8 +202,8 @@ export function buildAgentSandboxPolicy(
     [
       ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
       ...gitCommonDirs.flatMap(protectedGitDirPaths),
-      // A credential file in a write root (~/.cache/huggingface/token) stays unwritable too,
-      // and so do the npx and uv caches and a global plugin or skill folder that links into one.
+      // A credential file in a write root (~/.cache/huggingface/token) stays unwritable too, and
+      // so do the npx, uv and Bun caches and a global plugin or skill folder that links into one.
       ...[
         ...nestedDenies,
         ...[...AUTOMATION_READ_PATHS, ...cacheExecutablePaths()].map(expandSandboxPath),
@@ -258,7 +262,7 @@ function protectedPathsUnder(root: string): string[] {
   const listed = PROTECTED_WRITE_PATHS.flatMap((entry) => {
     if (typeof entry === "string") return [path.join(root, entry)];
     const target = path.join(root, entry.path);
-    return isFile(target) ? [target] : [];
+    return isFolder(target) ? [] : [target];
   });
   return [...listed, ...linkedWorktreePaths(path.join(root, ".git"))];
 }
@@ -404,6 +408,15 @@ function isFile(target: string): boolean {
     return false;
   }
 }
+
+/** Also through a symlink: a `.git` link to a git folder is a git folder for git. */
+function isFolder(target: string): boolean {
+  try {
+    return fs.statSync(target).isDirectory();
+  } catch {
+    return false;
+  }
+}
 /* eslint-enable local/no-sync-fs-methods */
 
 /**
@@ -424,9 +437,17 @@ function writeAllowed(policy: AgentSandboxPolicy, target: string): boolean {
   const roots = [...policy.writeRoots, ...policy.gitCommonDirs];
   return (
     isUnderAny(target, roots) &&
-    !isUnderAny(target, policy.denyWrite) &&
+    !policy.denyWrite.some((denied) => isAtOrUnderDeny(target, denied)) &&
     !isUnderNestedDeny(policy, target)
   );
+}
+
+/** isPathAtOrUnder(), where a trailing `*` in `denied` matches the rest of its last name. */
+function isAtOrUnderDeny(target: string, denied: string): boolean {
+  if (!denied.endsWith("*")) return isPathAtOrUnder(target, denied);
+  const folder = path.dirname(denied);
+  const [name] = path.relative(folder, target).split(path.sep);
+  return isPathAtOrUnder(target, folder) && name.startsWith(path.basename(denied).slice(0, -1));
 }
 
 function readAllowed(policy: AgentSandboxPolicy, target: string): boolean {

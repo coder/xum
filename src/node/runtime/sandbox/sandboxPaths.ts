@@ -20,10 +20,10 @@ export function tempWritePaths(): string[] {
 
 // Other apps keep caches in ~/Library/Caches too, so only tool folders open.
 // Not writable: ~/.bun/bin, ~/.cargo/bin, ~/go/bin, ~/.local/bin, /opt/homebrew and
-// /usr/local. A file there runs in every later shell.
+// /usr/local. A file there runs in every later shell. Bun's caches stay closed too
+// (cacheExecutablePaths()).
 export const CACHE_WRITE_PATHS: readonly string[] = [
   "~/.npm",
-  "~/.bun/install/cache",
   "~/.cache",
   "~/.cargo/registry",
   "~/.cargo/git",
@@ -37,29 +37,59 @@ export const CACHE_WRITE_PATHS: readonly string[] = [
   "~/Library/Caches/Yarn",
   "~/Library/Caches/ms-playwright",
   "~/Library/Caches/node-gyp",
-  "~/Library/Caches/bun",
   "~/Library/Developer/Xcode/DerivedData",
 ];
 
 /**
- * Read-only in the tool caches: Xum starts MCP servers with npx and uvx outside the sandbox, and
- * these run what they keep here as it is: npx its `_npx` packages, uvx the environments in the uv
- * cache. uv checks nothing it reads from that cache, so all of it stays read-only, also where
- * Xum's environment moves it; uv in the sandbox gets a cache of its own (sandboxToolEnv()).
- * Sandboxed commands can still run what is there.
+ * Read-only in the tool caches: Xum starts MCP servers with npx, uvx and bunx outside the
+ * sandbox, and these run what they keep here as it is: npx its `_npx` packages, uvx the
+ * environments in the uv cache, bunx the packages in Bun's install cache and in its folders in
+ * the temp folders (`bunx-<uid>-<package>` up to Bun 1.4.3, `.bunx-<uid>` after). Bun also runs
+ * what its transpiler cache holds. uv and Bun check nothing they read from these caches, so all
+ * of each stays read-only, also where Xum's environment moves it; uv and Bun in the sandbox get
+ * caches of their own (sandboxToolEnv()). Sandboxed commands can still run what is there. An
+ * entry that ends in `*` is a glob, which srt passes to Seatbelt.
  */
 export function cacheExecutablePaths(env: NodeJS.ProcessEnv = process.env): string[] {
-  const movedUvCaches = [
-    env.XDG_CACHE_HOME === undefined ? undefined : path.join(env.XDG_CACHE_HOME, "uv"),
-    env.UV_CACHE_DIR,
-  ].filter((dir): dir is string => dir !== undefined && path.isAbsolute(dir));
-  return dedupe(["~/.npm/_npx", "~/.cache/uv", ...movedUvCaches]);
+  const fromEnv = (name: string, ...rest: string[]): string[] => {
+    const dir = env[name];
+    return dir !== undefined && path.isAbsolute(dir) ? [path.join(dir, ...rest)] : [];
+  };
+  const uid = process.getuid?.();
+  const bunxTempFolders =
+    uid === undefined
+      ? []
+      : tempWritePaths().flatMap((dir) => [
+          path.join(dir, `bunx-${uid}-*`),
+          path.join(dir, `.bunx-${uid}`),
+        ]);
+  return dedupe([
+    "~/.npm/_npx",
+    "~/.cache/uv",
+    ...fromEnv("XDG_CACHE_HOME", "uv"),
+    ...fromEnv("UV_CACHE_DIR"),
+    // The order in which Bun picks its install cache, then its transpiler cache.
+    ...fromEnv("BUN_INSTALL_CACHE_DIR"),
+    ...fromEnv("BUN_INSTALL", "install", "cache"),
+    ...fromEnv("XDG_CACHE_HOME", ".bun", "install", "cache"),
+    "~/.bun/install/cache",
+    ...fromEnv("BUN_RUNTIME_TRANSPILER_CACHE_PATH"),
+    ...fromEnv("XDG_CACHE_HOME", "bun"),
+    "~/Library/Caches/bun",
+    ...bunxTempFolders,
+  ]);
 }
 
 /** Environment for sandboxed commands, under the keys srt adds. */
 export function sandboxToolEnv(): Record<string, string> {
-  // In the temp folder, a write root, so uv works in the sandbox without the read-only cache.
-  return { UV_CACHE_DIR: path.join(expandWriteRoot(os.tmpdir()), "xum-sandbox-uv-cache") };
+  // In the temp folder, a write root, so uv and Bun work in the sandbox without the read-only
+  // caches. Bun 1.4.4 and later keep what bunx runs in the install cache, so bunx works too.
+  const ownCache = (name: string) => path.join(expandWriteRoot(os.tmpdir()), `xum-sandbox-${name}`);
+  return {
+    UV_CACHE_DIR: ownCache("uv-cache"),
+    BUN_INSTALL_CACHE_DIR: ownCache("bun-cache"),
+    BUN_RUNTIME_TRANSPILER_CACHE_PATH: ownCache("bun-transpiler-cache"),
+  };
 }
 
 /**
@@ -72,6 +102,8 @@ export const PROTECTED_GIT_DIR_PATHS: readonly string[] = [
   "config",
   "config.worktree",
   "modules",
+  // Git takes the config and hooks of the folder that a `commondir` file names, in any git folder.
+  "commondir",
 ];
 
 /**
@@ -86,12 +118,13 @@ export const PROTECTED_LINKED_WORKTREE_PATHS: readonly string[] = [
 
 /**
  * Read-only under each write root. Xum, git or an editor runs these with full access, so a
- * sandboxed command that writes one escapes the sandbox later. `ifFile` entries apply only where
- * the path is a file (a worktree's `.git` pointer to its git folder).
+ * sandboxed command that writes one escapes the sandbox later. `unlessFolder` entries apply
+ * where the path is not a folder: a `.git` file (a worktree's pointer to its git folder) or a
+ * missing `.git`, where a new pointer file would hand git a config of the command's choosing.
  */
-export const PROTECTED_WRITE_PATHS: ReadonlyArray<string | { path: string; ifFile: true }> = [
+export const PROTECTED_WRITE_PATHS: ReadonlyArray<string | { path: string; unlessFolder: true }> = [
   ...PROTECTED_GIT_DIR_PATHS.map((name) => `.git/${name}`),
-  { path: ".git", ifFile: true },
+  { path: ".git", unlessFolder: true },
   // MCP servers start outside the sandbox, and the workspace overrides
   // (workspaceMcpOverridesService.ts) choose which of them start.
   ...["mcp.jsonc", "mcp.local.jsonc", "mcp.local.json"].flatMap(listProjectMetadataRelativePaths),

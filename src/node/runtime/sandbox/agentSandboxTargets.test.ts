@@ -12,7 +12,7 @@ import {
   setAgentSandboxTargets,
 } from "./agentSandboxTargets";
 import { askpassSessionsRoot } from "../sshAskpass";
-import { isPathAtOrUnder } from "./sandboxPaths";
+import { isPathAtOrUnder, sandboxToolEnv } from "./sandboxPaths";
 
 const SETTINGS: ResolvedAgentSandboxSettings = {
   enabled: true,
@@ -123,6 +123,29 @@ describe("buildAgentSandboxPolicy", () => {
     expect(agentSandboxPolicyAllows(policy, path.join(linked, "index"), "write")).toBe(true);
   });
 
+  // Git outside the sandbox follows a .git file, or a commondir file in a git folder, to the
+  // config and hooks of the folder it names.
+  test("lets no command point git at a git folder of its choosing", async () => {
+    const plain = path.join(root, "plain");
+    const linked = path.join(root, "linked");
+    await fs.mkdir(plain);
+    await fs.mkdir(linked);
+    await fs.symlink(commonDir, path.join(linked, ".git"));
+
+    const plainPolicy = buildAgentSandboxPolicy(SETTINGS, { cwd: plain });
+    expect(agentSandboxPolicyAllows(plainPolicy, path.join(plain, ".git"), "write")).toBe(false);
+    expect(agentSandboxPolicyAllows(plainPolicy, path.join(plain, "notes"), "write")).toBe(true);
+    const repoPolicy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+    expect(agentSandboxPolicyAllows(repoPolicy, path.join(commonDir, "commondir"), "write")).toBe(
+      false
+    );
+    // A .git link to a git folder is a git folder: commits still write it.
+    const linkedPolicy = buildAgentSandboxPolicy(SETTINGS, { cwd: linked });
+    expect(agentSandboxPolicyAllows(linkedPolicy, path.join(commonDir, "index"), "write")).toBe(
+      true
+    );
+  });
+
   test("keeps a protected file that is a symlink read-only where it points", async () => {
     const actual = path.join(commonDir, "config.actual");
     await fs.rename(path.join(commonDir, "config"), actual);
@@ -213,10 +236,12 @@ describe("buildAgentSandboxPolicy", () => {
     }
   });
 
-  // Xum starts MCP servers with npx and uvx outside the sandbox, and both run what they cache.
-  test("keeps what npx and uvx run read-only, and the rest of their caches writable", async () => {
+  // Xum starts MCP servers with npx, uvx and bunx outside the sandbox, and each runs what it
+  // caches.
+  test("keeps what npx, uvx and bunx run read-only, and the rest of their caches writable", async () => {
     const home = path.join(root, "home");
     const movedUvCache = path.join(root, "uv-cache");
+    const uid = process.getuid?.() ?? 0;
     await fs.mkdir(path.join(home, ".npm", "_npx"), { recursive: true });
     const savedUvCacheDir = process.env.UV_CACHE_DIR;
     process.env.UV_CACHE_DIR = movedUvCache;
@@ -225,14 +250,25 @@ describe("buildAgentSandboxPolicy", () => {
       const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
       const npm = path.join(home, ".npm");
       const cache = path.join(home, ".cache");
+      const temp = await fs.realpath(os.tmpdir());
 
       for (const file of [
         path.join(npm, "_npx", "a", "cli.js"),
         path.join(cache, "uv", "environments-v2", "a", "bin", "tool"),
         path.join(movedUvCache, "archive-v0", "a", "tool.py"),
+        path.join(home, ".bun", "install", "cache", "a@1.0.0@@@1", "cli.js"),
+        path.join(home, "Library", "Caches", "bun", "@t@", "a.pile"),
+        path.join(temp, `bunx-${uid}-a@latest`, "node_modules", ".bin", "a"),
+        path.join(temp, `.bunx-${uid}`, "a@latest", "package.json"),
       ]) {
         expect(agentSandboxPolicyAllows(policy, file, "write")).toBe(false);
       }
+      // Bun in the sandbox installs and runs bunx in a cache of its own.
+      const ownBunCache = sandboxToolEnv().BUN_INSTALL_CACHE_DIR;
+      expect(
+        agentSandboxPolicyAllows(policy, path.join(ownBunCache, `.bunx-${uid}`, "a"), "write")
+      ).toBe(true);
+      expect(agentSandboxPolicyAllows(policy, path.join(temp, `bunx-${uid}`), "write")).toBe(true);
       // The home folder is in a temp folder here, so the allows cannot show the rest is open.
       expect(
         policy.denyWrite.filter(

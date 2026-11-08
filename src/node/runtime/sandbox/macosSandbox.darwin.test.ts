@@ -253,6 +253,34 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       );
     });
 
+    // Git outside the sandbox follows both to the config and hooks of the folder they name.
+    it("lets no command make a .git file or a commondir file", async () => {
+      const repo = path.join(root, "repo");
+      const plain = path.join(root, "plain");
+      await fs.mkdir(repo);
+      await fs.mkdir(plain);
+      git(repo, "init", "-q");
+      const pointTo = `gitdir: ${root}`;
+
+      const result = await runSandboxed(
+        buildAgentSandboxPolicy(BASE_SETTINGS, {
+          cwd: plain,
+          workspaceRoots: [repo],
+          pathEnv: process.env.PATH,
+        }),
+        plain,
+        [
+          `echo ${JSON.stringify(pointTo)} > .git || echo GITFILE_DENIED`,
+          `echo ${root} > ${repo}/.git/commondir || echo COMMONDIR_DENIED`,
+        ].join("; ")
+      );
+
+      expect(result.stdout).toContain("GITFILE_DENIED");
+      expect(result.stdout).toContain("COMMONDIR_DENIED");
+      expect(await exists(path.join(plain, ".git"))).toBe(false);
+      expect(await exists(path.join(repo, ".git", "commondir"))).toBe(false);
+    });
+
     it("keeps a symlinked .git/config read-only where it points", async () => {
       const repo = path.join(root, "repo");
       await fs.mkdir(repo);
@@ -454,28 +482,58 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       }
     });
 
-    // The shared uv cache is read-only (uvx outside the sandbox runs what it holds), so uv in the
-    // sandbox must get a cache that it can write.
-    it("gives uv a cache of its own that it can write", async () => {
+    // The shared uv and Bun caches are read-only (uvx and bunx outside the sandbox run what they
+    // hold), so uv and Bun in the sandbox must get caches that they can write.
+    it("gives uv and Bun caches of their own that they can write", async () => {
       const workspace = path.join(root, "ws");
       await fs.mkdir(workspace);
       const probe = `xum-sandbox-test-${process.pid}`;
+      const names = ["UV_CACHE_DIR", "BUN_INSTALL_CACHE_DIR", "BUN_RUNTIME_TRANSPILER_CACHE_PATH"];
 
       const result = await runSandboxed(
         buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace }),
         workspace,
-        `mkdir -p "$UV_CACHE_DIR/${probe}" && echo "$UV_CACHE_DIR"`
+        names.map((name) => `mkdir -p "$${name}/${probe}" && echo "$${name}"`).join(" && ")
       );
 
-      const ownCache = result.stdout.trim();
-      if (path.isAbsolute(ownCache)) {
-        await fs.rm(path.join(ownCache, probe), { recursive: true, force: true });
+      const ownCaches = result.stdout.trim().split("\n");
+      for (const cache of ownCaches.filter((dir) => path.isAbsolute(dir))) {
+        await fs.rm(path.join(cache, probe), { recursive: true, force: true });
       }
       expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({
         exitCode: 0,
         stderr: "",
       });
-      expect(isPathAtOrUnder(ownCache, path.join(os.homedir(), ".cache", "uv"))).toBe(false);
+      expect(ownCaches).toHaveLength(names.length);
+      const shared = [".cache/uv", ".bun/install/cache", "Library/Caches/bun"];
+      for (const cache of ownCaches) {
+        expect(shared.some((dir) => isPathAtOrUnder(cache, path.join(os.homedir(), dir)))).toBe(
+          false
+        );
+      }
+    });
+
+    // Bun 1.4.3 and older keep what bunx runs in /private/tmp/bunx-<uid>-<package>, a write root.
+    it("keeps the bunx folders in the temp folders read-only", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(workspace);
+      const bunxFolder = path.join(
+        "/private/tmp",
+        `bunx-${process.getuid?.() ?? 0}-xum-sandbox-test-${process.pid}@latest`
+      );
+      try {
+        const result = await runSandboxed(
+          buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace }),
+          workspace,
+          `mkdir ${JSON.stringify(bunxFolder)} || echo BUNX_DENIED; echo ok > notes.txt && echo WROTE`
+        );
+
+        expect(result.stdout).toContain("BUNX_DENIED");
+        expect(result.stdout).toContain("WROTE");
+        expect(await exists(bunxFolder)).toBe(false);
+      } finally {
+        await fs.rm(bunxFolder, { recursive: true, force: true });
+      }
     });
 
     it("cuts the keychain rules out of the profile and blocks the keychain", async () => {
