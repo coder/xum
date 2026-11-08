@@ -21,6 +21,19 @@ import {
 const RUN_ID = randomUUID().slice(0, 12);
 
 /**
+ * The workspace directory of a spawn record (`<tempDir>/mux-bashes/<workspaceId>/<processId>`).
+ * Removing only the record leaves this empty parent behind. Every workspace id here ends in
+ * RUN_ID, so the check keeps a cleanup from ever deleting a directory this run did not create.
+ */
+function ownWorkspaceDir(outputDir: string): string {
+  const dir = path.dirname(outputDir);
+  if (!path.basename(dir).endsWith(RUN_ID)) {
+    throw new Error(`Refusing to clean ${dir}: its name does not end in this run's id`);
+  }
+  return dir;
+}
+
+/**
  * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so
  * spawnProcess treats it like a remote runtime. With `throwOnSpawn`, its exec throws for the
  * spawn command itself, simulating a transport-level (SSH/Coder channel) error after dispatch.
@@ -189,7 +202,7 @@ describe("spawnProcess", () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
 
     expect(await waitForExit(result.handle)).toBe(0);
     expect((await fs.readFile(outFile, "utf8")).trim()).toBe(execDir);
@@ -216,7 +229,7 @@ describe("spawnProcess", () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
 
     expect(await waitForExit(result.handle)).toBe(0);
     expect((await fs.readFile(outFile, "utf8")).trim()).toBe("/right/value");
@@ -239,7 +252,7 @@ describe("spawnProcess", () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
 
     // Monitors tick every 100ms on local runtimes; each shell probe forks the main process, so
     // the local read path must not touch runtime.exec at all.
@@ -285,7 +298,7 @@ describe("spawnProcess", () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
     expect(await waitForExit(result.handle)).toBe(0);
 
     await fs.rm(path.join(result.outputDir, "output.log"));
@@ -305,7 +318,7 @@ describe("spawnProcess", () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
     expect(await waitForExit(result.handle)).toBe(0);
 
     const markerPath = path.join(result.outputDir, BG_EXIT_CODE_FILENAME);
@@ -336,7 +349,7 @@ describe("spawnProcess", () => {
     expect(result.success).toBe(true);
     if (!result.success) throw new Error(result.error);
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
     const ready = () =>
       fs.access(readyFile).then(
         () => true,
@@ -393,7 +406,7 @@ describe("spawnProcess", () => {
       expect(result.success).toBe(true);
       if (!result.success) throw new Error(result.error);
       handles.push(result.handle);
-      cleanupDirs.push(path.dirname(result.outputDir));
+      cleanupDirs.push(ownWorkspaceDir(result.outputDir));
       expect(result.handle.localProcess).toBeUndefined();
       expect(await waitForExit(result.handle)).toBe(0);
       expect(result.handle.localProcess).toBeUndefined();
@@ -479,7 +492,7 @@ describe("spawnProcess", () => {
       });
       if (!result.success) throw new Error(result.error);
       handles.push(result.handle);
-      cleanupDirs.push(result.outputDir);
+      cleanupDirs.push(ownWorkspaceDir(result.outputDir));
       const outputPath = path.join(result.outputDir, "output.log");
       await fs.appendFile(outputPath, log);
       return Object.assign(result.handle, { outputPath });

@@ -2364,11 +2364,20 @@ describe("BackgroundProcessManager", () => {
         manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
         manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
-        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'bye\\n'", {
-          cwd: process.cwd(),
-          displayName: "settle-shutdown-midflight",
-          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
-        });
+        // The script waits for a gate file so the tail-read spy below is installed before the
+        // monitor can settle. A script that exits at once can settle first (a busy host is enough),
+        // and then the test waits for a tail read that already happened.
+        const gate = path.join(bgOutputDir, "settle-gate");
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          `while [ ! -e '${gate}' ]; do sleep 0.02; done; printf 'bye\\n'`,
+          {
+            cwd: process.cwd(),
+            displayName: "settle-shutdown-midflight",
+            monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+          }
+        );
         expect(result.success).toBe(true);
         if (!result.success) return;
 
@@ -2393,6 +2402,7 @@ describe("BackgroundProcessManager", () => {
           return realGetOutputFileSize();
         });
 
+        await fs.writeFile(gate, "");
         await tailReadStartedPromise;
         manager.beginShutdown();
         releaseTail();
@@ -2585,11 +2595,20 @@ describe("BackgroundProcessManager", () => {
         manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
         manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
-        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'out\\n'", {
-          cwd: process.cwd(),
-          displayName: "settle-cancel-race",
-          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
-        });
+        // The script waits for a gate file so the tail-read spy below is installed before the
+        // monitor can settle. A script that exits at once can settle first (a busy host is enough),
+        // and then the test waits for a tail read that already happened.
+        const gate = path.join(bgOutputDir, "settle-gate");
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          `while [ ! -e '${gate}' ]; do sleep 0.02; done; printf 'out\\n'`,
+          {
+            cwd: process.cwd(),
+            displayName: "settle-cancel-race",
+            monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+          }
+        );
         expect(result.success).toBe(true);
         if (!result.success) return;
 
@@ -2614,6 +2633,7 @@ describe("BackgroundProcessManager", () => {
           return realGetOutputFileSize();
         });
 
+        await fs.writeFile(gate, "");
         await tailReadStartedPromise;
         // Explicit cancel (task_stop path) while the settlement helper awaits the tail read.
         await manager.terminate(result.processId, { monitorDisposition: "discard" });
@@ -2625,6 +2645,7 @@ describe("BackgroundProcessManager", () => {
         expect(stoppedEvents[0]).toMatchObject({ processId: result.processId, reason: "canceled" });
       });
 
+      // It polls for up to 4 s before its final 300 ms wait, so it has its own timeout.
       it("emits no settlement wakes during shutdown", async () => {
         const matchEvents: MonitorMatchPayload[] = [];
         const stoppedEvents: MonitorStoppedPayload[] = [];
@@ -2653,7 +2674,7 @@ describe("BackgroundProcessManager", () => {
         // the next startup delivers the monitor-lost notice instead.
         expect(matchEvents).toHaveLength(0);
         expect(stoppedEvents).toHaveLength(0);
-      });
+      }, 15_000);
 
       it("marks terminalStatusShown on a filtered post-exit read without advancing the offset", async () => {
         const shownEvents: OutputShownPayload[] = [];
@@ -3806,6 +3827,8 @@ describe("BackgroundProcessManager", () => {
         const FILTERED_SCAN_CHUNK_BYTES = 1024 * 1024;
         const headNote = "was filtered on its first";
 
+        // It drains a 2 MB log one 16 KB page at a time, about 130 reads that are each checked, so
+        // the body takes seconds when the host is busy and has its own timeout.
         it("reads a large log one page at a time, and its pages rebuild it exactly", async () => {
           const raw = mixedLog(2 * 1024 * 1024);
           const { processId } = await spawnWithLog(raw);
@@ -3819,7 +3842,7 @@ describe("BackgroundProcessManager", () => {
             expect(limit).toBeDefined();
             expect(limit).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
           }
-        });
+        }, 30_000);
 
         // The drain makes about 170 shell execs (each read on a remote runtime runs a few): about a
         // second alone and several times that on a busy host, so this test has its own timeout.
