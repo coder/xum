@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { execFileSync } from "child_process";
 import * as fs from "fs/promises";
 import * as fsPromisesModule from "node:fs/promises";
 import * as nodeFs from "node:fs";
@@ -18,6 +19,7 @@ import {
   isPositivelyAbsent,
   MAX_WARNED_LENIENT_WALKS,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
+  OverridesFileTooLargeError,
   readHostOverrideDocumentNoFollow,
   readWorkspaceOverridesEpochToken,
   runtimeFilesystemIdentity,
@@ -4424,14 +4426,14 @@ describe("WorkspaceMcpOverridesService", () => {
       }
     });
 
-    // Runs `change` once, right before the sweep's own registry read: after the scan and the
-    // lock derivation, which read the same registry first.
+    // Runs `change` once, right before the sweep's own registry read under its locks: after the
+    // scan and the lock derivation, which read the same registry first.
     const beforeSweepRead = (change: () => void) => {
       const real = config.getAllWorkspaceMetadata.bind(config);
       let changed = false;
       return spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
         (...args: Parameters<Config["getAllWorkspaceMetadata"]>) => {
-          if (!changed && new Error().stack?.includes("sweepPluginOverrideKeys")) {
+          if (!changed && new Error().stack?.includes("sweepUnderLocks")) {
             changed = true;
             change();
           }
@@ -4986,8 +4988,9 @@ describe("WorkspaceMcpOverridesService", () => {
 
       expect(failures).toEqual([]);
       expect([...tracked.locked]).toEqual([]);
-      // Once only, empty: the wait for a save that validated before the sweep.
-      expect(tracked.state.globalLockLinks).toBe(1);
+      // Twice: the empty wait for a save that validated before the sweep, then the registry's
+      // comparison with the scan's.
+      expect(tracked.state.globalLockLinks).toBe(2);
       // The receiver's caches of the workspaces it did not look at are dropped once, not one by one.
       expect(published).toEqual([[ALL_WORKSPACES_TARGET, null]]);
     });
@@ -5166,6 +5169,42 @@ describe("WorkspaceMcpOverridesService", () => {
       });
     });
 
+    it("prunePluginOverrideKeysForWorkspaces publishes a workspace whose legacy value it pruned, though the receiver caches nothing for it", async () => {
+      // The pruned value is what the workspace resolves to now, as a rewritten document would be.
+      // A workspace whose own files did not change, and that the receiver holds nothing for, is
+      // only evicted; this one gets its own publication of the pruned value.
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspace = await registerWorkspace("legacy-published");
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const entry of project.workspaces) {
+            if (entry.id === workspace.workspaceId) {
+              entry.mcp = { enabledServers: [staleKey, "kept"] };
+            }
+          }
+        }
+        return cfg;
+      });
+      const published: Array<[string, unknown]> = [];
+
+      const failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [workspace.workspaceId],
+        prefix,
+        {
+          publish: (persisted, target) => {
+            published.push([target, persisted]);
+            return Promise.resolve();
+          },
+          hasSnapshot: () => false,
+        }
+      );
+
+      expect(failures).toEqual([]);
+      expect(
+        published.filter(([target, persisted]) => target === workspace.workspaceId && persisted)
+      ).toEqual([[workspace.workspaceId, { enabledServers: ["kept"] }]]);
+    });
+
     it("prunePluginOverrideKeysForWorkspaces leaves the legacy config.json value of a workspace it does not sweep", async () => {
       // The prune edits config.json, which holds every workspace's legacy value: it must touch
       // only the rows of the ids it swept, which are the ones it holds the locks of.
@@ -5282,30 +5321,344 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(legacyValue).toEqual(uneditable);
     });
 
+    // Every document name the scan reads, canonical and compatibility spellings.
+    const documentNames = [
+      ".xum/mcp.local.jsonc",
+      ".xum/mcp.local.json",
+      ".mux/mcp.local.jsonc",
+      ".mux/mcp.local.json",
+    ];
+
     it("prunePluginOverrideKeysForWorkspaces does not read a document through a symlink before it takes the locks", async () => {
-      // The scan takes no lock. A checkout can track its document as a symlink to a device
-      // such as /dev/zero, which a read through the link buffers until memory runs out. The
-      // scan must not follow it: the workspace is a candidate, and the prune under the locks
-      // refuses the symlink.
+      // The scan takes no lock. A checkout can track a document as a symlink to a device such
+      // as /dev/zero, which a read through the link buffers until memory runs out. The scan
+      // must not follow it, under any document name: the workspace is a candidate, and the
+      // prune under the locks refuses the symlink.
       const service = new WorkspaceMcpOverridesService(config);
-      const linked = await registerWorkspace("scan-symlinked-doc");
-      const outside = path.join(path.dirname(linked.workspacePath), "outside-overrides.json");
-      await fs.writeFile(outside, JSON.stringify({ enabledServers: ["other"] }));
-      await fs.mkdir(path.dirname(docOf(linked.workspacePath)), { recursive: true });
-      await fs.symlink(outside, docOf(linked.workspacePath));
-      const tracked = await trackLockedWorkspaces(service, [linked]);
+      const outsideText = JSON.stringify({ enabledServers: ["other"] });
+      const linked: Array<Awaited<ReturnType<typeof registerWorkspace>>> = [];
+      for (const [index, name] of documentNames.entries()) {
+        const workspace = await registerWorkspace(`scan-symlinked-doc-${index}`);
+        const outside = path.join(path.dirname(workspace.workspacePath), `outside-${index}.json`);
+        await fs.writeFile(outside, outsideText);
+        await fs.mkdir(path.dirname(path.join(workspace.workspacePath, name)), { recursive: true });
+        await fs.symlink(outside, path.join(workspace.workspacePath, name));
+        linked.push(workspace);
+      }
+      const ids = linked.map((workspace) => workspace.workspaceId);
+      const tracked = await trackLockedWorkspaces(service, linked);
       let failures: Array<{ workspaceId: string; error: unknown }>;
       try {
-        failures = await service.prunePluginOverrideKeysForWorkspaces([linked.workspaceId], prefix);
+        failures = await service.prunePluginOverrideKeysForWorkspaces(ids, prefix);
       } finally {
         tracked.restore();
       }
 
-      expect([...tracked.locked]).toEqual([linked.workspaceId]);
-      expect(failures.map((failure) => failure.workspaceId)).toEqual([linked.workspaceId]);
-      expect(await fs.readFile(outside, "utf-8")).toBe(
-        JSON.stringify({ enabledServers: ["other"] })
+      expect([...tracked.locked].sort()).toEqual([...ids].sort());
+      expect(failures.map((failure) => failure.workspaceId).sort()).toEqual([...ids].sort());
+    });
+
+    it("prunePluginOverrideKeysForWorkspaces reads no more than the prune limit of a document that grew after its stat", async () => {
+      // The scan's size check comes from a stat. A document that grows past the 1 MiB prune
+      // limit before the read must not be buffered whole: the read stops at the limit and the
+      // workspace is a candidate, which the prune under the locks then fails as too large.
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspace = await registerWorkspace("scan-growing-doc");
+      await writeDoc(workspace.workspacePath, ["other"]);
+      const doc = docOf(workspace.workspacePath);
+      const realStat = fsPromisesModule.stat;
+      let grown = false;
+      const statSpy = spyOn(fsPromisesModule, "stat").mockImplementation((async (
+        ...args: Parameters<typeof fsPromisesModule.stat>
+      ) => {
+        const stat = await realStat(...args);
+        if (!grown && String(args[0]) === doc) {
+          grown = true;
+          await fs.appendFile(doc, " ".repeat(2 * 1024 * 1024));
+        }
+        return stat;
+      }) as typeof fsPromisesModule.stat);
+      const tracked = await trackLockedWorkspaces(service, [workspace]);
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces(
+          [workspace.workspaceId],
+          prefix
+        );
+      } finally {
+        tracked.restore();
+        statSpy.mockRestore();
+      }
+
+      expect(grown).toBe(true);
+      expect([...tracked.locked]).toEqual([workspace.workspaceId]);
+      expect(failures.map((failure) => failure.workspaceId)).toEqual([workspace.workspaceId]);
+      expect(failures[0].error).toBeInstanceOf(OverridesFileTooLargeError);
+    });
+
+    // POSIX only: Windows has no mkfifo.
+    it.skipIf(process.platform === "win32")(
+      "prunePluginOverrideKeysForWorkspaces does not open a FIFO behind a document before it takes the locks",
+      async () => {
+        // A FIFO without a writer blocks the read that opens it, and an unlocked scan would wait
+        // out its whole read bound for every such checkout.
+        const service = new WorkspaceMcpOverridesService(config);
+        const workspace = await registerWorkspace("scan-fifo-doc");
+        const fifo = path.join(path.dirname(workspace.workspacePath), "outside.fifo");
+        execFileSync("mkfifo", [fifo]);
+        const doc = path.join(workspace.workspacePath, ".mux", "mcp.local.jsonc");
+        await fs.mkdir(path.dirname(doc), { recursive: true });
+        await fs.symlink(fifo, doc);
+        const tracked = await trackLockedWorkspaces(service, [workspace]);
+        const startedAt = Date.now();
+        let failures: Array<{ workspaceId: string; error: unknown }>;
+        try {
+          failures = await service.prunePluginOverrideKeysForWorkspaces(
+            [workspace.workspaceId],
+            prefix
+          );
+        } finally {
+          tracked.restore();
+          // Release a reader that opened the FIFO, if any, so no blocked read outlives the test.
+          await fs
+            .open(fifo, nodeFs.constants.O_WRONLY | nodeFs.constants.O_NONBLOCK)
+            .then((handle) => handle.close())
+            .catch(() => undefined);
+        }
+
+        // Well under the scan's 5 s read bound: the scan refused the link without opening it.
+        expect(Date.now() - startedAt).toBeLessThan(2_500);
+        expect([...tracked.locked]).toEqual([workspace.workspaceId]);
+        expect(failures.map((failure) => failure.workspaceId)).toEqual([workspace.workspaceId]);
+      }
+    );
+
+    /**
+     * Runs a sweep of `ids`, pauses its scan at the first stat of `docPath`, runs `change` (a
+     * writer that the app can run beside a plugin install), then lets the scan go on.
+     */
+    const sweepWithChangeDuringScan = async (
+      service: WorkspaceMcpOverridesService,
+      ids: readonly string[],
+      docPath: string,
+      change: () => Promise<void>
+    ) => {
+      const realStat = fsPromisesModule.stat;
+      let paused = false;
+      let reached!: () => void;
+      const atStat = new Promise<void>((resolve) => (reached = resolve));
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const statSpy = spyOn(fsPromisesModule, "stat").mockImplementation((async (
+        ...args: Parameters<typeof fsPromisesModule.stat>
+      ) => {
+        if (!paused && String(args[0]) === docPath) {
+          paused = true;
+          reached();
+          await gate;
+        }
+        return realStat(...args);
+      }) as typeof fsPromisesModule.stat);
+      try {
+        const sweep = service.prunePluginOverrideKeysForWorkspaces(ids, prefix);
+        await atStat;
+        await change();
+        release();
+        return await sweep;
+      } finally {
+        release();
+        statSpy.mockRestore();
+      }
+    };
+    /** The registry half of a rename: what renameWorkspace writes after it moved the checkout. */
+    const renameEntry = (workspaceId: string, newPath: string) =>
+      config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const entry of project.workspaces) {
+            if (entry.id === workspaceId) {
+              entry.name = path.basename(newPath);
+              entry.path = newPath;
+            }
+          }
+        }
+        return cfg;
+      });
+    /** renameWorkspace's steps under the workspace's lock: move the checkout, then rewrite the entry. */
+    const renameCheckout = async (
+      service: WorkspaceMcpOverridesService,
+      workspace: { workspaceId: string; workspacePath: string },
+      newPath: string
+    ) => {
+      const release = await service.acquireWorkspaceLock(workspace.workspaceId);
+      try {
+        await fs.rename(workspace.workspacePath, newPath);
+        await renameEntry(workspace.workspaceId, newPath);
+      } finally {
+        await release();
+      }
+    };
+
+    it("prunePluginOverrideKeysForWorkspaces prunes a workspace renamed while its scan read it", async () => {
+      // The rename finishes between the scan's registry read and its stat of the old path, so
+      // the keyed document is gone from where the scan looks. The checkout is gone too, so the
+      // workspace is a candidate, and the sweep prunes the checkout that the registry names.
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspace = await registerWorkspace("renamed-mid-scan");
+      await writeDoc(workspace.workspacePath, [staleKey, "other"]);
+      const newPath = path.join(path.dirname(workspace.workspacePath), "renamed");
+
+      const failures = await sweepWithChangeDuringScan(
+        service,
+        [workspace.workspaceId],
+        docOf(workspace.workspacePath),
+        () => renameCheckout(service, workspace, newPath)
       );
+
+      expect(failures).toEqual([]);
+      expect(await enabledOf(newPath)).toEqual(["other"]);
+    });
+
+    it("prunePluginOverrideKeysForWorkspaces waits for a rename that has moved the checkout but not yet its entry", async () => {
+      // The registry still names the old path under the sweep's locks, so only the missing
+      // checkout shows that the scan's empty read proves nothing. The rename finishes once the
+      // sweep waits for its lock (or, without that wait, once the sweep has returned).
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspace = await registerWorkspace("moving-mid-scan");
+      await writeDoc(workspace.workspacePath, [staleKey, "other"]);
+      const newPath = path.join(path.dirname(workspace.workspacePath), "moved");
+      const lockFiles = new Set(await checkoutLockFiles(service, workspace.workspaceId));
+      let finishRename!: () => void;
+      const renameMayFinish = new Promise<void>((resolve) => (finishRename = resolve));
+      let rename: Promise<void> | undefined;
+      const realLink = fsPromisesModule.link;
+      const linkSpy = spyOn(fsPromisesModule, "link").mockImplementation((existing, target) => {
+        if (rename !== undefined && lockFiles.has(String(target))) finishRename();
+        return realLink(existing, target);
+      });
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await sweepWithChangeDuringScan(
+          service,
+          [workspace.workspaceId],
+          docOf(workspace.workspacePath),
+          async () => {
+            const release = await service.acquireWorkspaceLock(workspace.workspaceId);
+            await fs.rename(workspace.workspacePath, newPath);
+            rename = renameMayFinish.then(async () => {
+              try {
+                await renameEntry(workspace.workspaceId, newPath);
+              } finally {
+                await release();
+              }
+            });
+          }
+        );
+      } finally {
+        finishRename();
+        await rename;
+        linkSpy.mockRestore();
+      }
+
+      expect(failures).toEqual([]);
+      expect(await enabledOf(newPath)).toEqual(["other"]);
+    });
+
+    // Writers that change a workspace's registry entry while the scan runs, and leave a
+    // checkout at the path the scan reads. Each fails the workspace whose entry differs from
+    // the scan's, and that workspace keeps its tombstone.
+    it.each([
+      {
+        writer: "rename that leaves a checkout at the old path",
+        change: async (subject: { workspaceId: string; workspacePath: string }) => {
+          const newPath = path.join(path.dirname(subject.workspacePath), "renamed-back");
+          await fs.rename(subject.workspacePath, newPath);
+          await fs.mkdir(subject.workspacePath);
+          await renameEntry(subject.workspaceId, newPath);
+        },
+      },
+      {
+        writer: "project move",
+        change: async (subject: { workspaceId: string; workspacePath: string }) => {
+          await config.editConfig((cfg) => {
+            for (const [projectPath, project] of [...cfg.projects]) {
+              if (!project.workspaces.some((entry) => entry.id === subject.workspaceId)) continue;
+              cfg.projects.delete(projectPath);
+              cfg.projects.set(`${projectPath}-moved`, project);
+            }
+            return cfg;
+          });
+        },
+      },
+      {
+        writer: "re-parent",
+        change: async (subject: { workspaceId: string }, bystander: { workspaceId: string }) => {
+          await setParent(subject.workspaceId, bystander.workspaceId);
+        },
+      },
+      {
+        writer: "runtime change",
+        change: async (subject: { workspaceId: string; workspacePath: string }) => {
+          await config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              for (const entry of project.workspaces) {
+                if (entry.id === subject.workspaceId) entry.runtimeConfig = { type: "local" };
+              }
+            }
+            return cfg;
+          });
+        },
+      },
+      {
+        writer: "delete",
+        change: async (subject: { workspaceId: string }) => {
+          await config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              project.workspaces = project.workspaces.filter(
+                (entry) => entry.id !== subject.workspaceId
+              );
+            }
+            return cfg;
+          });
+        },
+      },
+    ])(
+      "prunePluginOverrideKeysForWorkspaces fails a workspace when a $writer changes its entry during the scan",
+      async ({ change }) => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const subject = await registerWorkspace("changed-subject");
+        const bystander = await registerWorkspace("changed-bystander");
+
+        const failures = await sweepWithChangeDuringScan(
+          service,
+          [subject.workspaceId, bystander.workspaceId],
+          docOf(subject.workspacePath),
+          () => change(subject, bystander)
+        );
+
+        expect(failures.map((failure) => failure.workspaceId)).toEqual([subject.workspaceId]);
+        expect(String(failures[0].error)).toMatch(/changed or vanished in the registry/);
+      }
+    );
+
+    it("prunePluginOverrideKeysForWorkspaces fails a workspace that a fork or create registers during its scan", async () => {
+      // Registered after the scan's registry read, so the scan never read its documents: a fork
+      // copies its source's document, keys included.
+      const service = new WorkspaceMcpOverridesService(config);
+      const source = await registerWorkspace("fork-source");
+      let fork: { workspaceId: string; workspacePath: string } | undefined;
+
+      const failures = await sweepWithChangeDuringScan(
+        service,
+        [source.workspaceId],
+        docOf(source.workspacePath),
+        async () => {
+          const created = await registerWorkspace("fork-copy");
+          await writeDoc(created.workspacePath, [staleKey]);
+          fork = created;
+        }
+      );
+
+      expect(failures.map((failure) => failure.workspaceId)).toEqual([fork?.workspaceId]);
     });
 
     it("prunePluginOverrideKeysForWorkspaces waits for a save that passed validation before it, then prunes what the save wrote", async () => {
@@ -5654,6 +6007,62 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(unscannedFailures.map((failure) => failure.workspaceId).sort()).toEqual(
         notRead.map((workspace) => workspace.workspaceId).sort()
       );
+    }, 60_000);
+
+    it("prunePluginOverrideKeysForWorkspaces cuts a read that starts just before its scan's window closes", async () => {
+      // Each read is bounded by 5 s and by the time left in the scan's window. A read that
+      // starts 200 ms before the window closes must end then, not 5 s later: the scan's 30 s
+      // window is the whole delay that dead checkouts may add before the sweep takes a lock.
+      const service = new WorkspaceMcpOverridesService(config);
+      // 16 reads run at once: the first 16 checkouts never answer, so the 17th starts when the
+      // first of them times out, which opens the window.
+      const dead: Array<{ workspaceId: string; workspacePath: string }> = [];
+      for (let index = 0; index < 16; index++) {
+        dead.push(await registerWorkspace(`window-dead-${index}`));
+      }
+      const late = await registerWorkspace("window-late");
+      const docs = new Set([...dead, late].map((workspace) => docOf(workspace.workspacePath)));
+      const realNow = Date.now;
+      const realStat = fsPromisesModule.stat;
+      let skewMs = 0;
+      const scanned = new Set<string>();
+      let lateReadAt: number | undefined;
+      let firstLockedReadAt: number | undefined;
+      const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skewMs);
+      const statSpy = spyOn(fsPromisesModule, "stat").mockImplementation((async (
+        target: string,
+        ...rest: unknown[]
+      ) => {
+        if (!docs.has(target)) {
+          return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+        }
+        if (scanned.has(target)) {
+          // Under the locks: spend the sweep's budget at once, as in the test above.
+          firstLockedReadAt ??= realNow();
+          skewMs += 29_000;
+        } else {
+          scanned.add(target);
+          if (target === docOf(late.workspacePath)) {
+            // The window closes 30 s after the first timeout, which was just now.
+            lateReadAt = realNow();
+            skewMs += 29_800;
+          }
+        }
+        return new Promise(() => undefined);
+      }) as typeof fsPromisesModule.stat);
+      try {
+        await service.prunePluginOverrideKeysForWorkspaces(
+          [...dead, late].map((workspace) => workspace.workspaceId),
+          prefix
+        );
+      } finally {
+        statSpy.mockRestore();
+        nowSpy.mockRestore();
+      }
+
+      expect(lateReadAt).toBeDefined();
+      expect(firstLockedReadAt).toBeDefined();
+      expect((firstLockedReadAt ?? 0) - (lateReadAt ?? 0)).toBeLessThan(2_500);
     }, 60_000);
 
     it("prunePluginOverrideKeysForWorkspaces stops publishing once its budget is spent, and evicts every cache instead", async () => {
@@ -6457,24 +6866,17 @@ describe("WorkspaceMcpOverridesService", () => {
     // unwritable one would otherwise fail every workspace of an install.
     const service = new WorkspaceMcpOverridesService(config);
     const workspaces = [await registerWorkspace("no-doc-a"), await registerWorkspace("no-doc-b")];
-    // An empty legacy value makes the first a candidate (the sweep runs) and is cleared without
-    // writing any document.
-    await config.editConfig((cfg) => {
-      for (const project of cfg.projects.values()) {
-        for (const entry of project.workspaces) {
-          if (entry.id === workspaces[0].workspaceId) entry.mcp = {};
-        }
-      }
-      return cfg;
-    });
+    // An id the registry does not list is a candidate, so the sweep runs, and it fails without
+    // touching any document. (A legacy config.json value would owe the epoch, as a document does.)
+    const unlisted = "ws-not-registered";
     const before = await readWorkspaceOverridesEpochToken(config.rootDir);
 
     const failures = await service.prunePluginOverrideKeysForWorkspaces(
-      workspaces.map((workspace) => workspace.workspaceId),
+      [...workspaces.map((workspace) => workspace.workspaceId), unlisted],
       "plugin:0123456789abcdef:"
     );
 
-    expect(failures).toEqual([]);
+    expect(failures.map((failure) => failure.workspaceId)).toEqual([unlisted]);
     expect(await readWorkspaceOverridesEpochToken(config.rootDir)).toBe(before);
   });
 

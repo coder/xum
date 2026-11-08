@@ -293,7 +293,9 @@ export function runtimeFilesystemIdentity(config: RuntimeConfig): string | undef
  */
 export async function readHostOverrideDocumentNoFollow(
   filePath: string,
-  workspacePath: string
+  workspacePath: string,
+  /** Refuse a file over this many bytes, counted from the verified handle (see OverridesFileTooLargeError). */
+  maxBytes?: number
 ): Promise<string> {
   const refuse = (reason: string): never => {
     throw new Error(
@@ -320,7 +322,20 @@ export async function readHostOverrideDocumentNoFollow(
     if (canonical.dev !== opened.dev || canonical.ino !== opened.ino) {
       refuse("the opened file is not the checkout's own document");
     }
-    return await handle.readFile("utf-8");
+    if (maxBytes === undefined) {
+      return await handle.readFile("utf-8");
+    }
+    // A read of one byte past the cap: the file can grow after any stat, and the read never
+    // buffers more than the cap and that byte.
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+    if (length > maxBytes) throw new OverridesFileTooLargeError(filePath, length);
+    return buffer.toString("utf-8", 0, length);
   } finally {
     await handle.close();
   }
@@ -814,6 +829,11 @@ interface PluginSweepPlan {
    * other processes to drop the pre-prune overrides they cached.
    */
   documentedIds: readonly string[];
+  /**
+   * Each workspace's sweep identity in the registry that the scan read (see sweepIdentitiesById).
+   * The scan holds no lock, so the sweep compares it with the registry under the global lock.
+   */
+  scanIdentities: ReadonlyMap<string, string>;
 }
 /**
  * What a plugin sweep's scan (planPluginSweep) shares across its reads, chiefly its time
@@ -991,11 +1011,6 @@ function pruneLegacyValuesIn(
     }
   }
   return uneditable;
-}
-function uneditableLegacyValueError(workspaceId: string, keyPrefix: string): Error {
-  return new Error(
-    `Workspace ${workspaceId} carries a legacy MCP settings value in config.json that this version cannot edit and that may name "${keyPrefix}" keys`
-  );
 }
 /** Ids of the workspaces whose config.json entry still carries a legacy `workspace.mcp` value. */
 function idsWithLegacyOverrides(config: ProjectsConfig): Set<string> {
@@ -1440,6 +1455,14 @@ export class OverridesFileTooLargeError extends Error {
     );
   }
 }
+/** Whether a checkout's directory exists; a stat that fails for any reason counts as no. */
+async function checkoutDirectoryExists(resolved: ResolvedWorkspace): Promise<boolean> {
+  try {
+    return (await resolved.runtime.stat(resolved.workspacePath)).isDirectory;
+  } catch {
+    return false;
+  }
+}
 /**
  * Whether a candidate override file exists for the plugin-key prune.
  * Strict: "cannot tell" throws, like a file over MAX_PRUNED_OVERRIDES_BYTES,
@@ -1497,6 +1520,37 @@ function groupMetadataById(
     }
   }
   return grouped;
+}
+
+/**
+ * Each host-local workspace's part in a plugin sweep, as one string per id: what the scan's
+ * verdict on it rests on. That is its checkout (where its documents live and which workspaces
+ * share them), project, parent (what it inherits), runtime and isolation. Fields that change
+ * often and decide nothing here, such as its title or task status, are left out.
+ */
+function sweepIdentitiesById(
+  registry: readonly FrontendWorkspaceMetadata[],
+  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string
+): Map<string, string> {
+  const identities = new Map<string, string>();
+  for (const [id, entries] of groupMetadataById([...registry], /* hostLocalOnly */ true)) {
+    const identity = entries
+      .map((metadata) =>
+        JSON.stringify([
+          metadata.projectPath,
+          checkoutOf(metadata),
+          metadata.parentWorkspaceId ?? null,
+          metadata.runtimeConfig,
+          metadata.taskIsolation ?? null,
+          metadata.projects ?? null,
+          metadata.subProjectPath ?? null,
+        ])
+      )
+      .sort()
+      .join("\n");
+    identities.set(id, identity);
+  }
+  return identities;
 }
 
 export class WorkspaceMcpOverridesService {
@@ -4923,51 +4977,15 @@ export class WorkspaceMcpOverridesService {
     const plan = await this.planPluginSweep(workspaceIds, keyPrefix);
     // Every swept workspace's lock first, then the global lock: a rename
     // holding a workspace lock across its checkout move cannot be
-    // interleaved with this sweep's stat of that checkout.
+    // interleaved with this sweep's stat of that checkout. With no candidate,
+    // the global lock alone: the registry is still compared with the scan's.
     const failures =
       plan.lockedIds.length === 0
-        ? []
+        ? await this.runExclusive(() => this.sweepUnderLocks(plan, keyPrefix, options, undefined))
         : await this.withWorkspaceLocks(
             plan.lockedIds,
             (locked) =>
-              this.runExclusive(async () => {
-                // ONE budget for the whole sweep — the registry scan, every target's
-                // prune and the cache fan-out afterwards: this runs under every
-                // selected workspace lock AND the global lock, and a single checkout
-                // on a stalled NFS/FUSE mount must not hold unrelated settings writes
-                // past their acquisition timeout. Timed-out targets become
-                // per-workspace failures (the caller keeps their tombstones); a
-                // rewrite already in flight is joined before the locks are released.
-                const budget = createPublicationBudget();
-                const snapshot = new ConfigSnapshot(
-                  this.config,
-                  false,
-                  undefined,
-                  /* writerLocksHeld */ true
-                );
-                try {
-                  // Workspaces whose checkout identity could not be established, or
-                  // whose lock stayed busy, were not locked: they fail (tombstone
-                  // kept) instead of being pruned under a fence they do not hold.
-                  const unlocked = [...locked.unresolvable, ...locked.busy];
-                  const unlockedIds = new Set(unlocked.map((entry) => entry.workspaceId));
-                  const failures = await this.sweepPluginOverrideKeys(
-                    plan.lockedIds.filter((id) => !unlockedIds.has(id)),
-                    locked.keys,
-                    keyPrefix,
-                    options,
-                    budget,
-                    snapshot,
-                    plan
-                  );
-                  return [
-                    ...unlocked.map(({ workspaceId, error }) => ({ workspaceId, error })),
-                    ...failures,
-                  ];
-                } finally {
-                  await snapshot.settleSideEffects();
-                }
-              }),
+              this.runExclusive(() => this.sweepUnderLocks(plan, keyPrefix, options, locked)),
             WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS,
             { partialAtDeadline: true }
           );
@@ -4992,6 +5010,64 @@ export class WorkspaceMcpOverridesService {
       ),
     }));
     return [...unscanned, ...failures];
+  }
+
+  /**
+   * The part of prunePluginOverrideKeysForWorkspaces under the global lock and the locks of
+   * the scan's candidates (`locked`; undefined when there is none).
+   */
+  private async sweepUnderLocks(
+    plan: PluginSweepPlan,
+    keyPrefix: string,
+    options: PluginSweepOptions | undefined,
+    locked: LockedCheckouts | undefined
+  ): Promise<Array<{ workspaceId: string; error: unknown }>> {
+    // ONE budget for the whole sweep — the registry scan, every target's
+    // prune and the cache fan-out afterwards: this runs under every
+    // selected workspace lock AND the global lock, and a single checkout
+    // on a stalled NFS/FUSE mount must not hold unrelated settings writes
+    // past their acquisition timeout. Timed-out targets become
+    // per-workspace failures (the caller keeps their tombstones); a
+    // rewrite already in flight is joined before the locks are released.
+    const budget = createPublicationBudget();
+    const snapshot = new ConfigSnapshot(this.config, false, undefined, /* writerLocksHeld */ true);
+    try {
+      // The scan read the registry without a lock. A writer (a rename or move, a fork, a
+      // re-parent, a project move, a restore, a delete) may have changed an entry since, so
+      // compare every entry with the scan's. One read: the sweep below reuses it (snapshot).
+      const registry = await withDeadline(
+        snapshot.loadAllMetadataTolerant(plan.lockedIds),
+        budget.remaining(),
+        "workspace enumeration exceeded the plugin-prune budget"
+      );
+      const changed = this.changedSinceScan(registry, plan);
+      if (locked === undefined) {
+        return changed;
+      }
+      // Workspaces whose checkout identity could not be established, or
+      // whose lock stayed busy, were not locked: they fail (tombstone
+      // kept) instead of being pruned under a fence they do not hold.
+      const unlocked = [...locked.unresolvable, ...locked.busy];
+      const unlockedIds = new Set(unlocked.map((entry) => entry.workspaceId));
+      const failures = await this.sweepPluginOverrideKeys(
+        plan.lockedIds.filter((id) => !unlockedIds.has(id)),
+        locked.keys,
+        keyPrefix,
+        options,
+        budget,
+        snapshot,
+        plan
+      );
+      // A late descendant or alias of a candidate can also be one whose own entry changed.
+      const changedIds = new Set(changed.map((failure) => failure.workspaceId));
+      return [
+        ...changed,
+        ...unlocked.map(({ workspaceId, error }) => ({ workspaceId, error })),
+        ...failures.filter((failure) => !changedIds.has(failure.workspaceId)),
+      ];
+    } finally {
+      await snapshot.settleSideEffects();
+    }
   }
 
   /**
@@ -5044,16 +5120,42 @@ export class WorkspaceMcpOverridesService {
     // An unscanned descendant or alias of a candidate is locked and pruned like the others.
     const unscannedIds = [...unscanned].filter((id) => !locked.has(id));
     const documentedIds = [...scan.documented].filter((id) => !locked.has(id));
-    return { candidateIds, lockedIds: [...locked], unscannedIds, documentedIds };
+    const scanIdentities = sweepIdentitiesById(registry, (metadata) => this.checkoutOf(metadata));
+    return { candidateIds, lockedIds: [...locked], unscannedIds, documentedIds, scanIdentities };
   }
 
   private sweepMembers(
     registry: readonly FrontendWorkspaceMetadata[],
     candidateIds: ReadonlySet<string>
   ): Set<string> {
-    return sweepClosure(registry, candidateIds, (metadata) =>
-      path.resolve(this.resolveWorkspace(metadata).workspacePath)
-    );
+    return sweepClosure(registry, candidateIds, (metadata) => this.checkoutOf(metadata));
+  }
+
+  private checkoutOf(metadata: FrontendWorkspaceMetadata): string {
+    return path.resolve(this.resolveWorkspace(metadata).workspacePath);
+  }
+
+  /**
+   * The workspaces whose sweep identity (see sweepIdentitiesById) differs between the registry
+   * that the scan read and `registry`, read under the global lock: an entry that changed,
+   * appeared or vanished. The scan's verdict on such a workspace no longer holds (a rename
+   * moves a keyed document away from the path the scan read), so each one that this sweep did
+   * not lock fails and keeps its tombstone. The caller's retry scans the registry again.
+   */
+  private changedSinceScan(
+    registry: readonly FrontendWorkspaceMetadata[],
+    plan: PluginSweepPlan
+  ): Array<{ workspaceId: string; error: unknown }> {
+    const current = sweepIdentitiesById(registry, (metadata) => this.checkoutOf(metadata));
+    const lockedIds = new Set(plan.lockedIds);
+    return [...new Set([...plan.scanIdentities.keys(), ...current.keys()])]
+      .filter((id) => !lockedIds.has(id) && plan.scanIdentities.get(id) !== current.get(id))
+      .map((workspaceId) => ({
+        workspaceId,
+        error: new Error(
+          `Workspace ${workspaceId} appeared, changed or vanished in the registry after the plugin sweep read MCP overrides and before it took its locks; it was not pruned`
+        ),
+      }));
   }
 
   /** True unless every override document of the workspace's checkouts was read, and none holds `keyPrefix`. */
@@ -5090,21 +5192,33 @@ export class WorkspaceMcpOverridesService {
       resolved.workspacePath,
       resolved.metadata.runtimeConfig
     );
+    let documented = false;
     for (const filePath of filePaths) {
       const probe = await probeOverridesFile(resolved.runtime, filePath);
       if (probe.kind === "absent") continue;
+      documented = true;
       scan.documented.add(resolved.metadata.id);
       if (probe.kind === "indeterminate" || probe.size > MAX_PRUNED_OVERRIDES_BYTES) return true;
       // SECURITY: no lock guards this read, and the probe above follows symlinks. A checkout
       // can track the document as a symlink to a device such as /dev/zero (size 0), which a
       // plain read buffers until memory runs out. Read only the checkout's own regular file;
       // a symlink or other file throws, so the workspace is a candidate, and the prune under
-      // the locks refuses it as it does on main (assertPruneTargetNotSymlinked).
-      const text = await readHostOverrideDocumentNoFollow(filePath, resolved.workspacePath);
+      // the locks refuses it as it does on main (assertPruneTargetNotSymlinked). The read stops
+      // at the prune limit too: the file can grow after the stat above.
+      const text = await readHostOverrideDocumentNoFollow(
+        filePath,
+        resolved.workspacePath,
+        MAX_PRUNED_OVERRIDES_BYTES
+      );
       // Every decoded string of the parse tree, so an escaped spelling cannot hide a key.
       if (documentStringsContain(text, (value) => value.includes(keyPrefix))) return true;
     }
-    return false;
+    // No document proves nothing once the checkout itself is gone: a rename or a move can be
+    // taking it away under that workspace's lock, before its registry entry names the new
+    // path. Such a workspace is a candidate, so the sweep waits for that lock and prunes the
+    // checkout that the registry names then. Checked after the documents, so a checkout that
+    // moved during their reads is seen as gone.
+    return !documented && !(await checkoutDirectoryExists(resolved));
   }
 
   /** Body of prunePluginOverrideKeysForWorkspaces, run under its locks. */
@@ -5371,22 +5485,24 @@ export class WorkspaceMcpOverridesService {
     if (naming.length === 0) {
       return false;
     }
-    if (naming.some((value) => prunedLegacyValue(value, keyPrefix) === undefined)) {
-      throw uneditableLegacyValueError(workspaceId, keyPrefix);
+    // A value this build cannot edit fails the workspace before any write. The edit reads
+    // config.json again, and a value written since this check is checked there.
+    let uneditable = naming.some((value) => prunedLegacyValue(value, keyPrefix) === undefined);
+    if (!uneditable) {
+      if (step.cancelled) {
+        throw new Error(`pruning workspace ${workspaceId}'s legacy MCP settings was cancelled`);
+      }
+      await step.trackSideEffect(
+        this.config.editConfig((config) => {
+          uneditable = pruneLegacyValuesIn(config, workspaceId, keyPrefix);
+          return config;
+        })
+      );
     }
-    if (step.cancelled) {
-      throw new Error(`pruning workspace ${workspaceId}'s legacy MCP settings was cancelled`);
-    }
-    // The edit reads config.json again: a value written since the check above is checked there.
-    let uneditable = false;
-    await step.trackSideEffect(
-      this.config.editConfig((config) => {
-        uneditable = pruneLegacyValuesIn(config, workspaceId, keyPrefix);
-        return config;
-      })
-    );
     if (uneditable) {
-      throw uneditableLegacyValueError(workspaceId, keyPrefix);
+      throw new Error(
+        `Workspace ${workspaceId} carries a legacy MCP settings value in config.json that this version cannot edit and that may name "${keyPrefix}" keys`
+      );
     }
     return true;
   }
