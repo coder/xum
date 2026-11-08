@@ -450,12 +450,19 @@ function buildUserDisplayedMessages(options: {
   ];
 }
 
+// Some local models (Qwen via oMLX) emit a separate "\n\n" text part between
+// reasoning and each tool call. Rendering it would add an empty assistant row
+// (a visible gap) and steal last-part status, so whitespace-only text is hidden
+// here while persisted history keeps it byte-identical. The typeof check keeps a
+// corrupted history part without text from crashing the transcript.
+function isVisibleTextPart(
+  part: MuxMessage["parts"][number]
+): part is Extract<MuxMessage["parts"][number], { type: "text" }> {
+  return part.type === "text" && typeof part.text === "string" && part.text.trim().length > 0;
+}
+
 function isRenderableDisplayPart(part: MuxMessage["parts"][number]): boolean {
-  return (
-    part.type === "reasoning" ||
-    (part.type === "text" && Boolean(part.text)) ||
-    isDynamicToolPart(part)
-  );
+  return part.type === "reasoning" || isVisibleTextPart(part) || isDynamicToolPart(part);
 }
 
 function getRenderablePartStats(parts: MuxMessage["parts"]): {
@@ -806,7 +813,7 @@ function buildAssistantDisplayedMessages(options: {
       return;
     }
 
-    if (part.type === "text" && part.text) {
+    if (isVisibleTextPart(part)) {
       appendAssistantTextRow(displayedMessages, {
         message,
         part,
