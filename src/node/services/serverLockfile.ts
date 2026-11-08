@@ -22,9 +22,10 @@ export const ServerLockDataSchema = z.object({
   /** Additional base URLs that are reachable from other devices (LAN/VPN) */
   networkBaseUrls: z.array(z.url()).optional(),
   /**
-   * The backend's process identity (ProcessIdentity: pid start time, boot id, PID namespace), so a
-   * reader can tell the backend from another process that now holds its pid. Absent in locks that
-   * older builds wrote, and read as absent when it is malformed.
+   * The backend's process identity (ProcessIdentity: pid start time, boot id, PID namespace and
+   * platform, the fields judgeHolder decides on), so a reader can tell the backend from another
+   * process that now holds its pid. Absent in locks that older builds wrote, and read as absent
+   * when it is malformed.
    */
   identity: z.record(z.string(), z.unknown()).optional().catch(undefined),
 });
@@ -50,11 +51,15 @@ async function readLockFile(filePath: string): Promise<ServerLockData | null> {
 
 /**
  * What the lock's process identity says about its backend, without the network:
- * - "stale": the backend is not there (pid gone, other start time, or another boot or PID
- *   namespace, which processLiveness retires by contract).
+ * - "stale": the backend is not there (pid gone, other start time, or another boot, PID namespace
+ *   or platform, which processLiveness retires by contract).
  * - "live": a process with the recorded start time holds the pid, in this boot and PID namespace.
- * - "undecided": identity cannot say. The lock has none (an older build wrote it), or this is not
- *   Linux (a live pid is all judgeHolder can see), or the start time cannot be read.
+ * - "undecided": identity cannot say. This is the case when
+ *   - the lock has none (an older build wrote it), or
+ *   - this process has no Linux PID domain to compare (macOS, Windows, or a Linux process that
+ *     cannot read its own boot id or PID namespace), or
+ *   - on Linux, the lock's identity is incomplete (no boot id, PID namespace or start time), or
+ *     the start time of the pid cannot be read.
  */
 function judgeByIdentity(data: ServerLockData): "stale" | "live" | "undecided" {
   const identity = data.identity === undefined ? undefined : parseProcessIdentity(data.identity);
@@ -184,9 +189,11 @@ export class ServerLockfile {
     // branch reads the lock again.
     if (byIdentity === "live") return data;
     // "silent" (connected, no answer in time) is live on purpose: a frozen backend looks like it,
-    // and a second backend must not start next to one. Only macOS, Windows and older builds' locks
-    // reach this line, and there the public /version answer proves nothing either: a process that
-    // answers it gets the token as well as one that stalls (see the limits in probeXumBackend).
+    // and a second backend must not start next to one. Only a lock that judgeByIdentity left
+    // "undecided" reaches this line (macOS and Windows, a lock that an older build wrote, an
+    // incomplete identity, a start time that cannot be read), and there the public /version
+    // answer proves nothing either: a process that answers it gets the token as well as one that
+    // stalls (see the limits in probeXumBackend).
     if ((await probeXumBackend(data.baseUrl)) === "no") return null;
     // A restart can replace the lock while the probe waits. Hand out the lock that was asked
     // only if it is still the lock: a caller must not send its token to the successor.
