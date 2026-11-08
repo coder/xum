@@ -270,7 +270,13 @@ describe("iPhone Duo status-bar style", () => {
     expect(statusBarStyle(466, 678)).toBe("black-translucent");
   });
 
-  test("leaves an iPhone on the native status-bar layout", () => {
-    expect(statusBarStyle(402, 874)).toBeUndefined();
+  test("leaves other screens on the native status-bar layout, even one that shares a side", () => {
+    for (const [width, height] of [
+      [402, 874],
+      [466, 874],
+      [402, 678],
+    ]) {
+      expect(statusBarStyle(width, height)).toBeUndefined();
+    }
   });
 });

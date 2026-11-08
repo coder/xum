@@ -76,8 +76,8 @@ export function installIosFocusZoomGuard(): void {
  * the page to the Home Screen. The Duo reports a 466x678 screen on both displays.
  */
 export function installIphoneDuoStatusBarStyle(): void {
-  const { width, height } = window.screen;
-  if (Math.min(width, height) !== 466 || Math.max(width, height) !== 678) return;
+  // iOS reports the portrait size in either orientation.
+  if (window.screen.width !== 466 || window.screen.height !== 678) return;
   const meta = document.createElement("meta");
   meta.name = "apple-mobile-web-app-status-bar-style";
   meta.content = "black-translucent";
