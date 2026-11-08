@@ -2705,7 +2705,16 @@ describe("TaskService", () => {
         const creating = taskService.createMany([spawnArgs(rootId)], {
           abortSignal: controller.signal,
         });
-        await blocked.promise;
+        // A createMany that returns before it reaches the mutex would leave `blocked` pending until
+        // the file's test timeout, and a timed-out test skips this finally, so the spies below
+        // would stay installed for the rest of the file. Fail at once, with a label, instead.
+        const reached = await Promise.race([
+          blocked.promise.then(() => "blocked" as const),
+          creating.then(() => "returned" as const),
+        ]);
+        if (reached !== "blocked") {
+          throw new Error("createMany returned before it blocked on the mutex");
+        }
         warningHandler?.();
         expect(
           warned.some(
