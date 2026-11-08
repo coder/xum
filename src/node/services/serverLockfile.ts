@@ -50,16 +50,25 @@ async function readLockFile(filePath: string): Promise<ServerLockData | null> {
 }
 
 /**
- * What the lock's process identity says about its backend, without the network:
- * - "stale": the backend is not there (pid gone, other start time, or another boot, PID namespace
- *   or platform, which processLiveness retires by contract).
- * - "live": a process with the recorded start time holds the pid, in this boot and PID namespace.
- * - "undecided": identity cannot say. This is the case when
- *   - the lock has none (an older build wrote it), or
- *   - this process has no Linux PID domain to compare (macOS, Windows, or a Linux process that
- *     cannot read its own boot id or PID namespace), or
- *   - on Linux, the lock's identity is incomplete (no boot id, PID namespace or start time), or
- *     the start time of the pid cannot be read.
+ * What the lock's process identity says about its backend, without the network: "stale" (the
+ * backend is not there), "live" (a process with the recorded start time holds the pid), or
+ * "undecided" (identity cannot say). This is the one list of the "undecided" cases: peek() and
+ * probeXumBackend() point here.
+ *
+ * judgeHolder (processLiveness.ts) decides in the order below, and the first step that decides
+ * ends it. So a step names "undecided" only for a lock that no earlier step called "stale". A
+ * Linux PID domain means that this process can read its own boot id and PID namespace.
+ * 1. The lock has no identity (an older build wrote it): a gone pid is "stale", a live pid is
+ *    "undecided".
+ * 2. A recorded platform that differs from this one is "stale" (retired by contract).
+ * 3. With a Linux PID domain, a lock without a boot id or PID namespace is "undecided", and
+ *    another boot or PID namespace is "stale" (retired by contract). Without one (macOS, Windows,
+ *    or a Linux process that cannot read its own), a lock that names a boot id or PID namespace
+ *    is "undecided".
+ * 4. A gone pid is "stale".
+ * 5. Without a Linux PID domain, a live pid is "undecided" (a live pid is all judgeHolder sees).
+ * 6. With a Linux PID domain, a lock without a start time, or a pid whose start time cannot be
+ *    read, is "undecided". Another start time is "stale", and the recorded one is "live".
  */
 function judgeByIdentity(data: ServerLockData): "stale" | "live" | "undecided" {
   const identity = data.identity === undefined ? undefined : parseProcessIdentity(data.identity);
@@ -171,10 +180,9 @@ export class ServerLockfile {
    *   frozen, and any other start time (or a gone pid, or another boot or namespace) is not.
    *   That needs no network, so a squatter on the backend's port can neither pass for it nor
    *   receive the token, and a backend that does not answer is not mistaken for a dead one.
-   * - Identity cannot decide, and a probe of the lock's baseUrl does not say "no" (see
-   *   probeXumBackend). That covers macOS and Windows (a live pid is all there is), and locks that
-   *   an older build wrote (they record no identity). A backend that connects and does not answer
-   *   in time counts as live there too, as it did before the probe.
+   * - Identity cannot decide (judgeByIdentity() lists the cases), and a probe of the lock's
+   *   baseUrl does not say "no" (see probeXumBackend). A backend that connects and does not
+   *   answer in time counts as live there too, as it did before the probe.
    */
   async peek(): Promise<ServerLockData | null> {
     const data = await readLockFile(this.lockPath);
@@ -190,10 +198,9 @@ export class ServerLockfile {
     if (byIdentity === "live") return data;
     // "silent" (connected, no answer in time) is live on purpose: a frozen backend looks like it,
     // and a second backend must not start next to one. Only a lock that judgeByIdentity left
-    // "undecided" reaches this line (macOS and Windows, a lock that an older build wrote, an
-    // incomplete identity, a start time that cannot be read), and there the public /version
-    // answer proves nothing either: a process that answers it gets the token as well as one that
-    // stalls (see the limits in probeXumBackend).
+    // "undecided" reaches this line (it lists the cases), and there the public /version answer
+    // proves nothing either: a process that answers it gets the token as well as one that stalls
+    // (see the limits in probeXumBackend).
     if ((await probeXumBackend(data.baseUrl)) === "no") return null;
     // A restart can replace the lock while the probe waits. Hand out the lock that was asked
     // only if it is still the lock: a caller must not send its token to the successor.
