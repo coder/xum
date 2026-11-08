@@ -5128,16 +5128,13 @@ describe("WorkspaceMcpOverridesService", () => {
 
     // An id-less row with a legacy value, at `legacyPath`, whose metadata.json does not parse.
     const registerLegacyCarrier = async (legacyPath: string) => {
+      const legacyEntry = {
+        path: legacyPath,
+        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+        mcp: { enabledServers: ["legacy-server"] },
+      };
       await config.editConfig((cfg) => {
-        cfg.projects.set("/fake/legacy-project", {
-          workspaces: [
-            {
-              path: legacyPath,
-              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
-              mcp: { enabledServers: ["legacy-server"] },
-            } as never,
-          ],
-        });
+        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
         return cfg;
       });
       const sessionDir = path.join(config.sessionsDir, path.basename(legacyPath));
@@ -5243,16 +5240,13 @@ describe("WorkspaceMcpOverridesService", () => {
       const service = new WorkspaceMcpOverridesService(config);
       const healthy = await registerWorkspace("healthy-beside-legacy");
       await writeEnable(healthy.workspacePath);
+      const legacyEntry = {
+        path: healthy.workspacePath,
+        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+        mcp: { enabledServers: ["legacy-server"] },
+      };
       await config.editConfig((cfg) => {
-        cfg.projects.set("/fake/legacy-project", {
-          workspaces: [
-            {
-              path: healthy.workspacePath,
-              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
-              mcp: { enabledServers: ["legacy-server"] },
-            } as never,
-          ],
-        });
+        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
         return cfg;
       });
       const sessionDir = path.join(config.sessionsDir, path.basename(healthy.workspacePath));
