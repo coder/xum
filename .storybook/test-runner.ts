@@ -770,7 +770,7 @@ async function assertLiveLineClearsTheComposer(page: StoryPage) {
 }
 
 // Each guard below has a story built to trip it, except those that
-// src/browser/stories/PaintCheckFixtures.stories.tsx lists as not covered. `make
+// src/browser/stories/PaintCheckFixtures.stories.tsx lists by name as not covered. `make
 // test-storybook-paint-fixtures` runs those stories through this file. A message that changes needs
 // its new text in scripts/check-paint-check-fixtures.ts.
 const PAINT_CHECK_TAG = "paint-check";

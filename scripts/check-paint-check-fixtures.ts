@@ -40,6 +40,7 @@ export const FIXTURES: ReadonlyMap<string, string | null> = new Map([
   ["DiagramInHiddenParent", VIEWPORT_CHECK_MESSAGE],
   ["DiagramUnderAnOverlay", VIEWPORT_CHECK_MESSAGE],
   ["DiagramClippedAway", VIEWPORT_CHECK_MESSAGE],
+  ["DiagramBelowTheFoldInHiddenParent", VIEWPORT_CHECK_MESSAGE],
   ["DiagramPaintsOutsideItsBox", "paint only inside its box"],
   ["DiagramMountsWhenTheRunnerWaits", null],
 ]);

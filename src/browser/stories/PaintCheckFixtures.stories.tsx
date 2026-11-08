@@ -11,8 +11,15 @@ import { lightweightMeta, PIXEL_DISABLED } from "./meta.js";
  * them, and it requires each one to fail with its expected message (or to pass). Without them,
  * deleting a guard from the runner would leave every real paint-check story green.
  *
- * Not covered: a diagram that mounts after the runner's wait has returned is not checked, so no
- * fixture mounts one that late.
+ * Not covered, by name:
+ * - The assert "has no content below it to compare" (paintBelowWhenScrolled). It guards the shape
+ *   of a story (text after a diagram that ends below the viewport), not paint, and a real frame's
+ *   padding already gives it room, so only a hand-built frame can trip it.
+ * - The assert "Both screenshots must have the viewport's size" (differenceOutside). The runner
+ *   takes both screenshots in a row, and only the runner sets the viewport, so no story can break
+ *   it.
+ * - A diagram that mounts after the runner's wait has returned is not checked, so no fixture
+ *   mounts one that late.
  *
  * The fixture run sets a short render timeout for the runner (PAINT_CHECK_RENDER_TIMEOUT_ENV in
  * src/constants/mermaid.ts), so the story whose frame never draws does not wait the runner's whole
@@ -173,6 +180,24 @@ export const DiagramClippedAway: Story = {
           <MarkdownRenderer content={GOOD_CHART} />
         </div>
         <p>{TEXT_AFTER}</p>
+      </div>
+    </div>
+  ),
+};
+
+/**
+ * MUST FAIL like DiagramInHiddenParent. A tall spacer puts the diagram below the viewport, so the
+ * runner scrolls it into view to compare, and only that scrolled view of the rule can fail the
+ * story: the at-rest view has nothing to change in the viewport either way.
+ */
+export const DiagramBelowTheFoldInHiddenParent: Story = {
+  render: () => (
+    <div className="bg-background min-h-screen p-4">
+      <div style={{ width: 600 }}>
+        <div style={{ height: 1500 }} />
+        <div style={{ visibility: "hidden" }}>
+          <MarkdownRenderer content={[GOOD_CHART, TEXT_AFTER].join("\n\n")} />
+        </div>
       </div>
     </div>
   ),
