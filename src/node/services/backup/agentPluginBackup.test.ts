@@ -1467,6 +1467,70 @@ describe("backup of the managed plugin list", () => {
         expect(await listedNames()).toEqual(["alpha"]);
       });
 
+      /** Another machine's push of a change to the stored list file, applied to a fresh clone. */
+      async function changeStoredList(change: (file: string) => Promise<void>) {
+        const clone = path.join(tempDir, "tamper");
+        await fs.rm(clone, { recursive: true, force: true });
+        await runGit(["clone", "--quiet", originPath, clone]);
+        await change(path.join(clone, "xum", PLUGIN_BACKUP_MANIFEST_PATH));
+        await commitAll(clone, "change the plugin list");
+        await runGit(["-C", clone, "push", "--quiet", "origin", "HEAD:refs/heads/main"]);
+      }
+
+      it("asks again when another machine changes only the entries this build cannot read", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+        const addFuture = (url: string) =>
+          changeStoredList(async (file) => {
+            const list = JSON.parse(await fs.readFile(file, "utf-8")) as {
+              plugins: Array<{ name: string }>;
+            };
+            list.plugins = list.plugins.filter((plugin) => plugin.name !== "future");
+            list.plugins.push({ name: "future", source: { type: "archive", url } } as never);
+            await fs.writeFile(file, JSON.stringify(list), "utf-8");
+          });
+        await addFuture("https://x/one.tgz");
+        const shown = removalOf(await pushFromSecondMachine([registryRow("alpha")]));
+
+        // Same names and flags, other unreadable bytes: the approval of the card on screen no
+        // longer covers what the push would drop.
+        await addFuture("https://x/two.tgz");
+        const again = removalOf(
+          await pushFromSecondMachine([registryRow("alpha")], {
+            approvedPluginRemovalDigest: shown.approval,
+          })
+        );
+
+        expect(again).toMatchObject({ names: [], wholeList: false, unreadable: true });
+        expect(again.approval).not.toBe(shown.approval);
+        expect(await listedNames()).toEqual(["alpha", "future"]);
+      });
+
+      it("asks again when a list this build cannot read at all is unreadable for another reason", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+        // No file to hash: the approval rests on why the list was not read.
+        await changeStoredList(async (file) => {
+          // The folder stays (git keeps no empty one), so the list is there but has no file.
+          await fs.writeFile(path.join(path.dirname(file), "notes.txt"), "kept", "utf-8");
+          await fs.rm(file);
+        });
+        const shown = removalOf(await pushFromSecondMachine([registryRow("alpha")]));
+        const repeated = removalOf(await pushFromSecondMachine([registryRow("alpha")]));
+        expect(repeated.approval).toBe(shown.approval);
+
+        await changeStoredList(async (file) => {
+          await fs.writeFile(path.join(tempDir, "outside.json"), "{}", "utf-8");
+          await fs.symlink(path.join(tempDir, "outside.json"), file);
+        });
+        const again = removalOf(
+          await pushFromSecondMachine([registryRow("alpha")], {
+            approvedPluginRemovalDigest: shown.approval,
+          })
+        );
+
+        expect(again).toMatchObject({ names: [], wholeList: false, unreadable: true });
+        expect(again.approval).not.toBe(shown.approval);
+      });
+
       it("asks again when the same names gain an unreadable part or the whole list", async () => {
         await pushFromFirstMachine([registryRow("alpha")]);
         const namesOnly = removalOf(await pushFromSecondMachine([registryRow("beta")]));

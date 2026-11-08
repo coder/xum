@@ -314,8 +314,15 @@ function pluginRemovalOf(
   const unreadable = prior.warnings.length > 0;
   if (!wholeList && !unreadable && names.length === 0) return undefined;
   names.sort();
-  // JSON, not a delimiter: a name is repository-controlled text.
-  const approval = sha256(Buffer.from(JSON.stringify({ names, wholeList, unreadable }), "utf-8"));
+  // JSON, not a delimiter: a name is repository-controlled text. The digest of the list file as
+  // stored binds the approval to the exact list on screen: an entry this build cannot read has no
+  // name to compare, so another machine could change it without changing the names or the flags.
+  // With no file to hash (it is missing, a symlink or too large) the reason it was not read does
+  // the same. A string and an array cannot be told apart by accident in the JSON.
+  const list = prior.digest ?? prior.warnings;
+  const approval = sha256(
+    Buffer.from(JSON.stringify({ names, wholeList, unreadable, list }), "utf-8")
+  );
   return { names, wholeList, unreadable, approval };
 }
 
@@ -357,14 +364,14 @@ function pluginBackupExists(sourceDir: string): Promise<boolean> {
   return sidecarExists(sourceDir, PLUGIN_BACKUP_DIR);
 }
 
-async function readManifestText(sourceDir: string): Promise<string> {
+async function readManifestBytes(sourceDir: string): Promise<Buffer> {
   // The walk refuses a symlink at the sidecar folder or the manifest, which git can store.
   const manifestPath = await resolveContainedPath(sourceDir, PLUGIN_BACKUP_MANIFEST_PATH);
   const stat = await lstatIfExists(manifestPath);
   if (stat === null || !stat.isFile() || stat.size > MAX_BACKUP_FILE_BYTES) {
     throw new Error("Backup plugin list is missing, not a file, or too large");
   }
-  return await fs.readFile(manifestPath, "utf-8");
+  return await fs.readFile(manifestPath);
 }
 
 /** The version and the rows of the list file. Each row is read on its own (`readPluginRows`). */
@@ -383,6 +390,8 @@ const MAX_PLUGIN_LIST_WARNINGS = 10;
 export interface PluginListRead {
   plugins: BackupPluginEntry[];
   warnings: string[];
+  /** sha256 of the list file's bytes as stored: absent when the file could not be read. */
+  digest?: string;
 }
 
 function unreadableList(reason: string): PluginListRead {
@@ -451,14 +460,14 @@ function parsePluginList(text: string): PluginListRead {
  */
 async function readPluginBackup(sourceDir: string): Promise<PluginListRead> {
   if (!(await pluginBackupExists(sourceDir))) return { plugins: [], warnings: [] };
-  let text: string;
+  let bytes: Buffer;
   try {
-    text = await readManifestText(sourceDir);
+    bytes = await readManifestBytes(sourceDir);
   } catch (error) {
     if (isFilesystemError(error)) throw error;
     return unreadableList(getErrorMessage(error));
   }
-  return parsePluginList(text);
+  return { ...parsePluginList(bytes.toString("utf-8")), digest: sha256(bytes) };
 }
 
 async function hasPluginFolder(muxRoot: string, name: string): Promise<boolean> {
