@@ -7,6 +7,7 @@ import {
   resetAgentSandboxRuntime,
   wrapWithPolicy,
 } from "./macosSandbox";
+import { sandboxToolEnv } from "./sandboxPaths";
 
 // These run on every platform: srt is replaced by the wrap it returns on macOS, so CI on Linux
 // checks how Xum reads and edits it. macosSandbox.darwin.test.ts runs the real sandbox-exec.
@@ -110,6 +111,7 @@ describe("wrapWithPolicy", () => {
     // The allow list goes through srt's proxy.
     expect(profile).toContain('(remote ip "localhost:60811")');
     expect(wrap.env).toEqual({
+      ...sandboxToolEnv(),
       SANDBOX_RUNTIME: "1",
       HTTP_PROXY: PROXY,
       GIT_CONFIG_PARAMETERS: "'http.proxyAuthMethod=basic'",
@@ -129,7 +131,7 @@ describe("wrapWithPolicy", () => {
     expect(profile).toContain('(allow network-outbound (remote ip "*:*"))');
     expect(profile).not.toContain("localhost:60811");
     expect(profile).toContain("; File read");
-    expect(wrap.env).toEqual({ SANDBOX_RUNTIME: "1" });
+    expect(wrap.env).toEqual({ ...sandboxToolEnv(), SANDBOX_RUNTIME: "1" });
     expect(register).not.toHaveBeenCalled();
   });
 

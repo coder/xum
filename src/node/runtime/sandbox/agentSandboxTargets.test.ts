@@ -184,6 +184,8 @@ describe("buildAgentSandboxPolicy", () => {
         )
       ),
       ".agents/plugins/p/.mcp.json",
+      ".devcontainer.json",
+      ".devcontainer/py/devcontainer.json",
     ]) {
       expect(agentSandboxPolicyAllows(policy, path.join(repo, file), "write")).toBe(false);
     }
@@ -208,24 +210,40 @@ describe("buildAgentSandboxPolicy", () => {
     }
   });
 
-  // Xum starts MCP servers with npx outside the sandbox, and npx runs what it keeps in _npx.
-  test("keeps the packages that npx runs read-only, and the rest of its cache writable", async () => {
+  // Xum starts MCP servers with npx and uvx outside the sandbox, and both run what they cache.
+  test("keeps what npx and uvx run read-only, and the rest of their caches writable", async () => {
     const home = path.join(root, "home");
+    const movedUvCache = path.join(root, "uv-cache");
     await fs.mkdir(path.join(home, ".npm", "_npx"), { recursive: true });
+    const savedUvCacheDir = process.env.UV_CACHE_DIR;
+    process.env.UV_CACHE_DIR = movedUvCache;
     const homedir = spyOn(os, "homedir").mockReturnValue(home);
     try {
       const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
       const npm = path.join(home, ".npm");
+      const cache = path.join(home, ".cache");
 
-      expect(agentSandboxPolicyAllows(policy, path.join(npm, "_npx", "a", "cli.js"), "write")).toBe(
-        false
-      );
+      for (const file of [
+        path.join(npm, "_npx", "a", "cli.js"),
+        path.join(cache, "uv", "environments-v2", "a", "bin", "tool"),
+        path.join(movedUvCache, "archive-v0", "a", "tool.py"),
+      ]) {
+        expect(agentSandboxPolicyAllows(policy, file, "write")).toBe(false);
+      }
       // The home folder is in a temp folder here, so the allows cannot show the rest is open.
-      expect(policy.denyWrite.filter((denied) => isPathAtOrUnder(denied, npm))).toEqual([
+      expect(
+        policy.denyWrite.filter(
+          (denied) => isPathAtOrUnder(denied, npm) || isPathAtOrUnder(denied, cache)
+        )
+      ).toEqual([
+        path.join(cache, "huggingface", "token"),
         path.join(npm, "_npx"),
+        path.join(cache, "uv"),
       ]);
     } finally {
       homedir.mockRestore();
+      if (savedUvCacheDir === undefined) delete process.env.UV_CACHE_DIR;
+      else process.env.UV_CACHE_DIR = savedUvCacheDir;
     }
   });
 

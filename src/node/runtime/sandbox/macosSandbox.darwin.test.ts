@@ -454,6 +454,30 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       }
     });
 
+    // The shared uv cache is read-only (uvx outside the sandbox runs what it holds), so uv in the
+    // sandbox must get a cache that it can write.
+    it("gives uv a cache of its own that it can write", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(workspace);
+      const probe = `xum-sandbox-test-${process.pid}`;
+
+      const result = await runSandboxed(
+        buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace }),
+        workspace,
+        `mkdir -p "$UV_CACHE_DIR/${probe}" && echo "$UV_CACHE_DIR"`
+      );
+
+      const ownCache = result.stdout.trim();
+      if (path.isAbsolute(ownCache)) {
+        await fs.rm(path.join(ownCache, probe), { recursive: true, force: true });
+      }
+      expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({
+        exitCode: 0,
+        stderr: "",
+      });
+      expect(isPathAtOrUnder(ownCache, path.join(os.homedir(), ".cache", "uv"))).toBe(false);
+    });
+
     it("cuts the keychain rules out of the profile and blocks the keychain", async () => {
       const workspace = path.join(root, "ws");
       await fs.mkdir(workspace);

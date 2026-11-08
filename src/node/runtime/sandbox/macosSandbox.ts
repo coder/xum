@@ -9,6 +9,7 @@ import {
   buildAgentSandboxPolicy,
   type AgentSandboxPolicy,
 } from "./agentSandboxTargets";
+import { sandboxToolEnv } from "./sandboxPaths";
 
 const SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
 
@@ -116,7 +117,10 @@ function srtConfigForPolicy(policy: AgentSandboxPolicy): Partial<SandboxRuntimeC
 export interface AgentSandboxWrap {
   command: string;
   args: string[];
-  /** Only the keys srt adds (proxy variables and the like), to overlay onto Xum's own env. */
+  /**
+   * Only the keys srt adds (proxy variables and the like) and sandboxToolEnv(), to overlay onto
+   * Xum's own env.
+   */
   env: Record<string, string>;
   commandId: string;
   /** Unregisters the command's network allow list: call when the child exits or never started. */
@@ -192,7 +196,7 @@ export async function wrapWithPolicy(
   }
   const spawnPlan = parseSrtMacosArgv(wrapped.argv, script);
   const profile = postProcessProfile(spawnPlan.profile, policy.network);
-  const env = srtEnvOverlay(spawnPlan.assignments, policy.network);
+  const env = { ...sandboxToolEnv(), ...srtEnvOverlay(spawnPlan.assignments, policy.network) };
   if (policy.network === "allowlist") {
     registerAllowedHosts(commandId, policy.allowedHosts);
   }

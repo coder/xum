@@ -255,8 +255,8 @@ function spawnWithSandbox<T extends ChildProcess>(
   if (sandboxed === null) return start(input.bashPath, ["-c", input.script], input.env);
   let proc: T;
   try {
-    // Only the keys srt adds go on top of Xum's own env, so srt cannot bring back a key that
-    // Xum strips.
+    // Only the keys srt and sandboxToolEnv() add go on top of Xum's own env, so srt cannot
+    // bring back a key that Xum strips.
     proc = start(sandboxed.command, sandboxed.args, {
       ...stripSandboxedChildEnv(input.env),
       ...sandboxed.env,

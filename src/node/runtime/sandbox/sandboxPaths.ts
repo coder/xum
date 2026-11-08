@@ -42,10 +42,25 @@ export const CACHE_WRITE_PATHS: readonly string[] = [
 ];
 
 /**
- * Read-only in the tool caches: npx runs the packages it keeps in `_npx` as they are, and Xum
- * starts MCP servers with npx outside the sandbox. Sandboxed commands can still run them.
+ * Read-only in the tool caches: Xum starts MCP servers with npx and uvx outside the sandbox, and
+ * these run what they keep here as it is: npx its `_npx` packages, uvx the environments in the uv
+ * cache. uv checks nothing it reads from that cache, so all of it stays read-only, also where
+ * Xum's environment moves it; uv in the sandbox gets a cache of its own (sandboxToolEnv()).
+ * Sandboxed commands can still run what is there.
  */
-export const CACHE_EXECUTABLE_PATHS: readonly string[] = ["~/.npm/_npx"];
+export function cacheExecutablePaths(env: NodeJS.ProcessEnv = process.env): string[] {
+  const movedUvCaches = [
+    env.XDG_CACHE_HOME === undefined ? undefined : path.join(env.XDG_CACHE_HOME, "uv"),
+    env.UV_CACHE_DIR,
+  ].filter((dir): dir is string => dir !== undefined && path.isAbsolute(dir));
+  return dedupe(["~/.npm/_npx", "~/.cache/uv", ...movedUvCaches]);
+}
+
+/** Environment for sandboxed commands, under the keys srt adds. */
+export function sandboxToolEnv(): Record<string, string> {
+  // In the temp folder, a write root, so uv works in the sandbox without the read-only cache.
+  return { UV_CACHE_DIR: path.join(expandWriteRoot(os.tmpdir()), "xum-sandbox-uv-cache") };
+}
 
 /**
  * Read-only in every git folder the sandbox opens: Xum runs git with the user's full access
@@ -91,6 +106,9 @@ export const PROTECTED_WRITE_PATHS: ReadonlyArray<string | { path: string; ifFil
   ".idea",
   ".envrc",
   ".gitmodules",
+  // `devcontainer up` (Xum's Dev Container runtime, an editor) runs initializeCommand on the host.
+  ".devcontainer.json",
+  ".devcontainer",
 ];
 
 // Every home folder and every external disk. System files stay readable.

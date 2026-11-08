@@ -8,7 +8,6 @@ import type {
 import { getXumHome } from "@/common/constants/paths";
 import {
   AUTOMATION_READ_PATHS,
-  CACHE_EXECUTABLE_PATHS,
   CACHE_WRITE_PATHS,
   DENY_READ_ROOTS,
   HOME_READ_PATHS,
@@ -16,6 +15,7 @@ import {
   PROTECTED_GIT_DIR_PATHS,
   PROTECTED_LINKED_WORKTREE_PATHS,
   PROTECTED_WRITE_PATHS,
+  cacheExecutablePaths,
   dedupe,
   expandSandboxPath,
   expandSandboxPathSpelling,
@@ -157,10 +157,10 @@ export function buildAgentSandboxPolicy(
       ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
       ...gitCommonDirs.flatMap(protectedGitDirPaths),
       // A credential file in a write root (~/.cache/huggingface/token) stays unwritable too,
-      // and so do npx's packages and a global plugin or skill folder that is a link into one.
+      // and so do the npx and uv caches and a global plugin or skill folder that links into one.
       ...[
         ...nestedDenies,
-        ...[...AUTOMATION_READ_PATHS, ...CACHE_EXECUTABLE_PATHS].map(expandSandboxPath),
+        ...[...AUTOMATION_READ_PATHS, ...cacheExecutablePaths()].map(expandSandboxPath),
       ].filter((denied) => isUnderAny(denied, writeRoots)),
     ].flatMap(withLinkTarget)
   );
