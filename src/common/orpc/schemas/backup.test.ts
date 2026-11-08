@@ -105,6 +105,11 @@ describe("BackupPluginEntrySchema", () => {
     ["a drive-relative path in lower case", "c:repo.git"],
     ["a digit that Git for Windows reads as a drive", "1:repo.git"],
     ["a one-letter host without a user, which Git for Windows reads as a drive", "h:org/repo.git"],
+    // The host parser finds a host before the colon in each, so only the leading check catches them.
+    ["a backslash path with a colon", "\\x:y/z"],
+    ["a UNC share with a colon after the share", "\\\\host\\share:x"],
+    ["a home path with a colon", "~x:y"],
+    ["a user home path with a colon", "~user:repo.git"],
     ["a Win32 file namespace path", "\\\\?\\C:\\repo.git"],
     ["a Win32 device namespace path", "\\\\.\\C:\\repo.git"],
     ["a UNC share with a colon in its path", "\\\\attacker\\share\\repo:x.git"],
