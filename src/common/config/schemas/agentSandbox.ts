@@ -49,6 +49,35 @@ export function salvageAgentSandbox(value: unknown): AgentSandboxConfig | undefi
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
+const field = AgentSandboxConfigSchema.shape;
+
+/**
+ * A save of some `agentSandbox` fields: a value sets its field, null removes it (so it takes its
+ * default), and an absent field keeps its saved value. Settings sends only the field it changes,
+ * so two windows, or a window and a hand edit, that change different fields keep both changes.
+ */
+export const AgentSandboxPatchSchema = z.object({
+  enabled: field.enabled.unwrap().nullish(),
+  network: field.network.unwrap().nullish(),
+  allowedHosts: field.allowedHosts.unwrap().nullish(),
+  extraWritePaths: field.extraWritePaths.unwrap().nullish(),
+  extraReadPaths: field.extraReadPaths.unwrap().nullish(),
+});
+export type AgentSandboxPatch = z.infer<typeof AgentSandboxPatchSchema>;
+
+/** The saved value `current` with `patch` applied, or undefined when no field is left. */
+export function patchAgentSandbox(
+  current: AgentSandboxConfig | undefined,
+  patch: AgentSandboxPatch
+): AgentSandboxConfig | undefined {
+  const next: Record<string, unknown> = { ...current };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete next[key];
+    else if (value !== undefined) next[key] = value;
+  }
+  return salvageAgentSandbox(next);
+}
+
 /** Each field the project sets overrides that global field. */
 export function resolveAgentSandboxSettings(
   global: AgentSandboxConfig | undefined,

@@ -9,7 +9,7 @@ import {
   createTestApiClient,
   type TestApiOverrides,
 } from "@/browser/testUtils";
-import type { AgentSandboxConfig } from "@/common/config/schemas/agentSandbox";
+import { patchAgentSandbox, type AgentSandboxPatch } from "@/common/config/schemas/agentSandbox";
 import type { AgentSandboxState } from "@/common/orpc/schemas/agentSandbox";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { AgentSandboxSettings } from "./AgentSandboxSettings";
@@ -44,18 +44,19 @@ void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => (
 
 const PHAROS = "/home/user/src/pharos";
 
-/** The server's saved setting and the saves it receives; both saves replace what they get. */
+/** The server's saved setting and the saves it receives; it applies each save as the backend does. */
 function createServer(initial: AgentSandboxState) {
   let saved = initial;
-  const set = mock((global: AgentSandboxConfig) => {
-    saved = { ...saved, global };
+  const set = mock((patch: AgentSandboxPatch) => {
+    saved = { ...saved, global: patchAgentSandbox(saved.global, patch) ?? {} };
     return Promise.resolve(saved);
   });
   const setProject = mock(
-    ({ projectPath, sandbox }: { projectPath: string; sandbox: AgentSandboxConfig }) => {
+    ({ projectPath, sandbox }: { projectPath: string; sandbox: AgentSandboxPatch }) => {
       const projects = { ...saved.projects };
-      if (Object.keys(sandbox).length === 0) delete projects[projectPath];
-      else projects[projectPath] = sandbox;
+      const next = patchAgentSandbox(projects[projectPath], sandbox);
+      if (next === undefined) delete projects[projectPath];
+      else projects[projectPath] = next;
       saved = { ...saved, projects };
       return Promise.resolve(saved);
     }
@@ -125,8 +126,8 @@ describe("AgentSandboxSettings", () => {
     await waitFor(() => expect(view.setProject).toHaveBeenCalledTimes(2));
 
     expect(view.setProject.mock.calls.map(([input]) => input)).toEqual([
-      { projectPath: PHAROS, sandbox: { extraReadPaths: ["~/.npmrc"], enabled: false } },
-      { projectPath: PHAROS, sandbox: { extraReadPaths: ["~/.npmrc"] } },
+      { projectPath: PHAROS, sandbox: { enabled: false } },
+      { projectPath: PHAROS, sandbox: { enabled: null } },
     ]);
     expect(view.set).not.toHaveBeenCalled();
   });
@@ -152,20 +153,24 @@ describe("AgentSandboxSettings", () => {
     fireEvent.click(view.getByRole("button", { name: "Use defaults" }));
     await waitFor(() => expect(view.set).toHaveBeenCalledTimes(2));
 
-    expect(view.set.mock.calls.map(([global]) => global)).toEqual([
-      { enabled: true, network: "allowlist", allowedHosts: ["registry.npmjs.org", "example.com"] },
-      { enabled: true, network: "allowlist" },
+    expect(view.set.mock.calls.map(([patch]) => patch)).toEqual([
+      { allowedHosts: ["registry.npmjs.org", "example.com"] },
+      { allowedHosts: null },
     ]);
   });
 
-  test("a change made while a save is pending does not undo that save", async () => {
+  test("a save sends only its field, and a change made while one is pending is not sent", async () => {
     const view = renderSettings({ global: {}, projects: {}, support: { state: "supported" } });
     let finishFirstSave: (() => void) | undefined;
     view.set.mockImplementationOnce(
-      (global: AgentSandboxConfig) =>
+      (patch: AgentSandboxPatch) =>
         new Promise<AgentSandboxState>((resolve) => {
           finishFirstSave = () =>
-            resolve({ global, projects: {}, support: { state: "supported" } });
+            resolve({
+              global: patchAgentSandbox({}, patch) ?? {},
+              projects: {},
+              support: { state: "supported" },
+            });
         })
     );
     const anyHost = () => view.getByRole("radio", { name: /Any host/ }) as HTMLInputElement;
@@ -178,9 +183,9 @@ describe("AgentSandboxSettings", () => {
     fireEvent.click(anyHost());
 
     await waitFor(() => expect(view.set).toHaveBeenCalledTimes(2));
-    expect(view.set.mock.calls.map(([global]) => global)).toEqual([
+    expect(view.set.mock.calls.map(([patch]) => patch)).toEqual([
       { enabled: true },
-      { enabled: true, network: "open" },
+      { network: "open" },
     ]);
   });
 
@@ -219,7 +224,7 @@ describe("AgentSandboxSettings", () => {
     fireEvent.click(off);
     await waitFor(() =>
       expect(view.setProject.mock.calls).toEqual([
-        [{ projectPath: PHAROS, sandbox: { network: "loopback", enabled: false } }],
+        [{ projectPath: PHAROS, sandbox: { enabled: false } }],
       ])
     );
     // Once it is off, the project cannot be turned back on here.

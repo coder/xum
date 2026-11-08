@@ -7,6 +7,12 @@ import {
 } from "@/common/types/instructions";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
+import {
+  AgentSandboxPathError,
+  fileToolSandboxGate,
+  type FileToolSandboxGate,
+} from "@/node/services/agentSandbox/fileToolSandbox";
+import { log } from "@/node/services/log";
 import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { readFileString } from "@/node/utils/runtime/helpers";
@@ -57,11 +63,25 @@ function createLocalFileReader(files: HostFiles): FileReader {
 }
 
 /**
- * Create a FileReader for Runtime-based access (supports SSH).
+ * Create a FileReader for Runtime-based access (supports SSH). A sandboxed agent can replace an
+ * instruction file with a link to a file its sandbox hides, such as ~/.ssh/id_rsa, and this read
+ * puts the file in its prompt. So it reads only what a sandboxed command in `directory` could:
+ * any other file reads as empty. It still exists, so CLAUDE.md does not take AGENTS.md's place.
  */
-function createRuntimeFileReader(runtime: Runtime): FileReader {
+function createRuntimeFileReader(runtime: Runtime, directory: string): FileReader {
+  let gate: FileToolSandboxGate | undefined;
   return {
-    readFile: (filePath: string) => readFileString(runtime, filePath),
+    readFile: async (filePath: string) => {
+      gate ??= fileToolSandboxGate(runtime, directory);
+      try {
+        await gate(filePath, "read");
+      } catch (error) {
+        if (!(error instanceof AgentSandboxPathError)) throw error;
+        log.warn(`Skipping instruction file ${filePath}: the agent sandbox hides it`);
+        return "";
+      }
+      return readFileString(runtime, filePath);
+    },
   };
 }
 
@@ -311,5 +331,10 @@ export async function readInstructionSetFromRuntime(
   scope: InstructionScope,
   projectName?: string
 ): Promise<InstructionSet | null> {
-  return readInstructionSetWith(createRuntimeFileReader(runtime), directory, scope, projectName);
+  return readInstructionSetWith(
+    createRuntimeFileReader(runtime, directory),
+    directory,
+    scope,
+    projectName
+  );
 }

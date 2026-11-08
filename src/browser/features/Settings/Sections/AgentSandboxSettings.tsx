@@ -13,7 +13,11 @@ import { ToggleGroup } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { CONNECTION_LOST_MESSAGE, isStreamFailure } from "@/browser/contexts/connectionLink";
-import type { AgentSandboxConfig, AgentSandboxNetwork } from "@/common/config/schemas/agentSandbox";
+import type {
+  AgentSandboxConfig,
+  AgentSandboxNetwork,
+  AgentSandboxPatch,
+} from "@/common/config/schemas/agentSandbox";
 import { DEFAULT_ALLOWED_HOSTS } from "@/common/constants/agentSandbox";
 import type { AgentSandboxState } from "@/common/orpc/schemas/agentSandbox";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -61,22 +65,17 @@ function projectModeOf(sandbox: AgentSandboxConfig | undefined): ProjectSandboxM
   return sandbox.enabled ? "on" : "off";
 }
 
-/** The project's override with a new `enabled`; its other fields stay. */
-function withProjectMode(
-  sandbox: AgentSandboxConfig | undefined,
-  mode: ProjectSandboxMode
-): AgentSandboxConfig {
-  const { enabled: _enabled, ...rest } = sandbox ?? {};
-  return mode === "global" ? rest : { ...rest, enabled: mode === "on" };
+/** The save of a project's mode; Global removes its `enabled`, so it follows the global one. */
+function projectModePatch(mode: ProjectSandboxMode): AgentSandboxPatch {
+  return { enabled: mode === "global" ? null : mode === "on" };
 }
 
-/** The saved setting, following changes made elsewhere. Saves replace the whole value. */
+/** The saved setting, following changes made elsewhere. Each save sends only its fields. */
 function useAgentSandbox() {
   const api = useLiveAPI();
   const [state, setState] = useState<AgentSandboxState | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // One save at a time: each save sends the whole value built from the last saved state, so a
-  // second save sent before the first returns would undo the first one's change.
+  // One save at a time, so the controls show the answer to the latest save, not an earlier one.
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
 
@@ -124,9 +123,9 @@ function useAgentSandbox() {
     error,
     offline: api == null,
     saving,
-    save: (sandbox: AgentSandboxConfig) => send((client) => client.agentSandbox.set(sandbox)),
-    saveProject: (projectPath: string, sandbox: AgentSandboxConfig) =>
-      send((client) => client.agentSandbox.setProject({ projectPath, sandbox })),
+    save: (patch: AgentSandboxPatch) => send((client) => client.agentSandbox.set(patch)),
+    saveProject: (projectPath: string, patch: AgentSandboxPatch) =>
+      send((client) => client.agentSandbox.setProject({ projectPath, sandbox: patch })),
   };
 }
 
@@ -243,7 +242,7 @@ function ProjectOverride(props: {
   disabled: boolean;
   /** Where the sandbox cannot run, a project can only leave On, like the switch. */
   onlyTurnOff: boolean;
-  onSave: (projectPath: string, sandbox: AgentSandboxConfig) => void;
+  onSave: (projectPath: string, patch: AgentSandboxPatch) => void;
 }) {
   const { userProjects } = useProjectContext();
   // A sub-project without an override of its own follows its parent's, like its checkout.
@@ -255,8 +254,7 @@ function ProjectOverride(props: {
   // A project removed while Settings is open falls back to the first one.
   const project = projects.find((candidate) => candidate.path === picked) ?? projects[0];
   if (project === undefined) return null;
-  const sandbox = props.projects[project.path];
-  const mode = projectModeOf(sandbox);
+  const mode = projectModeOf(props.projects[project.path]);
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -282,7 +280,7 @@ function ProjectOverride(props: {
               options={PROJECT_MODE_OPTIONS}
               value={mode}
               disabled={props.disabled || (props.onlyTurnOff && mode !== "on")}
-              onChange={(mode) => props.onSave(project.path, withProjectMode(sandbox, mode))}
+              onChange={(mode) => props.onSave(project.path, projectModePatch(mode))}
             />
           </div>
         </div>
@@ -385,13 +383,13 @@ export function AgentSandboxSettings() {
         <EnabledSwitch
           enabled={enabled}
           disabled={switchDisabled}
-          onChange={(next) => save({ ...global, enabled: next })}
+          onChange={(next) => save({ enabled: next })}
         />
         <NetworkModes
           config={global}
           disabled={disabled}
-          onNetwork={(network) => save({ ...global, network })}
-          onSaveHosts={(allowedHosts) => save({ ...global, allowedHosts })}
+          onNetwork={(network) => save({ network })}
+          onSaveHosts={(allowedHosts) => save({ allowedHosts: allowedHosts ?? null })}
         />
         <ProjectOverride
           projects={state?.projects ?? {}}

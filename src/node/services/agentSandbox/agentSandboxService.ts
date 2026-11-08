@@ -1,6 +1,6 @@
 import {
   resolveAgentSandboxSettings,
-  type AgentSandboxConfig,
+  type AgentSandboxPatch,
   type ResolvedAgentSandboxSettings,
 } from "@/common/config/schemas/agentSandbox";
 import type { AgentSandboxState, AgentSandboxSupport } from "@/common/orpc/schemas/agentSandbox";
@@ -49,14 +49,14 @@ export class AgentSandboxService {
     return { global: config.agentSandbox ?? {}, projects, support: agentSandboxSupport() };
   }
 
-  async set(sandbox: AgentSandboxConfig): Promise<AgentSandboxState> {
-    await this.config.updateAgentSandbox(sandbox);
+  async set(patch: AgentSandboxPatch): Promise<AgentSandboxState> {
+    await this.config.updateAgentSandbox(patch);
     await this.apply();
     return this.get();
   }
 
-  async setProject(projectPath: string, sandbox: AgentSandboxConfig): Promise<AgentSandboxState> {
-    await this.config.updateProjectAgentSandbox(projectPath, sandbox);
+  async setProject(projectPath: string, patch: AgentSandboxPatch): Promise<AgentSandboxState> {
+    await this.config.updateProjectAgentSandbox(projectPath, patch);
     await this.apply();
     return this.get();
   }

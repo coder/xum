@@ -62,6 +62,36 @@ export class AgentSandboxPathError extends Error {
   }
 }
 
+/** Rejects with AgentSandboxPathError unless a sandboxed command could reach `resolvedPath`. */
+export type FileToolSandboxGate = (resolvedPath: string, access: "read" | "write") => Promise<void>;
+
+const allowAll: FileToolSandboxGate = () => Promise.resolve();
+
+/**
+ * The checks of assertFileToolSandboxAllows() against one policy, built once for many paths.
+ * Allows every path when no sandbox applies. Throws AgentSandboxStartError (fail closed) when
+ * the sandbox applies but has no policy for `cwd`.
+ */
+export function fileToolSandboxGate(
+  runtime: Runtime,
+  cwd: string,
+  context: FileToolSandboxContext = {}
+): FileToolSandboxGate {
+  const policy = runtime.agentSandboxPolicy?.({
+    cwd,
+    scratchDir: context.scratchDir,
+    pathEnv: context.pathEnv,
+  });
+  if (policy == null) return allowAll;
+  return async (resolvedPath, access) => {
+    // Seatbelt checks the path a write lands on, so a link in the workspace cannot point out.
+    const realPath = await realPathFollowingLinks(resolvedPath);
+    if (realPath !== undefined && agentSandboxPolicyAllows(policy, realPath, access)) return;
+    if (realPath !== undefined && (await isExempt(runtime, cwd, realPath, access, context))) return;
+    throw new AgentSandboxPathError(resolvedPath, access);
+  };
+}
+
 /**
  * Throws AgentSandboxPathError unless the runtime's sandbox policy lets a sandboxed command
  * reach `resolvedPath`, so file tools follow the same rules as the shell. No check when no
@@ -75,17 +105,7 @@ export async function assertFileToolSandboxAllows(
   access: "read" | "write",
   context: FileToolSandboxContext = {}
 ): Promise<void> {
-  const policy = runtime.agentSandboxPolicy?.({
-    cwd,
-    scratchDir: context.scratchDir,
-    pathEnv: context.pathEnv,
-  });
-  if (policy == null) return;
-  // Seatbelt checks the path a write lands on, so a link in the workspace cannot point out.
-  const realPath = await realPathFollowingLinks(resolvedPath);
-  if (realPath !== undefined && agentSandboxPolicyAllows(policy, realPath, access)) return;
-  if (realPath !== undefined && (await isExempt(runtime, cwd, realPath, access, context))) return;
-  throw new AgentSandboxPathError(resolvedPath, access);
+  await fileToolSandboxGate(runtime, cwd, context)(resolvedPath, access);
 }
 
 async function isExempt(

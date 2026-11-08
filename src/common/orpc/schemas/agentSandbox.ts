@@ -1,5 +1,8 @@
 import { z } from "zod";
-import { AgentSandboxConfigSchema } from "@/common/config/schemas/agentSandbox";
+import {
+  AgentSandboxConfigSchema,
+  AgentSandboxPatchSchema,
+} from "@/common/config/schemas/agentSandbox";
 
 /**
  * Whether the backend can sandbox agent commands. The browser can run on another OS than the
@@ -33,14 +36,14 @@ export const agentSandbox = {
     input: z.void(),
     output: AgentSandboxStateSchema,
   },
-  /** Replaces the global setting: an omitted field takes its default. */
+  /** Saves fields of the global setting over the latest saved value. */
   set: {
-    input: AgentSandboxConfigSchema,
+    input: AgentSandboxPatchSchema,
     output: AgentSandboxStateSchema,
   },
-  /** Replaces one project's override: an omitted field follows the global setting. */
+  /** Saves fields of one project's override; a removed field follows the global setting. */
   setProject: {
-    input: z.object({ projectPath: z.string(), sandbox: AgentSandboxConfigSchema }),
+    input: z.object({ projectPath: z.string(), sandbox: AgentSandboxPatchSchema }),
     output: AgentSandboxStateSchema,
   },
 };

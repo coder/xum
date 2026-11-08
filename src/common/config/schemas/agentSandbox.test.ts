@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { DEFAULT_ALLOWED_HOSTS } from "@/common/constants/agentSandbox";
-import { resolveAgentSandboxSettings, salvageAgentSandbox } from "./agentSandbox";
+import {
+  patchAgentSandbox,
+  resolveAgentSandboxSettings,
+  salvageAgentSandbox,
+} from "./agentSandbox";
 
 describe("resolveAgentSandboxSettings", () => {
   it("is off with the default network when nothing is set", () => {
@@ -46,5 +50,16 @@ describe("salvageAgentSandbox", () => {
     expect(salvageAgentSandbox({ network: 42 })).toBeUndefined();
     expect(salvageAgentSandbox(["enabled"])).toBeUndefined();
     expect(salvageAgentSandbox(null)).toBeUndefined();
+  });
+});
+
+describe("patchAgentSandbox", () => {
+  it("sets the fields with a value, removes the null ones, and keeps the rest", () => {
+    const saved = { enabled: true, network: "open" as const, extraReadPaths: ["~/.npmrc"] };
+
+    expect(
+      patchAgentSandbox(saved, { network: null, allowedHosts: ["a.example"], enabled: undefined })
+    ).toEqual({ enabled: true, extraReadPaths: ["~/.npmrc"], allowedHosts: ["a.example"] });
+    expect(patchAgentSandbox({ enabled: true }, { enabled: null })).toBeUndefined();
   });
 });

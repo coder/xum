@@ -69,6 +69,25 @@ describe("AgentSandboxService", () => {
     expect(agentSandboxSettingsFor(PARENT)).not.toBeNull();
   });
 
+  it("saves only the fields a save names, over the latest saved setting", async () => {
+    service = new AgentSandboxService(config);
+    await service.start();
+    // Another window, or a hand edit, turned the sandbox on after this window loaded.
+    await config.editConfig((current) => ({ ...current, agentSandbox: { enabled: true } }));
+    await config.updateProjectAgentSandbox(OTHER, { extraReadPaths: ["~/.npmrc"] });
+
+    await service.set({ network: "open" });
+    await service.setProject(OTHER, { enabled: false });
+    expect(service.get().global).toEqual({ enabled: true, network: "open" });
+    expect(service.get().projects[OTHER]).toEqual({ extraReadPaths: ["~/.npmrc"], enabled: false });
+
+    // null removes a field, so it takes its default or follows the global setting.
+    await service.set({ network: null });
+    const state = await service.setProject(OTHER, { enabled: null, extraReadPaths: null });
+    expect(state.global).toEqual({ enabled: true });
+    expect(state.projects).toEqual({});
+  });
+
   it("follows a config change made outside the service", async () => {
     service = new AgentSandboxService(config);
     await service.start();

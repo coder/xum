@@ -47,7 +47,11 @@ import {
   normalizeAgentResourceLimits,
   type AgentResourceLimits,
 } from "@/common/config/schemas/agentResourceLimits";
-import { salvageAgentSandbox, type AgentSandboxConfig } from "@/common/config/schemas/agentSandbox";
+import {
+  patchAgentSandbox,
+  salvageAgentSandbox,
+  type AgentSandboxPatch,
+} from "@/common/config/schemas/agentSandbox";
 import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
@@ -4033,24 +4037,24 @@ export class Config {
     });
   }
 
-  /** Replaces the global sandbox setting: an omitted field takes its default. */
-  async updateAgentSandbox(sandbox: AgentSandboxConfig): Promise<void> {
+  /** Saves fields of the global sandbox setting over the latest saved value (AgentSandboxPatch). */
+  async updateAgentSandbox(patch: AgentSandboxPatch): Promise<void> {
     await this.editConfig((config) => {
-      const salvaged = salvageAgentSandbox(sandbox);
-      if (salvaged) config.agentSandbox = salvaged;
+      const next = patchAgentSandbox(config.agentSandbox, patch);
+      if (next) config.agentSandbox = next;
       else delete config.agentSandbox;
       return config;
     });
   }
 
-  /** Replaces one project's sandbox override: an omitted field follows the global setting. */
-  async updateProjectAgentSandbox(projectPath: string, sandbox: AgentSandboxConfig): Promise<void> {
+  /** Saves fields of one project's sandbox override; a removed field follows the global one. */
+  async updateProjectAgentSandbox(projectPath: string, patch: AgentSandboxPatch): Promise<void> {
     await this.editConfig((config) => {
       const project = config.projects.get(projectPath);
       if (!project) {
         throw new Error(`Project not found: ${projectPath}`);
       }
-      setProjectAgentSandbox(project, sandbox);
+      setProjectAgentSandbox(project, patchAgentSandbox(project.agentSandbox, patch));
       return config;
     });
   }
