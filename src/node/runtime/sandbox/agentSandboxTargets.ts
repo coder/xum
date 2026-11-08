@@ -8,6 +8,7 @@ import type {
 import { getXumHome } from "@/common/constants/paths";
 import {
   AUTOMATION_READ_PATHS,
+  CACHE_EXECUTABLE_PATHS,
   CACHE_WRITE_PATHS,
   DENY_READ_ROOTS,
   HOME_READ_PATHS,
@@ -87,6 +88,14 @@ export class AgentSandboxStartError extends Error {
   }
 }
 
+/** Whether `error` is an AgentSandboxStartError, also as the cause that Runtime.exec() wraps. */
+export function isAgentSandboxStartError(error: unknown): boolean {
+  return (
+    error instanceof AgentSandboxStartError ||
+    (error instanceof Error && error.cause instanceof AgentSandboxStartError)
+  );
+}
+
 export interface AgentSandboxPolicyInput {
   /** The command's working directory: the workspace. */
   cwd: string;
@@ -148,10 +157,11 @@ export function buildAgentSandboxPolicy(
       ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
       ...gitCommonDirs.flatMap(protectedGitDirPaths),
       // A credential file in a write root (~/.cache/huggingface/token) stays unwritable too,
-      // and so does a global plugin or skill folder that is a link into one.
-      ...[...nestedDenies, ...AUTOMATION_READ_PATHS.map(expandSandboxPath)].filter((denied) =>
-        isUnderAny(denied, writeRoots)
-      ),
+      // and so do npx's packages and a global plugin or skill folder that is a link into one.
+      ...[
+        ...nestedDenies,
+        ...[...AUTOMATION_READ_PATHS, ...CACHE_EXECUTABLE_PATHS].map(expandSandboxPath),
+      ].filter((denied) => isUnderAny(denied, writeRoots)),
     ].flatMap(withLinkTarget)
   );
   const allowRead = dedupe([

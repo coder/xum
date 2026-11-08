@@ -9,6 +9,7 @@ import {
   agentSandboxPolicyAllows,
   buildAgentSandboxPolicy,
 } from "./agentSandboxTargets";
+import { isPathAtOrUnder } from "./sandboxPaths";
 
 const SETTINGS: ResolvedAgentSandboxSettings = {
   enabled: true,
@@ -202,6 +203,27 @@ describe("buildAgentSandboxPolicy", () => {
       expect(agentSandboxPolicyAllows(policy, path.join(plugins, "p", ".mcp.json"), "write")).toBe(
         false
       );
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  // Xum starts MCP servers with npx outside the sandbox, and npx runs what it keeps in _npx.
+  test("keeps the packages that npx runs read-only, and the rest of its cache writable", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(path.join(home, ".npm", "_npx"), { recursive: true });
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+      const npm = path.join(home, ".npm");
+
+      expect(agentSandboxPolicyAllows(policy, path.join(npm, "_npx", "a", "cli.js"), "write")).toBe(
+        false
+      );
+      // The home folder is in a temp folder here, so the allows cannot show the rest is open.
+      expect(policy.denyWrite.filter((denied) => isPathAtOrUnder(denied, npm))).toEqual([
+        path.join(npm, "_npx"),
+      ]);
     } finally {
       homedir.mockRestore();
     }

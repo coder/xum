@@ -7,7 +7,9 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { ContainerManager } from "@/node/multiProject/containerManager";
-import type { BackgroundHandle, ExecStream } from "@/node/runtime/Runtime";
+import type { BackgroundHandle, ExecOptions, ExecStream } from "@/node/runtime/Runtime";
+import { RuntimeError } from "@/node/runtime/Runtime";
+import { AgentSandboxStartError } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
@@ -339,6 +341,34 @@ describe("spawnProcess", () => {
       (error: unknown) => String(error)
     );
     expect(read).not.toContain("PRIVATE KEY");
+  });
+
+  // agent-sandbox.mdx: a call the user approves runs outside, also when the sandbox cannot start.
+  it("starts an approved call when the sandbox cannot start, and no other call", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-approved-"));
+    cleanupDirs.push(hostDir);
+    const runtime = new LocalRuntime(hostDir);
+    const exec = runtime.exec.bind(runtime);
+    spyOn(runtime, "exec").mockImplementation((command: string, options: ExecOptions) =>
+      options.sandbox === "off"
+        ? exec(command, options)
+        : Promise.reject(new RuntimeError("no", "exec", new AgentSandboxStartError("test")))
+    );
+    const workspaceId = `approved-${Date.now()}`;
+    const spawn = (processId: string, sandbox?: "off") =>
+      spawnProcess(runtime, "echo ran", { cwd: hostDir, workspaceId, processId, sandbox });
+
+    expect((await spawn("sandboxed")).success).toBe(false);
+    const approved = await spawn("approved", "off");
+    expect(approved.success).toBe(true);
+    if (!approved.success) return;
+    handles.push(approved.handle);
+    cleanupDirs.push(path.dirname(approved.outputDir));
+    expect(await waitForExit(approved.handle)).toBe(0);
+    await approved.handle.writeMeta('{"status":"exited"}');
+    expect(await fs.readFile(path.join(approved.outputDir, "meta.json"), "utf8")).toBe(
+      '{"status":"exited"}\n'
+    );
   });
 
   it("fails the strict exit probe when the exit marker is a dangling symlink", async () => {

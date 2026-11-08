@@ -49,6 +49,7 @@ import {
   localRuntimeTempRoot,
 } from "@/node/runtime/LocalBaseRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import { isAgentSandboxStartError } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
 import { isErrnoWithCode } from "@/node/utils/fs";
@@ -104,6 +105,24 @@ function backgroundSandboxRoots(options: SpawnOptions): string[] {
  */
 const XUM_INTERNAL: Pick<ExecOptions, "sandbox"> = { sandbox: "off" };
 const BACKGROUND_CWD_ENV = "XUM_INTERNAL_BACKGROUND_CWD";
+
+type RecordWrite = (script: string) => ReturnType<typeof execBuffered>;
+
+/**
+ * Runs record writes and deletes of one spawn in the sandbox when it applies (see XUM_INTERNAL).
+ * A call the user approved to run outside the sandbox runs also when the sandbox cannot start
+ * (agent-sandbox.mdx), so only then do its record writes run outside too.
+ */
+function recordWriter(runtime: Runtime, sandbox: SpawnOptions["sandbox"]): RecordWrite {
+  return async (script) => {
+    try {
+      return await execBuffered(runtime, script, { cwd: FALLBACK_CWD, timeout: 10 });
+    } catch (error) {
+      if (sandbox !== "off" || !isAgentSandboxStartError(error)) throw error;
+      return execBuffered(runtime, script, { cwd: FALLBACK_CWD, timeout: 10, ...XUM_INTERNAL });
+    }
+  };
+}
 // Upper bound on waiting for a killed migrated process to report its exit.
 const MIGRATED_PROCESS_EXIT_JOIN_MS = 5_000;
 
@@ -252,14 +271,11 @@ export async function spawnProcess(
   );
 
   // A failed spawn must not leave a recordless process directory behind: the crash-orphan
-  // probe fails closed on directories without readable metadata or an exit marker. In the
-  // sandbox when it applies (see XUM_INTERNAL).
+  // probe fails closed on directories without readable metadata or an exit marker.
+  const writeRecord = recordWriter(runtime, options.sandbox);
   const removeOutputDirBestEffort = async () => {
     try {
-      await execBuffered(runtime, `rm -rf ${quotePath(outputDir)}`, {
-        cwd: FALLBACK_CWD,
-        timeout: 10,
-      });
+      await writeRecord(`rm -rf ${quotePath(outputDir)}`);
     } catch {
       // Best-effort: a leftover directory only over-refuses model-driven archives.
     }
@@ -297,12 +313,10 @@ export async function spawnProcess(
     // process would be trusted as proof that the NEW process exited — both by getExitCode()
     // and by crash-orphan archive gating — so it must be gone before the wrapper's trap owns
     // the file again.
-    // In the sandbox when it applies (see XUM_INTERNAL), so a link a command put in place of a
-    // record folder cannot make Xum create a folder where it points.
-    const prepared = await execBuffered(
-      runtime,
-      `mkdir -p ${quotePath(outputDir)} && rm -f ${quotePath(exitCodePath)}`,
-      { cwd: FALLBACK_CWD, timeout: 10 }
+    // In the sandbox (see recordWriter), so a link a command put in place of a record folder
+    // cannot make Xum create a folder where it points.
+    const prepared = await writeRecord(
+      `mkdir -p ${quotePath(outputDir)} && rm -f ${quotePath(exitCodePath)}`
     );
     if (prepared.exitCode !== 0) {
       await removeOutputDirBestEffort();
@@ -403,7 +417,8 @@ export async function spawnProcess(
       outputDir,
       quotePath,
       probe,
-      releaseSandboxNetwork
+      releaseSandboxNetwork,
+      writeRecord
     );
     return { success: true, handle, pid, outputDir };
   } catch (error) {
@@ -718,7 +733,8 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     private readonly quotePath: (p: string) => string,
     private readonly probe: SpawnRecordProbe,
     /** Ends the process's sandbox network allow list (ExecOptions.keepSandboxNetwork). */
-    private readonly releaseSandboxNetwork: () => void
+    private readonly releaseSandboxNetwork: () => void,
+    private readonly writeRecord: RecordWrite
   ) {
     if (spawnRecordsAreHostLocal(runtime)) {
       this.localProcess = getLocalProcessEvidence(pid);
@@ -785,12 +801,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
       const exitCode = parseExitCode(killed.stdout);
       if (exitCode != null) {
         const exitCodePath = `${this.outputDir}/${EXIT_CODE_FILENAME}`;
-        // In the sandbox when it applies (see XUM_INTERNAL).
-        await execBuffered(
-          this.runtime,
-          buildPublishExitCodeCommand(exitCode, exitCodePath, this.quotePath),
-          { cwd: FALLBACK_CWD, timeout: 10 }
-        );
+        await this.writeRecord(buildPublishExitCodeCommand(exitCode, exitCodePath, this.quotePath));
       }
     } catch (error) {
       // Process may already be dead - that's fine
@@ -813,12 +824,8 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     // crash-orphan archive gating (BackgroundProcessManager.spawn aborts the spawn when it
     // cannot be written); status-update callers wrap this in their own best-effort catch.
     const metaPath = this.quotePath(`${this.outputDir}/${BG_META_FILENAME}`);
-    const result = await execBuffered(
-      this.runtime,
-      `cat > ${metaPath} << 'METAEOF'\n${metaJson}\nMETAEOF`,
-      // In the sandbox when it applies, which refuses a write through a symlink out of /tmp.
-      { cwd: FALLBACK_CWD, timeout: 10 }
-    );
+    // In the sandbox (see recordWriter), which refuses a write through a symlink out of /tmp.
+    const result = await this.writeRecord(`cat > ${metaPath} << 'METAEOF'\n${metaJson}\nMETAEOF`);
     if (result.exitCode !== 0) {
       throw new Error(`writeMeta failed with exit code ${result.exitCode}: ${result.stderr}`);
     }

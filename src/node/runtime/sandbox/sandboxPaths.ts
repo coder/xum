@@ -42,6 +42,12 @@ export const CACHE_WRITE_PATHS: readonly string[] = [
 ];
 
 /**
+ * Read-only in the tool caches: npx runs the packages it keeps in `_npx` as they are, and Xum
+ * starts MCP servers with npx outside the sandbox. Sandboxed commands can still run them.
+ */
+export const CACHE_EXECUTABLE_PATHS: readonly string[] = ["~/.npm/_npx"];
+
+/**
  * Read-only in every git folder the sandbox opens: Xum runs git with the user's full access
  * (gitNoHooksEnv.ts), and git runs hooks and reads config from these, also the config.worktree
  * of a repository with extensions.worktreeConfig and the git folders of its submodules.
