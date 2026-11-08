@@ -341,6 +341,21 @@ describe("buildAgentSandboxPolicy", () => {
     ).toThrow(AgentSandboxStartError);
   });
 
+  // Xum starts a global plugin's MCP servers outside the sandbox.
+  test("fails closed when the workspace is inside a global plugin folder", async () => {
+    const home = path.join(root, "home");
+    const plugin = path.join(home, ".agents", "plugins", "tool");
+    await fs.mkdir(plugin, { recursive: true });
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: plugin })).toThrow(
+        AgentSandboxStartError
+      );
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
   test("hides a home folder outside /Users", async () => {
     const home = path.join(root, "home");
     await fs.mkdir(home);

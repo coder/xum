@@ -209,6 +209,8 @@ export function buildAgentSandboxPolicy(
       `the extra write path ${extraRootInXumHome} is inside Xum's home folder ${xumHome}`
     );
   }
+  const automationPaths = AUTOMATION_READ_PATHS.map(expandSandboxPath);
+  assertNoWriteRootInAutomation(writeRoots, automationPaths);
   // A background command starts in a temp folder and gets its checkout in workspaceRoots.
   const gitCommonDirs = dedupe(
     [cwd, ...extraWorkspaceRoots].flatMap((root) => findGitCommonDir(root) ?? [])
@@ -222,7 +224,8 @@ export function buildAgentSandboxPolicy(
       // links into one.
       ...[
         ...nestedDenies,
-        ...[...AUTOMATION_READ_PATHS, ...cacheExecutablePaths()].map(expandSandboxPath),
+        ...automationPaths,
+        ...cacheExecutablePaths().map(expandSandboxPath),
       ].filter((denied) => isUnderAny(denied, writeRoots)),
     ].flatMap(withLinkTarget)
   );
@@ -251,6 +254,26 @@ export function buildAgentSandboxPolicy(
     allowedHosts: [...settings.allowedHosts],
     allowLocalBinding: true,
   };
+}
+
+/**
+ * The denies above keep an automation path in a write root read-only. A write root inside one (a
+ * workspace that is a plugin checkout in ~/.agents/plugins) cannot be denied without denying the
+ * workspace, and Xum starts that plugin's MCP servers outside the sandbox: fail closed.
+ */
+function assertNoWriteRootInAutomation(
+  writeRoots: readonly string[],
+  automationPaths: readonly string[]
+): void {
+  for (const root of writeRoots) {
+    const automationPath = automationPaths.find((automation) => isPathAtOrUnder(root, automation));
+    if (automationPath !== undefined) {
+      throw new AgentSandboxStartError(
+        `the folder ${root}, which commands can write, is inside ${automationPath}, ` +
+          "which holds code that Xum runs outside the sandbox"
+      );
+    }
+  }
 }
 
 function realpathIfSet(target: string | undefined): string[] {

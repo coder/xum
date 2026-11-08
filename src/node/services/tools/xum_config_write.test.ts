@@ -402,7 +402,13 @@ describe("mux_config_write", () => {
         refused: true,
       },
       {
-        name: "allows an unrelated change",
+        name: "refuses an unrelated change while the sandbox is on",
+        operations: [{ op: "set", path: ["taskSettings", "maxParallelAgentTasks"], value: 8 }],
+        refused: true,
+      },
+      {
+        name: "allows an unrelated change while no sandbox is on",
+        config: { taskSettings: { maxParallelAgentTasks: 4 } },
         operations: [{ op: "set", path: ["taskSettings", "maxParallelAgentTasks"], value: 8 }],
         refused: false,
       },
@@ -425,14 +431,15 @@ describe("mux_config_write", () => {
         refused: false,
       },
       {
+        name: "refuses turning the sandbox on",
+        config: { agentSandbox: { enabled: false } },
+        operations: [{ op: "set", path: ["agentSandbox", "enabled"], value: true }],
+        refused: true,
+      },
+      {
         name: "allows setting agentSandbox to the same value",
-        operations: [
-          {
-            op: "set",
-            path: ["agentSandbox"],
-            value: { enabled: true, network: "allowlist" },
-          },
-        ],
+        config: { agentSandbox: { enabled: false } },
+        operations: [{ op: "set", path: ["agentSandbox"], value: { enabled: false } }],
         refused: false,
       },
     ];
@@ -457,6 +464,34 @@ describe("mux_config_write", () => {
         }
       });
     }
+
+    // apiKeyFile makes the backend read a file the sandbox hides, and baseUrl sends it anywhere.
+    it("refuses a providers write while the sandbox is on", async () => {
+      using xumHome = new TestTempDir("mux-config-write");
+      const providersPath = path.join(xumHome.path, "providers.jsonc");
+      const before = JSON.stringify({ anthropic: { apiKey: "sk-ant-123" } }, null, 2);
+      await fs.writeFile(providersPath, before, "utf-8");
+      await fs.writeFile(
+        path.join(xumHome.path, "config.json"),
+        JSON.stringify(projectOnlyConfig),
+        "utf-8"
+      );
+
+      const tool = await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID);
+      const result = (await tool.execute!(
+        {
+          file: "providers",
+          operations: [
+            { op: "set", path: ["anthropic", "baseUrl"], value: "https://attacker.example" },
+          ],
+          confirm: true,
+        },
+        mockToolCallOptions
+      )) as XumConfigWriteResult;
+
+      expect(result.success ? "" : result.error).toContain("agentSandbox");
+      expect(await fs.readFile(providersPath, "utf-8")).toBe(before);
+    });
   });
 
   it("returns validation issues and does not write when schema validation fails", async () => {

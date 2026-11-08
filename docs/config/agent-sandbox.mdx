@@ -39,7 +39,7 @@ Commands in the sandbox can write only to these folders:
 
 A tool cache or `$TMPDIR` that is a symlink stays closed, because a command could replace it with a link to another folder. Add the folder that it links to to `extraWritePaths`.
 
-If Xum's home folder (`~/.xum`, or `XUM_ROOT`) is inside a folder that commands can write, such as a temp folder, a tool cache or an `extraWritePaths` entry, commands in the sandbox fail to start, because a command could change Xum's own settings there.
+If Xum's home folder (`~/.xum`, or `XUM_ROOT`) is inside a folder that commands can write, such as a temp folder, a tool cache or an `extraWritePaths` entry, commands in the sandbox fail to start, because a command could change Xum's own settings there. They also fail to start when the workspace or another folder that they can write is inside `~/.config/git` or a global skill or plugin folder, such as a plugin checkout in `~/.agents/plugins`, because Xum runs the code there outside the sandbox.
 
 Some files stay read-only, also inside the workspace and where they link to, because a command could use them to run code later outside the sandbox:
 
@@ -101,7 +101,7 @@ To let commands write or read more paths, edit `~/.xum/config.json`:
 }
 ```
 
-A path can start with `~/`. A project can have its own `agentSandbox` with the same fields, in its entry in `projects`. Each field that the project sets replaces the global field. For example, a project `extraReadPaths` replaces the global `extraReadPaths`, it does not add to it. A repository cannot set the sandbox. The agent's config tool cannot change `agentSandbox`, and while the sandbox is on, it cannot change `projects`: it cannot add, remove or trust a project, or add or change a workspace.
+A path can start with `~/`. A project can have its own `agentSandbox` with the same fields, in its entry in `projects`. Each field that the project sets replaces the global field. For example, a project `extraReadPaths` replaces the global `extraReadPaths`, it does not add to it. A repository cannot set the sandbox. The agent's config tool cannot change `agentSandbox`, and while the sandbox is on, it cannot write Xum's config or providers at all.
 
 Xum ignores a field that is not valid and keeps the valid fields, so a broken field next to `"enabled": true` does not turn the sandbox off. An `agentSandbox` value that is not an object is ignored as a whole. Xum shows no message for this, and the next save from Settings writes the value without the broken fields.
 
@@ -131,6 +131,6 @@ An approved call starts without `BASH_ENV`, as do MCP servers and the commands t
 - The VS Code extension shows no approval card yet. A request to run a command outside the sandbox waits there until you stop the agent.
 - Project secrets and the bash AI proxy key are still in the environment of agent commands.
 - The sandbox does not cover terminals that you open, MCP servers (they start outside the sandbox), and the Browser tab.
-- Commands can change the other files in the workspace. When you, your editor, or a Dev Container later runs one of them outside the sandbox, for example a script that `initializeCommand` names or a Dev Container config in another folder, the change runs with your full access.
+- Commands can change the other files in the workspace. When you, your editor, or a Dev Container later runs one of them outside the sandbox, for example a script that `initializeCommand` names or a Dev Container config in another folder, the change runs with your full access. This includes the git hooks and config of a repository nested in the workspace, such as `vendor/tool/.git`: only the `.git` of the workspace itself stays read-only, so the next git command in the nested repository runs what they name.
 - Tool caches, temp folders and the workspace are writable, so a command can change a package that a program outside the sandbox runs later, for example a build in your terminal or editor, also in another project that uses the same cached package (a crate in `~/.cargo/registry`, a Go module, a Maven or Gradle artifact, or a package in the pnpm store), or an MCP server that `npx` or `bunx` finds in the `node_modules` folder of the workspace or gets from a registry that a `.npmrc`, `bunfig.toml` or `uv.toml` in the workspace names.
 - With Bun 1.4.3 or older, `bunx` fails in the sandbox, because it keeps what it runs in `/private/tmp`, where that stays read-only. Update Bun, or approve the call outside the sandbox.

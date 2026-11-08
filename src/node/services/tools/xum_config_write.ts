@@ -73,13 +73,7 @@ function agentSandboxOnIn(document: unknown): boolean {
   return values.some((value) => fieldOf(value, "enabled") === true);
 }
 
-/**
- * Whether `next` changes agentSandbox by value, globally or in any project (added, edited or
- * removed), or changes `projects` at all while it is on anywhere. The projects list binds the
- * sandbox in more ways than its values: a workspace row's project picks its setting and its
- * path is a write root, Config derives sub-project parentage from the registered paths, and a
- * project's trust decides whether Xum starts its MCP servers outside the sandbox.
- */
+/** Whether `next` changes agentSandbox by value, globally or in any project (added, edited or removed). */
 function changesAgentSandbox(current: unknown, next: unknown): boolean {
   if (!isDeepStrictEqual(agentSandboxOf(current), agentSandboxOf(next))) return true;
   const before = projectAgentSandboxes(current);
@@ -87,10 +81,7 @@ function changesAgentSandbox(current: unknown, next: unknown): boolean {
   for (const key of new Set([...before.keys(), ...after.keys()])) {
     if (!isDeepStrictEqual(before.get(key) ?? [], after.get(key) ?? [])) return true;
   }
-  return (
-    agentSandboxOnIn(current) &&
-    !isDeepStrictEqual(fieldOf(current, "projects"), fieldOf(next, "projects"))
-  );
+  return false;
 }
 
 /** Applies `args.operations` to the stored document and writes it, unless a guard refuses. */
@@ -118,12 +109,24 @@ async function rewriteConfigDocument(
     };
   }
 
-  // The sandbox confines the agent, so the agent must not be able to turn it off.
-  if (changesAgentSandbox(currentDocument, mutationResult.document)) {
+  // The sandbox confines the agent, so the agent must not be able to turn it off. While it is
+  // on, the agent writes no Xum config at all: too many fields reach outside the sandbox. A
+  // workspace row's project picks its setting and its path is a write root, Config derives
+  // sub-project parentage from the registered paths, a project's trust starts its MCP servers
+  // outside the sandbox, and a provider's apiKeyFile and baseUrl make the backend read a file
+  // the sandbox hides and send it to any server.
+  const configDocument =
+    args.file === "config"
+      ? currentDocument
+      : await readConfigDocumentUnvalidated(xumHome, "config");
+  if (
+    agentSandboxOnIn(configDocument) ||
+    changesAgentSandbox(currentDocument, mutationResult.document)
+  ) {
     return {
       success: false,
       error:
-        "Refusing to change agentSandbox, or projects while it is on. Only the user can " +
+        "Refusing to change agentSandbox, or any Xum config while it is on. Only the user can " +
         "change them.",
     };
   }
