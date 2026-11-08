@@ -100,6 +100,13 @@ describe("summarizeInvalidToolInputErrors", () => {
 
   test("keeps the execution error of a later call that reuses a rejected call's ID", async () => {
     const rejected = rejectedCall("call_0", "{not json", new Error("JSON parsing failed"));
+    const laterCall = {
+      type: "tool-call" as const,
+      toolCallId: "call_0",
+      toolName: "note",
+      input: { text: "ok" },
+      dynamic: true as const,
+    };
     const executionFailure = {
       type: "tool-error" as const,
       toolCallId: "call_0",
@@ -108,9 +115,15 @@ describe("summarizeInvalidToolInputErrors", () => {
       error: new Error("disk full"),
     };
 
-    const output = await runTransform([rejected.call, rejected.toolError, executionFailure]);
+    const output = await runTransform([
+      rejected.call,
+      rejected.toolError,
+      laterCall,
+      executionFailure,
+    ]);
 
-    expect(output[2]).toBe(executionFailure);
+    expect(output).toHaveLength(4);
+    expect(output[3]).toBe(executionFailure);
   });
 
   test("falls back to the error message when the cause chain has no issues", async () => {
