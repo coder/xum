@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { displayRepoUrl } from "@/common/utils/agentPluginSource";
+import { displayRepoUrl, pointsAtThisMachine } from "@/common/utils/agentPluginSource";
 import type {
   BackupOperationError,
   BackupPluginEntry,
@@ -13,13 +13,24 @@ import type {
 import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
 /**
- * SECURITY: a review previews only https sources. The list is repository-controlled, and a
- * preview of an ssh or scp source makes git sign in with the user's SSH agent to whatever host
- * the list names, before any consent to that plugin. A remote marketplace follows the same rule
- * (assertMarketplaceMayName). The user adds such a plugin by hand in Settings → Plugins.
+ * SECURITY: a review previews only a plain https URL: a host name or IPv4 address, an optional
+ * port, and a path of unreserved characters, with no user, query, fragment, escape or backslash.
+ * The list is repository-controlled. A preview of an ssh or scp source makes git sign in with the
+ * user's SSH agent to whatever host the list names, before any consent to that plugin (a remote
+ * marketplace may name only https sources for the same reason, assertMarketplaceMayName). And a
+ * URL that other parsers read differently, such as `https://github.com\@attacker.example/x`
+ * (WHATWG sees github.com, git and libcurl connect to attacker.example), would show the user one
+ * host and fetch from another. An allowlist cannot be spelled around. The user adds any other
+ * plugin by hand in Settings → Plugins.
  */
+const PLAIN_HTTPS_URL =
+  /^https:\/\/[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*(?::[0-9]{1,5})?\/[A-Za-z0-9._~/-]+$/;
+
 function isAddedByHand(row: BackupPluginRow): boolean {
-  return row.status === "missing" && !row.source.url.startsWith("https://");
+  return (
+    row.status === "missing" &&
+    (!PLAIN_HTTPS_URL.test(row.source.url) || pointsAtThisMachine(row.source.url))
+  );
 }
 
 /** The plugins this machine lacks that a review can preview, as entries (the status is spent). */
@@ -228,9 +239,9 @@ export function BackupPluginsCard(props: {
       ) : null}
       {plugins.some(isAddedByHand) ? (
         <p className="text-muted text-xs">
-          A review previews only https sources. A plugin marked “Add it yourself” comes from an ssh
-          source, and a preview would sign in with your SSH keys to the host this backup names. To
-          reinstall it, add its repository yourself in Settings → Plugins.
+          A review previews only plain https URLs. A plugin marked “Add it yourself” has another
+          kind of source, such as ssh, where a preview would sign in with your SSH keys to the host
+          this backup names. To reinstall it, add its repository yourself in Settings → Plugins.
         </p>
       ) : null}
       {missing.length > 0 ? (
