@@ -10,7 +10,11 @@ import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelp
 import assert from "@/common/utils/assert";
 import { assertNever } from "@/common/utils/assertNever";
 import { REDACTION_LOOKAHEAD_CHARS, redactSecretLike } from "@/node/services/memorySecretRedaction";
-import { renderToolValue } from "@/node/services/memoryToolText";
+import {
+  SESSION_HISTORY_OMITTED,
+  derivesFromSessionHistory,
+  renderToolValue,
+} from "@/node/services/memoryToolText";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 
 const HARVEST_MAX_STEPS = 4;
@@ -71,8 +75,10 @@ function renderToolResult(part: MuxToolPart): string {
   const label = `TOOL RESULT (${part.toolName}): `;
   switch (part.state) {
     case "output-available":
-      return part.toolName === "session_history"
-        ? `${label}[session_history result omitted]`
+      // A history lookup returns other rows' text, and so does a tool that ran one: forwarding
+      // either would copy that text into this workspace's memory.
+      return derivesFromSessionHistory(part)
+        ? `${label}${SESSION_HISTORY_OMITTED}`
         : `${label}${renderToolValue(part.output, HARVEST_MAX_TOOL_OUTPUT_CHARS)}`;
     case "output-redacted":
       return `${label}[output redacted${part.failed ? "; tool failed" : ""}]`;
