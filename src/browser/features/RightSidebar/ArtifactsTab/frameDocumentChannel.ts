@@ -1,3 +1,4 @@
+import { useLayoutEffect, useRef } from "react";
 import assert from "@/common/utils/assert";
 import { createBridgeRateLimiter } from "./artifactBridge";
 
@@ -26,10 +27,10 @@ import { createBridgeRateLimiter } from "./artifactBridge";
  */
 
 /** Key of the preamble's document announcements (never a JSON-RPC message). */
-const MCP_APP_DOCUMENT_MARKER = "xumMcpAppDocument";
+const FRAME_DOCUMENT_MARKER = "xumFrameDocument";
 
 /** A fresh nonce for one view document. getRandomValues also works outside secure contexts. */
-export function newMcpAppDocumentNonce(): string {
+export function newFrameDocumentNonce(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -73,14 +74,14 @@ export function mcpAppDocumentChannelScript(nonce: string): string {
       // After the view's own listeners (also window-level ones added later): setTimeout reads
       // the event's final defaultPrevented, as the Artifacts bridge does. Not a timing guess.
       window.setTimeout(function () {
-        if (!event.defaultPrevented) send({ ${MCP_APP_DOCUMENT_MARKER}: 1, type: "exit" });
+        if (!event.defaultPrevented) send({ ${FRAME_DOCUMENT_MARKER}: 1, type: "exit" });
       }, 0);
     });
     window.addEventListener("pagehide", function () {
-      send({ ${MCP_APP_DOCUMENT_MARKER}: 1, type: "leave" });
+      send({ ${FRAME_DOCUMENT_MARKER}: 1, type: "leave" });
     }, true);
     Object.defineProperty(window, "parent", { value: port, configurable: true, writable: true });
-    host.postMessage({ ${MCP_APP_DOCUMENT_MARKER}: 1, type: "open", nonce: "${nonce}" }, "*", [channel.port2]);
+    host.postMessage({ ${FRAME_DOCUMENT_MARKER}: 1, type: "open", nonce: "${nonce}" }, "*", [channel.port2]);
   })();`;
 }
 
@@ -88,7 +89,7 @@ function isAnnouncement(data: unknown, type: "open" | "leave" | "exit"): boolean
   return (
     typeof data === "object" &&
     data !== null &&
-    MCP_APP_DOCUMENT_MARKER in data &&
+    FRAME_DOCUMENT_MARKER in data &&
     (data as { type?: unknown }).type === type
   );
 }
@@ -100,7 +101,7 @@ function announcementOf(data: unknown): "leave" | "exit" | null {
 }
 
 /** What the receiver does for each document-side announcement. */
-const ANNOUNCED: Record<"leave" | "exit", (receiver: McpAppDocumentReceiver) => void> = {
+const ANNOUNCED: Record<"leave" | "exit", (receiver: FrameDocumentReceiver) => void> = {
   leave: (receiver) => receiver.leave(),
   exit: (receiver) => receiver.exit?.(),
 };
@@ -112,7 +113,7 @@ function openedPort(event: Pick<MessageEvent, "data" | "ports">, nonce: string) 
   return matches && event.ports.length === 1 ? event.ports[0] : null;
 }
 
-export interface McpAppDocumentReceiver {
+export interface FrameDocumentReceiver {
   message: (data: unknown) => void;
   /** The document unloaded (it navigated away). */
   leave: () => void;
@@ -120,14 +121,14 @@ export interface McpAppDocumentReceiver {
   exit?: () => void;
 }
 
-export interface McpAppDocumentChannel {
+export interface FrameDocumentChannel {
   /**
    * A `message` event the frame's window sent to the app window: binds the channel when it is
    * this document's first open announcement. Returns whether it bound the channel.
    */
   acceptOpen: (event: Pick<MessageEvent, "data" | "ports">) => boolean;
   /** Who gets the document's messages; null drops them (no host is mounted). */
-  setReceiver: (receiver: McpAppDocumentReceiver | null) => void;
+  setReceiver: (receiver: FrameDocumentReceiver | null) => void;
   /** To the document only; dropped before it opened and after close. */
   post: (message: unknown) => void;
   close: () => void;
@@ -138,11 +139,11 @@ export interface McpAppDocumentChannel {
  * frame, across host rebuilds (the document announces itself once). Rate limited per document,
  * so a burst of an earlier document cannot drop this one's messages.
  */
-class DocumentChannel implements McpAppDocumentChannel {
+class DocumentChannel implements FrameDocumentChannel {
   // Bound once by the document's open announcement; the port is never replaced.
   private port: MessagePort | null = null;
   private closed = false;
-  private receiver: McpAppDocumentReceiver | null = null;
+  private receiver: FrameDocumentReceiver | null = null;
   private readonly allowMessage = createBridgeRateLimiter();
 
   constructor(private readonly nonce: string) {}
@@ -156,7 +157,7 @@ class DocumentChannel implements McpAppDocumentChannel {
     return true;
   };
 
-  setReceiver = (next: McpAppDocumentReceiver | null): void => {
+  setReceiver = (next: FrameDocumentReceiver | null): void => {
     this.receiver = next;
   };
 
@@ -180,6 +181,31 @@ class DocumentChannel implements McpAppDocumentChannel {
   }
 }
 
-export function createMcpAppDocumentChannel(nonce: string): McpAppDocumentChannel {
+export function createFrameDocumentChannel(nonce: string): FrameDocumentChannel {
   return new DocumentChannel(nonce);
+}
+
+/**
+ * Close the channel of a document that left the frame: a new one replaced it, it navigated away
+ * (the frame is removed until Reload, which loads a new document), or the view unmounted. The
+ * HTML standard asks to close discarded ports. StrictMode replays effects (setup, cleanup,
+ * setup) synchronously, so the cleanup closes only in a microtask, and only if no setup took
+ * the same document back by then. The host's own cleanup runs before it, so its teardown still
+ * went out on the channel.
+ */
+export function useCloseDiscardedDocumentChannel(
+  viewDocument: { channel: FrameDocumentChannel } | null,
+  frameMounted: boolean
+) {
+  const mountedDocument = useRef<typeof viewDocument>(null);
+  useLayoutEffect(() => {
+    if (viewDocument == null || !frameMounted) return;
+    mountedDocument.current = viewDocument;
+    return () => {
+      mountedDocument.current = null;
+      queueMicrotask(() => {
+        if (mountedDocument.current !== viewDocument) viewDocument.channel.close();
+      });
+    };
+  }, [viewDocument, frameMounted]);
 }

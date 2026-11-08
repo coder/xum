@@ -946,7 +946,7 @@ describe("McpAppFrame", () => {
     const nextReceived: unknown[] = [];
     next.port1.onmessage = (event) => nextReceived.push(event.data);
     postFromFrameWindow(frame, { jsonrpc: "2.0", id: 2, method: "ui/initialize", params: {} });
-    postFromFrameWindow(frame, { xumMcpAppDocument: 1, type: "open", nonce }, [next.port2]);
+    postFromFrameWindow(frame, { xumFrameDocument: 1, type: "open", nonce }, [next.port2]);
     next.port1.postMessage({ jsonrpc: "2.0", id: 3, method: "ping" });
 
     await pressAllow(allow);

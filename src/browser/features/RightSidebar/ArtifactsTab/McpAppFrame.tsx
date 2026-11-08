@@ -20,10 +20,11 @@ import {
   mcpAppPreambleScript,
 } from "./mcpAppCsp";
 import {
-  createMcpAppDocumentChannel,
-  type McpAppDocumentChannel,
-  newMcpAppDocumentNonce,
-} from "./mcpAppDocumentChannel";
+  createFrameDocumentChannel,
+  type FrameDocumentChannel,
+  newFrameDocumentNonce,
+  useCloseDiscardedDocumentChannel,
+} from "./frameDocumentChannel";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 import {
   flushOfflineMcpAppWidgetStates,
@@ -186,7 +187,7 @@ function McpAppViewHeader(props: {
  * origin other than their own; a sandboxed srcdoc frame already has a unique opaque origin, so
  * it cannot reach the app's DOM, storage, cookies or API, and no proxy frame is needed (the
  * desktop-host model). Host and view talk only over the view document's own MessagePort
- * (mcpAppDocumentChannel.ts), rate limited and zod-validated; tool calls go only to the view's own server through the backend, which
+ * (frameDocumentChannel.ts), rate limited and zod-validated; tool calls go only to the view's own server through the backend, which
  * enforces visibility and consent.
  */
 /**
@@ -297,7 +298,7 @@ function buildMcpAppViewSrcDoc(
 }
 
 /**
- * One nonce and host channel per loaded view document (mcpAppDocumentChannel.ts): a new grant,
+ * One nonce and host channel per loaded view document (frameDocumentChannel.ts): a new grant,
  * tool call or Reload loads a new one. Kept across host rebuilds of the same document, which
  * announces itself only once. Null until the first render with a document.
  *
@@ -315,12 +316,12 @@ function useMcpAppViewDocument(
   const [loaded, setLoaded] = useState<{
     key: string;
     nonce: string;
-    channel: McpAppDocumentChannel;
+    channel: FrameDocumentChannel;
     openAiSeed: McpAppOpenAiSeed;
   } | null>(null);
   if (key != null && loaded?.key !== key) {
-    const nonce = newMcpAppDocumentNonce();
-    setLoaded({ key, nonce, channel: createMcpAppDocumentChannel(nonce), openAiSeed: makeSeed() });
+    const nonce = newFrameDocumentNonce();
+    setLoaded({ key, nonce, channel: createFrameDocumentChannel(nonce), openAiSeed: makeSeed() });
   }
   return loaded?.key === key ? loaded : null;
 }
@@ -486,31 +487,6 @@ function McpAppViewUnavailable(props: {
   );
 }
 
-/**
- * Close the channel of a document that left the frame: a new one replaced it, it navigated away
- * (the frame is removed until Reload, which loads a new document), or the view unmounted. The
- * HTML standard asks to close discarded ports. StrictMode replays effects (setup, cleanup,
- * setup) synchronously, so the cleanup closes only in a microtask, and only if no setup took
- * the same document back by then. The host's own cleanup runs before it, so its teardown still
- * went out on the channel.
- */
-function useCloseDiscardedDocumentChannel(
-  viewDocument: { channel: McpAppDocumentChannel } | null,
-  frameMounted: boolean
-) {
-  const mountedDocument = useRef<typeof viewDocument>(null);
-  useLayoutEffect(() => {
-    if (viewDocument == null || !frameMounted) return;
-    mountedDocument.current = viewDocument;
-    return () => {
-      mountedDocument.current = null;
-      queueMicrotask(() => {
-        if (mountedDocument.current !== viewDocument) viewDocument.channel.close();
-      });
-    };
-  }, [viewDocument, frameMounted]);
-}
-
 /** The widget state a view document starts with; null before the view loaded. */
 function widgetStateSeedOf(workspaceId: string, loaded: Loaded | null): unknown {
   if (loaded === null) return null;
@@ -532,7 +508,7 @@ export function McpAppFrame(props: {
   variant?: McpAppFrameVariant;
   /** Panel only: closes the panel's host (its app tab). */
   onClose?: () => void;
-  /** Panel only: Escape or Shift+F inside the view (mcpAppDocumentChannel.ts): restore only. */
+  /** Panel only: Escape or Shift+F inside the view (frameDocumentChannel.ts): restore only. */
   onExitKey?: () => void;
   /** Panel only: whether its tab is maximized over the window (#6165), and the toggle. */
   maximized?: boolean;
@@ -830,7 +806,7 @@ export function McpAppFrame(props: {
     });
     hostRef.current = host;
     // SECURITY: the host talks only over the channel of the document built here; its port
-    // arrives with the document's open announcement (mcpAppDocumentChannel.ts).
+    // arrives with the document's open announcement (frameDocumentChannel.ts).
     channel.setReceiver({
       message: (data) => {
         if (!navigatedRef.current) void host.handleMessage(data);

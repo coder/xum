@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createMcpAppDocumentChannel, mcpAppDocumentChannelScript } from "./mcpAppDocumentChannel";
+import { createFrameDocumentChannel, mcpAppDocumentChannelScript } from "./frameDocumentChannel";
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -54,7 +54,7 @@ function openDocument(nonce: string, hostWindow: HostWindow) {
 }
 
 /** A host window that hands each announcement to `channel` like McpAppFrame does. */
-function hostFor(channel: ReturnType<typeof createMcpAppDocumentChannel>): HostWindow {
+function hostFor(channel: ReturnType<typeof createFrameDocumentChannel>): HostWindow {
   return {
     postMessage: (data: unknown, _origin: unknown, ports: MessagePort[] = []) =>
       channel.acceptOpen({ data, ports }),
@@ -64,7 +64,7 @@ function hostFor(channel: ReturnType<typeof createMcpAppDocumentChannel>): HostW
 describe("MCP App document channel", () => {
   // Keys inside the frame never reach the app: a maximized app tab restores on these (#6165).
   test("Escape and Shift+F the view did not handle reach the host as exit", async () => {
-    const channel = createMcpAppDocumentChannel("ab12");
+    const channel = createFrameDocumentChannel("ab12");
     const received: unknown[] = [];
     let exits = 0;
     channel.setReceiver({
@@ -95,7 +95,7 @@ describe("MCP App document channel", () => {
   });
 
   test("view and host talk only over the port of the document that opened it", async () => {
-    const channel = createMcpAppDocumentChannel("ab12");
+    const channel = createFrameDocumentChannel("ab12");
     const received: unknown[] = [];
     channel.setReceiver({ message: (data) => received.push(data), leave: () => undefined });
     const view = openDocument("ab12", hostFor(channel));
@@ -111,7 +111,7 @@ describe("MCP App document channel", () => {
   });
 
   test("only the first open with the document's nonce binds the channel", async () => {
-    const channel = createMcpAppDocumentChannel("ab12");
+    const channel = createFrameDocumentChannel("ab12");
     const received: unknown[] = [];
     channel.setReceiver({ message: (data) => received.push(data), leave: () => undefined });
     const host = hostFor(channel);
@@ -135,7 +135,7 @@ describe("MCP App document channel", () => {
   });
 
   test("an unloading document closes its frame; a closed channel carries nothing", async () => {
-    const channel = createMcpAppDocumentChannel("ab12");
+    const channel = createFrameDocumentChannel("ab12");
     const received: unknown[] = [];
     let left = 0;
     channel.setReceiver({ message: (data) => received.push(data), leave: () => left++ });

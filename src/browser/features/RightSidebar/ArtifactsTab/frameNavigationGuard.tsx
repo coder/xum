@@ -20,7 +20,7 @@ import { Notice } from "./SourceText";
  * destination's load is the first one seen here). The desktop app blocks the navigation itself.
  * MCP App views do not rely on the load count: the host talks to them only over their
  * document's own MessagePort, which a page the frame navigates to cannot reach
- * (mcpAppDocumentChannel.ts).
+ * (frameDocumentChannel.ts).
  */
 export function useFrameNavigationGuard(srcDoc: string | null) {
   // Loads seen for the srcdoc currently in the frame; a new srcdoc or a reload starts over.
@@ -57,7 +57,7 @@ export function useFrameNavigationGuard(srcDoc: string | null) {
       leave();
       return false;
     },
-    /** The frame told the host its document unloaded (MCP App views: mcpAppDocumentChannel.ts). */
+    /** The frame told the host its document unloaded (MCP App views: frameDocumentChannel.ts). */
     leave,
     reload: () => {
       navigatedRef.current = false;

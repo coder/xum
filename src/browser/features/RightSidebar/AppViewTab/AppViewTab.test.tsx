@@ -22,7 +22,7 @@ import {
 
 /**
  * Run the view document's preamble (its first script) as the frame's document would: it opens
- * the document's channel to the host (mcpAppDocumentChannel.ts), whose open announcement comes
+ * the document's channel to the host (frameDocumentChannel.ts), whose open announcement comes
  * from the frame's window. Returns the view's `window.parent`, which posts over that channel.
  * `onMessage` gets every message the host sends the document.
  */
