@@ -10,6 +10,12 @@ import {
   SIDE_INSET_VIEWPORT,
   TABLET_TOUCH_TARGET_PX,
 } from "../src/constants/layout";
+import {
+  MERMAID_ERROR_SELECTOR,
+  MERMAID_PAGE_DIAGRAM_SELECTOR,
+  MERMAID_PAGE_FRAME_SELECTOR,
+  PAINT_CHECK_WAIT_EVENT,
+} from "../src/constants/mermaid";
 
 // Real :hover for the primary-button contrast stories (#6022). A play runs inside the page and
 // cannot set :hover, so only stories under this id prefix get two page-level helpers backed by
@@ -723,9 +729,52 @@ async function assertSheetTouchTargets(page: StoryPage) {
     if (viewport) await page.setViewportSize(viewport);
   }
 }
+/**
+ * The live line clears the composer on a real touch phone. The touch floor makes every control's hit
+ * area taller than what it draws, and the row keeps padding below the controls so the line never
+ * sits on the composer's top edge. This is the only place that padding can be checked: it lives in
+ * the same `pointer: coarse` query as the floor, which a play cannot match.
+ */
+async function assertLiveLineClearsTheComposer(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.waitForFunction(() => matchMedia("(pointer: coarse)").matches, undefined, {
+      timeout: 5000,
+    });
+    const gap = await page.evaluate(() => {
+      const line = document.querySelector('[data-component="ChatActivityLine"]');
+      const surface = document.querySelector('[data-component="ChatInputSurface"]');
+      if (!line || !surface) return null;
+      const controls = [...line.querySelectorAll("button")].filter((control) => {
+        const style = getComputedStyle(control);
+        return style.visibility !== "hidden" && control.getBoundingClientRect().height > 0;
+      });
+      if (controls.length === 0) return null;
+      const bottom = Math.max(...controls.map((control) => control.getBoundingClientRect().bottom));
+      return surface.getBoundingClientRect().top - bottom;
+    });
+    assert(gap !== null, "No live-line control to measure on a 375px touch phone");
+    assert(
+      gap >= 5,
+      `The live line ends ${Math.round(gap)}px above the composer, so it reads as part of it`
+    );
+  } finally {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
 
+// The diagram wait, the error marker, the viewport check and the paint-outside check below each
+// have a story built to trip them (src/browser/stories/PaintCheckFixtures.stories.tsx), which
+// `make test-storybook-paint-fixtures` runs through this file. A message that changes needs its new
+// text in scripts/check-paint-check-fixtures.ts.
 const PAINT_CHECK_TAG = "paint-check";
-const PAGE_DIAGRAMS = ".mermaid-container:not(.mermaid-modal) > svg";
+const NO_DIAGRAM_MESSAGE = `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`;
+const DIAGRAM_RENDER_TIMEOUT_MS = 15_000;
 
 interface Box {
   left: number;
@@ -741,8 +790,35 @@ interface Pixels {
   channels: number;
 }
 
+async function waitForRenderedDiagrams(page: StoryPage) {
+  const args: [string, string, string, number, string] = [
+    MERMAID_PAGE_FRAME_SELECTOR,
+    MERMAID_PAGE_DIAGRAM_SELECTOR,
+    MERMAID_ERROR_SELECTOR,
+    DIAGRAM_RENDER_TIMEOUT_MS,
+    PAINT_CHECK_WAIT_EVENT,
+  ];
+  const rendered = await page.evaluate(async ([frames, diagrams, errors, timeout, waitEvent]) => {
+    // A diagram that fails replaces its whole frame, so the counts below cannot see it.
+    const hasFailed = () => document.querySelector(errors) !== null;
+    const isRendered = () => {
+      const drawn = document.querySelectorAll(diagrams).length;
+      return drawn > 0 && drawn === document.querySelectorAll(frames).length;
+    };
+    // The fixture story that mounts its diagram late waits for this, so it cannot mount early.
+    window.dispatchEvent(new Event(waitEvent));
+    // Not Date.now(): the preview freezes it (.storybook/preview.tsx).
+    const deadline = performance.now() + timeout;
+    while (!isRendered() && !hasFailed() && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return isRendered() && !hasFailed();
+  }, args);
+  assert(rendered, NO_DIAGRAM_MESSAGE);
+}
+
 async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
-  const boxes = await page.$$eval(PAGE_DIAGRAMS, (diagrams) =>
+  const boxes = await page.$$eval(MERMAID_PAGE_DIAGRAM_SELECTOR, (diagrams) =>
     diagrams.map((diagram) => {
       const own = diagram.getBoundingClientRect();
       const container = diagram.parentElement!;
@@ -754,10 +830,7 @@ async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
       return { left, top, right: Math.max(left, right), bottom: Math.max(top, bottom) };
     })
   );
-  assert(
-    boxes.length > 0,
-    `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`
-  );
+  assert(boxes.length > 0, NO_DIAGRAM_MESSAGE);
   return boxes;
 }
 
@@ -769,7 +842,7 @@ async function viewportPixels(page: StoryPage): Promise<Pixels> {
 
 function setDiagramHidden(page: StoryPage, index: number, hidden: boolean) {
   return page.$$eval(
-    PAGE_DIAGRAMS,
+    MERMAID_PAGE_DIAGRAM_SELECTOR,
     (diagrams, [target, hide]) => {
       // Opacity, because a child can set visibility: visible inside a hidden parent.
       (diagrams[target as number] as SVGElement).style.opacity = hide ? "0" : "";
@@ -854,7 +927,7 @@ async function paintOutside(
 
 function scrollBelowDiagram(page: StoryPage, index: number, scroll: boolean) {
   return page.$$eval(
-    PAGE_DIAGRAMS,
+    MERMAID_PAGE_DIAGRAM_SELECTOR,
     (diagrams, [target, down]) => {
       const frame = diagrams[target as number].parentElement!.parentElement!;
       if (down) {
@@ -875,11 +948,18 @@ function scrollBelowDiagram(page: StoryPage, index: number, scroll: boolean) {
 const MIN_BELOW_PX = 8;
 const roomBelow = (box: Box, viewportHeight: number) => viewportHeight - Math.ceil(box.bottom) - 1;
 
+function overlapsViewport(box: Box, viewport: Pick<Pixels, "width" | "height">) {
+  return (
+    Math.min(box.right, viewport.width) > Math.max(box.left, 0) &&
+    Math.min(box.bottom, viewport.height) > Math.max(box.top, 0)
+  );
+}
+
 /**
  * For a diagram that ends below the viewport. By now the first screenshot has repaired any stale
  * WebKit layout, so this scrolled view only catches paint that escapes a settled layout.
  */
-async function paintBelowWhenScrolled(page: StoryPage, index: number): Promise<string[]> {
+async function paintBelowWhenScrolled(page: StoryPage, index: number) {
   await scrollBelowDiagram(page, index, true);
   try {
     const box = (await diagramPaintBoxes(page))[index];
@@ -888,7 +968,10 @@ async function paintBelowWhenScrolled(page: StoryPage, index: number): Promise<s
       roomBelow(box, shown.height) >= MIN_BELOW_PX,
       `Diagram ${index} has no content below it to compare: put text after it in the story`
     );
-    return await paintOutside(page, index, box, shown);
+    return {
+      painted: await paintOutside(page, index, box, shown),
+      inViewport: overlapsViewport(box, shown),
+    };
   } finally {
     await scrollBelowDiagram(page, index, false);
   }
@@ -907,6 +990,7 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   await page.waitForFunction(() => document.querySelector('[role="tooltip"]') === null, undefined, {
     timeout: 5000,
   });
+  await waitForRenderedDiagrams(page);
   // Wait for fonts and late renders by polling boxes across frames, not by comparing screenshots:
   // a screenshot makes WebKit lay the page out again.
   await page.evaluate(async (selector) => {
@@ -927,20 +1011,31 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
       still = now === last ? still + 1 : 0;
       last = now;
     }
-  }, PAGE_DIAGRAMS);
+  }, MERMAID_PAGE_DIAGRAM_SELECTOR);
   const boxes = await diagramPaintBoxes(page);
   const shown = await viewportPixels(page);
   const painted: string[] = [];
+  const unseen: string[] = [];
   for (const [index, box] of boxes.entries()) {
     painted.push(...(await paintOutside(page, index, box, shown)));
+    let inViewport = overlapsViewport(box, shown);
     if (roomBelow(box, shown.height) < MIN_BELOW_PX) {
-      painted.push(...(await paintBelowWhenScrolled(page, index)));
+      const scrolled = await paintBelowWhenScrolled(page, index);
+      painted.push(...scrolled.painted);
+      inViewport ||= scrolled.inViewport;
     }
+    if (!inViewport)
+      unseen.push(`diagram ${index} (x ${box.left}-${box.right}, y ${box.top}-${box.bottom})`);
   }
   assert.equal(
     painted.join("; "),
     "",
     "A diagram must paint only inside its box and the container that clips it"
+  );
+  assert.equal(
+    unseen.join("; "),
+    "",
+    "A diagram that never overlaps the viewport is not compared with its box: bring it into view in the story"
   );
 }
 
@@ -1005,6 +1100,7 @@ const config: TestRunnerConfig = {
     }
     if (context.id === LANDSCAPE_SHEET_STORY) {
       if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertLiveLineClearsTheComposer(page);
         await assertSheetTouchTargets(page);
       }
       return;
@@ -1093,6 +1189,17 @@ const config: TestRunnerConfig = {
     const initialOrder = await tabs.evaluateAll((elements) => elements.map((el) => el.id));
     try {
       await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+      // A swipe has settled at the first scrollend after its touchEnd (`data-swipe-ended` marks
+      // that point), not at any scrollend: Playwright's scroll-into-view before a click and the
+      // previous swipe's fling also end with one, and a fast runner can have the swipe already
+      // listening by then. Counting that event started the next swipe, and in the end the tap on
+      // the last tab, during a fling. A touch that lands on a fling only stops it and sends no
+      // click, so the tab stayed unselected and the wait for it timed out.
+      await row.evaluate((el) => {
+        el.addEventListener("scrollend", () => {
+          if (el.hasAttribute("data-swipe-ended")) el.setAttribute("data-scroll-settled", "");
+        });
+      });
       for (const width of [1200, 375]) {
         // A visible-sidebar tablet and a phone viewport, both with a narrow overflowing strip.
         await page.setViewportSize({ width, height: 900 });
@@ -1124,10 +1231,8 @@ const config: TestRunnerConfig = {
             throw new Error("No tab label available to swipe");
           });
           await row.evaluate((el) => {
+            el.removeAttribute("data-swipe-ended");
             el.removeAttribute("data-scroll-settled");
-            el.addEventListener("scrollend", () => el.setAttribute("data-scroll-settled", ""), {
-              once: true,
-            });
           });
           await client.send("Input.dispatchTouchEvent", {
             type: "touchStart",
@@ -1142,6 +1247,8 @@ const config: TestRunnerConfig = {
               () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
             );
           }
+          // Arm before the touch ends: a scrollend that comes right as the finger lifts counts.
+          await row.evaluate((el) => el.setAttribute("data-swipe-ended", ""));
           await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
           await row.and(page.locator("[data-scroll-settled]")).waitFor({ timeout: 5000 });
           // The tap below lands 20 px into the last tab's visible part: on a phone, a long title

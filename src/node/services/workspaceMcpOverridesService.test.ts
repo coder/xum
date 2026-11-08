@@ -6,6 +6,8 @@ import { parse as jsoncParse, type ParseError as JsoncParseError } from "jsonc-p
 import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
+import { withProjectRegistrationFileLock } from "@/node/config/projectRegistrationLock";
+import { log } from "@/node/services/log";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
@@ -14,6 +16,7 @@ import {
   ALL_WORKSPACES_TARGET,
   boundContainerMutation,
   isPositivelyAbsent,
+  MAX_WARNED_LENIENT_WALKS,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
   readHostOverrideDocumentNoFollow,
   readWorkspaceOverridesEpochToken,
@@ -234,6 +237,85 @@ describe("WorkspaceMcpOverridesService", () => {
         disabledServers: ["noisy"],
       });
     });
+
+    // An id-less legacy row. The first build migrates it, and a migrated row is read from config
+    // alone: a parent link read from its legacy metadata.json would hold for the first read only.
+    // Every read, the first one included, takes the link from the config row (CONFIG_TREE_FIELDS).
+    const parentLinks = [
+      { name: "a link in the config row", row: "parent", file: undefined, inherits: "parent" },
+      {
+        name: "a link only in the legacy file",
+        row: undefined,
+        file: "parent",
+        inherits: undefined,
+      },
+      { name: "a file naming another parent", row: "parent", file: "other", inherits: "parent" },
+      {
+        name: "a file naming the row as its own parent",
+        row: undefined,
+        file: "self",
+        inherits: undefined,
+      },
+    ] as const;
+    for (const link of parentLinks) {
+      it(`a legacy child with ${link.name} reads the same on every read`, async () => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const parent = await registerWorkspace("legacy-parent");
+        await service.setOverridesForWorkspace(parent.workspaceId, { disabledServers: ["noisy"] });
+        const other = await registerWorkspace("legacy-other");
+        await service.setOverridesForWorkspace(other.workspaceId, { disabledServers: ["other"] });
+        const childId = "legacy-child-id";
+        const ids = { parent: parent.workspaceId, other: other.workspaceId, self: childId };
+        const childPath = getWorkspacePath({
+          srcDir: config.srcDir,
+          projectName: "legacy-child",
+          workspaceName: "old-child",
+        });
+        await fs.mkdir(childPath, { recursive: true });
+        await fs.mkdir(path.join(config.sessionsDir, "old-child"), { recursive: true });
+        await fs.writeFile(
+          path.join(config.sessionsDir, "old-child", "metadata.json"),
+          JSON.stringify({
+            id: childId,
+            name: "old-child",
+            ...(link.file === undefined ? {} : { parentWorkspaceId: ids[link.file] }),
+          })
+        );
+        await config.editConfig((cfg) => {
+          cfg.projects.set("/fake/legacy-child", {
+            workspaces: [
+              {
+                path: childPath,
+                runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+                ...(link.row === undefined ? {} : { parentWorkspaceId: ids[link.row] }),
+              },
+            ],
+          });
+          return cfg;
+        });
+
+        const expected = {
+          overrides: link.inherits === undefined ? {} : { disabledServers: ["noisy"] },
+          authoritative: true,
+        };
+        const read = async (reader: WorkspaceMcpOverridesService) => {
+          const { overrides, authoritative } = await reader.getOverridesForWorkspace(childId);
+          return { overrides, authoritative };
+        };
+        for (let attempt = 0; attempt < 3; attempt++) {
+          expect(await read(service)).toEqual(expected);
+        }
+        // The queued migration write lands before this no-op edit; a restart reads it from disk.
+        await config.editConfig((cfg) => cfg);
+        const restarted = new Config(tempDir);
+        expect(await read(new WorkspaceMcpOverridesService(restarted))).toEqual(expected);
+        const persisted = restarted.loadConfigOrDefault().projects.get("/fake/legacy-child")
+          ?.workspaces[0];
+        expect(persisted?.parentWorkspaceId).toBe(
+          link.row === undefined ? undefined : ids[link.row]
+        );
+      });
+    }
 
     it("child's own overrides win over the parent's, and saving them uses the inherited revision", async () => {
       const service = new WorkspaceMcpOverridesService(config);
@@ -1101,6 +1183,410 @@ describe("WorkspaceMcpOverridesService", () => {
         ["shared-parent", { enabledServers: ["shots"] }],
         ["shared-child", { enabledServers: ["shots"] }],
       ]);
+    });
+  });
+
+  describe("save cost with many unrelated workspaces", () => {
+    // At 7,550 registered workspaces one settings save took up to 34.6 s: each
+    // save realpathed every registered checkout to find sharers, and looked up
+    // a legacy value once per workspace with a registry scan each.
+    function isInside(target: unknown, dirs: readonly string[]): boolean {
+      const spelled = String(target);
+      return dirs.some((dir) => spelled === dir || spelled.startsWith(dir + path.sep));
+    }
+
+    async function registerLocalWorkspaces(
+      cfg: Config,
+      entries: ReadonlyArray<{ dir: string; id: string; parentWorkspaceId?: string }>
+    ): Promise<void> {
+      await Promise.all(entries.map((entry) => fs.mkdir(entry.dir, { recursive: true })));
+      await cfg.editConfig((current) => {
+        for (const entry of entries) {
+          const project = current.projects.get(entry.dir) ?? { workspaces: [] };
+          project.workspaces.push({
+            path: entry.dir,
+            id: entry.id,
+            name: entry.id,
+            runtimeConfig: { type: "local" },
+            // A missing createdAt is migrated by an extra config write.
+            createdAt: "2026-11-06T00:00:00.000Z",
+            ...(entry.parentWorkspaceId ? { parentWorkspaceId: entry.parentWorkspaceId } : {}),
+          });
+          current.projects.set(entry.dir, project);
+        }
+        return current;
+      });
+    }
+
+    async function countSaveWork(
+      unrelatedCount: number,
+      overrides: { disabledServers?: string[] } = { disabledServers: ["shots"] }
+    ) {
+      const root = await fs.mkdtemp(path.join(tempDir, `scale-${unrelatedCount}-`));
+      const cfg = new Config(path.join(root, "home"));
+      const unrelated = Array.from({ length: unrelatedCount }, (_, index) => ({
+        dir: path.join(root, `unrelated-${index}`),
+        id: `unrelated-${index}`,
+      }));
+      await registerLocalWorkspaces(cfg, [{ dir: path.join(root, "written"), id: "written" }]);
+      await registerLocalWorkspaces(cfg, unrelated);
+      const service = new WorkspaceMcpOverridesService(cfg);
+      const internals = service as unknown as {
+        getLegacyOverridesFromConfig: (...args: never[]) => unknown;
+      };
+      const legacySpy = spyOn(internals, "getLegacyOverridesFromConfig");
+      const editSpy = spyOn(cfg, "editConfig");
+      const realpathSpy = spyOn(fsPromisesModule, "realpath");
+      try {
+        await service.setOverridesForWorkspace("written", overrides, {
+          publish: () => Promise.resolve(),
+          hasSnapshot: () => false,
+        });
+        const unrelatedDirs = unrelated.map((entry) => entry.dir);
+        return {
+          legacyLookups: legacySpy.mock.calls.length,
+          configEdits: editSpy.mock.calls.length,
+          unrelatedRealpaths: realpathSpy.mock.calls.filter(([target]) =>
+            isInside(target, unrelatedDirs)
+          ).length,
+        };
+      } finally {
+        realpathSpy.mockRestore();
+        editSpy.mockRestore();
+        legacySpy.mockRestore();
+      }
+    }
+
+    it("a save does no per-workspace work for unrelated workspaces", async () => {
+      const few = await countSaveWork(2);
+      const many = await countSaveWork(24);
+      expect(many.unrelatedRealpaths).toBe(0);
+      expect(many.configEdits).toBe(few.configEdits);
+      expect(many.legacyLookups).toBe(few.legacyLookups);
+      // An empty save takes the removal branch, which publishes on its own path.
+      const cleared = await countSaveWork(24, {});
+      expect(cleared.unrelatedRealpaths).toBe(0);
+    });
+
+    it("a save checks only legacy-carrying workspaces for legacy retirement", async () => {
+      // A sharer's legacy value must be retired (see the shared-save tests above).
+      const carrierDir = path.join(tempDir, "legacy-carrier");
+      const others = Array.from({ length: 6 }, (_, index) => ({
+        dir: path.join(tempDir, `no-legacy-${index}`),
+        id: `no-legacy-${index}`,
+      }));
+      await registerLocalWorkspaces(config, [
+        { dir: path.join(tempDir, "legacy-writer"), id: "legacy-writer" },
+        { dir: carrierDir, id: "legacy-carrier" },
+        ...others,
+      ]);
+      const legacy = { enabledServers: ["shots"] };
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const entry = project.workspaces.find((w) => w.id === "legacy-carrier");
+          if (entry) entry.mcp = legacy;
+        }
+        return cfg;
+      });
+      const service = new WorkspaceMcpOverridesService(config);
+      const realpathSpy = spyOn(fsPromisesModule, "realpath");
+      try {
+        await service.setOverridesForWorkspace(
+          "legacy-writer",
+          { disabledServers: ["shots"] },
+          { publish: () => Promise.resolve(), hasSnapshot: () => false }
+        );
+        const touched = realpathSpy.mock.calls.map(([target]) => target);
+        expect(touched.some((target) => isInside(target, [carrierDir]))).toBe(true);
+        expect(
+          touched.filter((target) =>
+            isInside(
+              target,
+              others.map((entry) => entry.dir)
+            )
+          )
+        ).toEqual([]);
+      } finally {
+        realpathSpy.mockRestore();
+      }
+      // The carrier is on another checkout: its legacy value stays.
+      const stored = [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((w) => w.id === "legacy-carrier");
+      expect(stored?.mcp).toEqual(legacy);
+    });
+
+    it("publication reaches only workspaces the receiver holds state for, and their ancestors", async () => {
+      const realDir = path.join(tempDir, "hint-real");
+      const linkHot = path.join(tempDir, "hint-link-hot");
+      const linkCold = path.join(tempDir, "hint-link-cold");
+      const linkParent = path.join(tempDir, "hint-link-parent");
+      const childDir = path.join(tempDir, "hint-child");
+      await fs.mkdir(realDir, { recursive: true });
+      for (const link of [linkHot, linkCold, linkParent]) await fs.symlink(realDir, link);
+      await registerLocalWorkspaces(config, [
+        { dir: realDir, id: "hint-writer" },
+        { dir: linkHot, id: "hint-hot-alias" },
+        { dir: linkCold, id: "hint-cold-alias" },
+        { dir: linkParent, id: "hint-cold-parent-alias" },
+        { dir: childDir, id: "hint-hot-child", parentWorkspaceId: "hint-cold-parent-alias" },
+      ]);
+      const hot = new Set(["hint-hot-alias", "hint-hot-child"]);
+      const service = new WorkspaceMcpOverridesService(config);
+      const published: Array<[string, unknown]> = [];
+      const realpathSpy = spyOn(fsPromisesModule, "realpath");
+      try {
+        await service.setOverridesForWorkspace(
+          "hint-writer",
+          { disabledServers: ["shots"] },
+          {
+            publish: (persisted, workspaceId) => {
+              published.push([workspaceId, persisted]);
+              return Promise.resolve();
+            },
+            hasSnapshot: (workspaceId) => hot.has(workspaceId),
+          }
+        );
+        expect(realpathSpy.mock.calls.filter(([target]) => isInside(target, [linkCold]))).toEqual(
+          []
+        );
+      } finally {
+        realpathSpy.mockRestore();
+      }
+      const disabled = { disabledServers: ["shots"] };
+      expect(published).toContainEqual(["hint-writer", disabled]);
+      expect(published).toContainEqual(["hint-hot-alias", disabled]);
+      expect(published).toContainEqual(["hint-hot-child", disabled]);
+      expect(published.map(([id]) => id)).not.toContain("hint-cold-alias");
+    });
+
+    it("a duplicated id carries the legacy value of its first entry, as in every other lookup", async () => {
+      // Corrupted config: one id on two checkouts, only the second with a legacy value.
+      const firstDir = path.join(tempDir, "dup-legacy-first");
+      const secondDir = path.join(tempDir, "dup-legacy-second");
+      await registerLocalWorkspaces(config, [
+        { dir: path.join(tempDir, "dup-legacy-writer"), id: "dup-legacy-writer" },
+        { dir: firstDir, id: "dup-legacy" },
+        { dir: secondDir, id: "dup-legacy" },
+      ]);
+      await config.editConfig((cfg) => {
+        const entry = cfg.projects.get(secondDir)?.workspaces[0];
+        if (entry) entry.mcp = { enabledServers: ["shots"] };
+        return cfg;
+      });
+      const service = new WorkspaceMcpOverridesService(config);
+      const realpathSpy = spyOn(fsPromisesModule, "realpath");
+      try {
+        await service.setOverridesForWorkspace(
+          "dup-legacy-writer",
+          { disabledServers: ["shots"] },
+          { publish: () => Promise.resolve(), hasSnapshot: () => false }
+        );
+        expect(
+          realpathSpy.mock.calls.filter(([target]) => isInside(target, [firstDir, secondDir]))
+        ).toEqual([]);
+      } finally {
+        realpathSpy.mockRestore();
+      }
+    });
+
+    it("an ancestor chain through an off-host workspace still reaches a cached host descendant", async () => {
+      // hint-chain-host -> hint-chain-remote (SSH) -> hint-chain-alias, which shares the written
+      // checkout. The cached host workspace resolves through the remote parent, so the walk up
+      // must cross the off-host entry; the fan-out then evicts the remote subtree.
+      const realDir = path.join(tempDir, "chain-real");
+      const aliasDir = path.join(tempDir, "chain-alias");
+      await fs.mkdir(realDir, { recursive: true });
+      await fs.symlink(realDir, aliasDir);
+      await registerLocalWorkspaces(config, [
+        { dir: realDir, id: "hint-chain-writer" },
+        { dir: aliasDir, id: "hint-chain-alias" },
+      ]);
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/chain-remote", {
+          workspaces: [
+            {
+              path: "/remote/chain",
+              id: "hint-chain-remote",
+              name: "chain",
+              parentWorkspaceId: "hint-chain-alias",
+              runtimeConfig: { type: "ssh", host: "unreachable.invalid", srcBaseDir: "/remote" },
+              createdAt: "2026-11-06T00:00:00.000Z",
+            },
+          ],
+        });
+        return cfg;
+      });
+      await registerLocalWorkspaces(config, [
+        {
+          dir: path.join(tempDir, "chain-host"),
+          id: "hint-chain-host",
+          parentWorkspaceId: "hint-chain-remote",
+        },
+      ]);
+      const service = new WorkspaceMcpOverridesService(config);
+      const published: Array<[string, unknown]> = [];
+      await service.setOverridesForWorkspace(
+        "hint-chain-writer",
+        { disabledServers: ["shots"] },
+        {
+          publish: (persisted, workspaceId) => {
+            published.push([workspaceId, persisted]);
+            return Promise.resolve();
+          },
+          hasSnapshot: (workspaceId) => workspaceId === "hint-chain-host",
+        }
+      );
+      expect(published).toContainEqual(["hint-chain-host", null]);
+    });
+
+    it("a parent cycle among cached workspaces ends the ancestor walk", async () => {
+      // Corrupted config: cycle-a and cycle-b name each other as parent. The walk up from the
+      // cached workspaces must stop at one it already visited; without that check it spun in
+      // synchronous code forever. Each parent read counts, and past a bound it throws, so a
+      // spinning walk fails this test instead of hanging it.
+      await registerLocalWorkspaces(config, [
+        { dir: path.join(tempDir, "cycle-writer"), id: "cycle-writer" },
+        { dir: path.join(tempDir, "cycle-a"), id: "cycle-a", parentWorkspaceId: "cycle-b" },
+        { dir: path.join(tempDir, "cycle-b"), id: "cycle-b", parentWorkspaceId: "cycle-a" },
+      ]);
+      const readParents = config.getAllWorkspaceMetadata.bind(config);
+      let parentReads = 0;
+      const loadSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(async (...args) =>
+        (await readParents(...args)).map((m) => {
+          const parent = m.parentWorkspaceId;
+          if (parent == null) return m;
+          return Object.defineProperty({ ...m }, "parentWorkspaceId", {
+            enumerable: true,
+            get() {
+              parentReads += 1;
+              if (parentReads > 10_000) throw new Error("the ancestor walk did not end");
+              return parent;
+            },
+          });
+        })
+      );
+      const service = new WorkspaceMcpOverridesService(config);
+      try {
+        await service.setOverridesForWorkspace(
+          "cycle-writer",
+          { disabledServers: ["shots"] },
+          { publish: () => Promise.resolve(), hasSnapshot: () => true }
+        );
+      } finally {
+        loadSpy.mockRestore();
+      }
+      expect(parentReads).toBeLessThan(1_000);
+    });
+
+    it("the ancestor walk follows every entry of a duplicated id, as the fan-out does", async () => {
+      // Corrupted config: one cached id on two checkouts, and only its second entry has a
+      // parent, which shares the written checkout. Publication refreshes that parent's
+      // children, so the walk must reach the parent through the second entry too.
+      const realDir = path.join(tempDir, "dup-walk-real");
+      const parentAlias = path.join(tempDir, "dup-walk-parent-alias");
+      await fs.mkdir(realDir, { recursive: true });
+      await fs.symlink(realDir, parentAlias);
+      await registerLocalWorkspaces(config, [
+        { dir: realDir, id: "dup-walk-writer" },
+        { dir: parentAlias, id: "dup-walk-parent" },
+        { dir: path.join(tempDir, "dup-walk-first"), id: "dup-walk-cached" },
+        {
+          dir: path.join(tempDir, "dup-walk-second"),
+          id: "dup-walk-cached",
+          parentWorkspaceId: "dup-walk-parent",
+        },
+      ]);
+      const publishedTo = async (hasSnapshot?: (workspaceId: string) => boolean) => {
+        const targets: string[] = [];
+        await new WorkspaceMcpOverridesService(config).setOverridesForWorkspace(
+          "dup-walk-writer",
+          { disabledServers: ["shots"] },
+          {
+            publish: (_persisted, workspaceId) => {
+              targets.push(workspaceId);
+              return Promise.resolve();
+            },
+            hasSnapshot,
+          }
+        );
+        return targets;
+      };
+      // Without a hint every workspace is a candidate: the baseline the hint must keep.
+      expect(await publishedTo()).toContain("dup-walk-cached");
+      expect(await publishedTo((workspaceId) => workspaceId === "dup-walk-cached")).toContain(
+        "dup-walk-cached"
+      );
+    });
+
+    it("a writer's own legacy value adds no sharer scan to its save", async () => {
+      // The save retires the writer's own legacy value itself. Only other carriers need the
+      // up-front sharer scan, so a writer with a legacy value must not add one.
+      const withLegacy = path.join(tempDir, "own-legacy-writer");
+      const without = path.join(tempDir, "no-legacy-writer");
+      await registerLocalWorkspaces(config, [
+        { dir: withLegacy, id: "own-legacy-writer" },
+        { dir: without, id: "no-legacy-writer" },
+      ]);
+      await config.editConfig((cfg) => {
+        const entry = cfg.projects.get(withLegacy)?.workspaces[0];
+        if (entry) entry.mcp = { enabledServers: ["shots"] };
+        return cfg;
+      });
+      const sharerScansOfSave = async (workspaceId: string) => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const internals = service as unknown as {
+          findCheckoutSharers: (...args: never[]) => unknown;
+        };
+        const scanSpy = spyOn(internals, "findCheckoutSharers");
+        try {
+          await service.setOverridesForWorkspace(
+            workspaceId,
+            { disabledServers: ["shots"] },
+            { publish: () => Promise.resolve(), hasSnapshot: () => false }
+          );
+          return scanSpy.mock.calls.length;
+        } finally {
+          scanSpy.mockRestore();
+        }
+      };
+      // The writer with a legacy value saves first: no other workspace carries one.
+      const scansWithOwnLegacy = await sharerScansOfSave("own-legacy-writer");
+      const stored = [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((w) => w.id === "own-legacy-writer");
+      expect(stored?.mcp).toBeUndefined();
+      expect(scansWithOwnLegacy).toBe(await sharerScansOfSave("no-legacy-writer"));
+    });
+
+    it("the legacy clear sees a value another process commits under the config lock", async () => {
+      // A downgraded Xum can commit a legacy `workspace.mcp` value while it holds the
+      // cross-process config lock. The clear must read the config only after that hold ends,
+      // as its queued edit does: a check that read before it skipped the clear and left the
+      // value to come back over the user's save.
+      const dir = path.join(tempDir, "locked-legacy");
+      await registerLocalWorkspaces(config, [{ dir, id: "locked-legacy" }]);
+      const service = new WorkspaceMcpOverridesService(config);
+      const internals = service as unknown as {
+        clearLegacyOverridesInConfig: (workspaceId: string) => Promise<void>;
+      };
+      let clearing: Promise<void> | undefined;
+      await withProjectRegistrationFileLock(config.rootDir, async (lock) => {
+        clearing = internals.clearLegacyOverridesInConfig("locked-legacy");
+        await config.editConfig(
+          (cfg) => {
+            const entry = cfg.projects.get(dir)?.workspaces[0];
+            if (entry) entry.mcp = { enabledServers: ["shots"] };
+            return cfg;
+          },
+          { withinRegistrationLock: lock }
+        );
+      });
+      await clearing;
+      const stored = [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((w) => w.id === "locked-legacy");
+      expect(stored?.mcp).toBeUndefined();
     });
   });
 
@@ -4179,7 +4665,7 @@ describe("WorkspaceMcpOverridesService", () => {
     await expect(service.acquireWorkspaceLock(healthy.workspaceId)).rejects.toThrow();
   });
 
-  describe("plugin sweeps with an unrelated malformed legacy entry", () => {
+  describe("with an unrelated malformed legacy entry", () => {
     const pluginKey = "plugin:0123456789abcdef:echo";
     const overridesFile = (workspacePath: string) =>
       path.join(workspacePath, ".xum", "mcp.local.jsonc");
@@ -4197,11 +4683,13 @@ describe("WorkspaceMcpOverridesService", () => {
         }
       ).enabledServers;
     // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
+    // With `id`, a partially migrated row: config.json holds the id, but not the name.
     // Its own runtime config keeps its checkout under this test's root.
-    const registerMalformedLegacyEntry = async () => {
+    const registerMalformedLegacyEntry = async (id?: string) => {
       const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
       await fs.mkdir(legacyPath, { recursive: true });
       const legacyEntry: unknown = {
+        ...(id === undefined ? {} : { id }),
         path: legacyPath,
         runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
       };
@@ -4222,6 +4710,23 @@ describe("WorkspaceMcpOverridesService", () => {
       service.prunePluginOverrideKeysForWorkspaces(workspaceIds, "plugin:0123456789abcdef:").then(
         (failures) => failures.map((failure) => failure.workspaceId).sort(),
         () => "refused" as const
+      );
+    const setParent = (childId: string, parentWorkspaceId: string) =>
+      config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const workspace = project.workspaces.find((w) => w.id === childId);
+          if (workspace) workspace.parentWorkspaceId = parentWorkspaceId;
+        }
+        return cfg;
+      });
+    const served = (
+      service: WorkspaceMcpOverridesService,
+      workspaceId: string,
+      mode?: "lenient" | "strict"
+    ) =>
+      service.getOverridesForWorkspace(workspaceId, { mode }).then(
+        (read) => (read.authoritative ? read.overrides : "not authoritative"),
+        () => "refused"
       );
 
     it("prunes every requested workspace, the legacy entry's checkout included", async () => {
@@ -4261,13 +4766,7 @@ describe("WorkspaceMcpOverridesService", () => {
         JSON.stringify({ enabledServers: ["parent-server"] })
       );
       const child = await registerWorkspace("child-of-legacy");
-      await config.editConfig((cfg) => {
-        for (const project of cfg.projects.values()) {
-          const workspace = project.workspaces.find((w) => w.id === child.workspaceId);
-          if (workspace) workspace.parentWorkspaceId = "legacy-stable-id";
-        }
-        return cfg;
-      });
+      await setParent(child.workspaceId, "legacy-stable-id");
 
       const published: Array<[string, unknown]> = [];
       const failures = await service.prunePluginOverrideKeysForWorkspaces(
@@ -4284,6 +4783,124 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(published).toEqual([[ALL_WORKSPACES_TARGET, null]]);
     });
 
+    it("serves a workspace's pruned overrides authoritatively after the sweep", async () => {
+      // MCP serves read the registry too: one malformed legacy entry must not turn every serve off.
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry();
+      expect(await sweepOutcome(service, [healthy.workspaceId])).toEqual([]);
+
+      const read = await service.getOverridesForWorkspace(healthy.workspaceId);
+      expect(read.authoritative).toBe(true);
+      expect(read.overrides.enabledServers).toEqual(["other"]);
+    });
+
+    // Id-less: the child names the stable id that only the unreadable metadata.json holds.
+    // Partially migrated: the walk builds the parent from its config row alone (see below).
+    // Either way the inherited settings (a disable included) are unknown, not absent.
+    for (const { shape, entryId, parentId } of [
+      { shape: "id-less", entryId: undefined, parentId: "legacy-stable-id" },
+      { shape: "partially migrated", entryId: "partial-legacy-id", parentId: "partial-legacy-id" },
+    ]) {
+      it(`does not serve a child of the ${shape} legacy entry authoritatively`, async () => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const legacyPath = await registerMalformedLegacyEntry(entryId);
+        await fs.mkdir(path.join(legacyPath, ".xum"), { recursive: true });
+        await fs.writeFile(
+          overridesFile(legacyPath),
+          JSON.stringify({ disabledServers: ["global-server"] })
+        );
+        const child = await registerWorkspace("child-of-legacy");
+        await setParent(child.workspaceId, parentId);
+
+        expect(await served(service, child.workspaceId)).toBe("not authoritative");
+        // The settings dialog reads strictly: it must report the state unavailable, not show `{}`.
+        expect(await served(service, child.workspaceId, "strict")).toBe("refused");
+      });
+    }
+
+    it("does not serve a partially migrated legacy entry from its config row alone", async () => {
+      // Its id is in config.json, but its name (and on SSH or Docker its runtime) lives only in
+      // the unreadable metadata.json: the checkout the row alone names may not hold its override
+      // file. A healthy workspace beside it is still served.
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry("partial-legacy-id");
+
+      expect(await served(service, "partial-legacy-id")).toBe("refused");
+      expect(await served(service, "partial-legacy-id", "strict")).toBe("refused");
+      const read = await service.getOverridesForWorkspace(healthy.workspaceId);
+      expect(read.authoritative).toBe(true);
+      expect(read.overrides.enabledServers).toEqual([pluginKey, "other"]);
+    });
+
+    it("does not serve overrides while config.json is corrupt", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry();
+      // Parseable but structurally invalid: a lenient load still lists the healthy workspace, so
+      // only the strict config.json load refuses. Unparseable bytes would leave nothing to serve.
+      const configFile = path.join(tempDir, "config.json");
+      const doc = JSON.parse(await fs.readFile(configFile, "utf8")) as { projects: unknown[] };
+      doc.projects.push(["/fake/broken-project", { workspaces: "nope" }]);
+      await fs.writeFile(configFile, JSON.stringify(doc));
+
+      expect(await served(service, healthy.workspaceId)).toBe("refused");
+    });
+
+    it("logs the legacy entry's load failure and the lenient walk once across reads", async () => {
+      // Each override read walks the registry again (the tool-call gate reads on every call).
+      const errorSpy = spyOn(log, "error");
+      const warnSpy = spyOn(log, "warn");
+      try {
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await writeEnable(healthy.workspacePath);
+        await registerMalformedLegacyEntry();
+        for (let read = 0; read < 3; read++) {
+          expect(await served(service, healthy.workspaceId)).not.toBe("refused");
+        }
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        errorSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("warns about the lenient walk again for a new failure, and forgets the oldest past its cap", async () => {
+      const warnSpy = spyOn(log, "warn");
+      try {
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await registerMalformedLegacyEntry();
+        const metadataFile = path.join(config.sessionsDir, "old-branch", "metadata.json");
+        // Each content fails the strict walk with its own message; the workspace count stays 1.
+        const readWith = async (content: string) => {
+          await fs.writeFile(metadataFile, content);
+          expect(await served(service, healthy.workspaceId)).not.toBe("refused");
+        };
+        const lenientWarns = () =>
+          warnSpy.mock.calls.filter(([message]) =>
+            String(message).includes("lenient registry walk")
+          ).length;
+        await readWith("{ not json");
+        await readWith("[");
+        expect(lenientWarns()).toBe(2);
+        for (let failure = 0; failure <= MAX_WARNED_LENIENT_WALKS; failure++) {
+          await readWith(`x${failure}`);
+        }
+        expect(lenientWarns()).toBe(MAX_WARNED_LENIENT_WALKS + 3);
+        await readWith("{ not json");
+        expect(lenientWarns()).toBe(MAX_WARNED_LENIENT_WALKS + 4);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     // Runs `change` once, right before the sweep's own registry read: after the lock derivation,
     // which reads the same registry first.
     const beforeSweepRead = (change: () => void) => {
@@ -4291,7 +4908,7 @@ describe("WorkspaceMcpOverridesService", () => {
       let changed = false;
       return spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
         (...args: Parameters<Config["getAllWorkspaceMetadata"]>) => {
-          if (!changed && new Error().stack?.includes("loadSweepMetadata")) {
+          if (!changed && new Error().stack?.includes("sweepPluginOverrideKeys")) {
             changed = true;
             change();
           }

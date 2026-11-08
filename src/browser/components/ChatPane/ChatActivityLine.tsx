@@ -64,6 +64,13 @@ export function ChatActivityLine(props: ChatActivityLineProps) {
           onCancelCompaction={props.onCancelCompaction}
           showModelName={false}
           activity={chips}
+          // The phone line's controls are drawn smaller than their 44px touch boxes (see
+          // StreamingBarrierView's CancelControl and ChatActivityChipButton), so the gap below the
+          // line comes from padding rather than from the controls filling the row. It goes on the
+          // row, not on this wrapper, so a line that renders nothing takes no space: the row is
+          // `hidden` until a turn is live or a chip shows. The query has to keep matching the phone
+          // rule in globals.css that sets the 44px touch floor (src/constants/layout.ts holds it).
+          className="[@media(max-width:768px)_and_(pointer:coarse)]:pb-1.5"
         />
       </ChatActivityPanelsProvider>
     </ChatDockSurface>

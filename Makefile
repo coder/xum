@@ -151,7 +151,7 @@ include fmt.mk
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
-.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook test-storybook-webkit storybook-budget
+.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook test-storybook-webkit test-storybook-paint-fixtures storybook-budget
 .PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
@@ -628,13 +628,16 @@ crap-check: ## CRAP gate on files changed since BASE (default: merge-base with o
 CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --locked --quiet --only-group crap --only-group test python
 
 # tree-sitter-language-pack downloads its grammars from GitHub releases on
-# first use. The script tests are in static-check-full (Required), so retry a
-# transient failure there (seen: HTTP 504) once, before any test uses them.
+# first use. The script tests are in static-check-full (Required), so a transient failure
+# there (seen: HTTP 504) must not fail the job before any test uses the grammars. CI caches
+# the pack's directory, which makes this a no-op, and sets the budget to 15 minutes for a cold
+# cache: the 504 outage of 2026-11-08 outlasted the old 3 tries 10 s apart. The default
+# keeps an offline local run short. The script exits 64 on an HTTP 4xx that no retry changes.
+# A language added to its list needs a new key prefix in pr.yml's "Restore tree-sitter
+# grammars" step.
+GRAMMAR_DOWNLOAD_BUDGET_SECS ?= 60
 tree-sitter-grammars:
-	@for attempt in 1 2 3; do \
-		$(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])' && break; \
-		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
-	done
+	@./scripts/retry.sh --budget-secs $(GRAMMAR_DOWNLOAD_BUDGET_SECS) --max-backoff-secs 60 --fatal-status 64 0 2 env $(CRAP_PYTHON) scripts/ci/download_tree_sitter_grammars.py
 
 test-crap-scripts: tree-sitter-grammars ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
 	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
@@ -1014,7 +1017,12 @@ WEBKIT_STORY_FILES = $(shell grep -rlF -e '"webkit"' -e '"paint-check"' src/brow
 test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" or "paint-check" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)
 	$(check_node_version)
 	@test -n "$(WEBKIT_STORY_FILES)" || { echo "No story has the webkit or paint-check tag"; exit 1; }
-	@bun x test-storybook --browsers webkit --includeTags webkit paint-check --testTimeout 30000 $(WEBKIT_STORY_FILES)
+	@# paint-fixture stories are built to fail (one to pass), so only test-storybook-paint-fixtures runs them.
+	@bun x test-storybook --browsers webkit --includeTags webkit paint-check --excludeTags paint-fixture --testTimeout 30000 $(WEBKIT_STORY_FILES)
+
+test-storybook-paint-fixtures: node_modules/.installed ## Prove the runner's diagram wait, error marker, viewport check and paint-outside check still fire, with stories built to trip them (requires Storybook to be running or built; STORYBOOK_URL, default http://127.0.0.1:6006)
+	$(check_node_version)
+	@bun scripts/check-paint-check-fixtures.ts
 
 storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (requires Storybook served; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)
