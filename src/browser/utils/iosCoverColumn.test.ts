@@ -216,22 +216,76 @@ describe("installIosCoverColumn", () => {
     expect(column()).toBe("84px");
   });
 
-  test("undoes a sideways pan by laying the page out at device width for two frames", async () => {
-    setStandalone(true);
-    uninstall = installIosCoverColumn();
+  describe("a sideways scroll of the page", () => {
+    const panPage = () => {
+      Object.defineProperty(window, "scrollX", { configurable: true, value: 84 });
+      window.dispatchEvent(new window.Event("scroll"));
+    };
+    const layoutLog: string[] = [];
+    let observer: MutationObserver;
 
-    Object.defineProperty(window, "scrollX", { configurable: true, value: 84 });
-    window.dispatchEvent(new window.Event("scroll"));
-    expect(meta.content).toBe(DEVICE_WIDTH_META);
+    beforeEach(() => {
+      setStandalone(true);
+      uninstall = installIosCoverColumn();
+      layoutLog.length = 0;
+      observer = new window.MutationObserver(() => layoutLog.push(meta.content));
+      observer.observe(meta, { attributes: true });
+    });
 
-    Object.defineProperty(window, "scrollX", { configurable: true, value: 0 });
-    await frames(3);
-    expect(meta.content).toStartWith("width=466, height=678,");
+    afterEach(() => observer.disconnect());
 
-    // A later pan heals the same way.
-    Object.defineProperty(window, "scrollX", { configurable: true, value: 84 });
-    window.dispatchEvent(new window.Event("scroll"));
-    expect(meta.content).toBe(DEVICE_WIDTH_META);
+    // WebKit reveals the caret this way on every keystroke once typing passes the column's edge.
+    test("is scrolled back without laying the page out again when the page made it", async () => {
+      window.scrollTo = ((x: number) => {
+        Object.defineProperty(window, "scrollX", { configurable: true, value: x });
+      }) as typeof window.scrollTo;
+
+      for (let keystroke = 0; keystroke < 3; keystroke++) {
+        panPage();
+        expect(window.scrollX).toBe(0);
+        await frames(3);
+      }
+
+      await Promise.resolve();
+      expect(layoutLog).toEqual([]);
+    });
+
+    test("is healed by laying the page out at device width when iOS holds it", async () => {
+      window.scrollTo = (() => undefined) as typeof window.scrollTo;
+
+      panPage();
+      await frames(2);
+      expect(meta.content).toBe(DEVICE_WIDTH_META);
+
+      Object.defineProperty(window, "scrollX", { configurable: true, value: 0 });
+      await frames(3);
+      expect(meta.content).toStartWith("width=466, height=678,");
+    });
+
+    test("is scrolled back without a relayout when key repeat reveals the caret every frame", async () => {
+      window.scrollTo = ((x: number) => {
+        Object.defineProperty(window, "scrollX", { configurable: true, value: x });
+      }) as typeof window.scrollTo;
+
+      for (let keystroke = 0; keystroke < 6; keystroke++) {
+        panPage();
+        await frames(1);
+      }
+      await frames(3);
+
+      await Promise.resolve();
+      expect(layoutLog).toEqual([]);
+    });
+
+    test("is healed on time when iOS keeps panning the page back inside the undo window", async () => {
+      window.scrollTo = (() => undefined) as typeof window.scrollTo;
+
+      panPage();
+      await frames(1);
+      panPage();
+      await frames(1);
+      expect(meta.content).toBe(DEVICE_WIDTH_META);
+    });
   });
 
   test("leaves the pan of a pinch zoom alone", () => {
