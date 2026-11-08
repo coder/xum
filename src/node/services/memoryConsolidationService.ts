@@ -548,10 +548,16 @@ const OPEN_EPOCH_KEY_PREFIX = "open:";
  * skipping any.
  */
 function analyzedEpochRowIds(
-  records: Record<string, MemoryHarvestRecord> | undefined
+  records: Record<string, MemoryHarvestRecord> | undefined,
+  ownBoundaryKey: string
 ): Set<string> {
   const ids = new Set<string>();
   for (const [boundaryKey, record] of Object.entries(records ?? {})) {
+    // The job's own record says how far ITS chunk cursor got, not which rows an earlier run read:
+    // starting a retry after its own `readThroughRowId` would skip rows, since the cursor counts
+    // chunks of the rows after the job's floor (kept in `analyzedFloorRowId`). A record that has
+    // the cursor but no floor (older, or hand-edited) re-reads rows instead.
+    if (boundaryKey === ownBoundaryKey) continue;
     const isOpenEpochRecord = boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX);
     const readEverythingToKey =
       isOpenEpochRecord && record.status === "completed" && record.readThroughRowId === undefined;
@@ -1875,7 +1881,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const floorFrom = (records: Record<string, MemoryHarvestRecord> | undefined) =>
         recordedFloor !== undefined
           ? recordedFloor
-          : analyzedFloorRowId(epoch.data.messages, analyzedEpochRowIds(records));
+          : analyzedFloorRowId(epoch.data.messages, analyzedEpochRowIds(records, boundaryKey));
       // Every row was analyzed before: nothing is left to read, so no model call.
       const nothingLeftAfter = (floor: string | null) =>
         epoch.data.messages.length > 0 && rowsAfterFloor(epoch.data.messages, floor).length === 0;

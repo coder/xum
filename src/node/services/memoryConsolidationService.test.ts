@@ -3343,7 +3343,14 @@ describe("MemoryConsolidationService", () => {
         expect(closing).not.toContain("We settled on bun");
       });
 
-      it("keeps a retry of the closing compaction on the rows its first attempt read, even if an archive completes meanwhile", async () => {
+      /**
+       * A closing compaction whose epoch spans three chunks and whose first attempt fails on the
+       * second. `betweenAttempts` then changes the sidecar, and the retry runs. Returns the chunks
+       * the model was asked about (the failed one twice) and the compaction's final record.
+       */
+      async function retryAfterSecondChunkFailed(
+        betweenAttempts: (fixture: Fixture) => Promise<void>
+      ) {
         const chunkLabels: string[] = [];
         let failedOnce = false;
         using fixture = await createFixture({
@@ -3374,31 +3381,51 @@ describe("MemoryConsolidationService", () => {
           analyzedFloorRowId: null,
         });
 
-        // An archive pass that read the epoch before it closed finishes after the first attempt:
-        // its row is inside the closed epoch, so it must not move the rows under the saved cursor.
-        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
-        const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
-          harvestsByWorkspace: Record<string, Record<string, unknown>>;
-        };
-        sidecar.harvestsByWorkspace["ws-dream"]["open:bulk-9"] = {
-          status: "completed",
-          startedAt: Date.now(),
-          completedAt: Date.now(),
-          attemptCount: 1,
-          boundaryKey: "open:bulk-9",
-          compactionEpoch: 1,
-          acceptedCandidates: 0,
-          skippedCandidates: 0,
-        };
-        await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+        await betweenAttempts(fixture);
 
         expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+        return { chunkLabels, record: (await harvestRecords(fixture))["summary-1"] };
+      }
+
+      it("keeps a retry of the closing compaction on the rows its first attempt read, even if an archive completes meanwhile", async () => {
+        const { chunkLabels, record } = await retryAfterSecondChunkFailed(async (fixture) => {
+          // An archive pass that read the epoch before it closed finishes after the first attempt:
+          // its row is inside the closed epoch, so it must not move the rows under the saved cursor.
+          const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+          const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
+            harvestsByWorkspace: Record<string, Record<string, unknown>>;
+          };
+          sidecar.harvestsByWorkspace["ws-dream"]["open:bulk-9"] = {
+            status: "completed",
+            startedAt: Date.now(),
+            completedAt: Date.now(),
+            attemptCount: 1,
+            boundaryKey: "open:bulk-9",
+            compactionEpoch: 1,
+            acceptedCandidates: 0,
+            skippedCandidates: 0,
+          };
+          await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+        });
 
         expect(chunkLabels).toEqual(["1/3", "2/3", "2/3", "3/3"]);
-        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
-          status: "completed",
-          nextChunk: 3,
-        });
+        expect(record).toMatchObject({ status: "completed", nextChunk: 3 });
+      });
+
+      it("does not start a retry after what its own record read when that record names no floor", async () => {
+        // A record saved before the floor was: it has the cursor and the row its chunks read, no
+        // floor. The cursor counts chunks of the rows after the job's floor, so a floor taken from
+        // the record's own `readThroughRowId` would leave the retry fewer rows than the cursor
+        // counts, and skip some. With no floor to reuse it reads the rows again from the start.
+        const { chunkLabels, record } = await retryAfterSecondChunkFailed((fixture) =>
+          editHarvestRecord(fixture, "summary-1", (stored) => {
+            expect(typeof stored.readThroughRowId).toBe("string");
+            delete stored.analyzedFloorRowId;
+          })
+        );
+
+        expect(chunkLabels).toEqual(["1/3", "2/3", "2/3", "3/3"]);
+        expect(record).toMatchObject({ status: "completed", nextChunk: 3 });
       });
 
       it("makes no analyzer call for a compaction that closes an epoch an archive fully analyzed", async () => {
