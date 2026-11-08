@@ -10,6 +10,7 @@ import {
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
+import { MEMORY_HARVEST_MAX_CHUNKS } from "@/common/constants/memory";
 import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "./memoryService";
@@ -17,6 +18,16 @@ import { TestTempDir } from "./tools/testHelpers";
 import { buildHarvestChunks, runMemoryHarvest } from "./memoryHarvest";
 
 const INBOX_PATH = "/memories/workspace/harvest/summary-1.md";
+
+const planReviewSnapshot: PlanReviewRecord = {
+  v: 1,
+  kind: "snapshot",
+  recordId: "rec_snap",
+  snapshotId: "snap_1",
+  planPath: "/plans/p.md",
+  contentHash: "a".repeat(64),
+  content: "# Plan\n\nREMEMBER-THIS-PLANTED-INSTRUCTION\n",
+};
 
 function finishChunk(outputTokens = 0): LanguageModelV3StreamPart {
   return {
@@ -946,6 +957,27 @@ describe("runMemoryHarvest", () => {
     expect(streamCalls).toBeGreaterThan(1);
   });
 
+  it("makes at most the cap's model calls on a huge epoch, and tells the last that the epoch goes on", async () => {
+    using fixture = createFixture();
+    fixture.messages = Array.from({ length: 200 }, (_, index) =>
+      createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
+        historySequence: index,
+      })
+    );
+    const { model, calls } = recordingModel();
+
+    const result = await runHarvest(fixture, model);
+
+    expect(result.streamError).toBeUndefined();
+    const prompts = calls.map(userPromptText);
+    expect(prompts).toHaveLength(MEMORY_HARVEST_MAX_CHUNKS);
+    expect(prompts.at(-1)).toContain(
+      `Transcript chunk ${MEMORY_HARVEST_MAX_CHUNKS}/${MEMORY_HARVEST_MAX_CHUNKS}`
+    );
+    expect(prompts.at(-1)).toContain('"omitted"');
+    expect(prompts.slice(0, -1).join("\n")).not.toContain('"omitted"');
+  });
+
   it("redacts a credential in the compaction summary from every chunk's prompt", async () => {
     using fixture = createFixture();
     const githubToken = `ghp_${"a1B2".repeat(9)}`;
@@ -1270,7 +1302,7 @@ describe("buildHarvestChunks", () => {
 
   it("closes each chunk as the pretty JSON of its rows, filled until the next row would pass the limit", () => {
     // A fixed spread of sizes: long and short texts, some with tool parts.
-    const messages = Array.from({ length: 240 }, (_, index) =>
+    const messages = Array.from({ length: 80 }, (_, index) =>
       createMuxMessage(
         `m${index}`,
         "assistant",
@@ -1291,7 +1323,9 @@ describe("buildHarvestChunks", () => {
     const chunks = transcriptsOf(messages);
 
     const rowsOf = chunks.map((chunk) => JSON.parse(chunk) as Array<{ id: string }>);
-    expect(chunks.length).toBeGreaterThan(10);
+    // Many chunks, but under the epoch's cap: every message is in them, whole.
+    expect(chunks.length).toBeGreaterThan(5);
+    expect(chunks.length).toBeLessThan(MEMORY_HARVEST_MAX_CHUNKS);
     chunks.forEach((chunk, index) => {
       expect(chunk).toBe(JSON.stringify(rowsOf[index], null, 2));
       expect(chunk.length <= CHUNK_LIMIT || rowsOf[index].length === 1).toBe(true);
@@ -1304,6 +1338,111 @@ describe("buildHarvestChunks", () => {
     });
     const ids = rowsOf.flat().map((row) => row.id);
     expect([...new Set(ids)]).toEqual(messages.map((message) => message.id));
+  });
+
+  // One harvest reads at most MEMORY_HARVEST_MAX_CHUNKS chunks, from the head of the epoch: the
+  // calls, and the work of building the chunks, are bounded by the cap and not by the epoch.
+  describe("an epoch of more chunks than one harvest reads", () => {
+    const CAP = MEMORY_HARVEST_MAX_CHUNKS;
+    /** Rows of 7,000 characters, which fill a chunk five to a chunk (see `manyChunkMessages`). */
+    const ROWS_PER_CHUNK = 5;
+    const epochOf = (count: number): MuxMessage[] =>
+      Array.from({ length: count }, (_, index) =>
+        createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
+          historySequence: index,
+        })
+      );
+    interface CutRow {
+      omitted?: { note: string; unreadMessages: number; firstUnreadMessageId: string };
+      id?: string;
+    }
+    const rowsOfChunks = (messages: MuxMessage[]): CutRow[][] =>
+      transcriptsOf(messages).map((chunk) => JSON.parse(chunk) as CutRow[]);
+
+    it("keeps exactly the cap's chunks, the head of the epoch, and ends the last with a marker", () => {
+      const messages = epochOf(CAP * ROWS_PER_CHUNK * 2);
+
+      const chunks = rowsOfChunks(messages);
+
+      expect(chunks).toHaveLength(CAP);
+      const keptIds = chunks.flatMap((rows) => rows.flatMap((row) => (row.id ? [row.id] : [])));
+      const keptCount = CAP * ROWS_PER_CHUNK;
+      expect(keptIds).toEqual(messages.slice(0, keptCount).map((message) => message.id));
+      const markers = chunks.flatMap((rows) => rows.filter((row) => row.omitted !== undefined));
+      expect(markers).toHaveLength(1);
+      expect(chunks.at(-1)?.at(-1)?.omitted).toMatchObject({
+        unreadMessages: messages.length - keptCount,
+        firstUnreadMessageId: `m${keptCount}`,
+      });
+    });
+
+    it("cuts nothing from an epoch of exactly the cap, and the first row past it makes the cut", () => {
+      const exact = rowsOfChunks(epochOf(CAP * ROWS_PER_CHUNK));
+      expect(exact).toHaveLength(CAP);
+      expect(exact.flat().filter((row) => row.omitted !== undefined)).toEqual([]);
+      expect(exact.flatMap((rows) => rows.map((row) => row.id))).toHaveLength(CAP * ROWS_PER_CHUNK);
+
+      const over = rowsOfChunks(epochOf(CAP * ROWS_PER_CHUNK + 1));
+      expect(over).toHaveLength(CAP);
+      expect(over.at(-1)?.at(-1)?.omitted).toMatchObject({
+        unreadMessages: 1,
+        firstUnreadMessageId: `m${CAP * ROWS_PER_CHUNK}`,
+      });
+    });
+
+    it("does not count a model-hidden message past the cut among the unread ones", () => {
+      const hidden = createMuxMessage(
+        "hidden-snap",
+        "user",
+        formatPlanReviewEnvelope(planReviewSnapshot),
+        {
+          historySequence: 1_000,
+          synthetic: true,
+          muxMetadata: buildPlanReviewMetadata(planReviewSnapshot),
+        }
+      );
+
+      const chunks = rowsOfChunks([...epochOf(CAP * ROWS_PER_CHUNK + 2), hidden]);
+
+      expect(chunks.at(-1)?.at(-1)?.omitted?.unreadMessages).toBe(2);
+    });
+
+    it("never projects or formats a message past the cut", () => {
+      const pastTheCut = createMuxMessage("late", "user", "unread", { historySequence: 9_999 });
+      Object.defineProperty(pastTheCut, "parts", {
+        get() {
+          throw new Error("a message past the cut was read");
+        },
+      });
+
+      const chunks = rowsOfChunks([...epochOf(CAP * ROWS_PER_CHUNK + 1), pastTheCut]);
+
+      expect(chunks).toHaveLength(CAP);
+      expect(chunks.at(-1)?.at(-1)?.omitted?.unreadMessages).toBe(2);
+    });
+
+    it("bounds one message of hundreds of tool calls to the cap too", () => {
+      const parallelTools = createMuxMessage(
+        "a1",
+        "assistant",
+        "fan out",
+        { historySequence: 0 },
+        Array.from({ length: 400 }, (_, tool) =>
+          toolPart(
+            "bash",
+            { script: `step ${tool}` },
+            { output: `result ${tool} ${"o".repeat(3_000)}` }
+          )
+        )
+      );
+
+      const chunks = transcriptsOf([parallelTools]);
+
+      expect(chunks).toHaveLength(CAP);
+      // Each chunk stays within its limit, the last one by a marker row's length at most.
+      expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThan(CHUNK_LIMIT + 1_000);
+      expect(chunks.at(-1)).toContain('"omitted"');
+    });
   });
 
   describe("evidence rows", () => {

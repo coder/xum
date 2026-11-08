@@ -79,6 +79,15 @@ export const MEMORY_VIEW_MAX_DEPTH = 2;
 export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
 /** Generous step ceiling for the consolidation stream (reads + budgeted mutations). */
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
+/**
+ * Memory harvest: transcript chunks one epoch's harvest reads. Each chunk is a model call of at
+ * most 40,000 characters of transcript, and the per-part caps leave an epoch's total unbounded
+ * (thousands of parallel tool calls, or megabytes of pasted text, make hundreds of chunks). 12 is
+ * about 480,000 characters, or 120,000 tokens: a context window's worth of rendered transcript,
+ * and a run that fits the dream's timeout when each chunk takes under half a minute. Past it the
+ * transcript is cut, at its end, and the last chunk says so.
+ */
+export const MEMORY_HARVEST_MAX_CHUNKS = 12;
 /** Minimum gap between consolidation runs for one workspace (debounce across triggers). */
 export const MEMORY_CONSOLIDATION_DEBOUNCE_MS = 6 * 60 * 60 * 1000;
 /** Launch sweep: a workspace qualifies after this much user inactivity. */
