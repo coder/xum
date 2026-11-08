@@ -182,7 +182,7 @@ jobs:
         id: release-assets
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ~/.cache/xum-release-assets
+          path: ~/.cache/xum-release-assets/shfmt-hadolint
           key: release-assets-shfmt-hadolint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-release-tools.sh') }}
       - name: Install shfmt and hadolint
         run: |
@@ -192,7 +192,7 @@ jobs:
         if: steps.release-assets.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ~/.cache/xum-release-assets
+          path: ~/.cache/xum-release-assets/shfmt-hadolint
           key: ${{ steps.release-assets.outputs.cache-primary-key }}
       - name: Install shellcheck
         run: |
@@ -227,25 +227,19 @@ jobs:
             ${{ runner.os }}-lint-fmt-node-${{ steps.node-version.outputs.version }}-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-
       # tree-sitter-language-pack downloads its grammars from a GitHub release on first use
       # (`make tree-sitter-grammars`, a prerequisite of the script tests in static-check-full).
-      # The pack keeps them in a directory named by its version, so the key is that pin from
-      # pyproject.toml. A language added to the Makefile's list needs a new key prefix here.
+      # The pack loads them as native libraries, so a restored cache is untrusted input: the
+      # cache holds only the pinned manifest and bundle, in a directory of its own, and the
+      # script checks both against the sha256 pins in itself on every run (hit or miss), then
+      # rebuilds the pack's own directory from them. The key hashes that script, so a changed
+      # pin starts a fresh cache, and a language added to the Makefile's list needs no new key.
       # The step below downloads them (15 minutes of retries on a cold cache), and the save
       # follows at once, ahead of the long make run.
-      - name: Read the tree-sitter-language-pack pin
-        id: tslp
-        run: |
-          version=$(sed -n 's/^ *"tree-sitter-language-pack==\([0-9][0-9.]*\)".*/\1/p' pyproject.toml)
-          if [ -z "$version" ]; then
-            echo "::error::pyproject.toml does not pin tree-sitter-language-pack with =="
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Restore tree-sitter grammars
         id: tree-sitter-grammars
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ~/.cache/tree-sitter-language-pack
-          key: tree-sitter-grammars-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.tslp.outputs.version }}
+          path: ~/.cache/xum-tree-sitter-grammars
+          key: tree-sitter-grammars-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/download_tree_sitter_grammars.py') }}
       - name: Download tree-sitter grammars
         run: make tree-sitter-grammars
         env:
@@ -254,7 +248,7 @@ jobs:
         if: steps.tree-sitter-grammars.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ~/.cache/tree-sitter-language-pack
+          path: ~/.cache/xum-tree-sitter-grammars
           key: ${{ steps.tree-sitter-grammars.outputs.cache-primary-key }}
       - run: make -j static-check-full
         env:
@@ -335,7 +329,7 @@ jobs:
         if: matrix.shard == 1 && github.event.inputs.test_filter == ''
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ~/.cache/xum-release-assets
+          path: ~/.cache/xum-release-assets/static-curl
           key: release-assets-static-curl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-release-tools.sh') }}
       - name: Install static curl
         if: matrix.shard == 1 && github.event.inputs.test_filter == ''
@@ -346,7 +340,7 @@ jobs:
         if: matrix.shard == 1 && github.event.inputs.test_filter == '' && steps.static-curl-download.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ~/.cache/xum-release-assets
+          path: ~/.cache/xum-release-assets/static-curl
           key: ${{ steps.static-curl-download.outputs.cache-primary-key }}
       - name: web_fetch pinning tests with curl 8.7+
         if: matrix.shard == 1 && github.event.inputs.test_filter == ''

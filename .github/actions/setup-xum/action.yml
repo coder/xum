@@ -129,8 +129,11 @@ runs:
     # This cache has one purpose: the current zip, in a directory of its own that
     # electron_config_cache points @electron/get at. The key hashes checksums.json, so a new
     # Electron version or checksum starts a fresh cache, and there is no restore-keys fallback
-    # to bring old zips back. On a miss the zip is downloaded here, retrying for 15 minutes,
-    # and saved at once.
+    # to bring old zips back. The key does not start with `<os>-<arch>-electron-`, the
+    # restore-keys prefix of the two Electron caches above, so their prefix lookups cannot
+    # return it (scripts/ci/cachePaths.test.ts). @electron/get checks the zip against
+    # checksums.json on every use, so a restored entry never supplies unpinned bytes. On a
+    # miss the zip is downloaded here, retrying for 15 minutes, and saved at once.
     - name: Point Electron downloads at their own cache
       if: ${{ inputs.electron-zip == 'true' }}
       shell: bash
@@ -142,7 +145,7 @@ runs:
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ env.electron_config_cache }}
-        key: ${{ runner.os }}-${{ runner.arch }}-electron-zip-${{ hashFiles('node_modules/electron/checksums.json') }}
+        key: xum-electron-zip-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/electron/checksums.json') }}
 
     # The 15 minute budget fits both callers: E2E has no job time limit, and a Stories run
     # (4 to 5 minutes warm) stops at 50 minutes in the merge queue.
