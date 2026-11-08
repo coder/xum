@@ -767,6 +767,10 @@ async function assertLiveLineClearsTheComposer(page: StoryPage) {
   }
 }
 
+// The diagram wait, the error marker and the viewport check below each have a story built to trip
+// them (src/browser/stories/PaintCheckFixtures.stories.tsx), which `make test-storybook-paint-fixtures`
+// runs through this file. A message that changes needs its new text in
+// scripts/check-paint-check-fixtures.ts.
 const PAINT_CHECK_TAG = "paint-check";
 const NO_DIAGRAM_MESSAGE = `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`;
 const DIAGRAM_RENDER_TIMEOUT_MS = 15_000;

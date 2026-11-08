@@ -768,6 +768,8 @@ jobs:
       - run: make storybook-budget
       - run: make test-storybook
       - run: make test-storybook-webkit
+      # The stories built to trip the paint-check guards must still fail (or pass) as written.
+      - run: make test-storybook-paint-fixtures
 
   test-e2e:
     # No matrix expression in the name: GitHub then appends the matrix values ("linux, 1/4",
