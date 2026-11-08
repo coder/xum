@@ -1313,6 +1313,34 @@ describe("BackupSection", () => {
     await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
   });
 
+  test("editing the form does not read the settings or open the change stream again", async () => {
+    let getSettings: jest.SpyInstance | undefined;
+    let onConfigChanged: jest.SpyInstance | undefined;
+    const { view } = renderBackupSection({}, (client) => {
+      getSettings = jest.spyOn(client.backup, "getSettings");
+      onConfigChanged = jest.spyOn(client.config, "onConfigChanged");
+    });
+    const canvas = within(view.container);
+    await waitFor(() =>
+      expect(canvas.getByRole("button", { name: "Preview changes" }).hasAttribute("disabled")).toBe(
+        false
+      )
+    );
+    const readsBefore = getSettings?.mock.calls.length;
+    const streamsBefore = onConfigChanged?.mock.calls.length;
+
+    for (const value of ["git@github.com:example/a.git", "git@github.com:example/b.git"]) {
+      fireEvent.change(canvas.getByLabelText("Repository URL"), { target: { value } });
+    }
+    await canvas.findByText("Unsaved changes");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(getSettings?.mock.calls.length).toBe(readsBefore);
+    expect(onConfigChanged?.mock.calls.length).toBe(streamsBefore);
+  });
+
   describe("plugins in the backup", () => {
     const SHA_MISSING = "ab".repeat(20);
     const SHA_INSTALLED = "cd".repeat(20);
@@ -1474,6 +1502,28 @@ describe("BackupSection", () => {
       expect(consumePendingPluginsSectionIntent()?.type).toBe("install-from-backup");
     });
 
+    test("hides the plugin list while the form holds an unsaved change, and queues nothing from it", async () => {
+      const chord = { key: "y", code: "KeyY", ctrlKey: true, altKey: true };
+      const { view } = renderBackupSection({
+        backupPreview: { ...PREVIEW_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+      await canvas.findByText("Plugins in this backup");
+
+      fireEvent.change(canvas.getByLabelText("Repository URL"), {
+        target: { value: "git@github.com:example/other.git" },
+      });
+
+      await waitFor(() => expect(canvas.queryByText("Plugins in this backup")).toBeNull());
+      expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
+      const routeBefore = canvas.getByTestId("settings-route").textContent;
+      fireEvent.keyDown(window, chord);
+      expect(consumePendingPluginsSectionIntent()).toBeNull();
+      expect(canvas.getByTestId("settings-route").textContent).toBe(routeBefore);
+    });
+
     test("offers no review when every listed plugin is installed or its name is taken", async () => {
       const { view } = renderBackupSection({
         backupPreview: {
@@ -1502,28 +1552,6 @@ describe("BackupSection", () => {
     });
 
     test("says a plugin list was skipped when plugin backup is off", async () => {
-    test("hides the plugin list while the form holds an unsaved change, and queues nothing from it", async () => {
-      const chord = { key: "y", code: "KeyY", ctrlKey: true, altKey: true };
-      const { view } = renderBackupSection({
-        backupPreview: { ...PREVIEW_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
-      });
-      const canvas = within(view.container);
-      await canvas.findByText("Settings backup");
-      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
-      await canvas.findByText("Plugins in this backup");
-
-      fireEvent.change(canvas.getByLabelText("Repository URL"), {
-        target: { value: "git@github.com:example/other.git" },
-      });
-
-      await waitFor(() => expect(canvas.queryByText("Plugins in this backup")).toBeNull());
-      expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
-      const routeBefore = canvas.getByTestId("settings-route").textContent;
-      fireEvent.keyDown(window, chord);
-      expect(consumePendingPluginsSectionIntent()).toBeNull();
-      expect(canvas.getByTestId("settings-route").textContent).toBe(routeBefore);
-    });
-
       const { view } = renderBackupSection({
         backupPreview: { ...PREVIEW_BASE, plugins: reportOf([], { skipped: true }) },
       });

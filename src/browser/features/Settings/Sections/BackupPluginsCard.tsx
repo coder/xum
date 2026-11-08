@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
@@ -77,12 +77,6 @@ function PluginRow(props: { plugin: BackupPluginRow }) {
 export function usePluginRemovalPrompt(options: { busy: boolean; push: () => Promise<void> }) {
   const [removal, setRemoval] = useState<BackupPluginRemoval | null>(null);
   const approved = useRef<string | undefined>(undefined);
-  // A stable identity: the settings reload effect in BackupSection calls it and lists it as a
-  // dependency, which must not rerun the effect on every render.
-  const clear = useCallback(() => {
-    approved.current = undefined;
-    setRemoval(null);
-  }, []);
   return {
     removal,
     /** Shows what a refused push would remove; any other outcome leaves the card as it is. */
@@ -90,7 +84,11 @@ export function usePluginRemovalPrompt(options: { busy: boolean; push: () => Pro
       if (error.code === "PLUGIN_REMOVAL_APPROVAL_REQUIRED")
         setRemoval(error.pluginRemoval ?? null);
     },
-    clear,
+    /** A new function on every render: an effect that calls it reads it through a ref. */
+    clear: () => {
+      approved.current = undefined;
+      setRemoval(null);
+    },
     /** The digest the next push carries. */
     approvedDigest: () => approved.current,
     confirm: () => {
