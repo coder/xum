@@ -20,10 +20,12 @@ import {
 import { createSpendMeter, type SpendMeter } from "@/node/services/memoryDreamSpend";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import { REDACTION_LOOKAHEAD_CHARS, redactSecretLike } from "@/node/services/memorySecretRedaction";
+import { isCompactionRequestMessage } from "@/node/services/taskMessagePredicates";
 import {
   SESSION_HISTORY_OMITTED,
   derivesFromSessionHistory,
   renderToolValue,
+  takeWithoutMedia,
 } from "@/node/services/memoryToolText";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 
@@ -194,16 +196,18 @@ interface HarvestPiece {
 }
 
 /**
- * The text of a text part as rows read it: redacted, and cut at the part's cap. The scan reaches a
- * lookahead past the cap, so a secret that starts inside the kept text is matched whole, and what
- * lies past it is never scanned. Text parts are not tool output, but a credential a user pasted or
- * a model echoed sits in them just the same, and the cap is long enough to carry it to the model.
+ * The text of a text part as rows read it: free of data URLs, redacted, and cut at the part's cap.
+ * A data URL costs its `[media]` stub, as in a tool value, so a pasted or echoed screenshot does
+ * not spend the cap on bytes and fill dozens of chunks. The scan reaches a lookahead past the cap,
+ * so a secret that starts inside the kept text is matched whole, and what lies past it is never
+ * scanned. Text parts are not tool output, but a credential a user pasted or a model echoed sits
+ * in them just the same, and the cap is long enough to carry it to the model.
  */
 function boundedTextPart(raw: string): RowText {
-  const window = raw.slice(0, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
-  const prepared = neutralizeHarvestText(redactSecretLike(window));
+  const window = takeWithoutMedia(raw, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
+  const prepared = neutralizeHarvestText(redactSecretLike(window.text));
   const text = prepared.slice(0, HARVEST_MAX_TEXT_PART_CHARS);
-  return { text, cutChars: raw.length - window.length + prepared.length - text.length };
+  return { text, cutChars: raw.length - window.read + prepared.length - text.length };
 }
 
 function rowTextOfPart(part: MuxMessage["parts"][number]): RowText {
@@ -369,8 +373,14 @@ export interface OpenEpoch {
 /**
  * The open epoch of `getHistoryFromLatestBoundary`'s read. Its rows are the ones after the latest
  * context boundary (that row is the summary of the epoch before it), minus keep-recent tail
- * copies, whose originals the closed epoch's run already read, and model-hidden rows. `messages`
- * is empty when nothing in the epoch is worth a model call.
+ * copies, whose originals the closed epoch's run already read, model-hidden rows and compaction
+ * requests. `messages` is empty when nothing in the epoch is worth a model call.
+ *
+ * A compaction request is dropped because the compaction it asks for may still be pending when the
+ * workspace is archived (a failed one, retried after an unarchive). If it stayed, the open record
+ * would be keyed and read through to that row, and the compaction that later closes this epoch
+ * reads its rows without the request (`getMessagesForCompactionEpoch` skips it): the closing run
+ * could match no row the archive read, so it would analyze the epoch again on a fresh edit budget.
  */
 export function selectOpenEpoch(rows: MuxMessage[]): OpenEpoch {
   const boundaryIndex = findLatestContextBoundaryIndex(rows);
@@ -379,7 +389,12 @@ export function selectOpenEpoch(rows: MuxMessage[]): OpenEpoch {
     compactionEpoch: (boundary?.metadata?.compactionEpoch ?? 0) + 1,
     messages: rows
       .slice(boundaryIndex + 1)
-      .filter((row) => row.metadata?.rlmPreservedTailCopy !== true && !isModelHiddenMessage(row)),
+      .filter(
+        (row) =>
+          row.metadata?.rlmPreservedTailCopy !== true &&
+          !isModelHiddenMessage(row) &&
+          !isCompactionRequestMessage(row)
+      ),
   };
 }
 
@@ -435,6 +450,7 @@ Rules:
 
 - Write only under /memories/workspace/.... It is the one scope you can change. Project and global memory are read-only to you: a later organizer pass promotes durable lessons there. The tool rejects a write elsewhere with a reason; do not retry it.
 - Re-read a file right before you edit it. Another run can change a file between your read and your edit.
+- Add a fact in one of two ways: \`create\` a new file, or \`str_replace\` a line that is unique in a file with that line plus the new text. \`insert\` (a line number), \`delete\` and \`rename\` are not available to you: a line number goes stale when another call or writer changes the file, and the text of a line does not.
 - Never copy a secret: no key, token, password, private key or other credential value. Say what it is for and where it lives. The tool rejects text that holds one.
 - Write current understanding as plain statements, not a story. Do not narrate the session. Drop one-off task detail and anything the codebase already shows.
 - You have ${MEMORY_ANALYZER_OP_BUDGET} mutating commands for the whole epoch, shared by all its chunks. Spend them on the highest-value changes first.
@@ -443,7 +459,7 @@ Rules:
 When done, reply with one line: what you changed, or "no changes needed".`;
 
 const ANALYZER_TOOL_DESCRIPTION =
-  "Read and edit the persistent memory that future sessions read. You can read workspace, project and global memory. You can write only under /memories/workspace/, and you cannot delete or rename.";
+  "Read and edit the persistent memory that future sessions read. You can read workspace, project and global memory. You can write only under /memories/workspace/. You cannot insert at a line number, delete or rename: add to a file with str_replace (replace a line that is unique in it with that line plus the new text), or create a new file.";
 
 function buildChunkPrompt(args: {
   summary?: MuxMessage;
@@ -612,8 +628,8 @@ export async function runMemoryHarvest(args: {
   onChunkComplete?: (progress: HarvestProgress) => Promise<void>;
   /**
    * Required, so no caller can stream a chunk without deciding what excludes the other writers of
-   * the store: the model reads a file and then inserts at a numeric line offset, which another
-   * run's insert in between makes stale.
+   * the store: the organizer reads a file and then inserts at a numeric line offset, which this
+   * analyzer's write in between makes stale (the analyzer itself never inserts).
    */
   streamGate: ChunkStreamGate;
   /** Workspace removal; each chunk's own timeout is combined with it. */
@@ -715,7 +731,11 @@ export async function runMemoryHarvest(args: {
         abortSignal: signal,
         writableScopes: ["workspace"],
         // The cookbook's analyzers only add and correct; removing and moving files is the organizer's.
-        deniedCommands: ["delete", "rename"],
+        // `insert` goes too: its line offset is read earlier and goes stale under parallel calls,
+        // foreground memory writers and a replayed chunk, so a landed edit could be repeated or
+        // misplaced. `create` (refuses an existing path) and `str_replace` (needs exactly one match
+        // of its old text) are anchored to content, so a stale or replayed call fails instead.
+        deniedCommands: ["delete", "rename", "insert"],
         rejectSecretLike: true,
         description: ANALYZER_TOOL_DESCRIPTION,
       });
