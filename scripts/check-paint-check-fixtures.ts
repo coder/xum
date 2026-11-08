@@ -1,11 +1,12 @@
 /**
- * Prove that the paint-check guards of .storybook/test-runner.ts still fire.
+ * Prove that four guards of the paint-check runner (.storybook/test-runner.ts) still fire: the
+ * diagram wait, the error marker, the viewport check and the paint-outside check.
  *
- * Why this exists: every real paint-check story is valid, so deleting a guard from the runner (the
- * error-marker check, the "never overlaps the viewport" assert, the wait for the diagram) leaves
- * them all green. The stories in src/browser/stories/PaintCheckFixtures.stories.tsx are built to
- * trip one guard each. This runs them through the real runner (the same test-storybook that
- * `make test-storybook` runs) and requires each one to fail with its message, or to pass.
+ * Why this exists: every real paint-check story is valid, so deleting one of those guards from the
+ * runner leaves them all green. The stories in src/browser/stories/PaintCheckFixtures.stories.tsx
+ * are built to trip one guard each. This runs them through the real runner (the same
+ * test-storybook that `make test-storybook` runs) and requires each one to fail with its message,
+ * or to pass.
  *
  * Usage (Storybook must be built and served, like `make test-storybook`; STORYBOOK_URL names a
  * server other than http://127.0.0.1:6006):
@@ -28,21 +29,45 @@ const FIXTURE_FILE = "src/browser/stories/PaintCheckFixtures.stories.tsx";
 export const FIXTURES: ReadonlyMap<string, string | null> = new Map([
   ["BrokenChartNextToGoodChart", "must show a rendered Mermaid diagram"],
   ["DiagramOutsideTheViewport", "never overlaps the viewport"],
+  ["DiagramPaintsOutsideItsBox", "paint only inside its box"],
   ["DiagramMountsWhenTheRunnerWaits", null],
 ]);
 
 /** The part of Jest's --json report that this reads. */
 export interface JestReport {
   testResults: Array<{
-    assertionResults: Array<{
-      ancestorTitles: string[];
-      status: string;
-      failureMessages: string[];
-    }>;
+    assertionResults: Outcome[];
   }>;
 }
 
-type Outcome = JestReport["testResults"][number]["assertionResults"][number];
+interface Outcome {
+  ancestorTitles: string[];
+  status: string;
+  failureMessages: string[];
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const isStrings = (value: unknown) =>
+  Array.isArray(value) && value.every((item) => typeof item === "string");
+
+const isOutcome = (value: unknown): value is Outcome =>
+  isRecord(value) &&
+  isStrings(value.ancestorTitles) &&
+  typeof value.status === "string" &&
+  isStrings(value.failureMessages);
+
+// A crash in test-storybook or a Jest upgrade can leave a file that parses but is not a report.
+const isJestReport = (value: unknown): value is JestReport =>
+  isRecord(value) &&
+  Array.isArray(value.testResults) &&
+  value.testResults.every(
+    (file) =>
+      isRecord(file) &&
+      Array.isArray(file.assertionResults) &&
+      file.assertionResults.every(isOutcome)
+  );
 
 function mismatch(failsWith: string | null, outcome: Outcome): string | null {
   const message = stripVTControlCharacters(outcome.failureMessages.join("\n"));
@@ -56,7 +81,13 @@ function mismatch(failsWith: string | null, outcome: Outcome): string | null {
 }
 
 /** What differs from FIXTURES in a report. An empty list means every guard fired. */
-export function fixtureProblems(report: JestReport): string[] {
+export function fixtureProblems(report: unknown): string[] {
+  if (!isJestReport(report)) {
+    return [
+      "The report is not Jest's --json shape (testResults[].assertionResults[] with " +
+        `ancestorTitles, status and failureMessages): ${JSON.stringify(report)?.slice(0, 200)}`,
+    ];
+  }
   const outcomes = report.testResults.flatMap((file) => file.assertionResults);
   const problems: string[] = [];
   for (const [story, failsWith] of FIXTURES) {
@@ -91,17 +122,25 @@ function main(): number {
         "node_modules/.bin/test-storybook",
         // --no-index-json: a non-local URL would switch the runner to a mode that ignores the file
         // below and names each test after the story's display name instead of its export.
-        ...["--url", url, "--no-index-json", "--includeTags", FIXTURE_TAG, "--testTimeout", "30000"],
+        ...[
+          "--url",
+          url,
+          "--no-index-json",
+          "--includeTags",
+          FIXTURE_TAG,
+          "--testTimeout",
+          "30000",
+        ],
         ...["--json", "--outputFile", reportFile, FIXTURE_FILE],
       ],
       { encoding: "utf8", timeout: 5 * 60_000 }
     );
     const log = `${run.stdout}${run.stderr}`;
-    let report: JestReport;
+    let report: unknown;
     try {
-      report = JSON.parse(readFileSync(reportFile, "utf8")) as JestReport;
+      report = JSON.parse(readFileSync(reportFile, "utf8"));
     } catch {
-      console.error(`test-storybook wrote no report (exit ${run.status}):\n${log}`);
+      console.error(`test-storybook wrote no readable report (exit ${run.status}):\n${log}`);
       return 1;
     }
     const problems = fixtureProblems(report);

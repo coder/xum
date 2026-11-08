@@ -64,6 +64,20 @@ describe("fixtureProblems", () => {
 
     const extra = fixtureProblems(reportOf([...asExpected(), outcomeFor("Unlisted", null)]));
     expect(extra).toHaveLength(1);
-    expect(extra[0]).toContain("lists 3 fixtures");
+    expect(extra[0]).toContain(`lists ${FIXTURES.size} fixtures`);
+  });
+
+  test("names a report that is not Jest's shape instead of crashing", () => {
+    const malformed: unknown[] = [
+      null,
+      {},
+      { testResults: [{}] },
+      { testResults: [{ assertionResults: [{ ancestorTitles: "Tests", status: "failed" }] }] },
+    ];
+    for (const report of malformed) {
+      const problems = fixtureProblems(report);
+      expect(problems).toHaveLength(1);
+      expect(problems[0]).toContain("not Jest's --json shape");
+    }
   });
 });
