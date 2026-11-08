@@ -584,6 +584,7 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
     }
     var historyProto = window.History && window.History.prototype;
     var nativeReplaceState = historyProto && historyProto.replaceState;
+    // A "#" URL names this document, but a srcdoc frame resolves it against the app's URL.
     function inDocument(native) {
       return function () {
         var args = Array.prototype.slice.call(arguments);
