@@ -5080,6 +5080,54 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(await enabledOf(stale.workspacePath)).toEqual(["other"]);
     }, 60_000);
 
+    it("prunePluginOverrideKeysForWorkspaces stops publishing once its budget is spent, and evicts every cache instead", async () => {
+      // Past the budget, each workspace's publication still ran under a 0 ms deadline with
+      // its own eviction: 300 workspaces and a slow publisher held the locks twice the budget.
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspaces = [
+        await registerWorkspace("spent-a"),
+        await registerWorkspace("spent-b"),
+        await registerWorkspace("spent-c"),
+      ];
+      for (const workspace of workspaces) {
+        await writeDoc(workspace.workspacePath, [staleKey, "other"]);
+      }
+      const realNow = Date.now;
+      let skewMs = 0;
+      const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skewMs);
+      const publishedAfterBudget: Array<[string, unknown]> = [];
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces(
+          workspaces.map((workspace) => workspace.workspaceId),
+          prefix,
+          {
+            publish: (persisted, target) => {
+              if (skewMs > 0) {
+                publishedAfterBudget.push([target, persisted]);
+              } else if (persisted !== null) {
+                // The first publication spends the whole budget.
+                skewMs = 31_000;
+              }
+              return Promise.resolve();
+            },
+          }
+        );
+      } finally {
+        nowSpy.mockRestore();
+      }
+
+      // The prunes landed, so the rest are clean: their next serve reads the pruned documents.
+      expect(failures).toEqual([]);
+      expect(publishedAfterBudget.length).toBeGreaterThan(0);
+      expect(publishedAfterBudget.filter(([target]) => target !== ALL_WORKSPACES_TARGET)).toEqual(
+        []
+      );
+      for (const workspace of workspaces) {
+        expect(await enabledOf(workspace.workspacePath)).toEqual(["other"]);
+      }
+    });
+
     it("prunePluginOverrideKeysForWorkspaces leaves an off-host descendant of a candidate to the publication fan-out", async () => {
       // Plugin servers never run off-host: such a descendant is neither locked nor pruned (a remote
       // checkout cannot be reached under the locks), and the fan-out evicts its cache without I/O.

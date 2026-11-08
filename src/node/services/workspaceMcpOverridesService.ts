@@ -5170,6 +5170,7 @@ export class WorkspaceMcpOverridesService {
   /**
    * Publication phase of sweepPluginOverrideKeys: re-publish each swept
    * workspace's effective overrides, in sweep order, under the sweep's budget.
+   * Once the budget is spent, the rest are evicted with every other cache.
    * Returns the workspaces whose publication failed (the caller keeps their
    * tombstones).
    */
@@ -5200,6 +5201,15 @@ export class WorkspaceMcpOverridesService {
     // The sweep's single budget continues here: each fan-out would
     // otherwise reset its own 30 s while the locks stay held.
     for (const [workspaceId, { metadata, filePaths, ownFileRewritten }] of swept) {
+      // The budget is spent: every step below would still run, each under a 0 ms deadline
+      // and each with its eviction, while the locks stay held. 300 rewritten workspaces
+      // with a 250 ms publisher held the global lock 60 s, and a save queued behind it
+      // timed out. Evict every cache once instead, as the fan-out does when its budget runs
+      // out: every prune here already landed, so each next serve reads pruned documents.
+      if (budget.exhausted()) {
+        await publish(null, ALL_WORKSPACES_TARGET);
+        break;
+      }
       // This workspace's own files did not change and the receiver holds
       // nothing to repair for it: skip the (disk-reading) resolution. Still
       // evict: the I/O-free marker fences a cold first serve already in
