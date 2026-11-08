@@ -4,6 +4,7 @@ import { DESKTOP_TITLEBAR_HEIGHT_PX } from "@/browser/hooks/useDesktopTitlebar";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { windowDragsAtEach, withDesktopApi } from "@/browser/stories/helpers/windowDrag";
 import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
+import { expectNoDiagramInkOutsideBox } from "@/browser/stories/storyPlayHelpers";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 import { SIDE_INSET_VIEWPORT } from "@/constants/layout";
 import { MarkdownRenderer } from "./MarkdownRenderer";
@@ -294,22 +295,6 @@ function measureDiagram(canvasElement: HTMLElement, selector = INLINE_SVG): Diag
 
 /** The box and the zoom step are whole pixels, so they differ from the exact values by this much. */
 const PIXEL_TOLERANCE = 1.5;
-
-interface PaintHook {
-  __storybookAssertPaint?: () => Promise<void>;
-}
-
-/**
- * Runs the test runner's pixel check (.storybook/test-runner.ts) now, before a screenshot or
- * resize repairs a stale WebKit layout.
- */
-async function expectNoDiagramInkOutsideBox() {
-  const assertPaint = (window as Window & PaintHook).__storybookAssertPaint;
-  if (assertPaint) await assertPaint();
-  else if (navigator.userAgent.includes("StorybookTestRunner")) {
-    throw new Error("paint hook missing: .storybook/test-runner.ts did not register it");
-  }
-}
 
 /** The box is the drawing scaled by one factor, up to the rounding of each side to a pixel. */
 async function expectBoxKeepsDrawingProportions({ svg, drawing }: DiagramGeometry) {
