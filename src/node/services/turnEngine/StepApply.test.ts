@@ -1,12 +1,22 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test, type Mock } from "bun:test";
 
+import { log } from "@/node/services/log";
 import {
   createTestLanguageModel,
   createWorkspaceStreamInfoForTests,
 } from "@/node/services/streamManager.suite.testHarness";
 
-import { summarizeToolResultForLog, turnReplayOffAfterServerTool } from "./StepApply";
+import { type FoldIntent, partFold } from "./partFold";
+import {
+  foldView,
+  type PartLoopState,
+  StepApply,
+  type StepApplyDeps,
+  summarizeToolResultForLog,
+  turnReplayOffAfterServerTool,
+} from "./StepApply";
 import type { WorkspaceStreamInfo } from "./turnState";
+import type { WorkspaceId } from "./types";
 
 describe("summarizeToolResultForLog", () => {
   test("strings log their length and a preview cut at 160 characters", () => {
@@ -110,5 +120,94 @@ describe("turnReplayOffAfterServerTool", () => {
     turnReplayOffAfterServerTool(streamInfo);
     expect(streamInfo.initialMetadata?.anthropicThinkingReplay).toBeUndefined();
     expect(streamInfo.anthropicServerToolCallIds).toBeUndefined();
+  });
+});
+
+describe("StepApply log intents", () => {
+  const workspaceId = "ws-1" as WorkspaceId;
+  const setup = () => {
+    const streamInfo = createWorkspaceStreamInfoForTests();
+    const loop: PartLoopState = {
+      workspaceLog: log,
+      toolCalls: new Map(),
+      orphanToolResultCount: 0,
+    };
+    const apply = (intents: FoldIntent[]) =>
+      new StepApply({} as StepApplyDeps).applyStep(
+        workspaceId,
+        streamInfo,
+        { intents, lastPartTimestamp: 0 },
+        loop
+      );
+    return { streamInfo, loop, apply };
+  };
+
+  let logError: Mock<typeof log.error>;
+  let logWarn: Mock<typeof log.warn>;
+  beforeEach(() => {
+    logError = spyOn(log, "error").mockImplementation(() => undefined);
+    logWarn = spyOn(log, "warn").mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    logError.mockRestore();
+    logWarn.mockRestore();
+  });
+
+  test("logs a rejected call's summary redacted while the tool output keeps it", async () => {
+    const summary =
+      "Invalid input for tool bash: script: Invalid input: expected string, received undefined. Received arguments: ghp_ABCdefSECRETxyz=string(16 chars)";
+    const { streamInfo, loop, apply } = setup();
+    const step = partFold(
+      foldView(workspaceId, streamInfo, loop),
+      { type: "tool-error", toolCallId: "call-1", toolName: "bash", error: summary },
+      100
+    );
+
+    await apply(step.intents.filter((intent) => intent._tag === "LogToolError"));
+
+    expect(logError.mock.calls).toEqual([
+      [
+        "Tool execution error for 'bash'",
+        {
+          toolCallId: "call-1",
+          error:
+            "Invalid input for tool bash: script: Invalid input: expected string, received undefined. Received arguments: [redacted]",
+        },
+      ],
+    ]);
+    expect(step.intents.find((intent) => intent._tag === "FinishToolCall")).toMatchObject({
+      output: { success: false, error: summary },
+    });
+  });
+
+  test("stops warning about orphan tool results after the third", async () => {
+    const { loop, apply } = setup();
+    const orphan: FoldIntent = {
+      _tag: "LogOrphanToolResult",
+      toolCallId: "call-1",
+      toolName: "bash",
+      output: "ok",
+    };
+
+    await apply([orphan, orphan, orphan, orphan, orphan]);
+
+    expect(loop.orphanToolResultCount).toBe(5);
+    expect(logWarn.mock.calls.map(([message]) => message)).toEqual([
+      ...Array<string>(3).fill(
+        "[streamManager] Received tool-result without matching tool-call map entry; persisting fallback output"
+      ),
+      "[streamManager] Suppressing additional orphan tool-result warnings for this stream",
+    ]);
+  });
+
+  test("throws on an intent it has no handler for", async () => {
+    const { apply } = setup();
+
+    const outcome = await apply([{ _tag: "Unknown" } as unknown as FoldIntent]).then(
+      () => "resolved",
+      (error: unknown) => String(error)
+    );
+
+    expect(outcome).toContain("applyStep has no handler for Unknown");
   });
 });

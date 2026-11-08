@@ -73,6 +73,7 @@ import {
 } from "@/common/constants/toolLimits";
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
 import { getDefaultBashDisplayName } from "@/common/utils/tools/bashDisplayName";
+import { describeCutOffBashScript } from "@/common/utils/tools/bashScriptSyntax";
 import { STATUS_PAGE_AGENT_MAX_UPDATE_CHARS } from "@/common/constants/artifacts";
 import {
   ConfigMutationPathSchema,
@@ -659,31 +660,27 @@ export const TaskAwaitToolArgsSchema = z
     const offset = args.offset_chars ?? 0;
     // Bash output has no report pages: each read returns the next unread output by itself, so
     // an offset there would only mislead the model into thinking it skipped or re-read output.
-    const bashId = offset > 0 ? [...ids].find((id) => id.startsWith("bash:")) : undefined;
-    if (bashId !== undefined) {
+    // The messages never quote a submitted ID or offset: rejection text reaches the shared log.
+    // The log sink splits rejection clauses on "; " and shortens a label at its first ".", so
+    // these messages use neither "; " nor a colon after a word, otherwise the log copy loses text.
+    if (offset > 0 && [...ids].some((id) => id.startsWith("bash:"))) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "offset_chars pages agent reports, not bash output. Bash output pages by itself: call " +
-          `task_await(task_ids: [${JSON.stringify(bashId)}], timeout_secs: 0) without offset_chars ` +
-          "to read the next unread output.",
+          "offset_chars pages agent reports, not bash output. Bash output pages by itself, so call " +
+          "task_await with only a bash task ID from this call, timeout_secs 0 and no " +
+          "offset_chars to read the next unread output.",
         path: ["offset_chars"],
       });
       return;
     }
     if (offset > 0 && ids.size !== 1) {
-      const calls = [...ids].map(
-        (id) =>
-          `task_await(task_ids: [${JSON.stringify(id)}], timeout_secs: 0, offset_chars: ${offset})`
-      );
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "offset_chars pages one report, so it needs exactly one task ID. Call " +
-          (calls.length > 0
-            ? calls.join(" or ")
-            : `task_await(task_ids: ["<id>"], timeout_secs: 0, offset_chars: ${offset})`) +
-          ", and await other tasks without offset_chars.",
+          `offset_chars pages one report, so it needs exactly one task ID and this call has ${ids.size}. ` +
+          "Call task_await once per report with its one task ID, timeout_secs 0 and the same " +
+          "offset_chars, and await other tasks without offset_chars.",
         path: ["offset_chars"],
       });
     }
@@ -2333,7 +2330,13 @@ export const TOOL_DEFINITIONS = {
       },
       z
         .object({
-          script: z.string().describe("Bash script to run"),
+          script: z
+            .string()
+            .superRefine((script, ctx) => {
+              const message = describeCutOffBashScript(script);
+              if (message !== null) ctx.addIssue({ code: "custom", message });
+            })
+            .describe("Bash script to run"),
           model_intent: z
             .string()
             .nullish()

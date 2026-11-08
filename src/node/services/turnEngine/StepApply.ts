@@ -22,6 +22,7 @@ import type { StreamManagerTokenTracker, WorkspaceId } from "@/node/services/tur
 import type { TurnState, WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import type { UsageLedger } from "@/node/services/turnEngine/UsageLedger";
 import { nodeClock } from "@/node/utils/hostClock";
+import { redactRejectedToolCallError } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import {
   laterAnthropicThinkingReplayPoint,
   type AnthropicThinkingReplayPoint,
@@ -461,7 +462,7 @@ export class StepApply {
         const logLevel = streamInfo.abortController.signal.aborted ? log.debug : log.error;
         logLevel(`Tool execution error for '${intent.toolName}'`, {
           toolCallId: intent.toolCallId,
-          error: intent.error,
+          error: redactRejectedToolCallError(intent.error),
         });
         return;
       }

@@ -2,7 +2,7 @@ import * as fs from "fs";
 
 import { describe, it, expect, mock, spyOn } from "bun:test";
 import { nodeClock } from "@/node/utils/hostClock";
-import type { ToolExecutionOptions } from "ai";
+import { InvalidToolInputError, TypeValidationError, type ToolExecutionOptions } from "ai";
 
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { TOOL_TEXT_PAGE_MAX_CHARS } from "@/common/constants/toolLimits";
@@ -11,6 +11,10 @@ import {
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
 import type { WorkflowRunRecord, WorkflowRunStatus } from "@/common/types/workflow";
+import {
+  describeInvalidToolInput,
+  redactRejectedToolCallError,
+} from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import { createTaskAwaitTool } from "./task_await";
 import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
@@ -801,12 +805,12 @@ describe("task_await tool", () => {
       const parsed = schema.safeParse(args);
       return parsed.success ? null : parsed.error.issues[0]?.message;
     };
-    // Several IDs: the error names the exact single-ID call for each.
-    expect(issue({ task_ids: ["t1", "t2"], offset_chars: 50_000 })).toContain(
-      'task_await(task_ids: ["t1"], timeout_secs: 0, offset_chars: 50000) or task_await(task_ids: ["t2"]'
+    // Several IDs: the error says how many and how to page each report, without quoting them.
+    expect(issue({ task_ids: ["t1", "t2"], offset_chars: 50_000 })).toBe(
+      "offset_chars pages one report, so it needs exactly one task ID and this call has 2. Call task_await once per report with its one task ID, timeout_secs 0 and the same offset_chars, and await other tasks without offset_chars."
     );
     // No IDs awaits every task.
-    expect(issue({ offset_chars: 50_000 })).toContain("exactly one task ID");
+    expect(issue({ offset_chars: 50_000 })).toContain("exactly one task ID and this call has 0.");
     // One ID (also when repeated), or offset 0, is fine.
     expect(issue({ task_ids: ["t1"], offset_chars: 50_000 })).toBeNull();
     expect(issue({ task_ids: ["t1", "t1"], offset_chars: 50_000 })).toBeNull();
@@ -819,12 +823,46 @@ describe("task_await tool", () => {
       const parsed = schema.safeParse(args);
       return parsed.success ? null : parsed.error.issues[0]?.message;
     };
-    const readAgain = 'task_await(task_ids: ["bash:p1"], timeout_secs: 0) without offset_chars';
+    const readAgain =
+      "call task_await with only a bash task ID from this call, timeout_secs 0 and no offset_chars";
     expect(issue({ task_ids: ["bash:p1"], offset_chars: 1000 })).toContain(readAgain);
     // With other IDs too, the bash rule wins: the single-ID hint would name a refused call.
     expect(issue({ task_ids: ["t1", "bash:p1"], offset_chars: 1000 })).toContain(readAgain);
     expect(issue({ task_ids: ["bash:p1"], offset_chars: 0 })).toBeNull();
     expect(issue({ task_ids: ["bash:p1"] })).toBeNull();
+  });
+
+  it("keeps the whole offset_chars rejection in the shared log copy", () => {
+    const schema = TOOL_DEFINITIONS.task_await.schema;
+    const loggedRejection = (args: Record<string, unknown>) => {
+      const parsed = schema.safeParse(args);
+      if (parsed.success) throw new Error("Expected the schema to reject the input");
+      const error = new InvalidToolInputError({
+        toolName: "task_await",
+        toolInput: JSON.stringify(args),
+        cause: TypeValidationError.wrap({ value: args, cause: parsed.error }),
+      });
+      return String(
+        redactRejectedToolCallError(describeInvalidToolInput("task_await", args, error))
+      );
+    };
+    // The previous messages quoted these, so the log checks also catch a return of the echo.
+    const reportId = "t-report-5813";
+    const bashId = "bash:p-7741";
+    const offset = 48_271;
+
+    const oneReport = loggedRejection({ task_ids: ["t1", reportId], offset_chars: offset });
+    expect(oneReport).toContain("this call has 2");
+    expect(oneReport).toContain("offset_chars, and await other tasks without offset_chars");
+    expect(oneReport).not.toContain("[withheld]");
+    expect(oneReport).not.toContain(reportId);
+    expect(oneReport).not.toContain(String(offset));
+
+    const bash = loggedRejection({ task_ids: [bashId], offset_chars: offset });
+    expect(bash).toContain("timeout_secs 0 and no offset_chars to read the next unread output");
+    expect(bash).not.toContain("[withheld]");
+    expect(bash).not.toContain(bashId);
+    expect(bash).not.toContain(String(offset));
   });
 
   it("propagates report-time AI settings into completed results", async () => {
