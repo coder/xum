@@ -1168,7 +1168,7 @@ describe("hash routes", () => {
         this: typeof proto,
         state: unknown,
         title: string,
-        url?: string | null
+        url?: string | URL
       ) {
         return url == null
           ? originals[method].call(this, state, title)
@@ -1218,7 +1218,11 @@ describe("hash routes", () => {
     const events: string[] = [];
     win.addEventListener("popstate", () => events.push(`popstate ${win.location.hash}`));
     win.addEventListener("hashchange", (event) =>
-      events.push(`hashchange ${event.oldURL} -> ${event.newURL}`)
+      events.push(
+        event instanceof win.HashChangeEvent
+          ? `hashchange ${event.oldURL} -> ${event.newURL}`
+          : "hashchange (not a HashChangeEvent)"
+      )
     );
     const click = (id: string) =>
       doc
@@ -1250,6 +1254,9 @@ describe("hash routes", () => {
       try {
         click("alpha");
         expect(win.location.href).toBe("about:srcdoc#/s/alpha");
+        // The entry is replaced, not pushed: Back from a pushed one reloads the frame, and the
+        // navigation guard then closes the artifact.
+        expect(win.history.length).toBe(1);
         expect(events).toEqual([
           "popstate #/s/alpha",
           "hashchange about:srcdoc -> about:srcdoc#/s/alpha",
@@ -1328,7 +1335,6 @@ describe("hash routes", () => {
       try {
         win.history.replaceState({ n: 2 }, "");
         expect(win.history.state).toEqual({ n: 2 });
-        win.history.replaceState(null, "", null);
         win.history.replaceState(null, "", "about:srcdoc#/abs");
         expect(win.location.href).toBe("about:srcdoc#/abs");
         // Not the document's own URL: the browser's SecurityError, not a rewrite into the frame.
