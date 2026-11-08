@@ -19,6 +19,7 @@ import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCod
 import type { BashOutputEvent } from "@/common/types/stream";
 import type { ProjectRef } from "@/common/types/workspace";
 import type { BashToolResult } from "@/common/types/tools";
+import { describeReceivedCommandLine } from "@/common/utils/tools/bashCommandAlias";
 import { resolveBashDisplayName } from "@/common/utils/tools/bashDisplayName";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -543,7 +544,39 @@ function validateScript(script: string, config: ToolConfiguration): BashToolResu
     }
   }
 
+  const interactiveError = rejectInteractiveTui(script);
+  if (interactiveError) return interactiveError;
+
   return null; // Valid
+}
+
+// Programs that wait for a terminal when stdout is a pipe and stdin is closed, as in this tool.
+// Probed on macOS: these hang until the timeout; nano, less, more, man and ed exit at once, so
+// they are not listed.
+const INTERACTIVE_TUI_PROGRAMS = new Set(["vi", "vim", "view", "vimdiff", "nvim", "top", "htop"]);
+// Pipes, redirects, lists, subshells and expansions make the script more than a bare TUI launch.
+const SHELL_COMPOSITION_CHARS = /[|&;<>()$`\n]/;
+
+/**
+ * Models that mistake bash for another tool send `view <file>` (Vim) and wait the whole
+ * timeout for nothing. Reject only a bare launch: any flag (`top -l 1`, `vim -es`) or `+cmd`
+ * argument, or any shell composition, may make the program exit on its own.
+ */
+function rejectInteractiveTui(script: string): BashToolResult | null {
+  const trimmed = script.trim();
+  if (SHELL_COMPOSITION_CHARS.test(trimmed)) return null;
+  const [program, ...args] = trimmed.split(/\s+/);
+  if (!INTERACTIVE_TUI_PROGRAMS.has(path.posix.basename(program))) return null;
+  if (args.some((arg) => arg.startsWith("-") || arg.startsWith("+"))) return null;
+  return {
+    success: false,
+    error:
+      `${describeReceivedCommandLine("script", trimmed)} starts an interactive program that waits for a terminal; ` +
+      "bash has no terminal, so it would hang until the timeout. " +
+      "To read a file, call file_read; for /memories paths, call the memory tool; otherwise run a non-interactive command line.",
+    exitCode: -1,
+    wall_duration_ms: 0,
+  };
 }
 
 /**

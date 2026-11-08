@@ -63,6 +63,31 @@ describe("formatToolInputIssues", () => {
     expect(formatToolInputIssues(issues, { question: 42 })).toBe("question: Too big");
     expect(formatToolInputIssues(issues, null)).toBe("question: Too big");
   });
+
+  test("lists the received keys once when required fields are missing, never their values", () => {
+    const schema = z.object({ script: z.string(), display_name: z.string() });
+    const input = { agent_report: "<parameter=secret", ["k".repeat(100)]: 1 };
+
+    const message = formatToolInputIssues(issuesFor(schema, input), input);
+
+    expect(message.split("; ")).toHaveLength(3);
+    expect(message.match(/received keys: /g)).toHaveLength(1);
+    expect(message).toContain("agent_report");
+    expect(message).not.toContain("secret");
+    expect(message).not.toContain("k".repeat(41));
+    expect(formatToolInputIssues(issuesFor(schema, {}), {})).toEndWith("; received no keys");
+  });
+
+  test("does not list keys for a present field of the wrong type or another issue", () => {
+    const schema = z.object({ script: z.string(), count: z.number().max(1) });
+
+    for (const input of [
+      { script: 5, count: 0 },
+      { script: "ls", count: 2 },
+    ]) {
+      expect(formatToolInputIssues(issuesFor(schema, input), input)).not.toContain("received keys");
+    }
+  });
 });
 
 describe("isToolInputIssueArray", () => {

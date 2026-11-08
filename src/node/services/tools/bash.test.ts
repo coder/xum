@@ -1431,6 +1431,55 @@ describe("bash tool", () => {
     }
   });
 
+  describe("interactive TUI launches", () => {
+    function createSpiedBashTool() {
+      const tempDir = new TestTempDir("test-bash-tui");
+      const config = createTestToolConfig(process.cwd());
+      config.runtimeTempDir = tempDir.path;
+      const exec = spyOn(config.runtime, "exec").mockImplementation(() =>
+        Promise.resolve(createExecStream("ran\n"))
+      );
+      return {
+        tool: createBashTool(config),
+        exec,
+        [Symbol.dispose]() {
+          exec.mockRestore();
+          tempDir[Symbol.dispose]();
+        },
+      };
+    }
+
+    it.each(["view", "  vim notes.md  ", "/usr/bin/top"])(
+      "rejects %p without spawning it",
+      async (script) => {
+        using testEnv = createSpiedBashTool();
+
+        const result = (await testEnv.tool.execute!(
+          { script, run_in_background: false, display_name: "test" },
+          mockToolCallOptions
+        )) as BashToolResult;
+
+        expect(result).toMatchObject({ success: false, exitCode: -1, wall_duration_ms: 0 });
+        expect(testEnv.exec).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each(["top -l 1", "vim -es -c q file", "vim +q file", "cat f | less", "view < f", "nano f"])(
+      "still runs %s",
+      async (script) => {
+        using testEnv = createSpiedBashTool();
+
+        const result = (await testEnv.tool.execute!(
+          { script, run_in_background: false, display_name: "test" },
+          mockToolCallOptions
+        )) as BashToolResult;
+
+        expect(testEnv.exec).toHaveBeenCalledTimes(1);
+        expect(result.success).toBe(true);
+      }
+    );
+  });
+
   describe("script sanitization", () => {
     const shouldRewriteNullRedirects = process.platform === "win32";
 
