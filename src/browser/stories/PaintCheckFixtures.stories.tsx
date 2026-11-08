@@ -5,12 +5,10 @@ import { PAINT_CHECK_WAIT_EVENT } from "@/constants/mermaid";
 import { lightweightMeta, PIXEL_DISABLED } from "./meta.js";
 
 /**
- * Stories that exercise four guards of the paint-check runner (.storybook/test-runner.ts): the
- * diagram wait, the error marker, the viewport check (hiding a diagram must change pixels inside
- * its box) and the paint-outside check. Each story trips one guard, or is valid on purpose, so only
- * `make test-storybook-paint-fixtures` runs them, and it requires each one to fail with its
- * expected message (or to pass). Without them, deleting a guard from the runner would leave every
- * real paint-check story green.
+ * Stories that exercise the guards of the paint-check runner (.storybook/test-runner.ts). Each
+ * story trips a guard, or is valid on purpose, so only `make test-storybook-paint-fixtures` runs
+ * them, and it requires each one to fail with its expected message (or to pass). Without them,
+ * deleting a guard from the runner would leave every real paint-check story green.
  *
  * Not covered: the runner's count of drawn diagrams against frames (a frame that never draws and
  * shows no error marker). A story for it would wait the runner's whole render timeout on every CI
@@ -109,9 +107,9 @@ export const DiagramPaintsOutsideItsBox: Story = {
 };
 
 /**
- * MUST FAIL with "must change pixels inside its box", as do the next two stories. Each lays out a
- * diagram inside the viewport that no one can see, so nothing outside its box changes when the
- * runner hides it and only the viewport check can fail the story. This one sits in a parent with
+ * MUST FAIL with "must change pixels inside its box", as do the other stories that lay out a
+ * diagram inside the viewport that no one can see. Nothing outside its box changes when the runner
+ * hides it, so only the viewport check can fail the story. This one sits in a parent with
  * visibility: hidden. The text after the diagram gives the runner a page to compare.
  */
 export const DiagramInHiddenParent: Story = {
@@ -120,7 +118,10 @@ export const DiagramInHiddenParent: Story = {
   ),
 };
 
-/** An overlay in the page's own colour covers the diagram and the text after it. */
+/**
+ * MUST FAIL like DiagramInHiddenParent. An overlay in the page's own colour covers the diagram
+ * and the text after it.
+ */
 export const DiagramUnderAnOverlay: Story = {
   render: () => (
     <div className="bg-background min-h-screen p-4">
@@ -139,7 +140,10 @@ export const DiagramUnderAnOverlay: Story = {
   ),
 };
 
-/** A parent of height 0 with overflow: hidden clips the diagram away. */
+/**
+ * MUST FAIL like DiagramInHiddenParent. A parent of height 0 with overflow: hidden clips the
+ * diagram away.
+ */
 export const DiagramClippedAway: Story = {
   render: () => (
     <div className="bg-background min-h-screen p-4">

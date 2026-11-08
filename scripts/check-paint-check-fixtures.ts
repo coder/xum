@@ -1,12 +1,11 @@
 /**
- * Prove that four guards of the paint-check runner (.storybook/test-runner.ts) still fire: the
- * diagram wait, the error marker, the viewport check and the paint-outside check.
+ * Prove that the guards of the paint-check runner (.storybook/test-runner.ts) still fire.
  *
- * Why this exists: every real paint-check story is valid, so deleting one of those guards from the
- * runner leaves them all green. The stories in src/browser/stories/PaintCheckFixtures.stories.tsx
- * are built to trip one guard each. This runs them through the real runner (the same
- * test-storybook that `make test-storybook` runs) and requires each one to fail with its message,
- * or to pass.
+ * Why this exists: every real paint-check story is valid, so deleting a guard from the runner
+ * leaves them all green. The stories in src/browser/stories/PaintCheckFixtures.stories.tsx are
+ * built to trip a guard each, or to pass on purpose. This runs them through the real runner (the
+ * same test-storybook that `make test-storybook` runs) and requires each one to fail with its
+ * message, or to pass.
  *
  * Usage (Storybook must be built and served, like `make test-storybook`; STORYBOOK_URL names a
  * server other than http://127.0.0.1:6006):
@@ -121,7 +120,8 @@ function main(): number {
   const reportFile = join(dir, "report.json");
   try {
     // Node, as in `make test-storybook` (bun x runs the package's node bin). The run exits 1,
-    // because two fixtures fail on purpose: only the report says whether it did what it should.
+    // because the fixtures built to fail do fail: only the report says whether each did what it
+    // should.
     const run = spawnSync(
       "node",
       [
