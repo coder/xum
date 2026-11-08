@@ -58,11 +58,12 @@ export interface SpendMeter {
    */
   maxOutputTokens: number | undefined;
   /**
-   * True once a step finished with `length`: the model hit its output limit, the cap above or its
-   * own. The SDK runs a step's tool calls only when the step finishes with `stop` or
-   * `tool-calls`, so that step's memory command never ran, and the model never saw a failure to
-   * retry from. The stream still ends without an error, so the caller must read this and treat
-   * the run as incomplete. Such a step is the last of its stream: nothing came back to answer.
+   * True when the stream's last step finished with `length`: the model hit its output limit, the
+   * cap above or its own. The SDK runs a step's valid tool calls only when the step finishes with
+   * `stop` or `tool-calls`, so that step's memory command never ran, and the stream still ends
+   * without an error: the caller must read this and treat the run as incomplete. Only the last
+   * step counts: a cut-off call with broken input comes back to the model as a tool error, and a
+   * later step can retry it, which ends the run normally.
    */
   endedAtOutputLimit: () => boolean;
   /** Measured USD, with what `spentUsd` of the meter's creation already held. */
@@ -90,7 +91,7 @@ export function createSpendMeter(args: {
   return {
     maxOutputTokens: args.ceilingUsd === undefined ? undefined : MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
     recordStep: (step) => {
-      if (step.finishReason === "length") outputLimited = true;
+      outputLimited = step.finishReason === "length";
       const cost = stepCostUsd(step, args.pricingModel);
       if (cost === undefined) unpriced = true;
       else spent += cost;

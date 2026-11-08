@@ -1220,6 +1220,55 @@ function outputLimitedModel(): MockLanguageModelV3 {
   });
 }
 
+/**
+ * A model whose first step is cut off at the output limit mid tool call (its input is not valid
+ * JSON), whose second step creates a global file, and whose third ends the run.
+ */
+function recoveringModel(): MockLanguageModelV3 {
+  let calls = 0;
+  const usage = {
+    inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+    outputTokens: { total: 0, text: 0, reasoning: 0 },
+  };
+  const finish = (unified: "tool-calls" | "length" | "stop"): LanguageModelV3StreamPart => ({
+    type: "finish",
+    finishReason: { unified, raw: unified },
+    usage,
+  });
+  const steps: LanguageModelV3StreamPart[][] = [
+    [
+      {
+        type: "tool-call",
+        toolCallId: "cut",
+        toolName: "memory",
+        input: '{"command":"create","pa',
+      },
+      finish("length"),
+    ],
+    [
+      {
+        type: "tool-call",
+        toolCallId: "retry",
+        toolName: "memory",
+        input: JSON.stringify({
+          command: "create",
+          path: "/memories/global/recovered.md",
+          file_text: "fact\n",
+        }),
+      },
+      finish("tool-calls"),
+    ],
+    [finish("stop")],
+  ];
+  return new MockLanguageModelV3({
+    doStream: () => {
+      const chunks = steps[Math.min(calls, steps.length - 1)];
+      calls += 1;
+      return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+    },
+  });
+}
+
 describe("runMemoryConsolidation", () => {
   // The SDK runs no tool call of a step that finishes with `length`, and the stream ends without
   // an error: the pass must not read as a success, or it is journaled and the debounce holds off
@@ -1247,6 +1296,25 @@ describe("runMemoryConsolidation", () => {
     expect(result.ops.map((op) => op.path)).toEqual(["/memories/global/landed.md"]);
     expect(result.spentUsd).toBeCloseTo(1, 9);
     expect(await pathExists(path.join(fixture.globalMemoryDir, "cut.md"))).toBe(false);
+  });
+
+  it("completes a pass whose cut-off step the model retried in a later step", async () => {
+    using fixture = await createFixture();
+
+    const result = await runMemoryConsolidation({
+      model: recoveringModel(),
+      pricingModel: PRICED_MODEL,
+      ceilingUsd: 100,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.streamError).toBeUndefined();
+    expect(result.ops.map((op) => op.path)).toEqual(["/memories/global/recovered.md"]);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "recovered.md"))).toBe(true);
   });
 
   describe("cost ceiling", () => {

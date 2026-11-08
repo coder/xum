@@ -175,6 +175,15 @@ describe("createSpendMeter", () => {
     expect(meter.spentUsd()).toBeCloseTo(3, 9);
   });
 
+  it("clears the output limit when a later step of the stream ends normally", () => {
+    const meter = createSpendMeter({ pricingModel: OPENAI_MODEL, ceilingUsd: 100 });
+    meter.recordStep({ ...stepOf(250_000), finishReason: "length" });
+
+    meter.recordStep({ ...stepOf(250_000), finishReason: "tool-calls" });
+
+    expect(meter.endedAtOutputLimit()).toBe(false);
+  });
+
   it("carries the spend of earlier attempts", () => {
     const meter = createSpendMeter({ pricingModel: OPENAI_MODEL, ceilingUsd: 1, spentUsd: 0.75 });
     expect(meter.stopIfCeilingReached()).toBe(false);
