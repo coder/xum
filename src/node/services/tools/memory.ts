@@ -17,6 +17,7 @@ import {
   parseMemoryPath,
   type MemoryScopeContext,
   type MemoryService,
+  type MemoryWriteOptions,
 } from "@/node/services/memoryService";
 
 /**
@@ -170,7 +171,9 @@ export async function executeMemoryCommand(
   input: MemoryCommandInput,
   checkWriteAccess: (virtualPath: string) => MemoryToolResult | null,
   toolCallId?: string,
-  options?: {
+  // `MemoryWriteOptions` (rejectSecretLike) is handed on to the content-writing commands whole, so
+  // reading it adds no branch here.
+  options?: MemoryWriteOptions & {
     /**
      * Staged refine mutations only (r55 deletes, r58 inserts): staging-time
      * fingerprint of the mutation target, re-verified by MemoryService
@@ -194,12 +197,6 @@ export async function executeMemoryCommand(
      * MemoryService.assertNotPinnedForRemoval. Ignored by other commands.
      */
     rejectPinned?: boolean;
-    /**
-     * The harvest analyzer's credential check on the RESULTING file of a create, str_replace or
-     * insert, enforced by MemoryService INSIDE its mutation lock (see MemoryWriteOptions).
-     * Ignored by other commands.
-     */
-    rejectSecretLike?: boolean;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -226,7 +223,7 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.abortSignal,
-            { rejectSecretLike: options?.rejectSecretLike }
+            options
           ))
         );
       }
@@ -244,7 +241,7 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.abortSignal,
-            { rejectSecretLike: options?.rejectSecretLike }
+            options
           ))
         );
       }
@@ -266,7 +263,7 @@ export async function executeMemoryCommand(
             toolCallId,
             options?.expectedTargetFingerprint,
             options?.abortSignal,
-            { rejectSecretLike: options?.rejectSecretLike }
+            options
           ))
         );
       }
