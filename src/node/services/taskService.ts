@@ -893,10 +893,13 @@ export interface OwnedTaskAttempt {
    */
   receiptEligible: boolean;
   /**
-   * The row still read a completed report once the CAS that published this attempt had written
-   * it: a reactivated or reawakened task keeps its predecessor's terminal status while the new
-   * attempt runs. A reported row says nothing about this attempt then. In-memory only, read from
-   * that CAS (never from the row afterwards, where the report may be this attempt's own).
+   * The row still read a completed report (`reported`, or `interrupted` with a report time) once
+   * the CAS that published this attempt had written it. A reactivation keeps its predecessor's
+   * terminal status, and a reawakening of a settled reported task keeps it too, so the new attempt
+   * runs on a row that reads reported and that report says nothing about the attempt. A
+   * reawakening of an interrupted row sets it `running` in the same CAS: the value is false then.
+   * In-memory only, read from that CAS (never from the row afterwards, where the report may be
+   * this attempt's own).
    */
   readonly inheritedReport: boolean;
 }
