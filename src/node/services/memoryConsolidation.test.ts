@@ -3,15 +3,24 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { Tool } from "ai";
+import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import type { LanguageModelV3StreamPart, SharedV3ProviderMetadata } from "@ai-sdk/provider";
 
 import {
+  MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
+  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
 } from "@/common/constants/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { Config } from "@/node/config";
-import { createConsolidationMemoryTool, type MemoryConsolidationOp } from "./memoryConsolidation";
+import {
+  createConsolidationMemoryTool,
+  createMutationBudget,
+  runMemoryConsolidation,
+  type MemoryConsolidationOp,
+} from "./memoryConsolidation";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
 import { MemoryService, projectMemoryDirName, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir, mockToolCallOptions } from "./tools/testHelpers";
@@ -32,6 +41,7 @@ interface Fixture extends Disposable {
   journal: MemoryConsolidationOp[];
   tool: Tool;
   getMutationCount: () => number;
+  isBudgetExhausted: () => boolean;
   globalMemoryDir: string;
   projectMemoryDir: string;
 }
@@ -39,6 +49,8 @@ interface Fixture extends Disposable {
 async function createFixture(options?: {
   dryRun?: boolean;
   projectPath?: string;
+  /** Guard options under test (scopes, secret check, description, budget). */
+  guard?: Partial<Parameters<typeof createConsolidationMemoryTool>[0]>;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-memory-consolidation");
   const xumHome = path.join(tempDir.path, "mux-home");
@@ -58,12 +70,13 @@ async function createFixture(options?: {
     projectPath: options?.projectPath ?? "",
   };
   const journal: MemoryConsolidationOp[] = [];
-  const { tool, getMutationCount } = createConsolidationMemoryTool({
+  const { tool, getMutationCount, isBudgetExhausted } = createConsolidationMemoryTool({
     memoryService,
     metaService,
     ctx,
     dryRun: options?.dryRun ?? false,
     journal,
+    ...options?.guard,
   });
   return {
     xumHome,
@@ -75,6 +88,7 @@ async function createFixture(options?: {
     projectMemoryDir,
     tool,
     getMutationCount,
+    isBudgetExhausted,
     [Symbol.dispose]() {
       tempDir[Symbol.dispose]();
     },
@@ -177,7 +191,7 @@ describe("consolidation memory tool rails", () => {
       )
     ).toBe(false);
 
-    // The harvest inbox path (saveFile) refuses through the same check.
+    // The Memory tab's save path (saveFile) refuses through the same check.
     const saved = await fixture.memoryService.saveFile(
       fixture.ctx,
       "/memories/workspace/harvest/inbox.md",
@@ -219,6 +233,37 @@ describe("consolidation memory tool rails", () => {
     expect(result.success).toBe(false);
     if (!result.success) expect(result.error).toContain("cancelled");
     expect(await fsPromises.readFile(targetPath, "utf-8")).toContain("original");
+  });
+
+  it("a read stalled in filesystem I/O returns once the pass is cancelled", async () => {
+    // Only mutations re-check the signal inside MemoryService, and the provider loop waits for
+    // the tool result: a read that never settles would hold the run past its timeout.
+    using fixture = await createFixture();
+    const controller = new AbortController();
+    const { tool } = createConsolidationMemoryTool({
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      journal: [],
+      abortSignal: controller.signal,
+    });
+    let markReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve;
+    });
+    spyOn(fixture.memoryService, "view").mockImplementation(() => {
+      markReadStarted();
+      return new Promise(() => undefined);
+    });
+
+    const pending = execute(tool, { command: "view", path: "/memories/" });
+    await readStarted;
+    controller.abort();
+
+    const result = await pending;
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("cancelled");
   });
 
   it("applies in-scope mutations and journals them", async () => {
@@ -274,6 +319,355 @@ describe("consolidation memory tool rails", () => {
     expect(projectRead.success).toBe(false);
     const read = await execute(fixture.tool, { command: "view", path: "/memories/global/" });
     expect(read.success).toBe(true);
+  });
+
+  it("keeps the default guard open to workspace, global and project writes, and checks no text", async () => {
+    // The dream pass runs on the defaults: the analyzer's narrower scopes and secret check are opt-in.
+    using fixture = await createFixture({ projectPath: "/projects/demo" });
+    const writes = ["/memories/workspace/a.md", "/memories/global/b.md", "/memories/project/c.md"];
+    for (const target of writes) {
+      const result = await execute(fixture.tool, {
+        command: "create",
+        path: target,
+        file_text: "password: kept-as-written\n",
+      });
+      expect(result.success).toBe(true);
+    }
+    expect(fixture.journal.map((op) => op.applied)).toEqual([true, true, true]);
+
+    const session = await execute(fixture.tool, {
+      command: "create",
+      path: "/memories/session/checkpoint.md",
+      file_text: "x\n",
+    });
+    expect(session.success).toBe(false);
+    expect(fixture.journal.at(-1)?.applied).toBe(false);
+  });
+
+  describe("writable scopes", () => {
+    it("rejects and journals a write outside them, without spending budget", async () => {
+      using fixture = await createFixture({
+        projectPath: "/projects/demo",
+        guard: { writableScopes: ["workspace"] },
+      });
+
+      const global = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/global/x.md",
+        file_text: "x\n",
+      });
+      const project = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/project/x.md",
+        file_text: "x\n",
+      });
+      // A rename that starts inside a writable scope may not end outside it.
+      const seeded = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/workspace/y.md",
+        file_text: "y\n",
+      });
+      const moved = await execute(fixture.tool, {
+        command: "rename",
+        old_path: "/memories/workspace/y.md",
+        new_path: "/memories/global/y.md",
+      });
+
+      expect(seeded.success).toBe(true);
+      for (const result of [global, project, moved]) {
+        expect(result.success).toBe(false);
+        if (!result.success)
+          expect(result.error).toContain("this run can modify /memories/workspace/....");
+      }
+      expect(fixture.journal.map((op) => op.applied)).toEqual([false, false, true, false]);
+      // Only the accepted create consumed budget.
+      expect(fixture.getMutationCount()).toBe(1);
+      expect(await pathExists(path.join(fixture.globalMemoryDir, "x.md"))).toBe(false);
+      expect(await pathExists(path.join(fixture.projectMemoryDir, "x.md"))).toBe(false);
+    });
+
+    it("keeps reads open to every scope", async () => {
+      using fixture = await createFixture({
+        projectPath: "/projects/demo",
+        guard: { writableScopes: ["workspace"] },
+      });
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "env.md"), "GLOBAL-FACT\n");
+
+      const read = await execute(fixture.tool, {
+        command: "view",
+        path: "/memories/global/env.md",
+      });
+
+      expect(read.success).toBe(true);
+      if (read.success) expect(read.output).toContain("GLOBAL-FACT");
+    });
+
+    it("keeps project memory unavailable without a single project even when listed", async () => {
+      using fixture = await createFixture({
+        guard: { writableScopes: ["workspace", "project"] },
+      });
+
+      const result = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/project/x.md",
+        file_text: "x\n",
+      });
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("single-project runs");
+    });
+  });
+
+  describe("denied commands", () => {
+    it("rejects and journals a denied command without spending budget, and still allows the others", async () => {
+      using fixture = await createFixture({ guard: { deniedCommands: ["delete", "rename"] } });
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "keep.md"), "x\n");
+
+      const deleted = await execute(fixture.tool, {
+        command: "delete",
+        path: "/memories/global/keep.md",
+      });
+      const renamed = await execute(fixture.tool, {
+        command: "rename",
+        old_path: "/memories/global/keep.md",
+        new_path: "/memories/global/moved.md",
+      });
+      const edited = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/keep.md",
+        old_str: "x",
+        new_str: "y",
+      });
+
+      expect(deleted.success).toBe(false);
+      expect(renamed.success).toBe(false);
+      expect(edited.success).toBe(true);
+      expect(fixture.journal.map((op) => [op.command, op.applied])).toEqual([
+        ["delete", false],
+        ["rename", false],
+        ["str_replace", true],
+      ]);
+      expect(fixture.journal[0]?.note).toContain("delete");
+      expect(fixture.getMutationCount()).toBe(1);
+      expect(
+        await fsPromises.readFile(path.join(fixture.globalMemoryDir, "keep.md"), "utf-8")
+      ).toBe("y\n");
+    });
+  });
+
+  describe("denied command note", () => {
+    it("names the commands the run can still use, not the ones it was denied", async () => {
+      using fixture = await createFixture({
+        guard: { deniedCommands: ["delete", "rename", "insert"] },
+      });
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "keep.md"), "x\n");
+
+      const result = await execute(fixture.tool, {
+        command: "insert",
+        path: "/memories/global/keep.md",
+        insert_line: 0,
+        insert_text: "y\n",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      // Everything after "may not use insert;" is what the run is told it may do.
+      const allowed = result.error.slice(result.error.indexOf(";"));
+      expect(allowed).toContain("create");
+      expect(allowed).toContain("str_replace");
+      for (const denied of ["insert", "delete", "rename"]) expect(allowed).not.toContain(denied);
+      expect(fixture.getMutationCount()).toBe(0);
+      expect(
+        await fsPromises.readFile(path.join(fixture.globalMemoryDir, "keep.md"), "utf-8")
+      ).toBe("x\n");
+    });
+  });
+
+  describe("secret check", () => {
+    it("rejects create, str_replace and insert text that holds a credential, and journals it without the value", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "notes.md"), "line one\n");
+
+      const results = [
+        await execute(fixture.tool, {
+          command: "create",
+          path: "/memories/global/creds.md",
+          file_text: `GITHUB_TOKEN=${githubToken}\n`,
+        }),
+        await execute(fixture.tool, {
+          command: "str_replace",
+          path: "/memories/global/notes.md",
+          old_str: "line one",
+          new_str: "password: hunter2-correct-horse",
+        }),
+        await execute(fixture.tool, {
+          command: "insert",
+          path: "/memories/global/notes.md",
+          insert_line: 0,
+          insert_text: `Authorization: Bearer ${githubToken}\n`,
+        }),
+      ];
+
+      for (const result of results) {
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("credential");
+      }
+      expect(fixture.journal.map((op) => op.applied)).toEqual([false, false, false]);
+      expect(JSON.stringify(fixture.journal)).not.toContain(githubToken);
+      expect(JSON.stringify(fixture.journal)).not.toContain("hunter2");
+      expect(fixture.getMutationCount()).toBe(0);
+      expect(
+        await fsPromises.readFile(path.join(fixture.globalMemoryDir, "notes.md"), "utf-8")
+      ).toBe("line one\n");
+      expect(await pathExists(path.join(fixture.globalMemoryDir, "creds.md"))).toBe(false);
+    });
+
+    it("rejects a credential that has no keyword beside it", async () => {
+      // A check on the words `token`, `secret` and `password` lets these shapes through: the
+      // guard has to read the credential shapes themselves.
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+
+      const notes = [
+        `The deploy user authenticates as ${githubToken}.\n`,
+        "The notifier posts as xoxb-1234567890-abcdefghij.\n",
+        "The cache lives at redis://:hunter2pw@cache:6379/0.\n",
+      ];
+
+      for (const [index, note] of notes.entries()) {
+        const result = await execute(fixture.tool, {
+          command: "create",
+          path: `/memories/global/note-${index}.md`,
+          file_text: note,
+        });
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("credential");
+      }
+      expect(JSON.stringify(fixture.journal)).not.toContain("hunter2pw");
+      expect(fixture.getMutationCount()).toBe(0);
+    });
+
+    it("accepts text that only talks about tokens and passwords", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+
+      const result = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/global/auth.md",
+        file_text:
+          "The token budget resets each turn; max_tokens: 4096. Passwords live in the vault.\n",
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects a file name that holds a credential, journals it redacted, and never creates it", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const keyName = `sk-ant-api03-${"Ab3d".repeat(8)}`;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "old.md"), "x\n");
+
+      const created = await execute(fixture.tool, {
+        command: "create",
+        path: `/memories/global/${keyName}.md`,
+        file_text: "what the key is for\n",
+      });
+      const renamed = await execute(fixture.tool, {
+        command: "rename",
+        old_path: "/memories/global/old.md",
+        new_path: `/memories/global/${keyName}.md`,
+      });
+
+      for (const result of [created, renamed]) {
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("credential");
+      }
+      expect(fixture.journal.map((op) => op.applied)).toEqual([false, false]);
+      expect(JSON.stringify(fixture.journal)).not.toContain(keyName);
+      expect(fixture.getMutationCount()).toBe(0);
+      expect(await pathExists(path.join(fixture.globalMemoryDir, `${keyName}.md`))).toBe(false);
+      expect(await pathExists(path.join(fixture.globalMemoryDir, "old.md"))).toBe(true);
+    });
+
+    it("lets a rename or delete clear away a file that already has a credential in its name", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const keyName = `sk-ant-api03-${"Ab3d".repeat(8)}.md`;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, keyName), "x\n");
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, `other-${keyName}`), "y\n");
+
+      const renamed = await execute(fixture.tool, {
+        command: "rename",
+        old_path: `/memories/global/${keyName}`,
+        new_path: "/memories/global/clean.md",
+      });
+      const deleted = await execute(fixture.tool, {
+        command: "delete",
+        path: `/memories/global/other-${keyName}`,
+      });
+
+      expect(renamed.success).toBe(true);
+      expect(deleted.success).toBe(true);
+    });
+
+    it("leaves deletes and renames alone", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "old.md"), "x\n");
+
+      const renamed = await execute(fixture.tool, {
+        command: "rename",
+        old_path: "/memories/global/old.md",
+        new_path: "/memories/global/new.md",
+      });
+      const deleted = await execute(fixture.tool, {
+        command: "delete",
+        path: "/memories/global/new.md",
+      });
+
+      expect(renamed.success).toBe(true);
+      expect(deleted.success).toBe(true);
+    });
+  });
+
+  it("lets the caller set the lead of the tool description and keeps the command reference", async () => {
+    using fixture = await createFixture({ guard: { description: "Edit this workspace's notes." } });
+    const defaults = await createFixture();
+
+    expect(fixture.tool.description).toStartWith("Edit this workspace's notes. ");
+    expect(fixture.tool.description).not.toContain("you are consolidating");
+    expect(fixture.tool.description).toEndWith(TOOL_DEFINITIONS.memory.description);
+    expect(defaults.tool.description).toContain("you are consolidating");
+    defaults[Symbol.dispose]();
+  });
+
+  describe("budget exhaustion", () => {
+    it("is judged against the run's own budget limit, not the default one", async () => {
+      using fixture = await createFixture({ guard: { budget: createMutationBudget(2) } });
+      const create = (name: string) =>
+        execute(fixture.tool, {
+          command: "create",
+          path: `/memories/global/${name}.md`,
+          file_text: `${name}\n`,
+        });
+
+      expect(fixture.isBudgetExhausted()).toBe(false);
+      await create("one");
+      expect(fixture.isBudgetExhausted()).toBe(false);
+      await create("two");
+      expect(fixture.isBudgetExhausted()).toBe(true);
+    });
+
+    it("is not triggered by guard rejections", async () => {
+      using fixture = await createFixture({
+        guard: { budget: createMutationBudget(1), writableScopes: ["workspace"] },
+      });
+
+      await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/global/x.md",
+        file_text: "x\n",
+      });
+
+      expect(fixture.isBudgetExhausted()).toBe(false);
+    });
   });
 
   it("never deletes or renames pinned files but allows editing them", async () => {
@@ -718,5 +1112,371 @@ describe("consolidation memory tool rails", () => {
     expect(fixture.journal).toHaveLength(1);
     expect(fixture.journal[0]?.applied).toBe(false);
     expect(fixture.journal[0]?.note).toBeDefined();
+  });
+});
+
+describe("createMutationBudget", () => {
+  // Bounded, so a budget that never refuses (NaN, -Infinity) fails the test instead of hanging it.
+  function consumeAll(budget: ReturnType<typeof createMutationBudget>): number {
+    let granted = 0;
+    while (granted < 1_000 && budget.tryConsume()) granted++;
+    return granted;
+  }
+
+  it("resumes what an earlier attempt spent", () => {
+    expect(consumeAll(createMutationBudget(8, 3))).toBe(5);
+    expect(consumeAll(createMutationBudget(8, 8))).toBe(0);
+  });
+
+  // A persisted count that is not a whole, non-negative number must not widen the budget: -100
+  // used to grant 108 mutations, and NaN never reached the limit at all.
+  it.each([-100, -1, 2.5, Number.NaN, Number.NEGATIVE_INFINITY])(
+    "never grants more than its limit when it resumes from %d",
+    (alreadyUsed) => {
+      const budget = createMutationBudget(8, alreadyUsed);
+
+      expect(consumeAll(budget)).toBeLessThanOrEqual(8);
+      expect(budget.used()).toBeLessThanOrEqual(8);
+    }
+  );
+});
+
+// $2 per million input tokens, and a priority tier that bills at twice that: a step of 250k input
+// tokens costs $0.50 at Standard and $1.00 at priority.
+const PRICED_MODEL = "openai:gpt-6.1-sol";
+const HALF_DOLLAR_INPUT_TOKENS = 250_000;
+
+/** A model whose every step lists the memory directory, so the run takes as many steps as it may. */
+function listingModel(providerMetadata?: SharedV3ProviderMetadata): {
+  model: MockLanguageModelV3;
+  calls: Array<number | undefined>;
+} {
+  const calls: Array<number | undefined> = [];
+  const model = new MockLanguageModelV3({
+    doStream: (options) => {
+      calls.push(options.maxOutputTokens);
+      const chunks: LanguageModelV3StreamPart[] = [
+        {
+          type: "tool-call",
+          toolCallId: `list-${calls.length}`,
+          toolName: "memory",
+          input: JSON.stringify({ command: "view", path: "/memories/" }),
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          usage: {
+            inputTokens: {
+              total: HALF_DOLLAR_INPUT_TOKENS,
+              noCache: HALF_DOLLAR_INPUT_TOKENS,
+              cacheRead: 0,
+              cacheWrite: 0,
+            },
+            outputTokens: { total: 0, text: 0, reasoning: 0 },
+          },
+          ...(providerMetadata === undefined ? {} : { providerMetadata }),
+        },
+      ];
+      return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+    },
+  });
+  return { model, calls };
+}
+
+/** A model whose first step lands a global file and whose second is cut off at the output limit. */
+function outputLimitedModel(): MockLanguageModelV3 {
+  let calls = 0;
+  const step = (name: string, unified: "tool-calls" | "length"): LanguageModelV3StreamPart[] => [
+    {
+      type: "tool-call",
+      toolCallId: name,
+      toolName: "memory",
+      input: JSON.stringify({
+        command: "create",
+        path: `/memories/global/${name}.md`,
+        file_text: "fact\n",
+      }),
+    },
+    {
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: {
+        inputTokens: {
+          total: HALF_DOLLAR_INPUT_TOKENS,
+          noCache: HALF_DOLLAR_INPUT_TOKENS,
+          cacheRead: 0,
+          cacheWrite: 0,
+        },
+        outputTokens: { total: 0, text: 0, reasoning: 0 },
+      },
+    },
+  ];
+  return new MockLanguageModelV3({
+    doStream: () => {
+      calls += 1;
+      const chunks = calls === 1 ? step("landed", "tool-calls") : step("cut", "length");
+      return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+    },
+  });
+}
+
+/**
+ * A model whose first step is cut off at the output limit mid tool call (its input is not valid
+ * JSON), whose second step creates a global file, and whose third ends the run.
+ */
+function recoveringModel(): MockLanguageModelV3 {
+  let calls = 0;
+  const usage = {
+    inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+    outputTokens: { total: 0, text: 0, reasoning: 0 },
+  };
+  const finish = (unified: "tool-calls" | "length" | "stop"): LanguageModelV3StreamPart => ({
+    type: "finish",
+    finishReason: { unified, raw: unified },
+    usage,
+  });
+  const steps: LanguageModelV3StreamPart[][] = [
+    [
+      {
+        type: "tool-call",
+        toolCallId: "cut",
+        toolName: "memory",
+        input: '{"command":"create","pa',
+      },
+      finish("length"),
+    ],
+    [
+      {
+        type: "tool-call",
+        toolCallId: "retry",
+        toolName: "memory",
+        input: JSON.stringify({
+          command: "create",
+          path: "/memories/global/recovered.md",
+          file_text: "fact\n",
+        }),
+      },
+      finish("tool-calls"),
+    ],
+    [finish("stop")],
+  ];
+  return new MockLanguageModelV3({
+    doStream: () => {
+      const chunks = steps[Math.min(calls, steps.length - 1)];
+      calls += 1;
+      return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+    },
+  });
+}
+
+describe("runMemoryConsolidation", () => {
+  // The SDK runs no tool call of a step that finishes with `length`, and the stream ends without
+  // an error: the pass must not read as a success, or it is journaled and the debounce holds off
+  // the retry.
+  it.each([
+    ["a ceiling caps the step", 100],
+    ["no ceiling is set", undefined],
+  ])("fails a pass whose step ended at the output limit when %s", async (_name, ceilingUsd) => {
+    using fixture = await createFixture();
+
+    const result = await runMemoryConsolidation({
+      model: outputLimitedModel(),
+      pricingModel: PRICED_MODEL,
+      ceilingUsd,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.streamError).toContain("output limit");
+    expect(result.summary).toContain("stream error");
+    // What landed before the cut step stays, and what the steps cost stays counted.
+    expect(result.ops.map((op) => op.path)).toEqual(["/memories/global/landed.md"]);
+    expect(result.spentUsd).toBeCloseTo(1, 9);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "cut.md"))).toBe(false);
+  });
+
+  // Headless runs bypass the chat cost pipeline: what a pass was billed reaches session usage only
+  // through `recordUsage`, and a stream that ended at the output limit completed and was billed.
+  it("reports the usage of a pass whose step ended at the output limit", async () => {
+    using fixture = await createFixture();
+    const recorded: Array<number | undefined> = [];
+
+    const result = await runMemoryConsolidation({
+      model: outputLimitedModel(),
+      pricingModel: PRICED_MODEL,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    expect(result.streamError).toContain("output limit");
+    // Both steps count, the cut-off one too.
+    expect(recorded).toEqual([2 * HALF_DOLLAR_INPUT_TOKENS]);
+  });
+
+  it("reports no usage for a stream that failed", async () => {
+    using fixture = await createFixture();
+    const recorded: Array<number | undefined> = [];
+
+    const result = await runMemoryConsolidation({
+      model: new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              pull(controller) {
+                controller.error(new Error("provider exploded"));
+              },
+            }),
+          }),
+      }),
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    // After a mid-flight error the SDK's usage promise can stay pending forever: nothing waits on it.
+    expect(result.streamError).toContain("provider exploded");
+    expect(recorded).toEqual([]);
+    expect(result.usage).toBeUndefined();
+  });
+
+  it("completes a pass whose cut-off step the model retried in a later step", async () => {
+    using fixture = await createFixture();
+
+    const result = await runMemoryConsolidation({
+      model: recoveringModel(),
+      pricingModel: PRICED_MODEL,
+      ceilingUsd: 100,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.streamError).toBeUndefined();
+    expect(result.ops.map((op) => op.path)).toEqual(["/memories/global/recovered.md"]);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "recovered.md"))).toBe(true);
+  });
+
+  describe("cost ceiling", () => {
+    async function run(
+      fixture: Fixture,
+      scripted: ReturnType<typeof listingModel>,
+      ceilingUsd?: number
+    ) {
+      return runMemoryConsolidation({
+        model: scripted.model,
+        pricingModel: PRICED_MODEL,
+        ceilingUsd,
+        agentBody: "Consolidate the memory directories.",
+        memoryService: fixture.memoryService,
+        metaService: fixture.metaService,
+        ctx: fixture.ctx,
+        dryRun: false,
+      });
+    }
+
+    it("takes every step it may, and measures their cost, with no ceiling", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      const result = await run(fixture, scripted);
+
+      expect(scripted.calls).toHaveLength(MEMORY_CONSOLIDATION_MAX_STEPS);
+      expect(result.spentUsd).toBeCloseTo(0.5 * MEMORY_CONSOLIDATION_MAX_STEPS, 9);
+      expect(result.note).toBeUndefined();
+      expect(result.streamError).toBeUndefined();
+    });
+
+    it("stops after the step whose measured cost reaches the ceiling, as a normal end", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      // $0.50 a step: the third step brings the spend to $1.50, over the $1.25 ceiling.
+      const result = await run(fixture, scripted, 1.25);
+
+      expect(scripted.calls).toHaveLength(3);
+      expect(result.spentUsd).toBeCloseTo(1.5, 9);
+      expect(result.note).toBe("stopped at the cost ceiling after $1.50");
+      expect(result.streamError).toBeUndefined();
+    });
+
+    it("counts a step the provider billed at the priority tier at its billed rate", async () => {
+      using fixture = await createFixture();
+      const standard = listingModel();
+      const priority = listingModel({ openai: { serviceTier: "priority" } });
+
+      await run(fixture, standard, 1.25);
+      const result = await run(fixture, priority, 1.25);
+
+      // Standard needs three $0.50 steps to pass $1.25; priority bills $1.00 a step, so two do.
+      expect(standard.calls).toHaveLength(3);
+      expect(priority.calls).toHaveLength(2);
+      expect(result.spentUsd).toBeCloseTo(2, 9);
+    });
+
+    it("caps what one step can write, which bounds how far it can overshoot", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      await run(fixture, scripted, 0.25);
+
+      expect(scripted.calls).toEqual([MEMORY_MAX_OUTPUT_TOKENS_PER_STEP]);
+    });
+
+    it("leaves a step's output uncapped when no ceiling is set", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      await run(fixture, scripted);
+
+      // Every step the run may take, none of them capped: the cap exists only to bound the step
+      // that crosses a ceiling, and a user who set none keeps the model's own limit.
+      expect(scripted.calls).toHaveLength(MEMORY_CONSOLIDATION_MAX_STEPS);
+      expect(scripted.calls.every((cap) => cap === undefined)).toBe(true);
+    });
+  });
+
+  it("reports a pass cut short by its timeout as a stream error, not a clean run", async () => {
+    // A real provider stream ends silently when its request is aborted: no error part reaches
+    // consumeStream, so the pass used to read as clean and be journaled as a success.
+    using fixture = await createFixture();
+    const model = new MockLanguageModelV3({
+      doStream: (options) =>
+        new Promise((_resolve, reject) => {
+          options.abortSignal?.addEventListener("abort", () =>
+            reject(new Error("stalled provider call aborted"))
+          );
+        }),
+    });
+
+    const result = await runMemoryConsolidation({
+      model,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      abortSignal: AbortSignal.timeout(50),
+    });
+
+    expect(result.streamError).toContain("cut short");
+    expect(result.usage).toBeUndefined();
   });
 });

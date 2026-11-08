@@ -5,6 +5,10 @@ inputs:
     description: "Skip Electron and electron-builder caches (for test-only jobs)"
     required: false
     default: "false"
+  electron-zip:
+    description: "Cache the Electron zip that jobs launching Electron download, and fetch it with retries on a cache miss"
+    required: false
+    default: "false"
 runs:
   using: "composite"
   steps:
@@ -114,3 +118,43 @@ runs:
         key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-builder-
+
+    # The zip that node_modules/electron/install.js downloads from github.com on the first
+    # launch (bun skips Electron's postinstall, so nothing downloads it earlier). The caches
+    # above never served E2E and Stories: they key on the lockfiles alone, and whichever job
+    # misses a new key first saves it. Linux's entry held only the stale zips that its
+    # restore-keys prefix had restored (44.5.1 and 40.9.3). macOS's held the zip flat in the
+    # cache root, where @electron/get does not look. So every E2E and Stories job downloaded
+    # the zip, and a 504 from github.com failed those jobs on 2026-11-08.
+    # This cache has one purpose: the current zip, in a directory of its own that
+    # electron_config_cache points @electron/get at. The key hashes checksums.json, so a new
+    # Electron version or checksum starts a fresh cache, and there is no restore-keys fallback
+    # to bring old zips back. On a miss the zip is downloaded here, retrying for 15 minutes,
+    # and saved at once.
+    - name: Point Electron downloads at their own cache
+      if: ${{ inputs.electron-zip == 'true' }}
+      shell: bash
+      run: echo "electron_config_cache=$HOME/.cache/xum-electron-zip" >> "$GITHUB_ENV"
+
+    - name: Restore Electron zip
+      if: ${{ inputs.electron-zip == 'true' }}
+      id: cache-electron-zip
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ env.electron_config_cache }}
+        key: ${{ runner.os }}-${{ runner.arch }}-electron-zip-${{ hashFiles('node_modules/electron/checksums.json') }}
+
+    # The 15 minute budget fits both callers: E2E has no job time limit, and a Stories run
+    # (4 to 5 minutes warm) stops at 50 minutes in the merge queue.
+    - name: Download Electron zip
+      if: ${{ inputs.electron-zip == 'true' && steps.cache-electron-zip.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: ./scripts/retry.sh --budget-secs 900 --max-backoff-secs 60 --fatal-status 64 0 2 node scripts/ci/prefetch-electron-zip.cjs
+
+    # Saved at once: a later failing step in the job must not discard a zip that took minutes.
+    - name: Save Electron zip
+      if: ${{ inputs.electron-zip == 'true' && steps.cache-electron-zip.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ env.electron_config_cache }}
+        key: ${{ steps.cache-electron-zip.outputs.cache-primary-key }}

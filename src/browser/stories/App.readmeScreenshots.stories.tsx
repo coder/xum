@@ -34,7 +34,6 @@ import {
   groupWorkspacesByProject,
 } from "./mocks/workspaces";
 import { createMockORPCClient, type MockSessionUsage } from "./mocks/orpc";
-import { waitForRenderedMermaidDiagram } from "./storyPlayHelpers";
 import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
@@ -973,9 +972,6 @@ graph TD
       }}
     />
   ),
-  play: async ({ canvasElement }) => {
-    await waitForRenderedMermaidDiagram(canvasElement);
-  },
 };
 
 // README: docs/img/costs-tab.webp
