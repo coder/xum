@@ -1,5 +1,15 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  test,
+  expect,
+  mock,
+  spyOn,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+} from "bun:test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import * as fsPromises from "fs/promises";
 import {
@@ -13,6 +23,10 @@ import {
   type WorkspaceMetadataOptions,
 } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
+import {
+  isolateHostHome,
+  type IsolatedHostHome,
+} from "@/node/services/hostHomeIsolation.testHarness";
 import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import {
   getSubagentReportArtifactPath,
@@ -71,20 +85,24 @@ import {
 } from "@/node/services/taskService.shared.testHarness";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
+// Every agent-task reservation resolves its agent definition, which scans the runtime user's
+// global plugin roots (<XUM_ROOT>/plugins and ~/.agents/plugins). Point them at an empty home so
+// these tests neither read nor wait on the plugins installed on the machine that runs them (the
+// file ran about twice as slow on a host with eight plugins).
+let hostHome: IsolatedHostHome | undefined;
+beforeAll(() => {
+  hostHome = isolateHostHome("task-settlement-host-home");
+});
+afterAll(() => {
+  hostHome?.restore();
+});
+
 describe("TaskService", () => {
   let rootDir: string;
-  let previousXumRoot: string | undefined;
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
-    // Every agent-task reservation resolves its agent definition, which scans <XUM_ROOT>/plugins.
-    // Point it at an empty home so these tests neither read nor wait on the plugins installed on
-    // the machine that runs them (the file ran about twice as slow on a host with eight plugins).
-    previousXumRoot = process.env.XUM_ROOT;
-    process.env.XUM_ROOT = path.join(rootDir, "xum-home");
   });
   afterEach(async () => {
-    if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
-    else process.env.XUM_ROOT = previousXumRoot;
     await removeTaskServiceTestRoot(rootDir);
   });
 
