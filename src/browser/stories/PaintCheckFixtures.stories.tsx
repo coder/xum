@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useState } from "react";
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
+import { PAINT_CHECK_WAIT_EVENT } from "@/constants/mermaid";
 import { lightweightMeta, PIXEL_DISABLED } from "./meta.js";
 
 /**
@@ -43,13 +44,14 @@ function Page(props: { content: string; style?: React.CSSProperties }) {
   );
 }
 
-function LateMount(props: { delayMs: number; children: React.ReactNode }) {
+/** Mounts its children when the runner starts to wait for a diagram, not before. */
+function MountWhenRunnerWaits(props: { children: React.ReactNode }) {
   const [mounted, setMounted] = useState(false);
-  // The delay is the point: the diagram is missing when the runner's postVisit starts.
   useEffect(() => {
-    const timer = setTimeout(() => setMounted(true), props.delayMs);
-    return () => clearTimeout(timer);
-  }, [props.delayMs]);
+    const mount = () => setMounted(true);
+    window.addEventListener(PAINT_CHECK_WAIT_EVENT, mount);
+    return () => window.removeEventListener(PAINT_CHECK_WAIT_EVENT, mount);
+  }, []);
   return mounted ? props.children : null;
 }
 
@@ -76,14 +78,14 @@ export const DiagramOutsideTheViewport: Story = {
 };
 
 /**
- * MUST PASS. The play ends before the diagram exists, so the story only passes when the runner
- * waits for the diagram itself. Mermaid loads lazily, and Chromium loads it fast enough that the
- * real stories rarely show a missing wait: this delay always does.
+ * MUST PASS. The play ends before the diagram exists, and the diagram mounts only once the runner
+ * has started to wait for it, so the story passes only when the runner waits and keeps polling.
+ * A timer would not do: on a loaded host the diagram could mount before the runner looks.
  */
-export const DiagramMountsThreeSecondsLate: Story = {
+export const DiagramMountsWhenTheRunnerWaits: Story = {
   render: () => (
-    <LateMount delayMs={3000}>
+    <MountWhenRunnerWaits>
       <Page content={[GOOD_CHART, TEXT_AFTER].join("\n\n")} />
-    </LateMount>
+    </MountWhenRunnerWaits>
   ),
 };

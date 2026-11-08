@@ -7,14 +7,15 @@
  * trip one guard each. This runs them through the real runner (the same test-storybook that
  * `make test-storybook` runs) and requires each one to fail with its message, or to pass.
  *
- * Usage (Storybook must be built and served, like `make test-storybook`):
- *   bun scripts/check-paint-check-fixtures.ts [--url http://127.0.0.1:6006]
+ * Usage (Storybook must be built and served, like `make test-storybook`; STORYBOOK_URL names a
+ * server other than http://127.0.0.1:6006):
+ *   bun scripts/check-paint-check-fixtures.ts
  */
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseArgs, stripVTControlCharacters } from "node:util";
+import { stripVTControlCharacters } from "node:util";
 
 const FIXTURE_TAG = "paint-fixture";
 const FIXTURE_FILE = "src/browser/stories/PaintCheckFixtures.stories.tsx";
@@ -27,7 +28,7 @@ const FIXTURE_FILE = "src/browser/stories/PaintCheckFixtures.stories.tsx";
 export const FIXTURES: ReadonlyMap<string, string | null> = new Map([
   ["BrokenChartNextToGoodChart", "must show a rendered Mermaid diagram"],
   ["DiagramOutsideTheViewport", "never overlaps the viewport"],
-  ["DiagramMountsThreeSecondsLate", null],
+  ["DiagramMountsWhenTheRunnerWaits", null],
 ]);
 
 /** The part of Jest's --json report that this reads. */
@@ -77,9 +78,8 @@ export function fixtureProblems(report: JestReport): string[] {
 }
 
 function main(): number {
-  const { values } = parseArgs({
-    options: { url: { type: "string", default: "http://127.0.0.1:6006" } },
-  });
+  // From the environment, not a flag: Make passes it on without a shell reading its characters.
+  const url = process.env.STORYBOOK_URL || "http://127.0.0.1:6006";
   const dir = mkdtempSync(join(tmpdir(), "paint-check-fixtures-"));
   const reportFile = join(dir, "report.json");
   try {
@@ -89,7 +89,9 @@ function main(): number {
       "node",
       [
         "node_modules/.bin/test-storybook",
-        ...["--url", values.url, "--includeTags", FIXTURE_TAG, "--testTimeout", "30000"],
+        // --no-index-json: a non-local URL would switch the runner to a mode that ignores the file
+        // below and names each test after the story's display name instead of its export.
+        ...["--url", url, "--no-index-json", "--includeTags", FIXTURE_TAG, "--testTimeout", "30000"],
         ...["--json", "--outputFile", reportFile, FIXTURE_FILE],
       ],
       { encoding: "utf8", timeout: 5 * 60_000 }

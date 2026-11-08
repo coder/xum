@@ -48,8 +48,8 @@ describe("fixtureProblems", () => {
 
   test("names the fixture that must pass but failed", () => {
     const outcomes = asExpected().map((outcome) =>
-      outcome.ancestorTitles[1] === "DiagramMountsThreeSecondsLate"
-        ? outcomeFor("DiagramMountsThreeSecondsLate", "A story tagged paint-check must show")
+      outcome.ancestorTitles[1] === "DiagramMountsWhenTheRunnerWaits"
+        ? outcomeFor("DiagramMountsWhenTheRunnerWaits", "A story tagged paint-check must show")
         : outcome
     );
     const problems = fixtureProblems(reportOf(outcomes));

@@ -14,3 +14,9 @@ export const MERMAID_PAGE_DIAGRAM_SELECTOR = `${MERMAID_PAGE_FRAME_SELECTOR} > s
 /** Set on the error block that a diagram shows, in place of its frame, when it fails to render. */
 export const MERMAID_ERROR_ATTRIBUTE = "data-mermaid-error";
 export const MERMAID_ERROR_SELECTOR = `[${MERMAID_ERROR_ATTRIBUTE}]`;
+
+/**
+ * Dispatched on the page's window when the Storybook test runner (.storybook/test-runner.ts)
+ * starts to wait for a diagram. Only the paint-check fixture that mounts its diagram late listens.
+ */
+export const PAINT_CHECK_WAIT_EVENT = "paint-check-wait-started";

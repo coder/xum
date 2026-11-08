@@ -1022,7 +1022,7 @@ test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit
 
 test-storybook-paint-fixtures: node_modules/.installed ## Prove the paint-check guards of the runner still fire, with stories built to trip them (requires Storybook to be running or built; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)
-	@bun scripts/check-paint-check-fixtures.ts $(if $(STORYBOOK_URL),--url $(STORYBOOK_URL))
+	@bun scripts/check-paint-check-fixtures.ts
 
 storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (requires Storybook served; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)
