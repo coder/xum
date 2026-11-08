@@ -140,7 +140,7 @@ describe("setup-xum: Point Electron downloads at their own cache", () => {
     cygpath?: string
   ): Promise<{ result: RunResult; lines: string[] }> {
     // The host's own platform and arch, as `node -p` prints them.
-    await stub("node", [], "echo linux-x64");
+    await stub("node", [], "echo darwin-arm64");
     if (cygpath !== undefined) {
       await writeExecutable(path.join(work, "cygpath"), `echo ${cygpath}`);
     }
@@ -160,8 +160,8 @@ describe("setup-xum: Point Electron downloads at their own cache", () => {
     expect(result.exitCode).toBe(0);
     expect(lines).toEqual([
       "electron_config_cache=/home/ci/.cache/xum-electron-zip",
-      "ELECTRON_ZIP_TARGETS=linux-x64",
-      "ELECTRON_ZIP_SLUG=linux-x64",
+      "ELECTRON_ZIP_TARGETS=darwin-arm64",
+      "ELECTRON_ZIP_SLUG=darwin-arm64",
     ]);
   });
 
@@ -196,16 +196,29 @@ describe("setup-xum: Locate Electron zip", () => {
   // Each target has a zip in `dir()` (a file unless `missing` names it). The stub prints what the
   // real prefetch prints, on the run that succeeds only.
   async function locate(
-    options: { targets?: string[]; missing?: string[]; exits?: number[]; silent?: boolean } = {}
+    options: {
+      targets?: string[];
+      missing?: string[];
+      exits?: number[];
+      silent?: boolean;
+      noDir?: boolean;
+    } = {}
   ): Promise<{ result: RunResult; githubEnv: string }> {
-    const { targets = ["linux-x64"], missing = [], exits = [], silent = false } = options;
+    const {
+      targets = ["linux-x64"],
+      missing = [],
+      exits = [],
+      silent = false,
+      noDir = false,
+    } = options;
     const zips = targets.map((target) => path.join(dir(), `electron-v1.2.3-${target}.zip`));
     await mkdir(dir(), { recursive: true });
     for (const [index, zip] of zips.entries()) {
       if (!missing.includes(targets[index])) await writeFile(zip, "zip");
     }
     const lines = zips.map((zip) => `echo "Electron zip ready: ${zip}"`);
-    const printed = silent ? [] : [...lines, `echo "Electron zip dir: ${dir()}"`];
+    const dirLine = noDir ? [] : [`echo "Electron zip dir: ${dir()}"`];
+    const printed = silent ? [] : [...lines, ...dirLine];
     const onSuccess = printed.length === 0 ? "true" : printed.join("; ");
     await stub("node", exits, `[ "$n" = ${exits.length + 1} ] && { ${onSuccess}; true; }`);
     const githubEnv = path.join(work, "github-env");
@@ -246,6 +259,12 @@ describe("setup-xum: Locate Electron zip", () => {
 
   test("fails when the prefetch names no zip", async () => {
     const { result, githubEnv } = await locate({ silent: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(githubEnv).toBe("");
+  });
+
+  test("fails when the prefetch names zips but no directory", async () => {
+    const { result, githubEnv } = await locate({ noDir: true });
     expect(result.exitCode).not.toBe(0);
     expect(githubEnv).toBe("");
   });
