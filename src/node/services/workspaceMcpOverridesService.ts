@@ -5095,7 +5095,12 @@ export class WorkspaceMcpOverridesService {
       if (probe.kind === "absent") continue;
       scan.documented.add(resolved.metadata.id);
       if (probe.kind === "indeterminate" || probe.size > MAX_PRUNED_OVERRIDES_BYTES) return true;
-      const text = await readFileString(resolved.runtime, filePath);
+      // SECURITY: no lock guards this read, and the probe above follows symlinks. A checkout
+      // can track the document as a symlink to a device such as /dev/zero (size 0), which a
+      // plain read buffers until memory runs out. Read only the checkout's own regular file;
+      // a symlink or other file throws, so the workspace is a candidate, and the prune under
+      // the locks refuses it as it does on main (assertPruneTargetNotSymlinked).
+      const text = await readHostOverrideDocumentNoFollow(filePath, resolved.workspacePath);
       // Every decoded string of the parse tree, so an escaped spelling cannot hide a key.
       if (documentStringsContain(text, (value) => value.includes(keyPrefix))) return true;
     }

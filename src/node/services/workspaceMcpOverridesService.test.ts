@@ -5282,6 +5282,32 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(legacyValue).toEqual(uneditable);
     });
 
+    it("prunePluginOverrideKeysForWorkspaces does not read a document through a symlink before it takes the locks", async () => {
+      // The scan takes no lock. A checkout can track its document as a symlink to a device
+      // such as /dev/zero, which a read through the link buffers until memory runs out. The
+      // scan must not follow it: the workspace is a candidate, and the prune under the locks
+      // refuses the symlink.
+      const service = new WorkspaceMcpOverridesService(config);
+      const linked = await registerWorkspace("scan-symlinked-doc");
+      const outside = path.join(path.dirname(linked.workspacePath), "outside-overrides.json");
+      await fs.writeFile(outside, JSON.stringify({ enabledServers: ["other"] }));
+      await fs.mkdir(path.dirname(docOf(linked.workspacePath)), { recursive: true });
+      await fs.symlink(outside, docOf(linked.workspacePath));
+      const tracked = await trackLockedWorkspaces(service, [linked]);
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces([linked.workspaceId], prefix);
+      } finally {
+        tracked.restore();
+      }
+
+      expect([...tracked.locked]).toEqual([linked.workspaceId]);
+      expect(failures.map((failure) => failure.workspaceId)).toEqual([linked.workspaceId]);
+      expect(await fs.readFile(outside, "utf-8")).toBe(
+        JSON.stringify({ enabledServers: ["other"] })
+      );
+    });
+
     it("prunePluginOverrideKeysForWorkspaces waits for a save that passed validation before it, then prunes what the save wrote", async () => {
       // The save validated the key while the plugin was still installed, and it still holds
       // its locks when the uninstall commits. A scan that does not wait for it reads the
