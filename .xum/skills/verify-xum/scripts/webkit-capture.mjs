@@ -226,7 +226,7 @@ try {
   const has = (bit) => state !== undefined && (state & bit) !== 0;
   if (has(STATE.chunkFailed)) {
     say(
-      "the page shows '<name> failed to load.': a module fetch from Vite failed. Run the command again."
+      "the page shows '<name> failed to load.' or 'Xum could not load': a module fetch from Vite failed. Run the command again."
     );
     exitCode = EXIT_CHUNK_FAILED;
   } else if (has(STATE.connectionError) || has(STATE.authPrompt)) {

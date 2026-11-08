@@ -858,7 +858,10 @@ cmd_capture() {
   echo "$base.png $base.aria.txt $base.url.txt"
 }
 
-CHUNK_LOAD_FAILED_JS="[...document.querySelectorAll('[role=\"alert\"]')].some((e) => e.textContent.includes(' failed to load.'))"
+# Two screens report a failed module: a lazily loaded part shows "<name> failed to load.", and the
+# boot screen (index.html's boot-load-failure script) marks #boot-loader when a module of the first
+# load failed.
+CHUNK_LOAD_FAILED_JS="(document.querySelector('#boot-loader[data-load-failed]') !== null || [...document.querySelectorAll('[role=\"alert\"]')].some((e) => e.textContent.includes(' failed to load.')))"
 SETTLED_OR_CHUNK_FAILED_JS="(() => {
   if ($CHUNK_LOAD_FAILED_JS) return true;
   const log = document.querySelector('[role=\"log\"][aria-label=\"Conversation transcript\"]');
@@ -868,14 +871,14 @@ SETTLED_OR_CHUNK_FAILED_JS="(() => {
 
 cmd_idle() {
   load_run "${1:-}"
-  # A failed module of the first-load graph leaves the boot screen up with no message, so the wait
-  # times out. Say what to try, because the bare "Wait timed out" does not.
+  # A failed module ends the wait through CHUNK_LOAD_FAILED_JS. What times out is a slow load or a
+  # request that hangs, which raises no error. Say what to try, because "Wait timed out" does not.
   agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$SETTLED_OR_CHUNK_FAILED_JS" >/dev/null || {
-    echo "verify-xum: the page did not settle. If it shows only 'Loading Xum', a module request failed: run agent-browser reload (SKILL.md Gotchas)." >&2
+    echo "verify-xum: the page did not settle. If it shows only 'Loading Xum', the load is slow or a request hangs: run idle once more, then agent-browser reload (SKILL.md Gotchas)." >&2
     exit 1
   }
   if [[ $(agent-browser --session "$AGENT_BROWSER_SESSION" eval "$CHUNK_LOAD_FAILED_JS") == true ]]; then
-    echo "verify-xum: the page shows '<name> failed to load.': a module fetch failed (usually a host network change). Run agent-browser reload, then repeat the step." >&2
+    echo "verify-xum: the page shows '<name> failed to load.' or 'Xum could not load': a module fetch failed (usually a host network change). Run agent-browser reload, then repeat the step." >&2
     exit 3
   fi
 }
