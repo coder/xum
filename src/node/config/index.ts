@@ -5174,9 +5174,18 @@ export class Config {
 
             // The messaging tag lives only in config (legacy metadata.json predates it), so
             // overlay the validated config value or a tag write would publish stale metadata.
+            // The same holds for the consent, dispatch mode and goal defaults: read from the row
+            // as the current-format branch does, so a stray file value never reaches this build.
             workspaceMetadata.push({
               ...this.addPathsToMetadata(metadata, workspace.path),
               messagingTag: getValidMessagingTag(workspace.messagingTag),
+              unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
+                workspace.unrelatedWorkspaceConsent
+              ),
+              agentMessageDispatchMode: getValidAgentMessageDispatchMode(
+                workspace.agentMessageDispatchMode
+              ),
+              goalDefaults: workspace.goalDefaults,
             });
             metadataFound = true;
           }
