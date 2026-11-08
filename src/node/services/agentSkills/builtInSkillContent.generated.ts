@@ -4773,6 +4773,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- The VS Code extension shows no approval card yet. A request to run a command outside the sandbox waits there until you stop the agent.",
       "- Project secrets and the bash AI proxy key are still in the environment of agent commands.",
       "- The sandbox does not cover terminals that you open, MCP servers (they start outside the sandbox), and the Browser tab.",
+      "- Commands can change the other files in the workspace. When you, your editor, or a Dev Container later runs one of them outside the sandbox, for example a script that `initializeCommand` names, the change runs with your full access.",
       "- Tool caches and temp folders are writable, so a command can change a cached package that a program outside the sandbox runs later, for example an MCP server that `bunx` starts, or a build in your terminal.",
       "",
     ].join("\n"),
