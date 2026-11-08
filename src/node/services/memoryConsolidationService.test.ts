@@ -22,6 +22,7 @@ import {
 import { Err, Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
+  analyzerJobLockPath,
   dreamStreamLockPath,
   HARVEST_MAX_ATTEMPTS,
   harvestResumeState,
@@ -2469,13 +2470,11 @@ describe("MemoryConsolidationService", () => {
     });
 
     it("keeps a failed run's landed edits in the sidecar before the next run's turn, so that run seeds its budget with them", async () => {
-      // The failed record is saved after the turn is released, so what the run spent before its
-      // chunk failed reaches the sidecar in that save alone. Holding it here makes the order
-      // deterministic: the next run must find the spend without it.
+      // The failed record is saved before the run's turn (and its job lock) is released, so the
+      // next run's read under the job lock finds what the failed run spent.
       const created = [gate(), gate()];
       const streamStarted = [gate(), gate()];
       const released = [gate(), gate()];
-      const failedSaveReleased = gate();
       const models = editsEveryRunModels(
         5,
         async (run) => {
@@ -2492,24 +2491,6 @@ describe("MemoryConsolidationService", () => {
         },
       });
       await appendRows(fixture, openRowTexts);
-      const internals = fixture.service as unknown as {
-        saveHarvestRecordEffect: (
-          workspaceId: string,
-          boundaryKey: string,
-          record: { status: string },
-          projectPath: string
-        ) => Effect.Effect<void>;
-      };
-      const saveHarvestRecord = internals.saveHarvestRecordEffect.bind(fixture.service);
-      spyOn(internals, "saveHarvestRecordEffect").mockImplementation(
-        (workspaceId, boundaryKey, record, projectPath) =>
-          record.status === "failed"
-            ? Effect.flatMap(
-                Effect.promise(() => failedSaveReleased.opened),
-                () => saveHarvestRecord(workspaceId, boundaryKey, record, projectPath)
-              )
-            : saveHarvestRecord(workspaceId, boundaryKey, record, projectPath)
-      );
 
       try {
         const archive = fixture.service.maybeRunArchivePass("ws-dream");
@@ -2525,7 +2506,6 @@ describe("MemoryConsolidationService", () => {
         await streamStarted[1]?.opened;
         released[1]?.open();
         await compaction;
-        failedSaveReleased.open();
         expect((await archive).success).toBe(true);
 
         const records = await harvestRecords(fixture);
@@ -2535,7 +2515,6 @@ describe("MemoryConsolidationService", () => {
         expect(records["summary-1"]?.ops?.filter((op) => op.applied)).toHaveLength(3);
         expect(records["summary-1"]?.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
       } finally {
-        failedSaveReleased.open();
         released[0]?.open();
         released[1]?.open();
       }
@@ -2746,10 +2725,18 @@ describe("MemoryConsolidationService", () => {
         held.release(1);
         held.release(2);
         const releaseForeign = await holdForeignDreamLock(fixture);
+        // The chunk reads the foreign holder's lock record once it waits for the exclusion: past
+        // its turn and the job lock, so removal cancels the chunk and not the turn.
+        const lockPath = dreamStreamLockPath(fixture.xumHome);
+        const waiting = gate();
+        const { open } = fsPromises;
+        const openSpy = spyOn(fsPromises, "open").mockImplementation((file, flags, mode) => {
+          if (file === lockPath) waiting.open();
+          return open(file, flags, mode);
+        });
         try {
           const run = fixture.service.maybeHarvestThenSweep(epoch);
-          await held.modelCreated(1);
-          await settle();
+          await waiting.opened;
 
           await fixture.service.cancelInFlightConsolidation("ws-dream");
           await run;
@@ -2769,6 +2756,7 @@ describe("MemoryConsolidationService", () => {
             "completed"
           );
         } finally {
+          openSpy.mockRestore();
           await releaseForeign();
         }
       });
@@ -3067,10 +3055,10 @@ describe("MemoryConsolidationService", () => {
 
     /**
      * A second backend on the same root: its own in-process queue and run table, the same sidecar
-     * and the same dream lock. It counts the provider streams it starts.
+     * and the same dream lock. It counts the provider streams it starts, and the analyzer's apart.
      */
-    function secondBackend(fixture: Fixture) {
-      const counts = { modelsCreated: 0, streams: 0 };
+    function secondBackend(fixture: Fixture, model: () => MockLanguageModelV3 = scriptedModel) {
+      const counts = { modelsCreated: 0, streams: 0, analyzerStreams: 0 };
       const service = new MemoryConsolidationService(
         fixture.config,
         fixture.memoryService,
@@ -3079,12 +3067,15 @@ describe("MemoryConsolidationService", () => {
         {
           createModelWithPinnedMetadata: (modelString: string) => {
             counts.modelsCreated++;
-            const inner = scriptedModel();
+            const inner = model();
             return Promise.resolve(
               Ok({
                 model: new MockLanguageModelV3({
                   doStream: (options) => {
                     counts.streams++;
+                    if (systemPromptText(options) === MEMORY_ANALYZER_SYSTEM_PROMPT) {
+                      counts.analyzerStreams++;
+                    }
                     return inner.doStream(options);
                   },
                 }),
@@ -3213,6 +3204,25 @@ describe("MemoryConsolidationService", () => {
         );
       }
 
+      /** An analyzer whose streams log `<backend> <chunk>`; a dream stream passes unlogged. */
+      function chunkLoggingModel(
+        log: string[],
+        backend: string,
+        script: { holdFirstChunk?: Promise<void>; failChunk?: string } = {}
+      ): MockLanguageModelV3 {
+        const inner = scriptedModel();
+        return new MockLanguageModelV3({
+          doStream: async (options) => {
+            const chunk = /Transcript chunk (\d+\/\d+)/.exec(userPromptText(options))?.[1];
+            if (chunk === undefined) return inner.doStream(options);
+            log.push(`${backend} ${chunk}`);
+            if (chunk.startsWith("1/")) await script.holdFirstChunk;
+            if (chunk === script.failChunk) return { stream: failingStream() };
+            return inner.doStream(options);
+          },
+        });
+      }
+
       it("keeps both backends' sidecar writes when one lands inside the other's read-modify-write", async () => {
         using fixture = await createFixture();
         const second = secondBackend(fixture);
@@ -3259,10 +3269,63 @@ describe("MemoryConsolidationService", () => {
         ]);
       });
 
-      it("takes over the sidecar lock of a backend that died holding it", async () => {
+      it("streams a boundary that both backends got once, as one attempt", async () => {
+        const held = heldStreams();
+        using fixture = await createFixture({ modelFactory: held.factory });
+        const second = secondBackend(fixture);
+        const metadata = await seedCompactionEpoch(fixture);
+
+        const first = fixture.service.maybeHarvestThenSweep(metadata);
+        await until(() => held.events.includes("start-1"));
+        const behind = second.service.maybeHarvestThenSweep(metadata);
+        await until(() => second.counts.modelsCreated === 1);
+        held.release(1);
+        // This backend's dream after its analysis.
+        await until(() => held.events.includes("start-2"));
+        held.release(2);
+        await Promise.all([first, behind]);
+
+        expect(second.counts.analyzerStreams).toBe(0);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          attemptCount: 1,
+        });
+      });
+
+      it("resumes a boundary at the chunk where another backend's attempt failed while it waited", async () => {
+        const log: string[] = [];
+        const firstChunk = Promise.withResolvers<void>();
+        using fixture = await createFixture({
+          modelFactory: () =>
+            chunkLoggingModel(log, "A", { holdFirstChunk: firstChunk.promise, failChunk: "2/3" }),
+        });
+        const second = secondBackend(fixture, () => chunkLoggingModel(log, "B"));
+        await appendBulkRows(fixture);
+        const metadata = await seedCompactionEpoch(fixture);
+
+        const first = fixture.service.maybeHarvestThenSweep(metadata);
+        await until(() => log.includes("A 1/3"));
+        // B read the record before A's chunks were saved: only the record under the lock is current.
+        const retry = second.service.maybeHarvestThenSweep(metadata);
+        await until(() => second.counts.modelsCreated === 1);
+        firstChunk.resolve();
+        await Promise.all([first, retry]);
+
+        expect(log).toEqual(["A 1/3", "A 2/3", "B 2/3", "B 3/3"]);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          attemptCount: 2,
+          nextChunk: 3,
+        });
+      });
+
+      it("takes over the sidecar and analyzer locks of a backend that died holding them", async () => {
         using fixture = await createFixture();
         const metadata = await seedCompactionEpoch(fixture);
-        const lockPaths = [sidecarLockPath(fixture.xumHome)];
+        const lockPaths = [
+          sidecarLockPath(fixture.xumHome),
+          analyzerJobLockPath(fixture.xumHome, "ws-dream"),
+        ];
         for (const lockPath of lockPaths) {
           // A real holder record whose token this process no longer holds: its holder is gone.
           const release = await acquireCrossProcessLock({
