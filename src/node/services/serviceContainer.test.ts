@@ -3,6 +3,7 @@ import { EventEmitter } from "events";
 import { log } from "./log";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { AgentSession } from "./agentSession";
 import * as fs from "fs";
 import * as os from "os";
@@ -1649,6 +1650,18 @@ describe("ServiceContainer", () => {
     // IdleCompactionService.checkAllWorkspaces reads the config synchronously
     // at the start of every check.
     const loadConfigSpy = spyOn(services.config, "loadConfigOrDefault");
+    // HeartbeatService's first tick reads the extension metadata file and then the config, so it
+    // makes a loadConfigOrDefault call of its own. That read is real I/O: with a warm disk cache
+    // the call landed 0.3 to 0.5 ms after the clock advance below, racing the count (CI read 2).
+    // Hold the read until the count is asserted, so the count is the idle worker's alone.
+    const snapshotGate = Promise.withResolvers<void>();
+    const snapshotsSpy = spyOn(
+      ExtensionMetadataService.prototype,
+      "getAllSnapshots"
+    ).mockImplementation(async () => {
+      await snapshotGate.promise;
+      return new Map();
+    });
     // HeartbeatService's observable lifecycle contract: the scheduler fiber is
     // held in `startupTimeout` during the startup delay and moves to
     // `checkInterval` once ticking (same shape heartbeatService.test.ts pins).
@@ -1657,21 +1670,27 @@ describe("ServiceContainer", () => {
       checkInterval: unknown;
     };
 
-    services.idleCompactionService.start();
-    services.heartbeatService.start();
-    expect(loadConfigSpy).not.toHaveBeenCalled();
-    expect(heartbeatInternals.startupTimeout).not.toBeNull();
-    expect(heartbeatInternals.checkInterval).toBeNull();
+    try {
+      services.idleCompactionService.start();
+      services.heartbeatService.start();
+      expect(loadConfigSpy).not.toHaveBeenCalled();
+      expect(heartbeatInternals.startupTimeout).not.toBeNull();
+      expect(heartbeatInternals.checkInterval).toBeNull();
 
-    // Both workers wait one minute before their first tick.
-    await runtime.runPromise(TestClock.adjust(Duration.minutes(1)));
+      // Both workers wait one minute before their first tick.
+      await runtime.runPromise(TestClock.adjust(Duration.minutes(1)));
 
-    expect(loadConfigSpy).toHaveBeenCalledTimes(1);
-    expect(heartbeatInternals.startupTimeout).toBeNull();
-    expect(heartbeatInternals.checkInterval).not.toBeNull();
+      expect(loadConfigSpy).toHaveBeenCalledTimes(1);
+      expect(heartbeatInternals.startupTimeout).toBeNull();
+      expect(heartbeatInternals.checkInterval).not.toBeNull();
 
-    services.heartbeatService.stop();
-    services.idleCompactionService.stop();
+      services.heartbeatService.stop();
+      services.idleCompactionService.stop();
+    } finally {
+      // Let the held tick finish against the stopped service, and give later tests the real read.
+      snapshotGate.resolve();
+      snapshotsSpy.mockRestore();
+    }
   });
 
   it("serves every DI-built ORPC context field through its tag (one instance each)", () => {
