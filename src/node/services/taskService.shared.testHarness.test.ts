@@ -41,6 +41,20 @@ describe("createTaskServiceTestRoot", () => {
     expect(await fsPromises.stat(root).catch(() => null)).toBeNull();
   });
 
+  test("removing a superseded root leaves the newer root's isolation in place", async () => {
+    const first = await createTaskServiceTestRoot();
+    const second = await createTaskServiceTestRoot();
+    try {
+      const isolated = os.homedir();
+      await removeTaskServiceTestRoot(first);
+      expect(os.homedir()).toBe(isolated);
+      expect(isolated).not.toBe(hostHomedir);
+    } finally {
+      await removeTaskServiceTestRoot(second);
+    }
+    expectHostHome();
+  });
+
   test("a root whose removal was skipped does not nest the next isolation", async () => {
     const skipped = await createTaskServiceTestRoot();
     const second = await createTaskServiceTestRoot();
