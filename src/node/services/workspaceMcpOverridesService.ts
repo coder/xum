@@ -698,7 +698,7 @@ interface ForkCopyProgress {
 }
 /** Parallel realpath budget for the sharer scan (see publishEffectiveOverrides). */
 const CANONICALIZE_CONCURRENCY = 16;
-/** Budget for acquiring a workspace lock — or a whole batch of them (see withWorkspaceLocks). */
+/** Budget for waiting on busy workspace locks, for one workspace or a batch (see withWorkspaceLocks). */
 const WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS = 60_000;
 const WORKSPACE_LOCK_RETRY_BACKOFF_MS = 150;
 /** Budget for an unlocked reader's legacy migration to take the write locks (see migrateLegacyOverridesFenced). */
@@ -792,7 +792,8 @@ function passBlocker(
     ? undefined
     : { error: new CheckoutKeysChangedError() };
 }
-function isRetryableLockError(error: unknown): boolean {
+/** A busy or moved checkout: waiting and trying again can succeed. */
+export function isRetryableLockError(error: unknown): boolean {
   return (
     error instanceof CheckoutKeysChangedError ||
     // The lock's timeout message appends holder details to ours.
@@ -1249,6 +1250,21 @@ function selectProbedCandidate(
  */
 const MAX_PRUNED_OVERRIDES_BYTES = 1024 * 1024;
 /**
+ * An override file over MAX_PRUNED_OVERRIDES_BYTES. Only the user can fix it,
+ * so a plugin install refusal must say that a retry will not help (it tells
+ * this error apart from a busy lock by type, not by message).
+ */
+export class OverridesFileTooLargeError extends Error {
+  constructor(
+    readonly filePath: string,
+    size: number
+  ) {
+    super(
+      `Workspace MCP overrides file ${filePath} is ${size} bytes, over the ${MAX_PRUNED_OVERRIDES_BYTES} bytes Xum reads to remove plugin keys. Remove or shrink it, then retry.`
+    );
+  }
+}
+/**
  * Whether a candidate override file exists for the plugin-key prune.
  * Strict: "cannot tell" throws, like a file over MAX_PRUNED_OVERRIDES_BYTES,
  * so the caller keeps its tombstone instead of retiring it unread.
@@ -1262,9 +1278,7 @@ async function prunableFileExists(
     throw probe.error;
   }
   if (probe.kind === "file" && probe.size > MAX_PRUNED_OVERRIDES_BYTES) {
-    throw new Error(
-      `Workspace MCP overrides file ${filePath} is ${probe.size} bytes, over the ${MAX_PRUNED_OVERRIDES_BYTES} bytes Xum reads to remove plugin keys. Remove or shrink it, then retry.`
-    );
+    throw new OverridesFileTooLargeError(filePath, probe.size);
   }
   return probe.kind === "file";
 }
@@ -3836,8 +3850,9 @@ export class WorkspaceMcpOverridesService {
    * saves responsive during a slow remote rename (the global lock is never
    * held across a checkout move).
    *
-   * LOCK ORDER: workspace locks are acquired in sorted order and ALWAYS
-   * before the global lock (runExclusive), never while holding it.
+   * LOCK ORDER: workspace locks are ALWAYS taken before the global lock
+   * (runExclusive), never while holding it. A batch waits for at most one
+   * of them, holding nothing, and only tries the rest (see withWorkspaceLocks).
    * A crashed holder is reclaimed once provably dead (never on age), like
    * the global lock.
    */
@@ -4793,8 +4808,9 @@ export class WorkspaceMcpOverridesService {
     const swept = new Map<string, SweptWorkspace>();
     let anyOwesEpoch = false;
     // Many checkouts at once: thousands of sequential stats outlasted the
-    // sweep budget. One task per ID (first spelling), and IDs whose
-    // checkouts share a lock key run one after another (see groupByCheckout).
+    // sweep budget. One task per ID (first spelling). IDs whose checkouts
+    // share a lock key run one after another (see groupByCheckout), so no
+    // two prunes read or rewrite one checkout's document at once.
     const seen = new Set<string>();
     const uniqueIds = workspaceIds.filter((workspaceId) => {
       const id = workspaceId.trim();

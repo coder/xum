@@ -736,8 +736,8 @@ jobs:
       - uses: ./.github/actions/setup-playwright
         timeout-minutes: 10
         with:
-          # WebKit runs the stories tagged "webkit" (iPhone Safari sizes SVG and CSS zoom unlike
-          # Chromium).
+          # WebKit runs the stories tagged "webkit" or "paint-check" (iPhone Safari sizes SVG and
+          # CSS zoom unlike Chromium).
           browsers: chromium webkit
       - run: make storybook-build
       - run: |
