@@ -473,6 +473,15 @@ Data:
 The server didn't respond in time.
 </body></html>
 "`;
+    // Stable channel: GitHubProvider wraps the failed releases/latest request
+    // and keeps the status only as "HttpError: <code>" text.
+    const wrappedGatewayTimeoutError = `Unable to find latest version on GitHub (https://github.com/coder/xum/releases/latest), please ensure a production release exists: HttpError: 504 Gateway Time-out
+"method: GET url: https://github.com/coder/xum/releases/latest
+"`;
+    // A 503 that is only part of a nightly tag, not the response status.
+    const forbiddenOnNightly503Error = `403 Forbidden
+"method: GET url: https://github.com/coder/xum/releases/download/v0.32.2-nightly.503/nightly-mac.yml
+"`;
     const updateServerUnreachableMessage =
       "The update server didn't respond. This is usually a temporary GitHub problem; please try again in a few minutes.";
 
@@ -569,6 +578,46 @@ The server didn't respond in time.
         type: "error",
         phase: "check",
         message: updateServerUnreachableMessage,
+      });
+    });
+
+    it("should name the update server for a wrapped stable-channel gateway error", async () => {
+      mockAutoUpdater.checkForUpdates.mockImplementation(() => {
+        setImmediate(() => {
+          mockAutoUpdater.emit("error", new Error(wrappedGatewayTimeoutError));
+        });
+        return new Promise(() => {
+          // Never resolves — events drive state
+        });
+      });
+
+      service.checkForUpdates({ source: "manual" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(statusUpdates[statusUpdates.length - 1]).toEqual({
+        type: "error",
+        phase: "check",
+        message: updateServerUnreachableMessage,
+      });
+    });
+
+    it("should surface a non-gateway error whose URL contains a 50x number on auto checks", async () => {
+      mockAutoUpdater.checkForUpdates.mockImplementation(() => {
+        setImmediate(() => {
+          mockAutoUpdater.emit("error", new Error(forbiddenOnNightly503Error));
+        });
+        return new Promise(() => {
+          // Never resolves — events drive state
+        });
+      });
+
+      service.checkForUpdates({ source: "auto" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(statusUpdates[statusUpdates.length - 1]).toEqual({
+        type: "error",
+        phase: "check",
+        message: "403 Forbidden",
       });
     });
 

@@ -48,9 +48,12 @@ const MAX_USER_VISIBLE_UPDATE_ERROR_LENGTH = 240;
  * GitHub's own front end answers release-metadata requests with a gateway
  * error (502/503/504 and an HTML body) whenever its repository/release route
  * is degraded. The install itself is fine then, so treat it as retryable.
+ * Match only the failed request's status: a raw HttpError message starts with
+ * it, and GitHubProvider's wrapped error keeps it as "HttpError: <code>". A
+ * bare 50x token can also be a nightly tag or header value in the message.
  */
 function isGatewayUpdateError(error: Error): boolean {
-  return /\b50[234]\b/.test(error.message);
+  return /^50[234]\b|\bHttpError: 50[234]\b/.test(error.message);
 }
 
 /**
