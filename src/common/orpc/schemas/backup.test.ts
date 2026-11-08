@@ -128,6 +128,14 @@ describe("BackupPluginEntrySchema", () => {
     ["a url with a zero-width space", "https://github.com/exam\u200Bple/repo.git"],
     ["a url with a word joiner", "https://github.com/exam\u2060ple/repo.git"],
     ["a url with a credential", "https://user:pass-word@example.com/example/repo.git"],
+    // The secret scan reads the list as written, so a token spelled with escapes would pass it.
+    ["a url with a percent-escaped token", `https://example.com/%67hp_${"a".repeat(36)}/repo.git`],
+    ["a url that escapes a capital letter", "https://example.com/%41/repo.git"],
+    ["a url that escapes a digit", "https://example.com/%30/repo.git"],
+    ["a url that escapes a hyphen", "https://example.com/a%2Db/repo.git"],
+    ["a url that escapes a dot in lower case hex", "https://example.com/a%2eb/repo.git"],
+    ["a url that escapes an underscore", "https://example.com/a%5Fb/repo.git"],
+    ["a url that escapes a tilde", "https://example.com/a%7eb/repo.git"],
   ])("refuses %s", (_label, url) => {
     const row = entry({ source: { type: "git", url, ref: "main", refType: "branch" } });
     expect(BackupPluginEntrySchema.safeParse(row).success).toBe(false);
@@ -139,6 +147,11 @@ describe("BackupPluginEntrySchema", () => {
     ["an ssh url", "ssh://git@github.com/example/repo.git"],
     ["an scp-style url", "git@github.com:example/repo.git"],
     ["an scp-style url with a user and a one-letter host", "git@h:org/repo.git"],
+    // These characters have no other spelling, so a producer may escape them.
+    ["a url that escapes a space", "https://dev.azure.com/org/My%20Project/_git/plugins"],
+    ["a url that escapes a slash and a colon", "https://example.com/a%2Fb%3Ac/repo.git"],
+    ["a url that escapes a non-ASCII letter", "https://example.com/caf%C3%A9/repo.git"],
+    ["a url with a percent sign and no escape", "https://example.com/100%/repo.git"],
     ["an scp-style url with a two-letter host", "gh:org/repo.git"],
     ["an ssh url with a one-letter host", "ssh://git@h/org/repo.git"],
     ["a git url", "git://git.example.com/example/repo.git"],

@@ -11,6 +11,7 @@ import {
   AgentPluginInstallEntrySchema,
 } from "@/common/config/schemas/agentPluginInstalls";
 import {
+  hasEscapedUnreservedCharacter,
   isAbbreviatedCommitSha,
   isNormalizedAgentPluginSubpath,
   pointsAtThisMachine,
@@ -102,6 +103,11 @@ const BackupPluginUrlSchema = z
   })
   .refine((url) => !hasUrlCredentials(url), {
     message: "A repository URL must not carry a credential",
+  })
+  // The publish-time secret scan reads the list as written: a token spelled with escapes would
+  // pass it. The export leaves such a plugin out with the same predicate (agentPluginBackup.ts).
+  .refine((url) => !hasEscapedUnreservedCharacter(url), {
+    message: "A repository URL must not escape a letter, a digit or one of - . _ ~",
   });
 
 /**

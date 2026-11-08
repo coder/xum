@@ -323,6 +323,8 @@ describe("backup of the managed plugin list", () => {
         "scp-host-named-file": "file:host/share/scp-host-named-file.git",
         // A user before a one-letter host is no drive: Git for Windows reads `h:` alone as one.
         "scp-user-one-letter-host": "git@h:example/scp-user-one-letter-host.git",
+        // `%20` has no other spelling, so a producer escapes it: this install must still push.
+        "escaped-space": "https://dev.azure.com/org/My%20Project/_git/escaped-space",
       } as const;
       const leftOutUrls = {
         "abs-path": "/home/someone/plugins/abs-path",
@@ -394,6 +396,35 @@ describe("backup of the managed plugin list", () => {
         .filter(([message]) => String(message).includes("whitespace or a control character"))
         .map(([, fields]) => (fields as { plugin: string }).plugin);
       expect(logged.sort()).toEqual(Object.keys(spacedUrls).sort());
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin whose URL escapes a letter, a digit or one of - . _ ~, and logs it", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const withUrl = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const escapedUrls = {
+        // The publish-time secret scan reads the list as written, so this token would pass it.
+        "escaped-token": `https://example.com/%67hp_${"a".repeat(36)}/repo.git`,
+        "escaped-digit": "https://example.com/org/%31/escaped-digit.git",
+        "escaped-tilde": "https://example.com/%7Eorg/escaped-tilde.git",
+      };
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        ...Object.entries(escapedUrls).map(([name, url]) =>
+          registryRow(name, { source: withUrl(url) })
+        ),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      const exported = await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha"]);
+      expect(exported.secretFiles).toEqual([]);
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("as a percent escape"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(Object.keys(escapedUrls).sort());
       info.mockRestore();
     });
 

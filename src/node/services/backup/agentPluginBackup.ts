@@ -14,7 +14,10 @@ import {
   type BackupPluginStatus,
 } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
-import { pointsAtThisMachine } from "@/common/utils/agentPluginSource";
+import {
+  hasEscapedUnreservedCharacter,
+  pointsAtThisMachine,
+} from "@/common/utils/agentPluginSource";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
 import { isInstallerSourceUrl } from "@/node/services/agentPlugins/sourceInput";
 import {
@@ -189,13 +192,18 @@ const InstallablePluginEntrySchema = BackupPluginEntrySchema.refine(
  * Another machine cannot use a path or a loopback host on this one, and the list would publish it
  * (the home folder names the user). The installer also takes an scp-style source with a space in
  * its path (`gitbox:srv/my repos/r.git`), which the list refuses: whitespace, control and format
- * characters let a URL read differently from the one git gets. Failing the push for it would
- * block every backup for a plugin that installs and updates fine.
+ * characters let a URL read differently from the one git gets. A URL that escapes a letter, a
+ * digit or one of `- . _ ~` stays out too: the publish-time secret scan reads the list as
+ * written, so `%67hp_...` would hide a token (a `%20` has no other spelling and stays). Failing
+ * the push for these would block every backup for a plugin that installs and updates fine.
  */
 function sourceLeftOutReason(url: string): string | undefined {
   if (pointsAtThisMachine(url)) return "its source is on this machine";
   if (UNSAFE_URL_CHARACTERS.test(url)) {
     return "its source URL has whitespace or a control character that a backup does not carry";
+  }
+  if (hasEscapedUnreservedCharacter(url)) {
+    return "its source URL spells a letter, a digit or one of - . _ ~ as a percent escape, which would hide a token from the secret scan";
   }
   return undefined;
 }

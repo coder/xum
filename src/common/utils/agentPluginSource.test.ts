@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  hasEscapedUnreservedCharacter,
   isAbbreviatedCommitSha,
   isNormalizedAgentPluginSubpath,
   normalizeAgentPluginSubpath,
@@ -69,5 +70,31 @@ describe("isAbbreviatedCommitSha", () => {
 
   test.each(["abc123", "a".repeat(40), "main", "v1.0.0", "abc123g"])("is false for %j", (ref) => {
     expect(isAbbreviatedCommitSha(ref)).toBe(false);
+  });
+});
+
+describe("hasEscapedUnreservedCharacter", () => {
+  test.each([
+    ["a letter", "https://h/%67hp"],
+    ["a capital letter", "https://h/%47"],
+    ["a digit", "https://h/%35"],
+    ["a hyphen", "https://h/a%2Db"],
+    ["a dot", "https://h/a%2Eb"],
+    ["an underscore", "https://h/a%5fb"],
+    ["a tilde", "https://h/a%7Eb"],
+    ["an unreserved escape after a reserved one", "https://h/My%20Project/%61"],
+  ])("is true for an escaped %s", (_label, url) => {
+    expect(hasEscapedUnreservedCharacter(url)).toBe(true);
+  });
+
+  test.each([
+    ["no escape", "https://h/a/b.git"],
+    ["a space", "https://h/My%20Project"],
+    ["a slash", "https://h/a%2Fb"],
+    ["a UTF-8 letter", "https://h/caf%C3%A9"],
+    ["a percent sign with no digits", "https://h/100%/a%g1"],
+    ["an escaped percent sign", "https://h/a%25b"],
+  ])("is false for %s", (_label, url) => {
+    expect(hasEscapedUnreservedCharacter(url)).toBe(false);
   });
 });

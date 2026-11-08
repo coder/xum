@@ -145,3 +145,17 @@ export function isNormalizedAgentPluginSubpath(subpath: string): boolean {
 export function isAbbreviatedCommitSha(ref: string): boolean {
   return /^[0-9a-f]{7,39}$/i.test(ref);
 }
+
+/**
+ * True when `url` spells an unreserved character (ALPHA, DIGIT, `-`, `.`, `_`, `~`) as a percent
+ * escape. RFC 3986 section 2.3 says a producer must not do that, and every secret token is built
+ * from those characters: the publish-time scan reads the list as written, so `%67hp_...` would
+ * pass it. An escape of any other character (`%20` in `My%20Project`) is the only spelling it
+ * has, so it stays.
+ */
+export function hasEscapedUnreservedCharacter(url: string): boolean {
+  for (const [, hex] of url.matchAll(/%([0-9A-Fa-f]{2})/g)) {
+    if (/^[A-Za-z0-9._~-]$/.test(String.fromCharCode(Number.parseInt(hex ?? "", 16)))) return true;
+  }
+  return false;
+}
