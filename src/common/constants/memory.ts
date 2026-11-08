@@ -98,8 +98,10 @@ export const MEMORY_CONSOLIDATION_IDLE_MS = 24 * 60 * 60 * 1000;
  */
 export const MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP = 3;
 /**
- * Hard wall-clock ceiling per consolidation run. Without it a half-alive
+ * Hard wall-clock ceiling per consolidation stream. Without it a half-alive
  * provider stream (keepalives but no progress) would hold the workspace's
- * in-flight lock forever and block every future trigger.
+ * in-flight lock, and the service-wide dream queue, forever. It starts when the
+ * stream starts: time spent waiting behind another workspace's stream does not
+ * count.
  */
 export const MEMORY_CONSOLIDATION_TIMEOUT_MS = 5 * 60 * 1000;

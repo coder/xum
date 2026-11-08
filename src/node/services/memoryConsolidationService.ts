@@ -72,6 +72,7 @@ import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 export type MemoryConsolidationRecord = MemoryConsolidationRecordPayload;
 
 type MemoryHarvestRecord = MemoryHarvestRecordPayload;
@@ -293,6 +294,39 @@ function pruneHarvestRecords(records: Record<string, MemoryHarvestRecord>): void
   }
 }
 
+/**
+ * Cross-process half of the dream-stream queue. It lives in `<root>/locks`, not inside
+ * `<root>/memory`, because a memory mutation can delete directories there while it is held.
+ */
+export function dreamStreamLockPath(rootDir: string): string {
+  return path.join(rootDir, "locks", "memory-dream-stream.lock");
+}
+
+/** The skip reason of a run the debounce window refused (callers match on "debounced"). */
+const DEBOUNCED_SKIP_REASON =
+  "debounced: a recent consolidation run already covered this workspace";
+
+/** Where a dream stream's turn ended up (see runDreamStreamExclusively). */
+type DreamStreamTurn<T> =
+  | { outcome: "ran"; value: T }
+  /** The signal aborted while the run waited for its turn: `stream` never started. */
+  | { outcome: "cancelled" }
+  /** The cross-process lock could not be taken: `stream` never started. */
+  | { outcome: "lock-failed"; error: string };
+
+/** Resolves true once `turn` settles, or false if `signal` aborts first (a pre-aborted signal never waits). */
+function waitForTurnOrAbort(turn: Promise<void>, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise<boolean>((resolve) => {
+    const onAbort = () => resolve(false);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void turn.then(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    });
+  });
+}
+
 export const HARVEST_MAX_ATTEMPTS = 3;
 
 /** Completed, or failed with retries exhausted: nothing may retry it. */
@@ -325,6 +359,15 @@ export class MemoryConsolidationService extends EventEmitter {
    * active run via the stored promise.
    */
   private readonly inFlight = new Map<string, Promise<Result<MemoryConsolidationRecord, string>>>();
+
+  /**
+   * Tail of the service-wide dream-stream queue (see runDreamStreamExclusively).
+   * `inFlight` is per owner workspace, so two workspaces of one project (or any
+   * two, through global memory) could otherwise run the organizer over the same
+   * files at once. Never rejects: each link settles when its stream is done or
+   * its wait was cancelled.
+   */
+  private dreamStreamTail: Promise<void> = Promise.resolve();
 
   /**
    * Per-run removal controllers (r60): workspace removal must abort and
@@ -426,6 +469,29 @@ export class MemoryConsolidationService extends EventEmitter {
 
   private getRecordEffect(workspaceId: string): Effect.Effect<MemoryConsolidationRecord | null> {
     return Effect.map(this.loadEffect(), (file) => file.workspaces[workspaceId] ?? null);
+  }
+
+  /**
+   * Whether the 6 h window refuses this trigger. Manual runs bypass it (an explicit /dream is
+   * explicit intent), and so does archive: it is the workspace's one-shot final pass, the only
+   * chance to promote durable lessons to global scope, and archival typically follows a
+   * compaction-triggered run within the window. `skipWorkspaceDebounce` is the launch sweep's
+   * decision that project-level coverage justifies a run despite a recent workspace record.
+   * Always reads the sidecar from disk: another backend may have journaled since the last read.
+   */
+  private isDebouncedEffect(
+    workspaceId: string,
+    trigger: MemoryConsolidationTrigger,
+    options: MemoryConsolidationRunOptions
+  ): Effect.Effect<boolean> {
+    if (trigger === "manual" || trigger === "archive" || options.skipWorkspaceDebounce === true) {
+      return Effect.succeed(false);
+    }
+    return Effect.map(
+      this.getRecordEffect(workspaceId),
+      (record) =>
+        record !== null && Date.now() - record.lastRunAt < MEMORY_CONSOLIDATION_DEBOUNCE_MS
+    );
   }
 
   getStatus(workspaceId: string): Promise<MemoryConsolidationStatusPayload> {
@@ -866,6 +932,61 @@ export class MemoryConsolidationService extends EventEmitter {
     return result;
   }
 
+  /**
+   * Run one dream stream once every earlier queued one has settled, so at most
+   * one consolidation stream runs at a time across ALL workspaces (harvests are
+   * not queued here). The in-process queue orders this backend's runs; behind
+   * it, a cross-process lock excludes a second backend on the same root (the
+   * target locks only serialize single memory commands, not the model's
+   * read/decide/write pass). Nothing starts, and `cancelled` comes back, when
+   * `signal` aborts first: removal must cancel a run that is still waiting its
+   * turn. Waiting happens after maybeRun's synchronous in-flight reservation,
+   * so that per-workspace try-lock keeps its call-order semantics.
+   *
+   * `stream` is the whole turn: everything it awaits holds up every later dream, so it holds the
+   * provider/tool stream and the run's journal write (which the next run's debounce recheck must
+   * see before it gets the turn) and nothing else (see runTurn in runLockedEffect).
+   */
+  private async runDreamStreamExclusively<T>(
+    signal: AbortSignal,
+    stream: () => Promise<T>
+  ): Promise<DreamStreamTurn<T>> {
+    const previous = this.dreamStreamTail;
+    let release!: () => void;
+    const turnDone = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Linked before the first await so queue order is call order. A cancelled
+    // waiter still releases its link, which lets successors pass it.
+    this.dreamStreamTail = previous.then(() => turnDone);
+    try {
+      if (!(await waitForTurnOrAbort(previous, signal))) return { outcome: "cancelled" };
+      let releaseLock: () => Promise<void>;
+      try {
+        releaseLock = await acquireCrossProcessLock({
+          lockPath: dreamStreamLockPath(this.config.rootDir),
+          // A holder's stream is cut at this timeout, so one full timeout outlasts any healthy
+          // holder. A wedged live holder is never taken over (fail closed): this run errors and
+          // the next trigger retries.
+          acquireTimeoutMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
+          staleMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
+          timeoutMessage: "Another Xum process is running a memory consolidation.",
+          signal,
+        });
+      } catch (error) {
+        if (signal.aborted) return { outcome: "cancelled" };
+        return { outcome: "lock-failed", error: getErrorMessage(error) };
+      }
+      try {
+        return { outcome: "ran", value: await stream() };
+      } finally {
+        await releaseLock();
+      }
+    } finally {
+      release();
+    }
+  }
+
   /** The actual run; only ever invoked by maybeRun while holding the lock. */
   private runLockedEffect(
     workspaceId: string,
@@ -888,15 +1009,10 @@ export class MemoryConsolidationService extends EventEmitter {
         return Err("workspace is being removed; consolidation refused");
       }
 
-      // Manual runs bypass debounce (an explicit /dream is explicit intent).
-      // Archive too: it is the workspace's one-shot final pass — the only
-      // chance to promote durable lessons to global scope — and archival
-      // typically follows a compaction-triggered run within the window.
-      if (trigger !== "manual" && trigger !== "archive" && options.skipWorkspaceDebounce !== true) {
-        const record = yield* self.getRecordEffect(workspaceId);
-        if (record !== null && Date.now() - record.lastRunAt < MEMORY_CONSOLIDATION_DEBOUNCE_MS) {
-          return Err("debounced: a recent consolidation run already covered this workspace");
-        }
+      // Cheap early exit, before the model is created and a turn is queued for. It is not the
+      // gate: another backend can journal while this run waits, so the turn rechecks (below).
+      if (yield* self.isDebouncedEffect(workspaceId, trigger, options)) {
+        return Err(DEBOUNCED_SKIP_REASON);
       }
 
       const workspace = self.config.findWorkspace(workspaceId);
@@ -936,7 +1052,12 @@ export class MemoryConsolidationService extends EventEmitter {
           : {}),
       };
 
-      const result = yield* Effect.promise(async () =>
+      // The stream's usage is recorded after its queue slot is released, not inside it:
+      // recordHeadlessUsage takes the session directory's lock, and a stall there must not hold
+      // every later workspace's dream. An array, not a `let`, because TS cannot narrow
+      // assignments made inside the callback.
+      const recordings: Array<() => Promise<void>> = [];
+      const consolidate = () =>
         runMemoryConsolidation({
           model: modelResult.data.model,
           pricingModel: modelResult.data.metadataModel,
@@ -948,6 +1069,9 @@ export class MemoryConsolidationService extends EventEmitter {
           finalPass: trigger === "archive",
           // Hard timeout: a wedged provider stream must not hold the in-flight
           // lock forever (and stall the sequential launch sweep behind it).
+          // Created when this run's turn in the queue arrives (the call happens
+          // inside runDreamStreamExclusively), so it bounds the stream and
+          // never the wait behind other workspaces.
           // Combined with the removal controller (r60): workspace removal must
           // abort the stream AND flip the tool-level pre-commit checks so a
           // detached mutation cannot land after the session directory is gone.
@@ -955,51 +1079,95 @@ export class MemoryConsolidationService extends EventEmitter {
             AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
             removalSignal,
           ]),
-          recordUsage: async (usage, providerMetadata) => {
-            const recorded = await self.sessionUsageService?.recordHeadlessUsage(
-              workspaceId,
-              modelString,
-              usage,
-              providerMetadata,
-              {
-                analyticsSource: "memory_consolidation",
-                // Creation-time identity: a catalog refresh mid-run must not
-                // re-attribute this spend (see ModelFactoryLike).
-                metadataModel: modelResult.data.metadataModel,
+          recordUsage: (usage, providerMetadata) => {
+            recordings.push(async () => {
+              const recorded = await self.sessionUsageService?.recordHeadlessUsage(
+                workspaceId,
+                modelString,
+                usage,
+                providerMetadata,
+                {
+                  analyticsSource: "memory_consolidation",
+                  // Creation-time identity: a catalog refresh mid-run must not
+                  // re-attribute this spend (see ModelFactoryLike).
+                  metadataModel: modelResult.data.metadataModel,
+                }
+              );
+              // The sidecar row only reaches dashboard totals via an explicit
+              // ingest pass; request one (forwarded by ServiceContainer) so sweep
+              // spend doesn't strand until an unrelated stream-end or restart.
+              if (recorded) {
+                self.emit("analyticsIngest", { workspaceId });
               }
-            );
-            // The sidecar row only reaches dashboard totals via an explicit
-            // ingest pass; request one (forwarded by ServiceContainer) so sweep
-            // spend doesn't strand until an unrelated stream-end or restart.
-            if (recorded) {
-              self.emit("analyticsIngest", { workspaceId });
-            }
+            });
+            return Promise.resolve();
           },
-        })
-      );
-      // A stream failure (provider error or the run timeout) means the pass did
-      // NOT cover the memory state: skip the journal record so the debounce and
-      // launch sweep retry later instead of reporting a successful consolidation
-      // that never happened.
-      if (result.streamError !== undefined) {
-        return Err(`consolidation stream failed: ${result.streamError}`);
-      }
+        });
 
-      const record: MemoryConsolidationRecord = {
-        lastRunAt: Date.now(),
-        trigger,
-        summary: result.summary,
-        ops: result.ops,
-        usage: result.usage,
+      // Everything that must happen while this run holds the turn (the in-process tail and the
+      // cross-process lock), and nothing slower: the next run reads the journal the moment the
+      // turn is released. The debounce is rechecked here, from disk, because another backend
+      // that was ahead of this run may have journaled after the pre-queue check passed; and the
+      // success record is saved here, before release, so that read sees it. The save is the
+      // sidecar's brief in-process lock plus one atomic write. Usage recording is not part of the
+      // turn (see `recordings`).
+      const runTurn = async (): Promise<Result<MemoryConsolidationRecord, string>> => {
+        if (await Effect.runPromise(self.isDebouncedEffect(workspaceId, trigger, options))) {
+          return Err(DEBOUNCED_SKIP_REASON);
+        }
+        const result = await consolidate();
+        // A stream failure (provider error or the run timeout) means the pass did
+        // NOT cover the memory state: skip the journal record so the debounce and
+        // launch sweep retry later instead of reporting a successful consolidation
+        // that never happened.
+        if (result.streamError !== undefined) {
+          return Err(`consolidation stream failed: ${result.streamError}`);
+        }
+        const record: MemoryConsolidationRecord = {
+          lastRunAt: Date.now(),
+          trigger,
+          summary: result.summary,
+          ops: result.ops,
+          usage: result.usage,
+        };
+        await Effect.runPromise(self.saveRecordEffect(workspaceId, projectPath, record));
+        return Ok(record);
       };
-      yield* self.saveRecordEffect(workspaceId, projectPath, record);
+      const turn = yield* Effect.promise(async () =>
+        self.runDreamStreamExclusively(removalSignal, runTurn)
+      );
+      // Removal reached this run while it was still queued: no stream started.
+      if (turn.outcome === "cancelled") {
+        return Err("workspace is being removed; consolidation refused");
+      }
+      // No stream started: a stream without the cross-process lock could overlap another
+      // backend's. Nothing is journaled, so the next trigger retries.
+      if (turn.outcome === "lock-failed") {
+        return Err(`could not take the consolidation lock: ${turn.error}`);
+      }
+      // Debounced behind another run, or the stream failed: nothing was journaled.
+      if (!turn.value.success) return turn.value;
+      const record = turn.value.data;
+
+      // Best-effort, like the in-stream call it replaced: telemetry never fails the pass.
+      yield* Effect.promise(async () => {
+        for (const recordUsage of recordings) {
+          await recordUsage().catch((error: unknown) => {
+            log.warn("[MemoryConsolidation] could not record dream usage", {
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
+        }
+      });
+
       log.debug("[MemoryConsolidation] run complete", {
         workspaceId,
         trigger,
-        ops: result.ops.length,
-        applied: result.ops.filter((op) => op.applied).length,
-        globalWrites: result.ops.filter((op) => op.path.startsWith("/memories/global/")).length,
-        usage: result.usage,
+        ops: record.ops.length,
+        applied: record.ops.filter((op) => op.applied).length,
+        globalWrites: record.ops.filter((op) => op.path.startsWith("/memories/global/")).length,
+        usage: record.usage,
       });
       return Ok(record);
     });
@@ -1271,8 +1439,12 @@ export class MemoryConsolidationService extends EventEmitter {
       }
 
       const trigger = this.isWorkspaceCurrentlyArchived(workspaceId) ? "archive" : "compaction";
+      // Debounced like every other automatic trigger: each organizer pass costs
+      // a full read of the memory files, and a compaction is no reason to pay
+      // that again within the window. A debounced sweep returns its skip
+      // quietly (only "already in flight" loops); the harvested candidates wait
+      // in the workspace inbox for the next run. Archive stays undebounced.
       const result = await this.maybeRun(workspaceId, trigger, {
-        skipWorkspaceDebounce: true,
         skipHarvestRecovery: true,
         ...(actingWorkspaceId !== workspaceId ? { actingWorkspaceId } : {}),
       });
