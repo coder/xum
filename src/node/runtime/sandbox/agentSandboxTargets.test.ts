@@ -341,6 +341,44 @@ describe("buildAgentSandboxPolicy", () => {
     ).toThrow(AgentSandboxStartError);
   });
 
+  // Git outside the sandbox (Xum's `git worktree add` too) takes an included file as config.
+  test("keeps the files that the global git config includes read-only, also nested", async () => {
+    // The home folder is a nested deny in the temp folder, so the included files live in repo.
+    const home = path.join(root, "home");
+    await fs.mkdir(home);
+    await fs.mkdir(path.join(repo, "nested"));
+    await fs.writeFile(
+      path.join(home, ".gitconfig"),
+      "[user]\n\tname = t\n[include]\n\tpath = ~/../repo/a.gitconfig ; shared\n"
+    );
+    await fs.writeFile(
+      path.join(repo, "a.gitconfig"),
+      '[IncludeIf "onbranch:main"]\n\tpath = "nested/b c.gitconfig"\n'
+    );
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+      const writable = (...parts: string[]) =>
+        agentSandboxPolicyAllows(policy, path.join(repo, ...parts), "write");
+
+      expect(writable("a.gitconfig")).toBe(false);
+      expect(writable("nested", "b c.gitconfig")).toBe(false);
+      expect(writable("notes.md")).toBe(true);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  test("keeps a file that the repository's git config includes read-only", () => {
+    git(repo, "config", "include.path", "../shared.gitconfig");
+
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+    expect(agentSandboxPolicyAllows(policy, path.join(repo, "shared.gitconfig"), "write")).toBe(
+      false
+    );
+  });
+
   // Xum starts a global plugin's MCP servers outside the sandbox.
   test("fails closed when the workspace is inside a global plugin folder", async () => {
     const home = path.join(root, "home");

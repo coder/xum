@@ -226,6 +226,7 @@ export function buildAgentSandboxPolicy(
         ...nestedDenies,
         ...automationPaths,
         ...cacheExecutablePaths().map(expandSandboxPath),
+        ...gitConfigIncludes([...workspaceRoots, ...extraWriteRoots], gitCommonDirs),
       ].filter((denied) => isUnderAny(denied, writeRoots)),
     ].flatMap(withLinkTarget)
   );
@@ -441,6 +442,65 @@ function childDirs(folder: string): string[] {
   }
 }
 
+// Git reads both for every repository (also `$XDG_CONFIG_HOME/git/config`, not covered).
+const GLOBAL_GIT_CONFIG_FILES: readonly string[] = ["~/.gitconfig", "~/.config/git/config"];
+// Git stops at this include depth (MAX_INCLUDE_DEPTH in git's config.c).
+const GIT_MAX_INCLUDE_DEPTH = 10;
+const GIT_CONFIG_MAX_BYTES = 1024 * 1024;
+
+/**
+ * The real paths of the files that git config includes (`include.path`, and
+ * `includeIf.<condition>.path` whatever the condition), from the global config and the config of
+ * each repository in `roots` and `gitDirs`, recursively as git reads them. Git takes them as
+ * config, so a command that writes one can set `core.hooksPath` for git outside the sandbox,
+ * Xum's own `git worktree add` in a trusted project included.
+ */
+function gitConfigIncludes(roots: readonly string[], gitDirs: readonly string[]): string[] {
+  const repoGitDirs = [...roots.map((root) => path.join(root, ".git")), ...gitDirs];
+  const configFiles = [
+    ...GLOBAL_GIT_CONFIG_FILES.map(expandSandboxPathSpelling),
+    ...repoGitDirs.flatMap((gitDir) => [
+      path.join(gitDir, "config"),
+      ...[gitDir, ...childDirs(path.join(gitDir, "worktrees"))].map((dir) =>
+        path.join(dir, "config.worktree")
+      ),
+    ]),
+  ];
+  const found = new Set<string>();
+  for (const file of configFiles) collectGitConfigIncludes(file, 1, found);
+  return [...found].map(realpathOfNearest);
+}
+
+/** Adds the includes of `file` and of what they include to `found`, by the spelling git uses. */
+function collectGitConfigIncludes(file: string, depth: number, found: Set<string>): void {
+  if (depth > GIT_MAX_INCLUDE_DEPTH) return;
+  for (const value of gitConfigIncludeValues(readGitConfig(file))) {
+    const included = resolveGitInclude(value, file);
+    if (included === undefined || found.has(included)) continue;
+    found.add(included);
+    collectGitConfigIncludes(included, depth + 1, found);
+  }
+}
+
+/** A regular file's text, or "" (no FIFO or device can block the read, nothing over 1 MiB). */
+function readGitConfig(file: string): string {
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size > GIT_CONFIG_MAX_BYTES) return "";
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/** Git resolves a relative include against the folder of the file as spelled, not its target. */
+function resolveGitInclude(value: string, file: string): string | undefined {
+  if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
+  // Not followed: the rare `~user/` and `%(prefix)/` spellings.
+  if (value === "" || value.startsWith("~") || value.startsWith("%(")) return undefined;
+  return path.resolve(path.dirname(file), value);
+}
+
 function isFile(target: string): boolean {
   try {
     return fs.lstatSync(target).isFile();
@@ -458,6 +518,41 @@ function isFolder(target: string): boolean {
   }
 }
 /* eslint-enable local/no-sync-fs-methods */
+
+const GIT_SECTION = /^\s*\[\s*([A-Za-z0-9.-]+)(?:\s+"(?:[^"\\]|\\.)*")?\s*\](.*)$/;
+const GIT_PATH_ENTRY = /^\s*path\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^#;]*))/i;
+
+/**
+ * The `path` values of the `[include]` and `[includeIf "..."]` sections of git config `text`.
+ * Covers the plain and the fully quoted value; git also accepts a partly quoted value or a
+ * continued line, which this reads differently.
+ */
+function gitConfigIncludeValues(text: string): string[] {
+  const values: string[] = [];
+  let inInclude = false;
+  for (const line of text.split(/\r?\n/)) {
+    const header = gitSectionHeader(line);
+    if (header !== undefined) inInclude = header.isInclude;
+    const value = inInclude ? gitPathValue(header?.rest ?? line) : undefined;
+    if (value !== undefined) values.push(value);
+  }
+  return values;
+}
+
+/** For a `[section]` line: whether it opens an include section, and the text after it. */
+function gitSectionHeader(line: string): { isInclude: boolean; rest: string } | undefined {
+  if (!line.trimStart().startsWith("[")) return undefined;
+  const section = GIT_SECTION.exec(line);
+  const name = section?.[1].toLowerCase();
+  return { isInclude: name === "include" || name === "includeif", rest: section?.[2] ?? "" };
+}
+
+/** The value of a `path = ...` line: fully quoted (with escapes), or plain up to a comment. */
+function gitPathValue(line: string): string | undefined {
+  const entry = GIT_PATH_ENTRY.exec(line);
+  if (entry === null) return undefined;
+  return entry[1] !== undefined ? entry[1].replace(/\\(.)/g, "$1") : (entry[2] ?? "").trim();
+}
 
 /**
  * Whether `policy` lets a sandboxed command read or write the real path `target`, by the same
