@@ -120,6 +120,7 @@ function runRedactionPasses(text: string, onRemoved: (removed: string) => void):
   let redacted = text.replace(
     COOKIE_HEADER_PATTERN,
     (match: string, prefix: string, opener: string | undefined) => {
+      // mutation-equivalent: `opener` is undefined or a string, and "" or undefined both add nothing
       const kept = `${prefix}${opener ?? ""}`;
       onRemoved(match.slice(kept.length));
       return `${kept}${REDACTED}`;
@@ -151,9 +152,11 @@ export function redactSecretLike(text: string): string {
  */
 export function addsSecretLike(previous: string, updated: string): boolean {
   const held = new Map<string, number>();
+  // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
   runRedactionPasses(previous, (removed) => held.set(removed, (held.get(removed) ?? 0) + 1));
   let added = false;
   runRedactionPasses(updated, (removed) => {
+    // mutation-equivalent: a count of 0 and a missing one both read as 0
     const left = held.get(removed) ?? 0;
     if (left === 0) added = true;
     else held.set(removed, left - 1);
