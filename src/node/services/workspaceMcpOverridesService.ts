@@ -4672,9 +4672,12 @@ export class WorkspaceMcpOverridesService {
     canonicalWritten: string | undefined,
     snapshot: ConfigSnapshot
   ): Promise<boolean> {
-    const runtimeConfig = row.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
-    if (runtimeFilesystemIdentity(runtimeConfig) !== identity) return false;
-    const rowPath = this.getOverridesFilePaths(row.path, runtimeConfig)[0];
+    // A row without a runtime config gets the default runtime, as in the registry walk. The
+    // written checkout's identity is used for both paths: a mismatch only refuses more saves.
+    const rowPath = this.getOverridesFilePaths(
+      row.path,
+      row.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG
+    )[0];
     const canonicalRow = await snapshot.canonicalize(identity, rowPath);
     // An unresolvable path may share the checkout too.
     return (
