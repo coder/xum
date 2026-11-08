@@ -19,11 +19,12 @@ import {
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
 } from "@/common/constants/memory";
-import { Ok, type Result } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
   dreamStreamLockPath,
   HARVEST_MAX_ATTEMPTS,
+  harvestResumeState,
   MemoryConsolidationService,
   resolveDreamAgentBody,
   resolveDreamModelString,
@@ -31,9 +32,11 @@ import {
   resolveHeadlessAgentSettings,
   resolveHeadlessAgentBody,
   resolveHeadlessAgentDefinition,
+  staleExhaustedHarvestFailure,
 } from "./memoryConsolidationService";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
 import { MEMORY_ANALYZER_SYSTEM_PROMPT } from "./memoryHarvest";
+import { log } from "@/node/services/log";
 import { HistoryService } from "./historyService";
 import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
@@ -262,6 +265,130 @@ function spendEveryEditStream(): ReadableStream<LanguageModelV3StreamPart> {
   });
 }
 
+/**
+ * An analyzer that tries `editsPerRun` creates of distinct workspace notes in each run's first
+ * step, so a test can count the edits an epoch's runs got in total. The dream makes none.
+ * `beforeEdits(run)` holds a run's first step until it settles, to keep a stream open.
+ * `failRun` names the analyzer run whose stream fails after its edits landed.
+ */
+function editsEveryRunModels(
+  editsPerRun: number,
+  beforeEdits?: (run: number) => Promise<void>,
+  failRun?: number
+): {
+  factory: () => MockLanguageModelV3;
+  analyzerRuns: () => number;
+} {
+  let analyzerRuns = 0;
+  const factory = () =>
+    new MockLanguageModelV3({
+      doStream: async (options) => {
+        const afterToolResult = options.prompt.some((message) => message.role === "tool");
+        const isAnalyzer = systemPromptText(options) === MEMORY_ANALYZER_SYSTEM_PROMPT;
+        if (isAnalyzer && afterToolResult && analyzerRuns === failRun) {
+          return { stream: failingStream() };
+        }
+        if (!isAnalyzer || afterToolResult) {
+          return { stream: noChangesStream() };
+        }
+        const run = ++analyzerRuns;
+        await beforeEdits?.(run);
+        return {
+          stream: simulateReadableStream<LanguageModelV3StreamPart>({
+            chunks: [
+              ...Array.from(
+                { length: editsPerRun },
+                (_, index): LanguageModelV3StreamPart => ({
+                  type: "tool-call",
+                  toolCallId: `edit-${run}-${index}`,
+                  toolName: "memory",
+                  input: JSON.stringify({
+                    command: "create",
+                    path: `/memories/workspace/run-${run}-edit-${index}.md`,
+                    file_text: `fact ${run}.${index}\n`,
+                  }),
+                })
+              ),
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: {
+                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 1, text: 0, reasoning: 0 },
+                },
+              },
+            ],
+          }),
+        };
+      },
+    });
+  return { factory, analyzerRuns: () => analyzerRuns };
+}
+
+interface ArchivePassRun {
+  kind: "analyzer" | "dream";
+  prompt: string;
+  /** What the first analyzer run's workspace note held when this run began; null before it exists. */
+  noteAtStart: string | null;
+}
+
+/**
+ * Scripts the analyzer and the dream apart by their system prompts. Analyzer run n writes the
+ * workspace note `note-n.md`. Every run records the first note as it stood when the run began, so
+ * a test sees whether the dream started after the analyzer's write.
+ */
+function archivePassModels(
+  options: { analyzerFailures?: number; holdFirstAnalyzer?: Promise<void> } = {}
+): {
+  runs: ArchivePassRun[];
+  factory: () => MockLanguageModelV3;
+  readFirstNote: { current: () => Promise<string | null> };
+  /** Settles when the first analyzer run has begun. */
+  firstAnalyzerStarted: Promise<void>;
+} {
+  const runs: ArchivePassRun[] = [];
+  const readFirstNote = { current: () => Promise.resolve<string | null>(null) };
+  let analyzerFailures = options.analyzerFailures ?? 0;
+  let analyzerRuns = 0;
+  let markFirstAnalyzerStarted!: () => void;
+  const firstAnalyzerStarted = new Promise<void>((resolve) => (markFirstAnalyzerStarted = resolve));
+  const factory = () =>
+    new MockLanguageModelV3({
+      doStream: async (call) => {
+        if (call.prompt.some((message) => message.role === "tool")) {
+          return { stream: noChangesStream() };
+        }
+        const kind =
+          systemPromptText(call) === MEMORY_ANALYZER_SYSTEM_PROMPT ? "analyzer" : "dream";
+        const isFirstAnalyzer = kind === "analyzer" && runs.every((run) => run.kind !== "analyzer");
+        runs.push({
+          kind,
+          prompt: userPromptText(call),
+          noteAtStart: await readFirstNote.current(),
+        });
+        if (kind === "dream") return { stream: noChangesStream() };
+        if (isFirstAnalyzer) {
+          markFirstAnalyzerStarted();
+          await options.holdFirstAnalyzer;
+        }
+        if (analyzerFailures > 0) {
+          analyzerFailures--;
+          return { stream: failingStream() };
+        }
+        analyzerRuns++;
+        return {
+          stream: simulateReadableStream({
+            chunks: harvestWriteChunks(
+              `/memories/workspace/note-${analyzerRuns}.md`,
+              `analyzer note ${analyzerRuns}\n`
+            ),
+          }),
+        };
+      },
+    });
+  return { runs, factory, readFirstNote, firstAnalyzerStarted };
+}
+
 interface Fixture extends Disposable {
   xumHome: string;
   config: Config;
@@ -276,6 +403,8 @@ interface Fixture extends Disposable {
   setEnabled: (enabled: boolean) => void;
   /** When true, scripted runs emit a fatal stream error instead of finishing. */
   setStreamFailing: (failing: boolean) => void;
+  /** When true, creating the run's model returns an error: a run fails before it reads a chunk. */
+  setModelUnavailable: (unavailable: boolean) => void;
   addWorkspace: (
     id: string,
     opts?: { archivedAt?: string; parentWorkspaceId?: string }
@@ -287,6 +416,8 @@ async function createFixture(options?: {
   /** Holds every model run open until resolved (for in-flight race tests). */
   modelGate?: Promise<void>;
   modelFactory?: () => MockLanguageModelV3;
+  /** Holds one run's model creation (1-based, in call order) until the promise settles. */
+  beforeModelCreated?: (call: number) => Promise<void>;
   /** Wire a real SessionUsageService (headless cost telemetry tests). */
   withSessionUsage?: boolean;
 }): Promise<Fixture> {
@@ -309,6 +440,7 @@ async function createFixture(options?: {
 
   let enabled = true;
   let streamFailing = false;
+  let modelUnavailable = false;
   const sessionUsage = options?.withSessionUsage
     ? new SessionUsageService(config, historyService)
     : undefined;
@@ -324,6 +456,8 @@ async function createFixture(options?: {
       createModelWithPinnedMetadata: async (modelString: string) => {
         modelCalls.push(Date.now());
         if (options?.modelGate) await options.modelGate;
+        await options?.beforeModelCreated?.(modelCalls.length);
+        if (modelUnavailable) return Err({ type: "api_key_not_found" });
         return Ok({
           model:
             options?.modelFactory?.() ??
@@ -354,6 +488,9 @@ async function createFixture(options?: {
     },
     setStreamFailing: (value) => {
       streamFailing = value;
+    },
+    setModelUnavailable: (value) => {
+      modelUnavailable = value;
     },
     addWorkspace: async (id, opts) => {
       await config.editConfig((cfg) => {
@@ -432,6 +569,29 @@ async function seedCompactionEpoch(
   };
 }
 
+/** Closes the epoch the way a compaction does, without a row of its own to analyze. */
+async function closeEpochWithoutNewRows(fixture: Fixture): Promise<CompactionCompletionMetadata> {
+  await fixture.historyService.appendToHistory(
+    "ws-dream",
+    createMuxMessage("compact-request", "user", "Please compact", {
+      muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+    })
+  );
+  const summary = createMuxMessage("summary-1", "assistant", "Scripts use bun.", {
+    compactionBoundary: true,
+    compacted: "user",
+    compactionEpoch: 1,
+  });
+  await fixture.historyService.appendToHistory("ws-dream", summary);
+  return {
+    workspaceId: "ws-dream",
+    summaryMessageId: "summary-1",
+    summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+    compactionEpoch: 1,
+    compactionRequestMessageId: "compact-request",
+  };
+}
+
 function pathExists(target: string): Promise<boolean> {
   return fsPromises.access(target).then(
     () => true,
@@ -446,6 +606,21 @@ async function appendBulkRows(fixture: Fixture, workspaceId = "ws-dream"): Promi
       workspaceId,
       createMuxMessage(`bulk-${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`)
     );
+  }
+}
+
+const openRowTexts: Array<[string, string]> = [
+  ["open-1", "We settled on bun for every script in this repo."],
+  ["open-2", "Noted: scripts use bun, never npm."],
+];
+
+async function appendRows(
+  fixture: Fixture,
+  rows: Array<[string, string]>,
+  workspaceId = "ws-dream"
+): Promise<void> {
+  for (const [id, text] of rows) {
+    await fixture.historyService.appendToHistory(workspaceId, createMuxMessage(id, "user", text));
   }
 }
 
@@ -1621,144 +1796,11 @@ describe("MemoryConsolidationService", () => {
     });
   });
 
-  describe("a harvest record with a corrupt count", () => {
-    /** Chunk 1 of the first attempt lands one edit; its chunk 2 fails; then every step spends 8. */
-    function failingThenSpendingModels() {
-      let analyzerCalls = 0;
-      const factory = () =>
-        new MockLanguageModelV3({
-          doStream: (options) => {
-            const afterToolResult = options.prompt.some((message) => message.role === "tool");
-            if (systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT || afterToolResult) {
-              return Promise.resolve({ stream: noChangesStream() });
-            }
-            const call = ++analyzerCalls;
-            if (call === 1) {
-              return Promise.resolve({
-                stream: simulateReadableStream({
-                  chunks: harvestWriteChunks("/memories/workspace/landed.md", "landed\n"),
-                }),
-              });
-            }
-            if (call === 2) return Promise.resolve({ stream: failingStream() });
-            // Distinct paths per step, so every create applies unless the budget refuses it.
-            return Promise.resolve({
-              stream: simulateReadableStream({
-                chunks: [
-                  ...Array.from(
-                    { length: MEMORY_ANALYZER_OP_BUDGET },
-                    (_, index): LanguageModelV3StreamPart => ({
-                      type: "tool-call",
-                      toolCallId: `spend-${call}-${index}`,
-                      toolName: "memory",
-                      input: JSON.stringify({
-                        command: "create",
-                        path: `/memories/workspace/call-${call}-${index}.md`,
-                        file_text: "fact\n",
-                      }),
-                    })
-                  ),
-                  {
-                    type: "finish",
-                    finishReason: { unified: "tool-calls", raw: "tool-calls" },
-                    usage: {
-                      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
-                      outputTokens: { total: 1, text: 0, reasoning: 0 },
-                    },
-                  },
-                ],
-              }),
-            });
-          },
-        });
-      return { factory };
-    }
-
-    it("cannot widen the edit budget: a negative budgetUsed restarts the epoch on a fresh budget of 8", async () => {
-      using fixture = await createFixture({
-        modelFactory: failingThenSpendingModels().factory,
-      });
-      // Chunks bulk-0..4, bulk-5..9 and bulk-10..11.
-      await appendBulkRows(fixture);
-      const metadata = await seedCompactionEpoch(fixture);
-      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
-      expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
-        status: "failed",
-        nextChunk: 1,
-      });
-      // A budget of -100 used to leave 108 edits: chunks 2 and 3 would each spend 8 more.
-      await editHarvestRecord(fixture, "summary-1", (record) => {
-        record.budgetUsed = -100;
-      });
-
-      expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
-
-      const record = (await harvestRecords(fixture))["summary-1"];
-      expect(record?.status).toBe("completed");
-      expect(record?.ops?.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
-      expect(record?.note).toContain("edit budget spent");
-    });
-
-    it("cannot widen the attempt limit: a negative attemptCount restarts the epoch on the bound every epoch has", async () => {
-      let analyzerCalls = 0;
-      using fixture = await createFixture({
-        modelFactory: () =>
-          new MockLanguageModelV3({
-            doStream: (options) => {
-              if (systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT) {
-                return Promise.resolve({ stream: noChangesStream() });
-              }
-              analyzerCalls++;
-              return Promise.resolve({ stream: failingStream() });
-            },
-          }),
-      });
-      const metadata = await seedCompactionEpoch(fixture);
-      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
-      expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
-        status: "failed",
-        attemptCount: 1,
-      });
-      // An attemptCount of -100 used to stay under HARVEST_MAX_ATTEMPTS for 100 more attempts.
-      await editHarvestRecord(fixture, "summary-1", (record) => {
-        record.attemptCount = -100;
-      });
-      analyzerCalls = 0;
-
-      for (let run = 0; run < HARVEST_MAX_ATTEMPTS + 3; run++) {
-        await fixture.service.maybeHarvestThenSweep(metadata);
-      }
-
-      expect(analyzerCalls).toBe(HARVEST_MAX_ATTEMPTS);
-      expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
-        status: "failed",
-        attemptCount: HARVEST_MAX_ATTEMPTS,
-      });
-    });
-
-    it.each([
-      ["attemptCount", -1],
-      ["attemptCount", 1.5],
-      ["budgetUsed", -100],
-      ["budgetUsed", 1.5],
-      ["nextChunk", -1],
-      ["nextChunkOps", -1],
-    ])("drops a record whose %s is %d on load", async (field, value) => {
-      using fixture = await createFixture();
-      const metadata = await seedCompactionEpoch(fixture);
-      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
-      expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).not.toBeNull();
-      await editHarvestRecord(fixture, "summary-1", (record) => {
-        record[field] = value;
-      });
-
-      expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toBeNull();
-    });
-  });
-
   it("refuses a harvest for a workspace that another backend is removing, before any model call", async () => {
-    using fixture = await createFixture();
+    const models = archivePassModels();
+    using fixture = await createFixture({ modelFactory: models.factory });
     const metadata = await seedCompactionEpoch(fixture);
+    await appendRows(fixture, openRowTexts);
     // History writes refuse once the tombstone exists, so the rows come first.
     const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-dream");
     await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
@@ -1769,8 +1811,10 @@ describe("MemoryConsolidationService", () => {
     const harvested = await fixture.service.maybeHarvestThenSweep(metadata);
     expect(harvested.success).toBe(false);
     if (!harvested.success) expect(harvested.error).toContain("being removed");
+    const archived = await fixture.service.maybeRunArchivePass("ws-dream");
+    expect(archived.success).toBe(false);
 
-    expect(fixture.modelCalls).toHaveLength(0);
+    expect(models.runs).toEqual([]);
     expect(await harvestRecords(fixture)).toEqual({});
   });
 
@@ -2242,6 +2286,266 @@ describe("MemoryConsolidationService", () => {
       held.release(2);
       await nextRun;
       expect((await harvestRecords(fixture, "ws-dream"))["summary-2"]?.status).toBe("completed");
+    });
+
+    it("seeds a record's edit budget when its turn arrives, so an archive and a compaction of one epoch overlapping share it", async () => {
+      // The compaction's job reads the earlier records before it waits behind the archive's
+      // analyzer, and what the archive spends meanwhile reaches disk only when its record completes.
+      const created = [gate(), gate()];
+      const streamStarted = [gate(), gate()];
+      const released = [gate(), gate()];
+      const models = editsEveryRunModels(5, async (run) => {
+        streamStarted[run - 1]?.open();
+        await released[run - 1]?.opened;
+      });
+      let modelsCreated = 0;
+      using fixture = await createFixture({
+        modelFactory: () => {
+          created[modelsCreated++]?.open();
+          return models.factory();
+        },
+      });
+      await appendRows(fixture, openRowTexts);
+
+      const archive = fixture.service.maybeRunArchivePass("ws-dream");
+      await streamStarted[0]?.opened;
+      const compaction = fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+      await created[1]?.opened;
+      await settle();
+      expect(models.analyzerRuns()).toBe(1);
+
+      released[0]?.open();
+      await streamStarted[1]?.opened;
+      released[1]?.open();
+      expect((await archive).success).toBe(true);
+      // The compaction's own dream is debounced behind the archive's: only its analysis matters.
+      await compaction;
+
+      const records = await harvestRecords(fixture);
+      // The archive's 5 edits all landed. The compaction tried 5 more and got the 3 that are left.
+      expect(records["open:open-2"]?.budgetUsed).toBe(5);
+      expect(records["summary-1"]?.ops?.filter((op) => op.applied)).toHaveLength(3);
+      expect(records["summary-1"]?.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+    });
+
+    /**
+     * An archive pass held in its analyzer, and the compaction that `closeEpoch` makes for the
+     * same epoch, started behind it: past its model creation, so only its turn is left to wait
+     * for. The compaction's job reads the earlier records before that wait, and the archive's
+     * rows reach them only as its analyzer finishes chunks. Returns once both ended.
+     */
+    async function compactionBehindHeldArchive(
+      closeEpoch: (fixture: Fixture) => Promise<CompactionCompletionMetadata>
+    ) {
+      const releaseArchive = gate();
+      const secondModel = gate();
+      const models = archivePassModels({ holdFirstAnalyzer: releaseArchive.opened });
+      let modelsCreated = 0;
+      using fixture = await createFixture({
+        modelFactory: () => {
+          if (++modelsCreated === 2) secondModel.open();
+          return models.factory();
+        },
+      });
+      await appendRows(fixture, openRowTexts);
+
+      const archive = fixture.service.maybeRunArchivePass("ws-dream");
+      await models.firstAnalyzerStarted;
+      const compaction = fixture.service.maybeHarvestThenSweep(await closeEpoch(fixture));
+      await secondModel.opened;
+      await settle();
+      expect(models.runs.filter((run) => run.kind === "analyzer")).toHaveLength(1);
+
+      releaseArchive.open();
+      expect((await archive).success).toBe(true);
+      await compaction;
+      return {
+        analyzerPrompts: models.runs
+          .filter((run) => run.kind === "analyzer")
+          .map((run) => run.prompt),
+        records: await harvestRecords(fixture),
+      };
+    }
+
+    it("starts a compaction that waited behind the archive of its epoch after the rows that archive read", async () => {
+      // seedCompactionEpoch adds one more row, "remember that I prefer concise tests".
+      const { analyzerPrompts, records } = await compactionBehindHeldArchive((fixture) =>
+        seedCompactionEpoch(fixture)
+      );
+
+      expect(analyzerPrompts).toHaveLength(2);
+      const closing = analyzerPrompts[1] ?? "";
+      expect(closing).toContain("remember that I prefer concise tests");
+      expect(closing).not.toContain("We settled on bun");
+      expect(closing).not.toContain("never npm");
+      expect(records["summary-1"]?.status).toBe("completed");
+    });
+
+    it("makes no analyzer call for a compaction that waited behind the archive that read all of its epoch", async () => {
+      const { analyzerPrompts, records } =
+        await compactionBehindHeldArchive(closeEpochWithoutNewRows);
+
+      expect(analyzerPrompts).toHaveLength(1);
+      expect(records["summary-1"]).toMatchObject({
+        status: "completed",
+        nextChunk: 0,
+        analyzedFloorRowId: "open-2",
+      });
+    });
+
+    it("keeps a failed run's landed edits in the sidecar before the next run's turn, so that run seeds its budget with them", async () => {
+      // The failed record is saved after the turn is released, so what the run spent before its
+      // chunk failed reaches the sidecar in that save alone. Holding it here makes the order
+      // deterministic: the next run must find the spend without it.
+      const created = [gate(), gate()];
+      const streamStarted = [gate(), gate()];
+      const released = [gate(), gate()];
+      const failedSaveReleased = gate();
+      const models = editsEveryRunModels(
+        5,
+        async (run) => {
+          streamStarted[run - 1]?.open();
+          await released[run - 1]?.opened;
+        },
+        1
+      );
+      let modelsCreated = 0;
+      using fixture = await createFixture({
+        modelFactory: () => {
+          created[modelsCreated++]?.open();
+          return models.factory();
+        },
+      });
+      await appendRows(fixture, openRowTexts);
+      const internals = fixture.service as unknown as {
+        saveHarvestRecordEffect: (
+          workspaceId: string,
+          boundaryKey: string,
+          record: { status: string },
+          projectPath: string
+        ) => Effect.Effect<void>;
+      };
+      const saveHarvestRecord = internals.saveHarvestRecordEffect.bind(fixture.service);
+      spyOn(internals, "saveHarvestRecordEffect").mockImplementation(
+        (workspaceId, boundaryKey, record, projectPath) =>
+          record.status === "failed"
+            ? Effect.flatMap(
+                Effect.promise(() => failedSaveReleased.opened),
+                () => saveHarvestRecord(workspaceId, boundaryKey, record, projectPath)
+              )
+            : saveHarvestRecord(workspaceId, boundaryKey, record, projectPath)
+      );
+
+      try {
+        const archive = fixture.service.maybeRunArchivePass("ws-dream");
+        await streamStarted[0]?.opened;
+        const compaction = fixture.service.maybeHarvestThenSweep(
+          await seedCompactionEpoch(fixture)
+        );
+        await created[1]?.opened;
+        await settle();
+        expect(models.analyzerRuns()).toBe(1);
+
+        released[0]?.open();
+        await streamStarted[1]?.opened;
+        released[1]?.open();
+        await compaction;
+        failedSaveReleased.open();
+        expect((await archive).success).toBe(true);
+
+        const records = await harvestRecords(fixture);
+        // The archive's analyzer landed 5 edits and then failed. The compaction tried 5 more and
+        // got the 3 that are left of the epoch's budget.
+        expect(records["open:open-2"]).toMatchObject({ status: "failed", budgetUsed: 5 });
+        expect(records["summary-1"]?.ops?.filter((op) => op.applied)).toHaveLength(3);
+        expect(records["summary-1"]?.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+      } finally {
+        failedSaveReleased.open();
+        released[0]?.open();
+        released[1]?.open();
+      }
+    });
+
+    describe("an archive whose analyzer turn comes after the compaction that closed its epoch", () => {
+      /**
+       * An archive pass that took its snapshot of the open epoch and is held at its model creation,
+       * before its analyzer turn. The compaction that closes the epoch then runs to the end, and
+       * only then does the archive's turn arrive. The compaction's record, keyed by its summary,
+       * is then the only record of the rows and edits already spent.
+       */
+      async function archiveBehindClosingCompaction(
+        editsPerRun: number,
+        appendEpochRows: (fixture: Fixture) => Promise<void>
+      ) {
+        const archiveSnapshotted = gate();
+        const releaseArchive = gate();
+        const models = editsEveryRunModels(editsPerRun);
+        using fixture = await createFixture({
+          modelFactory: models.factory,
+          beforeModelCreated: async (call) => {
+            if (call !== 1) return;
+            archiveSnapshotted.open();
+            await releaseArchive.opened;
+          },
+        });
+        await appendEpochRows(fixture);
+
+        const archive = fixture.service.maybeRunArchivePass("ws-dream");
+        await archiveSnapshotted.opened;
+        // The compaction's own dream follows its analysis; only the analysis matters here.
+        await fixture.service.maybeHarvestThenSweep(await closeEpochWithoutNewRows(fixture));
+        const analyzerRunsBeforeArchiveTurn = models.analyzerRuns();
+
+        releaseArchive.open();
+        expect((await archive).success).toBe(true);
+        return {
+          analyzerRunsBeforeArchiveTurn,
+          analyzerRunsAfterArchive: models.analyzerRuns(),
+          records: await harvestRecords(fixture),
+        };
+      }
+
+      it("does not read again the rows the compaction read", async () => {
+        const { analyzerRunsBeforeArchiveTurn, analyzerRunsAfterArchive, records } =
+          await archiveBehindClosingCompaction(5, (fixture) => appendRows(fixture, openRowTexts));
+
+        expect(analyzerRunsBeforeArchiveTurn).toBe(1);
+        expect(records["summary-1"]).toMatchObject({
+          status: "completed",
+          readThroughRowId: "open-2",
+        });
+        // The compaction read both rows: the archive finds nothing left, so it makes no model call.
+        expect(analyzerRunsAfterArchive).toBe(1);
+        expect(records["open:open-2"]).toMatchObject({
+          status: "completed",
+          nextChunk: 0,
+          analyzedFloorRowId: "open-2",
+        });
+      });
+
+      it("starts from the edits the compaction spent on the epoch's budget", async () => {
+        const { analyzerRunsBeforeArchiveTurn, analyzerRunsAfterArchive, records } =
+          await archiveBehindClosingCompaction(MEMORY_ANALYZER_OP_BUDGET, (fixture) =>
+            appendBulkRows(fixture)
+          );
+
+        // The compaction spent the whole budget on its first chunk and skipped the other two.
+        expect(analyzerRunsBeforeArchiveTurn).toBe(1);
+        expect(records["summary-1"]).toMatchObject({
+          status: "completed",
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+          readThroughRowId: "bulk-4",
+        });
+        // The archive's floor leaves it the rows of those two chunks. Seeded with the spent
+        // budget it skips them without a model call; on a fresh budget it would edit memory again.
+        expect(analyzerRunsAfterArchive).toBe(1);
+        expect(records["open:bulk-11"]).toMatchObject({
+          status: "completed",
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+          analyzedFloorRowId: "bulk-4",
+        });
+        expect(records["open:bulk-11"]?.note).toContain("edit budget spent");
+      });
     });
 
     // The analyzer and the dream edit the same /memories/workspace files, and the dream's `insert`
@@ -2835,6 +3139,1176 @@ describe("MemoryConsolidationService", () => {
     const retry = await fixture.service.maybeRun("ws-dream", "compaction");
     expect(retry.success).toBe(true);
     expect(fixture.modelCalls).toHaveLength(2);
+  });
+
+  describe("archive pass", () => {
+    function readNote(fixture: Fixture, n: number): Promise<string | null> {
+      return fixture.memoryService
+        .readFileWithSha(
+          {
+            runtime: null,
+            checkoutCwd: "",
+            workspaceId: "ws-dream",
+            projectPath: "/projects/demo",
+          },
+          `/memories/workspace/note-${n}.md`
+        )
+        .then((file) => (file.success ? file.data.content : null));
+    }
+
+    it("analyzes the rows after the last compaction, then runs the dream over what it wrote", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      models.readFirstNote.current = () => readNote(fixture, 1);
+      await seedCompactionEpoch(fixture);
+      await appendRows(fixture, openRowTexts);
+
+      const result = await fixture.service.maybeRunArchivePass("ws-dream");
+
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.trigger).toBe("archive");
+      expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream"]);
+      const [analyzer, dream] = models.runs;
+      expect(analyzer?.prompt).toContain("We settled on bun");
+      expect(analyzer?.prompt).toContain("never npm");
+      // The closed epoch was analyzed when it closed: neither its rows nor its summary come back.
+      expect(analyzer?.prompt).not.toContain("remember that I prefer");
+      expect(analyzer?.prompt).not.toContain("prefers concise tests");
+      // The dream started after the analyzer's write, so it can promote it.
+      expect(dream?.noteAtStart).toContain("analyzer note 1");
+      expect(await harvestRecords(fixture)).toMatchObject({
+        "open:open-2": { status: "completed", nextChunk: 1, acceptedCandidates: 1 },
+      });
+    });
+
+    it("analyzes an epoch that never compacted", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await appendRows(fixture, openRowTexts);
+
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+      expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream"]);
+      expect(models.runs[0]?.prompt).toContain("We settled on bun");
+    });
+
+    it("makes no second analyzer call for an archive that finds no new rows", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await seedCompactionEpoch(fixture);
+      await appendRows(fixture, openRowTexts);
+
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+      // Archive is never debounced, so the final dream runs again.
+      expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream", "dream"]);
+    });
+
+    it("analyzes only the rows added after an unarchive on the next archive", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await seedCompactionEpoch(fixture);
+      await appendRows(fixture, openRowTexts);
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+      await appendRows(fixture, [["open-3", "CI pins node 22 for the release job."]]);
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+      expect(models.runs.map((run) => run.kind)).toEqual([
+        "analyzer",
+        "dream",
+        "analyzer",
+        "dream",
+      ]);
+      expect(models.runs[2]?.prompt).toContain("CI pins node 22");
+      // The rows the first archive's analysis already read are not sent again.
+      expect(models.runs[2]?.prompt).not.toContain("We settled on bun");
+      expect(models.runs[2]?.prompt).not.toContain("never npm");
+      expect(Object.keys(await harvestRecords(fixture)).sort()).toEqual([
+        "open:open-2",
+        "open:open-3",
+      ]);
+    });
+
+    describe("rows an earlier archive analyzed", () => {
+      const analyzerRuns = (models: ReturnType<typeof archivePassModels>) =>
+        models.runs.filter((run) => run.kind === "analyzer");
+
+      it("sends the compaction that closes the epoch only the rows after them", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await appendRows(fixture, [["open-3", "CI pins node 22 for the release job."]]);
+        // seedCompactionEpoch adds one more row, "remember that I prefer concise tests".
+        const metadata = await seedCompactionEpoch(fixture);
+
+        await fixture.service.maybeHarvestThenSweep(metadata);
+
+        expect(analyzerRuns(models)).toHaveLength(2);
+        const closing = analyzerRuns(models)[1]?.prompt ?? "";
+        expect(closing).toContain("CI pins node 22");
+        expect(closing).toContain("remember that I prefer concise tests");
+        expect(closing).not.toContain("We settled on bun");
+        expect(closing).not.toContain("never npm");
+        expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+      });
+
+      it("starts after the newest archive's floor, not the oldest, when several archives ran", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await appendRows(fixture, [["open-3", "CI pins node 22 for the release job."]]);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await appendRows(fixture, [["open-4", "Releases are cut from the main branch."]]);
+        const metadata = await seedCompactionEpoch(fixture);
+
+        await fixture.service.maybeHarvestThenSweep(metadata);
+
+        expect(analyzerRuns(models)).toHaveLength(3);
+        const closing = analyzerRuns(models)[2]?.prompt ?? "";
+        expect(closing).toContain("Releases are cut from the main branch.");
+        expect(closing).toContain("remember that I prefer concise tests");
+        // The second archive read up to open-3: the first archive's floor is behind it.
+        expect(closing).not.toContain("CI pins node 22");
+        expect(closing).not.toContain("We settled on bun");
+      });
+
+      it("keeps a retry of the closing compaction on the rows its first attempt read, even if an archive completes meanwhile", async () => {
+        const chunkLabels: string[] = [];
+        let failedOnce = false;
+        using fixture = await createFixture({
+          modelFactory: () =>
+            new MockLanguageModelV3({
+              doStream: (options) => {
+                const prompt = userPromptText(options);
+                const label = /Transcript chunk (\d+\/\d+)/.exec(prompt)?.[1] ?? "";
+                if (!prompt.includes("just-compacted transcript epoch")) {
+                  return Promise.resolve({ stream: noChangesStream() });
+                }
+                chunkLabels.push(label);
+                if (label.startsWith("2/") && !failedOnce) {
+                  failedOnce = true;
+                  return Promise.resolve({ stream: failingStream() });
+                }
+                return Promise.resolve({ stream: noChangesStream() });
+              },
+            }),
+        });
+        await appendBulkRows(fixture);
+        const metadata = await seedCompactionEpoch(fixture);
+        expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "failed",
+          nextChunk: 1,
+          // No archive had read this epoch: the record says "no floor", not "not looked at".
+          analyzedFloorRowId: null,
+        });
+
+        // An archive pass that read the epoch before it closed finishes after the first attempt:
+        // its row is inside the closed epoch, so it must not move the rows under the saved cursor.
+        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+        const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
+          harvestsByWorkspace: Record<string, Record<string, unknown>>;
+        };
+        sidecar.harvestsByWorkspace["ws-dream"]["open:bulk-9"] = {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "open:bulk-9",
+          compactionEpoch: 1,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+        };
+        await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+
+        expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+        expect(chunkLabels).toEqual(["1/3", "2/3", "2/3", "3/3"]);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          nextChunk: 3,
+        });
+      });
+
+      it("makes no analyzer call for a compaction that closes an epoch an archive fully analyzed", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        const metadata = await closeEpochWithoutNewRows(fixture);
+
+        await fixture.service.maybeHarvestThenSweep(metadata);
+
+        expect(analyzerRuns(models)).toHaveLength(1);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          nextChunk: 0,
+          acceptedCandidates: 0,
+        });
+      });
+
+      it("matches the archive of an epoch whose compaction was pending to the compaction that later closes it", async () => {
+        const models = editsEveryRunModels(5);
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        // The workspace is archived after the request row is saved, before the compaction ends.
+        // The closing compaction's reader skips this row (getMessagesForCompactionEpoch).
+        await fixture.historyService.appendToHistory(
+          "ws-dream",
+          createMuxMessage("compact-request", "user", "Please compact", {
+            muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+          })
+        );
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        const archive = (await harvestRecords(fixture))["open:open-2"];
+        expect(archive).toMatchObject({ readThroughRowId: "open-2", budgetUsed: 5 });
+
+        // The compaction completes after the unarchive, with one more row in the epoch.
+        await appendRows(fixture, [["open-3", "CI pins node 22 for the release job."]]);
+        const summary = createMuxMessage("summary-1", "assistant", "Scripts use bun.", {
+          compactionBoundary: true,
+          compacted: "user",
+          compactionEpoch: 1,
+        });
+        await fixture.historyService.appendToHistory("ws-dream", summary);
+        await fixture.service.maybeHarvestThenSweep({
+          workspaceId: "ws-dream",
+          summaryMessageId: "summary-1",
+          summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+          compactionEpoch: 1,
+          compactionRequestMessageId: "compact-request",
+        });
+
+        // The closing run starts after the rows the archive read and shares its budget: it tried
+        // 5 more edits and got the 3 that were left.
+        expect(models.analyzerRuns()).toBe(2);
+        const closing = (await harvestRecords(fixture))["summary-1"];
+        expect(closing).toMatchObject({
+          status: "completed",
+          analyzedFloorRowId: "open-2",
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+        });
+        expect(closing?.ops?.filter((op) => op.applied)).toHaveLength(3);
+      });
+
+      it("makes no analyzer call for the compaction that closes an epoch whose every edit an archive spent, though rows are left unread", async () => {
+        const analyzerPrompts: Array<{ closing: boolean; prompt: string }> = [];
+        using fixture = await createFixture({
+          modelFactory: () =>
+            new MockLanguageModelV3({
+              doStream: (options) => {
+                const afterToolResult = options.prompt.some((message) => message.role === "tool");
+                if (
+                  systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT ||
+                  afterToolResult
+                ) {
+                  return Promise.resolve({ stream: noChangesStream() });
+                }
+                const prompt = userPromptText(options);
+                const closing = prompt.includes("just-compacted transcript epoch");
+                analyzerPrompts.push({ closing, prompt });
+                if (closing) return Promise.resolve({ stream: noChangesStream() });
+                // The archive's first chunk spends every edit of the epoch's budget.
+                return Promise.resolve({
+                  stream: spendEveryEditStream(),
+                });
+              },
+            }),
+        });
+        // Three chunks of rows bulk-0..4, bulk-5..9 and bulk-10..11.
+        await appendBulkRows(fixture);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        expect(analyzerPrompts.map((run) => run.closing)).toEqual([false]);
+        const archive = (await harvestRecords(fixture))["open:bulk-11"];
+        expect(archive?.note).toContain("chunks 2-3 of 3");
+        expect(archive?.readThroughRowId).toBe("bulk-4");
+
+        await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+
+        // The epoch has one budget (see "the epoch's one edit budget"): the compaction that closes
+        // it starts with the archive's spend, so it reads none of the rows the archive left.
+        expect(analyzerPrompts.filter((run) => run.closing)).toEqual([]);
+        const closing = (await harvestRecords(fixture))["summary-1"];
+        expect(closing).toMatchObject({
+          status: "completed",
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+        });
+        expect(closing?.note).toContain("edit budget spent");
+      });
+
+      it("keeps the chunks an archive skipped unread when saving its completed record failed", async () => {
+        using fixture = await createFixture({
+          modelFactory: () =>
+            new MockLanguageModelV3({
+              doStream: (options) => {
+                const afterToolResult = options.prompt.some((message) => message.role === "tool");
+                const analyzing = systemPromptText(options) === MEMORY_ANALYZER_SYSTEM_PROMPT;
+                return Promise.resolve({
+                  stream:
+                    analyzing && !afterToolResult ? spendEveryEditStream() : noChangesStream(),
+                });
+              },
+            }),
+        });
+        // Three chunks of rows bulk-0..4, bulk-5..9 and bulk-10..11. The first spends every edit.
+        await appendBulkRows(fixture);
+        // The harvest's last step, the completed record, is the one write that fails (once).
+        const service = fixture.service as unknown as {
+          saveHarvestRecordEffect: (
+            workspaceId: string,
+            boundaryKey: string,
+            record: MemoryHarvestRecordPayload,
+            projectPath: string
+          ) => Effect.Effect<void>;
+        };
+        const save = service.saveHarvestRecordEffect.bind(service);
+        let failedOnce = false;
+        spyOn(service, "saveHarvestRecordEffect").mockImplementation(
+          (workspaceId, boundaryKey, record, projectPath) => {
+            if (record.status !== "completed" || failedOnce) {
+              return save(workspaceId, boundaryKey, record, projectPath);
+            }
+            failedOnce = true;
+            return Effect.promise(() => Promise.reject(new Error("disk full")));
+          }
+        );
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        // The failed record resumes at the first chunk nobody read, not past the skipped ones.
+        expect((await harvestRecords(fixture))["open:bulk-11"]).toMatchObject({
+          status: "failed",
+          nextChunk: 1,
+        });
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        // The retry meets the spent budget again: it says which chunks it skipped, and the rows
+        // after chunk 1 stay unread for the compaction that closes the epoch.
+        expect((await harvestRecords(fixture))["open:bulk-11"]).toMatchObject({
+          status: "completed",
+          readThroughRowId: "bulk-4",
+        });
+        expect((await harvestRecords(fixture))["open:bulk-11"]?.note).toContain("chunks 2-3 of 3");
+      });
+
+      describe("an archive that failed after reading some chunks", () => {
+        /**
+         * Chunks bulk-0..4, bulk-5..9 and bulk-10..11. The first chunk's edit lands; the stream of
+         * the archive's second chunk fails once, so the record reads through bulk-4.
+         */
+        function archiveFailingAtItsSecondChunk() {
+          const prompts: Array<{ closing: boolean; prompt: string }> = [];
+          let failed = false;
+          const factory = () =>
+            new MockLanguageModelV3({
+              doStream: (options) => {
+                const afterToolResult = options.prompt.some((message) => message.role === "tool");
+                if (
+                  systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT ||
+                  afterToolResult
+                ) {
+                  return Promise.resolve({ stream: noChangesStream() });
+                }
+                const prompt = userPromptText(options);
+                const closing = prompt.includes("just-compacted transcript epoch");
+                prompts.push({ closing, prompt });
+                const label = /Transcript chunk (\d+\/\d+)/.exec(prompt)?.[1] ?? "";
+                if (label.startsWith("2/") && !failed && !closing) {
+                  failed = true;
+                  return Promise.resolve({ stream: failingStream() });
+                }
+                return Promise.resolve({
+                  stream: label.startsWith("1/")
+                    ? simulateReadableStream({
+                        chunks: harvestWriteChunks("/memories/workspace/landed.md", "landed\n"),
+                      })
+                    : noChangesStream(),
+                });
+              },
+            });
+          return { prompts, factory };
+        }
+
+        async function failFirstArchive(fixture: Fixture): Promise<void> {
+          await appendBulkRows(fixture);
+          await fixture.service.maybeRunArchivePass("ws-dream");
+          expect((await harvestRecords(fixture))["open:bulk-11"]).toMatchObject({
+            status: "failed",
+            nextChunk: 1,
+            // The chunk that read cleanly is read through, though a later one failed.
+            readThroughRowId: "bulk-4",
+          });
+        }
+
+        function expectRowsFromFive(prompt: string): void {
+          for (let index = 0; index < 12; index++) {
+            const row = `preference ${index} x`;
+            if (index < 5) expect(prompt).not.toContain(row);
+            else expect(prompt).toContain(row);
+          }
+        }
+
+        it("starts the next archive, after another row arrived, behind the chunks it read", async () => {
+          const scripted = archiveFailingAtItsSecondChunk();
+          using fixture = await createFixture({ modelFactory: scripted.factory });
+          await failFirstArchive(fixture);
+          await appendRows(fixture, [["open-new", "CI pins node 22 for the release job."]]);
+          const before = scripted.prompts.length;
+
+          await fixture.service.maybeRunArchivePass("ws-dream");
+
+          const rerun = scripted.prompts
+            .slice(before)
+            .map((run) => run.prompt)
+            .join("\n");
+          expect(rerun).toContain("CI pins node 22");
+          expectRowsFromFive(rerun);
+          expect((await harvestRecords(fixture))["open:open-new"]?.status).toBe("completed");
+        });
+
+        it("keeps the rows its chunks read through a retry that fails before it reads a chunk", async () => {
+          const scripted = archiveFailingAtItsSecondChunk();
+          using fixture = await createFixture({ modelFactory: scripted.factory });
+          await failFirstArchive(fixture);
+
+          // The retry cannot load its model, so it fails with nothing read of its own.
+          fixture.setModelUnavailable(true);
+          await fixture.service.maybeRunArchivePass("ws-dream");
+          fixture.setModelUnavailable(false);
+
+          const failed = (await harvestRecords(fixture))["open:bulk-11"];
+          expect(failed?.error).toContain("could not create model");
+          expect(failed).toMatchObject({
+            status: "failed",
+            attemptCount: 2,
+            nextChunk: 1,
+            readThroughRowId: "bulk-4",
+          });
+          // The failure record is what the next run's floor comes from: it still skips chunk 1.
+          const before = scripted.prompts.length;
+          await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+          const closing = scripted.prompts
+            .slice(before)
+            .filter((run) => run.closing)
+            .map((run) => run.prompt)
+            .join("\n");
+          expectRowsFromFive(closing);
+        });
+
+        it("starts the compaction that closes the epoch behind the chunks it read", async () => {
+          const scripted = archiveFailingAtItsSecondChunk();
+          using fixture = await createFixture({ modelFactory: scripted.factory });
+          await failFirstArchive(fixture);
+          const before = scripted.prompts.length;
+
+          await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+
+          const closing = scripted.prompts
+            .slice(before)
+            .filter((run) => run.closing)
+            .map((run) => run.prompt)
+            .join("\n");
+          expect(closing).toContain("remember that I prefer concise tests");
+          expectRowsFromFive(closing);
+          expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+        });
+      });
+
+      describe("a harvest record with a corrupt count", () => {
+        /** Chunk 1 of the first attempt lands one edit; its chunk 2 fails; then every step spends 8. */
+        function failingThenSpendingModels() {
+          let analyzerCalls = 0;
+          const factory = () =>
+            new MockLanguageModelV3({
+              doStream: (options) => {
+                const afterToolResult = options.prompt.some((message) => message.role === "tool");
+                if (
+                  systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT ||
+                  afterToolResult
+                ) {
+                  return Promise.resolve({ stream: noChangesStream() });
+                }
+                const call = ++analyzerCalls;
+                if (call === 1) {
+                  return Promise.resolve({
+                    stream: simulateReadableStream({
+                      chunks: harvestWriteChunks("/memories/workspace/landed.md", "landed\n"),
+                    }),
+                  });
+                }
+                if (call === 2) return Promise.resolve({ stream: failingStream() });
+                // Distinct paths per step, so every create applies unless the budget refuses it.
+                return Promise.resolve({
+                  stream: simulateReadableStream({
+                    chunks: [
+                      ...Array.from(
+                        { length: MEMORY_ANALYZER_OP_BUDGET },
+                        (_, index): LanguageModelV3StreamPart => ({
+                          type: "tool-call",
+                          toolCallId: `spend-${call}-${index}`,
+                          toolName: "memory",
+                          input: JSON.stringify({
+                            command: "create",
+                            path: `/memories/workspace/call-${call}-${index}.md`,
+                            file_text: "fact\n",
+                          }),
+                        })
+                      ),
+                      {
+                        type: "finish",
+                        finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                        usage: {
+                          inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                          outputTokens: { total: 1, text: 0, reasoning: 0 },
+                        },
+                      },
+                    ],
+                  }),
+                });
+              },
+            });
+          return { factory };
+        }
+
+        it("cannot widen the edit budget: a negative budgetUsed restarts the epoch on a fresh budget of 8", async () => {
+          using fixture = await createFixture({
+            modelFactory: failingThenSpendingModels().factory,
+          });
+          // Chunks bulk-0..4, bulk-5..9 and bulk-10..11.
+          await appendBulkRows(fixture);
+          const metadata = await seedCompactionEpoch(fixture);
+          expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+          expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+            status: "failed",
+            nextChunk: 1,
+          });
+          // A budget of -100 used to leave 108 edits: chunks 2 and 3 would each spend 8 more.
+          await editHarvestRecord(fixture, "summary-1", (record) => {
+            record.budgetUsed = -100;
+          });
+
+          expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+          const record = (await harvestRecords(fixture))["summary-1"];
+          expect(record?.status).toBe("completed");
+          expect(record?.ops?.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
+          expect(record?.note).toContain("edit budget spent");
+        });
+
+        it("cannot widen the attempt limit: a negative attemptCount restarts the epoch on the bound every epoch has", async () => {
+          let analyzerCalls = 0;
+          using fixture = await createFixture({
+            modelFactory: () =>
+              new MockLanguageModelV3({
+                doStream: (options) => {
+                  if (systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT) {
+                    return Promise.resolve({ stream: noChangesStream() });
+                  }
+                  analyzerCalls++;
+                  return Promise.resolve({ stream: failingStream() });
+                },
+              }),
+          });
+          const metadata = await seedCompactionEpoch(fixture);
+          expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+          expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+            status: "failed",
+            attemptCount: 1,
+          });
+          // An attemptCount of -100 used to stay under HARVEST_MAX_ATTEMPTS for 100 more attempts.
+          await editHarvestRecord(fixture, "summary-1", (record) => {
+            record.attemptCount = -100;
+          });
+          analyzerCalls = 0;
+
+          for (let run = 0; run < HARVEST_MAX_ATTEMPTS + 3; run++) {
+            await fixture.service.maybeHarvestThenSweep(metadata);
+          }
+
+          expect(analyzerCalls).toBe(HARVEST_MAX_ATTEMPTS);
+          expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+            status: "failed",
+            attemptCount: HARVEST_MAX_ATTEMPTS,
+          });
+        });
+
+        it.each([
+          ["attemptCount", -1],
+          ["attemptCount", 1.5],
+          ["budgetUsed", -100],
+          ["budgetUsed", 1.5],
+          ["nextChunk", -1],
+          ["nextChunkOps", -1],
+        ])("drops a record whose %s is %d on load", async (field, value) => {
+          const models = archivePassModels();
+          using fixture = await createFixture({ modelFactory: models.factory });
+          await appendRows(fixture, openRowTexts);
+          expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+          expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).not.toBeNull();
+          await editHarvestRecord(fixture, "open:open-2", (record) => {
+            record[field] = value;
+          });
+
+          expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toBeNull();
+        });
+      });
+
+      it("takes an archive record from before `readThroughRowId` to have read up to the row its key names", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await editHarvestRecord(fixture, "open:open-2", (record) => {
+          expect(record.readThroughRowId).toBe("open-2");
+          delete record.readThroughRowId;
+        });
+
+        await fixture.service.maybeHarvestThenSweep(await closeEpochWithoutNewRows(fixture));
+
+        expect(analyzerRuns(models)).toHaveLength(1);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          nextChunk: 0,
+        });
+      });
+
+      it("keeps a record that read nothing, and reads every row at the compaction that closes the epoch", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        // An archive that found its edit budget spent before its first chunk read no row. The key
+        // still names the newest row, so a floor taken from the key would skip rows nobody read.
+        await editHarvestRecord(fixture, "open:open-2", (record) => {
+          record.readThroughRowId = null;
+        });
+
+        // The record must load: a record that fails the schema is dropped, and the status shows none.
+        expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toMatchObject({
+          boundaryKey: "open:open-2",
+          readThroughRowId: null,
+        });
+        await fixture.service.maybeHarvestThenSweep(await closeEpochWithoutNewRows(fixture));
+
+        expect(analyzerRuns(models)).toHaveLength(2);
+        expect(analyzerRuns(models)[1]?.prompt).toContain("We settled on bun");
+      });
+
+      it("analyzes every row again once the chat was rewound past the row an archive stopped at", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        // Rewind to before the row the archive stopped at, then grow past its old position. A
+        // history sequence is reused after a rewind; a row id never is.
+        expect(
+          (await fixture.historyService.truncateAfterMessage("ws-dream", "open-2")).success
+        ).toBe(true);
+        await appendRows(fixture, [["open-2b", "Actually scripts use pnpm."]]);
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+        const rerun = analyzerRuns(models)[1]?.prompt ?? "";
+        expect(rerun).toContain("Actually scripts use pnpm.");
+        expect(rerun).toContain("We settled on bun");
+      });
+
+      it("keeps the floor of an older archive when a newer one was rewound away", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await appendRows(fixture, [["open-3", "CI pins node 22 for the release job."]]);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        expect(
+          (await fixture.historyService.truncateAfterMessage("ws-dream", "open-3")).success
+        ).toBe(true);
+        await appendRows(fixture, [["open-3b", "CI pins node 24 instead."]]);
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+        // open-2 is still in the chat, so what an archive read up to it stays read.
+        const rerun = analyzerRuns(models)[2]?.prompt ?? "";
+        expect(rerun).toContain("CI pins node 24 instead.");
+        expect(rerun).not.toContain("We settled on bun");
+        expect(rerun).not.toContain("CI pins node 22");
+      });
+    });
+
+    type EmptyOpenEpoch =
+      | "no history"
+      | "only the boundary"
+      | "only keep-recent tail copies after the boundary";
+    const emptyOpenEpochs: EmptyOpenEpoch[] = [
+      "no history",
+      "only the boundary",
+      "only keep-recent tail copies after the boundary",
+    ];
+
+    async function seedEmptyOpenEpoch(fixture: Fixture, kind: EmptyOpenEpoch): Promise<void> {
+      if (kind === "no history") return;
+      await seedCompactionEpoch(fixture);
+      if (kind === "only the boundary") return;
+      await fixture.historyService.appendToHistory(
+        "ws-dream",
+        createMuxMessage("tail-copy", "user", "A row the closed epoch already analyzed.", {
+          synthetic: true,
+          rlmPreservedTailCopy: true,
+        })
+      );
+    }
+
+    it.each(emptyOpenEpochs)("makes no analyzer call for an open epoch with %s", async (kind) => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await seedEmptyOpenEpoch(fixture, kind);
+
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+      expect(models.runs.map((run) => run.kind)).toEqual(["dream"]);
+      expect(fixture.modelCalls).toHaveLength(1);
+      expect(await harvestRecords(fixture)).toEqual({});
+    });
+
+    describe("the epoch's one edit budget", () => {
+      const appliedEdits = (records: Record<string, MemoryHarvestRecordPayload>): number =>
+        Object.values(records).reduce(
+          (total, record) => total + (record.ops ?? []).filter((op) => op.applied).length,
+          0
+        );
+
+      it("cannot be spent again by archiving after each new row: the epoch gets MEMORY_ANALYZER_OP_BUDGET edits in all", async () => {
+        const models = editsEveryRunModels(3);
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        // Each cycle is an archive, an unarchive and a new row. Each archive tries 3 edits: the
+        // first two get 3 and 3, the third gets the 2 that are left, the fourth none.
+        for (const row of ["open-3", "open-4", "open-5"]) {
+          expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+          await appendRows(fixture, [[row, `Another fact in ${row}.`]]);
+        }
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+        const records = await harvestRecords(fixture);
+        expect(Object.keys(records).sort()).toEqual([
+          "open:open-2",
+          "open:open-3",
+          "open:open-4",
+          "open:open-5",
+        ]);
+        expect(appliedEdits(records)).toBe(MEMORY_ANALYZER_OP_BUDGET);
+        expect(records["open:open-4"]?.ops?.filter((op) => op.applied)).toHaveLength(2);
+        // The last archive found the budget spent: no analyzer call, and a note saying why.
+        expect(records["open:open-5"]).toMatchObject({
+          status: "completed",
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+        });
+        expect(records["open:open-5"]?.note).toContain("edit budget spent");
+        expect(models.analyzerRuns()).toBe(3);
+      });
+
+      it("is spent by the archives before it when the compaction closes the epoch", async () => {
+        const models = editsEveryRunModels(5);
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        expect((await harvestRecords(fixture))["open:open-2"]?.budgetUsed).toBe(5);
+
+        await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+
+        // The compaction tried 5 more edits and got the 3 the archive left.
+        const records = await harvestRecords(fixture);
+        expect(records["summary-1"]?.ops?.filter((op) => op.applied)).toHaveLength(3);
+        expect(records["summary-1"]?.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+        expect(appliedEdits(records)).toBe(MEMORY_ANALYZER_OP_BUDGET);
+      });
+
+      it("starts the next epoch on a fresh budget", async () => {
+        const models = editsEveryRunModels(MEMORY_ANALYZER_OP_BUDGET);
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+        // Epoch 1 spent everything on its archive. Epoch 2 is a different epoch.
+        await appendRows(fixture, [["next-1", "Epoch 2 settled on vitest for unit tests."]]);
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+        const next = (await harvestRecords(fixture))["open:next-1"];
+        expect(next?.ops?.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
+      });
+
+      it("does not count what a rewound-away timeline of the epoch spent", async () => {
+        const models = editsEveryRunModels(MEMORY_ANALYZER_OP_BUDGET);
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        // Rewind to before the row the archive stopped at: the new rows are a new timeline of
+        // the same epoch, which an epoch number alone cannot tell apart.
+        expect(
+          (await fixture.historyService.truncateAfterMessage("ws-dream", "open-1")).success
+        ).toBe(true);
+        await appendRows(fixture, [["open-2b", "Actually scripts use pnpm."]]);
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+        const rerun = (await harvestRecords(fixture))["open:open-2b"];
+        expect(rerun?.ops?.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
+      });
+    });
+
+    describe("a sub-agent's archive", () => {
+      const refusal = "share their owner's workspace memory";
+
+      it("analyzes its open epoch into the owner's workspace memory, without a final dream for it", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await appendRows(fixture, openRowTexts, "ws-sub");
+
+        const result = await fixture.service.maybeRunArchivePass("ws-sub");
+
+        // The owner's archive pass promotes: the child's own pass is still refused, after analyzing.
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain(refusal);
+        expect(models.runs.map((run) => run.kind)).toEqual(["analyzer"]);
+        expect(models.runs[0]?.prompt).toContain("We settled on bun");
+        expect(await readNote(fixture, 1)).toContain("analyzer note 1");
+        expect(await harvestRecords(fixture, "ws-sub")).toMatchObject({
+          "open:open-2": { status: "completed", nextChunk: 1, acceptedCandidates: 1 },
+        });
+        expect(await harvestRecords(fixture)).toEqual({});
+        expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+      });
+
+      it("does not analyze rows it already analyzed, and still refuses after a failed analysis", async () => {
+        const models = archivePassModels({ analyzerFailures: 1 });
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await appendRows(fixture, openRowTexts, "ws-sub");
+
+        const failed = await fixture.service.maybeRunArchivePass("ws-sub");
+        expect(failed.success).toBe(false);
+        if (!failed.success) expect(failed.error).toContain(refusal);
+        expect(await harvestRecords(fixture, "ws-sub")).toMatchObject({
+          "open:open-2": { status: "failed", attemptCount: 1 },
+        });
+
+        await fixture.service.maybeRunArchivePass("ws-sub");
+        await fixture.service.maybeRunArchivePass("ws-sub");
+
+        // The retry completed the epoch; the third archive found nothing new to read.
+        expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "analyzer"]);
+        expect(await harvestRecords(fixture, "ws-sub")).toMatchObject({
+          "open:open-2": { status: "completed", attemptCount: 2 },
+        });
+      });
+
+      it("makes no model call for a sub-agent with no rows to analyze", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+
+        const result = await fixture.service.maybeRunArchivePass("ws-sub");
+
+        expect(result.success).toBe(false);
+        expect(fixture.modelCalls).toHaveLength(0);
+      });
+    });
+
+    describe("a task-tree archive", () => {
+      /**
+       * The deterministic arrival of the owner's pass at its wait for the sub-agents' passes,
+       * which is the one point a test can tell "waiting" from "has not got there yet".
+       */
+      function ownerWaitsForSubAgents(): { arrived: Promise<void>; restore: () => void } {
+        let arrive!: () => void;
+        const arrived = new Promise<void>((resolve) => (arrive = resolve));
+        const debug = spyOn(log, "debug").mockImplementation((message) => {
+          if (String(message).includes("waiting for sub-agent archive analyses")) arrive();
+        });
+        return { arrived, restore: () => debug.mockRestore() };
+      }
+
+      /** Which happens first: the owner's pass starts waiting, or it finishes without waiting. */
+      function whatComesFirst(
+        wait: ReturnType<typeof ownerWaitsForSubAgents>,
+        owner: Promise<unknown>
+      ): Promise<"owner is waiting" | "owner finished"> {
+        return Promise.race([
+          wait.arrived.then(() => "owner is waiting" as const),
+          owner.then(() => "owner finished" as const),
+        ]);
+      }
+
+      it("starts the owner's final dream only after a sub-agent's analysis into the owner's memory settled", async () => {
+        let releaseChild!: () => void;
+        const models = archivePassModels({
+          holdFirstAnalyzer: new Promise<void>((resolve) => (releaseChild = resolve)),
+        });
+        using fixture = await createFixture({ modelFactory: models.factory });
+        models.readFirstNote.current = () => readNote(fixture, 1);
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await appendRows(fixture, openRowTexts, "ws-sub");
+        const wait = ownerWaitsForSubAgents();
+        try {
+          // The order of a task-tree archive: archive's own trigger starts each sub-agent's pass
+          // in the background, then the owner's follows.
+          fixture.service.triggerInBackground("ws-sub", "archive");
+          await models.firstAnalyzerStarted;
+          const owner = fixture.service.maybeRunArchivePass("ws-dream");
+
+          // The owner settling first would mean it ran its dream while the child's analysis,
+          // still held, could yet write to its memory.
+          expect(await whatComesFirst(wait, owner)).toBe("owner is waiting");
+          expect(models.runs.map((run) => run.kind)).toEqual(["analyzer"]);
+
+          releaseChild();
+          expect((await owner).success).toBe(true);
+          expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream"]);
+          // The dream saw what the sub-agent's analyzer wrote, so it could promote it.
+          expect(models.runs[1]?.noteAtStart).toContain("analyzer note 1");
+        } finally {
+          releaseChild();
+          wait.restore();
+        }
+      });
+
+      it("counts a sub-agent's archive pass as in flight from the call that triggers it", async () => {
+        // The owner's pass reaches its wait after disk reads, so a registration that slips by an
+        // await or a microtask still lands before that wait in every ordering a pass-against-pass
+        // race can produce. The wait itself, evaluated in the frame right after the trigger, is
+        // the one place a gap shows: a registration made later finds no pass there and returns.
+        let releaseChild!: () => void;
+        const models = archivePassModels({
+          holdFirstAnalyzer: new Promise<void>((resolve) => (releaseChild = resolve)),
+        });
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await appendRows(fixture, openRowTexts, "ws-sub");
+        const waitForSubAgents = (
+          fixture.service as unknown as {
+            awaitDescendantArchivePasses: (ownerId: string, signal: AbortSignal) => Promise<void>;
+          }
+        ).awaitDescendantArchivePasses.bind(fixture.service);
+        try {
+          fixture.service.triggerInBackground("ws-sub", "archive");
+          const ownerWait = waitForSubAgents("ws-dream", new AbortController().signal);
+
+          // Held in its analyzer, the child's pass cannot end, so the wait is pending unless it
+          // missed the pass.
+          await models.firstAnalyzerStarted;
+          const first = await Promise.race([
+            ownerWait.then(() => "wait ended"),
+            new Promise<string>((resolve) => setImmediate(() => resolve("still waiting"))),
+          ]);
+          expect(first).toBe("still waiting");
+
+          releaseChild();
+          await ownerWait;
+        } finally {
+          releaseChild();
+        }
+      });
+
+      it("stops waiting for the sub-agents when the owner is removed, and runs no dream", async () => {
+        let releaseChild!: () => void;
+        const models = archivePassModels({
+          holdFirstAnalyzer: new Promise<void>((resolve) => (releaseChild = resolve)),
+        });
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await appendRows(fixture, openRowTexts, "ws-sub");
+        const wait = ownerWaitsForSubAgents();
+        try {
+          const child = fixture.service.maybeRunArchivePass("ws-sub");
+          await models.firstAnalyzerStarted;
+          const owner = fixture.service.maybeRunArchivePass("ws-dream");
+          expect(await whatComesFirst(wait, owner)).toBe("owner is waiting");
+
+          // The child's analysis is still held: removal must not wait for it.
+          await fixture.service.cancelInFlightConsolidation("ws-dream");
+          const result = await owner;
+
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error).toContain("being removed");
+          expect(models.runs.map((run) => run.kind)).toEqual(["analyzer"]);
+          releaseChild();
+          await child;
+        } finally {
+          releaseChild();
+          wait.restore();
+        }
+      });
+
+      it("does not wait for the archive pass of a workspace outside the owner's task tree", async () => {
+        // The other pass is held before it takes any turn: every analyzer chunk and dream shares
+        // one stream exclusion, so holding its stream would hold up the owner for that reason.
+        let releaseOther!: () => void;
+        const otherHeld = new Promise<void>((resolve) => (releaseOther = resolve));
+        let otherReading!: () => void;
+        const otherReached = new Promise<void>((resolve) => (otherReading = resolve));
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-other");
+        await appendRows(fixture, openRowTexts, "ws-other");
+        const readHistory = fixture.historyService.getHistoryFromLatestBoundary.bind(
+          fixture.historyService
+        );
+        spyOn(fixture.historyService, "getHistoryFromLatestBoundary").mockImplementation(
+          async (...args: Parameters<typeof readHistory>) => {
+            if (args[0] === "ws-other") {
+              otherReading();
+              await otherHeld;
+            }
+            return readHistory(...args);
+          }
+        );
+        const wait = ownerWaitsForSubAgents();
+        try {
+          const other = fixture.service.maybeRunArchivePass("ws-other");
+          await otherReached;
+
+          // Settles while the other workspace's pass is held: no wait on it. Only the owner's
+          // dream runs (its own open epoch is empty).
+          const owner = fixture.service.maybeRunArchivePass("ws-dream");
+          expect(await whatComesFirst(wait, owner)).toBe("owner finished");
+          expect((await owner).success).toBe(true);
+          expect(models.runs.map((run) => run.kind)).toEqual(["dream"]);
+          releaseOther();
+          await other;
+        } finally {
+          releaseOther();
+          wait.restore();
+        }
+      });
+    });
+
+    it("still runs the final dream when the open epoch cannot be read", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await appendRows(fixture, openRowTexts);
+      const read = spyOn(
+        fixture.historyService,
+        "getHistoryFromLatestBoundary"
+      ).mockResolvedValueOnce(Err("history file unreadable"));
+
+      const result = await fixture.service.maybeRunArchivePass("ws-dream");
+
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+      expect(models.runs.map((run) => run.kind)).toEqual(["dream"]);
+      expect(await harvestRecords(fixture)).toEqual({});
+    });
+
+    it("still runs the final dream when the analysis itself throws", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await appendRows(fixture, openRowTexts);
+      spyOn(fixture.historyService, "getHistoryFromLatestBoundary").mockRejectedValueOnce(
+        new Error("history read exploded")
+      );
+
+      const result = await fixture.service.maybeRunArchivePass("ws-dream");
+
+      expect(result.success).toBe(true);
+      expect(models.runs.map((run) => run.kind)).toEqual(["dream"]);
+    });
+
+    it("still runs the final dream after a failed analysis, and retries that analysis on the next archive", async () => {
+      const models = archivePassModels({ analyzerFailures: 1 });
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await appendRows(fixture, openRowTexts);
+
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+      expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream"]);
+      expect(await harvestRecords(fixture)).toMatchObject({
+        "open:open-2": { status: "failed", attemptCount: 1 },
+      });
+
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+      expect(models.runs.map((run) => run.kind)).toEqual([
+        "analyzer",
+        "dream",
+        "analyzer",
+        "dream",
+      ]);
+      expect(await harvestRecords(fixture)).toMatchObject({
+        "open:open-2": { status: "completed", attemptCount: 2 },
+      });
+    });
+
+    it("queues an archive behind the active pass, so rows added meanwhile are analyzed", async () => {
+      let releaseFirstAnalyzer!: () => void;
+      const models = archivePassModels({
+        holdFirstAnalyzer: new Promise<void>((resolve) => (releaseFirstAnalyzer = resolve)),
+      });
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await appendRows(fixture, openRowTexts);
+
+      const first = fixture.service.maybeRunArchivePass("ws-dream");
+      await models.firstAnalyzerStarted;
+      // An unarchive, more chat and a second archive, all inside the first pass.
+      await appendRows(fixture, [["open-3", "CI pins node 22 for the release job."]]);
+      const second = fixture.service.maybeRunArchivePass("ws-dream");
+      releaseFirstAnalyzer();
+      expect((await first).success).toBe(true);
+      expect((await second).success).toBe(true);
+
+      expect(models.runs.map((run) => run.kind)).toEqual([
+        "analyzer",
+        "dream",
+        "analyzer",
+        "dream",
+      ]);
+      expect(models.runs[2]?.prompt).toContain("CI pins node 22");
+    });
+
+    it("is what archive's background trigger runs", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await appendRows(fixture, openRowTexts);
+
+      fixture.service.triggerInBackground("ws-dream", "archive");
+      // The trigger is fire-and-forget: wait for its two runs (bounded: 2 s).
+      for (let tick = 0; tick < 400 && models.runs.length < 2; tick++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+
+      expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream"]);
+    });
+
+    it("lets the removal drain abort an analysis in flight and stops before the dream", async () => {
+      let analyzerStarted!: () => void;
+      const started = new Promise<void>((resolve) => (analyzerStarted = resolve));
+      using fixture = await createFixture({
+        modelFactory: () =>
+          new MockLanguageModelV3({
+            doStream: (call) => {
+              analyzerStarted();
+              return new Promise((_resolve, reject) => {
+                call.abortSignal?.addEventListener("abort", () =>
+                  reject(new Error("stalled provider call aborted"))
+                );
+              });
+            },
+          }),
+      });
+      await appendRows(fixture, openRowTexts);
+
+      const pass = fixture.service.maybeRunArchivePass("ws-dream");
+      await started;
+      await fixture.service.cancelInFlightConsolidation("ws-dream");
+      const result = await pass;
+
+      // Only the analyzer's stream was ever opened: the removed workspace gets no final dream.
+      expect(fixture.modelCalls).toHaveLength(1);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("being removed");
+    });
   });
 
   it("does not treat a run of many chunks as stale while its chunks keep finishing", async () => {
@@ -3657,5 +5131,120 @@ describe("MemoryConsolidationService", () => {
       return cfg;
     });
     expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("anthropic:explicit-dream");
+  });
+});
+
+describe("staleExhaustedHarvestFailure", () => {
+  const pendingRecord = (overrides: Partial<MemoryHarvestRecordPayload> = {}) =>
+    ({
+      status: "pending",
+      startedAt: Date.now() - 10 * 60 * 1000,
+      attemptCount: HARVEST_MAX_ATTEMPTS,
+      boundaryKey: "summary-1",
+      compactionEpoch: 1,
+      acceptedCandidates: 2,
+      skippedCandidates: 1,
+      nextChunk: 3,
+      ...overrides,
+    }) satisfies MemoryHarvestRecordPayload;
+
+  it("fails a stale pending record that used its last attempt, keeping what it had read", () => {
+    const before = Date.now();
+    const failed = staleExhaustedHarvestFailure(pendingRecord());
+
+    expect(failed).toMatchObject({
+      status: "failed",
+      attemptCount: HARVEST_MAX_ATTEMPTS,
+      acceptedCandidates: 2,
+      skippedCandidates: 1,
+      nextChunk: 3,
+      error: "stale pending harvest exceeded retry attempts",
+    });
+    expect(failed?.completedAt).toBeGreaterThanOrEqual(before);
+  });
+
+  it("keeps the error an earlier attempt already recorded", () => {
+    expect(staleExhaustedHarvestFailure(pendingRecord({ error: "stream timed out" }))?.error).toBe(
+      "stream timed out"
+    );
+  });
+
+  it("leaves a record that a retry or a live run still owns", () => {
+    expect(staleExhaustedHarvestFailure(undefined)).toBeUndefined();
+    // Alive: its last sign of life is inside the timeout.
+    expect(
+      staleExhaustedHarvestFailure(pendingRecord({ progressAt: Date.now() - 1000 }))
+    ).toBeUndefined();
+    // Stale, but an attempt is left.
+    expect(
+      staleExhaustedHarvestFailure(pendingRecord({ attemptCount: HARVEST_MAX_ATTEMPTS - 1 }))
+    ).toBeUndefined();
+    for (const status of ["completed", "failed"] as const) {
+      expect(staleExhaustedHarvestFailure(pendingRecord({ status }))).toBeUndefined();
+    }
+  });
+});
+
+describe("harvestResumeState", () => {
+  it("starts a first attempt at the first chunk with nothing read and no floor", () => {
+    const { progress, attemptState } = harvestResumeState(undefined);
+
+    expect(progress).toEqual({
+      nextChunk: 0,
+      ops: [],
+      budgetUsed: undefined,
+      nextChunkOps: undefined,
+      readThroughRowId: undefined,
+      usage: undefined,
+    });
+    expect(attemptState.analyzedFloorRowId).toBeUndefined();
+  });
+
+  it("resumes a retry from the cursor, budget, read-through row and floor of the record", () => {
+    const ops = [{ command: "create" as const, path: "/memory/a.md", applied: true }];
+    const usage = { inputTokens: 10, outputTokens: 4 };
+    const { progress, attemptState } = harvestResumeState({
+      status: "failed",
+      startedAt: 1,
+      attemptCount: 1,
+      boundaryKey: "summary-1",
+      compactionEpoch: 1,
+      acceptedCandidates: 1,
+      skippedCandidates: 0,
+      nextChunk: 2,
+      ops,
+      budgetUsed: 5,
+      nextChunkOps: 1,
+      readThroughRowId: "row-9",
+      usage,
+      analyzedFloorRowId: "row-3",
+    });
+
+    expect(progress).toEqual({
+      nextChunk: 2,
+      ops,
+      budgetUsed: 5,
+      nextChunkOps: 1,
+      readThroughRowId: "row-9",
+      usage,
+    });
+    expect(attemptState.analyzedFloorRowId).toBe("row-3");
+  });
+
+  it("keeps a null floor (an attempt that found no earlier run) apart from an absent one", () => {
+    const record = {
+      status: "failed",
+      startedAt: 1,
+      attemptCount: 1,
+      boundaryKey: "summary-1",
+      compactionEpoch: 1,
+      acceptedCandidates: 0,
+      skippedCandidates: 0,
+    } satisfies MemoryHarvestRecordPayload;
+
+    expect(
+      harvestResumeState({ ...record, analyzedFloorRowId: null }).attemptState.analyzedFloorRowId
+    ).toBeNull();
+    expect(harvestResumeState(record).attemptState.analyzedFloorRowId).toBeUndefined();
   });
 });

@@ -116,10 +116,10 @@ export const CompactionCompletionMetadataSchema = z.object({
 const PersistedCountSchema = z.number().int().nonnegative();
 
 /**
- * One analyzer run over a closed compaction epoch (the "harvest"). The two candidate counts keep
- * their names and stay required so older binaries still parse the record: they hold the memory
- * edits that landed and the ones the memory tool rejected. `nextChunk` and `ops` are optional for
- * the same reason, and for records written before the analyzer.
+ * One analyzer run over a closed or open compaction epoch (the "harvest"). The two candidate
+ * counts keep their names and stay required so older binaries still parse the record: they hold
+ * the memory edits that landed and the ones the memory tool rejected. `nextChunk` and `ops` are
+ * optional for the same reason, and for records written before the analyzer.
  */
 export const MemoryHarvestRecordSchema = z.object({
   status: z.enum(["pending", "completed", "failed"]),
@@ -142,17 +142,34 @@ export const MemoryHarvestRecordSchema = z.object({
   ops: z.array(MemoryConsolidationOpSchema).optional(),
   /**
    * Mutations the epoch's budget has spent, dispatch failures included, which `ops` alone
-   * undercounts. A retry resumes the budget from it. Optional so older binaries parse the record.
+   * undercounts. A retry resumes the budget from it, and a new record of the same epoch (an
+   * archive after new rows, the compaction that closes it) starts from the most spent record's.
+   * Optional so older binaries parse the record.
    */
   budgetUsed: PersistedCountSchema.optional(),
   /** How many of the last `ops` came from the chunk `nextChunk`, which no attempt finished. */
   nextChunkOps: PersistedCountSchema.optional(),
+  /**
+   * The row of this epoch an earlier run (an archive, or the compaction that closed the epoch under
+   * an archive's snapshot) had analyzed up to when the first attempt's analyzer turn began (null:
+   * none), so the run reads the rows after it. A retry reuses it instead of looking again: a run
+   * that completes later must not move the rows under the saved chunk cursor. Absent before an attempt's turn began, and in older records.
+   */
+  analyzedFloorRowId: z.string().nullish(),
   error: z.string().optional(),
   /**
    * Why a completed run did not read every chunk: the epoch's edit budget ran out, so the model
    * calls of the remaining chunks were skipped. Optional so older binaries parse the record.
    */
   note: z.string().optional(),
+  /**
+   * The newest row of the epoch the run read completely (null: none). It is behind the newest row
+   * when the run skipped chunks for its budget: the floor of a later run is this row, not the
+   * newest one. A failed run records the last chunk it read cleanly, whose edits landed. Absent in
+   * older records, which read up to the row their key names (a failed one read nothing known; a
+   * closed epoch's key is its summary, no row, so such a record names none).
+   */
+  readThroughRowId: z.string().nullish(),
   /**
    * Tokens of every chunk stream that finished cleanly, across attempts. A pending or failed
    * record carries them so the retry that completes the epoch adds to them. Optional so older
