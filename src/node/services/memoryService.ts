@@ -51,6 +51,11 @@ import {
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import {
+  REDACTED,
+  containsSecretLike,
+  redactSecretLike,
+} from "@/node/services/memorySecretRedaction";
+import {
   adoptionTargetPresence,
   adoptionTargetStamp,
   legacyAdoptionManifestPath,
@@ -3078,7 +3083,8 @@ export class MemoryService extends EventEmitter {
     fileText: string,
     actor: MemoryActor,
     toolCallId?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options?: MemoryWriteOptions
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -3104,6 +3110,7 @@ export class MemoryService extends EventEmitter {
             `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
           );
         }
+        assertNoNewSecret(options, "", fileText, virtualPath);
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, fileText);
         // Row is written before the create is acknowledged (mutation → row → ack).
@@ -3132,7 +3139,8 @@ export class MemoryService extends EventEmitter {
     newStr: string,
     actor: MemoryActor,
     toolCallId?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options?: MemoryWriteOptions
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -3145,6 +3153,7 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
         assertWithinFileSizeCap(updated);
+        assertNoNewSecret(options, content, updated, virtualPath);
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
@@ -3174,7 +3183,8 @@ export class MemoryService extends EventEmitter {
     actor: MemoryActor,
     toolCallId?: string,
     expectedFingerprint?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options?: MemoryWriteOptions
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -3198,6 +3208,7 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
         assertWithinFileSizeCap(updated);
+        assertNoNewSecret(options, content, updated, virtualPath);
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
@@ -3854,6 +3865,45 @@ function computeInsertUpdate(
   if (insertedLines.at(-1) === "") insertedLines.pop();
   lines.splice(insertLine, 0, ...insertedLines);
   return { updated: lines.join("\n"), insertedLineCount: insertedLines.length };
+}
+
+/** Opt-in rails for a content-writing command (create, str_replace, insert). */
+export interface MemoryWriteOptions {
+  /**
+   * Refuse a write whose RESULTING file holds a credential shape the file did not already hold
+   * (see assertNoNewSecret). Checked INSIDE the mutation lock, against the content the write is
+   * about to replace: a check on the new text alone misses a credential that two calls assemble
+   * (`sk-` and a newline, then a replacement that drops the newline), and one run before the lock
+   * would judge a file another writer changes before this one lands.
+   */
+  rejectSecretLike?: boolean;
+}
+
+/** How many credential shapes `text` holds: the markers its redaction leaves. */
+function secretShapeCount(text: string): number {
+  return redactSecretLike(text).split(REDACTED).length - 1;
+}
+
+/**
+ * Refusal rule of `rejectSecretLike`: the result is credential-like and holds more credential
+ * shapes than `previous` did. A file that already held such text (a user's note, a placeholder the
+ * detector flags) stays editable where an edit adds none, since that text is the organizer's to
+ * clean, not a reason to freeze the file; an edit that assembles a new key there is still refused.
+ * The limit: an edit that removes one shape and assembles another keeps the count and passes. The
+ * message never quotes the content: the caller journals it.
+ */
+function assertNoNewSecret(
+  options: MemoryWriteOptions | undefined,
+  previous: string,
+  updated: string,
+  virtualPath: string
+): void {
+  if (options?.rejectSecretLike !== true) return;
+  if (!containsSecretLike(updated)) return;
+  if (secretShapeCount(updated) <= secretShapeCount(previous)) return;
+  throw new MemoryCommandError(
+    `${virtualPath} was not changed: the file would contain a credential-like value (a key, token, password or private key) after this edit. Memory must never hold secrets; say what the credential is for and where it lives, and leave the value out.`
+  );
 }
 
 /**

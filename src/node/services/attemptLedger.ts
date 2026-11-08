@@ -11,6 +11,7 @@ import {
   retiredAttemptMessage,
 } from "@/constants/agentMessaging";
 import { Err, Ok, type Result } from "@/common/types/result";
+import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { TaskAttemptOutcome, TaskAttemptSettlement } from "@/common/types/tasks";
 import type { Config, ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
@@ -334,11 +335,13 @@ export class AttemptLedger {
     if (identity.attemptId != null) {
       assertTaskAttemptId(identity.attemptId, "beginOwnedTaskAttempt");
     }
+    const row = findWorkspaceEntry(this.deps.config().loadConfigOrDefault(), taskId)?.workspace;
     const attempt: OwnedTaskAttempt = {
       generation: (this.ownedAttemptByTaskId.get(taskId)?.generation ?? 0) + 1,
       source,
       attemptId: identity.attemptId,
       receiptEligible: identity.receiptEligible,
+      inheritedReport: row != null && hasCompletedAgentReport(row),
       ...(identity.abortSignal != null ? { abortSignal: identity.abortSignal } : {}),
     };
     this.ownedAttemptByTaskId.set(taskId, attempt);

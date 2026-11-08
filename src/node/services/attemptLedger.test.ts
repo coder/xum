@@ -201,6 +201,19 @@ function begin(
 
 describe("AttemptLedger", () => {
   describe("attempt identity", () => {
+    test("an attempt records whether its row already read a completed report when it began", () => {
+      const { ledger, state } = createHarness();
+      expect(begin(ledger, ATTEMPT).inheritedReport).toBe(false);
+      // A reactivated or reawakened task keeps its predecessor's terminal status.
+      state.config = configWithRow({
+        parentWorkspaceId: PARENT,
+        taskAttemptId: OTHER,
+        taskStatus: "reported",
+        reportedAt: "2026-10-01T00:00:00.000Z",
+      });
+      expect(begin(ledger, OTHER).inheritedReport).toBe(true);
+    });
+
     test("a new attempt replaces the owner, bumps its generation and drops the stream-end decisions", () => {
       const { ledger, events } = createHarness();
       const first = begin(ledger, ATTEMPT);
@@ -393,6 +406,7 @@ describe("AttemptLedger", () => {
         attempt: undefined,
         attemptId: ATTEMPT,
         messageId: "msg-1",
+        inheritedReport: false,
         outcome,
         turn: undefined,
       };
@@ -896,6 +910,7 @@ describe("AttemptLedger", () => {
         attempt: undefined,
         attemptId: ATTEMPT,
         messageId: "msg-1",
+        inheritedReport: false,
         outcome,
         turn: undefined,
       });

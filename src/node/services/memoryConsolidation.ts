@@ -22,6 +22,8 @@
  *
  * Every mutating command is journaled ({command, path, applied, rejected})
  * for the audit trail that feeds the Memory tab's "last consolidated" line.
+ * Refused commands spend no budget, so their rows are capped
+ * (MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES) and so is a path's length.
  * Global-scope writes are intentionally permitted (merging into global files
  * is core consolidation work); they remain auditable in the journal via the
  * /memories/global/ path prefix.
@@ -34,8 +36,10 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import assert from "@/common/utils/assert";
 import {
+  MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES,
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   type MemoryScope,
 } from "@/common/constants/memory";
 import type { MemoryToolResult } from "@/common/types/tools";
@@ -88,6 +92,7 @@ const CANCELLED_PASS_ERROR = "Consolidation pass was cancelled";
 const DEFAULT_WRITABLE_SCOPES: readonly WritableMemoryScope[] = ["workspace", "global", "project"];
 const LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
 const MUTATING_COMMANDS = MemoryConsolidationOpSchema.shape.command.options;
+const JOURNAL_FULL_NOTE = "The journal is full; later refusals of this run are not recorded.";
 
 interface MutationTarget {
   command: MemoryConsolidationOp["command"];
@@ -304,14 +309,31 @@ function deniedCommandRejection(
 }
 
 /**
- * The rails that need no I/O: writable scope, denied command and (opt-in) credential check, in
- * that order. Throws on an invalid path (parseMemoryPath); the tool surfaces that as a tool error.
+ * Why a path (or rename target) is too long to use, or null. First of the rails, before the path is
+ * parsed: its note must not quote it, and a row for it is journaled clipped (see refusalRow).
+ */
+function pathLengthRejection(target: MutationTarget): string | null {
+  const tooLong = [target.path, target.newPath].some(
+    (virtualPath) =>
+      virtualPath !== undefined && virtualPath.length > MEMORY_CONSOLIDATION_PATH_MAX_CHARS
+  );
+  return tooLong
+    ? `A path may be at most ${MEMORY_CONSOLIDATION_PATH_MAX_CHARS} characters long; use a shorter one.`
+    : null;
+}
+
+/**
+ * The rails that need no I/O: path length, writable scope, denied command and (opt-in) credential
+ * check, in that order. Throws on an invalid path (parseMemoryPath); the tool surfaces that as a
+ * tool error.
  */
 function staticRejection(
   rails: MutationRails,
   target: MutationTarget,
   input: MemoryCommandInput
 ): string | null {
+  const lengthRejection = pathLengthRejection(target);
+  if (lengthRejection !== null) return lengthRejection;
   // Whitelist, not blacklist, so scopes added later stay out of bounds by default.
   for (const virtualPath of [target.path, target.newPath]) {
     if (virtualPath == null) continue;
@@ -374,6 +396,61 @@ async function mutationRejection(
         : rails.memoryService.resolveWorkspaceMemoryOwnerId(rails.ctx.workspaceId),
   });
   return pinnedRejection(entries, key, target.path);
+}
+
+type RefusalRow = MemoryConsolidationOp & { note: string };
+
+/**
+ * The journal row of a command a rail refused. The journal is persisted, and a refused path (or
+ * the note that quotes it) may itself be the credential the guard just refused. A path over the
+ * length cap is clipped to it: the row says what was refused, not the megabytes it named.
+ */
+function refusalRow(
+  rails: Pick<MutationRails, "rejectSecretLike">,
+  target: MutationTarget,
+  note: string
+): RefusalRow {
+  return {
+    ...persistedTarget(rails, target),
+    applied: false,
+    note: persistedText(rails, note),
+  };
+}
+
+function persistedText(rails: Pick<MutationRails, "rejectSecretLike">, text: string): string {
+  return rails.rejectSecretLike === true ? redactSecretLike(text) : text;
+}
+
+/**
+ * The target as a journal row stores it, refused or applied: a guarded run's journal must not keep
+ * a credential that named a file (a delete or rename of that file included), and a path is clipped
+ * to the length cap.
+ */
+function persistedTarget(
+  rails: Pick<MutationRails, "rejectSecretLike">,
+  target: MutationTarget
+): MutationTarget {
+  const stored = (virtualPath: string): string =>
+    persistedText(rails, virtualPath).slice(0, MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+  return {
+    ...target,
+    path: stored(target.path),
+    ...(target.newPath !== undefined && { newPath: stored(target.newPath) }),
+  };
+}
+
+/**
+ * Journal a refusal while the journal has room. The refusal that reaches the last slot carries the
+ * note that later ones are dropped, and so does the first one after rows of budgeted commands
+ * filled the journal past it: those are pushed directly and always (the budget bounds them), so
+ * the note is recorded once whatever the order, and the journal holds at most one refusal past
+ * the cap. The cap reads the journal itself, so it holds for every tool that shares one (the
+ * analyzer's chunks of a run).
+ */
+function journalRefusal(journal: MemoryConsolidationOp[], row: RefusalRow): void {
+  if (journal.some((op) => op.note?.endsWith(JOURNAL_FULL_NOTE) === true)) return;
+  const reachesLastSlot = journal.length >= MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - 1;
+  journal.push(reachesLastSlot ? { ...row, note: `${row.note} ${JOURNAL_FULL_NOTE}` } : row);
 }
 
 /**
@@ -485,17 +562,7 @@ export function createConsolidationMemoryTool(args: {
         return { success: false, error: getErrorMessage(error) };
       }
       if (rejection !== null) {
-        // The journal is persisted, and a rejected path (or the note that quotes it) may itself be
-        // the credential the guard just refused.
-        const persisted = (text: string): string =>
-          args.rejectSecretLike === true ? redactSecretLike(text) : text;
-        journal.push({
-          ...target,
-          path: persisted(target.path),
-          ...(target.newPath !== undefined && { newPath: persisted(target.newPath) }),
-          applied: false,
-          note: persisted(rejection),
-        });
+        journalRefusal(journal, refusalRow(rails, target, rejection));
         return { success: false, error: rejection };
       }
 
@@ -504,7 +571,7 @@ export function createConsolidationMemoryTool(args: {
       // atomicity lives in MutationBudget.tryConsume).
       if (!budget.tryConsume()) {
         const note = `Mutation budget exhausted (${budget.limit} per run); stop and summarize.`;
-        journal.push({ ...target, applied: false, note });
+        journalRefusal(journal, refusalRow(rails, target, note));
         return { success: false, error: note };
       }
 
@@ -529,11 +596,13 @@ export function createConsolidationMemoryTool(args: {
         expectedTargetFingerprint: args.expectedTargetFingerprints?.get(toolCallId),
         abortSignal: args.abortSignal,
         rejectPinned: true,
+        // The pre-check above sees only the new text; this one sees the file the write would leave.
+        rejectSecretLike: args.rejectSecretLike,
       });
       journal.push({
-        ...target,
+        ...persistedTarget(rails, target),
         applied: result.success,
-        note: result.success ? undefined : result.error,
+        note: result.success ? undefined : persistedText(rails, result.error),
       });
       return result;
     },
@@ -595,14 +664,22 @@ export async function runMemoryConsolidation(args: {
     // filesystem I/O must not commit durable memory (or recreate the deleted
     // session directory via its journal row) once the I/O unblocks.
     abortSignal: args.abortSignal,
+    // What the organizer writes can be promoted to project and global memory, which models of other
+    // workspaces read: refuse credential-like text in code, not only by the prompt's instruction.
+    rejectSecretLike: true,
   });
 
+  // Whatever the final pass promotes lands where models of unrelated projects read it, so a
+  // credential must not travel with it (the dream prompt says the same for the whole pass).
+  const finalPassNoSecrets =
+    " Never promote a credential or other secret-like value: leave the value out and say what it was for.";
   const finalPassPrompt =
     args.finalPass !== true
       ? ""
-      : args.ctx.projectPath === ""
-        ? " This is the FINAL pass for an archived workspace: preserve only cross-project user preferences or environment facts in /memories/global/... before workspace memory is deleted. Project memory is unavailable for this run; do not promote project-specific lessons to global memory."
-        : " This is the FINAL pass for an archived workspace: promote durable workspace lessons before workspace memory is deleted. Move repo-specific lessons to /memories/project/... and only cross-project user preferences or environment facts to /memories/global/....";
+      : (args.ctx.projectPath === ""
+          ? " This is the FINAL pass for an archived workspace: preserve only cross-project user preferences or environment facts in /memories/global/... before workspace memory is deleted. Project memory is unavailable for this run; do not promote project-specific lessons to global memory."
+          : " This is the FINAL pass for an archived workspace: promote durable workspace lessons before workspace memory is deleted. Move repo-specific lessons to /memories/project/... and only cross-project user preferences or environment facts to /memories/global/....") +
+        finalPassNoSecrets;
 
   const meter = createSpendMeter({ pricingModel: args.pricingModel, ceilingUsd: args.ceilingUsd });
   const stream = streamText({
@@ -644,8 +721,11 @@ export async function runMemoryConsolidation(args: {
     (streamCompleted && meter.endedAtOutputLimit()
       ? "memory consolidation ended a step at the model's output limit, so its tool call never ran"
       : undefined);
-  const summary =
-    streamError === undefined ? (await stream.text).trim() : `stream error: ${streamError}`;
+  // The summary is persisted in the sidecar and shown through status IPC: a credential the model
+  // repeats from memory in its closing text must not outlive the guarded writes.
+  const summary = redactSecretLike(
+    streamError === undefined ? (await stream.text).trim() : `stream error: ${streamError}`
+  );
 
   // Cost telemetry: headless runs bypass the chat cost pipeline, so the
   // journal record is the only place token usage is visible. Only awaited on

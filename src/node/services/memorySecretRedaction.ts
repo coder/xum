@@ -11,7 +11,8 @@
  * leave the tail of a long credential readable.
  */
 
-const REDACTED = "[redacted]";
+/** What a redacted value becomes. */
+export const REDACTED = "[redacted]";
 
 /**
  * Callers cut text at a cap. They scan this much past it, so a secret that starts inside the kept
@@ -20,8 +21,10 @@ const REDACTED = "[redacted]";
 export const REDACTION_LOOKAHEAD_CHARS = 512;
 
 // `token` excludes the plural so `max_tokens: 4096` and `input_tokens` stay readable.
-// `AccountKey` is the Azure storage connection string's secret; a key named `bearer` holds the token.
-const SECRET_NAME = String.raw`(?:api[_-]?key|account[_-]?key|secret|token(?!s\b)|bearer|passw(?:or)?d|authorization|credential)`;
+// `AccountKey` is the Azure storage connection string's secret and `SharedAccessKey` the Service Bus
+// and Event Hubs one (its sibling `SharedAccessKeyName` is the policy's name, so it stays readable,
+// as `AccountName` does); a key named `bearer` holds the token.
+const SECRET_NAME = String.raw`(?:api[_-]?key|account[_-]?key|shared[_-]?access[_-]?key(?![_-]?name)|secret|token(?!s\b)|bearer|passw(?:or)?d|authorization|credential)`;
 // Longest run after the name (`secret_access_key`, `token_endpoint_auth_method`) and widest gap
 // of spaces around the separator that still count. Past these a pair is not recognized.
 const NAME_SUFFIX_MAX = 48;
