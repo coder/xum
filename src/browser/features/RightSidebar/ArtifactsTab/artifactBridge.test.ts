@@ -1191,8 +1191,14 @@ describe("hash routes", () => {
     }
   }
 
-  function mount(script: string) {
+  /** `replaceStateThrows`: History.replaceState fails, as in Safari after 100 calls in 30 s. */
+  function mount(script: string, options: { replaceStateThrows?: boolean } = {}) {
     const { win, restore } = srcdocWindow();
+    if (options.replaceStateThrows) {
+      win.History.prototype.replaceState = () => {
+        throw new win.DOMException("Too many history changes", "SecurityError");
+      };
+    }
     const doc = win.document;
     doc.body.innerHTML = `
       <a id="alpha" href="#/s/alpha">Alpha</a>
@@ -1286,6 +1292,41 @@ describe("hash routes", () => {
         click("alpha");
         expect(events).toHaveLength(2);
         expect(win.location.hash).toBe("#/s/alpha");
+      } finally {
+        await restore();
+      }
+    }
+  );
+
+  test.each(scripts)(
+    "%s: the fragment is set with the original replaceState, not the artifact's",
+    async (_name, script) => {
+      const { win, restore, click } = mount(script);
+      try {
+        // An artifact (or a library) that wraps History after the script ran.
+        const patched: unknown[][] = [];
+        win.History.prototype.replaceState = (...args: unknown[]) => void patched.push(args);
+        click("alpha");
+        expect(patched).toEqual([]);
+        expect(win.location.href).toBe("about:srcdoc#/s/alpha");
+      } finally {
+        await restore();
+      }
+    }
+  );
+
+  test.each(scripts)(
+    "%s: when replaceState throws, the link still jumps and fires no events",
+    async (_name, script) => {
+      const { win, restore, events, scrolled, click } = mount(script, {
+        replaceStateThrows: true,
+      });
+      try {
+        click("intro-link");
+        expect(scrolled).toEqual(["intro"]);
+        click("alpha");
+        expect(win.location.href).toBe("about:srcdoc");
+        expect(events).toEqual([]);
       } finally {
         await restore();
       }

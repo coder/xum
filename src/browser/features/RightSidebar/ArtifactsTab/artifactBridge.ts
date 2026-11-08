@@ -599,7 +599,8 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
       historyProto.pushState = inDocument(historyProto.pushState);
       historyProto.replaceState = inDocument(nativeReplaceState);
     }
-    // The original replaceState: the artifact can patch History.prototype.replaceState.
+    // The original replaceState: the artifact can patch History.prototype.replaceState. It can throw:
+    // WebKit allows 100 calls in 30 s per frame, so then the link jumps and fires no event.
     function replaceFragment(fragment) {
       if (window.location.hash.slice(1) === fragment) return false;
       try {
