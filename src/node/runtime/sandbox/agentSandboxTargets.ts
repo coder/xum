@@ -223,13 +223,26 @@ export function buildAgentSandboxPolicy(
   // Xum and its git use these as spelled, outside the sandbox, so a command could replace a link
   // to one in a write root (Codex review): fail closed.
   assertNoPathThroughLink([getXumHome(), ...automationSpellings], writeRoots);
-  const linkedEntries = automationEntryLinkTargets();
+  const linkedEntries = automationEntryLinkTargets(writeRoots);
   const readableAutomation = [...readableSpellings.map(expandSandboxPath), ...linkedEntries];
   const automationPaths = [...automationSpellings.map(expandSandboxPath), ...linkedEntries];
   assertNoWriteRootInAutomation(writeRoots, automationPaths);
   // A background command starts in a temp folder and gets its checkout in workspaceRoots.
   const gitCommonDirs = dedupe(
     [cwd, ...extraWorkspaceRoots].flatMap((root) => findGitCommonDir(root) ?? [])
+  );
+  const configIncludePaths = [
+    ...gitConfigIncludes([...workspaceRoots, ...extraWriteRoots], gitCommonDirs),
+    ...sshConfigIncludes(),
+  ];
+  // Git and ssh open these as spelled, and git follows a `.git` link to whatever git folder a
+  // command points it at (Codex review).
+  assertNoPathThroughLink(
+    [
+      ...configIncludePaths,
+      ...[...workspaceRoots, ...extraWriteRoots].map((root) => path.join(root, ".git")),
+    ],
+    writeRoots
   );
   const denyWrite = dedupe(
     [
@@ -243,8 +256,7 @@ export function buildAgentSandboxPolicy(
         ...automationPaths,
         ...cacheExecutablePaths().map(expandSandboxPath),
         ...homeLinkTargets(home, writeRoots),
-        ...gitConfigIncludes([...workspaceRoots, ...extraWriteRoots], gitCommonDirs),
-        ...sshConfigIncludes(),
+        ...configIncludePaths.map(realpathOfNearest),
       ].filter((denied) => isUnderAny(denied, writeRoots)),
     ].flatMap(withLinkTarget)
   );
@@ -306,7 +318,8 @@ function assertNoWriteRootInAutomation(
 function assertNoPathThroughLink(spelled: readonly string[], writeRoots: readonly string[]): void {
   for (const entry of spelled.map(expandSandboxPathSpelling)) {
     const resolved = realpathOfNearest(entry);
-    const otherRoots = writeRoots.filter((root) => root !== resolved);
+    // A root itself, as spelled (a cache folder that is a link) or resolved, is not inside another.
+    const otherRoots = writeRoots.filter((root) => root !== resolved && root !== entry);
     if (realpathOutside(entry, otherRoots) !== resolved) {
       throw new AgentSandboxStartError(
         `${entry} leads through a link inside a folder that commands can write`
@@ -382,25 +395,46 @@ function pathFoldersUnderHome(
 
 /**
  * The real path of `target`, without following a symlink at or under one of `roots`: a sandboxed
- * command can make or replace such a link, so the rest of the path stays as spelled.
+ * command can make or replace such a link, so the rest of the path stays as spelled. Links are
+ * followed one at a time, so a chain (`~/.agents/plugins/demo` to `/repo/plugin` to `/elsewhere`)
+ * stops at the one in a root.
  */
 function realpathOutside(target: string, roots: readonly string[]): string {
-  const segments = path
+  const pending = segmentsOf(target);
+  let resolved: string = path.sep;
+  let hops = 0;
+  for (let segment = pending.shift(); segment !== undefined; segment = pending.shift()) {
+    const next = path.join(resolved, segment);
+    const link = isUnderAny(next, roots) ? undefined : linkOrFolder(next);
+    if (link === "") {
+      resolved = next;
+      continue;
+    }
+    if (link === undefined || ++hops > MAX_LINK_HOPS) return path.join(next, ...pending);
+    pending.unshift(...segmentsOf(path.resolve(resolved, link)));
+    resolved = path.sep;
+  }
+  return resolved;
+}
+
+// macOS follows at most 32 links in one path (MAXSYMLINKS).
+const MAX_LINK_HOPS = 32;
+
+function segmentsOf(target: string): string[] {
+  return path
     .resolve(target)
     .split(path.sep)
     .filter((segment) => segment.length > 0);
-  let resolved: string = path.sep;
-  for (const [index, segment] of segments.entries()) {
-    const next = path.join(resolved, segment);
-    if (isUnderAny(next, roots)) return path.join(next, ...segments.slice(index + 1));
-    try {
-      // eslint-disable-next-line local/no-sync-fs-methods -- the policy is built synchronously.
-      resolved = fs.realpathSync(next);
-    } catch {
-      return path.join(next, ...segments.slice(index + 1));
-    }
+}
+
+/** What the link `target` points to, "" when it exists and is no link, or undefined when missing. */
+function linkOrFolder(target: string): string | undefined {
+  try {
+    // eslint-disable-next-line local/no-sync-fs-methods -- the policy is built synchronously.
+    return fs.lstatSync(target).isSymbolicLink() ? fs.readlinkSync(target) : "";
+  } catch {
+    return undefined;
   }
-  return resolved;
 }
 
 /* eslint-disable local/no-sync-fs-methods -- Runtime.agentSandboxPolicy() is synchronous, so
@@ -522,9 +556,9 @@ function homeLinkTargets(home: string, writeRoots: readonly string[]): string[] 
     ...childLinks(home).filter((link) => path.basename(link).startsWith(".")),
     ...HOME_LINK_FOLDERS.flatMap((folder) => childLinks(expandSandboxPathSpelling(folder))),
   ];
-  return links
-    .flatMap((link) => withLinkTarget(link).slice(1))
-    .filter((target) => !writeRoots.some((root) => isPathAtOrUnder(root, target)));
+  return linkTargets(links, writeRoots).filter(
+    (target) => !writeRoots.some((root) => isPathAtOrUnder(root, target))
+  );
 }
 
 /**
@@ -533,10 +567,21 @@ function homeLinkTargets(home: string, writeRoots: readonly string[]): string[] 
  * outside the sandbox, so that checkout is automation too: read-only inside a write root, and a
  * write root at or inside it fails closed. Links deeper inside an entry are not followed.
  */
-function automationEntryLinkTargets(): string[] {
-  return AUTOMATION_ENTRY_ROOTS.flatMap((root) =>
-    childLinks(expandSandboxPathSpelling(root))
-  ).flatMap((link) => withLinkTarget(link).slice(1));
+function automationEntryLinkTargets(writeRoots: readonly string[]): string[] {
+  return linkTargets(
+    AUTOMATION_ENTRY_ROOTS.flatMap((root) => childLinks(expandSandboxPathSpelling(root))),
+    writeRoots
+  );
+}
+
+/**
+ * Where each link leads, as real paths. Git, ssh, the shell and Xum follow the link outside the
+ * sandbox, so another link on the way that is inside a write root, which a command could replace,
+ * fails closed.
+ */
+function linkTargets(links: readonly string[], writeRoots: readonly string[]): string[] {
+  assertNoPathThroughLink(links, writeRoots);
+  return links.flatMap((link) => withLinkTarget(link).slice(1));
 }
 
 function childLinks(folder: string): string[] {
@@ -588,7 +633,10 @@ function sshConfigIncludes(): string[] {
   );
 }
 
-/** Every file that `files` include, and what those include, by `includesOf`; as real paths. */
+/**
+ * Every file that `files` include, and what those include, by `includesOf`; as spelled, since git
+ * and ssh open them so.
+ */
 function configIncludes(
   files: readonly string[],
   includesOf: (file: string) => readonly string[]
@@ -603,7 +651,7 @@ function configIncludes(
     }
   };
   for (const file of files) visit(file, 1);
-  return [...found].map(realpathOfNearest);
+  return [...found];
 }
 
 /**
@@ -676,7 +724,7 @@ function isFile(target: string): boolean {
   }
 }
 
-/** Also through a symlink: a `.git` link to a git folder is a git folder for git. */
+/** Also through a symlink, though the policy fails closed on a `.git` link before this. */
 function isFolder(target: string): boolean {
   try {
     return fs.statSync(target).isDirectory();

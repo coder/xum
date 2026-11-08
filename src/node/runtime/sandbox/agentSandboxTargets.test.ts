@@ -28,8 +28,8 @@ function git(cwd: string, ...args: string[]): void {
 
 /**
  * Moves the temp write root off the test's temp folder, so a home folder there is outside the
- * write roots, as it is outside a test: a link in a write root that Xum reads as spelled fails
- * closed.
+ * write roots, as it is outside a test: the policy fails closed on a link in a write root that
+ * Xum, git or ssh follows.
  */
 function homeOutsideWriteRoots(): Disposable {
   const tmpdir = spyOn(os, "tmpdir").mockReturnValue("/private/tmp");
@@ -149,10 +149,9 @@ describe("buildAgentSandboxPolicy", () => {
     expect(agentSandboxPolicyAllows(repoPolicy, path.join(commonDir, "commondir"), "write")).toBe(
       false
     );
-    // A .git link to a git folder is a git folder: commits still write it.
-    const linkedPolicy = buildAgentSandboxPolicy(SETTINGS, { cwd: linked });
-    expect(agentSandboxPolicyAllows(linkedPolicy, path.join(commonDir, "index"), "write")).toBe(
-      true
+    // Git follows a .git link, and a command could point it at a git folder that it wrote.
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: linked })).toThrow(
+      AgentSandboxStartError
     );
   });
 
@@ -182,6 +181,7 @@ describe("buildAgentSandboxPolicy", () => {
     await fs.mkdir(home);
     await fs.symlink(home, path.join(home, ".npm"));
     const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
     try {
       expect(buildAgentSandboxPolicy(SETTINGS, { cwd: repo }).writeRoots).not.toContain(home);
     } finally {
@@ -255,6 +255,7 @@ describe("buildAgentSandboxPolicy", () => {
     await fs.mkdir(path.join(repo, "plugin"));
     await fs.symlink(path.join(repo, "plugin"), path.join(home, ".agents", "plugins", "demo"));
     const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
     try {
       const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
       const writable = (name: string) =>
@@ -270,6 +271,33 @@ describe("buildAgentSandboxPolicy", () => {
     } finally {
       homedir.mockRestore();
     }
+  });
+
+  // A command could replace the link in the workspace that the chain goes through.
+  test("fails closed when a global plugin links through a link in a write root", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(path.join(home, ".agents", "plugins"), { recursive: true });
+    // Any existing folder outside the write roots and the home folder.
+    await fs.symlink("/usr", path.join(repo, "plugin"));
+    await fs.symlink(path.join(repo, "plugin"), path.join(home, ".agents", "plugins", "demo"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
+    try {
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(
+        AgentSandboxStartError
+      );
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  // Git opens an include as spelled, so a command could replace a link there.
+  test("fails closed when a git include is a link in a write root", async () => {
+    // Any existing file outside the write roots and the home folder.
+    await fs.symlink("/etc/hosts", path.join(repo, "git.inc"));
+    git(repo, "config", "include.path", path.join(repo, "git.inc"));
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
   });
 
   // Git that Xum runs outside the sandbox runs a credential.helper from the global config.
@@ -430,6 +458,7 @@ describe("buildAgentSandboxPolicy", () => {
     await fs.symlink(path.join(repo, "ssh_config"), path.join(home, ".ssh", "config"));
     await fs.symlink(repo, path.join(home, ".dotfiles"));
     const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
     try {
       const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
       const writable = (name: string) =>
