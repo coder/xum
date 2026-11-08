@@ -195,6 +195,10 @@ export function buildAgentSandboxPolicy(
     ...CACHE_WRITE_PATHS.map(expandWriteRoot),
     ...extraWriteRoots,
   ]);
+  assertNoRootThroughLink(
+    [input.cwd, ...(input.workspaceRoots ?? []), ...settings.extraWritePaths],
+    writeRoots
+  );
   // Xum runs code from its home folder with full access (the global mcp.jsonc, tool hooks,
   // skills, plugins), so a policy that can write it does not hold. Workspaces and scratch
   // folders can live in it; an extraWritePaths entry cannot.
@@ -279,6 +283,23 @@ function assertNoWriteRootInAutomation(
       throw new AgentSandboxStartError(
         `the folder ${root}, which commands can write, is inside ${automationPath}, ` +
           "which holds code that Xum runs outside the sandbox"
+      );
+    }
+  }
+}
+
+/**
+ * A command can replace a folder in a write root (a checkout in /tmp, or a folder in an
+ * extraWritePaths entry) with a link to ~/.ssh, and the next policy would then open where the
+ * link points as a workspace: fail closed when a root as spelled leads through such a link.
+ */
+function assertNoRootThroughLink(spelled: readonly string[], writeRoots: readonly string[]): void {
+  for (const entry of spelled.map(expandSandboxPathSpelling)) {
+    const resolved = realpathOfNearest(entry);
+    const otherRoots = writeRoots.filter((root) => root !== resolved);
+    if (realpathOutside(entry, otherRoots) !== resolved) {
+      throw new AgentSandboxStartError(
+        `${entry} leads through a link inside a folder that commands can write`
       );
     }
   }
@@ -736,8 +757,13 @@ function writeAllowed(policy: AgentSandboxPolicy, target: string): boolean {
   );
 }
 
-/** isPathAtOrUnder(), where a trailing `*` in `denied` matches the rest of its last name. */
-function isAtOrUnderDeny(target: string, denied: string): boolean {
+/**
+ * isPathAtOrUnder(), where a trailing `*` in `denied` matches the rest of its last name. Case
+ * does not count: a default macOS volume opens `.XUM/MCP.JSONC` as `.xum/mcp.jsonc`, and Seatbelt
+ * denies it there too. On a case-sensitive volume this only denies more.
+ */
+function isAtOrUnderDeny(spelledTarget: string, spelledDeny: string): boolean {
+  const [target, denied] = [foldCase(spelledTarget), foldCase(spelledDeny)];
   if (!denied.endsWith("*")) return isPathAtOrUnder(target, denied);
   const folder = path.dirname(denied);
   const [name] = path.relative(folder, target).split(path.sep);
@@ -755,8 +781,13 @@ function isUnderAny(target: string, roots: readonly string[]): boolean {
 
 function isUnderNestedDeny(policy: AgentSandboxPolicy, target: string): boolean {
   return policy.denyRead.some(
-    (denied) => isNestedDeny(denied, policy) && isPathAtOrUnder(target, denied)
+    (denied) => isNestedDeny(denied, policy) && isPathAtOrUnder(foldCase(target), foldCase(denied))
   );
+}
+
+/** As APFS compares names: also `ſ` with `s`, and the Kelvin sign with `k`. */
+function foldCase(target: string): string {
+  return target.toUpperCase().toLowerCase();
 }
 
 /** A deny inside an allowed path: Seatbelt applies it after the allows. */

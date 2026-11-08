@@ -535,6 +535,32 @@ describe("buildAgentSandboxPolicy", () => {
     expect(readable("skills", "demo", "SKILL.md")).toBe(true);
   });
 
+  // A command can rename a checkout in a write root and leave a link to ~/.ssh in its place.
+  test("fails closed when the workspace leads through a link in a write root", async () => {
+    // Any existing folder outside the write roots and the home folder.
+    const linked = path.join(root, "linked");
+    await fs.symlink("/usr", linked);
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: linked })).toThrow(
+      AgentSandboxStartError
+    );
+    expect(() =>
+      buildAgentSandboxPolicy(SETTINGS, { cwd: repo, workspaceRoots: [linked] })
+    ).toThrow(AgentSandboxStartError);
+  });
+
+  // A default macOS volume opens `.XUM/MCP.JSONC` as `.xum/mcp.jsonc`.
+  test("keeps protected paths read-only in any case", () => {
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+    const writable = (...parts: string[]) =>
+      agentSandboxPolicyAllows(policy, path.join(repo, ...parts), "write");
+
+    expect(writable(".XUM", "MCP.JSONC")).toBe(false);
+    expect(writable(".git", "hook\u017f", "pre-commit")).toBe(false);
+    expect(writable(".git", "Hoo\u212As", "pre-commit")).toBe(false);
+    expect(writable("NOTES.md")).toBe(true);
+  });
+
   test("keeps the worktree config of a repository in the workspace read-only", () => {
     const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
 
