@@ -913,10 +913,10 @@ describe("runMemoryHarvest", () => {
             new_str: "password: hunter2-correct-horse",
           },
           {
-            command: "insert",
+            command: "str_replace",
             path: notesPath,
-            insert_line: 0,
-            insert_text: `Authorization: Bearer ${githubToken}\n`,
+            old_str: "line one",
+            new_str: `line one\nAuthorization: Bearer ${githubToken}`,
           },
           createFile("/memories/workspace/budget.md", "The token budget resets each turn.\n"),
         ])
@@ -966,6 +966,67 @@ describe("runMemoryHarvest", () => {
       ]);
       const kept = await fixture.memoryService.readFileWithSha(fixture.ctx, keepPath);
       expect(kept.success && kept.data.content).toBe("keep me\n");
+    });
+
+    it("cannot insert at a line number: refuses it with no edit spent and no file changed", async () => {
+      using fixture = createFixture();
+      const notesPath = "/memories/workspace/notes.md";
+      const seeded = await fixture.memoryService.saveFile(
+        fixture.ctx,
+        notesPath,
+        "line one\nline two\n",
+        null,
+        "agent"
+      );
+      expect(seeded.success).toBe(true);
+      const { model } = scriptedModel(
+        chunkScript([
+          { command: "insert", path: notesPath, insert_line: 1, insert_text: "a new fact\n" },
+          createFile("/memories/workspace/other.md", "another fact\n"),
+        ])
+      );
+
+      const result = await runHarvest(fixture, model);
+
+      const insert = result.ops.find((op) => op.command === "insert");
+      expect(insert?.applied).toBe(false);
+      expect(insert?.note).toContain("insert");
+      // Only the create counts: a denied command is no edit, so it must not eat the epoch's budget.
+      expect(result.budgetUsed).toBe(1);
+      const notes = await fixture.memoryService.readFileWithSha(fixture.ctx, notesPath);
+      expect(notes.success && notes.data.content).toBe("line one\nline two\n");
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/other.md")
+      ).toMatchObject({ success: true });
+    });
+
+    it("adds a fact to an existing file by replacing a unique line with that line plus the fact", async () => {
+      using fixture = createFixture();
+      const notesPath = "/memories/workspace/notes.md";
+      const seeded = await fixture.memoryService.saveFile(
+        fixture.ctx,
+        notesPath,
+        "line one\nline two\n",
+        null,
+        "agent"
+      );
+      expect(seeded.success).toBe(true);
+      const { model } = scriptedModel(
+        chunkScript([
+          {
+            command: "str_replace",
+            path: notesPath,
+            old_str: "line one",
+            new_str: "line one\na new fact",
+          },
+        ])
+      );
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.ops.map((op) => [op.command, op.applied])).toEqual([["str_replace", true]]);
+      const notes = await fixture.memoryService.readFileWithSha(fixture.ctx, notesPath);
+      expect(notes.success && notes.data.content).toBe("line one\na new fact\nline two\n");
     });
 
     it("shares one mutation budget across the chunks of an epoch", async () => {

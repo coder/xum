@@ -443,10 +443,11 @@ export class MemoryConsolidationService extends EventEmitter {
    * owner's /memories/workspace store), could otherwise run their chunks interleaved: a job
    * should read what the one ahead of it wrote, and its chunks follow one another.
    *
-   * This queue alone does not keep the model's read-to-insert sequences apart: the numeric
-   * `insert` line offset it read goes stale after another stream's insert, and a dream, or a
-   * second backend's analyzer, is not behind this queue. That is the dream exclusion's job
-   * (runDreamStreamExclusively), which every chunk's stream takes (runAnalyzerChunkExclusively).
+   * This queue alone does not keep an analyzer's writes out of a dream's read-to-insert sequence:
+   * the numeric `insert` line offset the dream read goes stale after another stream's write (the
+   * analyzer itself never inserts). A dream, or a second backend's analyzer, is not behind this
+   * queue either. That is the dream exclusion's job (runDreamStreamExclusively), which every
+   * chunk's stream takes (runAnalyzerChunkExclusively).
    *
    * LOCK ORDER: a job's turn here, then the exclusion, never the reverse. The exclusion is held
    * for one stream, and nothing that runs inside it waits for a turn here or runs an analyzer
@@ -1076,7 +1077,7 @@ export class MemoryConsolidationService extends EventEmitter {
 
   /**
    * The gate of one analyzer job's chunks (see ChunkStreamGate): each chunk's model stream runs
-   * inside the dream exclusion, so it never interleaves its read-to-insert sequences with a
+   * inside the dream exclusion, so it never interleaves its reads and writes with a
    * dream's or another analyzer's, in this process or another. A chunk, not the job, takes the
    * exclusion: its lock waiters give up after one consolidation timeout, which a job of many
    * chunks could outlast. `signal` is the job's removal: a chunk still waiting is cancelled.
