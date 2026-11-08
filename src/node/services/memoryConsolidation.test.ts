@@ -1498,34 +1498,6 @@ function recoveringModel(): MockLanguageModelV3 {
 }
 
 describe("runMemoryConsolidation", () => {
-  // The SDK runs no tool call of a step that finishes with `length`, and the stream ends without
-  // an error: the pass must not read as a success, or it is journaled and the debounce holds off
-  // the retry.
-  it.each([
-    ["a ceiling caps the step", 100],
-    ["no ceiling is set", undefined],
-  ])("fails a pass whose step ended at the output limit when %s", async (_name, ceilingUsd) => {
-    using fixture = await createFixture();
-
-    const result = await runMemoryConsolidation({
-      model: outputLimitedModel(),
-      pricingModel: PRICED_MODEL,
-      ceilingUsd,
-      agentBody: "Consolidate the memory directories.",
-      memoryService: fixture.memoryService,
-      metaService: fixture.metaService,
-      ctx: fixture.ctx,
-      dryRun: false,
-    });
-
-    expect(result.streamError).toContain("output limit");
-    expect(result.summary).toContain("stream error");
-    // What landed before the cut step stays, and what the steps cost stays counted.
-    expect(result.ops.map((op) => op.path)).toEqual(["/memories/global/landed.md"]);
-    expect(result.spentUsd).toBeCloseTo(1, 9);
-    expect(await pathExists(path.join(fixture.globalMemoryDir, "cut.md"))).toBe(false);
-  });
-
   it("redacts a credential the model repeats in its closing summary", async () => {
     // The summary is persisted and shown through status IPC, outside the guarded writes.
     using fixture = await createFixture();
@@ -1616,6 +1588,91 @@ describe("runMemoryConsolidation", () => {
     expect(result.ops[0]?.applied).toBe(false);
     expect(JSON.stringify(result.ops)).not.toContain(githubToken);
     expect(await pathExists(path.join(fixture.globalMemoryDir, "deploy.md"))).toBe(false);
+  });
+
+  // The SDK runs no tool call of a step that finishes with `length`, and the stream ends without
+  // an error: the pass must not read as a success, or it is journaled and the debounce holds off
+  // the retry.
+  it.each([
+    ["a ceiling caps the step", 100],
+    ["no ceiling is set", undefined],
+  ])("fails a pass whose step ended at the output limit when %s", async (_name, ceilingUsd) => {
+    using fixture = await createFixture();
+
+    const result = await runMemoryConsolidation({
+      model: outputLimitedModel(),
+      pricingModel: PRICED_MODEL,
+      ceilingUsd,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.streamError).toContain("output limit");
+    expect(result.summary).toContain("stream error");
+    // What landed before the cut step stays, and what the steps cost stays counted.
+    expect(result.ops.map((op) => op.path)).toEqual(["/memories/global/landed.md"]);
+    expect(result.spentUsd).toBeCloseTo(1, 9);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "cut.md"))).toBe(false);
+  });
+
+  // Headless runs bypass the chat cost pipeline: what a pass was billed reaches session usage only
+  // through `recordUsage`, and a stream that ended at the output limit completed and was billed.
+  it("reports the usage of a pass whose step ended at the output limit", async () => {
+    using fixture = await createFixture();
+    const recorded: Array<number | undefined> = [];
+
+    const result = await runMemoryConsolidation({
+      model: outputLimitedModel(),
+      pricingModel: PRICED_MODEL,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    expect(result.streamError).toContain("output limit");
+    // Both steps count, the cut-off one too.
+    expect(recorded).toEqual([2 * HALF_DOLLAR_INPUT_TOKENS]);
+  });
+
+  it("reports no usage for a stream that failed", async () => {
+    using fixture = await createFixture();
+    const recorded: Array<number | undefined> = [];
+
+    const result = await runMemoryConsolidation({
+      model: new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              pull(controller) {
+                controller.error(new Error("provider exploded"));
+              },
+            }),
+          }),
+      }),
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    // After a mid-flight error the SDK's usage promise can stay pending forever: nothing waits on it.
+    expect(result.streamError).toContain("provider exploded");
+    expect(recorded).toEqual([]);
+    expect(result.usage).toBeUndefined();
   });
 
   it("completes a pass whose cut-off step the model retried in a later step", async () => {

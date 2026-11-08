@@ -8,7 +8,11 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { BashOutputToolResult } from "@/common/types/tools";
 import { randomUUID } from "crypto";
-import { TestTempDir, createTestToolConfig as createBaseToolConfig } from "./testHelpers";
+import {
+  TestTempDir,
+  createTestToolConfig as createBaseToolConfig,
+  readExitCodeWhenWritten,
+} from "./testHelpers";
 import type { ToolExecutionOptions } from "ai";
 
 // Unique workspace IDs per run (#7256): spawn records live in the shared
@@ -296,8 +300,7 @@ describe("bash_output tool", () => {
       throw new Error("Failed to spawn process");
     }
 
-    // Wait for process to exit
-    await new Promise((r) => setTimeout(r, 200));
+    expect(await readExitCodeWhenWritten(spawnResult.outputDir)).toBe("0");
 
     const tool = createBashOutputTool(config);
     const result = (await tool.execute!(
@@ -314,7 +317,7 @@ describe("bash_output tool", () => {
     // Cleanup
     await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
-  });
+  }, 15_000);
 
   it("should block and wait for output when timeout_secs > 0", async () => {
     const tempDir = new TestTempDir("test-bash-output");
@@ -392,8 +395,7 @@ describe("bash_output tool", () => {
       throw new Error("Failed to spawn process");
     }
 
-    // Wait for process to exit
-    await new Promise((r) => setTimeout(r, 200));
+    expect(await readExitCodeWhenWritten(spawnResult.outputDir)).toBe("0");
 
     const tool = createBashOutputTool(config);
 
@@ -415,7 +417,7 @@ describe("bash_output tool", () => {
     // Cleanup
     await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
-  });
+  }, 15_000);
 
   it("should wait full timeout duration when no output and process running", async () => {
     const tempDir = new TestTempDir("test-bash-output");
