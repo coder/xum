@@ -367,4 +367,29 @@ describe("MultiProjectRuntime", () => {
       }
     }
   );
+
+  it("asks the first project's runtime for the policy, with every checkout open like the workspace", () => {
+    const primary = new WorktreeRuntime(srcBaseDir, { projectPath: projectAPath, workspaceName });
+    const multiRuntime = new MultiProjectRuntime(
+      containerManager,
+      [
+        { projectPath: projectAPath, projectName: "project-a", runtime: primary },
+        {
+          projectPath: projectBPath,
+          projectName: "project-b",
+          runtime: new WorktreeRuntime(srcBaseDir, { projectPath: projectBPath, workspaceName }),
+        },
+      ],
+      workspaceName
+    );
+    const policyFor = vi.spyOn(primary, "agentSandboxPolicy").mockReturnValue(null);
+
+    expect(
+      multiRuntime.agentSandboxPolicy({ cwd: "/container", workspaceRoots: ["/extra"] })
+    ).toBeNull();
+    expect(policyFor).toHaveBeenCalledWith({
+      cwd: "/container",
+      workspaceRoots: ["/extra", projectAWorkspacePath, projectBWorkspacePath],
+    });
+  });
 });

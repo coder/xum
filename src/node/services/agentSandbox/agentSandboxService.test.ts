@@ -53,6 +53,20 @@ describe("AgentSandboxService", () => {
     expect(agentSandboxSettingsFor(undefined)?.allowedHosts).toEqual(["global.example"]);
   });
 
+  it("saves the settings and returns them with only the projects that override the global one", async () => {
+    service = new AgentSandboxService(config);
+    await service.start();
+    expect(service.get().global).toEqual({});
+
+    await service.set({ enabled: true });
+    const state = await service.setProject(OTHER, { enabled: false });
+
+    expect(state.global).toEqual({ enabled: true });
+    expect(state.projects).toEqual({ [OTHER]: { enabled: false } });
+    expect(agentSandboxSettingsFor(OTHER)).toBeNull();
+    expect(agentSandboxSettingsFor(PARENT)).not.toBeNull();
+  });
+
   it("follows a config change made outside the service", async () => {
     service = new AgentSandboxService(config);
     await service.start();
