@@ -970,24 +970,32 @@ function legacyValueMayNameKey(value: unknown, keyPrefix: string): boolean {
   return documentStringsContain(JSON.stringify(value) ?? "", (text) => text.includes(keyPrefix));
 }
 /**
- * `config` with `keyPrefix` keys removed from each legacy value of `workspaceId` that may name
- * them (see pruneLegacyOverrides). Nothing writes a legacy value at runtime (reads only
- * migrate or clear one), so each value here is one that the caller checked, or gone.
+ * Removes `keyPrefix` keys, in place in `config`, from each legacy value of `workspaceId` that
+ * may name them (see pruneLegacyOverrides). Returns whether one of those values has a shape this
+ * build cannot edit, and so still names the key: another process (an older or newer build) can
+ * write a value after the caller checked it.
  */
-function withLegacyValuesPruned(
+function pruneLegacyValuesIn(
   config: ProjectsConfig,
   workspaceId: string,
   keyPrefix: string
-): ProjectsConfig {
+): boolean {
+  let uneditable = false;
   for (const projectConfig of config.projects.values()) {
     for (const workspace of projectConfig.workspaces) {
       if (workspace.id !== workspaceId || !legacyValueMayNameKey(workspace.mcp, keyPrefix))
         continue;
-      // mutation-equivalent: prunedLegacyValue yields a plain object or undefined, so ?? and || agree
-      workspace.mcp = prunedLegacyValue(workspace.mcp, keyPrefix) ?? workspace.mcp;
+      const pruned = prunedLegacyValue(workspace.mcp, keyPrefix);
+      if (pruned === undefined) uneditable = true;
+      else workspace.mcp = pruned;
     }
   }
-  return config;
+  return uneditable;
+}
+function uneditableLegacyValueError(workspaceId: string, keyPrefix: string): Error {
+  return new Error(
+    `Workspace ${workspaceId} carries a legacy MCP settings value in config.json that this version cannot edit and that may name "${keyPrefix}" keys`
+  );
 }
 /** Ids of the workspaces whose config.json entry still carries a legacy `workspace.mcp` value. */
 function idsWithLegacyOverrides(config: ProjectsConfig): Set<string> {
@@ -5272,8 +5280,12 @@ export class WorkspaceMcpOverridesService {
     sweep: { budget: PublicationBudget; snapshot: ConfigSnapshot; hasLegacyValue: boolean }
   ): Promise<SweptOutcome> {
     // Owed even when a later checkout of the ID fails: an earlier one may
-    // already be rewritten.
-    let owesEpoch = false;
+    // already be rewritten. A legacy config.json value owes it whether or not this
+    // sweep rewrites it, as a document does (see pruneResolvedWorkspace): the
+    // rewrite below can land and the document prune after it throw or time out,
+    // or an earlier sweep rewrote it and failed its epoch bump. Its retry then
+    // finds no key in the value, and must still publish the epoch.
+    let owesEpoch = sweep.hasLegacyValue;
     try {
       if (!entries) {
         throw new Error(`Host-local workspace metadata not found for ${workspaceId.trim()}`);
@@ -5332,9 +5344,9 @@ export class WorkspaceMcpOverridesService {
       keyPrefix,
       step
     );
-    // A rewritten legacy value changes what the workspace resolves to: it owes the
-    // cross-process epoch and its own publication, like a rewritten document.
-    return legacyRewritten ? { ...pruned, owesEpoch: true, rewrote: true } : pruned;
+    // A rewritten legacy value changes what the workspace resolves to: it owes its own
+    // publication, like a rewritten document. (The caller owes the epoch for any legacy value.)
+    return legacyRewritten ? { ...pruned, rewrote: true } : pruned;
   }
 
   /**
@@ -5355,16 +5367,22 @@ export class WorkspaceMcpOverridesService {
       return false;
     }
     if (naming.some((value) => prunedLegacyValue(value, keyPrefix) === undefined)) {
-      throw new Error(
-        `Workspace ${workspaceId} carries a legacy MCP settings value in config.json that this version cannot edit and that may name "${keyPrefix}" keys`
-      );
+      throw uneditableLegacyValueError(workspaceId, keyPrefix);
     }
     if (step.cancelled) {
       throw new Error(`pruning workspace ${workspaceId}'s legacy MCP settings was cancelled`);
     }
+    // The edit reads config.json again: a value written since the check above is checked there.
+    let uneditable = false;
     await step.trackSideEffect(
-      this.config.editConfig((config) => withLegacyValuesPruned(config, workspaceId, keyPrefix))
+      this.config.editConfig((config) => {
+        uneditable = pruneLegacyValuesIn(config, workspaceId, keyPrefix);
+        return config;
+      })
     );
+    if (uneditable) {
+      throw uneditableLegacyValueError(workspaceId, keyPrefix);
+    }
     return true;
   }
 

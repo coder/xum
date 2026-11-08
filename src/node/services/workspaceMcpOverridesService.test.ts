@@ -5,7 +5,7 @@ import * as nodeFs from "node:fs";
 import { parse as jsoncParse, type ParseError as JsoncParseError } from "jsonc-parser";
 import * as os from "os";
 import * as path from "path";
-import { Config } from "@/node/config";
+import { Config, type ProjectsConfig } from "@/node/config";
 import { log } from "@/node/services/log";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { buildAddedPluginKeyValidator } from "@/node/services/agentPlugins/mcpConfig";
@@ -5194,6 +5194,92 @@ describe("WorkspaceMcpOverridesService", () => {
           .find((entry) => entry.id === workspaceId)?.mcp;
       expect(legacyOf(swept.workspaceId)).toEqual({ enabledServers: ["kept"] });
       expect(legacyOf(other.workspaceId)).toEqual({ enabledServers: [staleKey, "kept"] });
+    });
+
+    it("prunePluginOverrideKeysForWorkspaces publishes the epoch for a legacy value it pruned before its document failed, and on the retry", async () => {
+      // The legacy value is pruned first, then the document cannot be edited, so the workspace
+      // fails. Other processes may still cache the legacy enable: the epoch is owed anyway. Once
+      // the user removes the document, the retry finds no key anywhere and must publish it again.
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspace = await registerWorkspace("legacy-then-bad-doc");
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const entry of project.workspaces) {
+            if (entry.id === workspace.workspaceId) {
+              entry.mcp = { enabledServers: [staleKey, "kept"] };
+            }
+          }
+        }
+        return cfg;
+      });
+      await fs.mkdir(path.dirname(docOf(workspace.workspacePath)), { recursive: true });
+      await fs.writeFile(docOf(workspace.workspacePath), `{ "enabledServers": ["${staleKey}"`);
+      const legacyOf = () =>
+        [...config.loadConfigOrDefault().projects.values()]
+          .flatMap((project) => project.workspaces)
+          .find((entry) => entry.id === workspace.workspaceId)?.mcp;
+      const epochBefore = await readWorkspaceOverridesEpochToken(config.rootDir);
+
+      const first = await service.prunePluginOverrideKeysForWorkspaces(
+        [workspace.workspaceId],
+        prefix
+      );
+      const epochAfterFirst = await readWorkspaceOverridesEpochToken(config.rootDir);
+      await fs.rm(docOf(workspace.workspacePath));
+      const second = await service.prunePluginOverrideKeysForWorkspaces(
+        [workspace.workspaceId],
+        prefix
+      );
+
+      expect(first.map((failure) => failure.workspaceId)).toEqual([workspace.workspaceId]);
+      expect(legacyOf()).toEqual({ enabledServers: ["kept"] });
+      expect(epochAfterFirst).not.toBe(epochBefore);
+      expect(second).toEqual([]);
+      expect(await readWorkspaceOverridesEpochToken(config.rootDir)).not.toBe(epochAfterFirst);
+    });
+
+    it("prunePluginOverrideKeysForWorkspaces fails a workspace whose legacy value another process made uneditable after the check", async () => {
+      // The check reads config.json, then the edit reads it again. A value written in between
+      // (by an older or newer build) in a shape this build cannot edit still names the key:
+      // the workspace must keep its tombstone.
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspace = await registerWorkspace("legacy-raced");
+      const settingLegacy = (value: unknown) => (cfg: ProjectsConfig) => {
+        for (const project of cfg.projects.values()) {
+          for (const entry of project.workspaces) {
+            if (entry.id === workspace.workspaceId) (entry as { mcp?: unknown }).mcp = value;
+          }
+        }
+        return cfg;
+      };
+      await config.editConfig(settingLegacy({ enabledServers: [staleKey, "kept"] }));
+      const uneditable = { enabledServers: [staleKey], fieldOfANewerBuild: true };
+      const realEdit = config.editConfig.bind(config);
+      let raced = false;
+      const editSpy = spyOn(config, "editConfig").mockImplementation(async (fn, options) => {
+        // Race only the prune's own edit: the scan's registry read can edit config.json too.
+        if (!raced && new Error().stack?.includes("pruneLegacyOverrides") === true) {
+          raced = true;
+          await realEdit(settingLegacy(uneditable));
+        }
+        return realEdit(fn, options);
+      });
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces(
+          [workspace.workspaceId],
+          prefix
+        );
+      } finally {
+        editSpy.mockRestore();
+      }
+
+      expect(raced).toBe(true);
+      expect(failures.map((failure) => failure.workspaceId)).toEqual([workspace.workspaceId]);
+      const legacyValue = [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((entry) => entry.id === workspace.workspaceId)?.mcp;
+      expect(legacyValue).toEqual(uneditable);
     });
 
     it("prunePluginOverrideKeysForWorkspaces waits for a save that passed validation before it, then prunes what the save wrote", async () => {
