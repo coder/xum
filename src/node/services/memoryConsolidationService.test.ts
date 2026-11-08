@@ -2926,6 +2926,22 @@ describe("MemoryConsolidationService", () => {
       }
     });
 
+    it("records the usage of a stream whose success record could not be saved", async () => {
+      using fixture = await createFixture({ withSessionUsage: true });
+      const recorded: string[] = [];
+      spyOn(fixture.sessionUsage!, "recordHeadlessUsage").mockImplementation((workspaceId) => {
+        recorded.push(workspaceId);
+        return Promise.resolve(undefined);
+      });
+      // A directory where the sidecar file belongs: the save's final rename fails, after the
+      // stream was billed.
+      await fsPromises.mkdir(path.join(fixture.xumHome, "memory-consolidation.json"));
+
+      await expect(fixture.service.maybeRun("ws-dream", "manual")).rejects.toThrow();
+
+      expect(recorded).toEqual(["ws-dream"]);
+    });
+
     it("waits for a dream stream in another process before starting its own", async () => {
       const held = heldStreams();
       using fixture = await createFixture({ modelFactory: held.factory });

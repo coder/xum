@@ -1457,9 +1457,16 @@ export class MemoryConsolidationService extends EventEmitter {
         await Effect.runPromise(self.saveRecordEffect(workspaceId, projectPath, record));
         return Ok(record);
       };
-      const turn = yield* Effect.promise(async () =>
-        self.runDreamStreamExclusively(removalSignal, runTurn)
-      );
+      const turn = yield* Effect.promise(async () => {
+        try {
+          return await self.runDreamStreamExclusively(removalSignal, runTurn);
+        } finally {
+          // On every path out of the turn, once it is released: the stream was billed whether
+          // the record's save threw, the pass failed or the run was refused. `flush` never
+          // rejects, so it cannot replace the error that is leaving.
+          await usageRecorder.flush();
+        }
+      });
       // Removal reached this run while it was still queued: no stream started.
       if (turn.outcome === "cancelled") {
         return Err("workspace is being removed; consolidation refused");
@@ -1472,8 +1479,6 @@ export class MemoryConsolidationService extends EventEmitter {
       // Debounced behind another run, or the stream failed: nothing was journaled.
       if (!turn.value.success) return turn.value;
       const record = turn.value.data;
-
-      yield* Effect.promise(usageRecorder.flush);
 
       log.debug("[MemoryConsolidation] run complete", {
         workspaceId,
