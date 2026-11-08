@@ -9,6 +9,10 @@ inputs:
     description: "Cache the Electron zip that jobs launching Electron download, and fetch it with retries on a cache miss"
     required: false
     default: "false"
+  electron-builder-zip:
+    description: "Cache the Electron zip that electron-builder downloads, and fetch it with retries when it is missing or does not match its pinned checksum"
+    required: false
+    default: "false"
 runs:
   using: "composite"
   steps:
@@ -158,3 +162,41 @@ runs:
       with:
         path: ${{ env.electron_config_cache }}
         key: ${{ steps.cache-electron-zip.outputs.cache-primary-key }}
+
+    # The zip that electron-builder downloads from github.com while it packages a build (the
+    # `make dist-*` jobs). Its app-builder binary does not use the cache above: it reads
+    # $ELECTRON_CACHE, keeps the zip flat in that directory as
+    # electron-v<version>-<platform>-<arch>.zip, uses a file that is already there without any
+    # network call, and never checks its checksum. So this cache holds that one file, and the
+    # prefetch step fills it before electron-builder runs: a 504 from github.com failed
+    # Build / Linux on 2026-11-08 at this download. The key hashes checksums.json, so a new
+    # Electron version starts a fresh cache with no restore-keys fallback. The key avoids the
+    # `electron-` prefix that the restore-keys of the two caches above match.
+    - name: Point electron-builder's Electron download at its own cache
+      if: ${{ inputs.electron-builder-zip == 'true' }}
+      shell: bash
+      run: echo "ELECTRON_CACHE=$HOME/.cache/xum-electron-builder-zip" >> "$GITHUB_ENV"
+
+    - name: Restore electron-builder's Electron zip
+      if: ${{ inputs.electron-builder-zip == 'true' }}
+      id: cache-electron-builder-zip
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ env.ELECTRON_CACHE }}
+        key: ${{ runner.os }}-${{ runner.arch }}-builder-electron-zip-${{ hashFiles('node_modules/electron/checksums.json') }}
+
+    # Runs on a cache hit too: app-builder would build with a corrupt cached zip, and this step
+    # downloads it again when its sha256 differs from the pin. Retries for 15 minutes (the
+    # script's default); Build / Linux sets no job time limit.
+    - name: Fetch electron-builder's Electron zip
+      if: ${{ inputs.electron-builder-zip == 'true' }}
+      shell: bash
+      run: ./scripts/ci/prefetch-electron-builder-zip.sh
+
+    # Saved at once: a later failing step in the job must not discard a zip that took minutes.
+    - name: Save electron-builder's Electron zip
+      if: ${{ inputs.electron-builder-zip == 'true' && steps.cache-electron-builder-zip.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ env.ELECTRON_CACHE }}
+        key: ${{ steps.cache-electron-builder-zip.outputs.cache-primary-key }}
