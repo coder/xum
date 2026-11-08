@@ -1,5 +1,16 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  test,
+  expect,
+  mock,
+  spyOn,
+  setDefaultTimeout,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+} from "bun:test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import * as fsPromises from "fs/promises";
 import {
@@ -13,6 +24,11 @@ import {
   type WorkspaceMetadataOptions,
 } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
+import {
+  isolateHostHome,
+  type IsolatedHostHome,
+} from "@/node/services/hostHomeIsolation.testHarness";
+import type { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import {
   getSubagentReportArtifactPath,
@@ -30,7 +46,8 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowRunner } from "@/node/services/workflows/WorkflowRunner";
 import { WorkflowTaskServiceAdapter } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { log } from "@/node/services/log";
+import { __resetFileSinkForTests, log } from "@/node/services/log";
+import * as tokenizerModule from "@/node/utils/main/tokenizer";
 import { Ok, Err, type Result } from "@/common/types/result";
 import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage } from "@/common/types/message";
@@ -70,6 +87,34 @@ import {
   removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+
+// These tests drive real stores, file locks and AgentSessions, and the Stop test runs two real
+// WorkflowRunner passes. Each takes about a second or less on an idle machine, but their CPU time
+// stretches with CPU contention (a loaded CI runner or developer host), and Bun's 5 s default then
+// fails tests that are not broken. A timed-out test also keeps running after its teardown and
+// fails the next test, so one slow test can show up as several failures.
+setDefaultTimeout(30_000);
+
+// Deadline of the polling helpers (waitUntil, waitForOutcomeKind). They wait for work that real
+// stores, locks and config writes do, and CPU contention stretches that work, so a short fixed
+// deadline fails tests that are not broken. It stays below the file's test timeout, so a real hang
+// fails with the helper's label instead of as an unlabelled test timeout.
+const POLL_DEADLINE_MS = 20_000;
+
+// Every agent-task reservation resolves its agent definition, which scans the runtime user's
+// global plugin roots (<XUM_ROOT>/plugins and ~/.agents/plugins). Point them at an empty home so
+// these tests neither read nor wait on the plugins installed on the machine that runs them (each
+// installed plugin adds file-system work to every reservation).
+let hostHome: IsolatedHostHome | undefined;
+beforeAll(() => {
+  hostHome = isolateHostHome("task-settlement-host-home");
+});
+afterAll(() => {
+  hostHome?.restore();
+  // The log file sink opens at the first log line, inside the isolated home that restore() just
+  // deleted. Drop it so the next log line reopens under the restored home.
+  __resetFileSinkForTests();
+});
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -964,6 +1009,15 @@ describe("TaskService", () => {
         (
           taskService as unknown as { workspaceEventLocks: MutexMap<string> }
         ).workspaceEventLocks.withLock(childId, () => Promise.resolve());
+      // This test checks how stream ends are classified, not token counts. The token budget
+      // requires a real encoding (contextBudgetCounting.ts), and loading it starts a worker thread
+      // that parses a large encoding table. That is the largest CPU cost in this test, and under
+      // heavy CPU contention it ran past even a 30 s timeout. A fake tokenizer keeps the budget
+      // path and skips the worker.
+      const tokenizerSpy = spyOn(tokenizerModule, "getTokenizerForModel").mockResolvedValue({
+        encoding: "fake-4",
+        countTokens: (text: string) => Promise.resolve(Math.ceil(text.length / 4)),
+      });
 
       try {
         // Turn 1: the child works until the settled step crosses the budget warning.
@@ -1079,6 +1133,7 @@ describe("TaskService", () => {
         expect(session.getQueueCutReceipt(continuationEntryId!)).toBeUndefined();
         expect(session.getQueueCutReceipt(queuedInputCause!.entryId)).toBeUndefined();
       } finally {
+        tokenizerSpy.mockRestore();
         await session.dispose();
         await sessionHarness.cleanup();
       }
@@ -1150,7 +1205,7 @@ describe("TaskService", () => {
   }
 
   async function waitUntil(condition: () => boolean, label: string): Promise<void> {
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + POLL_DEADLINE_MS;
     while (!condition()) {
       if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
       await new Promise((resolve) => setTimeout(resolve, 1));
@@ -1163,7 +1218,7 @@ describe("TaskService", () => {
     taskId: string,
     kind: string
   ): Promise<void> {
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + POLL_DEADLINE_MS;
     for (;;) {
       const outcome = await taskService.readAttemptOutcome(taskId, {
         requestingWorkspaceId: rootId,
@@ -2654,14 +2709,24 @@ describe("TaskService", () => {
         }
         return originalSetTimeout(handler, timeout);
       }) as typeof setTimeout);
-      const mutexQueue = (taskService as unknown as { mutex: { queue: unknown[] } }).mutex.queue;
+      const mutex = (taskService as unknown as { mutex: AsyncMutex }).mutex;
       const held = await taskService.acquireTaskCreationLock();
+      // Signal when the reservation queues behind the held lock, instead of polling for it under a
+      // fixed deadline: its read-only preparation runs first, and under CPU contention that can
+      // outlast any fixed deadline. acquire() pushes its waiter before it returns its promise.
+      const blocked = Promise.withResolvers<void>();
+      const acquire = mutex.acquire.bind(mutex);
+      const acquireSpy = spyOn(mutex, "acquire").mockImplementation(() => {
+        const pending = acquire();
+        blocked.resolve();
+        return pending;
+      });
       try {
         const controller = new AbortController();
         const creating = taskService.createMany([spawnArgs(rootId)], {
           abortSignal: controller.signal,
         });
-        await waitUntil(() => mutexQueue.length > 0, "the reservation to block on the mutex");
+        await blocked.promise;
         warningHandler?.();
         expect(
           warned.some(
@@ -2680,6 +2745,7 @@ describe("TaskService", () => {
         }
       } finally {
         await held[Symbol.asyncDispose]();
+        acquireSpy.mockRestore();
         timerSpy.mockRestore();
         warnSpy.mockRestore();
       }

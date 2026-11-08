@@ -54,7 +54,10 @@ MARKER = "mutation-equivalent"
 MAX_TEST_FILES = 10
 TIMEOUT_FACTOR = 10  # mutator's default: a mutant gets 10x the baseline,
 MIN_TIMEOUT = 2.0  # and at least 2 seconds.
-BASELINE_TIMEOUT = 120.0  # a test file that hangs unmutated is dropped
+# A test file that prints nothing this long, unmutated, is hung and dropped. This is the rule of
+# scripts/test-unit-ci.sh (BUN_TEST_STALL_SECS). Its total time is no sign of a hang: installService's
+# 270 tests take 80 to 145 s alone on a loaded host, and a total cap dropped them.
+BASELINE_STALL = 180.0
 DEADLINE = "the run's deadline came first"
 
 EXTENSIONS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
@@ -306,6 +309,59 @@ def run_test(worker: Path, test: str, timeout: float) -> tuple[bool, float, bool
     return code == 0, time.monotonic() - started, False
 
 
+def drain_output(stream, on_output) -> None:
+    """Read `stream` to its end and drop the bytes: only the fact that some arrived is kept."""
+
+    while stream.read1(65536):
+        on_output()
+
+
+def run_baseline(worker: Path, test: str, limit: float) -> tuple[bool, float, bool]:
+    """Like run_test, but cut off by silence, not by total time.
+
+    (passed, seconds, timed_out). A baseline runs until it ends, goes quiet for BASELINE_STALL seconds
+    (a hang) or has run for `limit` seconds (the time left before the run's deadline). Its output goes
+    through a pipe that a thread drains and drops: only the time of the last byte is kept, so a baseline
+    that loops printing fills no disk. Mutants keep their own bound, scaled from this run's seconds
+    (see run_mutant).
+    """
+
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        ["bun", "test", f"./{test}"],
+        cwd=worker,
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    last_output = [started]
+
+    def noted() -> None:
+        last_output[0] = time.monotonic()
+
+    assert proc.stdout is not None
+    reader = threading.Thread(target=drain_output, args=(proc.stdout, noted), daemon=True)
+    reader.start()
+    try:
+        while True:
+            try:
+                code = proc.wait(timeout=min(1.0, BASELINE_STALL / 4))
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                if now - last_output[0] >= BASELINE_STALL or now - started >= limit:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                    return False, now - started, True
+            else:
+                return code == 0, time.monotonic() - started, False
+    finally:
+        # The group is dead or done, so the pipe closes and the reader ends. A grandchild that left the
+        # group could hold it open: the reader is a daemon thread, so the run does not wait for it.
+        reader.join(timeout=1)
+        if not reader.is_alive() and proc.stdout is not None:
+            proc.stdout.close()
+
+
 def run_mutant(worker: Path, site: Site, tests: list[str], timeouts: dict[str, float], deadline: float) -> str:
     """killed, survived, or not-run when the run's deadline cut it short."""
 
@@ -400,12 +456,13 @@ def accept_marked(root: Path, rows: list[dict]) -> None:
 
 
 def baselines(
-    tests: list[str], free: Queue, worker_count: int, deadline: float, runner=run_test
+    tests: list[str], free: Queue, worker_count: int, deadline: float, runner=run_baseline
 ) -> tuple[dict[str, float], list[dict]]:
     """Run each test file alone, unmutated: (mutant timeouts, dropped tests).
 
     A baseline gets at most the time left before the run's deadline, so the
-    run ends with a report before the CI step's own timeout kills it.
+    run ends with a report before the CI step's own timeout kills it. A slow
+    baseline that keeps printing is not dropped (see run_baseline).
     """
 
     def one(test: str) -> tuple[bool, float, bool] | str:
@@ -415,8 +472,10 @@ def baselines(
             left = deadline - time.monotonic()
             if left <= 0:
                 return DEADLINE
-            passed, seconds, timed_out = runner(worker, test, min(BASELINE_TIMEOUT, left))
-            return DEADLINE if timed_out and left < BASELINE_TIMEOUT else (passed, seconds, timed_out)
+            passed, seconds, timed_out = runner(worker, test, left)
+            if timed_out:
+                return DEADLINE if seconds >= left else f"printed nothing for {BASELINE_STALL:.0f}s (hung)"
+            return passed, seconds, timed_out
         except Exception as error:  # noqa: BLE001 - one test, not the run
             return f"could not run: {error}"
         finally:

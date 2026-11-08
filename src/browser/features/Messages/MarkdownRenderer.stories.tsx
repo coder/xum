@@ -4,8 +4,10 @@ import { DESKTOP_TITLEBAR_HEIGHT_PX } from "@/browser/hooks/useDesktopTitlebar";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { windowDragsAtEach, withDesktopApi } from "@/browser/stories/helpers/windowDrag";
 import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
+import { expectNoDiagramInkOutsideBox } from "@/browser/stories/storyPlayHelpers";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 import { SIDE_INSET_VIEWPORT } from "@/constants/layout";
+import { MERMAID_PAGE_DIAGRAM_SELECTOR } from "@/constants/mermaid";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { UserMessageContent } from "./UserMessageContent";
 
@@ -275,10 +277,12 @@ interface DiagramGeometry {
   drawing: { width: number; height: number };
 }
 
-const INLINE_SVG = ".mermaid-container:not(.mermaid-modal) > svg.pele";
 const DIALOG_SVG = ".mermaid-modal > svg.pele";
 
-function measureDiagram(canvasElement: HTMLElement, selector = INLINE_SVG): DiagramGeometry {
+function measureDiagram(
+  canvasElement: HTMLElement,
+  selector = MERMAID_PAGE_DIAGRAM_SELECTOR
+): DiagramGeometry {
   const svg = canvasElement.querySelector<SVGSVGElement>(selector);
   if (!svg) throw new Error("The diagram has not rendered yet");
   const container = svg.parentElement!;
@@ -294,22 +298,6 @@ function measureDiagram(canvasElement: HTMLElement, selector = INLINE_SVG): Diag
 
 /** The box and the zoom step are whole pixels, so they differ from the exact values by this much. */
 const PIXEL_TOLERANCE = 1.5;
-
-interface PaintHook {
-  __storybookAssertPaint?: () => Promise<void>;
-}
-
-/**
- * Runs the test runner's pixel check (.storybook/test-runner.ts) now, before a screenshot or
- * resize repairs a stale WebKit layout.
- */
-async function expectNoDiagramInkOutsideBox() {
-  const assertPaint = (window as Window & PaintHook).__storybookAssertPaint;
-  if (assertPaint) await assertPaint();
-  else if (navigator.userAgent.includes("StorybookTestRunner")) {
-    throw new Error("paint hook missing: .storybook/test-runner.ts did not register it");
-  }
-}
 
 /** The box is the drawing scaled by one factor, up to the rounding of each side to a pixel. */
 async function expectBoxKeepsDrawingProportions({ svg, drawing }: DiagramGeometry) {

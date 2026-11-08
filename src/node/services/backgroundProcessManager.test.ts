@@ -25,7 +25,11 @@ import * as os from "os";
 import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createBashOutputTool } from "@/node/services/tools/bash_output";
-import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
+import {
+  TestTempDir,
+  createTestToolConfig,
+  readExitCodeWhenWritten,
+} from "@/node/services/tools/testHelpers";
 import type { BashToolResult, BashOutputToolResult } from "@/common/types/tools";
 
 interface ProbeFailureControl {
@@ -232,16 +236,7 @@ describe("BackgroundProcessManager", () => {
         });
         expect(first.success).toBe(true);
         if (!first.success) return;
-        const deadline = Date.now() + 5000;
-        while (Date.now() < deadline) {
-          try {
-            await fs.access(path.join(first.outputDir, "exit_code"));
-            break;
-          } catch {
-            await new Promise((resolve) => setTimeout(resolve, 25));
-          }
-        }
-        await fs.access(path.join(first.outputDir, "exit_code"));
+        expect(await readExitCodeWhenWritten(first.outputDir)).toBe("0");
 
         const second = await otherBackend.spawn(runtime, testWorkspaceId, "sleep 30", {
           cwd: process.cwd(),
@@ -258,7 +253,7 @@ describe("BackgroundProcessManager", () => {
       } finally {
         await otherBackend.cleanup(testWorkspaceId);
       }
-    });
+    }, 15_000);
 
     it("does not prune a recently settled record another backend tracks", async () => {
       // #4893: A has observed its command's exit (meta.json reads exited), so only the age
@@ -3309,8 +3304,7 @@ describe("BackgroundProcessManager", () => {
       });
 
       if (result.success) {
-        // Wait for process to exit
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(await readExitCodeWhenWritten(result.outputDir)).toBe("42");
 
         const proc = await manager.getProcess(result.processId);
         expect(proc?.status).toBe("exited");
@@ -3324,7 +3318,7 @@ describe("BackgroundProcessManager", () => {
         expect(meta.status).toBe("exited");
         expect(meta.exitCode).toBe(42);
       }
-    });
+    }, 15_000);
 
     it("should keep output files after process exits", async () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "echo test; exit 0", {
@@ -3333,7 +3327,7 @@ describe("BackgroundProcessManager", () => {
       });
 
       if (result.success) {
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
         const proc = await manager.getProcess(result.processId);
         expect(proc?.status).toBe("exited");
@@ -3343,7 +3337,7 @@ describe("BackgroundProcessManager", () => {
         const output = await fs.readFile(outputPath, "utf-8");
         expect(output).toContain("test");
       }
-    });
+    }, 15_000);
 
     it("should preserve killed status after terminate", async () => {
       // Spawn a long-running process
@@ -4042,15 +4036,14 @@ describe("BackgroundProcessManager", () => {
       if (!output1.success) return;
       // Status could be running or already exited depending on timing
 
-      // Wait for exit
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       const output2 = await manager.getOutput(result.processId);
       expect(output2.success).toBe(true);
       if (!output2.success) return;
       expect(output2.status).toBe("exited");
       expect(output2.exitCode).toBe(0);
-    });
+    }, 15_000);
 
     it("should filter output with regex when provided", async () => {
       const result = await manager.spawn(
@@ -4442,14 +4435,8 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // Wait for process to exit and exit_code to be written
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
-      // Check exit_code file exists and contains correct value
-      const exitCodePath = path.join(result.outputDir, "exit_code");
-      const exitCodeContent = await fs.readFile(exitCodePath, "utf-8");
-      expect(exitCodeContent.trim()).toBe("42");
-    });
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("42");
+    }, 15_000);
   });
 
   describe("hasOrphanedRunningBackgroundProcesses", () => {
@@ -5172,8 +5159,7 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // Wait for process to exit
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       // Make 3+ calls on exited process
       for (let i = 0; i < 4; i++) {
@@ -5183,6 +5169,6 @@ describe("BackgroundProcessManager", () => {
         // Should not get note since process is not running
         expect(output.note).toBeUndefined();
       }
-    });
+    }, 15_000);
   });
 });

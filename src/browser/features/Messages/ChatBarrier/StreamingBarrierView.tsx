@@ -221,33 +221,43 @@ function ActivityChips(props: {
 function CancelControl(props: StreamingBarrierViewProps) {
   return props.onCancel && props.cancelText.length > 0 ? (
     <TooltipIfPresent tooltip={props.cancelShortcutText} side="top">
+      {/* As for the activity chips (ChatActivityChipButton): the button is the touch target and the
+          inner span draws the control. globals.css grows every button to 44px on touch phones, so
+          drawing on the button itself would draw Stop at the touch floor. */}
       <button
         type="button"
         onClick={props.onCancel}
-        className={cn(
-          "text-muted hover:text-foreground inline-flex h-6 cursor-pointer items-center rounded-sm px-1.5 py-0.5 text-[11px] leading-none font-medium transition-colors duration-200",
-          // Beside chips in a phone-width row: a round icon button (approved phone design).
-          "@max-md:group-has-[[data-activity-chip]]/live:border-border-medium @max-md:group-has-[[data-activity-chip]]/live:text-foreground @max-md:group-has-[[data-activity-chip]]/live:size-8 @max-md:group-has-[[data-activity-chip]]/live:justify-center @max-md:group-has-[[data-activity-chip]]/live:rounded-full @max-md:group-has-[[data-activity-chip]]/live:border @max-md:group-has-[[data-activity-chip]]/live:p-0"
-        )}
+        // justify-center matters on a phone: the 44px floor makes the button wider than the drawn
+        // circle, and without it the circle sits flush left and the line's right edge reads ragged.
+        className="group/stop inline-flex cursor-pointer items-center justify-center"
         aria-label="Stop streaming"
       >
-        <CircleStopIcon
-          className="h-3.5 w-3.5 shrink-0 @max-md:group-has-[[data-activity-chip]]/live:hidden"
-          strokeWidth={2.2}
-        />
-        <Square
-          aria-hidden
-          className="hidden size-3 shrink-0 fill-current @max-md:group-has-[[data-activity-chip]]/live:block"
-        />
-        {/* Icon-only beside chips in a phone-width row; the aria-label still names it. */}
-        <span className="ml-1 leading-none @max-md:group-has-[[data-activity-chip]]/live:hidden">
-          Stop
-        </span>
-        {props.cancelShortcutText && (
-          <span className="border-border-medium text-muted ml-2 hidden items-center rounded border px-1 py-[1px] text-[10px] leading-none @lg:inline-flex">
-            {props.cancelShortcutText}
+        <span
+          className={cn(
+            "text-muted group-hover/stop:text-foreground inline-flex h-6 items-center rounded-sm px-1.5 py-0.5 text-[11px] leading-none font-medium transition-colors duration-200",
+            // Beside chips in a phone-width row: a round icon button (approved phone design),
+            // drawn at 32px inside the button's 44px hit area.
+            "@max-md:group-has-[[data-activity-chip]]/live:text-foreground @max-md:group-has-[[data-activity-chip]]/live:size-8 @max-md:group-has-[[data-activity-chip]]/live:justify-center @max-md:group-has-[[data-activity-chip]]/live:rounded-full @max-md:group-has-[[data-activity-chip]]/live:border @max-md:group-has-[[data-activity-chip]]/live:border-border-medium @max-md:group-has-[[data-activity-chip]]/live:p-0"
+          )}
+        >
+          <CircleStopIcon
+            className="h-3.5 w-3.5 shrink-0 @max-md:group-has-[[data-activity-chip]]/live:hidden"
+            strokeWidth={2.2}
+          />
+          <Square
+            aria-hidden
+            className="hidden size-3 shrink-0 fill-current @max-md:group-has-[[data-activity-chip]]/live:block"
+          />
+          {/* Icon-only beside chips in a phone-width row; the aria-label still names it. */}
+          <span className="ml-1 leading-none @max-md:group-has-[[data-activity-chip]]/live:hidden">
+            Stop
           </span>
-        )}
+          {props.cancelShortcutText && (
+            <span className="border-border-medium text-muted ml-2 hidden items-center rounded border px-1 py-[1px] text-[10px] leading-none @lg:inline-flex">
+              {props.cancelShortcutText}
+            </span>
+          )}
+        </span>
       </button>
     </TooltipIfPresent>
   ) : (

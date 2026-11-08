@@ -11,7 +11,7 @@ import { DESKTOP_TITLEBAR_HEIGHT_PX, isDesktopMode } from "@/browser/hooks/useDe
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
-import { MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
+import { MERMAID_ERROR_ATTRIBUTE, MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
 import {
   diagramPixelSize,
   NARROW_DIAGRAM_WIDTH,
@@ -746,8 +746,10 @@ const DIALOG_OVERLAY_PADDING_PX = 40;
 const DIALOG_PERCENT = 90;
 const DIALOG_PADDING_PX = 24;
 
+// The right side reads --safe-area-right, which also covers the Duo cover display's status column
+// on iOS 27.2 (see globals.css).
 const overlayInset = (side: "top" | "right" | "bottom" | "left") =>
-  `max(${DIALOG_OVERLAY_PADDING_PX}px, env(safe-area-inset-${side}, 0px))`;
+  `max(${DIALOG_OVERLAY_PADDING_PX}px, ${side === "right" ? "var(--safe-area-right)" : `env(safe-area-inset-${side}, 0px)`})`;
 
 // Modal component for fullscreen diagram view
 const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
@@ -812,7 +814,7 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
         style={{
           position: "absolute",
           top: `calc(${CLOSE_BUTTON_INSET_PX + (desktop ? DESKTOP_TITLEBAR_HEIGHT_PX : 0)}px + env(safe-area-inset-top, 0px))`,
-          right: `calc(${CLOSE_BUTTON_INSET_PX}px + env(safe-area-inset-right, 0px))`,
+          right: `calc(${CLOSE_BUTTON_INSET_PX}px + var(--safe-area-right))`,
           background: "var(--color-background)",
           border: "1px solid var(--color-border-subtle)",
           color: "var(--color-text)",
@@ -918,6 +920,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   if (error && !isStreaming) {
     return (
       <pre
+        {...{ [MERMAID_ERROR_ATTRIBUTE]: "" }}
         style={{
           color: "var(--color-syntax-error)",
           background: "hsl(from var(--color-syntax-error) h s l / 0.1)",
