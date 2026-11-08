@@ -9,6 +9,7 @@ import {
   installIphoneDuoStatusBarStyle,
   installViewportHeightSync,
 } from "@/browser/utils/viewportHeight";
+import { installIosCoverColumn } from "@/browser/utils/iosCoverColumn";
 import { removeDroppedCacheKeys } from "@/browser/utils/legacyLocalStorageCleanup";
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 import { initTelemetry } from "@/common/telemetry";
@@ -43,6 +44,13 @@ try {
 
 installWindowOpenLocalhostProxyNormalization();
 installViewportHeightSync();
+
+try {
+  installIosCoverColumn();
+} catch (error) {
+  // Taking back the cover display's status column is cosmetic and must never block startup.
+  console.error("iOS cover column: could not take back the status column", error);
+}
 
 try {
   installIosFocusZoomGuard();
