@@ -96,62 +96,27 @@ const SECRET_KEY_VALUE_PATTERN = new RegExp(
 // body takes everything but those, and a backslash that does not start an escape. The header may
 // also be a JSON key (`"cookie": "a=b"`, its opening quote kept so the quotes stay paired), whose
 // value may be an array (`"set-cookie": ["a=b", "c=d"]`, Node's shape), read to its `]`.
-// The rule fails closed: the name counts after any character that cannot be part of a longer name
-// (`getCookie:` and `X-Cookie-Policy:` stay readable), and whatever follows the colon goes, so a
-// sentence such as `Session cookie: HttpOnly is set` loses its tail too. Telling prose from a
-// header by the shape of its value drew a new bypass in every frame a tool prints (Markdown, ANSI
-// color codes, a request cookie named like a Set-Cookie attribute after a marker), so the rule
-// judges no shape: only a value with nothing in it, or the marker of an earlier pass with nothing
-// but punctuation after it, stays (`redactCookieValue`). That keeps redaction idempotent, so the
-// memory-write guard, which reuses this detector, accepts a note that quotes redacted output.
-// Linear: once the colon matched, the body and the array never fail and never backtrack, as
-// `QUOTED_VALUE` is (a run of body characters, or of backslashes, is one step: a step per backslash
-// cost 50 ms on 100 KB of them); the name, the context, the key's quote and the gaps are bounded,
-// and the value is read once, since the match ends it. The context is read backwards from the
-// name, so the scan pays for it only at the word `cookie`. A value that needs a check the pattern
-// cannot make without backtracking (see `redactCookieValue`) is read whole and judged afterwards.
-const COOKIE_NAME = "(?:Set-)?Cookie";
-// Behind the name: the start of the text, a character that cannot be part of a longer name, or the
-// escape of a line break in JSON text (`\n` ends in a letter).
-const COOKIE_CONTEXT = String.raw`(?:^|[^\w-]|\\[nr])`;
-const COOKIE_KEY_QUOTE = String.raw`(?:\\{0,${ESCAPE_RUN_MAX}}["'])`;
+// A name starts after a non-word character, so `getCookie:` and `X-Cookie:` are not headers; after
+// an escaped line break it starts behind the letter of `\n`. A prose line that begins with
+// `cookie:` is redacted to its end: the name and the colon are all this rule can see.
+// Linear: the body and the array never fail and never backtrack, as `QUOTED_VALUE` is (a run of
+// body characters is one step); the name, the key's quote and the gaps are bounded, and the value
+// is read once, since the match ends it.
 const COOKIE_HEADER_PATTERN = new RegExp(
-  String.raw`(${COOKIE_NAME}(?<=${COOKIE_CONTEXT}${COOKIE_NAME})${COOKIE_KEY_QUOTE}?[ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})` +
-    // A marker read back (`[redacted]`) is read to the end of the header like any value, so what
-    // follows it is judged too (`redactCookieValue`). A list (`[...]`, read to its `]`) follows a
-    // quoted key (`"set-cookie": [...]`), or a bare name when its first item is quoted
-    // (`Set-Cookie: ["a=b"]`, raw or JSON-escaped): a body would stop at that quote. Any other `[`
-    // after a bare name is part of the value (Go's `Cookie:[a=b]`), read to the end of the header.
-    String.raw`(?:\[redacted\](?:[^\r\n"'\\]+|\\+(?![nr"']))*|(?:(?<=["'][ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})|(?=\[[ \t]{0,${GAP_MAX}}${COOKIE_KEY_QUOTE}))\[[^\]]*\]?|(${COOKIE_KEY_QUOTE}?)(?:[^\r\n"'\\]+|\\+(?![nr"']))*)`,
+  String.raw`(?:(?<![\w-])|(?<=\\[nr]))` +
+    String.raw`((?:Set-)?Cookie(?:\\{0,${ESCAPE_RUN_MAX}}["'])?[ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})` +
+    String.raw`(?:\[[^\]]*\]?|((?:\\{0,${ESCAPE_RUN_MAX}}["'])?)(?:[^\r\n"'\\]+|\\(?![nr"']))*)`,
   "gi"
 );
-
-/**
- * A value that stays as it is: none (only spaces, or an empty list), or the marker an earlier pass
- * left, with nothing but punctuation after it (`"set-cookie": [redacted],` or Go's
- * `Cookie:[redacted]]` read back). Anything else after the marker, such as `; path=secret`, is
- * text the marker does not cover.
- */
-const UNCHANGED_COOKIE_VALUE = /^\s*(?:\[\s*\]?|\[redacted\][\s,;\])}]*)?$/;
-
-/**
- * What a matched cookie header becomes. The match runs to the end of the header whatever the value
- * is, and this decides what to do with it: checked here and not in the pattern, where a lookahead
- * before the value lets the gap give a space back, and the value start there.
- */
-function redactCookieValue(match: string, prefix: string, opener: string | undefined): string {
-  // mutation-equivalent: `opener` is a string or undefined, never a falsy string that `||` would
-  // replace with another one, so `??` and `||` agree.
-  const quote = opener ?? "";
-  if (UNCHANGED_COOKIE_VALUE.test(match.slice(prefix.length + quote.length))) return match;
-  return `${prefix}${quote}${REDACTED}`;
-}
 
 /** Replaces common credential shapes with `[redacted]`. */
 export function redactSecretLike(text: string): string {
   // First, while the value is still whole: a standalone pattern that redacts the head of a cookie
   // would end the value there and leave its tail readable.
-  let redacted = text.replace(COOKIE_HEADER_PATTERN, redactCookieValue);
+  let redacted = text.replace(
+    COOKIE_HEADER_PATTERN,
+    (_match, prefix: string, opener: string | undefined) => `${prefix}${opener ?? ""}${REDACTED}`
+  );
   for (const pattern of STANDALONE_SECRET_PATTERNS) redacted = redacted.replace(pattern, REDACTED);
   return redacted.replace(
     SECRET_KEY_VALUE_PATTERN,

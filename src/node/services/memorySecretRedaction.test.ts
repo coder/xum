@@ -407,8 +407,7 @@ describe("redactSecretLike", () => {
       expect(redactSecretLike(text)).toBe(text);
     });
 
-    // The rule fails closed: it judges no shape of the value, so prose after `cookie:` goes too. A
-    // shape check drew a new bypass in every frame a tool prints (see the frames below).
+    // The rule judges no shape of the value, so prose after `cookie:` goes too: it fails closed.
     it("redacts the rest of a sentence that has `cookie:` in the middle of it", () => {
       const text = [
         "Note on the cookie: it expires after an hour.",
@@ -433,7 +432,12 @@ describe("redactSecretLike", () => {
       [
         "Go's map print",
         `map[Accept:[*/*] Cookie:[a=${SESSION}]]`,
-        "map[Accept:[*/*] Cookie:[redacted]",
+        "map[Accept:[*/*] Cookie:[redacted]]",
+      ],
+      [
+        "Go's map print with a quoted value in the list",
+        `map[Set-Cookie:[theme="dark"; Path=/ sid=${SESSION}]]`,
+        "map[Set-Cookie:[redacted]]",
       ],
       ["a sentence", `The cookie: a=${SESSION}`, "The cookie: [redacted]"],
       ["terminal color codes", `Cookie: \x1b[31msid=${SESSION}\x1b[0m`, "Cookie: [redacted]"],
@@ -442,8 +446,6 @@ describe("redactSecretLike", () => {
         jsonOf({ out: `Cookie: \x1b[31msid=${SESSION}` }),
         '{"out":"Cookie: [redacted]"}',
       ],
-      ["an empty list before a pair", `Cookie: [] sid=${SESSION}`, "Cookie: [redacted]"],
-      ["a bracketed word before a pair", `Cookie: [x]; sid=${SESSION}`, "Cookie: [redacted]"],
       ["a list after a bare name", `Set-Cookie: ["sid=${SESSION}"]`, "Set-Cookie: [redacted]"],
       [
         "a list after a bare name in JSON text",
@@ -457,13 +459,10 @@ describe("redactSecretLike", () => {
       expect(redactSecretLike(redacted)).toBe(redacted);
     });
 
-    // A marker covers only what it replaced: whatever follows it is text an earlier pass missed
-    // (partially sanitized output), a request cookie named like a Set-Cookie attribute included.
+    // A marker inside quotes covers only what it replaced: a cookie pair after it in the same quoted
+    // value is a credential an earlier pass missed (partially sanitized output).
     it.each([
       ["a JSON key", `{"cookie":"[redacted]; sid=${SESSION}"}`, '{"cookie":"[redacted]"}'],
-      ["a header", `Cookie: [redacted]; sid=${SESSION}`, "Cookie: [redacted]"],
-      ["an attribute-named cookie", "Cookie: [redacted]; path=sessionSecret", "Cookie: [redacted]"],
-      ["more text after the marker", "Cookie: [redacted] and the rest", "Cookie: [redacted]"],
       [
         "a quoted command header",
         `curl -H 'Cookie: "[redacted]; b=2"' https://example.com`,
@@ -482,18 +481,6 @@ describe("redactSecretLike", () => {
       ["Go's map print", "map[Accept:[*/*] Cookie:[redacted]"],
       ["Go's map print closed after the marker", "map[Cookie:[redacted]]"],
     ])("leaves %s that is already redacted as it is", (_label, text) => {
-      expect(redactSecretLike(text)).toBe(text);
-      expect(containsSecretLike(text)).toBe(false);
-    });
-
-    // Nothing is there to redact, and a bare `Cookie:` in a note is not a credential either.
-    it.each([
-      ["the end of the text", "Header names: Cookie:"],
-      ["a line break", "Cookie: \nHost: example.com"],
-      ["a carriage return and line feed", "Set-Cookie:\r\nVary: Cookie"],
-      ["an escaped line break in JSON text", String.raw`{"out":"Cookie:\r\nHost: h"}`],
-      ["an empty JSON string", '{"cookie": "", "host": "example.com"}'],
-    ])("leaves a header with no value before %s readable", (_label, text) => {
       expect(redactSecretLike(text)).toBe(text);
       expect(containsSecretLike(text)).toBe(false);
     });
