@@ -344,6 +344,15 @@ describe("takeWithoutMedia", () => {
     });
   });
 
+  // RFC 2397 puts no limit on the parameters before `;base64`, so a header with many of them is a
+  // data URL like any other, and its payload must not reach the model.
+  it.each([
+    ["base64", `data:image/png;a=1;b=2;c=3;d=4;e=5;base64,${"QUJD".repeat(2_000)} after`],
+    ["percent-encoded", `data:image/svg+xml;a=1;b=2;c=3;d=4;e=5,${"%3Csvg%3E".repeat(800)} after`],
+  ])("drops a %s data URL whose header has many parameters", (_label, text) => {
+    expect(takeWithoutMedia(text, 1_000).text).toBe("[media] after");
+  });
+
   it("searches only the text the limit can reach for a URL", () => {
     const scanned = regexInputLengths(() => {
       takeWithoutMedia(`${"x".repeat(1_000_000)}data:image/png;base64,QUJD`, 100);
