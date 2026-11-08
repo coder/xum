@@ -15,6 +15,7 @@ import { runScript, writeExecutable, type RunResult } from "./runScript";
 
 const REPO = path.resolve(import.meta.dir, "../..");
 const ACTION = path.join(REPO, ".github/actions/setup-xum/action.yml");
+const PR_WORKFLOW = path.join(REPO, ".github/workflows/pr.yml");
 
 let work: string;
 
@@ -51,11 +52,15 @@ function env(extra: Record<string, string> = {}): Record<string, string> {
   return { PATH: `${work}:${process.env.PATH ?? ""}`, ...extra };
 }
 
-async function setupStep(name: string): Promise<string> {
+async function setupActionSteps(): Promise<{ name?: string; if?: string; run?: string }[]> {
   const action = parse(await readFile(ACTION, "utf8")) as {
-    runs: { steps: { name?: string; run?: string }[] };
+    runs: { steps: { name?: string; if?: string; run?: string }[] };
   };
-  const step = action.runs.steps.find((candidate) => candidate.name === name);
+  return action.runs.steps;
+}
+
+async function setupStep(name: string): Promise<string> {
+  const step = (await setupActionSteps()).find((candidate) => candidate.name === name);
   if (step?.run === undefined) throw new Error(`setup-xum has no run step named "${name}"`);
   return step.run;
 }
@@ -125,13 +130,21 @@ describe("setup-xum: Download Electron zip", () => {
 });
 
 describe("setup-xum: Locate Electron zip", () => {
-  async function locate(zipExists: boolean): Promise<{ result: RunResult; githubEnv: string }> {
+  async function locate(
+    zipExists: boolean,
+    exits: number[] = []
+  ): Promise<{ result: RunResult; githubEnv: string }> {
     const zip = path.join(work, "zips", "abc", "electron-v1.2.3-linux-x64.zip");
     if (zipExists) {
       await mkdir(path.dirname(zip), { recursive: true });
       await writeFile(zip, "zip");
     }
-    await stub("node", [], `echo "Electron zip ready: ${zip}"`);
+    // Only the run that succeeds finds the zip.
+    await stub(
+      "node",
+      exits,
+      `[ "$n" = ${exits.length + 1} ] && echo "Electron zip ready: ${zip}"`
+    );
     const githubEnv = path.join(work, "github-env");
     await writeFile(githubEnv, "");
     const result = await runStep(await setupStep("Locate Electron zip"), { GITHUB_ENV: githubEnv });
@@ -148,5 +161,47 @@ describe("setup-xum: Locate Electron zip", () => {
     const { result, githubEnv } = await locate(false);
     expect(result.exitCode).not.toBe(0);
     expect(githubEnv).toBe("");
+  });
+
+  test("retries a failed prefetch, as the download step does", async () => {
+    const { result, githubEnv } = await locate(true, [1]);
+    expect(result.exitCode).toBe(0);
+    expect(await runs("node")).toHaveLength(2);
+    expect(githubEnv).toBe(`ELECTRON_ZIP_DIR=${path.join(work, "zips", "abc")}\n`);
+  });
+});
+
+// The scripts above only run when the workflow calls them. These two checks pin the calls:
+// a dropped input or an inverted condition turns the Electron zip steps off or on silently, and
+// Build / Linux then falls back to app-builder's own download, which retries nothing.
+describe("the Electron zip wiring", () => {
+  test("setup-xum runs every Electron zip step only when the caller asks for the zip", async () => {
+    const steps = (await setupActionSteps()).filter((step) =>
+      /Electron zip|Point Electron downloads/.test(step.name ?? "")
+    );
+    expect(steps.map((step) => step.name)).toEqual([
+      "Point Electron downloads at their own cache",
+      "Restore Electron zip",
+      "Download Electron zip",
+      "Save Electron zip",
+      "Locate Electron zip",
+    ]);
+    for (const step of steps) {
+      expect(step.if).toContain("inputs.electron-zip == 'true'");
+    }
+  });
+
+  test("Build / Linux asks setup-xum for the Electron zip", async () => {
+    const workflow = parse(await readFile(PR_WORKFLOW, "utf8")) as {
+      jobs: Record<
+        string,
+        { name?: string; steps: { uses?: string; with?: Record<string, unknown> }[] }
+      >;
+    };
+    const job = workflow.jobs["build-linux"];
+    expect(job?.name).toBe("Build / Linux");
+    const setup = job.steps.filter((step) => step.uses === "./.github/actions/setup-xum");
+    expect(setup).toHaveLength(1);
+    expect(setup[0].with?.["electron-zip"]).toBe("true");
   });
 });
