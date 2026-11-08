@@ -1230,6 +1230,7 @@ else:
         request = comment("@codex review", "maintainer", REQUEST)
         running = comment(board_for(FIXTURES["running_summary"]["body"], PR_HEAD))
         commitless = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
+        board = FIXTURES["review_state_summary"]["body"]
         for case, comments, expected in (
             ("10 characters of the head", [request, code_receipt(PR_HEAD[:10])], 0),
             ("7 characters of the head", [request, code_receipt(PR_HEAD[:7])], 0),
@@ -1240,6 +1241,9 @@ else:
             ("too few characters to name a head", [request, code_receipt(PR_HEAD[:6])], 1),
             ("the head's start with another end", [request, code_receipt(PR_HEAD[:9] + "f")], 1),
             ("no reviewed commit", [request, commitless], 1),
+            # The board is Codex's record of the head: it binds a receipt that names no commit.
+            ("no reviewed commit, the board's code review of the head finished", [request, commitless, comment(board_for(board, PR_HEAD))], 0),
+            ("no reviewed commit, the board names an earlier head", [request, commitless, comment(board_for(board, EARLIER_HEAD))], 10),
             # Any receipt for the head approves it, whichever receipt is newest.
             (
                 "a later receipt for an earlier head",
@@ -1272,7 +1276,9 @@ else:
             ("the board names an earlier head", [request, comment(board_for(board, EARLIER_HEAD))], 10),
             ("the board's review of the head still runs", [request, comment(board_for(running, PR_HEAD))], 10),
             ("the board shows an unresolved finding", [request, comment(flagged("true"))], 1),
-            ("the board's flag is null (a silent run)", [request, comment(flagged("null"))], 10),
+            # A finished review can report null flags (#7734): its findings are threads and finding
+            # comments, which the gate already checked.
+            ("the board's flag is null", [request, comment(flagged("null"))], 0),
         ):
             for author in (BOT, BOT + "[bot]"):
                 with self.subTest(case=case, author=author):

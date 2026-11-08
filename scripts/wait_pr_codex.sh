@@ -5,11 +5,11 @@ set -euo pipefail
 #
 # Usage: ./scripts/wait_pr_codex.sh <pr_number> [--once]
 #
-# Approval is, after the latest request, an approval comment whose `Reviewed commit` names the PR
-# head, or a thumbs-up reaction while Codex's summary board records a finished code review of the
-# head with nothing unresolved. It needs check_codex_comments.sh to find nothing that blocks the
-# head. A receipt for an earlier head and a thumbs-up reaction alone name no current head (both
-# outlast a push), so neither approves.
+# Approval is, after the latest request, an approval comment or a thumbs-up reaction, and only
+# while check_codex_comments.sh finds nothing that blocks the head. A comment with a `Reviewed
+# commit` must name the PR head: a receipt for an earlier head outlasts a push, so it never
+# approves. A thumbs-up and a comment with no `Reviewed commit` name no head, so each counts only
+# while Codex's summary board records a finished code review of the head.
 #
 # Exits:
 #   0 - Codex approved, or reported a usage limit with no outstanding findings
@@ -493,13 +493,23 @@ CHECK_CODEX_STATUS_ONCE() {
     [.[] | select(.createdAt > $request_at and .isMinimized != true and codex_usage_limit($bot))]
     | sort_by(.createdAt) | last // empty | .body // empty')
 
-  # An approval comment counts for the head it names: the receipt's `Reviewed commit` is a short SHA
-  # (7 or more hex characters) that starts the PR head. A receipt for an earlier head outlasts a
-  # push, and a receipt that names no commit cannot be tied to a head, so neither approves.
-  approval_comment=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" --arg head "$pr_head" '
+  # The summary board is Codex's own record of which head its code review finished on. A thumbs-up
+  # and a receipt with no `Reviewed commit` name no head, so they count only beside it. Its
+  # flags are not read here: the gate above has already found nothing that blocks (a finished
+  # review can report null flags, whose findings are threads and finding comments).
+  board_reviewed_head=$(echo "$pr_data" | jq -r --arg head "$pr_head" --arg bot "$BOT_LOGIN_GRAPHQL" '
+    ([.data.repository.pullRequest.comments.nodes[]
+        | select(.author.login == $bot and (.body | startswith("<!-- codex-pull-request-review-summary -->")))
+        | .body | capture("<!-- codex-review-state:v1 (?<state>.*) -->").state | fromjson? | .code_review] | last) as $review
+    | $review != null and $review.commit_sha == $head and $review.status == "completed"')
+
+  # An approval comment with a `Reviewed commit` counts for the head it names: the printed SHA is a
+  # short SHA (7 or more hex characters) that starts the PR head. A receipt for an earlier head
+  # outlasts a push, so it does not approve. A receipt that names no commit counts with the board.
+  approval_comment=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" --arg head "$pr_head" --arg board "$board_reviewed_head" '
     [.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex)))
       | select(((.body | capture("[*][*]Reviewed commit:[*][*] `(?<sha>[0-9a-f]{7,40})`")?) // {sha: ""}).sha as $sha
-          | $sha != "" and ($head | startswith($sha)))
+          | if $sha == "" then $board == "true" else ($head | startswith($sha)) end)
       | {createdAt, body}] | sort_by(.createdAt) | last // empty | .body // empty')
 
   if [[ -n "$approval_comment" ]]; then
@@ -509,15 +519,6 @@ CHECK_CODEX_STATUS_ONCE() {
     echo "$approval_comment"
     return 0
   fi
-
-  # A thumbs-up names no head and outlasts a push, so it approves only beside the summary board's
-  # own record that the code review of this head finished with nothing unresolved. A null flag
-  # (a silent run) is not "nothing unresolved".
-  board_reviewed_head=$(echo "$pr_data" | jq -r --arg head "$pr_head" --arg bot "$BOT_LOGIN_GRAPHQL" '
-    ([.data.repository.pullRequest.comments.nodes[]
-        | select(.author.login == $bot and (.body | startswith("<!-- codex-pull-request-review-summary -->")))
-        | .body | capture("<!-- codex-review-state:v1 (?<state>.*) -->").state | fromjson? | .code_review] | last) as $review
-    | $review != null and $review.commit_sha == $head and $review.status == "completed" and $review.has_unresolved_findings == false')
 
   approval_reaction_at=$(echo "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.data.repository.pullRequest.reactions.nodes[]? | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
@@ -604,7 +605,7 @@ CHECK_CODEX_STATUS_ONCE() {
 
   echo ""
   echo "❌ Codex responded, but no approval signal was found after the latest '@codex review'."
-  echo "   👉 Expected an approval comment like 'Didn't find any major issues' whose 'Reviewed commit' names the PR head (${pr_head:0:10}), or a thumbs-up reaction while Codex's summary board shows a finished code review of that head."
+  echo "   👉 Expected an approval comment like 'Didn't find any major issues' whose 'Reviewed commit' names the PR head (${pr_head:0:10}), or a thumbs-up reaction or an approval comment with no 'Reviewed commit' while Codex's summary board shows a finished code review of that head."
   echo "   👉 If you expected approval, re-comment '@codex review' and run this script again."
   return 1
 }
@@ -631,7 +632,7 @@ echo "⏳ Waiting for Codex review on PR #$PR_NUMBER..."
 echo ""
 echo "Tip: after you comment '@codex review', Codex will respond with either:"
 echo "  - review comments / threads to address (script exits 1)"
-echo "  - an approval comment that names the PR head, OR a thumbs-up reaction on the PR description while the summary board shows a finished code review of the head (script exits 0)"
+echo "  - an approval comment that names the PR head, OR a thumbs-up reaction on the PR description (or an approval comment with no commit) while the summary board shows a finished code review of the head (script exits 0)"
 echo ""
 
 while true; do
