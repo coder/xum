@@ -21,6 +21,9 @@ import {
 } from "./appStyleVariables";
 import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { mcpAppPreambleScript } from "./mcpAppCsp";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 // Identity is all the acceptance check uses, so plain objects stand in for windows.
 const frame: Window = Object.create(null) as Window;

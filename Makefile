@@ -940,8 +940,12 @@ install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Appli
 dist-win: build ## Build Windows distributable
 	@bun x electron-builder --win --publish never
 
+# ELECTRON_ZIP_DIR (CI sets it, from setup-xum's electron-zip input) names the directory of the
+# checksum-checked electron-v<version>-linux-x64.zip. electron-builder then unpacks that zip and
+# downloads nothing: its own download retries nothing, and a github.com 504 failed Build / Linux
+# in five queue runs on 2026-11-08.
 dist-linux: build ## Build Linux distributable
-	@bun x electron-builder --linux --publish never
+	@bun x electron-builder --linux --publish never $(if $(ELECTRON_ZIP_DIR),-c.electronDist=$(ELECTRON_ZIP_DIR))
 
 dist-linux-arm64: build ## Build Linux arm64 distributable
 	@bun x electron-builder --linux --arm64 --publish never
