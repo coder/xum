@@ -681,11 +681,14 @@ function assertParentKnownForSave(snapshot: ConfigSnapshot, current: ResolvedOve
   }
 }
 
-/** Config rows with no id that still carry a legacy `workspace.mcp` value. */
+/**
+ * Config rows with no id that still carry a legacy `workspace.mcp` value. A null id counts as
+ * none: config.json accepts it as a legacy row's (see validateConfigStructure).
+ */
 function idlessLegacyRows(config: ProjectsConfig): Workspace[] {
   return [...config.projects.values()]
     .flatMap((project) => project.workspaces)
-    .filter((row) => row.id === undefined && row.mcp !== undefined);
+    .filter((row) => row.id == null && row.mcp !== undefined);
 }
 
 /** Unlocked fork-copy preparations attempted before the terminal fallback (see copyOverridesToForkedCheckout). */

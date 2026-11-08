@@ -4658,11 +4658,13 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(nodeFs.existsSync(overridesFile(healthy.workspacePath))).toBe(false);
     });
 
-    for (const { kind, overrides } of [
-      { kind: "clear", overrides: {} },
-      { kind: "save", overrides: { enabledServers: ["other"] } },
+    for (const { kind, overrides, nullId } of [
+      { kind: "clear", overrides: {}, nullId: false },
+      { kind: "save", overrides: { enabledServers: ["other"] }, nullId: false },
+      // config.json accepts a null id as a legacy row's (see validateConfigStructure).
+      { kind: "clear", overrides: {}, nullId: true },
     ]) {
-      it(`refuses a ${kind} while the legacy entry shares the checkout with a legacy value`, async () => {
+      it(`refuses a ${kind} while the legacy entry${nullId ? " (id: null)" : ""} shares the checkout with a legacy value`, async () => {
         // The legacy row's id lives only in its unreadable metadata.json, so no id lookup can
         // retire its legacy value: after a clear, it would migrate back over the user's write.
         const service = new WorkspaceMcpOverridesService(config);
@@ -4677,6 +4679,16 @@ describe("WorkspaceMcpOverridesService", () => {
           cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
           return cfg;
         });
+        if (nullId) {
+          const configFile = path.join(tempDir, "config.json");
+          const doc = JSON.parse(await fs.readFile(configFile, "utf8")) as {
+            projects: Array<[string, { workspaces: Array<Record<string, unknown>> }]>;
+          };
+          const legacyProject = doc.projects.find(([key]) => key === "/fake/legacy-project");
+          if (legacyProject === undefined) throw new Error("the legacy project is in config.json");
+          legacyProject[1].workspaces[0].id = null;
+          await fs.writeFile(configFile, JSON.stringify(doc));
+        }
         const sessionDir = path.join(config.sessionsDir, path.basename(healthy.workspacePath));
         await fs.mkdir(sessionDir, { recursive: true });
         await fs.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
