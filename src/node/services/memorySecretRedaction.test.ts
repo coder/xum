@@ -572,7 +572,7 @@ describe("redactSecretLike", () => {
   // The second scan must cost under 3 times the first (a floor keeps timer noise out of the ratio
   // for scans of a few milliseconds). A scan over 2 s at 100 KB fails at once: a quadratic one takes
   // many seconds there.
-  it.each([
+  it.each<[label: string, build: (repetitions: number) => string, size: number]>([
     // [label, the text for `n` repetitions of the shape, the repetitions of a 100 KB write]
     ["token", (n) => "token".repeat(n), 20_000],
     ["secret-", (n) => "secret-".repeat(n), 14_000],
