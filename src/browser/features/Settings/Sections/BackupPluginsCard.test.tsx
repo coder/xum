@@ -359,6 +359,12 @@ describe("reviewBackedUpPlugins", () => {
     ["an IPv6 literal", "https://[::1]/example/repo.git"],
     ["an upper-case scheme", "HTTPS://github.com/example/repo.git"],
     ["no path", "https://github.com"],
+    // An unanchored match would accept this: git signs in over ssh to attacker.example.
+    ["an ssh URL that ends in an https URL", "ssh://git@attacker.example/https://a.example/b"],
+    ["a bare query mark", "https://github.com/o/r?x"],
+    ["an at sign in the path", "https://github.com/o/r@x"],
+    ["a backslash in the host", "https://github.com\\attacker.example/o/r"],
+    ["a port over five digits", "https://github.com:123456/r"],
   ])("hands over no plugin whose https URL has %s", (_label, url) => {
     reviewBackedUpPlugins({
       report: reportOf([row("alpha", "missing"), row("beta", "missing", { url })]),
