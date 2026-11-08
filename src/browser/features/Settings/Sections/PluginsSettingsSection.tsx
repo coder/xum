@@ -827,7 +827,11 @@ const AddPluginPanel: React.FC<{
   // A backed-up plugin previews itself; its fields stay editable, so a preview that fails (a
   // repository that moved, a host that is down) can be fixed by hand.
   usePreviewOnMount(api, props.seed, {
-    onStart: () => setBusy(true),
+    onStart: () => {
+      setBusy(true);
+      // A reconnect previews again: the failure of the client that dropped no longer applies.
+      setError(null);
+    },
     onResult: showPreview,
     onError: setError,
     onEnd: () => setBusy(false),

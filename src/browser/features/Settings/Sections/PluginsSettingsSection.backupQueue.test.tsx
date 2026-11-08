@@ -460,41 +460,66 @@ test("the ordinary add flow installs the source its own preview resolved", async
   await waitFor(() => expect(header(view)).toContain("Plugin installed."));
 });
 
+/** The API context in one state: a section mounted with `connecting` gets its client later. */
+function apiState(
+  api: ReturnType<typeof previewingClient>["api"],
+  state: "connecting" | "connected"
+): UseAPIResult {
+  return state === "connecting"
+    ? {
+        status: "connecting",
+        api: null,
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      }
+    : {
+        status: "connected",
+        api,
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      };
+}
+
+const sectionWith = (
+  api: ReturnType<typeof previewingClient>["api"],
+  state: "connecting" | "connected"
+) => (
+  <APIContext.Provider value={apiState(api, state)}>
+    <TooltipProvider>
+      <PluginsSettingsSection />
+    </TooltipProvider>
+  </APIContext.Provider>
+);
+
 test("previews the first plugin once, when the API arrives after the panel mounted", async () => {
   const { api, previewSpy } = previewingClient({ alpha: previewOf("alpha") });
-  const apiState = (state: "connecting" | "connected"): UseAPIResult =>
-    state === "connecting"
-      ? {
-          status: "connecting",
-          api: null,
-          error: null,
-          authenticate: () => undefined,
-          retry: () => undefined,
-        }
-      : {
-          status: "connected",
-          api,
-          error: null,
-          authenticate: () => undefined,
-          retry: () => undefined,
-        };
-  const tree = (state: "connecting" | "connected") => (
-    <APIContext.Provider value={apiState(state)}>
-      <TooltipProvider>
-        <PluginsSettingsSection />
-      </TooltipProvider>
-    </APIContext.Provider>
-  );
   publishPluginsSectionIntent({ type: "install-from-backup", entries: [backedUp("alpha")] });
 
-  const view = render(tree("connecting"));
+  const view = render(sectionWith(api, "connecting"));
   await waitFor(() => expect(header(view)).toContain("From backup: 1 of 1"));
   expect(previewSpy).not.toHaveBeenCalled();
-  view.rerender(tree("connected"));
+  view.rerender(sectionWith(api, "connected"));
 
   await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
   expect(previewSpy).toHaveBeenCalledTimes(1);
   expect(previewSpy.mock.calls[0]?.[0]).toMatchObject({ ref: PINNED });
+});
+
+test("a reconnect previews again without the failure of the client that dropped", async () => {
+  const dropped = previewingClient({});
+  const reconnected = previewingClient({ alpha: previewOf("alpha") });
+  publishPluginsSectionIntent({ type: "install-from-backup", entries: [backedUp("alpha")] });
+  const view = render(sectionWith(dropped.api, "connected"));
+  await waitFor(() =>
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain("Could not fetch")
+  );
+
+  view.rerender(sectionWith(reconnected.api, "connected"));
+
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  expect(view.container.querySelector('[role="alert"]')).toBeNull();
 });
 
 test("under StrictMode, the result of the discarded first mount is not shown", async () => {
