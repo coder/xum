@@ -275,8 +275,8 @@ describe("ArtifactViewer renderers", () => {
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
   });
 
-  // WebKit fires the iframe's load event again when the artifact sets location.hash, and both
-  // engines do for history.back() to a pushed entry. The document is still the one Xum built.
+  // WebKit fires the iframe's load event again when the artifact sets location.hash, and Chromium
+  // does for a history.back() to the srcdoc's first entry. The document is still the one Xum built.
   test("a frame stays open with its bridge across loads of the same document", async () => {
     const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;

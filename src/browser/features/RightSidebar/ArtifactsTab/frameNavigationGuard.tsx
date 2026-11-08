@@ -19,8 +19,9 @@ type FrameLifecycle =
  * included. It closes the frame (unmounted until the user reloads it, no message in or out)
  * whenever the frame holds a document other than the one the host built.
  *
- * A load event cannot tell which document loaded: WebKit fires one for `location.hash`, and both
- * engines for `history.back()` to a pushed entry or `document.open()`, while the document stays.
+ * A load event cannot tell which document loaded: WebKit fires one for `location.hash` and every
+ * history traversal, Chromium for a `history.back()` to the srcdoc's first entry, and both for
+ * `document.open()`, while the document stays.
  * So loads never grant anything; they only trigger checks. Once the document's channel is bound
  * (`opened`), every load sends a check over its port with a fresh value, and only the bound
  * document can answer it: a page the frame navigated to gets a fresh realm without the port.
