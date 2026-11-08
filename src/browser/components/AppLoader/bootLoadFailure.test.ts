@@ -2,6 +2,8 @@ import "../../../../tests/ui/dom";
 
 import { cleanup, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import * as vm from "node:vm";
@@ -10,6 +12,8 @@ import { installDom } from "../../../../tests/ui/dom";
 // index.html's boot-load-failure script is the only code that can run when the app's module graph
 // fails to load, so these tests run that very script against index.html's own boot screen markup.
 // happy-dom does not run scripts it parses, so the test hands the script text a fresh window.
+
+const VERIFY_XUM_SCRIPT = path.join(process.cwd(), ".xum/skills/verify-xum/scripts/verify-xum.sh");
 
 let cleanupDom: (() => void) | null = null;
 let indexPage: Document;
@@ -71,9 +75,12 @@ describe("boot screen load failure", () => {
       failedModuleScript();
 
       expect(screen.queryByRole("status")).toBeNull();
-      expect(screen.getByRole("alert")).toBeTruthy();
-      expect(screen.getByRole("heading", { level: 1 })).toBeTruthy();
-      const button = screen.getByRole("button");
+      // The copy is the requested one: this is all the text the user gets.
+      expect(screen.getByRole("alert").textContent?.replace(/\s+/g, " ").trim()).toBe(
+        "Xum could not load Part of the app did not download. Reload to try again. Reload"
+      );
+      expect(screen.getByRole("heading", { level: 1, name: "Xum could not load" })).toBeTruthy();
+      const button = screen.getByRole("button", { name: "Reload" });
       // Focus is what lets Enter reload: a native button runs its click on Enter.
       expect(document.activeElement).toBe(button);
       expect(reload).not.toHaveBeenCalled();
@@ -84,15 +91,19 @@ describe("boot screen load failure", () => {
     }
   });
 
-  test("keeps the logo and drops the busy loading text", () => {
+  test("keeps the logo and drops the loading text with its busy and polite live region marks", () => {
     bootPage();
     const logo = document.querySelector(".boot-loader__logo");
     expect(logo).not.toBeNull();
+    // Before the failure the loader announces itself politely, and says it is busy.
+    expect(document.querySelector("[aria-live=polite][aria-busy=true]")).not.toBeNull();
 
     failedModuleScript();
 
     expect(document.querySelector(".boot-loader__logo")).toBe(logo);
     expect(document.querySelector("[aria-busy]")).toBeNull();
+    // A polite live region around the alert would announce the alert's text as a status update.
+    expect(document.querySelector("[aria-live]")).toBeNull();
     expect(document.querySelector(".boot-loader__dots")).toBeNull();
   });
 
@@ -178,5 +189,48 @@ describe("boot screen load failure", () => {
     const event = failedModuleScript();
 
     expect(event.defaultPrevented).toBe(false);
+  });
+});
+
+// verify-xum's `idle` and `webkit-capture` end a wait at once, with exit 3, when the page shows a
+// failed module load. For the boot screen they read the mark that index.html's script sets, and
+// the two live in different files, so these tests run verify-xum's own expression, as bash
+// expands it, against the page that script leaves.
+describe("verify-xum's check for a module that failed to load", () => {
+  /** CHUNK_LOAD_FAILED_JS as bash expands it: the text verify-xum.sh hands to the browser. */
+  function chunkLoadFailedExpression(): string {
+    const assignment = readFileSync(VERIFY_XUM_SCRIPT, "utf8")
+      .split("\n")
+      .find((line) => line.startsWith("CHUNK_LOAD_FAILED_JS="));
+    if (!assignment) throw new Error("verify-xum.sh has no CHUNK_LOAD_FAILED_JS assignment");
+    const run = spawnSync("bash", ["-c", `${assignment}\nprintf %s "$CHUNK_LOAD_FAILED_JS"`], {
+      encoding: "utf8",
+    });
+    if (run.status !== 0 || run.stdout === "")
+      throw new Error(`bash could not read it: ${run.stderr}`);
+    return run.stdout;
+  }
+
+  function pageShowsFailedLoad(): unknown {
+    return vm.runInNewContext(chunkLoadFailedExpression(), { document });
+  }
+
+  test("says no while the boot screen loads", () => {
+    bootPage();
+
+    expect(pageShowsFailedLoad()).toBe(false);
+  });
+
+  test("says yes once the boot screen shows that a module failed to load", () => {
+    bootPage();
+    failedModuleScript();
+
+    expect(pageShowsFailedLoad()).toBe(true);
+  });
+
+  test("says yes for a lazily loaded part that failed to load", () => {
+    document.body.innerHTML = '<div role="alert"><p>Review failed to load.</p></div>';
+
+    expect(pageShowsFailedLoad()).toBe(true);
   });
 });

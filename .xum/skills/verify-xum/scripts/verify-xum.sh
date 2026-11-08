@@ -430,10 +430,10 @@ seed() {
 # about 900 of them: about 45 CPU seconds, most of it in Babel, where React Compiler runs. That
 # outlasts `idle`'s 25 s wait, so the page stays on "Loading Xum". For that whole time Chrome also
 # holds dozens of queued module requests, and a host network change fails them (ERR_NETWORK_CHANGED,
-# then "<name> failed to load." or a page that stays on "Loading Xum"). Walking the module graph
-# here, over HTTP and before `ready`, moves that cost into the launch, so the first `open` gets
-# cached modules. The walk prints to stderr: stdout stays the run's `export` lines. env -i keeps
-# the live Xum's token out of its environment.
+# then "<name> failed to load." for a lazy part, or the boot screen's "Xum could not load" for a
+# module of the first load). Walking the module graph here, over HTTP and before `ready`, moves
+# that cost into the launch, so the first `open` gets cached modules. The walk prints to stderr:
+# stdout stays the run's `export` lines. env -i keeps the live Xum's token out of its environment.
 warm_vite_modules() {
   before_launch_deadline
   env -i PATH="$PATH" HOME="$HOME" bun "$CHECKOUT/scripts/warmViteModules.ts" \
