@@ -96,27 +96,53 @@ const SECRET_KEY_VALUE_PATTERN = new RegExp(
 // body takes everything but those, and a backslash that does not start an escape. The header may
 // also be a JSON key (`"cookie": "a=b"`, its opening quote kept so the quotes stay paired), whose
 // value may be an array (`"set-cookie": ["a=b", "c=d"]`, Node's shape), read to its `]`.
-// A name starts after a non-word character, so `getCookie:` and `X-Cookie:` are not headers; after
-// an escaped line break it starts behind the letter of `\n`. A prose line that begins with
-// `cookie:` is redacted to its end: the name and the colon are all this rule can see.
-// Linear: the body and the array never fail and never backtrack, as `QUOTED_VALUE` is (a run of
-// body characters is one step); the name, the key's quote and the gaps are bounded, and the value
-// is read once, since the match ends it.
+// The name counts only in header position (`COOKIE_CONTEXT`), so a sentence such as `Session
+// cookie: HttpOnly is set` or `getCookie:` stays readable: the memory-write guard reuses this
+// detector, and a note about cookies must stay writable. A prose line that begins with `cookie:`
+// is still a header to this rule and is redacted to its end.
+// Linear: once the colon matched, the body and the array never fail and never backtrack, as
+// `QUOTED_VALUE` is (a run of body characters, or of backslashes, is one step: a step per backslash
+// cost 50 ms on 100 KB of them); the name, the context, the key's quote and the gaps are bounded,
+// and the value is read once, since the match ends it. The context is read backwards from the
+// name, so the scan pays for it only at the word `cookie`. A value that needs a check the pattern
+// cannot make without backtracking (see `redactCookieValue`) is read whole and judged afterwards.
+const COOKIE_NAME = "(?:Set-)?Cookie";
+// Behind the name: a line start (the text's, a raw line break, or the escape of one: `\n` ends in a
+// letter), with the indent and the marker of a `curl -v` trace (`> Cookie:`, `< Set-Cookie:`) or a
+// list (`- Cookie:`); a quote, which is a JSON key, a `-H "Cookie: ..."` argument, or JSON text in
+// JSON text (`\"Cookie\"`); an object or argument list (`{ cookie: 'a=b' }`, Node's inspect shape);
+// or an unquoted `-H` / `--header` argument.
+const COOKIE_CONTEXT = String.raw`(?:(?:^|[\r\n]|\\[nr])[ \t]{0,16}(?:[<>*-][ \t]{0,4})?|["'{,][ \t]{0,8}|(?:-H|--header)[ =])`;
+const COOKIE_KEY_QUOTE = String.raw`(?:\\{0,${ESCAPE_RUN_MAX}}["'])`;
 const COOKIE_HEADER_PATTERN = new RegExp(
-  String.raw`(?:(?<![\w-])|(?<=\\[nr]))` +
-    String.raw`((?:Set-)?Cookie(?:\\{0,${ESCAPE_RUN_MAX}}["'])?[ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})` +
-    String.raw`(?:\[[^\]]*\]?|((?:\\{0,${ESCAPE_RUN_MAX}}["'])?)(?:[^\r\n"'\\]+|\\(?![nr"']))*)`,
+  String.raw`(${COOKIE_NAME}(?<=${COOKIE_CONTEXT}${COOKIE_NAME})${COOKIE_KEY_QUOTE}?[ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})` +
+    String.raw`(?:\[[^\]]*\]?|(${COOKIE_KEY_QUOTE}?)(?:[^\r\n"'\\]+|\\+(?![nr"']))*)`,
   "gi"
 );
+
+/** A value that stays as it is: none (only spaces, or an array with nothing in it), or `[redacted]`. */
+const UNTOUCHED_COOKIE_VALUE = /^\s*(?:$|\[\s*\]?$|\[redacted\])/;
+
+/**
+ * What a matched cookie header becomes. The match runs to the end of the header whatever the value
+ * is, and this decides what to do with it: an empty value is no credential (`Cookie:` in a note),
+ * and one that is already `[redacted]` stays as it is (`Cookie: "[redacted]; Path=/"` is not a new
+ * one), so the passes compose, as the key/value rule's do, and the write guard accepts a note that
+ * quotes redacted text. Checked here and not in the pattern, where a lookahead before the value
+ * lets the gap give a space back, and the value start there.
+ */
+function redactCookieValue(match: string, prefix: string, opener: string | undefined): string {
+  const quote = opener ?? "";
+  const value = match.slice(prefix.length + quote.length);
+  if (UNTOUCHED_COOKIE_VALUE.test(value)) return match;
+  return `${prefix}${quote}${REDACTED}`;
+}
 
 /** Replaces common credential shapes with `[redacted]`. */
 export function redactSecretLike(text: string): string {
   // First, while the value is still whole: a standalone pattern that redacts the head of a cookie
   // would end the value there and leave its tail readable.
-  let redacted = text.replace(
-    COOKIE_HEADER_PATTERN,
-    (_match, prefix: string, opener: string | undefined) => `${prefix}${opener ?? ""}${REDACTED}`
-  );
+  let redacted = text.replace(COOKIE_HEADER_PATTERN, redactCookieValue);
   for (const pattern of STANDALONE_SECRET_PATTERNS) redacted = redacted.replace(pattern, REDACTED);
   return redacted.replace(
     SECRET_KEY_VALUE_PATTERN,

@@ -347,6 +347,41 @@ describe("redactSecretLike", () => {
         `"set-cookie": [\n  "a=${SESSION}; Path=/",\n  "b=${SESSION}2"\n],\n"host": "example.com"`,
         '"set-cookie": [redacted],\n"host": "example.com"',
       ],
+      [
+        "a value with backslashes in it, up to the escape of a line break",
+        jsonOf({ output: `Cookie: sid=a\\b\\\r\nHost: h` }),
+        String.raw`{"output":"Cookie: [redacted]\r\nHost: h"}`,
+      ],
+      [
+        "the lines of a curl trace, behind their > and < markers",
+        `> GET / HTTP/1.1\n> Cookie: sid=${SESSION}\n< HTTP/1.1 200 OK\n< Set-Cookie: sid=${SESSION}; Path=/\n< Vary: Cookie`,
+        "> GET / HTTP/1.1\n> Cookie: [redacted]\n< HTTP/1.1 200 OK\n< Set-Cookie: [redacted]\n< Vary: Cookie",
+      ],
+      [
+        "an indented header and a header in a list",
+        `  headers:\n    Cookie: sid=${SESSION}\n  - Set-Cookie: sid=${SESSION}`,
+        "  headers:\n    Cookie: [redacted]\n  - Set-Cookie: [redacted]",
+      ],
+      [
+        "a header after an escaped line break and an indent",
+        String.raw`GET /\r\n  Cookie: sid=${SESSION}\r\nAccept: */*`,
+        String.raw`GET /\r\n  Cookie: [redacted]\r\nAccept: */*`,
+      ],
+      [
+        "a key of an object that a tool printed unquoted",
+        `{ host: 'example.com', cookie: 'sid=${SESSION}', accept: '*/*' }`,
+        "{ host: 'example.com', cookie: '[redacted]', accept: '*/*' }",
+      ],
+      [
+        "an unquoted -H argument",
+        `curl -H Cookie:sid=${SESSION} https://example.com`,
+        "curl -H Cookie:[redacted]",
+      ],
+      [
+        "a value behind a long gap",
+        `Cookie:${" ".repeat(60)}sid=${SESSION}\nHost: example.com`,
+        `Cookie:${" ".repeat(48)}[redacted]\nHost: example.com`,
+      ],
     ])("redacts %s and keeps what is around it", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
@@ -365,6 +400,44 @@ describe("redactSecretLike", () => {
       ].join("\n");
 
       expect(redactSecretLike(text)).toBe(text);
+    });
+
+    // The memory-write guard reuses this detector: a note that explains a cookie must stay writable.
+    // The name is a header only where a header starts, not after any word of a sentence.
+    it("leaves a sentence that has `cookie:` in the middle of it readable", () => {
+      const text = [
+        "Note on the cookie: it expires after an hour.",
+        "Session cookie: HttpOnly and Secure flags are set by the login route.",
+        "Remember: the Set-Cookie: header only reaches the browser over HTTPS.",
+        `The cookie: a=${SESSION}`,
+      ].join("\n");
+
+      expect(redactSecretLike(text)).toBe(text);
+      expect(containsSecretLike(text)).toBe(false);
+    });
+
+    // A redacted header read back (the model's own notes quote what it read) is not a new credential,
+    // as for the key/value rule: the write guard must accept it, with more text inside the quotes too.
+    it.each([
+      ["a header with more text after the marker", "Cookie: [redacted] and the rest of the line"],
+      ["a header whose marker has an attribute list", 'Set-Cookie: "[redacted]; Path=/; HttpOnly"'],
+      ["a JSON key whose marker has an attribute list", '{"cookie": "[redacted]; Path=/", "a": 1}'],
+      ["a quoted command header", `curl -H 'Cookie: "[redacted]; b=2"' https://example.com`],
+    ])("leaves %s as it is", (_label, text) => {
+      expect(redactSecretLike(text)).toBe(text);
+      expect(containsSecretLike(text)).toBe(false);
+    });
+
+    // Nothing is there to redact, and a bare `Cookie:` in a note is not a credential either.
+    it.each([
+      ["the end of the text", "Header names: Cookie:"],
+      ["a line break", "Cookie: \nHost: example.com"],
+      ["a carriage return and line feed", "Set-Cookie:\r\nVary: Cookie"],
+      ["an escaped line break in JSON text", String.raw`{"out":"Cookie:\r\nHost: h"}`],
+      ["an empty JSON string", '{"cookie": "", "host": "example.com"}'],
+    ])("leaves a header with no value before %s readable", (_label, text) => {
+      expect(redactSecretLike(text)).toBe(text);
+      expect(containsSecretLike(text)).toBe(false);
     });
   });
 
@@ -489,6 +562,19 @@ describe("redactSecretLike", () => {
     ["many cookie keys with a long backslash run", `cookie${"\\".repeat(31)}"`.repeat(2_800)],
     ["cookie array openers with no close", `Cookie:[`.repeat(25_000)],
     ["cookie names after escaped line breaks", String.raw`\nCookie`.repeat(15_000)],
+    ["a cookie colon and a long gap with no value", `Cookie:${" ".repeat(100_000)}`],
+    ["cookie colons and a gap with no value, line after line", "Cookie: \n".repeat(15_000)],
+    [
+      "cookie names behind an indent that is no line start",
+      `${" ".repeat(16)}Cookie`.repeat(5_900),
+    ],
+    ["cookie names behind an indent and a marker", `\n${" ".repeat(16)}> Cookie`.repeat(5_000)],
+    ["cookie values that open with a redacted marker", 'Cookie: "[redacted]\n'.repeat(7_000)],
+    [
+      "cookie values that open with a long gap and a marker",
+      `Cookie:${" ".repeat(40)}[redacted]\n`.repeat(2_500),
+    ],
+    ["cookie names behind quotes and commas", `,Cookie`.repeat(14_000)],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
     // Each scan gets the whole budget: `containsSecretLike` is a second pass of the same redaction,
