@@ -521,6 +521,34 @@ describe("consolidation memory tool rails", () => {
       });
     });
 
+    it("still says refusals are dropped when an accepted mutation took the last slot", async () => {
+      using fixture = await createFixture({ guard: { writableScopes: ["workspace"] } });
+      const refuse = (count: number, from: number) =>
+        Promise.all(
+          Array.from({ length: count }, (_, index) =>
+            execute(fixture.tool, {
+              command: "create",
+              path: `/memories/global/n${from + index}.md`,
+              file_text: "x\n",
+            })
+          )
+        );
+
+      await refuse(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - 1, 0);
+      const accepted = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/workspace/ok.md",
+        file_text: "ok\n",
+      });
+      await refuse(3, MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES);
+
+      expect(accepted.success).toBe(true);
+      // The first refusal past the full journal records the omission; the ones after it are dropped.
+      expect(fixture.journal).toHaveLength(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES + 1);
+      expect(fixture.journal.filter((op) => op.note?.includes("not recorded"))).toHaveLength(1);
+      expect(fixture.journal.at(-1)?.note).toContain("not recorded");
+    });
+
     it("bounds the rows a spent budget refuses, which spend nothing either", async () => {
       using fixture = await createFixture({ guard: { budget: createMutationBudget(1) } });
       await execute(fixture.tool, {

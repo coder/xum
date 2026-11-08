@@ -476,17 +476,12 @@ export function harvestResumeState(existing: MemoryHarvestRecord | undefined): {
 } {
   // A first attempt has no record: read each field off an empty one rather than check per field.
   const earlier: Partial<MemoryHarvestRecord> = existing ?? {};
-  // The chunk cursor counts chunks of the rows after the floor the first attempt fixed. A record
-  // with a cursor but no floor (older, or hand-edited) gets its floor recomputed, maybe a newer one
-  // that an archive completed meanwhile, and the old cursor would then skip chunks nobody read: start
-  // that retry at the first chunk again (re-reading rows, never skipping them).
-  const cursorHasFloor = earlier.analyzedFloorRowId !== undefined;
   return {
     progress: {
-      nextChunk: cursorHasFloor ? (earlier.nextChunk ?? 0) : 0,
+      nextChunk: earlier.nextChunk ?? 0,
       ops: earlier.ops ?? [],
       budgetUsed: earlier.budgetUsed,
-      nextChunkOps: cursorHasFloor ? earlier.nextChunkOps : undefined,
+      nextChunkOps: earlier.nextChunkOps,
       // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot be
       // loaded): its failure record would otherwise drop what the earlier attempt's chunks read.
       readThroughRowId: earlier.readThroughRowId,
@@ -496,8 +491,21 @@ export function harvestResumeState(existing: MemoryHarvestRecord | undefined): {
     },
     // A retry keeps the floor of the first attempt: the chunk cursor counts chunks of the rows
     // after it.
-    attemptState: { analyzedFloorRowId: earlier.analyzedFloorRowId },
+    attemptState: { analyzedFloorRowId: resumedFloor(earlier) },
   };
+}
+
+/**
+ * The floor a retry's cursor counts from. A record written before the floor existed has a cursor
+ * but no floor: the analyzer then read the whole epoch, so its cursor counts from the epoch's start
+ * (null). Recomputing a floor for it could find a newer one (an archive completed meanwhile) and
+ * skip chunks, and restarting its cursor would replay chunks whose landed edits it no longer knows.
+ * A record with no cursor yet has no floor to keep: the attempt takes one from the records.
+ */
+function resumedFloor(earlier: Partial<MemoryHarvestRecord>): string | null | undefined {
+  if (earlier.analyzedFloorRowId !== undefined) return earlier.analyzedFloorRowId;
+  const hasCursor = (earlier.nextChunk ?? 0) > 0 || (earlier.nextChunkOps ?? 0) > 0;
+  return hasCursor ? null : undefined;
 }
 
 /**
@@ -560,8 +568,8 @@ function analyzedEpochRowIds(
   for (const [boundaryKey, record] of Object.entries(records ?? {})) {
     // The job's own record says how far ITS chunk cursor got, not which rows an earlier run read:
     // starting a retry after its own `readThroughRowId` would skip rows, since the cursor counts
-    // chunks of the rows after the job's floor (kept in `analyzedFloorRowId`). A record that has
-    // the cursor but no floor (older, or hand-edited) re-reads rows instead.
+    // chunks of the rows after the job's floor (kept in `analyzedFloorRowId`; `resumedFloor` gives
+    // a record from before that field the epoch's start).
     if (boundaryKey === ownBoundaryKey) continue;
     const isOpenEpochRecord = boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX);
     const readEverythingToKey =

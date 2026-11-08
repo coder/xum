@@ -92,7 +92,7 @@ const CANCELLED_PASS_ERROR = "Consolidation pass was cancelled";
 const DEFAULT_WRITABLE_SCOPES: readonly WritableMemoryScope[] = ["workspace", "global", "project"];
 const LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
 const MUTATING_COMMANDS = MemoryConsolidationOpSchema.shape.command.options;
-const JOURNAL_FULL_NOTE = `The journal holds ${MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES} rows; later refusals of this run are not recorded.`;
+const JOURNAL_FULL_NOTE = "The journal is full; later refusals of this run are not recorded.";
 
 interface MutationTarget {
   command: MemoryConsolidationOp["command"];
@@ -440,15 +440,17 @@ function persistedTarget(
 }
 
 /**
- * Journal a refusal while the journal has room, the last slot carrying the note that later ones
- * are dropped. Rows of budgeted commands are pushed directly and always: the budget bounds them.
- * The cap reads the journal itself, so it holds for every tool that shares one (the analyzer's
- * chunks of a run).
+ * Journal a refusal while the journal has room. The refusal that reaches the last slot carries the
+ * note that later ones are dropped, and so does the first one after rows of budgeted commands
+ * filled the journal past it: those are pushed directly and always (the budget bounds them), so
+ * the note is recorded once whatever the order, and the journal holds at most one refusal past
+ * the cap. The cap reads the journal itself, so it holds for every tool that shares one (the
+ * analyzer's chunks of a run).
  */
 function journalRefusal(journal: MemoryConsolidationOp[], row: RefusalRow): void {
-  const slotsLeft = MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - journal.length;
-  if (slotsLeft <= 0) return;
-  journal.push(slotsLeft === 1 ? { ...row, note: `${row.note} ${JOURNAL_FULL_NOTE}` } : row);
+  if (journal.some((op) => op.note?.endsWith(JOURNAL_FULL_NOTE) === true)) return;
+  const reachesLastSlot = journal.length >= MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - 1;
+  journal.push(reachesLastSlot ? { ...row, note: `${row.note} ${JOURNAL_FULL_NOTE}` } : row);
 }
 
 /**

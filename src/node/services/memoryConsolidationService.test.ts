@@ -3416,8 +3416,8 @@ describe("MemoryConsolidationService", () => {
         // A record saved before the floor was: it has the cursor and the row its chunks read, no
         // floor. The cursor counts chunks of the rows after the job's floor, so a floor taken from
         // the record's own `readThroughRowId` would leave the retry fewer rows than the cursor
-        // counts, and skip some. With no floor to reuse it reads the rows again from the start,
-        // its first chunk included: the recomputed floor may differ from the one the cursor counted.
+        // counts, and skip some. Such a record's cursor counts from the epoch's start, so the retry
+        // resumes at its chunk there.
         const { chunkLabels, record } = await retryAfterSecondChunkFailed((fixture) =>
           editHarvestRecord(fixture, "summary-1", (stored) => {
             expect(typeof stored.readThroughRowId).toBe("string");
@@ -3425,7 +3425,7 @@ describe("MemoryConsolidationService", () => {
           })
         );
 
-        expect(chunkLabels).toEqual(["1/3", "2/3", "1/3", "2/3", "3/3"]);
+        expect(chunkLabels).toEqual(["1/3", "2/3", "2/3", "3/3"]);
         expect(record).toMatchObject({ status: "completed", nextChunk: 3 });
       });
 
@@ -5519,10 +5519,10 @@ describe("harvestResumeState", () => {
     expect(attemptState.analyzedFloorRowId).toBe("row-3");
   });
 
-  it("starts a retry whose record has a cursor but no floor at the first chunk", () => {
-    // Its floor is recomputed and may be newer than the one the cursor counted from: resuming at
-    // the old chunk would skip rows no run read.
-    const { progress } = harvestResumeState({
+  it("resumes a record from before the floor at its cursor, counted from the epoch's start", () => {
+    // Such a record's analyzer read the whole epoch. A recomputed floor could be newer and skip
+    // chunks; restarting the cursor would replay chunks without the edits they already landed.
+    const { progress, attemptState } = harvestResumeState({
       status: "failed",
       startedAt: 1,
       attemptCount: 1,
@@ -5535,7 +5535,8 @@ describe("harvestResumeState", () => {
       budgetUsed: 5,
     });
 
-    expect(progress).toMatchObject({ nextChunk: 0, nextChunkOps: undefined, budgetUsed: 5 });
+    expect(progress).toMatchObject({ nextChunk: 2, nextChunkOps: 1, budgetUsed: 5 });
+    expect(attemptState.analyzedFloorRowId).toBeNull();
   });
 
   it("keeps a null floor (an attempt that found no earlier run) apart from an absent one", () => {
