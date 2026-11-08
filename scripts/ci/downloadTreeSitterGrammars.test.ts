@@ -285,7 +285,7 @@ describe.skipIf(Bun.which("python3") === null)("download_tree_sitter_grammars.py
   });
 
   describe("platforms", () => {
-    const KEYS: Array<[string, string, string | null]> = [
+    const KEYS: [string, string, string | null][] = [
       ["Linux", "x86_64", "linux-x86_64"],
       ["Linux", "aarch64", "linux-aarch64"],
       ["Linux", "arm64", "linux-aarch64"],
@@ -308,7 +308,7 @@ describe.skipIf(Bun.which("python3") === null)("download_tree_sitter_grammars.py
       const { pins } = JSON.parse(result.stdout) as {
         pins: { bundle_sha256: Record<string, string> };
       };
-      expect(new Set(Object.keys(pins.bundle_sha256))).toEqual(named as Set<string>);
+      expect(new Set(Object.keys(pins.bundle_sha256))).toEqual(named);
     });
 
     test("a platform without a pin exits 2 before the pack is touched", async () => {

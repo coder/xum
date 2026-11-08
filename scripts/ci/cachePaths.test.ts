@@ -42,8 +42,13 @@ function literalPrefix(expression: string): string {
     .trim();
 }
 
+// A `with:` input as text. Cache inputs are strings; anything else counts as empty.
+function text(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
 function lines(value: unknown): string[] {
-  return String(value ?? "")
+  return text(value)
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line !== "");
@@ -78,7 +83,7 @@ function workflowFiles(): string[] {
 
 // A save step names its key by the restore step's output: `steps.<id>.outputs.cache-primary-key`.
 function keyOf(step: WorkflowStep, steps: WorkflowStep[]): string {
-  const key = String(step.with?.key ?? "");
+  const key = text(step.with?.key);
   const id = /^\$\{\{ steps\.([\w-]+)\.outputs\.cache-primary-key \}\}$/.exec(key)?.[1];
   if (id === undefined) {
     return key;
@@ -87,7 +92,7 @@ function keyOf(step: WorkflowStep, steps: WorkflowStep[]): string {
   if (restore === undefined) {
     throw new Error(`cache key refers to the unknown step ${id}`);
   }
-  return String(restore.with?.key ?? "");
+  return text(restore.with?.key);
 }
 
 function cacheStepsOf(file: string): CacheStep[] {
