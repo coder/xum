@@ -39,7 +39,10 @@ import {
   type MemoryScope,
 } from "@/common/constants/memory";
 import type { MemoryToolResult } from "@/common/types/tools";
-import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
+import {
+  MemoryConsolidationOpSchema,
+  type MemoryConsolidationOp,
+} from "@/common/orpc/schemas/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
@@ -78,7 +81,8 @@ type WritableMemoryScope = Exclude<MemoryScope, "session">;
 
 const CANCELLED_PASS_ERROR = "Consolidation pass was cancelled";
 const DEFAULT_WRITABLE_SCOPES: readonly WritableMemoryScope[] = ["workspace", "global", "project"];
-const PATH_LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
+const LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
+const MUTATING_COMMANDS = MemoryConsolidationOpSchema.shape.command.options;
 
 interface MutationTarget {
   command: MemoryConsolidationOp["command"];
@@ -261,7 +265,7 @@ function scopeRejection(
     rails.writableScopes.includes("project") && !rails.projectAvailable
       ? "project memory is available only for single-project runs; "
       : "";
-  return `Consolidation may not modify ${virtualPath}: ${projectNote}this run can modify ${PATH_LIST_FORMAT.format(modifiable)}.`;
+  return `Consolidation may not modify ${virtualPath}: ${projectNote}this run can modify ${LIST_FORMAT.format(modifiable)}.`;
 }
 
 /**
@@ -283,6 +287,18 @@ function secretRejection(target: MutationTarget, input: MemoryCommandInput): str
 }
 
 /**
+ * The note for a denied command. It names what the run may still use rather than describing the
+ * denial as "adding" or "editing": a run that is denied `insert` still adds, through the others.
+ */
+function deniedCommandRejection(
+  command: MemoryConsolidationOp["command"],
+  denied: ReadonlyArray<MemoryConsolidationOp["command"]>
+): string {
+  const allowed = MUTATING_COMMANDS.filter((candidate) => !denied.includes(candidate));
+  return `This run may not use ${command}; it can change memory only with ${LIST_FORMAT.format(allowed)}.`;
+}
+
+/**
  * The rails that need no I/O: writable scope, denied command and (opt-in) credential check, in
  * that order. Throws on an invalid path (parseMemoryPath); the tool surfaces that as a tool error.
  */
@@ -299,7 +315,7 @@ function staticRejection(
     }
   }
   if (rails.deniedCommands?.includes(target.command) === true) {
-    return `This run may not use ${target.command}; it can only add to and edit memory.`;
+    return deniedCommandRejection(target.command, rails.deniedCommands);
   }
   return rails.rejectSecretLike === true ? secretRejection(target, input) : null;
 }
@@ -402,7 +418,9 @@ export function createConsolidationMemoryTool(args: {
   writableScopes?: readonly WritableMemoryScope[];
   /**
    * Commands this run may not use. Default: none, which the dream pass uses. The harvest analyzer
-   * denies `delete` and `rename`: it adds and corrects, and only the organizer removes.
+   * denies `delete` and `rename` (only the organizer removes) and `insert`: its line offset comes
+   * from an earlier read, and goes stale under parallel calls, foreground writers and replay,
+   * where `create` and `str_replace` are anchored to content.
    */
   deniedCommands?: ReadonlyArray<MemoryConsolidationOp["command"]>;
   /**

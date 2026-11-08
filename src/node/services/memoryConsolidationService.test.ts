@@ -2463,7 +2463,7 @@ describe("MemoryConsolidationService", () => {
       }
     });
 
-    // The analyzer and the dream edit the same /memories/workspace files, and a model's `insert`
+    // The analyzer and the dream edit the same /memories/workspace files, and the dream's `insert`
     // takes a line offset from an earlier read: the two streams must never run at once.
     describe("with the dream stream's exclusion", () => {
       it("does not start a chunk while a dream stream of its owner holds the exclusion", async () => {

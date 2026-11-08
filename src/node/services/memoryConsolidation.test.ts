@@ -452,6 +452,34 @@ describe("consolidation memory tool rails", () => {
     });
   });
 
+  describe("denied command note", () => {
+    it("names the commands the run can still use, not the ones it was denied", async () => {
+      using fixture = await createFixture({
+        guard: { deniedCommands: ["delete", "rename", "insert"] },
+      });
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "keep.md"), "x\n");
+
+      const result = await execute(fixture.tool, {
+        command: "insert",
+        path: "/memories/global/keep.md",
+        insert_line: 0,
+        insert_text: "y\n",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      // Everything after "may not use insert;" is what the run is told it may do.
+      const allowed = result.error.slice(result.error.indexOf(";"));
+      expect(allowed).toContain("create");
+      expect(allowed).toContain("str_replace");
+      for (const denied of ["insert", "delete", "rename"]) expect(allowed).not.toContain(denied);
+      expect(fixture.getMutationCount()).toBe(0);
+      expect(
+        await fsPromises.readFile(path.join(fixture.globalMemoryDir, "keep.md"), "utf-8")
+      ).toBe("x\n");
+    });
+  });
+
   describe("secret check", () => {
     it("rejects create, str_replace and insert text that holds a credential, and journals it without the value", async () => {
       using fixture = await createFixture({ guard: { rejectSecretLike: true } });
