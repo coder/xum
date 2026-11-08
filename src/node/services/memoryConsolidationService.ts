@@ -486,6 +486,22 @@ function isLiveHarvestAttempt(record: MemoryHarvestRecord | undefined): boolean 
   return record?.status === "pending" && !isStalePendingHarvestRecord(record);
 }
 
+/** The number of the attempt after the ones `record` counts. */
+function nextAttemptCount(record: MemoryHarvestRecord | undefined): number {
+  return (record?.attemptCount ?? 0) + 1;
+}
+
+/**
+ * A save for a writer without the job lock (see saveHarvestRecordEffect): `build` makes the record
+ * from the stored one, since another backend's attempt may have moved it since this job read it,
+ * and nothing is written over an attempt that is still live.
+ */
+function unlessLiveAttempt(
+  build: (current: MemoryHarvestRecord | undefined) => MemoryHarvestRecord
+): (current: MemoryHarvestRecord | undefined) => MemoryHarvestRecord | undefined {
+  return (current) => (isLiveHarvestAttempt(current) ? undefined : build(current));
+}
+
 /**
  * Whether the record read under the job lock leaves its job nothing to do: completed, or out of
  * attempts. Unlike isTerminalHarvestRecord this counts a pending record too: under the lock it
@@ -504,7 +520,7 @@ function resumeHarvestAttemptFrom(
   const resumed = harvestResumeState(current);
   Object.assign(job.progress, resumed.progress);
   job.attemptState.analyzedFloorRowId = resumed.attemptState.analyzedFloorRowId;
-  job.attempt.count = (current?.attemptCount ?? 0) + 1;
+  job.attempt.count = nextAttemptCount(current);
 }
 
 /** The record fields of a run in flight: its progress and what the attempt learned. */
@@ -1967,17 +1983,9 @@ export class MemoryConsolidationService extends EventEmitter {
               boundaryKey,
               attempt.holdsJobLock
                 ? failedRecord(error, attempt.count, { progress, attemptState })
-                : // Without the job lock, another backend's attempt may have moved the record
-                  // since this job read it: fail on top of what is stored, and never over an
-                  // attempt that is still live.
-                  (current) =>
-                    isLiveHarvestAttempt(current)
-                      ? undefined
-                      : failedRecord(
-                          error,
-                          (current?.attemptCount ?? 0) + 1,
-                          harvestResumeState(current)
-                        ),
+                : unlessLiveAttempt((current) =>
+                    failedRecord(error, nextAttemptCount(current), harvestResumeState(current))
+                  ),
               projectPath
             );
             log.warn("[MemoryConsolidation] harvest failed", {
@@ -2069,12 +2077,12 @@ export class MemoryConsolidationService extends EventEmitter {
       const floorBeforeWait = floorFrom(opts.earlierRecords);
       if (nothingLeftAfter(floorBeforeWait)) {
         opts.attemptState.analyzedFloorRowId = floorBeforeWait;
-        // Not under the job lock: leave a record another backend's live attempt is updating.
+        // Not under the job lock: see unlessLiveAttempt.
         const completed = completedRecord(opts.progress);
         return yield* self.saveHarvestRecordEffect(
           workspaceId,
           boundaryKey,
-          (current) => (isLiveHarvestAttempt(current) ? undefined : completed),
+          unlessLiveAttempt(() => completed),
           ctx.projectPath
         );
       }
