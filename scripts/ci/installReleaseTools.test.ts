@@ -80,14 +80,14 @@ describe("install-release-tools.sh", () => {
 
   test("picks the asset of the CPU it runs on", async () => {
     await install(["static-curl", path.join(work, "bin")], "aarch64");
-    expect(await curlUrls()).toEqual([
-      expect.stringMatching(/\/curl-linux-aarch64-musl-[\d.]+\.tar\.xz$/),
-    ]);
+    const aarch64 = await curlUrls();
+    expect(aarch64).toHaveLength(1);
+    expect(aarch64[0]).toMatch(/\/curl-linux-aarch64-musl-[\d.]+\.tar\.xz$/);
     await rm(path.join(work, "curl-calls"));
     await install(["static-curl", path.join(work, "bin")], "x86_64");
-    expect(await curlUrls()).toEqual([
-      expect.stringMatching(/\/curl-linux-x86_64-musl-[\d.]+\.tar\.xz$/),
-    ]);
+    const x86 = await curlUrls();
+    expect(x86).toHaveLength(1);
+    expect(x86[0]).toMatch(/\/curl-linux-x86_64-musl-[\d.]+\.tar\.xz$/);
   });
 
   test("refuses an unknown tool set and a wrong command line", async () => {
