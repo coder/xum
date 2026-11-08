@@ -12,7 +12,7 @@ import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { configFilePath, type Config, type ProjectsConfig } from "@/node/config";
+import { configFilePath, type Config, type ProjectsConfig, type Workspace } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
@@ -679,6 +679,13 @@ function assertParentKnownForSave(snapshot: ConfigSnapshot, current: ResolvedOve
       "The parent workspace's MCP settings could not be read (another workspace's metadata is unreadable); the settings were not saved."
     );
   }
+}
+
+/** Config rows with no id that still carry a legacy `workspace.mcp` value. */
+function idlessLegacyRows(config: ProjectsConfig): Workspace[] {
+  return [...config.projects.values()]
+    .flatMap((project) => project.workspaces)
+    .filter((row) => row.id === undefined && row.mcp !== undefined);
 }
 
 /** Unlocked fork-copy preparations attempted before the terminal fallback (see copyOverridesToForkedCheckout). */
@@ -4646,27 +4653,35 @@ export class WorkspaceMcpOverridesService {
     snapshot: ConfigSnapshot
   ): Promise<void> {
     const identity = runtimeFilesystemIdentity(written.runtimeConfig);
-    const rows = [...legacyConfig.projects.values()]
-      .flatMap((project) => project.workspaces)
-      .filter((row) => row.id === undefined && row.mcp !== undefined);
+    const rows = idlessLegacyRows(legacyConfig);
     if (identity === undefined || rows.length === 0) return;
     const canonicalWritten = await snapshot.canonicalize(identity, writtenPath);
     for (const row of rows) {
-      const runtimeConfig = row.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
-      if (runtimeFilesystemIdentity(runtimeConfig) !== identity) continue;
-      const rowPath = this.getOverridesFilePaths(row.path, runtimeConfig)[0];
-      const canonicalRow = await snapshot.canonicalize(identity, rowPath);
-      // An unresolvable path may share the checkout too.
-      if (
-        canonicalWritten === undefined ||
-        canonicalRow === undefined ||
-        canonicalRow === canonicalWritten
-      ) {
+      if (await this.legacyRowMayShare(row, identity, canonicalWritten, snapshot)) {
         throw new Error(
           `The workspace registered at ${row.path} may share this checkout and carries legacy MCP settings that Xum cannot retire until config.json holds its id (its metadata.json is unreadable or not migrated yet); the settings were not saved. Repair that file, then try again.`
         );
       }
     }
+  }
+
+  /** Whether a config row's checkout may be the written one (see assertNoUnretirableLegacySharer). */
+  private async legacyRowMayShare(
+    row: Workspace,
+    identity: string,
+    canonicalWritten: string | undefined,
+    snapshot: ConfigSnapshot
+  ): Promise<boolean> {
+    const runtimeConfig = row.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
+    if (runtimeFilesystemIdentity(runtimeConfig) !== identity) return false;
+    const rowPath = this.getOverridesFilePaths(row.path, runtimeConfig)[0];
+    const canonicalRow = await snapshot.canonicalize(identity, rowPath);
+    // An unresolvable path may share the checkout too.
+    return (
+      canonicalWritten === undefined ||
+      canonicalRow === undefined ||
+      canonicalRow === canonicalWritten
+    );
   }
 
   /**
