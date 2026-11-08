@@ -728,6 +728,44 @@ async function assertSheetTouchTargets(page: StoryPage) {
     if (viewport) await page.setViewportSize(viewport);
   }
 }
+/**
+ * The live line clears the composer on a real touch phone. The touch floor makes every control's hit
+ * area taller than what it draws, and the row keeps padding below the controls so the line never
+ * sits on the composer's top edge. This is the only place that padding can be checked: it lives in
+ * the same `pointer: coarse` query as the floor, which a play cannot match.
+ */
+async function assertLiveLineClearsTheComposer(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.waitForFunction(() => matchMedia("(pointer: coarse)").matches, undefined, {
+      timeout: 5000,
+    });
+    const gap = await page.evaluate(() => {
+      const line = document.querySelector('[data-component="ChatActivityLine"]');
+      const surface = document.querySelector('[data-component="ChatInputSurface"]');
+      if (!line || !surface) return null;
+      const controls = [...line.querySelectorAll("button")].filter((control) => {
+        const style = getComputedStyle(control);
+        return style.visibility !== "hidden" && control.getBoundingClientRect().height > 0;
+      });
+      if (controls.length === 0) return null;
+      const bottom = Math.max(...controls.map((control) => control.getBoundingClientRect().bottom));
+      return surface.getBoundingClientRect().top - bottom;
+    });
+    assert(gap !== null, "No live-line control to measure on a 375px touch phone");
+    assert(
+      gap >= 5,
+      `The live line ends ${Math.round(gap)}px above the composer, so it reads as part of it`
+    );
+  } finally {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
 
 const PAINT_CHECK_TAG = "paint-check";
 const NO_DIAGRAM_MESSAGE = `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`;
@@ -1054,6 +1092,7 @@ const config: TestRunnerConfig = {
     }
     if (context.id === LANDSCAPE_SHEET_STORY) {
       if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertLiveLineClearsTheComposer(page);
         await assertSheetTouchTargets(page);
       }
       return;
