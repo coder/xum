@@ -16,6 +16,7 @@ import { makeTestEffectRunner } from "./di/testEffectRunner";
 import {
   ALL_WORKSPACES_TARGET,
   boundContainerMutation,
+  indexIdsByCheckout,
   isPositivelyAbsent,
   MAX_WARNED_LENIENT_WALKS,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
@@ -5235,6 +5236,68 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(legacyOf(other.workspaceId)).toEqual({ enabledServers: [staleKey, "kept"] });
     });
 
+    it("prunePluginOverrideKeysForWorkspaces prunes each row of a duplicated id's legacy values on its own", async () => {
+      // A corrupted config can list one id twice, each row with its own legacy value. The prune
+      // must check every row, not only the first (which here names no key), and must not copy
+      // one row's value into another.
+      const service = new WorkspaceMcpOverridesService(config);
+      const first = await registerWorkspace("dup-legacy-a");
+      const second = await registerWorkspace("dup-legacy-b");
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const entry of project.workspaces) {
+            if (entry.id === first.workspaceId) entry.mcp = { enabledServers: ["first"] };
+            if (entry.id === second.workspaceId) {
+              entry.id = first.workspaceId;
+              entry.mcp = { enabledServers: [staleKey, "second"] };
+            }
+          }
+        }
+        return cfg;
+      });
+
+      const failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [first.workspaceId],
+        prefix
+      );
+
+      expect(failures).toEqual([]);
+      const legacyByProject = new Map(
+        [...config.loadConfigOrDefault().projects].map(([projectPath, project]) => [
+          projectPath,
+          project.workspaces[0]?.mcp,
+        ])
+      );
+      expect(legacyByProject.get("/fake/dup-legacy-a")).toEqual({ enabledServers: ["first"] });
+      expect(legacyByProject.get("/fake/dup-legacy-b")).toEqual({ enabledServers: ["second"] });
+    });
+
+    it("prunePluginOverrideKeysForWorkspaces fails the unlocked workspaces with a document when their epoch cannot be published", async () => {
+      // A workspace that the sweep does not lock but that has a document owes the epoch (an
+      // earlier sweep may have rewritten it). When the bump fails, it keeps its tombstone.
+      const service = new WorkspaceMcpOverridesService(config);
+      const documented = await registerWorkspace("epoch-unlocked-doc");
+      const bare = await registerWorkspace("epoch-unlocked-bare");
+      await writeDoc(documented.workspacePath, ["other"]);
+      const realRename = fsPromisesModule.rename;
+      const renameSpy = spyOn(fsPromisesModule, "rename").mockImplementation((from, to) =>
+        path.basename(String(to)) === "mcp-overrides.epoch"
+          ? Promise.reject(new Error("no space left on device"))
+          : realRename(from, to)
+      );
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces(
+          [documented.workspaceId, bare.workspaceId],
+          prefix
+        );
+      } finally {
+        renameSpy.mockRestore();
+      }
+
+      expect(failures.map((failure) => failure.workspaceId)).toEqual([documented.workspaceId]);
+    });
+
     it("prunePluginOverrideKeysForWorkspaces publishes the epoch for a legacy value it pruned before its document failed, and on the retry", async () => {
       // The legacy value is pruned first, then the document cannot be edited, so the workspace
       // fails. Other processes may still cache the legacy enable: the epoch is owed anyway. Once
@@ -5563,6 +5626,46 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(await enabledOf(newPath)).toEqual(["other"]);
     });
 
+    it("prunePluginOverrideKeysForWorkspaces prunes an archived workspace whose checkout an unarchive restores after its scan", async () => {
+      // Archive deletes a worktree's checkout and keeps its entry. The scan finds no document
+      // and no checkout, so the workspace is a candidate. An unarchive that restores the
+      // checkout, keyed document included, before the sweep takes its lock is then pruned.
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspace = await registerWorkspace("archived-mid-scan");
+      const lockFiles = new Set(await checkoutLockFiles(service, workspace.workspaceId));
+      await fs.rm(workspace.workspacePath, { recursive: true });
+      let restored = false;
+      const unarchive = async () => {
+        if (restored) return;
+        restored = true;
+        await fs.mkdir(workspace.workspacePath, { recursive: true });
+        await writeDoc(workspace.workspacePath, [staleKey, "other"]);
+      };
+      // The restore lands when the sweep takes the workspace's lock, or, when the sweep never
+      // locks it, once the sweep has returned.
+      const realLink = fsPromisesModule.link;
+      let restoring: Promise<void> | undefined;
+      const linkSpy = spyOn(fsPromisesModule, "link").mockImplementation(
+        async (existing, target) => {
+          if (lockFiles.has(String(target))) await (restoring ??= unarchive());
+          return realLink(existing, target);
+        }
+      );
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces(
+          [workspace.workspaceId],
+          prefix
+        );
+      } finally {
+        linkSpy.mockRestore();
+        await unarchive();
+      }
+
+      expect(failures).toEqual([]);
+      expect(await enabledOf(workspace.workspacePath)).toEqual(["other"]);
+    });
+
     // Writers that change a workspace's registry entry while the scan runs, and leave a
     // checkout at the path the scan reads. Each fails the workspace whose entry differs from
     // the scan's, and that workspace keeps its tombstone.
@@ -5609,7 +5712,7 @@ describe("WorkspaceMcpOverridesService", () => {
         },
       },
       {
-        writer: "older build that writes a legacy config.json value",
+        writer: "config edit from an older build that adds a legacy config.json value",
         change: async (subject: { workspaceId: string }) => {
           await config.editConfig((cfg) => {
             for (const project of cfg.projects.values()) {
@@ -5774,6 +5877,58 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(members.size).toBe(5_000);
       // Each alias queued exactly once. The quadratic walk queued 5,000 per alias (about 1.2 s).
       expect(stats.queued).toBe(5_000);
+      // The checkout's alias list is set once and grows in place, not copied on each insert.
+      class CountingMap extends Map<string, string[]> {
+        sets = 0;
+        override set(key: string, value: string[]): this {
+          this.sets++;
+          return super.set(key, value);
+        }
+      }
+      const index = new CountingMap();
+      indexIdsByCheckout(
+        new Map(registry.map((metadata) => [metadata.id, [metadata]])),
+        () => projectPath,
+        index
+      );
+      expect(index.sets).toBe(1);
+      expect(index.get(projectPath)?.length).toBe(5_000);
+    });
+
+    it("sweepClosure follows every checkout of a duplicated id to its aliases", async () => {
+      // A corrupted config can list one id on two checkouts. Each checkout's aliases share its
+      // document, so the walk reaches them from either entry.
+      const projects = ["dup-checkout-a", "dup-checkout-b"].map((name) => path.join(tempDir, name));
+      await config.editConfig((cfg) => {
+        for (const [index, projectPath] of projects.entries()) {
+          cfg.projects.set(projectPath, {
+            workspaces: [
+              {
+                path: projectPath,
+                id: "ws-dup-checkouts",
+                name: `dup-${index}`,
+                runtimeConfig: { type: "local" as const },
+              },
+              {
+                path: projectPath,
+                id: `ws-dup-twin-${index}`,
+                name: `twin-${index}`,
+                runtimeConfig: { type: "local" as const },
+              },
+            ],
+          });
+        }
+        return cfg;
+      });
+      const registry = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+
+      const members = sweepClosure(
+        registry,
+        ["ws-dup-checkouts"],
+        (metadata) => metadata.projectPath
+      );
+
+      expect([...members].sort()).toEqual(["ws-dup-checkouts", "ws-dup-twin-0", "ws-dup-twin-1"]);
     });
 
     it("prunePluginOverrideKeysForWorkspaces locks a document that spells the key inside a longer string", async () => {

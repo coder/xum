@@ -273,6 +273,25 @@ export function runtimeFilesystemIdentity(config: RuntimeConfig): string | undef
   }
 }
 /**
+ * The text of `handle`'s file, refused over `maxBytes` (OverridesFileTooLargeError). It reads
+ * one byte past the cap and never buffers more: the file can grow after any stat.
+ */
+async function readHandleUpTo(
+  handle: fsPromises.FileHandle,
+  filePath: string,
+  maxBytes: number
+): Promise<string> {
+  const buffer = Buffer.alloc(maxBytes + 1);
+  let length = 0;
+  while (length < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+    if (bytesRead === 0) break;
+    length += bytesRead;
+  }
+  if (length > maxBytes) throw new OverridesFileTooLargeError(filePath, length);
+  return buffer.toString("utf-8", 0, length);
+}
+/**
  * SECURITY: read a host override document whose bytes leave the checkout (the
  * fork copy; unknown fields carried into another document) without following
  * a symlink swapped in after the point-in-time segment guards. Code running
@@ -322,20 +341,9 @@ export async function readHostOverrideDocumentNoFollow(
     if (canonical.dev !== opened.dev || canonical.ino !== opened.ino) {
       refuse("the opened file is not the checkout's own document");
     }
-    if (maxBytes === undefined) {
-      return await handle.readFile("utf-8");
-    }
-    // A read of one byte past the cap: the file can grow after any stat, and the read never
-    // buffers more than the cap and that byte.
-    const buffer = Buffer.alloc(maxBytes + 1);
-    let length = 0;
-    while (length < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
-      if (bytesRead === 0) break;
-      length += bytesRead;
-    }
-    if (length > maxBytes) throw new OverridesFileTooLargeError(filePath, length);
-    return buffer.toString("utf-8", 0, length);
+    return maxBytes === undefined
+      ? await handle.readFile("utf-8")
+      : await readHandleUpTo(handle, filePath, maxBytes);
   } finally {
     await handle.close();
   }
@@ -933,12 +941,15 @@ interface SweepClosureGraph {
   /** Checkouts whose aliases the walk already queued. */
   expandedCheckouts: Set<string>;
 }
-/** Every host-local checkout with the ids registered on it (its aliases). */
-function indexIdsByCheckout(
+/**
+ * Every host-local checkout with the ids registered on it (its aliases), filled into
+ * `idsByCheckout`. Each checkout's list grows in place: a copy per insert costs k² for k aliases.
+ */
+export function indexIdsByCheckout(
   hostLocalEntries: ReadonlyMap<string, readonly FrontendWorkspaceMetadata[]>,
-  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string
+  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string,
+  idsByCheckout = new Map<string, string[]>()
 ): Map<string, string[]> {
-  const idsByCheckout = new Map<string, string[]>();
   for (const entries of hostLocalEntries.values()) {
     for (const metadata of entries) {
       const checkout = checkoutOf(metadata);
