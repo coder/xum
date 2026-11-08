@@ -5931,6 +5931,34 @@ describe("WorkspaceMcpOverridesService", () => {
       expect([...members].sort()).toEqual(["ws-dup-checkouts", "ws-dup-twin-0", "ws-dup-twin-1"]);
     });
 
+    it("prunePluginOverrideKeysForWorkspaces fails only a workspace whose runtime cannot be built, and prunes the others", async () => {
+      // A worktree row without its srcBaseDir makes building its runtime throw. That must fail
+      // the one workspace and keep its tombstone, not every workspace of the install.
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("runtime-healthy");
+      const broken = await registerWorkspace("runtime-broken");
+      await writeDoc(healthy.workspacePath, [staleKey, "other"]);
+      await writeDoc(broken.workspacePath, [staleKey]);
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const entry of project.workspaces) {
+            if (entry.id === broken.workspaceId) {
+              (entry as { runtimeConfig?: unknown }).runtimeConfig = { type: "worktree" };
+            }
+          }
+        }
+        return cfg;
+      });
+
+      const failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [healthy.workspaceId, broken.workspaceId],
+        prefix
+      );
+
+      expect(failures.map((failure) => failure.workspaceId)).toEqual([broken.workspaceId]);
+      expect(await enabledOf(healthy.workspacePath)).toEqual(["other"]);
+    });
+
     it("prunePluginOverrideKeysForWorkspaces locks a document that spells the key inside a longer string", async () => {
       // The scan over-approximates: any decoded string that contains the key makes a candidate.
       // A spelling that the prune cannot edit then fails under the locks, and is never reported

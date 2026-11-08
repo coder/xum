@@ -4221,7 +4221,14 @@ export class WorkspaceMcpOverridesService {
       if (identity === undefined) {
         return [digest(["workspace", metadata.runtimeConfig.type, id])];
       }
-      const { workspacePath } = this.resolveWorkspace(metadata);
+      let workspacePath: string;
+      try {
+        ({ workspacePath } = this.resolveWorkspace(metadata));
+      } catch (error) {
+        return new Error(
+          `Could not establish the checkout of workspace ${id} (${getErrorMessage(error)})`
+        );
+      }
       if (identity !== "host") {
         const keys = [digest([identity, workspacePath])];
         if (metadata.runtimeConfig.type === "ssh") {
@@ -5157,8 +5164,17 @@ export class WorkspaceMcpOverridesService {
     return sweepClosure(registry, candidateIds, (metadata) => this.checkoutOf(metadata));
   }
 
+  /**
+   * The checkout that a sweep groups `metadata` by. An entry whose runtime cannot be built (a
+   * worktree row without its `srcBaseDir`) gets a key of its own: it is no alias of another
+   * entry, the scan reports it unreadable (a candidate), and its lock derivation fails it alone.
+   */
   private checkoutOf(metadata: FrontendWorkspaceMetadata): string {
-    return path.resolve(this.resolveWorkspace(metadata).workspacePath);
+    try {
+      return path.resolve(this.resolveWorkspace(metadata).workspacePath);
+    } catch {
+      return `\0unresolvable\0${metadata.id}\0${metadata.projectPath}\0${metadata.name}`;
+    }
   }
 
   /**
