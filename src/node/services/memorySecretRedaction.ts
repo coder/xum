@@ -116,12 +116,22 @@ const COOKIE_CONTEXT = String.raw`(?:^|[^\w-]|\\[nr])`;
 const COOKIE_KEY_QUOTE = String.raw`(?:\\{0,${ESCAPE_RUN_MAX}}["'])`;
 const COOKIE_HEADER_PATTERN = new RegExp(
   String.raw`(${COOKIE_NAME}(?<=${COOKIE_CONTEXT}${COOKIE_NAME})${COOKIE_KEY_QUOTE}?[ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})` +
-    String.raw`(?:\[[^\]]*\]?|(${COOKIE_KEY_QUOTE}?)(?:[^\r\n"'\\]+|\\+(?![nr"']))*)`,
+    // A marker read back (`[redacted]`) is read to the end of the header like any value, so a cookie
+    // pair after it is judged too (`redactCookieValue`); any other `[` starts a list, read to its `]`.
+    String.raw`(?:\[redacted\](?:[^\r\n"'\\]+|\\+(?![nr"']))*|\[[^\]]*\]?|(${COOKIE_KEY_QUOTE}?)(?:[^\r\n"'\\]+|\\+(?![nr"']))*)`,
   "gi"
 );
 
-/** A value that stays as it is: none (only spaces, or an array with nothing in it), or `[redacted]`. */
-const UNTOUCHED_COOKIE_VALUE = /^\s*(?:$|\[\s*\]?$|\[redacted\])/;
+/** A value that stays as it is: none (only spaces, or an array with nothing in it). */
+const EMPTY_COOKIE_VALUE = /^\s*(?:$|\[\s*\]?$)/;
+/** An already-redacted value: `[redacted]`, then attributes or nothing, but no other cookie pair. */
+const REDACTED_COOKIE_VALUE = /^\s*\[redacted\]/;
+/**
+ * A `name=` after the marker that is not a Set-Cookie attribute (RFC 6265: Path, Domain, Expires,
+ * Max-Age, SameSite; Secure and HttpOnly take no value): another cookie the marker does not cover.
+ */
+const COOKIE_PAIR_AFTER_MARKER =
+  /[\s;,"'](?!(?:path|domain|expires|max-age|samesite|priority)=)[^\s=;,"'\\[\]]+=/i;
 /** A header value: a `name=value` pair first, or a list (`[...]`, Node's and Go's shapes). */
 const COOKIE_HEADER_VALUE = /^\s*(?:\[|[^\s=;,"'\\[\]]+=)/;
 
@@ -138,7 +148,13 @@ function redactCookieValue(match: string, prefix: string, opener: string | undef
   // replace with another one, so `??` and `||` agree.
   const quote = opener ?? "";
   const value = match.slice(prefix.length + quote.length);
-  if (UNTOUCHED_COOKIE_VALUE.test(value) || !COOKIE_HEADER_VALUE.test(value)) return match;
+  if (EMPTY_COOKIE_VALUE.test(value)) return match;
+  // A marker read back from an earlier pass is not a new credential, unless a cookie pair follows it.
+  if (REDACTED_COOKIE_VALUE.test(value)) {
+    if (!COOKIE_PAIR_AFTER_MARKER.test(value)) return match;
+  } else if (!COOKIE_HEADER_VALUE.test(value)) {
+    return match;
+  }
   return `${prefix}${quote}${REDACTED}`;
 }
 

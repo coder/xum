@@ -440,13 +440,26 @@ describe("redactSecretLike", () => {
       expect(redactSecretLike(text)).toBe(expected);
     });
 
+    // A marker covers only what it replaced: a cookie pair after it is a credential the earlier pass
+    // missed (partially sanitized output), while Set-Cookie attributes after it are not.
+    it.each([
+      ["a JSON key", `{"cookie":"[redacted]; sid=${SESSION}"}`, '{"cookie":"[redacted]"}'],
+      ["a header", `Cookie: [redacted]; sid=${SESSION}`, "Cookie: [redacted]"],
+      [
+        "a quoted command header",
+        `curl -H 'Cookie: "[redacted]; b=2"' https://example.com`,
+        `curl -H 'Cookie: "[redacted]"' https://example.com`,
+      ],
+    ])("redacts a cookie pair after the marker in %s", (_label, text, expected) => {
+      expect(redactSecretLike(text)).toBe(expected);
+    });
+
     // A redacted header read back (the model's own notes quote what it read) is not a new credential,
     // as for the key/value rule: the write guard must accept it, with more text inside the quotes too.
     it.each([
       ["a header with more text after the marker", "Cookie: [redacted] and the rest of the line"],
       ["a header whose marker has an attribute list", 'Set-Cookie: "[redacted]; Path=/; HttpOnly"'],
       ["a JSON key whose marker has an attribute list", '{"cookie": "[redacted]; Path=/", "a": 1}'],
-      ["a quoted command header", `curl -H 'Cookie: "[redacted]; b=2"' https://example.com`],
     ])("leaves %s as it is", (_label, text) => {
       expect(redactSecretLike(text)).toBe(text);
       expect(containsSecretLike(text)).toBe(false);
