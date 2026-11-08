@@ -10,11 +10,13 @@ import {
 } from "@/common/constants/memory";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
+import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { findLatestContextBoundaryIndex } from "@/common/utils/messages/compactionBoundary";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import { assertNever } from "@/common/utils/assertNever";
+import { stripWorkflowRunRecordForModel } from "@/common/utils/workflowRunMessages";
 import {
   createConsolidationMemoryTool,
   createMutationBudget,
@@ -144,15 +146,49 @@ export interface MemoryHarvestResult extends HarvestProgress {
   readChunks: number;
 }
 
+type AvailableToolPart = Extract<MuxToolPart, { state: "output-available" }>;
+
+/**
+ * The output of `part` as a provider request sends it. The harvest model is a provider like any
+ * other: a persisted tool output reaches it only through `applyToolOutputRedaction`, without the
+ * workflow run record, `ui_only` payloads and the other fields the projection keeps out of every
+ * agent prompt. `bounded` is a bounded copy of the output (see `renderToolValue`): the projection
+ * reads and copies all it is given, so it never sees the persisted value, which can be a million
+ * entries wide. The part's nested calls are not rendered, so the projection does not copy them.
+ */
+function providerOutput(part: AvailableToolPart, bounded: unknown): unknown {
+  const { nestedCalls: _nestedCalls, ...partWithoutNestedCalls } = part;
+  const message: MuxMessage = {
+    id: part.toolCallId,
+    role: "assistant",
+    parts: [{ ...partWithoutNestedCalls, output: bounded }],
+  };
+  const projected = applyToolOutputRedaction([message])[0].parts[0];
+  assert(
+    projected.type === "dynamic-tool" && projected.state === "output-available",
+    "the projection keeps an available tool part available"
+  );
+  return projected.output;
+}
+
+function renderToolOutput(part: AvailableToolPart): string {
+  // A history lookup returns other rows' text, and so does a tool that ran one: forwarding either
+  // would copy that text into this workspace's memory. Judged on the persisted part, whole: its
+  // calls are what says where a copied value came from.
+  if (derivesFromSessionHistory(part)) return SESSION_HISTORY_OMITTED;
+  // A workflow's run record is stripped whole and can be as large as the run: dropping it first
+  // (shallow, at the root) keeps it from using up the bounded copy.
+  const output = stripWorkflowRunRecordForModel(part.toolName, part.output);
+  return renderToolValue(output, HARVEST_MAX_TOOL_OUTPUT_CHARS, (bounded) =>
+    providerOutput(part, bounded)
+  );
+}
+
 function renderToolResult(part: MuxToolPart): string {
   const label = `TOOL RESULT (${part.toolName}): `;
   switch (part.state) {
     case "output-available":
-      // A history lookup returns other rows' text, and so does a tool that ran one: forwarding
-      // either would copy that text into this workspace's memory.
-      return derivesFromSessionHistory(part)
-        ? `${label}${SESSION_HISTORY_OMITTED}`
-        : `${label}${renderToolValue(part.output, HARVEST_MAX_TOOL_OUTPUT_CHARS)}`;
+      return `${label}${renderToolOutput(part)}`;
     case "output-redacted":
       return `${label}[output redacted${part.failed ? "; tool failed" : ""}]`;
     case "input-available":
@@ -337,13 +373,11 @@ function* harvestRowsOf(messages: MuxMessage[]): Generator<RowSource> {
     // requests; this direct streamText path must not forward their repository/model-influenced
     // content to the Dream model and into persistent memory either.
     if (isModelHiddenMessage(message)) continue;
-    // The harvest model is a provider: persisted tool outputs reach it only as normal model
-    // requests send them, without the workflow run record, `ui_only` payloads and the other
-    // fields the projection keeps out of every agent prompt. Projecting here, the one place
+    // Tool outputs reach the harvest model only as normal model requests send them (see
+    // `providerOutput`, applied as each tool part is rendered). Formatting here, the one place
     // every layer builds chunks from, covers each reader of a row; one message at a time, so
-    // a message that is never read is never projected either.
-    const [projected] = applyToolOutputRedaction([message]);
-    for (const row of formatMessageForHarvest(projected)) {
+    // a message that is never read is never formatted either.
+    for (const row of formatMessageForHarvest(message)) {
       yield { json: indentedRowJson(row), messageId: message.id, messageIndex };
     }
   }

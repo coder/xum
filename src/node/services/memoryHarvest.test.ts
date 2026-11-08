@@ -3,6 +3,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
+import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutputRedaction";
 import { createMuxMessage, type MuxMessage, type MuxToolPart } from "@/common/types/message";
 import {
   buildPlanReviewMetadata,
@@ -26,6 +27,7 @@ import {
   type ChunkStreamGate,
   type HarvestProgress,
 } from "./memoryHarvest";
+import { renderToolValue } from "./memoryToolText";
 
 const planReviewSnapshot: PlanReviewRecord = {
   v: 1,
@@ -234,6 +236,23 @@ function toolPart(toolName: string, input: unknown, output: unknown): MuxToolPar
     input,
     output,
   };
+}
+
+/**
+ * An array of `length` items that exist only when read, so the reads are countable. It answers
+ * `in` too, as `Array.prototype.map` (what a projection copies with) skips what it says is absent.
+ */
+function lazyArray(length: number, itemAt: (index: number) => unknown): unknown[] {
+  const isIndex = (key: string | symbol): key is string =>
+    typeof key === "string" && /^\d+$/.test(key);
+  return new Proxy([] as unknown[], {
+    get(target, key, receiver): unknown {
+      if (key === "length") return length;
+      if (isIndex(key)) return itemAt(Number(key));
+      return Reflect.get(target, key, receiver) as unknown;
+    },
+    has: (target, key) => (isIndex(key) ? Number(key) < length : Reflect.has(target, key)),
+  });
 }
 
 /** Runs one harvest over `messages` and returns the prompt the harvest model received. */
@@ -2558,6 +2577,141 @@ describe("buildHarvestChunks", () => {
       chunkText([message]);
 
       expect(JSON.stringify(message)).toBe(before);
+    });
+
+    it("keeps the result of a workflow whose run record is far past the budget", () => {
+      const text = chunkText([
+        assistantWith(
+          toolPart(
+            "workflow_run",
+            {},
+            {
+              run: {
+                script: RUN_RECORD_MARKER,
+                events: lazyArray(1_000_000, () => ({ type: "log" })),
+              },
+              status: "completed",
+              result: "RESULT-KEPT",
+            }
+          )
+        ),
+      ]);
+
+      expect(text).toContain("RESULT-KEPT");
+      expect(text).not.toContain(RUN_RECORD_MARKER);
+    });
+
+    it("still omits the output of a code_execution whose session_history call is past the budget", () => {
+      const toolCalls = [
+        ...Array.from({ length: 5_000 }, () => ({ toolName: "bash", args: {}, result: "ok" })),
+        { toolName: "session_history", args: {}, result: "OTHER-SESSION-ROW" },
+      ];
+
+      const text = chunkText([
+        assistantWith(toolPart("code_execution", {}, { result: "OTHER-SESSION-ROW", toolCalls })),
+      ]);
+
+      expect(text).toContain("[session_history result omitted]");
+      expect(text).not.toContain("OTHER-SESSION-ROW");
+    });
+  });
+
+  // The projection reads and copies the whole value it is given, so it is given a bounded copy of
+  // each tool output: a tool can return a million entries, or a value nested past the stack.
+  describe("a tool output far past the render budget", () => {
+    const chunkText = (output: unknown): string =>
+      transcriptsOf([
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart("mcp__db__query", { sql: "select" }, output),
+        ]),
+      ]).join("\n");
+
+    it("is read only as far as the budget reaches", () => {
+      let reads = 0;
+      const rows = lazyArray(1_000_000, (index) => {
+        reads++;
+        return { id: index };
+      });
+
+      const text = chunkText({ rows });
+
+      expect(text).toContain(String.raw`{\"rows\":[{\"id\":0},{\"id\":1}`);
+      // The projection copied every entry before it was bounded.
+      expect(reads).toBeLessThan(100_000);
+    });
+
+    // The bound must change nothing for what fits: the projection runs on a copy of the output,
+    // and its result renders as it does from the persisted value.
+    it.each([
+      [
+        "ui_only payloads at every level",
+        {
+          success: true,
+          note: "EDIT-APPLIED",
+          ui_only: { file_edit: { diff: "UI-ONLY-DIFF" } },
+          files: [{ path: "b.ts", ui_only: { notify: { notifiedVia: "browser" } } }],
+        },
+      ],
+      ["the json container", { type: "json", value: { ui_only: { x: 1 }, kept: "KEPT" } }],
+      [
+        "a legacy image result",
+        {
+          success: true,
+          images: [{ path: "p.png", thumbnail: "THUMBNAIL-BYTES" }],
+          source: { path: "s.png", resolvedPath: "/abs/s.png" },
+        },
+      ],
+      ["a binary-like string", `PNG${"\u0000\u0001\u0002".repeat(40)}`],
+      [
+        "a value nested past the projection's depth",
+        { a: { b: { c: { d: { e: { f: { g: { h: { i: "LEAF" } } } } } } } } },
+      ],
+      ["a data URL and the text after it", `data:image/png;base64,${"QUJD".repeat(50)} tail text`],
+    ])("renders %s as the unbounded projection leaves it", (_label, output) => {
+      const message = createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+        toolPart("mcp__db__query", {}, output),
+      ]);
+      const projected = applyToolOutputRedaction([message])[0].parts[0];
+      if (projected.type !== "dynamic-tool" || projected.state !== "output-available") {
+        throw new Error("the projection keeps an available tool part available");
+      }
+
+      const [row] = JSON.parse(buildHarvestChunks([message])[0].transcript) as Array<{
+        text: string;
+      }>;
+
+      expect(row.text).toContain(
+        `TOOL RESULT (mcp__db__query): ${renderToolValue(projected.output, 2_000)}`
+      );
+    });
+
+    it("keeps the notes a result carried for the model", () => {
+      const part: MuxToolPart = {
+        type: "dynamic-tool",
+        toolCallId: "call-1",
+        toolName: "bash",
+        state: "output-available",
+        input: {},
+        output: { stdout: "RESULT-KEPT" },
+        modelOnlyNotifications: ["NOTE-FOR-THE-MODEL"],
+      };
+
+      const [chunk] = buildHarvestChunks([
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [part]),
+      ]);
+
+      expect(chunk.transcript).toContain("RESULT-KEPT");
+      expect(chunk.transcript).toContain("NOTE-FOR-THE-MODEL");
+    });
+
+    it("does not overflow the projection's stack when it is nested very deeply", () => {
+      let deep: unknown = "DEEP-LEAF";
+      for (let level = 0; level < 50_000; level++) deep = { inner: deep };
+
+      const text = chunkText(deep);
+
+      expect(text).toContain("[redacted deeply nested provider output]");
+      expect(text).not.toContain("DEEP-LEAF");
     });
   });
 

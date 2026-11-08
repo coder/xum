@@ -5,11 +5,14 @@
  * A tool value is untrusted and can be huge: a command's output of megabytes, an MCP result of a
  * million entries. Only a short prefix is sent, so the value is serialized straight into a budget
  * and the walk stops once the budget is full. Nothing is cloned or stringified whole, and a string
- * is cut to what is left of the budget before it is scanned for media.
+ * is cut to what is left of the budget before it is scanned for media. A transform that has to read
+ * and copy all of what it is given (the provider projection) gets a bounded copy of the value, never
+ * the value.
  */
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { isPlainObject } from "@/common/utils/isPlainObject";
+import { TOOL_OUTPUT_UI_ONLY_FIELD } from "@/common/utils/tools/toolOutputUiOnly";
 import { REDACTION_LOOKAHEAD_CHARS, redactSecretLike } from "@/node/services/memorySecretRedaction";
 
 const MEDIA_STUB = "[media]";
@@ -234,6 +237,71 @@ function walk(sink: Sink, value: unknown, depth: number): void {
   walkObject(sink, value, depth);
 }
 
+// How much of a value a transform may be given, as a multiple of the render budget: the transform
+// can strip what the render would have shown (a thumbnail, a binary-like string), so the copy keeps
+// more than the render reads, and what it strips rarely leaves the render short of its budget.
+const TRANSFORM_INPUT_FACTOR = 16;
+
+/** What is left of a bounded copy's allowance, in about the characters its serialization takes. */
+interface CopyAllowance {
+  left: number;
+  /** One past the render budget: a string cut here still reads as cut after the render cuts it. */
+  readonly stringChars: number;
+}
+
+function copyString(allowance: CopyAllowance, value: string): string {
+  // Data URLs cost their stub, as in the render, so the text after one is kept.
+  const kept = takeWithoutMedia(value, Math.min(allowance.stringChars, allowance.left)).text;
+  allowance.left -= kept.length + 2;
+  return kept;
+}
+
+function copyArray(allowance: CopyAllowance, value: unknown[], depth: number): unknown[] {
+  const items: unknown[] = [];
+  for (let index = 0; index < value.length && allowance.left > 0; index++) {
+    items.push(copyBounded(allowance, value[index], depth + 1));
+  }
+  return items;
+}
+
+function copyObject(
+  allowance: CopyAllowance,
+  value: Record<string, unknown>,
+  depth: number
+): Record<string, unknown> {
+  const entries: Array<[string, unknown]> = [];
+  for (const key of Object.keys(value)) {
+    if (allowance.left <= 0) break;
+    // Stripped from every level of a provider's tool output, and as large as a diff: it must not
+    // use up the allowance of the fields beside it.
+    if (key === TOOL_OUTPUT_UI_ONLY_FIELD) continue;
+    const item = value[key];
+    if (isOmittedFromObject(item)) continue;
+    allowance.left -= key.length + 3;
+    entries.push([key, copyBounded(allowance, item, depth + 1)]);
+  }
+  // Not `copy[key] = ...`: a `__proto__` key must stay a key.
+  return Object.fromEntries(entries);
+}
+
+function copyBounded(allowance: CopyAllowance, value: unknown, depth: number): unknown {
+  if (depth > MAX_TOOL_VALUE_DEPTH) return NESTED_OMITTED;
+  if (typeof value === "string") return copyString(allowance, value);
+  allowance.left -= 1;
+  if (Array.isArray(value)) return copyArray(allowance, value, depth);
+  // Anything but an array or a plain object is a leaf, as the walk treats it.
+  return isPlainObject(value) ? copyObject(allowance, value, depth) : value;
+}
+
+/**
+ * A copy of `value` of bounded size, with the same shape as far as it goes: the first items of an
+ * array, the first keys of an object, a string cut and free of data URLs, nothing past the depth
+ * limit. A value that fits the allowance is copied whole.
+ */
+function boundedCopy(value: unknown, budget: number): unknown {
+  return copyBounded({ left: budget * TRANSFORM_INPUT_FACTOR, stringChars: budget + 1 }, value, 0);
+}
+
 /**
  * Serializes `value` like `JSON.stringify` (a top-level string stays raw) into at most `budget`
  * characters, and says whether all of it fit. The walk stops at a full budget.
@@ -255,12 +323,29 @@ export function serializeToolValue(
  * A tool's input or output as at most `maxChars` characters of redacted text, then a marker that
  * says it was cut. A serialization that fits in the budget past the cap says how much was cut;
  * a longer one says at least how much, since the walk stopped before it knew.
+ *
+ * `transform` is what must run before the text is made (a projection that strips fields): it reads
+ * and copies whatever it is given, so it is given a bounded copy of the value, and the cost of a
+ * render stays bounded by the budget whatever the shape of the value.
  */
-export function renderToolValue(value: unknown, maxChars: number): string {
+export function renderToolValue(
+  value: unknown,
+  maxChars: number,
+  transform?: (bounded: unknown) => unknown
+): string {
   if (value === undefined) return NONE;
   // The redaction scans a lookahead past the cap, so a secret that starts inside the kept text is
   // matched whole before the cut, and not left as a readable prefix.
-  const { text, complete } = serializeToolValue(value, maxChars + REDACTION_LOOKAHEAD_CHARS);
+  const budget = maxChars + REDACTION_LOOKAHEAD_CHARS;
+  let source: unknown = value;
+  if (transform !== undefined) {
+    try {
+      source = transform(boundedCopy(value, budget));
+    } catch {
+      return UNSERIALIZABLE;
+    }
+  }
+  const { text, complete } = serializeToolValue(source, budget);
   const redacted = redactSecretLike(text);
   if (complete && text.length <= maxChars) return redacted;
   const cutChars = `${text.length - maxChars}${complete ? "" : "+"}`;
