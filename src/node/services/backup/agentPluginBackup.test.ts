@@ -13,6 +13,7 @@ import {
   collectPluginBackup,
   PLUGIN_BACKUP_DIR,
   PLUGIN_BACKUP_MANIFEST_PATH,
+  readPluginRestore,
 } from "./agentPluginBackup";
 import { captureRejection, commitAll, runGit, writeFixtureFile } from "./testHelpers";
 
@@ -100,6 +101,11 @@ describe("backup of the managed plugin list", () => {
     const request = { repositoryRoot: repository.rootDir, managedPath: settings.path };
     return { gitRepo, payload, repository, managed, request };
   }
+
+  /** The lock a plugin install, update or uninstall holds; calling what it returns finishes it. */
+  const startMutation = () => acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+  /** Long enough that a read which ignored the lock would be done. */
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 250));
 
   async function readSidecar(managed: string): Promise<unknown> {
     return JSON.parse(
@@ -488,9 +494,6 @@ describe("backup of the managed plugin list", () => {
     });
 
     describe("against a plugin install, update or uninstall in progress", () => {
-      /** The lock those mutations hold; `release` is the mutation finishing. */
-      const startMutation = () => acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
-      const settle = () => new Promise((resolve) => setTimeout(resolve, 250));
       const listedNames = (manifest: Awaited<ReturnType<typeof collectPluginBackup>>) =>
         manifest?.plugins.map((plugin) => `${plugin.name}@${plugin.lockedSha}`);
 
@@ -618,6 +621,80 @@ describe("backup of the managed plugin list", () => {
         "gone-one": "folderMissing",
       });
       expect(preview.plugins.skipped).toBe(false);
+    });
+
+    describe("against a plugin install, update or uninstall in progress", () => {
+      it("waits for the mutation, then compares with the registry and folders it left", async () => {
+        const { payload, request } = await backupOf([registryRow("alpha"), registryRow("beta")]);
+        await useLocalRegistry([registryRow("alpha"), registryRow("beta")]);
+        await writeFixtureFile(muxRoot, "plugins/alpha/plugin.json", "{}");
+        await writeFixtureFile(muxRoot, "plugins/beta/plugin.json", "{}");
+        const finishMutation = await startMutation();
+        let done = false;
+        const previewing = payload
+          .previewRestore({ ...request, contents: DEFAULT_CONTENTS })
+          .finally(() => {
+            done = true;
+          });
+
+        await settle();
+        expect(done).toBe(false);
+        // Beta is uninstalled while the read waits: its registry row and its folder go together.
+        await writeRegistry(muxRoot, [registryRow("alpha")]);
+        await fs.rm(path.join(muxRoot, "plugins", "beta"), { recursive: true });
+        await finishMutation();
+
+        const statuses = Object.fromEntries(
+          (await previewing).plugins.rows.map((row) => [row.name, row.status])
+        );
+        expect(statuses).toEqual({ alpha: "installed", beta: "missing" });
+      });
+
+      it("fails with an IO_ERROR that names the way out when the mutation outlasts the wait", async () => {
+        const { managed } = await backupOf([registryRow("alpha")]);
+        await writeFixtureFile(muxRoot, "plugins/alpha/plugin.json", "{}");
+        const finishMutation = await startMutation();
+
+        const error = (await captureRejection(
+          readPluginRestore({
+            muxRoot,
+            sourceDir: managed,
+            contents: DEFAULT_CONTENTS,
+            lockTimeoutMs: 50,
+          })
+        )) as { code?: string; message: string };
+
+        expect(error.code).toBe("IO_ERROR");
+        expect(error.message).toContain("modifying plugins");
+        expect(error.message).toContain('Turning off "Agent plugins" restores');
+        await finishMutation();
+        // The failed wait took nothing, and a read frees the lock when it is done.
+        const report = await readPluginRestore({
+          muxRoot,
+          sourceDir: managed,
+          contents: DEFAULT_CONTENTS,
+          lockTimeoutMs: 50,
+        });
+        expect(report.rows.map((row) => row.status)).toEqual(["installed"]);
+        await (
+          await startMutation()
+        )();
+      });
+
+      it("takes no lock with the flag off, which is the way out the error names", async () => {
+        const { managed } = await backupOf([registryRow("alpha")]);
+        const finishMutation = await startMutation();
+
+        const off = await readPluginRestore({
+          muxRoot,
+          sourceDir: managed,
+          contents: PLUGINS_OFF,
+          lockTimeoutMs: 50,
+        });
+
+        expect(off.skipped).toBe(true);
+        await finishMutation();
+      });
     });
 
     it("reads a plugin of the same name and commit from another repository, spelling or folder as in use", async () => {

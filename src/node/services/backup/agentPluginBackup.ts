@@ -107,19 +107,36 @@ interface InstallSnapshot {
   generated: GeneratedFrom | undefined;
 }
 
+/** The way out each side of a backup has when it cannot read the plugins: the flag skips the read. */
+const LOCK_WAIT_FAILURE = {
+  backup: {
+    reading: "the installed plugins for the backup",
+    wayOut: 'Turning off "Agent plugins" backs up without the plugin list.',
+  },
+  restore: {
+    reading: "the installed plugins to compare with the backup's list",
+    wayOut: 'Turning off "Agent plugins" restores without the plugin list.',
+  },
+} as const;
+
 /**
  * The plugin lock install, update and uninstall hold, taken for the reads only. A timeout is a
- * failed push, named like the other local reads: the holder is a process on this machine, not the
- * backup repository.
+ * failed push, preview or restore, named like the other local reads: the holder is a process on
+ * this machine, not the backup repository.
  */
-async function acquireSnapshotLock(muxRoot: string, timeoutMs: number) {
+async function acquireSnapshotLock(
+  muxRoot: string,
+  timeoutMs: number,
+  side: keyof typeof LOCK_WAIT_FAILURE
+) {
   try {
     return await acquirePluginMutationLock(muxRoot, { timeoutMs });
   } catch (error) {
     if (!(error instanceof CrossProcessLockTimeoutError)) throw error;
+    const { reading, wayOut } = LOCK_WAIT_FAILURE[side];
     throw new BackupServiceError(
       "IO_ERROR",
-      `Xum could not read the installed plugins for the backup. ${error.message} ${AGENT_PLUGINS_OFF_HINT}`
+      `Xum could not read ${reading}. ${error.message} ${wayOut}`
     );
   }
 }
@@ -131,14 +148,15 @@ async function acquireSnapshotLock(muxRoot: string, timeoutMs: number) {
  * plugin whose uninstall has begun. The lock is held for the reads and no longer, never across
  * git or network work. The installer clones under it, so the wait is bounded by the installer's own
  * timeout (`MUTATION_LOCK_ACQUIRE_TIMEOUT_MS`). Lock order: a push holds the backup locks (the
- * repository's and the local payload's) and then takes this one. Nothing that holds this lock
- * takes a backup lock, so the two cannot wait on each other.
+ * repository's and the local payload's) and then takes this one, and so do a preview and a restore
+ * (`planPluginRows`). Nothing that holds this lock takes a backup lock, so the two cannot wait on
+ * each other.
  */
 async function readInstallSnapshot(
   muxRoot: string,
   lockTimeoutMs: number
 ): Promise<InstallSnapshot[]> {
-  const release = await acquireSnapshotLock(muxRoot, lockTimeoutMs);
+  const release = await acquireSnapshotLock(muxRoot, lockTimeoutMs, "backup");
   try {
     const installs = await readInstallsToList(muxRoot);
     return await Promise.all(
@@ -444,19 +462,30 @@ async function statusOf(
   return folder ? "installed" : "folderMissing";
 }
 
+/**
+ * Each listed plugin against this machine's installs. The registry and the folders are read under
+ * the plugin lock (`readInstallSnapshot`): an uninstall that lands between the two reads would
+ * report a plugin that is gone as `folderMissing`, which a reinstall is withheld for.
+ */
 async function planPluginRows(
   muxRoot: string,
-  listed: readonly BackupPluginEntry[]
+  listed: readonly BackupPluginEntry[],
+  lockTimeoutMs: number
 ): Promise<BackupPluginRow[]> {
   // No rows, nothing to compare: a backup without a list never reads this machine's registry.
   if (listed.length === 0) return [];
-  const local = await readManagedInstalls(muxRoot);
-  return await Promise.all(
-    listed.map(async (plugin) => ({
-      ...plugin,
-      status: await statusOf(muxRoot, plugin, local.get(plugin.name)),
-    }))
-  );
+  const release = await acquireSnapshotLock(muxRoot, lockTimeoutMs, "restore");
+  try {
+    const local = await readManagedInstalls(muxRoot);
+    return await Promise.all(
+      listed.map(async (plugin) => ({
+        ...plugin,
+        status: await statusOf(muxRoot, plugin, local.get(plugin.name)),
+      }))
+    );
+  } finally {
+    await release();
+  }
 }
 
 /**
@@ -484,10 +513,16 @@ export async function readPluginRestore(options: {
   muxRoot: string;
   sourceDir: string;
   contents: BackupContents;
+  /** How long to wait for a plugin install, update or uninstall in progress. */
+  lockTimeoutMs?: number;
 }): Promise<BackupPluginReport> {
   const { skipped, list } = await readPluginSidecar(options.sourceDir, options.contents);
   return {
-    rows: await planPluginRows(options.muxRoot, list.plugins),
+    rows: await planPluginRows(
+      options.muxRoot,
+      list.plugins,
+      options.lockTimeoutMs ?? MUTATION_LOCK_ACQUIRE_TIMEOUT_MS
+    ),
     skipped,
     warnings: list.warnings,
   };
