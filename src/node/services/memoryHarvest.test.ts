@@ -590,6 +590,72 @@ describe("runMemoryHarvest", () => {
       expect(prompt).toContain("KEPT-NESTED-OUTPUT");
     });
 
+    // The returned or printed copy of a lookup's value carries no `toolName`, so only the calls the
+    // execution made say where it came from. The whole output goes, not just the lookup's record.
+    describe("a code_execution that ran session_history", () => {
+      const lookup = { items: [{ text: "OTHER-SESSION-ROW" }] };
+      const lookupRecord = { toolName: "session_history", args: { query: "q" }, result: lookup };
+      const persistedLookup = {
+        toolCallId: "nested-1",
+        toolName: "session_history",
+        input: { query: "q" },
+        output: lookup,
+        state: "output-available" as const,
+      };
+      const executionOutput = (copy: "returned" | "printed", toolCalls: unknown[]): unknown => ({
+        success: true,
+        result: copy === "returned" ? lookup : "done",
+        toolCalls,
+        consoleOutput: copy === "printed" ? [{ level: "log", args: [lookup], timestamp: 1 }] : [],
+        duration_ms: 5,
+      });
+
+      it.each([
+        ["returned", "the records of its result"],
+        ["printed", "the records of its result"],
+        ["returned", "its persisted nested calls"],
+        ["printed", "its persisted nested calls"],
+      ] as const)("omits a value it %s, found through %s", async (copy, source) => {
+        using fixture = createFixture();
+        const viaRecords = source === "the records of its result";
+        const part: MuxToolPart = {
+          ...toolPart(
+            "code_execution",
+            { code: "history()" },
+            executionOutput(copy, viaRecords ? [lookupRecord] : [])
+          ),
+          ...(viaRecords ? {} : { nestedCalls: [persistedLookup] }),
+        };
+
+        const prompt = await harvestPrompt(fixture, [
+          createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [part]),
+        ]);
+
+        expect(prompt).not.toContain("OTHER-SESSION-ROW");
+        expect(prompt).toContain("TOOL RESULT (code_execution): [session_history result omitted]");
+      });
+
+      it("keeps the output of an execution that ran other tools only", async () => {
+        using fixture = createFixture();
+
+        const prompt = await harvestPrompt(fixture, [
+          createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+            toolPart(
+              "code_execution",
+              { code: "run()" },
+              {
+                ...(executionOutput("returned", []) as object),
+                result: "KEPT-RESULT",
+                toolCalls: [{ toolName: "bash", args: {}, result: "ok" }],
+              }
+            ),
+          ]),
+        ]);
+
+        expect(prompt).toContain("KEPT-RESULT");
+      });
+    });
+
     it("keeps nested tool data down to a depth limit and omits what lies beyond it", async () => {
       using fixture = createFixture();
       const nest = (depth: number, leaf: string): unknown =>

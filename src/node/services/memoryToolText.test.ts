@@ -2,7 +2,12 @@ import { describe, expect, it, spyOn } from "bun:test";
 
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { redactSecretLike } from "./memorySecretRedaction";
-import { renderToolValue, serializeToolValue, takeWithoutMedia } from "./memoryToolText";
+import {
+  derivesFromSessionHistory,
+  renderToolValue,
+  serializeToolValue,
+  takeWithoutMedia,
+} from "./memoryToolText";
 
 // How the renderer worked before it was size-budgeted: clone and stringify the whole value, replace
 // every data URL, and only then cut. The budgeted one must print the same for what fits.
@@ -157,6 +162,27 @@ describe("renderToolValue", () => {
     expect(rendered).toContain("[redacted]");
     expect(rendered).not.toContain("ghp_");
   });
+
+  // A tool prints JSON, and a structured result holds that JSON as a string, so a credential sits
+  // in a string inside a string. Each layer doubles the backslashes before a quote (`\"`, `\\\"`,
+  // `\\\\\\"`), and the credential's own escaped quote must not end it early. Escaping a text again
+  // escapes the redacted text the same way, so that is what the rendering must equal.
+  describe("a credential in JSON nested in the tool's output", () => {
+    const stringifyTimes = (text: string, times: number): string =>
+      times === 0 ? text : stringifyTimes(JSON.stringify({ wrapped: text }), times - 1);
+    const passwords = ["plain-pw-4f9e", 'embedded"quote-7c1d', "trailing\\", 'back\\"slash-2b8a'];
+    const cases = [1, 2, 3].flatMap((layers) =>
+      passwords.map((password) => [layers, password] as const)
+    );
+
+    it.each(cases)("redacts it %i JSON strings deep: %j", (layers, password) => {
+      const nested = (text: string): string => stringifyTimes(text, layers - 1);
+
+      expect(
+        renderToolValue({ out: nested(JSON.stringify({ password, user: "alice" })) }, 2_000)
+      ).toBe(JSON.stringify({ out: nested('{"password":[redacted],"user":"alice"}') }));
+    });
+  });
 });
 
 /** An array of `length` items that exist only when read, so a walk's reads are countable. */
@@ -294,5 +320,56 @@ describe("takeWithoutMedia on hostile text", () => {
     const started = performance.now();
     takeWithoutMedia(text, Number.POSITIVE_INFINITY);
     expect(performance.now() - started).toBeLessThan(100);
+  });
+});
+
+describe("derivesFromSessionHistory", () => {
+  const lookup = { toolName: "session_history" };
+  const execution = (output: unknown, nestedCalls?: unknown): unknown => ({
+    toolName: "code_execution",
+    output,
+    nestedCalls,
+  });
+
+  it.each([
+    ["a lookup itself", lookup],
+    [
+      "a lookup in the records of its result",
+      execution({ toolCalls: [{ toolName: "bash" }, lookup] }),
+    ],
+    [
+      "a lookup in its persisted nested calls",
+      execution({ result: "x" }, [{ toolName: "bash" }, lookup]),
+    ],
+    [
+      "a lookup in a call it made in turn",
+      execution({ toolCalls: [{ toolName: "task", result: { toolCalls: [lookup] } }] }),
+    ],
+    [
+      "a lookup in the nested calls of a persisted call",
+      execution({}, [{ toolName: "task", nestedCalls: [lookup] }]),
+    ],
+  ])("is true for %s", (_label, part) => {
+    expect(derivesFromSessionHistory(part)).toBe(true);
+  });
+
+  it.each([
+    ["other tools only", execution({ toolCalls: [{ toolName: "bash" }] }, [{ toolName: "bash" }])],
+    ["no calls", execution({ result: "x", toolCalls: [] })],
+    ["a lookup named only in text", execution({ result: "session_history" })],
+    ["calls that are not lists", execution({ toolCalls: lookup }, lookup)],
+    ["a string output", execution("done")],
+    ["no part", undefined],
+  ])("is false for %s", (_label, part) => {
+    expect(derivesFromSessionHistory(part)).toBe(false);
+  });
+
+  // A chain too deep to read to its end cannot be shown to be free of a lookup.
+  it("is true for a chain of calls deeper than the depth limit", () => {
+    const chain = (depth: number): unknown =>
+      depth === 0 ? { toolName: "bash" } : { toolName: "task", nestedCalls: [chain(depth - 1)] };
+
+    expect(derivesFromSessionHistory(chain(5))).toBe(false);
+    expect(derivesFromSessionHistory(chain(60))).toBe(true);
   });
 });

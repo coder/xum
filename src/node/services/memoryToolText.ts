@@ -12,7 +12,8 @@ import { REDACTION_LOOKAHEAD_CHARS, redactSecretLike } from "@/node/services/mem
 
 const MEDIA_STUB = "[media]";
 const NESTED_OMITTED = "[nested data omitted]";
-const SESSION_HISTORY_OMITTED = "[session_history result omitted]";
+export const SESSION_HISTORY_OMITTED = "[session_history result omitted]";
+const SESSION_HISTORY_TOOL = "session_history";
 const UNSERIALIZABLE = "[unserializable]";
 const NONE = "[none]";
 // Tool-output attachment shapes: persisted `media`/`display_file` parts and the AI SDK's
@@ -144,8 +145,41 @@ function placeholderForObject(value: Record<string, unknown>): string | undefine
   if (typeof value.type === "string" && MEDIA_PART_TYPES.has(value.type)) return MEDIA_STUB;
   // A history lookup returns other rows' text; forwarding it would copy that text into this
   // workspace's memory and amplify one lookup into the next epoch's evidence.
-  if (value.toolName === "session_history") return SESSION_HISTORY_OMITTED;
+  if (value.toolName === SESSION_HISTORY_TOOL) return SESSION_HISTORY_OMITTED;
   return undefined;
+}
+
+/**
+ * The lists of calls a node made inside itself: persisted `nestedCalls`, and the `toolCalls` of a
+ * `code_execution` result.
+ */
+function innerCallLists(node: Record<string, unknown>): unknown[][] {
+  const lists = [node.nestedCalls];
+  // A persisted call keeps its value in `output`, a `code_execution` record in `result`.
+  for (const value of [node.output, node.result]) {
+    if (isPlainObject(value)) lists.push(value.toolCalls);
+  }
+  return lists.filter(Array.isArray);
+}
+
+function callsSessionHistory(node: unknown, depth: number): boolean {
+  if (!isPlainObject(node)) return false;
+  if (node.toolName === SESSION_HISTORY_TOOL) return true;
+  // A chain too deep to read to its end cannot be cleared, so it counts as a lookup.
+  if (depth >= MAX_TOOL_VALUE_DEPTH) return true;
+  return innerCallLists(node).some((calls) =>
+    calls.some((call) => callsSessionHistory(call, depth + 1))
+  );
+}
+
+/**
+ * Whether `part` is a `session_history` lookup, or ran one inside itself. A `code_execution` can
+ * return the lookup's value or print it, and nothing in that copy says where it came from, so the
+ * part's whole output (result, console, records) is judged by the calls it made and omitted if one
+ * was a lookup. Walking the output for a marker would miss every copy that dropped the marker.
+ */
+export function derivesFromSessionHistory(part: unknown): boolean {
+  return callsSessionHistory(part, 0);
 }
 
 /** What `JSON.stringify` writes for a null, a boolean or a number; undefined for anything else. */
