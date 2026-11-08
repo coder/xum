@@ -530,8 +530,7 @@ const HASH_ROUTER_ARTIFACT_HTML = `<!doctype html>
       addEventListener("hashchange", render);
       // Counts the hashchange events that arrive between the start of a click and a window click
       // listener of the artifact's own. The bridge script runs first, so this listener comes after its
-      // click listener, as a delegated router's does. A browser queues hashchange as a task after
-      // the click, so the count is 0.
+      // click listener.
       var hashchanges = 0;
       var atClickStart = 0;
       addEventListener("hashchange", function () {
