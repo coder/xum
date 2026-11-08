@@ -236,6 +236,91 @@ describe("redactSecretLike", () => {
     });
   });
 
+  // A session cookie is a bearer credential with no keyword and no token shape of its own. The
+  // value of a `Cookie` / `Set-Cookie` header goes to the end of its line (a raw break, or the
+  // escape of one in JSON text) or to the quote that ends it; the header name stays readable.
+  describe("a cookie header", () => {
+    const SESSION = "s%3AopaqueSessionValue.Zm9vYmFy";
+    const jsonOf = (value: unknown): string => JSON.stringify(value);
+
+    it.each([
+      [
+        "a Cookie request header",
+        `GET / HTTP/1.1\nHost: example.com\nCookie: connect.sid=${SESSION}; theme=dark\nAccept: */*`,
+        "GET / HTTP/1.1\nHost: example.com\nCookie: [redacted]\nAccept: */*",
+      ],
+      [
+        "a Set-Cookie header with attributes",
+        `Set-Cookie: sessionid=${SESSION}; Path=/; HttpOnly; Expires=Wed, 21 Oct 2026 07:28:00 GMT\nVary: Cookie`,
+        "Set-Cookie: [redacted]\nVary: Cookie",
+      ],
+      ["a header name in any letter case", `sEt-CoOkIe: sid=${SESSION}`, "sEt-CoOkIe: [redacted]"],
+      [
+        "a header that ends in a carriage return",
+        `Cookie: sid=${SESSION}\r\nHost: example.com`,
+        "Cookie: [redacted]\r\nHost: example.com",
+      ],
+      [
+        "a header block in a JSON string, where a line break is escaped",
+        jsonOf({ output: `GET /\r\nHost: h\r\nCookie: sid=${SESSION}; a=b\r\nAccept: */*` }),
+        String.raw`{"output":"GET /\r\nHost: h\r\nCookie: [redacted]\r\nAccept: */*"}`,
+      ],
+      [
+        "a header in JSON that a tool printed as JSON",
+        jsonOf({ out: jsonOf({ headers: `Set-Cookie: sid=${SESSION}; Path=/` }) }),
+        String.raw`{"out":"{\"headers\":\"Set-Cookie: [redacted]\"}"}`,
+      ],
+      [
+        "a header in a quoted command line",
+        `curl -H "Cookie: sid=${SESSION}; b=2" https://example.com`,
+        'curl -H "Cookie: [redacted]" https://example.com',
+      ],
+      [
+        "a header in a single-quoted command line",
+        `curl -H 'Cookie: sid=${SESSION}' https://example.com`,
+        "curl -H 'Cookie: [redacted]' https://example.com",
+      ],
+      [
+        "a header as a JSON key",
+        jsonOf({ headers: { cookie: `sid=${SESSION}; a=b`, host: "example.com" } }),
+        '{"headers":{"cookie":"[redacted]","host":"example.com"}}',
+      ],
+      [
+        "a header as a key of JSON that a tool printed as JSON",
+        jsonOf({ out: jsonOf({ Cookie: `sid=${SESSION}`, host: "example.com" }) }),
+        String.raw`{"out":"{\"Cookie\":\"[redacted]\",\"host\":\"example.com\"}"}`,
+      ],
+      [
+        "every value of a set-cookie array",
+        jsonOf({ "set-cookie": [`a=${SESSION}; Path=/`, `b=${SESSION}2`], host: "example.com" }),
+        '{"set-cookie":[redacted],"host":"example.com"}',
+      ],
+      [
+        "an array of values printed over several lines",
+        `"set-cookie": [\n  "a=${SESSION}; Path=/",\n  "b=${SESSION}2"\n],\n"host": "example.com"`,
+        '"set-cookie": [redacted],\n"host": "example.com"',
+      ],
+    ])("redacts %s and keeps what is around it", (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toBe(expected);
+      expect(redacted).not.toContain(SESSION);
+      // Redacting what is already redacted changes nothing, as the guard and the renderer both run it.
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
+    it("leaves a word that only contains the name, and prose about cookies, readable", () => {
+      const text = [
+        "The cookie banner was dismissed and the cookies were cleared.",
+        "cookie=none, cookies: 3, document.cookie, cookieJar.get('a')",
+        "getCookie: function () {}; X-Cookie-Policy: strict; Cookie-Policy: lax",
+        "Set-Cookie handling is described in RFC 6265.",
+      ].join("\n");
+
+      expect(redactSecretLike(text)).toBe(text);
+    });
+  });
+
   it("leaves ordinary text and token counts readable", () => {
     const text =
       "max_tokens: 4096, input_tokens=120, ran 3 tests in the task-runner, name: demo, bearer scheme, account name";
@@ -325,12 +410,25 @@ describe("redactSecretLike", () => {
     ["signature parameters with no value", "?sig=&signature=".repeat(20_000)],
     ["a signature name with no equals sign", "&X-Amz-Signature".repeat(20_000)],
     ["stacked signature prefixes", "?&amp;sig=".repeat(20_000)],
+    ["a cookie name with no colon", "Cookie".repeat(20_000)],
+    ["a cookie name and gap with no colon", `Set-Cookie${" ".repeat(100_000)}x`],
+    ["cookie names with a colon and no value", "Cookie:".repeat(20_000)],
+    ["cookie headers on one line", "Set-Cookie: a=b; ".repeat(10_000)],
+    ["a cookie value of backslashes", `Cookie: ${"\\".repeat(100_000)}x`],
+    ["a cookie value of escaped quotes", `Cookie: "${'\\"'.repeat(50_000)}`],
+    ["a cookie key followed by a long backslash run", `cookie${"\\".repeat(100_000)}"x`],
+    ["many cookie keys with a long backslash run", `cookie${"\\".repeat(31)}"`.repeat(2_800)],
+    ["cookie array openers with no close", `Cookie:[`.repeat(25_000)],
+    ["cookie names after escaped line breaks", String.raw`\nCookie`.repeat(15_000)],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
-    const started = performance.now();
-    redactSecretLike(text);
-    containsSecretLike(text);
-    expect(performance.now() - started).toBeLessThan(100);
+    // Each scan gets the whole budget: `containsSecretLike` is a second pass of the same redaction,
+    // and with the cookie rule a pass costs about half of it, so one budget for both flaked.
+    for (const scan of [redactSecretLike, containsSecretLike]) {
+      const started = performance.now();
+      scan(text);
+      expect(performance.now() - started).toBeLessThan(100);
+    }
   });
 });
 

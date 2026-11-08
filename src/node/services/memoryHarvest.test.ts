@@ -9,7 +9,7 @@ import {
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
-import { MEMORY_ANALYZER_OP_BUDGET } from "@/common/constants/memory";
+import { MEMORY_ANALYZER_OP_BUDGET, MEMORY_HARVEST_MAX_CHUNKS } from "@/common/constants/memory";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
@@ -22,6 +22,16 @@ import {
   type ChunkStreamGate,
   type HarvestProgress,
 } from "./memoryHarvest";
+
+const planReviewSnapshot: PlanReviewRecord = {
+  v: 1,
+  kind: "snapshot",
+  recordId: "rec_snap",
+  snapshotId: "snap_1",
+  planPath: "/plans/p.md",
+  contentHash: "a".repeat(64),
+  content: "# Plan\n\nREMEMBER-THIS-PLANTED-INSTRUCTION\n",
+};
 
 function finishChunk(outputTokens = 0): LanguageModelV3StreamPart {
   return {
@@ -532,6 +542,30 @@ describe("runMemoryHarvest", () => {
       expect(prompt).not.toContain("a1B2a1B2");
     });
 
+    it("never sends a session cookie from a tool's output or input to the harvest model", async () => {
+      using fixture = createFixture();
+      const session = "s%3AopaqueSessionValue.Zm9vYmFy";
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart(
+            "bash",
+            { script: `curl -i -H "Cookie: connect.sid=${session}" https://app.example.com/me` },
+            {
+              success: true,
+              output: `HTTP/1.1 200 OK\r\nSet-Cookie: sessionid=${session}; Path=/; HttpOnly\r\n\r\nlogged in`,
+              headers: { "set-cookie": [`a=${session}`, `b=${session}`], server: "nginx" },
+            }
+          ),
+        ]),
+      ]);
+
+      expect(prompt).not.toContain(session);
+      expect(prompt).toContain("Set-Cookie: [redacted]");
+      expect(prompt).toContain("logged in");
+      expect(prompt).toContain("nginx");
+    });
+
     it("redacts a whole quoted secret that holds an escaped quote, in a structured value", async () => {
       using fixture = createFixture();
 
@@ -657,21 +691,23 @@ describe("runMemoryHarvest", () => {
       });
     });
 
-    it("keeps nested tool data down to a depth limit and omits what lies beyond it", async () => {
+    // The provider projection cuts a value at its own depth limit before the harvest's (30, tested
+    // in memoryToolText.test.ts) is reached: the harvest model reads what a chat model reads.
+    it("keeps nested tool data down to the provider projection's depth and omits what lies beyond it", async () => {
       using fixture = createFixture();
       const nest = (depth: number, leaf: string): unknown =>
         depth === 0 ? leaf : { inner: nest(depth - 1, leaf) };
 
       const prompt = await harvestPrompt(fixture, [
         createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
-          toolPart("bash", { script: "shallow" }, { output: nest(20, "SHALLOW-LEAF") }),
-          toolPart("bash", { script: "deep" }, { output: nest(40, "DEEP-LEAF") }),
+          toolPart("bash", { script: "shallow" }, { output: nest(5, "SHALLOW-LEAF") }),
+          toolPart("bash", { script: "deep" }, { output: nest(20, "DEEP-LEAF") }),
         ]),
       ]);
 
       expect(prompt).toContain("SHALLOW-LEAF");
       expect(prompt).not.toContain("DEEP-LEAF");
-      expect(prompt).toContain("[nested data omitted]");
+      expect(prompt).toContain("[redacted deeply nested provider output]");
     });
   });
 
@@ -733,6 +769,45 @@ describe("runMemoryHarvest", () => {
 
     expect(calls).toHaveLength(3);
     for (const call of calls) expect(userPromptText(call)).toContain("SUMMARY-ONLY-FACT");
+  });
+
+  it("makes at most the cap's model calls on a huge epoch, and tells the last that the epoch goes on", async () => {
+    using fixture = createFixture();
+    fixture.messages = Array.from({ length: 200 }, (_, index) =>
+      createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
+        historySequence: index,
+      })
+    );
+    const { model, calls } = scriptedModel([]);
+
+    const result = await runHarvest(fixture, model);
+
+    expect(result.streamError).toBeUndefined();
+    const prompts = calls.map(userPromptText);
+    expect(prompts).toHaveLength(MEMORY_HARVEST_MAX_CHUNKS);
+    expect(prompts.at(-1)).toContain(
+      `Transcript chunk ${MEMORY_HARVEST_MAX_CHUNKS}/${MEMORY_HARVEST_MAX_CHUNKS}`
+    );
+    expect(prompts.at(-1)).toContain('"omitted"');
+    expect(prompts.slice(0, -1).join("\n")).not.toContain('"omitted"');
+  });
+
+  it("records the last row of the last chunk it read on a huge epoch, not a row the cap dropped", async () => {
+    using fixture = createFixture();
+    fixture.messages = Array.from({ length: 200 }, (_, index) =>
+      createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
+        historySequence: index,
+      })
+    );
+    const { model } = scriptedModel([]);
+
+    const result = await runHarvest(fixture, model);
+
+    // Five of these messages fill a chunk, so the cap keeps m0-m59. A later run of the epoch starts
+    // after the recorded row, so naming m199 would mark the dropped tail as analyzed.
+    expect(result.streamError).toBeUndefined();
+    expect(result.nextChunk).toBe(MEMORY_HARVEST_MAX_CHUNKS);
+    expect(result.readThroughRowId).toBe("m59");
   });
 
   it("redacts a credential in the compaction summary from every chunk's prompt", async () => {
@@ -1888,7 +1963,7 @@ describe("buildHarvestChunks", () => {
 
   it("closes each chunk as the pretty JSON of its rows, filled until the next row would pass the limit", () => {
     // A fixed spread of sizes: long and short texts, some with tool parts.
-    const messages = Array.from({ length: 240 }, (_, index) =>
+    const messages = Array.from({ length: 80 }, (_, index) =>
       createMuxMessage(
         `m${index}`,
         "assistant",
@@ -1909,7 +1984,9 @@ describe("buildHarvestChunks", () => {
     const chunks = transcriptsOf(messages);
 
     const rowsOf = chunks.map((chunk) => JSON.parse(chunk) as Array<{ id: string }>);
-    expect(chunks.length).toBeGreaterThan(10);
+    // Many chunks, but under the epoch's cap: every message is in them, whole.
+    expect(chunks.length).toBeGreaterThan(5);
+    expect(chunks.length).toBeLessThan(MEMORY_HARVEST_MAX_CHUNKS);
     chunks.forEach((chunk, index) => {
       expect(chunk).toBe(JSON.stringify(rowsOf[index], null, 2));
       expect(chunk.length <= CHUNK_LIMIT || rowsOf[index].length === 1).toBe(true);
@@ -1922,6 +1999,139 @@ describe("buildHarvestChunks", () => {
     });
     const ids = rowsOf.flat().map((row) => row.id);
     expect([...new Set(ids)]).toEqual(messages.map((message) => message.id));
+  });
+
+  // One harvest reads at most MEMORY_HARVEST_MAX_CHUNKS chunks, from the head of the epoch: the
+  // calls, and the work of building the chunks, are bounded by the cap and not by the epoch.
+  describe("an epoch of more chunks than one harvest reads", () => {
+    const CAP = MEMORY_HARVEST_MAX_CHUNKS;
+    /** Rows of 7,000 characters, which fill a chunk five to a chunk (see `manyChunkMessages`). */
+    const ROWS_PER_CHUNK = 5;
+    const epochOf = (count: number): MuxMessage[] =>
+      Array.from({ length: count }, (_, index) =>
+        createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
+          historySequence: index,
+        })
+      );
+    interface CutRow {
+      omitted?: { note: string; unreadMessages: number; firstUnreadMessageId: string };
+      id?: string;
+    }
+    const rowsOfChunks = (messages: MuxMessage[]): CutRow[][] =>
+      transcriptsOf(messages).map((chunk) => JSON.parse(chunk) as CutRow[]);
+
+    it("keeps exactly the cap's chunks, the head of the epoch, and ends the last with a marker", () => {
+      const messages = epochOf(CAP * ROWS_PER_CHUNK * 2);
+
+      const chunks = rowsOfChunks(messages);
+
+      expect(chunks).toHaveLength(CAP);
+      const keptIds = chunks.flatMap((rows) => rows.flatMap((row) => (row.id ? [row.id] : [])));
+      const keptCount = CAP * ROWS_PER_CHUNK;
+      expect(keptIds).toEqual(messages.slice(0, keptCount).map((message) => message.id));
+      const markers = chunks.flatMap((rows) => rows.filter((row) => row.omitted !== undefined));
+      expect(markers).toHaveLength(1);
+      expect(chunks.at(-1)?.at(-1)?.omitted).toMatchObject({
+        unreadMessages: messages.length - keptCount,
+        firstUnreadMessageId: `m${keptCount}`,
+      });
+    });
+
+    it("cuts nothing from an epoch of exactly the cap, and the first row past it makes the cut", () => {
+      const exact = rowsOfChunks(epochOf(CAP * ROWS_PER_CHUNK));
+      expect(exact).toHaveLength(CAP);
+      expect(exact.flat().filter((row) => row.omitted !== undefined)).toEqual([]);
+      expect(exact.flatMap((rows) => rows.map((row) => row.id))).toHaveLength(CAP * ROWS_PER_CHUNK);
+
+      const over = rowsOfChunks(epochOf(CAP * ROWS_PER_CHUNK + 1));
+      expect(over).toHaveLength(CAP);
+      expect(over.at(-1)?.at(-1)?.omitted).toMatchObject({
+        unreadMessages: 1,
+        firstUnreadMessageId: `m${CAP * ROWS_PER_CHUNK}`,
+      });
+    });
+
+    it("reads through the last message of the last kept chunk, and not through one the cut splits", () => {
+      const keptCount = CAP * ROWS_PER_CHUNK;
+      expect(buildHarvestChunks(epochOf(keptCount * 2)).at(-1)?.readThroughRowId).toBe(
+        `m${keptCount - 1}`
+      );
+
+      // The cut falls inside this message: its first rows were read and the rest were not.
+      const fanOut = createMuxMessage(
+        "a1",
+        "assistant",
+        "fan out",
+        { historySequence: 1 },
+        Array.from({ length: 400 }, (_, tool) =>
+          toolPart(
+            "bash",
+            { script: `step ${tool}` },
+            { output: `result ${tool} ${"o".repeat(3_000)}` }
+          )
+        )
+      );
+      const chunks = buildHarvestChunks([
+        createMuxMessage("before", "user", "short", { historySequence: 0 }),
+        fanOut,
+      ]);
+      expect(chunks).toHaveLength(CAP);
+      expect(chunks.at(-1)?.readThroughRowId).toBe("before");
+    });
+
+    it("does not count a model-hidden message past the cut among the unread ones", () => {
+      const hidden = createMuxMessage(
+        "hidden-snap",
+        "user",
+        formatPlanReviewEnvelope(planReviewSnapshot),
+        {
+          historySequence: 1_000,
+          synthetic: true,
+          muxMetadata: buildPlanReviewMetadata(planReviewSnapshot),
+        }
+      );
+
+      const chunks = rowsOfChunks([...epochOf(CAP * ROWS_PER_CHUNK + 2), hidden]);
+
+      expect(chunks.at(-1)?.at(-1)?.omitted?.unreadMessages).toBe(2);
+    });
+
+    it("never projects or formats a message past the cut", () => {
+      const pastTheCut = createMuxMessage("late", "user", "unread", { historySequence: 9_999 });
+      Object.defineProperty(pastTheCut, "parts", {
+        get() {
+          throw new Error("a message past the cut was read");
+        },
+      });
+
+      const chunks = rowsOfChunks([...epochOf(CAP * ROWS_PER_CHUNK + 1), pastTheCut]);
+
+      expect(chunks).toHaveLength(CAP);
+      expect(chunks.at(-1)?.at(-1)?.omitted?.unreadMessages).toBe(2);
+    });
+
+    it("bounds one message of hundreds of tool calls to the cap too", () => {
+      const parallelTools = createMuxMessage(
+        "a1",
+        "assistant",
+        "fan out",
+        { historySequence: 0 },
+        Array.from({ length: 400 }, (_, tool) =>
+          toolPart(
+            "bash",
+            { script: `step ${tool}` },
+            { output: `result ${tool} ${"o".repeat(3_000)}` }
+          )
+        )
+      );
+
+      const chunks = transcriptsOf([parallelTools]);
+
+      expect(chunks).toHaveLength(CAP);
+      // Each chunk stays within its limit, the last one by a marker row's length at most.
+      expect(Math.max(...chunks.map((chunk) => chunk.length))).toBeLessThan(CHUNK_LIMIT + 1_000);
+      expect(chunks.at(-1)).toContain('"omitted"');
+    });
   });
 
   describe("evidence rows", () => {
@@ -2047,6 +2257,89 @@ describe("buildHarvestChunks", () => {
           { id: "u1", sequence: 0, role: "user", text: "", truncated: false },
         ]);
       });
+    });
+  });
+
+  // The harvest model is a provider like any other: a persisted tool output reaches it only through
+  // the projection that normal model requests apply, so what that projection keeps out of every
+  // agent prompt (a workflow's run record, a tool's UI-only payload) stays out of this one too.
+  describe("a tool output the provider projection strips", () => {
+    const RUN_RECORD_MARKER = "WORKFLOW-SCRIPT-SOURCE-MARKER";
+    const UI_ONLY_MARKER = "UI-ONLY-DIFF-MARKER";
+
+    const chunkText = (messages: MuxMessage[]): string => transcriptsOf(messages).join("\n");
+    const assistantWith = (...parts: MuxToolPart[]): MuxMessage =>
+      createMuxMessage("a1", "assistant", "", { historySequence: 0 }, parts);
+
+    it.each(["workflow_run", "workflow_resume"])(
+      "drops the run record of a %s output and keeps its result",
+      (toolName) => {
+        const text = chunkText([
+          assistantWith(
+            toolPart(
+              toolName,
+              { script: "return 1" },
+              {
+                status: "completed",
+                runId: "run-1",
+                result: "RESULT-KEPT",
+                run: { script: RUN_RECORD_MARKER, events: [{ type: "log", message: "event-log" }] },
+              }
+            )
+          ),
+        ]);
+
+        expect(text).toContain("RESULT-KEPT");
+        expect(text).not.toContain(RUN_RECORD_MARKER);
+        expect(text).not.toContain("event-log");
+      }
+    );
+
+    it("drops a run record inside the json container a tool output can be wrapped in", () => {
+      const text = chunkText([
+        assistantWith(
+          toolPart(
+            "workflow_run",
+            {},
+            { type: "json", value: { status: "completed", run: { script: RUN_RECORD_MARKER } } }
+          )
+        ),
+      ]);
+
+      expect(text).toContain("completed");
+      expect(text).not.toContain(RUN_RECORD_MARKER);
+    });
+
+    it("drops a ui_only payload nested inside a tool output and keeps the fields beside it", () => {
+      const text = chunkText([
+        assistantWith(
+          toolPart(
+            "file_edit_replace_string",
+            { path: "a.ts" },
+            {
+              success: true,
+              note: "EDIT-APPLIED",
+              ui_only: { file_edit: { diff: UI_ONLY_MARKER } },
+              files: [{ path: "b.ts", ui_only: { file_edit: { diff: UI_ONLY_MARKER } } }],
+            }
+          )
+        ),
+      ]);
+
+      expect(text).toContain("EDIT-APPLIED");
+      expect(text).toContain("b.ts");
+      expect(text).not.toContain(UI_ONLY_MARKER);
+    });
+
+    it("leaves the persisted messages as they were", () => {
+      const message = assistantWith(
+        toolPart("workflow_run", {}, { status: "completed", run: { script: RUN_RECORD_MARKER } })
+      );
+      const before = JSON.stringify(message);
+
+      chunkText([message]);
+
+      expect(JSON.stringify(message)).toBe(before);
     });
   });
 
