@@ -165,6 +165,8 @@ function providerOutput(part: AvailableToolPart, bounded: unknown): unknown {
   };
   const projected = applyToolOutputRedaction([message])[0].parts[0];
   assert(
+    // mutation-equivalent: the projection keeps an available dynamic-tool part as it is, so both
+    // operands hold and `&&` and `||` agree; the assertion only narrows the type.
     projected.type === "dynamic-tool" && projected.state === "output-available",
     "the projection keeps an available tool part available"
   );

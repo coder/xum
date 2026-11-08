@@ -925,6 +925,58 @@ describe("runMemoryHarvest", () => {
     expect(prompt.length).toBeLessThan(200_000);
   });
 
+  it.each([
+    ["at the cap", 128_000, false],
+    ["one character over the cap", 128_001, true],
+  ])(
+    "notes a cut of the compaction summary only when it is over the cap: %s",
+    async (_label, chars, cut) => {
+      using fixture = createFixture();
+      fixture.summary = createMuxMessage("summary-1", "assistant", "x".repeat(chars), {
+        historySequence: 2,
+        compactionBoundary: true,
+      });
+      const { model, calls } = scriptedModel([]);
+
+      await runHarvest(fixture, model);
+
+      const prompt = userPromptText(calls[0]);
+      expect(prompt.includes("[truncated 1 more chars for memory harvest]")).toBe(cut);
+    }
+  );
+
+  // The lead of a prompt (everything before the transcript) says what the run is: the first chunk of
+  // an epoch has no earlier chunks to tell the model about, and the others share one lead.
+  it("tells the model that earlier chunks were analyzed, from the second chunk on", async () => {
+    using fixture = createFixture();
+    fixture.messages = manyChunkMessages();
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    const leads = calls.map((call) => userPromptText(call).split("\nTranscript chunk")[0]);
+    expect(leads).toHaveLength(3);
+    expect(leads[0]).not.toBe(leads[1]);
+    expect(leads[1]).toBe(leads[2]);
+  });
+
+  it("tells the model an epoch with no summary has none, and shows a summary where there is one", async () => {
+    using withSummary = createFixture();
+    using withoutSummary = createFixture();
+    const closed = scriptedModel([]);
+    const open = scriptedModel([]);
+
+    await runHarvest(withSummary, closed.model);
+    await runHarvest(withoutSummary, open.model, { summary: undefined });
+
+    const closedPrompt = userPromptText(closed.calls[0]);
+    const openPrompt = userPromptText(open.calls[0]);
+    expect(closedPrompt).toContain("Compaction summary (summary-1)");
+    expect(closedPrompt).not.toContain("no summary");
+    expect(openPrompt).toContain("no summary");
+    expect(openPrompt).not.toContain("Compaction summary (");
+  });
+
   it("analyzes an epoch that has no compaction summary", async () => {
     using fixture = createFixture();
     const prompts: string[] = [];
@@ -2487,6 +2539,11 @@ describe("buildHarvestChunks", () => {
         expect(over.slice(0, -1).some((row) => row.truncated)).toBe(false);
         expect(over.at(-1)?.truncated).toBe(true);
         expect(over.at(-1)?.text).toEndWith("[truncated 1500 more chars for memory harvest]");
+
+        // One character is a cut too: the note names it.
+        const byOne = rowsOf(messageOfTexts(TEXT_PART_LIMIT + 1));
+        expect(byOne.at(-1)?.truncated).toBe(true);
+        expect(byOne.at(-1)?.text).toEndWith("[truncated 1 more chars for memory harvest]");
       });
 
       it("keep the message's id on every segment", () => {

@@ -362,6 +362,19 @@ describe("renderToolValue with a transform", () => {
     expect(text).toContain(" more chars for memory harvest]");
   });
 
+  it("gives the transform only the first items of a huge array of numbers", () => {
+    let reads = 0;
+    const huge = lazyArray(1_000_000, (index) => {
+      reads++;
+      return index;
+    });
+
+    renderToolValue(huge, MAX, recorder().transform);
+
+    // A number is a node like any other: it costs the allowance, though it has no text.
+    expect(reads).toBeLessThan(READS_FAR_BELOW_HUGE);
+  });
+
   it("gives the transform only the first values of a wide object", () => {
     let reads = 0;
     const wide: Record<string, unknown> = {};
@@ -393,6 +406,25 @@ describe("renderToolValue with a transform", () => {
     expect(depth).toBeLessThanOrEqual(31);
     expect(text).toContain("[nested data omitted]");
   });
+
+  it("gives the transform no deeper a value than the walk reads, in arrays too", () => {
+    let deep: unknown = "LEAF";
+    for (let level = 0; level < 50_000; level++) deep = [deep];
+
+    expect(renderToolValue(deep, MAX, (bounded) => bounded)).toContain("[nested data omitted]");
+  });
+
+  // The copy must not cut a value earlier than the walk does: what the walk would print is printed.
+  it.each([29, 30, 31, 32])(
+    "gives the transform a value nested %i levels deep as far as the walk reads it",
+    (levels) => {
+      const nest = (depth: number): unknown => (depth === 0 ? "LEAF" : { inner: nest(depth - 1) });
+
+      expect(renderToolValue(nest(levels), MAX, (bounded) => bounded)).toBe(
+        renderToolValue(nest(levels), MAX)
+      );
+    }
+  );
 
   // The copy cuts a string one past the budget, so the render cuts it again and still says it
   // dropped at least that much: a cut the render cannot see would read as "512 more chars".

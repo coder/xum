@@ -242,7 +242,11 @@ function walk(sink: Sink, value: unknown, depth: number): void {
 // more than the render reads, and what it strips rarely leaves the render short of its budget.
 const TRANSFORM_INPUT_FACTOR = 16;
 
-/** What is left of a bounded copy's allowance, in about the characters its serialization takes. */
+/**
+ * What is left of a bounded copy's allowance, in about the characters its serialization takes: a
+ * node costs one, a string its kept text, a key its name. A rough bound, not a count: every node
+ * costs something, so a million empty ones are cut too, and no more is promised.
+ */
 interface CopyAllowance {
   left: number;
   /** One past the render budget: a string cut here still reads as cut after the render cuts it. */
@@ -252,12 +256,14 @@ interface CopyAllowance {
 function copyString(allowance: CopyAllowance, value: string): string {
   // Data URLs cost their stub, as in the render, so the text after one is kept.
   const kept = takeWithoutMedia(value, Math.min(allowance.stringChars, allowance.left)).text;
-  allowance.left -= kept.length + 2;
+  allowance.left -= kept.length;
   return kept;
 }
 
 function copyArray(allowance: CopyAllowance, value: unknown[], depth: number): unknown[] {
   const items: unknown[] = [];
+  // mutation-equivalent: the allowance is a rough bound. An item more or fewer, at its end, lies far
+  // past what the render reads, so the render prints the same.
   for (let index = 0; index < value.length && allowance.left > 0; index++) {
     items.push(copyBounded(allowance, value[index], depth + 1));
   }
@@ -271,13 +277,14 @@ function copyObject(
 ): Record<string, unknown> {
   const entries: Array<[string, unknown]> = [];
   for (const key of Object.keys(value)) {
+    // mutation-equivalent: a rough bound, as in `copyArray`: a key more or fewer prints the same.
     if (allowance.left <= 0) break;
     // Stripped from every level of a provider's tool output, and as large as a diff: it must not
     // use up the allowance of the fields beside it.
     if (key === TOOL_OUTPUT_UI_ONLY_FIELD) continue;
     const item = value[key];
     if (isOmittedFromObject(item)) continue;
-    allowance.left -= key.length + 3;
+    allowance.left -= key.length;
     entries.push([key, copyBounded(allowance, item, depth + 1)]);
   }
   // Not `copy[key] = ...`: a `__proto__` key must stay a key.
@@ -286,8 +293,8 @@ function copyObject(
 
 function copyBounded(allowance: CopyAllowance, value: unknown, depth: number): unknown {
   if (depth > MAX_TOOL_VALUE_DEPTH) return NESTED_OMITTED;
-  if (typeof value === "string") return copyString(allowance, value);
   allowance.left -= 1;
+  if (typeof value === "string") return copyString(allowance, value);
   if (Array.isArray(value)) return copyArray(allowance, value, depth);
   // Anything but an array or a plain object is a leaf, as the walk treats it.
   return isPlainObject(value) ? copyObject(allowance, value, depth) : value;
