@@ -160,9 +160,12 @@ export function hasEscapedUnreservedCharacter(url: string): boolean {
   return false;
 }
 
+// The path of an scp URL may start with one slash (`host:/srv/repo`); `//` and a second colon
+// (`ext::payload`, a transport helper) are not an scp path.
 const SSH_URL_PATTERN =
   /^ssh:\/\/(?:[^@/?#\s]+@)?(\[[^\]\s]+\]|[^:/?#\s@[\]]+)(?::\d+)?(\/[^?#\s]+)$/i;
-const SCP_URL_PATTERN = /^(?:[^@/\s:]+@)?(\[[^\]\s]+\]|[A-Za-z0-9._-]{2,}):(?!:|\/\/)(\S+)$/;
+const SCP_URL_PATTERN =
+  /^(?:[^@/\s:]+@)?(\[[^\]\s]+\]|[A-Za-z0-9._-]{2,}):(?!:|\/\/)\/?([^\s/]\S*)$/;
 
 /**
  * The https URL of the same host and path as an `ssh://[user@]host[:port]/path` or scp-style
@@ -171,11 +174,9 @@ const SCP_URL_PATTERN = /^(?:[^@/\s:]+@)?(\[[^\]\s]+\]|[A-Za-z0-9._-]{2,}):(?!:|
  * here: Git for Windows reads it as a drive (`isLocalGitUrl`).
  */
 export function httpsFormOfSshUrl(url: string): string | undefined {
-  const ssh = SSH_URL_PATTERN.exec(url);
-  if (ssh?.[1] !== undefined && ssh[2] !== undefined) return `https://${ssh[1]}${ssh[2]}`;
-  const scp = SCP_URL_PATTERN.exec(url);
-  const path = scp?.[2]?.replace(/^\/+/, "");
-  return scp?.[1] !== undefined && path ? `https://${scp[1]}/${path}` : undefined;
+  if (SSH_URL_PATTERN.test(url)) return url.replace(SSH_URL_PATTERN, "https://$1$2");
+  if (SCP_URL_PATTERN.test(url)) return url.replace(SCP_URL_PATTERN, "https://$1/$2");
+  return undefined;
 }
 
 /**
