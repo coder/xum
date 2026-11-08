@@ -1502,6 +1502,28 @@ describe("BackupSection", () => {
     });
 
     test("says a plugin list was skipped when plugin backup is off", async () => {
+    test("hides the plugin list while the form holds an unsaved change, and queues nothing from it", async () => {
+      const chord = { key: "y", code: "KeyY", ctrlKey: true, altKey: true };
+      const { view } = renderBackupSection({
+        backupPreview: { ...PREVIEW_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+      await canvas.findByText("Plugins in this backup");
+
+      fireEvent.change(canvas.getByLabelText("Repository URL"), {
+        target: { value: "git@github.com:example/other.git" },
+      });
+
+      await waitFor(() => expect(canvas.queryByText("Plugins in this backup")).toBeNull());
+      expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
+      const routeBefore = canvas.getByTestId("settings-route").textContent;
+      fireEvent.keyDown(window, chord);
+      expect(consumePendingPluginsSectionIntent()).toBeNull();
+      expect(canvas.getByTestId("settings-route").textContent).toBe(routeBefore);
+    });
+
       const { view } = renderBackupSection({
         backupPreview: { ...PREVIEW_BASE, plugins: reportOf([], { skipped: true }) },
       });

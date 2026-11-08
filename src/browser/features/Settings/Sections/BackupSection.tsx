@@ -367,6 +367,11 @@ export function BackupSection() {
   savedDraftRef.current = savedDraft;
 
   const isDirty = !draftsEqual(draft, savedDraft);
+  // The plugin list describes the saved repository. While the form holds an unsaved change, the
+  // other backup actions refuse to run (requireSavedSettings), so the list is hidden and cannot
+  // queue a review of plugins from the repository the form no longer names. It returns if the
+  // change is undone, since it still describes the saved one.
+  const shownPluginBackup = isDirty ? EMPTY_BACKUP_PLUGIN_REPORT : pluginBackup;
   // What the repository operations act on. With the Artifacts experiment off the global shelf
   // is left out even when the saved setting includes it: the row is hidden, so the user could
   // not see or change it. The saved setting itself is kept for when the experiment returns.
@@ -809,7 +814,7 @@ export function BackupSection() {
   // Hands the missing plugins to Settings → Plugins, where each one gets its install review.
   function reviewPlugins() {
     reviewBackedUpPlugins({
-      report: pluginBackup,
+      report: shownPluginBackup,
       enabled: !busy,
       openPlugins: () => setActiveSection("plugins"),
     });
@@ -1198,7 +1203,7 @@ export function BackupSection() {
         items={symlinkSkipped}
       />
 
-      <BackupPluginsCard report={pluginBackup} busy={busy} onReview={reviewPlugins} />
+      <BackupPluginsCard report={shownPluginBackup} busy={busy} onReview={reviewPlugins} />
 
       {projectImports.length > 0 ? (
         <div className="border-border-light space-y-3 rounded-md border p-3">
