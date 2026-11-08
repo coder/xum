@@ -58,7 +58,7 @@ import {
 } from "@/node/services/memoryMeta";
 import { containsSecretLike, redactSecretLike } from "@/node/services/memorySecretRedaction";
 import { parseMemoryPath, type MemoryScopeContext } from "@/node/services/memoryService";
-import type { MemoryService } from "@/node/services/memoryService";
+import type { MemoryService, MemoryWriteOptions } from "@/node/services/memoryService";
 import { executeMemoryCommand, type MemoryCommandInput } from "@/node/services/tools/memory";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
@@ -170,47 +170,63 @@ export function createMutationBudget(limit: number, alreadyUsed = 0): MutationBu
  * RESULTING file against the write cap (reading the current target for
  * state-dependent commands — a small insert into a near-cap file must fail
  * staging even though the new text alone is tiny) plus the occurrence,
- * exists/type, and containment checks the real command runs.
+ * exists/type, and containment checks the real command runs. `options` are
+ * the write's own rails: a guarded run's dry run must refuse the resulting
+ * file the real write would, or the preview shows as accepted an edit that
+ * apply mode refuses.
  */
 async function validateMutationForStaging(
   memoryService: MemoryService,
   ctx: MemoryScopeContext,
-  input: MemoryCommandInput
+  input: MemoryCommandInput,
+  options: MemoryWriteOptions
 ): Promise<string | null> {
   switch (input.command) {
     case "create": {
       if (input.path == null || input.file_text == null) {
         return "create requires 'path' and 'file_text'";
       }
-      const result = await memoryService.validateMutation(ctx, {
-        command: "create",
-        path: input.path,
-        file_text: input.file_text,
-      });
+      const result = await memoryService.validateMutation(
+        ctx,
+        {
+          command: "create",
+          path: input.path,
+          file_text: input.file_text,
+        },
+        options
+      );
       return result.ok ? null : result.error;
     }
     case "str_replace": {
       if (input.path == null || input.old_str == null) {
         return "str_replace requires 'path' and 'old_str'";
       }
-      const result = await memoryService.validateMutation(ctx, {
-        command: "str_replace",
-        path: input.path,
-        old_str: input.old_str,
-        new_str: input.new_str ?? "",
-      });
+      const result = await memoryService.validateMutation(
+        ctx,
+        {
+          command: "str_replace",
+          path: input.path,
+          old_str: input.old_str,
+          new_str: input.new_str ?? "",
+        },
+        options
+      );
       return result.ok ? null : result.error;
     }
     case "insert": {
       if (input.path == null || input.insert_line == null || input.insert_text == null) {
         return "insert requires 'path', 'insert_line' and 'insert_text'";
       }
-      const result = await memoryService.validateMutation(ctx, {
-        command: "insert",
-        path: input.path,
-        insert_line: input.insert_line,
-        insert_text: input.insert_text,
-      });
+      const result = await memoryService.validateMutation(
+        ctx,
+        {
+          command: "insert",
+          path: input.path,
+          insert_line: input.insert_line,
+          insert_text: input.insert_text,
+        },
+        options
+      );
       return result.ok ? null : result.error;
     }
     case "delete": {
@@ -582,7 +598,9 @@ export function createConsolidationMemoryTool(args: {
         // invalid/oversized proposal be staged, rendered in full into chat,
         // and only rejected by the real handler at /refine apply AFTER the
         // user approved, consuming the staged set as a silent no-op.
-        const invalid = await validateMutationForStaging(memoryService, ctx, input);
+        const invalid = await validateMutationForStaging(memoryService, ctx, input, {
+          rejectSecretLike: args.rejectSecretLike,
+        });
         if (invalid !== null) {
           journal.push({ ...target, applied: false, note: invalid });
           return { success: false, error: invalid };

@@ -3237,7 +3237,8 @@ export class MemoryService extends EventEmitter {
    * usage. Used by refine staging so a proposal the write path would reject
    * can never be staged, rendered, and approved. Advisory by design: no
    * mutation lock is taken (the state can change between staging and apply,
-   * where the real command re-validates authoritatively).
+   * where the real command re-validates authoritatively). `options` takes the
+   * write's own rails, so a dry run refuses what the guarded write would.
    */
   async validateMutation(
     ctx: MemoryScopeContext,
@@ -3246,7 +3247,8 @@ export class MemoryService extends EventEmitter {
       | { command: "str_replace"; path: string; old_str: string; new_str: string }
       | { command: "insert"; path: string; insert_line: number; insert_text: string }
       | { command: "delete"; path: string }
-      | { command: "rename"; path: string; new_path: string }
+      | { command: "rename"; path: string; new_path: string },
+    options?: MemoryWriteOptions
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const result = await this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(command.path);
@@ -3271,6 +3273,7 @@ export class MemoryService extends EventEmitter {
               `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
             );
           }
+          assertNoNewSecret(options, "", command.file_text, command.path);
           break;
         }
         case "str_replace": {
@@ -3279,17 +3282,26 @@ export class MemoryService extends EventEmitter {
           }
           const store = await this.resolveStore(ctx, scope, parsed.relPath);
           const content = await this.readTextFileForEdit(store, parsed.relPath, command.path);
-          assertWithinFileSizeCap(
-            computeStrReplaceUpdate(content, command.old_str, command.new_str, command.path)
+          const updated = computeStrReplaceUpdate(
+            content,
+            command.old_str,
+            command.new_str,
+            command.path
           );
+          assertWithinFileSizeCap(updated);
+          assertNoNewSecret(options, content, updated, command.path);
           break;
         }
         case "insert": {
           const store = await this.resolveStore(ctx, scope, parsed.relPath);
           const content = await this.readTextFileForEdit(store, parsed.relPath, command.path);
-          assertWithinFileSizeCap(
-            computeInsertUpdate(content, command.insert_line, command.insert_text).updated
+          const { updated } = computeInsertUpdate(
+            content,
+            command.insert_line,
+            command.insert_text
           );
+          assertWithinFileSizeCap(updated);
+          assertNoNewSecret(options, content, updated, command.path);
           break;
         }
         case "delete": {

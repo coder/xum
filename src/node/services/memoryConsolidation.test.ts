@@ -1208,6 +1208,32 @@ describe("consolidation memory tool rails", () => {
     expect(onDisk).toBe(nearCap);
   });
 
+  it("dry-run refuses an edit whose resulting file the guarded write would refuse", async () => {
+    // Each half of the key passes the new-text check; only the resulting file holds the key, and
+    // the preview must not show as accepted what apply mode refuses.
+    const staged: string[] = [];
+    using fixture = await createFixture({
+      dryRun: true,
+      guard: { rejectSecretLike: true, onStagedMutation: (_input, id) => staged.push(id) },
+    });
+    await fsPromises.writeFile(
+      path.join(fixture.globalMemoryDir, "halves.md"),
+      "sk-\nABCDEFGHIJKLMNO\n"
+    );
+
+    const joined = await execute(fixture.tool, {
+      command: "str_replace",
+      path: "/memories/global/halves.md",
+      old_str: "sk-\nABC",
+      new_str: "sk-ABC",
+    });
+
+    expect(joined.success).toBe(false);
+    if (!joined.success) expect(joined.error).toContain("credential");
+    expect(staged).toEqual([]);
+    expect(fixture.journal).toMatchObject([{ command: "str_replace", applied: false }]);
+  });
+
   it("dry-run rejects a create into a full memory scope", async () => {
     // Codex round 20: validateMutation accepted a create whenever the target
     // was free, but the real create() also rejects when the scope already
