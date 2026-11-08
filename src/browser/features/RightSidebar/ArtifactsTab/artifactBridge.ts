@@ -449,12 +449,12 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * after it. When the fragment changed, it is set on the document's own URL (`about:srcdoc#/route`)
  * with the original `History.prototype.replaceState` before the jump, and `popstate` then
  * `hashchange` fire after it, so a hash router sees the route. A click on the current fragment
- * fires neither, as in a browser. A native fragment navigation
+ * fires neither, though Chromium still fires `popstate` for it. A native fragment navigation
  * (`location.replace("about:srcdoc#x")`, `location.hash`, `<base href="about:srcdoc">`) would
  * do this for free, but WebKit fires the iframe's `load` event for it, which the navigation
  * guard must treat as leaving the document. `replaceState` fires none in WebKit or Chromium.
  * It is not `pushState`: a pushed entry makes Back (history.back, or the browser's Back in Xum on
- * the web) reload the frame, and the guard then closes the artifact for that `load`.
+ * the web) fire the frame's `load` event, and the guard then closes the artifact for it.
  *
  * `pushState` and `replaceState` are wrapped so that a string URL whose trimmed value starts
  * with `#` resolves against the document's URL, not the app's. Other calls pass through.
@@ -467,10 +467,10 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * before: a handler that stops the click's propagation hides it from window.
  *
  * SECURITY AUDIT: it only cancels a navigation, scrolls, focuses or reveals (opens a
- * `<details>`, removes `hidden`) inside the document, and replaces the document's own URL
- * fragment (replaceState rejects any other URL); it never navigates, so both navigation guards
- * stay as they are. The wrapper only prepends the document's own URL to a `#` URL, which the
- * absolute `about:srcdoc#...` URL already allowed.
+ * `<details>`, removes `hidden`) inside the document, replaces the document's own URL fragment
+ * (replaceState rejects any other URL) and fires `popstate` and `hashchange` at the window; it
+ * never navigates, so both navigation guards stay as they are. The wrapper only prepends the
+ * document's own URL to a `#` URL, which the absolute `about:srcdoc#...` URL already allowed.
  */
 export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
     var XLINK = "http://www.w3.org/1999/xlink";
@@ -578,14 +578,12 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
         }, { once: true });
       }
     }
-    // The document URL without its fragment ("about:srcdoc" in a srcdoc frame).
     function withoutFragment(url) {
       var hash = url.indexOf("#");
       return hash === -1 ? url : url.slice(0, hash);
     }
     var historyProto = window.History && window.History.prototype;
     var nativeReplaceState = historyProto && historyProto.replaceState;
-    // A "#" URL names this document, but a srcdoc frame resolves it against the app's URL.
     function inDocument(native) {
       return function () {
         var args = Array.prototype.slice.call(arguments);
@@ -600,8 +598,7 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
       historyProto.pushState = inDocument(historyProto.pushState);
       historyProto.replaceState = inDocument(nativeReplaceState);
     }
-    // Sets the document URL's fragment, as a fragment navigation does, and tells whether it changed.
-    // Uses the original replaceState: the wrapped one is the artifact's.
+    // The original replaceState: the artifact can patch History.prototype.replaceState.
     function replaceFragment(fragment) {
       if (window.location.hash.slice(1) === fragment) return false;
       try {

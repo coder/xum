@@ -1,5 +1,5 @@
 // artifact-hash-router: a hash router in an HTML artifact never saw its routes. A click on a
-// "#/route" link only scrolled (so the fragment stayed, and no hashchange fired), and
+// "#/route" link was cancelled and left the fragment alone (so no hashchange fired), and
 // history.replaceState(null, "", "#/route") threw a SecurityError, because a srcdoc frame resolves
 // that URL against the app's. Proves the rendered route follows each control and the frame stays.
 import { test } from "@e2e-dev/web";

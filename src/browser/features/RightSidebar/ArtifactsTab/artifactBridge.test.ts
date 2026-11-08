@@ -1148,10 +1148,6 @@ describe("in-page links", () => {
 });
 
 describe("hash routes", () => {
-  // A hash router needs the fragment to change, with hashchange and popstate, when a "#/route"
-  // link is clicked, and history.replaceState(null, "", "#/route") to work. In a srcdoc frame
-  // the document URL is about:srcdoc, but a URL passed to pushState or replaceState resolves
-  // against the app's URL, so a bare "#/route" throws SecurityError.
   const APP_URL = "http://localhost/workspace/abc";
 
   /**
@@ -1213,7 +1209,8 @@ describe("hash routes", () => {
     ) => void;
     run(win, doc, win.CustomEvent);
     doc.getElementById("own")!.addEventListener("click", (event) => event.preventDefault());
-    // Happy DOM navigates on a click the shim leaves alone: stop it, as a frame guard would.
+    // Happy DOM navigates on a click the shim leaves alone, which sets the fragment and fires
+    // hashchange by itself: stop it.
     win.addEventListener("click", (event) => event.preventDefault());
     const events: string[] = [];
     win.addEventListener("popstate", () => events.push(`popstate ${win.location.hash}`));
@@ -1254,8 +1251,6 @@ describe("hash routes", () => {
       try {
         click("alpha");
         expect(win.location.href).toBe("about:srcdoc#/s/alpha");
-        // The entry is replaced, not pushed: Back from a pushed one reloads the frame, and the
-        // navigation guard then closes the artifact.
         expect(win.history.length).toBe(1);
         expect(events).toEqual([
           "popstate #/s/alpha",
@@ -1267,7 +1262,6 @@ describe("hash routes", () => {
           "popstate #/s/beta",
           "hashchange about:srcdoc#/s/alpha -> about:srcdoc#/s/beta",
         ]);
-        // A link to an element still scrolls to it, and the fragment follows as in a browser.
         click("intro-link");
         expect(scrolled).toEqual(["intro"]);
         expect(win.location.hash).toBe("#intro");
@@ -1337,7 +1331,6 @@ describe("hash routes", () => {
         expect(win.history.state).toEqual({ n: 2 });
         win.history.replaceState(null, "", "about:srcdoc#/abs");
         expect(win.location.href).toBe("about:srcdoc#/abs");
-        // Not the document's own URL: the browser's SecurityError, not a rewrite into the frame.
         for (const url of ["?q=1", "/other", "https://example.com/#/x"]) {
           expect(errorName(() => win.history.replaceState(null, "", url))).toBe("SecurityError");
           expect(errorName(() => win.history.pushState(null, "", url))).toBe("SecurityError");
