@@ -25,6 +25,9 @@ const paintHookReady = new WeakSet<object>();
 // The Narrow story's strip scrolls up to 669 px, and the shortest swipe seen moved it 56 px:
 // 16 swipes cover it with room to spare.
 const MAX_TOUCH_SWIPES = 16;
+// A fling's scrollLeft changes at least every 3 frames (the longest pause between two changes in
+// 138 swipes: 48 ms), so 8 frames without a change mean the strip has stopped.
+const SCROLL_IDLE_FRAMES = 8;
 
 type StoryPage = Parameters<NonNullable<TestRunnerConfig["postVisit"]>>[0];
 
@@ -1190,13 +1193,17 @@ const config: TestRunnerConfig = {
         await tabs.first().click();
         await tabs.first().and(page.locator('[aria-selected="true"]')).waitFor({ timeout: 5000 });
         const before = await row.evaluate((el) => el.scrollLeft);
-        // Wait for native scroll completion: a tap during inertial scrolling cancels the
-        // scroll instead of selecting the tab, especially under parallel CI load.
         // Swipe until the last tab is reachable. How far one swipe scrolls depends on the
         // runner: Chromium adds a fling only when the moves arrive fast. Without one, the phone
         // width needed all four swipes of the old fixed count, so one disturbed swipe failed the
-        // check (#6476). A strip that does not pan still fails at its first swipe: no scrollend.
+        // check (#6476). A strip that does not pan fails its first swipe: it never moves.
+        // Each swipe waits until the strip stops moving, before the next swipe and the tap: a
+        // tap on a flinging strip only stops the fling and selects nothing. Watch scrollLeft,
+        // not scrollend: a touchStart that cancels the previous fling makes Chromium fire that
+        // fling's scrollend then, so the wait of a back-to-back swipe returned at once and the
+        // tap hit its fling (the Narrow play-test timed out in 5 of 877 finished CI jobs).
         for (let swipe = 0; swipe < MAX_TOUCH_SWIPES; swipe++) {
+          const scrolledFrom = await row.evaluate((el) => el.scrollLeft);
           const point = await row.evaluate((el) => {
             const r = el.getBoundingClientRect();
             for (const tab of Array.from(el.querySelectorAll('[role="tab"]')).reverse()) {
@@ -1210,12 +1217,6 @@ const config: TestRunnerConfig = {
               }
             }
             throw new Error("No tab label available to swipe");
-          });
-          await row.evaluate((el) => {
-            el.removeAttribute("data-scroll-settled");
-            el.addEventListener("scrollend", () => el.setAttribute("data-scroll-settled", ""), {
-              once: true,
-            });
           });
           await client.send("Input.dispatchTouchEvent", {
             type: "touchStart",
@@ -1231,7 +1232,24 @@ const config: TestRunnerConfig = {
             );
           }
           await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
-          await row.and(page.locator("[data-scroll-settled]")).waitFor({ timeout: 5000 });
+          const scrolledTo = await row.evaluate(
+            (el, idleFrames) =>
+              new Promise<number>((resolve, reject) => {
+                const deadline = performance.now() + 5000;
+                let last = el.scrollLeft;
+                let idle = 0;
+                const check = () => {
+                  idle = el.scrollLeft === last ? idle + 1 : 0;
+                  last = el.scrollLeft;
+                  if (idle >= idleFrames) resolve(last);
+                  else if (performance.now() > deadline) reject(new Error("The strip kept moving"));
+                  else requestAnimationFrame(check);
+                };
+                requestAnimationFrame(check);
+              }),
+            SCROLL_IDLE_FRAMES
+          );
+          assert.notEqual(scrolledTo, scrolledFrom, "A touch swipe must pan the strip");
           // The tap below lands 20 px into the last tab's visible part: on a phone, a long title
           // can be wider than the row, so the tab's own left edge never scrolls into view.
           const reachedLastTab = await row.evaluate((el) => {
