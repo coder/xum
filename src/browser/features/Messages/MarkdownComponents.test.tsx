@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
@@ -84,6 +84,54 @@ describe("MarkdownComponents command code blocks", () => {
     expect(
       getCurrentHighlightedCodeBlockLines(highlighted, "const oldValue = 1;", "typescript", "dark")
     ).toEqual(["<span>highlighted old value</span>"]);
+  });
+
+  test("reveals a tag payload in highlighted lines without touching the copied bytes", async () => {
+    // Once Shiki answers, lines are inserted as HTML, so the mark needs escaped brackets there (an
+    // unescaped `<U+E0058>` parses as an unknown element and paints nothing). The block's Copy button
+    // hands out `code`, not the drawn lines, so it must still be the raw bytes.
+    const tags = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+    const code = `const payload = ${tags("XY")};\n`;
+    const highlightSpy = spyOn(highlightWorkerClient, "highlightCode").mockResolvedValue(
+      `<pre><code><span class="line"><span style="color:#f8f8f8">const payload = ${tags("XY")};</span></span>\n</code></pre>`
+    );
+    const copies: string[] = [];
+    const clipboard = navigator.clipboard as unknown as {
+      writeText: (text: string) => Promise<void>;
+    };
+    const copySpy = spyOn(clipboard, "writeText").mockImplementation((text) => {
+      copies.push(text);
+      return Promise.resolve();
+    });
+    try {
+      const view = render(
+        <ThemeProvider forcedTheme="dark">
+          {markdownComponents.code({
+            inline: false,
+            className: "language-typescript",
+            children: code,
+          })}
+        </ThemeProvider>
+      );
+      await waitFor(() =>
+        expect(view.container.querySelector(".code-line")?.textContent).toBe(
+          "const payload = <U+E0058><U+E0059>;"
+        )
+      );
+      const drawn = view.container.querySelector(".code-line")!;
+      expect(drawn.querySelector("span")).not.toBeNull();
+      expect(drawn.textContent).not.toContain(tags("XY"));
+
+      fireEvent.click(
+        view.container.querySelector<HTMLButtonElement>('button[aria-label="Copy to clipboard"]')!
+      );
+      // The clipboard call is awaited inside the button, so wait for it to land.
+      await waitFor(() => expect(copies).toEqual([code]));
+    } finally {
+      highlightSpy.mockRestore();
+      copySpy.mockRestore();
+    }
   });
 
   test("aborts the highlight request of a superseded or unmounted code block without warning", async () => {

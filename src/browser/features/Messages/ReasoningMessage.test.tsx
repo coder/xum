@@ -108,6 +108,57 @@ describe("ReasoningMessage", () => {
     expect(strongSummary?.textContent).toBe("Collecting context");
   });
 
+  // Unicode tag characters are default-ignorables: the row paints nothing, yet reasoning is replayed
+  // to the provider from this part's own text and providerMetadata, so a payload spelled with them
+  // reached the model while the transcript showed an empty trace.
+  describe("unicode tag characters", () => {
+    const tags = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+
+    test("reveals a payload in the collapsed summary line", () => {
+      const message = createReasoningMessage(`checking${tags("AB")}\nSecond line details`);
+
+      const { getByText } = render(<ReasoningMessage message={message} />);
+
+      expect(getByText("checking<U+E0041><U+E0042>")).toBeDefined();
+    });
+
+    test("reveals a payload inside a leading-bold summary", () => {
+      const message = createReasoningMessage(`**read${tags("XY")}**\nSecond line details`);
+
+      const { container } = render(<ReasoningMessage message={message} />);
+
+      expect(container.querySelector("strong")?.textContent).toBe("read<U+E0058><U+E0059>");
+    });
+
+    test("hands the expanded trace its raw bytes and lets the markdown layer reveal", () => {
+      const message = createReasoningMessage(`Summary line\nstep one${tags("AB")}`);
+
+      const { getByText, queryByText } = render(<ReasoningMessage message={message} />);
+
+      // Collapsed: the trace is not mounted yet, so there is nothing to assert on.
+      expect(queryByText(/step one/)).toBeNull();
+
+      fireEvent.click(getByText("Summary line"));
+
+      // The markdown stand-in echoes the content it was handed. Revealing happens inside the
+      // markdown tree (MarkdownCore.test.tsx), never upstream of it: a code fence inside the trace
+      // offers a Copy of exactly the string it was given, and marks injected here would travel with
+      // it. Structure is still parsed from the raw bytes, so the trace reaches the renderer intact.
+      const trace = queryByText(/step one/);
+      expect(trace?.textContent).toContain(`step one${tags("AB")}`);
+      expect(trace?.textContent).not.toContain("<U+");
+    });
+
+    test("leaves ordinary reasoning text untouched", () => {
+      const message = createReasoningMessage("Checking the failing test\nSecond line details");
+
+      const { container } = render(<ReasoningMessage message={message} />);
+
+      expect(container.textContent).not.toContain("<U+");
+    });
+  });
+
   // The reasoning content container is the single <div> with these characteristic
   // font + opacity classes; the header icon's aria-hidden is on an SVG, so we
   // specifically target the text container.

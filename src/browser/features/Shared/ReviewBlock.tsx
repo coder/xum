@@ -17,6 +17,7 @@ import {
 } from "@/browser/utils/review/lineRange";
 import { matchesKeybind, formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { parseReviewLineRange } from "@/common/types/review";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -65,6 +66,14 @@ const ReviewBlockCore: React.FC<ReviewBlockCoreProps> = ({
   const [isEditing, setIsEditing] = useState(false);
   const [editValue, setEditValue] = useState(comment);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Every field below arrives as the raw bytes the review was created with, and each of them is a
+  // display-only leaf here except the edit draft: nothing in this component writes text back to the
+  // message, so revealing at the draw sites cannot persist a `<U+XXXX>` mark. `editValue` and
+  // `handleSaveEdit` deliberately stay raw for exactly that reason - `onEditComment` does write back.
+  const fullLocationLabel =
+    locationLabels?.full ?? `${filePath}:L${formatLineRangeCompact(lineRange)}`;
+  const compactLocationLabel = locationLabels?.compact ?? `L${formatLineRangeCompact(lineRange)}`;
 
   // Check if code has embedded line numbers (from review selection)
   // Format: "12 14 + content" or " 1  2   content"
@@ -121,14 +130,14 @@ const ReviewBlockCore: React.FC<ReviewBlockCoreProps> = ({
         {/* File path and line range - only show if not compact */}
         {!compact && (
           <span className="text-primary min-w-0 flex-1 truncate font-mono text-[11px]">
-            {locationLabels?.full ?? `${filePath}:L${formatLineRangeCompact(lineRange)}`}
+            {revealUnicodeTags(fullLocationLabel)}
           </span>
         )}
 
         {/* In compact mode, show line range only */}
         {compact && (
           <span className="text-muted min-w-0 flex-1 truncate font-mono text-[10px]">
-            {locationLabels?.compact ?? `L${formatLineRangeCompact(lineRange)}`}
+            {revealUnicodeTags(compactLocationLabel)}
           </span>
         )}
 
@@ -204,7 +213,7 @@ const ReviewBlockCore: React.FC<ReviewBlockCoreProps> = ({
         <div className="max-h-48 overflow-auto text-[11px]">
           {diff ? (
             <DiffRenderer
-              content={diff}
+              content={revealUnicodeTags(diff)}
               showLineNumbers={true}
               oldStart={oldStart ?? 1}
               newStart={newStart ?? 1}
@@ -216,14 +225,14 @@ const ReviewBlockCore: React.FC<ReviewBlockCoreProps> = ({
           ) : hasEmbeddedLineNumbers ? (
             // Legacy: code with embedded line numbers - render as plain monospace
             <pre className="font-monospace bg-code-bg p-1.5 text-[11px] leading-[1.4] whitespace-pre">
-              {code}
+              {revealUnicodeTags(code)}
             </pre>
           ) : (
             // Plain code without diff markers: prefix each line with a
             // space so DiffRenderer treats them as context lines and keeps
             // the first real character intact.
             <DiffRenderer
-              content={code
+              content={revealUnicodeTags(code)
                 .split("\n")
                 .map((line) => ` ${line}`)
                 .join("\n")}
@@ -277,7 +286,7 @@ const ReviewBlockCore: React.FC<ReviewBlockCoreProps> = ({
             </div>
           ) : (
             <blockquote className="text-secondary border-l-2 border-[var(--color-review-accent)]/50 pl-2 text-xs leading-relaxed whitespace-pre-wrap">
-              {comment || <span className="text-muted italic">No comment</span>}
+              {revealUnicodeTags(comment) || <span className="text-muted italic">No comment</span>}
             </blockquote>
           )}
         </div>

@@ -35,6 +35,7 @@ import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReas
 import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 import { parseAskUserQuestionAnswerMetadata } from "@/common/utils/tools/askUserQuestionSummary";
+import { isPaintableText } from "@/common/utils/messages/paintableText";
 
 /**
  * Check if a tool result indicates success (for tools that return { success: boolean })
@@ -450,15 +451,65 @@ function buildUserDisplayedMessages(options: {
   ];
 }
 
-function isRenderableDisplayPart(part: MuxMessage["parts"][number]): boolean {
-  return (
-    part.type === "reasoning" ||
-    (part.type === "text" && Boolean(part.text)) ||
-    isDynamicToolPart(part)
-  );
+/**
+ * Content a text part can actually paint. The predicate itself lives in common (paintableText) so the
+ * static first view `xum server` paints before the app JS filters the same rows: a check only this
+ * builder uses shows a blank row pre-hydration that then disappears when the app takes over.
+ */
+function hasDisplayText(text: unknown): boolean {
+  return typeof text === "string" && isPaintableText(text);
 }
 
-function getRenderablePartStats(parts: MuxMessage["parts"]): {
+/**
+ * Whether a part earns a transcript row.
+ *
+ * A paintable-empty text part earns none (see NO_PAINTABLE_CONTENT) — UNLESS the
+ * message is still streaming and it is the trailing part. That part is what
+ * incoming deltas append to, and a row that does not exist has no mounted
+ * subscriber: WorkspaceStore coalesces within-part deltas into a row-local bump,
+ * so the delta that finally carries visible text would wake nobody and the whole
+ * response would stay hidden until an unrelated workspace-level update or the
+ * stream settled. Keeping the row costs nothing visible while streaming (it
+ * paints nothing, exactly as it did before this predicate existed) and the part is
+ * dropped again the moment the stream ends, which is when the blank block would
+ * actually be seen.
+ *
+ * Paintability is judged on the text the row will draw, not the stored part: a goal-cleared summary
+ * loses its `Goal cleared: ` prefix in appendAssistantTextRow, so a part reading as printable here
+ * can still draw nothing.
+ */
+function hasDisplayRow(
+  part: MuxMessage["parts"][number],
+  partIndex: number,
+  partCount: number,
+  hasActiveStream: boolean,
+  muxMetadata: MuxMessageMetadata | undefined
+): boolean {
+  if (part.type === "reasoning" || isDynamicToolPart(part)) return true;
+  if (part.type !== "text") return false;
+  // The streaming tail first: it is kept whatever it holds, and the paintability test is an anchored
+  // regex over the whole accumulated part. Every within-part delta rebuilds these rows, so testing the
+  // text first would rescan a long run of invisible deltas each time and make an invisible stream
+  // quadratic for a row this branch was always going to keep.
+  if (hasActiveStream && partIndex === partCount - 1) return true;
+  return hasDisplayText(displayTextOfTextPart(part, muxMetadata));
+}
+
+/** The string a text part will be shown as, after the row builder's own display projection. */
+function displayTextOfTextPart(
+  part: Extract<MuxMessage["parts"][number], { type: "text" }>,
+  muxMetadata: MuxMessageMetadata | undefined
+): unknown {
+  return typeof part.text === "string"
+    ? getGoalClearedSummaryDisplayText(part.text, muxMetadata)
+    : part.text;
+}
+
+function getRenderablePartStats(
+  parts: MuxMessage["parts"],
+  hasActiveStream: boolean,
+  muxMetadata: MuxMessageMetadata | undefined
+): {
   lastPartIndex: number;
   isReasoningOnlyMessage: boolean;
 } {
@@ -468,7 +519,7 @@ function getRenderablePartStats(parts: MuxMessage["parts"]): {
 
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
-    if (!isRenderableDisplayPart(part)) continue;
+    if (!hasDisplayRow(part, i, parts.length, hasActiveStream, muxMetadata)) continue;
     lastPartIndex = i;
     renderableCount++;
     if (part.type === "reasoning") renderableReasoningCount++;
@@ -780,7 +831,11 @@ function buildAssistantDisplayedMessages(options: {
   const displayedMessages: DisplayedMessage[] = [];
   const isPartial = message.metadata?.partial === true;
   const mergedParts = mergeAdjacentParts(message.parts);
-  const { lastPartIndex, isReasoningOnlyMessage } = getRenderablePartStats(mergedParts);
+  const { lastPartIndex, isReasoningOnlyMessage } = getRenderablePartStats(
+    mergedParts,
+    hasActiveStream,
+    message.metadata?.muxMetadata
+  );
 
   if (isContextBoundaryMessage(message)) {
     displayedMessages.push(createCompactionBoundaryRow(message, historySequence));
@@ -806,7 +861,16 @@ function buildAssistantDisplayedMessages(options: {
       return;
     }
 
-    if (part.type === "text" && part.text) {
+    if (
+      part.type === "text" &&
+      hasDisplayRow(
+        part,
+        partIndex,
+        mergedParts.length,
+        hasActiveStream,
+        message.metadata?.muxMetadata
+      )
+    ) {
       appendAssistantTextRow(displayedMessages, {
         message,
         part,

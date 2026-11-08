@@ -1,5 +1,6 @@
 import { ArrowRightLeft, ChevronRight, CircleAlert } from "lucide-react";
 import { cn } from "@/common/lib/utils";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import type { SubagentFailureEnvelope } from "@/common/utils/subagentFailureEnvelope";
 
 export function SubagentFailureMessageContent(props: { failure: SubagentFailureEnvelope }) {
@@ -8,12 +9,19 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
   const isSuperseded = props.failure.errorType === "workspace_turn_superseded";
   const isIncomplete = props.failure.errorType === "workspace_turn_incomplete";
   const StatusIcon = isSuperseded ? ArrowRightLeft : CircleAlert;
-  const metadata = [
+  // Every value below is drawn from the envelope's own bytes, which stay provider-visible in full, so
+  // each reveals at the point of drawing: an imported or damaged envelope can hold a tag payload in an
+  // id or an error type, and "Technical details" is where a user looks to check one. The envelope
+  // itself is never rewritten — the row's Copy and any re-send read `message.content`, not this.
+  const metadata: Array<[string, string | undefined]> = [];
+  for (const [label, value] of [
     ["Task ID", props.failure.taskId],
     ["Error type", props.failure.errorType],
     ["Execution ID", props.failure.executionId],
     ["Execution version", props.failure.executionVersion],
-  ];
+  ] as const) {
+    metadata.push([label, value ? revealUnicodeTags(value) : undefined]);
+  }
 
   return (
     <div className="flex min-w-0 items-start gap-2.5">
@@ -31,13 +39,13 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
                 : "Subagent task failed"}
           </span>
           <span className="text-muted text-xs [overflow-wrap:anywhere]">
-            {props.failure.agentType}
+            {revealUnicodeTags(props.failure.agentType)}
           </span>
         </div>
         <p className="text-muted mt-1 leading-relaxed [overflow-wrap:anywhere] whitespace-pre-wrap">
           {isSuperseded
             ? "The workspace continues with the new input. This delegated turn won’t return a report."
-            : props.failure.errorMessage}
+            : revealUnicodeTags(props.failure.errorMessage)}
         </p>
         <details className="group mt-2">
           <summary className="text-muted hover:text-foreground focus-visible:ring-ring flex w-fit cursor-pointer list-none items-center gap-1 rounded-sm text-xs focus-visible:ring-2 focus-visible:outline-none [&::-webkit-details-marker]:hidden">
@@ -57,7 +65,7 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
             </dl>
             {isSuperseded && (
               <p className="text-muted mt-2 text-xs leading-relaxed [overflow-wrap:anywhere] whitespace-pre-wrap">
-                {props.failure.errorMessage}
+                {revealUnicodeTags(props.failure.errorMessage)}
               </p>
             )}
           </div>

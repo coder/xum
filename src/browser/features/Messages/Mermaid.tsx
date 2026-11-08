@@ -3,6 +3,7 @@ import React, { useContext, useEffect, useId, useRef, useState } from "react";
 import katex from "katex";
 import { render as renderPele, type MathMarkup, type RenderOptions } from "pele";
 import assert from "@/common/utils/assert";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
@@ -528,6 +529,25 @@ function attributeNestingDepth(svg: string): number {
   return deepest;
 }
 
+/**
+ * Reveals tag characters in a rendered diagram's own text. The pipeline above the renderer cannot do
+ * it: a diagram is opaque there, and a label's tag payload would otherwise draw nothing at all inside
+ * the chart. Display-only — the source the transcript copies out of a selected diagram
+ * (transcriptMermaidSources) stays the chart's raw bytes — and KaTeX's MathML annotation keeps the
+ * TeX it was typeset from, exactly as a formula in markdown does.
+ */
+function revealTagsInRenderedDiagram(root: Element): void {
+  for (const child of Array.from(root.childNodes)) {
+    if (child.nodeType === 3) {
+      child.nodeValue = revealUnicodeTags(child.nodeValue ?? "");
+    } else if (child.nodeType === 1) {
+      const element = child as Element;
+      if (asciiLowerCase(element.tagName) === "annotation") continue;
+      revealTagsInRenderedDiagram(element);
+    }
+  }
+}
+
 /** Sanitizes the SVG that Pele rendered with idPrefix. Null when it is not well-formed SVG. */
 export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null {
   assert(/^[\w-]+$/.test(idPrefix), "idPrefix is a plain id, as Mermaid builds it");
@@ -561,6 +581,7 @@ export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null
   for (const element of Array.from(svgRoot.querySelectorAll("*"))) {
     sanitizeAttributes(element, idPrefix, NO_CUSTOM_PROPERTIES);
   }
+  revealTagsInRenderedDiagram(svgRoot);
 
   return svgRoot.outerHTML;
 }

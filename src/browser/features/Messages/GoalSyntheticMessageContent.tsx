@@ -1,6 +1,7 @@
 import type { ReactElement } from "react";
 import { CircleStop, Target } from "lucide-react";
 import { unescapeXml } from "@/common/utils/xml";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { GOAL_OBJECTIVE_CLOSE_TAG, GOAL_OBJECTIVE_OPEN_TAG } from "@/constants/goals";
 
 type GoalCardVariant = "continuation" | "budget-limit";
@@ -76,6 +77,11 @@ export function GoalSyntheticMessageContent(props: GoalSyntheticMessageContentPr
     Icon = CircleStop;
   }
 
+  // Machine-authored prompt text, still drawn for the user: reveal hidden tag characters at the
+  // sinks below, never in the strings the extractors above match against.
+  const displayedDescription = revealUnicodeTags(description);
+  const displayedObjective = objective ? revealUnicodeTags(objective) : null;
+
   return (
     <div className="not-italic">
       <div className="flex items-start gap-2.5">
@@ -84,16 +90,16 @@ export function GoalSyntheticMessageContent(props: GoalSyntheticMessageContentPr
           <div className="text-sm leading-snug font-medium text-[var(--color-user-text)]">
             {title}
           </div>
-          <div className="text-muted mt-0.5 text-xs leading-snug">{description}</div>
+          <div className="text-muted mt-0.5 text-xs leading-snug">{displayedDescription}</div>
         </div>
       </div>
-      {objective && (
+      {displayedObjective && (
         // The blockquote is intentionally outside the icon row so it
         // can span the full bubble width. A small top margin keeps it
         // visually grouped with the title/description above without
         // resurrecting the heavier `space-y-2` rhythm.
         <blockquote className="mt-2 border-l-2 border-[var(--color-user-border)] pl-3 text-sm leading-relaxed whitespace-pre-wrap text-[var(--color-user-text)]">
-          {objective}
+          {displayedObjective}
         </blockquote>
       )}
     </div>

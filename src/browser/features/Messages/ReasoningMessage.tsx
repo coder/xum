@@ -1,5 +1,6 @@
 import React from "react";
 import type { DisplayedMessage } from "@/common/types/message";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { TypewriterMarkdown } from "./TypewriterMarkdown";
 import { useStickyExpand } from "./useStickyExpand";
 import { normalizeReasoningMarkdown } from "./MarkdownStyles";
@@ -66,7 +67,13 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
     summaryLineRaw.length > MAX_SUMMARY_CHARS
       ? `${summaryLineRaw.slice(0, MAX_SUMMARY_CHARS)}…`
       : summaryLineRaw;
-  const parsedLeadingBoldSummary = parseLeadingBoldSummary(summaryLine);
+  // The trace below replays to the provider from this part's own text and providerMetadata, so a
+  // payload encoded in tag characters is model-visible while the header would draw nothing. Only these
+  // two display values carry marks, and the bold split runs on the revealed line: a mark is `<U+XXXX>`
+  // and holds no `*`, so it cannot move an existing marker, and the only new emphasis a payload can
+  // spell is its own - in the header, where nothing is stored or copied from.
+  const displayedSummaryLine = revealUnicodeTags(summaryLine);
+  const displayedBoldSummary = parseLeadingBoldSummary(displayedSummaryLine);
   const hasAdditionalLines = hasContent && /[\r\n]/.test(trimmedContent);
   // OpenAI models often emit terse, single-line traces; surface them inline instead of hiding behind the label.
   const isSingleLineTrace = !isStreaming && hasContent && !hasAdditionalLines;
@@ -157,13 +164,13 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
               </Shimmer>
             ) : hasContent ? (
               <span className={cn("truncate whitespace-nowrap text-text", REASONING_FONT_CLASSES)}>
-                {parsedLeadingBoldSummary ? (
+                {displayedBoldSummary ? (
                   <>
-                    <strong>{parsedLeadingBoldSummary.boldText}</strong>
-                    {parsedLeadingBoldSummary.trailingText}
+                    <strong>{displayedBoldSummary.boldText}</strong>
+                    {displayedBoldSummary.trailingText}
                   </>
                 ) : (
-                  summaryLine
+                  displayedSummaryLine
                 )}
               </span>
             ) : (

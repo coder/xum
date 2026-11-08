@@ -2,6 +2,7 @@ import React from "react";
 import { FileText, X } from "lucide-react";
 
 import { formatBytes } from "./stagedAttachments";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 
 export interface ProviderChatAttachment {
   kind: "provider";
@@ -96,8 +97,11 @@ export const ChatAttachments: React.FC<ChatAttachmentsProps> = (props) => {
           );
         }
 
-        const label =
-          attachment.filename ?? (baseMediaType === "application/pdf" ? "PDF" : baseMediaType);
+        // The name is the same bytes buildStagedAttachmentNotice embeds in the message for the model,
+        // so the chip draws it revealed; remove/download paths keep reading attachment.filename raw.
+        const label = revealUnicodeTags(
+          attachment.filename ?? (baseMediaType === "application/pdf" ? "PDF" : baseMediaType)
+        );
         const detail =
           attachment.kind === "staged" || attachment.kind === "pending-file"
             ? `workspace file • ${formatBytes(attachment.sizeBytes)}`

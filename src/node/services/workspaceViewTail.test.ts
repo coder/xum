@@ -134,6 +134,71 @@ describe("readWorkspaceViewTail", () => {
     ]);
   });
 
+  // The first paint must reveal exactly what ModelDisplay draws once the app takes over: a persisted
+  // model string and a route provider are metadata this row was written with, so an imported or
+  // damaged history file can carry a payload in tag characters that would paint as nothing at all.
+  test("reveals tag payloads in the model label and an unrouted provider name", async () => {
+    const tagRun = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+    const stream = {
+      agentId: "exec",
+      finishReason: "stop",
+      timestamp: 1,
+      routeProvider: `gateway${tagRun("XY")}`,
+    };
+    const textPart = (text: string) => [{ type: "text", text, timestamp: 7 }] as never;
+    await append([
+      msg(
+        "a",
+        "assistant",
+        "",
+        { ...stream, model: `anthropic:sonnet-${tagRun("ab")}` },
+        textPart("hi")
+      ),
+    ]);
+
+    const { rows } = (await read())!;
+
+    expect(rows[0]?.model?.label).toBe("Sonnet <U+E0061><U+E0062>");
+    expect(rows[0]?.model?.via).toBe("gateway<U+E0058><U+E0059>");
+  });
+
+  // The live row builder drops a text part that can paint nothing, so the pre-hydration view must drop
+  // it too: otherwise the first paint shows a blank block that disappears when the app takes over.
+  test("a row that paints nothing carries no text, and a tag payload still does", async () => {
+    const tagRun = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+    const stream = { agentId: "exec", finishReason: "stop", timestamp: 1, model: STOP.model };
+    const part = (text: string) => [{ type: "text", text, timestamp: 7 }] as never;
+    await append([
+      msg("nl", "assistant", "", stream, part("\n")),
+      msg("zwsp", "assistant", "", stream, part("\u200b")),
+      msg("bel", "assistant", "", stream, part("\u0007")),
+      msg("braille", "assistant", "", stream, part("\u2800\u2800")),
+      msg("tags", "assistant", "", stream, part(tagRun("AB"))),
+      msg("real", "assistant", "", stream, part("done")),
+      // A user row is always drawn live, whatever its text holds, so only the pre-existing emptiness
+      // gate applies there: filtering a U+200B user row would lose a row the app then inserts.
+      msg("u-zwsp", "user", "\u200b"),
+      msg("u-nl", "user", "\n"),
+      msg("u-real", "user", "ship it"),
+    ]);
+
+    const { rows } = (await read())!;
+
+    expect(rows.map((row) => [row.id, row.text])).toEqual([
+      ["nl", null],
+      ["zwsp", null],
+      ["bel", null],
+      ["braille", null],
+      ["tags", tagRun("AB")],
+      ["real", "done"],
+      ["u-zwsp", "\u200b"],
+      ["u-nl", null],
+      ["u-real", "ship it"],
+    ]);
+  });
+
   test("rows the live transcript draws differently carry no text", async () => {
     const tool = { type: "dynamic-tool", toolName: "bash", toolCallId: "t", input: {} };
     await append([

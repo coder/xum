@@ -13,6 +13,7 @@ import { MATH_CLASS_NAMES, SHIKI_THEME, useKatexPlugins, withKatex } from "./mat
 import { normalizeMarkdown } from "./MarkdownStyles";
 import { repairIncompleteMarkdownTail } from "./repairIncompleteMarkdownTail";
 import { markdownComponents } from "./MarkdownComponents";
+import { rehypeRevealUnicodeTags } from "./rehypeRevealUnicodeTags";
 import { INTERNAL_INLINE_SKILL_HREF_PREFIX, remarkInlineSkillLinks } from "./inlineSkillMarkdown";
 
 interface MarkdownCoreProps {
@@ -264,6 +265,9 @@ function rehypePluginsAfterRawHtml(hardenOptions: HardenOptions): Pluggable[] {
     [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
     rehypeFootnoteLinks,
     [harden, hardenOptions], // Additional URL filtering for links and images
+    // Last, so it also reaches text that came out of raw HTML: invisible tag characters become
+    // readable marks in the drawn text only.
+    rehypeRevealUnicodeTags,
   ];
 }
 

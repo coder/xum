@@ -1,6 +1,7 @@
 import React, { useEffect } from "react";
 import { ArrowLeftRight, Github, MessageCircle } from "lucide-react";
 import { cn } from "@/common/lib/utils";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
@@ -378,7 +379,8 @@ function FooterLastPrompt(props: { workspaceId: string }) {
         collisionPadding={12}
         className="max-h-60 w-auto max-w-[min(25rem,var(--radix-popover-content-available-width,25rem))] overflow-y-auto p-3 text-xs leading-relaxed break-words"
       >
-        <div className="whitespace-pre-wrap">{lastPrompt.text}</div>
+        {/* Echoed text only: a hidden tag payload must not read as an ordinary prompt here either. */}
+        <div className="whitespace-pre-wrap">{revealUnicodeTags(lastPrompt.text)}</div>
         <button
           type="button"
           ref={revealButtonRef}

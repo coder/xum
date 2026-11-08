@@ -359,6 +359,21 @@ describe("Mermaid layout stability", () => {
       expect(out).not.toContain("onclick");
     });
 
+    test("reveals a tag payload in a label's drawn text", () => {
+      // A diagram is opaque to markdown's reveal pass, so a label that spells a payload in tag
+      // characters would draw nothing inside the chart: the renderer reveals its own text. The chart
+      // source the transcript copies out of a selected diagram stays raw (transcriptMermaidSources).
+      const tags = (ascii: string) =>
+        [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+      const chart =
+        `<svg xmlns="http://www.w3.org/2000/svg">` + `<text>x = ${tags("AB")}</text></svg>`;
+
+      const out = sanitizeMermaidSvg(chart, "mermaid-r1");
+
+      expect(out?.replace(/&lt;/g, "<").replace(/&gt;/g, ">")).toContain("x = <U+E0041><U+E0042>");
+      expect(out).not.toContain(tags("AB"));
+    });
+
     test("rejects input that contains no <svg> root", () => {
       expect(sanitizeMermaidSvg("<div>not an svg</div>", "mermaid-r1")).toBeNull();
       expect(sanitizeMermaidSvg("", "mermaid-r1")).toBeNull();
