@@ -1623,6 +1623,11 @@ function legacyOverridesById(
   return byId;
 }
 
+/** A checkout lock key: a short digest of what identifies the checkout (see checkoutLockKeys). */
+function checkoutLockKeyDigest(parts: string[]): string {
+  return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 32);
+}
+
 export class WorkspaceMcpOverridesService {
   /**
    * Root holding the cross-process coordination state (override epoch file,
@@ -4205,6 +4210,60 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
+   * The lock keys of one registry entry of `id` (see checkoutLockKeys), or the error that makes
+   * the id unresolvable: a runtime that cannot be built, or a checkout whose real path does not
+   * answer.
+   */
+  private async checkoutKeysOf(
+    id: string,
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<string[] | Error> {
+    const identity = runtimeFilesystemIdentity(metadata.runtimeConfig);
+    if (identity === undefined) {
+      return [checkoutLockKeyDigest(["workspace", metadata.runtimeConfig.type, id])];
+    }
+    let workspacePath: string;
+    try {
+      ({ workspacePath } = this.resolveWorkspace(metadata));
+    } catch (error) {
+      return new Error(
+        `Could not establish the checkout of workspace ${id} (${getErrorMessage(error)})`
+      );
+    }
+    if (identity !== "host") {
+      const keys = [checkoutLockKeyDigest([identity, workspacePath])];
+      if (metadata.runtimeConfig.type === "ssh") {
+        // SSH `host` may be an ssh_config alias: two aliases can name one
+        // machine, and nothing here can resolve them to a stable remote
+        // identity. A rename through one alias and a save through the
+        // other must still contend, so every SSH registration of a
+        // remote path also takes a path-only fence shared across SSH
+        // identities (conservative: same path on different hosts
+        // serializes needlessly, which only costs a short wait).
+        keys.push(checkoutLockKeyDigest(["ssh-path", workspacePath]));
+      }
+      return keys;
+    }
+    const spelled = path.resolve(workspacePath);
+    const keys = [checkoutLockKeyDigest([identity, spelled])];
+    try {
+      const real = await withDeadline(
+        fsPromises.realpath(spelled),
+        REALPATH_TIMEOUT_MS,
+        "realpath timed out"
+      );
+      if (real !== spelled) keys.push(checkoutLockKeyDigest([identity, real]));
+    } catch (error) {
+      if (!isPositivelyAbsent(error)) {
+        return new Error(
+          `Could not establish the checkout identity of workspace ${id} (${getErrorMessage(error)}); retry once its filesystem responds.`
+        );
+      }
+    }
+    return keys;
+  }
+
+  /**
    * The lock KEYS of each workspace's checkout. Keyed by checkout identity,
    * not workspace id: aliases sharing one checkout (an isolation:none child
    * and its parent, in-place registrations) hold distinct ids for one
@@ -4263,67 +4322,17 @@ export class WorkspaceMcpOverridesService {
     // sweep prunes EVERY such checkout, so the id's key set is the union over
     // all of them (any indeterminate entry makes the id unresolvable).
     const byId = groupMetadataById(all, /* hostLocalOnly */ false);
-    const digest = (parts: string[]): string =>
-      createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 32);
-    const keysFor = async (
-      id: string,
-      metadata: FrontendWorkspaceMetadata
-    ): Promise<string[] | Error> => {
-      const identity = runtimeFilesystemIdentity(metadata.runtimeConfig);
-      if (identity === undefined) {
-        return [digest(["workspace", metadata.runtimeConfig.type, id])];
-      }
-      let workspacePath: string;
-      try {
-        ({ workspacePath } = this.resolveWorkspace(metadata));
-      } catch (error) {
-        return new Error(
-          `Could not establish the checkout of workspace ${id} (${getErrorMessage(error)})`
-        );
-      }
-      if (identity !== "host") {
-        const keys = [digest([identity, workspacePath])];
-        if (metadata.runtimeConfig.type === "ssh") {
-          // SSH `host` may be an ssh_config alias: two aliases can name one
-          // machine, and nothing here can resolve them to a stable remote
-          // identity. A rename through one alias and a save through the
-          // other must still contend, so every SSH registration of a
-          // remote path also takes a path-only fence shared across SSH
-          // identities (conservative: same path on different hosts
-          // serializes needlessly, which only costs a short wait).
-          keys.push(digest(["ssh-path", workspacePath]));
-        }
-        return keys;
-      }
-      const spelled = path.resolve(workspacePath);
-      const keys = [digest([identity, spelled])];
-      try {
-        const real = await withDeadline(
-          fsPromises.realpath(spelled),
-          REALPATH_TIMEOUT_MS,
-          "realpath timed out"
-        );
-        if (real !== spelled) keys.push(digest([identity, real]));
-      } catch (error) {
-        if (!isPositivelyAbsent(error)) {
-          return new Error(
-            `Could not establish the checkout identity of workspace ${id} (${getErrorMessage(error)}); retry once its filesystem responds.`
-          );
-        }
-      }
-      return keys;
-    };
     const derived = await mapWithConcurrency(
       workspaceIds,
       CANONICALIZE_CONCURRENCY,
       async (id): Promise<string[] | Error> => {
         const entries = byId.get(id);
         if (entries === undefined) {
-          return [digest(["id", id])];
+          return [checkoutLockKeyDigest(["id", id])];
         }
         const union = new Set<string>();
         for (const metadata of entries) {
-          const result = await keysFor(id, metadata);
+          const result = await this.checkoutKeysOf(id, metadata);
           if (result instanceof Error) return result;
           for (const key of result) union.add(key);
         }
