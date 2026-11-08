@@ -22,6 +22,8 @@
  *
  * Every mutating command is journaled ({command, path, applied, rejected})
  * for the audit trail that feeds the Memory tab's "last consolidated" line.
+ * Refused commands spend no budget, so their rows are capped
+ * (MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES) and so is a path's length.
  * Global-scope writes are intentionally permitted (merging into global files
  * is core consolidation work); they remain auditable in the journal via the
  * /memories/global/ path prefix.
@@ -34,8 +36,10 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import assert from "@/common/utils/assert";
 import {
+  MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES,
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   type MemoryScope,
 } from "@/common/constants/memory";
 import type { MemoryToolResult } from "@/common/types/tools";
@@ -88,6 +92,7 @@ const CANCELLED_PASS_ERROR = "Consolidation pass was cancelled";
 const DEFAULT_WRITABLE_SCOPES: readonly WritableMemoryScope[] = ["workspace", "global", "project"];
 const LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
 const MUTATING_COMMANDS = MemoryConsolidationOpSchema.shape.command.options;
+const JOURNAL_FULL_NOTE = `The journal holds ${MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES} rows; later refusals of this run are not recorded.`;
 
 interface MutationTarget {
   command: MemoryConsolidationOp["command"];
@@ -304,14 +309,31 @@ function deniedCommandRejection(
 }
 
 /**
- * The rails that need no I/O: writable scope, denied command and (opt-in) credential check, in
- * that order. Throws on an invalid path (parseMemoryPath); the tool surfaces that as a tool error.
+ * Why a path (or rename target) is too long to use, or null. First of the rails, before the path is
+ * parsed: its note must not quote it, and a row for it is journaled clipped (see refusalRow).
+ */
+function pathLengthRejection(target: MutationTarget): string | null {
+  const tooLong = [target.path, target.newPath].some(
+    (virtualPath) =>
+      virtualPath !== undefined && virtualPath.length > MEMORY_CONSOLIDATION_PATH_MAX_CHARS
+  );
+  return tooLong
+    ? `A path may be at most ${MEMORY_CONSOLIDATION_PATH_MAX_CHARS} characters long; use a shorter one.`
+    : null;
+}
+
+/**
+ * The rails that need no I/O: path length, writable scope, denied command and (opt-in) credential
+ * check, in that order. Throws on an invalid path (parseMemoryPath); the tool surfaces that as a
+ * tool error.
  */
 function staticRejection(
   rails: MutationRails,
   target: MutationTarget,
   input: MemoryCommandInput
 ): string | null {
+  const lengthRejection = pathLengthRejection(target);
+  if (lengthRejection !== null) return lengthRejection;
   // Whitelist, not blacklist, so scopes added later stay out of bounds by default.
   for (const virtualPath of [target.path, target.newPath]) {
     if (virtualPath == null) continue;
@@ -374,6 +396,43 @@ async function mutationRejection(
         : rails.memoryService.resolveWorkspaceMemoryOwnerId(rails.ctx.workspaceId),
   });
   return pinnedRejection(entries, key, target.path);
+}
+
+type RefusalRow = MemoryConsolidationOp & { note: string };
+
+/**
+ * The journal row of a command a rail refused. The journal is persisted, and a refused path (or
+ * the note that quotes it) may itself be the credential the guard just refused. A path over the
+ * length cap is clipped to it: the row says what was refused, not the megabytes it named.
+ */
+function refusalRow(
+  rails: Pick<MutationRails, "rejectSecretLike">,
+  target: MutationTarget,
+  note: string
+): RefusalRow {
+  const persisted = (text: string): string =>
+    rails.rejectSecretLike === true ? redactSecretLike(text) : text;
+  const stored = (virtualPath: string): string =>
+    persisted(virtualPath).slice(0, MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+  return {
+    ...target,
+    path: stored(target.path),
+    ...(target.newPath !== undefined && { newPath: stored(target.newPath) }),
+    applied: false,
+    note: persisted(note),
+  };
+}
+
+/**
+ * Journal a refusal while the journal has room, the last slot carrying the note that later ones
+ * are dropped. Rows of budgeted commands are pushed directly and always: the budget bounds them.
+ * The cap reads the journal itself, so it holds for every tool that shares one (the analyzer's
+ * chunks of a run).
+ */
+function journalRefusal(journal: MemoryConsolidationOp[], row: RefusalRow): void {
+  const slotsLeft = MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - journal.length;
+  if (slotsLeft <= 0) return;
+  journal.push(slotsLeft === 1 ? { ...row, note: `${row.note} ${JOURNAL_FULL_NOTE}` } : row);
 }
 
 /**
@@ -485,17 +544,7 @@ export function createConsolidationMemoryTool(args: {
         return { success: false, error: getErrorMessage(error) };
       }
       if (rejection !== null) {
-        // The journal is persisted, and a rejected path (or the note that quotes it) may itself be
-        // the credential the guard just refused.
-        const persisted = (text: string): string =>
-          args.rejectSecretLike === true ? redactSecretLike(text) : text;
-        journal.push({
-          ...target,
-          path: persisted(target.path),
-          ...(target.newPath !== undefined && { newPath: persisted(target.newPath) }),
-          applied: false,
-          note: persisted(rejection),
-        });
+        journalRefusal(journal, refusalRow(rails, target, rejection));
         return { success: false, error: rejection };
       }
 
@@ -504,7 +553,7 @@ export function createConsolidationMemoryTool(args: {
       // atomicity lives in MutationBudget.tryConsume).
       if (!budget.tryConsume()) {
         const note = `Mutation budget exhausted (${budget.limit} per run); stop and summarize.`;
-        journal.push({ ...target, applied: false, note });
+        journalRefusal(journal, refusalRow(rails, target, note));
         return { success: false, error: note };
       }
 

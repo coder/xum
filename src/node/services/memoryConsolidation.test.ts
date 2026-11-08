@@ -7,8 +7,10 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart, SharedV3ProviderMetadata } from "@ai-sdk/provider";
 
 import {
+  MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES,
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
   MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
@@ -480,6 +482,111 @@ describe("consolidation memory tool rails", () => {
       expect(
         await fsPromises.readFile(path.join(fixture.globalMemoryDir, "keep.md"), "utf-8")
       ).toBe("x\n");
+    });
+  });
+
+  describe("journal bounds", () => {
+    it("records at most the journal cap of refusals, says so in the last row, and still journals an accepted mutation", async () => {
+      using fixture = await createFixture({ guard: { writableScopes: ["workspace"] } });
+
+      // One step can issue many parallel calls, so the refusals arrive together.
+      const refused = await Promise.all(
+        Array.from({ length: MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES * 2 }, (_, index) =>
+          execute(fixture.tool, {
+            command: "create",
+            path: `/memories/global/n${index}.md`,
+            file_text: "x\n",
+          })
+        )
+      );
+
+      // The model still hears about every refusal; the journal keeps the first ones.
+      expect(refused.every((result) => !result.success)).toBe(true);
+      expect(fixture.journal).toHaveLength(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES);
+      expect(fixture.journal.at(-1)?.note).toContain("not recorded");
+      expect(fixture.journal.at(-2)?.note).not.toContain("not recorded");
+      expect(fixture.getMutationCount()).toBe(0);
+
+      // A change the run makes must stay in the audit trail however many refusals came first.
+      const accepted = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/workspace/ok.md",
+        file_text: "ok\n",
+      });
+      expect(accepted.success).toBe(true);
+      expect(fixture.journal).toHaveLength(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES + 1);
+      expect(fixture.journal.at(-1)).toMatchObject({
+        applied: true,
+        path: "/memories/workspace/ok.md",
+      });
+    });
+
+    it("bounds the rows a spent budget refuses, which spend nothing either", async () => {
+      using fixture = await createFixture({ guard: { budget: createMutationBudget(1) } });
+      await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/global/first.md",
+        file_text: "x\n",
+      });
+
+      await Promise.all(
+        Array.from({ length: MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES * 2 }, (_, index) =>
+          execute(fixture.tool, {
+            command: "create",
+            path: `/memories/global/n${index}.md`,
+            file_text: "x\n",
+          })
+        )
+      );
+
+      expect(fixture.journal).toHaveLength(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES);
+      expect(fixture.journal.filter((op) => op.applied)).toHaveLength(1);
+    });
+
+    it("refuses a path over the length cap, journals it clipped, and never quotes it", async () => {
+      using fixture = await createFixture();
+      const long = `/memories/workspace/${"a".repeat(MEMORY_CONSOLIDATION_PATH_MAX_CHARS * 8)}.md`;
+
+      const results = [
+        await execute(fixture.tool, { command: "create", path: long, file_text: "x\n" }),
+        await execute(fixture.tool, {
+          command: "rename",
+          old_path: "/memories/workspace/a.md",
+          new_path: long,
+        }),
+      ];
+
+      for (const result of results) {
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toContain(`${MEMORY_CONSOLIDATION_PATH_MAX_CHARS} characters`);
+          expect(result.error.length).toBeLessThan(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+        }
+      }
+      expect(fixture.journal.map((op) => op.applied)).toEqual([false, false]);
+      for (const op of fixture.journal) {
+        expect(op.path.length).toBeLessThanOrEqual(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+        expect(op.newPath?.length ?? 0).toBeLessThanOrEqual(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+        expect(op.note?.length).toBeLessThan(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+      }
+      expect(fixture.getMutationCount()).toBe(0);
+    });
+
+    it("accepts a path of exactly the cap", async () => {
+      using fixture = await createFixture();
+      // Directories of 100 characters stay under the filesystem's name limit.
+      const prefix = `/memories/workspace/${"d".repeat(100)}/${"e".repeat(100)}/${"f".repeat(100)}/`;
+      const name = `${"n".repeat(MEMORY_CONSOLIDATION_PATH_MAX_CHARS - prefix.length - ".md".length)}.md`;
+      const atCap = `${prefix}${name}`;
+      expect(atCap).toHaveLength(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+
+      const result = await execute(fixture.tool, {
+        command: "create",
+        path: atCap,
+        file_text: "x\n",
+      });
+
+      expect(result.success).toBe(true);
     });
   });
 
