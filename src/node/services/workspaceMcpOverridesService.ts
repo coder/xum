@@ -769,10 +769,36 @@ export function isRetryableLockError(error: unknown): boolean {
     (error instanceof Error && error.message === WORKSPACE_LOCK_TIMEOUT_MESSAGE)
   );
 }
-/** What planPluginSweep decided: who may carry the key, and whom the sweep locks. */
+/** What planPluginSweep decided: who may carry the key, whom the sweep locks, and whom it did not read. */
 interface PluginSweepPlan {
   candidateIds: ReadonlySet<string>;
   lockedIds: readonly string[];
+  /** Not read before the scan's window closed, and not locked: they fail (see SweepScan). */
+  unscannedIds: readonly string[];
+  /**
+   * Not locked, with a document: they owe the cross-process epoch like a swept workspace with a
+   * document (see pruneResolvedWorkspace). A sweep may have rewritten the document and then
+   * failed its epoch bump; the tombstone's retry finds no key there, so only this signal tells
+   * other processes to drop the pre-prune overrides they cached.
+   */
+  documentedIds: readonly string[];
+}
+/**
+ * What a plugin sweep's scan (planPluginSweep) shares across its reads, chiefly its time
+ * window. A read that runs into its
+ * bound found a checkout that does not answer, such as a dead mount. Each more such
+ * checkout would cost the scan that bound again, CHECKOUT_IO_CONCURRENCY at a time, with no
+ * end, while the install waits on it (holding the plugin mutation queue) and every retry of
+ * a tombstone repeats it. So the first such timeout closes the window PUBLICATION_TIMEOUT_MS
+ * later: the workspaces the scan has not read by then fail and keep their tombstones. A scan
+ * that meets no such checkout has no window: its cost grows with the number of workspaces
+ * and the host's load (a unit run of 7,550 took 143 s on a core shared with three busy
+ * loops), and a cut there would fail the install that the scan exists to let through.
+ */
+interface SweepScan {
+  closesAt: number;
+  /** Workspaces with a document, read or not (see PluginSweepPlan.documentedIds). */
+  documented: Set<string>;
 }
 /** One workspace's result in sweepPluginOverrideKeys. */
 type SweptOutcome =
@@ -873,6 +899,29 @@ function sweepClosureEdges(id: string, graph: SweepClosureGraph): string[] {
     (metadata) => graph.idsByCheckout.get(graph.checkoutOf(metadata)) ?? []
   );
   return [...children, ...aliases];
+}
+/** Every legacy `workspace.mcp` value registered under `workspaceId`. */
+function legacyOverridesOf(config: ProjectsConfig, workspaceId: string): unknown[] {
+  return [...config.projects.values()]
+    .flatMap((projectConfig) => projectConfig.workspaces)
+    .filter((workspace) => workspace.id === workspaceId && workspace.mcp !== undefined)
+    .map((workspace) => workspace.mcp);
+}
+/** A legacy `workspace.mcp` value without `keyPrefix` keys; undefined for a shape this build cannot edit. */
+function prunedLegacyValue(value: unknown, keyPrefix: string): WorkspaceMCPOverrides | undefined {
+  if (!isRecognizedOverridesDocument(value)) {
+    return undefined;
+  }
+  try {
+    const text = prunePluginKeysFromDocument(
+      JSON.stringify(value),
+      keyPrefix,
+      "config.json workspace.mcp"
+    );
+    return JSON.parse(text) as WorkspaceMCPOverrides;
+  } catch {
+    return undefined;
+  }
 }
 /** Ids of the workspaces whose config.json entry still carries a legacy `workspace.mcp` value. */
 function idsWithLegacyOverrides(config: ProjectsConfig): Set<string> {
@@ -4323,6 +4372,8 @@ export class WorkspaceMcpOverridesService {
       ) {
         throw new WorkspaceMcpOverridesConflictError();
       }
+      // Validated and written in one hold of the global lock: a plugin sweep relies on it
+      // (see prunePluginOverrideKeysForWorkspaces).
       await options.validateAgainstCurrent?.(current.overrides, normalized);
     }
 
@@ -4776,6 +4827,13 @@ export class WorkspaceMcpOverridesService {
   ): Promise<Array<{ workspaceId: string; error: unknown }>> {
     assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
 
+    // A settings save validates a new plugin key against the discovered plugins and writes it
+    // in one hold of the global lock (setOverridesForWorkspace). A save that validated before
+    // the plugin's uninstall committed can still be writing now, and the scan below takes no
+    // lock. So take the global lock once first: every save that held it before has written
+    // its document, which the scan reads, and every later save validates against the
+    // committed uninstall, which refuses the swept plugin's keys.
+    await this.runExclusive(() => Promise.resolve());
     const plan = await this.planPluginSweep(workspaceIds, keyPrefix);
     // Every swept workspace's lock first, then the global lock: a rename
     // holding a workspace lock across its checkout move cannot be
@@ -4832,7 +4890,22 @@ export class WorkspaceMcpOverridesService {
     if (options?.publish) {
       await options.publish(null, ALL_WORKSPACES_TARGET);
     }
-    return failures;
+    // No lock: the bump is one atomic rename, and these workspaces' documents hold no key.
+    if (plan.documentedIds.length > 0) {
+      try {
+        await this.bumpOverridesEpoch();
+      } catch (error) {
+        failures.push(...plan.documentedIds.map((workspaceId) => ({ workspaceId, error })));
+      }
+    }
+    // Not read, so not known to be clean: they keep their tombstones (see SweepScan).
+    const unscanned = plan.unscannedIds.map((workspaceId) => ({
+      workspaceId,
+      error: new Error(
+        `The plugin sweep stopped reading MCP overrides after a checkout did not respond, before it read workspace ${workspaceId}`
+      ),
+    }));
+    return [...unscanned, ...failures];
   }
 
   /**
@@ -4841,30 +4914,51 @@ export class WorkspaceMcpOverridesService {
    * — a dead mount costs the scan that bound, not the sweep's lock hold) and name the
    * CANDIDATES: workspaces whose documents may carry `keyPrefix`, plus every workspace
    * the scan could not read (timeout, error, too large, not registered host-local), plus
-   * every workspace with a legacy config.json `workspace.mcp` value (it migrates into the
-   * workspace's document on first read, so it can bring a key along). Then close the
-   * set over what a prune of a candidate reaches (see sweepClosure): those workspaces
-   * are the ones to lock.
+   * every workspace with a legacy config.json `workspace.mcp` value (it decides in place of
+   * an absent or empty document, so it can bring a key along). Then close the set over what
+   * a prune of a candidate reaches (see sweepClosure): those workspaces are the ones to lock.
+   * A scan that meets a checkout that does not answer stops within a fixed window (see
+   * SweepScan): the workspaces it did not read by then are UNSCANNED.
    */
   private async planPluginSweep(
     workspaceIds: readonly string[],
     keyPrefix: string
   ): Promise<PluginSweepPlan> {
     const snapshot = new ConfigSnapshot(this.config);
-    const registry = await snapshot.loadSweepMetadata(workspaceIds);
+    // The scan only narrows what the sweep locks, so when the strict walk fails (one config
+    // row or another entry's metadata is malformed) it reads the registry leniently, as the
+    // lock-key derivation does (checkoutLockKeys): an id that the lenient walk does not list
+    // is a candidate, and the sweep under the locks reads the registry again.
+    const registry = await snapshot
+      .loadSweepMetadata(workspaceIds)
+      .catch(() => this.config.getAllWorkspaceMetadata({ probeCheckouts: false }));
     // mutation-equivalent: callers sweep host-local ids; an off-host entry that was scanned would
     // fail to read or hold no key, and the sweep reports the id as not found either way
     const entriesById = groupMetadataById(registry, /* hostLocalOnly */ true);
     const legacyIds = idsWithLegacyOverrides(snapshot.loadLegacyConfig());
     const ids = [...new Set(workspaceIds.map((id) => id.trim()))];
     const candidateIds = new Set<string>();
+    const unscanned = new Set<string>();
+    const scan: SweepScan = {
+      closesAt: Number.POSITIVE_INFINITY,
+      documented: new Set<string>(),
+    };
     await mapWithConcurrency(ids, CHECKOUT_IO_CONCURRENCY, async (id) => {
-      if (legacyIds.has(id) || (await this.mayCarryPluginKey(entriesById.get(id), keyPrefix))) {
+      const entries = entriesById.get(id);
+      // A legacy value, or an id the registry does not list, is a candidate without a read.
+      if (legacyIds.has(id) || entries === undefined) {
+        candidateIds.add(id);
+      } else if (Date.now() >= scan.closesAt) {
+        unscanned.add(id);
+      } else if (await this.mayCarryPluginKey(entries, keyPrefix, scan)) {
         candidateIds.add(id);
       }
     });
-    const lockedIds = [...this.sweepMembers(registry, candidateIds)];
-    return { candidateIds, lockedIds };
+    const locked = this.sweepMembers(registry, candidateIds);
+    // An unscanned descendant or alias of a candidate is locked and pruned like the others.
+    const unscannedIds = [...unscanned].filter((id) => !locked.has(id));
+    const documentedIds = [...scan.documented].filter((id) => !locked.has(id));
+    return { candidateIds, lockedIds: [...locked], unscannedIds, documentedIds };
   }
 
   private sweepMembers(
@@ -4878,18 +4972,19 @@ export class WorkspaceMcpOverridesService {
 
   /** True unless every override document of the workspace's checkouts was read, and none holds `keyPrefix`. */
   private async mayCarryPluginKey(
-    entries: readonly FrontendWorkspaceMetadata[] | undefined,
-    keyPrefix: string
+    entries: readonly FrontendWorkspaceMetadata[],
+    keyPrefix: string,
+    scan: SweepScan
   ): Promise<boolean> {
-    if (entries === undefined) {
-      return true;
-    }
     try {
       for (const metadata of entries) {
         const carries = await withDeadline(
-          this.documentsMayCarryKey(this.resolveWorkspace(metadata), keyPrefix),
-          HOST_DESCENDANT_TIMEOUT_MS,
-          `reading the override documents of workspace ${metadata.id} timed out`
+          this.documentsMayCarryKey(this.resolveWorkspace(metadata), keyPrefix, scan),
+          Math.min(HOST_DESCENDANT_TIMEOUT_MS, scan.closesAt - Date.now()),
+          `reading the override documents of workspace ${metadata.id} timed out`,
+          () => {
+            scan.closesAt = Math.min(scan.closesAt, Date.now() + PUBLICATION_TIMEOUT_MS);
+          }
         );
         if (carries) return true;
       }
@@ -4902,7 +4997,8 @@ export class WorkspaceMcpOverridesService {
 
   private async documentsMayCarryKey(
     resolved: ResolvedWorkspace,
-    keyPrefix: string
+    keyPrefix: string,
+    scan: SweepScan
   ): Promise<boolean> {
     const filePaths = this.getOverridesFilePaths(
       resolved.workspacePath,
@@ -4911,6 +5007,7 @@ export class WorkspaceMcpOverridesService {
     for (const filePath of filePaths) {
       const probe = await probeOverridesFile(resolved.runtime, filePath);
       if (probe.kind === "absent") continue;
+      scan.documented.add(resolved.metadata.id);
       if (probe.kind === "indeterminate" || probe.size > MAX_PRUNED_OVERRIDES_BYTES) return true;
       const text = await readFileString(resolved.runtime, filePath);
       // Every decoded string of the parse tree, so an escaped spelling cannot hide a key.
@@ -5116,7 +5213,7 @@ export class WorkspaceMcpOverridesService {
         // join a write that has been registered by then.
         const step = sweep.snapshot.scoped();
         const result = await withDeadline(
-          this.migrateThenPrune(metadata, keyPrefix, step, sweep.hasLegacyValue),
+          this.pruneSweptCheckout(metadata, keyPrefix, step, sweep.hasLegacyValue),
           sweep.budget.remaining(),
           `pruning workspace ${metadata.id} exceeded the plugin-prune budget`,
           () => step.cancel()
@@ -5137,34 +5234,71 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
-   * pruneResolvedWorkspace for one checkout of a sweep. A legacy config.json
-   * `workspace.mcp` value migrates into the workspace's document on first read, so its
-   * plugin keys would come back after the prune: resolve it first (the sweep holds the
-   * workspace and global locks, so the migration writes directly), then prune the
-   * document it produced. A legacy value this build cannot read stays in config.json and
-   * cannot be edited: it fails the workspace when it may carry the key.
+   * One checkout of a sweep: its config.json `workspace.mcp` value, then its documents
+   * (pruneResolvedWorkspace). The legacy value decides whenever the workspace has no
+   * document, or one that normalizes to nothing (resolveOverridesFor), so a key it keeps
+   * comes back after the documents' prune: right away when the prune empties the document,
+   * or on a later edit. The legacy value goes first, so that one this build cannot edit
+   * fails the workspace before any document is rewritten.
    */
-  private async migrateThenPrune(
+  private async pruneSweptCheckout(
     metadata: FrontendWorkspaceMetadata,
     keyPrefix: string,
     step: ConfigSnapshot,
     hasLegacyValue: boolean
   ): Promise<{ filePaths: readonly string[]; owesEpoch: boolean; rewrote: boolean }> {
-    if (hasLegacyValue) {
-      const { opaqueLegacyValue } = await this.resolveOverridesFor(metadata, "strict", step);
-      if (
-        opaqueLegacyValue !== undefined &&
-        // mutation-equivalent: JSON.stringify yields undefined or a non-empty string, so ?? and || agree
-        documentStringsContain(JSON.stringify(opaqueLegacyValue) ?? "", (value) =>
-          value.includes(keyPrefix)
-        )
-      ) {
-        throw new Error(
-          `Workspace ${metadata.id} carries a legacy MCP settings value in config.json that this version cannot edit and that may name "${keyPrefix}" keys`
-        );
-      }
+    const legacyRewritten =
+      hasLegacyValue && (await this.pruneLegacyOverrides(metadata.id, keyPrefix, step));
+    const pruned = await this.pruneResolvedWorkspace(
+      this.resolveWorkspace(metadata),
+      keyPrefix,
+      step
+    );
+    // A rewritten legacy value changes what the workspace resolves to: it owes the
+    // cross-process epoch and its own publication, like a rewritten document.
+    return legacyRewritten ? { ...pruned, owesEpoch: true, rewrote: true } : pruned;
+  }
+
+  /**
+   * Remove `keyPrefix` keys from the config.json `workspace.mcp` values registered under
+   * `workspaceId` (every entry: a corrupted config can list one ID twice). Returns whether
+   * one may have changed. A value this build cannot edit stays as it is, so it fails the
+   * workspace when it may name the key.
+   */
+  private async pruneLegacyOverrides(
+    workspaceId: string,
+    keyPrefix: string,
+    step: ConfigSnapshot
+  ): Promise<boolean> {
+    const mayNameKey = (value: unknown): boolean =>
+      // mutation-equivalent: JSON.stringify yields undefined or a non-empty string, so ?? and || agree
+      documentStringsContain(JSON.stringify(value) ?? "", (text) => text.includes(keyPrefix));
+    const naming = legacyOverridesOf(step.loadLegacyConfig(), workspaceId).filter(mayNameKey);
+    if (naming.length === 0) {
+      return false;
     }
-    return this.pruneResolvedWorkspace(this.resolveWorkspace(metadata), keyPrefix, step);
+    if (naming.some((value) => prunedLegacyValue(value, keyPrefix) === undefined)) {
+      throw new Error(
+        `Workspace ${workspaceId} carries a legacy MCP settings value in config.json that this version cannot edit and that may name "${keyPrefix}" keys`
+      );
+    }
+    if (step.cancelled) {
+      throw new Error(`pruning workspace ${workspaceId}'s legacy MCP settings was cancelled`);
+    }
+    await step.trackSideEffect(
+      this.config.editConfig((config) => {
+        // Nothing writes a legacy value at runtime (reads only migrate or clear one), so each
+        // value here is one checked above, or gone.
+        for (const projectConfig of config.projects.values()) {
+          for (const workspace of projectConfig.workspaces) {
+            if (workspace.id !== workspaceId || !mayNameKey(workspace.mcp)) continue;
+            workspace.mcp = prunedLegacyValue(workspace.mcp, keyPrefix) ?? workspace.mcp;
+          }
+        }
+        return config;
+      })
+    );
+    return true;
   }
 
   /**

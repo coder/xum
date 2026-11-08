@@ -7348,6 +7348,95 @@ describe("AgentPluginInstallService", () => {
       expect(await pathExists(installPath())).toBe(true);
     });
 
+    test("an uninstall waits for a settings save that validated the plugin's key before the commit", async () => {
+      // The save checked the key while the plugin was installed, and it still holds its locks
+      // when the uninstall commits. A sweep that scans without waiting for it reads the
+      // document before the enable lands, and clears the tombstone over a stale enable.
+      const overrides = new WorkspaceMcpOverridesService(config);
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overrides,
+      });
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      const key = buildPluginServerKey(computePluginInstanceId(installPath()), "echo");
+      const docOf = (workspaceId: string) =>
+        path.join(muxRoot, "checkouts", workspaceId, ".xum", "mcp.local.jsonc");
+      await registerLocalWorkspace("ws-saving");
+      await registerLocalWorkspace("ws-stale");
+      await fsPromises.mkdir(path.dirname(docOf("ws-stale")), { recursive: true });
+      await fsPromises.writeFile(docOf("ws-stale"), JSON.stringify({ enabledServers: [key] }));
+      // Discovery as the settings dialog's validator sees it: the managed plugin registry.
+      const validator = buildAddedPluginKeyValidator(async () =>
+        (await registry()).some((entry) => (entry as { name?: string }).name === "demo-plugin")
+          ? new Set([key])
+          : new Set<string>()
+      );
+      let validated!: () => void;
+      const validatedSignal = new Promise<void>((resolve) => (validated = resolve));
+      let resume!: () => void;
+      const resumed = new Promise<void>((resolve) => (resume = resolve));
+      const save = overrides.setOverridesForWorkspace(
+        "ws-saving",
+        { enabledServers: [key] },
+        {
+          validateAgainstCurrent: async (current, incoming) => {
+            await validator(current, incoming);
+            validated();
+            await resumed;
+          },
+        }
+      );
+      await validatedSignal;
+      // Resume the save once the sweep reads its document, or once the uninstall is done. An
+      // uninstall that waits for the save does neither, so a timer resumes it then.
+      const realStat = fsPromises.stat;
+      let scanned!: () => void;
+      const scannedSignal = new Promise<void>((resolve) => (scanned = resolve));
+      const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (
+        target: string,
+        ...rest: unknown[]
+      ) => {
+        if (target === docOf("ws-saving")) scanned();
+        return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+      }) as typeof fsPromises.stat);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const uninstall = serviceWithOverrides.uninstall({
+          name: "demo-plugin",
+          deletePluginData: false,
+        });
+        await Promise.race([
+          scannedSignal,
+          uninstall.then(
+            () => undefined,
+            () => undefined
+          ),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, 3_000);
+          }),
+        ]);
+        resume();
+        await save;
+        await uninstall;
+      } finally {
+        clearTimeout(timer);
+        statSpy.mockRestore();
+      }
+
+      expect(await registry()).toEqual([]);
+      const saved = JSON.parse(await fsPromises.readFile(docOf("ws-saving"), "utf8")) as {
+        enabledServers?: string[];
+      };
+      expect(saved.enabledServers).toEqual([]);
+      const envelope = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        pendingOverridePrunes?: unknown[];
+      };
+      expect(envelope.pendingOverridePrunes ?? []).toEqual([]);
+    }, 30_000);
+
     test("a fresh install sweeps every workspace when an unrelated legacy entry's metadata is malformed", async () => {
       const serviceWithOverrides = new AgentPluginInstallService(config, {
         workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
