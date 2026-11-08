@@ -482,8 +482,16 @@ The server didn't respond in time.
     const forbiddenOnNightly503Error = `403 Forbidden
 "method: GET url: https://github.com/coder/xum/releases/download/v0.32.2-nightly.503/nightly-mac.yml
 "`;
-    const updateServerUnreachableMessage =
-      "The update server didn't respond. This is usually a temporary GitHub problem; please try again in a few minutes.";
+    // A manual check still reports the failure, but in its own words: echoing
+    // GitHub's status line or HTML body is what the gateway handling replaces.
+    function expectRewordedGatewayCheckError(): void {
+      const status = service.getStatus();
+      if (status.type !== "error") {
+        throw new Error(`Expected error status, got: ${status.type}`);
+      }
+      expect(status.phase).toBe("check");
+      expect(status.message).not.toMatch(/504|HttpError|<html/i);
+    }
 
     it("should silently back off on 404 (latest.yml missing) for auto checks", async () => {
       mockAutoUpdater.checkForUpdates.mockImplementation(() => {
@@ -561,7 +569,7 @@ The server didn't respond in time.
       expect(statusUpdates.find((s) => s.type === "error")).toBeUndefined();
     });
 
-    it("should name the update server for a gateway error on a manual check", async () => {
+    it("should reword a gateway error on a manual check", async () => {
       mockAutoUpdater.checkForUpdates.mockImplementation(() => {
         setImmediate(() => {
           mockAutoUpdater.emit("error", new Error(gatewayTimeoutError));
@@ -574,14 +582,10 @@ The server didn't respond in time.
       service.checkForUpdates({ source: "manual" });
       await new Promise((resolve) => setImmediate(resolve));
 
-      expect(statusUpdates[statusUpdates.length - 1]).toEqual({
-        type: "error",
-        phase: "check",
-        message: updateServerUnreachableMessage,
-      });
+      expectRewordedGatewayCheckError();
     });
 
-    it("should name the update server for a wrapped stable-channel gateway error", async () => {
+    it("should reword a wrapped stable-channel gateway error", async () => {
       mockAutoUpdater.checkForUpdates.mockImplementation(() => {
         setImmediate(() => {
           mockAutoUpdater.emit("error", new Error(wrappedGatewayTimeoutError));
@@ -594,11 +598,7 @@ The server didn't respond in time.
       service.checkForUpdates({ source: "manual" });
       await new Promise((resolve) => setImmediate(resolve));
 
-      expect(statusUpdates[statusUpdates.length - 1]).toEqual({
-        type: "error",
-        phase: "check",
-        message: updateServerUnreachableMessage,
-      });
+      expectRewordedGatewayCheckError();
     });
 
     it("should surface a non-gateway error whose URL contains a 50x number on auto checks", async () => {
