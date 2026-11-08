@@ -12,7 +12,7 @@ import {
   setAgentSandboxTargets,
 } from "./agentSandboxTargets";
 import { askpassSessionsRoot } from "../sshAskpass";
-import { isPathAtOrUnder, sandboxToolEnv } from "./sandboxPaths";
+import { isPathAtOrUnder, realpathOfNearest, sandboxToolEnv } from "./sandboxPaths";
 
 const SETTINGS: ResolvedAgentSandboxSettings = {
   enabled: true,
@@ -24,6 +24,16 @@ const SETTINGS: ResolvedAgentSandboxSettings = {
 
 function git(cwd: string, ...args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "ignore" });
+}
+
+/**
+ * Moves the temp write root off the test's temp folder, so a home folder there is outside the
+ * write roots, as it is outside a test: a link in a write root that Xum reads as spelled fails
+ * closed.
+ */
+function homeOutsideWriteRoots(): Disposable {
+  const tmpdir = spyOn(os, "tmpdir").mockReturnValue("/private/tmp");
+  return { [Symbol.dispose]: () => tmpdir.mockRestore() };
 }
 
 const savedRoot = process.env.XUM_ROOT;
@@ -220,11 +230,12 @@ describe("buildAgentSandboxPolicy", () => {
   // root is in the temp folder, a write root outside the (hidden) home folder.
   test("keeps a global plugin folder that is a link into a write root read-only", async () => {
     const home = path.join(root, "home");
-    const plugins = path.join(root, "agent-plugins");
+    const plugins = path.join(repo, "agent-plugins");
     await fs.mkdir(plugins);
     await fs.mkdir(path.join(home, ".agents"), { recursive: true });
     await fs.symlink(plugins, path.join(home, ".agents", "plugins"));
     const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
     try {
       const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
 
@@ -264,13 +275,14 @@ describe("buildAgentSandboxPolicy", () => {
   // Git that Xum runs outside the sandbox runs a credential.helper from the global config.
   test("keeps a global git config that is a link into a write root read-only", async () => {
     const home = path.join(root, "home");
-    const dotfiles = path.join(root, "dotfiles");
+    const dotfiles = path.join(repo, "dotfiles");
     await fs.mkdir(path.join(dotfiles, "git"), { recursive: true });
     await fs.writeFile(path.join(dotfiles, "gitconfig"), "");
     await fs.mkdir(path.join(home, ".config"), { recursive: true });
     await fs.symlink(path.join(dotfiles, "gitconfig"), path.join(home, ".gitconfig"));
     await fs.symlink(path.join(dotfiles, "git"), path.join(home, ".config", "git"));
     const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
     try {
       const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
       const writable = (target: string) => agentSandboxPolicyAllows(policy, target, "write");
@@ -584,6 +596,40 @@ describe("buildAgentSandboxPolicy", () => {
     expect(() =>
       buildAgentSandboxPolicy(SETTINGS, { cwd: repo, workspaceRoots: [linked] })
     ).toThrow(AgentSandboxStartError);
+  });
+
+  // Xum and its git use these as spelled, outside the sandbox, so a command could replace the link.
+  test.each([
+    // Any existing folder and file outside the write roots and the home folder.
+    { name: "XUM_ROOT", target: "/usr" },
+    { name: "GIT_CONFIG_GLOBAL", target: "/etc/hosts" },
+  ])("fails closed when $name is a link in a write root", async ({ name, target }) => {
+    const alias = path.join(repo, "alias");
+    await fs.symlink(target, alias);
+    const saved = process.env[name];
+    process.env[name] = alias;
+    try {
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(
+        AgentSandboxStartError
+      );
+    } finally {
+      if (saved === undefined) delete process.env[name];
+      else process.env[name] = saved;
+    }
+  });
+
+  // It can hold a registry token, as ~/.npmrc can.
+  test("keeps ~/.bunfig.toml closed for reads unless extraReadPaths opens it", () => {
+    const bunfig = path.join(realpathOfNearest(os.homedir()), ".bunfig.toml");
+    const readable = (extraReadPaths: string[]) =>
+      agentSandboxPolicyAllows(
+        buildAgentSandboxPolicy({ ...SETTINGS, extraReadPaths }, { cwd: repo }),
+        bunfig,
+        "read"
+      );
+
+    expect(readable([])).toBe(false);
+    expect(readable(["~/.bunfig.toml"])).toBe(true);
   });
 
   // A default macOS volume opens `.XUM/MCP.JSONC` as `.xum/mcp.jsonc`.

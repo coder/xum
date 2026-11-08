@@ -9,6 +9,7 @@ import { getXumHome } from "@/common/constants/paths";
 import {
   AUTOMATION_ENTRY_ROOTS,
   AUTOMATION_READ_PATHS,
+  HIDDEN_AUTOMATION_PATHS,
   CACHE_WRITE_PATHS,
   DENY_READ_ROOTS,
   HOME_READ_PATHS,
@@ -198,7 +199,7 @@ export function buildAgentSandboxPolicy(
     ...CACHE_WRITE_PATHS.map(expandWriteRoot),
     ...extraWriteRoots,
   ]);
-  assertNoRootThroughLink(
+  assertNoPathThroughLink(
     [input.cwd, ...(input.workspaceRoots ?? []), ...settings.extraWritePaths],
     writeRoots
   );
@@ -217,10 +218,14 @@ export function buildAgentSandboxPolicy(
       `the extra write path ${extraRootInXumHome} is inside Xum's home folder ${xumHome}`
     );
   }
-  const automationPaths = [
-    ...[...AUTOMATION_READ_PATHS, ...gitGlobalConfigFiles()].map(expandSandboxPath),
-    ...automationEntryLinkTargets(),
-  ];
+  const readableSpellings = [...AUTOMATION_READ_PATHS, ...gitGlobalConfigFiles()];
+  const automationSpellings = [...readableSpellings, ...HIDDEN_AUTOMATION_PATHS];
+  // Xum and its git use these as spelled, outside the sandbox, so a command could replace a link
+  // to one in a write root (Codex review): fail closed.
+  assertNoPathThroughLink([getXumHome(), ...automationSpellings], writeRoots);
+  const linkedEntries = automationEntryLinkTargets();
+  const readableAutomation = [...readableSpellings.map(expandSandboxPath), ...linkedEntries];
+  const automationPaths = [...automationSpellings.map(expandSandboxPath), ...linkedEntries];
   assertNoWriteRootInAutomation(writeRoots, automationPaths);
   // A background command starts in a temp folder and gets its checkout in workspaceRoots.
   const gitCommonDirs = dedupe(
@@ -248,7 +253,7 @@ export function buildAgentSandboxPolicy(
     ...writeRoots,
     ...gitCommonDirs,
     ...HOME_READ_PATHS.map(expandSandboxPath),
-    ...automationPaths,
+    ...readableAutomation,
     ...pathFoldersUnderHome(input.pathEnv, home, writeRoots),
     // A command can replace an entry in a write root with a link, so links there are not followed.
     ...outsideNestedDenies(
@@ -295,9 +300,10 @@ function assertNoWriteRootInAutomation(
 /**
  * A command can replace a folder in a write root (a checkout in /tmp, or a folder in an
  * extraWritePaths entry) with a link to ~/.ssh, and the next policy would then open where the
- * link points as a workspace: fail closed when a root as spelled leads through such a link.
+ * link points as a workspace: fail closed when a root as spelled leads through such a link. The
+ * same holds for a path that Xum uses as spelled outside the sandbox (XUM_ROOT, GIT_CONFIG_GLOBAL).
  */
-function assertNoRootThroughLink(spelled: readonly string[], writeRoots: readonly string[]): void {
+function assertNoPathThroughLink(spelled: readonly string[], writeRoots: readonly string[]): void {
   for (const entry of spelled.map(expandSandboxPathSpelling)) {
     const resolved = realpathOfNearest(entry);
     const otherRoots = writeRoots.filter((root) => root !== resolved);

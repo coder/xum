@@ -183,10 +183,9 @@ export const AUTOMATION_ENTRY_ROOTS: readonly string[] = [...GLOBAL_SKILL_ROOTS,
  */
 export const AUTOMATION_READ_PATHS: readonly string[] = [
   // Git that Xum runs outside the sandbox runs what they name (credential.helper,
-  // core.sshCommand), and so does bunx for MCP servers (Bun's preload).
+  // core.sshCommand).
   "~/.gitconfig",
   "~/.config/git",
-  "~/.bunfig.toml",
   ...GLOBAL_SKILL_ROOTS,
   ...PLUGIN_ROOTS,
   // Xum's own helper scripts (tool_env and the like).
@@ -194,6 +193,12 @@ export const AUTOMATION_READ_PATHS: readonly string[] = [
   // The global tool hooks (hooks.ts): Xum runs them in the sandbox, so it must read them.
   ...["tool_env", "tool_hook", "tool_pre", "tool_post"].map((name) => `${XUM_HOME_TOKEN}/${name}`),
 ];
+
+/**
+ * Automation that stays closed for reads, as ~/.npmrc does: bunx for MCP servers runs the preload
+ * that it names, and it can hold a registry token. extraReadPaths can open it.
+ */
+export const HIDDEN_AUTOMATION_PATHS: readonly string[] = ["~/.bunfig.toml"];
 
 // Open under ~ for each command, with the workspace, its scratch folder, the main .git of a
 // worktree, all write paths and extraReadPaths.
@@ -216,8 +221,8 @@ export const HOME_READ_PATHS: readonly string[] = [
 
 // Denied after the allows, so no open folder or extraReadPaths entry exposes them.
 // <xumHome> can be outside ~ (XUM_ROOT), so its files need their own denies.
-// Not open either: ~/.npmrc, ~/.pypirc, ~/.gradle/gradle.properties, ~/.m2/settings.xml. They can
-// hold tokens; the user can add each one to extraReadPaths.
+// Not open either: ~/.npmrc, ~/.bunfig.toml, ~/.pypirc, ~/.gradle/gradle.properties,
+// ~/.m2/settings.xml. They can hold tokens; the user can add each one to extraReadPaths.
 export const NESTED_DENY_READ_PATHS: readonly string[] = [
   "~/.cargo/credentials.toml",
   "~/.cargo/credentials",
