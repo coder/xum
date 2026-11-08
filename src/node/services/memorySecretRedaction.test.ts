@@ -20,7 +20,10 @@ describe("redactSecretLike", () => {
     slackHook: `T${"0".repeat(8)}/B${"1".repeat(8)}/${"Xz9k".repeat(6)}`,
     urlPassword: "s3cr3t-pw",
     signature: "Zk3%2Bq9Lw%2FPd7%3D",
+    sharedAccessKey: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MCtB/xYz+Q==",
   };
+  const SERVICE_BUS =
+    "Endpoint=sb://demo.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey";
 
   it.each([
     ["a GitHub OAuth token", `token in env: ${FAKE.github}`, FAKE.github],
@@ -60,6 +63,50 @@ describe("redactSecretLike", () => {
       "Eby8vdM02xNOcqFlqUwJ+PEx/3x==",
     ],
     ["an account key in a JSON pair", '{"accountKey": "Eby8vdM02xNOc"}', "Eby8vdM02xNOc"],
+    [
+      "a Service Bus connection string with the key in the middle",
+      `${SERVICE_BUS};SharedAccessKey=${FAKE.sharedAccessKey};EntityPath=orders`,
+      FAKE.sharedAccessKey,
+    ],
+    [
+      "a Service Bus connection string that ends in the key",
+      `${SERVICE_BUS};SharedAccessKey=${FAKE.sharedAccessKey}`,
+      FAKE.sharedAccessKey,
+    ],
+    [
+      "a Service Bus connection string in an environment line",
+      `AZURE_SERVICEBUS_CONNECTION_STRING=${SERVICE_BUS};SharedAccessKey=${FAKE.sharedAccessKey}\nPORT=8080`,
+      FAKE.sharedAccessKey,
+    ],
+    [
+      "a Service Bus connection string in a quoted environment value",
+      `export EVENTHUB_CONNECTION_STRING="${SERVICE_BUS};SharedAccessKey=${FAKE.sharedAccessKey};EntityPath=hub"`,
+      FAKE.sharedAccessKey,
+    ],
+    [
+      "a Service Bus connection string in a JSON value",
+      JSON.stringify({
+        connectionString: `${SERVICE_BUS};SharedAccessKey=${FAKE.sharedAccessKey}`,
+      }),
+      FAKE.sharedAccessKey,
+    ],
+    [
+      "a Service Bus connection string in JSON that a tool printed as JSON",
+      JSON.stringify({
+        out: JSON.stringify({ cs: `${SERVICE_BUS};SharedAccessKey=${FAKE.sharedAccessKey}` }),
+      }),
+      FAKE.sharedAccessKey,
+    ],
+    [
+      "a shared access key in a JSON pair",
+      JSON.stringify({ SharedAccessKey: FAKE.sharedAccessKey, SharedAccessKeyName: "root" }),
+      FAKE.sharedAccessKey,
+    ],
+    [
+      "a shared access key in snake case",
+      `shared_access_key: ${FAKE.sharedAccessKey}`,
+      FAKE.sharedAccessKey,
+    ],
     ["a bearer assignment", "curl -d bearer=abc123def456 https://example.com", "abc123def456"],
     ["a bearer JSON pair", '{"bearer": "abc123def456"}', "abc123def456"],
     [
@@ -321,6 +368,25 @@ describe("redactSecretLike", () => {
     });
   });
 
+  // The policy name is not a secret, and a note about the policy must stay writable: the
+  // memory-write guard reuses this detector, as it does for `AccountName`.
+  it("redacts a connection string's key and keeps its endpoint and policy name readable", () => {
+    const text = `${SERVICE_BUS};SharedAccessKey=${FAKE.sharedAccessKey};EntityPath=orders`;
+
+    expect(redactSecretLike(text)).toBe(
+      `${SERVICE_BUS};SharedAccessKey=[redacted];EntityPath=orders`
+    );
+  });
+
+  it("leaves a note about a shared access policy readable", () => {
+    const text = [
+      `The bus is reached with ${SERVICE_BUS}; the key is in the vault.`,
+      "Rotate the shared access key every quarter: SharedAccessKeyName stays the same.",
+      "Each SharedAccessKey is scoped to one namespace.",
+    ].join("\n");
+    expect(redactSecretLike(text)).toBe(text);
+  });
+
   it("leaves ordinary text and token counts readable", () => {
     const text =
       "max_tokens: 4096, input_tokens=120, ran 3 tests in the task-runner, name: demo, bearer scheme, account name";
@@ -380,6 +446,9 @@ describe("redactSecretLike", () => {
     ["URL schemes with a short userinfo", "://a:".repeat(25_000)],
     ["a keyword followed by whitespace", `token${" ".repeat(100_000)}x`],
     ["account_key", "account_key".repeat(9_000)],
+    ["SharedAccessKey", "SharedAccessKey".repeat(6_600)],
+    ["shared_access_key_", "shared_access_key_".repeat(5_600)],
+    ["SharedAccessKeyName", "SharedAccessKeyName".repeat(5_200)],
     ["bearer", "bearer".repeat(16_000)],
     ["a PGP key header", "-----BEGIN PGP PRIVATE KEY BLOCK-----".repeat(3_000)],
     ["a quoted value of backslashes", `token:"${"\\".repeat(100_000)}`],
