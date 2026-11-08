@@ -394,7 +394,7 @@ describe("derivesFromSessionHistory", () => {
     ],
     [
       "a lookup in a call it made in turn",
-      execution({ toolCalls: [{ toolName: "task", result: { toolCalls: [lookup] } }] }),
+      execution({ toolCalls: [{ toolName: "code_execution", result: { toolCalls: [lookup] } }] }),
     ],
     [
       "a lookup in the nested calls of a persisted call",
@@ -410,6 +410,14 @@ describe("derivesFromSessionHistory", () => {
     ["a lookup named only in text", execution({ result: "session_history" })],
     ["calls that are not lists", execution({ toolCalls: lookup }, lookup)],
     ["a string output", execution("done")],
+    [
+      "another tool's application JSON with a toolCalls key",
+      { toolName: "mcp_crm_search", output: { toolCalls: [lookup] } },
+    ],
+    [
+      "a toolCalls key in what a nested call that is not code_execution returned",
+      execution({ toolCalls: [{ toolName: "task", result: { toolCalls: [lookup] } }] }),
+    ],
     ["no part", undefined],
   ])("is false for %s", (_label, part) => {
     expect(derivesFromSessionHistory(part)).toBe(false);
