@@ -418,6 +418,36 @@ describe("ArtifactViewer renderers", () => {
     );
   });
 
+  // The frame's first load usually reaches the host before the document's open announcement,
+  // so a theme or annotate change made before the bind must still reach the document.
+  test("the document gets the current theme and annotate mode when its channel binds", async () => {
+    const client = createTestApiClient({});
+    const frameIn = (theme: "dark" | "light", annotating: boolean) => (
+      <ThemeProvider forcedTheme={theme}>
+        <APIProvider client={client}>
+          <SandboxedArtifactFrame
+            workspaceId={null}
+            path="page.html"
+            kind="html"
+            content="<p>hi</p>"
+            onAnnotate={annotating ? () => undefined : undefined}
+          />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    const view = render(frameIn("dark", false));
+    // happy-dom has fired the srcdoc's one load by now, ahead of the bind, as browsers do.
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    view.rerender(frameIn("light", true));
+    const artifact = bootFrameDocument(frame);
+    await deliverFrameMessages();
+    expect(shownWithoutNotice(view, frame)).toBe(true);
+    expect(artifact.received).toContainEqual(
+      expect.objectContaining({ xumArtifact: 1, type: "theme", theme: "light" })
+    );
+    expect(artifact.received).toContainEqual({ xumArtifact: 1, type: "annotate", enabled: true });
+  });
+
   test("an open announcement from any other window binds nothing", async () => {
     const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
@@ -486,6 +516,9 @@ describe("ArtifactViewer renderers", () => {
     // Until the page reports, the pane shows through: no white flash while a dark page loads.
     expect(frame.className).not.toContain("bg-white");
     expect(frame.style.backgroundColor).toBe("");
+    // The bind sends the theme, which the bridge answers with its own backdrop report.
+    bootFrameDocument(frame);
+    await deliverFrameMessages();
 
     await postBackdrop(frame, "rgb(16, 15, 15)");
     expect(frame.style.backgroundColor).toBe("rgb(16, 15, 15)");

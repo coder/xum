@@ -313,8 +313,8 @@ function themeMessageOf(theme: ArtifactTheme, themeMode: ArtifactAppearance["the
  * (frameDocumentChannel.ts). It binds the document's channel from the open announcement of the
  * iframe's current window, hands each schema-valid bridge message to `onMessage`, and closes the
  * frame on the document's leave or a missed check (`guard`, frameNavigationGuard.tsx). It sends
- * the theme and annotate mode to the document, only over that channel: at the document's first
- * load and on every change. Returns the iframe's onLoad.
+ * the theme and annotate mode to the document, only over that channel: when the channel binds
+ * and on every change. Returns the iframe's onLoad.
  */
 function useArtifactFrameBridge(input: {
   built: BuiltDocument | null;
@@ -328,6 +328,11 @@ function useArtifactFrameBridge(input: {
   const { built, guard, frameRef, theme, themeMode, annotating, onMessage } = input;
   const { navigated, navigatedRef, leave, opened } = guard;
   const frameChannel = useArtifactFrameChannel(built, guard.frameKey);
+  // The host state the bind sends: the values of the latest render, not of the listener's.
+  const hostState = useRef({ theme, themeMode, annotating });
+  useLayoutEffect(() => {
+    hostState.current = { theme, themeMode, annotating };
+  });
   // A layout effect: the listener must be in place before the srcdoc's bridge announces itself.
   useLayoutEffect(() => {
     if (frameChannel == null || navigated) return;
@@ -342,7 +347,17 @@ function useArtifactFrameBridge(input: {
     const handler = frameDocumentOpenListener(
       channel,
       () => frameRef.current?.contentWindow,
-      opened
+      (bound) => {
+        opened(bound);
+        // At the bind, not at the first load: the frame's first load usually reaches the host
+        // before the open announcement (both engines), and a post before the bind is dropped.
+        // The bridge listens on its port from its first statement, so this one arrives.
+        const current = hostState.current;
+        postToFrame(navigatedRef, frameChannel, themeMessageOf(current.theme, current.themeMode));
+        if (current.annotating) {
+          postToFrame(navigatedRef, frameChannel, artifactAnnotateModeMessage(true));
+        }
+      }
     );
     window.addEventListener("message", handler);
     return () => {
@@ -360,12 +375,7 @@ function useArtifactFrameBridge(input: {
     postToFrame(navigatedRef, frameChannel, themeMessageOf(theme, themeMode));
   }, [theme, themeMode, frameChannel, navigatedRef]);
 
-  return () => {
-    // Only the document's first load posts the host state; the guard checks every load.
-    if (!guard.onLoad()) return;
-    postToFrame(navigatedRef, frameChannel, themeMessageOf(theme, themeMode));
-    if (annotating) postToFrame(navigatedRef, frameChannel, artifactAnnotateModeMessage(true));
-  };
+  return guard.onLoad;
 }
 
 /**

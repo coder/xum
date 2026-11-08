@@ -9,7 +9,7 @@ import { Notice } from "./SourceText";
  */
 type FrameLifecycle =
   | { kind: "unbound"; loads: number }
-  | { kind: "bound"; channel: FrameDocumentChannel; loads: number };
+  | { kind: "bound"; channel: FrameDocumentChannel };
 
 /**
  * SECURITY AUDIT: a sandboxed srcdoc frame can still navigate itself (`location.href = ...`, a
@@ -73,27 +73,23 @@ export function useFrameNavigationGuard(documentKey: string | null) {
     /** Stable; `.current` is true once the frame left its srcdoc: drop messages, stop posts. */
     navigatedRef,
     /**
-     * The iframe's onLoad. Returns true only for the document's first load (post the initial
-     * host state then). Closes the frame at an unbound document's second load, and checks a
-     * bound document at every load.
+     * The iframe's onLoad. Checks a bound document at every load, and closes the frame at an
+     * unbound document's second load.
      */
-    onLoad: (): boolean => {
-      const record = currentDocument();
-      if (record == null) return false;
-      record.state.loads += 1;
-      if (record.state.kind === "bound") {
-        record.state.channel.check(leave);
-        return record.state.loads === 1;
+    onLoad: () => {
+      const state = currentDocument()?.state;
+      if (state == null) return;
+      if (state.kind === "bound") {
+        state.channel.check(leave);
+        return;
       }
-      if (record.state.loads === 1) return true;
-      leave();
-      return false;
+      state.loads += 1;
+      if (state.loads > 1) leave();
     },
     /** The document's channel bound (its open announcement arrived): loads now check it. */
     opened: (channel: FrameDocumentChannel) => {
       const record = currentDocument();
-      if (record == null) return;
-      record.state = { kind: "bound", channel, loads: record.state.loads };
+      if (record != null) record.state = { kind: "bound", channel };
     },
     /** The frame's document unloaded, or it missed a check (frameDocumentChannel.ts). */
     leave,
