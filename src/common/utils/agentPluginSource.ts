@@ -65,3 +65,77 @@ export function pointsAtThisMachine(url: string): boolean {
   const host = gitUrlHost(url);
   return host === undefined || isLoopbackHost(host);
 }
+
+/**
+ * Validate and normalize a repo-relative plugin folder (`a/b/c`). Throws a
+ * user-facing error for anything that could leave the repository or be read
+ * as a pattern: absolute paths, `.`/`..`/empty segments, `.git`, control
+ * characters, and sparse-checkout/glob specials (`* ? [ ] \ ! #`). Applied
+ * to parsed shorthand and again at the installer boundary, because registry
+ * entries and direct API sources never pass through the parser.
+ */
+export function normalizeAgentPluginSubpath(raw: string): string {
+  let subpath = raw.trim();
+  if (subpath.endsWith("/")) {
+    subpath = subpath.slice(0, -1);
+  }
+  if (subpath.length === 0) {
+    throw new Error("The plugin subpath must not be empty.");
+  }
+  // `/abs`, `~/home`, and Windows drive letters (`C:`).
+  if (/^(?:[/~]|[a-zA-Z]:)/.test(subpath)) {
+    throw new Error(
+      `'${subpath}' is an absolute path. The plugin subpath must be relative to the repository root.`
+    );
+  }
+  // eslint-disable-next-line no-control-regex -- rejecting control characters is the point
+  if (/[\u0000-\u001f\u007f]/.test(subpath)) {
+    throw new Error("The plugin subpath must not contain control characters.");
+  }
+  if (/[*?[\]\\!#]/.test(subpath)) {
+    throw new Error(
+      `'${subpath}' contains a character that is not allowed in a plugin subpath (* ? [ ] \\ ! #).`
+    );
+  }
+  for (const segment of subpath.split("/")) {
+    assertValidSubpathSegment(subpath, segment);
+  }
+  return subpath;
+}
+
+function assertValidSubpathSegment(subpath: string, segment: string): void {
+  if (segment.length === 0 || segment === "." || segment === "..") {
+    throw new Error(
+      `'${subpath}' is not a valid plugin subpath. Use a folder path inside the repository, like path/to/plugin (no empty, '.' or '..' parts).`
+    );
+  }
+  if (segment.toLowerCase() === ".git") {
+    throw new Error(`'${subpath}' points into the .git folder, which is not a plugin folder.`);
+  }
+  if (segment !== segment.trim()) {
+    throw new Error(
+      `'${subpath}' has a path part that starts or ends with whitespace, which is not allowed in a plugin subpath.`
+    );
+  }
+}
+
+/**
+ * True when `subpath` is already the form `normalizeAgentPluginSubpath` returns for it. The
+ * installer takes only that form (`assertNormalizedSubpath` in installService.ts), so a stored
+ * source that is not in it cannot be previewed or installed.
+ */
+export function isNormalizedAgentPluginSubpath(subpath: string): boolean {
+  try {
+    return normalizeAgentPluginSubpath(subpath) === subpath;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True for a 7 to 39 digit hex ref: git reads it as a short commit id, which a shallow fetch cannot
+ * resolve, so the installer refuses it as a branch or tag name (`resolveRemoteRef`).
+ */
+export function isAbbreviatedCommitSha(ref: string): boolean {
+  return /^[0-9a-f]{7,39}$/i.test(ref);
+}

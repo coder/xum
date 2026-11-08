@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   hasUrlCredentials,
+  isValidBackupBranch,
   SettingsBackupInputSchema,
   SettingsBackupSchema,
   UNSAFE_URL_CHARACTERS,
@@ -9,7 +10,11 @@ import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
 } from "@/common/config/schemas/agentPluginInstalls";
-import { pointsAtThisMachine } from "@/common/utils/agentPluginSource";
+import {
+  isAbbreviatedCommitSha,
+  isNormalizedAgentPluginSubpath,
+  pointsAtThisMachine,
+} from "@/common/utils/agentPluginSource";
 import { ResultSchema } from "./result";
 
 /**
@@ -100,6 +105,39 @@ const BackupPluginUrlSchema = z
   });
 
 /**
+ * The branch or tag a plugin tracks, which the install review writes back into the installed
+ * source. The list is repository-controlled, so a ref that git cannot hold, or that the installer
+ * would refuse, is left out here: it would otherwise make every later update check of the plugin
+ * fail. The git name rules are the backup branch's (`isValidBackupBranch`), the short commit id
+ * is the installer's own refusal (`resolveRemoteRef`), and a format character (a bidi mark)
+ * could make the ref read as another one where it is shown.
+ */
+const BackupPluginRefSchema = z
+  .string()
+  .min(1)
+  .max(256)
+  .refine(isValidBackupBranch, { message: "A plugin ref must be a valid git branch or tag name" })
+  .refine((ref) => !UNSAFE_URL_CHARACTERS.test(ref), {
+    message: "A plugin ref must not contain whitespace, control or format characters",
+  })
+  .refine((ref) => !isAbbreviatedCommitSha(ref), {
+    message: "A plugin ref must not be an abbreviated commit id",
+  });
+
+/**
+ * The folder of a monorepo plugin, in the form the installer takes (`normalizeAgentPluginSubpath`).
+ * A row with another form (`/a`, `../a`, `a//b`, `.git`) would be offered for review and then
+ * refused by the preview, and a registry row in that form would back up into a list nobody can use.
+ */
+const BackupPluginSubpathSchema = z
+  .string()
+  .min(1)
+  .max(1024)
+  .refine(isNormalizedAgentPluginSubpath, {
+    message: "A plugin subpath must be a folder path inside the repository, like path/to/plugin",
+  });
+
+/**
  * One managed Agent Plugin as the backup records it: where it came from and which commit it was
  * pinned to. Only what is needed to offer the install again. Consent, hook trust, approved copies,
  * enabled servers and timestamps are local facts and never travel (the parse drops them): another
@@ -112,8 +150,8 @@ export const BackupPluginEntrySchema = z.object({
   name: AgentPluginInstallEntrySchema.shape.name,
   source: AgentPluginGitSourceSchema.extend({
     url: BackupPluginUrlSchema,
-    ref: z.string().min(1).max(256),
-    subpath: z.string().min(1).max(1024).optional(),
+    ref: BackupPluginRefSchema,
+    subpath: BackupPluginSubpathSchema.optional(),
   }),
   /** Full commit id: a restore previews this exact commit, whatever `source.ref` tracks now. */
   lockedSha: z.string().regex(FULL_COMMIT_SHA_PATTERN, { message: "Not a full commit id" }),

@@ -2,11 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import {
-  isFullCommitSha,
-  normalizeAgentPluginSubpath,
-  parseAgentPluginSourceInput,
-} from "./sourceInput";
+import { isFullCommitSha, parseAgentPluginSourceInput } from "./sourceInput";
 
 describe("parseAgentPluginSourceInput", () => {
   // Shorthand expansion depends on SSH-agent presence; pin it for determinism.
@@ -151,40 +147,6 @@ describe("parseAgentPluginSourceInput", () => {
     expect(() => parseAgentPluginSourceInput("./relative/path")).toThrow(/relative path/);
     expect(() => parseAgentPluginSourceInput("coder/mux@")).toThrow(/must not be empty/);
     expect(() => parseAgentPluginSourceInput("-bad/owner")).toThrow(/not a valid owner\/repo/);
-  });
-});
-
-describe("normalizeAgentPluginSubpath", () => {
-  test("accepts repo-relative folders, trimming whitespace and one trailing slash", () => {
-    expect(normalizeAgentPluginSubpath("pstack")).toBe("pstack");
-    expect(normalizeAgentPluginSubpath(" packages/demo/ ")).toBe("packages/demo");
-    expect(normalizeAgentPluginSubpath("a/.github/b-c_d.e")).toBe("a/.github/b-c_d.e");
-  });
-
-  test.each([
-    ["", /must not be empty/],
-    ["/", /must not be empty/],
-    ["/abs/path", /absolute path/],
-    ["~/plugins", /absolute path/],
-    ["C:/plugins", /absolute path/],
-    ["..", /not a valid plugin subpath/],
-    ["../x", /not a valid plugin subpath/],
-    ["a/../../x", /not a valid plugin subpath/],
-    ["./x", /not a valid plugin subpath/],
-    ["a//b", /not a valid plugin subpath/],
-    ["a/b//", /not a valid plugin subpath/],
-    [".git", /\.git folder/],
-    ["a/.GIT/hooks", /\.git folder/],
-    ["a\\b", /not allowed/],
-    ["a*", /not allowed/],
-    ["a/[b]", /not allowed/],
-    ["!a", /not allowed/],
-    ["#a", /not allowed/],
-    ["a\u0000b", /control characters/],
-    ["a\nb", /control characters/],
-    ["a /b", /whitespace/],
-  ])("rejects %j", (input, message) => {
-    expect(() => normalizeAgentPluginSubpath(input)).toThrow(message);
   });
 });
 

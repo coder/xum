@@ -253,6 +253,44 @@ describe("backup of the managed plugin list", () => {
         },
         "source.url",
       ],
+      [
+        "a folder the installer refuses",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "main",
+            refType: "branch",
+            subpath: "../mono",
+          },
+        },
+        "source.subpath",
+      ],
+      [
+        "a folder written with its slashes (the installer takes it without them)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "main",
+            refType: "branch",
+            subpath: "/plugins/beta/",
+          },
+        },
+        "source.subpath",
+      ],
+      [
+        "a ref git cannot hold",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "feature branch",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
       ["a commit that is not a full id", { lockedSha: "abc123" }, "lockedSha"],
     ])(
       "refuses the push for a plugin with %s, naming the plugin and the way out",
@@ -838,6 +876,36 @@ describe("backup of the managed plugin list", () => {
       expect(preview.plugins.warnings).toHaveLength(3);
     });
 
+    it("leaves out a row whose folder the installer refuses or whose ref git cannot hold", async () => {
+      const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
+      const [alpha] = sidecar.plugins;
+      const mono = "https://github.com/example/mono.git";
+      const source = (extra: Record<string, unknown>) => ({
+        type: "git",
+        url: mono,
+        ref: "main",
+        refType: "branch",
+        ...extra,
+      });
+      const rows = [
+        alpha,
+        { ...alpha, name: "absolute-folder", source: source({ subpath: "/plugins/demo" }) },
+        { ...alpha, name: "parent-folder", source: source({ subpath: "../demo" }) },
+        { ...alpha, name: "git-folder", source: source({ subpath: ".git" }) },
+        { ...alpha, name: "spaced-ref", source: source({ ref: "feature branch" }) },
+        { ...alpha, name: "short-id-ref", source: source({ ref: "abc1234" }) },
+        { ...alpha, name: "kept-folder", source: source({ subpath: "plugins/demo" }) },
+      ];
+      await writeSidecar(managed, JSON.stringify({ schemaVersion: 1, plugins: rows }));
+
+      const preview = await previewAndValidate(payload, request);
+
+      // A row the install review would refuse is never offered for it.
+      expect(preview.plugins.rows.map((row) => row.name)).toEqual(["alpha", "kept-folder"]);
+      expect(preview.plugins.warnings).toHaveLength(5);
+    });
+
     it("reads only the first rows of an oversized list and caps the warnings", async () => {
       const { payload, managed, request } = await backupOf([registryRow("alpha")]);
       const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
@@ -1149,20 +1217,6 @@ describe("backup of the managed plugin list", () => {
 
         expect(pushed.success).toBe(true);
         expect((await listedRows())[0]).toMatchObject({ name: "alpha", lockedSha: shaOf("z") });
-      });
-
-      it("keeps a plugin without approval when only the slashes of its folder differ", async () => {
-        const mono = "https://github.com/example/mono.git";
-        await pushFromFirstMachine([
-          registryRow("beta", { source: gitSource(mono, "plugins/beta") }),
-        ]);
-
-        const pushed = await pushFromSecondMachine([
-          registryRow("beta", { source: gitSource(mono, "/plugins/beta/") }),
-        ]);
-
-        expect(pushed.success).toBe(true);
-        expect((await listedRows()).map((row) => row.source.subpath)).toEqual(["/plugins/beta/"]);
       });
 
       it.each([

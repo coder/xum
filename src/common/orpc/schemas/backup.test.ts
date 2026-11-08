@@ -134,6 +134,61 @@ describe("BackupPluginEntrySchema", () => {
     expect(BackupPluginEntrySchema.safeParse(row).success).toBe(true);
   });
 
+  // A row the schema reads is a row the install review can open: the installer's own grammar for
+  // the folder and its refusals for the ref decide it, so the list and the installer cannot disagree.
+  const withSource = (source: Record<string, unknown>) =>
+    entry({
+      source: {
+        type: "git",
+        url: "https://github.com/example/mono.git",
+        ref: "main",
+        refType: "branch",
+        ...source,
+      },
+    });
+
+  test.each([
+    ["an absolute folder", "/plugins/demo"],
+    ["a parent folder", "../demo"],
+    ["a folder that leaves the repository midway", "a/../../x"],
+    ["an empty part", "a//b"],
+    ["the git folder", ".git"],
+    ["a folder inside the git folder", "a/.GIT/hooks"],
+    ["a glob", "plugins/*"],
+    ["a folder with a leading space", " packages/demo"],
+    ["a folder with a trailing slash", "packages/demo/"],
+    ["a folder with a control character", "packages/de\u0007mo"],
+  ])("refuses %s as a subpath", (_label, subpath) => {
+    expect(BackupPluginEntrySchema.safeParse(withSource({ subpath })).success).toBe(false);
+  });
+
+  test.each([
+    ["a branch", "main", "branch"],
+    ["a branch with a slash", "release/2026-11", "branch"],
+    ["a tag", "v1.2.0-rc.1", "tag"],
+    ["a full commit id", "a".repeat(40), "commit"],
+  ])("keeps %s as a ref", (_label, ref, refType) => {
+    expect(BackupPluginEntrySchema.safeParse(withSource({ ref, refType })).success).toBe(true);
+  });
+
+  test.each([
+    ["a ref with a space", "feature branch"],
+    ["a ref with a newline", "main\nextra"],
+    ["a ref with two dots", "a..b"],
+    ["a ref that ends in .lock", "feature.lock"],
+    ["a ref that ends in a dot", "v1."],
+    ["a ref with a tilde", "main~1"],
+    ["a ref with a colon", "origin:main"],
+    ["a ref that git would read as an option", "--upload-pack=x"],
+    ["a fully qualified ref", "refs/heads/main"],
+    ["a ref with a right-to-left override", "ma\u202Ein"],
+    ["a ref with a zero-width space", "ma\u200Bin"],
+    ["an abbreviated commit id", "abc1234"],
+    ["an abbreviated commit id in capitals", "ABCDEF1234"],
+  ])("refuses %s as a ref", (_label, ref) => {
+    expect(BackupPluginEntrySchema.safeParse(withSource({ ref })).success).toBe(false);
+  });
+
   describe("caps on repository-controlled fields", () => {
     const names = (count: number, length = 8) =>
       Array.from({ length: count }, (_, index) => `${index}`.padStart(length, "s"));

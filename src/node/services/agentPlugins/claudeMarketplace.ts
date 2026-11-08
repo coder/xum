@@ -23,16 +23,16 @@ import {
   type AgentPluginMarketplaceListing,
 } from "@/common/orpc/schemas/agentPlugins";
 import { isValidMarketplaceEntryName } from "@/common/utils/agentPluginName";
-import { displayRepoUrl, pointsAtThisMachine } from "@/common/utils/agentPluginSource";
+import {
+  displayRepoUrl,
+  normalizeAgentPluginSubpath,
+  pointsAtThisMachine,
+} from "@/common/utils/agentPluginSource";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { GITHUB_SHORTHAND_PATTERN } from "@/node/utils/gitUrls";
 import { isPlainObject } from "./manifest";
-import {
-  isFullCommitSha,
-  normalizeAgentPluginSubpath,
-  parseAgentPluginSourceInput,
-} from "./sourceInput";
+import { isFullCommitSha, parseAgentPluginSourceInput } from "./sourceInput";
 
 export const CLAUDE_MARKETPLACE_RELATIVE_PATH = ".claude-plugin/marketplace.json";
 export const CURSOR_MARKETPLACE_RELATIVE_PATH = ".cursor-plugin/marketplace.json";
