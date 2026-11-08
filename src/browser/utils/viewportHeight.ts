@@ -23,47 +23,30 @@ function syncViewportHeight(): void {
 /**
  * Size the app shell from the visual viewport on iOS home-screen web apps, where iOS 26 can
  * resolve 100dvh as if a browser toolbar were still present and leave a blank band under
- * the footer, and the keyboard resizes nothing else. Other environments keep the CSS dvh
- * fallback.
+ * the footer, and the keyboard resizes nothing else. Other environments keep the CSS dvh fallback.
  */
 export function installViewportHeightSync(): () => void {
   if (!isIosStandaloneWebApp()) {
     return () => undefined;
   }
 
-  syncViewportHeight();
-  window.addEventListener("resize", syncViewportHeight);
-  window.visualViewport?.addEventListener("resize", syncViewportHeight);
+  // Rotating an iPad can fire resize while innerHeight still holds the pre-rotation height, and no
+  // later resize follows, so the app kept filling only the old height. The rotated layout exists by
+  // the next frame, so sync once more then.
+  const syncAfterLayout = (): void => {
+    syncViewportHeight();
+    window.requestAnimationFrame(syncViewportHeight);
+  };
+  syncAfterLayout();
+  window.addEventListener("resize", syncAfterLayout);
+  window.visualViewport?.addEventListener("resize", syncAfterLayout);
+  // A scroll needs no re-layout, so it reads the height straight away.
   window.visualViewport?.addEventListener("scroll", syncViewportHeight);
 
-  // Turning an iPad from landscape to portrait can fire resize while innerHeight still holds the
-  // landscape height, and no later resize follows, so the app kept filling only the old height.
-  // A fixed box spanning the viewport resizes once the rotated layout exists; sync again then.
-  const viewportBox = document.createElement("div");
-  viewportBox.setAttribute("aria-hidden", "true");
-  viewportBox.style.cssText =
-    "position:fixed;inset:0;visibility:hidden;pointer-events:none;z-index:-1";
-  let observer: ResizeObserver | undefined;
-  try {
-    document.body.appendChild(viewportBox);
-    if (typeof window.ResizeObserver === "function") {
-      observer = new window.ResizeObserver(syncViewportHeight);
-      observer.observe(viewportBox);
-    }
-  } catch (error) {
-    // main.tsx calls this before React mounts, and startup must never fail on the probe:
-    // keep the resize listener alone.
-    console.error("Viewport height sync: could not observe the viewport", error);
-    observer?.disconnect();
-    viewportBox.remove();
-  }
-
   return () => {
-    window.removeEventListener("resize", syncViewportHeight);
-    window.visualViewport?.removeEventListener("resize", syncViewportHeight);
+    window.removeEventListener("resize", syncAfterLayout);
+    window.visualViewport?.removeEventListener("resize", syncAfterLayout);
     window.visualViewport?.removeEventListener("scroll", syncViewportHeight);
-    observer?.disconnect();
-    viewportBox.remove();
     document.documentElement.style.removeProperty(APP_VIEWPORT_HEIGHT_PROPERTY);
   };
 }

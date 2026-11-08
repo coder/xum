@@ -1144,11 +1144,11 @@ body,
   }
 }
 
-/* The OS draws only in a band at the top of that column (measured on a folded Duo, 2.95 px per pt:
-   glyphs at x 398..437, y 87..151 of 466x678) and takes the touches there. Padding the shell by the
-   whole column gives up a fifth of the width for the whole page, so in narrow portrait the shell
-   keeps no right padding, the fixed header keeps its controls left of the column, and the band
-   below the header is painted over. Content below the band uses the full width.
+/* Where iOS does report a side inset, it draws only in a band at the top of it (measured on a folded
+   Duo at 2.95 px per pt: glyphs at x 398..437, y 87..151 of 466x678) and takes the touches there.
+   Padding the shell by the whole column gives up a fifth of the width for the whole page, so in
+   narrow portrait the shell keeps no right padding, the fixed header keeps its controls left of the
+   column, and the band below the header is painted over. Content below the band uses the full width.
    Where no side column exists this changes nothing: iPhone and iPad portrait have none, and
    landscape and wide layouts keep the shell padding, because there a side inset is a full-height
    notch. .storybook/test-runner.ts asserts the band geometry. */
@@ -1175,7 +1175,7 @@ body,
     position: fixed;
     /* From the top: the fixed header (z-50) covers its own part. */
     top: 0;
-    /* IOS_STATUS_BAND_HEIGHT_PX: iosCoverColumn.ts takes no touches in the band. */
+    /* IOS_STATUS_BAND_HEIGHT_PX, which CSS cannot read; .storybook/test-runner.ts asserts the match. */
     height: 172px;
     right: 0;
     /* Zero wherever there is no side column, so nothing paints. */

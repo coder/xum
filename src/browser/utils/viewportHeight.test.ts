@@ -35,16 +35,20 @@ function appViewportHeight(): string {
   return document.documentElement.style.getPropertyValue(APP_VIEWPORT_HEIGHT_PROPERTY);
 }
 
-function withResizeObserver(value: unknown, run: () => void) {
-  const originalResizeObserver = window.ResizeObserver;
-  Object.defineProperty(window, "ResizeObserver", { configurable: true, value });
+/** Runs requestAnimationFrame callbacks inline, so a test can flush them when it chooses. */
+function withFrames(run: (drain: () => void) => void) {
+  const frames: Array<FrameRequestCallback> = [];
+  const original = window.requestAnimationFrame;
+  Object.defineProperty(window, "requestAnimationFrame", {
+    configurable: true,
+    value: (callback: FrameRequestCallback) => frames.push(callback),
+  });
   try {
-    run();
-  } finally {
-    Object.defineProperty(window, "ResizeObserver", {
-      configurable: true,
-      value: originalResizeObserver,
+    run(() => {
+      for (const frame of frames.splice(0)) frame(0);
     });
+  } finally {
+    Object.defineProperty(window, "requestAnimationFrame", { configurable: true, value: original });
   }
 }
 
@@ -170,60 +174,21 @@ describe("iOS standalone viewport", () => {
     }
   });
 
-  test("syncs again when the rotated layout resizes the viewport after a stale resize event", () => {
-    const callbacks: Array<() => void> = [];
-    class RecordingResizeObserver {
-      constructor(callback: () => void) {
-        callbacks.push(callback);
-      }
-      observe() {
-        return undefined;
-      }
-      disconnect() {
-        return undefined;
-      }
-    }
-    withResizeObserver(RecordingResizeObserver, () => {
+  test("re-reads the height on the next frame, when a rotation reported a stale one", () => {
+    withFrames((drain) => {
       setStandalone(true);
       setInnerHeight(820);
       cleanupSync = installViewportHeightSync();
+      expect(appViewportHeight()).toBe("820px");
+      drain();
 
       // iPad landscape to portrait: the resize event still sees the landscape height.
       window.dispatchEvent(new window.Event("resize"));
       setInnerHeight(1180);
-      for (const callback of callbacks) callback();
+      drain();
 
       expect(appViewportHeight()).toBe("1180px");
     });
-  });
-
-  test("keeps the resize sync and removes the probe when the viewport cannot be observed", () => {
-    class FailingResizeObserver {
-      observe() {
-        throw new Error("observe failed");
-      }
-      disconnect() {
-        return undefined;
-      }
-    }
-    const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
-    try {
-      withResizeObserver(FailingResizeObserver, () => {
-        setStandalone(true);
-        setInnerHeight(852);
-        const bodyChildren = document.body.childElementCount;
-
-        cleanupSync = installViewportHeightSync();
-
-        expect(document.body.childElementCount).toBe(bodyChildren);
-        expect(consoleError).toHaveBeenCalledTimes(1);
-        setInnerHeight(500);
-        window.dispatchEvent(new window.Event("resize"));
-        expect(appViewportHeight()).toBe("500px");
-      });
-    } finally {
-      consoleError.mockRestore();
-    }
   });
 });
 
