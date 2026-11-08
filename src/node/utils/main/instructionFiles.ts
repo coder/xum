@@ -63,12 +63,12 @@ function createLocalFileReader(files: HostFiles): FileReader {
 }
 
 /**
- * Create a FileReader for Runtime-based access (supports SSH). A sandboxed agent can replace an
- * instruction file with a link to a file its sandbox hides, such as ~/.ssh/id_rsa, and this read
- * puts the file in its prompt. So it reads only what a sandboxed command in `directory` could:
- * any other file reads as empty. It still exists, so CLAUDE.md does not take AGENTS.md's place.
+ * `reader`, reading only what a sandboxed command of `runtime` in `directory` could. A sandboxed
+ * agent can replace an instruction file with a link to a file its sandbox hides, such as
+ * ~/.ssh/id_rsa, and the read puts the file in its prompt. Such a file reads as empty: it still
+ * exists, so CLAUDE.md does not take AGENTS.md's place.
  */
-function createRuntimeFileReader(runtime: Runtime, directory: string): FileReader {
+function withSandboxGate(reader: FileReader, runtime: Runtime, directory: string): FileReader {
   let gate: FileToolSandboxGate | undefined;
   return {
     readFile: async (filePath: string) => {
@@ -80,9 +80,20 @@ function createRuntimeFileReader(runtime: Runtime, directory: string): FileReade
         log.warn(`Skipping instruction file ${filePath}: the agent sandbox hides it`);
         return "";
       }
-      return readFileString(runtime, filePath);
+      return reader.readFile(filePath);
     },
   };
+}
+
+/**
+ * Create a FileReader for Runtime-based access (supports SSH), behind the runtime's sandbox.
+ */
+function createRuntimeFileReader(runtime: Runtime, directory: string): FileReader {
+  return withSandboxGate(
+    { readFile: (filePath: string) => readFileString(runtime, filePath) },
+    runtime,
+    directory
+  );
 }
 
 type ReadInstructionFileResult = { exists: false } | { exists: true; file: InstructionFile | null };
@@ -274,12 +285,16 @@ export async function readInstructionSet(
   scope: InstructionScope,
   projectName?: string,
   /** The host files of the read (phase 5: the agent loop passes its own). Absent: the Node layer. */
-  files: HostFiles = nodeHostFiles
+  files: HostFiles = nodeHostFiles,
+  /** The workspace runtime whose agent sandbox the read follows, where its agent can write. */
+  sandboxRuntime?: Runtime
 ): Promise<InstructionSet | null> {
   if (!directory) return null;
+  const resolvedDirectory = path.resolve(directory);
+  const reader = createLocalFileReader(files);
   return readInstructionSetWith(
-    createLocalFileReader(files),
-    path.resolve(directory),
+    sandboxRuntime ? withSandboxGate(reader, sandboxRuntime, resolvedDirectory) : reader,
+    resolvedDirectory,
     scope,
     projectName
   );

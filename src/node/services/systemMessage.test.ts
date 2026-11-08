@@ -745,6 +745,41 @@ Include the secondary project context too.
     expect(customInstructions).toContain("Include the secondary project context too.");
   });
 
+  // In a Local project the container links to the project folder itself, so the fallback read of
+  // the project folder must follow the agent sandbox too.
+  test("withholds a multi-project instruction file that links to a file the sandbox hides", async () => {
+    const { metadata, primaryWorkspaceRepoDir } = await createMultiProjectFixture();
+    const real = await fs.realpath(tempDir);
+    await fs.mkdir(path.join(tempDir, "secret"));
+    await fs.writeFile(path.join(tempDir, "secret", "id_rsa"), "PRIVATE KEY");
+    await fs.symlink(
+      path.join(tempDir, "secret", "id_rsa"),
+      path.join(primaryWorkspaceRepoDir, "AGENTS.md")
+    );
+    const localMetadata: WorkspaceMetadata = {
+      ...metadata,
+      projectPath: primaryWorkspaceRepoDir,
+      projects: [
+        { projectName: "primary", projectPath: primaryWorkspaceRepoDir },
+        ...(metadata.projects ?? []).slice(1),
+      ],
+    };
+    runtime.agentSandboxPolicy = () => ({
+      writeRoots: [real],
+      gitCommonDirs: [],
+      denyWrite: [],
+      denyRead: [path.join(real, "secret")],
+      allowRead: [],
+      network: "allowlist",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    });
+
+    const systemMessage = await buildSystemMessage(localMetadata, runtime, workspaceDir);
+
+    expect(systemMessage).not.toContain("PRIVATE KEY");
+  });
+
   describe("project customInstructions from config", () => {
     const singleProjectMetadata = (projectPath: string): WorkspaceMetadata => ({
       id: "test-workspace",

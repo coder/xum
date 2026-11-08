@@ -7,6 +7,7 @@ import type {
 } from "@/common/config/schemas/agentSandbox";
 import { getXumHome } from "@/common/constants/paths";
 import {
+  AUTOMATION_ENTRY_ROOTS,
   AUTOMATION_READ_PATHS,
   CACHE_WRITE_PATHS,
   DENY_READ_ROOTS,
@@ -214,9 +215,10 @@ export function buildAgentSandboxPolicy(
       `the extra write path ${extraRootInXumHome} is inside Xum's home folder ${xumHome}`
     );
   }
-  const automationPaths = [...AUTOMATION_READ_PATHS, ...gitGlobalConfigFiles()].map(
-    expandSandboxPath
-  );
+  const automationPaths = [
+    ...[...AUTOMATION_READ_PATHS, ...gitGlobalConfigFiles()].map(expandSandboxPath),
+    ...automationEntryLinkTargets(),
+  ];
   assertNoWriteRootInAutomation(writeRoots, automationPaths);
   // A background command starts in a temp folder and gets its checkout in workspaceRoots.
   const gitCommonDirs = dedupe(
@@ -515,6 +517,18 @@ function homeLinkTargets(home: string, writeRoots: readonly string[]): string[] 
   return links
     .flatMap((link) => withLinkTarget(link).slice(1))
     .filter((target) => !writeRoots.some((root) => isPathAtOrUnder(root, target)));
+}
+
+/**
+ * Where the linked entries of the global skill and plugin folders lead. Xum loads a plugin linked
+ * to its checkout (`~/.agents/plugins/demo` to `~/src/demo`) from there and starts its MCP servers
+ * outside the sandbox, so that checkout is automation too: read-only inside a write root, and a
+ * write root at or inside it fails closed. Links deeper inside an entry are not followed.
+ */
+function automationEntryLinkTargets(): string[] {
+  return AUTOMATION_ENTRY_ROOTS.flatMap((root) =>
+    childLinks(expandSandboxPathSpelling(root))
+  ).flatMap((link) => withLinkTarget(link).slice(1));
 }
 
 function childLinks(folder: string): string[] {

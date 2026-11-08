@@ -500,6 +500,8 @@ async function readMultiProjectContextInstructions(
     seenProjectNames.add(project.projectName);
 
     const workspaceProjectPath = path.join(workspaceRootPath, project.projectName);
+    // A Local project's checkout is the project folder itself, which the agent can write, so the
+    // fallback read follows the agent sandbox as well.
     const projectInstructions =
       (await readInstructionSetFromRuntime(
         runtime,
@@ -511,7 +513,8 @@ async function readMultiProjectContextInstructions(
         project.projectPath,
         INSTRUCTION_SCOPE.PROJECT,
         project.projectName,
-        files
+        files,
+        runtime
       ));
     if (projectInstructions) {
       sets.push(projectInstructions);

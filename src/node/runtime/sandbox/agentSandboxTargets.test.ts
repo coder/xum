@@ -236,6 +236,31 @@ describe("buildAgentSandboxPolicy", () => {
     }
   });
 
+  // Xum loads a linked plugin from its checkout and starts its MCP servers outside the sandbox.
+  test("keeps a linked global plugin read-only, and fails closed in a linked skill", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(path.join(home, ".agents", "plugins"), { recursive: true });
+    await fs.mkdir(path.join(home, ".agents", "skills"), { recursive: true });
+    await fs.mkdir(path.join(repo, "plugin"));
+    await fs.symlink(path.join(repo, "plugin"), path.join(home, ".agents", "plugins", "demo"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+      const writable = (name: string) =>
+        agentSandboxPolicyAllows(policy, path.join(repo, name), "write");
+      expect(writable("plugin/.mcp.json")).toBe(false);
+      expect(writable("notes.md")).toBe(true);
+
+      // The workspace itself is a global skill: it cannot stay writable and read-only at once.
+      await fs.symlink(repo, path.join(home, ".agents", "skills", "demo"));
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(
+        AgentSandboxStartError
+      );
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
   // Git that Xum runs outside the sandbox runs a credential.helper from the global config.
   test("keeps a global git config that is a link into a write root read-only", async () => {
     const home = path.join(root, "home");

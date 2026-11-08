@@ -173,6 +173,8 @@ const GLOBAL_SKILL_ROOTS: readonly string[] = [
   "~/.mux/skills",
 ];
 const PLUGIN_ROOTS: readonly string[] = [`${XUM_HOME_TOKEN}/plugins`, "~/.agents/plugins"];
+/** Folders whose entries Xum loads as skills and plugins; an entry can be a link to a checkout. */
+export const AUTOMATION_ENTRY_ROOTS: readonly string[] = [...GLOBAL_SKILL_ROOTS, ...PLUGIN_ROOTS];
 
 /**
  * Read paths with code that Xum runs in every workspace, also in one without the sandbox, and
