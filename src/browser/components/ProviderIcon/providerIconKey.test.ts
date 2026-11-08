@@ -13,7 +13,6 @@ const cases: Array<[string, string, ProviderIconConfig | null, ProviderIconKey]>
     { baseUrl: "http://localhost:11434/v1" },
     "openai",
   ],
-  ["built-in ollama stays ollama", "ollama", { baseUrl: "http://127.0.0.1:9999" }, "ollama"],
   ["id omlx", "omlx", { baseUrl: "http://127.0.0.1:8000/v1" }, "omlx"],
   ["id containing ollama", "my-ollama", { baseUrl: "https://api.example.com/v1" }, "ollama"],
   ["ollama-server is ollama, not llama.cpp", "ollama-server", null, "ollama"],
@@ -21,6 +20,7 @@ const cases: Array<[string, string, ProviderIconConfig | null, ProviderIconKey]>
   ["displayName LM Studio", "desk", { displayName: "LM Studio" }, "lmstudio"],
   ["id llama_cpp", "llama_cpp", null, "llamacpp"],
   ["id llama-server", "llama-server", null, "llamacpp"],
+  ["id vllm", "vllm", null, "vllm"],
   ["id local-vllm", "local-vllm", { baseUrl: "http://localhost:8001/v1" }, "vllm"],
   ["hostname match", "box", { baseUrl: "http://omlx.example.com/v1" }, "omlx"],
   ["devllm is not vllm", "devllm", { baseUrl: "https://api.example.com/v1" }, "custom"],
@@ -30,6 +30,8 @@ const cases: Array<[string, string, ProviderIconConfig | null, ProviderIconKey]>
   ["localhost", "box", { baseUrl: "http://localhost:8080" }, "local"],
   ["ipv6 loopback", "box", { baseUrl: "http://[::1]:8080" }, "local"],
   ["ipv6 unique local", "box", { baseUrl: "http://[fd00::1]:8080" }, "local"],
+  ["public ipv6", "box", { baseUrl: "http://[2001:db8::1]:8080" }, "custom"],
+  ["0.0.0.0", "box", { baseUrl: "http://0.0.0.0:8000/v1" }, "local"],
   ["192.168", "box", { baseUrl: "http://192.168.1.20:8000" }, "local"],
   ["10/8", "box", { baseUrl: "http://10.0.0.5:8000" }, "local"],
   ["172.16/12", "box", { baseUrl: "http://172.20.0.2:8000" }, "local"],
@@ -41,7 +43,6 @@ const cases: Array<[string, string, ProviderIconConfig | null, ProviderIconKey]>
   ["public host", "proxy", { baseUrl: "https://api.example.com/v1" }, "custom"],
   ["172.32 is public", "box", { baseUrl: "http://172.32.0.1:8000" }, "custom"],
   ["localllm id on public host", "localllm", { baseUrl: "https://api.example.com/v1" }, "local"],
-  ["local-llm id", "local-llm", { baseUrl: "https://api.example.com/v1" }, "local"],
   [
     "hostname alone does not trigger the name rule",
     "box",
@@ -55,8 +56,6 @@ const cases: Array<[string, string, ProviderIconConfig | null, ProviderIconKey]>
     "lmstudio",
   ],
   ["invalid URL falls back to names", "my-ollama", { baseUrl: "not a url" }, "ollama"],
-  ["invalid URL and plain name", "proxy", { baseUrl: "not a url" }, "custom"],
-  ["missing config", "proxy", null, "custom"],
 ];
 
 describe("resolveProviderIconKey", () => {

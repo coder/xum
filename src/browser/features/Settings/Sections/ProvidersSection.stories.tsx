@@ -84,7 +84,8 @@ export const LocalProviderIcons: Story = {
         setupSettingsStory({
           providersConfig: {
             omlx: localStoryProvider("http://127.0.0.1:8000/v1", "qwen3-8b"),
-            "ollama-remote": localStoryProvider("http://gpu-box:11434/v1", "llama3.2"),
+            // Only the base URL's port names this runtime, so the icon must come from the config.
+            "gpu-box": localStoryProvider("http://gpu-box:11434/v1", "llama3.2"),
             "lm-studio": localStoryProvider("http://localhost:1234/v1", "gemma-3-12b"),
             "llama-cpp": localStoryProvider("http://127.0.0.1:8080/v1", "phi-4"),
             "local-vllm": localStoryProvider(
@@ -106,7 +107,7 @@ export const LocalProviderIcons: Story = {
 
     const expectedIcons: Array<[RegExp, string]> = [
       [/omlx/i, "oMLX"],
-      [/ollama-remote/i, "Ollama"],
+      [/gpu-box/i, "Ollama"],
       [/lm-studio/i, "LM Studio"],
       [/llama-cpp/i, "llama.cpp"],
       [/Local vLLM/, "vLLM"],
@@ -114,6 +115,15 @@ export const LocalProviderIcons: Story = {
     for (const [providerName, iconTitle] of expectedIcons) {
       const header = await canvas.findByRole("button", { name: providerName }, { timeout: 5000 });
       await within(header).findByTitle(iconTitle);
+    }
+
+    const expectedFallbacks: Array<[RegExp, string]> = [
+      [/mac-studio/i, ".lucide-cpu"],
+      [/proxy/i, ".lucide-server"],
+    ];
+    for (const [providerName, iconSelector] of expectedFallbacks) {
+      const header = await canvas.findByRole("button", { name: providerName });
+      await expect(header.querySelector(iconSelector)).not.toBeNull();
     }
   },
 };
