@@ -2,7 +2,6 @@ import * as path from "path";
 import { tool } from "ai";
 
 import { getCanonicalProjectMetadataRelativePath } from "@/common/compat/legacyMux";
-import { SkillNameSchema } from "@/common/orpc/schemas";
 import {
   REFINEMENT_CAPTURE_MAX_FILE_BYTES,
   REFINEMENT_CAPTURE_MAX_FILES,
@@ -34,6 +33,7 @@ import {
 import {
   hasErrorCode,
   isSkillMarkdownRootFile,
+  parseSkillNameForChange,
   resolveContainedSkillFilePath,
   SKILL_FILENAME,
   validateLocalSkillDirectory,
@@ -289,11 +289,11 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
         };
       }
 
-      const parsedName = SkillNameSchema.safeParse(name);
+      const parsedName = parseSkillNameForChange(name, config);
       if (!parsedName.success) {
         return {
           success: false,
-          error: parsedName.error.message,
+          error: parsedName.error,
         };
       }
 

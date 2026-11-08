@@ -4,7 +4,10 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { localExecEnv } from "@/node/runtime/childProcessEnv";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { mergeSecretsOverXumEnv } from "@/node/runtime/runtimeScratchDir";
-import { agentSandboxPolicyAllows } from "@/node/runtime/sandbox/agentSandboxTargets";
+import {
+  agentSandboxApplies,
+  agentSandboxPolicyAllows,
+} from "@/node/runtime/sandbox/agentSandboxTargets";
 import { isPathAtOrUnder } from "@/node/runtime/sandbox/sandboxPaths";
 
 /** What the file tools of one workspace add to the runtime's sandbox policy. */
@@ -28,6 +31,23 @@ export function fileToolSandboxContext(config: ToolConfiguration): FileToolSandb
     exemptPaths: config.planFilePath ? [config.planFilePath] : [],
     readExemptPaths: [...(config.ancestorPlanFilePaths ?? []), config.runtimeTempDir],
   };
+}
+
+export const GLOBAL_WRITE_SANDBOX_ERROR =
+  "The agent sandbox blocks changes to Xum's global skills and AGENTS.md: every workspace " +
+  "loads them, also one without the sandbox. Only the user can change them while it is on.";
+
+/**
+ * Whether the agent sandbox covers this workspace while its Xum tools write Xum's home (a system
+ * workspace's global scope). Every workspace loads the global skills and AGENTS.md as trusted
+ * instructions, also one without the sandbox, so a sandboxed agent must not change them.
+ */
+export function sandboxBlocksGlobalWrites(config: ToolConfiguration): boolean {
+  if (config.xumScope?.type !== "global") return false;
+  return agentSandboxApplies(config.runtime, {
+    cwd: config.cwd,
+    scratchDir: config.xumEnv?.XUM_SCRATCH_DIR,
+  });
 }
 
 /** Thrown when the macOS agent sandbox closes the path a file tool asked for. */

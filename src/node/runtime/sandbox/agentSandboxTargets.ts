@@ -220,13 +220,15 @@ export function buildAgentSandboxPolicy(
       ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
       ...gitCommonDirs.flatMap(protectedGitDirPaths),
       // A credential file in a write root (~/.cache/huggingface/token) stays unwritable too, and
-      // so do the npx, uv and Bun caches and a global git config, plugin or skill folder that
-      // links into one.
+      // so do the npx, uv and Bun caches, a plugin or skill folder or a dotfile that links into
+      // one, and the files that git and ssh config include from one.
       ...[
         ...nestedDenies,
         ...automationPaths,
         ...cacheExecutablePaths().map(expandSandboxPath),
+        ...homeLinkTargets(home, writeRoots),
         ...gitConfigIncludes([...workspaceRoots, ...extraWriteRoots], gitCommonDirs),
+        ...sshConfigIncludes(),
       ].filter((denied) => isUnderAny(denied, writeRoots)),
     ].flatMap(withLinkTarget)
   );
@@ -444,9 +446,38 @@ function childDirs(folder: string): string[] {
 
 // Git reads both for every repository (also `$XDG_CONFIG_HOME/git/config`, not covered).
 const GLOBAL_GIT_CONFIG_FILES: readonly string[] = ["~/.gitconfig", "~/.config/git/config"];
-// Git stops at this include depth (MAX_INCLUDE_DEPTH in git's config.c).
-const GIT_MAX_INCLUDE_DEPTH = 10;
-const GIT_CONFIG_MAX_BYTES = 1024 * 1024;
+// Beside the home folder's own dot entries.
+const HOME_LINK_FOLDERS: readonly string[] = ["~/.config", "~/.ssh"];
+// ssh stops at 16 (READCONF_MAX_DEPTH), git at 10; following more only protects more.
+const MAX_INCLUDE_DEPTH = 16;
+const CONFIG_MAX_BYTES = 1024 * 1024;
+
+/**
+ * The link targets of the dot entries in the home folder, and of the entries of `~/.config` and
+ * `~/.ssh`. A dotfiles checkout links them into a workspace, and git, ssh, npx, bunx and the shell
+ * read them outside the sandbox, Xum's own `git fetch` included. Not a target at or above a write
+ * root (`~/.dotfiles` linking to the checkout itself): that would close the whole root.
+ */
+function homeLinkTargets(home: string, writeRoots: readonly string[]): string[] {
+  const links = [
+    ...childLinks(home).filter((link) => path.basename(link).startsWith(".")),
+    ...HOME_LINK_FOLDERS.flatMap((folder) => childLinks(expandSandboxPathSpelling(folder))),
+  ];
+  return links
+    .flatMap((link) => withLinkTarget(link).slice(1))
+    .filter((target) => !writeRoots.some((root) => isPathAtOrUnder(root, target)));
+}
+
+function childLinks(folder: string): string[] {
+  try {
+    return fs
+      .readdirSync(folder, { withFileTypes: true })
+      .filter((entry) => entry.isSymbolicLink())
+      .map((entry) => path.join(folder, entry.name));
+  } catch {
+    return [];
+  }
+}
 
 /**
  * The real paths of the files that git config includes (`include.path`, and
@@ -466,39 +497,94 @@ function gitConfigIncludes(roots: readonly string[], gitDirs: readonly string[])
       ),
     ]),
   ];
+  return configIncludes(configFiles, (file) =>
+    gitConfigIncludeValues(readConfigText(file), file).map((value) =>
+      resolveGitInclude(value, file)
+    )
+  );
+}
+
+/**
+ * The real paths of what `~/.ssh/config` includes, recursively: a `ProxyCommand` there runs
+ * outside the sandbox for Xum's own `git fetch`. A pattern with a wildcard in its last name
+ * protects every name in its folder that starts like it.
+ */
+function sshConfigIncludes(): string[] {
+  return configIncludes([expandSandboxPathSpelling("~/.ssh/config")], (file) =>
+    sshIncludePatterns(readConfigText(file)).flatMap((pattern) => resolveSshInclude(pattern, file))
+  );
+}
+
+/** Every file that `files` include, and what those include, by `includesOf`; as real paths. */
+function configIncludes(
+  files: readonly string[],
+  includesOf: (file: string) => readonly string[]
+): string[] {
   const found = new Set<string>();
-  for (const file of configFiles) collectGitConfigIncludes(file, 1, found);
+  const visit = (file: string, depth: number): void => {
+    if (depth > MAX_INCLUDE_DEPTH) return;
+    for (const included of includesOf(file)) {
+      if (found.has(included)) continue;
+      found.add(included);
+      visit(included, depth + 1);
+    }
+  };
+  for (const file of files) visit(file, 1);
   return [...found].map(realpathOfNearest);
 }
 
-/** Adds the includes of `file` and of what they include to `found`, by the spelling git uses. */
-function collectGitConfigIncludes(file: string, depth: number, found: Set<string>): void {
-  if (depth > GIT_MAX_INCLUDE_DEPTH) return;
-  for (const value of gitConfigIncludeValues(readGitConfig(file))) {
-    const included = resolveGitInclude(value, file);
-    if (included === undefined || found.has(included)) continue;
-    found.add(included);
-    collectGitConfigIncludes(included, depth + 1, found);
-  }
-}
-
 /** A regular file's text, or "" (no FIFO or device can block the read, nothing over 1 MiB). */
-function readGitConfig(file: string): string {
+function readConfigText(file: string): string {
   try {
     const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size > GIT_CONFIG_MAX_BYTES) return "";
+    if (!stat.isFile() || stat.size > CONFIG_MAX_BYTES) return "";
     return fs.readFileSync(file, "utf8");
   } catch {
     return "";
   }
 }
 
-/** Git resolves a relative include against the folder of the file as spelled, not its target. */
-function resolveGitInclude(value: string, file: string): string | undefined {
+/**
+ * Git resolves a relative include against the folder of the file as spelled, not its target. A
+ * form this does not resolve (`~user/`, `%(prefix)/`) fails closed.
+ */
+function resolveGitInclude(value: string, file: string): string {
   if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
-  // Not followed: the rare `~user/` and `%(prefix)/` spellings.
-  if (value === "" || value.startsWith("~") || value.startsWith("%(")) return undefined;
+  if (value.startsWith("~") || value.startsWith("%(")) {
+    throw unreadableConfig(file, value);
+  }
   return path.resolve(path.dirname(file), value);
+}
+
+/**
+ * A relative pattern is in `~/.ssh`. A wildcard in the last name protects every name in the
+ * folder that starts like the pattern and reads those files; anywhere else, or a token or
+ * variable (`%d`, `${HOME}`), fails closed.
+ */
+function resolveSshInclude(pattern: string, file: string): string[] {
+  if (/[%$]/.test(pattern) || /^~[^/]/.test(pattern)) throw unreadableConfig(file, pattern);
+  const resolved = pattern.startsWith("~/")
+    ? path.join(os.homedir(), pattern.slice(2))
+    : path.resolve(expandSandboxPathSpelling("~/.ssh"), pattern);
+  if (!/[*?[]/.test(resolved)) return [resolved];
+  const folder = path.dirname(resolved);
+  const literal = /^[^*?[]*/.exec(path.basename(resolved))?.[0] ?? "";
+  if (/[*?[]/.test(folder)) throw unreadableConfig(file, pattern);
+  return [
+    path.join(folder, `${literal}*`),
+    ...childFiles(folder).filter((child) => path.basename(child).startsWith(literal)),
+  ];
+}
+
+function childFiles(folder: string): string[] {
+  try {
+    return fs
+      .readdirSync(folder, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => path.join(folder, entry.name));
+  } catch {
+    return [];
+  }
 }
 
 function isFile(target: string): boolean {
@@ -520,21 +606,24 @@ function isFolder(target: string): boolean {
 /* eslint-enable local/no-sync-fs-methods */
 
 const GIT_SECTION = /^\s*\[\s*([A-Za-z0-9.-]+)(?:\s+"(?:[^"\\]|\\.)*")?\s*\](.*)$/;
-const GIT_PATH_ENTRY = /^\s*path\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^#;]*))/i;
+const GIT_PATH_ENTRY = /^\s*path\s*=(.*)$/i;
+const GIT_QUOTED_VALUE = /^\s*"((?:[^"\\\n]|\\[\\"])*)"\s*(?:[#;].*)?$/;
+const GIT_PLAIN_VALUE = /^\s*([^"\\#;]*?)\s*(?:[#;].*)?$/;
+const SSH_INCLUDE = /^\s*include(?:\s*=\s*|\s+)(.*)$/i;
 
 /**
- * The `path` values of the `[include]` and `[includeIf "..."]` sections of git config `text`.
- * Covers the plain and the fully quoted value; git also accepts a partly quoted value or a
- * continued line, which this reads differently.
+ * The `path` values of the `[include]` and `[includeIf "..."]` sections of the git config `text`
+ * of `file`. A plain or fully quoted value reads as git reads it; a partly quoted, escaped or
+ * continued one fails closed.
  */
-function gitConfigIncludeValues(text: string): string[] {
+function gitConfigIncludeValues(text: string, file: string): string[] {
   const values: string[] = [];
   let inInclude = false;
   for (const line of text.split(/\r?\n/)) {
     const header = gitSectionHeader(line);
     if (header !== undefined) inInclude = header.isInclude;
-    const value = inInclude ? gitPathValue(header?.rest ?? line) : undefined;
-    if (value !== undefined) values.push(value);
+    const value = inInclude ? gitPathValue(header?.rest ?? line, file) : undefined;
+    if (value !== undefined && value !== "") values.push(value);
   }
   return values;
 }
@@ -547,11 +636,29 @@ function gitSectionHeader(line: string): { isInclude: boolean; rest: string } | 
   return { isInclude: name === "include" || name === "includeif", rest: section?.[2] ?? "" };
 }
 
-/** The value of a `path = ...` line: fully quoted (with escapes), or plain up to a comment. */
-function gitPathValue(line: string): string | undefined {
-  const entry = GIT_PATH_ENTRY.exec(line);
-  if (entry === null) return undefined;
-  return entry[1] !== undefined ? entry[1].replace(/\\(.)/g, "$1") : (entry[2] ?? "").trim();
+/** The value of a `path = ...` line, or undefined for another line. */
+function gitPathValue(line: string, file: string): string | undefined {
+  const raw = GIT_PATH_ENTRY.exec(line)?.[1];
+  if (raw === undefined) return undefined;
+  const quoted = GIT_QUOTED_VALUE.exec(raw)?.[1];
+  if (quoted !== undefined) return quoted.replace(/\\(.)/g, "$1");
+  const plain = GIT_PLAIN_VALUE.exec(raw)?.[1];
+  if (plain !== undefined) return plain;
+  throw unreadableConfig(file, raw.trim());
+}
+
+/** The arguments of each `Include` line of ssh config `text`, unquoted. */
+function sshIncludePatterns(text: string): string[] {
+  return text.split(/\r?\n/).flatMap((line) => {
+    const args = SSH_INCLUDE.exec(line)?.[1] ?? "";
+    return [...args.matchAll(/"([^"]*)"|(\S+)/g)].map((match) => match[1] ?? match[2] ?? "");
+  });
+}
+
+function unreadableConfig(file: string, value: string): AgentSandboxStartError {
+  return new AgentSandboxStartError(
+    `${file} includes "${value}" in a form the sandbox does not read; write the path plainly`
+  );
 }
 
 /**

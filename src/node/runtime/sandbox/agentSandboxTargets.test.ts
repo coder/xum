@@ -379,6 +379,52 @@ describe("buildAgentSandboxPolicy", () => {
     );
   });
 
+  test("fails closed on a git include path that it cannot read as git does", () => {
+    git(repo, "config", "include.path", '../"git config"');
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
+  });
+
+  // ssh runs a ProxyCommand outside the sandbox for Xum's own git fetch.
+  test("keeps a home dotfile that links into a write root read-only", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(path.join(home, ".ssh"), { recursive: true });
+    await fs.writeFile(path.join(repo, "ssh_config"), "Host *\n");
+    await fs.symlink(path.join(repo, "ssh_config"), path.join(home, ".ssh", "config"));
+    await fs.symlink(repo, path.join(home, ".dotfiles"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+      const writable = (name: string) =>
+        agentSandboxPolicyAllows(policy, path.join(repo, name), "write");
+
+      expect(writable("ssh_config")).toBe(false);
+      expect(writable("notes.md")).toBe(true);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  test("keeps what ~/.ssh/config includes read-only, also through a wildcard", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(path.join(home, ".ssh"), { recursive: true });
+    await fs.mkdir(path.join(repo, "ssh"));
+    await fs.writeFile(path.join(home, ".ssh", "config"), "Include ~/../repo/ssh/*.conf\n");
+    await fs.writeFile(path.join(repo, "ssh", "a.conf"), `Include "${repo}/deep conf"\n`);
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+      const writable = (...parts: string[]) =>
+        agentSandboxPolicyAllows(policy, path.join(repo, ...parts), "write");
+
+      expect(writable("ssh", "new.conf")).toBe(false);
+      expect(writable("deep conf")).toBe(false);
+      expect(writable("notes.md")).toBe(true);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
   // Xum starts a global plugin's MCP servers outside the sandbox.
   test("fails closed when the workspace is inside a global plugin folder", async () => {
     const home = path.join(root, "home");

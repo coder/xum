@@ -21,6 +21,7 @@ import { generateDiff } from "@/node/services/tools/fileCommon";
 import {
   hasErrorCode,
   isSkillMarkdownRootFile,
+  parseSkillNameForChange,
   resolveContainedSkillFilePath,
   resolveSkillFilePath,
   SKILL_FILENAME,
@@ -243,11 +244,11 @@ function makeAgentSkillWriteTool(
       { name, filePath, content }: AgentSkillWriteToolArgs,
       { toolCallId }
     ): Promise<AgentSkillWriteToolResult> => {
-      const parsedName = SkillNameSchema.safeParse(name);
+      const parsedName = parseSkillNameForChange(name, config);
       if (!parsedName.success) {
         return {
           success: false,
-          error: parsedName.error.message,
+          error: parsedName.error,
         };
       }
 
