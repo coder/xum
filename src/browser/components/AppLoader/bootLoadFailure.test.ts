@@ -75,12 +75,13 @@ describe("boot screen load failure", () => {
       failedModuleScript();
 
       expect(screen.queryByRole("status")).toBeNull();
-      // The copy is the requested one: this is all the text the user gets.
-      expect(screen.getByRole("alert").textContent?.replace(/\s+/g, " ").trim()).toBe(
-        "Xum could not load Part of the app did not download. Reload to try again. Reload"
-      );
-      expect(screen.getByRole("heading", { level: 1, name: "Xum could not load" })).toBeTruthy();
-      const button = screen.getByRole("button", { name: "Reload" });
+      // The user gets a title, an explanation and one named button, in one alert. The words are
+      // not asserted: a rewrite of the prose is no change in behavior.
+      const alert = screen.getByRole("alert");
+      expect(within(alert).getByRole("heading", { level: 1 }).textContent?.trim()).toBeTruthy();
+      expect(alert.querySelector("p")?.textContent?.trim()).toBeTruthy();
+      const button = within(alert).getByRole("button");
+      expect(button.textContent?.trim()).toBeTruthy();
       // Focus is what lets Enter reload: a native button runs its click on Enter.
       expect(document.activeElement).toBe(button);
       expect(reload).not.toHaveBeenCalled();

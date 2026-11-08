@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, within } from "storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import indexHtml from "virtual:index-html";
 
@@ -47,8 +47,8 @@ function failBootScreen(host: HTMLDivElement | null): void {
   failed.remove();
 }
 
-async function expectReloadPrompt(canvasElement: HTMLElement) {
-  const canvas = within(canvasElement);
+async function expectReloadPrompt(container: HTMLElement) {
+  const canvas = within(container);
   const alert = await canvas.findByRole("alert");
   await expect(within(alert).getByRole("heading", { level: 1 })).toBeVisible();
   await expect(canvas.queryByRole("status")).toBeNull();
@@ -61,8 +61,58 @@ export const Desktop: Story = {
   play: ({ canvasElement }) => expectReloadPrompt(canvasElement),
 };
 
+// The story test runner ignores `globals.viewport` (it only helps a person who opens the story),
+// and a fixed-width wrapper keeps the page's own viewport: the boot screen is `100vw` wide. An
+// iframe has a viewport of its own, so the phone story runs the same boot screen in a 390px one.
+const PHONE_WIDTH_PX = 390;
+
+/** Fills the phone iframe with index.html's styles, boot screen and script, then fails a module. */
+function failBootScreenInPhoneFrame(frame: HTMLIFrameElement | null): void {
+  if (!frame || frame.srcdoc) return;
+  // SECURITY AUDIT: indexHtml is this repo's own index.html, bundled at build time. No user,
+  // repo-content or network data reaches the parser or the document that srcdoc builds from it.
+  const page = new DOMParser().parseFromString(indexHtml, "text/html");
+  const outer = (selector: string) => {
+    const part = page.querySelector(selector);
+    if (!part) throw new Error(`index.html has no ${selector}`);
+    return part.outerHTML;
+  };
+  const styles = [...page.querySelectorAll("style")].map((style) => style.outerHTML).join("");
+  frame.addEventListener(
+    "load",
+    () => {
+      const doc = frame.contentDocument;
+      if (!doc) throw new Error("the phone frame has no document");
+      const failed = doc.createElement("script");
+      failed.type = "module";
+      doc.head.append(failed);
+      failed.dispatchEvent(new Event("error"));
+      failed.remove();
+    },
+    { once: true }
+  );
+  frame.srcdoc = `<!doctype html><html><head>${styles}${outer("#boot-load-failure-script")}</head><body>${outer("#root")}${outer("#boot-load-failure")}</body></html>`;
+}
+
 export const Phone: Story = {
-  globals: { viewport: { value: "mobile1", isRotated: false } },
-  render: () => <div ref={failBootScreen} />,
-  play: ({ canvasElement }) => expectReloadPrompt(canvasElement),
+  render: () => (
+    <iframe
+      title="Phone viewport"
+      ref={failBootScreenInPhoneFrame}
+      style={{ width: PHONE_WIDTH_PX, height: 700, border: 0 }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const frame = within(canvasElement).getByTitle<HTMLIFrameElement>("Phone viewport");
+    const win = frame.contentWindow;
+    if (!win) throw new Error("the phone frame has no window");
+    await waitFor(() => expect(win.document.querySelector("[role=alert]")).not.toBeNull());
+    await expectReloadPrompt(win.document.body);
+    await expect(win.innerWidth).toBe(PHONE_WIDTH_PX);
+    // Nothing sticks out of a 390px screen, and the page does not scroll sideways.
+    const box = win.document.querySelector("[role=alert]")?.getBoundingClientRect();
+    await expect(box?.left).toBeGreaterThanOrEqual(0);
+    await expect(box?.right).toBeLessThanOrEqual(PHONE_WIDTH_PX);
+    await expect(win.document.documentElement.scrollWidth).toBeLessThanOrEqual(PHONE_WIDTH_PX);
+  },
 };
