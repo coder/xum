@@ -108,20 +108,6 @@ describe("exponential backoff", () => {
     SLOW_TEST_MS
   );
 
-  // GNU `timeout` cuts the try off; a host without it (stock macOS) lets the try finish.
-  test.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
-    "cuts a running try off when the budget ends",
-    async () => {
-      const started = Date.now();
-      const result = await retry(["--budget-secs", "2", "0", "1", "/bin/sleep", "30"]);
-      expect(result.exitCode).toBe(1);
-      expect(result.stdout).toContain("exit 124");
-      expect(result.stdout).toContain("2s budget is spent");
-      expect(Date.now() - started).toBeLessThan(10_000);
-    },
-    SLOW_TEST_MS
-  );
-
   test("gives up at once on a fatal status", async () => {
     const result = await retry([
       "--fatal-status",
@@ -152,6 +138,64 @@ describe("exponential backoff", () => {
     expect(await lines("runs")).toHaveLength(2);
   });
 });
+
+describe.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
+  "cutting a running try off",
+  () => {
+    // A stub `timeout` records its arguments (`-k 5 <secs> cmd...`) and runs cmd, so the cut that
+    // retry.sh asks for is read, not waited for. retry.sh takes `timeout` first and `gtimeout`
+    // second, so the stub stands in for both.
+    async function stubTimeout(): Promise<void> {
+      for (const name of ["timeout", "gtimeout"]) {
+        await writeExecutable(
+          path.join(work, name),
+          `echo "$1 $2 $3" >> "${work}/cuts"\nshift 3\nexec "$@"`
+        );
+      }
+    }
+
+    test(
+      "cuts each later try off at what is left of the budget, not at the whole budget",
+      async () => {
+        await stubTimeout();
+        const result = await retry([
+          "--budget-secs",
+          "9",
+          "0",
+          "0",
+          await command({ succeedOn: 2, seconds: 2 }),
+        ]);
+        expect(result.exitCode).toBe(0);
+        const seconds = (await lines("cuts")).map((cut) => Number(cut.split(" ")[2]));
+        expect(seconds).toHaveLength(2);
+        expect(seconds[0]).toBe(9);
+        expect(seconds[1]).toBeLessThanOrEqual(7);
+        expect(seconds[1]).toBeGreaterThan(0);
+      },
+      SLOW_TEST_MS
+    );
+
+    test("kills a try that ignores the TERM 5 seconds after the cut", async () => {
+      await stubTimeout();
+      await retry(["--budget-secs", "9", "0", "0", await command({ succeedOn: 1 })]);
+      expect(await lines("cuts")).toEqual(["-k 5 9"]);
+    });
+
+    test(
+      "still cuts a try off when nothing is left of the budget",
+      async () => {
+        // `timeout 0` means no limit. With a budget of 0 the first try starts with 0 seconds left,
+        // and retry.sh must still cut it off (at 1 second) instead of letting it run to its end.
+        const started = Date.now();
+        const result = await retry(["--budget-secs", "0", "0", "1", "/bin/sleep", "15"]);
+        expect(result.exitCode).toBe(1);
+        expect(result.stdout).toContain("exit 124");
+        expect(Date.now() - started).toBeLessThan(10_000);
+      },
+      SLOW_TEST_MS
+    );
+  }
+);
 
 describe("usage", () => {
   test("refuses missing arguments, non-numeric values and an unlimited retry without a budget", async () => {
