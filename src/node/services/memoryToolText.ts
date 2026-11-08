@@ -35,12 +35,12 @@ const LINE_BREAK = String.raw`(?:\r?\n|\\r\\n|\\n)`;
 // A base64 payload may be wrapped (`base64 -w 76`, MIME): full lines of at least 16 characters, and
 // a short last line only behind a full one. A line of prose after an unwrapped payload stays.
 const BASE64_URL =
-  String.raw`data:(?:${MEDIA_TYPE})?(?:${PARAMETER}){0,3};base64,${BASE64_CHARS}+` +
+  String.raw`data:(?:${MEDIA_TYPE})?(?:${PARAMETER}){0,16};base64,${BASE64_CHARS}+` +
   String.raw`(?:(?:${LINE_BREAK}${BASE64_CHARS}{16,})+(?:${LINE_BREAK}${BASE64_CHARS}{1,15}(?=${LINE_BREAK}|$))?)?`;
 
 // Any other payload is percent-encoded (`data:image/svg+xml,%3Csvg...`): URL characters, no whitespace.
 const ENCODED_URL =
-  String.raw`data:(?:${MEDIA_TYPE}(?:${PARAMETER}){0,4}|(?:${PARAMETER}){1,4}),` +
+  String.raw`data:(?:${MEDIA_TYPE}(?:${PARAMETER}){0,16}|(?:${PARAMETER}){1,16}),` +
   String.raw`[\w\-.~!$&'()*+,;=:@/?%#]+`;
 
 // Sticky: matches only at `lastIndex`, so a scan reads the URL it finds and not the text after it.

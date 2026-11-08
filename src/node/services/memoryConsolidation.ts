@@ -568,7 +568,8 @@ export async function runMemoryConsolidation(args: {
   /**
    * Best-effort cost telemetry: headless consolidation bypasses the chat cost
    * pipeline, so the caller records the full stream usage (with cache-token
-   * breakdown) into session-usage.json. Invoked only after a clean stream.
+   * breakdown) into session-usage.json. Invoked after every stream that completed, one cut
+   * off at the output limit included, and never after a failed or aborted one.
    * providerMetadata is step-accumulated — Anthropic reports billed
    * cache-write tokens only there, so dropping it would price cache writes
    * as ordinary input.
@@ -632,22 +633,27 @@ export async function runMemoryConsolidation(args: {
   if (streamErrors.length === 0 && args.abortSignal?.aborted === true) {
     streamErrors.push("memory consolidation was cut short by its timeout or by workspace removal");
   }
-  // A step that hit the output limit never ran its tool call, yet the stream ends clean: without
-  // this the pass would be journaled as a success and the debounce would hold off its retry.
-  if (streamErrors.length === 0 && meter.endedAtOutputLimit()) {
-    streamErrors.push(
-      "memory consolidation ended a step at the model's output limit, so its tool call never ran"
-    );
-  }
+  // Set apart from `streamErrors`: only a stream that failed or was aborted has unreliable usage.
+  const streamCompleted = streamErrors.length === 0;
+  // When the stream's last step hit the output limit, the SDK ran none of its tool calls, yet the
+  // stream ends clean: without this the pass would be journaled as a success and the debounce
+  // would hold off its retry. An earlier cut-off step does not count: its call comes back to the
+  // model as a tool error, and a later step can retry it (the meter keeps only the last step).
+  const streamError =
+    streamErrors[0] ??
+    (streamCompleted && meter.endedAtOutputLimit()
+      ? "memory consolidation ended a step at the model's output limit, so its tool call never ran"
+      : undefined);
   const summary =
-    streamErrors.length === 0 ? (await stream.text).trim() : `stream error: ${streamErrors[0]}`;
+    streamError === undefined ? (await stream.text).trim() : `stream error: ${streamError}`;
 
   // Cost telemetry: headless runs bypass the chat cost pipeline, so the
   // journal record is the only place token usage is visible. Only awaited on
-  // clean streams — after a mid-flight error, totalUsage can stay pending
-  // forever (streamManager guards the same promise with withTimeout).
+  // completed streams — after a mid-flight error, totalUsage can stay pending
+  // forever (streamManager guards the same promise with withTimeout). A stream
+  // cut off at the output limit completed and was billed, so it is recorded too.
   let usage: MemoryConsolidationResult["usage"];
-  if (streamErrors.length === 0) {
+  if (streamCompleted) {
     try {
       // AI SDK 7: top-level `usage` is the all-steps total (old `totalUsage`).
       const totalUsage = await stream.usage;
@@ -673,6 +679,6 @@ export async function runMemoryConsolidation(args: {
     usage,
     spentUsd: meter.spentUsd(),
     note: meter.note(),
-    streamError: streamErrors[0],
+    streamError,
   };
 }
