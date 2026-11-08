@@ -1536,6 +1536,45 @@ describe("runMemoryHarvest", () => {
     expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 15 });
   });
 
+  it("reports the usage of a chunk whose step ended at the output limit, though that fails the chunk", async () => {
+    using fixture = createFixture();
+    const recorded: Array<number | undefined> = [];
+    // The stream ends clean, so the whole of it was billed, the cut-off step included.
+    const { model } = scriptedModel([
+      [
+        memoryToolCall(createFile("/memories/workspace/cut.md", "half a comm"), "call-cut"),
+        lengthFinishChunk(7),
+      ],
+    ]);
+
+    const result = await runHarvest(fixture, model, {
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    expect(result.streamError).toContain("output limit");
+    expect(recorded).toEqual([7]);
+  });
+
+  it("reports no usage for a chunk whose stream failed", async () => {
+    using fixture = createFixture();
+    const recorded: Array<number | undefined> = [];
+    const { model } = scriptedModel([new Error("provider exploded")]);
+
+    const result = await runHarvest(fixture, model, {
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    // After a mid-flight error the SDK's usage promise can stay pending forever: nothing waits on it.
+    expect(result.streamError).toContain("provider exploded");
+    expect(recorded).toEqual([]);
+  });
+
   it("sums the usage of the chunks that reported one and none when no chunk did", async () => {
     using fixture = createFixture();
     fixture.messages = manyChunkMessages();
@@ -1703,6 +1742,42 @@ describe("runMemoryHarvest", () => {
       expect(
         await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/cut.md")
       ).toMatchObject({ success: false });
+    });
+
+    it("completes a chunk whose cut-off step the model retried in a later step", async () => {
+      using fixture = createFixture();
+      // A step cut off mid tool call has input that is not valid JSON, so the SDK hands the model a
+      // tool error instead of ending the stream, and the model's next step retries the command.
+      const { model, calls } = scriptedModel([
+        [
+          {
+            type: "tool-call",
+            toolCallId: "call-cut",
+            toolName: "memory",
+            input: '{"command":"cre',
+          },
+          lengthFinishChunk(1),
+        ],
+        [
+          memoryToolCall(createFile("/memories/workspace/recovered.md", "fact\n"), "call-retry"),
+          toolFinishChunk(),
+        ],
+        [finishChunk(1)],
+      ]);
+
+      const result = await runHarvest(fixture, model, { ...priced, ceilingUsd: 100 });
+
+      // Only the last step's finish reason counts: the chunk is read, not failed.
+      expect(result.streamError).toBeUndefined();
+      expect(calls).toHaveLength(3);
+      expect(result.nextChunk).toBe(1);
+      expect(result.readChunks).toBe(1);
+      expect(result.ops).toEqual([
+        { command: "create", path: "/memories/workspace/recovered.md", applied: true },
+      ]);
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/recovered.md")
+      ).toMatchObject({ success: true });
     });
 
     it("caps what one step can write, which bounds how far it can overshoot", async () => {

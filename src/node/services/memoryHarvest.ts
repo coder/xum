@@ -655,15 +655,10 @@ async function analyzeChunk(args: {
       streamError: `memory analysis of chunk ${args.label} was cut short by its timeout or by workspace removal`,
     };
   }
-  // A step that hit the output limit never ran its tool call, yet the stream ends clean: the
-  // cursor would move past a chunk the model only partly analyzed. The meter is the job's, but a
-  // step like that ends its chunk's stream and the run with it, so the flag is this chunk's.
-  if (args.meter.endedAtOutputLimit()) {
-    return {
-      streamError: `memory analysis of chunk ${args.label} ended a step at the model's output limit, so its tool call never ran`,
-    };
-  }
-
+  // The stream completed, so every step in it was billed, one cut off at the output limit
+  // included: the usage is recorded before that step fails the chunk. Telemetry never fails a
+  // chunk, so a sink that throws leaves the chunk without usage for the record.
+  let usage: ChunkOutcome["usage"];
   try {
     // AI SDK 7: top-level `usage` is the all-steps total (old `totalUsage`).
     const totalUsage = await stream.usage;
@@ -671,15 +666,24 @@ async function analyzeChunk(args: {
       totalUsage,
       accumulateStepsProviderMetadata(await stream.steps, args.pricingModel)
     );
-    return {
-      usage: {
-        inputTokens: totalUsage.inputTokens ?? 0,
-        outputTokens: totalUsage.outputTokens ?? 0,
-      },
+    usage = {
+      inputTokens: totalUsage.inputTokens ?? 0,
+      outputTokens: totalUsage.outputTokens ?? 0,
     };
   } catch {
-    return {};
+    usage = undefined;
   }
+  // When the stream's last step hit the output limit, the SDK ran none of its tool calls, yet the
+  // stream ends clean: the cursor would move past a chunk the model only partly analyzed. An
+  // earlier cut-off step does not count: its call comes back to the model as a tool error, and a
+  // later step can retry it (the meter keeps only the last step). The meter is the job's, but a
+  // chunk that ends this way fails and ends the run, so the flag is always this chunk's.
+  if (args.meter.endedAtOutputLimit()) {
+    return {
+      streamError: `memory analysis of chunk ${args.label} ended a step at the model's output limit, so its tool call never ran`,
+    };
+  }
+  return usage === undefined ? {} : { usage };
 }
 
 /**
@@ -715,10 +719,11 @@ export async function runMemoryHarvest(args: {
   chunkTimeoutMs?: number;
   /**
    * Best-effort cost telemetry: headless harvest bypasses the chat cost
-   * pipeline, so the caller records each clean chunk stream's full usage
-   * (with cache-token breakdown) into session-usage.json. providerMetadata
-   * is step-accumulated — Anthropic reports billed cache-write tokens only
-   * there, so dropping it would price cache writes as ordinary input.
+   * pipeline, so the caller records each completed chunk stream's full usage
+   * (with cache-token breakdown) into session-usage.json: a stream that failed or
+   * was aborted has none, one cut off at the output limit was billed and has.
+   * providerMetadata is step-accumulated — Anthropic reports billed cache-write
+   * tokens only there, so dropping it would price cache writes as ordinary input.
    * Called while the chunk holds the stream gate, so it must return at once: a caller
    * with anything slow to do defers it until the run is over.
    */
