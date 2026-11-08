@@ -48,8 +48,10 @@ REVIEWED_COMMIT = re.compile(r"\*\*Reviewed commit:\*\* `([0-9a-f]+)`")
 
 
 def receipt_head(body):
-    """A PR head that the receipt's `Reviewed commit` names: the printed short SHA, padded."""
-    return REVIEWED_COMMIT.search(body).group(1).ljust(40, "0")
+    """A PR head that the receipt's `Reviewed commit` names (the printed short SHA, padded), or
+    None for a receipt that names no commit."""
+    match = REVIEWED_COMMIT.search(body)
+    return match.group(1).ljust(40, "0") if match else None
 
 
 def code_receipt(sha, author=BOT, created_at=AFTER):
@@ -1076,8 +1078,7 @@ else:
         for name, fixture in FIXTURES.items():
             with self.subTest(name=name):
                 # A fixture can name its own readiness result: the clean code-review receipt
-                # is approval (for the head it names), a receipt that names no commit is not,
-                # and the account notice is a failed review.
+                # is approval (for the head it names), and the account notice is a failed review.
                 expected = fixture.get(
                     "wait_exit_code", 10 if fixture["expected_exit_code"] in (0, 10) else 1
                 )
@@ -1224,41 +1225,43 @@ else:
                 )
                 self.assert_gate(expected, data, "wait_pr_codex.sh")
 
-    def test_approval_comment_must_name_the_pr_head(self):
-        # An approval is a receipt whose `Reviewed commit` is the PR head. A receipt for an earlier
-        # head stays after the latest request when a push follows it (observed on #7967 and #7998).
+    def test_approval_comment_must_not_name_another_head(self):
+        # A receipt for an earlier head stays after the latest request when a push follows it
+        # (observed on #7967 and #7998). It approves only the head it names.
         request = comment("@codex review", "maintainer", REQUEST)
         running = comment(board_for(FIXTURES["running_summary"]["body"], PR_HEAD))
         commitless = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
         board = FIXTURES["review_state_summary"]["body"]
         for case, comments, expected in (
             ("10 characters of the head", [request, code_receipt(PR_HEAD[:10])], 0),
-            ("7 characters of the head", [request, code_receipt(PR_HEAD[:7])], 0),
             ("the whole head", [request, code_receipt(PR_HEAD)], 0),
             ("an earlier head", [request, code_receipt(EARLIER_HEAD[:10])], 1),
             # The head's own review is still running: wait for it, do not report the old receipt.
             ("an earlier head, head's review running", [request, running, code_receipt(EARLIER_HEAD[:10])], 10),
-            ("too few characters to name a head", [request, code_receipt(PR_HEAD[:6])], 1),
+            # A short SHA is cheap to collide: Codex prints 10 characters.
+            ("7 characters of the head", [request, code_receipt(PR_HEAD[:7])], 1),
+            ("9 characters of the head", [request, code_receipt(PR_HEAD[:9])], 1),
             ("the head's start with another end", [request, code_receipt(PR_HEAD[:9] + "f")], 1),
-            ("no reviewed commit", [request, commitless], 1),
-            # The board is Codex's record of the head: it binds a receipt that names no commit.
-            ("no reviewed commit, the board's code review of the head finished", [request, commitless, comment(board_for(board, PR_HEAD))], 0),
-            ("no reviewed commit, the board names an earlier head", [request, commitless, comment(board_for(board, EARLIER_HEAD))], 10),
             # Any receipt for the head approves it, whichever receipt is newest.
             (
                 "a later receipt for an earlier head",
                 [request, code_receipt(PR_HEAD[:10]), code_receipt(EARLIER_HEAD[:10], created_at=LATER)],
                 0,
             ),
+            # A receipt that names no commit says nothing about a head: the gate decides.
+            ("no reviewed commit", [request, commitless], 0),
+            ("no reviewed commit, the board names an earlier head", [request, commitless, comment(board_for(board, EARLIER_HEAD))], 10),
+            ("no reviewed commit, the head's review running", [request, commitless, running], 10),
         ):
             with self.subTest(case=case):
                 result = self.assert_gate(expected, snapshot(comments, head=PR_HEAD), "wait_pr_codex.sh")
                 self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
 
-    def test_a_thumbs_up_approves_only_a_head_the_board_reviewed(self):
-        # A reaction names no head and outlasts a push (#7300, #7325). It counts only beside the
-        # summary board's own record that the code review of this head finished with nothing
-        # unresolved.
+    def test_a_thumbs_up_waits_for_the_comments_gate(self):
+        # A reaction names no head and outlasts a push (#7300, #7325). The gate binds the head: it
+        # waits while the head's summary board is old or still running, and fails while a finding
+        # is open, so a reaction left from an earlier head cannot approve a head Codex has not
+        # finished.
         request = comment("@codex review", "maintainer", REQUEST)
         board = FIXTURES["review_state_summary"]["body"]
         flags = '"has_any_findings":true,"has_unresolved_findings":false,"status":"completed"},"security'
@@ -1270,15 +1273,13 @@ else:
 
         running = FIXTURES["review_state_running_summary"]["body"]
         for case, comments, expected in (
-            ("no board", [request], 10),
-            ("a receipt for an earlier head, no board", [request, code_receipt(EARLIER_HEAD[:10])], 1),
-            ("the board's code review of the head finished clean", [request, comment(flagged("false"))], 0),
+            ("the board's code review of the head finished", [request, comment(flagged("false"))], 0),
+            # A finished review can report null flags (#7734): its findings are threads and comments.
+            ("the board's flag is null", [request, comment(flagged("null"))], 0),
             ("the board names an earlier head", [request, comment(board_for(board, EARLIER_HEAD))], 10),
             ("the board's review of the head still runs", [request, comment(board_for(running, PR_HEAD))], 10),
             ("the board shows an unresolved finding", [request, comment(flagged("true"))], 1),
-            # A finished review can report null flags (#7734): its findings are threads and finding
-            # comments, which the gate already checked.
-            ("the board's flag is null", [request, comment(flagged("null"))], 0),
+            ("a finding comment", [request, comment("[P1] Fix authorization")], 1),
         ):
             for author in (BOT, BOT + "[bot]"):
                 with self.subTest(case=case, author=author):
@@ -1291,7 +1292,7 @@ else:
                     self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
         # With more than 100 reactions the script pages through all of them: the same rule applies.
         for case, board_comment, expected in (
-            ("paged: the board's code review of the head finished clean", comment(flagged("false")), 0),
+            ("paged: the board's code review of the head finished", comment(flagged("false")), 0),
             ("paged: the board names an earlier head", comment(board_for(board, EARLIER_HEAD)), 10),
         ):
             with self.subTest(case):
