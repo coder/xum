@@ -9,10 +9,12 @@ import { History } from "happy-dom";
  * it puts the original methods back after each test.
  */
 export function restoreHistoryPrototypeAfterEach(): void {
-  // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
-  const { pushState, replaceState } = History.prototype;
+  const originals = ["pushState", "replaceState"].map(
+    (name) => [name, Object.getOwnPropertyDescriptor(History.prototype, name)] as const
+  );
   afterEach(() => {
-    History.prototype.pushState = pushState;
-    History.prototype.replaceState = replaceState;
+    for (const [name, descriptor] of originals) {
+      if (descriptor) Object.defineProperty(History.prototype, name, descriptor);
+    }
   });
 }
