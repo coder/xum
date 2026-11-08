@@ -223,9 +223,7 @@ test.each([
   expect(header(view)).toContain("From backup: 1 of 2");
   // Nothing is fetched for it, and the form does not offer its address to a click on Preview.
   expect(previewSpy).not.toHaveBeenCalled();
-  expect((view.container.querySelector("#plugin-source") as HTMLInputElement | null)?.value).toBe(
-    ""
-  );
+  expect(view.container.querySelector<HTMLInputElement>("#plugin-source")?.value).toBe("");
 
   await clickButton(view, /^Skip$/);
   await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
