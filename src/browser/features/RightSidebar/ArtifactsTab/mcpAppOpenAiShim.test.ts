@@ -9,6 +9,9 @@ import { buildMcpAppCsp, mcpAppPreambleScript } from "./mcpAppCsp";
 import { createFrameDocumentChannel } from "./frameDocumentChannel";
 import { createMcpAppHost, type McpAppConsentRequest } from "./mcpAppHost";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 interface OpenAi {
   toolInput: unknown;

@@ -22,6 +22,9 @@ import {
 import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { mcpAppPreambleScript } from "./mcpAppCsp";
 import { runFrameScript, type FrameScriptGlobals } from "./frameDocument.testHarness";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 const NONCE = "ab12";
 

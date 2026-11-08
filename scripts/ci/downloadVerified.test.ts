@@ -161,6 +161,15 @@ describe("download-verified.sh", () => {
       const again = await runScript([DOWNLOAD, url("/ok"), BODY_SHA256, dest], { cwd: work, env });
       expect(again.stdout).toContain("no download");
       expect(requests).toEqual(["/ok"]);
+      // The fallback must also refuse bytes that miss the pin, and leave nothing behind.
+      const other = path.join(path.dirname(dest), "other");
+      const wrong = await runScript([DOWNLOAD, url("/ok"), "0".repeat(64), other], {
+        cwd: work,
+        env,
+      });
+      expect(wrong.exitCode).toBe(1);
+      expect(wrong.stderr).toContain("does not match the pinned sha256");
+      expect(await destDirEntries()).toEqual(["tool"]);
     }
   );
 

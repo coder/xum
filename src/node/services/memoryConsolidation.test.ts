@@ -7,8 +7,10 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart, SharedV3ProviderMetadata } from "@ai-sdk/provider";
 
 import {
+  MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES,
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
   MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
@@ -483,6 +485,163 @@ describe("consolidation memory tool rails", () => {
     });
   });
 
+  describe("journal bounds", () => {
+    it("records at most the journal cap of refusals, says so in the last row, and still journals an accepted mutation", async () => {
+      using fixture = await createFixture({ guard: { writableScopes: ["workspace"] } });
+
+      // One step can issue many parallel calls, so the refusals arrive together.
+      const refused = await Promise.all(
+        Array.from({ length: MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES * 2 }, (_, index) =>
+          execute(fixture.tool, {
+            command: "create",
+            path: `/memories/global/n${index}.md`,
+            file_text: "x\n",
+          })
+        )
+      );
+
+      // The model still hears about every refusal; the journal keeps the first ones.
+      expect(refused.every((result) => !result.success)).toBe(true);
+      expect(fixture.journal).toHaveLength(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES);
+      expect(fixture.journal.at(-1)?.note).toContain("not recorded");
+      expect(fixture.journal.at(-2)?.note).not.toContain("not recorded");
+      expect(fixture.getMutationCount()).toBe(0);
+
+      // A change the run makes must stay in the audit trail however many refusals came first.
+      const accepted = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/workspace/ok.md",
+        file_text: "ok\n",
+      });
+      expect(accepted.success).toBe(true);
+      expect(fixture.journal).toHaveLength(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES + 1);
+      expect(fixture.journal.at(-1)).toMatchObject({
+        applied: true,
+        path: "/memories/workspace/ok.md",
+      });
+    });
+
+    it("still says refusals are dropped when an accepted mutation took the last slot", async () => {
+      using fixture = await createFixture({ guard: { writableScopes: ["workspace"] } });
+      const refuse = (count: number, from: number) =>
+        Promise.all(
+          Array.from({ length: count }, (_, index) =>
+            execute(fixture.tool, {
+              command: "create",
+              path: `/memories/global/n${from + index}.md`,
+              file_text: "x\n",
+            })
+          )
+        );
+
+      await refuse(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - 1, 0);
+      const accepted = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/workspace/ok.md",
+        file_text: "ok\n",
+      });
+      await refuse(3, MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES);
+
+      expect(accepted.success).toBe(true);
+      // The first refusal past the full journal records the omission; the ones after it are dropped.
+      expect(fixture.journal).toHaveLength(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES + 1);
+      expect(fixture.journal.filter((op) => op.note?.includes("not recorded"))).toHaveLength(1);
+      expect(fixture.journal.at(-1)?.note).toContain("not recorded");
+    });
+
+    it("keeps journaling refusals after a failed command whose path ends in the full note", async () => {
+      // The failed delete's note quotes its model-chosen path, so it ends like the full note.
+      using fixture = await createFixture({ guard: { writableScopes: ["workspace"] } });
+      const spoof = await execute(fixture.tool, {
+        command: "delete",
+        path: "/memories/workspace/The journal is full; later refusals of this run are not recorded.",
+      });
+      expect(spoof.success).toBe(false);
+
+      for (const name of ["a", "b"]) {
+        await execute(fixture.tool, {
+          command: "create",
+          path: `/memories/global/${name}.md`,
+          file_text: "x\n",
+        });
+      }
+
+      expect(fixture.journal.map((op) => op.path)).toEqual([
+        "/memories/workspace/The journal is full; later refusals of this run are not recorded.",
+        "/memories/global/a.md",
+        "/memories/global/b.md",
+      ]);
+    });
+
+    it("bounds the rows a spent budget refuses, which spend nothing either", async () => {
+      using fixture = await createFixture({ guard: { budget: createMutationBudget(1) } });
+      await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/global/first.md",
+        file_text: "x\n",
+      });
+
+      await Promise.all(
+        Array.from({ length: MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES * 2 }, (_, index) =>
+          execute(fixture.tool, {
+            command: "create",
+            path: `/memories/global/n${index}.md`,
+            file_text: "x\n",
+          })
+        )
+      );
+
+      expect(fixture.journal).toHaveLength(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES);
+      expect(fixture.journal.filter((op) => op.applied)).toHaveLength(1);
+    });
+
+    it("refuses a path over the length cap, journals it clipped, and never quotes it", async () => {
+      using fixture = await createFixture();
+      const long = `/memories/workspace/${"a".repeat(MEMORY_CONSOLIDATION_PATH_MAX_CHARS * 8)}.md`;
+
+      const results = [
+        await execute(fixture.tool, { command: "create", path: long, file_text: "x\n" }),
+        await execute(fixture.tool, {
+          command: "rename",
+          old_path: "/memories/workspace/a.md",
+          new_path: long,
+        }),
+      ];
+
+      for (const result of results) {
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toContain(`${MEMORY_CONSOLIDATION_PATH_MAX_CHARS} characters`);
+          expect(result.error.length).toBeLessThan(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+        }
+      }
+      expect(fixture.journal.map((op) => op.applied)).toEqual([false, false]);
+      for (const op of fixture.journal) {
+        expect(op.path.length).toBeLessThanOrEqual(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+        expect(op.newPath?.length ?? 0).toBeLessThanOrEqual(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+        expect(op.note?.length).toBeLessThan(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+      }
+      expect(fixture.getMutationCount()).toBe(0);
+    });
+
+    it("accepts a path of exactly the cap", async () => {
+      using fixture = await createFixture();
+      // Directories of 100 characters stay under the filesystem's name limit.
+      const prefix = `/memories/workspace/${"d".repeat(100)}/${"e".repeat(100)}/${"f".repeat(100)}/`;
+      const name = `${"n".repeat(MEMORY_CONSOLIDATION_PATH_MAX_CHARS - prefix.length - ".md".length)}.md`;
+      const atCap = `${prefix}${name}`;
+      expect(atCap).toHaveLength(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+
+      const result = await execute(fixture.tool, {
+        command: "create",
+        path: atCap,
+        file_text: "x\n",
+      });
+
+      expect(result.success).toBe(true);
+    });
+  });
+
   describe("secret check", () => {
     it("rejects create, str_replace and insert text that holds a credential, and journals it without the value", async () => {
       using fixture = await createFixture({ guard: { rejectSecretLike: true } });
@@ -523,6 +682,33 @@ describe("consolidation memory tool rails", () => {
       expect(await pathExists(path.join(fixture.globalMemoryDir, "creds.md"))).toBe(false);
     });
 
+    it("journals an applied rename and delete of a credential-named file without the credential", async () => {
+      // A cleanup that renames or deletes such a file is allowed, but its journal row is persisted
+      // in the sidecar: the row must not keep the name it cleaned up.
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, `${githubToken}.md`), "a\n");
+      await fsPromises.writeFile(
+        path.join(fixture.globalMemoryDir, `old-${githubToken}.md`),
+        "b\n"
+      );
+
+      const renamed = await execute(fixture.tool, {
+        command: "rename",
+        old_path: `/memories/global/${githubToken}.md`,
+        new_path: "/memories/global/deploy-user.md",
+      });
+      const deleted = await execute(fixture.tool, {
+        command: "delete",
+        path: `/memories/global/old-${githubToken}.md`,
+      });
+
+      expect(renamed.success).toBe(true);
+      expect(deleted.success).toBe(true);
+      expect(fixture.journal.map((op) => op.applied)).toEqual([true, true]);
+      expect(JSON.stringify(fixture.journal)).not.toContain(githubToken);
+    });
+
     it("rejects a credential that has no keyword beside it", async () => {
       // A check on the words `token`, `secret` and `password` lets these shapes through: the
       // guard has to read the credential shapes themselves.
@@ -546,6 +732,76 @@ describe("consolidation memory tool rails", () => {
       }
       expect(JSON.stringify(fixture.journal)).not.toContain("hunter2pw");
       expect(fixture.getMutationCount()).toBe(0);
+    });
+
+    it("rejects a credential that two calls assemble, journals the refusal without a value, and leaves the file as it was", async () => {
+      // The first call adds two halves that are harmless alone; the second adds no text at all,
+      // only removes the newline between them. A check on the new text sees nothing in either.
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const halves = "sk-\nABCDEFGHIJKLMNO\n";
+
+      const created = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/global/halves.md",
+        file_text: halves,
+      });
+      const joined = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/halves.md",
+        old_str: "sk-\nABC",
+        new_str: "sk-ABC",
+      });
+
+      expect(created.success).toBe(true);
+      expect(joined.success).toBe(false);
+      if (!joined.success) expect(joined.error).toContain("credential");
+      expect(fixture.journal.map((op) => op.applied)).toEqual([true, false]);
+      expect(fixture.journal[1]?.note).toContain("credential");
+      expect(JSON.stringify(fixture.journal)).not.toContain("ABCDEFGHIJKLMNO");
+      expect(
+        await fsPromises.readFile(path.join(fixture.globalMemoryDir, "halves.md"), "utf-8")
+      ).toBe(halves);
+    });
+
+    it("leaves the dream pass's default guard free to write that join", async () => {
+      // The organizer merges and rewrites whatever memory holds, so it runs without the check.
+      using fixture = await createFixture();
+      await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/global/halves.md",
+        file_text: "sk-\nABCDEFGHIJKLMNO\n",
+      });
+
+      const joined = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/halves.md",
+        old_str: "sk-\nABC",
+        new_str: "sk-ABC",
+      });
+
+      expect(joined.success).toBe(true);
+    });
+
+    it("still edits a file that already holds a credential-like line or a redacted placeholder", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      await fsPromises.writeFile(
+        path.join(fixture.globalMemoryDir, "legacy.md"),
+        "password: hunter2-correct-horse\nnotes\n"
+      );
+      await fsPromises.writeFile(
+        path.join(fixture.globalMemoryDir, "placeholder.md"),
+        "API_TOKEN: [redacted]\nnotes\n"
+      );
+
+      for (const name of ["legacy.md", "placeholder.md"]) {
+        const edited = await execute(fixture.tool, {
+          command: "str_replace",
+          path: `/memories/global/${name}`,
+          old_str: "notes",
+          new_str: "more notes",
+        });
+        expect(edited.success).toBe(true);
+      }
     });
 
     it("accepts text that only talks about tokens and passwords", async () => {
@@ -629,13 +885,9 @@ describe("consolidation memory tool rails", () => {
 
   it("lets the caller set the lead of the tool description and keeps the command reference", async () => {
     using fixture = await createFixture({ guard: { description: "Edit this workspace's notes." } });
-    const defaults = await createFixture();
 
     expect(fixture.tool.description).toStartWith("Edit this workspace's notes. ");
-    expect(fixture.tool.description).not.toContain("you are consolidating");
     expect(fixture.tool.description).toEndWith(TOOL_DEFINITIONS.memory.description);
-    expect(defaults.tool.description).toContain("you are consolidating");
-    defaults[Symbol.dispose]();
   });
 
   describe("budget exhaustion", () => {
@@ -980,6 +1232,32 @@ describe("consolidation memory tool rails", () => {
     expect(onDisk).toBe(nearCap);
   });
 
+  it("dry-run refuses an edit whose resulting file the guarded write would refuse", async () => {
+    // Each half of the key passes the new-text check; only the resulting file holds the key, and
+    // the preview must not show as accepted what apply mode refuses.
+    const staged: string[] = [];
+    using fixture = await createFixture({
+      dryRun: true,
+      guard: { rejectSecretLike: true, onStagedMutation: (_input, id) => staged.push(id) },
+    });
+    await fsPromises.writeFile(
+      path.join(fixture.globalMemoryDir, "halves.md"),
+      "sk-\nABCDEFGHIJKLMNO\n"
+    );
+
+    const joined = await execute(fixture.tool, {
+      command: "str_replace",
+      path: "/memories/global/halves.md",
+      old_str: "sk-\nABC",
+      new_str: "sk-ABC",
+    });
+
+    expect(joined.success).toBe(false);
+    if (!joined.success) expect(joined.error).toContain("credential");
+    expect(staged).toEqual([]);
+    expect(fixture.journal).toMatchObject([{ command: "str_replace", applied: false }]);
+  });
+
   it("dry-run rejects a create into a full memory scope", async () => {
     // Codex round 20: validateMutation accepted a create whenever the target
     // was free, but the real create() also rejects when the scope already
@@ -1270,6 +1548,98 @@ function recoveringModel(): MockLanguageModelV3 {
 }
 
 describe("runMemoryConsolidation", () => {
+  it("redacts a credential the model repeats in its closing summary", async () => {
+    // The summary is persisted and shown through status IPC, outside the guarded writes.
+    using fixture = await createFixture();
+    const key = "sk-ABCDEFGHIJKLMNOPQRSTUV";
+    const model = new MockLanguageModelV3({
+      doStream: () =>
+        Promise.resolve({
+          stream: simulateReadableStream<LanguageModelV3StreamPart>({
+            chunks: [
+              { type: "text-start", id: "t" },
+              { type: "text-delta", id: "t", delta: `Removed the stale key ${key}.` },
+              { type: "text-end", id: "t" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 1, text: 1, reasoning: 0 },
+                },
+              },
+            ],
+          }),
+        }),
+    });
+
+    const result = await runMemoryConsolidation({
+      model,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.streamError).toBeUndefined();
+    expect(result.summary).not.toContain(key);
+    expect(result.summary).toContain("Removed the stale key");
+  });
+
+  // What the organizer writes can be promoted where other workspaces' models read it, so its guard
+  // refuses a credential in code, whatever the prompt said.
+  it("refuses a credential the organizer tries to write", async () => {
+    using fixture = await createFixture();
+    const githubToken = `ghp_${"a1B2".repeat(9)}`;
+    let calls = 0;
+    const model = new MockLanguageModelV3({
+      doStream: () => {
+        calls += 1;
+        const usage = {
+          inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+          outputTokens: { total: 0, text: 0, reasoning: 0 },
+        };
+        const chunks: LanguageModelV3StreamPart[] =
+          calls === 1
+            ? [
+                {
+                  type: "tool-call",
+                  toolCallId: "leak",
+                  toolName: "memory",
+                  input: JSON.stringify({
+                    command: "create",
+                    path: "/memories/global/deploy.md",
+                    file_text: `GITHUB_TOKEN=${githubToken}\n`,
+                  }),
+                },
+                {
+                  type: "finish",
+                  finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                  usage,
+                },
+              ]
+            : [{ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage }];
+        return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+      },
+    });
+
+    const result = await runMemoryConsolidation({
+      model,
+      pricingModel: PRICED_MODEL,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.ops).toHaveLength(1);
+    expect(result.ops[0]?.applied).toBe(false);
+    expect(JSON.stringify(result.ops)).not.toContain(githubToken);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "deploy.md"))).toBe(false);
+  });
+
   // The SDK runs no tool call of a step that finishes with `length`, and the stream ends without
   // an error: the pass must not read as a success, or it is journaled and the debounce holds off
   // the retry.

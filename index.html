@@ -109,6 +109,77 @@
         color: var(--color-text-secondary, #607081);
       }
 
+      /* Boot failure state (see the boot-load-failure script below). The app's stylesheet loads
+         with the app, and the app is what failed, so this state paints from this block alone:
+         the theme variables name the app's tokens, and the hex or hsl values after them are the
+         dark and light values of those tokens for a page that has none. */
+      .boot-loader__failure {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+        box-sizing: border-box;
+        max-width: min(44ch, 100vw);
+        padding: 0 24px;
+        text-align: center;
+      }
+
+      /* The loading text is a quiet hint. This one is what the user has to read, and the dark
+         secondary text color is below 4.5:1 on the dark page. The light rules above are higher
+         up in specificity and keep their own color, which passes. */
+      .boot-loader__failure .boot-loader__text {
+        text-wrap: balance;
+        color: var(--color-foreground, #d4d4d4);
+      }
+
+      .boot-loader__title {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 600;
+        color: var(--color-foreground, #d4d4d4);
+      }
+
+      :root[data-theme="light"] .boot-loader__title,
+      :root[data-theme$="-light"] .boot-loader__title {
+        color: var(--color-foreground, #212930);
+      }
+
+      .boot-loader__button {
+        height: 36px;
+        padding: 0 16px;
+        border: 0;
+        border-radius: 6px;
+        font: inherit;
+        font-weight: 500;
+        cursor: pointer;
+        color: var(--color-accent-foreground, #ffffff);
+        background: var(--color-accent, hsl(207 100% 40%));
+      }
+
+      :root[data-theme="light"] .boot-loader__button,
+      :root[data-theme$="-light"] .boot-loader__button {
+        background: var(--color-accent, hsl(207 90% 42%));
+      }
+
+      .boot-loader__button:hover {
+        background: var(--color-accent-button-hover, hsl(207 100% 37%));
+      }
+
+      :root[data-theme="light"] .boot-loader__button:hover,
+      :root[data-theme$="-light"] .boot-loader__button:hover {
+        background: var(--color-accent-button-hover, hsl(207 90% 38%));
+      }
+
+      .boot-loader__button:focus-visible {
+        outline: 2px solid var(--color-foreground, #d4d4d4);
+        outline-offset: 2px;
+      }
+
+      :root[data-theme="light"] .boot-loader__button:focus-visible,
+      :root[data-theme$="-light"] .boot-loader__button:focus-visible {
+        outline-color: var(--color-foreground, #212930);
+      }
+
       /* Animated "..." after the loading text. Uses ::after so it works in
          both the static HTML boot loader and the React LoadingScreen. */
       @keyframes boot-ellipsis {
@@ -212,6 +283,72 @@
         }
       })();
     </script>
+    <script id="boot-load-failure-script">
+      // Until the app's module graph loads, the boot screen below is all a user sees. When a module
+      // of that graph fails to load (a network error, or a 404 for a chunk that a new deploy
+      // replaced), the browser runs none of the graph: not React, not the app's components, not
+      // its keybinds. So this plain script, which imports nothing, is the only code that can tell
+      // the user. It swaps "Loading Xum" for a reload prompt when the browser reports a module that
+      // did not load:
+      //   - a module script element's error event: the entry or one of its static imports
+      //     failed to load. A syntax error or a throw while a module runs is an error event on
+      //     the window, not on the element, so a runtime error in the static graph never passes
+      //     as a load failure. (The dev server answers a module that Vite cannot transform with
+      //     HTTP 500, which the browser reports as a failed load too.)
+      //   - Vite's vite:preloadError (production builds): a dynamic import or its preload was
+      //     rejected. Vite raises it for every rejection of the import, a module that throws as
+      //     it runs included.
+      // It never cancels an event, so the browser and the app's handlers still see every error.
+      // It does nothing once the app replaced the boot screen: from then on the app's own
+      // boundaries show load failures. A slow load raises neither event, so a slow load shows
+      // the boot screen as before. The copy and the markup are in the template below.
+      (function () {
+        function show() {
+          const loader = document.getElementById("boot-loader");
+          const template = document.getElementById("boot-load-failure");
+          const loading = loader && loader.querySelector(".boot-loader__text");
+          if (!loader || !template || !loading || loader.hasAttribute("data-load-failed")) {
+            return;
+          }
+
+          const failure = template.content.cloneNode(true);
+          const reload = failure.querySelector("button");
+          reload.addEventListener("click", function () {
+            location.reload();
+          });
+          loading.replaceWith(failure);
+          loader.setAttribute("data-load-failed", "");
+          // The alert below announces the failure, so the loader is no longer a busy status.
+          loader.removeAttribute("role");
+          loader.removeAttribute("aria-live");
+          loader.removeAttribute("aria-busy");
+          // Focused, so Enter reloads: a keyboard user needs no other way in.
+          reload.focus();
+        }
+
+        function report() {
+          if (document.getElementById("boot-loader")) {
+            show();
+          } else {
+            // A failure that comes before the page body is parsed.
+            document.addEventListener("DOMContentLoaded", show, { once: true });
+          }
+        }
+
+        // Load errors of scripts and stylesheets do not bubble, so listen while capturing.
+        window.addEventListener(
+          "error",
+          function (event) {
+            const target = event.target;
+            if (target && target.tagName === "SCRIPT" && target.type === "module") {
+              report();
+            }
+          },
+          true
+        );
+        window.addEventListener("vite:preloadError", report);
+      })();
+    </script>
   </head>
   <body>
     <!-- Invisible color source for the iOS standalone status bar; see .ios-status-bar-band. -->
@@ -219,7 +356,7 @@
     <div id="root">
       <!-- #6017: the boot screen is the whole page, so it holds the one main landmark. -->
       <main>
-        <div class="boot-loader" role="status" aria-live="polite" aria-busy="true">
+        <div id="boot-loader" class="boot-loader" role="status" aria-live="polite" aria-busy="true">
           <div class="boot-loader__inner">
             <svg class="boot-loader__logo" aria-hidden="true" viewBox="0 0 134.7754 62" fill="none" xmlns="http://www.w3.org/2000/svg">
               <!-- Reordered prior Mux outlines keep Xum on the established Geist Sans Bold geometry. -->
@@ -231,6 +368,13 @@
         </div>
       </main>
     </div>
+    <template id="boot-load-failure">
+      <div class="boot-loader__failure" role="alert">
+        <h1 class="boot-loader__title">Xum could not load</h1>
+        <p class="boot-loader__text">Part of the app did not download. Reload to try again.</p>
+        <button type="button" class="boot-loader__button">Reload</button>
+      </div>
+    </template>
     <script type="module" src="/src/browser/main.tsx"></script>
   </body>
 </html>

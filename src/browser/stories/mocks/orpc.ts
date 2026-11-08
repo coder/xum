@@ -21,6 +21,7 @@ import type {
   ArtifactShelfListing,
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
+import { EMPTY_BACKUP_PLUGIN_REPORT, type BackupPluginReport } from "@/common/orpc/schemas/backup";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { McpAppToolCallResult, McpAppView } from "@/common/orpc/schemas/mcpApps";
 import type { APIClient } from "@/browser/contexts/API";
@@ -152,6 +153,11 @@ type MockBackupData<Route extends Exclude<MockBackupRoute, "getSettings">> = Ext
   MockBackupRouteOutput<Route>,
   { success: true }
 >["data"];
+/** A fixture may leave out the plugin report: the mock then reports a backup with no plugin list. */
+type MockBackupFixture<Route extends "preview" | "restore"> = Omit<
+  MockBackupData<Route>,
+  "plugins"
+> & { plugins?: BackupPluginReport };
 type MockBackupSettings = NonNullable<MockBackupRouteOutput<"getSettings">>;
 
 export interface MockORPCClientOptions {
@@ -441,9 +447,9 @@ export interface MockORPCClientOptions {
   };
   backupSettings?: MockBackupSettings | null;
   backupValidation?: MockBackupData<"validate">;
-  backupPreview?: MockBackupData<"preview">;
+  backupPreview?: MockBackupFixture<"preview">;
   backupPush?: MockBackupData<"push">;
-  backupRestore?: MockBackupData<"restore">;
+  backupRestore?: MockBackupFixture<"restore">;
   /** Per-workspace runtime statuses for RuntimeStatusStore stories */
   runtimeStatuses?: Map<string, "running" | "stopped" | "unknown" | "unsupported">;
 }
@@ -811,15 +817,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     empty: false,
     credential: "gh",
   };
-  const backupPreviewResult: MockBackupData<"preview"> = backupPreview ?? {
-    pushChanges: [],
-    restoreChanges: [],
-    localOnlyFiles: [],
-    redactions: [],
-    commandApprovals: [],
-    projectImports: [],
-    projectBundleSkipped: false,
-    pushError: null,
+  const backupPreviewResult: MockBackupData<"preview"> = {
+    plugins: EMPTY_BACKUP_PLUGIN_REPORT,
+    ...(backupPreview ?? {
+      pushChanges: [],
+      restoreChanges: [],
+      localOnlyFiles: [],
+      redactions: [],
+      commandApprovals: [],
+      projectImports: [],
+      projectBundleSkipped: false,
+      pushError: null,
+    }),
   };
   const backupPushResult: MockBackupData<"push"> = backupPush ?? {
     commit: "abc1234",
@@ -827,14 +836,17 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     credential: backupValidationResult.credential,
     redactions: [],
   };
-  const backupRestoreResult: MockBackupData<"restore"> = backupRestore ?? {
-    commit: "def5678",
-    snapshotPath: "/tmp/mux-backup-snapshot",
-    changedFiles: [],
-    localOnlyFiles: [],
-    projectImportResults: [],
-    projectBundleSkipped: false,
-    unapprovedProjectImports: [],
+  const backupRestoreResult: MockBackupData<"restore"> = {
+    plugins: EMPTY_BACKUP_PLUGIN_REPORT,
+    ...(backupRestore ?? {
+      commit: "def5678",
+      snapshotPath: "/tmp/mux-backup-snapshot",
+      changedFiles: [],
+      localOnlyFiles: [],
+      projectImportResults: [],
+      projectBundleSkipped: false,
+      unapprovedProjectImports: [],
+    }),
   };
 
   const mockStats: ChatStats = {
