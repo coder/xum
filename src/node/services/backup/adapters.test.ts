@@ -1624,7 +1624,7 @@ describe("backup adapters project bundle", () => {
       })
     );
     expect((error as Error).message).toContain(`${MAX_BACKUP_FILE_COUNT}`);
-    // Writes and walks MAX_BACKUP_FILE_COUNT + 3 files: 3 to 17 s on a dev workspace and
+    // Writes and walks MAX_BACKUP_FILE_COUNT + 1 files: 3 to 17 s on a dev workspace and
     // over 30 s when other test runs share the host, so the limit leaves room for a loaded run.
   }, 120_000);
 
