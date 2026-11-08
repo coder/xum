@@ -820,6 +820,16 @@ describe("runMemoryHarvest", () => {
       expect(open.messages.map((row) => row.id)).toEqual(["after"]);
     });
 
+    it("drops a compaction request, which the reader of the epoch the compaction closes skips", () => {
+      const request = userRow("compact-request", 7, {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      });
+
+      const open = selectOpenEpoch([userRow("a", 6), request]);
+
+      expect(open.messages.map((row) => row.id)).toEqual(["a"]);
+    });
+
     it("drops keep-recent tail copies and model-hidden rows, which the epoch's run never reads", () => {
       const snapshot: PlanReviewRecord = {
         v: 1,

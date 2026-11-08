@@ -3266,6 +3266,50 @@ describe("MemoryConsolidationService", () => {
         });
       });
 
+      it("matches the archive of an epoch whose compaction was pending to the compaction that later closes it", async () => {
+        const models = editsEveryRunModels(5);
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        // The workspace is archived after the request row is saved, before the compaction ends.
+        // The closing compaction's reader skips this row (getMessagesForCompactionEpoch).
+        await fixture.historyService.appendToHistory(
+          "ws-dream",
+          createMuxMessage("compact-request", "user", "Please compact", {
+            muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+          })
+        );
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        const archive = (await harvestRecords(fixture))["open:open-2"];
+        expect(archive).toMatchObject({ readThroughRowId: "open-2", budgetUsed: 5 });
+
+        // The compaction completes after the unarchive, with one more row in the epoch.
+        await appendRows(fixture, [["open-3", "CI pins node 22 for the release job."]]);
+        const summary = createMuxMessage("summary-1", "assistant", "Scripts use bun.", {
+          compactionBoundary: true,
+          compacted: "user",
+          compactionEpoch: 1,
+        });
+        await fixture.historyService.appendToHistory("ws-dream", summary);
+        await fixture.service.maybeHarvestThenSweep({
+          workspaceId: "ws-dream",
+          summaryMessageId: "summary-1",
+          summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+          compactionEpoch: 1,
+          compactionRequestMessageId: "compact-request",
+        });
+
+        // The closing run starts after the rows the archive read and shares its budget: it tried
+        // 5 more edits and got the 3 that were left.
+        expect(models.analyzerRuns()).toBe(2);
+        const closing = (await harvestRecords(fixture))["summary-1"];
+        expect(closing).toMatchObject({
+          status: "completed",
+          analyzedFloorRowId: "open-2",
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+        });
+        expect(closing?.ops?.filter((op) => op.applied)).toHaveLength(3);
+      });
+
       it("makes no analyzer call for the compaction that closes an epoch whose every edit an archive spent, though rows are left unread", async () => {
         const analyzerPrompts: Array<{ closing: boolean; prompt: string }> = [];
         using fixture = await createFixture({

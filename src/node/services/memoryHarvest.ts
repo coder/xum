@@ -19,6 +19,7 @@ import {
 } from "@/node/services/memoryConsolidation";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import { REDACTION_LOOKAHEAD_CHARS, redactSecretLike } from "@/node/services/memorySecretRedaction";
+import { isCompactionRequestMessage } from "@/node/services/taskMessagePredicates";
 import {
   SESSION_HISTORY_OMITTED,
   derivesFromSessionHistory,
@@ -362,8 +363,14 @@ export interface OpenEpoch {
 /**
  * The open epoch of `getHistoryFromLatestBoundary`'s read. Its rows are the ones after the latest
  * context boundary (that row is the summary of the epoch before it), minus keep-recent tail
- * copies, whose originals the closed epoch's run already read, and model-hidden rows. `messages`
- * is empty when nothing in the epoch is worth a model call.
+ * copies, whose originals the closed epoch's run already read, model-hidden rows and compaction
+ * requests. `messages` is empty when nothing in the epoch is worth a model call.
+ *
+ * A compaction request is dropped because the compaction it asks for may still be pending when the
+ * workspace is archived (a failed one, retried after an unarchive). If it stayed, the open record
+ * would be keyed and read through to that row, and the compaction that later closes this epoch
+ * reads its rows without the request (`getMessagesForCompactionEpoch` skips it): the closing run
+ * could match no row the archive read, so it would analyze the epoch again on a fresh edit budget.
  */
 export function selectOpenEpoch(rows: MuxMessage[]): OpenEpoch {
   const boundaryIndex = findLatestContextBoundaryIndex(rows);
@@ -372,7 +379,12 @@ export function selectOpenEpoch(rows: MuxMessage[]): OpenEpoch {
     compactionEpoch: (boundary?.metadata?.compactionEpoch ?? 0) + 1,
     messages: rows
       .slice(boundaryIndex + 1)
-      .filter((row) => row.metadata?.rlmPreservedTailCopy !== true && !isModelHiddenMessage(row)),
+      .filter(
+        (row) =>
+          row.metadata?.rlmPreservedTailCopy !== true &&
+          !isModelHiddenMessage(row) &&
+          !isCompactionRequestMessage(row)
+      ),
   };
 }
 
