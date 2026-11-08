@@ -1346,6 +1346,10 @@ describe("ServiceContainer", () => {
     expect(services.appFiberScope.state._tag).toBe("Closed");
   });
 
+  // Real work, end to end: a container, a real stream, durable history writes and the analytics
+  // worker's DuckDB shutdown (about 0.2 s of its own). It takes 0.1 to 0.4 s of CPU alone and
+  // 5.2 to 7.0 s with eight busy processes per core, so the default 5 s limit failed it while
+  // nothing was wrong.
   it.each([false, true])(
     "dispose() joins engine and session policy before bridge teardown (session=%s)",
     async (throughSession) => {
@@ -1524,7 +1528,8 @@ describe("ServiceContainer", () => {
             part.type === "text" && part.text === "hello from a stream shutdown must not lose"
         )
       ).toBe(true);
-    }
+    },
+    20_000
   );
 
   it("joins cleanup enqueued by a closing session callback before dependency teardown", async () => {
