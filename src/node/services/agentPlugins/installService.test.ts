@@ -7559,6 +7559,120 @@ describe("AgentPluginInstallService", () => {
       expect(envelope.pendingOverridePrunes ?? []).toEqual([]);
     }, 30_000);
 
+    test("an uninstall keeps the tombstone of a workspace whose renamed checkout's old path another directory took before the scan", async () => {
+      // A rename has moved the checkout and not yet rewritten its entry, and another directory
+      // took the old path before the sweep's scan read it. The scan reads that directory from
+      // start to end, so only the barrier, which waits out the rename's lock before the
+      // registry comparison, shows that the entry changed.
+      const overrides = new WorkspaceMcpOverridesService(config);
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overrides,
+      });
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      const key = buildPluginServerKey(computePluginInstanceId(installPath()), "echo");
+      const oldPath = path.join(config.srcDir, "taken-project", "branch");
+      const newPath = path.join(config.srcDir, "taken-project", "renamed");
+      await fsPromises.mkdir(path.join(oldPath, ".xum"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(oldPath, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: [key, "kept"] })
+      );
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/taken-project", {
+          workspaces: [
+            {
+              path: oldPath,
+              id: "ws-taken",
+              name: "branch",
+              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+            },
+          ],
+        });
+        return cfg;
+      });
+      // The scan pauses at its identity stat of the checkout, before it reads any document.
+      const realStat = fsPromises.stat;
+      let paused = false;
+      let reached!: () => void;
+      const atStat = new Promise<void>((resolve) => (reached = resolve));
+      let resume!: () => void;
+      const resumed = new Promise<void>((resolve) => (resume = resolve));
+      const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (
+        target: string,
+        ...rest: unknown[]
+      ) => {
+        if (
+          !paused &&
+          target === oldPath &&
+          (rest[0] as { bigint?: boolean } | undefined)?.bigint === true
+        ) {
+          paused = true;
+          reached();
+          await resumed;
+        }
+        return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+      }) as typeof fsPromises.stat);
+      // The rename rewrites the entry once the sweep waits for a workspace lock, or, when the
+      // sweep never takes one, once the uninstall is done.
+      let finishRename!: () => void;
+      const renameMayFinish = new Promise<void>((resolve) => (finishRename = resolve));
+      let moved = false;
+      const realLink = fsPromises.link;
+      const linkSpy = spyOn(fsPromises, "link").mockImplementation((existing, target) => {
+        if (moved && String(target).includes("mcp-overrides-locks")) finishRename();
+        return realLink(existing, target);
+      });
+      let rename: Promise<void> | undefined;
+      try {
+        const uninstall = serviceWithOverrides.uninstall({
+          name: "demo-plugin",
+          deletePluginData: false,
+        });
+        await atStat;
+        const release = await overrides.acquireWorkspaceLock("ws-taken");
+        await fsPromises.rename(oldPath, newPath);
+        await fsPromises.mkdir(oldPath);
+        moved = true;
+        rename = renameMayFinish.then(async () => {
+          try {
+            await config.editConfig((cfg) => {
+              for (const project of cfg.projects.values()) {
+                for (const entry of project.workspaces) {
+                  if (entry.id === "ws-taken") {
+                    entry.path = newPath;
+                    entry.name = "renamed";
+                  }
+                }
+              }
+              return cfg;
+            });
+          } finally {
+            await release();
+          }
+        });
+        resume();
+        await uninstall;
+      } finally {
+        resume();
+        finishRename();
+        await rename;
+        linkSpy.mockRestore();
+        statSpy.mockRestore();
+      }
+
+      expect(await registry()).toEqual([]);
+      const envelope = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        pendingOverridePrunes?: Array<{ workspaceIds?: string[] }>;
+      };
+      expect(
+        (envelope.pendingOverridePrunes ?? []).flatMap((tombstone) => tombstone.workspaceIds ?? [])
+      ).toContain("ws-taken");
+    }, 30_000);
+
     test("a fresh install sweeps every workspace when an unrelated legacy entry's metadata is malformed", async () => {
       const serviceWithOverrides = new AgentPluginInstallService(config, {
         workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),

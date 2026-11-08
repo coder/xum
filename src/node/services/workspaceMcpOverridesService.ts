@@ -5099,6 +5099,10 @@ export class WorkspaceMcpOverridesService {
     // committed uninstall, which refuses the swept plugin's keys.
     await this.runExclusive(() => Promise.resolve());
     const plan = await this.planPluginSweep(workspaceIds, keyPrefix);
+    // The barrier (waitOutUnlockedWriters): every writer that held the lock of a workspace
+    // that the sweep will not lock has finished before the registry comparison below.
+    const busy = await this.waitOutUnlockedWriters(workspaceIds, plan);
+    const busyIds = new Set(busy.map((failure) => failure.workspaceId));
     // Every swept workspace's lock first, then the global lock: a rename
     // holding a workspace lock across its checkout move cannot be
     // interleaved with this sweep's stat of that checkout. With no candidate,
@@ -5133,7 +5137,11 @@ export class WorkspaceMcpOverridesService {
         `The plugin sweep stopped reading MCP overrides after a checkout did not respond, before it read workspace ${workspaceId}`
       ),
     }));
-    return [...unscanned, ...failures];
+    return [
+      ...unscanned,
+      ...busy,
+      ...failures.filter((failure) => !busyIds.has(failure.workspaceId)),
+    ];
   }
 
   /**
@@ -5196,6 +5204,66 @@ export class WorkspaceMcpOverridesService {
     } finally {
       await snapshot.settleSideEffects();
     }
+  }
+
+  /**
+   * The sweep's barrier, between its scan and its locks. A rename or a move holds its
+   * workspace's lock across the checkout move and the entry rewrite. While that rewrite is
+   * pending, the scan cannot tell the old path from another directory made there since, and
+   * the registry comparison under the global lock still sees the old entry. So this takes and
+   * releases each lock key of every workspace that the scan read and the sweep will not lock,
+   * CHECKOUT_IO_CONCURRENCY keys at a time, with the keys derived from one registry read.
+   * Every writer that held one of those locks has then rewritten its entry before the
+   * comparison, which fails that workspace. A writer that starts later moves only documents
+   * that the scan has read in full. Each key is released before the sweep takes its own locks,
+   * so the critical section holds only the candidates' locks.
+   *
+   * Limit: a lock that another writer holds makes the barrier wait for it, up to
+   * WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS for the whole barrier. A workspace whose key stays busy
+   * that long, or whose keys cannot be derived, fails and keeps its tombstone: the barrier
+   * never reports it clean.
+   */
+  private async waitOutUnlockedWriters(
+    workspaceIds: readonly string[],
+    plan: PluginSweepPlan
+  ): Promise<Array<{ workspaceId: string; error: unknown }>> {
+    const skipped = new Set([...plan.lockedIds, ...plan.unscannedIds]);
+    const ids = [...new Set(workspaceIds.map((id) => id.trim()))].filter((id) => !skipped.has(id));
+    if (ids.length === 0) return [];
+    const deadline = Date.now() + WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS;
+    let derived: CheckoutLockKeys;
+    try {
+      derived = await withDeadline(
+        this.checkoutLockKeys(ids),
+        WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS,
+        WORKSPACE_LOCK_TIMEOUT_MESSAGE
+      );
+    } catch (error) {
+      return ids.map((workspaceId) => ({ workspaceId, error }));
+    }
+    const failures: Array<{ workspaceId: string; error: unknown }> = [...derived.unresolvable];
+    // Aliases of one checkout share its keys: each key is taken once, for all of them.
+    const idsByKey = new Map<string, string[]>();
+    for (const [workspaceId, keys] of derived.keys) {
+      for (const key of keys) {
+        const keyIds = idsByKey.get(key);
+        if (keyIds === undefined) idsByKey.set(key, [workspaceId]);
+        else keyIds.push(workspaceId);
+      }
+    }
+    const failed = new Set<string>();
+    await mapWithConcurrency([...idsByKey], CHECKOUT_IO_CONCURRENCY, async ([key, keyIds]) => {
+      try {
+        const release = await this.acquireCheckoutLock(key, Math.max(0, deadline - Date.now()));
+        await release();
+      } catch (error) {
+        for (const workspaceId of keyIds.filter((id) => !failed.has(id))) {
+          failed.add(workspaceId);
+          failures.push({ workspaceId, error });
+        }
+      }
+    });
+    return failures;
   }
 
   /**
@@ -5787,8 +5855,16 @@ export class WorkspaceMcpOverridesService {
       // survives) until the link is removed.
       await assertPruneTargetNotSymlinked(filePath, workspacePath);
       // Strict read: unreadable/unparseable content must throw so the
-      // caller keeps its retry tombstone (mirrors readOverridesFile).
-      const original = await readFileString(runtime, filePath);
+      // caller keeps its retry tombstone (mirrors readOverridesFile). Verified
+      // and bounded like the scan's read (readHostOverrideDocumentNoFollow): a
+      // FIFO at this path, which code in the checkout can make, is refused at
+      // once instead of blocking this read, and every lock held, until the
+      // sweep's budget runs out.
+      const original = await readHostOverrideDocumentNoFollow(
+        filePath,
+        workspacePath,
+        MAX_PRUNED_OVERRIDES_BYTES
+      );
       let text: string;
       try {
         text = prunePluginKeysFromDocument(original, keyPrefix, filePath);
