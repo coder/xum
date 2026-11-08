@@ -216,6 +216,20 @@ describe("installIosCoverColumn", () => {
     expect(column()).toBe("84px");
   });
 
+  test("gives the column back when the unfold reaches the page after its window resize", () => {
+    setStandalone(true);
+    const visualViewport = new window.EventTarget();
+    Object.defineProperty(window, "visualViewport", { configurable: true, value: visualViewport });
+    uninstall = installIosCoverColumn();
+
+    window.dispatchEvent(new window.Event("resize"));
+    display.current = INNER;
+    visualViewport.dispatchEvent(new window.Event("resize"));
+
+    expect(meta.content).toBe(DEVICE_WIDTH_META);
+    expect(document.documentElement.style.getPropertyValue(IOS_COVER_COLUMN_PROPERTY)).toBe("");
+  });
+
   describe("a sideways scroll of the page", () => {
     const panPage = () => {
       Object.defineProperty(window, "scrollX", { configurable: true, value: 84 });

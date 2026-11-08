@@ -600,10 +600,17 @@ export function installIosCoverColumn(): () => void {
   if (!isIosStandaloneWebApp() || meta == null) return () => undefined;
   const viewport = new CoverColumnViewport(meta);
   viewport.sync();
+  // Unfolding fires the window resize while the page still has the cover display's layout, so the
+  // sync there took the column again and kept the 466pt width on the open display. The rest of the
+  // change arrives as visual viewport resizes only, so check on those too.
+  const onResize = (): void => viewport.onResize();
+  const visualViewport = window.visualViewport;
+  visualViewport?.addEventListener("resize", onResize);
   const removers = [
     new ColumnTouchBridge(() => viewport.column).install(),
-    listen("resize", () => viewport.onResize()),
+    listen("resize", onResize),
     listen("scroll", () => viewport.onScroll()),
+    () => visualViewport?.removeEventListener("resize", onResize),
   ];
   return () => {
     for (const remove of removers) remove();

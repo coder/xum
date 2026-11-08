@@ -7,6 +7,7 @@ import { installDom } from "../../../tests/ui/dom";
 import {
   APP_VIEWPORT_HEIGHT_PROPERTY,
   installIosFocusZoomGuard,
+  installIphoneDuoStatusBarStyle,
   installViewportHeightSync,
 } from "./viewportHeight";
 
@@ -276,5 +277,41 @@ describe("iOS focus-zoom guard", () => {
     installIosFocusZoomGuard();
 
     expect(meta.content).toBe(original);
+  });
+});
+
+describe("iPhone Duo status-bar style", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  function statusBarStyle(width: number, height: number): string | null | undefined {
+    Object.defineProperty(window.screen, "width", { configurable: true, get: () => width });
+    Object.defineProperty(window.screen, "height", { configurable: true, get: () => height });
+    installIphoneDuoStatusBarStyle();
+    return document
+      .querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')
+      ?.getAttribute("content");
+  }
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("goes black-translucent on the Duo, which reports one screen size on both displays", () => {
+    expect(statusBarStyle(466, 678)).toBe("black-translucent");
+  });
+
+  test("leaves other screens on the native status-bar layout, even one that shares a side", () => {
+    for (const [width, height] of [
+      [402, 874],
+      [466, 874],
+      [402, 678],
+    ]) {
+      expect(statusBarStyle(width, height)).toBeUndefined();
+    }
   });
 });
