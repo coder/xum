@@ -1158,6 +1158,7 @@ describe("hash routes", () => {
   function srcdocWindow() {
     const win = new HappyWindow({ url: "about:srcdoc" });
     const proto = win.History.prototype;
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
     const originals = { pushState: proto.pushState, replaceState: proto.replaceState };
     for (const method of ["pushState", "replaceState"] as const) {
       proto[method] = function (
