@@ -245,6 +245,7 @@ export class FakeMcpServers {
     this.processes.length = 0;
     this.hungConnects = 0;
     this.hungWaiters.clear();
+    this.startupHangWaitMs = STARTUP_HANG_WAIT_MS;
     this.exec.mockClear();
   }
 

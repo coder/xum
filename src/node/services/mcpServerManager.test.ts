@@ -5535,7 +5535,23 @@ describe("MCPServerManager", () => {
   /** Mirrors mcpServerManager's fail-safe wait for a timed-out startup's abort cleanup. */
   const STARTUP_CLEANUP_WAIT_MS = MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS;
 
+  test("a startup that neither hangs nor ends fails with its cause, not the test timeout", async () => {
+    // connect() never resolves and the connection does not hang on purpose, so the startup waits
+    // for a deadline that fake timers never fire. The harness bounds its wait in real time.
+    configService.listServers = mock(() => Promise.resolve({ idle: stdioConfig("idle-cmd") }));
+    servers.serve("idle-cmd", { connect: () => new Promise<void>(() => undefined) });
+    servers.startupHangWaitMs = 100;
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      servers.expireStartupDeadline(() =>
+        manager.getToolsForWorkspace(workspaceRequest("ws-idle-startup"))
+      )
+    ).rejects.toThrow("startup never hung (still running after 100 ms)");
+  });
+
   test("the startup deadline fires once a connection hangs, however long real I/O delays the hang", async () => {
+    // This test follows the bounded-wait test below on purpose: that one shortens the harness's
+    // real-time bound to 100 ms, and reset() must put it back, or this 400 ms hang fails.
     // The harness waits for the hang itself. It once gave the hang a fixed number of event-loop
     // turns, which a loaded host used up before the startup's real I/O (here a child process that
     // runs 400 ms: fake timers fake every sleep, so only I/O takes real time) reached the hang:
@@ -5549,20 +5565,6 @@ describe("MCPServerManager", () => {
       manager.getToolsForWorkspace(workspaceRequest("ws-late-hang"))
     );
     expect(result.stats.failedServerNames).toEqual(["late"]);
-  });
-
-  test("a startup that neither hangs nor ends fails with its cause, not the test timeout", async () => {
-    // connect() never resolves and the connection does not hang on purpose, so the startup waits
-    // for a deadline that fake timers never fire. The harness bounds its wait in real time.
-    configService.listServers = mock(() => Promise.resolve({ idle: stdioConfig("idle-cmd") }));
-    servers.serve("idle-cmd", { connect: () => new Promise<void>(() => undefined) });
-    servers.startupHangWaitMs = 100;
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(
-      servers.expireStartupDeadline(() =>
-        manager.getToolsForWorkspace(workspaceRequest("ws-idle-startup"))
-      )
-    ).rejects.toThrow("startup never hung (still running after 100 ms)");
   });
 
   test("a startup timeout waits for its abort cleanup before surfacing", async () => {
