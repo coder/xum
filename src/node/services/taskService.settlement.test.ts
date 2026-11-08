@@ -95,6 +95,12 @@ import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks"
 // fails the next test, so one slow test can show up as several failures.
 setDefaultTimeout(30_000);
 
+// Deadline of the polling helpers (waitUntil, waitForOutcomeKind). They wait for work that real
+// stores, locks and config writes do, and CPU contention stretches that work, so a short fixed
+// deadline fails tests that are not broken. It stays below the file's test timeout, so a real hang
+// fails with the helper's label instead of as an unlabelled test timeout.
+const POLL_DEADLINE_MS = 20_000;
+
 // Every agent-task reservation resolves its agent definition, which scans the runtime user's
 // global plugin roots (<XUM_ROOT>/plugins and ~/.agents/plugins). Point them at an empty home so
 // these tests neither read nor wait on the plugins installed on the machine that runs them (each
@@ -1199,7 +1205,7 @@ describe("TaskService", () => {
   }
 
   async function waitUntil(condition: () => boolean, label: string): Promise<void> {
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + POLL_DEADLINE_MS;
     while (!condition()) {
       if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
       await new Promise((resolve) => setTimeout(resolve, 1));
@@ -1212,7 +1218,7 @@ describe("TaskService", () => {
     taskId: string,
     kind: string
   ): Promise<void> {
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + POLL_DEADLINE_MS;
     for (;;) {
       const outcome = await taskService.readAttemptOutcome(taskId, {
         requestingWorkspaceId: rootId,
