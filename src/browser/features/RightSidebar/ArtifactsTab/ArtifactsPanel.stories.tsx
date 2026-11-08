@@ -876,23 +876,27 @@ export const NavigateAwayLink: Story = {
 };
 
 // A hash router (superblink's map nodes set location.hash). WebKit fires the iframe's load event
-// again for that fragment change, and both engines do for history.back() to a pushed entry. The
-// document is still the one Xum built, so the artifact must stay open with its bridge. The play
-// starts the routes once it listens for the frame's loads, and asks for the save after the last.
+// again for every fragment change and history traversal. Chromium does for history.back() only
+// when it returns to the srcdoc's own first entry. The document is still the one Xum built, so the
+// artifact must stay open with its bridge. The play starts the routes once it listens for the
+// frame's loads, and asks for the save after the last one, which both engines fire.
 const HASH_ROUTER_HTML = `<!doctype html><html><head><script>
+  // Each step waits for the last one's events, and for WebKit's load about 100 ms after them.
+  function later(step) { setTimeout(step, 500); }
   window.addEventListener("message", function (event) {
     var test = event.data && event.data.xumRouteTest;
     if (test === "save") window.xum.setState({ route: location.hash });
     if (test !== "go") return;
-    window.addEventListener("hashchange", function () {
-      setTimeout(function () {
+    location.hash = "#/s/gamma";
+    later(function () {
+      history.back();
+      later(function () {
         history.pushState(null, "", "about:srcdoc#/p");
         parent.postMessage({ xumRouteTest: "back" }, "*");
         // A task later, so the story sees "back" before the traversal's load.
         setTimeout(function () { history.back(); }, 50);
-      }, 500);
-    }, { once: true });
-    location.hash = "#/s/gamma";
+      });
+    });
   });
   window.addEventListener("load", function () {
     parent.postMessage({ xumRouteTest: "ready" }, "*");
@@ -947,7 +951,8 @@ export const HashRouterStaysOpen: Story = {
     });
     await expect(notice()).toBeNull();
     await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
-    await expect(routeStates).toEqual([{ route: "#/s/gamma" }]);
+    // Back on the srcdoc's own entry, which has no fragment.
+    await expect(routeStates).toEqual([{ route: "" }]);
   },
 };
 
