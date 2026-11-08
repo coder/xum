@@ -419,8 +419,8 @@ export function createConsolidationMemoryTool(args: {
   /**
    * Commands this run may not use. Default: none, which the dream pass uses. The harvest analyzer
    * denies `delete` and `rename` (only the organizer removes) and `insert`: its line offset comes
-   * from an earlier read, and goes stale under parallel calls, foreground writers and replay,
-   * where `create` and `str_replace` are anchored to content.
+   * from an earlier read and goes stale under parallel calls and foreground writers, where
+   * `create` and `str_replace` are anchored to content.
    */
   deniedCommands?: ReadonlyArray<MemoryConsolidationOp["command"]>;
   /**
