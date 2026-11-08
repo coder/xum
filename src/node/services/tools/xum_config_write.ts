@@ -71,54 +71,37 @@ function projectAgentSandboxes(document: unknown): Map<string, unknown[]> {
 
 /** The project path of a stored `[path, config]` entry, normalized like Config does. */
 function projectKeyOf(entry: unknown): string | undefined {
-  return Array.isArray(entry) ? projectPathKey(entry[0]) : undefined;
-}
-
-function projectPathKey(projectPath: unknown): string | undefined {
-  if (typeof projectPath !== "string") return undefined;
-  return stripTrailingSlashes(projectPath === "" ? "/" : projectPath);
+  if (!Array.isArray(entry) || typeof entry[0] !== "string") return undefined;
+  return stripTrailingSlashes(entry[0] === "" ? "/" : entry[0]);
 }
 
 /**
- * The agentSandbox values that bind each workspace row: those of its project and of each project
- * in its `projects` list, the global value standing in for a project without one, as in
- * agentSandboxSettingsFor(). Keyed by row id and by row path, so moving a row under another
- * project, or adding a row for the same folder there, is seen.
+ * The fields of a workspace row that decide where its commands run and which sandbox setting
+ * binds them: the path is their cwd and a write root, and the projects pick the setting.
  */
-function workspaceAgentSandboxes(document: unknown): Map<string, unknown[]> {
-  const byProject = projectAgentSandboxes(document);
-  const settingOf = (key: string | undefined): unknown[] => {
-    const values = byProject.get(key ?? "") ?? [];
-    return values.length > 0 ? values : [agentSandboxOf(document)];
-  };
-  const byRow = new Map<string, unknown[]>();
-  for (const entry of projectEntriesOf(document)) {
-    for (const row of listOf(fieldOf(listOf(entry)[1], "workspaces"))) {
-      const bound = [projectKeyOf(entry), ...rowProjectKeys(row)].map(settingOf);
-      for (const key of rowKeys(row)) byRow.set(key, [...(byRow.get(key) ?? []), bound]);
-    }
-  }
-  return byRow;
+const SANDBOX_BINDING_ROW_FIELDS = ["id", "path", "projects", "subProjectPath", "runtimeConfig"];
+
+/** Each workspace row as its project key and its SANDBOX_BINDING_ROW_FIELDS. */
+function workspaceBindings(document: unknown): unknown[] {
+  return projectEntriesOf(document).flatMap((entry) =>
+    listOf(fieldOf(listOf(entry)[1], "workspaces")).map((row) => [
+      projectKeyOf(entry),
+      SANDBOX_BINDING_ROW_FIELDS.map((field) => fieldOf(row, field)),
+    ])
+  );
 }
 
-/** The keys of a workspace row: its id and its path. */
-function rowKeys(row: unknown): string[] {
-  const id = fieldOf(row, "id");
-  const rowPath = fieldOf(row, "path");
-  return [
-    ...(typeof id === "string" ? [`id:${id}`] : []),
-    ...(typeof rowPath === "string" ? [`path:${stripTrailingSlashes(rowPath)}`] : []),
+function agentSandboxOnIn(document: unknown): boolean {
+  const values = [
+    agentSandboxOf(document),
+    ...[...projectAgentSandboxes(document).values()].flat(),
   ];
-}
-
-/** The project keys in the `projects` list of a multi-project workspace row. */
-function rowProjectKeys(row: unknown): Array<string | undefined> {
-  return listOf(fieldOf(row, "projects")).map((ref) => projectPathKey(fieldOf(ref, "projectPath")));
+  return values.some((value) => fieldOf(value, "enabled") === true);
 }
 
 /**
  * Whether `next` changes agentSandbox by value, globally or in any project (added, edited or
- * removed), or changes which values bind a workspace.
+ * removed), or, while it is on anywhere, adds a workspace row or changes a row's bindings.
  */
 function changesAgentSandbox(current: unknown, next: unknown): boolean {
   if (!isDeepStrictEqual(agentSandboxOf(current), agentSandboxOf(next))) return true;
@@ -127,23 +110,11 @@ function changesAgentSandbox(current: unknown, next: unknown): boolean {
   for (const key of new Set([...before.keys(), ...after.keys()])) {
     if (!isDeepStrictEqual(before.get(key) ?? [], after.get(key) ?? [])) return true;
   }
-  return movesWorkspaceAcrossAgentSandboxes(current, next);
-}
-
-/** Whether a workspace row that `current` has is bound by other agentSandbox values in `next`. */
-function movesWorkspaceAcrossAgentSandboxes(current: unknown, next: unknown): boolean {
-  const before = workspaceAgentSandboxes(current);
-  for (const [key, afterValues] of workspaceAgentSandboxes(next)) {
-    const beforeValues = before.get(key);
-    if (beforeValues !== undefined && !sameMembers(beforeValues, afterValues)) return true;
-  }
-  return false;
-}
-
-function sameMembers(list: unknown[], other: unknown[]): boolean {
-  const within = (values: unknown[], pool: unknown[]) =>
-    values.every((value) => pool.some((candidate) => isDeepStrictEqual(value, candidate)));
-  return within(list, other) && within(other, list);
+  if (!agentSandboxOnIn(current)) return false;
+  const known = workspaceBindings(current);
+  return workspaceBindings(next).some(
+    (row) => !known.some((candidate) => isDeepStrictEqual(row, candidate))
+  );
 }
 
 /** Applies `args.operations` to the stored document and writes it, unless a guard refuses. */
@@ -175,7 +146,9 @@ async function rewriteConfigDocument(
   if (changesAgentSandbox(currentDocument, mutationResult.document)) {
     return {
       success: false,
-      error: "Refusing to change agentSandbox. Only the user can change it in Settings.",
+      error:
+        "Refusing to change agentSandbox, or while it is on, to add a workspace or change " +
+        "a workspace's id, path, projects or runtime. Only the user can change them.",
     };
   }
 

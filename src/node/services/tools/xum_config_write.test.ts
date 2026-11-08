@@ -250,7 +250,7 @@ describe("mux_config_write", () => {
       taskSettings: { maxParallelAgentTasks: 4 },
     };
     // The global sandbox is off and only /test/proj has it on, so a workspace row that moves out
-    // of /test/proj leaves the sandbox.
+    // of /test/proj leaves the sandbox. While it is on, only the user adds or re-points rows.
     const projectOnlyConfig = {
       agentSandbox: { enabled: false },
       projects: [
@@ -258,7 +258,6 @@ describe("mux_config_write", () => {
           "/test/proj",
           { workspaces: [{ path: "/test/proj/ws", id: "ws1" }], agentSandbox: { enabled: true } },
         ],
-        ["/test/twin", { workspaces: [], agentSandbox: { enabled: true } }],
         ["/test/multi", { workspaces: [] }],
       ],
     };
@@ -320,20 +319,55 @@ describe("mux_config_write", () => {
         operations: [
           {
             op: "set",
-            path: ["projects", 2, 1, "workspaces", 0, "projects"],
+            path: ["projects", 1, 1, "workspaces", 0, "projects"],
             value: [multiWorkspace.projects[0]],
           },
         ],
         refused: true,
       },
+      // The row's path is its commands' cwd and a write root.
       {
-        name: "allows moving a workspace to a project with the same override",
+        name: "refuses changing a workspace row's path",
+        config: projectOnlyConfig,
+        operations: [
+          { op: "set", path: ["projects", 0, 1, "workspaces", 0, "path"], value: "/test/.ssh" },
+        ],
+        refused: true,
+      },
+      {
+        name: "refuses a moved row whose id and path both change",
         config: projectOnlyConfig,
         operations: [
           {
             op: "set",
             path: ["projects"],
-            value: withRows({ "/test/twin": [{ path: "/test/proj/ws", id: "ws1" }] }),
+            value: withRows({ "/test/multi": [{ path: "/test/proj/ws/.", id: "ws9" }] }),
+          },
+        ],
+        refused: true,
+      },
+      {
+        name: "allows renaming a workspace row while the sandbox is on",
+        config: projectOnlyConfig,
+        operations: [
+          { op: "set", path: ["projects", 0, 1, "workspaces", 0, "title"], value: "renamed" },
+        ],
+        refused: false,
+      },
+      {
+        name: "allows removing a workspace row while the sandbox is on",
+        config: projectOnlyConfig,
+        operations: [{ op: "set", path: ["projects", 0, 1, "workspaces"], value: [] }],
+        refused: false,
+      },
+      {
+        name: "allows adding a workspace row while no sandbox is on",
+        config: { projects: [["/test/proj", { workspaces: [] }]] },
+        operations: [
+          {
+            op: "set",
+            path: ["projects", 0, 1, "workspaces", 0],
+            value: { path: "/test/proj/ws", id: "ws1" },
           },
         ],
         refused: false,
