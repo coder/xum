@@ -1147,6 +1147,203 @@ describe("in-page links", () => {
   });
 });
 
+describe("hash routes", () => {
+  // A hash router needs the fragment to change, with hashchange and popstate, when a "#/route"
+  // link is clicked, and history.replaceState(null, "", "#/route") to work. In a srcdoc frame
+  // the document URL is about:srcdoc, but a URL passed to pushState or replaceState resolves
+  // against the app's URL, so a bare "#/route" throws SecurityError.
+  const APP_URL = "http://localhost/workspace/abc";
+
+  /**
+   * A window shaped like a srcdoc frame: History resolves its URL argument against APP_URL, as a
+   * browser does for srcdoc. Happy DOM resolves against the document URL instead, and shares
+   * History.prototype between windows, so `restore` puts the originals back.
+   */
+  function srcdocWindow() {
+    const win = new HappyWindow({ url: "about:srcdoc" });
+    const proto = win.History.prototype;
+    const originals = { pushState: proto.pushState, replaceState: proto.replaceState };
+    for (const method of ["pushState", "replaceState"] as const) {
+      proto[method] = function (
+        this: typeof proto,
+        state: unknown,
+        title: string,
+        url?: string | null
+      ) {
+        return url == null
+          ? originals[method].call(this, state, title)
+          : originals[method].call(this, state, title, new URL(url, APP_URL).href);
+      };
+    }
+    return {
+      win,
+      restore: async () => {
+        proto.pushState = originals.pushState;
+        proto.replaceState = originals.replaceState;
+        await win.happyDOM.close();
+      },
+    };
+  }
+
+  function errorName(action: () => void): string | null {
+    try {
+      action();
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.name : String(error);
+    }
+  }
+
+  function mount(script: string) {
+    const { win, restore } = srcdocWindow();
+    const doc = win.document;
+    doc.body.innerHTML = `
+      <a id="alpha" href="#/s/alpha">Alpha</a>
+      <a id="beta" href="#/s/beta">Beta</a>
+      <a id="intro-link" href="#intro">Intro</a>
+      <a id="own" href="#/s/own">Handled by the artifact</a>
+      <h2 id="intro">Intro</h2>`;
+    const scrolled: string[] = [];
+    doc.getElementById("intro")!.scrollIntoView = () => scrolled.push("intro");
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+    const run = new Function("window", "document", "CustomEvent", script) as (
+      window: unknown,
+      document: unknown,
+      customEvent: unknown
+    ) => void;
+    run(win, doc, win.CustomEvent);
+    doc.getElementById("own")!.addEventListener("click", (event) => event.preventDefault());
+    // Happy DOM navigates on a click the shim leaves alone: stop it, as a frame guard would.
+    win.addEventListener("click", (event) => event.preventDefault());
+    const events: string[] = [];
+    win.addEventListener("popstate", () => events.push(`popstate ${win.location.hash}`));
+    win.addEventListener("hashchange", (event) =>
+      events.push(`hashchange ${event.oldURL} -> ${event.newURL}`)
+    );
+    const click = (id: string) =>
+      doc
+        .getElementById(id)!
+        .dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+    return { win, restore, events, scrolled, click };
+  }
+
+  const scripts = [
+    ["HTML artifact bridge", buildArtifactBridgeScript("light")],
+    ["MCP App preamble", mcpAppPreambleScript("00")],
+  ] as const;
+
+  test("the srcdoc model rejects a bare fragment URL, as a browser does", async () => {
+    const { win, restore } = srcdocWindow();
+    try {
+      expect(errorName(() => win.history.replaceState(null, "", "#/x"))).toBe("SecurityError");
+      win.history.replaceState(null, "", "about:srcdoc#/x");
+      expect(win.location.href).toBe("about:srcdoc#/x");
+    } finally {
+      await restore();
+    }
+  });
+
+  test.each(scripts)(
+    "%s: a #/route link sets the fragment, then fires popstate and hashchange",
+    async (_name, script) => {
+      const { win, restore, events, scrolled, click } = mount(script);
+      try {
+        click("alpha");
+        expect(win.location.href).toBe("about:srcdoc#/s/alpha");
+        expect(events).toEqual([
+          "popstate #/s/alpha",
+          "hashchange about:srcdoc -> about:srcdoc#/s/alpha",
+        ]);
+        click("beta");
+        expect(win.location.hash).toBe("#/s/beta");
+        expect(events.slice(2)).toEqual([
+          "popstate #/s/beta",
+          "hashchange about:srcdoc#/s/alpha -> about:srcdoc#/s/beta",
+        ]);
+        // A link to an element still scrolls to it, and the fragment follows as in a browser.
+        click("intro-link");
+        expect(scrolled).toEqual(["intro"]);
+        expect(win.location.hash).toBe("#intro");
+        expect(events.slice(4)).toEqual([
+          "popstate #intro",
+          "hashchange about:srcdoc#/s/beta -> about:srcdoc#intro",
+        ]);
+      } finally {
+        await restore();
+      }
+    }
+  );
+
+  test.each(scripts)(
+    "%s: clicking the current fragment again fires neither event",
+    async (_name, script) => {
+      const { win, restore, events, click } = mount(script);
+      try {
+        click("alpha");
+        expect(events).toHaveLength(2);
+        click("alpha");
+        expect(events).toHaveLength(2);
+        expect(win.location.hash).toBe("#/s/alpha");
+      } finally {
+        await restore();
+      }
+    }
+  );
+
+  test.each(scripts)(
+    "%s: a click the artifact cancels keeps the fragment",
+    async (_name, script) => {
+      const { win, restore, events, click } = mount(script);
+      try {
+        click("own");
+        expect(win.location.href).toBe("about:srcdoc");
+        expect(events).toEqual([]);
+      } finally {
+        await restore();
+      }
+    }
+  );
+
+  test.each(scripts)(
+    "%s: replaceState and pushState resolve a # URL against the document",
+    async (_name, script) => {
+      const { win, restore } = mount(script);
+      try {
+        win.history.replaceState(null, "", "#/s/delta");
+        expect(win.location.href).toBe("about:srcdoc#/s/delta");
+        // The URL parser ignores surrounding whitespace.
+        win.history.pushState({ n: 1 }, "", "  #/s/echo ");
+        expect(win.location.href).toBe("about:srcdoc#/s/echo");
+        expect(win.history.state).toEqual({ n: 1 });
+      } finally {
+        await restore();
+      }
+    }
+  );
+
+  test.each(scripts)(
+    "%s: replaceState and pushState leave other URLs to the browser",
+    async (_name, script) => {
+      const { win, restore } = mount(script);
+      try {
+        win.history.replaceState({ n: 2 }, "");
+        expect(win.history.state).toEqual({ n: 2 });
+        win.history.replaceState(null, "", null);
+        win.history.replaceState(null, "", "about:srcdoc#/abs");
+        expect(win.location.href).toBe("about:srcdoc#/abs");
+        // Not the document's own URL: the browser's SecurityError, not a rewrite into the frame.
+        for (const url of ["?q=1", "/other", "https://example.com/#/x"]) {
+          expect(errorName(() => win.history.replaceState(null, "", url))).toBe("SecurityError");
+          expect(errorName(() => win.history.pushState(null, "", url))).toBe("SecurityError");
+        }
+        expect(win.location.href).toBe("about:srcdoc#/abs");
+      } finally {
+        await restore();
+      }
+    }
+  );
+});
+
 /** Minimal event target: the suite may run with Happy DOM's globals installed by other files. */
 class FakeTarget {
   private readonly listeners = new Map<string, Array<(event: { detail?: unknown }) => void>>();
