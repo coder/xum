@@ -9,10 +9,9 @@ import {
 } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
-import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { configFilePath, type Config, type ProjectsConfig, type Workspace } from "@/node/config";
+import { configFilePath, type Config, type ProjectsConfig } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
@@ -675,13 +674,18 @@ class ConfigSnapshot {
     return this.store.fallbackIds !== undefined;
   }
 
+  /** Whether the lenient walk built this entry from its config row alone (see loadAllMetadataTolerant). */
+  isFallbackEntry(workspaceId: string): boolean {
+    return this.store.fallbackIds?.has(workspaceId) === true;
+  }
+
   /**
    * Throws for an entry that the lenient walk built from its config row alone: its name and
    * runtime may live only in its unreadable metadata.json, so the checkout it names may not
    * hold its override file, and a disable there is unknown, not absent.
    */
   assertReadableEntry(workspaceId: string): void {
-    if (this.store.fallbackIds?.has(workspaceId) === true) {
+    if (this.isFallbackEntry(workspaceId)) {
       throw new Error(
         `Workspace ${workspaceId} metadata is unreadable; its MCP overrides are unknown`
       );
@@ -713,16 +717,6 @@ function assertParentKnownForSave(snapshot: ConfigSnapshot, current: ResolvedOve
       "The parent workspace's MCP settings could not be read (another workspace's metadata is unreadable); the settings were not saved."
     );
   }
-}
-
-/**
- * Config rows with no id that still carry a legacy `workspace.mcp` value. A null id counts as
- * none: config.json accepts it as a legacy row's (see validateConfigStructure).
- */
-function idlessLegacyRows(config: ProjectsConfig): Workspace[] {
-  return [...config.projects.values()]
-    .flatMap((project) => project.workspaces)
-    .filter((row) => row.id == null && row.mcp !== undefined);
 }
 
 /** Unlocked fork-copy preparations attempted before the terminal fallback (see copyOverridesToForkedCheckout). */
@@ -4661,9 +4655,10 @@ export class WorkspaceMcpOverridesService {
     opaqueFields: Record<string, unknown>;
   }> {
     const legacyConfig = snapshot.loadLegacyConfig();
-    await this.assertNoUnretirableLegacySharer(written, writtenPath, legacyConfig, snapshot);
     const legacyById = legacyOverridesById(legacyConfig);
     const all = await snapshot.loadAllMetadata();
+    // After the walk: it is what records which entries were built from config.json alone.
+    this.assertNoLegacyValueOnFallbackRow(legacyConfig, snapshot);
     // Legacy values are pre-migration leftovers, and only a carrier's sharing
     // matters here: canonicalize the carriers, never every registered
     // checkout (one realpath each made saves at 7,550 workspaces take seconds).
@@ -4705,52 +4700,30 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
-   * Refuses a save when an id-less config row that carries a legacy `workspace.mcp` value may
-   * share the written checkout. The id lookups in planSharersLegacyRetirement cannot reach that
-   * row's value, so nothing retires it: after a clear it would migrate back over the user's write
-   * once the row gets its id. On a degraded host the id lives only in an unreadable metadata.json
-   * (the lenient walk lists the row under a fallback id). On a healthy host the row is id-less
-   * only until its read-time migration lands, so the check runs for every registry.
+   * Refuses every save while a config row that the lenient walk built from config.json alone
+   * still carries a legacy `workspace.mcp` value. Its id (when the row lacks one), its name and
+   * maybe its runtime live only in its unreadable metadata.json, so neither the id lookups nor the
+   * sharer scan above can tell whether it shares the written checkout: a row without a runtime
+   * gets the default one. Wherever it is, its value could survive a clear and migrate back over
+   * the user's write once the file is readable. A healthy registry builds no such row.
    */
-  private async assertNoUnretirableLegacySharer(
-    written: FrontendWorkspaceMetadata,
-    writtenPath: string,
+  private assertNoLegacyValueOnFallbackRow(
     legacyConfig: ProjectsConfig,
     snapshot: ConfigSnapshot
-  ): Promise<void> {
-    const identity = runtimeFilesystemIdentity(written.runtimeConfig);
-    const rows = idlessLegacyRows(legacyConfig);
-    if (identity === undefined || rows.length === 0) return;
-    const canonicalWritten = await snapshot.canonicalize(identity, writtenPath);
-    for (const row of rows) {
-      if (await this.legacyRowMayShare(row, identity, canonicalWritten, snapshot)) {
-        throw new Error(
-          `The workspace registered at ${row.path} may share this checkout and carries legacy MCP settings that Xum cannot retire until config.json holds its id (its metadata.json is unreadable or not migrated yet); the settings were not saved. Repair that file, then try again.`
-        );
+  ): void {
+    for (const [projectPath, project] of legacyConfig.projects) {
+      for (const row of project.workspaces) {
+        if (row.mcp === undefined) continue;
+        // The walk's fallback id: the row's own, else the generated legacy one (a null id
+        // counts as none, as config.json accepts it for a legacy row).
+        const id = row.id ?? this.config.generateLegacyId(projectPath, row.path);
+        if (snapshot.isFallbackEntry(id)) {
+          throw new Error(
+            `The workspace registered at ${row.path} carries legacy MCP settings, and Xum cannot read its metadata.json to tell whether they belong to this checkout; the settings were not saved. Repair that file, then try again.`
+          );
+        }
       }
     }
-  }
-
-  /** Whether a config row's checkout may be the written one (see assertNoUnretirableLegacySharer). */
-  private async legacyRowMayShare(
-    row: Workspace,
-    identity: string,
-    canonicalWritten: string | undefined,
-    snapshot: ConfigSnapshot
-  ): Promise<boolean> {
-    // A row without a runtime config gets the default runtime, as in the registry walk. The
-    // written checkout's identity is used for both paths: a mismatch only refuses more saves.
-    const rowPath = this.getOverridesFilePaths(
-      row.path,
-      row.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG
-    )[0];
-    const canonicalRow = await snapshot.canonicalize(identity, rowPath);
-    // An unresolvable path may share the checkout too.
-    return (
-      canonicalWritten === undefined ||
-      canonicalRow === undefined ||
-      canonicalRow === canonicalWritten
-    );
   }
 
   /**

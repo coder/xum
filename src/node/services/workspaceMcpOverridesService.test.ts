@@ -3099,6 +3099,8 @@ describe("WorkspaceMcpOverridesService", () => {
       loadAllMetadata: () =>
         config.getAllWorkspaceMetadata({ throwOnError: true, probeCheckouts: false }),
       canonicalize: (_identity: string, filePath: string) => Promise.resolve(filePath),
+      // A strict registry builds no entry from config.json alone.
+      isFallbackEntry: () => false,
     };
     const written = await internals.getRuntimeAndWorkspacePath("ws-ssh-proj-a");
     const plan = await internals.planSharersLegacyRetirement(
@@ -5126,89 +5128,6 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(nodeFs.existsSync(overridesFile(healthy.workspacePath))).toBe(false);
     });
 
-    // An id-less row with a legacy value, at `legacyPath`, whose metadata.json does not parse.
-    const registerLegacyCarrier = async (legacyPath: string) => {
-      const legacyEntry = {
-        path: legacyPath,
-        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
-        mcp: { enabledServers: ["legacy-server"] },
-      };
-      await config.editConfig((cfg) => {
-        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
-        return cfg;
-      });
-      const sessionDir = path.join(config.sessionsDir, path.basename(legacyPath));
-      await fs.mkdir(sessionDir, { recursive: true });
-      await fs.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
-    };
-
-    it("refuses a save while the legacy carrier's checkout cannot be resolved", async () => {
-      // A checkout whose realpath fails may still be the written one (a stalled mount).
-      const service = new WorkspaceMcpOverridesService(config);
-      const healthy = await registerWorkspace("healthy-beside-legacy");
-      await writeEnable(healthy.workspacePath);
-      const missing = path.join(config.srcDir, "legacy-project", "gone-branch");
-      await registerLegacyCarrier(missing);
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-      await expect(
-        service.setOverridesForWorkspace(healthy.workspaceId, { enabledServers: ["other"] })
-      ).rejects.toThrow(`The workspace registered at ${missing}`);
-      expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
-    });
-
-    it("refuses a clear while the written checkout cannot be resolved", async () => {
-      // The carrier sits elsewhere, but an unresolvable written path may be its checkout too.
-      const service = new WorkspaceMcpOverridesService(config);
-      const healthy = await registerWorkspace("healthy-beside-legacy");
-      const elsewhere = path.join(config.srcDir, "legacy-project", "old-branch");
-      await fs.mkdir(elsewhere, { recursive: true });
-      await registerLegacyCarrier(elsewhere);
-      await fs.rm(healthy.workspacePath, { recursive: true, force: true });
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-      await expect(service.setOverridesForWorkspace(healthy.workspaceId, {})).rejects.toThrow(
-        `The workspace registered at ${elsewhere}`
-      );
-    });
-
-    it("never pairs a Docker checkout with a host carrier that spells the same path", async () => {
-      // Docker never shares (every container reports `/src`), whatever a host row's path says.
-      // Driven directly: a Docker save needs a running container.
-      const service = new WorkspaceMcpOverridesService(config);
-      const internals = service as unknown as {
-        assertNoUnretirableLegacySharer: (
-          written: { runtimeConfig: unknown },
-          writtenPath: string,
-          legacyConfig: unknown,
-          snapshot: { canonicalize: (identity: string, filePath: string) => Promise<string> }
-        ) => Promise<void>;
-      };
-      const legacyConfig = {
-        projects: new Map([
-          ["/fake/legacy-project", { workspaces: [{ path: "/src", mcp: { enabledServers: [] } }] }],
-        ]),
-      };
-      const spelled = {
-        canonicalize: (_identity: string, filePath: string) => Promise.resolve(filePath),
-      };
-      const sharedPath = path.join("/src", ".xum", "mcp.local.jsonc");
-      await internals.assertNoUnretirableLegacySharer(
-        { runtimeConfig: { type: "docker", image: "node:20" } },
-        sharedPath,
-        legacyConfig,
-        spelled
-      );
-      // The same spelling on the host is a sharer: the guard above is what keeps Docker apart.
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-      await expect(
-        internals.assertNoUnretirableLegacySharer(
-          { runtimeConfig: { type: "local" } },
-          sharedPath,
-          legacyConfig,
-          spelled
-        )
-      ).rejects.toThrow("The workspace registered at /src");
-    });
-
     it("reports a config.json that breaks after the save wrote its document as it is", async () => {
       // The repair advice says the settings were not saved, so it is only for failures before the
       // locked save writes anything. Here the document lands and the legacy clear fails after it.
@@ -5234,51 +5153,56 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(await enabledServers(healthy.workspacePath)).toEqual(["other"]);
     });
 
-    it("refuses a clear on a healthy host while an id-less carrier's migration has not landed", async () => {
-      // Its metadata.json is readable, but until the read-time migration writes its id into
-      // config.json, no id lookup can retire its legacy value either.
-      const service = new WorkspaceMcpOverridesService(config);
-      const healthy = await registerWorkspace("healthy-beside-legacy");
-      await writeEnable(healthy.workspacePath);
-      const legacyEntry = {
-        path: healthy.workspacePath,
-        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
-        mcp: { enabledServers: ["legacy-server"] },
-      };
-      await config.editConfig((cfg) => {
-        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
-        return cfg;
-      });
-      const sessionDir = path.join(config.sessionsDir, path.basename(healthy.workspacePath));
-      await fs.mkdir(sessionDir, { recursive: true });
-      await fs.writeFile(
-        path.join(sessionDir, "metadata.json"),
-        JSON.stringify({ id: "legacy-alias-id", name: path.basename(healthy.workspacePath) })
-      );
-      // The migration write is best effort: when it fails, the row stays id-less.
-      const real = config.editConfig.bind(config);
-      const editSpy = spyOn(config, "editConfig").mockImplementation((...args) =>
-        new Error().stack?.includes("getAllWorkspaceMetadata")
-          ? Promise.reject(new Error("the migration write failed"))
-          : real(...args)
-      );
-      try {
-        expect(
-          (await config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true })).map(
-            (metadata) => metadata.id
-          )
-        ).toContain("legacy-alias-id");
-        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-        await expect(service.setOverridesForWorkspace(healthy.workspaceId, {})).rejects.toThrow(
-          `The workspace registered at ${healthy.workspacePath}`
+    it.each([
+      ["a Docker", "/src", { type: "docker", image: "node:20" }],
+      [
+        "an SSH",
+        "/remote/checkouts/old",
+        { type: "ssh", host: "remote.example.invalid", srcBaseDir: "/remote/src" },
+      ],
+    ] as const)(
+      "saves and clears on a healthy host beside an id-less legacy row on %s runtime",
+      async (_kind, legacyPath, runtimeConfig) => {
+        // Its metadata.json is readable, so nothing was built from config.json alone, and the save
+        // runs as on main even while the row is still id-less in config.json.
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await writeEnable(healthy.workspacePath);
+        const legacyEntry = {
+          path: legacyPath,
+          runtimeConfig,
+          mcp: { enabledServers: ["legacy-server"] },
+        };
+        await config.editConfig((cfg) => {
+          cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
+          return cfg;
+        });
+        const sessionDir = path.join(config.sessionsDir, path.basename(legacyPath));
+        await fs.mkdir(sessionDir, { recursive: true });
+        await fs.writeFile(
+          path.join(sessionDir, "metadata.json"),
+          JSON.stringify({ id: "legacy-alias-id", name: "old", runtimeConfig })
         );
-      } finally {
-        editSpy.mockRestore();
+        // A registry read that skips the migration write (as the workspace view tail's does)
+        // leaves the row id-less for every later read of this config snapshot.
+        const fallbackIds = new Set<string>();
+        await config.getAllWorkspaceMetadata({
+          probeCheckouts: false,
+          throwOnError: true,
+          persistMigrations: false,
+          fallbackIds,
+        });
+        expect(fallbackIds.size).toBe(0);
+        await service.setOverridesForWorkspace(healthy.workspaceId, { enabledServers: ["saved"] });
+        expect(await enabledServers(healthy.workspacePath)).toEqual(["saved"]);
+        await service.setOverridesForWorkspace(healthy.workspaceId, {});
+        expect(nodeFs.existsSync(overridesFile(healthy.workspacePath))).toBe(false);
       }
-      expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
-    });
+    );
 
-    it("saves while the legacy entry with a legacy value sits at another checkout", async () => {
+    it("refuses a save while the legacy entry with a legacy value sits at another checkout", async () => {
+      // The path in its config row may not be its checkout: its runtime may live only in the
+      // unreadable metadata.json.
       const service = new WorkspaceMcpOverridesService(config);
       const healthy = await registerWorkspace("healthy-beside-legacy");
       await writeEnable(healthy.workspacePath);
@@ -5289,9 +5213,70 @@ describe("WorkspaceMcpOverridesService", () => {
         return cfg;
       });
       expect(legacyPath).not.toBe(healthy.workspacePath);
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        service.setOverridesForWorkspace(healthy.workspaceId, { enabledServers: ["other"] })
+      ).rejects.toThrow(`The workspace registered at ${legacyPath}`);
+      expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
+    });
+
+    it("saves beside a readable legacy row that carries a legacy value at another checkout", async () => {
+      // Only rows built from config.json alone block saves, not every legacy value on the host.
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry();
+      const carrier = await registerWorkspace("readable-carrier");
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const row = project.workspaces.find((w) => w.id === carrier.workspaceId);
+          if (row) row.mcp = { enabledServers: ["legacy-server"] };
+        }
+        return cfg;
+      });
       await service.setOverridesForWorkspace(healthy.workspaceId, { enabledServers: ["other"] });
       expect(await enabledServers(healthy.workspacePath)).toEqual(["other"]);
     });
+
+    it.each([
+      ["no runtime in config.json", undefined],
+      [
+        "an SSH runtime",
+        { type: "ssh", host: "remote.example.invalid", srcBaseDir: "/remote/src" },
+      ],
+    ] as const)(
+      "refuses a save and a clear while a nameless legacy row with %s carries a legacy value",
+      async (_kind, runtimeConfig) => {
+        // The row holds its id, but its name and maybe its runtime live only in the unreadable
+        // metadata.json: the walk builds it from config.json alone (the default runtime without
+        // one), so the sharer scan cannot tell whether its value must be retired.
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await writeEnable(healthy.workspacePath);
+        const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
+        await fs.mkdir(legacyPath, { recursive: true });
+        const legacyEntry = {
+          id: "partial-legacy-id",
+          path: legacyPath,
+          ...(runtimeConfig === undefined ? {} : { runtimeConfig }),
+          mcp: { enabledServers: ["legacy-server"] },
+        };
+        await config.editConfig((cfg) => {
+          cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
+          return cfg;
+        });
+        const sessionDir = path.join(config.sessionsDir, "old-branch");
+        await fs.mkdir(sessionDir, { recursive: true });
+        await fs.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
+        for (const overrides of [{ enabledServers: ["other"] }, {}]) {
+          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+          await expect(
+            service.setOverridesForWorkspace(healthy.workspaceId, overrides)
+          ).rejects.toThrow(`The workspace registered at ${legacyPath}`);
+        }
+        expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
+      }
+    );
 
     for (const { shape, entryId, parentId } of [
       { shape: "id-less", entryId: undefined, parentId: "legacy-stable-id" },
