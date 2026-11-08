@@ -90,6 +90,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          skip-build-caches: "true"
       # The replay seed (tests/bugbash/sandbox/cacheSeed.ts): this ref's newest seed, else
       # main's. GitHub scopes each saved cache to the ref that saved it (refs/pull/<n>/merge for
       # a PR run), so a PR or the merge queue never changes what main replays. The launcher

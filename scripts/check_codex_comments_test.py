@@ -48,6 +48,21 @@ def board_for(body, head):
     return body.replace(board_head(body), head)
 
 
+RUNNING_LABEL = "🔄 Running"
+COMPLETED_LABEL = "✅ Completed"
+HEADING = "\n## Codex Review Summary\n"
+FOLD = re.compile(r"\n<details>\n<summary><strong>Codex Review Summary</strong>: (.+?)</summary>\n")
+
+
+def collapsed(body, label):
+    """A heading board folded into one <details> block, as Codex posts it since 2026-11-06
+    (collapsed_* fixtures): the heading becomes a summary line with an overall status,
+    and a closing tag follows the help text."""
+    assert body.count(HEADING) == 1, body
+    folded = f"\n<details>\n<summary><strong>Codex Review Summary</strong>: {label}</summary>\n"
+    return body.replace(HEADING, folded, 1) + "\n\n</details>"
+
+
 def comment(body, author=BOT, created_at=AFTER, minimized=False, association="MEMBER"):
     return {
         "id": "comment",
@@ -99,6 +114,28 @@ def snapshot(comments=(), threads=(), reactions=(), more=False, head=None):
             }
         }
     }
+
+
+def gate_verdicts(bodies, head):
+    """check_codex_comments.sh's verdict for each body posted alone by Codex, with no review
+    threads (0 clean, 10 still running, 1 blocking) and the bodies it would show, computed by
+    its own jq classifier in one process."""
+    program = """include "codex_comments";
+      (([] | codex_resolved_finding_commits($bot)) + {clean_security_receipt: false}) as $cleared
+      | .[]
+      | [{author: {login: $bot}, authorAssociation: "MEMBER", isMinimized: false, body: .}]
+      | codex_blocking_comments($bot; $head; []; $cleared) as $blocking
+      | ($blocking | codex_pending_count($bot; $head; []; $cleared)) as $pending
+      | {exit: (if ($blocking | length) == 0 then 0
+          elif $pending == ($blocking | length) then 10 else 1 end),
+        shown: [$blocking[].body]}"""
+    result = subprocess.run(
+        ["jq", "-c", "-L", str(SCRIPTS / "lib"), "--arg", "bot", BOT, "--arg", "head", head, program],
+        input=json.dumps(bodies), text=True, capture_output=True, timeout=60, check=True,
+    )
+    verdicts = [json.loads(line) for line in result.stdout.splitlines()]
+    assert len(verdicts) == len(bodies), result.stderr
+    return verdicts
 
 
 class CodexGateTest(unittest.TestCase):
@@ -723,6 +760,170 @@ else:
         ):
             with self.subTest(name):
                 self.assert_gate(1, data)
+
+    def test_collapsed_board_reads_like_its_heading_form(self):
+        # Since 2026-11-06 Codex can fold its board into one <details> block. The gate read
+        # that form as unknown, so --wait-for-review failed at once on a running review.
+        # Folding must not change a verdict, except that a Running summary line never lets
+        # a board count as completed.
+        def folded_verdict(expected, label):
+            return 10 if label == RUNNING_LABEL and expected == 0 else expected
+
+        real = {name: f for name, f in FIXTURES.items() if FOLD.search(f["body"])}
+        self.assertIn("collapsed_running_summary", real)
+        for name, fixture in real.items():
+            label = FOLD.search(fixture["body"]).group(1)
+            heading = FOLD.sub(HEADING, fixture["body"], 1).removesuffix("\n\n</details>")
+            with self.subTest(real=name):
+                # The helper below folds a board exactly the way Codex does.
+                self.assertEqual(collapsed(heading, label), fixture["body"])
+                result = self.run_gate(snapshot([comment(heading)]))
+                self.assertEqual(
+                    folded_verdict(result.returncode, label),
+                    fixture["expected_exit_code"],
+                    result.stdout + result.stderr,
+                )
+        for name, fixture in FIXTURES.items():
+            if HEADING not in fixture["body"]:
+                continue
+            for label in (COMPLETED_LABEL, RUNNING_LABEL):
+                with self.subTest(heading=name, label=label):
+                    self.assert_gate(
+                        folded_verdict(fixture["expected_exit_code"], label),
+                        snapshot([comment(collapsed(fixture["body"], label))]),
+                    )
+
+        board = FIXTURES["heading_completed_summary"]["body"]
+        receipt = comment(FIXTURES["heading_completed_summary_receipt"]["body"])
+        for label, expected in ((None, 0), (COMPLETED_LABEL, 0), (RUNNING_LABEL, 10)):
+            with self.subTest("a completed board beside its security receipt", label=label):
+                body = board if label is None else collapsed(board, label)
+                self.assert_gate(expected, snapshot([comment(body), receipt]))
+        findings = FIXTURES["collapsed_running_findings_summary"]["body"]
+        advisory = re.search(r"#discussion_r([0-9]+)\)", findings).group(1)
+        with self.subTest("a resolved advisory clears its bullet on a collapsed board"):
+            resolved = thread("[P2] Advisory", resolved=True, discussion=advisory)
+            self.assert_gate(10, snapshot([comment(findings)], [resolved]))
+
+        # Only that exact fold is read; anything around it still blocks (text inserted into its
+        # tag lines: test_text_inserted_around_the_fold_never_reads_as_a_board).
+        clean = collapsed(FIXTURES["summary"]["body"], COMPLETED_LABEL)
+        self.assert_gate(0, snapshot([comment(clean)]))
+        finding = "[P1] Validate the caller before reading credentials"
+        for case, body in (
+            ("unknown summary status", clean.replace(COMPLETED_LABEL, "⚠️ Findings")),
+            ("failed summary status", clean.replace(COMPLETED_LABEL, "❌ Failed")),
+            ("text before the table", clean.replace("</summary>\n", "</summary>\n\n" + finding + "\n", 1)),
+            ("no closing tag", clean.removesuffix("\n\n</details>")),
+            ("two closing tags", clean + "\n\n</details>"),
+            ("text after the closing tag", clean + "\n\n" + finding),
+            ("a closing tag without the fold", FIXTURES["summary"]["body"] + "\n\n</details>"),
+        ):
+            with self.subTest(case):
+                self.assertNotEqual(body, clean)
+                self.assert_gate(1, snapshot([comment(body)]))
+
+    def test_text_inserted_around_the_fold_never_reads_as_a_board(self):
+        # Each regex position that tolerated extra text let a hidden finding pass (verifier
+        # mutants on #7975). So a finding goes into every character gap of the fold's three tag
+        # lines, and onto a line of its own at eight boundaries: before the marker, after the
+        # marker, after the review state, before the fold, between the details and summary
+        # lines, after the summary line, after the help text and before the closing tag. It also
+        # goes in place of the blank line before the closing tag, at the end of the help text,
+        # after the fold and onto the marker's line. It goes in as plain text, as an attribute
+        # and as an HTML comment, since tolerance written for any of those shapes could hide
+        # it. The template carries the three metadata lines (marker, review state, security)
+        # that real folds have once the security review has started. Every such body must
+        # block at once and show the finding: never read completed (0) or running (10). One jq
+        # process applies the gate's own classifier to all of them, since a gate run per body
+        # took minutes; the real gate checks one body per position kind.
+        finding = "[P1] Validate the caller before reading credentials"
+        shapes = {
+            "text": finding,
+            "attribute": f' data-note="{finding}"',
+            "comment": f"<!-- {finding} -->",
+        }
+        end = "\n\n</details>"
+        cases, gate_cases = [], []
+        for label, exact in ((COMPLETED_LABEL, 0), (RUNNING_LABEL, 10)):
+            fold = collapsed(FIXTURES["review_state_summary"]["body"], label)
+            opening = fold.index("\n<details>\n<summary><strong>") + 1
+            summary = opening + len("<details>\n")
+            summary_end = fold.index("</summary>\n", summary) + len("</summary>")
+            closing = len(fold) - len("</details>")
+            marker_end = fold.index("\n") + 1
+            state_end = fold.index("\n", marker_end) + 1
+            self.assertTrue(fold[marker_end:].startswith("<!-- codex-review-state:v1 "))
+            self.assertTrue(fold[state_end:].startswith("<!-- codex-security-review:v1 "))
+            self.assertTrue(fold.endswith(end))
+            inserted = {}
+            for shape, text in shapes.items():
+                for line, start, stop in (
+                    ("details line", opening, summary - 1),
+                    ("summary line", summary, summary_end),
+                    ("closing line", closing, len(fold)),
+                ):
+                    for gap in range(start, stop + 1):
+                        inserted[f"{label}, {shape}, {line} gap {gap - start}"] = (
+                            fold[:gap] + text + fold[gap:]
+                        )
+                own_line = {
+                    "before the marker": 0,
+                    "after the marker": marker_end,
+                    "after the review state": state_end,
+                    "before the fold": opening,
+                    "between the details and summary lines": summary,
+                    "after the summary line": summary_end + 1,
+                    "after the help text": closing - 1,
+                    "before the closing tag": closing,
+                }
+                for where, at in own_line.items():
+                    inserted[f"{label}, {shape}, line {where}"] = fold[:at] + text + "\n" + fold[at:]
+                inserted[f"{label}, {shape}, in place of the blank line"] = (
+                    fold[: -len(end)] + "\n" + text + "\n</details>"
+                )
+                inserted[f"{label}, {shape}, end of the help text"] = fold[: -len(end)] + text + end
+                inserted[f"{label}, {shape}, line after the fold"] = fold + "\n" + text
+                inserted[f"{label}, {shape}, marker's line"] = text + " " + fold
+            cases.append((f"{label}, exact fold", fold, exact))
+            cases += [(case, body, 1) for case, body in inserted.items()]
+            gate_cases += [(f"{label}, exact fold", fold, exact)] + [
+                (case, inserted[case], 1)
+                for case in (
+                    f"{label}, text, details line gap 0",
+                    f"{label}, text, summary line gap 20",
+                    f"{label}, text, closing line gap {len('</details>')}",
+                    f"{label}, text, line before the marker",
+                    f"{label}, attribute, details line gap {len('<details')}",
+                    f"{label}, comment, line after the summary line",
+                    f"{label}, text, line after the review state",
+                )
+            ]
+        verdicts = gate_verdicts([body for _, body, _ in cases], board_head(cases[0][1]))
+        for (case, body, expected), verdict in zip(cases, verdicts):
+            with self.subTest(case):
+                self.assertEqual(verdict["exit"], expected, body)
+                if expected == 1:
+                    self.assertIn(finding, "".join(verdict["shown"]))
+        # The real gate agrees with the classifier on each kind of position.
+        for case, body, expected in gate_cases:
+            with self.subTest("gate: " + case):
+                result = self.assert_gate(expected, snapshot([comment(body)]))
+                if expected == 1:
+                    self.assertIn(finding, result.stdout)
+
+    def test_a_collapsed_running_board_waits_out_an_earlier_failure_notice(self):
+        # coder/xum#7966: CI saw Codex's collapsed running board beside the failure notice of
+        # an earlier attempt and failed at once. A rerun after the review finished passed.
+        failure = comment(FIXTURES["review_failure_unknown_error"]["body"], created_at=BEFORE)
+        receipt = comment(FIXTURES["heading_completed_summary_receipt"]["body"])
+        running = snapshot([comment(FIXTURES["collapsed_running_summary"]["body"]), failure])
+        later = snapshot([comment(FIXTURES["heading_running_summary"]["body"]), failure])
+        done = snapshot([comment(FIXTURES["heading_completed_summary"]["body"]), failure, receipt])
+        result = self.assert_gate(10, running)
+        self.assertIn("has not finished reviewing", result.stdout)
+        self.assert_gate(0, [running, later, done], wait=60)
+        self.assertEqual(self.comment_rounds, 3)
 
     def test_wait_for_review_gives_up_and_never_hides_findings(self):
         running = snapshot([comment(FIXTURES["running_summary"]["body"])])

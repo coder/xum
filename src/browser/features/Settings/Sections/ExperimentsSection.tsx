@@ -27,6 +27,7 @@ import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { ArtifactsExperimentConfig } from "./ArtifactsExperimentConfig";
 import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
+import { MemoryDreamCostCeilingSetting } from "./MemoryDreamCostCeilingSetting";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
 
@@ -741,6 +742,7 @@ export function ExperimentsSection() {
   const { api } = useAPI();
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const memoryConsolidationEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   const artifactsSubExperimentIds = visibleArtifactsSubExperimentIds(
@@ -803,6 +805,7 @@ export function ExperimentsSection() {
               {exp.id === EXPERIMENT_IDS.MEMORY && memoryEnabled && (
                 <ExperimentSettingsPanel>
                   <SubExperimentRows experimentIds={MEMORY_SUB_EXPERIMENT_IDS} />
+                  {memoryConsolidationEnabled && <MemoryDreamCostCeilingSetting />}
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING && ptcEnabled && (
