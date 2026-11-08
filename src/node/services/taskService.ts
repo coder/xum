@@ -1111,8 +1111,8 @@ export interface StreamEndDecision {
   readonly messageId: string;
   /**
    * The row's completed report predates this attempt (OwnedTaskAttempt.inheritedReport; always
-   * false for an attempt this process does not own, which has no start to compare). Only a report
-   * that is not inherited contradicts a `nonreport` decision (see
+   * false for an attempt this process does not own, which has no publishing CAS to read). Only a
+   * report that is not inherited contradicts a `nonreport` decision (see
    * StreamEndLedger.resolveStreamEndDecision).
    */
   readonly inheritedReport: boolean;
@@ -4099,8 +4099,9 @@ export class TaskService implements AgentTaskIntegration {
 
   /**
    * Tests call this; AttemptLedger owns the attempt identity. A reservation or launch begins on a
-   * row that is `starting` or not yet written, so it passes `inheritedReport: false`; only the
-   * reawakening and reactivation CAS can keep a completed row, and they pass what they wrote.
+   * row that has never reported (not yet written, `starting` or `running`), so it passes
+   * `inheritedReport: false`; only the reawakening and reactivation CAS can keep a completed row,
+   * and they pass what they wrote.
    */
   private beginOwnedTaskAttempt(
     taskId: string,
