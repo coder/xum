@@ -1686,6 +1686,8 @@ describe("ServiceContainer", () => {
       await runtime.runPromise(TestClock.adjust(Duration.minutes(1)));
 
       expect(loadConfigSpy).toHaveBeenCalledTimes(1);
+      // The held read is the heartbeat's first tick, so exactly one tick started on the clock.
+      expect(snapshotsSpy).toHaveBeenCalledTimes(1);
       expect(heartbeatInternals.startupTimeout).toBeNull();
       expect(heartbeatInternals.checkInterval).not.toBeNull();
 
