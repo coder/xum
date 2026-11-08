@@ -594,10 +594,11 @@ export async function runMemoryHarvest(args: {
         abortSignal: signal,
         writableScopes: ["workspace"],
         // The cookbook's analyzers only add and correct; removing and moving files is the organizer's.
-        // `insert` goes too: its line offset is read earlier and goes stale under parallel calls,
-        // foreground memory writers and a replayed chunk, so a landed edit could be repeated or
-        // misplaced. `create` (refuses an existing path) and `str_replace` (needs exactly one match
-        // of its old text) are anchored to content, so a stale or replayed call fails instead.
+        // `insert` goes too: its line offset is read earlier and goes stale under parallel calls
+        // and foreground memory writers, so an edit could land in the wrong place. `create`
+        // (refuses an existing path) and `str_replace` (needs exactly one match of its old text)
+        // are anchored to content. A replayed chunk can still repeat an append-style `str_replace`
+        // (its old line still matches once); only a replayed `create` fails.
         deniedCommands: ["delete", "rename", "insert"],
         rejectSecretLike: true,
         description: ANALYZER_TOOL_DESCRIPTION,
