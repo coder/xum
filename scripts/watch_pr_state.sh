@@ -11,6 +11,12 @@
 # stdout: one line per PR for the first poll, then one line per state change, then
 #   RESULT <ok|fail|error|timeout> <pr>:<state>...
 #
+# Output carries only fixed tokens, counts and GitHub IDs. A failed state reads
+#   failed 2/31 checks, never the check names: names, descriptions and links are written by
+#   the PR author and by apps that post statuses, so they need an explicit read:
+#   ./scripts/wait_pr_checks.sh <pr> --once prints each failed check with its name and link.
+#   A failed read prints GitHub's GraphQL error messages and fixed text, not the reply.
+#
 # Without --queue, checks on the head and merge commit count as in wait_pr_checks.sh:
 #   pending, and the final states ready, blocked, failed, conflicting, behind, draft,
 #   closed, merged. ready means every non-visual check passed or was skipped (SKIPPED or
@@ -50,7 +56,7 @@ DEADLINE_MINS=120
 
 finish() {
   trap - EXIT
-  rm -f "${RESPONSE_FILE:-}"
+  rm -f "${RESPONSE_FILE:-}" "${JQ_ERR_FILE:-}"
   local line="RESULT $1" i
   for i in "${!PRS[@]}"; do
     line+=" ${PRS[i]}:${FINAL[i]:-${STATE[i]:-unread}}"
@@ -62,6 +68,7 @@ finish() {
 usage_error() {
   echo "❌ $1" >&2
   echo "Usage: $0 <pr>... [--queue] [--deadline-mins N]" >&2
+  echo "Failed check names are not printed. Read them with: ./scripts/wait_pr_checks.sh <pr> --once" >&2
   finish error 2
 }
 
@@ -92,6 +99,7 @@ TIMEOUT=$(command -v timeout || command -v gtimeout) || {
 # Any other exit (a failed date or jq under set -e) still ends with a RESULT line.
 trap 'echo "❌ Unexpected failure (exit $?)" >&2; finish error 2' EXIT
 RESPONSE_FILE=$(mktemp)
+JQ_ERR_FILE=$(mktemp)
 
 ROLLUP="statusCheckRollup { contexts(first: 100) { pageInfo { hasNextPage } nodes { $(check_context_graphql_fields) } } }"
 if [[ $MODE == queue ]]; then
@@ -113,10 +121,10 @@ fi
 # printed with it. Any value outside the known GitHub enums is an error, never pending.
 # shellcheck disable=SC2016 # jq variables, not shell variables.
 CLASSIFY='
-def fail($pr; $msg): error("PR #\($pr): \($msg)");
+# The "watch_pr_state: " prefix marks the messages this script wrote. The shell prints only those:
+# jq prints its own type errors with a piece of the offending value.
+def fail($pr; $msg): error("watch_pr_state: PR #\($pr): \($msg)");
 def token: gsub("[^A-Za-z0-9_.-]"; "_");
-def names: map(.name) as $n
-  | ($n[0:5] | join(", ")) + (if ($n | length) > 5 then " (+\(($n | length) - 5) more)" else "" end);
 def is_known_check_state: del(.bucket) | is_failed_check or is_pending_check or is_passing_check or is_skipped_check;
 def rollup($pr; $commit):
   if $commit == null or $commit.statusCheckRollup == null then []
@@ -124,7 +132,7 @@ def rollup($pr; $commit):
   then fail($pr; "malformed check rollup")
   elif $commit.statusCheckRollup.contexts.pageInfo.hasNextPage != false
   then fail($pr; "more than 100 checks on \($commit.oid); this script reads one page")
-  else [$commit.statusCheckRollup.contexts.nodes[] | normalize_check($commit.oid)] end;
+  else [$commit.statusCheckRollup.contexts.nodes[] | try normalize_check($commit.oid) catch fail($pr; "Unknown check context")] end;
 
 def queue_state($pr; $p):
   if $p.mergeQueueEntry != null then
@@ -157,12 +165,14 @@ def checks_state($pr; $p):
     | (rollup($pr; $p.commits.nodes[0].commit) + rollup($pr; $p.potentialMergeCommit)) as $all
     | [$all[] | select(is_known_check_state | not)] as $unknown
     | [$all[] | select(is_visual_review_check | not)] as $checks
-    | if ($unknown | length) > 0 then fail($pr; "unknown check state: \($unknown | map("\(.name)=\(.state)") | join(", "))")
+    | if ($unknown | length) > 0
+      then fail($pr; "unknown check state on \($unknown | length) of \($all | length) checks; read them with: gh pr view \($pr) --json statusCheckRollup")
       elif $p.mergeable == "CONFLICTING" or $p.mergeStateStatus == "DIRTY" then ["conflicting", $at]
       elif $p.mergeStateStatus == "BEHIND" then ["behind", $at]
       # Codex skips drafts and the queue refuses them, so checks alone do not make one ready.
       elif $p.isDraft then ["draft", $at]
-      elif any($checks[]; is_failed_check) then ["failed", "\($at) failed: \([$checks[] | select(is_failed_check)] | names)"]
+      elif any($checks[]; is_failed_check)
+      then ["failed", "\($at) failed \([$checks[] | select(is_failed_check)] | length)/\($checks | length) checks"]
       elif any($checks[]; is_pending_check) or (any($checks[]; is_passing_check or is_skipped_check) | not)
       then ["pending", "\($at) \([$checks[] | select(is_pending_check | not)] | length)/\($checks | length) checks done"]
       elif $p.mergeStateStatus == "CLEAN"
@@ -172,8 +182,8 @@ def checks_state($pr; $p):
       else ["pending", "\($at) checks passed, merge state \($p.mergeStateStatus)"] end
   end;
 
-if (.errors // []) != [] then error("GraphQL errors: \(.errors | map(.message) | join("; "))")
-elif (.data.repository | type) != "object" then error("no repository in the response")
+if (.errors // []) != [] then error("watch_pr_state: GraphQL errors: \(.errors | map(.message | tostring | gsub("[[:cntrl:]]"; " ") | .[0:300]) | join("; "))")
+elif (.data.repository | type) != "object" then error("watch_pr_state: no repository in the response")
 else .data.repository end
 | . as $repo
 | $prs[] as $pr
@@ -215,7 +225,10 @@ poll() {
     >"$RESPONSE_FILE" || rc=$?
   response=$(<"$RESPONSE_FILE")
   if ((rc != 0)); then
-    printf '%s\n' "$response" >&2
+    # A reply with errors can still carry data (check names, descriptions), so print only
+    # each errors[].message. A reply that is not JSON prints nothing here.
+    jq -r '(.errors // [])[]? | .message? | strings | "GitHub error: " + (gsub("[[:cntrl:]]"; " ") | .[0:300])' \
+      <<<"$response" >&2 2>/dev/null || true
     if ((rc == 124 || rc == 137)); then
       echo "❌ GitHub read timed out after ${READ_TIMEOUT_SECS}s; this is an error, not a pending state." >&2
     else
@@ -224,7 +237,9 @@ poll() {
     finish error 2
   fi
   if ! rows=$(jq -r --argjson prs "$(printf '%s\n' "${pending[@]}" | jq -cs .)" --arg mode "$MODE" \
-    "$(visual_check_jq_defs) $CLASSIFY" <<<"$response"); then
+    "$(visual_check_jq_defs) $CLASSIFY" <<<"$response" 2>"$JQ_ERR_FILE"); then
+    # Print only this script's own messages (see fail in CLASSIFY), never jq's type errors.
+    grep -E '^jq: error \(at [^)]*\): watch_pr_state: ' "$JQ_ERR_FILE" >&2 || true
     echo "❌ Could not classify the GitHub response for: ${pending[*]}" >&2
     finish error 2
   fi
