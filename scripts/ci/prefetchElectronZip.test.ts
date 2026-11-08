@@ -14,17 +14,24 @@ import * as path from "node:path";
 const PREFETCH = path.resolve(import.meta.dir, "prefetch-electron-zip.cjs");
 const ELECTRON = path.resolve(import.meta.dir, "../../node_modules/electron");
 
-// The stub library: the outcome comes from HOOK_MODE, and a call ends the process.
+// The stub library: HOOK_MODE=reject fails the download with a real HTTPError of status
+// HOOK_STATUS (HOOK_MODE=network: a plain error with no status), and a call ends the process.
 const HOOK = `
 const Module = require("node:module");
 const load = Module._load;
+let loadingReal = false;
 Module._load = function (request, ...rest) {
-  if (request !== "@electron/get") return load.call(this, request, ...rest);
+  if (request !== "@electron/get" || loadingReal) return load.call(this, request, ...rest);
   return {
     downloadArtifact(options) {
       process.stdout.write("OPTIONS " + JSON.stringify(options) + "\\n");
-      if (process.env.HOOK_MODE === "reject") return Promise.reject(new Error("Response code 504"));
-      return Promise.resolve("/cache/electron.zip");
+      if (process.env.HOOK_MODE === "network") return Promise.reject(new Error("socket hang up"));
+      if (process.env.HOOK_MODE !== "reject") return Promise.resolve("/cache/electron.zip");
+      loadingReal = true;
+      const { HTTPError } = Module.createRequire(process.env.ELECTRON_DIR + "/")("@electron/get");
+      loadingReal = false;
+      const status = Number(process.env.HOOK_STATUS);
+      return Promise.reject(new HTTPError(new Response(null, { status, statusText: "stub" })));
     },
   };
 };
@@ -59,7 +66,12 @@ afterEach(async () => {
 async function node(script: string, env: Record<string, string> = {}): Promise<RunResult> {
   const proc = Bun.spawn(["node", "-r", hook, script], {
     cwd: project,
-    env: { ...process.env, electron_config_cache: path.join(project, "zip-cache"), ...env },
+    env: {
+      ...process.env,
+      electron_config_cache: path.join(project, "zip-cache"),
+      ELECTRON_DIR: ELECTRON,
+      ...env,
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -97,8 +109,20 @@ test("reports the zip it fetched", async () => {
   expect(result.stdout).toContain("Electron zip ready: /cache/electron.zip");
 });
 
-test("exits 1 with the download's error, so retry.sh tries again", async () => {
-  const result = await node(PREFETCH, { HOOK_MODE: "reject" });
-  expect(result.exitCode).toBe(1);
-  expect(result.stderr).toContain("Response code 504");
+test("exits 1 with the download's error on a failure a retry can fix", async () => {
+  for (const status of ["408", "429", "503", "504"]) {
+    const result = await node(PREFETCH, { HOOK_MODE: "reject", HOOK_STATUS: status });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(`Response code ${status}`);
+  }
+  const network = await node(PREFETCH, { HOOK_MODE: "network" });
+  expect(network.exitCode).toBe(1);
+});
+
+test("exits 64 on a 4xx that no retry changes, so retry.sh stops at once", async () => {
+  for (const status of ["400", "403", "404"]) {
+    const result = await node(PREFETCH, { HOOK_MODE: "reject", HOOK_STATUS: status });
+    expect(result.exitCode).toBe(64);
+    expect(result.stderr).toContain(`Response code ${status}`);
+  }
 });

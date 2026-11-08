@@ -10,6 +10,9 @@ import { runScript, writeExecutable, type RunResult } from "./ci/runScript";
 
 const RETRY = path.resolve(import.meta.dir, "retry.sh");
 
+// A test whose command really sleeps (4 s here) needs more than bun's 5 s default on a busy host.
+const SLOW_TEST_MS = 30_000;
+
 let work: string;
 
 beforeEach(async () => {
@@ -83,23 +86,27 @@ describe("exponential backoff", () => {
     expect(await lines("sleeps")).toEqual(["2", "4", "8", "16", "32", "60", "60", "60"]);
   });
 
-  test("stops when the next wait would end after the budget, counting the wait", async () => {
-    // Each try takes 1 s, so the wait before try 4 (16 s) is the first to pass the 15 s budget.
-    // A budget check that ignored the wait would run on until the tries alone took 15 s.
-    const result = await retry([
-      "--max-backoff-secs",
-      "60",
-      "--budget-secs",
-      "15",
-      "0",
-      "2",
-      await command({ seconds: 1 }),
-    ]);
-    expect(result.exitCode).toBe(1);
-    expect(result.stdout).toContain("15s budget is spent");
-    expect(await lines("runs")).toHaveLength(4);
-    expect(await lines("sleeps")).toEqual(["2", "4", "8"]);
-  });
+  test(
+    "stops when the next wait would end after the budget, counting the wait",
+    async () => {
+      // Each try takes 1 s, so the wait before try 4 (16 s) is the first to pass the 15 s budget.
+      // A budget check that ignored the wait would run on until the tries alone took 15 s.
+      const result = await retry([
+        "--max-backoff-secs",
+        "60",
+        "--budget-secs",
+        "15",
+        "0",
+        "2",
+        await command({ seconds: 1 }),
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain("15s budget is spent");
+      expect(await lines("runs")).toHaveLength(4);
+      expect(await lines("sleeps")).toEqual(["2", "4", "8"]);
+    },
+    SLOW_TEST_MS
+  );
 
   // GNU `timeout` cuts the try off; a host without it (stock macOS) lets the try finish.
   test.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
@@ -111,7 +118,8 @@ describe("exponential backoff", () => {
       expect(result.stdout).toContain("exit 124");
       expect(result.stdout).toContain("2s budget is spent");
       expect(Date.now() - started).toBeLessThan(10_000);
-    }
+    },
+    SLOW_TEST_MS
   );
 
   test("gives up at once on a fatal status", async () => {

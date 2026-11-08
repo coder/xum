@@ -149,7 +149,7 @@ runs:
     - name: Download Electron zip
       if: ${{ inputs.electron-zip == 'true' && steps.cache-electron-zip.outputs.cache-hit != 'true' }}
       shell: bash
-      run: ./scripts/retry.sh --budget-secs 900 --max-backoff-secs 60 0 2 node scripts/ci/prefetch-electron-zip.cjs
+      run: ./scripts/retry.sh --budget-secs 900 --max-backoff-secs 60 --fatal-status 64 0 2 node scripts/ci/prefetch-electron-zip.cjs
 
     # Saved at once: a later failing step in the job must not discard a zip that took minutes.
     - name: Save Electron zip

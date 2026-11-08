@@ -18,7 +18,8 @@ const BODY = "pinned release asset\n";
 const BODY_SHA256 = createHash("sha256").update(BODY).digest("hex");
 
 // Answers each request by the first path segment: /ok, /missing (404), /busy/<n> (504 for
-// the first n requests of the test, then 200), /limited (429 once, then 200) and /down (504).
+// the first n requests of the test, then 200), /limited (429 once, then 200), /timeout (408
+// once, then 200) and /down (504).
 let server: ReturnType<typeof Bun.serve>;
 let requests: string[];
 
@@ -36,6 +37,7 @@ beforeAll(() => {
         return new Response("gateway timeout", { status: 504 });
       }
       if (kind === "limited" && served === 1) return new Response("slow down", { status: 429 });
+      if (kind === "timeout" && served === 1) return new Response("too slow", { status: 408 });
       return new Response(BODY);
     },
   });
@@ -112,6 +114,12 @@ describe("download-verified.sh", () => {
     const result = await download("/limited");
     expect(result.exitCode).toBe(0);
     expect(requests).toEqual(["/limited", "/limited"]);
+  });
+
+  test("retries a 408", async () => {
+    const result = await download("/timeout");
+    expect(result.exitCode).toBe(0);
+    expect(requests).toEqual(["/timeout", "/timeout"]);
   });
 
   test("gives up on a 504 that outlasts the budget", async () => {

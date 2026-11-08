@@ -632,11 +632,12 @@ CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --locked --quiet --only-group cr
 # there (seen: HTTP 504) must not fail the job before any test uses the grammars. CI caches
 # the pack's directory, which makes this a no-op, and sets the budget to 15 minutes for a cold
 # cache: the 504 outage of 2026-11-08 outlasted the old 3 tries 10 s apart. The default
-# keeps an offline local run short. A language added here needs a new key prefix in pr.yml's
-# "Restore tree-sitter grammars" step.
+# keeps an offline local run short. The script exits 64 on an HTTP 4xx that no retry changes.
+# A language added to its list needs a new key prefix in pr.yml's "Restore tree-sitter
+# grammars" step.
 GRAMMAR_DOWNLOAD_BUDGET_SECS ?= 60
 tree-sitter-grammars:
-	@./scripts/retry.sh --budget-secs $(GRAMMAR_DOWNLOAD_BUDGET_SECS) --max-backoff-secs 60 0 2 env $(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])'
+	@./scripts/retry.sh --budget-secs $(GRAMMAR_DOWNLOAD_BUDGET_SECS) --max-backoff-secs 60 --fatal-status 64 0 2 env $(CRAP_PYTHON) scripts/ci/download_tree_sitter_grammars.py
 
 test-crap-scripts: tree-sitter-grammars ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
 	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
