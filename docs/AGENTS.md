@@ -29,7 +29,7 @@ description: Agent instructions for AI assistants working on the Xum codebase
 - For planning artifacts, use the `propose_plan` tool or inline comments instead of ad-hoc docs.
 - Do not add new root-level docs without explicit request; during feature work rely on code + tests + inline comments.
 - Vercel AI SDK docs live in `/tmp/ai-sdk-docs/**.mdx` once `./scripts/update_vercel_docs.sh` has fetched them; never browse `https://sdk.vercel.ai/docs/ai-sdk-core` directly.
-- Built-in skill text (`src/node/builtinSkills/`) states only the watcher trust rule: run watcher scripts only on a checkout you trust. Do not describe which files a `bash` call sources, give an audit procedure for untrusted code, or promise when a monitor wake is consumed.
+- For watcher scripts, built-in skill text (`src/node/builtinSkills/`) states only the trust rule: run watcher scripts only on a checkout you trust. Do not describe which files a `bash` call sources, give an audit procedure for untrusted code, or promise that a read consumes a monitor wake.
 
 ### Code Comments
 
