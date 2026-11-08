@@ -36,7 +36,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
-import { localExecEnv, stripSandboxedChildEnv } from "./childProcessEnv";
+import { DEFAULT_EXEC_PATH, localExecEnv, stripSandboxedChildEnv } from "./childProcessEnv";
 import {
   agentSandboxDenialsAfterExit,
   wrapForAgentSandbox,
@@ -336,17 +336,25 @@ export abstract class LocalBaseRuntime implements Runtime {
   }
 
   /**
-   * Env overrides for a call that opts out of an agent sandbox that applies: approved bash calls,
-   * Xum's own commands and MCP servers. Bash sources the file that BASH_ENV names before the
-   * script, and a sandboxed command can write that file in the workspace.
+   * The bash and env overrides of a call that opts out of an agent sandbox that applies: approved
+   * bash calls, MCP servers and Xum's own commands. Bash sources the file that BASH_ENV names
+   * before the script, and a sandboxed command can write that file in the workspace. Xum's own
+   * scripts also skip the inherited PATH, which can hold a folder that sandboxed commands write
+   * (an activated <workspace>/.venv/bin), so a planted `rm` or `bash` never runs unsandboxed.
    */
-  private sandboxOptOutEnv(cwd: string, options: ExecOptions): NodeJS.ProcessEnv {
-    if (options.sandbox !== "off") return {};
+  private sandboxOptOut(
+    cwd: string,
+    options: ExecOptions
+  ): { bashPath: string; env: NodeJS.ProcessEnv } {
+    const inherited = { bashPath: getBashPath(), env: {} };
+    if (options.sandbox === undefined) return inherited;
     const applies = agentSandboxApplies(this, {
       cwd,
       otherProjectPaths: options.sandboxProjectPaths,
     });
-    return applies ? { BASH_ENV: "" } : {};
+    if (!applies) return inherited;
+    if (options.sandbox === "off") return { ...inherited, env: { BASH_ENV: "" } };
+    return { bashPath: "/bin/bash", env: { BASH_ENV: "", PATH: DEFAULT_EXEC_PATH } };
   }
 
   async exec(command: string, options: ExecOptions): Promise<ExecStream> {
@@ -368,7 +376,8 @@ export abstract class LocalBaseRuntime implements Runtime {
     // without this second check the process would start and run to its end after the abort.
     throwIfAbortedBeforeExec(options.abortSignal);
 
-    const bashPath = getBashPath();
+    const optOut = this.sandboxOptOut(cwd, options);
+    const bashPath = optOut.bashPath;
 
     // Match RemoteRuntime behavior: ensure non-interactive env vars are set inside the shell.
     //
@@ -394,7 +403,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       ...mergedEnv,
       ...NON_INTERACTIVE_ENV_VARS,
       PATH: effectivePath,
-      ...this.sandboxOptOutEnv(cwd, options),
+      ...optOut.env,
     };
 
     // Null when the sandbox is off, not on macOS, or the caller opts out. Throws (and runs
@@ -403,7 +412,7 @@ export abstract class LocalBaseRuntime implements Runtime {
     const sandboxed = await this.wrapForSandbox(cwd, script, {
       bashPath,
       abortSignal: options.abortSignal,
-      optOut: options.sandbox === "off",
+      optOut: options.sandbox !== undefined,
       workspaceRoots: options.sandboxRoots,
       scratchDir: callerEnv.XUM_SCRATCH_DIR,
       pathEnv: effectivePath,

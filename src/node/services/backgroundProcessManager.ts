@@ -3418,7 +3418,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       const result = await execBuffered(runtime, script, {
         cwd: "/tmp",
         timeout: 10,
-        sandbox: "off",
+        sandbox: "internal",
       });
       if (result.exitCode === 0) {
         const claimed = /__MUX_SPAWN_NAME_CLAIMED__:(\d+):/.exec(result.stdout);
@@ -3462,7 +3462,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       await execBuffered(runtime, script, {
         cwd: "/tmp",
         timeout: 10,
-        sandbox: "off",
+        sandbox: "internal",
       });
     } catch (error) {
       log.debug(`Keeping claimed background record ${processId}: ${getErrorMessage(error)}`);
@@ -3531,7 +3531,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       const result = await execBuffered(runtime, script, {
         cwd: "/tmp",
         timeout: 15,
-        sandbox: "off",
+        sandbox: "internal",
       });
       if (result.exitCode === 0) {
         if (result.stdout.includes("__MUX_BG_REMOTE_UNREADABLE__")) {

@@ -203,7 +203,7 @@ export async function readPlanFile(
             },
             timeout: 5,
             // Xum code, not agent code: moves a plan file under <xumHome>/plans.
-            sandbox: "off",
+            sandbox: "internal",
           }
         );
       } catch {
@@ -246,7 +246,7 @@ export async function movePlanFile(
     },
     timeout: 5,
     // Xum code, not agent code: moves a plan file under <xumHome>/plans.
-    sandbox: "off",
+    sandbox: "internal",
   });
   throwIfTransportFailure(runtime, result, "Failed to move plan file");
   if (result.exitCode !== 0) {

@@ -365,7 +365,7 @@ function postProcessProfile(profile: string, network: AgentSandboxPolicy["networ
   return result;
 }
 
-// srt points TMPDIR at its own folder; Xum keeps the user's TMPDIR, which is a write root.
+// srt points TMPDIR at its own folder; Xum sets its own temp folder, a write root (sandboxToolEnv()).
 const SRT_ENV_KEYS_NOT_COPIED = new Set(["TMPDIR"]);
 // The proxy plumbing; without a restricted network ("open") nothing should go through it.
 const SRT_KEYS_KEPT_WITH_OPEN_NETWORK = new Set(["SANDBOX_RUNTIME"]);

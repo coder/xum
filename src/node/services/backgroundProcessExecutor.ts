@@ -103,7 +103,7 @@ function backgroundSandboxRoots(options: SpawnOptions): string[] {
  * place of its folder (see backgroundRecordFiles.ts), and the sandbox refuses a write or delete
  * through it.
  */
-const XUM_INTERNAL: Pick<ExecOptions, "sandbox"> = { sandbox: "off" };
+const XUM_INTERNAL: Pick<ExecOptions, "sandbox"> = { sandbox: "internal" };
 const BACKGROUND_CWD_ENV = "XUM_INTERNAL_BACKGROUND_CWD";
 
 type RecordWrite = (script: string) => ReturnType<typeof execBuffered>;

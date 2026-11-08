@@ -83,14 +83,15 @@ export interface ExecOptions {
   /** Force PTY allocation (SSH only - adds -t flag) */
   forcePTY?: boolean;
   /**
-   * "off" runs the command outside the macOS agent sandbox (local runtimes only). Only three kinds
-   * of caller may set it: MCP servers, which the user configured and which start outside the
-   * sandbox; a bash call the user approved to run outside it once; and fixed Xum-internal
-   * scripts that never run agent or repo code (plan file moves, temp cleanup, skill path probes).
-   * Agent-reachable paths (bash, background bash, tool hooks, the init hook, web_fetch) never set
-   * it otherwise.
+   * Runs the command outside the macOS agent sandbox (local runtimes only). "off" is for MCP
+   * servers, which the user configured and which start outside the sandbox, and a bash call the
+   * user approved to run outside it once. "internal" is for fixed Xum-internal scripts that never
+   * run agent or repo code (plan file moves, temp cleanup, skill path probes): while the sandbox
+   * applies they take bash and their tools from the system folders, because the inherited PATH
+   * can hold a folder that sandboxed commands write. Agent-reachable paths (bash, background
+   * bash, tool hooks, the init hook, web_fetch) never set it otherwise.
    */
-  sandbox?: "off";
+  sandbox?: "off" | "internal";
   /**
    * Workspace folders the sandbox opens like cwd: the checkouts of a multi-project workspace, or
    * the workspace of a background command that starts in /tmp and cd's into it.

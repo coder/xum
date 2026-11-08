@@ -350,7 +350,7 @@ describe("spawnProcess", () => {
     const runtime = new LocalRuntime(hostDir);
     const exec = runtime.exec.bind(runtime);
     spyOn(runtime, "exec").mockImplementation((command: string, options: ExecOptions) =>
-      options.sandbox === "off"
+      options.sandbox !== undefined
         ? exec(command, options)
         : Promise.reject(new RuntimeError("no", "exec", new AgentSandboxStartError("test")))
     );

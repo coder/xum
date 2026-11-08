@@ -310,6 +310,33 @@ describe("LocalBaseRuntime.exec sandbox opt-out", () => {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
+
+  // An inherited PATH can hold a folder that sandboxed commands write, such as a .venv/bin.
+  it("runs Xum's own opt-out commands with system tools, and approved calls with the PATH", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-opt-out-path-"));
+    try {
+      const planted = path.join(dir, "rm");
+      await fs.writeFile(planted, "#!/bin/sh\necho planted\n", { mode: 0o755 });
+      const resolve = async (runtime: LocalBaseRuntime, sandbox: "off" | "internal") => {
+        const stream = await runtime.exec('command -v rm; echo "$BASH"', {
+          cwd: dir,
+          timeout: 5,
+          env: { PATH: `${dir}:${process.env.PATH ?? ""}` },
+          sandbox,
+        });
+        await stream.stdin.close();
+        return (await readStreamAsString(stream.stdout)).trim().split("\n");
+      };
+
+      const [internalRm, internalBash] = await resolve(new SandboxedRuntime(true), "internal");
+      expect(internalRm).not.toBe(planted);
+      expect(internalBash).toBe("/bin/bash");
+      expect((await resolve(new SandboxedRuntime(true), "off"))[0]).toBe(planted);
+      expect((await resolve(new SandboxedRuntime(false), "internal"))[0]).toBe(planted);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("LocalBaseRuntime agent cgroup enrollment", () => {

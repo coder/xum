@@ -408,6 +408,28 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       }
     });
 
+    // A project secret can set TMPDIR to a folder that is not a write root.
+    it("points TMPDIR at a temp folder it can write, whatever the caller set", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(workspace);
+      const elsewhere = await homeProbePath();
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+      try {
+        const result = await execBuffered(
+          new LocalRuntime(workspace),
+          'mkdir -p "$TMPDIR/probe" && rmdir "$TMPDIR/probe" && echo ok',
+          { cwd: workspace, timeout: 10, env: { TMPDIR: elsewhere } }
+        );
+
+        expect({ exitCode: result.exitCode, stdout: result.stdout.trim() }).toEqual({
+          exitCode: 0,
+          stdout: "ok",
+        });
+      } finally {
+        await fs.rm(elsewhere, { recursive: true, force: true });
+      }
+    });
+
     it("keeps a credential file in a write root unwritable, and its folder in place", async () => {
       const workspace = path.join(root, "ws");
       // ~/.cache is a write root, and ~/.cache/huggingface/token a credential file in it.

@@ -210,7 +210,7 @@ export function hostChildEnv(mode: "inherit" | "minimal" | undefined): NodeJS.Pr
   return mode === "minimal" ? pickMinimalChildEnv(process.env) : process.env;
 }
 
-const DEFAULT_EXEC_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+export const DEFAULT_EXEC_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 /**
  * The env of a local command whose caller passes `callerEnv` (the host env per `hostEnv` under

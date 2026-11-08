@@ -250,7 +250,7 @@ describe("mux_config_write", () => {
       taskSettings: { maxParallelAgentTasks: 4 },
     };
     // The global sandbox is off and only /test/proj has it on, so a workspace row that moves out
-    // of /test/proj leaves the sandbox. While it is on, only the user adds or re-points rows.
+    // of /test/proj leaves the sandbox. While it is on, only the user changes projects.
     const projectOnlyConfig = {
       agentSandbox: { enabled: false },
       projects: [
@@ -346,19 +346,12 @@ describe("mux_config_write", () => {
         ],
         refused: true,
       },
+      // A trusted project's repo MCP servers start outside the sandbox.
       {
-        name: "allows renaming a workspace row while the sandbox is on",
+        name: "refuses marking a project trusted while the sandbox is on",
         config: projectOnlyConfig,
-        operations: [
-          { op: "set", path: ["projects", 0, 1, "workspaces", 0, "title"], value: "renamed" },
-        ],
-        refused: false,
-      },
-      {
-        name: "allows removing a workspace row while the sandbox is on",
-        config: projectOnlyConfig,
-        operations: [{ op: "set", path: ["projects", 0, 1, "workspaces"], value: [] }],
-        refused: false,
+        operations: [{ op: "set", path: ["projects", 0, 1, "trusted"], value: true }],
+        refused: true,
       },
       {
         name: "allows adding a workspace row while no sandbox is on",

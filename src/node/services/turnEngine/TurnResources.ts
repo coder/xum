@@ -201,7 +201,7 @@ export class TurnResources {
         cwd: tempDirParent,
         timeout: 10,
         // Xum code, not agent code: removes Xum's own folder under ~/.xum-tmp.
-        sandbox: "off",
+        sandbox: "internal",
       })
       .then(async (result) => {
         await result.exitCode;

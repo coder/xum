@@ -40,25 +40,15 @@ function agentSandboxOf(value: unknown): unknown {
   return Array.isArray(value) ? undefined : fieldOf(value, "agentSandbox");
 }
 
-/** The stored `[path, config]` entries of `document`. */
-function projectEntriesOf(document: unknown): unknown[] {
-  const projects = (document as { projects?: unknown } | null)?.projects;
-  return Array.isArray(projects) ? projects : [];
-}
-
-/** `value` as a list, or [] when it is not an array. */
-function listOf(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
 /**
  * Each project's agentSandbox values, keyed the way Config loads project paths, so an alias of
  * a path ("/repo/") cannot replace the setting of "/repo". A key whose entries have no value
  * maps to [], so adding or removing a project without a setting changes nothing.
  */
 function projectAgentSandboxes(document: unknown): Map<string, unknown[]> {
+  const projects = fieldOf(document, "projects");
   const byProject = new Map<string, unknown[]>();
-  for (const entry of projectEntriesOf(document)) {
+  for (const entry of Array.isArray(projects) ? projects : []) {
     const key = projectKeyOf(entry);
     if (key === undefined) continue;
     byProject.set(key, [...(byProject.get(key) ?? []), agentSandboxOf((entry as unknown[])[1])]);
@@ -75,22 +65,6 @@ function projectKeyOf(entry: unknown): string | undefined {
   return stripTrailingSlashes(entry[0] === "" ? "/" : entry[0]);
 }
 
-/**
- * The fields of a workspace row that decide where its commands run and which sandbox setting
- * binds them: the path is their cwd and a write root, and the projects pick the setting.
- */
-const SANDBOX_BINDING_ROW_FIELDS = ["id", "path", "projects", "subProjectPath", "runtimeConfig"];
-
-/** Each workspace row as its project key and its SANDBOX_BINDING_ROW_FIELDS. */
-function workspaceBindings(document: unknown): unknown[] {
-  return projectEntriesOf(document).flatMap((entry) =>
-    listOf(fieldOf(listOf(entry)[1], "workspaces")).map((row) => [
-      projectKeyOf(entry),
-      SANDBOX_BINDING_ROW_FIELDS.map((field) => fieldOf(row, field)),
-    ])
-  );
-}
-
 function agentSandboxOnIn(document: unknown): boolean {
   const values = [
     agentSandboxOf(document),
@@ -101,8 +75,10 @@ function agentSandboxOnIn(document: unknown): boolean {
 
 /**
  * Whether `next` changes agentSandbox by value, globally or in any project (added, edited or
- * removed), or, while it is on anywhere, adds or removes a project, adds a workspace row or
- * changes a row's bindings.
+ * removed), or changes `projects` at all while it is on anywhere. The projects list binds the
+ * sandbox in more ways than its values: a workspace row's project picks its setting and its
+ * path is a write root, Config derives sub-project parentage from the registered paths, and a
+ * project's trust decides whether Xum starts its MCP servers outside the sandbox.
  */
 function changesAgentSandbox(current: unknown, next: unknown): boolean {
   if (!isDeepStrictEqual(agentSandboxOf(current), agentSandboxOf(next))) return true;
@@ -111,13 +87,9 @@ function changesAgentSandbox(current: unknown, next: unknown): boolean {
   for (const key of new Set([...before.keys(), ...after.keys()])) {
     if (!isDeepStrictEqual(before.get(key) ?? [], after.get(key) ?? [])) return true;
   }
-  if (!agentSandboxOnIn(current)) return false;
-  // Which project a workspace or sub-project falls under (Config derives parentage from the
-  // registered paths) picks its setting, so the set of projects stays fixed too.
-  if (!isDeepStrictEqual(new Set(before.keys()), new Set(after.keys()))) return true;
-  const known = workspaceBindings(current);
-  return workspaceBindings(next).some(
-    (row) => !known.some((candidate) => isDeepStrictEqual(row, candidate))
+  return (
+    agentSandboxOnIn(current) &&
+    !isDeepStrictEqual(fieldOf(current, "projects"), fieldOf(next, "projects"))
   );
 }
 
@@ -151,8 +123,8 @@ async function rewriteConfigDocument(
     return {
       success: false,
       error:
-        "Refusing to change agentSandbox, or while it is on, to add or remove a project, add a " +
-        "workspace or change a workspace's id, path, projects or runtime. Only the user can change them.",
+        "Refusing to change agentSandbox, or projects while it is on. Only the user can " +
+        "change them.",
     };
   }
 

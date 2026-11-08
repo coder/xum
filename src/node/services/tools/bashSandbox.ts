@@ -1,7 +1,7 @@
 import type { BashSandboxApprovalEvent } from "@/common/types/stream";
 import type { BashToolResult } from "@/common/types/tools";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
-import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
+import type { ExecStream } from "@/node/runtime/Runtime";
 import { agentSandboxApplies } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import { clockOf } from "@/node/utils/hostClock";
@@ -16,7 +16,7 @@ export type SandboxApproval = "not-asked" | "approved" | "denied";
  * The sandbox option of a bash call: an approved call runs outside the sandbox, with full access
  * (and without BASH_ENV, see LocalBaseRuntime.exec()).
  */
-export function sandboxExecOptions(approval: SandboxApproval): Pick<ExecOptions, "sandbox"> {
+export function sandboxExecOptions(approval: SandboxApproval): { sandbox?: "off" } {
   return approval === "approved" ? { sandbox: "off" } : {};
 }
 

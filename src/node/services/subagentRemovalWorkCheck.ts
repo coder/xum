@@ -97,7 +97,7 @@ async function openGitRepo(
       `d=$(dirname "$p"); while [ ! -e "$d" ] && [ ! -L "$d" ]; do d=$(dirname "$d"); done; ` +
       `if [ -d "$d" ] && [ -x "$d" ]; then echo no; else echo unknown; fi; fi`,
     // Xum code, not agent code: a fixed read-only probe, and the sandbox refuses a cwd of /.
-    { cwd: "/", timeout: 10, sandbox: "off" }
+    { cwd: "/", timeout: 10, sandbox: "internal" }
   );
   const answer = exists.stdout.trim();
   if (exists.exitCode !== 0 || (answer !== "yes" && answer !== "no")) {

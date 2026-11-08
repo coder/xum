@@ -86,6 +86,8 @@ export function sandboxToolEnv(): Record<string, string> {
   // caches. Bun 1.4.4 and later keep what bunx runs in the install cache, so bunx works too.
   const ownCache = (name: string) => path.join(expandWriteRoot(os.tmpdir()), `xum-sandbox-${name}`);
   return {
+    // A caller (a project secret) can set another TMPDIR, which the policy does not open.
+    TMPDIR: os.tmpdir(),
     UV_CACHE_DIR: ownCache("uv-cache"),
     BUN_INSTALL_CACHE_DIR: ownCache("bun-cache"),
     BUN_RUNTIME_TRANSPILER_CACHE_PATH: ownCache("bun-transpiler-cache"),
