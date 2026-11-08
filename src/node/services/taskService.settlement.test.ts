@@ -44,7 +44,8 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowRunner } from "@/node/services/workflows/WorkflowRunner";
 import { WorkflowTaskServiceAdapter } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { log } from "@/node/services/log";
+import { __resetFileSinkForTests, log } from "@/node/services/log";
+import * as tokenizerModule from "@/node/utils/main/tokenizer";
 import { Ok, Err, type Result } from "@/common/types/result";
 import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage } from "@/common/types/message";
@@ -95,6 +96,9 @@ beforeAll(() => {
 });
 afterAll(() => {
   hostHome?.restore();
+  // The log file sink opens at the first log line, inside the isolated home that restore() just
+  // deleted. Drop it so the next log line reopens under the restored home.
+  __resetFileSinkForTests();
 });
 
 describe("TaskService", () => {
@@ -990,6 +994,15 @@ describe("TaskService", () => {
         (
           taskService as unknown as { workspaceEventLocks: MutexMap<string> }
         ).workspaceEventLocks.withLock(childId, () => Promise.resolve());
+      // This test checks how stream ends are classified, not token counts. The token budget
+      // requires a real encoding (contextBudgetCounting.ts), and the worker thread that loads it
+      // costs about 1.5 s of CPU on a cold process. Under CPU contention (16 processes on 2 cores)
+      // that took 29 to 31 s and 13 of 16 runs hit this test's 30 s timeout. A fake tokenizer
+      // keeps the budget path and skips the worker.
+      const tokenizerSpy = spyOn(tokenizerModule, "getTokenizerForModel").mockResolvedValue({
+        encoding: "fake-4",
+        countTokens: (text: string) => Promise.resolve(Math.ceil(text.length / 4)),
+      });
 
       try {
         // Turn 1: the child works until the settled step crosses the budget warning.
@@ -1105,14 +1118,14 @@ describe("TaskService", () => {
         expect(session.getQueueCutReceipt(continuationEntryId!)).toBeUndefined();
         expect(session.getQueueCutReceipt(queuedInputCause!.entryId)).toBeUndefined();
       } finally {
+        tokenizerSpy.mockRestore();
         await session.dispose();
         await sessionHarness.cleanup();
       }
       // The timeout is a literal because Prettier formats `test(name, fn, <number>)` as a test
-      // call and re-indents the whole callback for any other third argument. The first turn
-      // loads the real tokenizer encoding in a worker (the token budget requires it, see
-      // contextBudgetCounting.ts), about 1.5 s of CPU when the process is cold. That took 5 to
-      // 7 s on a host at load 70 to 100 on 32 cores, over Bun's 5 s default.
+      // call and re-indents the whole callback for any other third argument. A real AgentSession
+      // turn takes under 1 s alone and 1.8 to 5.1 s with 16 processes on 2 cores, so Bun's 5 s
+      // default is too tight there.
     }, 30_000);
   });
 
@@ -3441,7 +3454,7 @@ describe("TaskService", () => {
         expect(findWorkspaceInConfig(config, id)?.taskStatus).toBe("reported");
       }
       // Two real WorkflowRunner passes over on-disk stores with a QuickJS runtime each: about 1 s
-      // at moderate load and up to 3 s at load 100 on 32 cores, so Bun's 5 s default is too tight.
+      // alone and 3.1 to 9.0 s with 16 processes on 2 cores, so Bun's 5 s default is too tight.
     }, 30_000);
   });
 });
