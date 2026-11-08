@@ -124,8 +124,12 @@
         text-align: center;
       }
 
+      /* The loading text is a quiet hint. This one is what the user has to read, and the dark
+         secondary text color is below 4.5:1 on the dark page. The light rules above are higher
+         up in specificity and keep their own color, which passes. */
       .boot-loader__failure .boot-loader__text {
         text-wrap: balance;
+        color: var(--color-foreground, #d4d4d4);
       }
 
       .boot-loader__title {
