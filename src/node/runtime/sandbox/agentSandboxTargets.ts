@@ -154,6 +154,21 @@ export interface AgentSandboxPolicyInput {
 }
 
 /**
+ * Whether the agent sandbox covers the commands that `runtime` runs with `input`. True when it
+ * applies but has no safe policy there: those commands fail closed.
+ */
+export function agentSandboxApplies(
+  runtime: { agentSandboxPolicy?(input: AgentSandboxPolicyInput): AgentSandboxPolicy | null },
+  input: AgentSandboxPolicyInput
+): boolean {
+  try {
+    return runtime.agentSandboxPolicy?.(input) != null;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * The sandbox policy of one command. Throws AgentSandboxStartError for a working directory that
  * would open the whole home folder (`/`, `~` or a parent of it): the caller must then run
  * nothing.

@@ -2,6 +2,7 @@ import type { BashSandboxApprovalEvent } from "@/common/types/stream";
 import type { BashToolResult } from "@/common/types/tools";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
+import { agentSandboxApplies } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import { clockOf } from "@/node/utils/hostClock";
 import { emitChatEventBestEffort } from "./toolUtils";
@@ -9,29 +10,14 @@ import { emitChatEventBestEffort } from "./toolUtils";
 export const SANDBOX_APPROVAL_DENIED =
   "The user did not approve running this command outside the sandbox. Do not retry it outside the sandbox; find a way that works inside it, or ask the user.";
 
-/** Whether the macOS agent sandbox applies to the commands of this tool configuration. */
-function agentSandboxApplies(config: ToolConfiguration): boolean {
-  try {
-    return config.runtime.agentSandboxPolicy?.({ cwd: config.cwd }) != null;
-  } catch {
-    // The sandbox applies but has no safe policy for this cwd, so commands fail closed there.
-    return true;
-  }
-}
-
 export type SandboxApproval = "not-asked" | "approved" | "denied";
 
 /**
- * The exec options of a bash call with environment `env`: an approved call runs outside the
- * sandbox, with full access, and without BASH_ENV. Bash sources the file that BASH_ENV names
- * before the script, and that file can be in the workspace, where the agent can change it after
- * the user approved the script.
+ * The sandbox option of a bash call: an approved call runs outside the sandbox, with full access
+ * (and without BASH_ENV, see LocalBaseRuntime.exec()).
  */
-export function sandboxExecOptions(
-  approval: SandboxApproval,
-  env: Record<string, string>
-): Pick<ExecOptions, "sandbox" | "env"> {
-  return approval === "approved" ? { sandbox: "off", env: { ...env, BASH_ENV: "" } } : { env };
+export function sandboxExecOptions(approval: SandboxApproval): Pick<ExecOptions, "sandbox"> {
+  return approval === "approved" ? { sandbox: "off" } : {};
 }
 
 /**
@@ -47,7 +33,9 @@ export async function requestSandboxApproval(
   reason: string | null | undefined,
   abortSignal: AbortSignal | undefined
 ): Promise<SandboxApproval> {
-  if (reason == null || !agentSandboxApplies(config)) return "not-asked";
+  if (reason == null || !agentSandboxApplies(config.runtime, { cwd: config.cwd })) {
+    return "not-asked";
+  }
   const workspaceId = config.workspaceId;
   if (config.noInteractiveUser === true || workspaceId === undefined) return "denied";
   const event = (pending: boolean): BashSandboxApprovalEvent => ({

@@ -1,7 +1,9 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
+import { localExecEnv } from "@/node/runtime/childProcessEnv";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { mergeSecretsOverXumEnv } from "@/node/runtime/runtimeScratchDir";
 import { agentSandboxPolicyAllows } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { isPathAtOrUnder } from "@/node/runtime/sandbox/sandboxPaths";
 
@@ -9,6 +11,8 @@ import { isPathAtOrUnder } from "@/node/runtime/sandbox/sandboxPaths";
 export interface FileToolSandboxContext {
   /** The workspace's $XUM_SCRATCH_DIR: open like the workspace, as it is for bash. */
   scratchDir?: string;
+  /** The PATH that bash starts with: its folders under ~ are open for reads, as they are for bash. */
+  pathEnv?: string;
   /** Xum-managed paths (and what is under them) the file tools read and write outside the policy. */
   exemptPaths?: readonly string[];
   /** Xum-managed paths the file tools only read outside the policy. */
@@ -18,6 +22,7 @@ export interface FileToolSandboxContext {
 export function fileToolSandboxContext(config: ToolConfiguration): FileToolSandboxContext {
   return {
     scratchDir: config.xumEnv?.XUM_SCRATCH_DIR,
+    pathEnv: localExecEnv(mergeSecretsOverXumEnv(config.xumEnv, config.secrets)).path,
     // Xum keeps plan files under <xumHome>/plans and bash overflow output in runtimeTempDir, both
     // outside the policy; plan mode writes the plan file and the agent reads the rest.
     exemptPaths: config.planFilePath ? [config.planFilePath] : [],
@@ -50,7 +55,11 @@ export async function assertFileToolSandboxAllows(
   access: "read" | "write",
   context: FileToolSandboxContext = {}
 ): Promise<void> {
-  const policy = runtime.agentSandboxPolicy?.({ cwd, scratchDir: context.scratchDir });
+  const policy = runtime.agentSandboxPolicy?.({
+    cwd,
+    scratchDir: context.scratchDir,
+    pathEnv: context.pathEnv,
+  });
   if (policy == null) return;
   // Seatbelt checks the path a write lands on, so a link in the workspace cannot point out.
   const realPath = await realPathFollowingLinks(resolvedPath);

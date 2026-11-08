@@ -7,6 +7,7 @@ import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiv
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { LocalRuntime } from "./LocalRuntime";
 import { setAgentCgroupEnrollmentTargets } from "./agentCgroupEnrollment";
+import type { AgentSandboxPolicy } from "./sandbox/agentSandboxTargets";
 import type {
   InitLogger,
   WorkspaceCreationParams,
@@ -259,6 +260,54 @@ describe("LocalBaseRuntime.exec hostEnv", () => {
       } else {
         process.env.XUM_TEST_HOST_SECRET = original;
       }
+    }
+  });
+});
+
+describe("LocalBaseRuntime.exec sandbox opt-out", () => {
+  const POLICY: AgentSandboxPolicy = {
+    writeRoots: [],
+    gitCommonDirs: [],
+    denyWrite: [],
+    denyRead: [],
+    allowRead: [],
+    network: "loopback",
+    allowedHosts: [],
+    allowLocalBinding: true,
+  };
+
+  /** A runtime whose agent sandbox applies (or not), so the test runs on every platform. */
+  class SandboxedRuntime extends TestLocalRuntime {
+    constructor(private readonly sandboxed: boolean) {
+      super();
+    }
+
+    override agentSandboxPolicy(): AgentSandboxPolicy | null {
+      return this.sandboxed ? POLICY : null;
+    }
+  }
+
+  // A sandboxed command can write the file that BASH_ENV names in the workspace.
+  it("does not source BASH_ENV in a call that opts out of a sandbox that applies", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-bash-env-"));
+    try {
+      const startup = path.join(dir, "startup.sh");
+      await fs.writeFile(startup, "echo sourced\n");
+      const run = async (runtime: LocalBaseRuntime) => {
+        const stream = await runtime.exec("echo ran", {
+          cwd: dir,
+          timeout: 5,
+          env: { BASH_ENV: startup },
+          sandbox: "off",
+        });
+        await stream.stdin.close();
+        return readStreamAsString(stream.stdout);
+      };
+
+      expect(await run(new SandboxedRuntime(true))).toBe("ran\n");
+      expect(await run(new SandboxedRuntime(false))).toBe("sourced\nran\n");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
     }
   });
 });

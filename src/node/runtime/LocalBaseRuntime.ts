@@ -36,12 +36,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
-import {
-  hostChildEnv,
-  mergeChildEnv,
-  sanitizeXumChildEnv,
-  stripSandboxedChildEnv,
-} from "./childProcessEnv";
+import { localExecEnv, stripSandboxedChildEnv } from "./childProcessEnv";
 import {
   agentSandboxDenialsAfterExit,
   wrapForAgentSandbox,
@@ -49,6 +44,7 @@ import {
   type WrapForAgentSandboxOptions,
 } from "./sandbox/macosSandbox";
 import {
+  agentSandboxApplies,
   agentSandboxSettingsFor,
   buildAgentSandboxPolicy,
   type AgentSandboxPolicy,
@@ -230,13 +226,6 @@ function throwIfAbortedBeforeExec(signal: AbortSignal | undefined): void {
   }
 }
 
-const DEFAULT_EXEC_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-
-function execPathOf(callerEnv: NodeJS.ProcessEnv, mergedEnv: NodeJS.ProcessEnv): string {
-  const callerSetPath = callerEnv.PATH !== undefined && callerEnv.PATH.length > 0;
-  return (callerSetPath ? mergedEnv.PATH : (mergedEnv.PATH ?? mergedEnv.Path)) ?? DEFAULT_EXEC_PATH;
-}
-
 /**
  * Spawns `bash -c script` through `start`, or sandbox-exec when `sandboxed` is set, and frees the
  * sandbox registration when the process fails to start, and when it ends unless `keepNetwork`
@@ -346,6 +335,20 @@ export abstract class LocalBaseRuntime implements Runtime {
     return inCheckout ? [...listed, checkout] : listed;
   }
 
+  /**
+   * Env overrides for a call that opts out of an agent sandbox that applies: approved bash calls,
+   * Xum's own commands and MCP servers. Bash sources the file that BASH_ENV names before the
+   * script, and a sandboxed command can write that file in the workspace.
+   */
+  private sandboxOptOutEnv(cwd: string, options: ExecOptions): NodeJS.ProcessEnv {
+    if (options.sandbox !== "off") return {};
+    const applies = agentSandboxApplies(this, {
+      cwd,
+      otherProjectPaths: options.sandboxProjectPaths,
+    });
+    return applies ? { BASH_ENV: "" } : {};
+  }
+
   async exec(command: string, options: ExecOptions): Promise<ExecStream> {
     const startTime = performance.now();
 
@@ -386,15 +389,12 @@ export abstract class LocalBaseRuntime implements Runtime {
     const script = `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`;
 
     const callerEnv = options.env ?? {};
-    const mergedEnv = sanitizeXumChildEnv(mergeChildEnv(hostChildEnv(options.hostEnv), callerEnv), {
-      ...process.env,
-      ...callerEnv,
-    });
-    const effectivePath = execPathOf(callerEnv, mergedEnv);
+    const { env: mergedEnv, path: effectivePath } = localExecEnv(callerEnv, options.hostEnv);
     const childEnv: NodeJS.ProcessEnv = {
       ...mergedEnv,
       ...NON_INTERACTIVE_ENV_VARS,
       PATH: effectivePath,
+      ...this.sandboxOptOutEnv(cwd, options),
     };
 
     // Null when the sandbox is off, not on macOS, or the caller opts out. Throws (and runs

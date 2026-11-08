@@ -249,11 +249,95 @@ describe("mux_config_write", () => {
       projects: [["/test/proj", { workspaces: [], agentSandbox: { enabled: true } }]],
       taskSettings: { maxParallelAgentTasks: 4 },
     };
+    // The global sandbox is off and only /test/proj has it on, so a workspace row that moves out
+    // of /test/proj leaves the sandbox.
+    const projectOnlyConfig = {
+      agentSandbox: { enabled: false },
+      projects: [
+        [
+          "/test/proj",
+          { workspaces: [{ path: "/test/proj/ws", id: "ws1" }], agentSandbox: { enabled: true } },
+        ],
+        ["/test/twin", { workspaces: [], agentSandbox: { enabled: true } }],
+        ["/test/multi", { workspaces: [] }],
+      ],
+    };
+    const multiWorkspace = {
+      path: "/test/multi/ws",
+      id: "ws2",
+      projects: [
+        { projectPath: "/test/multi", projectName: "multi" },
+        { projectPath: "/test/proj", projectName: "proj" },
+      ],
+    };
+    const withRows = (rows: Record<string, unknown[]>) =>
+      projectOnlyConfig.projects.map(([projectPath, config]) => [
+        projectPath,
+        { ...(config as object), workspaces: rows[projectPath as string] ?? [] },
+      ]);
     const cases: Array<{
       name: string;
+      config?: object;
       operations: Array<{ op: "set"; path: Array<string | number>; value: unknown }>;
       refused: boolean;
     }> = [
+      {
+        name: "refuses moving a workspace to a project without the override",
+        config: projectOnlyConfig,
+        operations: [
+          {
+            op: "set",
+            path: ["projects"],
+            value: withRows({ "/test/multi": [{ path: "/test/proj/ws", id: "ws1" }] }),
+          },
+        ],
+        refused: true,
+      },
+      {
+        name: "refuses a second row for a workspace folder under a project without the override",
+        config: projectOnlyConfig,
+        operations: [
+          {
+            op: "set",
+            path: ["projects"],
+            value: withRows({
+              "/test/proj": [{ path: "/test/proj/ws", id: "ws1" }],
+              "/test/multi": [{ path: "/test/proj/ws/", id: "ws3" }],
+            }),
+          },
+        ],
+        refused: true,
+      },
+      {
+        name: "refuses dropping a sandboxed project from a multi-project workspace",
+        config: {
+          ...projectOnlyConfig,
+          projects: withRows({
+            "/test/proj": [{ path: "/test/proj/ws", id: "ws1" }],
+            "/test/multi": [multiWorkspace],
+          }),
+        },
+        operations: [
+          {
+            op: "set",
+            path: ["projects", 2, 1, "workspaces", 0, "projects"],
+            value: [multiWorkspace.projects[0]],
+          },
+        ],
+        refused: true,
+      },
+      {
+        name: "allows moving a workspace to a project with the same override",
+        config: projectOnlyConfig,
+        operations: [
+          {
+            op: "set",
+            path: ["projects"],
+            value: withRows({ "/test/twin": [{ path: "/test/proj/ws", id: "ws1" }] }),
+          },
+        ],
+        refused: false,
+      },
       {
         name: "refuses turning the global sandbox off",
         operations: [{ op: "set", path: ["agentSandbox", "enabled"], value: false }],
@@ -319,7 +403,7 @@ describe("mux_config_write", () => {
       it(testCase.name, async () => {
         using xumHome = new TestTempDir("mux-config-write");
         const configPath = path.join(xumHome.path, "config.json");
-        const before = JSON.stringify(initialConfig, null, 2);
+        const before = JSON.stringify(testCase.config ?? initialConfig, null, 2);
         await fs.writeFile(configPath, before, "utf-8");
 
         const tool = await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID);

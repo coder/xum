@@ -11,7 +11,8 @@ import {
   resolvePathWithinCwd,
   MAX_FILE_SIZE,
 } from "./fileCommon";
-import { TestTempDir } from "./testHelpers";
+import { createTestToolConfig, TestTempDir } from "./testHelpers";
+import { fileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
 import type { AgentSandboxPolicy } from "@/node/runtime/sandbox/agentSandboxTargets";
 // A static import, not a require("...?real=1") copy: Bun's LCOV keeps only the last-loaded copy of
 // a file, so a copy would replace runtimeFactory.test.ts's coverage of runtimeFactory.ts.
@@ -139,7 +140,7 @@ describe("fileCommon", () => {
         exemptPaths: [path.join(plans, "plan.md")],
         readExemptPaths: [path.join(plans, "ancestor.md"), outputs],
       };
-      return { home, workspace, runtime, sandbox };
+      return { home, workspace, runtime, sandbox, policy };
     }
 
     const cases: Array<{
@@ -234,6 +235,33 @@ describe("fileCommon", () => {
         }
       });
     }
+
+    // Bash opens the folders on its PATH under ~ for reads, so the file tools must too.
+    it("allows reads of a folder on the PATH that bash starts with", async () => {
+      using temp = new TestTempDir("file-sandbox");
+      const fixture = await sandboxFixture(temp);
+      const bin = path.join(fixture.home, "secret");
+      fixture.runtime.agentSandboxPolicy = (input) => ({
+        ...fixture.policy,
+        allowRead: [...fixture.policy.allowRead, ...(input.pathEnv ?? "").split(path.delimiter)],
+      });
+      const config: ToolConfiguration = {
+        ...createTestToolConfig(fixture.workspace, { runtime: fixture.runtime }),
+        secrets: { PATH: `${bin}${path.delimiter}/usr/bin` },
+      };
+
+      const outcome = await resolvePathWithinCwd(
+        path.join(bin, "tool"),
+        fixture.workspace,
+        fixture.runtime,
+        "read",
+        fileToolSandboxContext(config)
+      ).then(
+        () => "allowed",
+        (error: unknown) => String(error)
+      );
+      expect(outcome).toBe("allowed");
+    });
 
     it("checks nothing when no sandbox applies", async () => {
       using temp = new TestTempDir("file-sandbox");

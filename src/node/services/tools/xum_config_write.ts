@@ -29,10 +29,26 @@ function containsRedactedSentinel(value: unknown): boolean {
   return false;
 }
 
-function agentSandboxOf(value: unknown): unknown {
-  return value != null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>).agentSandbox
+/** The `field` of `value` when it is an object. */
+function fieldOf(value: unknown, field: string): unknown {
+  return value != null && typeof value === "object"
+    ? (value as Record<string, unknown>)[field]
     : undefined;
+}
+
+function agentSandboxOf(value: unknown): unknown {
+  return Array.isArray(value) ? undefined : fieldOf(value, "agentSandbox");
+}
+
+/** The stored `[path, config]` entries of `document`. */
+function projectEntriesOf(document: unknown): unknown[] {
+  const projects = (document as { projects?: unknown } | null)?.projects;
+  return Array.isArray(projects) ? projects : [];
+}
+
+/** `value` as a list, or [] when it is not an array. */
+function listOf(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
 }
 
 /**
@@ -41,9 +57,8 @@ function agentSandboxOf(value: unknown): unknown {
  * maps to [], so adding or removing a project without a setting changes nothing.
  */
 function projectAgentSandboxes(document: unknown): Map<string, unknown[]> {
-  const projects = (document as { projects?: unknown } | null)?.projects;
   const byProject = new Map<string, unknown[]>();
-  for (const entry of Array.isArray(projects) ? projects : []) {
+  for (const entry of projectEntriesOf(document)) {
     const key = projectKeyOf(entry);
     if (key === undefined) continue;
     byProject.set(key, [...(byProject.get(key) ?? []), agentSandboxOf((entry as unknown[])[1])]);
@@ -56,11 +71,55 @@ function projectAgentSandboxes(document: unknown): Map<string, unknown[]> {
 
 /** The project path of a stored `[path, config]` entry, normalized like Config does. */
 function projectKeyOf(entry: unknown): string | undefined {
-  if (!Array.isArray(entry) || typeof entry[0] !== "string") return undefined;
-  return stripTrailingSlashes(entry[0] === "" ? "/" : entry[0]);
+  return Array.isArray(entry) ? projectPathKey(entry[0]) : undefined;
 }
 
-/** Whether `next` changes agentSandbox by value, globally or in any project (added, edited or removed). */
+function projectPathKey(projectPath: unknown): string | undefined {
+  if (typeof projectPath !== "string") return undefined;
+  return stripTrailingSlashes(projectPath === "" ? "/" : projectPath);
+}
+
+/**
+ * The agentSandbox values that bind each workspace row: those of its project and of each project
+ * in its `projects` list, the global value standing in for a project without one, as in
+ * agentSandboxSettingsFor(). Keyed by row id and by row path, so moving a row under another
+ * project, or adding a row for the same folder there, is seen.
+ */
+function workspaceAgentSandboxes(document: unknown): Map<string, unknown[]> {
+  const byProject = projectAgentSandboxes(document);
+  const settingOf = (key: string | undefined): unknown[] => {
+    const values = byProject.get(key ?? "") ?? [];
+    return values.length > 0 ? values : [agentSandboxOf(document)];
+  };
+  const byRow = new Map<string, unknown[]>();
+  for (const entry of projectEntriesOf(document)) {
+    for (const row of listOf(fieldOf(listOf(entry)[1], "workspaces"))) {
+      const bound = [projectKeyOf(entry), ...rowProjectKeys(row)].map(settingOf);
+      for (const key of rowKeys(row)) byRow.set(key, [...(byRow.get(key) ?? []), bound]);
+    }
+  }
+  return byRow;
+}
+
+/** The keys of a workspace row: its id and its path. */
+function rowKeys(row: unknown): string[] {
+  const id = fieldOf(row, "id");
+  const rowPath = fieldOf(row, "path");
+  return [
+    ...(typeof id === "string" ? [`id:${id}`] : []),
+    ...(typeof rowPath === "string" ? [`path:${stripTrailingSlashes(rowPath)}`] : []),
+  ];
+}
+
+/** The project keys in the `projects` list of a multi-project workspace row. */
+function rowProjectKeys(row: unknown): Array<string | undefined> {
+  return listOf(fieldOf(row, "projects")).map((ref) => projectPathKey(fieldOf(ref, "projectPath")));
+}
+
+/**
+ * Whether `next` changes agentSandbox by value, globally or in any project (added, edited or
+ * removed), or changes which values bind a workspace.
+ */
 function changesAgentSandbox(current: unknown, next: unknown): boolean {
   if (!isDeepStrictEqual(agentSandboxOf(current), agentSandboxOf(next))) return true;
   const before = projectAgentSandboxes(current);
@@ -68,7 +127,23 @@ function changesAgentSandbox(current: unknown, next: unknown): boolean {
   for (const key of new Set([...before.keys(), ...after.keys()])) {
     if (!isDeepStrictEqual(before.get(key) ?? [], after.get(key) ?? [])) return true;
   }
+  return movesWorkspaceAcrossAgentSandboxes(current, next);
+}
+
+/** Whether a workspace row that `current` has is bound by other agentSandbox values in `next`. */
+function movesWorkspaceAcrossAgentSandboxes(current: unknown, next: unknown): boolean {
+  const before = workspaceAgentSandboxes(current);
+  for (const [key, afterValues] of workspaceAgentSandboxes(next)) {
+    const beforeValues = before.get(key);
+    if (beforeValues !== undefined && !sameMembers(beforeValues, afterValues)) return true;
+  }
   return false;
+}
+
+function sameMembers(list: unknown[], other: unknown[]): boolean {
+  const within = (values: unknown[], pool: unknown[]) =>
+    values.every((value) => pool.some((candidate) => isDeepStrictEqual(value, candidate)));
+  return within(list, other) && within(other, list);
 }
 
 /** Applies `args.operations` to the stored document and writes it, unless a guard refuses. */

@@ -1238,10 +1238,8 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           scriptWithEnv,
           {
             cwd: config.cwd,
-            ...sandboxExecOptions(approval, {
-              ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets),
-              ...hooksEnv,
-            }),
+            env: { ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets), ...hooksEnv },
+            ...sandboxExecOptions(approval),
             pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
@@ -1334,11 +1332,12 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 ${scriptWithEnv}`;
       const execStream = await config.runtime.exec(scriptWithClosedStdin, {
         cwd: config.cwd,
-        ...sandboxExecOptions(approval, {
+        env: {
           ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets),
           ...hooksEnv,
           ...NON_INTERACTIVE_ENV_VARS,
-        }),
+        },
+        ...sandboxExecOptions(approval),
         pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,
