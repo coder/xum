@@ -16,6 +16,7 @@ const MEDIA_STUB = "[media]";
 const NESTED_OMITTED = "[nested data omitted]";
 export const SESSION_HISTORY_OMITTED = "[session_history result omitted]";
 const SESSION_HISTORY_TOOL = "session_history";
+const CODE_EXECUTION_TOOL = "code_execution";
 const UNSERIALIZABLE = "[unserializable]";
 const NONE = "[none]";
 // The AI SDK's model-output attachment forms, recognized by type alone as the provider projection
@@ -169,13 +170,17 @@ function placeholderForObject(value: Record<string, unknown>): string | undefine
 
 /**
  * The lists of calls a node made inside itself: persisted `nestedCalls`, and the `toolCalls` of a
- * `code_execution` result.
+ * `code_execution` result. Only a `code_execution` value's `toolCalls` are calls: any other tool
+ * can return application JSON with that key, and reading it as provenance would drop that tool's
+ * whole output.
  */
 function innerCallLists(node: Record<string, unknown>): unknown[][] {
   const lists = [node.nestedCalls];
-  // A persisted call keeps its value in `output`, a `code_execution` record in `result`.
-  for (const value of [node.output, node.result]) {
-    if (isPlainObject(value)) lists.push(value.toolCalls);
+  if (node.toolName === CODE_EXECUTION_TOOL) {
+    // A persisted call keeps its value in `output`, a `code_execution` record in `result`.
+    for (const value of [node.output, node.result]) {
+      if (isPlainObject(value)) lists.push(value.toolCalls);
+    }
   }
   return lists.filter(Array.isArray);
 }
