@@ -448,7 +448,8 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * cannot take focus, given `tabindex="-1"` until it loses focus, so the next Tab continues
  * after it. When the fragment changed, it is set on the document's own URL (`about:srcdoc#/route`)
  * with the original `History.prototype.replaceState` before the jump, and `popstate` then
- * `hashchange` fire after it, so a hash router sees the route. A click on the current fragment
+ * `hashchange` fire in a task after the click's other listeners, as the browser queues them, so
+ * a hash router sees the route. A click on the current fragment
  * fires neither, though Chromium still fires `popstate` for it. A native fragment navigation
  * (`location.replace("about:srcdoc#x")`, `location.hash`, `<base href="about:srcdoc">`) would
  * do this for free, but WebKit fires the iframe's `load` event for it, which the navigation
@@ -457,7 +458,10 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * the web) fire the frame's `load` event, and the guard then closes the artifact for it.
  *
  * `pushState` and `replaceState` are wrapped so that a string URL whose trimmed value starts
- * with `#` resolves against the document's URL, not the app's. Other calls pass through.
+ * with `#` resolves against the document's URL, not the app's. Other calls pass through. A
+ * `pushState` of the artifact's own still makes Back fire the frame's `load`, as its
+ * `location.hash` and absolute-URL entries already do: that is the navigation guard's to handle,
+ * and this script leaves the guard as it is.
  *
  * It decides when the click reaches window in the bubble phase, after the artifact's element
  * and document handlers, so one of those that calls preventDefault keeps the click. Window
@@ -619,8 +623,12 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
       var changed = replaceFragment(fragment);
       jump(fragment);
       if (!changed) return;
-      window.dispatchEvent(new window.PopStateEvent("popstate", { state: null }));
-      window.dispatchEvent(new window.HashChangeEvent("hashchange", { oldURL: oldURL, newURL: window.location.href }));
+      var newURL = window.location.href;
+      // A task after the click's other listeners, as the browser queues them.
+      window.setTimeout(function () {
+        window.dispatchEvent(new window.PopStateEvent("popstate", { state: null }));
+        window.dispatchEvent(new window.HashChangeEvent("hashchange", { oldURL: oldURL, newURL: newURL }));
+      }, 0);
     });
   })();`;
 

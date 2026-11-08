@@ -1153,13 +1153,23 @@ describe("hash routes", () => {
   /**
    * A window shaped like a srcdoc frame: History resolves its URL argument against APP_URL, as a
    * browser does for srcdoc. Happy DOM resolves against the document URL instead, and shares
-   * History.prototype between windows, so `restore` puts the originals back.
+   * History.prototype between windows, so `restore` puts the originals back. Happy DOM also
+   * queues a hashchange when History changes the fragment, which a browser does not, so the
+   * window drops that one: the events a test sees are the script's own.
    */
   function srcdocWindow() {
     const win = new HappyWindow({ url: "about:srcdoc" });
     const proto = win.History.prototype;
     // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
     const originals = { pushState: proto.pushState, replaceState: proto.replaceState };
+    const queuedByHappyDom: string[] = [];
+    win.addEventListener("hashchange", (event) => {
+      if (!(event instanceof win.HashChangeEvent)) return;
+      const at = queuedByHappyDom.indexOf(`${event.oldURL} ${event.newURL}`);
+      if (at === -1) return;
+      queuedByHappyDom.splice(at, 1);
+      event.stopImmediatePropagation();
+    });
     for (const method of ["pushState", "replaceState"] as const) {
       proto[method] = function (
         this: typeof proto,
@@ -1167,9 +1177,13 @@ describe("hash routes", () => {
         title: string,
         url?: string | URL
       ) {
-        return url == null
-          ? originals[method].call(this, state, title)
-          : originals[method].call(this, state, title, new URL(url, APP_URL).href);
+        if (url == null) return originals[method].call(this, state, title);
+        const before = win.location.href;
+        originals[method].call(this, state, title, new URL(url, APP_URL).href);
+        const after = win.location.href;
+        if (new URL(before).hash !== new URL(after).hash) {
+          queuedByHappyDom.push(`${before} ${after}`);
+        }
       };
     }
     return {
@@ -1232,7 +1246,9 @@ describe("hash routes", () => {
       doc
         .getElementById(id)!
         .dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
-    return { win, restore, events, scrolled, click };
+    /** Runs the tasks the script queued, such as the route events. */
+    const flush = () => win.happyDOM.waitUntilComplete();
+    return { win, restore, events, scrolled, click, flush };
   }
 
   const scripts = [
@@ -1254,9 +1270,10 @@ describe("hash routes", () => {
   test.each(scripts)(
     "%s: a #/route link sets the fragment, then fires popstate and hashchange",
     async (_name, script) => {
-      const { win, restore, events, scrolled, click } = mount(script);
+      const { win, restore, events, scrolled, click, flush } = mount(script);
       try {
         click("alpha");
+        await flush();
         expect(win.location.href).toBe("about:srcdoc#/s/alpha");
         expect(win.history.length).toBe(1);
         expect(events).toEqual([
@@ -1264,12 +1281,14 @@ describe("hash routes", () => {
           "hashchange about:srcdoc -> about:srcdoc#/s/alpha",
         ]);
         click("beta");
+        await flush();
         expect(win.location.hash).toBe("#/s/beta");
         expect(events.slice(2)).toEqual([
           "popstate #/s/beta",
           "hashchange about:srcdoc#/s/alpha -> about:srcdoc#/s/beta",
         ]);
         click("intro-link");
+        await flush();
         expect(scrolled).toEqual(["intro"]);
         expect(win.location.hash).toBe("#intro");
         expect(events.slice(4)).toEqual([
@@ -1283,13 +1302,35 @@ describe("hash routes", () => {
   );
 
   test.each(scripts)(
+    "%s: the route events fire after the click's other listeners, the URL before them",
+    async (_name, script) => {
+      const { win, restore, events, click, flush } = mount(script);
+      try {
+        // An artifact's delegated handler, registered after the script's own.
+        const seen: Array<{ hash: string; events: number }> = [];
+        win.addEventListener("click", () =>
+          seen.push({ hash: win.location.hash, events: events.length })
+        );
+        click("alpha");
+        expect(seen).toEqual([{ hash: "#/s/alpha", events: 0 }]);
+        await flush();
+        expect(events).toHaveLength(2);
+      } finally {
+        await restore();
+      }
+    }
+  );
+
+  test.each(scripts)(
     "%s: clicking the current fragment again fires neither event",
     async (_name, script) => {
-      const { win, restore, events, click } = mount(script);
+      const { win, restore, events, click, flush } = mount(script);
       try {
         click("alpha");
+        await flush();
         expect(events).toHaveLength(2);
         click("alpha");
+        await flush();
         expect(events).toHaveLength(2);
         expect(win.location.hash).toBe("#/s/alpha");
       } finally {
@@ -1318,13 +1359,14 @@ describe("hash routes", () => {
   test.each(scripts)(
     "%s: when replaceState throws, the link still jumps and fires no events",
     async (_name, script) => {
-      const { win, restore, events, scrolled, click } = mount(script, {
+      const { win, restore, events, scrolled, click, flush } = mount(script, {
         replaceStateThrows: true,
       });
       try {
         click("intro-link");
         expect(scrolled).toEqual(["intro"]);
         click("alpha");
+        await flush();
         expect(win.location.href).toBe("about:srcdoc");
         expect(events).toEqual([]);
       } finally {
@@ -1336,9 +1378,10 @@ describe("hash routes", () => {
   test.each(scripts)(
     "%s: a click the artifact cancels keeps the fragment",
     async (_name, script) => {
-      const { win, restore, events, click } = mount(script);
+      const { win, restore, events, click, flush } = mount(script);
       try {
         click("own");
+        await flush();
         expect(win.location.href).toBe("about:srcdoc");
         expect(events).toEqual([]);
       } finally {
