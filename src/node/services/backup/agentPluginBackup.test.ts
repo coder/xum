@@ -326,6 +326,8 @@ describe("backup of the managed plugin list", () => {
         "host-starts-with-localhost": "ssh://git@localhost.example.com/example/repo.git",
         // scp-style ssh to a host named `file`: a remote source, which the backup schema reads.
         "scp-host-named-file": "file:host/share/scp-host-named-file.git",
+        // A user before a one-letter host is no drive: Git for Windows reads `h:` alone as one.
+        "scp-user-one-letter-host": "git@h:example/scp-user-one-letter-host.git",
       } as const;
       const leftOutUrls = {
         "abs-path": "/home/someone/plugins/abs-path",
@@ -334,6 +336,9 @@ describe("backup of the managed plugin list", () => {
         "nt-share": "/??/UNC/someone/share/nt-share.git",
         "home-path": "~/plugins/home-path",
         "drive-path": "C:\\plugins\\drive-path",
+        // Git for Windows opens a drive-relative path as a local folder, not as ssh to a host `C`.
+        "drive-relative-path": "C:plugins/drive-relative-path",
+        "drive-relative-namespace": String.raw`\\?\C:\plugins\drive-relative-namespace`,
         "ssh-localhost": "ssh://user@localhost/home/someone/repo.git",
         "git-loopback": "git://127.0.0.1/someone/repo.git",
         "scp-localhost": "localhost:someone/repo.git",

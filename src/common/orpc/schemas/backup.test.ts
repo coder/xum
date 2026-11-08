@@ -100,6 +100,14 @@ describe("BackupPluginEntrySchema", () => {
     ["a home path", "~/repo.git"],
     ["a drive path", "C:\\repo.git"],
     ["a drive path with a slash", "C:/repo.git"],
+    // Each of these has a colon, so host parsing alone would call it a remote scp host.
+    ["a drive-relative path", "C:repo.git"],
+    ["a drive-relative path in lower case", "c:repo.git"],
+    ["a digit that Git for Windows reads as a drive", "1:repo.git"],
+    ["a one-letter host without a user, which Git for Windows reads as a drive", "h:org/repo.git"],
+    ["a Win32 file namespace path", "\\\\?\\C:\\repo.git"],
+    ["a Win32 device namespace path", "\\\\.\\C:\\repo.git"],
+    ["a UNC share with a colon in its path", "\\\\attacker\\share\\repo:x.git"],
     ["a loopback ssh host", "ssh://git@localhost/someone/repo.git"],
     ["a loopback scp host", "git@127.0.0.1:someone/repo.git"],
     ["a url with internal whitespace", "https://github.com/example/my repo.git"],
@@ -125,6 +133,9 @@ describe("BackupPluginEntrySchema", () => {
     ["an https url with a port", "https://git.example.com:8443/example/repo.git"],
     ["an ssh url", "ssh://git@github.com/example/repo.git"],
     ["an scp-style url", "git@github.com:example/repo.git"],
+    ["an scp-style url with a user and a one-letter host", "git@h:org/repo.git"],
+    ["an scp-style url with a two-letter host", "gh:org/repo.git"],
+    ["an ssh url with a one-letter host", "ssh://git@h/org/repo.git"],
     ["a git url", "git://git.example.com/example/repo.git"],
     // Git reads this as scp-style ssh to a host named `file`, and Xum installs it, so the export
     // writes it and a restore must read it.

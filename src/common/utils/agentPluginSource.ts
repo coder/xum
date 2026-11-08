@@ -14,10 +14,16 @@ export function displayRepoUrl(url: string): string {
  * True for a path or `file://` URL: a repository only this machine can reach. The check is the
  * same on every platform (a backup written on Linux is read on Windows): a leading `/` or `\`
  * covers POSIX paths, Windows rooted paths, UNC shares and NT-namespace spellings such as
- * `/??/UNC/host/share`, which Git for Windows can turn into an SMB open.
+ * `/??/UNC/host/share` and `\\?\C:\repo.git`, which Git for Windows can turn into an SMB open.
+ *
+ * A first character and a colon read as a drive, `C:\repo.git` and the drive-relative `C:repo.git`
+ * alike: Git for Windows decides so for any one character, not only a letter
+ * (`url_is_local_not_ssh` in connect.c with `win32_has_dos_drive_prefix`). An scp URL whose host
+ * has one character and no user (`h:org/repo.git`) reads the same there, so it counts as local
+ * too. One with a user (`git@h:org/repo.git`) does not start with a drive, and stays remote.
  */
 function isLocalGitUrl(url: string): boolean {
-  return /^file:\/\//i.test(url) || /^[~\\/]/.test(url) || /^[a-zA-Z]:[\\/]/.test(url);
+  return /^file:\/\//i.test(url) || /^[~\\/]/.test(url) || /^.:/su.test(url);
 }
 
 /** The host of a scheme URL (`ssh://`, `https://`, …) or of an SCP form (`user@host:path`). */
