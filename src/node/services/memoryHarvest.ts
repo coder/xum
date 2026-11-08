@@ -240,7 +240,8 @@ interface HarvestPiece {
  * not spend the cap on bytes and fill dozens of chunks. The scan reaches a lookahead past the cap,
  * so a secret that starts inside the kept text is matched whole, and what lies past it is never
  * scanned. Text parts are not tool output, but a credential a user pasted or a model echoed sits
- * in them just the same, and the cap is long enough to carry it to the model.
+ * in them just the same, and the cap is long enough to carry it to the model. The compaction
+ * summary is prepared the same way.
  */
 function boundedTextPart(raw: string): RowText {
   const window = takeWithoutMedia(raw, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
@@ -252,6 +253,11 @@ function boundedTextPart(raw: string): RowText {
 function rowTextOfPart(part: MuxMessage["parts"][number]): RowText {
   if (part.type === "text") return boundedTextPart(part.text.trim());
   return { text: neutralizeHarvestText(partToText(part).trim()), cutChars: 0 };
+}
+
+/** What ends a text that `boundedTextPart` cut: how many characters of it were left out. */
+function truncationNote(cutChars: number): string {
+  return `[truncated ${cutChars} more chars for memory harvest]`;
 }
 
 function piecesOfPart(
@@ -270,9 +276,7 @@ function piecesOfPart(
     );
     const isCutEnd = cutChars > 0 && index === count - 1;
     return {
-      text: isCutEnd
-        ? `${segment}\n[truncated ${cutChars} more chars for memory harvest]`
-        : segment,
+      text: isCutEnd ? `${segment}\n${truncationNote(cutChars)}` : segment,
       truncated: isCutEnd,
       part: position,
       segment: `${index + 1} of ${count}`,
@@ -572,6 +576,17 @@ When done, reply with one line: what you changed, or "no changes needed".`;
 const ANALYZER_TOOL_DESCRIPTION =
   "Read and edit the persistent memory that future sessions read. You can read workspace, project and global memory. You can write only under /memories/workspace/. You cannot insert at a line number, delete or rename: add to a file with str_replace (replace a line that is unique in it with that line plus the new text), or create a new file.";
 
+/**
+ * The compaction summary as the analyzer reads it with every chunk: prepared as a text part is (see
+ * `boundedTextPart`), free of data URLs and cut at the part's cap. The summary is model-written text
+ * of the whole epoch, so what a tool printed or the user pasted can come back through it, a screenshot
+ * included, and each chunk's prompt carries it again.
+ */
+function summaryText(summary: MuxMessage): string {
+  const { text, cutChars } = boundedTextPart(summary.parts.map(partToText).join("\n"));
+  return cutChars > 0 ? `${text}\n${truncationNote(cutChars)}` : text;
+}
+
 function buildChunkPrompt(args: {
   summary?: MuxMessage;
   index: number;
@@ -593,9 +608,7 @@ function buildChunkPrompt(args: {
   const summarySection =
     args.summary === undefined
       ? ""
-      : // The summary is model-written text of the whole epoch, so a credential that a tool printed
-        // can come back through it; the transcript's own redaction never saw it.
-        `\nCompaction summary (${args.summary.id}):\n${redactSecretLike(args.summary.parts.map(partToText).join("\n"))}\n`;
+      : `\nCompaction summary (${args.summary.id}):\n${summaryText(args.summary)}\n`;
   // Command and path only, never the text: the files hold it, and re-reading them is the way to
   // see it. Without this note the replay of a failed chunk would apply its edits a second time.
   const landedSection =

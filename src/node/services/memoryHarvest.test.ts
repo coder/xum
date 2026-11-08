@@ -883,6 +883,48 @@ describe("runMemoryHarvest", () => {
     }
   });
 
+  // The summary is read with every chunk, so a screenshot it echoes, or a megabyte of text, would be
+  // sent again with each one.
+  it("replaces a data URL in the compaction summary by a stub in every chunk's prompt", async () => {
+    using fixture = createFixture();
+    fixture.summary = createMuxMessage(
+      "summary-1",
+      "assistant",
+      `SUMMARY-FACT: the screenshot data:image/png;base64,${"QUJD".repeat(100_000)} showed the error.`,
+      { historySequence: 2, compactionBoundary: true }
+    );
+    fixture.messages = manyChunkMessages();
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    expect(calls).toHaveLength(3);
+    for (const call of calls) {
+      const prompt = userPromptText(call);
+      expect(prompt).toContain("SUMMARY-FACT: the screenshot [media] showed the error.");
+      expect(prompt).not.toContain("QUJD");
+    }
+  });
+
+  it("cuts a compaction summary at the cap of a text part, and says so", async () => {
+    using fixture = createFixture();
+    fixture.summary = createMuxMessage(
+      "summary-1",
+      "assistant",
+      `SUMMARY-HEAD ${"x".repeat(500_000)} SUMMARY-TAIL`,
+      { historySequence: 2, compactionBoundary: true }
+    );
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    const prompt = userPromptText(calls[0]);
+    expect(prompt).toContain("SUMMARY-HEAD");
+    expect(prompt).not.toContain("SUMMARY-TAIL");
+    expect(prompt).toMatch(/\[truncated \d+ more chars for memory harvest\]/);
+    expect(prompt.length).toBeLessThan(200_000);
+  });
+
   it("analyzes an epoch that has no compaction summary", async () => {
     using fixture = createFixture();
     const prompts: string[] = [];
