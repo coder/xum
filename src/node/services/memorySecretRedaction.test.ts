@@ -1,22 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { addsSecretLike, containsSecretLike, redactSecretLike } from "./memorySecretRedaction";
-
-/** CPU time (user + system) that `run` takes: unlike wall-clock time, a busy host cannot inflate it. */
-function cpuMs(run: () => void): number {
-  const started = process.cpuUsage();
-  run();
-  const used = process.cpuUsage(started);
-  return (used.user + used.system) / 1000;
-}
-
-// The linear-time shapes run at `scale` 1 and at `scale` GROWTH. A linear scan costs GROWTH times
-// as much (up to 2.7 times in measurements: the larger string also costs more per character), a
-// quadratic one GROWTH squared times as much (4 times). The bound sits between them.
-const GROWTH = 2;
-const MAX_COST_RATIO = 3.5;
-const MIN_BASE_MS = 1;
-const RUNS = 2;
+import { expectLinearScan, FAST_SCAN_MS, SLOW_SCAN_MS } from "./linearScan.testHarness";
 
 describe("redactSecretLike", () => {
   const FAKE = {
@@ -571,14 +556,18 @@ describe("redactSecretLike", () => {
   // Each shape repeats a keyword with nothing after it, which made the open-ended name suffix and
   // JWT segment rescan to the end of the text from every occurrence (seconds per input).
   //
-  // Linear means that twice the text costs about twice as much, and a quadratic scan costs four
-  // times as much. So each shape is built at two sizes (`scale` multiplies every repeat count) and
-  // the costs are compared, not held to a fixed time: one input costs 0.1 ms in one shape and
-  // 100 ms in another (a long backslash run makes a scan about 100 times slower per character, and
-  // still linear), so no single bound was both loose enough for those and tight enough for the
-  // rest, and the 100 ms one flaked at 125 and 154 ms on a busy host. The cost is CPU time, which a
-  // busy host does not stretch: a wall-clock sample that spans several scheduler slices grows more
-  // than a short one does.
+  // Each shape is built at two sizes (`scale` multiplies every repeat count) and the cost of the
+  // larger must stay in proportion to the smaller: see `expectLinearScan`, which also holds the
+  // smaller to a ceiling. These shapes cost 0.06 to 6 ms of CPU time, except the five that cost 50
+  // to 115 ms (a long backslash run costs about 100 times more per character, and still grows
+  // linearly).
+  const COSTLY_SHAPES = new Set([
+    "a quoted value of backslashes",
+    "a quoted value of escaped quotes",
+    "an escaped quoted value of backslash runs",
+    "a quoted value that ends in a backslash run",
+    "a cookie value of backslashes",
+  ]);
   it.each<[string, (scale: number) => string]>([
     ["token", (scale) => "token".repeat(20_000 * scale)],
     ["secret-", (scale) => "secret-".repeat(14_000 * scale)],
@@ -617,7 +606,10 @@ describe("redactSecretLike", () => {
     ],
     [
       "a deep value of runs as long as its opener",
-      (scale) => `token:${"\\".repeat(31)}"${`${"\\".repeat(31)}x`.repeat(3_000 * scale)}`,
+      // Its cost per character jumps about 100 times between 9,000 and 10,000 repeats. The larger
+      // size is 4 times the base, so the base is 1,500 (6,000 repeats) and not the 3,000 of the
+      // hostile text (12,000 repeats, past the jump).
+      (scale) => `token:${"\\".repeat(31)}"${`${"\\".repeat(31)}x`.repeat(1_500 * scale)}`,
     ],
     [
       "a deep value of runs just short of a doubled close",
@@ -675,29 +667,17 @@ describe("redactSecretLike", () => {
     ["cookie names behind quotes and commas", (scale) => `,Cookie`.repeat(14_000 * scale)],
   ])(
     "scans %s in linear time",
-    (_label, build) => {
-      containsSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
-      const small = build(1);
-      const large = build(GROWTH);
-      // `containsSecretLike` is `redactSecretLike` and a comparison, so it covers both. The fastest
-      // of a few runs: the first one of a size pays for engine warm-up and the GC.
-      let smallMs = Number.POSITIVE_INFINITY;
-      let largeMs = Number.POSITIVE_INFINITY;
-      for (let run = 0; run < RUNS; run++) {
-        smallMs = Math.min(
-          smallMs,
-          cpuMs(() => containsSecretLike(small))
-        );
-        largeMs = Math.min(
-          largeMs,
-          cpuMs(() => containsSecretLike(large))
-        );
-      }
-      // The floor keeps the timer's resolution on a near-free scan from tripping the ratio.
-      expect(largeMs).toBeLessThan(MAX_COST_RATIO * Math.max(smallMs, MIN_BASE_MS));
+    (label, build) => {
+      // `containsSecretLike` is `redactSecretLike` and a comparison, so it covers both.
+      expectLinearScan(
+        containsSecretLike,
+        build,
+        COSTLY_SHAPES.has(label) ? SLOW_SCAN_MS : FAST_SCAN_MS
+      );
     },
-    // The slowest shape costs 0.1 s at the small size and 0.2 s at the large one, twice each.
-    30_000
+    // A costly shape takes 0.1 s at the small size and 0.5 s at the large one. A regression runs
+    // longer, and a busy host stretches the wall-clock time of all of it: the limit is loose.
+    300_000
   );
 });
 

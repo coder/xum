@@ -3,6 +3,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { isPlainObject } from "@/common/utils/isPlainObject";
+import { cpuMs } from "./linearScan.testHarness";
 import { redactSecretLike } from "./memorySecretRedaction";
 import {
   derivesFromSessionHistory,
@@ -377,9 +378,11 @@ describe("takeWithoutMedia on hostile text", () => {
     ["escaped line breaks", `data:image/png;base64,${`${"A".repeat(20)}\\n`.repeat(8_000)}`],
   ])("scans %s in linear time", (_label, text) => {
     takeWithoutMedia(text, Number.POSITIVE_INFINITY); // keep a cold regex compile out of the timing
-    const started = performance.now();
-    takeWithoutMedia(text, Number.POSITIVE_INFINITY);
-    expect(performance.now() - started).toBeLessThan(100);
+    // CPU time, not wall-clock time: a busy host stretched this scan to 77 ms, and it takes 5 ms.
+    // Not the size ratio of `expectLinearScan` either: between 100 KB and 800 KB the cost per
+    // character of four of these shapes jumps once (by 3 to 75 times), so no size step keeps all
+    // of them on one side.
+    expect(cpuMs(() => takeWithoutMedia(text, Number.POSITIVE_INFINITY))).toBeLessThan(100);
   });
 });
 
