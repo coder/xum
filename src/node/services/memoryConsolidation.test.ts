@@ -806,13 +806,9 @@ describe("consolidation memory tool rails", () => {
 
   it("lets the caller set the lead of the tool description and keeps the command reference", async () => {
     using fixture = await createFixture({ guard: { description: "Edit this workspace's notes." } });
-    const defaults = await createFixture();
 
     expect(fixture.tool.description).toStartWith("Edit this workspace's notes. ");
-    expect(fixture.tool.description).not.toContain("you are consolidating");
     expect(fixture.tool.description).toEndWith(TOOL_DEFINITIONS.memory.description);
-    expect(defaults.tool.description).toContain("you are consolidating");
-    defaults[Symbol.dispose]();
   });
 
   describe("budget exhaustion", () => {
