@@ -28,6 +28,14 @@ USAGE_LIMIT_NOTICES = (
 )
 # A PR head no fixture board was written for.
 NEWER_HEAD = "b" * 40
+# Hang guard for one gate run, not a speed requirement: with MUX_CODEX_WAIT_POLL_SECS=0 a run ends
+# when its fixture ends (one test instead waits for a --wait-for-review deadline of 1 s), so only
+# a loop that never ends reaches this bound. The four gate test targets take 62 to 74 s together
+# in CI (about 0.1 s a run). On a host that other agents load, a run took 5 s at the median and
+# 13.5 s at the longest of 373 runs, and the 15 s this replaced then failed the test with
+# TimeoutExpired, which says nothing about the gate. The bound is about 9 times the longest run
+# seen there.
+GATE_RUN_TIMEOUT_SECS = 120
 
 
 def board_head(body):
@@ -187,7 +195,7 @@ else:
         if wait is not None:
             args += ["--wait-for-review", str(wait)]
         result = subprocess.run(
-            args, env=env, text=True, capture_output=True, timeout=15, check=False
+            args, env=env, text=True, capture_output=True, timeout=GATE_RUN_TIMEOUT_SECS, check=False
         )
         self.assertTrue(
             calls.read_text(), "a cached verdict must still re-query GitHub"
