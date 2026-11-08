@@ -5835,6 +5835,18 @@ describe("MemoryService refinement journal", () => {
       using fixture = await createFixture();
       await fixture.service.create(fixture.ctx, "/memories/global/a.md", `t=${TOKEN}\n`, "agent");
       await fixture.service.create(fixture.ctx, "/memories/global/b.md", `t=${TOKEN}\n`, "agent");
+      // An edit beside a credential it leaves is not journaled either: its pre-image holds it.
+      const inserted = await fixture.service.insert(
+        fixture.ctx,
+        "/memories/global/a.md",
+        0,
+        "# deploy",
+        "agent",
+        undefined,
+        undefined,
+        undefined,
+        GUARDED
+      );
       const edited = await fixture.service.strReplace(
         fixture.ctx,
         "/memories/global/a.md",
@@ -5854,7 +5866,7 @@ describe("MemoryService refinement journal", () => {
         undefined,
         GUARDED
       );
-      expect([edited.success, deleted.success]).toEqual([true, true]);
+      expect([inserted.success, edited.success, deleted.success]).toEqual([true, true, true]);
 
       const events = await readRefinementEvents(sessionDirOf(fixture));
       expect(
@@ -5875,11 +5887,11 @@ describe("MemoryService refinement journal", () => {
       expect(deletedFile.success).toBe(false);
       if (!deletedFile.success) expect(deletedFile.error).toContain("but it is gone");
       expect(await fsPromises.readFile(physicalOf(fixture, "a.md"), "utf-8")).toBe(
-        "t=(in 1Password)\n"
+        "# deploy\nt=(in 1Password)\n"
       );
     });
 
-    it("journals no row for a guarded rename or delete that names a credential", async () => {
+    it("journals no row for a guarded create, rename or delete that names a credential", async () => {
       using fixture = await createFixture();
       await fixture.service.create(fixture.ctx, "/memories/global/old.md", "x\n", "agent");
       await fixture.service.create(fixture.ctx, `/memories/global/d/${TOKEN}.md`, "y\n", "agent");
@@ -5902,7 +5914,16 @@ describe("MemoryService refinement journal", () => {
         undefined,
         GUARDED
       );
-      expect([renamed.success, deleted.success]).toEqual([true, true]);
+      const created = await fixture.service.create(
+        fixture.ctx,
+        `/memories/global/new-${TOKEN}.md`,
+        "z\n",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+      expect([renamed.success, deleted.success, created.success]).toEqual([true, true, true]);
 
       expect(await readRefinementEvents(sessionDirOf(fixture))).toHaveLength(2);
     });

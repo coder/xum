@@ -3914,24 +3914,18 @@ export interface MemoryWriteOptions {
 
 /**
  * Whether a refinement row would put credential-like text into durable state: the action's
- * virtual paths, the inverse's physical paths, or a pre-image the inverse captures. Memory rows
- * never carry `deletePaths` (only rollback rows do), so it is not read here.
+ * virtual paths, or a file a restore inverse captures (its path and its pre-image, which the
+ * journal offloads verbatim to the session blob store). A create or rename inverse holds only the
+ * physical form of the action's own paths, and a directory delete's restore lists the files under
+ * it, whose names the action does not show. Memory rows never carry `deletePaths`.
  */
 function refinementHoldsSecretLike(
   action: MemoryRefinementAction,
   inverse: RefinementInverseDraft
 ): boolean {
   const texts = [action.path, action.newPath ?? ""];
-  switch (inverse.op) {
-    case "delete-files":
-      texts.push(...inverse.paths);
-      break;
-    case "rename":
-      texts.push(inverse.from, inverse.to);
-      break;
-    case "restore-files":
-      for (const file of inverse.files) texts.push(file.path, file.content);
-      break;
+  if (inverse.op === "restore-files") {
+    for (const file of inverse.files) texts.push(file.path, file.content);
   }
   return texts.some(containsSecretLike);
 }

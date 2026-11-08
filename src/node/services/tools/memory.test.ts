@@ -6,11 +6,21 @@ import type { Tool } from "ai";
 import { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
+import {
+  MemoryService,
+  projectMemoryDirName,
+  type MemoryScopeContext,
+} from "@/node/services/memoryService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { RefinementEvidenceSchema } from "@/common/types/refinement";
 import { readRefinementEvents } from "@/node/services/refinement/refinementTestHelpers";
-import { createMemoryTool, resolveMemoryAccessPolicy, resolveMemoryScopes } from "./memory";
+import {
+  createMemoryTool,
+  executeMemoryCommand,
+  type MemoryCommandInput,
+  resolveMemoryAccessPolicy,
+  resolveMemoryScopes,
+} from "./memory";
 import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 import type { MemoryToolResult } from "@/common/types/tools";
 import { MEMORY_SCOPES, type MemoryScopeAccess, type MemoryScope } from "@/common/constants/memory";
@@ -489,5 +499,41 @@ describe("memory tool refinement journal", () => {
     const evidence = RefinementEvidenceSchema.parse(events[0].data.evidence);
     expect(evidence.toolCallId).toBe("test-call-id");
     expect(evidence.toolName).toBe("memory");
+  });
+
+  it("hands rejectSecretLike to every mutating command, so none journals a credential-named path", async () => {
+    using fixture = await createFixture();
+    const token = `ghp_${"a1B2".repeat(9)}`;
+    const ctx: MemoryScopeContext = {
+      runtime: new LocalRuntime(fixture.checkout),
+      checkoutCwd: fixture.checkout,
+      workspaceId: "ws-tool",
+      projectPath: FIXTURE_PROJECT_PATH,
+    };
+    const inputs: MemoryCommandInput[] = [
+      { command: "create", path: `/memories/global/${token}.md`, file_text: "a\n" },
+      { command: "insert", path: `/memories/global/${token}.md`, insert_line: 0, insert_text: "b" },
+      { command: "str_replace", path: `/memories/global/${token}.md`, old_str: "a", new_str: "c" },
+      {
+        command: "rename",
+        old_path: `/memories/global/${token}.md`,
+        new_path: `/memories/global/x-${token}.md`,
+      },
+      { command: "delete", path: `/memories/global/x-${token}.md` },
+    ];
+    for (const input of inputs) {
+      const result = await executeMemoryCommand(
+        fixture.config.memoryService!,
+        ctx,
+        input,
+        () => null,
+        undefined,
+        { rejectSecretLike: true }
+      );
+      expect(result).toMatchObject({ success: true });
+    }
+
+    const sessionDir = path.join(new Config(fixture.xumHome).sessionsDir, "ws-tool");
+    expect(await readRefinementEvents(sessionDir)).toHaveLength(0);
   });
 });
