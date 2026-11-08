@@ -661,12 +661,8 @@ describe("MemoryService", () => {
       ] as const;
 
       for (const command of commands) {
-        expect(await fixture.service.validateMutation(fixture.ctx, command, GUARDED)).toMatchObject(
-          {
-            ok: false,
-            error: expect.stringContaining("credential"),
-          }
-        );
+        const guarded = await fixture.service.validateMutation(fixture.ctx, command, GUARDED);
+        expect(guarded.ok ? "accepted" : guarded.error).toContain("credential");
         expect(await fixture.service.validateMutation(fixture.ctx, command)).toEqual({ ok: true });
       }
     });
