@@ -190,8 +190,10 @@ export class FakeMcpServers {
       const pending = operation();
       // Wait for the hang itself, not for a number of event-loop turns: the startup path does real
       // I/O before it hangs, and a loaded host ran out of turns first. An operation that ends
-      // without hanging, or is still running after a bound in real time, fails here with its
-      // cause instead of waiting for the test's own timeout.
+      // without hanging fails here with its cause at once. One that is still running after a
+      // bound in real time fails here too, but a test with the default 5 s limit then reports
+      // "timed out after 5000ms" (after the bound): the limit marks the test only when it ends.
+      // The cause text shows in a test that shortens the bound or raises its limit.
       const bound = realTimeBound(this.startupHangWaitMs);
       let outcome: "hung" | "settled" | "bound";
       try {
