@@ -630,6 +630,33 @@ describe("consolidation memory tool rails", () => {
       expect(await pathExists(path.join(fixture.globalMemoryDir, "creds.md"))).toBe(false);
     });
 
+    it("journals an applied rename and delete of a credential-named file without the credential", async () => {
+      // A cleanup that renames or deletes such a file is allowed, but its journal row is persisted
+      // in the sidecar: the row must not keep the name it cleaned up.
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, `${githubToken}.md`), "a\n");
+      await fsPromises.writeFile(
+        path.join(fixture.globalMemoryDir, `old-${githubToken}.md`),
+        "b\n"
+      );
+
+      const renamed = await execute(fixture.tool, {
+        command: "rename",
+        old_path: `/memories/global/${githubToken}.md`,
+        new_path: "/memories/global/deploy-user.md",
+      });
+      const deleted = await execute(fixture.tool, {
+        command: "delete",
+        path: `/memories/global/old-${githubToken}.md`,
+      });
+
+      expect(renamed.success).toBe(true);
+      expect(deleted.success).toBe(true);
+      expect(fixture.journal.map((op) => op.applied)).toEqual([true, true]);
+      expect(JSON.stringify(fixture.journal)).not.toContain(githubToken);
+    });
+
     it("rejects a credential that has no keyword beside it", async () => {
       // A check on the words `token`, `secret` and `password` lets these shapes through: the
       // guard has to read the credential shapes themselves.
@@ -1469,6 +1496,59 @@ describe("runMemoryConsolidation", () => {
     expect(result.ops.map((op) => op.path)).toEqual(["/memories/global/landed.md"]);
     expect(result.spentUsd).toBeCloseTo(1, 9);
     expect(await pathExists(path.join(fixture.globalMemoryDir, "cut.md"))).toBe(false);
+  });
+
+  // What the organizer writes can be promoted where other workspaces' models read it, so its guard
+  // refuses a credential in code, whatever the prompt said.
+  it("refuses a credential the organizer tries to write", async () => {
+    using fixture = await createFixture();
+    const githubToken = `ghp_${"a1B2".repeat(9)}`;
+    let calls = 0;
+    const model = new MockLanguageModelV3({
+      doStream: () => {
+        calls += 1;
+        const usage = {
+          inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+          outputTokens: { total: 0, text: 0, reasoning: 0 },
+        };
+        const chunks: LanguageModelV3StreamPart[] =
+          calls === 1
+            ? [
+                {
+                  type: "tool-call",
+                  toolCallId: "leak",
+                  toolName: "memory",
+                  input: JSON.stringify({
+                    command: "create",
+                    path: "/memories/global/deploy.md",
+                    file_text: `GITHUB_TOKEN=${githubToken}\n`,
+                  }),
+                },
+                {
+                  type: "finish",
+                  finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                  usage,
+                },
+              ]
+            : [{ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage }];
+        return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+      },
+    });
+
+    const result = await runMemoryConsolidation({
+      model,
+      pricingModel: PRICED_MODEL,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.ops).toHaveLength(1);
+    expect(result.ops[0]?.applied).toBe(false);
+    expect(JSON.stringify(result.ops)).not.toContain(githubToken);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "deploy.md"))).toBe(false);
   });
 
   it("completes a pass whose cut-off step the model retried in a later step", async () => {

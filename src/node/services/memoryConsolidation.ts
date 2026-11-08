@@ -410,16 +410,32 @@ function refusalRow(
   target: MutationTarget,
   note: string
 ): RefusalRow {
-  const persisted = (text: string): string =>
-    rails.rejectSecretLike === true ? redactSecretLike(text) : text;
+  return {
+    ...persistedTarget(rails, target),
+    applied: false,
+    note: persistedText(rails, note),
+  };
+}
+
+function persistedText(rails: Pick<MutationRails, "rejectSecretLike">, text: string): string {
+  return rails.rejectSecretLike === true ? redactSecretLike(text) : text;
+}
+
+/**
+ * The target as a journal row stores it, refused or applied: a guarded run's journal must not keep
+ * a credential that named a file (a delete or rename of that file included), and a path is clipped
+ * to the length cap.
+ */
+function persistedTarget(
+  rails: Pick<MutationRails, "rejectSecretLike">,
+  target: MutationTarget
+): MutationTarget {
   const stored = (virtualPath: string): string =>
-    persisted(virtualPath).slice(0, MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+    persistedText(rails, virtualPath).slice(0, MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
   return {
     ...target,
     path: stored(target.path),
     ...(target.newPath !== undefined && { newPath: stored(target.newPath) }),
-    applied: false,
-    note: persisted(note),
   };
 }
 
@@ -582,9 +598,9 @@ export function createConsolidationMemoryTool(args: {
         rejectSecretLike: args.rejectSecretLike,
       });
       journal.push({
-        ...target,
+        ...persistedTarget(rails, target),
         applied: result.success,
-        note: result.success ? undefined : result.error,
+        note: result.success ? undefined : persistedText(rails, result.error),
       });
       return result;
     },
@@ -645,6 +661,9 @@ export async function runMemoryConsolidation(args: {
     // filesystem I/O must not commit durable memory (or recreate the deleted
     // session directory via its journal row) once the I/O unblocks.
     abortSignal: args.abortSignal,
+    // What the organizer writes can be promoted to project and global memory, which models of other
+    // workspaces read: refuse credential-like text in code, not only by the prompt's instruction.
+    rejectSecretLike: true,
   });
 
   // Whatever the final pass promotes lands where models of unrelated projects read it, so a
