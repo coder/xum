@@ -51,10 +51,7 @@ export const CACHE_WRITE_PATHS: readonly string[] = [
  * entry that ends in `*` is a glob, which srt passes to Seatbelt.
  */
 export function cacheExecutablePaths(env: NodeJS.ProcessEnv = process.env): string[] {
-  const fromEnv = (name: string, ...rest: string[]): string[] => {
-    const dir = env[name];
-    return dir !== undefined && path.isAbsolute(dir) ? [path.join(dir, ...rest)] : [];
-  };
+  const fromEnv = (name: string, ...rest: string[]) => envPath(env, name, ...rest);
   const uid = process.getuid?.();
   const bunxTempFolders =
     uid === undefined
@@ -78,6 +75,25 @@ export function cacheExecutablePaths(env: NodeJS.ProcessEnv = process.env): stri
     "~/Library/Caches/bun",
     ...bunxTempFolders,
   ]);
+}
+
+/**
+ * The config files that git reads in every repository, also where Xum's environment moves them:
+ * Xum's own git runs outside the sandbox with that environment and runs what they name.
+ */
+export function gitGlobalConfigFiles(env: NodeJS.ProcessEnv = process.env): string[] {
+  return [
+    ...["~/.gitconfig", "~/.config/git/config"].map(expandSandboxPathSpelling),
+    ...envPath(env, "XDG_CONFIG_HOME", "git", "config"),
+    ...envPath(env, "GIT_CONFIG_GLOBAL"),
+    ...envPath(env, "GIT_CONFIG_SYSTEM"),
+  ];
+}
+
+/** `env[name]` joined with `rest`, when it is an absolute path. */
+function envPath(env: NodeJS.ProcessEnv, name: string, ...rest: string[]): string[] {
+  const dir = env[name];
+  return dir !== undefined && path.isAbsolute(dir) ? [path.join(dir, ...rest)] : [];
 }
 
 /** Environment for sandboxed commands, under the keys srt adds. */

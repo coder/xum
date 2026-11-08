@@ -20,6 +20,7 @@ import {
   expandSandboxPath,
   expandSandboxPathSpelling,
   expandWriteRoot,
+  gitGlobalConfigFiles,
   isPathAtOrUnder,
   realpathOfNearest,
   tempWritePaths,
@@ -209,7 +210,9 @@ export function buildAgentSandboxPolicy(
       `the extra write path ${extraRootInXumHome} is inside Xum's home folder ${xumHome}`
     );
   }
-  const automationPaths = AUTOMATION_READ_PATHS.map(expandSandboxPath);
+  const automationPaths = [...AUTOMATION_READ_PATHS, ...gitGlobalConfigFiles()].map(
+    expandSandboxPath
+  );
   assertNoWriteRootInAutomation(writeRoots, automationPaths);
   // A background command starts in a temp folder and gets its checkout in workspaceRoots.
   const gitCommonDirs = dedupe(
@@ -232,10 +235,12 @@ export function buildAgentSandboxPolicy(
       ].filter((denied) => isUnderAny(denied, writeRoots)),
     ].flatMap(withLinkTarget)
   );
+  assertSingleLinks([...denyWrite, ...automationPaths]);
   const allowRead = dedupe([
     ...writeRoots,
     ...gitCommonDirs,
     ...HOME_READ_PATHS.map(expandSandboxPath),
+    ...automationPaths,
     ...pathFoldersUnderHome(input.pathEnv, home, writeRoots),
     // A command can replace an entry in a write root with a link, so links there are not followed.
     ...outsideNestedDenies(
@@ -433,6 +438,31 @@ function withLinkTarget(target: string): string[] {
   return resolved === target ? [target] : [target, resolved];
 }
 
+function assertSingleLinks(files: readonly string[]): void {
+  for (const file of files) assertSingleLink(file, statIfExists(file));
+}
+
+/**
+ * Seatbelt and the file tools check the name that a write goes through, so another hard link to
+ * a protected file writes it unchecked, and no rule can name every link. A sandboxed command
+ * cannot make one (Seatbelt refuses a link to a file it may not write), but one can be there.
+ */
+function assertSingleLink(file: string, stat: fs.Stats | undefined): void {
+  if (stat?.isFile() === true && stat.nlink > 1) {
+    throw new AgentSandboxStartError(
+      `${file} has ${stat.nlink} hard links, and the sandbox cannot keep the others read-only`
+    );
+  }
+}
+
+function statIfExists(target: string): fs.Stats | undefined {
+  try {
+    return fs.statSync(target);
+  } catch {
+    return undefined;
+  }
+}
+
 function childDirs(folder: string): string[] {
   try {
     return fs
@@ -444,8 +474,6 @@ function childDirs(folder: string): string[] {
   }
 }
 
-// Git reads both for every repository (also `$XDG_CONFIG_HOME/git/config`, not covered).
-const GLOBAL_GIT_CONFIG_FILES: readonly string[] = ["~/.gitconfig", "~/.config/git/config"];
 // Beside the home folder's own dot entries.
 const HOME_LINK_FOLDERS: readonly string[] = ["~/.config", "~/.ssh"];
 // ssh stops at 16 (READCONF_MAX_DEPTH), git at 10; following more only protects more.
@@ -489,7 +517,7 @@ function childLinks(folder: string): string[] {
 function gitConfigIncludes(roots: readonly string[], gitDirs: readonly string[]): string[] {
   const repoGitDirs = [...roots.map((root) => path.join(root, ".git")), ...gitDirs];
   const configFiles = [
-    ...GLOBAL_GIT_CONFIG_FILES.map(expandSandboxPathSpelling),
+    ...gitGlobalConfigFiles(),
     ...repoGitDirs.flatMap((gitDir) => [
       path.join(gitDir, "config"),
       ...[gitDir, ...childDirs(path.join(gitDir, "worktrees"))].map((dir) =>
@@ -511,7 +539,9 @@ function gitConfigIncludes(roots: readonly string[], gitDirs: readonly string[])
  */
 function sshConfigIncludes(): string[] {
   return configIncludes([expandSandboxPathSpelling("~/.ssh/config")], (file) =>
-    sshIncludePatterns(readConfigText(file)).flatMap((pattern) => resolveSshInclude(pattern, file))
+    sshIncludePatterns(readConfigText(file), file).flatMap((pattern) =>
+      resolveSshInclude(pattern, file)
+    )
   );
 }
 
@@ -533,11 +563,19 @@ function configIncludes(
   return [...found].map(realpathOfNearest);
 }
 
-/** A regular file's text, or "" (no FIFO or device can block the read, nothing over 1 MiB). */
+/**
+ * A regular file's text, or "" (no FIFO or device can block the read). Git and ssh read a file of
+ * any size, so one over 1 MiB fails closed, and so does one with another hard link, which can be
+ * in a write root.
+ */
 function readConfigText(file: string): string {
+  const stat = statIfExists(file);
+  if (stat?.isFile() !== true) return "";
+  if (stat.size > CONFIG_MAX_BYTES) {
+    throw new AgentSandboxStartError(`${file} is over 1 MiB, more than the sandbox reads`);
+  }
+  assertSingleLink(file, stat);
   try {
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size > CONFIG_MAX_BYTES) return "";
     return fs.readFileSync(file, "utf8");
   } catch {
     return "";
@@ -610,6 +648,9 @@ const GIT_PATH_ENTRY = /^\s*path\s*=(.*)$/i;
 const GIT_QUOTED_VALUE = /^\s*"((?:[^"\\\n]|\\[\\"])*)"\s*(?:[#;].*)?$/;
 const GIT_PLAIN_VALUE = /^\s*([^"\\#;]*?)\s*(?:[#;].*)?$/;
 const SSH_INCLUDE = /^\s*include(?:\s*=\s*|\s+)(.*)$/i;
+// Whole arguments, plain or quoted, up to a `#` that starts a comment.
+const SSH_PLAIN_ARGS = /^(?:\s*(?:"[^"\\]*"|'[^'\\]*'|[^\s"'\\#][^\s"'\\]*)(?=\s|$))*\s*(?:#.*)?$/;
+const SSH_ARG = /"([^"]*)"|'([^']*)'|(\S+)/g;
 
 /**
  * The `path` values of the `[include]` and `[includeIf "..."]` sections of the git config `text`
@@ -647,12 +688,23 @@ function gitPathValue(line: string, file: string): string | undefined {
   throw unreadableConfig(file, raw.trim());
 }
 
-/** The arguments of each `Include` line of ssh config `text`, unquoted. */
-function sshIncludePatterns(text: string): string[] {
-  return text.split(/\r?\n/).flatMap((line) => {
-    const args = SSH_INCLUDE.exec(line)?.[1] ?? "";
-    return [...args.matchAll(/"([^"]*)"|(\S+)/g)].map((match) => match[1] ?? match[2] ?? "");
-  });
+/** The arguments of each `Include` line of the ssh config `text` of `file`, unquoted. */
+function sshIncludePatterns(text: string, file: string): string[] {
+  return text.split(/\r?\n/).flatMap((line) => sshArgs(SSH_INCLUDE.exec(line)?.[1] ?? "", file));
+}
+
+/**
+ * The arguments in `args`, as ssh splits them. ssh also reads backslash escapes and arguments
+ * quoted in part (`a" b"`): those fail closed.
+ */
+function sshArgs(args: string, file: string): string[] {
+  if (!SSH_PLAIN_ARGS.test(args)) throw unreadableConfig(file, args.trim());
+  const found: string[] = [];
+  for (const [, doubleQuoted, singleQuoted, plain] of args.matchAll(SSH_ARG)) {
+    if (plain?.startsWith("#") === true) break;
+    found.push(doubleQuoted ?? singleQuoted ?? plain);
+  }
+  return found;
 }
 
 function unreadableConfig(file: string, value: string): AgentSandboxStartError {

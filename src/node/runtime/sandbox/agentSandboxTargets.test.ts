@@ -409,8 +409,14 @@ describe("buildAgentSandboxPolicy", () => {
     const home = path.join(root, "home");
     await fs.mkdir(path.join(home, ".ssh"), { recursive: true });
     await fs.mkdir(path.join(repo, "ssh"));
-    await fs.writeFile(path.join(home, ".ssh", "config"), "Include ~/../repo/ssh/*.conf\n");
-    await fs.writeFile(path.join(repo, "ssh", "a.conf"), `Include "${repo}/deep conf"\n`);
+    await fs.writeFile(
+      path.join(home, ".ssh", "config"),
+      "Include ~/../repo/ssh/*.conf # Mike's hosts\n"
+    );
+    await fs.writeFile(
+      path.join(repo, "ssh", "a.conf"),
+      `Include "${repo}/deep conf" '${repo}/single conf'\n`
+    );
     const homedir = spyOn(os, "homedir").mockReturnValue(home);
     try {
       const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
@@ -419,10 +425,71 @@ describe("buildAgentSandboxPolicy", () => {
 
       expect(writable("ssh", "new.conf")).toBe(false);
       expect(writable("deep conf")).toBe(false);
+      expect(writable("single conf")).toBe(false);
       expect(writable("notes.md")).toBe(true);
     } finally {
       homedir.mockRestore();
     }
+  });
+
+  // OpenSSH reads `a\ b` and `a" b"` as the one name `a b`.
+  test("fails closed on an ssh Include argument that is escaped or quoted in part", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(path.join(home, ".ssh"), { recursive: true });
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      for (const include of ["proxy\\ config", 'proxy" config"']) {
+        await fs.writeFile(path.join(home, ".ssh", "config"), `Include ${repo}/${include}\n`);
+
+        expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(
+          AgentSandboxStartError
+        );
+      }
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  // Xum's own git reads the global config where its environment moves it.
+  test("keeps the global git config that the environment names read-only", async () => {
+    const saved = { XDG: process.env.XDG_CONFIG_HOME, GLOBAL: process.env.GIT_CONFIG_GLOBAL };
+    process.env.XDG_CONFIG_HOME = path.join(repo, "xdg");
+    process.env.GIT_CONFIG_GLOBAL = path.join(repo, "global.gitconfig");
+    await fs.writeFile(path.join(repo, "global.gitconfig"), "[include]\n\tpath = more.gitconfig\n");
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+      const writable = (...parts: string[]) =>
+        agentSandboxPolicyAllows(policy, path.join(repo, ...parts), "write");
+
+      expect(writable("xdg", "git", "config")).toBe(false);
+      expect(writable("global.gitconfig")).toBe(false);
+      expect(writable("more.gitconfig")).toBe(false);
+      expect(writable("notes.md")).toBe(true);
+    } finally {
+      for (const [name, value] of [
+        ["XDG_CONFIG_HOME", saved.XDG],
+        ["GIT_CONFIG_GLOBAL", saved.GLOBAL],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
+  // Git reads all of it, so an include past the first MiB still counts.
+  test("fails closed on a git config that is too large to read", async () => {
+    await fs.appendFile(path.join(commonDir, "config"), `#${"x".repeat(1024 * 1024)}\n`);
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
+  });
+
+  // A write through the other name changes the protected file, and no rule can name every link.
+  test("fails closed on a protected file with another hard link", async () => {
+    await fs.mkdir(path.join(repo, ".xum"));
+    await fs.writeFile(path.join(repo, ".xum", "mcp.jsonc"), "{}\n");
+    await fs.link(path.join(repo, ".xum", "mcp.jsonc"), path.join(repo, "editable-mcp.jsonc"));
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
   });
 
   // Xum starts a global plugin's MCP servers outside the sandbox.
