@@ -118,6 +118,8 @@ function harness(args: {
 }
 
 const followup = (text: unknown) => ({ stdout: JSON.stringify({ followup_message: text }) });
+/** A hook command as the runner starts it from the plugin folder. */
+const inPlugin = (command: string) => `cd -- '${pluginRoot}' || exit 1\n${command}`;
 const stdinOf = (runtime: FakeRuntime, index = 0) =>
   JSON.parse(runtime.execCalls[index].stdin) as Record<string, unknown>;
 
@@ -146,6 +148,8 @@ describe("Cursor hook input, environment and working folder", () => {
     await h.stop();
     const options = runtime.execCalls[0].options;
     expect(options.hostEnv).toBe("minimal");
+    // The sandbox closes Xum's home folder, where the transcript is.
+    expect(options.sandboxReadPaths).toEqual([transcriptPath]);
     expect(options.env).toEqual({
       CURSOR_PROJECT_DIR: workspaceRoot,
       CLAUDE_PROJECT_DIR: workspaceRoot,
@@ -159,8 +163,13 @@ describe("Cursor hook input, environment and working folder", () => {
     expect(options.env).not.toHaveProperty("CURSOR_CODE_REMOTE");
   });
 
-  test("stop runs in the workspace root, afterAgentResponse and afterFileEdit in the plugin folder", async () => {
-    const runtime = fakeRuntime({ "./a.sh": {}, "./s.sh": {}, "./e.sh": {} });
+  test("stop runs in the workspace root, afterAgentResponse and afterFileEdit cd into the plugin folder from it", async () => {
+    // The sandbox opens the exec folder for writes, and a global plugin's folder must stay closed.
+    const runtime = fakeRuntime({
+      [inPlugin("./a.sh")]: {},
+      "./s.sh": {},
+      [inPlugin("./e.sh")]: {},
+    });
     const h = harness({
       hooks: await hooksOf({
         afterAgentResponse: [{ command: "./a.sh" }],
@@ -172,15 +181,16 @@ describe("Cursor hook input, environment and working folder", () => {
     await h.stop();
     await h.edit("file_edit_insert", { path: "a.txt", content: "x" }, { success: true });
     expect(runtime.execCalls.map((call) => [call.command, call.options.cwd])).toEqual([
-      ["./a.sh", pluginRoot],
+      [inPlugin("./a.sh"), workspaceRoot],
       ["./s.sh", workspaceRoot],
-      ["./e.sh", pluginRoot],
+      [inPlugin("./e.sh"), workspaceRoot],
     ]);
+    expect(h.notices).toEqual([]);
     expect(stdinOf(runtime, 0).text).toBe("All done. <promise>DONE</promise>");
   });
 
   test("afterFileEdit runs after the two edit tools with Cursor's edits, not after bash or a failed edit", async () => {
-    const runtime = fakeRuntime({ "./e.sh": {} });
+    const runtime = fakeRuntime({ [inPlugin("./e.sh")]: {} });
     const h = harness({
       hooks: await hooksOf({ afterFileEdit: [{ command: "./e.sh" }] }),
       runtime,
@@ -212,7 +222,7 @@ describe("Cursor hook input, environment and working folder", () => {
 
   test("afterFileEdit runs after an edit whose result an inner post hook replaced", async () => {
     // A Codex PostToolUse block replaces the result the model sees; the file changed anyway.
-    const runtime = fakeRuntime({ "./e.sh": {} });
+    const runtime = fakeRuntime({ [inPlugin("./e.sh")]: {} });
     const h = harness({
       hooks: await hooksOf({ afterFileEdit: [{ command: "./e.sh" }] }),
       runtime,

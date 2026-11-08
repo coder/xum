@@ -419,6 +419,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       abortSignal: options.abortSignal,
       optOut: options.sandbox !== undefined,
       workspaceRoots: options.sandboxRoots,
+      readPaths: options.sandboxReadPaths,
       scratchDir: callerEnv.XUM_SCRATCH_DIR,
       pathEnv: effectivePath,
       otherProjectPaths: options.sandboxProjectPaths,

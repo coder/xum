@@ -148,6 +148,8 @@ export interface AgentSandboxPolicyInput {
   scratchDir?: string;
   /** The command's PATH: folders on it under ~ open for reads. */
   pathEnv?: string;
+  /** Files and folders the command may also read, like extraReadPaths (ExecOptions.sandboxReadPaths). */
+  readPaths?: readonly string[];
   /**
    * The other projects of a multi-project workspace. Only Runtime.agentSandboxPolicy() reads it,
    * to pick the setting (agentSandboxSettingsFor()).
@@ -250,7 +252,7 @@ export function buildAgentSandboxPolicy(
     ...pathFoldersUnderHome(input.pathEnv, home, writeRoots),
     // A command can replace an entry in a write root with a link, so links there are not followed.
     ...outsideNestedDenies(
-      settings.extraReadPaths.map((entry) =>
+      [...settings.extraReadPaths, ...(input.readPaths ?? [])].map((entry) =>
         realpathOutside(expandSandboxPathSpelling(entry), writeRoots)
       ),
       nestedDenies

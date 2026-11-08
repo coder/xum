@@ -98,6 +98,11 @@ export interface ExecOptions {
    */
   sandboxRoots?: string[];
   /**
+   * Files the sandbox also opens for reads, like extraReadPaths: the chat transcript that a Cursor
+   * hook gets in `transcript_path`, which is in Xum's home folder.
+   */
+  sandboxReadPaths?: string[];
+  /**
    * The projects of a multi-project workspace: a command there can change each checkout, so the
    * sandbox applies the strictest of their settings.
    */

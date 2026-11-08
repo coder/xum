@@ -560,6 +560,18 @@ describe("buildAgentSandboxPolicy", () => {
     expect(readable("skills", "demo", "SKILL.md")).toBe(true);
   });
 
+  // A Cursor hook gets its chat's transcript in transcript_path.
+  test("opens the files a call names in readPaths, not their neighbors", () => {
+    const transcript = path.join(xumRoot, "sessions", "ws", "chat.jsonl");
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo, readPaths: [transcript] });
+    const allows = (file: string, access: "read" | "write") =>
+      agentSandboxPolicyAllows(policy, file, access);
+
+    expect(allows(transcript, "read")).toBe(true);
+    expect(allows(transcript, "write")).toBe(false);
+    expect(allows(path.join(xumRoot, "sessions", "ws", "partial.json"), "read")).toBe(false);
+  });
+
   // A command can rename a checkout in a write root and leave a link to ~/.ssh in its place.
   test("fails closed when the workspace leads through a link in a write root", async () => {
     // Any existing folder outside the write roots and the home folder.

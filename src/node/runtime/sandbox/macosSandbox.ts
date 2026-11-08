@@ -138,6 +138,8 @@ export interface WrapForAgentSandboxOptions {
   scratchDir?: string;
   /** The command's PATH: folders on it under ~ open for reads. */
   pathEnv?: string;
+  /** ExecOptions.sandboxReadPaths: open for reads like extraReadPaths. */
+  readPaths?: readonly string[];
   /** ExecOptions.sandboxProjectPaths: their settings apply too (agentSandboxSettingsFor()). */
   otherProjectPaths?: readonly string[];
 }
@@ -164,6 +166,7 @@ export async function wrapForAgentSandbox(
     workspaceRoots: options.workspaceRoots,
     scratchDir: options.scratchDir,
     pathEnv: options.pathEnv,
+    readPaths: options.readPaths,
   });
   return wrapWithPolicy(policy, script, options);
 }
