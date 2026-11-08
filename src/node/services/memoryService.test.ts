@@ -5891,25 +5891,16 @@ describe("MemoryService refinement journal", () => {
       );
     });
 
-    it("journals no row for a guarded create, rename or delete that names a credential", async () => {
+    it("refuses a guarded create or rename that adds a credential-like name", async () => {
+      // A name is stored text: a guarded write must not add a credential by name while the journal
+      // skip below drops its row.
       using fixture = await createFixture();
       await fixture.service.create(fixture.ctx, "/memories/global/old.md", "x\n", "agent");
-      await fixture.service.create(fixture.ctx, `/memories/global/d/${TOKEN}.md`, "y\n", "agent");
       const renamed = await fixture.service.rename(
         fixture.ctx,
         "/memories/global/old.md",
         `/memories/global/${TOKEN}.md`,
         "agent",
-        undefined,
-        undefined,
-        GUARDED
-      );
-      // The directory's own path is clean; only the file it holds is named for the credential.
-      const deleted = await fixture.service.deletePath(
-        fixture.ctx,
-        "/memories/global/d",
-        "agent",
-        undefined,
         undefined,
         undefined,
         GUARDED
@@ -5923,7 +5914,48 @@ describe("MemoryService refinement journal", () => {
         undefined,
         GUARDED
       );
-      expect([renamed.success, deleted.success, created.success]).toEqual([true, true, true]);
+      const validated = await fixture.service.validateMutation(
+        fixture.ctx,
+        {
+          command: "rename",
+          path: "/memories/global/old.md",
+          new_path: `/memories/global/${TOKEN}.md`,
+        },
+        GUARDED
+      );
+
+      expect([renamed.success, created.success, validated.ok]).toEqual([false, false, false]);
+      expect(await pathExists(physicalOf(fixture, "old.md"))).toBe(true);
+      expect(await pathExists(physicalOf(fixture, `new-${TOKEN}.md`))).toBe(false);
+      // Only the unguarded setup create is journaled.
+      expect(await readRefinementEvents(sessionDirOf(fixture))).toHaveLength(1);
+    });
+
+    it("journals no row for a guarded cleanup of a credential-like name", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, `/memories/global/${TOKEN}.md`, "x\n", "agent");
+      await fixture.service.create(fixture.ctx, `/memories/global/d/${TOKEN}.md`, "y\n", "agent");
+      // Renaming the credential away and deleting a directory that holds one add no name; their
+      // rows would keep the old one.
+      const renamed = await fixture.service.rename(
+        fixture.ctx,
+        `/memories/global/${TOKEN}.md`,
+        "/memories/global/api-key-location.md",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+      const deleted = await fixture.service.deletePath(
+        fixture.ctx,
+        "/memories/global/d",
+        "agent",
+        undefined,
+        undefined,
+        undefined,
+        GUARDED
+      );
+      expect([renamed.success, deleted.success]).toEqual([true, true]);
 
       expect(await readRefinementEvents(sessionDirOf(fixture))).toHaveLength(2);
     });

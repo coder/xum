@@ -3121,6 +3121,7 @@ export class MemoryService extends EventEmitter {
             `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
           );
         }
+        assertNoSecretPath(options, virtualPath);
         assertNoNewSecret(options, "", fileText, virtualPath);
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, fileText);
@@ -3291,6 +3292,7 @@ export class MemoryService extends EventEmitter {
               `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
             );
           }
+          assertNoSecretPath(options, command.path);
           assertNoNewSecret(options, "", command.file_text, command.path);
           break;
         }
@@ -3358,6 +3360,7 @@ export class MemoryService extends EventEmitter {
           if (newKind !== null) {
             throw new MemoryCommandError(`Destination ${command.new_path} already exists`);
           }
+          assertNoSecretPath(options, command.new_path);
           break;
         }
       }
@@ -3490,6 +3493,7 @@ export class MemoryService extends EventEmitter {
         if (newKind !== null) {
           throw new MemoryCommandError(`Destination ${newVirtualPath} already exists`);
         }
+        assertNoSecretPath(options, newVirtualPath);
         await this.assertMutationCommittable(ctx, store, abortSignal, oldVirtualPath);
         await store.rename(oldParsed.relPath, newParsed.relPath);
         // Row is written before the rename is acknowledged (mutation → row → ack).
@@ -3947,6 +3951,20 @@ function assertNoNewSecret(
   if (!addsSecretLike(previous, updated)) return;
   throw new MemoryCommandError(
     `${virtualPath} was not changed: the file would contain a credential-like value (a key, token, password or private key) after this edit. Memory must never hold secrets; say what the credential is for and where it lives, and leave the value out.`
+  );
+}
+
+/**
+ * Name rule of `rejectSecretLike`: a file name is stored text too (`sk-....md` keeps the key in the
+ * directory listing), so a guarded create or rename refuses a credential-like path it would add.
+ * This keeps the refinement journal's skip (see refinementHoldsSecretLike) to cleanups: a guarded
+ * write cannot add a credential by name while its row is dropped. A delete or a rename's source
+ * names a file that already exists and adds nothing. The message never quotes the path.
+ */
+function assertNoSecretPath(options: MemoryWriteOptions | undefined, addedPath: string): void {
+  if (options?.rejectSecretLike !== true || !containsSecretLike(addedPath)) return;
+  throw new MemoryCommandError(
+    "The path contains a credential-like value, so it was not used. Name the file for what it holds, not for a key, token or password."
   );
 }
 

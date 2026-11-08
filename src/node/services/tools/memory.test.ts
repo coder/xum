@@ -501,7 +501,7 @@ describe("memory tool refinement journal", () => {
     expect(evidence.toolName).toBe("memory");
   });
 
-  it("hands rejectSecretLike to every mutating command, so none journals a credential-named path", async () => {
+  it("hands rejectSecretLike to every mutating command", async () => {
     using fixture = await createFixture();
     const token = `ghp_${"a1B2".repeat(9)}`;
     const ctx: MemoryScopeContext = {
@@ -510,30 +510,44 @@ describe("memory tool refinement journal", () => {
       workspaceId: "ws-tool",
       projectPath: FIXTURE_PROJECT_PATH,
     };
-    const inputs: MemoryCommandInput[] = [
-      { command: "create", path: `/memories/global/${token}.md`, file_text: "a\n" },
-      { command: "insert", path: `/memories/global/${token}.md`, insert_line: 0, insert_text: "b" },
-      { command: "str_replace", path: `/memories/global/${token}.md`, old_str: "a", new_str: "c" },
-      {
-        command: "rename",
-        old_path: `/memories/global/${token}.md`,
-        new_path: `/memories/global/x-${token}.md`,
-      },
-      { command: "delete", path: `/memories/global/x-${token}.md` },
-    ];
-    for (const input of inputs) {
-      const result = await executeMemoryCommand(
+    const run = (input: MemoryCommandInput, guarded: boolean) =>
+      executeMemoryCommand(
         fixture.config.memoryService!,
         ctx,
         input,
         () => null,
         undefined,
-        { rejectSecretLike: true }
+        guarded ? { rejectSecretLike: true } : undefined
       );
-      expect(result).toMatchObject({ success: true });
+    const named = `/memories/global/${token}.md`;
+    // Adding a credential-like name is refused (create, and a rename's destination)...
+    expect(await run({ command: "create", path: named, file_text: "a\n" }, true)).toMatchObject({
+      success: false,
+    });
+    expect(
+      await run({ command: "create", path: "/memories/global/clean.md", file_text: "a\n" }, false)
+    ).toMatchObject({ success: true });
+    expect(
+      await run({ command: "rename", old_path: "/memories/global/clean.md", new_path: named }, true)
+    ).toMatchObject({ success: false });
+    // ...and the guarded cleanups of files that already have one are not journaled.
+    for (const setup of [named, `/memories/global/d/${token}.md`]) {
+      expect(await run({ command: "create", path: setup, file_text: "a\n" }, false)).toMatchObject({
+        success: true,
+      });
+    }
+    const sessionDir = path.join(new Config(fixture.xumHome).sessionsDir, "ws-tool");
+    const before = (await readRefinementEvents(sessionDir)).length;
+    const cleanups: MemoryCommandInput[] = [
+      { command: "insert", path: named, insert_line: 0, insert_text: "b" },
+      { command: "str_replace", path: named, old_str: "a", new_str: "c" },
+      { command: "rename", old_path: named, new_path: "/memories/global/moved.md" },
+      { command: "delete", path: "/memories/global/d" },
+    ];
+    for (const input of cleanups) {
+      expect(await run(input, true)).toMatchObject({ success: true });
     }
 
-    const sessionDir = path.join(new Config(fixture.xumHome).sessionsDir, "ws-tool");
-    expect(await readRefinementEvents(sessionDir)).toHaveLength(0);
+    expect(await readRefinementEvents(sessionDir)).toHaveLength(before);
   });
 });
