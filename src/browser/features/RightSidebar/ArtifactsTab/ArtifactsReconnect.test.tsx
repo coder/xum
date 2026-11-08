@@ -30,6 +30,9 @@ import { CanvasArtifact } from "./CanvasArtifact";
 import { McpAppFrame } from "./McpAppFrame";
 import type { McpAppViewRef } from "./mcpAppViewsStore";
 import { frameDocumentOf, postFromFrameDocument } from "./frameDocument.testHarness";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 /*
  * A dropped backend connection: while it is down, useAPI() returns `api: null`; the reconnect

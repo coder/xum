@@ -24,6 +24,9 @@ import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND } from "./frameDocumentChannel";
 import { postFromFrameDocument } from "./frameDocument.testHarness";
 import { ARTIFACT_CLICK_SEND_WINDOW_MS } from "@/common/constants/artifactInteractions";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 const HTML: ArtifactReadResult = {
   status: "ok",

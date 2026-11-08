@@ -20,6 +20,9 @@ import {
   AppViewTabTooltip,
   findOwnMaximizedAppPanel,
 } from "./AppViewTab";
+import { restoreHistoryPrototypeAfterEach } from "../ArtifactsTab/historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 /**
  * Run the view document's preamble (its first script) as the frame's document would: it opens

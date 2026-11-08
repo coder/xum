@@ -30,6 +30,9 @@ import {
   frameDocumentOf,
   postFromFrameDocument,
 } from "./frameDocument.testHarness";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 function page(content: string): ArtifactReadResult {
   // One fixed mtime: remote runtimes list whole seconds, so a quick rewrite can keep it.

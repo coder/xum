@@ -28,6 +28,9 @@ import {
   useMcpAppViewReloadKey,
   type McpAppViewRef,
 } from "./mcpAppViewsStore";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 // The card's display values: the aggregated tool name and the pre-sanitization arguments.
 const VIEW: McpAppViewRef = {

@@ -29,6 +29,9 @@ import { ArtifactsPanel } from "./ArtifactsPanel";
 import { ARTIFACT_TABLE_MAX_COLUMNS, ARTIFACT_TABLE_MAX_ROWS } from "./DataTable";
 import { JSON_TREE_MAX_NODES } from "./jsonData";
 import { useAgentBrowserAvailable } from "./useAgentBrowserAvailable";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 function ok(
   path: string,
