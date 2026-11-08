@@ -10,6 +10,7 @@ import type {
   BackupPluginRow,
   BackupPluginStatus,
 } from "@/common/orpc/schemas/backup";
+import { EMPTY_BACKUP_PLUGIN_REPORT } from "@/common/orpc/schemas/backup";
 import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
 /** The plugins this machine lacks, as the entries a reinstall offers (the status is spent). */
@@ -17,6 +18,16 @@ function missingPlugins(report: BackupPluginReport): BackupPluginEntry[] {
   return report.rows
     .filter((row) => row.status === "missing")
     .map(({ status: _status, ...entry }) => entry);
+}
+
+/**
+ * The plugin list the form may act on. It describes the saved repository. While the form holds an
+ * unsaved change, the other backup actions refuse to run (requireSavedSettings in BackupSection),
+ * so the list is hidden and cannot queue a review of plugins from the repository the form no
+ * longer names. It returns if the change is undone, since it still describes the saved one.
+ */
+export function savedPluginReport(report: BackupPluginReport, dirty: boolean): BackupPluginReport {
+  return dirty ? EMPTY_BACKUP_PLUGIN_REPORT : report;
 }
 
 /**
