@@ -154,10 +154,10 @@ export const MemoryHarvestRecordSchema = z.object({
   /** How many of the last `ops` came from the chunk `nextChunk`, which no attempt finished. */
   nextChunkOps: PersistedCountSchema.optional(),
   /**
-   * The row of this epoch an earlier open-epoch run had analyzed up to when the first attempt's
-   * analyzer turn began (null: none), so the run reads the rows after it. A retry reuses it
-   * instead of looking again: an open-epoch run that completes later must not move the rows
-   * under the saved chunk cursor. Absent before an attempt's turn began, and in older records.
+   * The row of this epoch an earlier run (an archive, or the compaction that closed the epoch under
+   * an archive's snapshot) had analyzed up to when the first attempt's analyzer turn began (null:
+   * none), so the run reads the rows after it. A retry reuses it instead of looking again: a run
+   * that completes later must not move the rows under the saved chunk cursor. Absent before an attempt's turn began, and in older records.
    */
   analyzedFloorRowId: z.string().nullish(),
   error: z.string().optional(),
@@ -170,7 +170,8 @@ export const MemoryHarvestRecordSchema = z.object({
    * The newest row of the epoch the run read completely (null: none). It is behind the newest row
    * when the run skipped chunks for its budget: the floor of a later run is this row, not the
    * newest one. A failed run records the last chunk it read cleanly, whose edits landed. Absent in
-   * older records, which read up to the row their key names (a failed one read nothing known).
+   * older records, which read up to the row their key names (a failed one read nothing known; a
+   * closed epoch's key is its summary, no row, so such a record names none).
    */
   readThroughRowId: z.string().nullish(),
   /**

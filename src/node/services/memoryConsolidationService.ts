@@ -527,26 +527,34 @@ export function staleExhaustedHarvestFailure(
 const OPEN_EPOCH_KEY_PREFIX = "open:";
 
 /**
- * The ids of the rows that open-epoch runs read up to: every row up to each was analyzed. That is
+ * The ids of the rows that runs of an epoch read up to: every row up to each was analyzed. That is
  * the record's `readThroughRowId`, not always the newest row its key names: a run that skipped
- * chunks for its budget never read the rows after it. A completed record from before the field
- * read everything up to its key's row. A failed run counts through the last chunk it read
- * cleanly: those chunks' edits landed, and a later run, an archive after a new row or the
+ * chunks for its budget never read the rows after it. A completed open-epoch record from before
+ * the field read everything up to its key's row. A failed run counts through the last chunk it
+ * read cleanly: those chunks' edits landed, and a later run, an archive after a new row or the
  * compaction that closes the epoch, would otherwise read the rows again with a fresh budget. A
  * pending record counts the same way: a run saves its cursor after each chunk, and the run queued
  * behind it (an archive and the compaction of its epoch can overlap) starts when the turn is
  * released, before the completed record is saved. A record without the field read nothing known.
+ *
+ * A closed epoch's record counts too, by its `readThroughRowId` alone: its key is the summary, no
+ * row of the epoch. An archive can snapshot the open epoch and reach its analyzer turn after the
+ * compaction that closes the epoch ran; that record is then the only one of what was read. Row ids
+ * are never reused (tail copies get fresh ones), so a row another epoch read never matches here. A
+ * closed record without the field names no row (a history sequence or an epoch number is reused
+ * by a rewound chat): it counts for nothing, so rows are read again, never skipped.
+ *
  * Read from the records, so a pruned record only loses its floor, which re-reads rows instead of
  * skipping any.
  */
-function analyzedOpenEpochRowIds(
+function analyzedEpochRowIds(
   records: Record<string, MemoryHarvestRecord> | undefined
 ): Set<string> {
   const ids = new Set<string>();
   for (const [boundaryKey, record] of Object.entries(records ?? {})) {
-    if (!boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX)) continue;
+    const isOpenEpochRecord = boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX);
     const readEverythingToKey =
-      record.status === "completed" && record.readThroughRowId === undefined;
+      isOpenEpochRecord && record.status === "completed" && record.readThroughRowId === undefined;
     const readThrough = readEverythingToKey
       ? boundaryKey.slice(OPEN_EPOCH_KEY_PREFIX.length)
       : record.readThroughRowId;
@@ -556,13 +564,25 @@ function analyzedOpenEpochRowIds(
 }
 
 /**
+ * The row that ties `record` to an epoch's rows, by id: an open-epoch key names its newest row; a
+ * closed epoch's key is its summary, no row of the epoch, so only `readThroughRowId` can (see
+ * analyzedEpochRowIds).
+ */
+function epochRowIdOfRecord(boundaryKey: string, record: MemoryHarvestRecord): string | undefined {
+  if (boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX)) {
+    return boundaryKey.slice(OPEN_EPOCH_KEY_PREFIX.length);
+  }
+  return typeof record.readThroughRowId === "string" ? record.readThroughRowId : undefined;
+}
+
+/**
  * Mutations the earlier records of the epoch `rows` belong to have spent. The epoch has one budget
  * (MEMORY_ANALYZER_OP_BUDGET), but a record is one run: every archive after new rows and the
  * compaction that closes the epoch each make a new record, and each starts from this number, so
  * the epoch's edits add up to one budget instead of one per record. A record's `budgetUsed`
- * already includes what it started with, so the most spent record is the total. An open-epoch
- * record belongs to the epoch when the row its key names is one of `rows`, matched by id like the
- * floors: a rewound chat can reuse an epoch number but never a row id, so the abandoned
+ * already includes what it started with, so the most spent record is the total. A record belongs
+ * to the epoch when the row it is tied to (epochRowIdOfRecord) is one of `rows`, matched by id
+ * like the floors: a rewound chat can reuse an epoch number but never a row id, so the abandoned
  * timeline's edits do not spend the new one's budget. Read from the records, so a pruned record
  * only loses what it spent, which the newer records of the epoch carry.
  */
@@ -573,8 +593,8 @@ function epochBudgetSpent(
   const rowIds = new Set(rows.map((row) => row.id));
   let spent = 0;
   for (const [boundaryKey, record] of Object.entries(records ?? {})) {
-    if (!boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX)) continue;
-    if (!rowIds.has(boundaryKey.slice(OPEN_EPOCH_KEY_PREFIX.length))) continue;
+    const rowId = epochRowIdOfRecord(boundaryKey, record);
+    if (rowId === undefined || !rowIds.has(rowId)) continue;
     spent = Math.max(spent, budgetSpent({ ops: record.ops ?? [], budgetUsed: record.budgetUsed }));
   }
   return spent;
@@ -1621,7 +1641,7 @@ export class MemoryConsolidationService extends EventEmitter {
   /**
    * Analyzer run over the rows after the latest context boundary. The record key is the newest
    * row (see OPEN_EPOCH_KEY_PREFIX): the same rows are never analyzed twice, new rows get a new
-   * run that reads only them (see analyzedOpenEpochRowIds), and an epoch with nothing to read makes
+   * run that reads only them (see analyzedEpochRowIds), and an epoch with nothing to read makes
    * no model call and no record.
    */
   private analyzeOpenEpochEffect(
@@ -1841,7 +1861,9 @@ export class MemoryConsolidationService extends EventEmitter {
         );
 
       // An archive that read part of this epoch's rows already analyzed them: a second archive
-      // after new rows, and the compaction that later closes the epoch, both start after them.
+      // after new rows, and the compaction that later closes the epoch, both start after them. So
+      // does an archive that snapshotted the epoch and reached its turn after the compaction that
+      // closed it ran: that compaction's record counts like an archive's.
       // The first attempt fixes the floor in the record and a retry reuses it: the chunk cursor
       // counts chunks of the rows after that floor, and looking again could find a newer one (an
       // archive that read the epoch before it closed may complete after the first attempt).
@@ -1853,7 +1875,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const floorFrom = (records: Record<string, MemoryHarvestRecord> | undefined) =>
         recordedFloor !== undefined
           ? recordedFloor
-          : analyzedFloorRowId(epoch.data.messages, analyzedOpenEpochRowIds(records));
+          : analyzedFloorRowId(epoch.data.messages, analyzedEpochRowIds(records));
       // Every row was analyzed before: nothing is left to read, so no model call.
       const nothingLeftAfter = (floor: string | null) =>
         epoch.data.messages.length > 0 && rowsAfterFloor(epoch.data.messages, floor).length === 0;

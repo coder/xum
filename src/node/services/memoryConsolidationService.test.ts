@@ -481,6 +481,8 @@ async function createFixture(options?: {
   /** Holds every model run open until resolved (for in-flight race tests). */
   modelGate?: Promise<void>;
   modelFactory?: () => MockLanguageModelV3;
+  /** Holds one run's model creation (1-based, in call order) until the promise settles. */
+  beforeModelCreated?: (call: number) => Promise<void>;
   /** Wire a real SessionUsageService (headless cost telemetry tests). */
   withSessionUsage?: boolean;
   /** The pricing identity every created model reports; default: the requested model string. */
@@ -521,6 +523,7 @@ async function createFixture(options?: {
       createModelWithPinnedMetadata: async (modelString: string) => {
         modelCalls.push(Date.now());
         if (options?.modelGate) await options.modelGate;
+        await options?.beforeModelCreated?.(modelCalls.length);
         if (modelUnavailable) return Err({ type: "api_key_not_found" });
         return Ok({
           model:
@@ -2528,6 +2531,88 @@ describe("MemoryConsolidationService", () => {
         released[0]?.open();
         released[1]?.open();
       }
+    });
+
+    describe("an archive whose analyzer turn comes after the compaction that closed its epoch", () => {
+      /**
+       * An archive pass that took its snapshot of the open epoch and is held at its model creation,
+       * before its analyzer turn. The compaction that closes the epoch then runs to the end, and
+       * only then does the archive's turn arrive. The compaction's record, keyed by its summary,
+       * is then the only record of the rows and edits already spent.
+       */
+      async function archiveBehindClosingCompaction(
+        editsPerRun: number,
+        appendEpochRows: (fixture: Fixture) => Promise<void>
+      ) {
+        const archiveSnapshotted = gate();
+        const releaseArchive = gate();
+        const models = editsEveryRunModels(editsPerRun);
+        using fixture = await createFixture({
+          modelFactory: models.factory,
+          beforeModelCreated: async (call) => {
+            if (call !== 1) return;
+            archiveSnapshotted.open();
+            await releaseArchive.opened;
+          },
+        });
+        await appendEpochRows(fixture);
+
+        const archive = fixture.service.maybeRunArchivePass("ws-dream");
+        await archiveSnapshotted.opened;
+        // The compaction's own dream follows its analysis; only the analysis matters here.
+        await fixture.service.maybeHarvestThenSweep(await closeEpochWithoutNewRows(fixture));
+        const analyzerRunsBeforeArchiveTurn = models.analyzerRuns();
+
+        releaseArchive.open();
+        expect((await archive).success).toBe(true);
+        return {
+          analyzerRunsBeforeArchiveTurn,
+          analyzerRunsAfterArchive: models.analyzerRuns(),
+          records: await harvestRecords(fixture),
+        };
+      }
+
+      it("does not read again the rows the compaction read", async () => {
+        const { analyzerRunsBeforeArchiveTurn, analyzerRunsAfterArchive, records } =
+          await archiveBehindClosingCompaction(5, (fixture) => appendRows(fixture, openRowTexts));
+
+        expect(analyzerRunsBeforeArchiveTurn).toBe(1);
+        expect(records["summary-1"]).toMatchObject({
+          status: "completed",
+          readThroughRowId: "open-2",
+        });
+        // The compaction read both rows: the archive finds nothing left, so it makes no model call.
+        expect(analyzerRunsAfterArchive).toBe(1);
+        expect(records["open:open-2"]).toMatchObject({
+          status: "completed",
+          nextChunk: 0,
+          analyzedFloorRowId: "open-2",
+        });
+      });
+
+      it("starts from the edits the compaction spent on the epoch's budget", async () => {
+        const { analyzerRunsBeforeArchiveTurn, analyzerRunsAfterArchive, records } =
+          await archiveBehindClosingCompaction(MEMORY_ANALYZER_OP_BUDGET, (fixture) =>
+            appendBulkRows(fixture)
+          );
+
+        // The compaction spent the whole budget on its first chunk and skipped the other two.
+        expect(analyzerRunsBeforeArchiveTurn).toBe(1);
+        expect(records["summary-1"]).toMatchObject({
+          status: "completed",
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+          readThroughRowId: "bulk-4",
+        });
+        // The archive's floor leaves it the rows of those two chunks. Seeded with the spent
+        // budget it skips them without a model call; on a fresh budget it would edit memory again.
+        expect(analyzerRunsAfterArchive).toBe(1);
+        expect(records["open:bulk-11"]).toMatchObject({
+          status: "completed",
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+          analyzedFloorRowId: "bulk-4",
+        });
+        expect(records["open:bulk-11"]?.note).toContain("edit budget spent");
+      });
     });
 
     // The analyzer and the dream edit the same /memories/workspace files, and the dream's `insert`
