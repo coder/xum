@@ -463,6 +463,18 @@ describe("UpdaterService", () => {
       'Cannot find latest-mac.yml in the latest release artifacts (https://github.com/coder/mux/releases/download/v0.18.1-nightly.16/latest-mac.yml): HttpError: 404 "method: GET url: https://github.com/coder/mux/releases/download/v0.18.1-nightly.16/latest-mac.yml\n\nPlease double check that your authentication token is correct.\n" Headers: { ... }\n    at createHttpError (/path/httpExecutor.ts:31:10)';
     const nightlyManifestPendingMessage =
       "Update metadata isn't available yet. The latest release may still be publishing; please try again in a few minutes.";
+    // GitHub's own edge answering a nightly metadata request while its release
+    // route is degraded; this HTML body is what reached the About dialog.
+    const gatewayTimeoutError = `504
+"method: GET url: https://github.com/coder/xum/releases/download/v0.32.2-nightly.194/nightly-mac.yml
+
+Data:
+<html><body><h1>504 Gateway Time-out</h1>
+The server didn't respond in time.
+</body></html>
+"`;
+    const updateServerUnreachableMessage =
+      "The update server didn't respond. This is usually a temporary GitHub problem; please try again in a few minutes.";
 
     it("should silently back off on 404 (latest.yml missing) for auto checks", async () => {
       mockAutoUpdater.checkForUpdates.mockImplementation(() => {
@@ -519,6 +531,44 @@ describe("UpdaterService", () => {
         type: "error",
         phase: "check",
         message: nightlyManifestPendingMessage,
+      });
+    });
+
+    it("should silently back off on gateway errors for auto checks", async () => {
+      mockAutoUpdater.checkForUpdates.mockImplementation(() => {
+        setImmediate(() => {
+          mockAutoUpdater.emit("error", new Error(gatewayTimeoutError));
+        });
+        return new Promise(() => {
+          // Never resolves — events drive state
+        });
+      });
+
+      service.checkForUpdates({ source: "auto" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const lastStatus = statusUpdates[statusUpdates.length - 1];
+      expect(lastStatus).toEqual({ type: "idle" });
+      expect(statusUpdates.find((s) => s.type === "error")).toBeUndefined();
+    });
+
+    it("should name the update server for a gateway error on a manual check", async () => {
+      mockAutoUpdater.checkForUpdates.mockImplementation(() => {
+        setImmediate(() => {
+          mockAutoUpdater.emit("error", new Error(gatewayTimeoutError));
+        });
+        return new Promise(() => {
+          // Never resolves — events drive state
+        });
+      });
+
+      service.checkForUpdates({ source: "manual" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(statusUpdates[statusUpdates.length - 1]).toEqual({
+        type: "error",
+        phase: "check",
+        message: updateServerUnreachableMessage,
       });
     });
 

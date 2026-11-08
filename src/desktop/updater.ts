@@ -40,12 +40,24 @@ function getGitHubRepo(): { owner: string; repo: string } {
 // exposing low-level electron-updater stack traces in the About dialog.
 const MISSING_UPDATE_METADATA_MESSAGE =
   "Update metadata isn't available yet. The latest release may still be publishing; please try again in a few minutes.";
+const UPDATE_SERVER_UNREACHABLE_MESSAGE =
+  "The update server didn't respond. This is usually a temporary GitHub problem; please try again in a few minutes.";
 const MAX_USER_VISIBLE_UPDATE_ERROR_LENGTH = 240;
+
+/**
+ * GitHub's own front end answers release-metadata requests with a gateway
+ * error (502/503/504 and an HTML body) whenever its repository/release route
+ * is degraded. The install itself is fine then, so treat it as retryable.
+ */
+function isGatewayUpdateError(error: Error): boolean {
+  return /\b50[234]\b/.test(error.message);
+}
 
 /**
  * Detect transient errors that should trigger silent backoff rather than
  * surfacing an error to the user. Covers:
  * - 404 (latest.yml not yet uploaded for a new release)
+ * - Gateway errors from GitHub while its release route is degraded
  * - Network errors (offline, DNS, timeout)
  * - GitHub rate-limiting (explicit rate-limit signatures only — bare 403s
  *   may indicate persistent auth/config issues and should remain visible)
@@ -53,6 +65,7 @@ const MAX_USER_VISIBLE_UPDATE_ERROR_LENGTH = 240;
 function isTransientUpdateError(error: Error): boolean {
   const msg = error.message;
   return (
+    isGatewayUpdateError(error) ||
     /404|Not Found/i.test(msg) ||
     /ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN/i.test(msg) ||
     /network|socket hang up/i.test(msg) ||
@@ -81,6 +94,10 @@ function sanitizeUpdateCheckErrorMessage(message: string): string {
 function getUserVisibleCheckErrorMessage(error: Error): string {
   if (isMissingLatestManifestError(error)) {
     return MISSING_UPDATE_METADATA_MESSAGE;
+  }
+
+  if (isGatewayUpdateError(error)) {
+    return UPDATE_SERVER_UNREACHABLE_MESSAGE;
   }
 
   return sanitizeUpdateCheckErrorMessage(error.message);
