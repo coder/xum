@@ -864,6 +864,100 @@ describe("runMemoryHarvest", () => {
     }
   });
 
+  // The summary is read with every chunk, so a screenshot it echoes, or a megabyte of text, would be
+  // sent again with each one.
+  it("replaces a data URL in the compaction summary by a stub in every chunk's prompt", async () => {
+    using fixture = createFixture();
+    fixture.summary = createMuxMessage(
+      "summary-1",
+      "assistant",
+      `SUMMARY-FACT: the screenshot data:image/png;base64,${"QUJD".repeat(100_000)} showed the error.`,
+      { historySequence: 2, compactionBoundary: true }
+    );
+    fixture.messages = manyChunkMessages();
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    expect(calls).toHaveLength(3);
+    for (const call of calls) {
+      const prompt = userPromptText(call);
+      expect(prompt).toContain("SUMMARY-FACT: the screenshot [media] showed the error.");
+      expect(prompt).not.toContain("QUJD");
+    }
+  });
+
+  it("cuts a compaction summary at the cap of a text part, and says so", async () => {
+    using fixture = createFixture();
+    fixture.summary = createMuxMessage(
+      "summary-1",
+      "assistant",
+      `SUMMARY-HEAD ${"x".repeat(500_000)} SUMMARY-TAIL`,
+      { historySequence: 2, compactionBoundary: true }
+    );
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    const prompt = userPromptText(calls[0]);
+    expect(prompt).toContain("SUMMARY-HEAD");
+    expect(prompt).not.toContain("SUMMARY-TAIL");
+    expect(prompt).toMatch(/\[truncated \d+ more chars for memory harvest\]/);
+    expect(prompt.length).toBeLessThan(200_000);
+  });
+
+  it.each([
+    ["at the cap", 128_000, false],
+    ["one character over the cap", 128_001, true],
+  ])(
+    "notes a cut of the compaction summary only when it is over the cap: %s",
+    async (_label, chars, cut) => {
+      using fixture = createFixture();
+      fixture.summary = createMuxMessage("summary-1", "assistant", "x".repeat(chars), {
+        historySequence: 2,
+        compactionBoundary: true,
+      });
+      const { model, calls } = scriptedModel([]);
+
+      await runHarvest(fixture, model);
+
+      const prompt = userPromptText(calls[0]);
+      expect(prompt.includes("[truncated 1 more chars for memory harvest]")).toBe(cut);
+    }
+  );
+
+  // The lead of a prompt (everything before the transcript) says what the run is: the first chunk of
+  // an epoch has no earlier chunks to tell the model about, and the others share one lead.
+  it("tells the model that earlier chunks were analyzed, from the second chunk on", async () => {
+    using fixture = createFixture();
+    fixture.messages = manyChunkMessages();
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    const leads = calls.map((call) => userPromptText(call).split("\nTranscript chunk")[0]);
+    expect(leads).toHaveLength(3);
+    expect(leads[0]).not.toBe(leads[1]);
+    expect(leads[1]).toBe(leads[2]);
+  });
+
+  it("tells the model an epoch with no summary has none, and shows a summary where there is one", async () => {
+    using withSummary = createFixture();
+    using withoutSummary = createFixture();
+    const closed = scriptedModel([]);
+    const open = scriptedModel([]);
+
+    await runHarvest(withSummary, closed.model);
+    await runHarvest(withoutSummary, open.model, { summary: undefined });
+
+    const closedPrompt = userPromptText(closed.calls[0]);
+    const openPrompt = userPromptText(open.calls[0]);
+    expect(closedPrompt).toContain("Compaction summary (summary-1)");
+    expect(closedPrompt).not.toContain("no summary");
+    expect(openPrompt).toContain("no summary");
+    expect(openPrompt).not.toContain("Compaction summary (");
+  });
+
   it("analyzes an epoch that has no compaction summary", async () => {
     using fixture = createFixture();
     const prompts: string[] = [];
@@ -1536,6 +1630,45 @@ describe("runMemoryHarvest", () => {
     expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 15 });
   });
 
+  it("reports the usage of a chunk whose step ended at the output limit, though that fails the chunk", async () => {
+    using fixture = createFixture();
+    const recorded: Array<number | undefined> = [];
+    // The stream ends clean, so the whole of it was billed, the cut-off step included.
+    const { model } = scriptedModel([
+      [
+        memoryToolCall(createFile("/memories/workspace/cut.md", "half a comm"), "call-cut"),
+        lengthFinishChunk(7),
+      ],
+    ]);
+
+    const result = await runHarvest(fixture, model, {
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    expect(result.streamError).toContain("output limit");
+    expect(recorded).toEqual([7]);
+  });
+
+  it("reports no usage for a chunk whose stream failed", async () => {
+    using fixture = createFixture();
+    const recorded: Array<number | undefined> = [];
+    const { model } = scriptedModel([new Error("provider exploded")]);
+
+    const result = await runHarvest(fixture, model, {
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    // After a mid-flight error the SDK's usage promise can stay pending forever: nothing waits on it.
+    expect(result.streamError).toContain("provider exploded");
+    expect(recorded).toEqual([]);
+  });
+
   it("sums the usage of the chunks that reported one and none when no chunk did", async () => {
     using fixture = createFixture();
     fixture.messages = manyChunkMessages();
@@ -1703,6 +1836,42 @@ describe("runMemoryHarvest", () => {
       expect(
         await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/cut.md")
       ).toMatchObject({ success: false });
+    });
+
+    it("completes a chunk whose cut-off step the model retried in a later step", async () => {
+      using fixture = createFixture();
+      // A step cut off mid tool call has input that is not valid JSON, so the SDK hands the model a
+      // tool error instead of ending the stream, and the model's next step retries the command.
+      const { model, calls } = scriptedModel([
+        [
+          {
+            type: "tool-call",
+            toolCallId: "call-cut",
+            toolName: "memory",
+            input: '{"command":"cre',
+          },
+          lengthFinishChunk(1),
+        ],
+        [
+          memoryToolCall(createFile("/memories/workspace/recovered.md", "fact\n"), "call-retry"),
+          toolFinishChunk(),
+        ],
+        [finishChunk(1)],
+      ]);
+
+      const result = await runHarvest(fixture, model, { ...priced, ceilingUsd: 100 });
+
+      // Only the last step's finish reason counts: the chunk is read, not failed.
+      expect(result.streamError).toBeUndefined();
+      expect(calls).toHaveLength(3);
+      expect(result.nextChunk).toBe(1);
+      expect(result.readChunks).toBe(1);
+      expect(result.ops).toEqual([
+        { command: "create", path: "/memories/workspace/recovered.md", applied: true },
+      ]);
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/recovered.md")
+      ).toMatchObject({ success: true });
     });
 
     it("caps what one step can write, which bounds how far it can overshoot", async () => {
@@ -2426,6 +2595,11 @@ describe("buildHarvestChunks", () => {
         expect(over.slice(0, -1).some((row) => row.truncated)).toBe(false);
         expect(over.at(-1)?.truncated).toBe(true);
         expect(over.at(-1)?.text).toEndWith("[truncated 1500 more chars for memory harvest]");
+
+        // One character is a cut too: the note names it.
+        const byOne = rowsOf(messageOfTexts(TEXT_PART_LIMIT + 1));
+        expect(byOne.at(-1)?.truncated).toBe(true);
+        expect(byOne.at(-1)?.text).toEndWith("[truncated 1 more chars for memory harvest]");
       });
 
       it("keep the message's id on every segment", () => {

@@ -7,7 +7,6 @@ import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createProposePlanTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
-import { waitForRenderedMermaidDiagram } from "@/browser/stories/storyPlayHelpers";
 
 const meta = { ...appMeta, title: "App/Chat/Tools/ProposePlan" };
 export default meta;
@@ -81,9 +80,6 @@ graph TD
       }
     />
   ),
-  play: async ({ canvasElement }) => {
-    await waitForRenderedMermaidDiagram(canvasElement);
-  },
   parameters: {
     docs: {
       description: {
@@ -161,9 +157,6 @@ graph TD
       }}
     />
   ),
-  play: async ({ canvasElement }) => {
-    await waitForRenderedMermaidDiagram(canvasElement);
-  },
   parameters: {
     docs: {
       description: {
@@ -286,7 +279,6 @@ Blue/green cutover with automatic rollback on auth-error spikes.
     viewport: { value: "wide", isRotated: false },
   },
   play: async ({ canvasElement }) => {
-    await waitForRenderedMermaidDiagram(canvasElement);
     const shouldAssertFullToc = isPixel() || window.innerWidth >= PLAN_TOC_MIN_WIDTH;
     if (!shouldAssertFullToc) {
       return;
