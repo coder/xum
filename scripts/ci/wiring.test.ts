@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { appBuilderPath } from "app-builder-bin";
 import { parse } from "yaml";
 import { runScript, writeExecutable, type RunResult } from "./runScript";
 
@@ -203,5 +204,50 @@ describe("the Electron zip wiring", () => {
     const setup = job.steps.filter((step) => step.uses === "./.github/actions/setup-xum");
     expect(setup).toHaveLength(1);
     expect(setup[0].with?.["electron-zip"]).toBe("true");
+  });
+});
+
+// scripts/ci/prefetch-appimage-tool.sh only runs when the workflow calls it, and it only helps
+// while it fetches what app-builder asks for. These checks pin the call, and the pin: an
+// electron-builder bump that moves app-builder to another AppImage tool would leave the cache
+// holding a tool that app-builder never reads, and Build / Linux would download the new one with no retry.
+describe("the AppImage tool wiring", () => {
+  test("setup-xum fetches the tool only when the caller asks, after it restores the electron-builder cache", async () => {
+    const steps = await setupActionSteps();
+    const names = steps.map((step) => step.name);
+    const fetchTool = steps.find((step) => step.name === "Fetch the AppImage tool");
+
+    expect(fetchTool?.if).toContain("inputs.appimage-tool == 'true'");
+    expect(fetchTool?.run).toBe("./scripts/ci/prefetch-appimage-tool.sh");
+    expect(names.indexOf("Fetch the AppImage tool")).toBeGreaterThan(
+      names.indexOf("Cache electron-builder")
+    );
+  });
+
+  test("Build / Linux asks setup-xum for the tool", async () => {
+    const workflow = parse(await readFile(PR_WORKFLOW, "utf8")) as {
+      jobs: Record<string, { steps: { uses?: string; with?: Record<string, unknown> }[] }>;
+    };
+    const setup = workflow.jobs["build-linux"]?.steps.filter(
+      (step) => step.uses === "./.github/actions/setup-xum"
+    );
+
+    expect(setup).toHaveLength(1);
+    expect(setup?.[0]?.with?.["appimage-tool"]).toBe("true");
+  });
+
+  test("app-builder asks for the version and the archive that the script pins", async () => {
+    const script = await readFile(path.join(REPO, "scripts/ci/prefetch-appimage-tool.sh"), "utf8");
+    const version = /^version=(appimage-[\d.]+)$/m.exec(script)?.[1];
+    // The archive's sha512 (base64) as the script's comment records it. app-builder holds the
+    // same string for the archive it downloads.
+    const sha512 = /^#\s+([A-Za-z0-9+/]{86}==)$/m.exec(script)?.[1];
+    expect(version).toBeDefined();
+    expect(sha512).toBeDefined();
+
+    const binary = await readFile(appBuilderPath, "latin1");
+
+    expect(binary).toContain(version ?? "");
+    expect(binary).toContain(sha512 ?? "");
   });
 });
