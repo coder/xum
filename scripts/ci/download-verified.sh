@@ -6,8 +6,12 @@
 #
 # A CI cache can hold <dest> from an earlier run. The checksum decides whether to trust it, so
 # a stale or tampered cache entry costs a download and never lets unpinned bytes through. The
-# download retries for DOWNLOAD_BUDGET_SECS (default 900) because a GitHub release outage can
-# last that long (see retry.sh). The bytes reach <dest> only after the checksum passes.
+# bytes reach <dest> only after the checksum passes.
+#
+# Retries (scripts/retry.sh): DOWNLOAD_BUDGET_SECS (default 900) is the time to keep trying, and
+# DOWNLOAD_BACKOFF_SECS (default 2) the first wait, which doubles up to 60 s. A GitHub release
+# outage can last that long, and fetch-once.sh ends the retries at once on an HTTP 404 or any
+# other answer that no retry changes. Each caller sizes the budget to its job's time limit.
 set -euo pipefail
 
 if (($# != 3)); then
@@ -35,8 +39,8 @@ fi
 mkdir -p "$(dirname "$dest")"
 tmp=$(mktemp "$dest.XXXXXX")
 trap 'rm -f "$tmp"' EXIT
-"$here/retry.sh" "${DOWNLOAD_BUDGET_SECS:-900}" \
-  curl -fsSL --connect-timeout 30 --max-time 300 -o "$tmp" "$url"
+"$here/../retry.sh" --budget-secs "${DOWNLOAD_BUDGET_SECS:-900}" --max-backoff-secs 60 --fatal-status 64 \
+  0 "${DOWNLOAD_BACKOFF_SECS:-2}" "$here/fetch-once.sh" "$url" "$tmp"
 if ! matches "$tmp"; then
   echo "::error::$url does not match the pinned sha256 $sha256" >&2
   exit 1

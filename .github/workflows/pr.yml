@@ -174,9 +174,13 @@ jobs:
       # shfmt and hadolint: release binaries pinned by checksum in the install script, which
       # also says how to bump them. The cache holds the verified downloads and is keyed on that
       # script, so a changed pin starts fresh. A cache hit skips the download, which github.com
-      # answered with 504 for 7+ minutes on 2026-11-08. A cold cache retries for 15 minutes.
-      - name: Cache shfmt and hadolint downloads
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      # answered with 504 for more than 7 minutes on 2026-11-08. A cold cache retries each
+      # download for 15 minutes: this job has no time limit of its own (the default is 6 hours).
+      # The cache is saved right after the install, because the job's post step saves only when
+      # every later step passes, and the steps below download more (the grammars).
+      - name: Restore shfmt and hadolint downloads
+        id: release-assets
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/xum-release-assets
           key: release-assets-shfmt-hadolint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-release-tools.sh') }}
@@ -184,6 +188,12 @@ jobs:
         run: |
           ./scripts/ci/install-release-tools.sh shfmt-hadolint "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Save shfmt and hadolint downloads
+        if: steps.release-assets.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/xum-release-assets
+          key: ${{ steps.release-assets.outputs.cache-primary-key }}
       - name: Install shellcheck
         run: |
           set -euo pipefail
@@ -215,6 +225,37 @@ jobs:
           key: ${{ runner.os }}-lint-fmt-node-${{ steps.node-version.outputs.version }}-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-lint-fmt-node-${{ steps.node-version.outputs.version }}-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-
+      # tree-sitter-language-pack downloads its grammars from a GitHub release on first use
+      # (`make tree-sitter-grammars`, a prerequisite of the script tests in static-check-full).
+      # The pack keeps them in a directory named by its version, so the key is that pin from
+      # pyproject.toml. A language added to the Makefile's list needs a new key prefix here.
+      # The step below downloads them (15 minutes of retries on a cold cache), and the save
+      # follows at once, ahead of the long make run.
+      - name: Read the tree-sitter-language-pack pin
+        id: tslp
+        run: |
+          version=$(sed -n 's/^ *"tree-sitter-language-pack==\([0-9][0-9.]*\)".*/\1/p' pyproject.toml)
+          if [ -z "$version" ]; then
+            echo "::error::pyproject.toml does not pin tree-sitter-language-pack with =="
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Restore tree-sitter grammars
+        id: tree-sitter-grammars
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: tree-sitter-grammars-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.tslp.outputs.version }}
+      - name: Download tree-sitter grammars
+        run: make tree-sitter-grammars
+        env:
+          GRAMMAR_DOWNLOAD_BUDGET_SECS: 900
+      - name: Save tree-sitter grammars
+        if: steps.tree-sitter-grammars.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/tree-sitter-language-pack
+          key: ${{ steps.tree-sitter-grammars.outputs.cache-primary-key }}
       - run: make -j static-check-full
         env:
           MUX_ESLINT_CONCURRENCY: 4
@@ -284,21 +325,35 @@ jobs:
       # curl 8.7+ (curl.se lists stunnel/static-curl), so CI also checks the address
       # fallback and its no-retry cases (#6414). The env var fails the file if that curl is
       # not the one on PATH. The pin and its checksums live in the install script. As for
-      # shfmt above, a cache hit skips the download.
-      - name: Cache the static curl download
+      # shfmt above, a cache hit skips the download, and the cache is saved right after it.
+      # A cold cache retries for 8 minutes (DOWNLOAD_BUDGET_SECS), not 15: this job stops at
+      # 20 minutes. The step starts after 7 minutes of build and tests, and the pinning tests,
+      # the cache save and the cleanup take under 1 more (measured on PR 8001), so a full budget
+      # ends the job at about 16 minutes and leaves room for a slow runner.
+      - name: Restore the static curl download
+        id: static-curl-download
         if: matrix.shard == 1 && github.event.inputs.test_filter == ''
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/xum-release-assets
           key: release-assets-static-curl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-release-tools.sh') }}
+      - name: Install static curl
+        if: matrix.shard == 1 && github.event.inputs.test_filter == ''
+        env:
+          DOWNLOAD_BUDGET_SECS: 480
+        run: ./scripts/ci/install-release-tools.sh static-curl "$RUNNER_TEMP/static-curl"
+      - name: Save the static curl download
+        if: matrix.shard == 1 && github.event.inputs.test_filter == '' && steps.static-curl-download.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/xum-release-assets
+          key: ${{ steps.static-curl-download.outputs.cache-primary-key }}
       - name: web_fetch pinning tests with curl 8.7+
         if: matrix.shard == 1 && github.event.inputs.test_filter == ''
         env:
           XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK: "1"
         run: |
-          dir="$RUNNER_TEMP/static-curl"
-          ./scripts/ci/install-release-tools.sh static-curl "$dir"
-          PATH="$dir:$PATH"
+          PATH="$RUNNER_TEMP/static-curl:$PATH"
           curl -q --version
           bun test src/node/services/tools/web_fetch.pinning.test.ts
       # The host trap and the in-memory agent-loop proof run in their own bun process, with

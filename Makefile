@@ -628,13 +628,15 @@ crap-check: ## CRAP gate on files changed since BASE (default: merge-base with o
 CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --locked --quiet --only-group crap --only-group test python
 
 # tree-sitter-language-pack downloads its grammars from GitHub releases on
-# first use. The script tests are in static-check-full (Required), so retry a
-# transient failure there (seen: HTTP 504) once, before any test uses them.
+# first use. The script tests are in static-check-full (Required), so a transient failure
+# there (seen: HTTP 504) must not fail the job before any test uses the grammars. CI caches
+# the pack's directory, which makes this a no-op, and sets the budget to 15 minutes for a cold
+# cache: the 504 outage of 2026-11-08 outlasted the old 3 tries 10 s apart. The default
+# keeps an offline local run short. A language added here needs a new key prefix in pr.yml's
+# "Restore tree-sitter grammars" step.
+GRAMMAR_DOWNLOAD_BUDGET_SECS ?= 60
 tree-sitter-grammars:
-	@for attempt in 1 2 3; do \
-		$(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])' && break; \
-		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
-	done
+	@./scripts/retry.sh --budget-secs $(GRAMMAR_DOWNLOAD_BUDGET_SECS) --max-backoff-secs 60 0 2 env $(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])'
 
 test-crap-scripts: tree-sitter-grammars ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
 	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
