@@ -375,6 +375,31 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(physical, "utf-8")).toBe("alpha BETA gamma");
     });
 
+    // String.prototype.replace reads `$&`, `$'`, `` $` `` and `$$` in a replacement string as
+    // patterns. The analyzer now appends a fact by replacing a line with itself plus the fact, so
+    // new_str is model-written prose (prices, shell snippets) that must land as written.
+    it.each(["$&", "$'", "$`", "$$"])("writes %s in new_str literally", async (token) => {
+      using fixture = await createFixture();
+      await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/s.md",
+        "alpha beta gamma",
+        "agent"
+      );
+      const result = await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/s.md",
+        "beta",
+        `beta costs ${token} here`,
+        "agent"
+      );
+      expect(result.success).toBe(true);
+      const physical = path.join(fixture.xumHome, "memory", "global", "s.md");
+      expect(await fsPromises.readFile(physical, "utf-8")).toBe(
+        `alpha beta costs ${token} here gamma`
+      );
+    });
+
     it("errors when old_str is not found", async () => {
       using fixture = await createFixture();
       await fixture.service.create(fixture.ctx, "/memories/global/s.md", "alpha", "agent");
