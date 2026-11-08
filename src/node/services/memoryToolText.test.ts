@@ -2,7 +2,12 @@ import { describe, expect, it, spyOn } from "bun:test";
 
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { redactSecretLike } from "./memorySecretRedaction";
-import { renderToolValue, serializeToolValue, takeWithoutMedia } from "./memoryToolText";
+import {
+  derivesFromSessionHistory,
+  renderToolValue,
+  serializeToolValue,
+  takeWithoutMedia,
+} from "./memoryToolText";
 
 // How the renderer worked before it was size-budgeted: clone and stringify the whole value, replace
 // every data URL, and only then cut. The budgeted one must print the same for what fits.
@@ -294,5 +299,56 @@ describe("takeWithoutMedia on hostile text", () => {
     const started = performance.now();
     takeWithoutMedia(text, Number.POSITIVE_INFINITY);
     expect(performance.now() - started).toBeLessThan(100);
+  });
+});
+
+describe("derivesFromSessionHistory", () => {
+  const lookup = { toolName: "session_history" };
+  const execution = (output: unknown, nestedCalls?: unknown): unknown => ({
+    toolName: "code_execution",
+    output,
+    nestedCalls,
+  });
+
+  it.each([
+    ["a lookup itself", lookup],
+    [
+      "a lookup in the records of its result",
+      execution({ toolCalls: [{ toolName: "bash" }, lookup] }),
+    ],
+    [
+      "a lookup in its persisted nested calls",
+      execution({ result: "x" }, [{ toolName: "bash" }, lookup]),
+    ],
+    [
+      "a lookup in a call it made in turn",
+      execution({ toolCalls: [{ toolName: "task", result: { toolCalls: [lookup] } }] }),
+    ],
+    [
+      "a lookup in the nested calls of a persisted call",
+      execution({}, [{ toolName: "task", nestedCalls: [lookup] }]),
+    ],
+  ])("is true for %s", (_label, part) => {
+    expect(derivesFromSessionHistory(part)).toBe(true);
+  });
+
+  it.each([
+    ["other tools only", execution({ toolCalls: [{ toolName: "bash" }] }, [{ toolName: "bash" }])],
+    ["no calls", execution({ result: "x", toolCalls: [] })],
+    ["a lookup named only in text", execution({ result: "session_history" })],
+    ["calls that are not lists", execution({ toolCalls: lookup }, lookup)],
+    ["a string output", execution("done")],
+    ["no part", undefined],
+  ])("is false for %s", (_label, part) => {
+    expect(derivesFromSessionHistory(part)).toBe(false);
+  });
+
+  // A chain too deep to read to its end cannot be shown to be free of a lookup.
+  it("is true for a chain of calls deeper than the depth limit", () => {
+    const chain = (depth: number): unknown =>
+      depth === 0 ? { toolName: "bash" } : { toolName: "task", nestedCalls: [chain(depth - 1)] };
+
+    expect(derivesFromSessionHistory(chain(5))).toBe(false);
+    expect(derivesFromSessionHistory(chain(60))).toBe(true);
   });
 });
