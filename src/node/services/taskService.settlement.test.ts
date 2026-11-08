@@ -73,10 +73,18 @@ import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks"
 
 describe("TaskService", () => {
   let rootDir: string;
+  let previousXumRoot: string | undefined;
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
+    // Every agent-task reservation resolves its agent definition, which scans <XUM_ROOT>/plugins.
+    // Point it at an empty home so these tests neither read nor wait on the plugins installed on
+    // the machine that runs them (the file ran about twice as slow on a host with eight plugins).
+    previousXumRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = path.join(rootDir, "xum-home");
   });
   afterEach(async () => {
+    if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
+    else process.env.XUM_ROOT = previousXumRoot;
     await removeTaskServiceTestRoot(rootDir);
   });
 
@@ -1082,7 +1090,12 @@ describe("TaskService", () => {
         await session.dispose();
         await sessionHarness.cleanup();
       }
-    });
+      // The timeout is a literal because Prettier formats `test(name, fn, <number>)` as a test
+      // call and re-indents the whole callback for any other third argument. The first turn
+      // loads the real tokenizer encoding in a worker (the token budget requires it, see
+      // contextBudgetCounting.ts), about 1.5 s of CPU when the process is cold. That took 5 to
+      // 7 s on a host at load 70 to 100 on 32 cores, over Bun's 5 s default.
+    }, 30_000);
   });
 
   const rootId = "root-teardown";
@@ -3409,6 +3422,8 @@ describe("TaskService", () => {
       for (const id of replacementIds) {
         expect(findWorkspaceInConfig(config, id)?.taskStatus).toBe("reported");
       }
-    });
+      // Two real WorkflowRunner passes over on-disk stores with a QuickJS runtime each: about 1 s
+      // at moderate load and up to 3 s at load 100 on 32 cores, so Bun's 5 s default is too tight.
+    }, 30_000);
   });
 });
