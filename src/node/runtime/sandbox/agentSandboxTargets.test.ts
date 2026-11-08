@@ -7,8 +7,11 @@ import type { ResolvedAgentSandboxSettings } from "@/common/config/schemas/agent
 import {
   AgentSandboxStartError,
   agentSandboxPolicyAllows,
+  agentSandboxSettingsFor,
   buildAgentSandboxPolicy,
+  setAgentSandboxTargets,
 } from "./agentSandboxTargets";
+import { askpassSessionsRoot } from "../sshAskpass";
 import { isPathAtOrUnder } from "./sandboxPaths";
 
 const SETTINGS: ResolvedAgentSandboxSettings = {
@@ -319,5 +322,51 @@ describe("buildAgentSandboxPolicy credential files", () => {
 
     expect(agentSandboxPolicyAllows(policy, secrets, "read")).toBe(false);
     expect(agentSandboxPolicyAllows(policy, secrets, "write")).toBe(false);
+  });
+
+  // An SSH password that the user types into Xum passes through this folder.
+  test("hide the answers to SSH prompts", () => {
+    const answer = path.join(askpassSessionsRoot(), "mux-askpass-a", "response.1.txt");
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: os.tmpdir() });
+
+    expect(agentSandboxPolicyAllows(policy, answer, "read")).toBe(false);
+  });
+});
+
+// A command of a multi-project workspace can change every project's checkout.
+describe("agentSandboxSettingsFor several projects", () => {
+  afterEach(() => setAgentSandboxTargets(null));
+
+  test("applies the sandbox when one project has it on, with what each such project allows", () => {
+    const on = (overrides: Partial<ResolvedAgentSandboxSettings>) => ({
+      ...SETTINGS,
+      ...overrides,
+    });
+    const a = on({
+      network: "allowlist",
+      allowedHosts: ["x.dev", "y.dev"],
+      extraWritePaths: ["~/.gradle", "~/.m2"],
+      extraReadPaths: ["~/.npmrc"],
+    });
+    setAgentSandboxTargets({
+      fallback: { ...SETTINGS, enabled: false },
+      byProject: new Map([
+        ["/a", a],
+        ["/b", on({ network: "allowlist", allowedHosts: ["y.dev"], extraWritePaths: ["~/.m2"] })],
+        ["/open", on({ network: "open", extraWritePaths: ["~/.m2", "~/.gradle"] })],
+        ["/loopback", on({ network: "loopback" })],
+      ]),
+    });
+
+    expect(agentSandboxSettingsFor("/off")).toBeNull();
+    expect(agentSandboxSettingsFor("/off", ["/a"])).toEqual(a);
+    expect(agentSandboxSettingsFor("/a", ["/off", "/b", "/open"])).toEqual({
+      enabled: true,
+      network: "allowlist",
+      allowedHosts: ["y.dev"],
+      extraWritePaths: ["~/.m2"],
+      extraReadPaths: [],
+    });
+    expect(agentSandboxSettingsFor("/open", ["/loopback"])?.network).toBe("loopback");
   });
 });

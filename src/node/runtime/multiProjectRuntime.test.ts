@@ -10,6 +10,7 @@ import { execBuffered } from "@/node/utils/runtime/helpers";
 import { WorktreeRuntime } from "./WorktreeRuntime";
 import { MultiProjectRuntime } from "./multiProjectRuntime";
 import { setAgentSandboxTargets } from "./sandbox/agentSandboxTargets";
+import { resetAgentSandboxRuntime } from "./sandbox/macosSandbox";
 
 const SANDBOX_SETTINGS: ResolvedAgentSandboxSettings = {
   enabled: true,
@@ -368,6 +369,35 @@ describe("MultiProjectRuntime", () => {
     }
   );
 
+  // A command in the container can change the second project's checkout too.
+  it.skipIf(process.platform !== "darwin")(
+    "sandboxes commands when only a project after the first has the sandbox on",
+    async () => {
+      const containerPath = await containerManager.createContainer(workspaceName, [
+        { projectName: "project-a", workspacePath: projectAWorkspacePath },
+        { projectName: "project-b", workspacePath: projectBWorkspacePath },
+      ]);
+      const probe = path.join(await fs.realpath(os.homedir()), `.xum-multi-test-${process.pid}`);
+      setAgentSandboxTargets({
+        fallback: { ...SANDBOX_SETTINGS, enabled: false },
+        byProject: new Map([[projectBPath, SANDBOX_SETTINGS]]),
+      });
+      try {
+        const result = await execBuffered(runtime, `echo x > ${probe} || echo DENIED`, {
+          cwd: containerPath,
+          timeout: 10,
+        });
+
+        expect(result.stdout).toContain("DENIED");
+        expect(runtime.agentSandboxPolicy({ cwd: containerPath })).not.toBeNull();
+      } finally {
+        setAgentSandboxTargets(null);
+        await fs.rm(probe, { force: true });
+        await resetAgentSandboxRuntime();
+      }
+    }
+  );
+
   it("asks the first project's runtime for the policy, with every checkout open like the workspace", () => {
     const primary = new WorktreeRuntime(srcBaseDir, { projectPath: projectAPath, workspaceName });
     const multiRuntime = new MultiProjectRuntime(
@@ -390,6 +420,7 @@ describe("MultiProjectRuntime", () => {
     expect(policyFor).toHaveBeenCalledWith({
       cwd: "/container",
       workspaceRoots: ["/extra", projectAWorkspacePath, projectBWorkspacePath],
+      otherProjectPaths: [projectAPath, projectBPath],
     });
   });
 });

@@ -138,6 +138,8 @@ export interface WrapForAgentSandboxOptions {
   scratchDir?: string;
   /** The command's PATH: folders on it under ~ open for reads. */
   pathEnv?: string;
+  /** ExecOptions.sandboxProjectPaths: their settings apply too (agentSandboxSettingsFor()). */
+  otherProjectPaths?: readonly string[];
 }
 
 /**
@@ -152,7 +154,7 @@ export async function wrapForAgentSandbox(
   options: WrapForAgentSandboxOptions
 ): Promise<AgentSandboxWrap | null> {
   if (options.optOut === true || process.platform !== "darwin") return null;
-  const settings = agentSandboxSettingsFor(projectPath);
+  const settings = agentSandboxSettingsFor(projectPath, options.otherProjectPaths);
   if (settings === null) return null;
   if (!isAgentSandboxSupported()) {
     throw new AgentSandboxStartError(`${SANDBOX_EXEC_PATH} is missing`);

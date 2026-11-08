@@ -407,6 +407,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       workspaceRoots: options.sandboxRoots,
       scratchDir: callerEnv.XUM_SCRATCH_DIR,
       pathEnv: effectivePath,
+      otherProjectPaths: options.sandboxProjectPaths,
     });
 
     const childProcess = spawnWithSandbox(
@@ -539,7 +540,10 @@ export abstract class LocalBaseRuntime implements Runtime {
   agentSandboxPolicy(input: AgentSandboxPolicyInput): AgentSandboxPolicy | null {
     // Devcontainer commands run in the container, which the macOS sandbox does not cover.
     if (this.location !== "local" || process.platform !== "darwin") return null;
-    const settings = agentSandboxSettingsFor(this.agentCgroupProjectPath());
+    const settings = agentSandboxSettingsFor(
+      this.agentCgroupProjectPath(),
+      input.otherProjectPaths
+    );
     if (settings === null) return null;
     return buildAgentSandboxPolicy(settings, {
       ...input,

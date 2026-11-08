@@ -97,6 +97,11 @@ export interface ExecOptions {
    */
   sandboxRoots?: string[];
   /**
+   * The projects of a multi-project workspace: a command there can change each checkout, so the
+   * sandbox applies the strictest of their settings.
+   */
+  sandboxProjectPaths?: string[];
+  /**
    * Hands the end of the sandbox's network allow list to the caller (local runtimes, when the
    * sandbox applies). Without it the list ends when the command's shell exits, so a command that
    * leaves a process running after that (background bash) passes this and calls `release` once

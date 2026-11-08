@@ -173,6 +173,8 @@ export const NESTED_DENY_READ_PATHS: readonly string[] = [
   `${XUM_HOME_TOKEN}/secrets.json`,
   `${XUM_HOME_TOKEN}/mcp-oauth.json`,
   `${XUM_HOME_TOKEN}/config.json`,
+  // SSH prompts and their answers, passwords too (askpassSessionsRoot() in sshAskpass.ts).
+  `${XUM_HOME_TOKEN}/askpass`,
 ];
 
 /** `~/x`, `<xumHome>/x` or an absolute path, as the real path Seatbelt matches. */

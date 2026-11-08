@@ -43,15 +43,52 @@ export function setAgentSandboxTargets(targets: AgentSandboxTargets | null): voi
 /**
  * The sandbox setting for a command of the project at `projectPath` (the same key the agent
  * cgroup uses), or null when no sandbox applies. An unknown project gets the global setting.
+ * A command of a multi-project workspace can change the checkout of each of `otherProjectPaths`
+ * too, so it gets the strictest of their settings: the sandbox applies when any of them has it
+ * on.
  */
 export function agentSandboxSettingsFor(
-  projectPath: string | undefined
+  projectPath: string | undefined,
+  otherProjectPaths: readonly string[] = []
 ): ResolvedAgentSandboxSettings | null {
-  if (sandboxTargets === null) return null;
-  const settings =
-    (projectPath === undefined ? undefined : sandboxTargets.byProject.get(projectPath)) ??
-    sandboxTargets.fallback;
-  return settings.enabled ? settings : null;
+  const targets = sandboxTargets;
+  if (targets === null) return null;
+  const settingsOf = (key: string | undefined): ResolvedAgentSandboxSettings =>
+    (key === undefined ? undefined : targets.byProject.get(key)) ?? targets.fallback;
+  const enabled = [projectPath, ...otherProjectPaths]
+    .map(settingsOf)
+    .filter((settings) => settings.enabled);
+  return enabled.length === 0 ? null : strictestSettings(enabled);
+}
+
+const NETWORK_STRICTNESS: Record<AgentSandboxNetwork, number> = {
+  loopback: 0,
+  allowlist: 1,
+  open: 2,
+};
+
+/** What every one of `list` allows (a project with the sandbox off limits nothing). */
+function strictestSettings(
+  list: readonly ResolvedAgentSandboxSettings[]
+): ResolvedAgentSandboxSettings {
+  if (list.length === 1) return list[0];
+  const shared = (lists: ReadonlyArray<readonly string[]>): string[] =>
+    lists.reduce<string[]>(
+      (kept, next) => kept.filter((entry) => next.includes(entry)),
+      [...lists[0]]
+    );
+  const network = list
+    .map((settings) => settings.network)
+    .reduce((a, b) => (NETWORK_STRICTNESS[b] < NETWORK_STRICTNESS[a] ? b : a));
+  // A project with the open network allows every host, so only the allow lists limit the hosts.
+  const hostLists = list.filter((settings) => settings.network === "allowlist");
+  return {
+    enabled: true,
+    network,
+    allowedHosts: network === "allowlist" ? shared(hostLists.map((s) => s.allowedHosts)) : [],
+    extraWritePaths: shared(list.map((settings) => settings.extraWritePaths)),
+    extraReadPaths: shared(list.map((settings) => settings.extraReadPaths)),
+  };
 }
 
 /** True when the sandbox could apply to some command, so the srt session should be ready. */
@@ -105,6 +142,11 @@ export interface AgentSandboxPolicyInput {
   scratchDir?: string;
   /** The command's PATH: folders on it under ~ open for reads. */
   pathEnv?: string;
+  /**
+   * The other projects of a multi-project workspace. Only Runtime.agentSandboxPolicy() reads it,
+   * to pick the setting (agentSandboxSettingsFor()).
+   */
+  otherProjectPaths?: readonly string[];
 }
 
 /**

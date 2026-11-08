@@ -453,17 +453,26 @@ export class MultiProjectRuntime implements Runtime {
       ...options,
       cwd: options.cwd || this.containerPath,
       sandboxRoots: [...(options.sandboxRoots ?? []), ...this.checkoutPaths()],
+      sandboxProjectPaths: [...(options.sandboxProjectPaths ?? []), ...this.projectPaths()],
     });
   }
 
-  /** The primary project's policy, with every checkout open like the workspace. */
+  /**
+   * The primary runtime's policy under the strictest setting of all projects, with every
+   * checkout open like the workspace.
+   */
   agentSandboxPolicy(input: AgentSandboxPolicyInput): AgentSandboxPolicy | null {
     return (
       this.primaryRuntime.agentSandboxPolicy?.({
         ...input,
         workspaceRoots: [...(input.workspaceRoots ?? []), ...this.checkoutPaths()],
+        otherProjectPaths: [...(input.otherProjectPaths ?? []), ...this.projectPaths()],
       }) ?? null
     );
+  }
+
+  private projectPaths(): string[] {
+    return this.projectRuntimes.map((entry) => entry.projectPath);
   }
 
   /**
