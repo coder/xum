@@ -647,12 +647,17 @@ export async function runMemoryConsolidation(args: {
     abortSignal: args.abortSignal,
   });
 
+  // Whatever the final pass promotes lands where models of unrelated projects read it, so a
+  // credential must not travel with it (the dream prompt says the same for the whole pass).
+  const finalPassNoSecrets =
+    " Never promote a credential or other secret-like value: leave the value out and say what it was for.";
   const finalPassPrompt =
     args.finalPass !== true
       ? ""
-      : args.ctx.projectPath === ""
-        ? " This is the FINAL pass for an archived workspace: preserve only cross-project user preferences or environment facts in /memories/global/... before workspace memory is deleted. Project memory is unavailable for this run; do not promote project-specific lessons to global memory."
-        : " This is the FINAL pass for an archived workspace: promote durable workspace lessons before workspace memory is deleted. Move repo-specific lessons to /memories/project/... and only cross-project user preferences or environment facts to /memories/global/....";
+      : (args.ctx.projectPath === ""
+          ? " This is the FINAL pass for an archived workspace: preserve only cross-project user preferences or environment facts in /memories/global/... before workspace memory is deleted. Project memory is unavailable for this run; do not promote project-specific lessons to global memory."
+          : " This is the FINAL pass for an archived workspace: promote durable workspace lessons before workspace memory is deleted. Move repo-specific lessons to /memories/project/... and only cross-project user preferences or environment facts to /memories/global/....") +
+        finalPassNoSecrets;
 
   const meter = createSpendMeter({ pricingModel: args.pricingModel, ceilingUsd: args.ceilingUsd });
   const stream = streamText({
