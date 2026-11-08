@@ -813,21 +813,23 @@ describe("runMemoryHarvest", () => {
       });
     });
 
-    it("keeps nested tool data down to a depth limit and omits what lies beyond it", async () => {
+    // The provider projection cuts a value at its own depth limit before the harvest's (30, tested
+    // in memoryToolText.test.ts) is reached: the harvest model reads what a chat model reads.
+    it("keeps nested tool data down to the provider projection's depth and omits what lies beyond it", async () => {
       using fixture = createFixture();
       const nest = (depth: number, leaf: string): unknown =>
         depth === 0 ? leaf : { inner: nest(depth - 1, leaf) };
 
       const prompt = await harvestPrompt(fixture, [
         createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
-          toolPart("bash", { script: "shallow" }, { output: nest(20, "SHALLOW-LEAF") }),
-          toolPart("bash", { script: "deep" }, { output: nest(40, "DEEP-LEAF") }),
+          toolPart("bash", { script: "shallow" }, { output: nest(5, "SHALLOW-LEAF") }),
+          toolPart("bash", { script: "deep" }, { output: nest(20, "DEEP-LEAF") }),
         ]),
       ]);
 
       expect(prompt).toContain("SHALLOW-LEAF");
       expect(prompt).not.toContain("DEEP-LEAF");
-      expect(prompt).toContain("[nested data omitted]");
+      expect(prompt).toContain("[redacted deeply nested provider output]");
     });
   });
 
@@ -1403,6 +1405,89 @@ describe("buildHarvestChunks", () => {
           { id: "u1", sequence: 0, role: "user", text: "", truncated: false },
         ]);
       });
+    });
+  });
+
+  // The harvest model is a provider like any other: a persisted tool output reaches it only through
+  // the projection that normal model requests apply, so what that projection keeps out of every
+  // agent prompt (a workflow's run record, a tool's UI-only payload) stays out of this one too.
+  describe("a tool output the provider projection strips", () => {
+    const RUN_RECORD_MARKER = "WORKFLOW-SCRIPT-SOURCE-MARKER";
+    const UI_ONLY_MARKER = "UI-ONLY-DIFF-MARKER";
+
+    const chunkText = (messages: MuxMessage[]): string => transcriptsOf(messages).join("\n");
+    const assistantWith = (...parts: MuxToolPart[]): MuxMessage =>
+      createMuxMessage("a1", "assistant", "", { historySequence: 0 }, parts);
+
+    it.each(["workflow_run", "workflow_resume"])(
+      "drops the run record of a %s output and keeps its result",
+      (toolName) => {
+        const text = chunkText([
+          assistantWith(
+            toolPart(
+              toolName,
+              { script: "return 1" },
+              {
+                status: "completed",
+                runId: "run-1",
+                result: "RESULT-KEPT",
+                run: { script: RUN_RECORD_MARKER, events: [{ type: "log", message: "event-log" }] },
+              }
+            )
+          ),
+        ]);
+
+        expect(text).toContain("RESULT-KEPT");
+        expect(text).not.toContain(RUN_RECORD_MARKER);
+        expect(text).not.toContain("event-log");
+      }
+    );
+
+    it("drops a run record inside the json container a tool output can be wrapped in", () => {
+      const text = chunkText([
+        assistantWith(
+          toolPart(
+            "workflow_run",
+            {},
+            { type: "json", value: { status: "completed", run: { script: RUN_RECORD_MARKER } } }
+          )
+        ),
+      ]);
+
+      expect(text).toContain("completed");
+      expect(text).not.toContain(RUN_RECORD_MARKER);
+    });
+
+    it("drops a ui_only payload nested inside a tool output and keeps the fields beside it", () => {
+      const text = chunkText([
+        assistantWith(
+          toolPart(
+            "file_edit_replace_string",
+            { path: "a.ts" },
+            {
+              success: true,
+              note: "EDIT-APPLIED",
+              ui_only: { file_edit: { diff: UI_ONLY_MARKER } },
+              files: [{ path: "b.ts", ui_only: { file_edit: { diff: UI_ONLY_MARKER } } }],
+            }
+          )
+        ),
+      ]);
+
+      expect(text).toContain("EDIT-APPLIED");
+      expect(text).toContain("b.ts");
+      expect(text).not.toContain(UI_ONLY_MARKER);
+    });
+
+    it("leaves the persisted messages as they were", () => {
+      const message = assistantWith(
+        toolPart("workflow_run", {}, { status: "completed", run: { script: RUN_RECORD_MARKER } })
+      );
+      const before = JSON.stringify(message);
+
+      chunkText([message]);
+
+      expect(JSON.stringify(message)).toBe(before);
     });
   });
 

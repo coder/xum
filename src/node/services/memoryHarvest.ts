@@ -2,6 +2,7 @@ import { stepCountIs, streamText, tool, type LanguageModel } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { z } from "zod";
 
+import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutputRedaction";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -260,7 +261,13 @@ export function buildHarvestChunks(messages: MuxMessage[]): HarvestChunk[] {
     // requests; this direct streamText path must not forward their repository/model-influenced
     // content to the Dream model and into persistent memory either.
     if (isModelHiddenMessage(message)) continue;
-    for (const row of formatMessageForHarvest(message)) {
+    // The harvest model is a provider: persisted tool outputs reach it only as normal model
+    // requests send them, without the workflow run record, `ui_only` payloads and the other
+    // fields the projection keeps out of every agent prompt. Projecting here, the one place
+    // every layer builds chunks from, covers each reader of a row; one message at a time, so
+    // a message that is never read is never projected either.
+    const [projected] = applyToolOutputRedaction([message]);
+    for (const row of formatMessageForHarvest(projected)) {
       const rowJson = `${ROW_INDENT}${JSON.stringify(row, null, 2).replaceAll("\n", `\n${ROW_INDENT}`)}`;
       let grownChars =
         currentRows.length === 0
