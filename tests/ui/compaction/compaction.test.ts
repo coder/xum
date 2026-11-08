@@ -15,6 +15,7 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 
 import { fireEvent } from "@testing-library/react";
 import { createAppHarness } from "../harness";
+import { startWaitBudget } from "./waitBudget";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { getAppConfigStore, updateUserPreferences } from "@/browser/stores/AppConfigStore";
@@ -80,22 +81,11 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
 
 const FORCE_THRESHOLD_PERCENT = 10;
 
-// Jest does not stop a test body when its timeout fires. It starts the next test while the body
-// keeps waiting, and the body's `finally` then disposes the shared DOM under that next test: a
-// timed-out "auto-compacts after context_exceeded" turned the next test into an unrelated
-// "Workspace still in setup" failure. So every long wait in a test draws on one budget that
-// starts with the test and ends before the test's limit. The failure is then the body's own
-// assertion, and its `finally` finishes inside the test. The limits on the `test(...)` calls stay
-// literals (prettier unwraps a test body only for a literal), so keep them in step with these.
+// Every long wait in a test draws on a budget that ends before the test's limit (waitBudget.ts).
+// The limits on the `test(...)` calls stay literals (prettier unwraps a test body only for a
+// literal), so keep them in step with these.
 const TEST_LIMIT_MS = 60_000;
 const FORCE_TEST_LIMIT_MS = 120_000;
-const CLEANUP_MARGIN_MS = 15_000;
-
-/** Returns the time left for waits in the test that starts now (at least 1 ms). */
-function startWaitBudget(testLimitMs: number): () => number {
-  const deadline = Date.now() + testLimitMs - CLEANUP_MARGIN_MS;
-  return () => Math.max(deadline - Date.now(), 1);
-}
 
 /**
  * Move the per-model slider the way the UI does (a merge patch to config.json).
@@ -157,11 +147,13 @@ describe("Compaction UI (mock AI router)", () => {
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     try {
-      // The UI compacts into the largest-context model of a configured provider (see
-      // getHigherContextCompactionSuggestion), and only OpenAI offers a larger context than the
-      // default model. Without one, it pastes "/compact" into the input and never compacts. The
-      // mock router never calls the provider, so a dummy key is enough. Seeding it here keeps
-      // the test independent of an ambient OPENAI_API_KEY.
+      // The UI auto-compacts into the largest-context model of a configured provider (see
+      // getHigherContextCompactionSuggestion), and a model qualifies only with a larger context
+      // than the default model's (OpenAI, Google, Moonshot AI, Meta and Z.ai each list one).
+      // Without such a provider the UI does not auto-compact: it shows the manual "Insert /compact"
+      // button, and this test waits for a summary that never comes. The mock router never calls
+      // the provider, so a dummy key is enough. Seeding it here keeps the test independent of an
+      // ambient OPENAI_API_KEY.
       await setupProviders(app.env, { openai: { apiKey: "test-key-for-ui-tests" } });
 
       const triggerMessage = "Trigger context error";
