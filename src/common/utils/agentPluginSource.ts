@@ -159,3 +159,35 @@ export function hasEscapedUnreservedCharacter(url: string): boolean {
   }
   return false;
 }
+
+const SSH_URL_PATTERN =
+  /^ssh:\/\/(?:[^@/?#\s]+@)?(\[[^\]\s]+\]|[^:/?#\s@[\]]+)(?::\d+)?(\/[^?#\s]+)$/i;
+const SCP_URL_PATTERN = /^(?:[^@/\s:]+@)?(\[[^\]\s]+\]|[A-Za-z0-9._-]{2,}):(?!:|\/\/)(\S+)$/;
+
+/**
+ * The https URL of the same host and path as an `ssh://[user@]host[:port]/path` or scp-style
+ * `[user@]host:path` source, or undefined for any other source (an https one included). The user
+ * and the port belong to ssh, so they are dropped. A one-character host is never an scp host
+ * here: Git for Windows reads it as a drive (`isLocalGitUrl`).
+ */
+export function httpsFormOfSshUrl(url: string): string | undefined {
+  const ssh = SSH_URL_PATTERN.exec(url);
+  if (ssh?.[1] !== undefined && ssh[2] !== undefined) return `https://${ssh[1]}${ssh[2]}`;
+  const scp = SCP_URL_PATTERN.exec(url);
+  const path = scp?.[2]?.replace(/^\/+/, "");
+  return scp?.[1] !== undefined && path ? `https://${scp[1]}/${path}` : undefined;
+}
+
+/**
+ * The URL a review of a backed-up plugin previews: the source itself when it is https, else the
+ * https form of an ssh source, else undefined (the user adds that plugin by hand).
+ *
+ * SECURITY: a preview of an ssh or scp source makes git sign in with the user's SSH agent to
+ * whatever host the list names, before any consent to that plugin, and the list is
+ * repository-controlled. So a review never previews one: it previews the https form, which signs
+ * in with nothing but the credentials git holds for that host. The preview is at the pinned
+ * commit, and a commit id names its content, so a repository that serves it serves the same code.
+ */
+export function reviewUrlOf(url: string): string | undefined {
+  return url.startsWith("https://") ? url : httpsFormOfSshUrl(url);
+}

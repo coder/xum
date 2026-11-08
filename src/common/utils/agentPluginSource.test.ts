@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 
 import {
   hasEscapedUnreservedCharacter,
+  httpsFormOfSshUrl,
   isAbbreviatedCommitSha,
   isNormalizedAgentPluginSubpath,
   normalizeAgentPluginSubpath,
+  reviewUrlOf,
 } from "./agentPluginSource";
 
 describe("normalizeAgentPluginSubpath", () => {
@@ -97,4 +99,76 @@ describe("hasEscapedUnreservedCharacter", () => {
   ])("is false for %s", (_label, url) => {
     expect(hasEscapedUnreservedCharacter(url)).toBe(false);
   });
+});
+
+describe("httpsFormOfSshUrl", () => {
+  test.each([
+    [
+      "an scp URL with a user",
+      "git@github.com:example/repo.git",
+      "https://github.com/example/repo.git",
+    ],
+    ["an scp URL with no user", "gitbox:srv/repo.git", "https://gitbox/srv/repo.git"],
+    ["an scp URL with a rooted path", "git@host:/srv/repo.git", "https://host/srv/repo.git"],
+    ["an ssh URL", "ssh://git@github.com/example/repo.git", "https://github.com/example/repo.git"],
+    [
+      "an ssh URL with a port",
+      "ssh://git@host:2222/example/repo.git",
+      "https://host/example/repo.git",
+    ],
+    ["an ssh URL with no user", "ssh://host/example/repo.git", "https://host/example/repo.git"],
+    [
+      "an ssh scheme in capitals",
+      "SSH://git@host/example/repo.git",
+      "https://host/example/repo.git",
+    ],
+    [
+      "an scp URL with a bracketed host",
+      "git@[2001:db8::1]:example/r.git",
+      "https://[2001:db8::1]/example/r.git",
+    ],
+  ])("gives the https form of %s", (_label, url, https) => {
+    expect(httpsFormOfSshUrl(url)).toBe(https);
+  });
+
+  test.each([
+    ["an https URL", "https://github.com/example/repo.git"],
+    ["an http URL", "http://github.com/example/repo.git"],
+    ["a git URL", "git://github.com/example/repo.git"],
+    ["a file URL", "file:///srv/repo.git"],
+    ["an ssh URL with no path", "ssh://git@host"],
+    ["an ssh URL with only a slash", "ssh://git@host/"],
+    ["a transport helper", "ext::payload"],
+    ["a one-letter host (a drive on Windows)", "h:org/repo.git"],
+    ["an scp URL with whitespace in its path", "gitbox:srv/my repos/r.git"],
+    ["an scp URL with no path", "git@host:"],
+    ["a path", "/srv/repo.git"],
+    ["a name", "repo"],
+  ])("gives nothing for %s", (_label, url) => {
+    expect(httpsFormOfSshUrl(url)).toBeUndefined();
+  });
+});
+
+describe("reviewUrlOf", () => {
+  test("previews an https source as written", () => {
+    expect(reviewUrlOf("https://github.com/example/repo.git")).toBe(
+      "https://github.com/example/repo.git"
+    );
+  });
+
+  test("previews the https form of an ssh or scp source", () => {
+    expect(reviewUrlOf("git@github.com:example/repo.git")).toBe(
+      "https://github.com/example/repo.git"
+    );
+    expect(reviewUrlOf("ssh://git@github.com:22/example/repo.git")).toBe(
+      "https://github.com/example/repo.git"
+    );
+  });
+
+  test.each(["http://host/r.git", "git://host/r.git", "HTTPS://host/r.git", "file:///r.git"])(
+    "previews nothing for %s",
+    (url) => {
+      expect(reviewUrlOf(url)).toBeUndefined();
+    }
+  );
 });

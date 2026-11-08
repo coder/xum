@@ -850,6 +850,57 @@ describe("backup of the managed plugin list", () => {
       });
     });
 
+    it("reads the https form of a listed ssh source as that plugin, and nothing else as it", async () => {
+      const source = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const { payload, request } = await backupOf([
+        registryRow("ssh-listed", { source: source("git@github.com:example/ssh-listed.git") }),
+        registryRow("ssh-url-listed", {
+          source: source("ssh://git@host.example:2222/example/ssh-url-listed.git"),
+        }),
+        registryRow("https-listed", {
+          source: source("https://github.com/example/https-listed.git"),
+        }),
+        registryRow("another-path", { source: source("git@github.com:example/another-path.git") }),
+        registryRow("another-port", {
+          source: source("ssh://git@host.example:2222/example/another-port.git"),
+        }),
+      ]);
+      await useLocalRegistry([
+        // Installed by a review from the https address of the listed ssh source.
+        registryRow("ssh-listed", { source: source("https://github.com/example/ssh-listed.git") }),
+        registryRow("ssh-url-listed", {
+          source: source("https://host.example/example/ssh-url-listed.git"),
+        }),
+        // Installed over ssh where the backup lists the https address.
+        registryRow("https-listed", { source: source("git@github.com:example/https-listed.git") }),
+        registryRow("another-path", { source: source("https://github.com/example/elsewhere.git") }),
+        registryRow("another-port", {
+          source: source("ssh://git@host.example:2200/example/another-port.git"),
+        }),
+      ]);
+      for (const name of [
+        "ssh-listed",
+        "ssh-url-listed",
+        "https-listed",
+        "another-path",
+        "another-port",
+      ]) {
+        await writeFixtureFile(muxRoot, `plugins/${name}/plugin.json`, "{}");
+      }
+
+      const preview = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
+
+      expect(Object.fromEntries(preview.plugins.rows.map((row) => [row.name, row.status]))).toEqual(
+        {
+          "ssh-listed": "installed",
+          "ssh-url-listed": "installed",
+          "https-listed": "installed",
+          "another-path": "conflict",
+          "another-port": "conflict",
+        }
+      );
+    });
+
     it("hands back the pin and the source a reinstall needs", async () => {
       const { payload, request } = await backupOf([
         registryRow("alpha", {
@@ -1422,9 +1473,10 @@ describe("backup of the managed plugin list", () => {
         expect(removalOf(refused).names).toEqual(["alpha"]);
       });
 
-      it("asks for approval once when the same repository comes back over SSH instead of HTTPS", async () => {
+      it("asks for approval once when an ssh install is not exactly the https form of the listed URL", async () => {
         await pushFromFirstMachine([registryRow("alpha")]);
         // The other machine has an SSH agent, so `example/alpha` shorthand became an scp URL there.
+        // Its https form (no `.git`) is not the listed `...alpha.git`: another spelling, another source.
         const overSsh = [
           registryRow("alpha", { source: gitSource("git@github.com:example/alpha") }),
         ];
@@ -1444,6 +1496,54 @@ describe("backup of the managed plugin list", () => {
         ]);
         // The backup now spells it that way, so the next push needs no approval.
         expect((await pushFromSecondMachine(overSsh)).success).toBe(true);
+      });
+
+      it("needs no approval when the install is the https form of the listed ssh source, or the other way round", async () => {
+        const https = registryRow("alpha", {
+          source: gitSource("https://github.com/example/alpha.git"),
+        });
+        const overSsh = registryRow("alpha", {
+          source: gitSource("git@github.com:example/alpha.git"),
+        });
+        // The backup lists the ssh source. A review installed it from its https address.
+        await pushFromFirstMachine([overSsh]);
+        expect((await pushFromSecondMachine([https])).success).toBe(true);
+        expect((await listedRows()).map((row) => row.source.url)).toEqual([
+          "https://github.com/example/alpha.git",
+        ]);
+
+        // The machine that installed it over ssh pushes next, and is not asked in turn.
+        expect((await pushFromSecondMachine([overSsh])).success).toBe(true);
+        expect((await listedRows()).map((row) => row.source.url)).toEqual([
+          "git@github.com:example/alpha.git",
+        ]);
+      });
+
+      it.each([
+        [
+          "another port",
+          "ssh://git@host.example:2222/example/alpha.git",
+          "ssh://git@host.example:2200/example/alpha.git",
+        ],
+        ["another path", "git@github.com:example/alpha.git", "https://github.com/example/beta.git"],
+        [
+          "another host",
+          "git@github.com:example/alpha.git",
+          "https://gitlab.com/example/alpha.git",
+        ],
+        [
+          "an ssh and an scp spelling",
+          "ssh://git@github.com/example/alpha.git",
+          "git@github.com:example/alpha.git",
+        ],
+      ])("still asks for approval for %s", async (_label, listed, installed) => {
+        await pushFromFirstMachine([registryRow("alpha", { source: gitSource(listed) })]);
+
+        const refused = await pushFromSecondMachine([
+          registryRow("alpha", { source: gitSource(installed) }),
+        ]);
+
+        expect(removalOf(refused).names).toEqual(["alpha"]);
       });
 
       it("pushes once the approval of that removal comes back with it", async () => {

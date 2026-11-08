@@ -171,8 +171,8 @@ test("previews the pinned commit of the first backed-up plugin and installs it t
   });
 });
 
-test("keeps tracking the backup's branch when the user fixed the URL and the preview resolved the pinned commit", async () => {
-  const { view, installSpy } = renderWithBackup(
+test("previews an ssh source at its https address and installs it from there, tracking the backup's branch", async () => {
+  const { view, installSpy, previewSpy } = renderWithBackup(
     [
       backedUp("alpha", {
         source: {
@@ -186,6 +186,12 @@ test("keeps tracking the backup's branch when the user fixed the URL and the pre
     { alpha: previewOf("alpha") }
   );
   await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  // Git never sees the ssh address: the preview is of the https one, at the pinned commit.
+  expect(previewSpy).toHaveBeenCalledTimes(1);
+  expect(previewSpy.mock.calls[0]?.[0]).toMatchObject({
+    input: "https://github.com/example/alpha.git",
+    ref: PINNED,
+  });
 
   await clickButton(view, /^Install$/);
 
@@ -193,6 +199,39 @@ test("keeps tracking the backup's branch when the user fixed the URL and the pre
   expect(installSpy.mock.calls[0]?.[0]).toMatchObject({
     source: { url: "https://github.com/example/alpha.git", ref: "main", refType: "branch" },
     expectedSha: PINNED,
+  });
+});
+
+test.each([
+  ["an http URL", "http://host.example/gone.git"],
+  ["a git URL", "git://host.example/gone.git"],
+  ["an ssh URL with no path", "ssh://git@host.example"],
+])("does not preview %s, says why, and moves on when it is skipped", async (_label, url) => {
+  const { view, previewSpy } = renderWithBackup(
+    [
+      backedUp("gone", { source: { type: "git", url, ref: "main", refType: "branch" } }),
+      backedUp("beta"),
+    ],
+    { beta: previewOf("beta"), gone: previewOf("gone") }
+  );
+
+  await waitFor(() =>
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain(
+      "comes from a source that is not https"
+    )
+  );
+  expect(header(view)).toContain("From backup: 1 of 2");
+  // Nothing is fetched for it, and the form does not offer its address to a click on Preview.
+  expect(previewSpy).not.toHaveBeenCalled();
+  expect((view.container.querySelector("#plugin-source") as HTMLInputElement | null)?.value).toBe(
+    ""
+  );
+
+  await clickButton(view, /^Skip$/);
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  expect(previewSpy).toHaveBeenCalledTimes(1);
+  expect(previewSpy.mock.calls[0]?.[0]).toMatchObject({
+    input: "https://github.com/example/beta.git",
   });
 });
 

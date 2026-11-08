@@ -16,6 +16,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   hasEscapedUnreservedCharacter,
+  httpsFormOfSshUrl,
   pointsAtThisMachine,
 } from "@/common/utils/agentPluginSource";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
@@ -280,16 +281,27 @@ function folderIdentity(subpath: string | undefined): string {
 
 /**
  * The same repository URL as written, and the same folder, wherever the commit or ref of either
- * one points. Another spelling of one repository (`.git`, ssh against https, a host's case) is
- * another source here: a rule that merged spellings could also merge two repositories, and that
- * would count a different repository's plugin as kept with no approval. A spelling difference
- * asks for approval on a push and reads "Name in use" on a restore, which is the safe direction.
+ * one points. Another spelling of one repository (`.git`, a host's case) is another source here: a
+ * rule that merged spellings could also merge two repositories, and that would count a different
+ * repository's plugin as kept with no approval. A spelling difference asks for approval on a push
+ * and reads "Name in use" on a restore, which is the safe direction.
+ *
+ * The one exception is the https form of an ssh source (`httpsFormOfSshUrl`), compared as the
+ * exact URL it gives. A review previews a listed ssh source at that address and installs it from
+ * there, so the install is the listed plugin, not a plugin that replaces it: asking to remove
+ * it on the next push would be wrong, and the machine that installed it over ssh would be asked in
+ * turn. Two ssh spellings are still two sources (ports can name different servers), and so is an
+ * https URL that is not exactly that form.
  */
 function isSameSource(
   a: Pick<BackupPluginEntry["source"], "url" | "subpath">,
   b: Pick<BackupPluginEntry["source"], "url" | "subpath">
 ): boolean {
-  return a.url === b.url && folderIdentity(a.subpath) === folderIdentity(b.subpath);
+  return isSameRepository(a.url, b.url) && folderIdentity(a.subpath) === folderIdentity(b.subpath);
+}
+
+function isSameRepository(a: string, b: string): boolean {
+  return a === b || httpsFormOfSshUrl(a) === b || httpsFormOfSshUrl(b) === a;
 }
 
 /**

@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { displayRepoUrl } from "@/common/utils/agentPluginSource";
+import { displayRepoUrl, reviewUrlOf } from "@/common/utils/agentPluginSource";
 import type {
   BackupOperationError,
   BackupPluginEntry,
@@ -14,13 +14,20 @@ import { EMPTY_BACKUP_PLUGIN_REPORT } from "@/common/orpc/schemas/backup";
 import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
 /**
- * SECURITY: a review previews only https sources. The list is repository-controlled, and a
- * preview of an ssh or scp source makes git sign in with the user's SSH agent to whatever host
- * the list names, before any consent to that plugin. A remote marketplace follows the same rule
- * (assertMarketplaceMayName). The user adds such a plugin by hand in Settings → Plugins.
+ * A missing plugin the review does not preview: its source is not https and has no https address
+ * (`reviewUrlOf` holds the rule and why). The user adds it by hand in Settings → Plugins.
  */
 function isAddedByHand(row: BackupPluginRow): boolean {
-  return row.status === "missing" && !row.source.url.startsWith("https://");
+  return row.status === "missing" && reviewUrlOf(row.source.url) === undefined;
+}
+
+/** A missing plugin from an ssh source, which a review previews at the https address of its host. */
+function isPreviewedOverHttps(row: BackupPluginRow): boolean {
+  return (
+    row.status === "missing" &&
+    !row.source.url.startsWith("https://") &&
+    reviewUrlOf(row.source.url) !== undefined
+  );
 }
 
 /** The plugins this machine lacks that a review can preview, as entries (the status is spent). */
@@ -193,6 +200,28 @@ function PluginListWarnings(props: { warnings: readonly string[] }) {
   );
 }
 
+/** What a review does with a source that is not https, said once under the list. */
+function SourceNotes(props: { rows: readonly BackupPluginRow[] }) {
+  return (
+    <>
+      {props.rows.some(isPreviewedOverHttps) ? (
+        <p className="text-muted text-xs">
+          A review previews only https addresses. A plugin from an ssh source is previewed at the
+          https address of the same host and path, so git never signs in with your SSH keys to a
+          host this backup names.
+        </p>
+      ) : null}
+      {props.rows.some(isAddedByHand) ? (
+        <p className="text-muted text-xs">
+          A plugin marked “Add it yourself” comes from a non-https source that has no https address,
+          such as http or git, and a review does not preview it. To reinstall it, add its repository
+          yourself in Settings → Plugins.
+        </p>
+      ) : null}
+    </>
+  );
+}
+
 /**
  * The backup's plugin list after a preview or restore, with the one way forward: review each
  * missing plugin through the normal install preview. Also says so when a list was skipped.
@@ -235,13 +264,7 @@ export function BackupPluginsCard(props: {
           another repository or folder, or a folder Xum does not manage, under that name.
         </p>
       ) : null}
-      {plugins.some(isAddedByHand) ? (
-        <p className="text-muted text-xs">
-          A review previews only https sources. A plugin marked “Add it yourself” comes from an ssh
-          source, and a preview would sign in with your SSH keys to the host this backup names. To
-          reinstall it, add its repository yourself in Settings → Plugins.
-        </p>
-      ) : null}
+      <SourceNotes rows={plugins} />
       {missing.length > 0 ? (
         <Button
           size="sm"

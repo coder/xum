@@ -255,22 +255,41 @@ describe("BackupPluginsCard", () => {
     expect(reviews).toEqual([]);
   });
 
-  test("offers no review of a plugin from an ssh source, and says to add it by hand", () => {
+  test("offers a plugin from an ssh source at its https address, and a non-https source to add by hand", () => {
     const view = renderCard(
       reportOf([
         row("alpha", "missing"),
-        row("beta", "missing", { url: "ssh://git@attacker.example/beta.git" }),
-        row("gamma", "missing", { url: "git@attacker.example:gamma.git" }),
-        row("delta", "installed", { url: "git@github.com:example/delta.git" }),
+        row("beta", "missing", { url: "ssh://git@host.example/beta.git" }),
+        row("gamma", "missing", { url: "git@host.example:gamma.git" }),
+        row("delta", "missing", { url: "http://host.example/delta.git" }),
+        row("epsilon", "missing", { url: "git://host.example/epsilon.git" }),
+        row("zeta", "installed", { url: "git@github.com:example/zeta.git" }),
       ])
     );
 
-    expect(view.getByRole("button", { name: /Review and install \(1\)/ })).toBeTruthy();
+    expect(view.getByRole("button", { name: /Review and install \(3\)/ })).toBeTruthy();
     const badges = view
       .getAllByRole("listitem")
       .map((item) => item.querySelectorAll("span")[1]?.textContent);
-    expect(badges).toEqual(["Not installed", "Add it yourself", "Add it yourself", "Installed"]);
-    expect(view.getByText(/add its repository yourself/)).toBeTruthy();
+    expect(badges).toEqual([
+      "Not installed",
+      "Not installed",
+      "Not installed",
+      "Add it yourself",
+      "Add it yourself",
+      "Installed",
+    ]);
+    expect(view.getByText(/previewed at the https address of the same host/)).toBeTruthy();
+    // The badge covers http and git, so the note must not call its source ssh.
+    expect(view.getByText(/comes from a non-https source/)).toBeTruthy();
+    expect(view.queryByText(/comes from an ssh source/)).toBeNull();
+  });
+
+  test("says nothing about https or adding by hand when every source is https", () => {
+    const view = renderCard(reportOf([row("alpha", "missing"), row("beta", "installed")]));
+
+    expect(view.queryByText(/https address/)).toBeNull();
+    expect(view.queryByText(/non-https/)).toBeNull();
   });
 
   test("explains a name in use only when a plugin has one", () => {
@@ -306,15 +325,16 @@ describe("reviewBackedUpPlugins", () => {
     expect(opened).toBe(1);
   });
 
-  test("hands over no plugin from an ssh or scp source", () => {
+  test("hands over a plugin from an ssh or scp source as listed, and none from another non-https source", () => {
     let opened = 0;
 
     reviewBackedUpPlugins({
       report: reportOf([
         row("alpha", "missing"),
-        row("beta", "missing", { url: "ssh://git@attacker.example/beta.git" }),
-        row("gamma", "missing", { url: "git@attacker.example:gamma.git" }),
-        row("delta", "missing", { url: "http://attacker.example/delta.git" }),
+        row("beta", "missing", { url: "ssh://git@host.example/beta.git" }),
+        row("gamma", "missing", { url: "git@host.example:gamma.git" }),
+        row("delta", "missing", { url: "http://host.example/delta.git" }),
+        row("epsilon", "missing", { url: "git://host.example/epsilon.git" }),
       ]),
       enabled: true,
       openPlugins: () => opened++,
@@ -322,15 +342,20 @@ describe("reviewBackedUpPlugins", () => {
 
     const intent = consumePendingPluginsSectionIntent();
     const entries = intent?.type === "install-from-backup" ? intent.entries : [];
-    expect(entries.map((entry) => entry.name)).toEqual(["alpha"]);
+    expect(entries.map((entry) => entry.name)).toEqual(["alpha", "beta", "gamma"]);
+    // The ssh address stays as listed: the review turns it into the https address when it previews.
+    expect(entries[2]?.source.url).toBe("git@host.example:gamma.git");
     expect(opened).toBe(1);
   });
 
-  test("opens nothing when every missing plugin comes from an ssh source", () => {
+  test("opens nothing when every missing plugin comes from a non-https source with no https address", () => {
     let opened = 0;
 
     reviewBackedUpPlugins({
-      report: reportOf([row("beta", "missing", { url: "git@attacker.example:beta.git" })]),
+      report: reportOf([
+        row("beta", "missing", { url: "http://host.example/beta.git" }),
+        row("gamma", "missing", { url: "git://host.example/gamma.git" }),
+      ]),
       enabled: true,
       openPlugins: () => opened++,
     });
