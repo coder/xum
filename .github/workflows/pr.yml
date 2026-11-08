@@ -1214,7 +1214,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # electron-builder unpacks the checked Electron zip of this job's arch (the runner is
+      # arm64, so the x64 job needs the darwin-x64 zip) instead of downloading it without retries.
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: darwin-${{ matrix.arch }}
       - name: Setup code signing
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: ./scripts/setup-macos-signing.sh
@@ -1251,7 +1256,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # electron-builder unpacks the checked Electron zip instead of downloading it without retries.
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: win32-x64
       - name: Add MSYS2 make to PATH
         shell: pwsh
         run: |

@@ -896,15 +896,22 @@ ensure-mac-sharp-runtime-deps: node_modules/.installed
 		fi; \
 	done
 
+# ELECTRON_ZIP_DIR (CI sets it, from setup-xum's electron-zip input) names the directory of the
+# checksum-checked electron-v<version>-<platform>-<arch>.zip files. electron-builder then unpacks
+# them and downloads nothing: its own download retries nothing, and a github.com 504 failed
+# Build / Linux in five queue runs on 2026-11-08. The directory must hold the zip of every arch
+# the call builds, or electron-builder looks for an unpacked Electron there and fails.
+ELECTRON_DIST_FLAG = $(if $(ELECTRON_ZIP_DIR),-c.electronDist="$(ELECTRON_ZIP_DIR)")
+
 dist-mac: build ## Build macOS distributables (x64 + arm64)
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@if [ -n "$$CSC_LINK" ]; then \
 		echo "🔐 Code signing enabled - using unified build for correct yml..."; \
-		bun x electron-builder --mac --x64 --arm64 --publish never; \
+		bun x electron-builder --mac --x64 --arm64 --publish never $(ELECTRON_DIST_FLAG); \
 	else \
 		echo "Building macOS architectures in parallel..."; \
-		bun x electron-builder --mac --x64 --publish never & pid1=$$! ; \
-		bun x electron-builder --mac --arm64 --publish never & pid2=$$! ; \
+		bun x electron-builder --mac --x64 --publish never $(ELECTRON_DIST_FLAG) & pid1=$$! ; \
+		bun x electron-builder --mac --arm64 --publish never $(ELECTRON_DIST_FLAG) & pid2=$$! ; \
 		wait $$pid1 && wait $$pid2; \
 	fi
 	@# electron-updater skips an update when os.release() (the Darwin version) is below the
@@ -923,12 +930,12 @@ MAC_TARGETS ?=
 dist-mac-x64: build ## Build macOS x64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS x64..."
-	@bun x electron-builder --mac $(MAC_TARGETS) --x64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --x64 --publish never $(ELECTRON_DIST_FLAG)
 
 dist-mac-arm64: build ## Build macOS arm64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS arm64..."
-	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never $(ELECTRON_DIST_FLAG)
 
 install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Applications
 	@app_bundle="$$(bun -e 'import { resolveMacPackagedAppNames } from "./src/common/compat/macPackagedApp.ts"; import pkg from "./package.json"; process.stdout.write(resolveMacPackagedAppNames(pkg.build).appBundleName)')"; \
@@ -938,7 +945,7 @@ install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Appli
 	echo "Installed $$app_bundle to /Applications"
 
 dist-win: build ## Build Windows distributable
-	@bun x electron-builder --win --publish never
+	@bun x electron-builder --win --publish never $(ELECTRON_DIST_FLAG)
 
 # ELECTRON_ZIP_DIR (CI sets it, from setup-xum's electron-zip input) names the directory of the
 # checksum-checked electron-v<version>-linux-x64.zip. electron-builder then unpacks that zip and
@@ -948,7 +955,7 @@ dist-linux: build ## Build Linux distributable
 	@bun x electron-builder --linux --publish never $(if $(ELECTRON_ZIP_DIR),-c.electronDist=$(ELECTRON_ZIP_DIR))
 
 dist-linux-arm64: build ## Build Linux arm64 distributable
-	@bun x electron-builder --linux --arm64 --publish never
+	@bun x electron-builder --linux --arm64 --publish never $(ELECTRON_DIST_FLAG)
 
 # MAC_ARCH=x64|arm64 validates a single-arch build (dist-mac-<arch>) instead of both.
 check-mac-attach-file-runtime: ## Validate packaged macOS attach_file runtime assets (requires prior dist-mac build)
