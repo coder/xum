@@ -56,16 +56,32 @@ const STANDALONE_SECRET_PATTERNS: RegExp[] = [
 // Every position can take a character, except a closing delimiter and the end of the text, which
 // end the value. So a match never fails and backtracks into the body, and the scan stays linear.
 const QUOTED_VALUE = String.raw`(["'])(?:\\[\s\S]|(?!\2)[^\\]|\\$)*(?:\2|$)`;
-// Inside a JSON-escaped string the delimiter is `\"` and an inner escaped quote is `\\\"`. A run of
-// backslashes before a quote ends the value only when it is one more than a multiple of four.
-const ESCAPED_QUOTED_VALUE = String.raw`\\(["'])(?:[^\\]|\\{4}|\\{3}\3|\\{1,3}(?!\3)[^\\]|\\(?!\3))*(?:\\\3|$)`;
 
-// `key=value`, `key: value`, `"key": "value"`, `os.environ["KEY"] = "value"` and the same inside a
-// JSON-escaped string (`\"key\": \"value\"`). The value is a quoted run (to its closing quote, or
-// to the end of an unterminated one) or one unquoted word, optionally behind an auth scheme.
+// Text that went through JSON.stringify `d` times writes a quote as `2^d - 1` backslashes and a quote
+// (`\"`, `\\\"`, `\\\\\\\"`), so a pair nested in JSON strings has delimiters of 1, 3, 7, 15 or 31
+// backslashes: five layers. A pair nested deeper is not recognized.
+const ESCAPE_RUN_MAX = 31;
+
+// Where a nested value ends: its quote behind the opener's run of backslashes (`n`), or behind `n`
+// plus a multiple of `2 * (n + 1)`, since a backslash the value itself ends in is written as that
+// many at this depth. A quote behind any other run is the value's own: an escaped quote in it has
+// one more escape level than the delimiter. The body reads a run whole, so only a run's start is
+// checked. At one layer this is a run of one more than a multiple of four. Nothing is decoded.
+const ESCAPED_CLOSE = String.raw`\k<run>(?:\k<run>\\\k<run>\\)*\k<quote>`;
+
+// The pair inside JSON-escaped text. The body takes a character, or a whole run of backslashes
+// unless the run is the close, so it stops only at the close or at the end of the text: a match
+// never fails and backtracks, and a run costs its length plus a check bounded by the opener's. An
+// unterminated value reads to the end of the text, so a credential the cap cut off is redacted.
+const ESCAPED_QUOTED_VALUE = String.raw`(?<run>\\{1,${ESCAPE_RUN_MAX}})(?<quote>["'])(?:[^\\]|(?!${ESCAPED_CLOSE})\\+)*(?:${ESCAPED_CLOSE}|$)`;
+
+// `key=value`, `key: value`, `"key": "value"`, `os.environ["KEY"] = "value"` and the same inside
+// JSON-escaped text (`\"key\": \"value\"`, the key's closing quote behind a run of backslashes too).
+// The value is a quoted run (to its closing quote, or to the end of an unterminated one) or one
+// unquoted word, optionally behind an auth scheme.
 // Already-redacted values are skipped so the passes compose, and so are comparisons (`token === x`).
 const SECRET_KEY_VALUE_PATTERN = new RegExp(
-  String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}(?:\\?["']\]?)?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}})` +
+  String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}(?:\\{0,${ESCAPE_RUN_MAX}}["']\]?)?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}})` +
     String.raw`(?![=]|\[redacted\])(?:${QUOTED_VALUE}|${ESCAPED_QUOTED_VALUE}|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+)`,
   "gi"
 );

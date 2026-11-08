@@ -162,6 +162,27 @@ describe("renderToolValue", () => {
     expect(rendered).toContain("[redacted]");
     expect(rendered).not.toContain("ghp_");
   });
+
+  // A tool prints JSON, and a structured result holds that JSON as a string, so a credential sits
+  // in a string inside a string. Each layer doubles the backslashes before a quote (`\"`, `\\\"`,
+  // `\\\\\\"`), and the credential's own escaped quote must not end it early. Escaping a text again
+  // escapes the redacted text the same way, so that is what the rendering must equal.
+  describe("a credential in JSON nested in the tool's output", () => {
+    const stringifyTimes = (text: string, times: number): string =>
+      times === 0 ? text : stringifyTimes(JSON.stringify({ wrapped: text }), times - 1);
+    const passwords = ["plain-pw-4f9e", 'embedded"quote-7c1d', "trailing\\", 'back\\"slash-2b8a'];
+    const cases = [1, 2, 3].flatMap((layers) =>
+      passwords.map((password) => [layers, password] as const)
+    );
+
+    it.each(cases)("redacts it %i JSON strings deep: %j", (layers, password) => {
+      const nested = (text: string): string => stringifyTimes(text, layers - 1);
+
+      expect(
+        renderToolValue({ out: nested(JSON.stringify({ password, user: "alice" })) }, 2_000)
+      ).toBe(JSON.stringify({ out: nested('{"password":[redacted],"user":"alice"}') }));
+    });
+  });
 });
 
 /** An array of `length` items that exist only when read, so a walk's reads are countable. */
