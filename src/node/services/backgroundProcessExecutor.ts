@@ -31,7 +31,8 @@ import {
   buildSpawnCommand,
   parsePid,
   parseExitCode,
-  buildTerminateCommand,
+  buildKillGroupCommand,
+  buildPublishExitCodeCommand,
   shellQuote,
 } from "@/node/runtime/backgroundCommands";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
@@ -96,9 +97,10 @@ function backgroundSandboxRoots(options: SpawnOptions): string[] {
 /**
  * Xum's own record keeping (spawn records, the kill sequence), not agent code, so it runs
  * outside the macOS agent sandbox: a sandboxed kill cannot signal another sandbox. Writes and
- * deletes of a record do not use it (writeMeta, removing a failed spawn's record): agent commands
- * can put a symlink on the record's path (see backgroundRecordFiles.ts), and the sandbox refuses
- * a write or delete through it.
+ * deletes of a record do not use it (creating the record folder, writeMeta, a stop's exit code,
+ * removing a failed spawn's record): agent commands can put a symlink on the record's path or in
+ * place of its folder (see backgroundRecordFiles.ts), and the sandbox refuses a write or delete
+ * through it.
  */
 const XUM_INTERNAL: Pick<ExecOptions, "sandbox"> = { sandbox: "off" };
 const BACKGROUND_CWD_ENV = "XUM_INTERNAL_BACKGROUND_CWD";
@@ -290,25 +292,26 @@ export async function spawnProcess(
 
   // Create output directory and empty file
   try {
-    await runtime.ensureDir(outputDir);
-    await createEmptyOutputLog(runtime, tempDir, outputPath);
     // Process IDs are display-name based and only deduplicated within one app session, so a
     // restart can reuse a previous session's directory. A stale exit_code from that prior
     // process would be trusted as proof that the NEW process exited — both by getExitCode()
     // and by crash-orphan archive gating — so it must be gone before the wrapper's trap owns
     // the file again.
-    // In the sandbox when it applies (see XUM_INTERNAL).
-    const rmResult = await execBuffered(runtime, `rm -f ${quotePath(exitCodePath)}`, {
-      cwd: FALLBACK_CWD,
-      timeout: 10,
-    });
-    if (rmResult.exitCode !== 0) {
+    // In the sandbox when it applies (see XUM_INTERNAL), so a link a command put in place of a
+    // record folder cannot make Xum create a folder where it points.
+    const prepared = await execBuffered(
+      runtime,
+      `mkdir -p ${quotePath(outputDir)} && rm -f ${quotePath(exitCodePath)}`,
+      { cwd: FALLBACK_CWD, timeout: 10 }
+    );
+    if (prepared.exitCode !== 0) {
       await removeOutputDirBestEffort();
       return {
         success: false,
-        error: `Failed to clear stale exit_code file: ${rmResult.stderr}`,
+        error: `Failed to create output directory: ${prepared.stderr}`,
       };
     }
+    await createEmptyOutputLog(runtime, tempDir, outputPath);
   } catch (error) {
     await removeOutputDirBestEffort();
     return {
@@ -773,14 +776,22 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
 
   private async runTerminate(): Promise<void> {
     try {
-      const exitCodePath = `${this.outputDir}/${EXIT_CODE_FILENAME}`;
-      const terminateCmd = buildTerminateCommand(this.pid, exitCodePath, this.quotePath);
-      await execBuffered(this.runtime, terminateCmd, {
+      const killed = await execBuffered(this.runtime, buildKillGroupCommand(this.pid), {
         cwd: FALLBACK_CWD,
         timeout: 15,
         ...XUM_INTERNAL,
       });
       log.debug(`RuntimeBackgroundHandle: Terminated process group ${this.pid}`);
+      const exitCode = parseExitCode(killed.stdout);
+      if (exitCode != null) {
+        const exitCodePath = `${this.outputDir}/${EXIT_CODE_FILENAME}`;
+        // In the sandbox when it applies (see XUM_INTERNAL).
+        await execBuffered(
+          this.runtime,
+          buildPublishExitCodeCommand(exitCode, exitCodePath, this.quotePath),
+          { cwd: FALLBACK_CWD, timeout: 10 }
+        );
+      }
     } catch (error) {
       // Process may already be dead - that's fine
       log.debug(`RuntimeBackgroundHandle.terminate: Error: ${errorMsg(error)}`);

@@ -727,6 +727,65 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       }
     });
 
+    it("does not create a record folder through a link in place of its parent", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(workspace);
+      const victim = await homeProbePath();
+      await fs.mkdir(victim);
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+      const runtime = new LocalRuntime(workspace);
+      const workspaceId = `sandbox-test-${path.basename(root)}`;
+      const recordRoot = `/tmp/mux-bashes/${workspaceId}`;
+      await fs.mkdir(path.dirname(recordRoot), { recursive: true });
+      await fs.symlink(victim, recordRoot);
+      try {
+        const result = await spawnProcess(runtime, "true", {
+          cwd: workspace,
+          workspaceId,
+          processId: "bg",
+        });
+
+        expect(result.success).toBe(false);
+        expect(await fs.readdir(victim)).toEqual([]);
+      } finally {
+        await fs.rm(recordRoot, { force: true });
+        await fs.rm(victim, { recursive: true, force: true });
+      }
+    });
+
+    it("does not write a stop's exit code through a link in place of the record folder", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(workspace);
+      const victim = await homeProbePath();
+      await fs.mkdir(victim);
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+      const runtime = new LocalRuntime(workspace);
+      const workspaceId = `sandbox-test-${path.basename(root)}`;
+      const recordDir = `/tmp/mux-bashes/${workspaceId}/bg`;
+
+      const result = await spawnProcess(
+        runtime,
+        `rm -rf ${recordDir} && ln -s ${victim} ${recordDir} && exec sleep 30`,
+        { cwd: workspace, workspaceId, processId: "bg" }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      try {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if ((await fs.lstat(recordDir).catch(() => null))?.isSymbolicLink()) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        expect((await fs.lstat(recordDir)).isSymbolicLink()).toBe(true);
+
+        await result.handle.terminate();
+        expect(await fs.readdir(victim)).toEqual([]);
+      } finally {
+        await result.handle.dispose();
+        await fs.rm(recordDir, { force: true });
+        await fs.rm(victim, { recursive: true, force: true });
+      }
+    }, 15_000);
+
     it("reports what it blocked in the bash result", async () => {
       const workspace = path.join(root, "ws");
       await fs.mkdir(workspace);

@@ -83,7 +83,7 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
   parts.push(`trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT`);
   // Without a TERM trap, bash killed by SIGTERM runs the EXIT trap with `$?` = 0, so a stopped
   // process would record 0. This trap runs only on SIGTERM and makes the EXIT trap record 128+15,
-  // which lets buildTerminateCommand publish its own code only when no file exists.
+  // which lets buildPublishExitCodeCommand publish a stop's code only when no file exists.
   parts.push(`trap 'exit ${EXIT_CODE_SIGTERM}' TERM`);
 
   // Change to working directory
@@ -154,16 +154,14 @@ export function buildSpawnCommand(options: SpawnCommandOptions): string {
 }
 
 /**
- * Build the terminate command for killing a process group.
+ * Build the command that kills a process group and prints the exit code a stop publishes.
  *
  * Uses negative PID to kill entire process group.
  * Relies on set -m ensuring PID === PGID (process is its own group leader).
- * Sends SIGTERM, waits 2 seconds, then SIGKILL if still running.
- * Writes EXIT_CODE_SIGKILL on force kill.
- *
- * The command never overwrites an exit_code file: it publishes 143/137 only when no file exists
- * (`[ -e ]`, then noclobber `set -C` so the create is O_EXCL). A code the wrapper's EXIT trap
- * wrote (a natural exit, or 143 from its TERM trap) always wins.
+ * Sends SIGTERM, waits 2 seconds, then SIGKILL if still running, and prints EXIT_CODE_SIGKILL
+ * after a force kill, else EXIT_CODE_SIGTERM. buildPublishExitCodeCommand writes that code: the
+ * kill runs outside the macOS agent sandbox (a sandboxed kill cannot signal another sandbox),
+ * and the write must not, because a sandboxed command can put a link in place of its record.
  *
  * Still open (#5481): the command signals the group without knowing whether the process
  * already exited. The caller's in-memory status follows a natural exit only when something polls
@@ -172,29 +170,39 @@ export function buildSpawnCommand(options: SpawnCommandOptions): string {
  * record's.
  *
  * @param pid - Process ID (equals PGID due to set -m in buildSpawnCommand)
- * @param exitCodePath - Path to write exit code (raw, will be quoted by quotePath)
- * @param quotePath - Function to quote path (default: shellQuote). Use expandTildeForSSH for SSH.
  */
-export function buildTerminateCommand(
-  pid: number,
-  exitCodePath: string,
-  quotePath: (p: string) => string = shellQuote
-): string {
+export function buildKillGroupCommand(pid: number): string {
   const negPid = -pid; // Negative PID targets process group (PID === PGID due to set -m)
-  const quotedExitCodePath = quotePath(exitCodePath);
-  // `[ -e ]` first: noclobber still opens an existing FIFO or device, which can block.
-  const publish = (code: number) =>
-    `[ -e ${quotedExitCodePath} ] || (set -C; echo ${code} > ${quotedExitCodePath}) 2>/dev/null || true`;
-  // Send SIGTERM, wait for process to exit, then publish an exit code if none exists.
   // After sleep 2, either the process exited (SIGTERM code) or we escalate to SIGKILL.
   return (
     `kill -15 ${negPid} 2>/dev/null || true; ` +
     `sleep 2; ` +
     `if kill -0 ${negPid} 2>/dev/null; then ` +
     `kill -9 ${negPid} 2>/dev/null || true; ` +
-    `${publish(EXIT_CODE_SIGKILL)}; ` +
+    `echo ${EXIT_CODE_SIGKILL}; ` +
     `else ` +
-    `${publish(EXIT_CODE_SIGTERM)}; ` +
+    `echo ${EXIT_CODE_SIGTERM}; ` +
     `fi`
   );
+}
+
+/**
+ * Build the command that publishes a stopped process's exit code (see buildKillGroupCommand).
+ *
+ * The command never overwrites an exit_code file: it publishes the code only when no file exists
+ * (`[ -e ]`, then noclobber `set -C` so the create is O_EXCL). A code the wrapper's EXIT trap
+ * wrote (a natural exit, or 143 from its TERM trap) always wins.
+ *
+ * @param exitCode - The code buildKillGroupCommand printed
+ * @param exitCodePath - Path to write exit code (raw, will be quoted by quotePath)
+ * @param quotePath - Function to quote path (default: shellQuote). Use expandTildeForSSH for SSH.
+ */
+export function buildPublishExitCodeCommand(
+  exitCode: number,
+  exitCodePath: string,
+  quotePath: (p: string) => string = shellQuote
+): string {
+  const quotedExitCodePath = quotePath(exitCodePath);
+  // `[ -e ]` first: noclobber still opens an existing FIFO or device, which can block.
+  return `[ -e ${quotedExitCodePath} ] || (set -C; echo ${exitCode} > ${quotedExitCodePath}) 2>/dev/null || true`;
 }
