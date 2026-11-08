@@ -50,7 +50,7 @@ import {
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
-import { addsSecretLike } from "@/node/services/memorySecretRedaction";
+import { addsSecretLike, containsSecretLike } from "@/node/services/memorySecretRedaction";
 import {
   adoptionTargetPresence,
   adoptionTargetStamp,
@@ -2722,6 +2722,13 @@ export class MemoryService extends EventEmitter {
    * from) whichever workspace made them — the intended v1 scope. When the
    * context has no workspace, there is no session journal; skip (log-only).
    * Never throws: journaling failures must not fail the memory command.
+   *
+   * A guarded write (`rejectSecretLike`) whose row would carry credential-like text is not
+   * journaled either (see refinementHoldsSecretLike): the organizer cleans a credential out of
+   * memory with these commands, and a row would keep it in durable state, the pre-image offloaded
+   * verbatim to the session blob store and a credential-named path in the row. The cost is the
+   * point: the cleanup cannot be rolled back, so nothing can bring the credential back, and a
+   * rollback of an earlier row on the same file refuses on divergence (the file changed after it).
    */
   private async journalRefinement(
     ctx: MemoryScopeContext,
@@ -2729,10 +2736,18 @@ export class MemoryService extends EventEmitter {
     inverse: RefinementInverseDraft,
     actor: MemoryActor,
     toolCallId?: string,
-    postFiles?: RefinementFileCapture[]
+    postFiles?: RefinementFileCapture[],
+    options?: MemoryWriteOptions
   ): Promise<void> {
     if (!ctx.workspaceId) {
       log.debug("[MemoryService] skipping refinement journal: no workspace session", {
+        op: action.op,
+      });
+      return;
+    }
+    if (options?.rejectSecretLike === true && refinementHoldsSecretLike(action, inverse)) {
+      // Only the op: the path itself may be the credential.
+      log.debug("[MemoryService] skipping refinement journal: credential-like row", {
         op: action.op,
       });
       return;
@@ -3116,7 +3131,8 @@ export class MemoryService extends EventEmitter {
           { op: "delete-files", paths: [store.physicalPath(parsed.relPath)] },
           actor,
           toolCallId,
-          [{ path: store.physicalPath(parsed.relPath), content: fileText }]
+          [{ path: store.physicalPath(parsed.relPath), content: fileText }],
+          options
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -3162,7 +3178,8 @@ export class MemoryService extends EventEmitter {
           },
           actor,
           toolCallId,
-          [{ path: store.physicalPath(parsed.relPath), content: updated }]
+          [{ path: store.physicalPath(parsed.relPath), content: updated }],
+          options
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -3217,7 +3234,8 @@ export class MemoryService extends EventEmitter {
           },
           actor,
           toolCallId,
-          [{ path: store.physicalPath(parsed.relPath), content: updated }]
+          [{ path: store.physicalPath(parsed.relPath), content: updated }],
+          options
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -3374,7 +3392,7 @@ export class MemoryService extends EventEmitter {
     toolCallId?: string,
     expectedFingerprint?: string,
     abortSignal?: AbortSignal,
-    options?: { rejectPinned?: boolean }
+    options?: { rejectPinned?: boolean } & MemoryWriteOptions
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -3412,7 +3430,9 @@ export class MemoryService extends EventEmitter {
             { op: "delete", path: toVirtualPath(scope, parsed.relPath) },
             inverse,
             actor,
-            toolCallId
+            toolCallId,
+            undefined,
+            options
           );
         }
         await this.recordDelete(ctx, scope, parsed.relPath);
@@ -3432,7 +3452,7 @@ export class MemoryService extends EventEmitter {
     actor: MemoryActor,
     toolCallId?: string,
     abortSignal?: AbortSignal,
-    options?: { rejectPinned?: boolean }
+    options?: { rejectPinned?: boolean } & MemoryWriteOptions
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const oldParsed = parseMemoryPath(oldVirtualPath);
@@ -3486,7 +3506,9 @@ export class MemoryService extends EventEmitter {
             to: store.physicalPath(oldParsed.relPath),
           },
           actor,
-          toolCallId
+          toolCallId,
+          undefined,
+          options
         );
         await this.recordRename(ctx, scope, oldParsed.relPath, newParsed.relPath);
         this.emitChange(ctx, scope, oldParsed.relPath, actor);
@@ -3875,7 +3897,7 @@ function computeInsertUpdate(
   return { updated: lines.join("\n"), insertedLineCount: insertedLines.length };
 }
 
-/** Opt-in rails for a content-writing command (create, str_replace, insert). */
+/** Opt-in rails for a mutating command (create, str_replace, insert, delete, rename). */
 export interface MemoryWriteOptions {
   /**
    * Refuse a write whose RESULTING file holds a credential shape the file did not already hold
@@ -3883,8 +3905,35 @@ export interface MemoryWriteOptions {
    * about to replace: a check on the new text alone misses a credential that two calls assemble
    * (`sk-` and a newline, then a replacement that drops the newline), and one run before the lock
    * would judge a file another writer changes before this one lands.
+   *
+   * Also keeps every guarded mutation (delete and rename too, which write no content) out of the
+   * refinement journal when its row would carry credential-like text (see journalRefinement).
    */
   rejectSecretLike?: boolean;
+}
+
+/**
+ * Whether a refinement row would put credential-like text into durable state: the action's
+ * virtual paths, the inverse's physical paths, or a pre-image the inverse captures. Memory rows
+ * never carry `deletePaths` (only rollback rows do), so it is not read here.
+ */
+function refinementHoldsSecretLike(
+  action: MemoryRefinementAction,
+  inverse: RefinementInverseDraft
+): boolean {
+  const texts = [action.path, action.newPath ?? ""];
+  switch (inverse.op) {
+    case "delete-files":
+      texts.push(...inverse.paths);
+      break;
+    case "rename":
+      texts.push(inverse.from, inverse.to);
+      break;
+    case "restore-files":
+      for (const file of inverse.files) texts.push(file.path, file.content);
+      break;
+  }
+  return texts.some(containsSecretLike);
 }
 
 /**
