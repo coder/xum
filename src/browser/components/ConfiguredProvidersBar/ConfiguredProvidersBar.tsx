@@ -40,7 +40,7 @@ export function ConfiguredProvidersBar(props: ConfiguredProvidersBarProps) {
             <Check className="text-success-text h-3.5 w-3.5" />
             <span className="flex items-center gap-1">
               {configuredProviders.map((provider) =>
-                hasProviderIcon(provider) ? (
+                hasProviderIcon(provider, props.providersConfig[provider]) ? (
                   <ProviderIcon key={provider} provider={provider} />
                 ) : (
                   <span key={provider} className="text-muted-foreground text-xs font-medium">

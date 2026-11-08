@@ -58,7 +58,7 @@ import {
 } from "@/node/services/memoryMeta";
 import { containsSecretLike, redactSecretLike } from "@/node/services/memorySecretRedaction";
 import { parseMemoryPath, type MemoryScopeContext } from "@/node/services/memoryService";
-import type { MemoryService } from "@/node/services/memoryService";
+import type { MemoryService, MemoryWriteOptions } from "@/node/services/memoryService";
 import { executeMemoryCommand, type MemoryCommandInput } from "@/node/services/tools/memory";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
@@ -170,47 +170,63 @@ export function createMutationBudget(limit: number, alreadyUsed = 0): MutationBu
  * RESULTING file against the write cap (reading the current target for
  * state-dependent commands — a small insert into a near-cap file must fail
  * staging even though the new text alone is tiny) plus the occurrence,
- * exists/type, and containment checks the real command runs.
+ * exists/type, and containment checks the real command runs. `options` are
+ * the write's own rails: a guarded run's dry run must refuse the resulting
+ * file the real write would, or the preview shows as accepted an edit that
+ * apply mode refuses.
  */
 async function validateMutationForStaging(
   memoryService: MemoryService,
   ctx: MemoryScopeContext,
-  input: MemoryCommandInput
+  input: MemoryCommandInput,
+  options: MemoryWriteOptions
 ): Promise<string | null> {
   switch (input.command) {
     case "create": {
       if (input.path == null || input.file_text == null) {
         return "create requires 'path' and 'file_text'";
       }
-      const result = await memoryService.validateMutation(ctx, {
-        command: "create",
-        path: input.path,
-        file_text: input.file_text,
-      });
+      const result = await memoryService.validateMutation(
+        ctx,
+        {
+          command: "create",
+          path: input.path,
+          file_text: input.file_text,
+        },
+        options
+      );
       return result.ok ? null : result.error;
     }
     case "str_replace": {
       if (input.path == null || input.old_str == null) {
         return "str_replace requires 'path' and 'old_str'";
       }
-      const result = await memoryService.validateMutation(ctx, {
-        command: "str_replace",
-        path: input.path,
-        old_str: input.old_str,
-        new_str: input.new_str ?? "",
-      });
+      const result = await memoryService.validateMutation(
+        ctx,
+        {
+          command: "str_replace",
+          path: input.path,
+          old_str: input.old_str,
+          new_str: input.new_str ?? "",
+        },
+        options
+      );
       return result.ok ? null : result.error;
     }
     case "insert": {
       if (input.path == null || input.insert_line == null || input.insert_text == null) {
         return "insert requires 'path', 'insert_line' and 'insert_text'";
       }
-      const result = await memoryService.validateMutation(ctx, {
-        command: "insert",
-        path: input.path,
-        insert_line: input.insert_line,
-        insert_text: input.insert_text,
-      });
+      const result = await memoryService.validateMutation(
+        ctx,
+        {
+          command: "insert",
+          path: input.path,
+          insert_line: input.insert_line,
+          insert_text: input.insert_text,
+        },
+        options
+      );
       return result.ok ? null : result.error;
     }
     case "delete": {
@@ -440,6 +456,14 @@ function persistedTarget(
 }
 
 /**
+ * Journals that recorded the full note. Kept beside the rows, not read from them: a failed
+ * command's note quotes its model-chosen path, so a path ending in the full note would otherwise
+ * drop every later refusal. Keyed by the array, so it holds for every tool that shares one; a
+ * resumed analyzer attempt starts an empty journal (earlier ops stay apart), and so a fresh cap.
+ */
+const fullJournals = new WeakSet<MemoryConsolidationOp[]>();
+
+/**
  * Journal a refusal while the journal has room. The refusal that reaches the last slot carries the
  * note that later ones are dropped, and so does the first one after rows of budgeted commands
  * filled the journal past it: those are pushed directly and always (the budget bounds them), so
@@ -448,9 +472,13 @@ function persistedTarget(
  * analyzer's chunks of a run).
  */
 function journalRefusal(journal: MemoryConsolidationOp[], row: RefusalRow): void {
-  if (journal.some((op) => op.note?.endsWith(JOURNAL_FULL_NOTE) === true)) return;
-  const reachesLastSlot = journal.length >= MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - 1;
-  journal.push(reachesLastSlot ? { ...row, note: `${row.note} ${JOURNAL_FULL_NOTE}` } : row);
+  if (fullJournals.has(journal)) return;
+  if (journal.length < MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - 1) {
+    journal.push(row);
+    return;
+  }
+  fullJournals.add(journal);
+  journal.push({ ...row, note: `${row.note} ${JOURNAL_FULL_NOTE}` });
 }
 
 /**
@@ -582,7 +610,9 @@ export function createConsolidationMemoryTool(args: {
         // invalid/oversized proposal be staged, rendered in full into chat,
         // and only rejected by the real handler at /refine apply AFTER the
         // user approved, consuming the staged set as a silent no-op.
-        const invalid = await validateMutationForStaging(memoryService, ctx, input);
+        const invalid = await validateMutationForStaging(memoryService, ctx, input, {
+          rejectSecretLike: args.rejectSecretLike,
+        });
         if (invalid !== null) {
           journal.push({ ...target, applied: false, note: invalid });
           return { success: false, error: invalid };
