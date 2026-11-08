@@ -26,6 +26,8 @@ const SECRET_NAME = String.raw`(?:api[_-]?key|account[_-]?key|secret|token(?!s\b
 const NAME_SUFFIX_MAX = 48;
 const GAP_MAX = 48;
 
+const SIGNED_URL_PARAM = "(?:sig|signature|x-amz-signature|x-goog-signature)";
+
 // Credential shapes that are secret on their own, wherever they appear.
 const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // An unterminated block (a tool that cut its own output) redacts through to the end of the text.
@@ -39,6 +41,11 @@ const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // may be empty (`redis://:password@host`).
   /(?<=:\/\/)[^\s:/@]{0,64}:[^\s/@]{1,256}(?=@)/g,
   new RegExp(String.raw`\bBearer\s{1,${GAP_MAX}}[A-Za-z0-9._~+/=-]{8,}`, "gi"),
+  // A signed URL's signature is the credential: Azure SAS `sig`, `signature`, AWS `X-Amz-Signature`,
+  // Google `X-Goog-Signature`. Only the value goes, and only in query position (after `?` or `&`,
+  // `&amp;` too, as in XML listings). `signature` stays out of SECRET_NAME: the memory-write guard
+  // reuses it, and prose such as `signature: foo(a, b)` must stay writable.
+  new RegExp(String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)[^\s"'\\<>&#,;)\]}]+`, "gi"),
   // Anchored to the start of a character run: `\b` also matches after `-`, so `eyJ-eyJ-eyJ-...`
   // would start a scan to the end of the run at every `eyJ`.
   /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,

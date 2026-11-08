@@ -19,6 +19,7 @@ describe("redactSecretLike", () => {
     npm: `npm_${"Ab3d".repeat(9)}`,
     slackHook: `T${"0".repeat(8)}/B${"1".repeat(8)}/${"Xz9k".repeat(6)}`,
     urlPassword: "s3cr3t-pw",
+    signature: "Zk3%2Bq9Lw%2FPd7%3D",
   };
 
   it.each([
@@ -103,6 +104,41 @@ describe("redactSecretLike", () => {
       String.raw`{"c":"cfg[\"token\"] = \"zz9plural\""}`,
       "zz9plural",
     ],
+    [
+      "an Azure SAS signature",
+      `https://acct.blob.core.windows.net/c/b?sv=2022-11-02&se=2030-01-01&sig=${FAKE.signature}&sp=r`,
+      FAKE.signature,
+    ],
+    [
+      "a signature parameter",
+      `https://files.example.com/d?expires=99&signature=${FAKE.signature}`,
+      FAKE.signature,
+    ],
+    [
+      "an AWS presigned URL signature",
+      `https://b.s3.amazonaws.com/k?X-Amz-Expires=60&X-Amz-Signature=${FAKE.signature}`,
+      FAKE.signature,
+    ],
+    [
+      "a Google signed URL signature",
+      `https://storage.googleapis.com/b/o?X-Goog-Expires=60&X-Goog-Signature=${FAKE.signature}`,
+      FAKE.signature,
+    ],
+    [
+      "a signature parameter in any letter case",
+      `https://h.example.com/p?SIG=${FAKE.signature}`,
+      FAKE.signature,
+    ],
+    [
+      "a signature parameter after an XML-escaped ampersand",
+      `<Url>https://h.example.com/p?se=1&amp;sig=${FAKE.signature}&amp;sp=r</Url>`,
+      FAKE.signature,
+    ],
+    [
+      "a signed URL inside a JSON-escaped string",
+      JSON.stringify({ url: `https://h.example.com/p?a=1&sig=${FAKE.signature}` }),
+      FAKE.signature,
+    ],
   ])("redacts %s", (_label, text, secret) => {
     const redacted = redactSecretLike(text);
     expect(redacted).not.toContain(secret);
@@ -180,6 +216,26 @@ describe("redactSecretLike", () => {
     expect(redactSecretLike(text)).toBe(text);
   });
 
+  it("redacts only a signature's value and keeps the rest of the URL readable", () => {
+    expect(
+      redactSecretLike("https://h.example.com/p?sv=1&sig=abc%2Bdef%3D&sp=r#frag (see ?signature=x1)")
+    ).toBe("https://h.example.com/p?sv=1&sig=[redacted]&sp=r#frag (see ?signature=[redacted])");
+  });
+
+  // `signature` is not a secret name: the memory-write guard reuses this detector, and a note
+  // about a function signature or a signed commit must stay writable.
+  it("leaves a signature or sig that is not a URL query parameter readable", () => {
+    const text = [
+      "signature: foo(a, b)",
+      "def verify(signature=None, sig=b'')",
+      "sig: 12 bytes, signature = checked",
+      "git commit --signature=abc123",
+      "see the signature=value form in the docs",
+      "https://h.example.com/p?design=1&signed=yes&sigma=3",
+    ].join("\n");
+    expect(redactSecretLike(text)).toBe(text);
+  });
+
   it("keeps the userinfo's host readable", () => {
     expect(redactSecretLike("https://deploy:pw@git.example.com/org/repo")).toBe(
       "https://[redacted]@git.example.com/org/repo"
@@ -211,6 +267,10 @@ describe("redactSecretLike", () => {
     ],
     ["a quoted value that ends in a backslash run", `token:"a${"\\".repeat(100_000)}`],
     ["many opening quotes", 'token:"a'.repeat(12_000)],
+    ["a signature parameter with a long value", `?sig=${"a".repeat(100_000)}`],
+    ["signature parameters with no value", "?sig=&signature=".repeat(20_000)],
+    ["a signature name with no equals sign", "&X-Amz-Signature".repeat(20_000)],
+    ["stacked signature prefixes", "?&amp;sig=".repeat(20_000)],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
     const started = performance.now();
