@@ -142,6 +142,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - Never let a single malformed line in history brick a workspace—apply defensive filtering in request-building paths so the user can continue working.
 - When streaming crashes, any incomplete state committed to disk should either be repairable on next load or excluded from provider requests to avoid API validation errors.
 - **Startup-time initialization must never crash the app.** Wrap in try-catch, use timeouts, fall back silently.
+- **`server.lock` liveness is decided by process identity** (pid, start time, boot id and PID namespace; `judgeHolder()` in `src/node/utils/concurrency/processLiveness.ts`), except that a lock with this process's own pid is live only if this process wrote it. The `/version` probe (`src/node/services/xumBackendProbe.ts`) covers only what identity cannot decide: macOS, Windows, locks from older builds, and a start time that cannot be read. Do not add more liveness heuristics (timeouts, extra probes, process-state guesses) to `src/node/services/serverLockfile.ts` or the probe. A lock reader never deletes a lock: `acquire()` replaces a stale one, and its owner's `release()` removes it.
 
 ## Command Palette & UI Access
 
