@@ -2,6 +2,22 @@ import { describe, expect, it } from "bun:test";
 
 import { containsSecretLike, redactSecretLike } from "./memorySecretRedaction";
 
+/** CPU time (user + system) that `run` takes: unlike wall-clock time, a busy host cannot inflate it. */
+function cpuMs(run: () => void): number {
+  const started = process.cpuUsage();
+  run();
+  const used = process.cpuUsage(started);
+  return (used.user + used.system) / 1000;
+}
+
+// The linear-time shapes run at `scale` 1 and at `scale` GROWTH. A linear scan costs GROWTH times
+// as much (up to 2.7 times in measurements: the larger string also costs more per character), a
+// quadratic one GROWTH squared times as much (4 times). The bound sits between them.
+const GROWTH = 2;
+const MAX_COST_RATIO = 3.5;
+const MIN_BASE_MS = 1;
+const RUNS = 2;
+
 describe("redactSecretLike", () => {
   const FAKE = {
     github: `gho_${"Q7w3".repeat(9)}`,
@@ -554,83 +570,135 @@ describe("redactSecretLike", () => {
   // The guard scans text a model supplied, so a hostile 100 KB write must not stall the process.
   // Each shape repeats a keyword with nothing after it, which made the open-ended name suffix and
   // JWT segment rescan to the end of the text from every occurrence (seconds per input).
-  it.each([
-    ["token", "token".repeat(20_000)],
-    ["secret-", "secret-".repeat(14_000)],
-    ["authorization", "authorization".repeat(7_700)],
-    ["credential_", "credential_".repeat(9_000)],
-    ["api_key", "api_key".repeat(14_000)],
-    ["a JWT header after a dash", "eyJ-".repeat(25_000)],
-    ["a bare bracket assignment", 'password"]'.repeat(10_000)],
-    ["URL schemes with a short userinfo", "://a:".repeat(25_000)],
-    ["a keyword followed by whitespace", `token${" ".repeat(100_000)}x`],
-    ["account_key", "account_key".repeat(9_000)],
-    ["SharedAccessKey", "SharedAccessKey".repeat(6_600)],
-    ["shared_access_key_", "shared_access_key_".repeat(5_600)],
-    ["SharedAccessKeyName", "SharedAccessKeyName".repeat(5_200)],
-    ["bearer", "bearer".repeat(16_000)],
-    ["a PGP key header", "-----BEGIN PGP PRIVATE KEY BLOCK-----".repeat(3_000)],
-    ["a quoted value of backslashes", `token:"${"\\".repeat(100_000)}`],
-    ["a quoted value of escaped quotes", `token:"${'\\"'.repeat(50_000)}`],
+  //
+  // Linear means that twice the text costs about twice as much, and a quadratic scan costs four
+  // times as much. So each shape is built at two sizes (`scale` multiplies every repeat count) and
+  // the costs are compared, not held to a fixed time: one input costs 0.1 ms in one shape and
+  // 100 ms in another (a long backslash run makes a scan about 100 times slower per character, and
+  // still linear), so no single bound was both loose enough for those and tight enough for the
+  // rest, and the 100 ms one flaked at 125 and 154 ms on a busy host. The cost is CPU time, which a
+  // busy host does not stretch: a wall-clock sample that spans several scheduler slices grows more
+  // than a short one does.
+  it.each<[string, (scale: number) => string]>([
+    ["token", (scale) => "token".repeat(20_000 * scale)],
+    ["secret-", (scale) => "secret-".repeat(14_000 * scale)],
+    ["authorization", (scale) => "authorization".repeat(7_700 * scale)],
+    ["credential_", (scale) => "credential_".repeat(9_000 * scale)],
+    ["api_key", (scale) => "api_key".repeat(14_000 * scale)],
+    ["a JWT header after a dash", (scale) => "eyJ-".repeat(25_000 * scale)],
+    ["a bare bracket assignment", (scale) => 'password"]'.repeat(10_000 * scale)],
+    ["URL schemes with a short userinfo", (scale) => "://a:".repeat(25_000 * scale)],
+    ["a keyword followed by whitespace", (scale) => `token${" ".repeat(100_000 * scale)}x`],
+    ["account_key", (scale) => "account_key".repeat(9_000 * scale)],
+    ["SharedAccessKey", (scale) => "SharedAccessKey".repeat(6_600 * scale)],
+    ["shared_access_key_", (scale) => "shared_access_key_".repeat(5_600 * scale)],
+    ["SharedAccessKeyName", (scale) => "SharedAccessKeyName".repeat(5_200 * scale)],
+    ["bearer", (scale) => "bearer".repeat(16_000 * scale)],
+    ["a PGP key header", (scale) => "-----BEGIN PGP PRIVATE KEY BLOCK-----".repeat(3_000 * scale)],
+    ["a quoted value of backslashes", (scale) => `token:"${"\\".repeat(100_000 * scale)}`],
+    ["a quoted value of escaped quotes", (scale) => `token:"${'\\"'.repeat(50_000 * scale)}`],
     [
       "an escaped quoted value of backslash runs",
-      String.raw`token:\"` + String.raw`\\\"`.repeat(25_000),
+      (scale) => String.raw`token:\"` + String.raw`\\\"`.repeat(25_000 * scale),
     ],
-    ["a quoted value that ends in a backslash run", `token:"a${"\\".repeat(100_000)}`],
-    ["many opening quotes", 'token:"a'.repeat(12_000)],
-    ["a key followed by a long backslash run", `token${"\\".repeat(100_000)}"`],
-    ["a value opened by a long backslash run", `token:${"\\".repeat(100_000)}"a`],
+    [
+      "a quoted value that ends in a backslash run",
+      (scale) => `token:"a${"\\".repeat(100_000 * scale)}`,
+    ],
+    ["many opening quotes", (scale) => 'token:"a'.repeat(12_000 * scale)],
+    ["a key followed by a long backslash run", (scale) => `token${"\\".repeat(100_000 * scale)}"`],
+    [
+      "a value opened by a long backslash run",
+      (scale) => `token:${"\\".repeat(100_000 * scale)}"a`,
+    ],
     [
       "a deep value of one long backslash run",
-      `token:${"\\".repeat(31)}"a${"\\".repeat(100_000)}"`,
+      (scale) => `token:${"\\".repeat(31)}"a${"\\".repeat(100_000 * scale)}"`,
     ],
     [
       "a deep value of runs as long as its opener",
-      `token:${"\\".repeat(31)}"${`${"\\".repeat(31)}x`.repeat(3_000)}`,
+      (scale) => `token:${"\\".repeat(31)}"${`${"\\".repeat(31)}x`.repeat(3_000 * scale)}`,
     ],
     [
       "a deep value of runs just short of a doubled close",
-      `token:${"\\".repeat(31)}"${`${"\\".repeat(62)}x`.repeat(1_500)}`,
+      (scale) => `token:${"\\".repeat(31)}"${`${"\\".repeat(62)}x`.repeat(1_500 * scale)}`,
     ],
-    ["many deep openers", `token:${"\\".repeat(31)}"a`.repeat(2_500)],
-    ["many deep keys", `token${"\\".repeat(31)}"`.repeat(2_800)],
-    ["a signature parameter with a long value", `?sig=${"a".repeat(100_000)}`],
-    ["signature parameters with no value", "?sig=&signature=".repeat(20_000)],
-    ["a signature name with no equals sign", "&X-Amz-Signature".repeat(20_000)],
-    ["stacked signature prefixes", "?&amp;sig=".repeat(20_000)],
-    ["a cookie name with no colon", "Cookie".repeat(20_000)],
-    ["a cookie name and gap with no colon", `Set-Cookie${" ".repeat(100_000)}x`],
-    ["cookie names with a colon and no value", "Cookie:".repeat(20_000)],
-    ["cookie headers on one line", "Set-Cookie: a=b; ".repeat(10_000)],
-    ["a cookie value of backslashes", `Cookie: ${"\\".repeat(100_000)}x`],
-    ["a cookie value of escaped quotes", `Cookie: "${'\\"'.repeat(50_000)}`],
-    ["a cookie key followed by a long backslash run", `cookie${"\\".repeat(100_000)}"x`],
-    ["many cookie keys with a long backslash run", `cookie${"\\".repeat(31)}"`.repeat(2_800)],
-    ["cookie array openers with no close", `Cookie:[`.repeat(25_000)],
-    ["cookie names after escaped line breaks", String.raw`\nCookie`.repeat(15_000)],
-    ["a cookie colon and a long gap with no value", `Cookie:${" ".repeat(100_000)}`],
-    ["cookie colons and a gap with no value, line after line", "Cookie: \n".repeat(15_000)],
+    ["many deep openers", (scale) => `token:${"\\".repeat(31)}"a`.repeat(2_500 * scale)],
+    ["many deep keys", (scale) => `token${"\\".repeat(31)}"`.repeat(2_800 * scale)],
+    ["a signature parameter with a long value", (scale) => `?sig=${"a".repeat(100_000 * scale)}`],
+    ["signature parameters with no value", (scale) => "?sig=&signature=".repeat(20_000 * scale)],
+    ["a signature name with no equals sign", (scale) => "&X-Amz-Signature".repeat(20_000 * scale)],
+    ["stacked signature prefixes", (scale) => "?&amp;sig=".repeat(20_000 * scale)],
+    ["a cookie name with no colon", (scale) => "Cookie".repeat(20_000 * scale)],
+    ["a cookie name and gap with no colon", (scale) => `Set-Cookie${" ".repeat(100_000 * scale)}x`],
+    ["cookie names with a colon and no value", (scale) => "Cookie:".repeat(20_000 * scale)],
+    ["cookie headers on one line", (scale) => "Set-Cookie: a=b; ".repeat(10_000 * scale)],
+    ["a cookie value of backslashes", (scale) => `Cookie: ${"\\".repeat(100_000 * scale)}x`],
+    ["a cookie value of escaped quotes", (scale) => `Cookie: "${'\\"'.repeat(50_000 * scale)}`],
+    [
+      "a cookie key followed by a long backslash run",
+      (scale) => `cookie${"\\".repeat(100_000 * scale)}"x`,
+    ],
+    [
+      "many cookie keys with a long backslash run",
+      (scale) => `cookie${"\\".repeat(31)}"`.repeat(2_800 * scale),
+    ],
+    ["cookie array openers with no close", (scale) => `Cookie:[`.repeat(25_000 * scale)],
+    [
+      "cookie names after escaped line breaks",
+      (scale) => String.raw`\nCookie`.repeat(15_000 * scale),
+    ],
+    [
+      "a cookie colon and a long gap with no value",
+      (scale) => `Cookie:${" ".repeat(100_000 * scale)}`,
+    ],
+    [
+      "cookie colons and a gap with no value, line after line",
+      (scale) => "Cookie: \n".repeat(15_000 * scale),
+    ],
     [
       "cookie names behind an indent that is no line start",
-      `${" ".repeat(16)}Cookie`.repeat(5_900),
+      (scale) => `${" ".repeat(16)}Cookie`.repeat(5_900 * scale),
     ],
-    ["cookie names behind an indent and a marker", `\n${" ".repeat(16)}> Cookie`.repeat(5_000)],
-    ["cookie values that open with a redacted marker", 'Cookie: "[redacted]\n'.repeat(7_000)],
+    [
+      "cookie names behind an indent and a marker",
+      (scale) => `\n${" ".repeat(16)}> Cookie`.repeat(5_000 * scale),
+    ],
+    [
+      "cookie values that open with a redacted marker",
+      (scale) => 'Cookie: "[redacted]\n'.repeat(7_000 * scale),
+    ],
     [
       "cookie values that open with a long gap and a marker",
-      `Cookie:${" ".repeat(40)}[redacted]\n`.repeat(2_500),
+      (scale) => `Cookie:${" ".repeat(40)}[redacted]\n`.repeat(2_500 * scale),
     ],
-    ["cookie names behind quotes and commas", `,Cookie`.repeat(14_000)],
-  ])("scans %s in linear time", (_label, text) => {
-    redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
-    // Each scan gets the whole budget: `containsSecretLike` is a second pass of the same redaction,
-    // and with the cookie rule a pass costs about half of it, so one budget for both flaked.
-    for (const scan of [redactSecretLike, containsSecretLike]) {
-      const started = performance.now();
-      scan(text);
-      expect(performance.now() - started).toBeLessThan(100);
-    }
-  });
+    ["cookie names behind quotes and commas", (scale) => `,Cookie`.repeat(14_000 * scale)],
+  ])(
+    "scans %s in linear time",
+    (_label, build) => {
+      containsSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
+      const small = build(1);
+      const large = build(GROWTH);
+      // `containsSecretLike` is `redactSecretLike` and a comparison, so it covers both. The fastest
+      // of a few runs: the first one of a size pays for engine warm-up and the GC.
+      let smallMs = Number.POSITIVE_INFINITY;
+      let largeMs = Number.POSITIVE_INFINITY;
+      for (let run = 0; run < RUNS; run++) {
+        smallMs = Math.min(
+          smallMs,
+          cpuMs(() => containsSecretLike(small))
+        );
+        largeMs = Math.min(
+          largeMs,
+          cpuMs(() => containsSecretLike(large))
+        );
+      }
+      // The floor keeps the timer's resolution on a near-free scan from tripping the ratio.
+      expect(largeMs).toBeLessThan(MAX_COST_RATIO * Math.max(smallMs, MIN_BASE_MS));
+    },
+    // The slowest shape costs 0.1 s at the small size and 0.2 s at the large one, twice each.
+    30_000
+  );
 });
 
 describe("containsSecretLike", () => {

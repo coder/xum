@@ -29,6 +29,22 @@ export interface TestEnvironment {
 }
 
 /**
+ * A mock function from whichever runner loaded this file. `jest` is no real global: Jest hands
+ * it to every module it loads, and Bun's transpiler injects it only into a file that `bun test`
+ * itself transpiled. Bun's transpiler cache does not record that mode, so a file that a plain
+ * `bun <script>` ran first stays cached without the injection, and every later `bun test` died
+ * with "jest is not defined" before it reached product code. Under Bun, take the factory from
+ * `bun:test` explicitly. It has the same `fn` API, and `process.versions.bun` keeps Jest from
+ * ever loading `bun:test`.
+ */
+function mockFn(implementation?: () => unknown): unknown {
+  if (process.versions.bun == null) return jest.fn(implementation);
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { jest: bunJest } = require("bun:test") as typeof import("bun:test");
+  return bunJest.fn(implementation);
+}
+
+/**
  * Create a mock BrowserWindow for tests.
  * Note: Events are now consumed via ORPC subscriptions (StreamCollector),
  * not via windowService.send(). This mock just satisfies the window service API.
@@ -36,16 +52,16 @@ export interface TestEnvironment {
 function createMockBrowserWindow(): BrowserWindow {
   const mockWindow = {
     webContents: {
-      send: jest.fn(),
-      openDevTools: jest.fn(),
+      send: mockFn(),
+      openDevTools: mockFn(),
     } as unknown as WebContents,
-    isDestroyed: jest.fn(() => false),
-    isMinimized: jest.fn(() => false),
-    restore: jest.fn(),
-    focus: jest.fn(),
-    loadURL: jest.fn(),
-    on: jest.fn(),
-    setTitle: jest.fn(),
+    isDestroyed: mockFn(() => false),
+    isMinimized: mockFn(() => false),
+    restore: mockFn(),
+    focus: mockFn(),
+    loadURL: mockFn(),
+    on: mockFn(),
+    setTitle: mockFn(),
   } as unknown as BrowserWindow;
 
   return mockWindow;
