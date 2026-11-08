@@ -56,7 +56,10 @@ const PROVIDER_ICONS: Record<BrandIconKey, React.FC> = {
  * Check if a provider has a brand icon (built-in or recognized local runtime).
  * The generic local and custom fallback icons do not count.
  */
-export function hasProviderIcon(provider: string, config?: ProviderIconConfig | null): boolean {
+export function hasProviderIcon(
+  provider: string,
+  config: ProviderIconConfig | null | undefined
+): boolean {
   return isBrandIconKey(resolveProviderIconKey(provider, config));
 }
 
