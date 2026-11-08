@@ -407,17 +407,17 @@ describe("redactSecretLike", () => {
       expect(redactSecretLike(text)).toBe(text);
     });
 
-    // The memory-write guard reuses this detector: a note that explains a cookie must stay writable.
-    // What marks a header is its value (`name=value`), so a sentence with words after the colon stays.
-    it("leaves a sentence that has `cookie:` in the middle of it readable", () => {
+    // The rule fails closed: it judges no shape of the value, so prose after `cookie:` goes too. A
+    // shape check drew a new bypass in every frame a tool prints (see the frames below).
+    it("redacts the rest of a sentence that has `cookie:` in the middle of it", () => {
       const text = [
         "Note on the cookie: it expires after an hour.",
         "Session cookie: HttpOnly and Secure flags are set by the login route.",
-        "Remember: the Set-Cookie: header only reaches the browser over HTTPS.",
       ].join("\n");
 
-      expect(redactSecretLike(text)).toBe(text);
-      expect(containsSecretLike(text)).toBe(false);
+      expect(redactSecretLike(text)).toBe(
+        "Note on the cookie: [redacted]\nSession cookie: [redacted]"
+      );
     });
 
     // A cookie pair is a credential wherever the header sits: the frames a tool or a model wraps it
@@ -433,18 +433,31 @@ describe("redactSecretLike", () => {
       [
         "Go's map print",
         `map[Accept:[*/*] Cookie:[a=${SESSION}]]`,
-        "map[Accept:[*/*] Cookie:[redacted]]",
+        "map[Accept:[*/*] Cookie:[redacted]",
       ],
       ["a sentence", `The cookie: a=${SESSION}`, "The cookie: [redacted]"],
+      ["terminal color codes", `Cookie: \x1b[31msid=${SESSION}\x1b[0m`, "Cookie: [redacted]"],
+      [
+        "terminal color codes in JSON text",
+        jsonOf({ out: `Cookie: \x1b[31msid=${SESSION}` }),
+        '{"out":"Cookie: [redacted]"}',
+      ],
+      ["an empty list before a pair", `Cookie: [] sid=${SESSION}`, "Cookie: [redacted]"],
+      ["a bracketed word before a pair", `Cookie: [x]; sid=${SESSION}`, "Cookie: [redacted]"],
     ])("redacts a cookie pair in %s", (_label, text, expected) => {
-      expect(redactSecretLike(text)).toBe(expected);
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toBe(expected);
+      expect(redactSecretLike(redacted)).toBe(redacted);
     });
 
-    // A marker covers only what it replaced: a cookie pair after it is a credential the earlier pass
-    // missed (partially sanitized output), while Set-Cookie attributes after it are not.
+    // A marker covers only what it replaced: whatever follows it is text an earlier pass missed
+    // (partially sanitized output), a request cookie named like a Set-Cookie attribute included.
     it.each([
       ["a JSON key", `{"cookie":"[redacted]; sid=${SESSION}"}`, '{"cookie":"[redacted]"}'],
       ["a header", `Cookie: [redacted]; sid=${SESSION}`, "Cookie: [redacted]"],
+      ["an attribute-named cookie", "Cookie: [redacted]; path=sessionSecret", "Cookie: [redacted]"],
+      ["more text after the marker", "Cookie: [redacted] and the rest", "Cookie: [redacted]"],
       [
         "a quoted command header",
         `curl -H 'Cookie: "[redacted]; b=2"' https://example.com`,
@@ -454,13 +467,15 @@ describe("redactSecretLike", () => {
       expect(redactSecretLike(text)).toBe(expected);
     });
 
-    // A redacted header read back (the model's own notes quote what it read) is not a new credential,
-    // as for the key/value rule: the write guard must accept it, with more text inside the quotes too.
+    // What this rule writes, read back (the model's own notes quote what it read), is not a new
+    // credential, as for the key/value rule: the write guard must accept it.
     it.each([
-      ["a header with more text after the marker", "Cookie: [redacted] and the rest of the line"],
-      ["a header whose marker has an attribute list", 'Set-Cookie: "[redacted]; Path=/; HttpOnly"'],
-      ["a JSON key whose marker has an attribute list", '{"cookie": "[redacted]; Path=/", "a": 1}'],
-    ])("leaves %s as it is", (_label, text) => {
+      ["a header", "Cookie: [redacted]\nHost: example.com"],
+      ["a quoted value", '{"cookie": "[redacted]", "a": 1}'],
+      ["a list", '{"set-cookie": [redacted], "a": 1}'],
+      ["Go's map print", "map[Accept:[*/*] Cookie:[redacted]"],
+      ["Go's map print closed after the marker", "map[Cookie:[redacted]]"],
+    ])("leaves %s that is already redacted as it is", (_label, text) => {
       expect(redactSecretLike(text)).toBe(text);
       expect(containsSecretLike(text)).toBe(false);
     });
