@@ -4661,9 +4661,7 @@ export class WorkspaceMcpOverridesService {
     opaqueFields: Record<string, unknown>;
   }> {
     const legacyConfig = snapshot.loadLegacyConfig();
-    if (snapshot.lenientRegistry) {
-      await this.assertNoUnretirableLegacySharer(written, writtenPath, legacyConfig, snapshot);
-    }
+    await this.assertNoUnretirableLegacySharer(written, writtenPath, legacyConfig, snapshot);
     const legacyById = legacyOverridesById(legacyConfig);
     const all = await snapshot.loadAllMetadata();
     // Legacy values are pre-migration leftovers, and only a carrier's sharing
@@ -4707,11 +4705,12 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
-   * Refuses a save under a lenient registry when an id-less config row that carries a legacy
-   * `workspace.mcp` value may share the written checkout. That row's id lives only in its
-   * unreadable metadata.json (the walk lists it under a fallback id), so the id lookups in
-   * planSharersLegacyRetirement cannot reach its value, and nothing retires it: after a clear it
-   * would migrate back over the user's write once the file is readable again.
+   * Refuses a save when an id-less config row that carries a legacy `workspace.mcp` value may
+   * share the written checkout. The id lookups in planSharersLegacyRetirement cannot reach that
+   * row's value, so nothing retires it: after a clear it would migrate back over the user's write
+   * once the row gets its id. On a degraded host the id lives only in an unreadable metadata.json
+   * (the lenient walk lists the row under a fallback id). On a healthy host the row is id-less
+   * only until its read-time migration lands, so the check runs for every registry.
    */
   private async assertNoUnretirableLegacySharer(
     written: FrontendWorkspaceMetadata,

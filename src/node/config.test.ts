@@ -6277,62 +6277,69 @@ describe("Config", () => {
       expect(metadata).toMatchObject({ id: "legacy-tag", messagingTag: "research" });
     });
 
-    it("publishes the config row's consent, dispatch mode and goal defaults for an id-less legacy workspace", async () => {
-      // No Xum build wrote these to metadata.json, and the current-format branch reads them from
-      // the row, validated. A stray file value must not reach the first build either: its consent
-      // would let unrelated workspaces message this one.
-      const projectPath = path.join(tempDir, "repo");
-      const rowGoalDefaults = {
-        defaultBudgetCents: 500,
-        defaultTurnCap: null,
-        alwaysRequireExplicitBudget: null,
-      };
-      await config.editConfig((cfg) => {
-        cfg.projects.set(projectPath, {
-          workspaces: [
-            {
-              path: projectPath,
-              unrelatedWorkspaceConsent: "row-consent",
-              // Invalid: the row's value is validated, never served raw.
-              agentMessageDispatchMode: "bogus" as never,
-              goalDefaults: rowGoalDefaults,
-            },
-          ],
+    // A padded consent value is invalid (getValidUnrelatedWorkspaceConsent): it reads as off.
+    it.each([
+      ["a valid", "row-consent", "row-consent"],
+      ["an invalid", " row-consent ", undefined],
+    ] as const)(
+      "publishes the config row's consent (%s), dispatch mode and goal defaults for an id-less legacy workspace",
+      async (_kind, rowConsent, expectedConsent) => {
+        // No Xum build wrote these to metadata.json, and the current-format branch reads them from
+        // the row, validated. A stray file value must not reach the first build either: its consent
+        // would let unrelated workspaces message this one.
+        const projectPath = path.join(tempDir, "repo");
+        const rowGoalDefaults = {
+          defaultBudgetCents: 500,
+          defaultTurnCap: null,
+          alwaysRequireExplicitBudget: null,
+        };
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, {
+            workspaces: [
+              {
+                path: projectPath,
+                unrelatedWorkspaceConsent: rowConsent,
+                // Invalid: the row's value is validated, never served raw.
+                agentMessageDispatchMode: "bogus" as never,
+                goalDefaults: rowGoalDefaults,
+              },
+            ],
+          });
+          return cfg;
         });
-        return cfg;
-      });
-      const sessionDir = path.join(config.sessionsDir, "repo");
-      fs.mkdirSync(sessionDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(sessionDir, "metadata.json"),
-        JSON.stringify({
-          id: "legacy-consent",
-          name: "legacy-consent",
-          unrelatedWorkspaceConsent: "file-consent",
-          agentMessageDispatchMode: "turn-end",
-          goalDefaults: {
-            defaultBudgetCents: 9,
-            defaultTurnCap: 9,
-            alwaysRequireExplicitBudget: true,
-          },
-        })
-      );
-      const fields = (metadata: WorkspaceMetadata | undefined) => ({
-        unrelatedWorkspaceConsent: metadata?.unrelatedWorkspaceConsent,
-        agentMessageDispatchMode: metadata?.agentMessageDispatchMode,
-        goalDefaults: metadata?.goalDefaults,
-      });
-      const first = fields((await config.getAllWorkspaceMetadata())[0]);
-      // The queued migration write lands before this no-op edit.
-      await config.editConfig((cfg) => cfg);
-      const restarted = fields((await new Config(tempDir).getAllWorkspaceMetadata())[0]);
-      const expected = {
-        unrelatedWorkspaceConsent: "row-consent",
-        agentMessageDispatchMode: undefined,
-        goalDefaults: rowGoalDefaults,
-      };
-      expect([first, restarted]).toEqual([expected, expected]);
-    });
+        const sessionDir = path.join(config.sessionsDir, "repo");
+        fs.mkdirSync(sessionDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(sessionDir, "metadata.json"),
+          JSON.stringify({
+            id: "legacy-consent",
+            name: "legacy-consent",
+            unrelatedWorkspaceConsent: "file-consent",
+            agentMessageDispatchMode: "turn-end",
+            goalDefaults: {
+              defaultBudgetCents: 9,
+              defaultTurnCap: 9,
+              alwaysRequireExplicitBudget: true,
+            },
+          })
+        );
+        const fields = (metadata: WorkspaceMetadata | undefined) => ({
+          unrelatedWorkspaceConsent: metadata?.unrelatedWorkspaceConsent,
+          agentMessageDispatchMode: metadata?.agentMessageDispatchMode,
+          goalDefaults: metadata?.goalDefaults,
+        });
+        const first = fields((await config.getAllWorkspaceMetadata())[0]);
+        // The queued migration write lands before this no-op edit.
+        await config.editConfig((cfg) => cfg);
+        const restarted = fields((await new Config(tempDir).getAllWorkspaceMetadata())[0]);
+        const expected = {
+          unrelatedWorkspaceConsent: expectedConsent,
+          agentMessageDispatchMode: undefined,
+          goalDefaults: rowGoalDefaults,
+        };
+        expect([first, restarted]).toEqual([expected, expected]);
+      }
+    );
 
     it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {
       const projectPath = path.join(tempDir, "project");
