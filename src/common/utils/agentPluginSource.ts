@@ -180,15 +180,31 @@ export function httpsFormOfSshUrl(url: string): string | undefined {
 }
 
 /**
- * The URL a review of a backed-up plugin previews: the source itself when it is https, else the
- * https form of an ssh source, else undefined (the user adds that plugin by hand).
+ * A plain https URL: a host name or IPv4 address, an optional port, and a path of unreserved
+ * characters, with no user, query, fragment, escape, backslash or bracket. An allowlist, because a
+ * URL that other parsers read differently, such as `https://github.com\@attacker.example/x`
+ * (WHATWG sees github.com, while git and libcurl connect to attacker.example), would show the user
+ * one host and fetch from another. An allowlist cannot be spelled around.
+ */
+export const PLAIN_HTTPS_URL =
+  /^https:\/\/[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*(?::[0-9]{1,5})?\/[A-Za-z0-9._~/-]+$/;
+
+/**
+ * The one URL a review of a backed-up plugin previews, or undefined (the user adds that plugin by
+ * hand in Settings → Plugins). The card, the producer of the review queue and the queue's consumer
+ * all ask this, so they cannot disagree. It is the source itself when it is https, else the https
+ * form of an ssh source (`httpsFormOfSshUrl`), and it must be a plain https URL
+ * (`PLAIN_HTTPS_URL`) that does not point at this machine.
  *
- * SECURITY: a preview of an ssh or scp source makes git sign in with the user's SSH agent to
- * whatever host the list names, before any consent to that plugin, and the list is
- * repository-controlled. So a review never previews one: it previews the https form, which signs
- * in with nothing but the credentials git holds for that host. The preview is at the pinned
- * commit, and a commit id names its content, so a repository that serves it serves the same code.
+ * SECURITY: the list is repository-controlled. A preview of an ssh or scp source makes git sign in
+ * with the user's SSH agent to whatever host the list names, before any consent to that plugin
+ * (a remote marketplace may name only https sources for the same reason), so a review previews
+ * the https form, which signs in with nothing but the credentials git holds for that host. The
+ * preview is at the pinned commit, and a commit id names its content, so a repository that serves
+ * it serves the same code.
  */
 export function reviewUrlOf(url: string): string | undefined {
-  return url.startsWith("https://") ? url : httpsFormOfSshUrl(url);
+  const candidate = url.startsWith("https://") ? url : httpsFormOfSshUrl(url);
+  if (candidate === undefined || !PLAIN_HTTPS_URL.test(candidate)) return undefined;
+  return pointsAtThisMachine(candidate) ? undefined : candidate;
 }

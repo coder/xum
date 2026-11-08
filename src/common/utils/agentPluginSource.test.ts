@@ -6,6 +6,7 @@ import {
   isAbbreviatedCommitSha,
   isNormalizedAgentPluginSubpath,
   normalizeAgentPluginSubpath,
+  PLAIN_HTTPS_URL,
   reviewUrlOf,
 } from "./agentPluginSource";
 
@@ -150,25 +151,63 @@ describe("httpsFormOfSshUrl", () => {
 });
 
 describe("reviewUrlOf", () => {
-  test("previews an https source as written", () => {
-    expect(reviewUrlOf("https://github.com/example/repo.git")).toBe(
-      "https://github.com/example/repo.git"
-    );
+  test.each([
+    [
+      "an https source",
+      "https://github.com/example/repo.git",
+      "https://github.com/example/repo.git",
+    ],
+    [
+      "an https source with a port and a nested path",
+      "https://git.example.com:8443/group/sub_group/repo-name.v2.git",
+      "https://git.example.com:8443/group/sub_group/repo-name.v2.git",
+    ],
+    [
+      "an IPv4 host",
+      "https://203.0.113.7/example/repo.git",
+      "https://203.0.113.7/example/repo.git",
+    ],
+    ["an scp source", "git@github.com:example/repo.git", "https://github.com/example/repo.git"],
+    [
+      "an ssh source with a port",
+      "ssh://git@github.com:22/example/repo.git",
+      "https://github.com/example/repo.git",
+    ],
+  ])("previews %s at a plain https URL", (_label, url, previewed) => {
+    expect(reviewUrlOf(url)).toBe(previewed);
   });
 
-  test("previews the https form of an ssh or scp source", () => {
-    expect(reviewUrlOf("git@github.com:example/repo.git")).toBe(
-      "https://github.com/example/repo.git"
-    );
-    expect(reviewUrlOf("ssh://git@github.com:22/example/repo.git")).toBe(
-      "https://github.com/example/repo.git"
-    );
+  // One allowlist decides, for an https row and for the https form of an ssh row alike.
+  test.each([
+    ["a backslash before a user part", "https://github.com\\@attacker.example/repo.git"],
+    ["a user part", "https://user@github.com/example/repo.git"],
+    ["a query", "https://github.com/example/repo.git?mirror=1"],
+    ["a fragment", "https://github.com/example/repo.git#main"],
+    ["a percent escape", "https://github.com/example/my%20repo.git"],
+    ["a loopback host", "https://127.0.0.1/example/repo.git"],
+    ["a localhost name", "https://localhost/example/repo.git"],
+    ["an IPv6 literal", "https://[::1]/example/repo.git"],
+    ["an upper-case scheme", "HTTPS://github.com/example/repo.git"],
+    ["no path", "https://github.com"],
+    ["an ssh source whose https form is on this machine", "git@127.0.0.1:example/repo.git"],
+    ["an ssh URL whose https form is localhost", "ssh://git@localhost/example/repo.git"],
+    ["an ssh source whose path is not plain", "git@github.com:example/repo.git?x=1"],
+    ["an ssh source with a bracketed host", "git@[2001:db8::1]:example/repo.git"],
+    ["an ssh source with a space in its path", "gitbox:srv/my repos/r.git"],
+    ["an http source", "http://host.example/r.git"],
+    ["a git source", "git://host.example/r.git"],
+    ["a file source", "file:///r.git"],
+  ])("previews nothing for %s", (_label, url) => {
+    expect(reviewUrlOf(url)).toBeUndefined();
   });
 
-  test.each(["http://host/r.git", "git://host/r.git", "HTTPS://host/r.git", "file:///r.git"])(
-    "previews nothing for %s",
-    (url) => {
-      expect(reviewUrlOf(url)).toBeUndefined();
+  test("returns only what PLAIN_HTTPS_URL accepts", () => {
+    for (const url of [
+      "git@github.com:example/repo.git",
+      "ssh://git@host.example:2222/example/repo.git",
+      "https://github.com/example/repo.git",
+    ]) {
+      expect(PLAIN_HTTPS_URL.test(reviewUrlOf(url) ?? "")).toBe(true);
     }
-  );
+  });
 });

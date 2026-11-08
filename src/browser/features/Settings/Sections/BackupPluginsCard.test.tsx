@@ -281,7 +281,7 @@ describe("BackupPluginsCard", () => {
     ]);
     expect(view.getByText(/previewed at the https address of the same host/)).toBeTruthy();
     // The badge covers http and git, so the note must not call its source ssh.
-    expect(view.getByText(/comes from a non-https source/)).toBeTruthy();
+    expect(view.getByText(/non-https source with no https address/)).toBeTruthy();
     expect(view.queryByText(/comes from an ssh source/)).toBeNull();
   });
 
@@ -346,6 +346,42 @@ describe("reviewBackedUpPlugins", () => {
     // The ssh address stays as listed: the review turns it into the https address when it previews.
     expect(entries[2]?.source.url).toBe("git@host.example:gamma.git");
     expect(opened).toBe(1);
+  });
+
+  test.each([
+    ["a backslash before a user part", "https://github.com\\@attacker.example/repo.git"],
+    ["a user part", "https://user@github.com/example/repo.git"],
+    ["a query", "https://github.com/example/repo.git?mirror=1"],
+    ["a fragment", "https://github.com/example/repo.git#main"],
+    ["a percent escape", "https://github.com/example/my%20repo.git"],
+    ["a loopback host", "https://127.0.0.1/example/repo.git"],
+    ["a localhost name", "https://localhost/example/repo.git"],
+    ["an IPv6 literal", "https://[::1]/example/repo.git"],
+    ["an upper-case scheme", "HTTPS://github.com/example/repo.git"],
+    ["no path", "https://github.com"],
+  ])("hands over no plugin whose https URL has %s", (_label, url) => {
+    reviewBackedUpPlugins({
+      report: reportOf([row("alpha", "missing"), row("beta", "missing", { url })]),
+      enabled: true,
+      openPlugins: () => undefined,
+    });
+
+    const intent = consumePendingPluginsSectionIntent();
+    const entries = intent?.type === "install-from-backup" ? intent.entries : [];
+    expect(entries.map((entry) => entry.name)).toEqual(["alpha"]);
+  });
+
+  test("hands over a plain https URL with a port and a nested path", () => {
+    const url = "https://git.example.com:8443/group/sub_group/repo-name.v2.git";
+    reviewBackedUpPlugins({
+      report: reportOf([row("alpha", "missing", { url })]),
+      enabled: true,
+      openPlugins: () => undefined,
+    });
+
+    const intent = consumePendingPluginsSectionIntent();
+    const entries = intent?.type === "install-from-backup" ? intent.entries : [];
+    expect(entries.map((entry) => entry.source.url)).toEqual([url]);
   });
 
   test("opens nothing when every missing plugin comes from a non-https source with no https address", () => {

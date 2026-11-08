@@ -213,9 +213,10 @@ function SourceNotes(props: { rows: readonly BackupPluginRow[] }) {
       ) : null}
       {props.rows.some(isAddedByHand) ? (
         <p className="text-muted text-xs">
-          A plugin marked “Add it yourself” comes from a non-https source that has no https address,
-          such as http or git, and a review does not preview it. To reinstall it, add its repository
-          yourself in Settings → Plugins.
+          A plugin marked “Add it yourself” has a source that a review does not preview: a non-https
+          source with no https address, such as http or git, or an https URL that is not plain (one
+          with a user, a query, an escape, or a host on this machine). To reinstall it, add its
+          repository yourself in Settings → Plugins.
         </p>
       ) : null}
     </>

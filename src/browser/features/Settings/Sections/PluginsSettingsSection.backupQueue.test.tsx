@@ -206,6 +206,13 @@ test.each([
   ["an http URL", "http://host.example/gone.git"],
   ["a git URL", "git://host.example/gone.git"],
   ["an ssh URL with no path", "ssh://git@host.example"],
+  // Not plain: WHATWG reads github.com, while git and libcurl connect to attacker.example.
+  [
+    "an https URL with a backslash before a user part",
+    "https://github.com\\@attacker.example/gone.git",
+  ],
+  ["an https URL on this machine", "https://127.0.0.1/example/gone.git"],
+  ["an ssh URL whose https form is on this machine", "git@127.0.0.1:example/gone.git"],
 ])("does not preview %s, says why, and moves on when it is skipped", async (_label, url) => {
   const { view, previewSpy } = renderWithBackup(
     [
