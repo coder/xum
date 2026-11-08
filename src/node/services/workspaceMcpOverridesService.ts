@@ -923,6 +923,30 @@ function prunedLegacyValue(value: unknown, keyPrefix: string): WorkspaceMCPOverr
     return undefined;
   }
 }
+/** Whether a legacy `workspace.mcp` value may name `keyPrefix` keys in any of its decoded strings. */
+function legacyValueMayNameKey(value: unknown, keyPrefix: string): boolean {
+  // mutation-equivalent: JSON.stringify yields undefined or a non-empty string, so ?? and || agree
+  return documentStringsContain(JSON.stringify(value) ?? "", (text) => text.includes(keyPrefix));
+}
+/**
+ * `config` with `keyPrefix` keys removed from each legacy value of `workspaceId` that may name
+ * them (see pruneLegacyOverrides). Nothing writes a legacy value at runtime (reads only
+ * migrate or clear one), so each value here is one that the caller checked, or gone.
+ */
+function withLegacyValuesPruned(
+  config: ProjectsConfig,
+  workspaceId: string,
+  keyPrefix: string
+): ProjectsConfig {
+  for (const projectConfig of config.projects.values()) {
+    for (const workspace of projectConfig.workspaces) {
+      if (workspace.id !== workspaceId || !legacyValueMayNameKey(workspace.mcp, keyPrefix))
+        continue;
+      workspace.mcp = prunedLegacyValue(workspace.mcp, keyPrefix) ?? workspace.mcp;
+    }
+  }
+  return config;
+}
 /** Ids of the workspaces whose config.json entry still carries a legacy `workspace.mcp` value. */
 function idsWithLegacyOverrides(config: ProjectsConfig): Set<string> {
   const ids = new Set<string>();
@@ -5270,10 +5294,9 @@ export class WorkspaceMcpOverridesService {
     keyPrefix: string,
     step: ConfigSnapshot
   ): Promise<boolean> {
-    const mayNameKey = (value: unknown): boolean =>
-      // mutation-equivalent: JSON.stringify yields undefined or a non-empty string, so ?? and || agree
-      documentStringsContain(JSON.stringify(value) ?? "", (text) => text.includes(keyPrefix));
-    const naming = legacyOverridesOf(step.loadLegacyConfig(), workspaceId).filter(mayNameKey);
+    const naming = legacyOverridesOf(step.loadLegacyConfig(), workspaceId).filter((value) =>
+      legacyValueMayNameKey(value, keyPrefix)
+    );
     if (naming.length === 0) {
       return false;
     }
@@ -5286,17 +5309,7 @@ export class WorkspaceMcpOverridesService {
       throw new Error(`pruning workspace ${workspaceId}'s legacy MCP settings was cancelled`);
     }
     await step.trackSideEffect(
-      this.config.editConfig((config) => {
-        // Nothing writes a legacy value at runtime (reads only migrate or clear one), so each
-        // value here is one checked above, or gone.
-        for (const projectConfig of config.projects.values()) {
-          for (const workspace of projectConfig.workspaces) {
-            if (workspace.id !== workspaceId || !mayNameKey(workspace.mcp)) continue;
-            workspace.mcp = prunedLegacyValue(workspace.mcp, keyPrefix) ?? workspace.mcp;
-          }
-        }
-        return config;
-      })
+      this.config.editConfig((config) => withLegacyValuesPruned(config, workspaceId, keyPrefix))
     );
     return true;
   }

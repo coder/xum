@@ -5351,7 +5351,7 @@ describe("WorkspaceMcpOverridesService", () => {
       const notRead = dead.filter((workspace) => !scanned.has(docOf(workspace.workspacePath)));
       expect(notRead.length).toBeGreaterThan(0);
       const unscannedFailures = failures.filter((failure) =>
-        /stopped reading MCP overrides/.test(String(failure.error))
+        String(failure.error).includes("stopped reading MCP overrides")
       );
       expect(unscannedFailures.map((failure) => failure.workspaceId).sort()).toEqual(
         notRead.map((workspace) => workspace.workspaceId).sort()
