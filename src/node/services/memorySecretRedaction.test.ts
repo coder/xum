@@ -19,6 +19,7 @@ describe("redactSecretLike", () => {
     npm: `npm_${"Ab3d".repeat(9)}`,
     slackHook: `T${"0".repeat(8)}/B${"1".repeat(8)}/${"Xz9k".repeat(6)}`,
     urlPassword: "s3cr3t-pw",
+    signature: "Zk3%2Bq9Lw%2FPd7%3D",
   };
 
   it.each([
@@ -103,6 +104,41 @@ describe("redactSecretLike", () => {
       String.raw`{"c":"cfg[\"token\"] = \"zz9plural\""}`,
       "zz9plural",
     ],
+    [
+      "an Azure SAS signature",
+      `https://acct.blob.core.windows.net/c/b?sv=2022-11-02&se=2030-01-01&sig=${FAKE.signature}&sp=r`,
+      FAKE.signature,
+    ],
+    [
+      "a signature parameter",
+      `https://files.example.com/d?expires=99&signature=${FAKE.signature}`,
+      FAKE.signature,
+    ],
+    [
+      "an AWS presigned URL signature",
+      `https://b.s3.amazonaws.com/k?X-Amz-Expires=60&X-Amz-Signature=${FAKE.signature}`,
+      FAKE.signature,
+    ],
+    [
+      "a Google signed URL signature",
+      `https://storage.googleapis.com/b/o?X-Goog-Expires=60&X-Goog-Signature=${FAKE.signature}`,
+      FAKE.signature,
+    ],
+    [
+      "a signature parameter in any letter case",
+      `https://h.example.com/p?SIG=${FAKE.signature}`,
+      FAKE.signature,
+    ],
+    [
+      "a signature parameter after an XML-escaped ampersand",
+      `<Url>https://h.example.com/p?se=1&amp;sig=${FAKE.signature}&amp;sp=r</Url>`,
+      FAKE.signature,
+    ],
+    [
+      "a signed URL inside a JSON-escaped string",
+      JSON.stringify({ url: `https://h.example.com/p?a=1&sig=${FAKE.signature}` }),
+      FAKE.signature,
+    ],
   ])("redacts %s", (_label, text, secret) => {
     const redacted = redactSecretLike(text);
     expect(redacted).not.toContain(secret);
@@ -163,6 +199,43 @@ describe("redactSecretLike", () => {
     expect(redactSecretLike(text)).toBe(expected);
   });
 
+  // Text that went through JSON.stringify once more is the same text with every quote and backslash
+  // escaped, so redacting it must give the escaped form of what redacting the original gives. The
+  // passwords are the shapes that move the value's close: none, an escaped quote, a trailing
+  // backslash, and a backslash before a quote.
+  describe("a credential inside JSON that was stringified again", () => {
+    const escapeOnce = (text: string): string => JSON.stringify(text).slice(1, -1);
+    const escapeTimes = (text: string, times: number): string =>
+      times === 0 ? text : escapeTimes(escapeOnce(text), times - 1);
+    const passwords = ["plain-pw-4f9e", 'embedded"quote-7c1d', "trailing\\", 'back\\"slash-2b8a'];
+    const cases = [1, 2, 3, 4, 5].flatMap((layers) =>
+      passwords.map((password) => [layers, password] as const)
+    );
+
+    it.each(cases)("redacts the whole value at %i layers of escaping: %j", (layers, password) => {
+      const text = JSON.stringify({ password, user: "alice" });
+
+      expect(redactSecretLike(escapeTimes(text, layers))).toBe(
+        escapeTimes('{"password":[redacted],"user":"alice"}', layers)
+      );
+    });
+
+    it("redacts an unterminated value through to the end of the text", () => {
+      const text = escapeTimes(JSON.stringify({ password: 'abc"cut-tail' }), 3).slice(0, -8);
+
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toEndWith("[redacted]");
+      expect(redacted).not.toContain("cut");
+    });
+
+    it("keeps a pair after the value readable at its own depth", () => {
+      const text = escapeTimes(JSON.stringify({ a: { token: "t0k3n-val", b: "kept" } }), 3);
+
+      expect(redactSecretLike(text)).toBe(escapeTimes('{"a":{"token":[redacted],"b":"kept"}}', 3));
+    });
+  });
+
   it("leaves ordinary text and token counts readable", () => {
     const text =
       "max_tokens: 4096, input_tokens=120, ran 3 tests in the task-runner, name: demo, bearer scheme, account name";
@@ -176,6 +249,28 @@ describe("redactSecretLike", () => {
       "npm_config_cache and npm_package_version",
       "seen[token] = true; tokens[id] = 1",
       "pk_live_publishable and sk_live_ is a prefix",
+    ].join("\n");
+    expect(redactSecretLike(text)).toBe(text);
+  });
+
+  it("redacts only a signature's value and keeps the rest of the URL readable", () => {
+    expect(
+      redactSecretLike(
+        "https://h.example.com/p?sv=1&sig=abc%2Bdef%3D&sp=r#frag (see ?signature=x1)"
+      )
+    ).toBe("https://h.example.com/p?sv=1&sig=[redacted]&sp=r#frag (see ?signature=[redacted])");
+  });
+
+  // `signature` is not a secret name: the memory-write guard reuses this detector, and a note
+  // about a function signature or a signed commit must stay writable.
+  it("leaves a signature or sig that is not a URL query parameter readable", () => {
+    const text = [
+      "signature: foo(a, b)",
+      "def verify(signature=None, sig=b'')",
+      "sig: 12 bytes, signature = checked",
+      "git commit --signature=abc123",
+      "see the signature=value form in the docs",
+      "https://h.example.com/p?design=1&signed=yes&sigma=3",
     ].join("\n");
     expect(redactSecretLike(text)).toBe(text);
   });
@@ -210,6 +305,26 @@ describe("redactSecretLike", () => {
     ],
     ["a quoted value that ends in a backslash run", `token:"a${"\\".repeat(100_000)}`],
     ["many opening quotes", 'token:"a'.repeat(12_000)],
+    ["a key followed by a long backslash run", `token${"\\".repeat(100_000)}"`],
+    ["a value opened by a long backslash run", `token:${"\\".repeat(100_000)}"a`],
+    [
+      "a deep value of one long backslash run",
+      `token:${"\\".repeat(31)}"a${"\\".repeat(100_000)}"`,
+    ],
+    [
+      "a deep value of runs as long as its opener",
+      `token:${"\\".repeat(31)}"${`${"\\".repeat(31)}x`.repeat(3_000)}`,
+    ],
+    [
+      "a deep value of runs just short of a doubled close",
+      `token:${"\\".repeat(31)}"${`${"\\".repeat(62)}x`.repeat(1_500)}`,
+    ],
+    ["many deep openers", `token:${"\\".repeat(31)}"a`.repeat(2_500)],
+    ["many deep keys", `token${"\\".repeat(31)}"`.repeat(2_800)],
+    ["a signature parameter with a long value", `?sig=${"a".repeat(100_000)}`],
+    ["signature parameters with no value", "?sig=&signature=".repeat(20_000)],
+    ["a signature name with no equals sign", "&X-Amz-Signature".repeat(20_000)],
+    ["stacked signature prefixes", "?&amp;sig=".repeat(20_000)],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
     const started = performance.now();
