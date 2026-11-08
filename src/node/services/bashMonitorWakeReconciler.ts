@@ -203,6 +203,44 @@ function normalizedTerminalStatus(
   return terminal.status === "timed_out" ? "killed" : terminal.status;
 }
 
+type SettledDeliveryState = Extract<BashMonitorWakeDeliveryState, { status: "settled" }>;
+
+/** End of the latest matched output the snapshot knows about, from any of its sources. */
+function latestMatchOffset(snapshot: BashMonitorProcessSnapshot): number | undefined {
+  const offsets = [
+    snapshot.lost?.failedMatch?.matchedThroughOffset,
+    snapshot.match?.throughOffset,
+    snapshot.terminal?.matchedThroughOffset,
+  ].filter((offset): offset is number => offset != null);
+  return offsets.length > 0 ? Math.max(...offsets) : undefined;
+}
+
+/** What the wake may say about the shared read cursor: numbers only, never output. */
+function readCursorFacts(
+  matchOffset: number | undefined,
+  readState: SettledDeliveryState | undefined
+): Pick<DerivedSignal, "unreadBytes" | "matchedOutputReadPast"> {
+  const cursor = readState?.readCursorOffset;
+  if (readState == null || cursor == null) return { matchedOutputReadPast: false };
+  return {
+    ...(readState.outputThroughOffset != null
+      ? { unreadBytes: Math.max(0, readState.outputThroughOffset - cursor) }
+      : {}),
+    // Definite case only: the whole latest match lies behind the cursor. When only part of it
+    // does, the next read still returns the latest matched line.
+    matchedOutputReadPast:
+      matchOffset != null && readState.shownThroughOffset < matchOffset && matchOffset <= cursor,
+  };
+}
+
+function wakeLostSummary(lost: BashMonitorLostSummary): WakeLostSummary {
+  return {
+    reason: lost.reason,
+    ...(lost.failedOperations != null ? { failedOperations: lost.failedOperations } : {}),
+    failedAt: lost.failedAt,
+  };
+}
+
 function describeTerminal(terminal: BashMonitorTerminalSummary): string {
   switch (terminal.status) {
     case "exited":
@@ -938,19 +976,9 @@ export class BashMonitorWakeReconciler {
     snapshot: BashMonitorProcessSnapshot,
     deadRegistryRow: boolean,
     taskAwaitable: boolean,
-    readState?: Extract<BashMonitorWakeDeliveryState, { status: "settled" }>
+    readState?: SettledDeliveryState
   ): DerivedSignal {
-    const matchOffset =
-      snapshot.lost?.failedMatch?.matchedThroughOffset != null ||
-      snapshot.match != null ||
-      snapshot.terminal?.matchedThroughOffset != null
-        ? Math.max(
-            snapshot.lost?.failedMatch?.matchedThroughOffset ?? -1,
-            snapshot.match?.throughOffset ?? -1,
-            snapshot.terminal?.matchedThroughOffset ?? -1
-          )
-        : undefined;
-    const readCursor = readState?.readCursorOffset;
+    const matchOffset = latestMatchOffset(snapshot);
     return {
       key: signalKey(snapshot.processId, snapshot.createdAt),
       ownerWorkspaceId: snapshot.ownerWorkspaceId,
@@ -963,29 +991,9 @@ export class BashMonitorWakeReconciler {
       createdAt: snapshot.createdAt,
       kind: "match",
       ...(matchOffset != null ? { matchOffset } : {}),
-      ...(readCursor != null && readState?.outputThroughOffset != null
-        ? { unreadBytes: Math.max(0, readState.outputThroughOffset - readCursor) }
-        : {}),
-      // Definite case only: the whole latest match lies behind the cursor. When only part of it
-      // does, the next read still returns the latest matched line.
-      matchedOutputReadPast:
-        matchOffset != null &&
-        readCursor != null &&
-        readState != null &&
-        readState.shownThroughOffset < matchOffset &&
-        matchOffset <= readCursor,
+      ...readCursorFacts(matchOffset, readState),
       ...(snapshot.terminal?.wakeOnExit === true ? { terminal: snapshot.terminal } : {}),
-      ...(snapshot.lost != null
-        ? {
-            lost: {
-              reason: snapshot.lost.reason,
-              ...(snapshot.lost.failedOperations != null
-                ? { failedOperations: snapshot.lost.failedOperations }
-                : {}),
-              failedAt: snapshot.lost.failedAt,
-            },
-          }
-        : {}),
+      ...(snapshot.lost != null ? { lost: wakeLostSummary(snapshot.lost) } : {}),
       taskAwaitable,
       deadRegistryRow,
       retired: snapshot.retired,
