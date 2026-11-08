@@ -2518,7 +2518,8 @@ export class WorkspaceStore {
    * Get current live streaming stats for a workspace, or null if no stream is active.
    *
    * Cached per MapStore version: changes only when {@link streamingStatsStore} is
-   * bumped (stream-start + every coalesced delta + every terminal stream event).
+   * bumped (stream-start + every coalesced delta + every tool-call-start + every terminal
+   * stream event).
    * Reading uses Date.now() at the bump point, so the trailing-window TPS is
    * always current relative to the latest delta.
    */
