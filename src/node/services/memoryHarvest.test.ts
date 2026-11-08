@@ -830,6 +830,79 @@ describe("runMemoryHarvest", () => {
     });
   });
 
+  // A data URL in a message the user typed or the model wrote is attachment bytes like one in a
+  // tool's output: the model reads the stub, and the bytes use none of the part's cap.
+  describe("a data URL in a text part", () => {
+    const ROW_TEXT_LIMIT = 8_000;
+    const TEXT_PART_LIMIT = 128_000;
+    const base64Url = (chars: number) => `data:image/png;base64,${"QUJD".repeat(chars / 4)}`;
+    const encodedUrl = (chars: number) =>
+      `data:image/svg+xml,${"%3Csvg%20xmlns%3D%27a%27%3E".repeat(chars / 26)}`;
+
+    function rowsOfText(text: string, role: "user" | "assistant" = "assistant") {
+      const message = createMuxMessage("t1", role, text, { historySequence: 0 });
+      return buildHarvestChunks([message]).flatMap(
+        (chunk) =>
+          JSON.parse(chunk.transcript) as Array<{
+            text: string;
+            segment?: string;
+            truncated: boolean;
+          }>
+      );
+    }
+
+    it.each([
+      ["a base64 image", base64Url(200_000), "QUJD"],
+      ["a percent-encoded SVG", encodedUrl(200_000), "%3Csvg"],
+    ])("replaces %s past the row limit by the stub", (_label, url, leak) => {
+      const rows = rowsOfText(`${"x".repeat(ROW_TEXT_LIMIT + 1_000)} ${url} END-OF-TEXT`);
+
+      const text = rows.map((row) => row.text).join("");
+      expect(text).toBe(`${"x".repeat(ROW_TEXT_LIMIT + 1_000)} [media] END-OF-TEXT`);
+      expect(text).not.toContain(leak);
+      expect(rows).toHaveLength(2);
+      expect(rows.some((row) => row.truncated)).toBe(false);
+    });
+
+    it("does not spend the part's cap on attachment bytes", () => {
+      const rows = rowsOfText(
+        `${"x".repeat(TEXT_PART_LIMIT - 100)}${base64Url(400_000)} END-OF-TEXT`
+      );
+
+      expect(rows.some((row) => row.truncated)).toBe(false);
+      expect(rows.map((row) => row.text).join("")).toEndWith("[media] END-OF-TEXT");
+    });
+
+    it("counts the cut characters of the text, not the bytes of a URL it took", () => {
+      const rows = rowsOfText(`${base64Url(200_000)} ${"y".repeat(TEXT_PART_LIMIT + 1_000)}`);
+
+      // The text is 7 characters of stub, a space and the y's: 1,008 of them lie past the cap.
+      expect(rows.at(-1)?.text).toEndWith("[truncated 1008 more chars for memory harvest]");
+    });
+
+    it("is replaced before the harvest model reads the message", async () => {
+      using fixture = createFixture();
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage(
+          "u1",
+          "user",
+          `${"x".repeat(ROW_TEXT_LIMIT + 1_000)} ${base64Url(200_000)} done`,
+          { historySequence: 0 }
+        ),
+      ]);
+
+      expect(prompt).toContain("[media] done");
+      expect(prompt).not.toContain("QUJDQUJD");
+    });
+
+    it("is replaced before a secret next to it is redacted", () => {
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      const rows = rowsOfText(`${base64Url(2_000)} ${githubToken}`, "user");
+
+      expect(rows.map((row) => row.text).join("")).toBe("[media] [redacted]");
+    });
+  });
+
   describe("analyzer", () => {
     it("creates a workspace memory file through the memory tool, its only tool", async () => {
       using fixture = createFixture();

@@ -1,5 +1,7 @@
 import { describe, expect, it, spyOn } from "bun:test";
 
+import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { redactSecretLike } from "./memorySecretRedaction";
 import {
@@ -17,8 +19,10 @@ function renderBeforeBudget(value: unknown, maxChars: number): string {
     if (Array.isArray(item)) return item.map((child) => sanitize(child, depth + 1));
     if (!isPlainObject(item)) return item;
     if (
-      typeof item.type === "string" &&
-      ["media", "display_file", "image-data", "file-data"].includes(item.type)
+      isMediaPart(item) ||
+      isDisplayOnlyFilePart(item) ||
+      item.type === "image-data" ||
+      item.type === "file-data"
     ) {
       return "[media]";
     }
@@ -86,7 +90,7 @@ describe("renderToolValue", () => {
       {
         content: [
           { type: "text", text: "hi" },
-          { type: "display_file", data: "x" },
+          { type: "display_file", data: "x", mediaType: "text/plain" },
         ],
       },
     ],
@@ -154,6 +158,40 @@ describe("renderToolValue", () => {
     expect(renderToolValue({ shot, log: "build ok" }, 2_000)).toBe(
       '{"shot":"[media]","log":"build ok"}'
     );
+  });
+
+  it.each([
+    ["a media part", { type: "media", data: "QUJD".repeat(100), mediaType: "image/png" }],
+    [
+      "a media part with a null filename",
+      { type: "media", data: "QUJD", mediaType: "image/png", filename: null },
+    ],
+    [
+      "a display-only file",
+      { type: "display_file", data: "QUJD".repeat(100), mediaType: "text/csv" },
+    ],
+    [
+      "an image-data output",
+      { type: "image-data", data: "QUJD".repeat(100), mediaType: "image/png" },
+    ],
+    ["a file-data output", { type: "file-data", data: "QUJD".repeat(100), mediaType: "text/csv" }],
+  ])("replaces %s by the stub", (_label, attachment) => {
+    expect(renderToolValue({ shot: attachment, log: "build ok" }, 2_000)).toBe(
+      '{"shot":"[media]","log":"build ok"}'
+    );
+  });
+
+  // The provider sends a record typed "media" or "display_file" as an attachment only with the
+  // shared shape, and any other record reaches it as tool-result JSON, so it may be the durable
+  // evidence of the call and the harvest reads it the same way.
+  it.each([
+    ["a media record of application data", { type: "media", text: "campaign channel" }],
+    ["a media record without a media type", { type: "media", data: "QUJD" }],
+    ["a media record with a data that is not text", { type: "media", data: 5, mediaType: "x/y" }],
+    ["a display_file record of application data", { type: "display_file", note: "invoice 42" }],
+  ])("renders %s like any other record", (_label, record) => {
+    expect(renderToolValue({ result: record }, 2_000)).toBe(JSON.stringify({ result: record }));
+    expect(renderToolValue(record, 2_000)).toBe(JSON.stringify(record));
   });
 
   it("redacts a secret that starts inside the cap and ends past it", () => {
@@ -282,15 +320,28 @@ describe("a value far past the budget", () => {
 
 describe("takeWithoutMedia", () => {
   it("takes the text when it fits, and says nothing followed", () => {
-    expect(takeWithoutMedia("a data:x b", 100)).toEqual({ text: "a data:x b", cut: false });
-    expect(takeWithoutMedia("", 100)).toEqual({ text: "", cut: false });
+    expect(takeWithoutMedia("a data:x b", 100)).toEqual({
+      text: "a data:x b",
+      cut: false,
+      read: 10,
+    });
+    expect(takeWithoutMedia("", 100)).toEqual({ text: "", cut: false, read: 0 });
   });
 
   it("counts the stub, not the payload, against the limit", () => {
     const text = `data:image/png;base64,${"A".repeat(100_000)} tail text here`;
 
-    expect(takeWithoutMedia(text, 12)).toEqual({ text: "[media] tail", cut: true });
-    expect(takeWithoutMedia(text, 1_000)).toEqual({ text: "[media] tail text here", cut: false });
+    const urlLength = text.indexOf(" tail");
+    expect(takeWithoutMedia(text, 12)).toEqual({
+      text: "[media] tail",
+      cut: true,
+      read: urlLength + 5,
+    });
+    expect(takeWithoutMedia(text, 1_000)).toEqual({
+      text: "[media] tail text here",
+      cut: false,
+      read: text.length,
+    });
   });
 
   it("searches only the text the limit can reach for a URL", () => {
