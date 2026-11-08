@@ -1298,6 +1298,63 @@ describe("runMemoryConsolidation", () => {
     expect(await pathExists(path.join(fixture.globalMemoryDir, "cut.md"))).toBe(false);
   });
 
+  // Headless runs bypass the chat cost pipeline: what a pass was billed reaches session usage only
+  // through `recordUsage`, and a stream that ended at the output limit completed and was billed.
+  it("reports the usage of a pass whose step ended at the output limit", async () => {
+    using fixture = await createFixture();
+    const recorded: Array<number | undefined> = [];
+
+    const result = await runMemoryConsolidation({
+      model: outputLimitedModel(),
+      pricingModel: PRICED_MODEL,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    expect(result.streamError).toContain("output limit");
+    // Both steps count, the cut-off one too.
+    expect(recorded).toEqual([2 * HALF_DOLLAR_INPUT_TOKENS]);
+  });
+
+  it("reports no usage for a stream that failed", async () => {
+    using fixture = await createFixture();
+    const recorded: Array<number | undefined> = [];
+
+    const result = await runMemoryConsolidation({
+      model: new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              pull(controller) {
+                controller.error(new Error("provider exploded"));
+              },
+            }),
+          }),
+      }),
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      recordUsage: (usage) => {
+        recorded.push(usage.inputTokens);
+        return Promise.resolve();
+      },
+    });
+
+    // After a mid-flight error the SDK's usage promise can stay pending forever: nothing waits on it.
+    expect(result.streamError).toContain("provider exploded");
+    expect(recorded).toEqual([]);
+    expect(result.usage).toBeUndefined();
+  });
+
   it("completes a pass whose cut-off step the model retried in a later step", async () => {
     using fixture = await createFixture();
 
