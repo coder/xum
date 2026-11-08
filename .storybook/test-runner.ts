@@ -1162,11 +1162,41 @@ const config: TestRunnerConfig = {
             }
             throw new Error("No tab label available to swipe");
           });
+          // The pan has ended at the first scrollend that comes after the finger lifts. An earlier
+          // scrollend belongs to another scroll: the strip's own reveal of the selected tab is a
+          // programmatic scroll whose scrollend can still be queued when this swipe starts, and
+          // taking it for the end of the swipe set the flag while the fling still ran. The tap
+          // below then stopped the fling, and Chromium drops a tap that stops a fling, so the
+          // tab was never selected (a Timeout 5000ms on its aria-selected, about 2 runs in 100 in
+          // CI). Event timestamps decide, so the order in which the page sees the two events does
+          // not matter. The listeners end with the swipe: one left over would set the flag during
+          // the next swipe.
           await row.evaluate((el) => {
             el.removeAttribute("data-scroll-settled");
-            el.addEventListener("scrollend", () => el.setAttribute("data-scroll-settled", ""), {
-              once: true,
-            });
+            const swipe = new AbortController();
+            let releasedAt: number | null = null;
+            let lastScrollEndAt = -1;
+            const settleIfDone = () => {
+              if (releasedAt === null || lastScrollEndAt < releasedAt) return;
+              el.setAttribute("data-scroll-settled", "");
+              swipe.abort();
+            };
+            document.addEventListener(
+              "touchend",
+              (event) => {
+                releasedAt = event.timeStamp;
+                settleIfDone();
+              },
+              { once: true, capture: true, signal: swipe.signal }
+            );
+            el.addEventListener(
+              "scrollend",
+              (event) => {
+                lastScrollEndAt = event.timeStamp;
+                settleIfDone();
+              },
+              { signal: swipe.signal }
+            );
           });
           await client.send("Input.dispatchTouchEvent", {
             type: "touchStart",
