@@ -7,13 +7,13 @@ import {
   ARTIFACT_SEND_TEXT_MAX_CHARS,
 } from "@/common/constants/artifactInteractions";
 import {
-  acceptArtifactFrameMessage,
   ARTIFACT_BACKDROP_COLOR_MAX_CHARS,
-  ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND,
   ARTIFACT_STATE_POST_INTERVAL_MS,
   ARTIFACT_WORKSPACE_ID_MAX_CHARS,
+  ArtifactFrameToHostMessageSchema,
   buildArtifactBridgeScript,
-  createBridgeRateLimiter,
+  type ArtifactTheme,
+  type ArtifactAppearance,
 } from "./artifactBridge";
 import {
   ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS,
@@ -21,26 +21,47 @@ import {
 } from "./appStyleVariables";
 import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { mcpAppPreambleScript } from "./mcpAppCsp";
+import { runFrameScript, type FrameScriptGlobals } from "./frameDocument.testHarness";
 
-// Identity is all the acceptance check uses, so plain objects stand in for windows.
-const frame: Window = Object.create(null) as Window;
-const other: Window = Object.create(null) as Window;
+const NONCE = "ab12";
+
+/** The bridge script with this suite's nonce; the arguments after it are the bridge's own. */
+function bridgeScript(
+  theme: ArtifactTheme,
+  state: unknown = null,
+  appearance: ArtifactAppearance | null = null,
+  followColorScheme = false,
+  forwardsViewSwitch = false
+): string {
+  return buildArtifactBridgeScript(
+    NONCE,
+    theme,
+    state,
+    appearance,
+    followColorScheme,
+    forwardsViewSwitch
+  );
+}
+
+/** The frame message the host acts on, or null when the host's schema refuses it. */
+function parsed(data: unknown) {
+  const result = ArtifactFrameToHostMessageSchema.safeParse(data);
+  return result.success ? result.data : null;
+}
+
 const keyMessage = { xumArtifact: 1, type: "key", key: "Escape", shiftKey: false };
 
-describe("acceptArtifactFrameMessage", () => {
-  test("accepts a valid key message from the frame window", () => {
-    expect(
-      acceptArtifactFrameMessage({ source: frame, data: keyMessage }, frame, () => true)
-    ).toEqual({ xumArtifact: 1, type: "key", key: "Escape", shiftKey: false });
+describe("frame messages", () => {
+  test("accepts a valid key message", () => {
+    expect(parsed(keyMessage)).toEqual({
+      xumArtifact: 1,
+      type: "key",
+      key: "Escape",
+      shiftKey: false,
+    });
   });
 
-  test("rejects other sources, a missing frame, and invalid payloads", () => {
-    const allow = () => true;
-    expect(
-      acceptArtifactFrameMessage({ source: other, data: keyMessage }, frame, allow)
-    ).toBeNull();
-    expect(acceptArtifactFrameMessage({ source: null, data: keyMessage }, frame, allow)).toBeNull();
-    expect(acceptArtifactFrameMessage({ source: frame, data: keyMessage }, null, allow)).toBeNull();
+  test("rejects invalid payloads", () => {
     for (const data of [
       { ...keyMessage, xumArtifact: 2 },
       { ...keyMessage, key: "Enter" },
@@ -50,27 +71,8 @@ describe("acceptArtifactFrameMessage", () => {
       "Escape",
       null,
     ]) {
-      expect(acceptArtifactFrameMessage({ source: frame, data }, frame, allow)).toBeNull();
+      expect(parsed(data)).toBeNull();
     }
-  });
-
-  test("drops messages over the rate limit, valid or not", () => {
-    let now = 0;
-    const allow = createBridgeRateLimiter(ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND, 1000, () => now);
-    const results = Array.from({ length: ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND + 5 }, (_, i) =>
-      acceptArtifactFrameMessage(
-        { source: frame, data: i === 0 ? "junk" : keyMessage },
-        frame,
-        allow
-      )
-    );
-    expect(results.filter((r) => r !== null)).toHaveLength(
-      ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND - 1
-    );
-    now = 1000;
-    expect(
-      acceptArtifactFrameMessage({ source: frame, data: keyMessage }, frame, allow)
-    ).not.toBeNull();
   });
 });
 
@@ -85,13 +87,11 @@ function runBridgeScript(
   // Every listener, in registration order: keys use capture listeners and bubble ones.
   const listeners: Array<{ type: string; capture: boolean; listener: (event: unknown) => void }> =
     [];
-  const posted: unknown[] = [];
   // window.setTimeout callbacks, run once a key press has gone through every listener.
   const timers: Array<() => void> = [];
   // preventDefault calls by the bridge's own listeners.
   let prevented = 0;
   const fakeWindow: { xum?: { openWorkspace: (id: unknown) => void } } & Record<string, unknown> = {
-    parent: { postMessage: (message: unknown) => posted.push(message) },
     addEventListener: (type: string, listener: (event: unknown) => void, capture?: unknown) => {
       listeners.push({ type, capture: capture === true, listener });
     },
@@ -103,14 +103,10 @@ function runBridgeScript(
     addEventListener: () => undefined,
     querySelectorAll: options.querySelectorAll ?? (() => []),
   };
-  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
-  const run = new Function(
-    "window",
-    "document",
-    "CustomEvent",
-    buildArtifactBridgeScript("dark", null, null, false, options.forwardsViewSwitch)
-  ) as (window: unknown, document: unknown, customEvent: unknown) => void;
-  run(fakeWindow, fakeDocument, class {});
+  const { posted } = runFrameScript(
+    bridgeScript("dark", null, null, false, options.forwardsViewSwitch),
+    { window: fakeWindow, document: fakeDocument, CustomEvent: class {} }
+  );
   /**
    * One key press as the browser dispatches it to the window: the capture listeners, the page's
    * own handlers, the bubble listeners, the key's default action, then the timers.
@@ -180,6 +176,17 @@ function runBridgeScript(
     }
   };
   return { keydown, fire, posted, xum: fakeWindow.xum, prevented: () => prevented };
+}
+
+/** A happy-dom window's own globals, as runFrameScript passes them to a frame script. */
+function happyGlobals(win: HappyWindow): FrameScriptGlobals {
+  return {
+    window: win,
+    document: win.document,
+    CustomEvent: win.CustomEvent,
+    EventTarget: win.EventTarget,
+    Document: win.Document,
+  };
 }
 
 describe("bridge script keys", () => {
@@ -537,8 +544,7 @@ describe("bridge script interrupt keys", () => {
 
 describe("interruptKey messages", () => {
   test("accepts a known keybind name only", () => {
-    const accept = (data: unknown) =>
-      acceptArtifactFrameMessage({ source: frame, data }, frame, () => true);
+    const accept = parsed;
     for (const keybind of ["normal", "vim"] as const) {
       const message = { xumArtifact: 1, type: "interruptKey", keybind } as const;
       expect(accept(message)).toEqual(message);
@@ -555,8 +561,7 @@ describe("interruptKey messages", () => {
 
 describe("sidebarKey messages", () => {
   test("accepts a known chord name and the two modifier flags only", () => {
-    const accept = (data: unknown) =>
-      acceptArtifactFrameMessage({ source: frame, data }, frame, () => true);
+    const accept = parsed;
     const sidebarKey = {
       xumArtifact: 1,
       type: "sidebarKey",
@@ -581,8 +586,7 @@ describe("sidebarKey messages", () => {
 });
 
 describe("openWorkspace messages", () => {
-  const accept = (data: unknown) =>
-    acceptArtifactFrameMessage({ source: frame, data }, frame, () => true);
+  const accept = parsed;
   const open = (workspaceId: unknown) => ({ xumArtifact: 1, type: "openWorkspace", workspaceId });
 
   test("accepts a workspace ID", () => {
@@ -614,9 +618,7 @@ describe("openWorkspace messages", () => {
 });
 
 describe("send and setState messages", () => {
-  const allow = () => true;
-  const accept = (data: unknown, source: Window = frame) =>
-    acceptArtifactFrameMessage({ source, data }, frame, allow);
+  const accept = parsed;
 
   test("accepts text with optional JSON data, and state, under the caps", () => {
     expect(accept({ xumArtifact: 1, type: "send", text: "Ship it" })).toMatchObject({
@@ -632,7 +634,7 @@ describe("send and setState messages", () => {
     });
   });
 
-  test("refuses oversize text, oversize or non-JSON data, and other sources", () => {
+  test("refuses oversize text and oversize or non-JSON data", () => {
     const big = "x".repeat(ARTIFACT_JSON_MAX_BYTES);
     for (const data of [
       { xumArtifact: 1, type: "send", text: "x".repeat(ARTIFACT_SEND_TEXT_MAX_CHARS + 1) },
@@ -645,7 +647,6 @@ describe("send and setState messages", () => {
     ]) {
       expect(accept(data)).toBeNull();
     }
-    expect(accept({ xumArtifact: 1, type: "send", text: "x" }, other)).toBeNull();
   });
 
   test("refuses a small graph of shared references without expanding it", () => {
@@ -704,7 +705,7 @@ describe("send and setState messages", () => {
 
 describe("buildArtifactBridgeScript", () => {
   test("interpolates the theme as a JSON string literal and parses as JavaScript", () => {
-    const script = buildArtifactBridgeScript("light");
+    const script = bridgeScript("light");
     expect(script).toContain('var theme = "light";');
     // Bun's transpiler throws on a syntax error, which is all this needs to prove.
     expect(() => new Bun.Transpiler({ loader: "js" }).transformSync(script)).not.toThrow();
@@ -714,9 +715,7 @@ describe("buildArtifactBridgeScript", () => {
     const attributes = new Map<string, string>();
     type FakeMessageListener = (event: { source: unknown; data: unknown }) => void;
     const listeners: FakeMessageListener[] = [];
-    const parent = {};
     const fakeWindow = {
-      parent,
       addEventListener: (type: string, listener: FakeMessageListener) => {
         if (type === "message") listeners.push(listener);
       },
@@ -733,87 +732,62 @@ describe("buildArtifactBridgeScript", () => {
         readonly init: unknown
       ) {}
     }
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
-    const run = new Function(
-      "window",
-      "document",
-      "CustomEvent",
-      buildArtifactBridgeScript("light")
-    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
-    run(fakeWindow, fakeDocument, FakeCustomEvent);
+    const bridge = runFrameScript(bridgeScript("light"), {
+      window: fakeWindow,
+      document: fakeDocument,
+      CustomEvent: FakeCustomEvent,
+    });
     expect(attributes.get("data-xum-theme")).toBe("light");
 
-    const send = (data: unknown, source: unknown = parent) =>
-      listeners.forEach((listener) => listener({ source, data }));
-    send({ xumArtifact: 1, type: "theme", theme: "dark" }, {});
+    // A window message, even one from the parent window, is not the host: only the port is.
+    const theme = { xumArtifact: 1, type: "theme", theme: "dark" };
+    const parent = (fakeWindow as Record<string, unknown>).parent;
+    listeners.forEach((listener) => listener({ source: parent, data: theme }));
     expect(attributes.get("data-xum-theme")).toBe("light");
-    send({ xumArtifact: 1, type: "theme", theme: "dark" });
+    bridge.toFrame(theme);
     expect(attributes.get("data-xum-theme")).toBe("dark");
   });
 
   test("applies the app palette as --xum-* properties, at load and on theme messages", () => {
     const attributes = new Map<string, string>();
     const properties = new Map<string, string>();
-    type FakeMessageListener = (event: { source: unknown; data: unknown }) => void;
-    const listeners: FakeMessageListener[] = [];
-    const parent = {};
-    const fakeWindow = {
-      parent,
-      addEventListener: (type: string, listener: FakeMessageListener) => {
-        if (type === "message") listeners.push(listener);
-      },
-      dispatchEvent: () => true,
-    };
+    const fakeWindow = { addEventListener: () => undefined, dispatchEvent: () => true };
     const fakeDocument = {
       documentElement: {
         setAttribute: (name: string, value: string) => attributes.set(name, value),
         style: { setProperty: (name: string, value: string) => properties.set(name, value) },
       },
     };
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
-    const run = new Function(
-      "window",
-      "document",
-      "CustomEvent",
-      buildArtifactBridgeScript("light", null, {
+    const bridge = runFrameScript(
+      bridgeScript("light", null, {
         themeName: "flexoki-light",
         variables: { "--xum-bg": "#fffcf0" },
-      })
-    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
-    run(fakeWindow, fakeDocument, class {});
+      }),
+      { window: fakeWindow, document: fakeDocument, CustomEvent: class {} }
+    );
     expect(attributes.get("data-xum-theme-name")).toBe("flexoki-light");
     expect(properties.get("--xum-bg")).toBe("#fffcf0");
 
-    listeners.forEach((listener) =>
-      listener({
-        source: parent,
-        data: {
-          xumArtifact: 1,
-          type: "theme",
-          theme: "dark",
-          themeName: "flexoki-dark",
-          variables: {
-            "--xum-bg": "#100f0f",
-            // Not --xum-*: an artifact's own properties (or anything else) stay untouched.
-            "--color-background": "red",
-            background: "red",
-            "--xum-fg": 7,
-          },
-        },
-      })
-    );
+    bridge.toFrame({
+      xumArtifact: 1,
+      type: "theme",
+      theme: "dark",
+      themeName: "flexoki-dark",
+      variables: {
+        "--xum-bg": "#100f0f",
+        // Not --xum-*: an artifact's own properties (or anything else) stay untouched.
+        "--color-background": "red",
+        background: "red",
+        "--xum-fg": 7,
+      },
+    });
     expect(attributes.get("data-xum-theme-name")).toBe("flexoki-dark");
     expect(Object.fromEntries(properties)).toEqual({ "--xum-bg": "#100f0f" });
 
     // The frame bounds what a theme message may set: too many names set none, and an over-long
     // value is skipped.
     const sendVariables = (variables: Record<string, string>) =>
-      listeners.forEach((listener) =>
-        listener({
-          source: parent,
-          data: { xumArtifact: 1, type: "theme", theme: "dark", variables },
-        })
-      );
+      bridge.toFrame({ xumArtifact: 1, type: "theme", theme: "dark", variables });
     sendVariables(
       Object.fromEntries(
         Array.from({ length: ARTIFACT_THEME_VARIABLES_MAX_COUNT + 1 }, (_, i) => [
@@ -834,34 +808,112 @@ describe("buildArtifactBridgeScript", () => {
 
   test("gives only a page without styles of its own the theme's color scheme, kept live", () => {
     const runWith = (followColorScheme: boolean) => {
-      type FakeMessageListener = (event: { source: unknown; data: unknown }) => void;
-      const listeners: FakeMessageListener[] = [];
-      const parent = {};
       const style: { colorScheme?: string } = {};
-      const fakeWindow = {
-        parent,
-        addEventListener: (type: string, listener: FakeMessageListener) => {
-          if (type === "message") listeners.push(listener);
-        },
-        dispatchEvent: () => true,
-      };
+      const fakeWindow = { addEventListener: () => undefined, dispatchEvent: () => true };
       const fakeDocument = { documentElement: { setAttribute: () => undefined, style } };
-      // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
-      const run = new Function(
-        "window",
-        "document",
-        "CustomEvent",
-        buildArtifactBridgeScript("dark", null, null, followColorScheme)
-      ) as (window: unknown, document: unknown, customEvent: unknown) => void;
-      run(fakeWindow, fakeDocument, class {});
+      const bridge = runFrameScript(bridgeScript("dark", null, null, followColorScheme), {
+        window: fakeWindow,
+        document: fakeDocument,
+        CustomEvent: class {},
+      });
       const atLoad = style.colorScheme;
-      listeners.forEach((listener) =>
-        listener({ source: parent, data: { xumArtifact: 1, type: "theme", theme: "light" } })
-      );
+      bridge.toFrame({ xumArtifact: 1, type: "theme", theme: "light" });
       return [atLoad, style.colorScheme];
     };
     expect(runWith(true)).toEqual(["dark", "light"]);
     expect(runWith(false)).toEqual([undefined, undefined]);
+  });
+});
+
+describe("bridge document channel", () => {
+  /** A window that keeps its listeners like a browser: one per type and listener. */
+  function pageWindow() {
+    const listeners: Array<{ type: string; listener: (event: unknown) => void }> = [];
+    const win: Record<string, unknown> = {
+      addEventListener: (type: string, listener: (event: unknown) => void) => {
+        if (!listeners.some((entry) => entry.type === type && entry.listener === listener)) {
+          listeners.push({ type, listener });
+        }
+      },
+      dispatchEvent: () => true,
+    };
+    const fire = (type: string) => {
+      for (const entry of listeners.filter((candidate) => candidate.type === type)) {
+        entry.listener({ type });
+      }
+    };
+    return { win, listeners, fire };
+  }
+  const page = () => ({ documentElement: { setAttribute: () => undefined } });
+
+  test("its one window message is the open announcement, with the nonce and one port", () => {
+    const { win } = pageWindow();
+    const bridge = runFrameScript(bridgeScript("dark"), {
+      window: win,
+      document: page(),
+      CustomEvent: FakeCustomEvent,
+    });
+    const xum = win.xum as {
+      send: (text: string) => void;
+      setState: (state: unknown) => void;
+      openWorkspace: (id: string) => void;
+    };
+    xum.send("Ship it");
+    xum.setState({ step: 2 });
+    xum.openWorkspace("a1b2c3d4e5");
+    expect(bridge.windowPosts.map((post) => [post.data, post.ports.length])).toEqual([
+      [{ xumFrameDocument: 1, type: "open", nonce: NONCE }, 1],
+    ]);
+    expect(bridge.posted).toEqual([
+      { xumArtifact: 1, type: "send", text: "Ship it" },
+      { xumArtifact: 1, type: "setState", state: { step: 2 } },
+      { xumArtifact: 1, type: "openWorkspace", workspaceId: "a1b2c3d4e5" },
+    ]);
+  });
+
+  test("answers the host's checks over its port with the value it got", () => {
+    const { win } = pageWindow();
+    const bridge = runFrameScript(bridgeScript("dark"), {
+      window: win,
+      document: page(),
+      CustomEvent: FakeCustomEvent,
+    });
+    bridge.toFrame({ xumFrameDocument: 1, type: "check", value: "c1" });
+    bridge.toFrame({ xumFrameDocument: 1, type: "check", value: "c2" });
+    expect(bridge.posted).toEqual([
+      { xumFrameDocument: 1, type: "checked", value: "c1" },
+      { xumFrameDocument: 1, type: "checked", value: "c2" },
+    ]);
+  });
+
+  // document.open() erases the window's listeners (WebKit and Chromium): the bridge adds its
+  // pagehide listener again, so a later navigation still closes the frame at once.
+  test("pagehide sends leave, also after document.open() erased the window's listeners", () => {
+    const { win, listeners, fire } = pageWindow();
+    class PageDocument {
+      // document.open() erases the window's listeners, as in WebKit and Chromium.
+      open() {
+        listeners.length = 0;
+      }
+      write() {
+        // Only open() matters here.
+      }
+      writeln() {
+        // Only open() matters here.
+      }
+    }
+    const bridge = runFrameScript(bridgeScript("dark"), {
+      window: win,
+      document: page(),
+      CustomEvent: FakeCustomEvent,
+      Document: PageDocument,
+    });
+    const leave = { xumFrameDocument: 1, type: "leave" };
+    fire("pagehide");
+    expect(bridge.posted).toEqual([leave]);
+    PageDocument.prototype.open.call(new PageDocument());
+    fire("pagehide");
+    expect(bridge.posted).toEqual([leave, leave]);
   });
 });
 
@@ -870,7 +922,6 @@ describe("bridge script WebRTC removal", () => {
     // CSP cannot govern WebRTC: connect-src 'none' leaves RTCPeerConnection's STUN/TURN traffic
     // open (Chromium ignores `webrtc 'block'`), so the first script removes the constructors.
     const fakeWindow: Record<string, unknown> = {
-      parent: { postMessage: () => undefined },
       addEventListener: () => undefined,
       RTCPeerConnection: class {},
       webkitRTCPeerConnection: class {},
@@ -880,14 +931,11 @@ describe("bridge script WebRTC removal", () => {
     };
     // A fake document too: later bridge versions mirror the theme onto the root element.
     const fakeDocument = { documentElement: { setAttribute: () => undefined } };
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
-    const run = new Function(
-      "window",
-      "document",
-      "CustomEvent",
-      buildArtifactBridgeScript("dark")
-    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
-    run(fakeWindow, fakeDocument, class {});
+    runFrameScript(bridgeScript("dark"), {
+      window: fakeWindow,
+      document: fakeDocument,
+      CustomEvent: class {},
+    });
     expect(Object.keys(fakeWindow).filter((name) => name.includes("RTC"))).toEqual([]);
     expect(typeof fakeWindow.fetch).toBe("function");
   });
@@ -895,15 +943,12 @@ describe("bridge script WebRTC removal", () => {
 
 describe("bridge setState", () => {
   test("coalesces a burst of saves and still posts the final state", async () => {
-    const posts: unknown[] = [];
     // The shim defines `xum` on the window it is given.
     const fakeWindow: {
-      parent: { postMessage: (message: unknown) => void };
       addEventListener: () => void;
       dispatchEvent: () => boolean;
       xum?: { setState: (state: unknown) => void };
     } = {
-      parent: { postMessage: (message: unknown) => posts.push(message) },
       addEventListener: () => undefined,
       dispatchEvent: () => true,
     };
@@ -914,14 +959,11 @@ describe("bridge setState", () => {
         readonly init: unknown
       ) {}
     }
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
-    const run = new Function(
-      "window",
-      "document",
-      "CustomEvent",
-      buildArtifactBridgeScript("light")
-    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
-    run(fakeWindow, fakeDocument, FakeCustomEvent);
+    const { posted: posts } = runFrameScript(bridgeScript("light"), {
+      window: fakeWindow,
+      document: fakeDocument,
+      CustomEvent: FakeCustomEvent,
+    });
     const xum = fakeWindow.xum!;
 
     // A drag that saves 100 times in one go stays far under the host's per-second limit.
@@ -937,26 +979,11 @@ describe("bridge annotate mode", () => {
   test("swallows the click before the artifact's own window listeners see it", async () => {
     // A real DOM window, so listener ordering and propagation follow the DOM spec.
     const win = new HappyWindow({ url: "http://localhost" });
-    const posts: unknown[] = [];
-    // Top-level window: `window.parent` is the window itself, so its postMessage is the host's.
-    win.postMessage = ((message: unknown) => posts.push(message)) as typeof win.postMessage;
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
-    const run = new Function(
-      "window",
-      "document",
-      "CustomEvent",
-      buildArtifactBridgeScript("light")
-    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
-    run(win, win.document, win.CustomEvent);
+    const { posted: posts, toFrame } = runFrameScript(bridgeScript("light"), happyGlobals(win));
     // The artifact's own capture listener, registered after the shim.
     let artifactSawClick = false;
     win.addEventListener("click", () => (artifactSawClick = true), true);
-    win.dispatchEvent(
-      new win.MessageEvent("message", {
-        data: { xumArtifact: 1, type: "annotate", enabled: true },
-        source: win as never,
-      })
-    );
+    toFrame({ xumArtifact: 1, type: "annotate", enabled: true });
     win.document.body.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
     expect(artifactSawClick).toBe(false);
     expect(posts).toEqual([expect.objectContaining({ xumArtifact: 1, type: "annotate" })]);
@@ -969,7 +996,7 @@ describe("in-page links", () => {
   // frame to the app and the navigation guard closes the artifact. The handler cancels it and
   // jumps to the target itself. HTML artifacts and MCP App views both get it.
   test.each([
-    ["HTML artifact bridge", buildArtifactBridgeScript("light")],
+    ["HTML artifact bridge", bridgeScript("light")],
     ["MCP App preamble", mcpAppPreambleScript("00")],
   ])("%s jumps to # targets inside the frame document", async (_name, script) => {
     const win = new HappyWindow({ url: "http://localhost/workspace/abc" });
@@ -999,13 +1026,7 @@ describe("in-page links", () => {
       element.scrollIntoView = () => scrolled.push(element.textContent);
     }
     win.scrollTo = (() => scrolled.push("top")) as typeof win.scrollTo;
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
-    const run = new Function("window", "document", "CustomEvent", script) as (
-      window: unknown,
-      document: unknown,
-      customEvent: unknown
-    ) => void;
-    run(win, doc, win.CustomEvent);
+    runFrameScript(script, happyGlobals(win));
     // The artifact's own handler, which takes over one link.
     doc.getElementById("own")!.addEventListener("click", (event) => event.preventDefault());
     // A window listener added after the shim's runs after it: record what the shim decided, then
@@ -1067,7 +1088,7 @@ describe("in-page links", () => {
   // the parsed URL's, so its percent-encoded form is tried first, and it is percent-decoded as
   // UTF-8 with replacement characters. <area> links count like <a>.
   test.each([
-    ["HTML artifact bridge", buildArtifactBridgeScript("light")],
+    ["HTML artifact bridge", bridgeScript("light")],
     ["MCP App preamble", mcpAppPreambleScript("00")],
   ])("%s reveals hidden targets and parses the fragment like a browser", async (_name, script) => {
     const win = new HappyWindow({ url: "http://localhost/workspace/abc" });
@@ -1107,13 +1128,7 @@ describe("in-page links", () => {
         event.target.setAttribute("hidden", "");
       }
     });
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
-    const run = new Function("window", "document", "CustomEvent", script) as (
-      window: unknown,
-      document: unknown,
-      customEvent: unknown
-    ) => void;
-    run(win, doc, win.CustomEvent);
+    runFrameScript(script, happyGlobals(win));
     win.addEventListener("click", (event) => event.preventDefault());
     const click = (id: string): string[] => {
       scrolled.length = 0;
@@ -1205,8 +1220,18 @@ async function runBridge(state: unknown, options: { listenOn?: "DOMContentLoaded
     document: doc,
     CustomEvent: FakeCustomEvent,
     setTimeout,
+    // The document channel's globals (frameDocumentScript); its messages go nowhere here.
+    MessageChannel,
+    EventTarget: {
+      prototype: {
+        addEventListener(this: FakeTarget, type: string, listener: () => void) {
+          this.addEventListener(type, listener);
+        },
+      },
+    },
+    Document: class {},
   });
-  vm.runInContext(buildArtifactBridgeScript("dark", state), context);
+  vm.runInContext(bridgeScript("dark", state), context);
   if (options.listenOn === "DOMContentLoaded") {
     doc.addEventListener("DOMContentLoaded", listen, { once: true });
   } else if (options.listenOn === "load") {
@@ -1256,15 +1281,12 @@ describe("baked-in state", () => {
 });
 
 describe("annotate messages", () => {
-  const allow = () => true;
   const pin = { xumArtifact: 1, type: "annotate", x: 0.25, y: 1, selector: "#chart" } as const;
 
   test("accepts a pin with fractional coordinates and a capped quote", () => {
-    expect(acceptArtifactFrameMessage({ source: frame, data: pin }, frame, allow)).toEqual(pin);
+    expect(parsed(pin)).toEqual(pin);
     const quoted = { ...pin, quote: "q".repeat(ARTIFACT_ANNOTATION_QUOTE_MAX_CHARS), prefix: "a" };
-    expect(acceptArtifactFrameMessage({ source: frame, data: quoted }, frame, allow)).toEqual(
-      quoted
-    );
+    expect(parsed(quoted)).toEqual(quoted);
   });
 
   test("rejects coordinates outside the frame, oversize text and unknown fields", () => {
@@ -1277,28 +1299,25 @@ describe("annotate messages", () => {
       { ...pin, selector: "s".repeat(201) },
       { ...pin, comment: "injected" },
     ]) {
-      expect(acceptArtifactFrameMessage({ source: frame, data }, frame, allow)).toBeNull();
+      expect(parsed(data)).toBeNull();
     }
   });
 });
 
 describe("backdrop messages", () => {
-  const allow = () => true;
   const backdrop = { xumArtifact: 1, type: "backdrop", color: "rgb(16, 15, 15)" } as const;
 
   test("accepts a reported color or null, and nothing else", () => {
-    expect(acceptArtifactFrameMessage({ source: frame, data: backdrop }, frame, allow)).toEqual(
-      backdrop
-    );
+    expect(parsed(backdrop)).toEqual(backdrop);
     const none = { ...backdrop, color: null };
-    expect(acceptArtifactFrameMessage({ source: frame, data: none }, frame, allow)).toEqual(none);
+    expect(parsed(none)).toEqual(none);
     for (const data of [
       { ...backdrop, color: "#".repeat(ARTIFACT_BACKDROP_COLOR_MAX_CHARS + 1) },
       { ...backdrop, color: 0 },
       { ...backdrop, color: undefined },
       { ...backdrop, extra: "x" },
     ]) {
-      expect(acceptArtifactFrameMessage({ source: frame, data }, frame, allow)).toBeNull();
+      expect(parsed(data)).toBeNull();
     }
   });
 });
@@ -1311,34 +1330,24 @@ describe("bridge backdrop", () => {
   async function runWithPage(html: string) {
     const win = new HappyWindow({ url: "http://localhost" });
     win.document.write(html);
-    const posts: unknown[] = [];
-    // Top-level window: `window.parent` is the window itself, so its postMessage is the host's.
-    win.postMessage = ((message: { type?: unknown }) => {
-      if (message.type === "backdrop") posts.push(message);
-    }) as typeof win.postMessage;
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
-    const run = new Function(
-      "window",
-      "document",
-      "CustomEvent",
-      buildArtifactBridgeScript("dark", null, {
-        themeName: "dark",
-        variables: { "--xum-bg": "#100f0f" },
-      })
-    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
-    run(win, win.document, win.CustomEvent);
+    const bridge = runFrameScript(
+      bridgeScript("dark", null, { themeName: "dark", variables: { "--xum-bg": "#100f0f" } }),
+      happyGlobals(win)
+    );
     const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
     win.dispatchEvent(new win.Event("load"));
     await settle();
     const sendTheme = async (bg: string) => {
-      win.dispatchEvent(
-        new win.MessageEvent("message", {
-          data: { xumArtifact: 1, type: "theme", theme: "light", variables: { "--xum-bg": bg } },
-          source: win as never,
-        })
-      );
+      bridge.toFrame({
+        xumArtifact: 1,
+        type: "theme",
+        theme: "light",
+        variables: { "--xum-bg": bg },
+      });
       await settle();
     };
+    const posts = () =>
+      bridge.posted.filter((message) => (message as { type?: unknown }).type === "backdrop");
     return { win, posts, sendTheme, close: () => win.happyDOM.close() };
   }
   const posted = (color: string | null) => ({ xumArtifact: 1, type: "backdrop", color });
@@ -1356,7 +1365,7 @@ describe("bridge backdrop", () => {
       ["<p>no background</p>", null],
     ] as const) {
       const page = await runWithPage(html);
-      expect(page.posts).toEqual([posted(color)]);
+      expect(page.posts()).toEqual([posted(color)]);
       await page.close();
     }
   });
@@ -1365,7 +1374,7 @@ describe("bridge backdrop", () => {
     const page = await runWithPage("<style>html { background: var(--xum-bg) }</style>");
     await page.sendTheme("#fffcf0");
     await page.sendTheme("#fffcf0");
-    expect(page.posts).toEqual([posted("#100f0f"), posted("#fffcf0")]);
+    expect(page.posts()).toEqual([posted("#100f0f"), posted("#fffcf0")]);
     await page.close();
   });
 
@@ -1377,7 +1386,7 @@ describe("bridge backdrop", () => {
       void Promise.resolve().then(() => root.style.setProperty("background", "#223344"));
     });
     await page.sendTheme("#fffcf0");
-    expect(page.posts.at(-1)).toEqual(posted("#223344"));
+    expect(page.posts().at(-1)).toEqual(posted("#223344"));
     await page.close();
   });
 });

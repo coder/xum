@@ -21,7 +21,8 @@ import { openArtifact } from "./openArtifact";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { useArtifactInteractions, type ArtifactInteractionTarget } from "./useArtifactInteractions";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
-import { ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND } from "./artifactBridge";
+import { ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND } from "./frameDocumentChannel";
+import { postFromFrameDocument } from "./frameDocument.testHarness";
 import { ARTIFACT_CLICK_SEND_WINDOW_MS } from "@/common/constants/artifactInteractions";
 
 const HTML: ArtifactReadResult = {
@@ -128,12 +129,8 @@ function messageEvent(data: unknown, source: unknown): Event {
   return event;
 }
 
-/** Deliver a bridge message as if the artifact frame posted it. */
-function postFromFrame(frame: HTMLIFrameElement, data: unknown) {
-  act(() => {
-    window.dispatchEvent(messageEvent(data, frame.contentWindow));
-  });
-}
+/** Deliver a bridge message as the artifact frame's document sends it: over its own port. */
+const postFromFrame = postFromFrameDocument;
 
 describe("artifact interactions in the Artifacts panel", () => {
   let cleanupDom: (() => void) | null = null;
@@ -169,8 +166,8 @@ describe("artifact interactions in the Artifacts panel", () => {
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
 
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "First", data: { n: 1 } });
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Second" });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "First", data: { n: 1 } });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Second" });
     // One strip per artifact; a shown strip is never replaced.
     const strip = await view.findByTestId("artifact-send-strip");
     expect(strip.textContent).toContain("First");
@@ -190,7 +187,7 @@ describe("artifact interactions in the Artifacts panel", () => {
 
     // Bait-and-switch: a send posted between the user's pointerdown and click changes nothing.
     fireEvent.pointerDown(sendButton);
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Swapped" });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Swapped" });
     expect(strip.textContent).not.toContain("Swapped");
     fireEvent.click(sendButton);
     await waitFor(() => expect(sends).toHaveLength(1));
@@ -198,7 +195,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     await waitFor(() => expect(view.queryByTestId("artifact-send-strip")).toBeNull());
 
     // After Send the artifact can ask again.
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Third" });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Third" });
     expect((await view.findByTestId("artifact-send-strip")).textContent).toContain("Third");
   });
 
@@ -224,31 +221,31 @@ describe("artifact interactions in the Artifacts panel", () => {
       // Neither half of the gesture alone sends: activation with focus elsewhere, then focus
       // with no activation (focus stays in the frame long after the click).
       active = true;
-      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "No focus" });
+      await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "No focus" });
       fireEvent.click(await view.findByRole("button", { name: "Dismiss" }));
       active = false;
       act(() => frame.focus());
-      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "No activation" });
+      await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "No activation" });
       fireEvent.click(await view.findByRole("button", { name: "Dismiss" }));
       expect(sends).toEqual([]);
 
       // The user's click: sent at once, with no strip.
       active = true;
-      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Clicked", data: { n: 1 } });
+      await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Clicked", data: { n: 1 } });
       await waitFor(() => expect(sends).toHaveLength(1));
       expect(sends[0]).toMatchObject({ path: "form.html", text: "Clicked", data: { n: 1 } });
       expect(view.queryByTestId("artifact-send-strip")).toBeNull();
 
       // A second send in the same click's window (a script riding the activation) asks first.
       now += ARTIFACT_CLICK_SEND_WINDOW_MS - 1;
-      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Riding" });
+      await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Riding" });
       expect((await view.findByTestId("artifact-send-strip")).textContent).toContain("Riding");
       expect(sends).toHaveLength(1);
       fireEvent.click(view.getByRole("button", { name: "Dismiss" }));
 
       // A later click sends at once again.
       now += 1;
-      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Next click" });
+      await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Next click" });
       await waitFor(() => expect(sends).toHaveLength(2));
       expect(sends[1]).toMatchObject({ text: "Next click" });
       expect(view.queryByTestId("artifact-send-strip")).toBeNull();
@@ -265,7 +262,7 @@ describe("artifact interactions in the Artifacts panel", () => {
       const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
       const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
       act(() => frame.focus());
-      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Answers" });
+      await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Answers" });
       const strip = await view.findByTestId("artifact-send-strip");
       await waitFor(() => expect(strip.textContent).toContain("Workspace not found: ws-i"));
       expect(strip.textContent).toContain("Answers");
@@ -303,11 +300,11 @@ describe("artifact interactions in the Artifacts panel", () => {
     delete window.api;
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "From the phone" });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "From the phone" });
     expect((await view.findByTestId("artifact-send-strip")).textContent).toContain(
       "From the phone"
     );
-    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 3 } });
+    await postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 3 } });
     await waitFor(() => expect(savedStates).toEqual([{ step: 3 }]));
     expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
   });
@@ -315,7 +312,7 @@ describe("artifact interactions in the Artifacts panel", () => {
   test("Dismiss drops the pending send without delivering it", async () => {
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Nope" });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Nope" });
     fireEvent.click(await view.findByRole("button", { name: "Dismiss" }));
     expect(view.queryByTestId("artifact-send-strip")).toBeNull();
     expect(sends).toEqual([]);
@@ -326,7 +323,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     const panel = view.getByTestId("artifacts-panel");
     const sendKey = { key: "Enter", ctrlKey: true };
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship it" });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship it" });
     await view.findByTestId("artifact-send-strip");
     // Like the button: nothing before the strip arms.
     fireEvent.keyDown(panel, sendKey);
@@ -342,7 +339,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(sends[0]).toMatchObject({ text: "Ship it" });
     await waitFor(() => expect(view.queryByTestId("artifact-send-strip")).toBeNull());
 
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Nope" });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Nope" });
     await view.findByTestId("artifact-send-strip");
     fireEvent.keyDown(panel, { key: "Backspace", ctrlKey: true });
     expect(view.queryByTestId("artifact-send-strip")).toBeNull();
@@ -354,7 +351,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     sendGate = gate.promise;
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship it" });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship it" });
     const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
     await waitFor(() => expect(sendButton.disabled).toBe(false), {
       timeout: CONFIRM_ARM_DELAY_MS + 1000,
@@ -379,7 +376,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     act(() => {
       window.dispatchEvent(messageEvent({ xumArtifact: 1, type: "send", text: "spoof" }, window));
     });
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "x".repeat(4001) });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "x".repeat(4001) });
     expect(view.queryByTestId("artifact-send-strip")).toBeNull();
   });
 
@@ -419,7 +416,7 @@ describe("artifact interactions in the Artifacts panel", () => {
   test("setState from the frame is persisted for the artifact", async () => {
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
+    await postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
     await waitFor(() => expect(savedStates).toEqual([{ step: 2 }]));
   });
 
@@ -599,26 +596,26 @@ describe("window.xum.openWorkspace", () => {
 
   test("a click in the frame opens an active workspace through the app's navigation", async () => {
     const { view, frame } = await renderClickedFrame();
-    postFromFrame(frame, open(active.id));
+    await postFromFrame(frame, open(active.id));
     expect(opened).toEqual([active.id]);
     expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
   });
 
   test("a workspace-turn task handle opens the workspace it created", async () => {
     const { frame } = await renderClickedFrame();
-    postFromFrame(frame, open("wst_side_task"));
+    await postFromFrame(frame, open("wst_side_task"));
     expect(opened).toEqual([turnTarget.id]);
   });
 
   test("an unknown or archived ID does not switch and shows a host notice", async () => {
     const { view, frame } = await renderClickedFrame();
-    postFromFrame(frame, open("ffffffffff"));
+    await postFromFrame(frame, open("ffffffffff"));
     expect(opened).toEqual([]);
     expect(view.getByTestId("artifact-open-workspace-notice")).toBeTruthy();
-    postFromFrame(frame, open(archived.id));
+    await postFromFrame(frame, open(archived.id));
     expect(opened).toEqual([]);
     // A later valid open clears the notice.
-    postFromFrame(frame, open(active.id));
+    await postFromFrame(frame, open(active.id));
     expect(opened).toEqual([active.id]);
     expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
   });
@@ -627,13 +624,13 @@ describe("window.xum.openWorkspace", () => {
     const { view, frame } = await renderClickedFrame();
     // A script-only call: no live user activation.
     activation = { isActive: false };
-    postFromFrame(frame, open(active.id));
-    postFromFrame(frame, open("ffffffffff"));
+    await postFromFrame(frame, open(active.id));
+    await postFromFrame(frame, open("ffffffffff"));
     // Activation from typing elsewhere in the app: focus is not in the frame.
     activation = { isActive: true };
     act(() => view.getByTestId("artifacts-panel").focus());
-    postFromFrame(frame, open(active.id));
-    postFromFrame(frame, open("ffffffffff"));
+    await postFromFrame(frame, open(active.id));
+    await postFromFrame(frame, open("ffffffffff"));
     expect(opened).toEqual([]);
     expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
   });
@@ -649,21 +646,22 @@ describe("window.xum.openWorkspace", () => {
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     await waitFor(() => expect(frame.title).toBe(PINNED.path));
     act(() => frame.focus());
-    postFromFrame(frame, open(active.id));
-    postFromFrame(frame, open("ffffffffff"));
+    await postFromFrame(frame, open(active.id));
+    await postFromFrame(frame, open("ffffffffff"));
     expect(opened).toEqual([]);
     expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
   });
 
   test("invalid shapes, other windows and messages over the rate limit never switch", async () => {
     const { view, frame } = await renderClickedFrame();
-    postFromFrame(frame, open(42));
-    postFromFrame(frame, { ...open(active.id), title: "x" });
+    await postFromFrame(frame, open(42));
+    await postFromFrame(frame, { ...open(active.id), title: "x" });
     act(() => {
       window.dispatchEvent(messageEvent(open(active.id), window));
     });
-    for (let i = 0; i < ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND; i++) postFromFrame(frame, "junk");
-    postFromFrame(frame, open(active.id));
+    for (let i = 0; i < ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND; i++)
+      await postFromFrame(frame, "junk");
+    await postFromFrame(frame, open(active.id));
     expect(opened).toEqual([]);
     expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
   });

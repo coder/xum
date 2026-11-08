@@ -1,45 +1,132 @@
 import { useLayoutEffect, useRef } from "react";
+import { FRAME_DOCUMENT_CHECK_DEADLINE_MS } from "@/common/constants/artifactInteractions";
 import assert from "@/common/utils/assert";
-import { createBridgeRateLimiter } from "./artifactBridge";
 
 /**
- * The host channel of one MCP App view document (#6187).
+ * The host channel of one sandboxed frame document: an HTML or SVG artifact
+ * (SandboxedArtifactFrame.tsx, its bridge in artifactBridge.ts) or an MCP App view
+ * (McpAppFrame.tsx, #6187).
  *
  * SECURITY AUDIT: a page the frame navigates to keeps the frame's window, so a gate on
  * `event.source` alone accepts it, and in browser mode nothing blocks the navigation (the
  * desktop app does: subframeNavigation.ts). Messages sent around the navigation are not ordered
  * either: across processes the next page can post before an unload message of the old document
- * arrives. So the host does not talk to the frame's window at all. The view document's preamble
- * creates a MessageChannel and hands one port to the host in its open announcement, before any
- * view script runs. Host and view talk only over that port. The port stays with the document:
- * a page the frame navigates to gets a fresh window object and cannot reach it, and a host
- * message posted after the navigation goes to the old document's port, never to the new page.
- *
- * The preamble makes that port the view's `window.parent`, so views written for the plain
- * window channel keep working: `parent.postMessage(message, "*")` goes over the port, and the
- * host's messages arrive as `message` events whose `source` is `window.parent` (the check the
- * MCP Apps SDK's PostMessageTransport makes). A view that posts to `window.top` instead reaches
- * no host.
+ * arrives. So the host does not talk to the frame's window at all. The document's first script
+ * (frameDocumentScript) creates a MessageChannel and hands one port to the host in its open
+ * announcement, before any artifact or view script runs. Host and document talk only over that
+ * port. The port stays with the document: a page the frame navigates to gets a fresh window
+ * object and cannot reach it, and a host message posted after the navigation goes to the old
+ * document's port, never to the new page.
  *
  * The open announcement carries the host's per-document nonce: an earlier document of the same
- * frame (replaced by a new grant) cannot bind the new document's channel, and only the first
- * open binds it. A view that hands its port to another page gains nothing it did not have.
+ * frame (replaced by new content or a new grant) cannot bind the new document's channel, and
+ * only the first open binds it. A document that hands its port to another page gains nothing it
+ * did not have.
+ *
+ * `check` asks the bound document to answer over its port, which only that document can do. The
+ * navigation guard sends one at every load of the frame (frameNavigationGuard.tsx), so a frame
+ * that holds another document closes without any help from code running in it.
  */
 
-/** Key of the preamble's document announcements (never a JSON-RPC message). */
+/** Key of the document-side announcements and checks (never a bridge or JSON-RPC message). */
 const FRAME_DOCUMENT_MARKER = "xumFrameDocument";
 
-/** A fresh nonce for one view document. getRandomValues also works outside secure contexts. */
+/** Messages above this rate (per frame document, per second) are dropped unparsed. */
+export const ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND = 20;
+
+/**
+ * Fixed-window limiter: allows `maxPerWindow` calls per `windowMs`. Every message from the
+ * frame counts, valid or not, so a flood of junk cannot keep the parser busy.
+ */
+export function createBridgeRateLimiter(
+  maxPerWindow = ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND,
+  windowMs = 1000,
+  now: () => number = Date.now
+): () => boolean {
+  let windowStart = now();
+  let count = 0;
+  return () => {
+    const current = now();
+    if (current - windowStart >= windowMs) {
+      windowStart = current;
+      count = 0;
+    }
+    count += 1;
+    return count <= maxPerWindow;
+  };
+}
+
+/** A fresh random hex value (a document nonce, a check value). Works outside secure contexts. */
 export function newFrameDocumentNonce(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /**
- * Preamble part (mcpAppPreambleScript) that opens the document's channel. It runs before any
- * view script, so no view script holds the real parent window or a listener ahead of it. A
- * `pagehide` (the document unloads: it navigated away) is announced over the port, so the host
- * can close the frame early. That is cleanup only: the port already keeps the next page out.
+ * Frame script (a statement, run first in the artifact bridge and the MCP App preamble, right
+ * after the WebRTC removal) that opens the document's channel. No artifact or view script has
+ * run yet, so none holds the real parent window, the port, or a listener ahead of these.
+ *
+ * It declares `frameDocument`, `{ port, send }`, where `send` is the port's own postMessage.
+ * The port's listener answers the host's checks itself and hands every other host message to
+ * `onHostMessage` (a function expression), so a check never reaches artifact or view code. It
+ * uses addEventListener, so a view that sets `onmessage` on its port (its `window.parent`)
+ * does not remove it.
+ *
+ * `pagehide` (the document unloads) sends `leave`, so the host can close the frame at once.
+ * `document.open()` erases the window's listeners, so `Document.prototype` `open`, `write` and
+ * `writeln` add the listener again after each call, through EventTarget's addEventListener as
+ * it was before any artifact script ran. This is a fast path, not a security control: artifact
+ * code can still keep it from running (a capturing pagehide listener that stops propagation), and
+ * then the host's unanswered check closes the frame.
+ */
+export function frameDocumentScript(nonce: string, onHostMessage: string): string {
+  assert(/^[0-9a-f]+$/.test(nonce), "frame document nonce must be hex");
+  return `var frameDocument = (function (onHostMessage) {
+    var documentParent = window.parent;
+    var channel = new MessageChannel();
+    var port = channel.port1;
+    var send = port.postMessage.bind(port);
+    var addListener = EventTarget.prototype.addEventListener;
+    port.addEventListener("message", function (event) {
+      var data = event.data;
+      if (data && typeof data === "object" && data.${FRAME_DOCUMENT_MARKER} === 1 && data.type === "check") {
+        send({ ${FRAME_DOCUMENT_MARKER}: 1, type: "checked", value: data.value });
+      } else {
+        onHostMessage(data);
+      }
+    });
+    port.start();
+    function announceLeave() {
+      send({ ${FRAME_DOCUMENT_MARKER}: 1, type: "leave" });
+    }
+    function listenForLeave() {
+      addListener.call(window, "pagehide", announceLeave, true);
+    }
+    listenForLeave();
+    ["open", "write", "writeln"].forEach(function (name) {
+      var original = Document.prototype[name];
+      if (typeof original !== "function") return;
+      Document.prototype[name] = function () {
+        try {
+          return original.apply(this, arguments);
+        } finally {
+          listenForLeave();
+        }
+      };
+    });
+    documentParent.postMessage({ ${FRAME_DOCUMENT_MARKER}: 1, type: "open", nonce: "${nonce}" }, "*", [channel.port2]);
+    return { port: port, send: send };
+  })(${onHostMessage});`;
+}
+
+/**
+ * Preamble part (mcpAppPreambleScript) that opens an MCP App view's channel
+ * (frameDocumentScript) and makes its port the view's `window.parent`, so views written for the
+ * plain window channel keep working: `parent.postMessage(message, "*")` goes over the port, and
+ * the host's messages arrive as `message` events whose `source` is `window.parent` (the check
+ * the MCP Apps SDK's PostMessageTransport makes). A view that posts to `window.top` instead
+ * reaches no host.
  *
  * Escape, or Shift+F outside a text field, that the view did not handle (no preventDefault,
  * read once every listener ran) is announced as `exit`:
@@ -48,19 +135,17 @@ export function newFrameDocumentNonce(): string {
  * it, never maximizes.
  */
 export function mcpAppDocumentChannelScript(nonce: string): string {
-  assert(/^[0-9a-f]+$/.test(nonce), "MCP App document nonce must be hex");
   return `(function () {
-    var host = window.parent;
     var MessageEventCtor = window.MessageEvent;
     var dispatch = window.dispatchEvent.bind(window);
-    var channel = new MessageChannel();
-    var port = channel.port1;
-    var send = port.postMessage.bind(port);
+    ${frameDocumentScript(
+      nonce,
+      `function (data) { dispatch(new MessageEventCtor("message", { data: data, source: frameDocument.port })); }`
+    )}
+    var port = frameDocument.port;
+    var send = frameDocument.send;
     // The view calls parent.postMessage(message, "*"): a MessagePort takes no target origin.
     port.postMessage = function (message) { send(message); };
-    port.onmessage = function (event) {
-      dispatch(new MessageEventCtor("message", { data: event.data, source: port }));
-    };
     window.addEventListener("keydown", function (event) {
       // The innermost target: an input inside an open shadow root retargets event.target to
       // its host element.
@@ -77,15 +162,13 @@ export function mcpAppDocumentChannelScript(nonce: string): string {
         if (!event.defaultPrevented) send({ ${FRAME_DOCUMENT_MARKER}: 1, type: "exit" });
       }, 0);
     });
-    window.addEventListener("pagehide", function () {
-      send({ ${FRAME_DOCUMENT_MARKER}: 1, type: "leave" });
-    }, true);
     Object.defineProperty(window, "parent", { value: port, configurable: true, writable: true });
-    host.postMessage({ ${FRAME_DOCUMENT_MARKER}: 1, type: "open", nonce: "${nonce}" }, "*", [channel.port2]);
   })();`;
 }
 
-function isAnnouncement(data: unknown, type: "open" | "leave" | "exit"): boolean {
+type Announcement = "leave" | "exit" | "checked";
+
+function isAnnouncement(data: unknown, type: "open" | Announcement): boolean {
   return (
     typeof data === "object" &&
     data !== null &&
@@ -94,17 +177,11 @@ function isAnnouncement(data: unknown, type: "open" | "leave" | "exit"): boolean
   );
 }
 
-/** Which document-side announcement `data` is, or null for a view message. */
-function announcementOf(data: unknown): "leave" | "exit" | null {
-  if (isAnnouncement(data, "leave")) return "leave";
-  return isAnnouncement(data, "exit") ? "exit" : null;
+/** Which document-side announcement `data` is, or null for a bridge or view message. */
+function announcementOf(data: unknown): Announcement | null {
+  const types: Announcement[] = ["leave", "exit", "checked"];
+  return types.find((type) => isAnnouncement(data, type)) ?? null;
 }
-
-/** What the receiver does for each document-side announcement. */
-const ANNOUNCED: Record<"leave" | "exit", (receiver: FrameDocumentReceiver) => void> = {
-  leave: (receiver) => receiver.leave(),
-  exit: (receiver) => receiver.exit?.(),
-};
 
 /** The port of `event` when it is the open announcement of the document with `nonce`. */
 function openedPort(event: Pick<MessageEvent, "data" | "ports">, nonce: string) {
@@ -117,7 +194,7 @@ export interface FrameDocumentReceiver {
   message: (data: unknown) => void;
   /** The document unloaded (it navigated away). */
   leave: () => void;
-  /** Escape or Shift+F inside the view, which the view did not handle. Only ever restores. */
+  /** Escape or Shift+F inside an MCP App view, which the view did not handle. Only restores. */
   exit?: () => void;
 }
 
@@ -131,6 +208,13 @@ export interface FrameDocumentChannel {
   setReceiver: (receiver: FrameDocumentReceiver | null) => void;
   /** To the document only; dropped before it opened and after close. */
   post: (message: unknown) => void;
+  /**
+   * Asks the bound document to answer a fresh value over its port. `onMissed` runs when
+   * FRAME_DOCUMENT_CHECK_DEADLINE_MS passes, from the first check no answer has cleared, without
+   * an answer to the latest check.
+   */
+  check: (onMissed: () => void) => void;
+  /** Closes the port and stops the deadline. */
   close: () => void;
 }
 
@@ -145,6 +229,9 @@ class DocumentChannel implements FrameDocumentChannel {
   private closed = false;
   private receiver: FrameDocumentReceiver | null = null;
   private readonly allowMessage = createBridgeRateLimiter();
+  // The latest check no answer has cleared, and the deadline the first of them started. An
+  // answer to an older check (sent just before the document died) clears nothing.
+  private pending: { value: string; deadline: ReturnType<typeof setTimeout> } | null = null;
 
   constructor(private readonly nonce: string) {}
 
@@ -165,24 +252,71 @@ class DocumentChannel implements FrameDocumentChannel {
     if (!this.closed) this.port?.postMessage(message);
   };
 
+  check = (onMissed: () => void): void => {
+    if (this.closed) return;
+    assert(this.port != null, "only a bound frame document channel can check its document");
+    const value = newFrameDocumentNonce();
+    // A later load keeps the deadline: a page that reloads itself cannot push it out.
+    const deadline =
+      this.pending?.deadline ??
+      setTimeout(() => {
+        this.pending = null;
+        if (!this.closed) onMissed();
+      }, FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    this.pending = { value, deadline };
+    this.port.postMessage({ [FRAME_DOCUMENT_MARKER]: 1, type: "check", value });
+  };
+
   close = (): void => {
     this.closed = true;
     this.port?.close();
+    if (this.pending != null) clearTimeout(this.pending.deadline);
+    this.pending = null;
   };
 
+  private answered(value: unknown): void {
+    if (this.pending == null || value !== this.pending.value) return;
+    clearTimeout(this.pending.deadline);
+    this.pending = null;
+  }
+
   private receive(data: unknown): void {
-    const receiver = this.closed ? null : this.receiver;
-    if (receiver == null) return;
-    // Announcements are not rate limited: the unload must close the frame even after a burst,
-    // and either one can only close or restore the view's own frame.
+    if (this.closed) return;
+    // Announcements are not rate limited: a burst must neither hide the unload nor leave a check
+    // unanswered, and each one can only close, restore or keep the document's own frame.
     const announced = announcementOf(data);
-    if (announced !== null) ANNOUNCED[announced](receiver);
+    if (announced === "checked") {
+      this.answered((data as { value?: unknown }).value);
+      return;
+    }
+    const receiver = this.receiver;
+    if (receiver == null) return;
+    if (announced === "leave") receiver.leave();
+    else if (announced === "exit") receiver.exit?.();
     else if (this.allowMessage()) receiver.message(data);
   }
 }
 
 export function createFrameDocumentChannel(nonce: string): FrameDocumentChannel {
   return new DocumentChannel(nonce);
+}
+
+/**
+ * The app window's `message` listener that opens `channel`. SECURITY: only an event whose source
+ * is the frame's current window (`frameWindow`, null once the frame left its document) may bind
+ * it, and only its first open announcement with the document's nonce does. `onOpened` runs when
+ * it bound the channel.
+ */
+export function frameDocumentOpenListener(
+  channel: FrameDocumentChannel,
+  frameWindow: () => Window | null | undefined,
+  onOpened: (channel: FrameDocumentChannel) => void
+): (event: MessageEvent) => void {
+  return (event) => {
+    const source = frameWindow();
+    if (source == null || event.source !== source) return;
+    if (channel.acceptOpen(event)) onOpened(channel);
+  };
 }
 
 /**

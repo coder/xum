@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import {
   toWorkspaceSelection,
@@ -19,17 +19,17 @@ import { createArtifactAssetLoader, type ArtifactAssetReader } from "./artifactA
 import {
   ARTIFACT_FRAME_CHORDS,
   ARTIFACT_FRAME_INTERRUPT_KEYS,
-  acceptArtifactFrameMessage,
+  artifactAnnotateModeMessage,
   artifactBackdropColor,
+  artifactThemeMessage,
+  ArtifactFrameToHostMessageSchema,
   buildArtifactBridgeScript,
-  createBridgeRateLimiter,
-  postArtifactAnnotateMode,
-  postArtifactTheme,
   STATUS_PAGE_FRAME_CHORDS,
   type ArtifactAppearance,
   type ArtifactFrameChord,
   type ArtifactFrameInterruptKey,
   type ArtifactFrameToHostMessage,
+  type ArtifactHostToFrameMessage,
   type ArtifactTheme,
 } from "./artifactBridge";
 import { buildArtifactCsp } from "./artifactCsp";
@@ -42,6 +42,13 @@ import {
 } from "./artifactDocument";
 import { pickFromFrameAnnotation, type ArtifactAnnotationPick } from "./artifactAnnotation";
 import type { ArtifactInteractionHandlers, ArtifactSendOrigin } from "./artifactInteractions";
+import {
+  createFrameDocumentChannel,
+  frameDocumentOpenListener,
+  newFrameDocumentNonce,
+  useCloseDiscardedDocumentChannel,
+  type FrameDocumentChannel,
+} from "./frameDocumentChannel";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { Notice, SourceText } from "./SourceText";
 import { readAppStyleVariables } from "./appStyleVariables";
@@ -66,6 +73,8 @@ interface BuiltDocument {
   error: string | null;
   /** The page takes the theme's color scheme (isUnstyledHtmlDocument), so no white backdrop. */
   followsColorScheme: boolean;
+  /** Baked into the srcdoc's bridge: the host binds only this document's open announcement. */
+  nonce: string;
 }
 
 /**
@@ -260,12 +269,103 @@ async function buildFrameDocument(input: {
   }
 }
 
-/** The frame's window while it still shows our srcdoc; null after it navigated away. */
-function liveFrameWindow(
+/**
+ * The host channel (frameDocumentChannel.ts) of the document `built` in the iframe with
+ * `frameKey`. Reload mounts a new iframe, which loads the same srcdoc and nonce into a new
+ * document, so it gets a new channel: the old iframe and its documents are gone. New content
+ * builds a new srcdoc with a new nonce. Null until the first render with a document.
+ */
+function useArtifactFrameChannel(built: BuiltDocument | null, frameKey: number) {
+  const [opened, setOpened] = useState<{
+    built: BuiltDocument;
+    frameKey: number;
+    channel: FrameDocumentChannel;
+  } | null>(null);
+  const matches = opened?.built === built && opened.frameKey === frameKey;
+  if (built != null && !matches) {
+    setOpened({ built, frameKey, channel: createFrameDocumentChannel(built.nonce) });
+  }
+  return built != null && matches ? opened : null;
+}
+
+/**
+ * Sends `message` to the document over its channel; dropped once the frame left the document (and,
+ * by the channel, before the document opened it).
+ */
+function postToFrame(
   navigatedRef: RefObject<boolean>,
-  frameRef: RefObject<HTMLIFrameElement | null>
-): Window | null | undefined {
-  return navigatedRef.current ? null : frameRef.current?.contentWindow;
+  frameChannel: { channel: FrameDocumentChannel } | null,
+  message: ArtifactHostToFrameMessage
+): void {
+  if (!navigatedRef.current) frameChannel?.channel.post(message);
+}
+
+/** The theme mode's palette as the frame applies it (`--xum-*`, appStyleVariables.ts). */
+function themeMessageOf(theme: ArtifactTheme, themeMode: ArtifactAppearance["themeName"]) {
+  return artifactThemeMessage(theme, {
+    themeName: themeMode,
+    variables: readAppStyleVariables("xum"),
+  });
+}
+
+/**
+ * The host side of the bridge to the document `built` in the iframe `frameRef`
+ * (frameDocumentChannel.ts). It binds the document's channel from the open announcement of the
+ * iframe's current window, hands each schema-valid bridge message to `onMessage`, and closes the
+ * frame on the document's leave or a missed check (`guard`, frameNavigationGuard.tsx). It sends
+ * the theme and annotate mode to the document, only over that channel: at the document's first
+ * load and on every change. Returns the iframe's onLoad.
+ */
+function useArtifactFrameBridge(input: {
+  built: BuiltDocument | null;
+  guard: ReturnType<typeof useFrameNavigationGuard>;
+  frameRef: RefObject<HTMLIFrameElement | null>;
+  theme: ArtifactTheme;
+  themeMode: ArtifactAppearance["themeName"];
+  annotating: boolean;
+  onMessage: (message: ArtifactFrameToHostMessage) => void;
+}): () => void {
+  const { built, guard, frameRef, theme, themeMode, annotating, onMessage } = input;
+  const { navigated, navigatedRef, leave, opened } = guard;
+  const frameChannel = useArtifactFrameChannel(built, guard.frameKey);
+  // A layout effect: the listener must be in place before the srcdoc's bridge announces itself.
+  useLayoutEffect(() => {
+    if (frameChannel == null || navigated) return;
+    const { channel } = frameChannel;
+    channel.setReceiver({
+      message: (data) => {
+        const parsed = ArtifactFrameToHostMessageSchema.safeParse(data);
+        if (parsed.success && !navigatedRef.current) onMessage(parsed.data);
+      },
+      leave,
+    });
+    const handler = frameDocumentOpenListener(
+      channel,
+      () => frameRef.current?.contentWindow,
+      opened
+    );
+    window.addEventListener("message", handler);
+    return () => {
+      window.removeEventListener("message", handler);
+      channel.setReceiver(null);
+    };
+  }, [frameChannel, navigated, navigatedRef, leave, opened, frameRef, onMessage]);
+  useCloseDiscardedDocumentChannel(frameChannel, !navigated);
+
+  useEffect(() => {
+    postToFrame(navigatedRef, frameChannel, artifactAnnotateModeMessage(annotating));
+  }, [annotating, frameChannel, navigatedRef]);
+  // Keep the artifact's view of the theme current without reloading it.
+  useEffect(() => {
+    postToFrame(navigatedRef, frameChannel, themeMessageOf(theme, themeMode));
+  }, [theme, themeMode, frameChannel, navigatedRef]);
+
+  return () => {
+    // Only the document's first load posts the host state; the guard checks every load.
+    if (!guard.onLoad()) return;
+    postToFrame(navigatedRef, frameChannel, themeMessageOf(theme, themeMode));
+    if (annotating) postToFrame(navigatedRef, frameChannel, artifactAnnotateModeMessage(true));
+  };
 }
 
 /**
@@ -375,7 +475,6 @@ export function SandboxedArtifactFrame(props: {
     variables: readAppStyleVariables("xum"),
   });
   const [initialAppearance] = useState(currentAppearance);
-  const [allowMessage] = useState(() => createBridgeRateLimiter());
   const [built, setBuilt] = useState<BuiltDocument | null>(null);
   const { openWorkspace, openWorkspaceRefused } = useArtifactWorkspaceOpener();
   const frameRef = useRef<HTMLIFrameElement | null>(null);
@@ -383,8 +482,8 @@ export function SandboxedArtifactFrame(props: {
   const lastClickSendAtRef = useRef<number | null>(null);
   const { kind, content, path, mainPaneInterruptKey } = props;
   const forwardsViewSwitch = mainPaneInterruptKey !== undefined;
-  // SECURITY AUDIT: the persisted state goes into the srcdoc, never through postMessage (which
-  // must target "*" and could reach a page the frame navigated to). So an interactive artifact
+  // SECURITY AUDIT: the persisted state goes into the srcdoc, never through a message, so the
+  // artifact has it before its first script runs (artifactBridge.ts). So an interactive artifact
   // is built only once its state is known; `undefined` means it is still loading.
   const initialState = props.interactions?.initialState;
   const waitingForState = props.interactions != null && initialState === undefined;
@@ -394,18 +493,18 @@ export function SandboxedArtifactFrame(props: {
       ? built
       : null;
   const guard = useFrameNavigationGuard(current?.srcDoc ?? null);
-  const { navigatedRef } = guard;
   // The canvas color the frame last reported (the bridge's backdrop message): undefined until
   // its first report, null when it paints none. It outlives the document that reported it: a
   // rewritten or reloaded page keeps the previous color until it reports its own (the bridge
   // always reports after load), so a dark page is not followed by a flash of frameClassName's
   // white.
   const [backdropColor, setBackdropColor] = useState<string | null | undefined>(undefined);
-  const liveWindow = () => liveFrameWindow(navigatedRef, frameRef);
 
   useEffect(() => {
     if (waitingForState) return;
     let cancelled = false;
+    // Before the build: the nonce goes into the bridge script it bakes in.
+    const nonce = newFrameDocumentNonce();
     buildFrameDocument({
       kind,
       content,
@@ -414,6 +513,7 @@ export function SandboxedArtifactFrame(props: {
       read,
       bridgeScript: (followsColorScheme) =>
         buildArtifactBridgeScript(
+          nonce,
           initialTheme,
           state,
           initialAppearance,
@@ -422,7 +522,7 @@ export function SandboxedArtifactFrame(props: {
         ),
     })
       .then((frameDocument) => {
-        if (!cancelled) setBuilt({ content, allowCdn, state, ...frameDocument });
+        if (!cancelled) setBuilt({ content, allowCdn, state, nonce, ...frameDocument });
       })
       .catch((error: unknown) => {
         console.error("[Artifacts] building the frame document failed:", getErrorMessage(error));
@@ -443,80 +543,59 @@ export function SandboxedArtifactFrame(props: {
     forwardsViewSwitch,
   ]);
 
-  // Bridge, host side: only messages from this frame's window, rate limited, schema-valid.
+  // Bridge, host side: what each bridge message from the document does.
   const onFrameKey = props.onFrameKey;
   const interactions = props.interactions;
   const onAnnotate = props.onAnnotate;
-  useEffect(() => {
-    const handler = (event: MessageEvent) => {
-      const message = acceptArtifactFrameMessage(
-        event,
-        liveFrameWindow(navigatedRef, frameRef),
-        allowMessage
-      );
-      if (message == null) return;
-      switch (message.type) {
-        case "key":
-        case "sidebarKey":
-        case "interruptKey":
-          handleFrameKeyMessage(message, frameRef.current, { onFrameKey, mainPaneInterruptKey });
-          break;
-        case "send":
-          // A live click or key in this frame sends at once, one message per click; any other
-          // send asks in the host's confirm strip.
-          interactions?.requestSend(
-            message.text,
-            message.data,
-            takeFrameSendOrigin(frameRef.current, lastClickSendAtRef)
-          );
-          break;
-        case "setState":
-          interactions?.setState?.(message.state);
-          break;
-        case "openWorkspace": {
-          // Like send/setState, only for interactive artifacts: pinned files and shelf
-          // copies stay read-only. Ignored without a gesture, with no notice, so a script cannot
-          // spam the notice either.
-          if (interactions == null || !hasLiveUserGesture(frameRef.current)) break;
-          openWorkspace(message.workspaceId);
-          break;
-        }
-        case "annotate": {
-          // Only honoured while annotate mode is on, whatever the frame claims.
-          const frame = frameRef.current;
-          if (onAnnotate == null || frame == null) break;
-          onAnnotate(pickFromFrameAnnotation(message, frame.getBoundingClientRect()));
-          break;
-        }
-        case "backdrop":
-          setBackdropColor(artifactBackdropColor(message.color));
-          break;
+  const onMessage = (message: ArtifactFrameToHostMessage) => {
+    switch (message.type) {
+      case "key":
+      case "sidebarKey":
+      case "interruptKey":
+        handleFrameKeyMessage(message, frameRef.current, { onFrameKey, mainPaneInterruptKey });
+        break;
+      case "send":
+        // A live click or key in this frame sends at once, one message per click; any other
+        // send asks in the host's confirm strip.
+        interactions?.requestSend(
+          message.text,
+          message.data,
+          takeFrameSendOrigin(frameRef.current, lastClickSendAtRef)
+        );
+        break;
+      case "setState":
+        interactions?.setState?.(message.state);
+        break;
+      case "openWorkspace": {
+        // Like send/setState, only for interactive artifacts: pinned files and shelf
+        // copies stay read-only. Ignored without a gesture, with no notice, so a script cannot
+        // spam the notice either.
+        if (interactions == null || !hasLiveUserGesture(frameRef.current)) break;
+        openWorkspace(message.workspaceId);
+        break;
       }
-    };
-    window.addEventListener("message", handler);
-    return () => window.removeEventListener("message", handler);
-  }, [
-    allowMessage,
-    onFrameKey,
-    mainPaneInterruptKey,
-    interactions,
-    onAnnotate,
-    navigatedRef,
-    openWorkspace,
-  ]);
-
+      case "annotate": {
+        // Only honoured while annotate mode is on, whatever the frame claims.
+        const frame = frameRef.current;
+        if (onAnnotate == null || frame == null) break;
+        onAnnotate(pickFromFrameAnnotation(message, frame.getBoundingClientRect()));
+        break;
+      }
+      case "backdrop":
+        setBackdropColor(artifactBackdropColor(message.color));
+        break;
+    }
+  };
   const annotating = onAnnotate != null;
-  useEffect(() => {
-    postArtifactAnnotateMode(liveFrameWindow(navigatedRef, frameRef), annotating);
-  }, [annotating, navigatedRef]);
-
-  // Keep the artifact's view of the theme current without reloading it.
-  useEffect(() => {
-    postArtifactTheme(liveFrameWindow(navigatedRef, frameRef), theme, {
-      themeName: themeMode,
-      variables: readAppStyleVariables("xum"),
-    });
-  }, [theme, themeMode, navigatedRef]);
+  const onFrameLoad = useArtifactFrameBridge({
+    built: current,
+    guard,
+    frameRef,
+    theme,
+    themeMode,
+    annotating,
+    onMessage,
+  });
 
   if (current == null) return <Notice>Loading…</Notice>;
   if (current.error != null) return <div className="text-danger p-4 text-xs">{current.error}</div>;
@@ -554,12 +633,7 @@ export function SandboxedArtifactFrame(props: {
         sandbox={ARTIFACT_IFRAME_SANDBOX}
         referrerPolicy="no-referrer"
         srcDoc={current.srcDoc}
-        onLoad={() => {
-          // A second load is the frame navigating away: never re-post into it.
-          if (!guard.onLoad()) return;
-          postArtifactTheme(liveWindow(), theme, currentAppearance());
-          if (annotating) postArtifactAnnotateMode(liveWindow(), true);
-        }}
+        onLoad={onFrameLoad}
         className={frameClassName(current.followsColorScheme, annotating, backdropColor)}
         // SECURITY AUDIT: the frame's script picks this color. It only ever reaches this one CSS
         // property through React's style object, bounded in length, limited to a plain computed

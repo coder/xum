@@ -21,6 +21,7 @@ import {
 } from "./mcpAppCsp";
 import {
   createFrameDocumentChannel,
+  frameDocumentOpenListener,
   type FrameDocumentChannel,
   newFrameDocumentNonce,
   useCloseDiscardedDocumentChannel,
@@ -632,7 +633,7 @@ export function McpAppFrame(props: {
   };
   const documentKey = mcpAppViewDocumentKey(current, grant);
   const guard = useFrameNavigationGuard(documentKey);
-  const { navigatedRef, leave: leaveDocument } = guard;
+  const { navigatedRef, leave: leaveDocument, opened: documentOpened } = guard;
   // The window.openai globals start with this host context (useMcpAppViewDocument), and with
   // this view instance's last widget state (mcpAppWidgetState.ts).
   const viewDocument = useMcpAppViewDocument(documentKey, guard.frameKey, () => ({
@@ -814,10 +815,12 @@ export function McpAppFrame(props: {
       leave: leaveDocument,
       exit: () => runIfSet(latest.current.onExitKey),
     });
-    const handler = (event: MessageEvent) => {
-      const frameWindow = navigatedRef.current ? null : frameRef.current?.contentWindow;
-      if (frameWindow != null && event.source === frameWindow) channel.acceptOpen(event);
-    };
+    // Bound: from now on every load of the frame checks this document (frameNavigationGuard).
+    const handler = frameDocumentOpenListener(
+      channel,
+      () => (navigatedRef.current ? null : frameRef.current?.contentWindow),
+      documentOpened
+    );
     window.addEventListener("message", handler);
     return () => {
       window.removeEventListener("message", handler);
@@ -974,7 +977,7 @@ export function McpAppFrame(props: {
             }
             style={{ height: height ?? (inline ? INLINE_INITIAL_HEIGHT : "100%") }}
             data-testid="mcp-app-frame"
-            // A second load means the view navigated itself away (frameNavigationGuard.tsx).
+            // Each load checks that the frame still holds the view (frameNavigationGuard.tsx).
             onLoad={() => guard.onLoad()}
           />
         )}

@@ -29,6 +29,7 @@ import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { CanvasArtifact } from "./CanvasArtifact";
 import { McpAppFrame } from "./McpAppFrame";
 import type { McpAppViewRef } from "./mcpAppViewsStore";
+import { frameDocumentOf, postFromFrameDocument } from "./frameDocument.testHarness";
 
 /*
  * A dropped backend connection: while it is down, useAPI() returns `api: null`; the reconnect
@@ -187,14 +188,8 @@ function expectSameFrame(current: HTMLElement | null, frame: HTMLIFrameElement) 
   );
 }
 
-function postFromFrame(frame: HTMLIFrameElement, data: unknown) {
-  const event = new window.Event("message");
-  Object.defineProperty(event, "data", { value: data });
-  Object.defineProperty(event, "source", { value: frame.contentWindow });
-  act(() => {
-    window.dispatchEvent(event);
-  });
-}
+/** Deliver a bridge message as the artifact frame's document sends it: over its own port. */
+const postFromFrame = postFromFrameDocument;
 
 // Every case runs with the provider of today (null-gap) and after the switch (kept-gap).
 describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", (mode) => {
@@ -238,13 +233,13 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     await settle();
     const srcdoc = frame.getAttribute("srcdoc");
     const statesRead = getStateCalls;
-    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
+    await postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
     await waitFor(() => expect(savedStates).toEqual([{ step: 2 }]));
 
     await dropConnection();
     expectSameFrame(view.queryByTestId("artifact-frame"), frame);
     expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
-    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 3 } });
+    await postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 3 } });
 
     await reconnect();
     await waitFor(() => expect(savedStates).toEqual([{ step: 2 }, { step: 3 }]));
@@ -316,10 +311,8 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
       wrapper: ConnectionWrapper,
     });
     const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
-    const posted: Array<{ method?: string }> = [];
-    frame.contentWindow!.postMessage = ((message: { method?: string }) => {
-      posted.push(message);
-    }) as Window["postMessage"];
+    // Everything the host sends the view's document, over its port.
+    const posted = frameDocumentOf(frame).received as Array<{ method?: string }>;
 
     await dropConnection();
     harness.reconnect();
@@ -376,7 +369,11 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     await settle();
     await dropConnection();
-    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { marker: "zq-offline" } });
+    await postFromFrame(frame, {
+      xumArtifact: 1,
+      type: "setState",
+      state: { marker: "zq-offline" },
+    });
     // A tab switch unmounts the panel before the connection is back.
     view.unmount();
     expect(savedStates).toEqual([]);
@@ -397,7 +394,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     await settle();
-    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship" });
+    await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship" });
     const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
     await waitFor(() => expect(sendButton.disabled).toBe(false), {
       timeout: CONFIRM_ARM_DELAY_MS + 1000,

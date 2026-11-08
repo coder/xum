@@ -936,15 +936,14 @@ export const HashRouterStaysOpen: Story = {
     await waitFor(() => expect(routeEvents).toContain("ready"));
     frame.contentWindow?.postMessage({ xumRouteTest: "go" }, "*");
     const notice = () => canvas.queryByText(/This artifact navigated away/);
+    const loadedAfterBack = () => {
+      const back = routeEvents.indexOf("back");
+      return back !== -1 && routeEvents.includes("load", back);
+    };
     // The load that follows history.back(), or the notice that closed the frame before it.
-    await waitFor(
-      () => {
-        const back = routeEvents.indexOf("back");
-        const loadAfterBack = back !== -1 && routeEvents.indexOf("load", back) !== -1;
-        expect(loadAfterBack || notice() != null).toBe(true);
-      },
-      { timeout: 10000 }
-    );
+    await waitFor(() => expect(loadedAfterBack() || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
     frame.contentWindow?.postMessage({ xumRouteTest: "save" }, "*");
     await waitFor(() => expect(routeStates.length > 0 || notice() != null).toBe(true), {
       timeout: 10000,

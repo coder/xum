@@ -7,7 +7,7 @@ import {
   MCP_APP_TOOL_CALLS_PER_WINDOW,
 } from "@/common/utils/mcpApps";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
-import { createBridgeRateLimiter } from "./artifactBridge";
+import { createBridgeRateLimiter } from "./frameDocumentChannel";
 import type { GrantedMcpAppCsp } from "./mcpAppCsp";
 
 /**

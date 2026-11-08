@@ -1,7 +1,7 @@
 // Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
 import "../../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test, vi } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -9,10 +9,17 @@ import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connectio
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import { advanceClock } from "@/browser/testFakeClock";
+import { FRAME_DOCUMENT_CHECK_DEADLINE_MS } from "@/common/constants/artifactInteractions";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import assert from "@/common/utils/assert";
 import type { McpAppView, McpAppViewDomains } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
+import {
+  bootFrameDocument,
+  postFromFrameWindow,
+  runFrameScript,
+} from "./frameDocument.testHarness";
 import { McpAppFrame } from "./McpAppFrame";
 import {
   markMcpAppViewHosted,
@@ -155,17 +162,6 @@ function Wrapper(props: { children: ReactNode }) {
   );
 }
 
-/** Post from the frame's window to the app window: what a page the view navigated to can do. */
-function postFromFrameWindow(frame: HTMLIFrameElement, data: unknown, ports: unknown[] = []) {
-  const event = new window.Event("message");
-  Object.defineProperty(event, "data", { value: data });
-  Object.defineProperty(event, "source", { value: frame.contentWindow });
-  Object.defineProperty(event, "ports", { value: ports });
-  act(() => {
-    window.dispatchEvent(event);
-  });
-}
-
 /** A view document run from the frame's srcdoc (its real preamble), by frame. */
 interface BootedDocument {
   /** The view's `window.parent`: the document's port to the host. */
@@ -174,6 +170,8 @@ interface BootedDocument {
   listeners: Array<(message: Posted) => void>;
   /** Fire a window event (e.g. pagehide) in the document. */
   dispatch: (type: string) => void;
+  /** The document goes away without a word: it answers no check (frameDocument.testHarness). */
+  kill: () => void;
 }
 const bootedDocuments = new WeakMap<HTMLIFrameElement, BootedDocument>();
 
@@ -242,35 +240,17 @@ async function pressAllow(button: HTMLElement) {
  * opens the document's channel: its open announcement reaches the app from the frame's window.
  */
 function bootDocument(frame: HTMLIFrameElement): BootedDocument {
-  const doc = new window.DOMParser().parseFromString(frame.getAttribute("srcdoc")!, "text/html");
-  const preamble = doc.querySelector("script")?.textContent ?? "";
-  const handlers: Array<{ type: string; listener: () => void }> = [];
+  const document = bootFrameDocument(frame);
   const listeners: BootedDocument["listeners"] = [];
-  const documentWindow: Record<string, unknown> = {
-    parent: {
-      postMessage: (data: unknown, _origin: string, ports: unknown[] = []) =>
-        postFromFrameWindow(frame, data, ports),
-    },
-    MessageEvent: class {
-      constructor(
-        readonly type: string,
-        readonly init: { data: Posted }
-      ) {}
-    },
-    dispatchEvent: (event: { init: { data: Posted } }) => {
-      for (const listener of listeners) listener(event.init.data);
-      return true;
-    },
-    addEventListener: (type: string, listener: () => void) => handlers.push({ type, listener }),
-  };
-  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
-  (new Function("window", preamble) as (window: unknown) => void)(documentWindow);
+  document.win.addEventListener("message", (event) => {
+    const data = (event as unknown as { data: Posted }).data;
+    for (const listener of listeners) listener(data);
+  });
   const booted: BootedDocument = {
-    parent: documentWindow.parent as BootedDocument["parent"],
+    parent: document.win.parent as unknown as BootedDocument["parent"],
     listeners,
-    dispatch: (type) => {
-      for (const entry of handlers) if (entry.type === type) entry.listener();
-    },
+    dispatch: document.dispatch,
+    kill: document.kill,
   };
   bootedDocuments.set(frame, booted);
   return booted;
@@ -874,18 +854,11 @@ describe("McpAppFrame", () => {
       fetch: () => undefined,
       // The preamble also installs the in-page link handler and opens the host channel.
       addEventListener: () => undefined,
-      parent: { postMessage: () => undefined },
       dispatchEvent: () => true,
     };
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
-    const run = new Function("window", firstScript) as (window: unknown) => void;
-    run(fakeWindow);
-    expect(Object.keys(fakeWindow)).toEqual([
-      "fetch",
-      "addEventListener",
-      "parent",
-      "dispatchEvent",
-    ]);
+    runFrameScript(firstScript, { window: fakeWindow, document: {}, CustomEvent: class {} });
+    expect(Object.keys(fakeWindow).filter((name) => name.includes("RTC"))).toEqual([]);
+    expect(typeof fakeWindow.fetch).toBe("function");
   });
 
   test("the view mounts in desktop and browser mode and is told which platform it is on", async () => {
@@ -913,10 +886,35 @@ describe("McpAppFrame", () => {
     }
   });
 
-  test("a view that navigates away loses its host", async () => {
+  // WebKit fires the iframe's load for location.hash, both engines for history.back() and
+  // document.open(): the view's document stays, answers the host's check and keeps its host.
+  test("a view stays mounted with its host across loads of its own document", async () => {
     const { view, frame, posted } = await renderFrame();
-    fireEvent.load(frame);
-    fireEvent.load(frame);
+    vi.useFakeTimers();
+    try {
+      fireEvent.load(frame);
+      fireEvent.load(frame);
+      await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(view.queryByText(/This artifact navigated away/) == null).toBe(true);
+    postFromView(frame, { jsonrpc: "2.0", id: 8, method: "ping" });
+    await waitFor(() => expect(posted.some((m) => m.id === 8)).toBe(true));
+  });
+
+  // A view that lost its pagehide listener (F2: document.open() erased it before the preamble
+  // re-adds it, or the view blocked it), then navigated: no leave, and no answer to the check.
+  test("a view that navigates away without a leave loses its host at the check deadline", async () => {
+    const { view, frame, posted, document } = await renderFrame();
+    document.kill();
+    vi.useFakeTimers();
+    try {
+      fireEvent.load(frame);
+      await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    } finally {
+      vi.useRealTimers();
+    }
     expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
     expect(view.queryByTestId("mcp-app-frame")).toBeNull();
     postFromView(frame, { jsonrpc: "2.0", id: 9, method: "ping" });
