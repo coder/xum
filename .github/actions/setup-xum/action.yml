@@ -5,6 +5,10 @@ inputs:
     description: "Skip Electron and electron-builder caches (for test-only jobs)"
     required: false
     default: "false"
+  electron-zip:
+    description: "Cache the Electron zip that jobs launching Electron download, and fetch it with retries on a cache miss"
+    required: false
+    default: "false"
 runs:
   using: "composite"
   steps:
@@ -114,3 +118,51 @@ runs:
         key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-builder-
+
+    # The zip that node_modules/electron/install.js downloads from github.com on the first
+    # launch (bun skips Electron's postinstall, so nothing downloads it earlier). The caches
+    # above never held it for E2E and Stories: they key on the lockfiles alone, and a new key
+    # is saved by whichever job misses first, with the stale zips its restore-keys prefix
+    # restored (Linux held 44.5.1 and 40.9.3 only), or hold the zip flat in the cache root
+    # (macOS), where @electron/get does not look. So every E2E and Stories job downloaded it,
+    # and a 504 from github.com failed them on three PRs on 2026-11-08.
+    # This cache has one purpose: the current zip, in a directory of its own that
+    # electron_config_cache points @electron/get at. The key hashes checksums.json, so a new
+    # Electron version or checksum starts a fresh cache, and there is no restore-keys fallback
+    # to bring old zips back. On a miss the zip is downloaded here, retrying for 15 minutes,
+    # and the cache action saves it when the job ends.
+    - name: Point Electron downloads at their own cache
+      if: ${{ inputs.electron-zip == 'true' }}
+      shell: bash
+      run: echo "electron_config_cache=$HOME/.cache/xum-electron-zip" >> "$GITHUB_ENV"
+
+    - name: Cache Electron zip
+      if: ${{ inputs.electron-zip == 'true' }}
+      id: cache-electron-zip
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ env.electron_config_cache }}
+        key: ${{ runner.os }}-${{ runner.arch }}-electron-zip-${{ hashFiles('node_modules/electron/checksums.json') }}
+
+    # Zip only: install.js would also unpack 280 MB into node_modules/electron/dist, and the
+    # node_modules cache would then save it. The launch step unpacks from this cache without
+    # the network. The options mirror install.js: the zip is checked against checksums.json.
+    - name: Download Electron zip
+      if: ${{ inputs.electron-zip == 'true' && steps.cache-electron-zip.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: |
+        ./scripts/ci/retry.sh 900 node -e '
+          const { createRequire } = require("node:module");
+          const electron = createRequire(`${process.cwd()}/node_modules/electron/`);
+          electron("@electron/get").downloadArtifact({
+            version: electron("./package.json").version,
+            artifactName: "electron",
+            cacheRoot: process.env.electron_config_cache,
+            checksums: electron("./checksums.json"),
+            platform: process.platform,
+            arch: process.arch,
+          }).then((zip) => console.log(`Electron zip ready: ${zip}`), (err) => {
+            console.error(err.message);
+            process.exit(1);
+          });
+        '
