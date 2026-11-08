@@ -1181,6 +1181,17 @@ const config: TestRunnerConfig = {
     const initialOrder = await tabs.evaluateAll((elements) => elements.map((el) => el.id));
     try {
       await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+      // A swipe has settled at the first scrollend after its touchEnd (`data-swipe-ended` marks
+      // that point), not at any scrollend: Playwright's scroll-into-view before a click and the
+      // previous swipe's fling also end with one, and a fast runner can have the swipe already
+      // listening by then. Counting that event started the next swipe, and in the end the tap on
+      // the last tab, during a fling. A touch that lands on a fling only stops it and sends no
+      // click, so the tab stayed unselected and the wait for it timed out.
+      await row.evaluate((el) => {
+        el.addEventListener("scrollend", () => {
+          if (el.hasAttribute("data-swipe-ended")) el.setAttribute("data-scroll-settled", "");
+        });
+      });
       for (const width of [1200, 375]) {
         // A visible-sidebar tablet and a phone viewport, both with a narrow overflowing strip.
         await page.setViewportSize({ width, height: 900 });
@@ -1212,10 +1223,8 @@ const config: TestRunnerConfig = {
             throw new Error("No tab label available to swipe");
           });
           await row.evaluate((el) => {
+            el.removeAttribute("data-swipe-ended");
             el.removeAttribute("data-scroll-settled");
-            el.addEventListener("scrollend", () => el.setAttribute("data-scroll-settled", ""), {
-              once: true,
-            });
           });
           await client.send("Input.dispatchTouchEvent", {
             type: "touchStart",
@@ -1230,6 +1239,8 @@ const config: TestRunnerConfig = {
               () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
             );
           }
+          // Arm before the touch ends: a scrollend that comes right as the finger lifts counts.
+          await row.evaluate((el) => el.setAttribute("data-swipe-ended", ""));
           await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
           await row.and(page.locator("[data-scroll-settled]")).waitFor({ timeout: 5000 });
           // The tap below lands 20 px into the last tab's visible part: on a phone, a long title

@@ -1768,7 +1768,10 @@ describe("ArtifactsPanel", () => {
     expect(document.activeElement).toBe(menu);
 
     act(() => menu.remove());
-    await waitFor(() => expect(document.activeElement).toBe(dialog));
+    // Focus comes back on a later tick, so the first poll always fails. Compare with `===`: a
+    // failing `toBe` on happy-dom nodes formats their whole window graph (190 MB, 2-3 s here),
+    // which used most of the test's 5 s timeout in that one early failure.
+    await waitFor(() => expect(document.activeElement === dialog).toBe(true));
   });
 
   // E.g. a phone rotated back to portrait after the full-screen sidebar closed: the sidebar
