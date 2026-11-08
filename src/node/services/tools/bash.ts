@@ -554,8 +554,16 @@ function validateScript(script: string, config: ToolConfiguration): BashToolResu
 // Probed on macOS: these hang until the timeout; nano, less, more, man and ed exit at once, so
 // they are not listed.
 const INTERACTIVE_TUI_PROGRAMS = new Set(["vi", "vim", "view", "vimdiff", "nvim", "top", "htop"]);
+// A path names one of those programs only in a system bin directory: a project's own `./top`
+// or `bin/view` can be anything.
+const SYSTEM_BIN_DIRS = new Set(["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]);
 // Pipes, redirects, lists, subshells and expansions make the script more than a bare TUI launch.
 const SHELL_COMPOSITION_CHARS = /[|&;<>()$`\n]/;
+
+function isInteractiveTuiProgram(program: string): boolean {
+  if (!INTERACTIVE_TUI_PROGRAMS.has(path.posix.basename(program))) return false;
+  return !program.includes("/") || SYSTEM_BIN_DIRS.has(path.posix.dirname(program));
+}
 
 /**
  * Models that mistake bash for another tool send `view <file>` (Vim) and wait the whole
@@ -566,7 +574,7 @@ function rejectInteractiveTui(script: string): BashToolResult | null {
   const trimmed = script.trim();
   if (SHELL_COMPOSITION_CHARS.test(trimmed)) return null;
   const [program, ...args] = trimmed.split(/\s+/);
-  if (!INTERACTIVE_TUI_PROGRAMS.has(path.posix.basename(program))) return null;
+  if (!isInteractiveTuiProgram(program)) return null;
   if (args.some((arg) => arg.startsWith("-") || arg.startsWith("+"))) return null;
   return {
     success: false,

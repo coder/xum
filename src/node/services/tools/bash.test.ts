@@ -1464,20 +1464,26 @@ describe("bash tool", () => {
       }
     );
 
-    it.each(["top -l 1", "vim -es -c q file", "vim +q file", "top | head", "view < f", "nano f"])(
-      "still runs %s",
-      async (script) => {
-        using testEnv = createSpiedBashTool();
+    it.each([
+      "top -l 1",
+      "vim -es -c q file",
+      "vim +q file",
+      "top | head",
+      "view < f",
+      "nano f",
+      "./top",
+      "bin/view notes.md",
+    ])("still runs %s", async (script) => {
+      using testEnv = createSpiedBashTool();
 
-        const result = (await testEnv.tool.execute!(
-          { script, run_in_background: false, display_name: "test" },
-          mockToolCallOptions
-        )) as BashToolResult;
+      const result = (await testEnv.tool.execute!(
+        { script, run_in_background: false, display_name: "test" },
+        mockToolCallOptions
+      )) as BashToolResult;
 
-        expect(testEnv.exec).toHaveBeenCalledTimes(1);
-        expect(result.success).toBe(true);
-      }
-    );
+      expect(testEnv.exec).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+    });
   });
 
   describe("script sanitization", () => {

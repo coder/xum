@@ -90,20 +90,39 @@ function replayedErrorText(output: ToolResultPart["output"]): string | undefined
   return failed.success ? failed.data.error : undefined;
 }
 
-function collectRejectedToolCallIds(messages: readonly ModelMessage[]): Set<string> {
-  const rejected = new Set<string>();
-  for (const message of messages) {
-    if (message.role !== "tool") continue;
-    for (const part of message.content) {
-      if (
-        part.type === "tool-result" &&
-        replayedErrorText(part.output)?.startsWith(invalidToolInputPrefix(part.toolName)) === true
-      ) {
-        rejected.add(part.toolCallId);
-      }
+/**
+ * The IDs to blank per assistant message index. A rejection pairs with the latest earlier call
+ * of its ID, not with every call of it: providers may reuse IDs across turns (OpenAI-compatible
+ * servers that number calls per response), and a call that ran must keep its input.
+ */
+function findRejectedToolCalls(messages: readonly ModelMessage[]): Map<number, Set<string>> {
+  const latestCallMessage = new Map<string, number>();
+  const rejected = new Map<number, Set<string>>();
+  messages.forEach((message, index) => {
+    for (const id of toolCallIds(message)) latestCallMessage.set(id, index);
+    for (const id of rejectedToolResultIds(message)) {
+      const callIndex = latestCallMessage.get(id);
+      if (callIndex === undefined) continue;
+      rejected.set(callIndex, (rejected.get(callIndex) ?? new Set<string>()).add(id));
     }
-  }
+  });
   return rejected;
+}
+
+function toolCallIds(message: ModelMessage): string[] {
+  if (message.role !== "assistant" || typeof message.content === "string") return [];
+  return message.content.flatMap((part) => (part.type === "tool-call" ? [part.toolCallId] : []));
+}
+
+/** IDs of the message's tool-results that are invalid-input errors. */
+function rejectedToolResultIds(message: ModelMessage): string[] {
+  if (message.role !== "tool") return [];
+  return message.content.flatMap((part) =>
+    part.type === "tool-result" &&
+    replayedErrorText(part.output)?.startsWith(invalidToolInputPrefix(part.toolName)) === true
+      ? [part.toolCallId]
+      : []
+  );
 }
 
 /**
@@ -115,9 +134,12 @@ function collectRejectedToolCallIds(messages: readonly ModelMessage[]): Set<stri
  * (and message objects) when nothing changes, keeping the prompt prefix stable across steps.
  */
 export function blankInvalidToolCallInputs(messages: ModelMessage[]): ModelMessage[] {
-  const rejected = collectRejectedToolCallIds(messages);
+  const rejected = findRejectedToolCalls(messages);
   if (rejected.size === 0) return messages;
-  const result = messages.map((message) => blankRejectedToolCalls(message, rejected));
+  const result = messages.map((message, index) => {
+    const ids = rejected.get(index);
+    return ids === undefined ? message : blankRejectedToolCalls(message, ids);
+  });
   return result.some((message, index) => message !== messages[index]) ? result : messages;
 }
 

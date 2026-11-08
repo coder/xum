@@ -199,6 +199,24 @@ describe("blankInvalidToolCallInputs", () => {
     expect(blankInvalidToolCallInputs(blanked)).toBe(blanked);
   });
 
+  test("blanks only the rejected call when a provider reuses its ID in another turn", () => {
+    const ran = conversation([
+      { id: "call_0", output: { type: "json", value: { success: true, output: "ok" } } },
+    ]);
+    const rejected = conversation([
+      { id: "call_0", output: { type: "error-text", value: schemaRejection } },
+    ]);
+    const callInputs = (messages: ModelMessage[]) =>
+      blankInvalidToolCallInputs(messages).flatMap((message) =>
+        message.role === "assistant" && typeof message.content !== "string"
+          ? message.content.flatMap((part) => (part.type === "tool-call" ? [part.input] : []))
+          : []
+      );
+
+    expect(callInputs([...ran, ...rejected])).toEqual([rejectedInput, {}]);
+    expect(callInputs([...rejected, ...ran])).toEqual([{}, rejectedInput]);
+  });
+
   test("returns the same array when no call was rejected", () => {
     const messages = conversation([
       { id: "ran", output: { type: "json", value: { success: true, output: "ok" } } },
