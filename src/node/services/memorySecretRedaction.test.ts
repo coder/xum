@@ -565,8 +565,8 @@ describe("redactSecretLike", () => {
   // The check is growth, not a wall-clock bound. A linear scan takes twice the CPU time for twice
   // the text, and a quadratic one four times. The cost per character is not constant: in Bun 1.4.3
   // a scan of one long backslash run costs about 4 nanoseconds a character up to 30 KB and about
-  // 1 microsecond a character past 40 to 75 KB (the step falls at a different size for each shape),
-  // so one 100 KB scan takes 50 to 120 ms of CPU and still grows linearly. A fixed 100 ms bound
+  // 0.5 to 1 microsecond a character past 40 to 75 KB (the step falls at a different size for each
+  // shape), so five shapes take 50 to 120 ms of CPU at 100 KB and still grow linearly. A fixed 100 ms bound
   // failed on that, with no load. So each scan runs on the text at 100 KB and at 200 KB, both past
   // the step, and the check uses CPU time, which a busy host inflates much less than wall time.
   // The second scan must cost under 3 times the first (a floor keeps timer noise out of the ratio
