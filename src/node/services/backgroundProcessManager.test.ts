@@ -761,11 +761,14 @@ describe("BackgroundProcessManager", () => {
     });
 
     it("stops monitoring after maxEvents without killing the process", async () => {
-      const eventPromise = waitForMonitorMatch(manager);
+      // spawn() resolves only after it releases its name lock, and the monitor's first poll can
+      // run before that. A script that prints at once can match and retire the monitor (maxEvents)
+      // before the assert below, so the script waits for a gate file the test writes after it.
+      const gate = path.join(bgOutputDir, "start-printing");
       const result = await manager.spawn(
         runtime,
         testWorkspaceId,
-        "for i in 1 2 3; do echo ERR$i; sleep 0.05; done; sleep 2",
+        `while [ ! -e '${gate}' ]; do sleep 0.02; done; for i in 1 2 3; do echo ERR$i; sleep 0.05; done; sleep 2`,
         {
           cwd: process.cwd(),
           displayName: "monitor-max-events",
@@ -786,6 +789,8 @@ describe("BackgroundProcessManager", () => {
       expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(1);
       expect(manager.getActiveMonitorCount(testWorkspaceId2)).toBe(0);
 
+      const eventPromise = waitForMonitorMatch(manager);
+      await fs.writeFile(gate, "");
       const event = await eventPromise;
       expect(event.payload.lines).toEqual(["ERR1"]);
       expect(event.payload.totalMatches).toBe(1);
@@ -1722,7 +1727,7 @@ describe("BackgroundProcessManager", () => {
       // A filtered task_await / bash_output read advances outputBytesRead past every complete line
       // but returns only lines matching its own filter. A pending monitor match for "ERR" must still
       // wake on natural exit: the error line was never shown to the agent.
-      const eventPromise = waitForMonitorMatch(manager);
+      const eventPromise = waitForMonitorMatch(manager, 6_000);
 
       const result = await manager.spawn(
         runtime,
@@ -1772,7 +1777,7 @@ describe("BackgroundProcessManager", () => {
       expect(event.payload.lines[0]).toBe("ERR boom");
       expect(event.payload.matchedThroughOffset).toBeDefined();
       expect(event.payload.terminal?.status).toBe("exited");
-    });
+    }, 15_000);
 
     it(
       "does not advance the shown frontier across lines a prior filtered read consumed",
@@ -3715,7 +3720,9 @@ describe("BackgroundProcessManager", () => {
           text += read.output;
           if (!read.note?.includes("continues the current line")) text += "\n";
           // At most the read window of raw bytes stays in memory (decoded: no more UTF-16 units).
-          const retained = (await manager.getProcess(processId))?.incompleteLineBuffer ?? "";
+          // peekProcess: getProcess would also probe the exit marker, one more exec per page on a
+          // remote runtime, and this check only reads a field of the tracked process.
+          const retained = manager.peekProcess(processId)?.incompleteLineBuffer ?? "";
           expect(retained.length).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES + 3);
           if (read.note?.includes("more bytes are unread")) continue;
           // Paging is not polling: the last read gets no polling advice.
@@ -3814,6 +3821,8 @@ describe("BackgroundProcessManager", () => {
           }
         });
 
+        // The drain makes about 170 shell execs (each read on a remote runtime runs a few): about a
+        // second alone and several times that on a busy host, so this test has its own timeout.
         it("reads a large remote log once, and its pages rebuild it exactly", async () => {
           const tailReads = { calls: 0, bytes: 0 };
           const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), { tailReads });
@@ -3824,7 +3833,7 @@ describe("BackgroundProcessManager", () => {
           // What tail sent back: each byte about once (plus a few to finish a character per read).
           expect(tailReads.bytes).toBeGreaterThanOrEqual(raw.length);
           expect(tailReads.bytes).toBeLessThan(raw.length * 1.05);
-        });
+        }, 60_000);
 
         // A line longer than the read window is decided on its head, and its tail, which
         // matches differently, follows that decision; the note says so. A line that fits in the
@@ -3863,7 +3872,8 @@ describe("BackgroundProcessManager", () => {
         });
 
         // A sparse filter over a remote log far larger than the window: one call scans it all
-        // in a few large reads, instead of returning one empty window per call.
+        // in a few large reads, instead of returning one empty window per call. It moves 4 MB
+        // through a remote runtime's exec streams, so it has its own timeout.
         it("scans a large remote log for a sparse filter in one call", async () => {
           const tailReads = { calls: 0, bytes: 0 };
           const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), { tailReads });
@@ -3883,7 +3893,7 @@ describe("BackgroundProcessManager", () => {
           // Each byte once, plus at most 3 per read to finish a character.
           expect(tailReads.bytes).toBeGreaterThanOrEqual(raw.length);
           expect(tailReads.bytes).toBeLessThanOrEqual(raw.length + 3 * tailReads.calls);
-        });
+        }, 30_000);
 
         // Blank lines are kept by filter_exclude: while it waits for a line that is not blank,
         // they stay in the window and come back with that line, as when a read held the whole log.
@@ -5083,15 +5093,14 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // Wait for process to exit
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       const output = await manager.getOutput(result.processId, undefined, undefined, 0.5);
       expect(output.success).toBe(true);
       if (!output.success) return;
       expect(output.output).toContain("no newline at end");
       expect(output.status).not.toBe("running");
-    });
+    }, 15_000);
   });
 
   describe("polling detection", () => {
