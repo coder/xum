@@ -95,8 +95,8 @@ export const DiagramPaintsOutsideItsBox: Story = {
       <div style={{ width: 600 }}>
         <div className="mermaid-container" style={{ overflow: "visible", contain: "none" }}>
           <svg width={240} height={80} style={{ width: 240, height: 80, overflow: "visible" }}>
-            <rect width={240} height={80} fill="#4f46e5" />
-            <rect y={200} width={240} height={40} fill="#e11d48" />
+            <rect width={240} height={80} style={{ fill: "var(--color-accent)" }} />
+            <rect y={200} width={240} height={40} style={{ fill: "var(--color-danger)" }} />
           </svg>
         </div>
         <p>{TEXT_AFTER}</p>
