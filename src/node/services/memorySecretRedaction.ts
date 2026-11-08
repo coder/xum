@@ -118,10 +118,11 @@ const COOKIE_KEY_QUOTE = String.raw`(?:\\{0,${ESCAPE_RUN_MAX}}["'])`;
 const COOKIE_HEADER_PATTERN = new RegExp(
   String.raw`(${COOKIE_NAME}(?<=${COOKIE_CONTEXT}${COOKIE_NAME})${COOKIE_KEY_QUOTE}?[ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})` +
     // A marker read back (`[redacted]`) is read to the end of the header like any value, so what
-    // follows it is judged too (`redactCookieValue`). A list (`[...]`, read to its `]`) only follows
-    // a quoted key (`"set-cookie": [...]`), whose items are quoted: after a bare header name a `[`
-    // is part of the value (Go's `Cookie:[a=b]`), read to the end of the header like any other.
-    String.raw`(?:\[redacted\](?:[^\r\n"'\\]+|\\+(?![nr"']))*|(?<=["'][ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})\[[^\]]*\]?|(${COOKIE_KEY_QUOTE}?)(?:[^\r\n"'\\]+|\\+(?![nr"']))*)`,
+    // follows it is judged too (`redactCookieValue`). A list (`[...]`, read to its `]`) follows a
+    // quoted key (`"set-cookie": [...]`), or a bare name when its first item is quoted
+    // (`Set-Cookie: ["a=b"]`, raw or JSON-escaped): a body would stop at that quote. Any other `[`
+    // after a bare name is part of the value (Go's `Cookie:[a=b]`), read to the end of the header.
+    String.raw`(?:\[redacted\](?:[^\r\n"'\\]+|\\+(?![nr"']))*|(?:(?<=["'][ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})|(?=\[[ \t]{0,${GAP_MAX}}${COOKIE_KEY_QUOTE}))\[[^\]]*\]?|(${COOKIE_KEY_QUOTE}?)(?:[^\r\n"'\\]+|\\+(?![nr"']))*)`,
   "gi"
 );
 

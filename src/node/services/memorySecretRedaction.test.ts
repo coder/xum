@@ -444,6 +444,12 @@ describe("redactSecretLike", () => {
       ],
       ["an empty list before a pair", `Cookie: [] sid=${SESSION}`, "Cookie: [redacted]"],
       ["a bracketed word before a pair", `Cookie: [x]; sid=${SESSION}`, "Cookie: [redacted]"],
+      ["a list after a bare name", `Set-Cookie: ["sid=${SESSION}"]`, "Set-Cookie: [redacted]"],
+      [
+        "a list after a bare name in JSON text",
+        jsonOf({ stdout: `Set-Cookie: ["sid=${SESSION}", "a=b"]\nVary: Cookie` }),
+        String.raw`{"stdout":"Set-Cookie: [redacted]\nVary: Cookie"}`,
+      ],
     ])("redacts a cookie pair in %s", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
