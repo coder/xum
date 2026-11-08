@@ -12,10 +12,20 @@ import type {
 } from "@/common/orpc/schemas/backup";
 import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
-/** The plugins this machine lacks, as the entries a reinstall offers (the status is spent). */
-function missingPlugins(report: BackupPluginReport): BackupPluginEntry[] {
+/**
+ * SECURITY: a review previews only https sources. The list is repository-controlled, and a
+ * preview of an ssh or scp source makes git sign in with the user's SSH agent to whatever host
+ * the list names, before any consent to that plugin. A remote marketplace follows the same rule
+ * (assertMarketplaceMayName). The user adds such a plugin by hand in Settings → Plugins.
+ */
+function isAddedByHand(row: BackupPluginRow): boolean {
+  return row.status === "missing" && !row.source.url.startsWith("https://");
+}
+
+/** The plugins this machine lacks that a review can preview, as entries (the status is spent). */
+function reviewablePlugins(report: BackupPluginReport): BackupPluginEntry[] {
   return report.rows
-    .filter((row) => row.status === "missing")
+    .filter((row) => row.status === "missing" && !isAddedByHand(row))
     .map(({ status: _status, ...entry }) => entry);
 }
 
@@ -30,7 +40,7 @@ export function reviewBackedUpPlugins(options: {
   enabled: boolean;
   openPlugins: () => void;
 }): void {
-  const missing = missingPlugins(options.report);
+  const missing = reviewablePlugins(options.report);
   if (!options.enabled || missing.length === 0) return;
   publishPluginsSectionIntent({ type: "install-from-backup", entries: missing });
   options.openPlugins();
@@ -43,9 +53,11 @@ const STATUS_BADGE: Record<BackupPluginStatus, { label: string; tone: string }> 
   conflict: { label: "Name in use", tone: "text-warning border-warning/40" },
 };
 
+const ADD_BY_HAND_BADGE = { label: "Add it yourself", tone: "text-warning border-warning/40" };
+
 function PluginRow(props: { plugin: BackupPluginRow }) {
   const { plugin } = props;
-  const badge = STATUS_BADGE[plugin.status];
+  const badge = isAddedByHand(plugin) ? ADD_BY_HAND_BADGE : STATUS_BADGE[plugin.status];
   const folder = plugin.source.subpath === undefined ? "" : `/${plugin.source.subpath}`;
   // Every string here comes from the repository, so each wraps instead of widening the card.
   return (
@@ -183,7 +195,7 @@ export function BackupPluginsCard(props: {
 }) {
   const plugins = props.report.rows;
   const warnings = props.report.warnings;
-  const missing = missingPlugins(props.report);
+  const missing = reviewablePlugins(props.report);
   if (props.report.skipped) {
     return (
       <div className="border-border-light text-muted rounded-md border p-3 text-xs">
@@ -212,6 +224,13 @@ export function BackupPluginsCard(props: {
         <p className="text-muted text-xs">
           A plugin marked “Name in use” is not offered: this machine already has another commit,
           another repository or folder, or a folder Xum does not manage, under that name.
+        </p>
+      ) : null}
+      {plugins.some(isAddedByHand) ? (
+        <p className="text-muted text-xs">
+          A review previews only https sources. A plugin marked “Add it yourself” comes from an ssh
+          source, and a preview would sign in with your SSH keys to the host this backup names. To
+          reinstall it, add its repository yourself in Settings → Plugins.
         </p>
       ) : null}
       {missing.length > 0 ? (
