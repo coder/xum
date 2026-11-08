@@ -4757,6 +4757,33 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(await enabledServers(legacyPath)).toEqual(["other"]);
     });
 
+    it("clears a child of a healthy parent with a publisher and evicts every cache", async () => {
+      // The re-read after the removal walks the strict registry, which fails on the legacy entry:
+      // the child's inheritance is then unknown, so the clear evicts instead of publishing.
+      const service = new WorkspaceMcpOverridesService(config);
+      const parent = await registerWorkspace("healthy-parent");
+      const child = await registerWorkspace("healthy-child");
+      await setParent(child.workspaceId, parent.workspaceId);
+      await writeEnable(child.workspacePath);
+      await registerMalformedLegacyEntry();
+      const published: Array<[string, unknown]> = [];
+      await service.setOverridesForWorkspace(
+        child.workspaceId,
+        {},
+        {
+          publish: (persisted, workspaceId) => {
+            published.push([workspaceId, persisted]);
+            return Promise.resolve();
+          },
+        }
+      );
+      expect(nodeFs.existsSync(overridesFile(child.workspacePath))).toBe(false);
+      expect(published).toEqual([
+        [child.workspaceId, null],
+        [ALL_WORKSPACES_TARGET, null],
+      ]);
+    });
+
     it("evicts every cache instead of publishing from the degraded registry", async () => {
       // The child's parent is the legacy entry, whose stable id lives only in its unreadable
       // metadata.json: resolving the child from the lenient walk would read that parent as gone.
