@@ -46,6 +46,7 @@ import {
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
+import { createSpendMeter } from "@/node/services/memoryDreamSpend";
 import {
   memoryLogicalKey,
   type MemoryMetaEntry,
@@ -68,6 +69,10 @@ export interface MemoryConsolidationResult {
   budgetExhausted: boolean;
   /** Token cost of the run; undefined when the provider reported none. */
   usage?: { inputTokens: number; outputTokens: number };
+  /** USD the run's steps cost, as priced from what each reported. */
+  spentUsd: number;
+  /** Set when the cost ceiling ended the run before the model finished: see SpendMeter. */
+  note?: string;
   /**
    * Fatal stream error (provider failure or abort/timeout). When set, the
    * pass did NOT complete — callers must not treat the memory state as
@@ -574,6 +579,8 @@ export async function runMemoryConsolidation(args: {
   ) => Promise<void>;
   /** Pricing identity of `model`; its long-context threshold sets each step's tier. */
   pricingModel?: string;
+  /** The run stops once its measured spend reaches this many USD; none when absent. */
+  ceilingUsd?: number;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
   const journal: MemoryConsolidationOp[] = [];
@@ -596,6 +603,7 @@ export async function runMemoryConsolidation(args: {
         ? " This is the FINAL pass for an archived workspace: preserve only cross-project user preferences or environment facts in /memories/global/... before workspace memory is deleted. Project memory is unavailable for this run; do not promote project-specific lessons to global memory."
         : " This is the FINAL pass for an archived workspace: promote durable workspace lessons before workspace memory is deleted. Move repo-specific lessons to /memories/project/... and only cross-project user preferences or environment facts to /memories/global/....";
 
+  const meter = createSpendMeter({ pricingModel: args.pricingModel, ceilingUsd: args.ceilingUsd });
   const stream = streamText({
     model: args.model,
     system: args.agentBody,
@@ -603,7 +611,9 @@ export async function runMemoryConsolidation(args: {
       "Run a memory-consolidation pass now. Survey the memory directories, then apply the highest-value cleanups within budget." +
       finalPassPrompt,
     tools: { memory: memoryTool },
-    stopWhen: stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS),
+    stopWhen: [stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS), meter.stopIfCeilingReached],
+    onStepEnd: meter.recordStep,
+    maxOutputTokens: meter.maxOutputTokens,
     abortSignal: args.abortSignal,
   });
 
@@ -621,6 +631,13 @@ export async function runMemoryConsolidation(args: {
   // workspace removal would read as clean and be journaled as a success.
   if (streamErrors.length === 0 && args.abortSignal?.aborted === true) {
     streamErrors.push("memory consolidation was cut short by its timeout or by workspace removal");
+  }
+  // A step that hit the output limit never ran its tool call, yet the stream ends clean: without
+  // this the pass would be journaled as a success and the debounce would hold off its retry.
+  if (streamErrors.length === 0 && meter.endedAtOutputLimit()) {
+    streamErrors.push(
+      "memory consolidation ended a step at the model's output limit, so its tool call never ran"
+    );
   }
   const summary =
     streamErrors.length === 0 ? (await stream.text).trim() : `stream error: ${streamErrors[0]}`;
@@ -654,6 +671,8 @@ export async function runMemoryConsolidation(args: {
     // rejections must not report a budget the run never spent (MEM-RPT-01).
     budgetExhausted: isBudgetExhausted(),
     usage,
+    spentUsd: meter.spentUsd(),
+    note: meter.note(),
     streamError: streamErrors[0],
   };
 }

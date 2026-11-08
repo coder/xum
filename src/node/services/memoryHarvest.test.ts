@@ -9,7 +9,11 @@ import {
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
-import { MEMORY_ANALYZER_OP_BUDGET, MEMORY_HARVEST_MAX_CHUNKS } from "@/common/constants/memory";
+import {
+  MEMORY_ANALYZER_OP_BUDGET,
+  MEMORY_HARVEST_MAX_CHUNKS,
+  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+} from "@/common/constants/memory";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
@@ -33,24 +37,36 @@ const planReviewSnapshot: PlanReviewRecord = {
   content: "# Plan\n\nREMEMBER-THIS-PLANTED-INSTRUCTION\n",
 };
 
-function finishChunk(outputTokens = 0): LanguageModelV3StreamPart {
+function finishChunk(outputTokens = 0, inputTokens = 1): LanguageModelV3StreamPart {
   return {
     type: "finish",
     finishReason: { unified: "stop", raw: "stop" },
     usage: {
-      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+      inputTokens: { total: inputTokens, noCache: inputTokens, cacheRead: 0, cacheWrite: 0 },
       outputTokens: { total: outputTokens, text: outputTokens, reasoning: 0 },
     },
   };
 }
 
-function toolFinishChunk(): LanguageModelV3StreamPart {
+function toolFinishChunk(inputTokens = 1): LanguageModelV3StreamPart {
   return {
     type: "finish",
     finishReason: { unified: "tool-calls", raw: "tool-calls" },
     usage: {
-      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+      inputTokens: { total: inputTokens, noCache: inputTokens, cacheRead: 0, cacheWrite: 0 },
       outputTokens: { total: 1, text: 0, reasoning: 0 },
+    },
+  };
+}
+
+/** A step cut off at the model's output limit: its tool call is the half-written command. */
+function lengthFinishChunk(inputTokens = 1): LanguageModelV3StreamPart {
+  return {
+    type: "finish",
+    finishReason: { unified: "length", raw: "length" },
+    usage: {
+      inputTokens: { total: inputTokens, noCache: inputTokens, cacheRead: 0, cacheWrite: 0 },
+      outputTokens: { total: 0, text: 0, reasoning: 0 },
     },
   };
 }
@@ -127,6 +143,21 @@ function chunkScript(commands: Array<Record<string, unknown>>): LanguageModelV3S
   return [
     [...commands.map((input, index) => memoryToolCall(input, `call-${index}`)), toolFinishChunk()],
     [finishChunk(1)],
+  ];
+}
+
+// $2 per million input tokens: a step of this many input tokens costs $0.50.
+const PRICED_MODEL = "openai:gpt-6.1-sol";
+const HALF_DOLLAR_INPUT_TOKENS = 250_000;
+
+/** One chunk's two model calls, each costing $0.50: an edit step, then the step that ends the chunk. */
+function pricedChunkScript(path: string): LanguageModelV3StreamPart[][] {
+  return [
+    [
+      memoryToolCall(createFile(path, "fact\n"), `call-${path}`),
+      toolFinishChunk(HALF_DOLLAR_INPUT_TOKENS),
+    ],
+    [finishChunk(1, HALF_DOLLAR_INPUT_TOKENS)],
   ];
 }
 
@@ -1532,6 +1563,193 @@ describe("runMemoryHarvest", () => {
 
     expect(none.nextChunk).toBe(3);
     expect(none.usage).toBeUndefined();
+  });
+
+  describe("cost ceiling", () => {
+    const threeChunkScript = () => [
+      ...pricedChunkScript("/memories/workspace/one.md"),
+      ...pricedChunkScript("/memories/workspace/two.md"),
+      ...pricedChunkScript("/memories/workspace/three.md"),
+    ];
+    const priced: HarvestExtras = { pricingModel: PRICED_MODEL };
+
+    it("reads every chunk and measures what the steps cost when no ceiling is set", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model, calls } = scriptedModel(threeChunkScript());
+
+      const result = await runHarvest(fixture, model, priced);
+
+      expect(calls).toHaveLength(6);
+      expect(result.nextChunk).toBe(3);
+      expect(result.spentUsd).toBeCloseTo(3, 3);
+      expect(result.note).toBeUndefined();
+    });
+
+    it("ends the chunk after the step that reaches the ceiling, keeping what that step wrote", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model, calls } = scriptedModel(threeChunkScript());
+
+      // The first step costs $0.50, over the $0.25 ceiling: the chunk's second step never runs.
+      const result = await runHarvest(fixture, model, { ...priced, ceilingUsd: 0.25 });
+
+      expect(calls).toHaveLength(1);
+      expect(result.streamError).toBeUndefined();
+      expect(result.ops).toEqual([
+        { command: "create", path: "/memories/workspace/one.md", applied: true },
+      ]);
+      // A normal end: the cursor is past the chunks nobody will read, so nothing resumes them. The
+      // chunk the model read counts as read.
+      expect(result.nextChunk).toBe(3);
+      expect(result.readChunks).toBe(1);
+      expect(result.readThroughRowId).toBe("m4");
+      expect(result.spentUsd).toBeCloseTo(0.5, 3);
+      expect(result.note).toBe("stopped at the cost ceiling after $0.50");
+    });
+
+    it("starts no chunk once the spend has reached the ceiling", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model, calls } = scriptedModel(threeChunkScript());
+
+      // Chunk 1 ends on its own at $1.00, over the $0.75 ceiling.
+      const result = await runHarvest(fixture, model, { ...priced, ceilingUsd: 0.75 });
+
+      expect(calls).toHaveLength(2);
+      expect(result.readChunks).toBe(1);
+      expect(result.nextChunk).toBe(3);
+      expect(result.note).toBe("stopped at the cost ceiling after $1.00");
+    });
+
+    it("reports no stop for a job whose last chunk ends over the ceiling on its own", async () => {
+      using fixture = createFixture();
+      const { model } = scriptedModel(pricedChunkScript("/memories/workspace/one.md"));
+
+      const result = await runHarvest(fixture, model, { ...priced, ceilingUsd: 0.75 });
+
+      expect(result.spentUsd).toBeCloseTo(1, 3);
+      expect(result.note).toBeUndefined();
+    });
+
+    it("continues from the spend of the earlier attempts at the job", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const resume: HarvestProgress = { nextChunk: 1, ops: [], spentUsd: 0.75 };
+      const retried = scriptedModel(threeChunkScript());
+      const fresh = scriptedModel(threeChunkScript());
+
+      const result = await runHarvest(fixture, retried.model, {
+        ...priced,
+        ceilingUsd: 1,
+        resume,
+      });
+      await runHarvest(fixture, fresh.model, {
+        ...priced,
+        ceilingUsd: 1,
+        resume: { nextChunk: 1, ops: [] },
+      });
+
+      // $0.75 carried plus the first step's $0.50 is over the $1.00 ceiling. The same retry with
+      // no spend carried needs both of the chunk's steps, and reads no further.
+      expect(retried.calls).toHaveLength(1);
+      expect(result.spentUsd).toBeCloseTo(1.25, 3);
+      expect(fresh.calls).toHaveLength(2);
+    });
+
+    it("counts the finished steps of a chunk that then fails", async () => {
+      using fixture = createFixture();
+      const { model } = scriptedModel([
+        [
+          memoryToolCall(createFile("/memories/workspace/one.md", "fact\n")),
+          toolFinishChunk(HALF_DOLLAR_INPUT_TOKENS),
+        ],
+        new Error("provider exploded"),
+      ]);
+
+      const result = await runHarvest(fixture, model, priced);
+
+      expect(result.streamError).toContain("provider exploded");
+      expect(result.spentUsd).toBeCloseTo(0.5, 3);
+    });
+
+    it("fails a chunk whose step ended at the output limit, keeping what landed and what it cost", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      // The SDK runs no tool call of a step that finishes with `length`, and the stream ends clean.
+      const { model, calls } = scriptedModel([
+        [
+          memoryToolCall(createFile("/memories/workspace/landed.md", "fact\n"), "call-landed"),
+          toolFinishChunk(HALF_DOLLAR_INPUT_TOKENS),
+        ],
+        [
+          memoryToolCall(createFile("/memories/workspace/cut.md", "half a comm"), "call-cut"),
+          lengthFinishChunk(HALF_DOLLAR_INPUT_TOKENS),
+        ],
+      ]);
+
+      const result = await runHarvest(fixture, model, { ...priced, ceilingUsd: 100 });
+
+      expect(result.streamError).toContain("output limit");
+      // Like any failed stream: the cursor stays on the chunk, and the later chunks are not read.
+      expect(result.nextChunk).toBe(0);
+      expect(result.readChunks).toBe(0);
+      expect(calls).toHaveLength(2);
+      expect(result.ops).toEqual([
+        { command: "create", path: "/memories/workspace/landed.md", applied: true },
+      ]);
+      expect(result.nextChunkOps).toBe(1);
+      expect(result.spentUsd).toBeCloseTo(1, 3);
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/cut.md")
+      ).toMatchObject({ success: false });
+    });
+
+    it("caps what one step can write, which bounds how far it can overshoot", async () => {
+      using fixture = createFixture();
+      const { model, calls } = scriptedModel(pricedChunkScript("/memories/workspace/one.md"));
+
+      // A ceiling the two $0.50 steps stay under: the cap is set, and the run still takes both.
+      await runHarvest(fixture, model, { ...priced, ceilingUsd: 100 });
+
+      expect(calls.map((call) => call.maxOutputTokens)).toEqual([
+        MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+        MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+      ]);
+    });
+
+    it("says the ceiling was not enforced for a model with no known price, beside a spent edit budget", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model } = scriptedModel(
+        chunkScript(
+          Array.from({ length: MEMORY_ANALYZER_OP_BUDGET }, (_, index) =>
+            createFile(`/memories/workspace/spent-${index}.md`, `fact ${index}\n`)
+          )
+        )
+      );
+
+      const result = await runHarvest(fixture, model, {
+        pricingModel: "ollama:no-such-model",
+        ceilingUsd: 1,
+      });
+
+      // The spent budget skipped chunks 2 and 3; its note must not hide the unenforced ceiling.
+      expect(result.note).toBe(
+        "edit budget spent: chunks 2-3 of 3 were not read; price unknown, ceiling not enforced"
+      );
+    });
+
+    it("leaves a step's output uncapped when no ceiling is set", async () => {
+      using fixture = createFixture();
+      const { model, calls } = scriptedModel(pricedChunkScript("/memories/workspace/one.md"));
+
+      // The cap exists only to bound the step that crosses a ceiling: a user who set none keeps
+      // the model's own limit.
+      await runHarvest(fixture, model, priced);
+
+      expect(calls.map((call) => call.maxOutputTokens)).toEqual([undefined, undefined]);
+    });
   });
 
   it("adds the usage of the chunks it runs to the usage of the attempt it resumes", async () => {

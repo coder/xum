@@ -389,6 +389,71 @@ function archivePassModels(
   return { runs, factory, readFirstNote, firstAnalyzerStarted };
 }
 
+// $2 per million input tokens: a step of this many input tokens costs $0.50.
+const PRICED_MODEL = "openai:gpt-6.1-sol";
+
+function halfDollarUsage() {
+  return {
+    inputTokens: { total: 250_000, noCache: 250_000, cacheRead: 0, cacheWrite: 0 },
+    outputTokens: { total: 0, text: 0, reasoning: 0 },
+  };
+}
+
+/**
+ * Scripts the analyzer and the dream with every model step costing $0.50 at PRICED_MODEL, and logs
+ * each step. The analyzer edits in its first step of a chunk and ends the chunk in its second. The
+ * dream either ends in its first step or lists memory in every step until the run stops it.
+ */
+function pricedPassModels(options: { dream: "ends" | "never-ends"; failChunkOnce?: string }): {
+  steps: string[];
+  factory: () => MockLanguageModelV3;
+} {
+  const steps: string[] = [];
+  let failChunkOnce = options.failChunkOnce;
+  const factory = () =>
+    new MockLanguageModelV3({
+      doStream: (call) => {
+        const afterToolResult = call.prompt.some((message) => message.role === "tool");
+        const finish = (reason: "stop" | "tool-calls"): LanguageModelV3StreamPart => ({
+          type: "finish",
+          finishReason: { unified: reason, raw: reason },
+          usage: halfDollarUsage(),
+        });
+        const toolCall = (input: unknown): LanguageModelV3StreamPart => ({
+          type: "tool-call",
+          toolCallId: `call-${steps.length}`,
+          toolName: "memory",
+          input: JSON.stringify(input),
+        });
+        const stream = (chunks: LanguageModelV3StreamPart[]) =>
+          Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+
+        if (systemPromptText(call) !== MEMORY_ANALYZER_SYSTEM_PROMPT) {
+          steps.push("dream");
+          if (options.dream === "ends") return stream([finish("stop")]);
+          return stream([toolCall({ command: "view", path: "/memories/" }), finish("tool-calls")]);
+        }
+        const chunk = /Transcript chunk (\d+\/\d+)/.exec(userPromptText(call))?.[1] ?? "?";
+        if (!afterToolResult && chunk === failChunkOnce) {
+          failChunkOnce = undefined;
+          steps.push(`analyzer ${chunk} fails`);
+          return Promise.resolve({ stream: failingStream() });
+        }
+        steps.push(`analyzer ${chunk} ${afterToolResult ? "end" : "edit"}`);
+        if (afterToolResult) return stream([finish("stop")]);
+        return stream([
+          toolCall({
+            command: "create",
+            path: `/memories/workspace/chunk-${chunk.replace("/", "-of-")}.md`,
+            file_text: "fact\n",
+          }),
+          finish("tool-calls"),
+        ]);
+      },
+    });
+  return { steps, factory };
+}
+
 interface Fixture extends Disposable {
   xumHome: string;
   config: Config;
@@ -420,6 +485,8 @@ async function createFixture(options?: {
   beforeModelCreated?: (call: number) => Promise<void>;
   /** Wire a real SessionUsageService (headless cost telemetry tests). */
   withSessionUsage?: boolean;
+  /** The pricing identity every created model reports; default: the requested model string. */
+  metadataModel?: string;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-memory-consolidation-service");
   const xumHome = path.join(tempDir.path, "mux-home");
@@ -462,7 +529,7 @@ async function createFixture(options?: {
           model:
             options?.modelFactory?.() ??
             (streamFailing ? failingScriptedModel(capturePrompt) : scriptedModel(capturePrompt)),
-          metadataModel: modelString,
+          metadataModel: options?.metadataModel ?? modelString,
         });
       },
     },
@@ -4308,6 +4375,199 @@ describe("MemoryConsolidationService", () => {
       expect(fixture.modelCalls).toHaveLength(1);
       expect(result.success).toBe(false);
       if (!result.success) expect(result.error).toContain("being removed");
+    });
+  });
+
+  describe("dream cost ceiling", () => {
+    function setCeiling(fixture: Fixture, usd: number | null): Promise<void> {
+      return fixture.config.updateUserPreferences([{ memory: { dreamCostCeilingUsd: usd } }]);
+    }
+
+    it("runs both passes to their own ends with no ceiling, and records what each cost", async () => {
+      const models = pricedPassModels({ dream: "ends" });
+      using fixture = await createFixture({
+        modelFactory: models.factory,
+        metadataModel: PRICED_MODEL,
+      });
+      await appendRows(fixture, openRowTexts);
+
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+      expect(models.steps).toEqual(["analyzer 1/1 edit", "analyzer 1/1 end", "dream"]);
+      const harvest = (await harvestRecords(fixture))["open:open-2"];
+      expect(harvest?.status).toBe("completed");
+      expect(harvest?.spentUsd).toBeCloseTo(1, 3);
+      expect(harvest?.note).toBeUndefined();
+      const dream = await fixture.service.getRecord("ws-dream");
+      expect(dream?.spentUsd).toBeCloseTo(0.5, 3);
+      expect(dream?.note).toBeUndefined();
+    });
+
+    it("completes an analyzer job the ceiling stopped, with its cursor saved, and never retries it", async () => {
+      const models = pricedPassModels({ dream: "ends" });
+      using fixture = await createFixture({
+        modelFactory: models.factory,
+        metadataModel: PRICED_MODEL,
+      });
+      await appendBulkRows(fixture);
+      const metadata = await seedCompactionEpoch(fixture);
+      await setCeiling(fixture, 0.25);
+
+      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+
+      // The first step costs $0.50, over the ceiling: chunk 1 never takes its second step, and
+      // chunks 2 and 3 are never read.
+      expect(models.steps.filter((step) => step.startsWith("analyzer"))).toEqual([
+        "analyzer 1/3 edit",
+      ]);
+      const record = (await harvestRecords(fixture))["summary-1"];
+      expect(record).toMatchObject({
+        status: "completed",
+        attemptCount: 1,
+        nextChunk: 3,
+        readThroughRowId: "bulk-4",
+        acceptedCandidates: 1,
+        note: "stopped at the cost ceiling after $0.50",
+      });
+      expect(record?.error).toBeUndefined();
+      expect(record?.spentUsd).toBeCloseTo(0.5, 3);
+
+      // A later trigger finds a completed job: raising the ceiling does not reread the epoch.
+      await setCeiling(fixture, null);
+      expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+      expect(models.steps.filter((step) => step.startsWith("analyzer"))).toHaveLength(1);
+    });
+
+    it("continues a retry from the spend its failed attempt persisted", async () => {
+      const models = pricedPassModels({ dream: "ends", failChunkOnce: "2/3" });
+      using fixture = await createFixture({
+        modelFactory: models.factory,
+        metadataModel: PRICED_MODEL,
+      });
+      await appendBulkRows(fixture);
+      const metadata = await seedCompactionEpoch(fixture);
+      await setCeiling(fixture, 1.5);
+
+      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+      const failed = (await harvestRecords(fixture))["summary-1"];
+      // Chunk 1's two steps are paid for ($1.00, under the ceiling); chunk 2's stream failed.
+      expect(failed).toMatchObject({ status: "failed", nextChunk: 1 });
+      expect(failed?.spentUsd).toBeCloseTo(1, 3);
+
+      expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+      // The retry's first step brings the job to $1.50: chunk 2 stops there, chunk 3 is never
+      // read. Without the carried $1.00 the retry would run chunk 2 whole and read chunk 3 too.
+      expect(models.steps.filter((step) => step.startsWith("analyzer"))).toEqual([
+        "analyzer 1/3 edit",
+        "analyzer 1/3 end",
+        "analyzer 2/3 fails",
+        "analyzer 2/3 edit",
+      ]);
+      const retried = (await harvestRecords(fixture))["summary-1"];
+      expect(retried).toMatchObject({
+        status: "completed",
+        attemptCount: 2,
+        nextChunk: 3,
+        note: "stopped at the cost ceiling after $1.50",
+      });
+      expect(retried?.spentUsd).toBeCloseTo(1.5, 3);
+    });
+
+    it("cannot widen the ceiling: a negative persisted spend drops the record and restarts the job from nothing", async () => {
+      const models = pricedPassModels({ dream: "ends", failChunkOnce: "2/3" });
+      using fixture = await createFixture({
+        modelFactory: models.factory,
+        metadataModel: PRICED_MODEL,
+      });
+      await appendBulkRows(fixture);
+      const metadata = await seedCompactionEpoch(fixture);
+      await setCeiling(fixture, 1.5);
+      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+      await editHarvestRecord(fixture, "summary-1", (record) => {
+        record.spentUsd = -100;
+      });
+
+      expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+      // A carried -$100 would let every chunk run. The invalid record is dropped on load, so the
+      // job starts again at chunk 1, as a first attempt, and the ceiling holds on its own spend.
+      const restarted = (await harvestRecords(fixture))["summary-1"];
+      expect(restarted).toMatchObject({ status: "completed", attemptCount: 1 });
+      expect(restarted?.spentUsd).toBeCloseTo(1.5, 3);
+    });
+
+    describe("a model with no known price", () => {
+      // The meter counts such a step as $0, so a ceiling would never stop the run. The note puts
+      // that on the record the Memory tab shows, instead of leaving the ceiling looking enforced.
+      const UNPRICED_MODEL = "ollama:no-such-model";
+      const unenforced = "price unknown, ceiling not enforced";
+
+      it("notes on an organizer run that the ceiling was not enforced", async () => {
+        const models = pricedPassModels({ dream: "ends" });
+        using fixture = await createFixture({
+          modelFactory: models.factory,
+          metadataModel: UNPRICED_MODEL,
+        });
+        await setCeiling(fixture, 0.25);
+
+        expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+
+        expect((await fixture.service.getRecord("ws-dream"))?.note).toBe(unenforced);
+      });
+
+      it("notes on an analyzer job that the ceiling was not enforced", async () => {
+        const models = pricedPassModels({ dream: "ends" });
+        using fixture = await createFixture({
+          modelFactory: models.factory,
+          metadataModel: UNPRICED_MODEL,
+        });
+        await appendBulkRows(fixture);
+        const metadata = await seedCompactionEpoch(fixture);
+        await setCeiling(fixture, 0.25);
+
+        expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+
+        // Every chunk was read: the ceiling stopped nothing.
+        expect(models.steps.filter((step) => step.startsWith("analyzer"))).toHaveLength(6);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          note: unenforced,
+        });
+      });
+
+      it("makes no note when no ceiling is set", async () => {
+        const models = pricedPassModels({ dream: "ends" });
+        using fixture = await createFixture({
+          modelFactory: models.factory,
+          metadataModel: UNPRICED_MODEL,
+        });
+
+        expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+
+        expect((await fixture.service.getRecord("ws-dream"))?.note).toBeUndefined();
+      });
+    });
+
+    it("saves the record of an organizer run the ceiling stopped, so the debounce applies", async () => {
+      const models = pricedPassModels({ dream: "never-ends" });
+      using fixture = await createFixture({
+        modelFactory: models.factory,
+        metadataModel: PRICED_MODEL,
+      });
+      await setCeiling(fixture, 0.75);
+
+      const result = await fixture.service.maybeRun("ws-dream", "manual");
+
+      // $0.50 a step: the second step brings the run to $1.00, over the ceiling.
+      expect(models.steps).toEqual(["dream", "dream"]);
+      expect(result.success).toBe(true);
+      const record = await fixture.service.getRecord("ws-dream");
+      expect(record?.note).toBe("stopped at the cost ceiling after $1.00");
+      expect(record?.spentUsd).toBeCloseTo(1, 3);
+
+      expectDebounced(await fixture.service.maybeRun("ws-dream", "compaction"));
+      expect(models.steps).toHaveLength(2);
     });
   });
 

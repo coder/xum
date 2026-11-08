@@ -91,6 +91,10 @@ export const MemoryConsolidationRecordSchema = z.object({
   ops: z.array(MemoryConsolidationOpSchema),
   /** Token cost of the run (absent for records persisted before telemetry). */
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
+  /** USD the run cost, priced from what each step reported. Optional so older records parse. */
+  spentUsd: z.number().nonnegative().optional(),
+  /** Why the run ended before the model finished: the cost ceiling stopped it. */
+  note: z.string().optional(),
 });
 export type MemoryConsolidationRecordPayload = z.infer<typeof MemoryConsolidationRecordSchema>;
 
@@ -176,6 +180,13 @@ export const MemoryHarvestRecordSchema = z.object({
    * binaries parse the record.
    */
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
+  /**
+   * USD the epoch's job has cost across its attempts, priced from what each step reported. A retry
+   * continues from it, so it feeds the cost ceiling like a count feeds a limit: not negative (see
+   * PersistedCountSchema). A job the ceiling stopped completes with a `note` that says so.
+   * Optional so older binaries parse the record.
+   */
+  spentUsd: z.number().nonnegative().optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),
 });
 export type MemoryHarvestRecordPayload = z.infer<typeof MemoryHarvestRecordSchema>;

@@ -89,6 +89,24 @@ export const MEMORY_ANALYZER_OP_BUDGET = 8;
 /** Step ceiling for one analyzer chunk (reads of related memory + budgeted edits). */
 export const MEMORY_ANALYZER_MAX_STEPS = 12;
 /**
+ * Output cap of one model call (one step) of the analyzer and of the organizer. The dream's cost
+ * ceiling stops a run only after a step whose measured cost reaches it, so the step in flight
+ * can still go past the ceiling. The cap bounds what that step can write, so it applies only to a
+ * run that has a ceiling (see SpendMeter.maxOutputTokens). A step that hits it finishes with
+ * `length`, and the SDK runs no valid tool call of such a step. A call cut off mid-input comes
+ * back to the model as a tool error it can retry from; a stream whose last step still ends at the
+ * limit is an incomplete run for both callers (see SpendMeter.endedAtOutputLimit).
+ */
+export const MEMORY_MAX_OUTPUT_TOKENS_PER_STEP = 4_096;
+/** Smallest dream cost ceiling a user can set, in USD: the cent, the unit a stopped run reports in. */
+export const MEMORY_DREAM_COST_CEILING_MIN_USD = 0.01;
+/**
+ * Largest dream cost ceiling a user can set, in USD. Far above what a dream run costs, so it is
+ * the same as no ceiling; the cap keeps the saved number short enough that `String()` never
+ * prints it in exponent notation (1e+21), which the ceiling field would then read as invalid.
+ */
+export const MEMORY_DREAM_COST_CEILING_MAX_USD = 100_000;
+/**
  * Memory harvest: transcript chunks one epoch's harvest reads. Each chunk is a model call of at
  * most 40,000 characters of transcript, and the per-part caps leave an epoch's total unbounded
  * (thousands of parallel tool calls, or megabytes of pasted text, make hundreds of chunks). 12 is

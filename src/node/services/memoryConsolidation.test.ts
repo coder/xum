@@ -3,12 +3,15 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { Tool } from "ai";
-import { MockLanguageModelV3 } from "ai/test";
+import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import type { LanguageModelV3StreamPart, SharedV3ProviderMetadata } from "@ai-sdk/provider";
 
 import {
+  MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
+  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
 } from "@/common/constants/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { Config } from "@/node/config";
@@ -1138,7 +1141,261 @@ describe("createMutationBudget", () => {
   );
 });
 
+// $2 per million input tokens, and a priority tier that bills at twice that: a step of 250k input
+// tokens costs $0.50 at Standard and $1.00 at priority.
+const PRICED_MODEL = "openai:gpt-6.1-sol";
+const HALF_DOLLAR_INPUT_TOKENS = 250_000;
+
+/** A model whose every step lists the memory directory, so the run takes as many steps as it may. */
+function listingModel(providerMetadata?: SharedV3ProviderMetadata): {
+  model: MockLanguageModelV3;
+  calls: Array<number | undefined>;
+} {
+  const calls: Array<number | undefined> = [];
+  const model = new MockLanguageModelV3({
+    doStream: (options) => {
+      calls.push(options.maxOutputTokens);
+      const chunks: LanguageModelV3StreamPart[] = [
+        {
+          type: "tool-call",
+          toolCallId: `list-${calls.length}`,
+          toolName: "memory",
+          input: JSON.stringify({ command: "view", path: "/memories/" }),
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          usage: {
+            inputTokens: {
+              total: HALF_DOLLAR_INPUT_TOKENS,
+              noCache: HALF_DOLLAR_INPUT_TOKENS,
+              cacheRead: 0,
+              cacheWrite: 0,
+            },
+            outputTokens: { total: 0, text: 0, reasoning: 0 },
+          },
+          ...(providerMetadata === undefined ? {} : { providerMetadata }),
+        },
+      ];
+      return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+    },
+  });
+  return { model, calls };
+}
+
+/** A model whose first step lands a global file and whose second is cut off at the output limit. */
+function outputLimitedModel(): MockLanguageModelV3 {
+  let calls = 0;
+  const step = (name: string, unified: "tool-calls" | "length"): LanguageModelV3StreamPart[] => [
+    {
+      type: "tool-call",
+      toolCallId: name,
+      toolName: "memory",
+      input: JSON.stringify({
+        command: "create",
+        path: `/memories/global/${name}.md`,
+        file_text: "fact\n",
+      }),
+    },
+    {
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: {
+        inputTokens: {
+          total: HALF_DOLLAR_INPUT_TOKENS,
+          noCache: HALF_DOLLAR_INPUT_TOKENS,
+          cacheRead: 0,
+          cacheWrite: 0,
+        },
+        outputTokens: { total: 0, text: 0, reasoning: 0 },
+      },
+    },
+  ];
+  return new MockLanguageModelV3({
+    doStream: () => {
+      calls += 1;
+      const chunks = calls === 1 ? step("landed", "tool-calls") : step("cut", "length");
+      return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+    },
+  });
+}
+
+/**
+ * A model whose first step is cut off at the output limit mid tool call (its input is not valid
+ * JSON), whose second step creates a global file, and whose third ends the run.
+ */
+function recoveringModel(): MockLanguageModelV3 {
+  let calls = 0;
+  const usage = {
+    inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+    outputTokens: { total: 0, text: 0, reasoning: 0 },
+  };
+  const finish = (unified: "tool-calls" | "length" | "stop"): LanguageModelV3StreamPart => ({
+    type: "finish",
+    finishReason: { unified, raw: unified },
+    usage,
+  });
+  const steps: LanguageModelV3StreamPart[][] = [
+    [
+      {
+        type: "tool-call",
+        toolCallId: "cut",
+        toolName: "memory",
+        input: '{"command":"create","pa',
+      },
+      finish("length"),
+    ],
+    [
+      {
+        type: "tool-call",
+        toolCallId: "retry",
+        toolName: "memory",
+        input: JSON.stringify({
+          command: "create",
+          path: "/memories/global/recovered.md",
+          file_text: "fact\n",
+        }),
+      },
+      finish("tool-calls"),
+    ],
+    [finish("stop")],
+  ];
+  return new MockLanguageModelV3({
+    doStream: () => {
+      const chunks = steps[Math.min(calls, steps.length - 1)];
+      calls += 1;
+      return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+    },
+  });
+}
+
 describe("runMemoryConsolidation", () => {
+  // The SDK runs no tool call of a step that finishes with `length`, and the stream ends without
+  // an error: the pass must not read as a success, or it is journaled and the debounce holds off
+  // the retry.
+  it.each([
+    ["a ceiling caps the step", 100],
+    ["no ceiling is set", undefined],
+  ])("fails a pass whose step ended at the output limit when %s", async (_name, ceilingUsd) => {
+    using fixture = await createFixture();
+
+    const result = await runMemoryConsolidation({
+      model: outputLimitedModel(),
+      pricingModel: PRICED_MODEL,
+      ceilingUsd,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.streamError).toContain("output limit");
+    expect(result.summary).toContain("stream error");
+    // What landed before the cut step stays, and what the steps cost stays counted.
+    expect(result.ops.map((op) => op.path)).toEqual(["/memories/global/landed.md"]);
+    expect(result.spentUsd).toBeCloseTo(1, 9);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "cut.md"))).toBe(false);
+  });
+
+  it("completes a pass whose cut-off step the model retried in a later step", async () => {
+    using fixture = await createFixture();
+
+    const result = await runMemoryConsolidation({
+      model: recoveringModel(),
+      pricingModel: PRICED_MODEL,
+      ceilingUsd: 100,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(result.streamError).toBeUndefined();
+    expect(result.ops.map((op) => op.path)).toEqual(["/memories/global/recovered.md"]);
+    expect(await pathExists(path.join(fixture.globalMemoryDir, "recovered.md"))).toBe(true);
+  });
+
+  describe("cost ceiling", () => {
+    async function run(
+      fixture: Fixture,
+      scripted: ReturnType<typeof listingModel>,
+      ceilingUsd?: number
+    ) {
+      return runMemoryConsolidation({
+        model: scripted.model,
+        pricingModel: PRICED_MODEL,
+        ceilingUsd,
+        agentBody: "Consolidate the memory directories.",
+        memoryService: fixture.memoryService,
+        metaService: fixture.metaService,
+        ctx: fixture.ctx,
+        dryRun: false,
+      });
+    }
+
+    it("takes every step it may, and measures their cost, with no ceiling", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      const result = await run(fixture, scripted);
+
+      expect(scripted.calls).toHaveLength(MEMORY_CONSOLIDATION_MAX_STEPS);
+      expect(result.spentUsd).toBeCloseTo(0.5 * MEMORY_CONSOLIDATION_MAX_STEPS, 9);
+      expect(result.note).toBeUndefined();
+      expect(result.streamError).toBeUndefined();
+    });
+
+    it("stops after the step whose measured cost reaches the ceiling, as a normal end", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      // $0.50 a step: the third step brings the spend to $1.50, over the $1.25 ceiling.
+      const result = await run(fixture, scripted, 1.25);
+
+      expect(scripted.calls).toHaveLength(3);
+      expect(result.spentUsd).toBeCloseTo(1.5, 9);
+      expect(result.note).toBe("stopped at the cost ceiling after $1.50");
+      expect(result.streamError).toBeUndefined();
+    });
+
+    it("counts a step the provider billed at the priority tier at its billed rate", async () => {
+      using fixture = await createFixture();
+      const standard = listingModel();
+      const priority = listingModel({ openai: { serviceTier: "priority" } });
+
+      await run(fixture, standard, 1.25);
+      const result = await run(fixture, priority, 1.25);
+
+      // Standard needs three $0.50 steps to pass $1.25; priority bills $1.00 a step, so two do.
+      expect(standard.calls).toHaveLength(3);
+      expect(priority.calls).toHaveLength(2);
+      expect(result.spentUsd).toBeCloseTo(2, 9);
+    });
+
+    it("caps what one step can write, which bounds how far it can overshoot", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      await run(fixture, scripted, 0.25);
+
+      expect(scripted.calls).toEqual([MEMORY_MAX_OUTPUT_TOKENS_PER_STEP]);
+    });
+
+    it("leaves a step's output uncapped when no ceiling is set", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      await run(fixture, scripted);
+
+      // Every step the run may take, none of them capped: the cap exists only to bound the step
+      // that crosses a ceiling, and a user who set none keeps the model's own limit.
+      expect(scripted.calls).toHaveLength(MEMORY_CONSOLIDATION_MAX_STEPS);
+      expect(scripted.calls.every((cap) => cap === undefined)).toBe(true);
+    });
+  });
+
   it("reports a pass cut short by its timeout as a stream error, not a clean run", async () => {
     // A real provider stream ends silently when its request is aborted: no error part reaches
     // consumeStream, so the pass used to read as clean and be journaled as a success.

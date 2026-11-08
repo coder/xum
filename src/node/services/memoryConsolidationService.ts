@@ -201,6 +201,14 @@ export function resolveDreamModelString(config: Config, workspaceId: string): st
   return resolveHeadlessAgentModelString(config, workspaceId, "dream");
 }
 
+/**
+ * The user's ceiling on one dream run, in USD; undefined means none. Read at each run, so raising
+ * or clearing it takes effect on the next trigger without a restart.
+ */
+function resolveDreamCostCeilingUsd(config: Config): number | undefined {
+  return config.loadConfigOrDefault().userPreferences?.memory?.dreamCostCeilingUsd;
+}
+
 export function resolveDreamAgentBody(muxRoot: string): Promise<string | null> {
   return resolveHeadlessAgentBody(muxRoot, "dream");
 }
@@ -395,6 +403,7 @@ function harvestProgressFields(
   | "budgetUsed"
   | "nextChunkOps"
   | "readThroughRowId"
+  | "spentUsd"
   | "usage"
   | "acceptedCandidates"
   | "skippedCandidates"
@@ -406,6 +415,7 @@ function harvestProgressFields(
     budgetUsed: progress.budgetUsed,
     nextChunkOps: progress.nextChunkOps,
     readThroughRowId: progress.readThroughRowId,
+    spentUsd: progress.spentUsd,
     usage: progress.usage,
     acceptedCandidates: applied,
     skippedCandidates: progress.ops.length - applied,
@@ -475,6 +485,8 @@ export function harvestResumeState(existing: MemoryHarvestRecord | undefined): {
       // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot be
       // loaded): its failure record would otherwise drop what the earlier attempt's chunks read.
       readThroughRowId: earlier.readThroughRowId,
+      // What the earlier attempts cost: the cost ceiling is on the job, so a retry continues from it.
+      spentUsd: earlier.spentUsd,
       usage: earlier.usage,
     },
     // A retry keeps the floor of the first attempt: the chunk cursor counts chunks of the rows
@@ -1371,6 +1383,7 @@ export class MemoryConsolidationService extends EventEmitter {
         runMemoryConsolidation({
           model: modelResult.data.model,
           pricingModel: modelResult.data.metadataModel,
+          ceilingUsd: resolveDreamCostCeilingUsd(self.config),
           agentBody,
           memoryService: self.memoryService,
           metaService: self.metaService,
@@ -1437,6 +1450,9 @@ export class MemoryConsolidationService extends EventEmitter {
           summary: result.summary,
           ops: result.ops,
           usage: result.usage,
+          spentUsd: result.spentUsd,
+          // A run the cost ceiling ended is a normal end: it keeps its record, so the debounce holds.
+          note: result.note,
         };
         await Effect.runPromise(self.saveRecordEffect(workspaceId, projectPath, record));
         return Ok(record);
@@ -1890,6 +1906,7 @@ export class MemoryConsolidationService extends EventEmitter {
         opts.progress.budgetUsed = reached.budgetUsed;
         opts.progress.nextChunkOps = reached.nextChunkOps;
         opts.progress.readThroughRowId = reached.readThroughRowId;
+        opts.progress.spentUsd = reached.spentUsd;
         opts.progress.usage = reached.usage;
       };
       const savePending = (progress: HarvestProgress): Effect.Effect<void> =>
@@ -1936,6 +1953,7 @@ export class MemoryConsolidationService extends EventEmitter {
               const result = await runMemoryHarvest({
                 model: modelResult.data.model,
                 pricingModel: modelResult.data.metadataModel,
+                ceilingUsd: resolveDreamCostCeilingUsd(self.config),
                 memoryService: self.memoryService,
                 metaService: self.metaService,
                 ctx,
