@@ -233,14 +233,6 @@ function readCursorFacts(
   };
 }
 
-function wakeLostSummary(lost: BashMonitorLostSummary): WakeLostSummary {
-  return {
-    reason: lost.reason,
-    ...(lost.failedOperations != null ? { failedOperations: lost.failedOperations } : {}),
-    failedAt: lost.failedAt,
-  };
-}
-
 function describeTerminal(terminal: BashMonitorTerminalSummary): string {
   switch (terminal.status) {
     case "exited":
@@ -993,7 +985,18 @@ export class BashMonitorWakeReconciler {
       ...(matchOffset != null ? { matchOffset } : {}),
       ...readCursorFacts(matchOffset, readState),
       ...(snapshot.terminal?.wakeOnExit === true ? { terminal: snapshot.terminal } : {}),
-      ...(snapshot.lost != null ? { lost: wakeLostSummary(snapshot.lost) } : {}),
+      // Narrowed on purpose: the registry row can still hold failure text and matched lines.
+      ...(snapshot.lost != null
+        ? {
+            lost: {
+              reason: snapshot.lost.reason,
+              ...(snapshot.lost.failedOperations != null
+                ? { failedOperations: snapshot.lost.failedOperations }
+                : {}),
+              failedAt: snapshot.lost.failedAt,
+            },
+          }
+        : {}),
       taskAwaitable,
       deadRegistryRow,
       retired: snapshot.retired,
