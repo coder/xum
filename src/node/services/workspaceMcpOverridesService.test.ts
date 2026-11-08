@@ -5980,6 +5980,58 @@ describe("WorkspaceMcpOverridesService", () => {
       }
     );
 
+    // POSIX only: Windows has no mkfifo.
+    it.skipIf(process.platform === "win32")(
+      "prunePluginOverrideKeysForWorkspaces opens no document behind a symlinked metadata directory before it takes the locks",
+      async () => {
+        // A tracked `.xum` symlink can lead out of the checkout to a FIFO named like the
+        // document. O_NOFOLLOW guards only the last component, so an open before the parent
+        // check reached the FIFO, and that open stayed pending after the scan's bound.
+        const service = new WorkspaceMcpOverridesService(config);
+        const workspace = await registerWorkspace("scan-fifo-parent");
+        const outside = path.join(path.dirname(workspace.workspacePath), "outside-metadata");
+        await fs.mkdir(outside);
+        const fifo = path.join(outside, "mcp.local.jsonc");
+        execFileSync("mkfifo", [fifo]);
+        await fs.symlink(outside, path.join(workspace.workspacePath, ".xum"));
+        const doc = docOf(workspace.workspacePath);
+        const realOpen = fsPromisesModule.open;
+        const opens: Array<Promise<unknown>> = [];
+        const openSpy = spyOn(fsPromisesModule, "open").mockImplementation(((
+          ...args: Parameters<typeof fsPromisesModule.open>
+        ) => {
+          const opening = realOpen(...args);
+          if (String(args[0]) === doc) opens.push(opening.catch(() => undefined));
+          return opening;
+        }) as typeof fsPromisesModule.open);
+        const tracked = await trackLockedWorkspaces(service, [workspace]);
+        let failures: Array<{ workspaceId: string; error: unknown }>;
+        try {
+          failures = await service.prunePluginOverrideKeysForWorkspaces(
+            [workspace.workspaceId],
+            prefix
+          );
+        } finally {
+          tracked.restore();
+          // Release a reader that opened the FIFO, if any (synchronously: the worker pool can be
+          // busy with that very open), so no blocked open outlives the test.
+          let writer: number | undefined;
+          try {
+            writer = nodeFs.openSync(fifo, nodeFs.constants.O_WRONLY | nodeFs.constants.O_NONBLOCK);
+          } catch {
+            // No reader has it open.
+          }
+          await Promise.all(opens);
+          if (writer !== undefined) nodeFs.closeSync(writer);
+          openSpy.mockRestore();
+        }
+
+        expect(opens).toHaveLength(0);
+        expect([...tracked.locked]).toEqual([workspace.workspaceId]);
+        expect(failures.map((failure) => failure.workspaceId)).toEqual([workspace.workspaceId]);
+      }
+    );
+
     /**
      * Runs a sweep of `ids`, pauses its scan at the first stat of `docPath`, runs `change` (a
      * writer that the app can run beside a plugin install), then lets the scan go on.
@@ -6065,14 +6117,19 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(await enabledOf(newPath)).toEqual(["other"]);
     });
 
-    it("prunePluginOverrideKeysForWorkspaces waits for a rename that has moved the checkout but not yet its entry", async () => {
-      // The registry still names the old path under the sweep's locks, so only the missing
-      // checkout shows that the scan's empty read proves nothing. The rename finishes once the
-      // sweep waits for its lock (or, without that wait, once the sweep has returned).
-      const service = new WorkspaceMcpOverridesService(config);
-      const workspace = await registerWorkspace("moving-mid-scan");
-      await writeDoc(workspace.workspacePath, [staleKey, "other"]);
-      const newPath = path.join(path.dirname(workspace.workspacePath), "moved");
+    /**
+     * Sweeps `workspace` while a rename holds its lock: the scan pauses at the first stat of
+     * `pauseAt`, the rename moves the checkout to `newPath` (and, with `leaveDirectory`, another
+     * directory takes the old path), and it rewrites the entry only once the sweep waits for the
+     * workspace's lock (or, without that wait, once the sweep returned).
+     */
+    const sweepDuringPendingRename = async (
+      service: WorkspaceMcpOverridesService,
+      workspace: { workspaceId: string; workspacePath: string },
+      pauseAt: string,
+      newPath: string,
+      leaveDirectory = false
+    ) => {
       const lockFiles = new Set(await checkoutLockFiles(service, workspace.workspaceId));
       let finishRename!: () => void;
       const renameMayFinish = new Promise<void>((resolve) => (finishRename = resolve));
@@ -6082,15 +6139,15 @@ describe("WorkspaceMcpOverridesService", () => {
         if (rename !== undefined && lockFiles.has(String(target))) finishRename();
         return realLink(existing, target);
       });
-      let failures: Array<{ workspaceId: string; error: unknown }>;
       try {
-        failures = await sweepWithChangeDuringScan(
+        return await sweepWithChangeDuringScan(
           service,
           [workspace.workspaceId],
-          docOf(workspace.workspacePath),
+          pauseAt,
           async () => {
             const release = await service.acquireWorkspaceLock(workspace.workspaceId);
             await fs.rename(workspace.workspacePath, newPath);
+            if (leaveDirectory) await fs.mkdir(workspace.workspacePath);
             rename = renameMayFinish.then(async () => {
               try {
                 await renameEntry(workspace.workspaceId, newPath);
@@ -6105,10 +6162,66 @@ describe("WorkspaceMcpOverridesService", () => {
         await rename;
         linkSpy.mockRestore();
       }
+    };
+
+    it("prunePluginOverrideKeysForWorkspaces waits for a rename that has moved the checkout but not yet its entry", async () => {
+      // The registry still names the old path under the sweep's locks, so only the missing
+      // checkout shows that the scan's empty read proves nothing.
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspace = await registerWorkspace("moving-mid-scan");
+      await writeDoc(workspace.workspacePath, [staleKey, "other"]);
+      const newPath = path.join(path.dirname(workspace.workspacePath), "moved");
+
+      const failures = await sweepDuringPendingRename(
+        service,
+        workspace,
+        docOf(workspace.workspacePath),
+        newPath
+      );
 
       expect(failures).toEqual([]);
       expect(await enabledOf(newPath)).toEqual(["other"]);
     });
+
+    it.each([
+      { left: "no checkout", leaveDirectory: false },
+      { left: "another directory", leaveDirectory: true },
+    ])(
+      "prunePluginOverrideKeysForWorkspaces waits for a rename between two document reads that leaves $left at the old path",
+      async ({ leaveDirectory }) => {
+        // The scan reads the clean canonical document, then the checkout moves, and the keyed
+        // compatibility document is absent at the old path. A document was read, so only the
+        // checkout's identity, taken before the first read and compared after the last, shows
+        // that the reads did not all come from one directory.
+        const service = new WorkspaceMcpOverridesService(config);
+        const workspace = await registerWorkspace("moving-between-reads");
+        await writeDoc(workspace.workspacePath, ["other"]);
+        const compatibilityOf = (workspacePath: string) =>
+          path.join(workspacePath, ".mux", "mcp.local.jsonc");
+        await fs.mkdir(path.dirname(compatibilityOf(workspace.workspacePath)), {
+          recursive: true,
+        });
+        await fs.writeFile(
+          compatibilityOf(workspace.workspacePath),
+          JSON.stringify({ enabledServers: [staleKey, "kept"] })
+        );
+        const newPath = path.join(path.dirname(workspace.workspacePath), "moved-between-reads");
+
+        const failures = await sweepDuringPendingRename(
+          service,
+          workspace,
+          compatibilityOf(workspace.workspacePath),
+          newPath,
+          leaveDirectory
+        );
+
+        expect(failures).toEqual([]);
+        const compatibility = jsoncParse(await fs.readFile(compatibilityOf(newPath), "utf-8")) as {
+          enabledServers?: string[];
+        };
+        expect(compatibility.enabledServers).toEqual(["kept"]);
+      }
+    );
 
     it("prunePluginOverrideKeysForWorkspaces prunes an archived workspace whose checkout an unarchive restores after its scan", async () => {
       // Archive deletes a worktree's checkout and keeps its entry. The scan finds no document
@@ -6156,6 +6269,9 @@ describe("WorkspaceMcpOverridesService", () => {
     it.each([
       {
         writer: "rename that leaves a checkout at the old path",
+        // Before the scan takes the checkout's identity: a rename after it leaves another
+        // directory there, which makes the workspace a candidate (see the rename tests above).
+        pauseAt: (subject: { workspacePath: string }) => subject.workspacePath,
         change: async (subject: { workspaceId: string; workspacePath: string }) => {
           const newPath = path.join(path.dirname(subject.workspacePath), "renamed-back");
           await fs.rename(subject.workspacePath, newPath);
@@ -6223,7 +6339,7 @@ describe("WorkspaceMcpOverridesService", () => {
       },
     ])(
       "prunePluginOverrideKeysForWorkspaces fails a workspace when a $writer changes its entry during the scan",
-      async ({ change }) => {
+      async ({ change, pauseAt }) => {
         const service = new WorkspaceMcpOverridesService(config);
         const subject = await registerWorkspace("changed-subject");
         const bystander = await registerWorkspace("changed-bystander");
@@ -6231,7 +6347,7 @@ describe("WorkspaceMcpOverridesService", () => {
         const failures = await sweepWithChangeDuringScan(
           service,
           [subject.workspaceId, bystander.workspaceId],
-          docOf(subject.workspacePath),
+          pauseAt?.(subject) ?? docOf(subject.workspacePath),
           () => change(subject, bystander)
         );
 
@@ -6713,6 +6829,16 @@ describe("WorkspaceMcpOverridesService", () => {
         target: string,
         ...rest: unknown[]
       ) => {
+        if (
+          target === late.workspacePath &&
+          (rest[0] as { bigint?: boolean } | undefined)?.bigint === true &&
+          lateReadAt === undefined
+        ) {
+          // The late read's first stat, of its checkout's identity, runs before the scan takes
+          // the read's bound. The window closes 30 s after the first timeout, which was just now.
+          lateReadAt = realNow();
+          skewMs += 29_800;
+        }
         if (!docs.has(target)) {
           return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
         }
@@ -6722,11 +6848,6 @@ describe("WorkspaceMcpOverridesService", () => {
           skewMs += 29_000;
         } else {
           scanned.add(target);
-          if (target === docOf(late.workspacePath)) {
-            // The window closes 30 s after the first timeout, which was just now.
-            lateReadAt = realNow();
-            skewMs += 29_800;
-          }
         }
         return new Promise(() => undefined);
       }) as typeof fsPromisesModule.stat);
@@ -7666,6 +7787,42 @@ describe("WorkspaceMcpOverridesService", () => {
       /outside the checkout/
     );
   });
+
+  // POSIX only: Windows has no mkfifo.
+  it.skipIf(process.platform === "win32")(
+    "the verified document read refuses a FIFO at once, without waiting for a writer",
+    async () => {
+      // Code in the checkout can make the document a FIFO. An open of a FIFO without a writer
+      // never returns, and no caller's deadline cancels it.
+      const checkout = path.join(config.srcDir, "nofollow-fifo");
+      await fs.mkdir(path.join(checkout, ".xum"), { recursive: true });
+      const own = path.join(checkout, ".xum", "mcp.local.jsonc");
+      execFileSync("mkfifo", [own]);
+      const reading = readHostOverrideDocumentNoFollow(own, checkout).then(
+        () => "read",
+        (error: unknown) => String(error)
+      );
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        reading,
+        new Promise<string>((resolve) => {
+          timer = setTimeout(() => resolve("still waiting"), 1_000);
+        }),
+      ]);
+      clearTimeout(timer);
+      // Release a blocked open, if any, so it does not outlive the test.
+      let writer: number | undefined;
+      try {
+        writer = nodeFs.openSync(own, nodeFs.constants.O_WRONLY | nodeFs.constants.O_NONBLOCK);
+      } catch {
+        // No reader has it open.
+      }
+      await reading;
+      if (writer !== undefined) nodeFs.closeSync(writer);
+
+      expect(outcome).toMatch(/not a regular file/);
+    }
+  );
 
   it("the verified document read refuses a handle that is not the checkout's own document", async () => {
     // A parent segment swapped to a symlink at open time, and back before the guards, leaves the

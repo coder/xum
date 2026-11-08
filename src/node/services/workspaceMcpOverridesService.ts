@@ -326,6 +326,29 @@ async function readHandleUpTo(
   if (length > maxBytes) throw new OverridesFileTooLargeError(filePath, length);
   return buffer.toString("utf-8", 0, length);
 }
+/** See readHostOverrideDocumentNoFollow, step 2. */
+const VERIFIED_DOCUMENT_OPEN_FLAGS =
+  fsConstants.O_RDONLY |
+  // mutation-equivalent: O_NOFOLLOW is a nonzero constant wherever Node defines it, so ?? and || agree; only Windows, which lacks it, reads the 0, and these tests run on POSIX
+  (fsConstants.O_NOFOLLOW ?? 0) |
+  // mutation-equivalent: as O_NOFOLLOW above
+  (fsConstants.O_NONBLOCK ?? 0);
+/**
+ * The path of `segments` joined under the checkout's realpath `root`, refused when any of
+ * them is a symbolic link (see readHostOverrideDocumentNoFollow).
+ */
+async function guardOverrideSegments(
+  root: string,
+  segments: readonly string[],
+  refuse: (reason: string) => never
+): Promise<string> {
+  let current = root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    if ((await fsPromises.lstat(current)).isSymbolicLink()) refuse(`${segment} is a symbolic link`);
+  }
+  return current;
+}
 /**
  * SECURITY: read a host override document whose bytes leave the checkout (the
  * fork copy; unknown fields carried into another document) without following
@@ -334,12 +357,17 @@ async function readHandleUpTo(
  * design) can replace the document — or a PARENT segment such as `.xum` —
  * with a symlink between a check and a path-based read. Node cannot open
  * relative to a pinned directory descriptor, so the read is verified instead:
- * 1. open once with O_NOFOLLOW (the final component is never followed) and
- *    fstat the handle (a regular file);
- * 2. AFTER the open, re-guard every repo-controlled segment under the
- *    checkout's realpath (`lstat`, not a symlink) and require the file at
- *    that canonical path to be the very inode the handle holds.
- * A parent swapped to a symlink at open time either still is one at step 2
+ * 1. BEFORE the open, guard every parent segment under the checkout's
+ *    realpath (`lstat`, not a symlink): a path whose parent chain was not
+ *    checked is never opened. (A tracked `.xum` symlink can lead to a FIFO or
+ *    a device outside the checkout, and an open of a FIFO without a writer
+ *    never returns, even after the caller's deadline.)
+ * 2. open once with O_NOFOLLOW (the final component is never followed) and
+ *    O_NONBLOCK (an open of a FIFO swapped in after step 1 returns at once),
+ *    and fstat the handle: only a regular file is read;
+ * 3. AFTER the open, guard every segment again and require the file at that
+ *    canonical path to be the very inode the handle holds.
+ * A parent swapped to a symlink at open time either still is one at step 3
  * (guard fails) or was swapped back (the handle's inode then differs from
  * the checkout's own file); the bytes are read from the verified handle. A
  * hardlink planted inside the checkout is indistinguishable from the
@@ -356,23 +384,16 @@ export async function readHostOverrideDocumentNoFollow(
       `Workspace MCP overrides path could not be verified (${reason}); refusing to read it: ${filePath}`
     );
   };
-  const handle = await fsPromises.open(
-    filePath,
-    // mutation-equivalent: O_NOFOLLOW is a nonzero constant wherever Node defines it, so ?? and || agree; only Windows, which lacks it, reads the 0, and these tests run on POSIX
-    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)
-  );
+  const relative = path.relative(workspacePath, filePath).replaceAll("\\", "/");
+  if (relative.startsWith("..") || path.isAbsolute(relative)) refuse("outside the checkout");
+  const segments = relative.split("/");
+  const root = await fsPromises.realpath(workspacePath);
+  await guardOverrideSegments(root, segments.slice(0, -1), refuse);
+  const handle = await fsPromises.open(filePath, VERIFIED_DOCUMENT_OPEN_FLAGS);
   try {
     const opened = await handle.stat();
     if (!opened.isFile()) refuse("not a regular file");
-    const relative = path.relative(workspacePath, filePath).replaceAll("\\", "/");
-    if (relative.startsWith("..") || path.isAbsolute(relative)) refuse("outside the checkout");
-    const root = await fsPromises.realpath(workspacePath);
-    let current = root;
-    for (const segment of relative.split("/")) {
-      current = path.join(current, segment);
-      if ((await fsPromises.lstat(current)).isSymbolicLink())
-        refuse(`${segment} is a symbolic link`);
-    }
+    const current = await guardOverrideSegments(root, segments, refuse);
     const canonical = await fsPromises.stat(current);
     if (canonical.dev !== opened.dev || canonical.ino !== opened.ino) {
       refuse("the opened file is not the checkout's own document");
@@ -1506,12 +1527,16 @@ export class OverridesFileTooLargeError extends Error {
     );
   }
 }
-/** Whether a checkout's directory exists; a stat that fails for any reason counts as no. */
-async function checkoutDirectoryExists(resolved: ResolvedWorkspace): Promise<boolean> {
+/**
+ * The device and inode of a host checkout's directory (see documentsMayCarryKey), or
+ * undefined when it is no directory now; a stat that fails for any reason counts as gone.
+ */
+async function checkoutIdentity(workspacePath: string): Promise<string | undefined> {
   try {
-    return (await resolved.runtime.stat(resolved.workspacePath)).isDirectory;
+    const stat = await fsPromises.stat(workspacePath, { bigint: true });
+    return stat.isDirectory() ? `${stat.dev}:${stat.ino}` : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
 /**
@@ -5313,11 +5338,19 @@ export class WorkspaceMcpOverridesService {
       resolved.workspacePath,
       resolved.metadata.runtimeConfig
     );
-    let documented = false;
+    // A verdict on a checkout holds only for documents read from one directory. A rename or a
+    // move can take the checkout away under that workspace's lock, between two of the reads
+    // below and before its registry entry names the new path: a document read after the move
+    // is absent at the old path while it still exists (a clean canonical document read before
+    // the move then hid a keyed compatibility document). So the checkout's identity is taken
+    // before the first read and compared after the last, whatever the reads found. A checkout
+    // that is gone, or is another directory, makes the workspace a candidate: the sweep waits
+    // for its lock and prunes the checkout that the registry names then.
+    const identity = await checkoutIdentity(resolved.workspacePath);
+    if (identity === undefined) return true;
     for (const filePath of filePaths) {
       const probe = await probeOverridesFile(resolved.runtime, filePath);
       if (probe.kind === "absent") continue;
-      documented = true;
       scan.documented.add(resolved.metadata.id);
       if (probe.kind === "indeterminate" || probe.size > MAX_PRUNED_OVERRIDES_BYTES) return true;
       // SECURITY: no lock guards this read, and the probe above follows symlinks. A checkout
@@ -5334,12 +5367,7 @@ export class WorkspaceMcpOverridesService {
       // Every decoded string of the parse tree, so an escaped spelling cannot hide a key.
       if (documentStringsContain(text, (value) => value.includes(keyPrefix))) return true;
     }
-    // No document proves nothing once the checkout itself is gone: a rename or a move can be
-    // taking it away under that workspace's lock, before its registry entry names the new
-    // path. Such a workspace is a candidate, so the sweep waits for that lock and prunes the
-    // checkout that the registry names then. Checked after the documents, so a checkout that
-    // moved during their reads is seen as gone.
-    return !documented && !(await checkoutDirectoryExists(resolved));
+    return (await checkoutIdentity(resolved.workspacePath)) !== identity;
   }
 
   /** Body of prunePluginOverrideKeysForWorkspaces, run under its locks. */
