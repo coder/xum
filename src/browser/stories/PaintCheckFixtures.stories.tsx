@@ -6,14 +6,16 @@ import { lightweightMeta, PIXEL_DISABLED } from "./meta.js";
 
 /**
  * Stories that exercise four guards of the paint-check runner (.storybook/test-runner.ts): the
- * diagram wait, the error marker, the viewport check and the paint-outside check. Each story
- * trips one guard, or is valid on purpose, so only `make test-storybook-paint-fixtures` runs them,
- * and it requires each one to fail with its expected message (or to pass). Without them, deleting
- * a guard from the runner would leave every real paint-check story green.
+ * diagram wait, the error marker, the viewport check (hiding a diagram must change pixels inside
+ * its box) and the paint-outside check. Each story trips one guard, or is valid on purpose, so only
+ * `make test-storybook-paint-fixtures` runs them, and it requires each one to fail with its
+ * expected message (or to pass). Without them, deleting a guard from the runner would leave every
+ * real paint-check story green.
  *
  * Not covered: the runner's count of drawn diagrams against frames (a frame that never draws and
  * shows no error marker). A story for it would wait the runner's whole render timeout on every CI
- * run.
+ * run. The runner also never checks a diagram that mounts after its wait has returned, so no
+ * fixture mounts one that late.
  *
  * - "!test" keeps them out of the default `make test-storybook` run.
  * - The paint-fixture tag lets `--includeTags` pick them, and the WebKit step excludes it.
@@ -70,8 +72,9 @@ export const BrokenChartNextToGoodChart: Story = {
 };
 
 /**
- * MUST FAIL with "never overlaps the viewport". The diagram renders, and nothing outside its box
- * changes when it is hidden, so only the runner's viewport check can fail this story.
+ * MUST FAIL with "must change pixels inside its box". The diagram renders, and nothing outside its
+ * box changes when it is hidden, so only the runner's viewport check can fail this story. The box
+ * lies off the viewport, so hiding the diagram changes no pixel the runner can see.
  */
 export const DiagramOutsideTheViewport: Story = {
   render: () => (
@@ -98,6 +101,51 @@ export const DiagramPaintsOutsideItsBox: Story = {
             <rect width={240} height={80} style={{ fill: "var(--color-accent)" }} />
             <rect y={200} width={240} height={40} style={{ fill: "var(--color-danger)" }} />
           </svg>
+        </div>
+        <p>{TEXT_AFTER}</p>
+      </div>
+    </div>
+  ),
+};
+
+/**
+ * MUST FAIL with "must change pixels inside its box", as do the next two stories. Each lays out a
+ * diagram inside the viewport that no one can see, so nothing outside its box changes when the
+ * runner hides it and only the viewport check can fail the story. This one sits in a parent with
+ * visibility: hidden. The text after the diagram gives the runner a page to compare.
+ */
+export const DiagramInHiddenParent: Story = {
+  render: () => (
+    <Page content={[GOOD_CHART, TEXT_AFTER].join("\n\n")} style={{ visibility: "hidden" }} />
+  ),
+};
+
+/** An overlay in the page's own colour covers the diagram and the text after it. */
+export const DiagramUnderAnOverlay: Story = {
+  render: () => (
+    <div className="bg-background min-h-screen p-4">
+      <div style={{ width: 600, position: "relative" }}>
+        <MarkdownRenderer content={[GOOD_CHART, TEXT_AFTER].join("\n\n")} />
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 10,
+            background: "var(--color-background)",
+          }}
+        />
+      </div>
+    </div>
+  ),
+};
+
+/** A parent of height 0 with overflow: hidden clips the diagram away. */
+export const DiagramClippedAway: Story = {
+  render: () => (
+    <div className="bg-background min-h-screen p-4">
+      <div style={{ width: 600 }}>
+        <div style={{ height: 0, overflow: "hidden" }}>
+          <MarkdownRenderer content={GOOD_CHART} />
         </div>
         <p>{TEXT_AFTER}</p>
       </div>

@@ -21,6 +21,9 @@ import { stripVTControlCharacters } from "node:util";
 const FIXTURE_TAG = "paint-fixture";
 const FIXTURE_FILE = "src/browser/stories/PaintCheckFixtures.stories.tsx";
 
+// The runner's viewport check fails a diagram that is off screen, hidden, covered or clipped.
+const VIEWPORT_CHECK_MESSAGE = "must change pixels inside its box";
+
 /**
  * Story export name -> a piece of the runner's failure message, or null for a story that must
  * pass. The pieces are exact on purpose: a story that fails for another reason is not the guard
@@ -28,7 +31,10 @@ const FIXTURE_FILE = "src/browser/stories/PaintCheckFixtures.stories.tsx";
  */
 export const FIXTURES: ReadonlyMap<string, string | null> = new Map([
   ["BrokenChartNextToGoodChart", "must show a rendered Mermaid diagram"],
-  ["DiagramOutsideTheViewport", "never overlaps the viewport"],
+  ["DiagramOutsideTheViewport", VIEWPORT_CHECK_MESSAGE],
+  ["DiagramInHiddenParent", VIEWPORT_CHECK_MESSAGE],
+  ["DiagramUnderAnOverlay", VIEWPORT_CHECK_MESSAGE],
+  ["DiagramClippedAway", VIEWPORT_CHECK_MESSAGE],
   ["DiagramPaintsOutsideItsBox", "paint only inside its box"],
   ["DiagramMountsWhenTheRunnerWaits", null],
 ]);

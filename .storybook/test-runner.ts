@@ -768,10 +768,11 @@ async function assertLiveLineClearsTheComposer(page: StoryPage) {
   }
 }
 
-// The diagram wait, the error marker, the viewport check and the paint-outside check below each
-// have a story built to trip them (src/browser/stories/PaintCheckFixtures.stories.tsx), which
-// `make test-storybook-paint-fixtures` runs through this file. A message that changes needs its new
-// text in scripts/check-paint-check-fixtures.ts.
+// The diagram wait, the error marker, the viewport check (hiding a diagram must change pixels inside
+// its box) and the paint-outside check below each have a story built to trip them
+// (src/browser/stories/PaintCheckFixtures.stories.tsx), which `make test-storybook-paint-fixtures`
+// runs through this file. A message that changes needs its new text in
+// scripts/check-paint-check-fixtures.ts.
 const PAINT_CHECK_TAG = "paint-check";
 const NO_DIAGRAM_MESSAGE = `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`;
 const DIAGRAM_RENDER_TIMEOUT_MS = 15_000;
@@ -790,6 +791,8 @@ interface Pixels {
   channels: number;
 }
 
+// Known limit (stated in docs/AGENTS.md): the check covers the diagrams that exist when this wait
+// returns. A broken or extra diagram that mounts later is not checked, and nothing here re-checks.
 async function waitForRenderedDiagrams(page: StoryPage) {
   const args: [string, string, string, number, string] = [
     MERMAID_PAGE_FRAME_SELECTOR,
@@ -907,19 +910,38 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels) {
   return { count, sides: [...sides].sort(), bounds };
 }
 
-async function paintOutside(
-  page: StoryPage,
-  index: number,
-  box: Box,
-  shown: Pixels
-): Promise<string[]> {
+/**
+ * Pixels that hiding the diagram changed inside its box, as far as the viewport shows it. A diagram
+ * that is seen changes many; one under a hidden parent, an overlay or a clip changes none, which
+ * leaves nothing outside its box to compare either. Stops counting once it is clearly seen.
+ */
+function differenceInside(box: Box, shown: Pixels, hidden: Pixels) {
+  const right = Math.min(Math.ceil(box.right), shown.width);
+  const bottom = Math.min(Math.ceil(box.bottom), shown.height);
+  let count = 0;
+  for (let y = Math.max(Math.floor(box.top), 0); y < bottom; y++) {
+    for (let x = Math.max(Math.floor(box.left), 0); x < right; x++) {
+      if (pixelDiffers(shown, hidden, (y * shown.width + x) * shown.channels)) count++;
+      if (count >= MIN_INK_PIXELS) return count;
+    }
+  }
+  return count;
+}
+
+/** Hides the diagram and compares the viewport with `shown`: ink outside its box, and ink inside. */
+async function compareWithHidden(page: StoryPage, index: number, box: Box, shown: Pixels) {
   await setDiagramHidden(page, index, true);
   try {
-    const { sides, bounds, count } = differenceOutside(box, shown, await viewportPixels(page));
+    const hidden = await viewportPixels(page);
+    const { sides, bounds, count } = differenceOutside(box, shown, hidden);
     const where = `x ${bounds.left}-${bounds.right}, y ${bounds.top}-${bounds.bottom}`;
-    return count >= MIN_INK_PIXELS
-      ? [`diagram ${index} paints ${sides.join(" and ")} its box (${count} px, ${where})`]
-      : [];
+    return {
+      painted:
+        count >= MIN_INK_PIXELS
+          ? [`diagram ${index} paints ${sides.join(" and ")} its box (${count} px, ${where})`]
+          : [],
+      changedInside: differenceInside(box, shown, hidden),
+    };
   } finally {
     await setDiagramHidden(page, index, false);
   }
@@ -948,13 +970,6 @@ function scrollBelowDiagram(page: StoryPage, index: number, scroll: boolean) {
 const MIN_BELOW_PX = 8;
 const roomBelow = (box: Box, viewportHeight: number) => viewportHeight - Math.ceil(box.bottom) - 1;
 
-function overlapsViewport(box: Box, viewport: Pick<Pixels, "width" | "height">) {
-  return (
-    Math.min(box.right, viewport.width) > Math.max(box.left, 0) &&
-    Math.min(box.bottom, viewport.height) > Math.max(box.top, 0)
-  );
-}
-
 /**
  * For a diagram that ends below the viewport. By now the first screenshot has repaired any stale
  * WebKit layout, so this scrolled view only catches paint that escapes a settled layout.
@@ -968,10 +983,7 @@ async function paintBelowWhenScrolled(page: StoryPage, index: number) {
       roomBelow(box, shown.height) >= MIN_BELOW_PX,
       `Diagram ${index} has no content below it to compare: put text after it in the story`
     );
-    return {
-      painted: await paintOutside(page, index, box, shown),
-      inViewport: overlapsViewport(box, shown),
-    };
+    return await compareWithHidden(page, index, box, shown);
   } finally {
     await scrollBelowDiagram(page, index, false);
   }
@@ -982,7 +994,7 @@ async function paintBelowWhenScrolled(page: StoryPage, index: number) {
  * only. WebKit lays the page out again at its next screenshot or resize, which repairs that
  * state, so each diagram is compared against one first screenshot (one that ends below the
  * viewport also gets a scrolled one) and the viewport is left alone: with a diagram hidden, the
- * page outside its box must look the same as with it shown.
+ * page outside its box must look the same as with it shown, and its box must look different.
  */
 async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   // A hovered button shows a tooltip, which fades in and out between two screenshots.
@@ -1017,15 +1029,19 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   const painted: string[] = [];
   const unseen: string[] = [];
   for (const [index, box] of boxes.entries()) {
-    painted.push(...(await paintOutside(page, index, box, shown)));
-    let inViewport = overlapsViewport(box, shown);
+    const atRest = await compareWithHidden(page, index, box, shown);
+    painted.push(...atRest.painted);
+    let changedInside = atRest.changedInside;
     if (roomBelow(box, shown.height) < MIN_BELOW_PX) {
       const scrolled = await paintBelowWhenScrolled(page, index);
       painted.push(...scrolled.painted);
-      inViewport ||= scrolled.inViewport;
+      changedInside = Math.max(changedInside, scrolled.changedInside);
     }
-    if (!inViewport)
-      unseen.push(`diagram ${index} (x ${box.left}-${box.right}, y ${box.top}-${box.bottom})`);
+    if (changedInside < MIN_INK_PIXELS) {
+      unseen.push(
+        `diagram ${index} (x ${box.left}-${box.right}, y ${box.top}-${box.bottom}) changed ${changedInside} px when hidden`
+      );
+    }
   }
   assert.equal(
     painted.join("; "),
@@ -1035,7 +1051,7 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   assert.equal(
     unseen.join("; "),
     "",
-    "A diagram that never overlaps the viewport is not compared with its box: bring it into view in the story"
+    "Hiding a diagram must change pixels inside its box: a diagram outside the viewport, under a hidden parent, under an overlay or clipped away is not compared with anything, so show it in the story"
   );
 }
 
