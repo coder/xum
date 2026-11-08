@@ -9,6 +9,7 @@ import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
 } from "@/common/config/schemas/agentPluginInstalls";
+import { pointsAtThisMachine } from "@/common/utils/agentPluginSource";
 import { ResultSchema } from "./result";
 
 /**
@@ -77,25 +78,19 @@ const BackupPluginComponentNamesSchema = z
 /**
  * A repository URL a restore hands to git. The list is repository-controlled, so the URL must not
  * read as a git option (a leading dash, or whitespace before it, since the preview trims its
- * input), as a UNC share (`//host/share`, which Windows opens over SMB and so sends the user's
- * credentials), or carry whitespace, control or bidi characters or a credential. A local path
- * or a loopback host is not refused here: the export leaves those out (agentPluginBackup.ts), and
- * the user sees the URL before any preview runs.
+ * input), or carry whitespace, control or bidi characters or a credential. It must also not point
+ * at this machine: the export leaves out every such source with this same check
+ * (agentPluginBackup.ts), so only a tampered list carries one, and on Windows a path, a `file:`
+ * URL or a UNC or NT-namespace spelling of one can make the preview's fetch open SMB, which can
+ * send the user's credentials before any consent.
  */
 const BackupPluginUrlSchema = z
   .string()
   .min(1)
   .max(2048)
   .regex(/^[^\s-]/, { message: "A repository URL must not start with '-' or whitespace" })
-  .refine((url) => !/^[\\/]{2}/.test(url), {
-    message: "A repository URL must not be a network share",
-  })
-  // An export never writes a file: source (it is local to the machine that installed it), so
-  // only a tampered list carries one. On Windows, file://host/share and file:////host/share are
-  // UNC shares: the preview's fetch would open SMB, which can send the user's credentials before
-  // any consent.
-  .refine((url) => !/^file:/i.test(url), {
-    message: "A repository URL must not be a file: URL",
+  .refine((url) => !pointsAtThisMachine(url), {
+    message: "A repository URL must not be a path, a file: URL or a host on this machine",
   })
   .refine((url) => !UNSAFE_URL_CHARACTERS.test(url), {
     message: "A repository URL must not contain whitespace or control characters",

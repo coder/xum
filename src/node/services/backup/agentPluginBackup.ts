@@ -14,7 +14,7 @@ import {
   type BackupPluginStatus,
 } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
-import { pointsAtThisMachine } from "@/node/services/agentPlugins/claudeMarketplace";
+import { pointsAtThisMachine } from "@/common/utils/agentPluginSource";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
 import {
   acquirePluginMutationLock,

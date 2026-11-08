@@ -280,10 +280,14 @@ describe("backup of the managed plugin list", () => {
         "ssh-host": "git@github.com:example/ssh-host.git",
         "name-has-localhost": "https://github.com/example/localhost.git",
         "host-starts-with-localhost": "ssh://git@localhost.example.com/example/repo.git",
+        // scp-style ssh to a host named `file`: a remote source, which the backup schema reads.
+        "scp-host-named-file": "file:host/share/scp-host-named-file.git",
       } as const;
       const leftOutUrls = {
         "abs-path": "/home/someone/plugins/abs-path",
         "file-url": "file:///home/someone/plugins/file-url",
+        "file-url-upper": "FILE:///home/someone/plugins/file-url-upper",
+        "nt-share": "/??/UNC/someone/share/nt-share.git",
         "home-path": "~/plugins/home-path",
         "drive-path": "C:\\plugins\\drive-path",
         "ssh-localhost": "ssh://user@localhost/home/someone/repo.git",

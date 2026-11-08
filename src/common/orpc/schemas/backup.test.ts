@@ -94,6 +94,14 @@ describe("BackupPluginEntrySchema", () => {
     ["a file URL with a host (a Windows share)", "file://attacker/share/repo.git"],
     ["a file URL with a UNC path", "file:////attacker/share/repo.git"],
     ["a local file URL in another case", "FILE:///tmp/repo.git"],
+    ["a path that Git for Windows can open as a share", "/??/UNC/attacker/share/repo.git"],
+    ["a POSIX path", "/home/someone/repo.git"],
+    ["a Windows rooted path", "\\??\\UNC\\attacker\\share"],
+    ["a home path", "~/repo.git"],
+    ["a drive path", "C:\\repo.git"],
+    ["a drive path with a slash", "C:/repo.git"],
+    ["a loopback ssh host", "ssh://git@localhost/someone/repo.git"],
+    ["a loopback scp host", "git@127.0.0.1:someone/repo.git"],
     ["a url with internal whitespace", "https://github.com/example/my repo.git"],
     ["a url with a newline", "https://github.com/example/repo.git\nextra"],
     ["a url with a control character", "https://github.com/example/rep\u0007o.git"],
@@ -118,6 +126,9 @@ describe("BackupPluginEntrySchema", () => {
     ["an ssh url", "ssh://git@github.com/example/repo.git"],
     ["an scp-style url", "git@github.com:example/repo.git"],
     ["a git url", "git://git.example.com/example/repo.git"],
+    // Git reads this as scp-style ssh to a host named `file`, and Xum installs it, so the export
+    // writes it and a restore must read it.
+    ["an scp-style url to a host named file", "file:host/share/repo.git"],
   ])("keeps %s", (_label, url) => {
     const row = entry({ source: { type: "git", url, ref: "main", refType: "branch" } });
     expect(BackupPluginEntrySchema.safeParse(row).success).toBe(true);
