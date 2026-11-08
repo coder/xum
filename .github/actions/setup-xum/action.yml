@@ -121,11 +121,11 @@ runs:
 
     # The zip that node_modules/electron/install.js downloads from github.com on the first
     # launch (bun skips Electron's postinstall, so nothing downloads it earlier). The caches
-    # above never held it for E2E and Stories: they key on the lockfiles alone, and a new key
-    # is saved by whichever job misses first, with the stale zips its restore-keys prefix
-    # restored (Linux held 44.5.1 and 40.9.3 only), or hold the zip flat in the cache root
-    # (macOS), where @electron/get does not look. So every E2E and Stories job downloaded it,
-    # and a 504 from github.com failed them on three PRs on 2026-11-08.
+    # above never served E2E and Stories: they key on the lockfiles alone, and whichever job
+    # misses a new key first saves it. Linux's entry held only the stale zips that its
+    # restore-keys prefix had restored (44.5.1 and 40.9.3). macOS's held the zip flat in the
+    # cache root, where @electron/get does not look. So every E2E and Stories job downloaded
+    # the zip, and a 504 from github.com failed those jobs on 2026-11-08.
     # This cache has one purpose: the current zip, in a directory of its own that
     # electron_config_cache points @electron/get at. The key hashes checksums.json, so a new
     # Electron version or checksum starts a fresh cache, and there is no restore-keys fallback

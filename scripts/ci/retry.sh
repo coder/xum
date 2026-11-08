@@ -5,10 +5,11 @@
 # Usage: scripts/ci/retry.sh <budget-seconds> <command> [args...]
 #
 # Why: github.com release downloads answered 504 for more than 7 minutes on 2026-11-08 and
-# failed CI on three PRs. `curl --retry 5` waits about 30 seconds in total, so a fixed retry
+# failed CI on two PRs. `curl --retry 5` waits about 30 seconds in total, so a fixed retry
 # count cannot outlast an outage like that. The wait starts at RETRY_INITIAL_DELAY_SECS,
 # doubles after each failure and stops growing at RETRY_MAX_DELAY_SECS. The script gives up
 # when the next wait would end after the budget. It then exits with the command's last status.
+# No -e: the loop reads each failed status itself.
 set -uo pipefail
 
 if (($# < 2)) || ! [[ "$1" =~ ^[0-9]+$ ]]; then
