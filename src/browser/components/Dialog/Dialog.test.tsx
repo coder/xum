@@ -113,3 +113,55 @@ describe("isDialogOpen with the shared Dialog primitives", () => {
     expect(isDialogOpen()).toBe(false);
   });
 });
+
+/**
+ * Radix modal layers lock page scroll with react-remove-scroll, which cancels any touchmove over
+ * content that cannot scroll. iOS synthesizes no click for a touch whose move was cancelled, so
+ * the patch leaves moves within a tap slop alone.
+ */
+describe("touch moves inside an open modal dialog", () => {
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  function touchOn(target: Element, type: string, x: number, y: number): TouchEvent {
+    const point = new window.Touch({ identifier: 1, target, clientX: x, clientY: y });
+    const event = new window.TouchEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      touches: [point],
+      targetTouches: [point],
+      changedTouches: [point],
+    });
+    target.dispatchEvent(event);
+    return event;
+  }
+
+  test("a move within the tap slop is not cancelled, a drag over unscrollable content is", () => {
+    const view = render(
+      <Dialog open>
+        <DialogOverlay />
+        <DialogPrimitive.Content>
+          <DialogPrimitive.Title>Settings</DialogPrimitive.Title>
+          <button type="button">General</button>
+        </DialogPrimitive.Content>
+      </Dialog>
+    );
+    const button = view.getByRole("button", { name: "General" });
+
+    touchOn(button, "touchstart", 100, 100);
+    expect(touchOn(button, "touchmove", 102, 100).defaultPrevented).toBe(false);
+    expect(touchOn(button, "touchmove", 100, 140).defaultPrevented).toBe(true);
+    // Once a drag has left the slop, coming back near the start does not make it a tap again.
+    expect(touchOn(button, "touchmove", 101, 101).defaultPrevented).toBe(true);
+
+    touchOn(button, "touchstart", 100, 100);
+    expect(touchOn(button, "touchmove", 101, 102).defaultPrevented).toBe(false);
+  });
+});
