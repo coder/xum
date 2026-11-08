@@ -320,15 +320,28 @@ describe("a value far past the budget", () => {
 
 describe("takeWithoutMedia", () => {
   it("takes the text when it fits, and says nothing followed", () => {
-    expect(takeWithoutMedia("a data:x b", 100)).toEqual({ text: "a data:x b", cut: false });
-    expect(takeWithoutMedia("", 100)).toEqual({ text: "", cut: false });
+    expect(takeWithoutMedia("a data:x b", 100)).toEqual({
+      text: "a data:x b",
+      cut: false,
+      read: 10,
+    });
+    expect(takeWithoutMedia("", 100)).toEqual({ text: "", cut: false, read: 0 });
   });
 
   it("counts the stub, not the payload, against the limit", () => {
     const text = `data:image/png;base64,${"A".repeat(100_000)} tail text here`;
 
-    expect(takeWithoutMedia(text, 12)).toEqual({ text: "[media] tail", cut: true });
-    expect(takeWithoutMedia(text, 1_000)).toEqual({ text: "[media] tail text here", cut: false });
+    const urlLength = text.indexOf(" tail");
+    expect(takeWithoutMedia(text, 12)).toEqual({
+      text: "[media] tail",
+      cut: true,
+      read: urlLength + 5,
+    });
+    expect(takeWithoutMedia(text, 1_000)).toEqual({
+      text: "[media] tail text here",
+      cut: false,
+      read: text.length,
+    });
   });
 
   it("searches only the text the limit can reach for a URL", () => {

@@ -14,6 +14,7 @@ import {
   SESSION_HISTORY_OMITTED,
   derivesFromSessionHistory,
   renderToolValue,
+  takeWithoutMedia,
 } from "@/node/services/memoryToolText";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 
@@ -126,16 +127,18 @@ interface HarvestPiece {
 }
 
 /**
- * The text of a text part as rows read it: redacted, and cut at the part's cap. The scan reaches a
- * lookahead past the cap, so a secret that starts inside the kept text is matched whole, and what
- * lies past it is never scanned. Text parts are not tool output, but a credential a user pasted or
- * a model echoed sits in them just the same, and the cap is long enough to carry it to the model.
+ * The text of a text part as rows read it: free of data URLs, redacted, and cut at the part's cap.
+ * A data URL costs its `[media]` stub, as in a tool value, so a pasted or echoed screenshot does
+ * not spend the cap on bytes and fill dozens of chunks. The scan reaches a lookahead past the cap,
+ * so a secret that starts inside the kept text is matched whole, and what lies past it is never
+ * scanned. Text parts are not tool output, but a credential a user pasted or a model echoed sits
+ * in them just the same, and the cap is long enough to carry it to the model.
  */
 function boundedTextPart(raw: string): RowText {
-  const window = raw.slice(0, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
-  const prepared = neutralizeHarvestText(redactSecretLike(window));
+  const window = takeWithoutMedia(raw, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
+  const prepared = neutralizeHarvestText(redactSecretLike(window.text));
   const text = prepared.slice(0, HARVEST_MAX_TEXT_PART_CHARS);
-  return { text, cutChars: raw.length - window.length + prepared.length - text.length };
+  return { text, cutChars: raw.length - window.read + prepared.length - text.length };
 }
 
 function rowTextOfPart(part: MuxMessage["parts"][number]): RowText {

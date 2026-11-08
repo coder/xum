@@ -47,17 +47,21 @@ const DATA_URL_AT = new RegExp(`${BASE64_URL}|${ENCODED_URL}`, "iy");
 const DATA_SCHEME = /data:/i;
 
 /**
- * The first `limit` characters of `text` once its data URLs are replaced by `[media]`, and whether
- * more followed. A URL costs the stub, not its payload, so attachment bytes never use up the limit.
- * Only the next `limit - kept` characters are searched for a URL start, so text past the limit is
- * not read; a URL that starts inside it is read to its end.
+ * The first `limit` characters of `text` once its data URLs are replaced by `[media]`, whether more
+ * followed, and how many characters of `text` were read to get them. A URL costs the stub, not its
+ * payload, so attachment bytes never use up the limit. Only the next `limit - kept` characters are
+ * searched for a URL start, so text past the limit is not read; a URL that starts inside it is read
+ * to its end.
  */
-export function takeWithoutMedia(text: string, limit: number): { text: string; cut: boolean } {
+export function takeWithoutMedia(
+  text: string,
+  limit: number
+): { text: string; cut: boolean; read: number } {
   let kept = "";
   let position = 0;
   while (position < text.length) {
     const room = limit - kept.length;
-    if (room <= 0) return { text: kept, cut: true };
+    if (room <= 0) return { text: kept, cut: true, read: position };
     const ahead = text.slice(position, position + room);
     const scheme = DATA_SCHEME.exec(ahead);
     if (scheme === null) {
@@ -73,7 +77,7 @@ export function takeWithoutMedia(text: string, limit: number): { text: string; c
     kept += url === null ? scheme[0] : MEDIA_STUB;
     position += url === null ? scheme[0].length : url[0].length;
   }
-  return { text: kept, cut: false };
+  return { text: kept, cut: false, read: position };
 }
 
 interface Sink {
