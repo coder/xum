@@ -132,6 +132,8 @@ const UNTOUCHED_COOKIE_VALUE = /^\s*(?:$|\[\s*\]?$|\[redacted\])/;
  * lets the gap give a space back, and the value start there.
  */
 function redactCookieValue(match: string, prefix: string, opener: string | undefined): string {
+  // mutation-equivalent: `opener` is a string or undefined, never a falsy string that `||` would
+  // replace with another one, so `??` and `||` agree.
   const quote = opener ?? "";
   const value = match.slice(prefix.length + quote.length);
   if (UNTOUCHED_COOKIE_VALUE.test(value)) return match;
