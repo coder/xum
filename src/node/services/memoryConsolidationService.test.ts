@@ -3319,6 +3319,61 @@ describe("MemoryConsolidationService", () => {
         });
       });
 
+      it("stops a job whose last attempt another backend ran and failed while it waited", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+        const failedAfter = (attemptCount: number) =>
+          fsPromises.writeFile(
+            sidecarPath,
+            JSON.stringify({
+              harvestsByWorkspace: {
+                "ws-dream": {
+                  "summary-1": {
+                    status: "failed",
+                    startedAt: 1,
+                    completedAt: 1,
+                    attemptCount,
+                    boundaryKey: "summary-1",
+                    compactionEpoch: 1,
+                    acceptedCandidates: 0,
+                    skippedCandidates: 0,
+                    completionMetadata: metadata,
+                    error: "provider exploded",
+                  },
+                },
+              },
+            })
+          );
+        await failedAfter(HARVEST_MAX_ATTEMPTS - 1);
+        // The other backend: it holds the owner's job lock while its last attempt fails.
+        const releaseForeign = await acquireCrossProcessLock({
+          lockPath: analyzerJobLockPath(fixture.xumHome, "ws-dream"),
+          acquireTimeoutMs: 1_000,
+          staleMs: 60_000,
+          timeoutMessage: "test holder",
+        });
+        let run: Promise<unknown> | undefined;
+        try {
+          run = fixture.service.maybeHarvestThenSweep(metadata);
+          // Past its model creation, the job read the record with one attempt left.
+          await until(() => fixture.modelCalls.length === 1);
+          await failedAfter(HARVEST_MAX_ATTEMPTS);
+        } finally {
+          await releaseForeign();
+        }
+        await run;
+
+        const analyzerPrompts = fixture.modelPrompts.filter((prompt) =>
+          prompt.includes("just-compacted transcript epoch")
+        );
+        expect(analyzerPrompts).toEqual([]);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "failed",
+          attemptCount: HARVEST_MAX_ATTEMPTS,
+        });
+      });
+
       it("takes over the sidecar and analyzer locks of a backend that died holding them", async () => {
         using fixture = await createFixture();
         const metadata = await seedCompactionEpoch(fixture);

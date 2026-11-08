@@ -486,6 +486,16 @@ function isLiveHarvestAttempt(record: MemoryHarvestRecord | undefined): boolean 
   return record?.status === "pending" && !isStalePendingHarvestRecord(record);
 }
 
+/**
+ * Whether the record read under the job lock leaves its job nothing to do: completed, or out of
+ * attempts. Unlike isTerminalHarvestRecord this counts a pending record too: under the lock it
+ * is a dead attempt's, and its count includes that attempt.
+ */
+function isSettledUnderJobLock(record: MemoryHarvestRecord | undefined): boolean {
+  if (record === undefined) return false;
+  return record.status === "completed" || record.attemptCount >= HARVEST_MAX_ATTEMPTS;
+}
+
 /** Points a job's attempt at `current`, the record read under the job lock: it resumes there. */
 function resumeHarvestAttemptFrom(
   current: MemoryHarvestRecord | undefined,
@@ -2134,12 +2144,7 @@ export class MemoryConsolidationService extends EventEmitter {
               // here, not before the wait, since another backend may have completed it, used up
               // its attempts or moved its cursor meanwhile. The attempt claims it and resumes there.
               const current = harvestsByWorkspace[workspaceId]?.[boundaryKey];
-              if (
-                current?.status === "completed" ||
-                (current?.attemptCount ?? 0) >= HARVEST_MAX_ATTEMPTS
-              ) {
-                return;
-              }
+              if (isSettledUnderJobLock(current)) return;
               resumeHarvestAttemptFrom(current, opts);
               await Effect.runPromise(savePending(opts.progress));
               opts.attempt.holdsJobLock = true;
