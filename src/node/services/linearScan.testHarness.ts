@@ -31,10 +31,12 @@ export const FAST_SCAN_MS = 50;
 /** Ceiling for a shape past such a jump at scale 1 (they cost up to 115 ms today). */
 export const SLOW_SCAN_MS = 500;
 
-// Each run costs both sizes. There are up to MAX_RUNS of them, and none after the first once
-// RUN_BUDGET_MS of CPU time is spent: a cheap shape gets many runs, because the first ones pay for
-// engine warm-up and the GC and a few milliseconds are within their noise, and a slow shape gets
-// one, because those costs are small beside its own.
+// Each run costs both sizes. There are at least MIN_RUNS and at most MAX_RUNS of them, and none
+// past MIN_RUNS once RUN_BUDGET_MS of CPU time is spent: the first run pays for engine warm-up,
+// and any run can pay for the GC or a busy neighbour on the same core (one run of a shape that
+// costs 60 ms measured 8.6 times at 3x load, and its other runs 4 to 5 times). A cheap shape gets
+// many runs, because a few milliseconds are within that noise, and a costly shape gets two.
+const MIN_RUNS = 2;
 const MAX_RUNS = 5;
 const RUN_BUDGET_MS = 40;
 
@@ -56,7 +58,7 @@ export function expectLinearScan(
   let smallMs = Number.POSITIVE_INFINITY;
   let largeMs = Number.POSITIVE_INFINITY;
   let spentMs = 0;
-  for (let run = 0; run < MAX_RUNS && (run === 0 || spentMs < RUN_BUDGET_MS); run++) {
+  for (let run = 0; run < MAX_RUNS && (run < MIN_RUNS || spentMs < RUN_BUDGET_MS); run++) {
     const smallRun = cpuMs(() => scan(small));
     const largeRun = cpuMs(() => scan(large));
     smallMs = Math.min(smallMs, smallRun);
