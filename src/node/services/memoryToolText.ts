@@ -7,6 +7,8 @@
  * and the walk stops once the budget is full. Nothing is cloned or stringified whole, and a string
  * is cut to what is left of the budget before it is scanned for media.
  */
+import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { REDACTION_LOOKAHEAD_CHARS, redactSecretLike } from "@/node/services/memorySecretRedaction";
 
@@ -16,9 +18,9 @@ export const SESSION_HISTORY_OMITTED = "[session_history result omitted]";
 const SESSION_HISTORY_TOOL = "session_history";
 const UNSERIALIZABLE = "[unserializable]";
 const NONE = "[none]";
-// Tool-output attachment shapes: persisted `media`/`display_file` parts and the AI SDK's
-// model-output `image-data`/`file-data` forms. Their bytes never go to the harvest model.
-const MEDIA_PART_TYPES = new Set(["media", "display_file", "image-data", "file-data"]);
+// The AI SDK's model-output attachment forms, recognized by type alone as the provider projection
+// does (compactionRowSizing.ts). Their bytes never go to the harvest model.
+const SDK_ATTACHMENT_TYPES = new Set(["image-data", "file-data"]);
 const MAX_TOOL_VALUE_DEPTH = 30;
 
 // RFC 2397: `data:[<media type>][;<parameter>]...[;base64],<payload>`. The header has a media type
@@ -45,17 +47,21 @@ const DATA_URL_AT = new RegExp(`${BASE64_URL}|${ENCODED_URL}`, "iy");
 const DATA_SCHEME = /data:/i;
 
 /**
- * The first `limit` characters of `text` once its data URLs are replaced by `[media]`, and whether
- * more followed. A URL costs the stub, not its payload, so attachment bytes never use up the limit.
- * Only the next `limit - kept` characters are searched for a URL start, so text past the limit is
- * not read; a URL that starts inside it is read to its end.
+ * The first `limit` characters of `text` once its data URLs are replaced by `[media]`, whether more
+ * followed, and how many characters of `text` were read to get them. A URL costs the stub, not its
+ * payload, so attachment bytes never use up the limit. Only the next `limit - kept` characters are
+ * searched for a URL start, so text past the limit is not read; a URL that starts inside it is read
+ * to its end.
  */
-export function takeWithoutMedia(text: string, limit: number): { text: string; cut: boolean } {
+export function takeWithoutMedia(
+  text: string,
+  limit: number
+): { text: string; cut: boolean; read: number } {
   let kept = "";
   let position = 0;
   while (position < text.length) {
     const room = limit - kept.length;
-    if (room <= 0) return { text: kept, cut: true };
+    if (room <= 0) return { text: kept, cut: true, read: position };
     const ahead = text.slice(position, position + room);
     const scheme = DATA_SCHEME.exec(ahead);
     if (scheme === null) {
@@ -71,7 +77,7 @@ export function takeWithoutMedia(text: string, limit: number): { text: string; c
     kept += url === null ? scheme[0] : MEDIA_STUB;
     position += url === null ? scheme[0].length : url[0].length;
   }
-  return { text: kept, cut: false };
+  return { text: kept, cut: false, read: position };
 }
 
 interface Sink {
@@ -140,9 +146,21 @@ function walkObject(sink: Sink, value: Record<string, unknown>, depth: number): 
   write(sink, "}");
 }
 
+/**
+ * Whether `value` is an attachment record whose bytes must not reach the harvest model. A `media`
+ * or `display_file` record counts only with the shared attachment shape the provider projection
+ * checks: any other record typed so is application data the tool returned (`{ "type": "media",
+ * "text": "campaign channel" }`) and carries evidence, so it renders like any other record.
+ */
+function isAttachmentRecord(value: Record<string, unknown>): boolean {
+  if (value.type === "media") return isMediaPart(value);
+  if (value.type === "display_file") return isDisplayOnlyFilePart(value);
+  return typeof value.type === "string" && SDK_ATTACHMENT_TYPES.has(value.type);
+}
+
 /** What stands for an attachment or a history lookup in place of its object, if `value` is one. */
 function placeholderForObject(value: Record<string, unknown>): string | undefined {
-  if (typeof value.type === "string" && MEDIA_PART_TYPES.has(value.type)) return MEDIA_STUB;
+  if (isAttachmentRecord(value)) return MEDIA_STUB;
   // A history lookup returns other rows' text; forwarding it would copy that text into this
   // workspace's memory and amplify one lookup into the next epoch's evidence.
   if (value.toolName === SESSION_HISTORY_TOOL) return SESSION_HISTORY_OMITTED;
