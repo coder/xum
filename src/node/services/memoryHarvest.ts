@@ -2,6 +2,8 @@ import { stepCountIs, streamText, tool, type LanguageModel } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { z } from "zod";
 
+import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutputRedaction";
+import { MEMORY_HARVEST_MAX_CHUNKS } from "@/common/constants/memory";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -22,14 +24,15 @@ const HARVEST_MAX_STEPS = 4;
 const HARVEST_MIN_CONFIDENCE = 0.8;
 const HARVEST_INBOX_DIR = "/memories/workspace/harvest";
 const HARVEST_MAX_TRANSCRIPT_CHARS = 40_000;
-// A message is never cut as a whole: every part reaches the harvest model, because the failure
-// and the fix of a long agent turn sit in its later steps. A long message becomes several evidence
-// rows of at most this many characters of text, which `buildHarvestChunks` then spreads over
-// chunks. A text part too long for one row is split into segments, one row each, so its tail is
-// read too; tool input and output are bounded part by part below.
+// A message is never cut as a whole: every part reaches the harvest model (up to the epoch's chunk
+// cap, `MEMORY_HARVEST_MAX_CHUNKS`), because the failure and the fix of a long agent turn sit in
+// its later steps. A long message becomes several evidence rows of at most this many characters
+// of text, which `buildHarvestChunks` then spreads over chunks. A text part too long for one row
+// is split into segments, one row each, so its tail is read too; tool input and output are
+// bounded part by part below.
 const HARVEST_MAX_ROW_TEXT_CHARS = 8_000;
-// A text part still ends here, with a marker: a pasted log of megabytes is not worth hundreds of
-// model calls, and nothing else bounds how many chunks one epoch makes.
+// A text part still ends here, with a marker: a pasted log of megabytes is not worth the epoch's
+// chunks, and the chunk cap would spend them on one part's segments.
 const HARVEST_MAX_TEXT_PART_CHARS = 128_000;
 const HARVEST_MAX_TOOL_INPUT_CHARS = 1_000;
 const HARVEST_MAX_TOOL_OUTPUT_CHARS = 2_000;
@@ -231,9 +234,72 @@ const ROW_SEPARATOR = ",\n";
 const ROW_INDENT = "  ";
 const CHUNK_FRAME_CHARS = CHUNK_OPEN.length + CHUNK_CLOSE.length;
 
+/** The JSON of a row as it sits, indented one level, inside a chunk's `JSON.stringify(rows, null, 2)`. */
+function indentedRowJson(row: HarvestEvidenceRow | CutMarkerRow): string {
+  return `${ROW_INDENT}${JSON.stringify(row, null, 2).replaceAll("\n", `\n${ROW_INDENT}`)}`;
+}
+
+/** An evidence row's JSON, and the message it came from: its id, and its place in the epoch. */
+interface RowSource {
+  json: string;
+  messageId: string;
+  messageIndex: number;
+}
+
+/**
+ * The epoch's evidence rows in order, as the harvest model reads them. Lazy: a reader that stops
+ * has not projected or formatted the messages after its last row.
+ */
+function* harvestRowsOf(messages: MuxMessage[]): Generator<RowSource> {
+  for (const [messageIndex, message] of messages.entries()) {
+    // Model-hidden rows (plan-review snapshot/resolve/reopen records) never reach provider
+    // requests; this direct streamText path must not forward their repository/model-influenced
+    // content to the Dream model and into persistent memory either.
+    if (isModelHiddenMessage(message)) continue;
+    // The harvest model is a provider: persisted tool outputs reach it only as normal model
+    // requests send them, without the workflow run record, `ui_only` payloads and the other
+    // fields the projection keeps out of every agent prompt. Projecting here, the one place
+    // every layer builds chunks from, covers each reader of a row; one message at a time, so
+    // a message that is never read is never projected either.
+    const [projected] = applyToolOutputRedaction([message]);
+    for (const row of formatMessageForHarvest(projected)) {
+      yield { json: indentedRowJson(row), messageId: message.id, messageIndex };
+    }
+  }
+}
+
+/** The last row of a transcript that hit the chunk cap: where it was cut, and how much went unread. */
+interface CutMarkerRow {
+  omitted: { note: string; unreadMessages: number; firstUnreadMessageId: string };
+}
+
+/**
+ * The marker that closes a transcript cut at the chunk cap. It tells the model that the epoch goes
+ * on past the cut, so a lesson that needs the rest is not drawn from the absence of it. `cut` is
+ * the first row left out; the unread messages are the visible ones from its message on.
+ */
+function cutMarkerRow(messages: MuxMessage[], cut: RowSource): CutMarkerRow {
+  return {
+    omitted: {
+      note:
+        `The transcript is cut here: this epoch has more than ${MEMORY_HARVEST_MAX_CHUNKS} chunks of rows, ` +
+        "the most one harvest reads. The rest is unread; do not infer that anything is absent from it.",
+      unreadMessages: messages
+        .slice(cut.messageIndex)
+        .filter((message) => !isModelHiddenMessage(message)).length,
+      firstUnreadMessageId: cut.messageId,
+    },
+  };
+}
+
 /**
  * Splits the epoch into transcript chunks: each chunk holds whole rows, so a message with many
- * parts spans several rows and so possibly several chunks.
+ * parts spans several rows and so possibly several chunks. At most `MEMORY_HARVEST_MAX_CHUNKS`:
+ * the build stops there, so the work, and the calls that follow, are bounded by the cap and not by
+ * the epoch. The cut falls at the end of the epoch, not at its head: the chunks are a clean
+ * prefix (every row before the cut was read, and a chunk keeps its number however long the epoch
+ * runs), and the compaction summary, which the model reads with each chunk, covers the rest. The
+ * last chunk then ends in a marker row that says where the cut fell.
  */
 export function buildHarvestChunks(messages: MuxMessage[]): HarvestChunk[] {
   const chunks: HarvestChunk[] = [];
@@ -255,27 +321,27 @@ export function buildHarvestChunks(messages: MuxMessage[]): HarvestChunk[] {
     currentIds = new Set<string>();
   }
 
-  for (const message of messages) {
-    // Model-hidden rows (plan-review snapshot/resolve/reopen records) never reach provider
-    // requests; this direct streamText path must not forward their repository/model-influenced
-    // content to the Dream model and into persistent memory either.
-    if (isModelHiddenMessage(message)) continue;
-    for (const row of formatMessageForHarvest(message)) {
-      const rowJson = `${ROW_INDENT}${JSON.stringify(row, null, 2).replaceAll("\n", `\n${ROW_INDENT}`)}`;
-      let grownChars =
-        currentRows.length === 0
-          ? rowJson.length
-          : currentRowChars + ROW_SEPARATOR.length + rowJson.length;
-      // A chunk always takes its first row, however long.
-      if (currentRows.length > 0 && CHUNK_FRAME_CHARS + grownChars > HARVEST_MAX_TRANSCRIPT_CHARS) {
+  for (const row of harvestRowsOf(messages)) {
+    let grownChars =
+      currentRows.length === 0
+        ? row.json.length
+        : currentRowChars + ROW_SEPARATOR.length + row.json.length;
+    // A chunk always takes its first row, however long.
+    if (currentRows.length > 0 && CHUNK_FRAME_CHARS + grownChars > HARVEST_MAX_TRANSCRIPT_CHARS) {
+      if (chunks.length + 1 >= MEMORY_HARVEST_MAX_CHUNKS) {
+        // This row opens a chunk past the cap: it is the first row left out. The marker closes the
+        // last chunk, a few hundred characters over the chunk's usual limit.
+        currentRows.push(indentedRowJson(cutMarkerRow(messages, row)));
         flush();
-        grownChars = rowJson.length;
+        return chunks;
       }
-      currentRowChars = grownChars;
-      currentRows.push(rowJson);
-      // A message that spans chunks is evidence in each chunk that holds a row of it.
-      currentIds.add(message.id);
+      flush();
+      grownChars = row.json.length;
     }
+    currentRowChars = grownChars;
+    currentRows.push(row.json);
+    // A message that spans chunks is evidence in each chunk that holds a row of it.
+    currentIds.add(row.messageId);
   }
 
   flush();
