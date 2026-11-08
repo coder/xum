@@ -819,17 +819,14 @@ function sweepClosure(
   seedIds: Iterable<string>,
   checkoutOf: (metadata: FrontendWorkspaceMetadata) => string
 ): Set<string> {
-  const childrenByParent = indexChildrenByParent(registry);
   const hostLocalEntries = groupMetadataById([...registry], /* hostLocalOnly */ true);
+  const graph: SweepClosureGraph = {
+    childrenByParent: indexChildrenByParent(registry),
+    hostLocalEntries,
+    idsByCheckout: indexIdsByCheckout(hostLocalEntries, checkoutOf),
+    checkoutOf,
+  };
   const registeredIds = new Set(registry.map((metadata) => metadata.id));
-  const idsByCheckout = new Map<string, string[]>();
-  for (const entries of hostLocalEntries.values()) {
-    for (const metadata of entries) {
-      const checkout = checkoutOf(metadata);
-      // mutation-equivalent: an array is never falsy, so ?? and || agree
-      idsByCheckout.set(checkout, [...(idsByCheckout.get(checkout) ?? []), metadata.id]);
-    }
-  }
   const members = new Set<string>();
   const visited = new Set<string>();
   const queue = [...seedIds];
@@ -840,15 +837,42 @@ function sweepClosure(
     if (hostLocalEntries.has(id) || !registeredIds.has(id)) {
       members.add(id);
     }
-    // mutation-equivalent: an array is never falsy, so ?? and || agree
-    for (const child of childrenByParent.get(id) ?? []) queue.push(child.id);
-    // mutation-equivalent: an array is never falsy, so ?? and || agree
-    for (const metadata of hostLocalEntries.get(id) ?? []) {
-      // mutation-equivalent: an array is never falsy, so ?? and || agree
-      queue.push(...(idsByCheckout.get(checkoutOf(metadata)) ?? []));
-    }
+    queue.push(...sweepClosureEdges(id, graph));
   }
   return members;
+}
+/** The registry relations sweepClosure walks. */
+interface SweepClosureGraph {
+  childrenByParent: ReadonlyMap<string, readonly FrontendWorkspaceMetadata[]>;
+  hostLocalEntries: ReadonlyMap<string, readonly FrontendWorkspaceMetadata[]>;
+  idsByCheckout: ReadonlyMap<string, readonly string[]>;
+  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string;
+}
+/** Every host-local checkout with the ids registered on it (its aliases). */
+function indexIdsByCheckout(
+  hostLocalEntries: ReadonlyMap<string, readonly FrontendWorkspaceMetadata[]>,
+  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string
+): Map<string, string[]> {
+  const idsByCheckout = new Map<string, string[]>();
+  for (const entries of hostLocalEntries.values()) {
+    for (const metadata of entries) {
+      const checkout = checkoutOf(metadata);
+      // mutation-equivalent: an array is never falsy, so ?? and || agree
+      idsByCheckout.set(checkout, [...(idsByCheckout.get(checkout) ?? []), metadata.id]);
+    }
+  }
+  return idsByCheckout;
+}
+/** The workspaces one closure member reaches: its registry children, then its checkouts' aliases. */
+function sweepClosureEdges(id: string, graph: SweepClosureGraph): string[] {
+  // mutation-equivalent: an array is never falsy, so ?? and || agree
+  const children = (graph.childrenByParent.get(id) ?? []).map((child) => child.id);
+  // mutation-equivalent: an array is never falsy, so ?? and || agree
+  const aliases = (graph.hostLocalEntries.get(id) ?? []).flatMap(
+    // mutation-equivalent: an array is never falsy, so ?? and || agree
+    (metadata) => graph.idsByCheckout.get(graph.checkoutOf(metadata)) ?? []
+  );
+  return [...children, ...aliases];
 }
 /** Ids of the workspaces whose config.json entry still carries a legacy `workspace.mcp` value. */
 function idsWithLegacyOverrides(config: ProjectsConfig): Set<string> {
