@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -8,6 +8,7 @@ import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { LocalRuntime } from "./LocalRuntime";
 import { setAgentCgroupEnrollmentTargets } from "./agentCgroupEnrollment";
 import type { AgentSandboxPolicy } from "./sandbox/agentSandboxTargets";
+import * as macosSandbox from "./sandbox/macosSandbox";
 import type {
   InitLogger,
   WorkspaceCreationParams,
@@ -318,7 +319,7 @@ describe("LocalBaseRuntime.exec sandbox opt-out", () => {
       const planted = path.join(dir, "rm");
       await fs.writeFile(planted, "#!/bin/sh\necho planted\n", { mode: 0o755 });
       const resolve = async (runtime: LocalBaseRuntime, sandbox: "off" | "internal") => {
-        const stream = await runtime.exec('command -v rm; echo "$BASH"', {
+        const stream = await runtime.exec('command -v rm; echo "$BASH"; echo "$PATH"', {
           cwd: dir,
           timeout: 5,
           env: { PATH: `${dir}:${process.env.PATH ?? ""}` },
@@ -328,13 +329,59 @@ describe("LocalBaseRuntime.exec sandbox opt-out", () => {
         return (await readStreamAsString(stream.stdout)).trim().split("\n");
       };
 
-      const [internalRm, internalBash] = await resolve(new SandboxedRuntime(true), "internal");
+      const [internalRm, internalBash, internalPath] = await resolve(
+        new SandboxedRuntime(true),
+        "internal"
+      );
       expect(internalRm).not.toBe(planted);
       expect(internalBash).toBe("/bin/bash");
+      // Only root can write a folder on it (an Intel Homebrew owns /usr/local/bin).
+      for (const folder of internalPath.split(":")) {
+        const stat = await fs.stat(folder);
+        expect({ folder, uid: stat.uid, groupOrOtherWrite: stat.mode & 0o022 }).toEqual({
+          folder,
+          uid: 0,
+          groupOrOtherWrite: 0,
+        });
+      }
       expect((await resolve(new SandboxedRuntime(true), "off"))[0]).toBe(planted);
       expect((await resolve(new SandboxedRuntime(false), "internal"))[0]).toBe(planted);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("LocalBaseRuntime.exec sandbox wrap", () => {
+  // No process starts after the abort, so nothing else frees the wrap's network registration.
+  it("frees the sandbox wrap when the call is aborted while the wrap is set up", async () => {
+    const controller = new AbortController();
+    const dispose = mock(() => undefined);
+    const wrap = spyOn(macosSandbox, "wrapForAgentSandbox").mockImplementation(() => {
+      controller.abort();
+      return Promise.resolve({
+        command: "/usr/bin/true",
+        args: [],
+        env: {},
+        commandId: "c",
+        dispose,
+      });
+    });
+    try {
+      const run = new TestLocalRuntime().exec("echo ran", {
+        cwd: os.tmpdir(),
+        timeout: 5,
+        abortSignal: controller.signal,
+      });
+
+      const error = await run.then(
+        () => null,
+        (reason: unknown) => reason
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect(dispose).toHaveBeenCalledTimes(1);
+    } finally {
+      wrap.mockRestore();
     }
   });
 });

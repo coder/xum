@@ -110,7 +110,7 @@ export interface AgentSandboxPolicy {
    * Seatbelt as one).
    */
   denyWrite: string[];
-  /** DENY_READ_ROOTS, the home folder and NESTED_DENY_READ_PATHS. */
+  /** DENY_READ_ROOTS, the home folder, Xum's home folder and NESTED_DENY_READ_PATHS. */
   denyRead: string[];
   /** The write roots, gitCommonDirs, HOME_READ_PATHS, PATH folders under ~ and extraReadPaths. */
   allowRead: string[];
@@ -218,7 +218,8 @@ export function buildAgentSandboxPolicy(
       ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
       ...gitCommonDirs.flatMap(protectedGitDirPaths),
       // A credential file in a write root (~/.cache/huggingface/token) stays unwritable too, and
-      // so do the npx, uv and Bun caches and a global plugin or skill folder that links into one.
+      // so do the npx, uv and Bun caches and a global git config, plugin or skill folder that
+      // links into one.
       ...[
         ...nestedDenies,
         ...[...AUTOMATION_READ_PATHS, ...cacheExecutablePaths()].map(expandSandboxPath),
@@ -243,7 +244,8 @@ export function buildAgentSandboxPolicy(
     gitCommonDirs,
     denyWrite,
     // The home folder itself too: an account's home can live outside /Users (a network home).
-    denyRead: dedupe([...DENY_READ_ROOTS.map(realpathOfNearest), home, ...nestedDenies]),
+    // So does Xum's home (XUM_ROOT), with chats, checkouts and the bash AI proxy's key.
+    denyRead: dedupe([...DENY_READ_ROOTS.map(realpathOfNearest), home, xumHome, ...nestedDenies]),
     allowRead,
     network: settings.network,
     allowedHosts: [...settings.allowedHosts],

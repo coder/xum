@@ -36,7 +36,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
-import { DEFAULT_EXEC_PATH, localExecEnv, stripSandboxedChildEnv } from "./childProcessEnv";
+import { localExecEnv, stripSandboxedChildEnv } from "./childProcessEnv";
 import {
   agentSandboxDenialsAfterExit,
   wrapForAgentSandbox,
@@ -281,6 +281,11 @@ function killInitHook(proc: ChildProcess): void {
   }
 }
 
+// The PATH of Xum's own commands outside the agent sandbox: macOS System Integrity Protection
+// keeps these folders read-only, also for extraWritePaths. /usr/local/bin is not one of them
+// (Homebrew on Intel owns it).
+const SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+
 /**
  * Abstract base class for local runtimes (both WorktreeRuntime and LocalRuntime).
  *
@@ -354,7 +359,7 @@ export abstract class LocalBaseRuntime implements Runtime {
     });
     if (!applies) return inherited;
     if (options.sandbox === "off") return { ...inherited, env: { BASH_ENV: "" } };
-    return { bashPath: "/bin/bash", env: { BASH_ENV: "", PATH: DEFAULT_EXEC_PATH } };
+    return { bashPath: "/bin/bash", env: { BASH_ENV: "", PATH: SYSTEM_PATH } };
   }
 
   async exec(command: string, options: ExecOptions): Promise<ExecStream> {
@@ -572,6 +577,8 @@ export abstract class LocalBaseRuntime implements Runtime {
         ...options,
         workspaceRoots: this.withCheckoutRoot(cwd, options.workspaceRoots),
       });
+      // Nothing spawns it, so nothing else frees its network list registration.
+      if (options.abortSignal?.aborted) sandboxed?.dispose();
       throwIfAbortedBeforeExec(options.abortSignal);
       return sandboxed;
     } catch (error) {

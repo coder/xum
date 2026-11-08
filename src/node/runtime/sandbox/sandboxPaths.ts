@@ -164,6 +164,11 @@ const PLUGIN_ROOTS: readonly string[] = [`${XUM_HOME_TOKEN}/plugins`, "~/.agents
  * setup), where it must stay read-only.
  */
 export const AUTOMATION_READ_PATHS: readonly string[] = [
+  // Git that Xum runs outside the sandbox runs what they name (credential.helper,
+  // core.sshCommand), and so does bunx for MCP servers (Bun's preload).
+  "~/.gitconfig",
+  "~/.config/git",
+  "~/.bunfig.toml",
   ...GLOBAL_SKILL_ROOTS,
   ...PLUGIN_ROOTS,
   // Xum's own helper scripts (tool_env and the like).
@@ -175,9 +180,6 @@ export const AUTOMATION_READ_PATHS: readonly string[] = [
 // Open under ~ for each command, with the workspace, its scratch folder, the main .git of a
 // worktree, all write paths and extraReadPaths.
 export const HOME_READ_PATHS: readonly string[] = [
-  "~/.gitconfig",
-  "~/.config/git",
-  "~/.bunfig.toml",
   "~/.bun",
   "~/.cargo",
   "~/.rustup",

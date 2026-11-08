@@ -236,6 +236,28 @@ describe("buildAgentSandboxPolicy", () => {
     }
   });
 
+  // Git that Xum runs outside the sandbox runs a credential.helper from the global config.
+  test("keeps a global git config that is a link into a write root read-only", async () => {
+    const home = path.join(root, "home");
+    const dotfiles = path.join(root, "dotfiles");
+    await fs.mkdir(path.join(dotfiles, "git"), { recursive: true });
+    await fs.writeFile(path.join(dotfiles, "gitconfig"), "");
+    await fs.mkdir(path.join(home, ".config"), { recursive: true });
+    await fs.symlink(path.join(dotfiles, "gitconfig"), path.join(home, ".gitconfig"));
+    await fs.symlink(path.join(dotfiles, "git"), path.join(home, ".config", "git"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+      const writable = (target: string) => agentSandboxPolicyAllows(policy, target, "write");
+
+      expect(writable(path.join(dotfiles, "gitconfig"))).toBe(false);
+      expect(writable(path.join(dotfiles, "git", "config"))).toBe(false);
+      expect(writable(path.join(dotfiles, "notes.md"))).toBe(true);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
   // Xum starts MCP servers with npx, uvx and bunx outside the sandbox, and each runs what it
   // caches.
   test("keeps what npx, uvx and bunx run read-only, and the rest of their caches writable", async () => {
@@ -332,6 +354,19 @@ describe("buildAgentSandboxPolicy", () => {
     } finally {
       homedir.mockRestore();
     }
+  });
+
+  // xumRoot is outside the home folder, /Users and /Volumes.
+  test("hides Xum's home folder outside the home folder, except the folders it opens", () => {
+    const scratchDir = path.join(xumRoot, "sessions", "ws", "scratch");
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo, scratchDir });
+    const readable = (...parts: string[]) =>
+      agentSandboxPolicyAllows(policy, path.join(xumRoot, ...parts), "read");
+
+    expect(readable("bash-ai-proxy.json")).toBe(false);
+    expect(readable("sessions", "other", "chat.jsonl")).toBe(false);
+    expect(readable("sessions", "ws", "scratch", "notes.md")).toBe(true);
+    expect(readable("skills", "demo", "SKILL.md")).toBe(true);
   });
 
   test("keeps the worktree config of a repository in the workspace read-only", () => {
