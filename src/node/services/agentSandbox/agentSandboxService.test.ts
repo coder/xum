@@ -41,6 +41,8 @@ describe("AgentSandboxService", () => {
     await config.updateAgentSandbox({ enabled: true, allowedHosts: ["global.example"] });
     await config.updateProjectAgentSandbox(PARENT, { allowedHosts: ["parent.example"] });
     await config.updateProjectAgentSandbox(OTHER, { enabled: false });
+    // Its commands look the setting up by the parent's path, so its own would change nothing.
+    await config.updateProjectAgentSandbox(CHILD, { enabled: false });
     service = new AgentSandboxService(config);
 
     await service.start();

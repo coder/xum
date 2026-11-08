@@ -4670,6 +4670,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- **On**: the sandbox is on for this project, also when the switch is off.",
       "- **Off**: the sandbox is off for this project, also when the switch is on.",
       "",
+      "A sub-project has the setting of its parent project, because its workspaces work in the parent's checkout. **Project** lists only parent projects, and Xum ignores an `agentSandbox` setting of a sub-project in `config.json`.",
+      "",
       "Agent tools cannot change the sandbox setting.",
       "",
       "## What commands can write",

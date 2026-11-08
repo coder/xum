@@ -87,12 +87,19 @@ function projectAgentSandboxSettings(
 ): Map<string, ResolvedAgentSandboxSettings> {
   const byProject = new Map<string, ResolvedAgentSandboxSettings>();
   for (const [projectPath, project] of config.projects) {
-    // A sub-project without an override of its own follows its parent's.
-    const parentOverride =
+    // A sub-project has its parent's setting, as it has its parent's resource limit: its
+    // workspaces work in the parent's checkout, and their commands look the setting up by the
+    // parent's path (agentCgroupProjectPath). Settings offers no sub-project setting, so one in
+    // config.json would look applied and change nothing.
+    if (project.parentProjectPath !== undefined && project.agentSandbox !== undefined) {
+      log.warn(
+        `Ignoring the agentSandbox setting of sub-project ${projectPath}: it has the setting of ${project.parentProjectPath}`
+      );
+    }
+    const override =
       project.parentProjectPath === undefined
-        ? undefined
+        ? project.agentSandbox
         : config.projects.get(project.parentProjectPath)?.agentSandbox;
-    const override = project.agentSandbox ?? parentOverride;
     if (override !== undefined) {
       byProject.set(projectPath, resolveAgentSandboxSettings(config.agentSandbox, override));
     }
