@@ -21,6 +21,7 @@ import {
   readHostOverrideDocumentNoFollow,
   readWorkspaceOverridesEpochToken,
   runtimeFilesystemIdentity,
+  sweepClosure,
   WorkspaceMcpOverridesConflictError,
   WorkspaceMcpOverridesService,
 } from "./workspaceMcpOverridesService";
@@ -5239,6 +5240,33 @@ describe("WorkspaceMcpOverridesService", () => {
       const reader = new WorkspaceMcpOverridesService(config);
       expect((await reader.getOverridesForWorkspace(child.workspaceId)).overrides).toEqual({});
     }, 30_000);
+
+    it("sweepClosure queues the aliases of one checkout once, so thousands of them stay cheap", async () => {
+      // isolation:none tasks share their parent's checkout. Queueing a checkout's aliases again
+      // for each alias made k of them cost k² steps: 5,000 took more than a second.
+      const projectPath = path.join(tempDir, "many-aliases");
+      await fs.mkdir(projectPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: Array.from({ length: 5_000 }, (_, index) => ({
+            path: projectPath,
+            id: `ws-alias-${index}`,
+            name: `alias-${index}`,
+            runtimeConfig: { type: "local" as const },
+          })),
+        });
+        return cfg;
+      });
+      const registry = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+      const startedAt = performance.now();
+      const members = sweepClosure(registry, ["ws-alias-0"], () => projectPath);
+      const elapsedMs = performance.now() - startedAt;
+
+      expect(members.size).toBe(5_000);
+      // A few milliseconds once per checkout. The quadratic walk took about 1.2 s, and copying
+      // the growing alias list on each insert about 0.2 s.
+      expect(elapsedMs).toBeLessThan(150);
+    });
 
     it("prunePluginOverrideKeysForWorkspaces locks a document that spells the key inside a longer string", async () => {
       // The scan over-approximates: any decoded string that contains the key makes a candidate.

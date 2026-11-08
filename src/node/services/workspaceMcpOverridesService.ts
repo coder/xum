@@ -872,7 +872,7 @@ function groupByCheckout(
  * fan-out evicts their caches without I/O. Seeds are kept even when unregistered (the sweep
  * reports them).
  */
-function sweepClosure(
+export function sweepClosure(
   registry: readonly FrontendWorkspaceMetadata[],
   seedIds: Iterable<string>,
   checkoutOf: (metadata: FrontendWorkspaceMetadata) => string
@@ -883,6 +883,7 @@ function sweepClosure(
     hostLocalEntries,
     idsByCheckout: indexIdsByCheckout(hostLocalEntries, checkoutOf),
     checkoutOf,
+    expandedCheckouts: new Set<string>(),
   };
   const registeredIds = new Set(registry.map((metadata) => metadata.id));
   const members = new Set<string>();
@@ -905,6 +906,8 @@ interface SweepClosureGraph {
   hostLocalEntries: ReadonlyMap<string, readonly FrontendWorkspaceMetadata[]>;
   idsByCheckout: ReadonlyMap<string, readonly string[]>;
   checkoutOf: (metadata: FrontendWorkspaceMetadata) => string;
+  /** Checkouts whose aliases the walk already queued. */
+  expandedCheckouts: Set<string>;
 }
 /** Every host-local checkout with the ids registered on it (its aliases). */
 function indexIdsByCheckout(
@@ -915,8 +918,9 @@ function indexIdsByCheckout(
   for (const entries of hostLocalEntries.values()) {
     for (const metadata of entries) {
       const checkout = checkoutOf(metadata);
-      // mutation-equivalent: an array is never falsy, so ?? and || agree
-      idsByCheckout.set(checkout, [...(idsByCheckout.get(checkout) ?? []), metadata.id]);
+      const ids = idsByCheckout.get(checkout);
+      if (ids === undefined) idsByCheckout.set(checkout, [metadata.id]);
+      else ids.push(metadata.id);
     }
   }
   return idsByCheckout;
@@ -926,10 +930,15 @@ function sweepClosureEdges(id: string, graph: SweepClosureGraph): string[] {
   // mutation-equivalent: an array is never falsy, so ?? and || agree
   const children = (graph.childrenByParent.get(id) ?? []).map((child) => child.id);
   // mutation-equivalent: an array is never falsy, so ?? and || agree
-  const aliases = (graph.hostLocalEntries.get(id) ?? []).flatMap(
+  const aliases = (graph.hostLocalEntries.get(id) ?? []).flatMap((metadata) => {
+    const checkout = graph.checkoutOf(metadata);
+    // Each checkout's aliases once: every alias of a checkout reaches the same list, so
+    // queueing it per alias made k aliases cost k² steps.
+    if (graph.expandedCheckouts.has(checkout)) return [];
+    graph.expandedCheckouts.add(checkout);
     // mutation-equivalent: an array is never falsy, so ?? and || agree
-    (metadata) => graph.idsByCheckout.get(graph.checkoutOf(metadata)) ?? []
-  );
+    return graph.idsByCheckout.get(checkout) ?? [];
+  });
   return [...children, ...aliases];
 }
 /** Every legacy `workspace.mcp` value registered under `workspaceId`. */
