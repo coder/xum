@@ -1251,22 +1251,42 @@ else:
                 result = self.assert_gate(expected, snapshot(comments, head=PR_HEAD), "wait_pr_codex.sh")
                 self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
 
-    def test_a_thumbs_up_never_approves_a_head(self):
-        # A reaction names no head: it can stay from an earlier head's review (#7300, #7325).
+    def test_a_thumbs_up_approves_only_a_head_the_board_reviewed(self):
+        # A reaction names no head and outlasts a push (#7300, #7325). It counts only beside the
+        # summary board's own record that the code review of this head finished with nothing
+        # unresolved.
         request = comment("@codex review", "maintainer", REQUEST)
-        for author in (BOT, BOT + "[bot]"):
-            for case, comments, expected in (
-                ("thumbs-up alone", [request], 10),
-                ("thumbs-up beside a receipt for an earlier head", [request, code_receipt(EARLIER_HEAD[:10])], 1),
-            ):
-                with self.subTest(author=author, case=case):
+        board = FIXTURES["review_state_summary"]["body"]
+        flags = '"has_any_findings":true,"has_unresolved_findings":false,"status":"completed"},"security'
+        self.assertIn(flags, board)
+
+        def flagged(unresolved):
+            changed = flags.replace('"has_unresolved_findings":false', f'"has_unresolved_findings":{unresolved}')
+            return board_for(board, PR_HEAD).replace(flags, changed, 1)
+
+        running = FIXTURES["review_state_running_summary"]["body"]
+        for case, comments, expected in (
+            ("no board", [request], 10),
+            ("a receipt for an earlier head, no board", [request, code_receipt(EARLIER_HEAD[:10])], 1),
+            ("the board's code review of the head finished clean", [request, comment(flagged("false"))], 0),
+            ("the board names an earlier head", [request, comment(board_for(board, EARLIER_HEAD))], 10),
+            ("the board's review of the head still runs", [request, comment(board_for(running, PR_HEAD))], 10),
+            ("the board shows an unresolved finding", [request, comment(flagged("true"))], 1),
+            ("the board's flag is null (a silent run)", [request, comment(flagged("null"))], 10),
+        ):
+            for author in (BOT, BOT + "[bot]"):
+                with self.subTest(case=case, author=author):
                     data = snapshot(
                         comments,
                         reactions=[{"user": {"login": author}, "createdAt": AFTER}],
                         head=PR_HEAD,
                     )
                     result = self.assert_gate(expected, data, "wait_pr_codex.sh")
-                    self.assertNotIn("Codex approved", result.stdout)
+                    self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
+        with self.subTest("the thumbs-up came before the request"):
+            stale = {"user": {"login": BOT}, "createdAt": BEFORE}
+            data = snapshot([request, comment(flagged("false"))], reactions=[stale], head=PR_HEAD)
+            self.assert_gate(10, data, "wait_pr_codex.sh")
 
     def test_approval_waits_for_the_comments_gate(self):
         # check_codex_comments.sh decides what blocks a head. An approval must not hide a finding
