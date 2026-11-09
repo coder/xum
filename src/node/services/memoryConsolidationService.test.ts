@@ -3209,7 +3209,8 @@ describe("MemoryConsolidationService", () => {
       /** Saves a completed harvest record under `boundaryKey` through `service`'s sidecar write. */
       function saveHarvestRecord(
         service: MemoryConsolidationService,
-        boundaryKey: string
+        boundaryKey: string,
+        workspaceId = "ws-dream"
       ): Promise<void> {
         const internals = service as unknown as {
           saveHarvestRecordEffect: (
@@ -3230,7 +3231,7 @@ describe("MemoryConsolidationService", () => {
           skippedCandidates: 0,
         };
         return Effect.runPromise(
-          internals.saveHarvestRecordEffect("ws-dream", boundaryKey, record, "")
+          internals.saveHarvestRecordEffect(workspaceId, boundaryKey, record, "")
         );
       }
 
@@ -3742,25 +3743,74 @@ describe("MemoryConsolidationService", () => {
         expect((await harvestRecords(fixture))["summary-1"]).toEqual(dead.record);
       });
 
-      it("keeps a live job's record past the retention cap until that job ends", async () => {
+      /**
+       * 20 newer records saved without the job lock, while a job of ws-dream holds its lock: a
+       * live job's pending record past the cap stays, any other record there goes. After the job
+       * dies, the next save prunes the pending record too.
+       */
+      async function pruneAroundLiveJob(workspaceId: string) {
         using fixture = await createFixture();
-        const metadata = await seedCompactionEpoch(fixture);
+        if (workspaceId !== "ws-dream") {
+          await fixture.addWorkspace(workspaceId, { parentWorkspaceId: "ws-dream" });
+        }
+        const metadata = await seedCompactionEpoch(fixture, workspaceId);
         const second = secondBackend(fixture);
-        const live = await slowChunkInAnotherBackend(fixture, metadata);
+        // Newer than the pending record, so it falls past the cap while that record is kept.
+        const older: MemoryHarvestRecordPayload = {
+          status: "completed",
+          startedAt: Date.now() - MEMORY_CONSOLIDATION_TIMEOUT_MS,
+          completedAt: Date.now() - MEMORY_CONSOLIDATION_TIMEOUT_MS,
+          attemptCount: 1,
+          boundaryKey: "summary-0",
+          compactionEpoch: 1,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+        };
+        const live = await slowChunkInAnotherBackend(fixture, metadata, { "summary-0": older });
         const newerRecords = Array.from({ length: 20 }, (_, index) => `summary-${index + 2}`);
         try {
-          // Newer records of the workspace, saved by a backend without the job lock.
-          for (const boundaryKey of newerRecords)
-            await saveHarvestRecord(second.service, boundaryKey);
-          expect((await harvestRecords(fixture))["summary-1"]).toEqual(live.record);
+          for (const boundaryKey of newerRecords) {
+            await saveHarvestRecord(second.service, boundaryKey, workspaceId);
+          }
+          const records = await harvestRecords(fixture, workspaceId);
+          expect(records["summary-1"]).toEqual(live.record);
+          expect(records["summary-0"]).toBeUndefined();
         } finally {
           await live.kill();
         }
 
-        await saveHarvestRecord(second.service, "summary-22");
-        const records = await harvestRecords(fixture);
+        await saveHarvestRecord(second.service, "summary-22", workspaceId);
+        const records = await harvestRecords(fixture, workspaceId);
         expect(records["summary-1"]).toBeUndefined();
         expect(Object.keys(records)).toHaveLength(20);
+      }
+
+      it("keeps a live job's record past the retention cap until that job ends", async () => {
+        await pruneAroundLiveJob("ws-dream");
+      });
+
+      it("keeps a sub-agent's record past the retention cap while its owner's job is live", async () => {
+        // The sub-agent's job runs under its owner's lock (ws-dream), never one of its own.
+        await pruneAroundLiveJob("ws-sub");
+      });
+
+      it("recovers a pending record whose job died at once, however recent its last save", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        const dead = await slowChunkInAnotherBackend(fixture, metadata);
+        await dead.kill();
+        const fresh = { ...dead.record, startedAt: Date.now(), progressAt: Date.now() };
+        await fsPromises.writeFile(
+          path.join(fixture.xumHome, "memory-consolidation.json"),
+          JSON.stringify({ harvestsByWorkspace: { "ws-dream": { "summary-1": fresh } } })
+        );
+
+        expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+        expect(analyzerPrompts(fixture)).toHaveLength(1);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          attemptCount: 2,
+        });
       });
 
       it("does not stream a job whose claim another backend's failure ended first", async () => {
