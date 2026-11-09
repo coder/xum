@@ -352,6 +352,21 @@ describe("frame document channel: checks", () => {
     expect(missed).toBe(1);
   });
 
+  // A destination page that reloads itself sends loads; each one must not push the cap out.
+  test("a later check keeps the cap counted from the first unanswered check", async () => {
+    const { blocked, now } = blockedClock();
+    const { channel } = boundChannel(now);
+    let missed = 0;
+    channel.check(() => missed++);
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS - 1000);
+    channel.check(() => missed++);
+    // The timer fires at the deadline, 1 s past the cap by the blocked clock, but 3 s before a cap
+    // counted from the later check.
+    blocked.ms = FRAME_DOCUMENT_CHECK_CAP_MS - FRAME_DOCUMENT_CHECK_DEADLINE_MS + 1000;
+    await advanceClock(1000);
+    expect(missed).toBe(1);
+  });
+
   test("close stops the deadline", async () => {
     const { channel } = boundChannel();
     let missed = 0;
