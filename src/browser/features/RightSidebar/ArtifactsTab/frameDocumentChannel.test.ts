@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import { advanceClock } from "@/browser/testFakeClock";
-import { FRAME_DOCUMENT_CHECK_DEADLINE_MS } from "@/common/constants/artifactInteractions";
+import {
+  FRAME_DOCUMENT_CHECK_CAP_MS,
+  FRAME_DOCUMENT_CHECK_DEADLINE_MS,
+  FRAME_DOCUMENT_CHECK_LATE_MS,
+} from "@/common/constants/artifactInteractions";
 import {
   ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND,
   createFrameDocumentChannel,
@@ -33,8 +37,8 @@ function openView(nonce: string, channel: FrameDocumentChannel) {
 }
 
 /** A channel bound to a port the test holds: the document side, answering only as told. */
-function boundChannel() {
-  const channel = createFrameDocumentChannel("ab12");
+function boundChannel(now?: () => number) {
+  const channel = createFrameDocumentChannel("ab12", now);
   const document = new MessageChannel();
   const checks: string[] = [];
   document.port1.onmessage = (event: MessageEvent<{ type?: string; value?: string }>) => {
@@ -241,6 +245,82 @@ describe("frame document channel: checks", () => {
     answer(checks[0]);
     await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
     expect(missed).toBe(0);
+  });
+
+  /**
+   * The channel's clock, `blocked.ms` ahead of the fake timers: as if the app's thread had been
+   * blocked that long, so a timer due now fires that much late.
+   */
+  function blockedClock() {
+    const blocked = { ms: 0 };
+    return { blocked, now: () => performance.now() + blocked.ms };
+  }
+
+  // The app's own thread was blocked past the deadline, so the document could not answer either.
+  test("a deadline that fires late extends the same check and sends no new one", async () => {
+    const { blocked, now } = blockedClock();
+    const { channel, checks, answer } = boundChannel(now);
+    let missed = 0;
+    channel.check(() => missed++);
+    await advanceClock(1);
+    blocked.ms = FRAME_DOCUMENT_CHECK_LATE_MS + 1;
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    expect(missed).toBe(0);
+    expect(checks).toHaveLength(1);
+    answer(checks[0]);
+    await advanceClock(FRAME_DOCUMENT_CHECK_CAP_MS);
+    expect(missed).toBe(0);
+  });
+
+  test("an extended check that stays unanswered misses one deadline after the late timer", async () => {
+    const { blocked, now } = blockedClock();
+    const { channel } = boundChannel(now);
+    let missed = 0;
+    channel.check(() => missed++);
+    await advanceClock(1);
+    blocked.ms = FRAME_DOCUMENT_CHECK_LATE_MS + 1;
+    // The late timer fires at the deadline; the extension ends one deadline later.
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS * 2 - 2);
+    expect(missed).toBe(0);
+    await advanceClock(1);
+    expect(missed).toBe(1);
+  });
+
+  // A busy host fires timers a little late; only a blocked thread is late by more.
+  test("a deadline late by the threshold or less still misses at once", async () => {
+    const { blocked, now } = blockedClock();
+    const { channel } = boundChannel(now);
+    let missed = 0;
+    channel.check(() => missed++);
+    blocked.ms = FRAME_DOCUMENT_CHECK_LATE_MS;
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    expect(missed).toBe(1);
+  });
+
+  // However often its timers fire late, a check closes the frame by the cap.
+  test("an extension never ends past the cap after the first unanswered check", async () => {
+    const { blocked, now } = blockedClock();
+    const { channel } = boundChannel(now);
+    let missed = 0;
+    channel.check(() => missed++);
+    await advanceClock(1);
+    // The timer fires at the deadline, 1 s before the cap by the blocked clock, so the extension
+    // ends at the cap: 1 s later, not one full deadline later.
+    blocked.ms = FRAME_DOCUMENT_CHECK_CAP_MS - FRAME_DOCUMENT_CHECK_DEADLINE_MS - 1000;
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS + 998);
+    expect(missed).toBe(0);
+    await advanceClock(1);
+    expect(missed).toBe(1);
+  });
+
+  test("a deadline that fires late past the cap misses at once", async () => {
+    const { blocked, now } = blockedClock();
+    const { channel } = boundChannel(now);
+    let missed = 0;
+    channel.check(() => missed++);
+    blocked.ms = FRAME_DOCUMENT_CHECK_CAP_MS;
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    expect(missed).toBe(1);
   });
 
   test("close stops the deadline", async () => {
