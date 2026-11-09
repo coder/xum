@@ -202,7 +202,7 @@ const InstallablePluginEntrySchema = BackupPluginEntrySchema.refine(
 function sourceLeftOutReason(url: string): string | undefined {
   if (pointsAtThisMachine(url)) return "its source is on this machine";
   if (UNSAFE_URL_CHARACTERS.test(url)) {
-    return "its source URL has whitespace or a control character that a backup does not carry";
+    return "its source URL has whitespace, a control character or a format character (a bidi mark, a zero-width space) that a backup does not carry";
   }
   if (hasEscapedUnreservedCharacter(url)) {
     return "its source URL spells a letter, a digit or one of - . _ ~ as a percent escape, which would hide a token from the secret scan";

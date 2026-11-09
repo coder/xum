@@ -136,6 +136,19 @@ describe("BackupPluginEntrySchema", () => {
     ["a url that escapes a dot in lower case hex", "https://example.com/a%2eb/repo.git"],
     ["a url that escapes an underscore", "https://example.com/a%5Fb/repo.git"],
     ["a url that escapes a tilde", "https://example.com/a%7eb/repo.git"],
+    [
+      "a url that escapes the escape of a letter",
+      `https://example.com/%2567hp_${"a".repeat(36)}/repo.git`,
+    ],
+    [
+      "a url that escapes the escape of a letter three times",
+      "https://example.com/%252567/repo.git",
+    ],
+    ["a url with an escape that cannot be decoded", "https://example.com/%E0%A4%A/repo.git"],
+    [
+      "a url whose escapes are four levels deep and more",
+      `https://example.com/%${"25".repeat(5)}20/repo.git`,
+    ],
   ])("refuses %s", (_label, url) => {
     const row = entry({ source: { type: "git", url, ref: "main", refType: "branch" } });
     expect(BackupPluginEntrySchema.safeParse(row).success).toBe(false);
@@ -149,6 +162,7 @@ describe("BackupPluginEntrySchema", () => {
     ["an scp-style url with a user and a one-letter host", "git@h:org/repo.git"],
     // These characters have no other spelling, so a producer may escape them.
     ["a url that escapes a space", "https://dev.azure.com/org/My%20Project/_git/plugins"],
+    ["a url that escapes a space twice", "https://dev.azure.com/org/My%2520Project/_git/plugins"],
     ["a url that escapes a slash and a colon", "https://example.com/a%2Fb%3Ac/repo.git"],
     ["a url that escapes a non-ASCII letter", "https://example.com/caf%C3%A9/repo.git"],
     ["a url with a percent sign and no escape", "https://example.com/100%/repo.git"],
@@ -196,6 +210,14 @@ describe("BackupPluginEntrySchema", () => {
     ["a branch with a slash", "release/2026-11", "branch"],
     ["a tag", "v1.2.0-rc.1", "tag"],
     ["a full commit id", "a".repeat(40), "commit"],
+    // Branches a remote can hold, that `ls-remote` resolves and `clone --branch <ref>` clones: the
+    // installer takes them, so the list does (they would otherwise fail every push).
+    ["a branch named HEAD", "HEAD", "branch"],
+    ["a branch that starts with refs/", "refs/foo", "branch"],
+    ["a branch that starts with refs/team", "refs/team", "branch"],
+    ["a branch that starts with a dash", "-x", "branch"],
+    ["a branch that looks like an option", "--upload-pack=x", "branch"],
+    ["a tag that starts with refs/tags/", "refs/tags/v1", "tag"],
   ])("keeps %s as a ref", (_label, ref, refType) => {
     expect(BackupPluginEntrySchema.safeParse(withSource({ ref, refType })).success).toBe(true);
   });
@@ -208,10 +230,16 @@ describe("BackupPluginEntrySchema", () => {
     ["a ref that ends in a dot", "v1."],
     ["a ref with a tilde", "main~1"],
     ["a ref with a colon", "origin:main"],
-    ["a ref that git would read as an option", "--upload-pack=x"],
-    ["a fully qualified ref", "refs/heads/main"],
     ["a ref with a right-to-left override", "ma\u202Ein"],
     ["a ref with a zero-width space", "ma\u200Bin"],
+    ["a ref with a hidden folder", "a/.b"],
+    ["a ref with an empty part", "a//b"],
+    ["a ref that ends in a slash", "a/"],
+    ["a ref with a glob", "a*"],
+    ["a ref with a zero-width joiner", "ma\u200Din"],
+    ["a ref with a soft hyphen", "ma\u00ADin"],
+    ["a ref with an emoji tag character", "ma\u{E0067}in"],
+    ["a ref with a no-break space", "ma\u00A0in"],
     ["an abbreviated commit id", "abc1234"],
     ["an abbreviated commit id in capitals", "ABCDEF1234"],
   ])("refuses %s as a ref", (_label, ref) => {

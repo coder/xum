@@ -146,18 +146,51 @@ export function isAbbreviatedCommitSha(ref: string): boolean {
   return /^[0-9a-f]{7,39}$/i.test(ref);
 }
 
+const PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/;
+
+/** Escapes of escapes (`%2567`) are decoded this many times, and a text still escaped after that is refused. */
+export const MAX_ESCAPE_PASSES = 4;
+
 /**
- * True when `url` spells an unreserved character (ALPHA, DIGIT, `-`, `.`, `_`, `~`) as a percent
- * escape. RFC 3986 section 2.3 says a producer must not do that, and every secret token is built
- * from those characters: the publish-time scan reads the list as written, so `%67hp_...` would
- * pass it. An escape of any other character (`%20` in `My%20Project`) is the only spelling it
- * has, so it stays.
+ * `text` with its percent escapes decoded one level per entry, until the text stops changing: the
+ * forms a reader that decodes once, twice or more would see (`%2567` gives `%67`, then `g`).
+ * Undefined when an escape cannot be decoded (a cut-short multi-byte sequence, bytes that are not
+ * UTF-8) or when the text is still escaped after `MAX_ESCAPE_PASSES` passes: nothing says how a
+ * reader would read it, so the callers treat it as suspect. A `%` that starts no escape is text.
  */
-export function hasEscapedUnreservedCharacter(url: string): boolean {
-  for (const [, hex] of url.matchAll(/%([0-9A-Fa-f]{2})/g)) {
+export function percentDecodedForms(text: string): string[] | undefined {
+  const forms: string[] = [];
+  let current = text;
+  while (PERCENT_ESCAPE.test(current)) {
+    if (forms.length === MAX_ESCAPE_PASSES) return undefined;
+    try {
+      current = decodeURIComponent(current);
+    } catch {
+      return undefined;
+    }
+    forms.push(current);
+  }
+  return forms;
+}
+
+function spellsUnreservedAsEscape(text: string): boolean {
+  for (const [, hex] of text.matchAll(/%([0-9A-Fa-f]{2})/g)) {
     if (/^[A-Za-z0-9._~-]$/.test(String.fromCharCode(Number.parseInt(hex ?? "", 16)))) return true;
   }
   return false;
+}
+
+/**
+ * True when `url` spells an unreserved character (ALPHA, DIGIT, `-`, `.`, `_`, `~`) as a percent
+ * escape, at any level of decoding (`%2567` is `%67`, which is `g`), or has an escape that cannot
+ * be decoded. RFC 3986 section 2.3 says a producer must not escape those characters, and every
+ * secret token is built from them: the publish-time scan reads the list as written, so `%67hp_...`
+ * would pass it. An escape of any other character (`%20` in `My%20Project`, `%2520` for the same
+ * space escaped twice) is the only spelling it has, so it stays.
+ */
+export function hasEscapedUnreservedCharacter(url: string): boolean {
+  const forms = percentDecodedForms(url);
+  return forms === undefined || [url, ...forms].some(spellsUnreservedAsEscape);
 }
 
 // The path of an scp URL may start with one slash (`host:/srv/repo`); `//` and a second colon

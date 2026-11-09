@@ -318,24 +318,48 @@ describe("backup of the managed plugin list", () => {
       ],
       ["a commit that is not a full id", { lockedSha: "abc123" }, "lockedSha"],
       [
-        "a ref that starts with refs/ (a branch the installer takes)",
-        {
-          source: {
-            type: "git",
-            url: "https://github.com/example/mono.git",
-            ref: "refs/team",
-            refType: "branch",
-          },
-        },
-        "source.ref",
-      ],
-      [
         "a ref with a bidi character (a branch the installer takes)",
         {
           source: {
             type: "git",
             url: "https://github.com/example/mono.git",
             ref: "ma\u202Ein",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a ref with a zero-width joiner (a branch the installer takes)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "ma\u200Din",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a ref with a soft hyphen (a branch the installer takes)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "ma\u00ADin",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a ref with an emoji tag character (a branch the installer takes)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "ma\u{E0067}in",
             refType: "branch",
           },
         },
@@ -459,7 +483,7 @@ describe("backup of the managed plugin list", () => {
       info.mockRestore();
     });
 
-    it("leaves out a plugin whose URL has whitespace or a control character, and logs it", async () => {
+    it("leaves out a plugin whose URL has whitespace, a control character or a format character, and logs it", async () => {
       const info = spyOn(log, "info").mockImplementation(() => undefined);
       // The installer takes an scp-style source with a space, so that plugin works here: the push
       // must not fail for it, or no backup could be made.
@@ -483,7 +507,7 @@ describe("backup of the managed plugin list", () => {
       const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
       expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha"]);
       const logged = info.mock.calls
-        .filter(([message]) => String(message).includes("whitespace or a control character"))
+        .filter(([message]) => String(message).includes("a format character"))
         .map(([, fields]) => (fields as { plugin: string }).plugin);
       expect(logged.sort()).toEqual(Object.keys(spacedUrls).sort());
       info.mockRestore();
@@ -527,7 +551,7 @@ describe("backup of the managed plugin list", () => {
         "key-header": "https://example.com/-----BEGIN%20PRIVATE%20KEY-----/repo.git",
         // An escape of an escape decodes to the token on a second read.
         "double-escaped": `https://example.com/%2520ghp_${"b".repeat(36)}/repo.git`,
-        // A malformed escape has no reading to rely on.
+        // A malformed escape has no reading to rely on (left out for that, not for a token).
         "malformed-escape": "https://example.com/%E0%A4%A/repo.git",
       };
       await writeRegistry(muxRoot, [
@@ -549,12 +573,94 @@ describe("backup of the managed plugin list", () => {
       expect(text).not.toContain("PRIVATE");
       expect(exported.secretFiles).toEqual([]);
       const logged = info.mock.calls
-        .filter(([message]) => String(message).includes("hides a token behind percent escapes"))
+        .filter(([message]) => String(message).includes("percent escape"))
         .map(([, fields]) => (fields as { plugin: string }).plugin);
       expect(logged.sort()).toEqual(Object.keys(hiddenUrls).sort());
       // The log names the plugin only: no URL and no token.
       const everything = JSON.stringify(info.mock.calls);
       for (const leak of ["ghp_", "PRIVATE", "example.com"]) expect(everything).not.toContain(leak);
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin that hides a token behind a double escape, and lists a space escaped twice", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const withUrl = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const token = "a".repeat(36);
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        // `%2520` is a space escaped twice: it hides nothing, so the plugin stays listed.
+        registryRow("spaced-twice", {
+          source: withUrl("https://dev.azure.com/org/My%2520Project/_git/x"),
+        }),
+        // `%2567` is `%67`, which is `g`: the first pass sees only a percent sign.
+        registryRow("g-twice", { source: withUrl(`https://example.com/%2567hp_${token}/r.git`) }),
+        registryRow("g-thrice", {
+          source: withUrl(`https://example.com/%252567hp_${token}/r.git`),
+        }),
+        // A space escaped twice right before a token: no pass of the raw scan finds the token.
+        registryRow("space-twice-token", {
+          source: withUrl(`https://example.com/%2520ghp_${token}/r.git`),
+        }),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const text = await fs.readFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "utf-8");
+      const sidecar = JSON.parse(text) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha", "spaced-twice"]);
+      expect(text).not.toContain("ghp_");
+      const logged = info.mock.calls.map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(["g-thrice", "g-twice", "space-twice-token"]);
+      expect(JSON.stringify(info.mock.calls)).not.toContain(token);
+      info.mockRestore();
+    });
+
+    it("lists a plugin on a ref the installer takes, and leaves out one with a format character", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const withRef = (name: string, ref: string) =>
+        registryRow(name, {
+          source: {
+            type: "git",
+            url: `https://github.com/example/${name}.git`,
+            ref,
+            refType: "branch",
+          },
+        });
+      // Real git holds all of these as branches, resolves them in `ls-remote` and clones them with
+      // `--branch <ref>`, which takes the next argument as its value even when it starts with a dash.
+      const listedRefs = {
+        main: "main",
+        "branch-head": "HEAD",
+        "branch-refs-foo": "refs/foo",
+        "branch-refs-team": "refs/team",
+        "branch-dash-x": "-x",
+      };
+      // The list refuses what the card would show as another ref: bidi, joiner, soft hyphen, tag.
+      const leftOutRefs = {
+        "ref-bidi": "ma\u202Ein",
+        "ref-joiner": "ma\u200Din",
+        "ref-soft-hyphen": "ma\u00ADin",
+        "ref-emoji-tag": "ma\u{E0067}in",
+      };
+      await writeRegistry(muxRoot, [
+        ...Object.entries(listedRefs).map(([name, ref]) => withRef(name, ref)),
+        ...Object.entries(leftOutRefs).map(([name, ref]) => withRef(name, ref)),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const sidecar = (await readSidecar(managed)) as {
+        plugins: Array<{ name: string; source: { ref: string } }>;
+      };
+      expect(sidecar.plugins.map((plugin) => [plugin.name, plugin.source.ref])).toEqual(
+        Object.entries(listedRefs).sort(([a], [b]) => a.localeCompare(b))
+      );
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("source.ref"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(Object.keys(leftOutRefs).sort());
       info.mockRestore();
     });
 
@@ -1690,12 +1796,12 @@ describe("backup of the managed plugin list", () => {
           });
         await pushFromFirstMachine([withRef("alpha", "main"), withRef("beta", "main")]);
 
-        // The installer takes both of these refs: a branch named refs/team, and one with a bidi mark.
+        // The installer takes a branch with a bidi mark (or a zero-width joiner), the list does not.
         const refused = removalOf(
           await pushFromSecondMachine([
             withRef("alpha", "main"),
-            withRef("beta", "refs/team"),
-            withRef("gamma", "ma\u202Ein"),
+            withRef("beta", "ma\u202Ein"),
+            withRef("gamma", "ma\u200Din"),
           ])
         );
         // Only the plugin that was listed is named. `gamma` was never in the backup.
@@ -1703,7 +1809,7 @@ describe("backup of the managed plugin list", () => {
         expect(await listedNames()).toEqual(["alpha", "beta"]);
 
         const approved = await pushFromSecondMachine(
-          [withRef("alpha", "main"), withRef("beta", "refs/team"), withRef("gamma", "ma\u202Ein")],
+          [withRef("alpha", "main"), withRef("beta", "ma\u202Ein"), withRef("gamma", "ma\u200Din")],
           { approvedPluginRemovalDigest: refused.approval }
         );
         expect(approved.success).toBe(true);

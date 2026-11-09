@@ -5,7 +5,9 @@ import {
   httpsFormOfSshUrl,
   isAbbreviatedCommitSha,
   isNormalizedAgentPluginSubpath,
+  MAX_ESCAPE_PASSES,
   normalizeAgentPluginSubpath,
+  percentDecodedForms,
   PLAIN_HTTPS_URL,
   reviewUrlOf,
 } from "./agentPluginSource";
@@ -76,6 +78,9 @@ describe("isAbbreviatedCommitSha", () => {
   });
 });
 
+/** A space escaped `levels` times: `%20`, `%2520`, `%252520`, and so on. */
+const escapedSpace = (levels: number) => `%${"25".repeat(levels - 1)}20`;
+
 describe("hasEscapedUnreservedCharacter", () => {
   test.each([
     ["a letter", "https://h/%67hp"],
@@ -86,7 +91,23 @@ describe("hasEscapedUnreservedCharacter", () => {
     ["an underscore", "https://h/a%5fb"],
     ["a tilde", "https://h/a%7Eb"],
     ["an unreserved escape after a reserved one", "https://h/My%20Project/%61"],
+    // The first pass sees only `%25`, a percent sign. Each later pass sees the escape it hides.
+    ["a letter escaped twice", "https://h/%2567hp_aaaa"],
+    ["a letter escaped three times", "https://h/%252567hp_aaaa"],
+    ["a letter escaped four times", "https://h/%25252567hp_aaaa"],
+    ["a letter escaped past the passes the check makes", "https://h/%2525252567hp_aaaa"],
   ])("is true for an escaped %s", (_label, url) => {
+    expect(hasEscapedUnreservedCharacter(url)).toBe(true);
+  });
+
+  test.each([
+    ["an escape that is cut short", "https://h/%E0%A4%A/r.git"],
+    ["bytes that are not UTF-8", "https://h/%FF/r.git"],
+    [
+      "a space escaped more often than the passes the check makes",
+      `https://h/${escapedSpace(MAX_ESCAPE_PASSES + 1)}`,
+    ],
+  ])("is true for %s: nothing says how a reader decodes it", (_label, url) => {
     expect(hasEscapedUnreservedCharacter(url)).toBe(true);
   });
 
@@ -97,8 +118,35 @@ describe("hasEscapedUnreservedCharacter", () => {
     ["a UTF-8 letter", "https://h/caf%C3%A9"],
     ["a percent sign with no digits", "https://h/100%/a%g1"],
     ["an escaped percent sign", "https://h/a%25b"],
+    ["a space escaped twice", "https://h/My%2520Project"],
+    ["a space escaped three times", "https://h/My%252520Project"],
   ])("is false for %s", (_label, url) => {
     expect(hasEscapedUnreservedCharacter(url)).toBe(false);
+  });
+});
+
+describe("percentDecodedForms", () => {
+  test.each([
+    ["no escape", "https://h/a", []],
+    ["a percent sign that starts no escape", "100%", []],
+    ["an escaped space", "a%20b", ["a b"]],
+    ["an escaped space escaped again", "a%2520b", ["a%20b", "a b"]],
+    ["a letter escaped three times", "%252567", ["%2567", "%67", "g"]],
+    ["a UTF-8 letter", "caf%C3%A9", ["café"]],
+  ])("decodes %s one level at a time", (_label, text, forms) => {
+    expect(percentDecodedForms(text)).toEqual(forms);
+  });
+
+  test.each([
+    ["an escape that is cut short", "%E0%A4%A"],
+    ["bytes that are not UTF-8", "%FF"],
+    ["more levels than the passes it makes", escapedSpace(MAX_ESCAPE_PASSES + 1)],
+  ])("gives nothing for %s", (_label, text) => {
+    expect(percentDecodedForms(text)).toBeUndefined();
+  });
+
+  test("decodes as many levels as it makes passes", () => {
+    expect(percentDecodedForms(escapedSpace(MAX_ESCAPE_PASSES))).toHaveLength(MAX_ESCAPE_PASSES);
   });
 });
 

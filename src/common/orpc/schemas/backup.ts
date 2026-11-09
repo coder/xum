@@ -112,17 +112,24 @@ const BackupPluginUrlSchema = z
 
 /**
  * The branch or tag a plugin tracks, which the install review writes back into the installed
- * source. The list is repository-controlled, so a ref that git cannot hold, or that the installer
- * would refuse, is left out here: it would otherwise make every later update check of the plugin
- * fail. The git name rules are the backup branch's (`isValidBackupBranch`), the short commit id
- * is the installer's own refusal (`resolveRemoteRef`), and a format character (a bidi mark)
- * could make the ref read as another one where it is shown.
+ * source. The installer has no syntax rule of its own for a ref: it takes any text, refuses an
+ * abbreviated commit id (`resolveRemoteRef`), and asks git for `refs/heads/<ref>` and
+ * `refs/tags/<ref>`, so a remote can hold (and Xum installs from) a branch `HEAD`, `refs/team` or
+ * `-x`. The list takes the same refs. It refuses only what a remote can never hold, a name that
+ * `git check-ref-format` refuses (`a..b`, `x.lock`, `main~1`: the install review would persist it,
+ * and every later update check of the plugin would fail), and a ref with whitespace, a control
+ * character or a format character such as a bidi mark, which the card shows and which can make
+ * one ref read as another. The export leaves such a plugin out and logs it (agentPluginBackup.ts).
  */
 const BackupPluginRefSchema = z
   .string()
   .min(1)
   .max(256)
-  .refine(isValidBackupBranch, { message: "A plugin ref must be a valid git branch or tag name" })
+  // The `x/` folder takes the rules of a branch name that do not apply to a ref (`HEAD`, a leading
+  // `refs/` or `-`) out of the check: the rest are the rules of any ref name, in `refs/heads/<ref>`.
+  .refine((ref) => isValidBackupBranch(`x/${ref}`), {
+    message: "A plugin ref must be a name git can hold",
+  })
   .refine((ref) => !UNSAFE_URL_CHARACTERS.test(ref), {
     message: "A plugin ref must not contain whitespace, control or format characters",
   })

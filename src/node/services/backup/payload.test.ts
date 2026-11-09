@@ -5743,6 +5743,11 @@ describe("hidesSecretBehindEscapes", () => {
     ["a private key header with escaped spaces", "https://h/-----BEGIN%20PRIVATE%20KEY-----/r.git"],
     ["an escape of an escape", `https://h/%2520${token}/r.git`],
     ["three levels of escape", `https://h/%252520${token}/r.git`],
+    ["four levels of escape", `https://h/%25252520${token}/r.git`],
+    // Still escaped after the passes: nothing says how a reader decodes it.
+    ["more levels of escape than the passes", `https://h/%2525252520${token}/r.git`],
+    ["a letter of the token escaped twice", `https://h/%2567hp_${"a".repeat(36)}/r.git`],
+    ["a letter of the token escaped three times", `https://h/%252567hp_${"a".repeat(36)}/r.git`],
     ["an escape that is cut short", "https://h/%E0%A4%A/r.git"],
     ["bytes that are not UTF-8", "https://h/%FF/r.git"],
     ["a malformed escape next to a valid one", "https://h/%zz%20x"],
@@ -5757,6 +5762,8 @@ describe("hidesSecretBehindEscapes", () => {
     ["a UTF-8 letter", "https://h/caf%C3%A9/r.git"],
     ["a percent sign that starts no escape", "https://h/100%/r.git"],
     ["an escaped percent sign", "https://h/100%25/r.git"],
+    ["a space escaped twice", "https://h/My%2520Project/r.git"],
+    ["a space escaped three times", "https://h/My%252520Project/r.git"],
   ])("lets %s through", (_label, text) => {
     expect(hidesSecretBehindEscapes(text)).toBe(false);
   });

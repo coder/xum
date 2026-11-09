@@ -23,6 +23,7 @@ import {
 import { acquireGlobalMcpConfigLock } from "@/node/services/mcpConfigService";
 import { projectPathHashSuffix } from "@/node/services/memoryService";
 import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/constants/memory";
+import { percentDecodedForms } from "@/common/utils/agentPluginSource";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BackupCommandApproval, BackupProjectImport } from "@/common/orpc/schemas/backup";
@@ -113,32 +114,17 @@ function matchesSecretPattern(text: string): boolean {
   return SECRET_PATTERNS.some((pattern) => pattern.test(text));
 }
 
-const PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/;
-/** Escapes of escapes (`%2567`) are decoded this far, and a text still escaped after that is refused. */
-const MAX_ESCAPE_DECODE_ROUNDS = 3;
-
 /**
- * True when a text that carries percent escapes matches a secret pattern once they are decoded, or
- * cannot be decoded. The publish-time scan reads a file as written, so `%20ghp_...` has no word
- * boundary before the token and `-----BEGIN%20PRIVATE%20KEY-----` has no space in its header: the
- * scan passes both, while whatever reads the text decoded sees the token. A malformed escape
- * counts as a match: nothing says how a reader would decode that text. A `%` that starts no
- * escape does not.
+ * True when a text that carries percent escapes matches a secret pattern in any form a reader could
+ * decode it to (`percentDecodedForms`), or cannot be decoded. The publish-time scan reads a file as
+ * written, so `%20ghp_...` has no word boundary before the token and
+ * `-----BEGIN%20PRIVATE%20KEY-----` has no space in its header: the scan passes both, while whatever
+ * reads the text decoded sees the token. A malformed escape counts as a match: nothing says how a
+ * reader would decode that text. A `%` that starts no escape does not.
  */
 export function hidesSecretBehindEscapes(text: string): boolean {
-  let current = text;
-  for (let round = 0; PERCENT_ESCAPE.test(current); round++) {
-    if (round === MAX_ESCAPE_DECODE_ROUNDS) return true;
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(current);
-    } catch {
-      return true;
-    }
-    if (matchesSecretPattern(decoded)) return true;
-    current = decoded;
-  }
-  return false;
+  const forms = percentDecodedForms(text);
+  return forms === undefined || forms.some(matchesSecretPattern);
 }
 
 export interface BackupFile {
