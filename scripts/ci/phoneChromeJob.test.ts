@@ -75,6 +75,20 @@ describe("the phone chrome check in pr.yml", () => {
       "src/common/staticWorkspaceView/phoneChrome.generated.ts",
       // The file whose new class broke main in #7993.
       "src/browser/components/ChatPane/ChatActivityLine.tsx",
+      // What builds the renderer and runs the generator.
+      "src/browser/styles/globals.css",
+      "src/constants/layout.ts",
+      "src/vite/reactCompilerConfig.ts",
+      "index.html",
+      "vite.config.ts",
+      "tsconfig.json",
+      "patches/react-remove-scroll@2.7.2.patch",
+      "package.json",
+      "bun.lock",
+      "Makefile",
+      ".github/workflows/pr.yml",
+      ".github/actions/setup-xum/action.yml",
+      ".github/actions/setup-playwright/action.yml",
     ]);
 
     expect(missed).toEqual([]);
