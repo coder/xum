@@ -367,8 +367,8 @@ export class StreamEndLedger {
 
   /**
    * The task's row reads a completed report bound to `attemptId`, other than `inherited` (the one
-   * the row carried when the attempt began): a report writes a new `reportedAt`, so the row's
-   * report is the inherited one only while its `reportedAt` is still the captured one.
+   * the row carried when the attempt began). Only an inherited report of an `interrupted` row can
+   * be replaced, and the replacing report writes `reported` (see InheritedReport).
    */
   private rowReportsAttempt(
     taskId: string,
@@ -380,7 +380,10 @@ export class StreamEndLedger {
       taskId
     )?.workspace;
     if (workspace?.taskAttemptId !== attemptId || !hasCompletedAgentReport(workspace)) return false;
-    return inherited == null || workspace.reportedAt !== inherited.reportedAt;
+    return (
+      inherited == null ||
+      (inherited.taskStatus === "interrupted" && workspace.taskStatus === "reported")
+    );
   }
 
   /**

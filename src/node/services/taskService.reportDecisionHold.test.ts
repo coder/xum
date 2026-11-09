@@ -1,14 +1,4 @@
-import {
-  afterAll,
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  mock,
-  setSystemTime,
-  spyOn,
-  test,
-} from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
@@ -70,13 +60,6 @@ interface Internals {
   };
   taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
-  finalizeAgentTaskReport: (
-    childWorkspaceId: string,
-    childEntry: { projectPath: string; workspace: WorkspaceConfigEntry },
-    reportArgs: { reportMarkdown: string },
-    reportedAttempt: undefined,
-    reportedAttemptId: string | undefined
-  ) => Promise<{ finalized: boolean }>;
   editWorkspaceEntry: (
     workspaceId: string,
     updater: (workspace: WorkspaceConfigEntry) => void,
@@ -1272,33 +1255,30 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     }
   }, 20_000);
 
-  // The fresh attempt of a reactivated or reawakened reported child inherits the row's report, and
-  // the row reads reported from its first send on. Another backend's report of the fresh attempt
-  // then changes nothing but the row's `reportedAt` (the status was `reported` already): only
-  // that timestamp tells the attempt's own report from the one it inherited.
+  // A reactivated child whose row reads `interrupted` and still carries a report inherits that
+  // report, and the row reads it from the first send on. Another backend's report of the fresh
+  // attempt turns the row `reported`: its status, not its report time, tells that report from the
+  // inherited one, so even a report time that equals the inherited one (the same millisecond, a
+  // clock that stands still) refuses the held follow-up. A `reported` row ends every later report
+  // early (finalizeAgentTaskReport), so nothing replaces its report: "a follow-up queued during a
+  // reactivated child's stream still runs after it" covers that row.
   const REPORTED_AGAIN_AT = "2026-10-01T00:00:09.000Z";
   test.each([
-    { path: "reawakening", status: "reported" },
-    { path: "reactivation", status: "reported" },
-    // The one shape that a later report can write: finalizeAgentTaskReport ends early on `reported`.
-    { path: "reactivation", status: "interrupted" },
-  ] as const)(
-    "a report of the fresh attempt that another backend writes onto a row that carries a report and reads $status during the $path's stream refuses the held follow-up as indeterminate",
+    { name: "in the millisecond of the inherited one", reportedAt: REPORTED_AT },
+    { name: "later than the inherited one", reportedAt: REPORTED_AGAIN_AT },
+  ])(
+    "a report of the fresh attempt that another backend writes $name onto an interrupted row that carries a report refuses the held follow-up as indeterminate",
     async (c) => {
-      const { path } = c;
       const childId = "holdrereport001";
-      const stack = await createStack(childId, { taskStatus: c.status, reportedAt: REPORTED_AT });
+      const stack = await createStack(childId, {
+        taskStatus: "interrupted",
+        reportedAt: REPORTED_AT,
+      });
       const { config, taskService, workspaceService, completions, sendOptions } = stack;
       try {
-        if (path === "reawakening") {
-          expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
-            Ok(undefined)
-          );
-        } else {
-          expect(
-            await taskService.sendMessageToDescendantAgentTask(rootId, childId, "work", "turn-end")
-          ).toMatchObject(Ok({ delivery: "reactivated" }));
-        }
+        expect(
+          await taskService.sendMessageToDescendantAgentTask(rootId, childId, "work", "turn-end")
+        ).toMatchObject(Ok({ delivery: "reactivated" }));
         await until(() => completions.length === 1, "the continuation stream");
         const onCanceled = mock((_reason: string) => undefined);
         expect(
@@ -1306,12 +1286,12 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         ).toEqual(Ok(undefined));
         // The row kept the predecessor's report across the CAS and still reads it now.
         expect(entryOf(config, childId)).toMatchObject({
-          taskStatus: c.status,
+          taskStatus: "interrupted",
           reportedAt: REPORTED_AT,
         });
         await editChildRow(config, childId, (row) => {
           row.taskStatus = "reported";
-          row.reportedAt = REPORTED_AGAIN_AT;
+          row.reportedAt = c.reportedAt;
         });
         stack.endStream(0, {}, true);
         await until(
@@ -1331,35 +1311,34 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     20_000
   );
 
-  // The row's report time is how a report of the fresh attempt is told from the inherited one, so a
-  // report must change it even when the clock repeats the inherited report's millisecond. Only a
-  // row that reads `interrupted` can be reported again: a `reported` row ends every later report
-  // early (finalizeAgentTaskReport), so its report time never moves.
-  test("a report written in the millisecond of the inherited report time still changes the row's report time", async () => {
-    const childId = "holdsametime001";
+  test("a follow-up queued during an interrupted reactivated child's stream still runs when its row keeps the report", async () => {
+    const childId = "holdinterrupted01";
     const stack = await createStack(childId, {
       taskStatus: "interrupted",
       reportedAt: REPORTED_AT,
     });
-    const { config, svc } = stack;
+    const { config, taskService, workspaceService, completions, sendOptions } = stack;
     try {
-      const entry = findWorkspaceInConfig(config, childId);
-      setSystemTime(new Date(REPORTED_AT));
       expect(
-        await svc.finalizeAgentTaskReport(
-          childId,
-          { projectPath: entry!.path, workspace: entry! },
-          { reportMarkdown: "done" },
-          undefined,
-          entry!.taskAttemptId
-        )
-      ).toMatchObject({ finalized: true });
-      setSystemTime();
-      expect(entryOf(config, childId)?.taskStatus).toBe("reported");
-      expect(entryOf(config, childId)?.reportedAt).toBeString();
-      expect(entryOf(config, childId)?.reportedAt).not.toBe(REPORTED_AT);
+        await taskService.sendMessageToDescendantAgentTask(rootId, childId, "work", "turn-end")
+      ).toMatchObject(Ok({ delivery: "reactivated" }));
+      await until(() => completions.length === 1, "the continuation stream");
+      expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(entryOf(config, childId)).toMatchObject({
+        taskStatus: "interrupted",
+        reportedAt: REPORTED_AT,
+      });
+      stack.endStream(0, {}, true);
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "dispatched or held"
+      );
+      // The inherited report says nothing about this attempt: its follow-up runs.
+      expect(completions).toHaveLength(2);
+      expect(stack.heldTexts()).toEqual([]);
     } finally {
-      setSystemTime();
       await stack.cleanup();
     }
   }, 20_000);

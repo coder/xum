@@ -770,13 +770,13 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(continuedAttemptId).not.toBe(reportedAttemptId);
       // Lineage: the completed attempt is neither settled by this process nor by a receipt.
       expect(continued?.taskAttemptUnproven).toBe(true);
-      // The report stays on the row, and its time is what the new attempt inherits.
-      expect(continued?.reportedAt).toBeString();
+      // The report stays on the row, and its status is what the new attempt inherits.
+      expect(continued?.taskStatus).toBe("reported");
       expect(svc.attemptLedger.ownedAttemptByTaskId.get(taskId)).toMatchObject({
         source: "reawaken",
         attemptId: continuedAttemptId,
         receiptEligible: false,
-        inheritedReport: { reportedAt: continued?.reportedAt },
+        inheritedReport: { taskStatus: "reported" },
       });
       // The historical report still decides the task's outcome for its ancestors.
       expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("reported");

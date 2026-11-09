@@ -218,7 +218,7 @@ describe("AttemptLedger", () => {
         reportedAt: "2026-10-01T00:00:00.000Z",
       });
       expect(begin(ledger, ATTEMPT, true, null).inheritedReport).toBeNull();
-      const inherited = { reportedAt: "2026-10-01T00:00:00.000Z" };
+      const inherited = { taskStatus: "reported" } as const;
       expect(begin(ledger, OTHER, true, inherited).inheritedReport).toBe(inherited);
     });
 

@@ -38,7 +38,6 @@ import {
   formatSubagentFailureUserMessage,
   formatSubagentReportUserMessage,
   getIsoNow,
-  getReportedAtAfter,
   resolveTaskAgentIdForResume,
   terminalAttentionOutcome,
   type AgentTaskIntegration,
@@ -899,9 +898,9 @@ export interface OwnedTaskAttempt {
    * predecessor's terminal status, and a reawakening of a settled reported task keeps it too, so
    * the new attempt runs on a row that reads reported and that report says nothing about the
    * attempt. A reawakening of an interrupted row sets it `running` in the same CAS: null then.
-   * The row's report counts as inherited only while its `reportedAt` is still the one captured
-   * here (see InheritedReport). In-memory only, read from that CAS (never from the row
-   * afterwards, where the report may be this attempt's own).
+   * A later report of the attempt is told from the inherited one by the row's status (see
+   * InheritedReport). In-memory only, read from that CAS (never from the row afterwards, where
+   * the report may be this attempt's own).
    */
   readonly inheritedReport: InheritedReport | null;
 }
@@ -909,15 +908,22 @@ export interface OwnedTaskAttempt {
 /** A completed report that a row already carried when the CAS that published an attempt wrote it. */
 export interface InheritedReport {
   /**
-   * The row's `reportedAt` then. Every report of the row (a publication, an adopted artifact, on
-   * any backend) writes a new one, so a row that reads another value was reported again since.
+   * The row's status then. Only a row that read `interrupted` can be reported again: a report
+   * writes `reported`, finalizeAgentTaskReport ends early on a row that reads it, and an adopted
+   * artifact needs a row without a completed report. So a `reported` row's report is never
+   * replaced, and an `interrupted` row's is replaced exactly when the row reads `reported`.
    */
-  readonly reportedAt: string | undefined;
+  readonly taskStatus: "reported" | "interrupted";
 }
 
 /** The report `ws` carries now, or null. Read inside the CAS's config edit, on the row it writes. */
 function readInheritedReport(ws: WorkspaceConfigEntry): InheritedReport | null {
-  return hasCompletedAgentReport(ws) ? { reportedAt: ws.reportedAt } : null;
+  if (!hasCompletedAgentReport(ws)) return null;
+  assert(
+    ws.taskStatus === "reported" || ws.taskStatus === "interrupted",
+    "a completed report reads reported or interrupted"
+  );
+  return { taskStatus: ws.taskStatus };
 }
 
 /** In-process settlement ledger entry; see AttemptLedger.attemptSettlementByTaskId. */
@@ -22980,7 +22986,7 @@ export class TaskService implements AgentTaskIntegration {
         if (superseded) return;
         reportedAttemptId = ws.taskAttemptId;
         ws.taskStatus = "reported";
-        ws.reportedAt = getReportedAtAfter(ws.reportedAt);
+        ws.reportedAt = getIsoNow();
         markChildGoalPauseOwed(ws);
         // Successful completion resets the persisted recovery circuit breaker.
         delete ws.taskRecoveryAttempts;
@@ -23273,7 +23279,7 @@ export class TaskService implements AgentTaskIntegration {
           return;
         }
         workspace.taskStatus = "reported";
-        workspace.reportedAt = getReportedAtAfter(workspace.reportedAt);
+        workspace.reportedAt = getIsoNow();
         markChildGoalPauseOwed(workspace);
         delete workspace.taskRecoveryAttempts;
       },

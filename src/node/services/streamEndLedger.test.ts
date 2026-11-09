@@ -280,59 +280,61 @@ describe("StreamEndLedger decisions", () => {
       reportedAt: PREDECESSOR_REPORTED_AT,
       taskAttemptId: ATTEMPT,
     });
-    const owned = attempt(ATTEMPT, { reportedAt: PREDECESSOR_REPORTED_AT });
+    const owned = attempt(ATTEMPT, { taskStatus: "reported" });
     const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
     expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
     expect(decision?.outcome).toBe("nonreport");
-    // Its next reawaken may still prove a no-report receipt.
+    // The attempt continues: a later no-report end may still prove it never reported.
+    expect(owned.receiptEligible).toBe(true);
+  });
+
+  // A report writes `reported`, and finalizeAgentTaskReport ends early on a row that reads it, so
+  // a reported row's report is never replaced. Only an interrupted row's report can be.
+  test.each([
+    {
+      name: "a reported row that another writer's report time changed",
+      inherited: "reported",
+      row: { taskStatus: "reported", reportedAt: "2026-10-01T00:00:09.000Z" },
+    },
+    {
+      name: "a reported row that a failure turned interrupted",
+      inherited: "reported",
+      row: { taskStatus: "interrupted", reportedAt: PREDECESSOR_REPORTED_AT },
+    },
+    {
+      name: "an interrupted row that still carries its report",
+      inherited: "interrupted",
+      row: { taskStatus: "interrupted", reportedAt: PREDECESSOR_REPORTED_AT },
+    },
+  ] as const)("an inherited report that the row still carries ($name) continues", (c) => {
+    const t = harness();
+    t.state.config = configWithRow({ ...c.row, taskAttemptId: ATTEMPT });
+    const owned = attempt(ATTEMPT, { taskStatus: c.inherited });
+    const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
+    expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+    expect(decision?.outcome).toBe("nonreport");
     expect(owned.receiptEligible).toBe(true);
   });
 
   test.each([
-    {
-      name: "a new report time",
-      reportedAt: "2026-10-01T00:00:09.000Z",
-      inherited: PREDECESSOR_REPORTED_AT,
-    },
-    {
-      name: "a report time on a row that had none",
-      reportedAt: "2026-10-01T00:00:09.000Z",
-      inherited: undefined,
-    },
-    {
-      name: "no report time on a row that had one",
-      reportedAt: undefined,
-      inherited: PREDECESSOR_REPORTED_AT,
-    },
+    { name: "the same millisecond", reportedAt: PREDECESSOR_REPORTED_AT },
+    { name: "a later time", reportedAt: "2026-10-01T00:00:09.000Z" },
   ])(
-    "an inherited report that the row has since replaced ($name) turns the decision indeterminate",
+    "an inherited report of an interrupted row that the row has since replaced ($name) turns the decision indeterminate",
     (c) => {
       const t = harness();
       t.state.config = configWithRow({
         taskStatus: "reported",
+        reportedAt: c.reportedAt,
         taskAttemptId: ATTEMPT,
-        ...(c.reportedAt != null ? { reportedAt: c.reportedAt } : {}),
       });
-      const owned = attempt(ATTEMPT, { reportedAt: c.inherited });
+      const owned = attempt(ATTEMPT, { taskStatus: "interrupted" });
       const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
       expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
       expect(decision?.outcome).toBe("indeterminate");
       expect(owned.receiptEligible).toBe(false);
     }
   );
-
-  test("an inherited report on a row without a report time stays inherited until one is written", () => {
-    const t = harness();
-    t.state.config = configWithRow({ taskStatus: "reported", taskAttemptId: ATTEMPT });
-    const decision = t.ledger.registerStreamEndDecision(
-      TASK,
-      "m1",
-      attempt(ATTEMPT, { reportedAt: undefined }),
-      undefined
-    );
-    expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
-    expect(decision?.outcome).toBe("nonreport");
-  });
 
   test("an unowned stream whose row reads reported is refused, never assumed to continue", () => {
     const t = harness();
