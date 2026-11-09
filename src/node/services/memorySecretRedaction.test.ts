@@ -246,40 +246,31 @@ describe("redactSecretLike", () => {
     expect(redactSecretLike(text)).toBe(expected);
   });
 
-  // Markdown emphasis around the name or the separator is how notes and model summaries write a
-  // pair. The value is the word after the emphasis: taking the closing `**` as the value left the
-  // credential readable and broke the Markdown.
+  // A bold or italic label is how notes and model summaries write a pair. The value is the word
+  // after the label's closing run: taking that run as the value left the credential readable.
   it.each([
-    [
-      "bold around the name and colon",
-      "**Password:** hunter2-correct-horse",
-      "**Password:** [redacted]",
-    ],
-    [
-      "bold around the name only",
-      "**Password**: hunter2-correct-horse",
-      "**Password**: [redacted]",
-    ],
-    ["italics around the name", "*token*: abcdef123456 next", "*token*: [redacted] next"],
+    ["a bold label", "**Password:** hunter2-correct-horse", "**Password:** [redacted]"],
     ["a bold label in a list", "- **Secret:** abc123def456", "- **Secret:** [redacted]"],
-    [
-      "a bold label in prose (fails closed, Markdown intact)",
-      "- **No credentials:** the files name where secrets live",
-      "- **No credentials:** [redacted] files name where secrets live",
-    ],
-    [
-      "stars glued to the value (not emphasis)",
-      "PASSWORD=****secret npm start",
-      "PASSWORD=[redacted] npm start",
-    ],
-    ["a value of stars only", "password=***", "password=[redacted]"],
-    ["stars then a command, no opener", "password=*** npm start", "password=[redacted] npm start"],
-    ["a list bullet is no opener", "* password=*** npm start", "* password=[redacted] npm start"],
-  ])("redacts the value after Markdown emphasis in %s", (_label, text, expected) => {
+    ["an italic label", "*token:* abcdef123456 next", "*token:* [redacted] next"],
+    ["stars glued to the value", "PASSWORD=****secret npm start", "PASSWORD=[redacted] npm start"],
+  ])("redacts the value of %s", (_label, text, expected) => {
     const redacted = redactSecretLike(text);
 
     expect(redacted).toBe(expected);
     expect(redactSecretLike(redacted)).toBe(redacted);
+  });
+
+  // 1 to 3 asterisks hold no credential: a mask, or a closing run whose label is not adjacent to the
+  // name (prose). Stars that are not an exact label (an operator, unpaired runs) stay as before.
+  it.each([
+    ["a bold label in prose", "- **No credentials:** the files name where secrets live"],
+    ["a mask", "password=***"],
+    ["a mask before a command", "password=*** npm start"],
+    ["unpaired runs on the line", "*note password=*** npm start"],
+    ["a multiplication assignment", "token*=2; token**=2"],
+  ])("leaves %s as it is", (_label, text) => {
+    expect(redactSecretLike(text)).toBe(text);
+    expect(containsSecretLike(text)).toBe(false);
   });
 
   // Text that went through JSON.stringify once more is the same text with every quote and backslash
@@ -605,6 +596,7 @@ describe("redactSecretLike", () => {
     ["bold keyword labels with no value", "**password:**".repeat(8_000)],
     ["many separators after one opening run", `**x ${"password:".repeat(10_000)}`],
     ["opening runs before keyword pairs", "*a password=b ".repeat(7_000)],
+    ["bold labels with values", "**password:** x ".repeat(6_000)],
     ["SharedAccessKey", "SharedAccessKey".repeat(6_600)],
     ["shared_access_key_", "shared_access_key_".repeat(5_600)],
     ["SharedAccessKeyName", "SharedAccessKeyName".repeat(5_200)],
