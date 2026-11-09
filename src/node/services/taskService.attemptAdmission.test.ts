@@ -81,7 +81,7 @@ interface Internals {
   attemptLedger: {
     ownedAttemptByTaskId: Map<
       string,
-      { attemptId?: string; receiptEligible: boolean; source: string }
+      { attemptId?: string; receiptEligible: boolean; source: string; inheritedReport?: unknown }
     >;
     attemptSettlementByTaskId: Map<
       string,
