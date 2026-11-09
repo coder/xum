@@ -888,6 +888,12 @@ else:
                 }
                 for where, at in own_line.items():
                     inserted[f"{label}, {shape}, line {where}"] = fold[:at] + text + "\n" + fold[at:]
+                for where, at in (
+                    ("end of the marker line", marker_end - 1),
+                    ("end of the review state line", state_end - 1),
+                    ("end of the security line", fold.index("\n", state_end)),
+                ):
+                    inserted[f"{label}, {shape}, {where}"] = fold[:at] + text + fold[at:]
                 inserted[f"{label}, {shape}, in place of the blank line"] = (
                     fold[: -len(end)] + "\n" + text + "\n</details>"
                 )

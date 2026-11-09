@@ -20,3 +20,10 @@ export const MERMAID_ERROR_SELECTOR = `[${MERMAID_ERROR_ATTRIBUTE}]`;
  * starts to wait for a diagram. Only the paint-check fixture that mounts its diagram late listens.
  */
 export const PAINT_CHECK_WAIT_EVENT = "paint-check-wait-started";
+
+/**
+ * Names the env var, in milliseconds, that shortens how long the Storybook test runner waits for
+ * its diagrams to render. Only scripts/check-paint-check-fixtures.ts sets it, so the fixture whose
+ * second diagram never draws does not wait the runner's whole default.
+ */
+export const PAINT_CHECK_RENDER_TIMEOUT_ENV = "PAINT_CHECK_RENDER_TIMEOUT_MS";
