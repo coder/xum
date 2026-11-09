@@ -442,6 +442,8 @@ CHECK_CODEX_STATUS_ONCE() {
 
   all_comments=$(reply_connection_nodes "$pr_data" comments) || return 1
   all_threads=$(reply_connection_nodes "$pr_data" reviewThreads) || return 1
+  # The reaction times are printed on approval, so the window's reactions get the same check.
+  reply_connection_nodes "$pr_data" reactions >/dev/null || return 1
 
   # Ignore Codex's own comments since they mention "@codex review" in boilerplate.
   request_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" '[.[] | select(.author.login != $bot and (.body | contains("@codex review")))] | sort_by(.createdAt) | last | .createdAt // empty')
