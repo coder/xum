@@ -143,6 +143,10 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - When streaming crashes, any incomplete state committed to disk should either be repairable on next load or excluded from provider requests to avoid API validation errors.
 - **Startup-time initialization must never crash the app.** Wrap in try-catch, use timeouts, fall back silently.
 
+## Agent Plugins
+
+- Plugin install-method choice is a Draft (`rfc/20261106_plugin-install-method-choice.md`). Before anyone builds it, its design must cover what every other Xum build does to a plugin whose saved manifest that build does not load: hook trust, OAuth sign-ins, the registry row and updates. Never repair state that another build changed: fail closed and let a reinstall review it.
+
 ## Command Palette & UI Access
 
 - Palette shortcuts are `OPEN_COMMAND_PALETTE` and `OPEN_COMMAND_PALETTE_ACTIONS` (opens in `>` command mode) in `src/browser/utils/ui/keybinds.ts`.

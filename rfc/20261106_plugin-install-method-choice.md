@@ -5,7 +5,7 @@ date: 2026-11-06
 
 # Plugin install method choice
 
-- **Status:** Draft. Split out of [`20261104_plugin-install-methods.md`](./20261104_plugin-install-methods.md), which keeps Part A (foreign plugin agents). The plan labels start at B1 and the acceptance criteria at 9, so that the code PRs' references to them stay valid.
+- **Status:** Draft. Split out of [`20261104_plugin-install-methods.md`](./20261104_plugin-install-methods.md), which keeps Part A (foreign plugin agents). The plan labels start at B1 and the acceptance criteria at 9, so that the prototype branches' references to them stay valid.
 
 ---
 
@@ -15,7 +15,7 @@ Xum installs agent plugins from git repositories (Settings → Plugins). Some pl
 
 This design makes each manifest that Xum can load an install method. The install preview lists the methods with the components each one gives. Xum saves the method the user picks, and discovery, consent reviews and updates load that manifest.
 
-The motivating plugin is egm ([google/elephant-goldfish-model](https://github.com/google/elephant-goldfish-model)), a design-review plugin whose skills spawn persona reviewer agents. Its Claude agents also need the foreign plugin agent fixes of [`20261104_plugin-install-methods.md`](./20261104_plugin-install-methods.md) (Part A), which have shipped. The work ships as two stacked PRs: [#7940](https://github.com/coder/xum/pull/7940) (B1, B2, B3, B5) and [#7948](https://github.com/coder/xum/pull/7948) (B4, B6).
+The motivating plugin is egm ([google/elephant-goldfish-model](https://github.com/google/elephant-goldfish-model)), a design-review plugin whose skills spawn persona reviewer agents. Its Claude agents also need the foreign plugin agent fixes of [`20261104_plugin-install-methods.md`](./20261104_plugin-install-methods.md) (Part A), which have shipped. This design is not built. Two closed prototype PRs hold code for it (Delivery).
 
 ### Terms
 
@@ -180,10 +180,17 @@ flowchart TD
 
 ### Delivery
 
-Two stacked PRs, each with its own tests and downgrade note. They keep the names PR 3 and PR 4, which the criteria and the file plan use:
+Before this design is built, it must cover what every other Xum build does to a plugin whose saved manifest that build does not load: hook trust, OAuth sign-ins, the registry row and updates. No build repairs state that another build changed: the plugin fails closed, and a reinstall reviews it.
 
-- PR 3 ([#7940](https://github.com/coder/xum/pull/7940)): B1, B2, B3 and B5: rule M1, named-manifest selection, the saved method and the update rule. These ship together so that a method choice holds from the first PR that offers it.
-- PR 4 ([#7948](https://github.com/coder/xum/pull/7948), stacked on PR 3): B4 and B6: per-method counts in the preview, and visibility.
+The work splits into two stacked PRs, each with its own tests and downgrade note. The criteria and the file plan name them PR 3 and PR 4:
+
+- PR 3: B1, B2, B3 and B5: rule M1, named-manifest selection, the saved method and the update rule. These ship together so that a method choice holds from the first PR that offers it.
+- PR 4, stacked on PR 3: B4 and B6: per-method counts in the preview, and visibility.
+
+Two prototype PRs, closed without merging, hold code for these PRs. Their latest work is on branches:
+
+- PR 3: [#7940](https://github.com/coder/xum/pull/7940), branch `plugin-install-method-choice-parked`.
+- PR 4: [#7948](https://github.com/coder/xum/pull/7948), branch `plugin-install-method-visibility-parked`.
 
 ## Alternatives Considered
 
