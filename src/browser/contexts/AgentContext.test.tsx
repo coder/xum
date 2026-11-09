@@ -157,6 +157,7 @@ function createApiClient(
         ),
       onChat: () => Promise.resolve(createEmptyAsyncIterable()),
       getSessionUsage: () => Promise.resolve(undefined),
+      getSubagentUsage: () => Promise.resolve({ children: {} }),
       activity: {
         list: () => Promise.resolve({}),
         subscribe: () => Promise.resolve(createEmptyAsyncIterable()),

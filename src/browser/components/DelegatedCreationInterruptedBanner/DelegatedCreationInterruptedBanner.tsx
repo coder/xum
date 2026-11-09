@@ -1,7 +1,13 @@
 import React, { useRef, useState } from "react";
 import { Check, Loader2, TriangleAlert, Trash2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
+import {
+  useWaitingOnYou,
+  type WaitingOnYouEntry,
+} from "@/browser/components/ChatPane/WaitingOnYou";
 import { useLiveAPI } from "@/browser/contexts/API";
+import type { WorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { confirmAndRemoveWorkspace } from "@/browser/utils/confirmAndRemoveWorkspace";
 import {
   useConfirmDialog,
   type ConfirmDialogOptions,
@@ -24,13 +30,20 @@ export const DELEGATED_CREATION_INTERRUPTED_MESSAGE =
 
 type BannerAction = "remove" | "keep";
 
+const SETUP_INTERRUPTED_ENTRY: WaitingOnYouEntry = {
+  icon: TriangleAlert,
+  tab: "Setup interrupted",
+  title: "Setup interrupted",
+  detail: "Keep or remove this workspace",
+};
+
 export interface DelegatedCreationInterruptedNoticeProps {
   workspaceId: string;
   /** Names what the removal deletes on this workspace's runtime (#5204). */
   workspace: RemovableWorkspace;
   confirm: (options: ConfirmDialogOptions) => Promise<boolean>;
   /** The normal user removal: never forced, so a dirty checkout or a busy workspace refuses. */
-  removeWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+  removeWorkspace: WorkspaceContext["removeWorkspace"];
 }
 
 /**
@@ -41,6 +54,7 @@ export interface DelegatedCreationInterruptedNoticeProps {
 export const DelegatedCreationInterruptedNotice: React.FC<
   DelegatedCreationInterruptedNoticeProps
 > = (props) => {
+  useWaitingOnYou(SETUP_INTERRUPTED_ENTRY);
   const liveApi = useLiveAPI();
   const [pendingAction, setPendingAction] = useState<BannerAction | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -73,7 +87,11 @@ export const DelegatedCreationInterruptedNotice: React.FC<
         removeWorkspaceConfirmOptions("Remove current workspace?", props.workspace)
       );
       if (!confirmed) return null;
-      const result = await props.removeWorkspace(props.workspaceId);
+      const result = await confirmAndRemoveWorkspace({
+        removeWorkspace: props.removeWorkspace,
+        confirm: props.confirm,
+        workspaceId: props.workspaceId,
+      });
       return result.success ? null : (result.error ?? "Failed to remove workspace");
     });
 
@@ -159,7 +177,7 @@ export const DelegatedCreationInterruptedBanner: React.FC<{
         kind: meta?.kind,
       }}
       confirm={confirm}
-      removeWorkspace={(workspaceId) => removeWorkspace(workspaceId)}
+      removeWorkspace={removeWorkspace}
     />
   );
 };

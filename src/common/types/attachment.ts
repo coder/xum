@@ -76,12 +76,13 @@ export interface ReadFilesReferenceAttachment {
 }
 
 /**
- * Published artifacts (Artifacts M4): handles only (path, latest version, label), so after
- * compaction the model still knows which artifacts exist and can republish or reread them.
+ * Published artifacts (Artifacts M4): handles only (path, title), so after compaction the model
+ * still knows which artifacts exist and can republish or reread them. Rows written before
+ * versions were removed carry `latestVersion` and `label` instead of `title`.
  */
 export interface ArtifactsIndexAttachment {
   type: "artifacts_index";
-  artifacts: Array<{ path: string; latestVersion: number; label: string | null }>;
+  artifacts: Array<{ path: string; title?: string }>;
 }
 
 export type PostCompactionAttachment =

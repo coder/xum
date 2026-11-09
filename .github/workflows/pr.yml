@@ -38,6 +38,7 @@ jobs:
       nix_deps: ${{ steps.filter.outputs.nix_deps }}
       docker: ${{ steps.filter.outputs.docker }}
       e2e_tests: ${{ steps.filter.outputs.e2e_tests }}
+      phone_chrome: ${{ steps.filter.outputs.phone_chrome }}
       vscode: ${{ steps.filter.outputs.vscode }}
       # Shared job gates, computed once instead of repeated in every job.
       # tests: code or CI config changed, and this isn't the merge queue's post-merge
@@ -90,6 +91,8 @@ jobs:
               - '.github/**'
               - 'scripts/**'
               - 'packages/mux-compat/**'
+              # scripts/verifyXumWebkit.test.ts runs the verify-xum skill's helper and reads its script.
+              - '.xum/skills/verify-xum/scripts/**'
               - 'jest.config.js'
               # e2e_tests below lists it too: without it here, `tests` stays false on a
               # Playwright-config-only change and test-e2e never runs.
@@ -107,16 +110,48 @@ jobs:
               - 'pixel.jsonc'
               - '.storybook/**'
             # Queue-only jobs (test-e2e, bugbash-sandbox, build-vscode) still run on a PR that
-            # changes their own tests or sources. This workflow holds their steps, the Makefile
-            # their targets, and bun.lock the playwright-core version that keys the sandbox image.
+            # changes their own tests or sources. This workflow and the setup-xum action hold
+            # their steps, the Makefile their targets, and bun.lock the playwright-core version
+            # that keys the sandbox image.
             e2e_tests:
               - 'tests/e2e/**'
               - 'tests/bugbash/**'
               - 'playwright.config.ts'
               - '.github/workflows/pr.yml'
+              - '.github/actions/setup-xum/**'
               - 'Makefile'
               - 'package.json'
               - 'bun.lock'
+            # Test / Phone chrome: what the live phone page is built from. The renderer bundle holds
+            # src/browser, src/common and src/constants (read from the sourcemaps of `make
+            # build-renderer`, 2026-11-09), vite builds it with the config and the packages named
+            # here, and the generator brings its own seed and token helpers. Server code (src/node,
+            # src/cli) only supplies data that the skeleton turns into slots: the merge queue runs the
+            # job for every group that changes code or CI config (the `tests` filter), so a change
+            # there that moves the page still stops at the queue. A group that changes only docs skips it.
+            phone_chrome:
+              - 'src/browser/**'
+              - 'src/common/**'
+              - 'src/constants/**'
+              - 'src/vite/**'
+              - 'src/node/orpc/staticWorkspaceView/**'
+              - 'index.html'
+              - 'vite*.ts'
+              - 'tsconfig*.json'
+              - 'patches/**'
+              - 'public/**'
+              - 'package.json'
+              - 'bun.lock'
+              - 'Makefile'
+              - 'scripts/perf/generatePhoneChrome.ts'
+              - 'scripts/perf/neutralSeed.ts'
+              - 'scripts/perf/fixtures/neutralSeed/**'
+              - 'scripts/perf/serverToken.ts'
+              - 'scripts/precompress-static.ts'
+              - 'scripts/stamp-service-worker.ts'
+              - '.github/workflows/pr.yml'
+              - '.github/actions/setup-xum/**'
+              - '.github/actions/setup-playwright/**'
             vscode:
               - 'vscode/**'
             nix_deps:
@@ -167,47 +202,29 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-version.sh
-      # Release binaries pinned by checksum. A version bump needs new checksums for every asset
-      # below. Never copy them from the release page: download each asset yourself, run
-      # `sha256sum` on it, and check that the result equals the digest GitHub computed at upload
-      # (`gh api repos/<owner>/<repo>/releases/tags/<tag> --jq '.assets[] | .name + " " +
-      # .digest'`). hadolint v2.12.0 predates those digests: compare with its .sha256 assets.
+      # shfmt and hadolint: release binaries pinned by checksum in the install script, which
+      # also says how to bump them. The cache holds the verified downloads and is keyed on that
+      # script, so a changed pin starts fresh. A cache hit skips the download, which github.com
+      # answered with 504 for more than 7 minutes on 2026-11-08. A cold cache retries each
+      # download for 15 minutes: this job has no time limit of its own (the default is 6 hours).
+      # The cache is saved right after the install, because the job's post step saves only when
+      # every later step passes, and the steps below download more (the grammars).
+      - name: Restore shfmt and hadolint downloads
+        id: release-assets
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/xum-release-assets/shfmt-hadolint
+          key: release-assets-shfmt-hadolint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-release-tools.sh') }}
       - name: Install shfmt and hadolint
-        env:
-          SHFMT_VERSION: v3.14.1
-          SHFMT_SHA256_X86_64: 76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf
-          SHFMT_SHA256_AARCH64: 5f2db09dae91fca848f7adbdd014632e921a383863a2ad7e0450ad3aba0c6489
-          HADOLINT_VERSION: v2.12.0
-          HADOLINT_SHA256_X86_64: 56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010
-          HADOLINT_SHA256_AARCH64: 5798551bf19f33951881f15eb238f90aef023f11e7ec7e9f4c37961cb87c5df6
         run: |
-          set -euo pipefail
-          case "$(uname -m)" in
-            x86_64)
-              shfmt_arch=amd64 shfmt_sha256="$SHFMT_SHA256_X86_64"
-              hadolint_arch=x86_64 hadolint_sha256="$HADOLINT_SHA256_X86_64"
-              ;;
-            aarch64 | arm64)
-              shfmt_arch=arm64 shfmt_sha256="$SHFMT_SHA256_AARCH64"
-              hadolint_arch=arm64 hadolint_sha256="$HADOLINT_SHA256_AARCH64"
-              ;;
-            *)
-              echo "::error::no pinned shfmt or hadolint for $(uname -m); add its assets and checksums"
-              exit 1
-              ;;
-          esac
-          bin="$HOME/.local/bin"
-          mkdir -p "$bin"
-          curl -fsSL --retry 5 --retry-all-errors -o "$bin/shfmt" \
-            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_${shfmt_arch}"
-          curl -fsSL --retry 5 --retry-all-errors -o "$bin/hadolint" \
-            "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-${hadolint_arch}"
-          echo "${shfmt_sha256}  $bin/shfmt" | sha256sum -c -
-          echo "${hadolint_sha256}  $bin/hadolint" | sha256sum -c -
-          chmod +x "$bin/shfmt" "$bin/hadolint"
-          "$bin/shfmt" --version
-          "$bin/hadolint" --version
-          echo "$bin" >> "$GITHUB_PATH"
+          ./scripts/ci/install-release-tools.sh shfmt-hadolint "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Save shfmt and hadolint downloads
+        if: steps.release-assets.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/xum-release-assets/shfmt-hadolint
+          key: ${{ steps.release-assets.outputs.cache-primary-key }}
       - name: Install shellcheck
         run: |
           set -euo pipefail
@@ -239,6 +256,37 @@ jobs:
           key: ${{ runner.os }}-lint-fmt-node-${{ steps.node-version.outputs.version }}-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-lint-fmt-node-${{ steps.node-version.outputs.version }}-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-
+      # tree-sitter-language-pack downloads its grammars from a GitHub release on first use
+      # (`make tree-sitter-grammars`, a prerequisite of the script tests in static-check-full).
+      # The pack loads them as native libraries, so a restored cache is untrusted input. The
+      # cache holds only the pinned manifest and bundle, in a directory of its own (the stage
+      # directory, GRAMMAR_STAGE_DIR, under the runner's temp directory, so a local run or a
+      # test never writes a cache under ~/.cache). The script checks both files against the
+      # sha256 pins in itself on every run (hit or miss), then rebuilds the pack's own directory
+      # from them. The key hashes that script, so a changed pin starts a fresh cache, and a
+      # language added to `LANGUAGES` in that script changes its hash and needs no other key
+      # change. The step below downloads them
+      # (15 minutes of retries on a cold cache), and the save follows at once, ahead of the long
+      # make run. A hit whose files fail the pins is discarded and downloaded again (the log
+      # shows `::warning::`). A cache entry cannot be replaced, so that bad entry keeps its key
+      # and every run pays the download until someone raises `v2` in the key.
+      - name: Restore tree-sitter grammars
+        id: tree-sitter-grammars
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/xum-tree-sitter-grammars
+          key: tree-sitter-grammars-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/download_tree_sitter_grammars.py') }}
+      - name: Download tree-sitter grammars
+        run: make tree-sitter-grammars
+        env:
+          GRAMMAR_DOWNLOAD_BUDGET_SECS: 900
+          GRAMMAR_STAGE_DIR: ${{ runner.temp }}/xum-tree-sitter-grammars
+      - name: Save tree-sitter grammars
+        if: steps.tree-sitter-grammars.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/xum-tree-sitter-grammars
+          key: ${{ steps.tree-sitter-grammars.outputs.cache-primary-key }}
       - run: make -j static-check-full
         env:
           MUX_ESLINT_CONCURRENCY: 4
@@ -307,39 +355,36 @@ jobs:
       # single-attempt path. Run the real-curl pinning tests once more with a pinned static
       # curl 8.7+ (curl.se lists stunnel/static-curl), so CI also checks the address
       # fallback and its no-retry cases (#6414). The env var fails the file if that curl is
-      # not the one on PATH.
+      # not the one on PATH. The pin and its checksums live in the install script. As for
+      # shfmt above, a cache hit skips the download, and the cache is saved right after it.
+      # A cold cache retries for 8 minutes (DOWNLOAD_BUDGET_SECS), not 15: this job stops at
+      # 20 minutes. The step starts after 7 minutes of build and tests, and the pinning tests,
+      # the cache save and the cleanup take under 1 more (measured on PR 8001), so a full budget
+      # ends the job at about 16 minutes and leaves room for a slow runner.
+      - name: Restore the static curl download
+        id: static-curl-download
+        if: matrix.shard == 1 && github.event.inputs.test_filter == ''
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/xum-release-assets/static-curl
+          key: release-assets-static-curl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-release-tools.sh') }}
+      - name: Install static curl
+        if: matrix.shard == 1 && github.event.inputs.test_filter == ''
+        env:
+          DOWNLOAD_BUDGET_SECS: 480
+        run: ./scripts/ci/install-release-tools.sh static-curl "$RUNNER_TEMP/static-curl"
+      - name: Save the static curl download
+        if: matrix.shard == 1 && github.event.inputs.test_filter == '' && steps.static-curl-download.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/xum-release-assets/static-curl
+          key: ${{ steps.static-curl-download.outputs.cache-primary-key }}
       - name: web_fetch pinning tests with curl 8.7+
         if: matrix.shard == 1 && github.event.inputs.test_filter == ''
         env:
-          # A version bump needs new checksums for BOTH assets below (#6492). Never copy them
-          # from the release page: download each curl-linux-<arch>-musl-<version>.tar.xz
-          # yourself, run `sha256sum` on it, and check that the result equals the digest
-          # GitHub computed at upload (`gh api repos/stunnel/static-curl/releases/tags/<version>
-          # --jq '.assets[] | select(.name == "<asset>") | .digest'`). The release has no
-          # build attestations, so those two must agree before the new values land.
-          STATIC_CURL_VERSION: 8.22.0
-          STATIC_CURL_SHA256_X86_64: dfb02460ba2abe513087538f12a3cf79b74b64a5ea3787ce8ac0cdb11251f884
-          STATIC_CURL_SHA256_AARCH64: cf94cbeaae1b3c1944a4a761ef04478f8f0b23e93a324b5ed009b2082eda11f3
           XUM_WEB_FETCH_REQUIRE_CURL_FALLBACK: "1"
         run: |
-          # Pick the asset for this runner's CPU, so a move to arm64 runners keeps the step
-          # (#6492). Any other CPU fails here instead of silently testing nothing.
-          case "$(uname -m)" in
-            x86_64) arch=x86_64 sha256="$STATIC_CURL_SHA256_X86_64" ;;
-            aarch64 | arm64) arch=aarch64 sha256="$STATIC_CURL_SHA256_AARCH64" ;;
-            *)
-              echo "::error::no pinned static curl for $(uname -m); add its asset and checksum"
-              exit 1
-              ;;
-          esac
-          dir="$RUNNER_TEMP/static-curl"
-          mkdir -p "$dir"
-          archive="$dir/curl.tar.xz"
-          curl -fsSL --retry 3 -o "$archive" \
-            "https://github.com/stunnel/static-curl/releases/download/${STATIC_CURL_VERSION}/curl-linux-${arch}-musl-${STATIC_CURL_VERSION}.tar.xz"
-          echo "${sha256}  ${archive}" | sha256sum -c -
-          tar -xJf "$archive" -C "$dir" curl
-          PATH="$dir:$PATH"
+          PATH="$RUNNER_TEMP/static-curl:$PATH"
           curl -q --version
           bun test src/node/services/tools/web_fetch.pinning.test.ts
       # The host trap and the in-memory agent-loop proof run in their own bun process, with
@@ -733,6 +778,10 @@ jobs:
       - uses: ./.github/actions/setup-xum
       - uses: ./.github/actions/setup-playwright
         timeout-minutes: 10
+        with:
+          # WebKit runs the stories tagged "webkit" or "paint-check" (iPhone Safari sizes SVG and
+          # CSS zoom unlike Chromium).
+          browsers: chromium webkit
       - run: make storybook-build
       - run: |
           bun x http-server storybook-static -p 6006 &
@@ -749,6 +798,10 @@ jobs:
       # Separate step so a budget overrun is not mixed up with interaction-test failures.
       - run: make storybook-budget
       - run: make test-storybook
+      - run: make test-storybook-webkit
+      # The stories built to trip the paint-check runner's guards must still fail (or pass) as
+      # written.
+      - run: make test-storybook-paint-fixtures
 
   test-e2e:
     # No matrix expression in the name: GitHub then appends the matrix values ("linux, 1/4",
@@ -780,6 +833,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          skip-build-caches: "true"
       - name: Install xvfb
         if: matrix.os == 'linux'
         run: |
@@ -808,12 +864,6 @@ jobs:
           SHARD: ${{ matrix.shard }}
           # No provider secrets here, so the repros' app uses the mock AI.
           BUGBASH_REPROS: ${{ matrix.shard == '1/4' && '1' || '0' }}
-      # The static workspace view's phone skeleton must match the live page (#5971). On drift, the
-      # failure names the element and the command that regenerates the skeleton.
-      # It reuses the `make build` of `make test-e2e` above.
-      - name: Check the phone chrome skeleton
-        if: matrix.os == 'linux' && matrix.shard == '1/4'
-        run: make check-phone-chrome
       - name: Run tests
         if: matrix.os == 'macos'
         env:
@@ -840,11 +890,48 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  test-phone-chrome:
+    # The static workspace view's phone skeleton must match the live page (#5971). On drift, the
+    # failure names the element and the command that regenerates the skeleton. This was a step of
+    # Test / E2E (linux, 1/4), which a PR runs only when it changes e2e_tests: #7993 changed a class
+    # in src/browser, skipped that job, and broke main (skipped counts as passing in Required).
+    # Here a PR runs it when phone_chrome matches, and the merge queue runs it for every group that
+    # changes code or CI config (a group that changes only docs skips it).
+    # It does not wait for `tests`: index.html, public/ and patches/ build the page too and are in
+    # neither the src nor the config filter, so a PR that changes only them has tests false.
+    # Like `tests`, it skips the push that the merge queue's own merge makes on main.
+    name: Test / Phone chrome
+    # Five runs took 2 min 13 s to 2 min 32 s (the build is 1 of those minutes). 15 minutes is about
+    # 6 times the longest, and a job that hangs holds a runner until GitHub's 6 h limit without it.
+    timeout-minutes: 15
+    needs: [changes]
+    if: >-
+      github.event.inputs.test_filter == '' &&
+      (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') &&
+      (needs.changes.outputs.phone_chrome == 'true' ||
+      (github.event_name != 'pull_request' && needs.changes.outputs.tests == 'true'))
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-xum
+        with:
+          skip-build-caches: "true"
+      # Bound browser setup; Playwright downloads can stall after progress reaches 100%.
+      - uses: ./.github/actions/setup-playwright
+        timeout-minutes: 10
+      # check-phone-chrome drives the built tree (`xum server` and the renderer), as its recipe
+      # says. These are the build prerequisites of its sibling generate-phone-chrome.
+      - run: make build-main build-renderer build-static
+      - run: make check-phone-chrome
+
   bugbash-sandbox:
     # The bug-bash sandbox (#5714, #5931): its self-check (isolation, proxy and export refusals,
     # against a fake upstream) and the repros of fixed bugs through its launcher, on the mock app
-    # AI. No secrets and no model. The launcher pulls the pinned image by digest without
-    # credentials, and exits nonzero on a refusal, a failed check or a container left `unknown`.
+    # AI. No secrets and no model. The launcher pulls main's attested image by digest without
+    # registry credentials (or builds one from this checkout), and exits nonzero on a refusal, a
+    # failed check or a container left `unknown`.
     # E2E shard 1 still runs the same repros on the host until this job proves stable.
     name: Test / Bug-bash sandbox
     needs: [changes]
@@ -852,24 +939,25 @@ jobs:
     if: >-
       needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == '' &&
       (github.event_name != 'pull_request' || needs.changes.outputs.e2e_tests == 'true')
-    # 45, not 30: a stale image key adds a local image build of up to 25 minutes (below).
+    # 45, not 30: a PR that changes the image inputs has no published image yet (main publishes
+    # it after the merge), so the launcher builds one locally, for up to 25 minutes.
     timeout-minutes: 45
     runs-on: ${{ needs.changes.outputs.runner-4 }}
-    # Stale-key local build: only main publishes the image, so a PR that changes its inputs (Dockerfile, build.sh,
-    # playwright-core) has a stale image.json. With this opt-in the launcher then builds the image
-    # locally with build.sh, for these two jobs only, and prints a warning. Model-driven runs
-    # (make bug-bash, make mcp-apps-e2e) ignore it and keep the pinned digest.
-    env:
-      BUGBASH_SANDBOX_BUILD_STALE: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
+      # GH_TOKEN: the launcher's gh verifies the published image's attestation on the host. It
+      # never reaches Docker or a job container (the container env drops it).
       - name: Sandbox self-check
         run: make bug-bash-sandbox-check
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Repros in the sandbox
         run: make test-bugbash-repros-sandbox
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   test-windows:
     name: Test / Windows
@@ -1155,6 +1243,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          appimage-tool: "true"
       - run: bun run build
       - run: make dist-linux
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -1185,7 +1276,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # electron-builder unpacks the checked Electron zip of this job's arch (the runner is
+      # arm64, so the x64 job needs the darwin-x64 zip) instead of downloading it without retries.
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: darwin-${{ matrix.arch }}
       - name: Setup code signing
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: ./scripts/setup-macos-signing.sh
@@ -1222,7 +1318,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # electron-builder unpacks the checked Electron zip instead of downloading it without retries.
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: win32-x64
       - name: Add MSYS2 make to PATH
         shell: pwsh
         run: |
@@ -1294,8 +1394,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # The four test targets take 70 to 112 s here (93 s at the median of 33 PR runs). Each gate run
+      # in them has a 120 s hang guard (scripts/check_codex_comments_test.py), so a gate that hung
+      # on every run would hold the job until GitHub's 6 h limit without a step limit. 15 minutes is
+      # about 8 times the longest run seen.
       - name: Test PR readiness gates
-        run: make test-codex-comments test-pr-checks test-required-superseded
+        timeout-minutes: 15
+        run: make test-codex-comments test-pr-checks test-required-superseded test-branch-sync-guard
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Codex starts reviewing the same push that started this job, so give it
@@ -1317,6 +1422,7 @@ jobs:
       - test-storybook
       - test-windows
       - test-e2e
+      - test-phone-chrome
       - bugbash-sandbox
       - smoke-server
       - smoke-docker

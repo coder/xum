@@ -8,6 +8,7 @@
  */
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { Instructions, LanguageModel, ModelMessage, streamText, Tool } from "ai";
+import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import type { ResolvedCallSettingsOverrides } from "@/common/config/schemas/modelParameters";
 import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
 import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
@@ -151,6 +152,7 @@ export interface PreparedModelFallback {
    */
   tools: Record<string, Tool> | undefined;
   providerOptions?: Record<string, unknown>;
+  anthropicCacheTtl?: AnthropicCacheTtl;
   headers?: Record<string, string | undefined>;
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   thinkingLevel?: string;
@@ -275,6 +277,8 @@ export interface StreamRequestConfig {
   system?: Instructions;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
+  /** The turn's Anthropic cache-marker TTL, so prefix markers built later match its markers. */
+  anthropicCacheTtl?: AnthropicCacheTtl;
   /** Per-request HTTP headers (e.g., anthropic-beta for 1M context). */
   headers?: Record<string, string | undefined>;
   maxOutputTokens?: number;

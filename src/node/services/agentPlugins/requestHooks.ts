@@ -4,6 +4,8 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
+import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { sideChatCapabilityGrants } from "@/node/services/sideChat";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
@@ -31,7 +33,7 @@ export async function prepareWorkspaceRequestHooks(args: {
   metadata: WorkspaceMetadata;
   hostCheckoutRoot: string | null;
   journal: DurableEventJournal;
-  /** Codex-format hooks (hooks.json) call plugin MCP servers through it; absent: none run. */
+  /** Codex-format hooks (hooks.json) call plugin MCP servers through it; absent: no Codex hook runs. */
   mcpServerManager?: Pick<MCPServerManager, "callToolForPluginHook" | "canCallToolForPluginHook">;
   /** The loop's host files and paths, for the hooks.js discovery. Absent: the Node layers. */
   hostFiles?: HostFiles;
@@ -51,20 +53,48 @@ export async function prepareWorkspaceRequestHooks(args: {
     hostFiles: args.hostFiles,
     hostPaths: args.hostPaths,
   });
-  if (args.mcpServerManager !== undefined) {
-    const { config, metadata } = args;
-    await codexPluginHookService.ensureWorkspaceHooks({
-      workspaceId: metadata.id,
-      sideChat: sideChatCapabilityGrants(metadata) != null,
-      noPluginMcp: pluginContext === null,
-      xumHome: config.rootDir,
-      // A function, not a value: the gate re-reads trust before every hook call. Every project of
-      // the workspace must be trusted: hooks run MCP tools in the runtime they all share, the
-      // rule for the repo's own tool hooks too (Codex PRRT_kwDOPxxmWM6r_vUC).
-      isProjectTrusted: () => isWorkspaceTrustedNow(config, metadata),
-      mcp: args.mcpServerManager,
-      notifyUser: (pluginName, message) =>
-        eventSpine.emit("plugin.hook.notice", { workspaceId: metadata.id, pluginName, message }),
-    });
-  }
+  const { config, metadata } = args;
+  await codexPluginHookService.ensureWorkspaceHooks({
+    workspaceId: metadata.id,
+    sideChat: sideChatCapabilityGrants(metadata) != null,
+    noPluginMcp: pluginContext === null,
+    xumHome: config.rootDir,
+    // A function, not a value: the gate re-reads trust before every hook call. Every project of
+    // the workspace must be trusted: hooks run MCP tools in the runtime they all share, the
+    // rule for the repo's own tool hooks too (Codex PRRT_kwDOPxxmWM6r_vUC).
+    isProjectTrusted: () => isWorkspaceTrustedNow(config, metadata),
+    ...(args.mcpServerManager !== undefined ? { mcp: args.mcpServerManager } : {}),
+    ...(runsOnHost(metadata)
+      ? {
+          cursorHookRuntime: createRuntimeForWorkspace(metadata),
+          cursorWorkspaceRoots: (cwd: string) => cursorWorkspaceRoots(config, metadata, cwd),
+        }
+      : {}),
+    transcriptPath: path.join(config.sessionsDir, metadata.id, "chat.jsonl"),
+    notifyUser: (pluginName, message) =>
+      eventSpine.emit("plugin.hook.notice", { workspaceId: metadata.id, pluginName, message }),
+  });
+}
+
+/**
+ * Cursor `workspace_roots`: the root folder of each project. A multi-project workspace runs in
+ * its container, which holds one folder per project under its name (ContainerManager), so the
+ * call's `cwd` alone would hand a hook the container instead (Codex review). Like the trust gate,
+ * it reads the workspace's projects again: a project added mid-session counts on the next call.
+ */
+export function cursorWorkspaceRoots(
+  config: Pick<Config, "findWorkspace">,
+  metadata: WorkspaceMetadata,
+  cwd: string
+): string[] {
+  const current = config.findWorkspace(metadata.id);
+  const live =
+    current?.projects !== undefined ? { ...metadata, projects: current.projects } : metadata;
+  if (!isMultiProject(live)) return [cwd];
+  return getProjects(live).map((project) => path.join(cwd, project.projectName));
+}
+
+function runsOnHost(metadata: WorkspaceMetadata): boolean {
+  const type = metadata.runtimeConfig.type;
+  return type === "local" || type === "worktree";
 }

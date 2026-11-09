@@ -13,6 +13,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     markDelegatedCreationInterrupted: () => Promise.resolve(false),
     resumeStream: () => Promise.resolve(Ok({ started: true })),
     clearQueue: () => Ok(undefined),
+    abandonAutoRetry: () => undefined,
     replaceHistory: () => Promise.resolve(Ok(undefined)),
     waitForIdleAndNoQueuedMessages: () => Promise.resolve(),
     refuseUnavailableGoalTurnAgent: () => Promise.resolve(null),
@@ -116,6 +117,7 @@ export function makeAgentTaskIntegrationFake(
     noteWorkspaceUnarchived: () => Promise.resolve(),
     settleOwedChildGoalPause: () => Promise.resolve(),
     isWorkspaceStopInProgress: () => false,
+    isWorkspaceTurnStopped: () => Promise.resolve(false),
     getWorkspaceStopEpoch: () => 0,
     reactivateInactiveAgentTaskFromBashMonitorWake: () => Promise.resolve(null),
     // Derived from the (possibly overridden) boolean rescue, so suites that script only

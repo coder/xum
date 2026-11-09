@@ -75,6 +75,10 @@ const mockWindow: BrowserWindow = {
   },
 } as unknown as BrowserWindow;
 
+function printUnixSocket(socketPath: string | undefined): void {
+  if (socketPath) console.log(`  Unix socket: ${socketPath}`);
+}
+
 async function main(): Promise<void> {
   const program = new Command();
   program
@@ -89,6 +93,10 @@ async function main(): Promise<void> {
       "--allow-http-origin",
       "allow HTTPS origins when TLS is terminated by a proxy that forwards X-Forwarded-Proto=http"
     )
+    .option(
+      "--unix-socket <path>",
+      "also listen on a Unix socket (absolute path that fits the platform limit). Its folder must be mode 0700 and owned by you (it is created if missing), and no other user may be able to rename it"
+    )
     .option("--ssh-host <host>", "SSH hostname/alias for editor deep links (e.g., devbox)")
     .option("--add-project <path>", "add and open project at the specified path (idempotent)")
     .parse(process.argv, getParseOptions());
@@ -101,6 +109,7 @@ async function main(): Promise<void> {
     cliToken: options.authToken as string | undefined,
     envToken: resolveXumEnvironmentValue("SERVER_AUTH_TOKEN", process.env),
   });
+  const UNIX_SOCKET_PATH = options.unixSocket as string | undefined;
   const ADD_PROJECT_PATH = options.addProject as string | undefined;
   // HTTPS-terminating proxy compatibility is opt-in so local/default deployments stay strict.
   const ALLOW_HTTP_ORIGIN = options.allowHttpOrigin === true;
@@ -201,6 +210,7 @@ async function main(): Promise<void> {
     authToken: resolved.token,
     serveStatic: true,
     allowHttpOrigin: ALLOW_HTTP_ORIGIN,
+    unixSocketPath: UNIX_SOCKET_PATH,
   });
 
   // Housekeeping is best-effort background work; a failure must not take the listening server
@@ -223,6 +233,7 @@ async function main(): Promise<void> {
     }
   }
   console.log(`  Docs: ${serverInfo.baseUrl}/api/docs`);
+  printUnixSocket(UNIX_SOCKET_PATH);
 
   if (resolved.mode === "disabled") {
     console.warn(

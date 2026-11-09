@@ -23,15 +23,12 @@ import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
-import type {
-  MessageSendOrigin,
-  RequestAssemblySnapshot,
-  TurnStopContext,
-} from "./events/eventSpine";
+import type { MessageSendOrigin, RequestAssemblySnapshot } from "./events/eventSpine";
 import {
   lastAssistantText,
   type MessageSendHookInput,
   type MessageSendHookOutcome,
+  type TurnStopHookInput,
   type TurnStopHookOutcome,
 } from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
@@ -132,6 +129,7 @@ import {
 import { resolveLegacyTodoNudgeToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
+import { MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN } from "@/constants/pluginHooks";
 import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
@@ -269,6 +267,13 @@ import type { SessionContextController } from "./contextManagement/sessionContex
 import type { SessionContextHost } from "./contextManagement/sessionContextHost";
 import type { ContextDispatchRequest, CompactionContinuation } from "./contextManagement/types";
 import {
+  findLastRetryUserMessage,
+  isSyntheticGoalPauseBoundaryMessage,
+  retriedWorkspaceTurn,
+  isVisibleCompletedSubagentReportMessage,
+  shouldUseUserMessageForRetry,
+} from "./retryUserMessage";
+import {
   inheritOpenWorkspaceTurnMetadata,
   computeKeepRecentTailStamp,
   isCompactionRequestMetadata,
@@ -287,7 +292,7 @@ import type { TelemetryService } from "./telemetryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 
 import { AttachmentService } from "./attachmentService";
-import { generateArtifactsIndexAttachment } from "./artifactVersionsOperations";
+import { generateArtifactsIndexAttachment } from "./artifactPublishOperations";
 import type { TodoItem } from "@/common/types/tools";
 import type {
   LoadedSkillSnapshot,
@@ -377,7 +382,6 @@ import {
   MemoryContextStore,
 } from "@/node/services/memoryContextPersistence";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
-import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getEditTruncateTargetFromMessages } from "@/common/utils/history/editTruncation";
 import { isHistoryEditPreconditionMismatch, isStreamFinalizedPartial } from "./historyService";
@@ -396,7 +400,7 @@ type AgentSessionInterruptResult = Result<void> & { streamStopped?: true };
 
 /**
  * Tracked file state for detecting external edits.
- * Uses timestamp-based polling with diff injection.
+ * Uses timestamp-based polling and a content-free notice (see createFileChangeNotificationMessage).
  */
 // Re-export types from FileChangeTracker for backward compatibility
 export type { FileState } from "@/node/services/utils/fileChangeTracker";
@@ -523,6 +527,19 @@ function isRetriedGoalStillRunning(
 ): boolean {
   if (goal == null || goalId == null || goal.goalId !== goalId) return false;
   return goal.status === (goalKind === GOAL_BUDGET_LIMIT_KIND ? "budget_limited" : "active");
+}
+
+/** The auto-retry failure for a terminal stream error. */
+function streamErrorRetryFailure(failureType: string, data: StreamErrorPayload): RetryFailureError {
+  return {
+    type: failureType,
+    message: data.error,
+    // Only for the final rate_limit class: the rollover/budget rewrites in handleStreamError
+    // spread `data` and can replace the error type while an older retryAfterMs survives.
+    ...(failureType === "rate_limit" && data.retryAfterMs != null
+      ? { retryAfterMs: data.retryAfterMs }
+      : {}),
+  };
 }
 
 /** A heartbeat's own row: its turn, or the compaction that a compact heartbeat runs first. */
@@ -702,8 +719,6 @@ function coerceGoalId(value: unknown): string | undefined {
 }
 
 const PDF_MEDIA_TYPE = "application/pdf";
-/** Codex Stop: a turn.stop hook continues one user turn at most this many times. */
-const MAX_STOP_HOOK_CONTINUATIONS = 3;
 const STOP_HOOK_CONTINUATION_DEDUPE_KEY = "stop-hook-continuation";
 
 /** The ended stream's provenance that its turn.stop continuation keeps. */
@@ -1072,10 +1087,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     hooksLoaded?: boolean
   ): Promise<MessageSendHookOutcome>;
   /** The turn.stop prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
-  runTurnStopHooks?(
-    workspaceId: string,
-    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "model">
-  ): Promise<TurnStopHookOutcome>;
+  runTurnStopHooks?(workspaceId: string, input: TurnStopHookInput): Promise<TurnStopHookOutcome>;
   /** The Agent interface view's status page nudge the turn earns, or null. Absent: never. */
   statusPageTurnEndNudge?(
     workspaceId: string,
@@ -1149,6 +1161,11 @@ interface AgentSessionOptions {
    */
   isStopInProgress?: () => boolean;
   getStopEpoch?: () => number;
+  /**
+   * Whether an explicit Stop ended the workspace turn that a history row correlates to: its
+   * handle is `interrupted` on disk (WorkspaceTurnManager.isWorkspaceTurnStopped).
+   */
+  isWorkspaceTurnStopped?: (correlation: WorkspaceTurnTaskCorrelation) => Promise<boolean>;
   /** Authoritative turn settlement for stop cascades: the admitted generation ended for good. */
   onTurnSettled?: (turnGeneration: symbol) => void;
   /**
@@ -1470,6 +1487,9 @@ export class AgentSession {
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly hasExternalManualSendPreflight?: () => boolean;
   private readonly isStopInProgress: () => boolean;
+  private readonly isWorkspaceTurnStopped?: (
+    correlation: WorkspaceTurnTaskCorrelation
+  ) => Promise<boolean>;
   private readonly getStopEpoch: () => number;
   private readonly onTurnSettled?: (turnGeneration: symbol) => void;
   /**
@@ -1640,10 +1660,20 @@ export class AgentSession {
   private readonly compactionCancellation: CompactionCancellation;
   private compactionStopGeneration = 0;
   /**
+   * Stops that ended this session's retry loop through abandonAutoRetry (a task Stop, a
+   * workspace-turn interrupt, a hard timeout). Unlike the workspace stop epoch, an interrupt of a
+   * queued workspace turn leaves it alone, so the turn that keeps running still retries.
+   */
+  private autoRetryStops = 0;
+  /**
    * turn.stop continuations queued since the last manual send or the last turn Stop did not
-   * continue: the hooks see `stopHookActive`, and the cap ends the loop.
+   * continue: the hooks see `stopHookActive`, and the ceiling ends the loop.
    */
   private stopHookContinuations = 0;
+  /** The same continuations per hook (runTurnStopHooks' hookKeys), for each hook's own limit. */
+  private readonly stopHookCountsByKey = new Map<string, number>();
+  /** The running turn.stop chain's abort: a hard interruptStream (a user Stop) kills its hooks. */
+  private turnStopHooksAbort?: AbortController;
   private pendingResumeIntent?: AbortController;
 
   private readonly retryManager: RetryManager;
@@ -1910,6 +1940,8 @@ export class AgentSession {
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
     /** The Stop epoch at this turn's admission: a Stop since then fences its turn.stop continuation. */
     admissionStopEpoch: number;
+    /** autoRetryStops when this turn's stream started: a Stop since then arms no retry for it. */
+    admissionAutoRetryStops: number;
   };
 
   private activeCompactionRequest?: {
@@ -1956,6 +1988,7 @@ export class AgentSession {
       hasExternalSendPreflight,
       hasExternalManualSendPreflight,
       isStopInProgress,
+      isWorkspaceTurnStopped,
       getStopEpoch,
       onTurnSettled,
       onTurnSuperseded,
@@ -1997,6 +2030,7 @@ export class AgentSession {
     this.hasExternalSendPreflight = hasExternalSendPreflight;
     this.hasExternalManualSendPreflight = hasExternalManualSendPreflight;
     this.isStopInProgress = isStopInProgress ?? (() => false);
+    this.isWorkspaceTurnStopped = isWorkspaceTurnStopped;
     this.getStopEpoch = getStopEpoch ?? (() => 0);
     this.onTurnSettled = onTurnSettled;
     this.onTurnSuperseded = onTurnSuperseded;
@@ -2115,6 +2149,7 @@ export class AgentSession {
         workspaceId: notice.workspaceId,
         plugin: notice.pluginName,
         message: notice.message,
+        severity: notice.severity,
       });
     });
     // A subscription is lazy: protect an existing engine before any caller can
@@ -2471,7 +2506,8 @@ export class AgentSession {
 
   private async handleStreamFailureForAutoRetry(
     error: RetryFailureError,
-    isCurrent = this.retryManager.captureGeneration()
+    isCurrent = this.retryManager.captureGeneration(),
+    autoRetryStops = this.autoRetryStops
   ): Promise<void> {
     assert(
       typeof error.type === "string" && error.type.length > 0,
@@ -2487,6 +2523,12 @@ export class AgentSession {
     const turn = this.coordinator.turnId;
     await this.loadAutoRetryEnabledPreference(isCurrent);
     if (this.coordinator.closing || !isCurrent() || !this.coordinator.isCurrentTurn(turn)) return;
+    // Every Stop abandons a pending retry, but a workspace-turn interrupt drops its latch without
+    // waiting for this handler, and a hard timeout of an idle task takes none: a retry armed now
+    // would restart the stopped workspace. A Stop since the failed turn's stream started
+    // (autoRetryStops) ends the retry loop. The stop latch is no signal here: an interrupt of a
+    // queued workspace turn latches too, and must leave the running turn's retry alone.
+    if (this.autoRetryStops !== autoRetryStops) return;
     this.retryManager.handleStreamFailure(error);
   }
 
@@ -2539,6 +2581,12 @@ export class AgentSession {
     const request = this.lastAutoRetryResumeRequest;
     if (request?.goalKind == null || request.goalId !== goalId) return;
     this.retryManager.abandon(GOAL_INACTIVE_RETRY_REASON);
+  }
+
+  /** End the auto-retry loop for a Stop that does not run interruptStream (a task Stop). */
+  abandonAutoRetry(reason: string): void {
+    this.autoRetryStops += 1;
+    this.retryManager.abandon(reason);
   }
 
   private async retryActiveStream(
@@ -2919,14 +2967,6 @@ export class AgentSession {
     );
   }
 
-  private isSyntheticGoalPauseBoundaryMessage(message: MuxMessage): boolean {
-    return (
-      message.role === "user" &&
-      message.metadata?.synthetic === true &&
-      message.metadata.muxMetadata?.type === "goal-pause-boundary"
-    );
-  }
-
   /**
    * Whether an edit targets authentic plan-review feedback, judged from the persisted row (never
    * from client flags or envelope-looking text), in getEditTruncateTargetId's lookup order. An
@@ -2990,7 +3030,7 @@ export class AgentSession {
     return historyTail.findLast(
       (candidate) =>
         candidate.role !== "system" &&
-        !this.isSyntheticGoalPauseBoundaryMessage(candidate) &&
+        !isSyntheticGoalPauseBoundaryMessage(candidate) &&
         !isSyntheticSnapshotUserMessage(candidate)
     );
   }
@@ -3221,61 +3261,6 @@ export class AgentSession {
     return metadata?.success ? metadata.data : undefined;
   }
 
-  private isVisibleCompletedSubagentReportMessage(message: MuxMessage): boolean {
-    if (
-      message.role !== "user" ||
-      message.metadata?.synthetic !== true ||
-      message.metadata.uiVisible !== true
-    ) {
-      return false;
-    }
-    const text = message.parts
-      .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-      .map((part) => part.text)
-      .join("\n");
-    return parseSubagentReportEnvelope(text)?.status === "completed";
-  }
-
-  /** Rejected rows terminate retry lookup, including empty assistant capsules from newer builds. */
-  private findLastRetryUserMessage(messages: MuxMessage[]): MuxMessage | undefined {
-    return messages.findLast(
-      (message) =>
-        Boolean(message.metadata?.contextBudgetRejected) ||
-        this.shouldUseUserMessageForRetry(message)
-    );
-  }
-
-  private shouldUseUserMessageForRetry(message: MuxMessage): boolean {
-    if (message.role !== "user" || message.metadata?.contextBudgetRejected) {
-      return false;
-    }
-
-    if (this.isVisibleCompletedSubagentReportMessage(message)) {
-      return false;
-    }
-    if (this.isSyntheticGoalPauseBoundaryMessage(message)) {
-      return false;
-    }
-    if (isSyntheticSnapshotUserMessage(message)) {
-      return false;
-    }
-    if (isContextBudgetWarningMessage(message)) {
-      return false;
-    }
-
-    // Include UI-visible synthetic rows (e.g., crash-recovered compaction follow-ups)
-    // so retries continue the most recent pending user intent.
-    if (message.metadata?.synthetic === true) {
-      return (
-        message.metadata?.uiVisible === true ||
-        message.metadata.muxMetadata?.contextBudgetContinuation === true ||
-        isCompactionRequestMetadata(message.metadata?.muxMetadata)
-      );
-    }
-
-    return true;
-  }
-
   /**
    * Startup crash recovery replays the ORIGINAL interrupted request from
    * persisted retry options / history metadata / workspace buckets. This is
@@ -3288,7 +3273,7 @@ export class AgentSession {
     historyTail: MuxMessage[];
     workspaceMetadata?: WorkspaceMetadata;
   }): Promise<StartupRetrySendOptions | undefined> {
-    const lastUserMessage = this.findLastRetryUserMessage(params.historyTail);
+    const lastUserMessage = findLastRetryUserMessage(params.historyTail);
     if (lastUserMessage?.metadata?.contextBudgetRejected) return undefined;
 
     const lastAssistantMessage =
@@ -3523,7 +3508,7 @@ export class AgentSession {
     }
     const last = this.getLastNonSystemHistoryMessage(history);
     return last?.role === "user"
-      ? !this.isVisibleCompletedSubagentReportMessage(last)
+      ? !isVisibleCompletedSubagentReportMessage(last)
       : last?.role === "assistant" &&
           last.metadata?.partial === true &&
           !this.isPendingAskUserQuestion(last);
@@ -3533,6 +3518,45 @@ export class AgentSession {
     if (this.coordinator.closing) return;
     using _execution = this.coordinator.enterExecution();
     return await step();
+  }
+
+  /** A heartbeat turn resumes only while the heartbeat is on (#5610). */
+  private startupHeartbeatOutcome(
+    retryMetadata: MuxMessageMetadata | undefined
+  ): StartupRecoveryOutcome | undefined {
+    if (!isHeartbeatTriggerMetadata(retryMetadata)) return undefined;
+    // An unreadable config retries the read and never resumes the turn.
+    let heartbeatOn: boolean;
+    try {
+      heartbeatOn = this.isHeartbeatOnOnDisk();
+    } catch {
+      return "retryable";
+    }
+    if (heartbeatOn) return undefined;
+    this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "heartbeat_disabled" });
+    return "completed";
+  }
+
+  /**
+   * A workspace-turn interrupt writes the turn's handle `interrupted` before it abandons the
+   * retry loop or stops the stream: that handle is the Stop's trace on disk. A Stop that lands
+   * after this read bumps the retry generation, so the arm refuses.
+   */
+  private async startupWorkspaceTurnOutcome(
+    workspaceTurn: WorkspaceTurnTaskCorrelation | null,
+    isCurrent: () => boolean
+  ): Promise<StartupRecoveryOutcome | undefined> {
+    if (workspaceTurn == null) return undefined;
+    let stopped: boolean;
+    try {
+      stopped = (await this.isWorkspaceTurnStopped?.(workspaceTurn)) === true;
+    } catch {
+      return "retryable";
+    }
+    if (!isCurrent()) return "completed";
+    if (!stopped) return undefined;
+    this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "task_stopped" });
+    return "completed";
   }
 
   private async scheduleStartupAutoRetryIfNeeded(
@@ -3565,7 +3589,7 @@ export class AgentSession {
       return "retryable";
     }
 
-    const startupRetryUserMessage = this.findLastRetryUserMessage(historyResult.data);
+    const startupRetryUserMessage = findLastRetryUserMessage(historyResult.data);
     if (startupRetryUserMessage?.metadata?.contextBudgetRejected) return "completed";
     if (!this.hasInterruptedStartupTail(partial, historyResult.data)) return "completed";
 
@@ -3593,20 +3617,13 @@ export class AgentSession {
       return "completed";
     }
 
-    // A heartbeat turn resumes only while the heartbeat is on (#5610). An unreadable config retries
-    // the read and never resumes the turn.
-    if (isHeartbeatTriggerMetadata(retryMetadata)) {
-      let heartbeatOn: boolean;
-      try {
-        heartbeatOn = this.isHeartbeatOnOnDisk();
-      } catch {
-        return "retryable";
-      }
-      if (!heartbeatOn) {
-        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "heartbeat_disabled" });
-        return "completed";
-      }
-    }
+    const triggerOutcome =
+      this.startupHeartbeatOutcome(retryMetadata) ??
+      (await this.startupWorkspaceTurnOutcome(
+        retriedWorkspaceTurn(startupRetryUserMessage),
+        isCurrent
+      ));
+    if (triggerOutcome != null) return triggerOutcome;
 
     if (this.startupAutoRetryAbandon) {
       const abandonReason = this.startupAutoRetryAbandon.reason;
@@ -3789,7 +3806,7 @@ export class AgentSession {
       // Accepted synthetic guidance is new intent too; snapshots/notices are not.
       const latest = history.data.findLast(
         (message) =>
-          this.shouldUseUserMessageForRetry(message) ||
+          shouldUseUserMessageForRetry(message) ||
           (message.role === "user" && message.metadata?.retrySendOptions != null)
       );
       if (!abandon.userMessageId || !latest || latest.id === abandon.userMessageId)
@@ -5190,7 +5207,7 @@ export class AgentSession {
         internal?.pluginSendHooksApplied == null &&
         !isCompactionRequestMetadata(options?.muxMetadata))
     )
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
 
     // A client retry of an accepted send (same send ids after a lost response) adds nothing:
     // the accepted row wins over anything the hooks decide.
@@ -5799,7 +5816,7 @@ export class AgentSession {
     // Materialize @file mentions from the user message into a snapshot.
     // This ensures prompt-cache stability: we read files once and persist the content,
     // so subsequent turns don't re-read (which would change the prompt prefix if files changed).
-    // File changes after this point are surfaced via <system-file-update> diffs instead.
+    // File changes after this point are surfaced via <system-file-update> notices instead.
     const snapshotResult = isPlanReviewFeedbackSend
       ? null
       : await this.materializeFileAtMentionsSnapshot(trimmedMessage);
@@ -7345,7 +7362,7 @@ export class AgentSession {
           extractAcpDelegatedTools(optionsMuxMetadata),
         muxMetadata: resolveStreamMuxMetadata(
           optionsMuxMetadata,
-          this.findLastRetryUserMessage(messages)?.metadata?.muxMetadata,
+          findLastRetryUserMessage(messages)?.metadata?.muxMetadata,
           messages
         ),
         recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
@@ -7901,10 +7918,17 @@ export class AgentSession {
       const handledByNestedSend = sendResult.failureHandled === true;
 
       if (!handledByNestedSend) {
-        await this.handleStreamFailureForAutoRetry({
-          type: failureType,
-          message: this.extractRetryFailureMessage(sendResult.error),
-        });
+        // A workspace-turn interrupt or a hard timeout stops without cancelCompaction, so
+        // admissionStale stays false and the dispatch fails as a retryable refusal: only the
+        // interrupted stream's Stop count shows that the turn was stopped.
+        await this.handleStreamFailureForAutoRetry(
+          {
+            type: failureType,
+            message: this.extractRetryFailureMessage(sendResult.error),
+          },
+          undefined,
+          streamContext.admissionAutoRetryStops
+        );
         await this.updateStartupAutoRetryAbandonFromFailure(
           failureType,
           continuation.interruptedUserMessageId
@@ -8296,7 +8320,7 @@ export class AgentSession {
     // The same row a resume retries, searched across the whole active window: completed report
     // cards and other non-retry rows are skipped, however many follow the interrupted turn.
     const rows = await this.loadActiveRoutingRows();
-    const lastUserRow = this.findLastRetryUserMessage(rows);
+    const lastUserRow = findLastRetryUserMessage(rows);
     // History is untyped on disk; a hand-edited or damaged record must not brick Continue.
     const parsedRecord = AutoModelRoutingRecordSchema.safeParse(
       lastUserRow?.metadata?.autoModelRouting
@@ -8526,6 +8550,7 @@ export class AgentSession {
     ) => void;
   }): Promise<AgentSessionInterruptResult> {
     this.assertNotDisposed("interruptStream");
+    this.abortTurnStopHooksOnHardStop(options);
     const settled = Promise.withResolvers<boolean>();
     const initiallySettled = Promise.withResolvers<Result<void>>();
     let physicallyStopped = false;
@@ -8741,28 +8766,48 @@ export class AgentSession {
     const failureType = error.type;
 
     if (failureType === "runtime_not_ready" || failureType === "runtime_start_failed") {
-      const failedUserMessageId = this.activeStreamUserMessageId;
-      const failedContext = this.activeStreamContext;
-      this.activeCompactionRequest = undefined;
-      this.resetActiveStreamState();
-      await this.handleStreamFailureForAutoRetry({
-        type: failureType,
-        message: this.extractRetryFailureMessage(error),
-      });
-      if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
-        return { success: false, error, failureHandled: true };
-      await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
-      if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
-        return { success: false, error, failureHandled: true };
-      // This failure has no stream error event, so handleStreamError's goal settlement never runs:
-      // settle here, or a non-retryable runtime_not_ready leaves an active goal stranded and its
-      // failed kickoff installed (#5546). The hand-over waits for this preparation's idle.
-      await this.recordGoalAdvancementAfterStreamError(failureType, failedContext);
+      await this.settleRuntimeFailureWithoutErrorEvent(turn, operation, failureType, error);
     } else {
       await this.handleStreamError(buildStreamErrorEventData(error, { acpPromptId }), operation);
     }
 
     return { success: false, error, failureHandled: true };
+  }
+
+  /**
+   * A runtime failure without a pre-start error event, such as an emergency rollover's request
+   * preparation reports: no handleStreamError runs for it, so its retry decision, startup
+   * abandon marker and goal settlement happen here.
+   */
+  private async settleRuntimeFailureWithoutErrorEvent(
+    turn: TurnId,
+    operation: OperationId,
+    failureType: "runtime_not_ready" | "runtime_start_failed",
+    error: SendMessageError
+  ): Promise<void> {
+    const failedUserMessageId = this.activeStreamUserMessageId;
+    const failedContext = this.activeStreamContext;
+    this.activeCompactionRequest = undefined;
+    this.resetActiveStreamState();
+    // The failure comes after the turn's stream started (a remote runtime reports a Stop-aborted
+    // start as runtime_start_failed): a Stop since then arms no retry.
+    await this.handleStreamFailureForAutoRetry(
+      {
+        type: failureType,
+        message: this.extractRetryFailureMessage(error),
+      },
+      undefined,
+      failedContext?.admissionAutoRetryStops
+    );
+    if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
+      return;
+    await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+    if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
+      return;
+    // This failure has no stream error event, so handleStreamError's goal settlement never runs:
+    // settle here, or a non-retryable runtime_not_ready leaves an active goal stranded and its
+    // failed kickoff installed (#5546). The hand-over waits for this preparation's idle.
+    await this.recordGoalAdvancementAfterStreamError(failureType, failedContext);
   }
 
   private async streamWithHistory(
@@ -8866,6 +8911,7 @@ export class AgentSession {
         ...(taskTurnKind != null ? { taskTurnKind } : {}),
         providersConfig,
         admissionStopEpoch,
+        admissionAutoRetryStops: this.autoRetryStops,
       };
       this.activeStreamContext = streamContext;
       if (activeTurnThinkingOverride != null) {
@@ -8914,7 +8960,7 @@ export class AgentSession {
         // something resumable. Never search backward past an ineligible final row.
         const tail = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
         if (!tail.success) return await fail(createUnknownSendMessageError(tail.error));
-        const retryRequest = this.findLastRetryUserMessage(tail.data);
+        const retryRequest = findLastRetryUserMessage(tail.data);
         if (retryRequest?.metadata?.contextBudgetRejected)
           return await refuseRejectedResume(retryRequest);
         // Model-hidden records (plan-review snapshot/resolve/reopen rows) are UI state that can
@@ -8925,7 +8971,7 @@ export class AgentSession {
         );
         if (!target) return await fail(createUnknownSendMessageError(EMPTY_RESUME_HISTORY_ERROR));
         if (target.metadata?.contextBudgetRejected) return await refuseRejectedResume(target);
-        if (target.role !== "assistant" && !this.shouldUseUserMessageForRetry(target))
+        if (target.role !== "assistant" && !shouldUseUserMessageForRetry(target))
           return Ok(undefined);
         // Accepting stamps the resumed row (a history rewrite) and retires the Stop: a resume
         // refused by the lease leaves both as they were (#5434).
@@ -9004,7 +9050,7 @@ export class AgentSession {
         return await fail(createUnknownSendMessageError(historyResult.error));
       }
 
-      const lastUserMessage = this.findLastRetryUserMessage(historyResult.data);
+      const lastUserMessage = findLastRetryUserMessage(historyResult.data);
       if (lastUserMessage?.metadata?.contextBudgetRejected) {
         return await refuseRejectedResume(lastUserMessage);
       }
@@ -10086,15 +10132,11 @@ export class AgentSession {
     }
 
     try {
-      await this.handleStreamFailureForAutoRetry({
-        type: failureType,
-        message: data.error,
-        // Only for the final rate_limit class: the rollover/budget rewrites above spread `data`
-        // and can replace the error type while an older retryAfterMs survives the spread.
-        ...(failureType === "rate_limit" && data.retryAfterMs != null
-          ? { retryAfterMs: data.retryAfterMs }
-          : {}),
-      });
+      await this.handleStreamFailureForAutoRetry(
+        streamErrorRetryFailure(failureType, data),
+        undefined,
+        context?.admissionAutoRetryStops
+      );
     } catch (error) {
       // Uncertain cancellation forbids this retry, but terminal error cleanup must still finish.
       // Startup callers keep the rejection so their recovery checkpoint remains retryable.
@@ -10730,8 +10772,9 @@ export class AgentSession {
 
   /**
    * Run the turn.stop prompt hooks (Codex Stop) for a turn that ended normally. A continuation
-   * (Codex `decision: "block"`) queues its prompt as a new synthetic user row, at most
-   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Xum's own nudges (needsTodoTurnEndNudge,
+   * (Codex `decision: "block"`) queues its prompt as a new synthetic user row. Each hook continues
+   * a user turn up to its own limit (runTurnStopHooks), and all of them together at most
+   * MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN times. Xum's own nudges (needsTodoTurnEndNudge,
    * statusPageTurnEndNudge) ride the same continuation and gates. Sub-agent turns skip the
    * hooks: TaskService owns their stream end (Codex has SubagentStop for them). A delegated
    * workspace turn (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager
@@ -10754,7 +10797,7 @@ export class AgentSession {
     // Stop notices would then be lost (Codex PRRT_kwDOPxxmWM6sT80F). Those still cancel the
     // continuation below.
     if (!provenance.externallyOwnedTurn && this.messageQueue.hasDispatchableEntries()) {
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
     // A hard Stop can land while a slow hook runs, after the stream ended: it then finds no live
@@ -10766,7 +10809,7 @@ export class AgentSession {
     const stopEpochAtTurn = provenance.admissionStopEpoch;
     const continuation = await this.readTurnStopContinuation(payload, options, provenance);
     if (continuation == null || options == null) {
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
     // The hook ran (its notices are shown), but it cannot continue a turn whose end an outside
@@ -10775,7 +10818,7 @@ export class AgentSession {
       log.info("Prompt hooks: an ACP or xum run turn cannot be continued by turn.stop", {
         workspaceId: this.workspaceId,
       });
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
     // A goal turn's continuation stays a goal turn: the goal counts its turns and cost against
@@ -10790,7 +10833,7 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           goalKind: provenance.goalKind,
         });
-        this.stopHookContinuations = 0;
+        this.resetStopHookCounts();
         return;
       }
       goalAdmissionStale = admission.admissionStale;
@@ -10799,22 +10842,22 @@ export class AgentSession {
     // send still in its preflight (this session's or WorkspaceService's) is not queued yet, but
     // it wins too: the continuation must not run another model turn ahead of newer input.
     if (this.hasDispatchableFollowUp()) {
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
     // A Stop since the turn started ends it: no continuation runs after it.
     if (this.stoppedSince(stopEpochAtTurn)) {
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
-    if (this.stopHookContinuations >= MAX_STOP_HOOK_CONTINUATIONS) {
-      log.warn("Prompt hooks: turn.stop continuation cap reached; ending the turn", {
+    if (this.stopHookContinuations >= MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN) {
+      log.warn("Prompt hooks: turn.stop continuation ceiling reached; ending the turn", {
         workspaceId: this.workspaceId,
       });
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
-    this.stopHookContinuations++;
+    this.countAndAnnounceStopHookContinuation(continuation);
     this.queueMessage(continuation.prompt, this.stopContinuationOptions(options, provenance), {
       acceptanceOrigin: "automatic",
       synthetic: true,
@@ -10828,6 +10871,33 @@ export class AgentSession {
       dedupeKey: STOP_HOOK_CONTINUATION_DEDUPE_KEY,
       // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
       skipPromptHooks: true,
+    });
+  }
+
+  /** A user Stop (a hard interrupt) ends the turn.stop hooks: their processes must not outlive it. */
+  private abortTurnStopHooksOnHardStop(options: { soft?: boolean } | undefined): void {
+    if (options?.soft === true) return;
+    this.turnStopHooksAbort?.abort();
+  }
+
+  // dry-duplicate-ok: field resets of unrelated state (stream, file tracking) only share a shape
+  private resetStopHookCounts(): void {
+    this.stopHookContinuations = 0;
+    this.stopHookCountsByKey.clear();
+  }
+
+  private countAndAnnounceStopHookContinuation(continuation: TurnStopContinuation): void {
+    this.stopHookContinuations++;
+    for (const key of continuation.hookKeys) {
+      this.stopHookCountsByKey.set(key, (this.stopHookCountsByKey.get(key) ?? 0) + 1);
+    }
+    // A continuation of Xum's nudges alone names no plugin, so it shows no notice.
+    if (continuation.pluginNames.length === 0) return;
+    eventSpine.emit("plugin.hook.notice", {
+      workspaceId: this.workspaceId,
+      pluginName: continuation.pluginNames.join(", "),
+      message: `plugin continued turn ${this.stopHookContinuations} of ${MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN}`,
+      severity: "info",
     });
   }
 
@@ -10849,17 +10919,27 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     provenance: StopContinuationProvenance
   ): Promise<TurnStopContinuation | null> {
-    const hookOutcome: TurnStopHookOutcome = (await this.aiService.runTurnStopHooks?.(
-      this.workspaceId,
-      {
+    const hooksAbort = new AbortController();
+    this.turnStopHooksAbort = hooksAbort;
+    // A Stop that landed after the stream ended and before this point had nothing to abort. No
+    // await sits between storing the controller and this check, so no Stop falls between them.
+    if (this.stoppedSince(provenance.admissionStopEpoch)) hooksAbort.abort();
+    let hookOutcome: TurnStopHookOutcome;
+    try {
+      hookOutcome = (await this.aiService.runTurnStopHooks?.(this.workspaceId, {
         messageId: payload.messageId,
         lastAssistantMessage: lastAssistantText(payload.parts),
-        stopHookActive: this.stopHookContinuations > 0,
         model: stopHookModel(payload, provenance),
-      }
-    )) ?? { kind: "none" };
+        turnContinuations: this.stopHookContinuations,
+        hookContinuations: this.stopHookCountsByKey,
+        // A shutdown or dispose ends the hooks too: their processes must not delay teardown.
+        abortSignal: AbortSignal.any([hooksAbort.signal, this.closingSignal]),
+      })) ?? { kind: "none" };
+    } finally {
+      if (this.turnStopHooksAbort === hooksAbort) this.turnStopHooksAbort = undefined;
+    }
     return mergeTurnStopContinuation({
-      hookPrompt: hookOutcome.kind === "continue" ? hookOutcome.prompt : null,
+      hookReasons: hookOutcome.kind === "continue" ? hookOutcome.reasons : [],
       nudges: await this.readTurnEndNudges(hookOutcome, options, payload, provenance),
     });
   }
@@ -13594,8 +13674,8 @@ export class AgentSession {
     const readFilesAttachment = AttachmentService.generateReadFilesAttachment(
       context.readFilePaths
     );
-    // Artifacts M4: handles of published artifacts (host session dir; empty without versions).
-    // Off with the Artifacts experiment: versions recorded while it was on stay out of context.
+    // Artifacts M4: handles of published artifacts (host session dir; empty without records).
+    // Off with the Artifacts experiment: records made while it was on stay out of context.
     const artifactsIndexAttachment = this.aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)
       ? await generateArtifactsIndexAttachment(
           path.join(this.config.sessionsDir, this.workspaceId)

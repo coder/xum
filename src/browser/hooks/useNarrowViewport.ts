@@ -1,25 +1,31 @@
 import { useSyncExternalStore } from "react";
-import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX, SHORT_VIEWPORT_MAX_HEIGHT_PX } from "@/constants/layout";
 
 const NARROW_VIEWPORT_QUERY = `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`;
+const SHORT_VIEWPORT_QUERY = `(max-height: ${SHORT_VIEWPORT_MAX_HEIGHT_PX}px)`;
 
 // Resolve matchMedia per call rather than at module load, so tests can stub it per test and a
 // window without matchMedia (a partial test DOM) reads as wide instead of throwing.
-function subscribe(onChange: () => void): () => void {
+function subscribeToQuery(query: string, onChange: () => void): () => void {
   // eslint-disable-next-line @typescript-eslint/no-empty-function -- no matchMedia outside a browser
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") return () => {};
-  const mql = window.matchMedia(NARROW_VIEWPORT_QUERY);
+  const mql = window.matchMedia(query);
   mql.addEventListener("change", onChange);
   return () => mql.removeEventListener("change", onChange);
 }
 
-function getSnapshot(): boolean {
+function queryMatches(query: string): boolean {
   return (
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
-    window.matchMedia(NARROW_VIEWPORT_QUERY).matches
+    window.matchMedia(query).matches
   );
 }
+
+const subscribe = (onChange: () => void) => subscribeToQuery(NARROW_VIEWPORT_QUERY, onChange);
+const getSnapshot = () => queryMatches(NARROW_VIEWPORT_QUERY);
+const subscribeShort = (onChange: () => void) => subscribeToQuery(SHORT_VIEWPORT_QUERY, onChange);
+const getShortSnapshot = () => queryMatches(SHORT_VIEWPORT_QUERY);
 
 function getServerSnapshot(): boolean {
   return false;
@@ -28,6 +34,11 @@ function getServerSnapshot(): boolean {
 /** True at phone and narrow-browser widths (the same breakpoint as the `max-width: 768px` CSS). */
 export function useNarrowViewport(): boolean {
   return useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+}
+
+/** True at short viewport heights, such as a phone in landscape. */
+export function useShortViewport(): boolean {
+  return useSyncExternalStore(subscribeShort, getShortSnapshot, getServerSnapshot);
 }
 
 let narrowSession = 0;

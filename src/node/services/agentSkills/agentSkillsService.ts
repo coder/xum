@@ -74,6 +74,7 @@ import { getRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/rem
 import {
   pluginSkillFileName,
   pluginSkillMarkdown,
+  type PluginSkillFileKind,
 } from "@/node/services/agentPlugins/claudeCommands";
 import type {
   ComponentConsent,
@@ -348,10 +349,12 @@ interface AgentSkillScanCandidate {
   singleSkillName?: string;
   /** Agent Plugins only: the single skill is a Claude command, `<root>/<name>.md` (claudeCommands.ts). */
   commandSkill?: true | undefined;
+  ruleFile?: string | undefined;
   /** Agent Plugins only: the plugin is skills-only (a generated Skills install): no scripts run. */
   skillsOnlyPlugin?: true | undefined;
   /** Agent Plugins only: the plugin is a Claude Code package (AgentPluginInfo.claudeFallback). */
   claudePackagePlugin?: true | undefined;
+  cursorPackagePlugin?: true | undefined;
   importedSkills?: string[];
   /** Managed plugins only: the reviewed skill fingerprints (#6498). */
   skillConsent?: PluginSkillConsentGate;
@@ -387,9 +390,10 @@ async function buildRemotePluginScanCandidates(
   const snapshot = await getRemoteProjectPluginSnapshot(runtime, checkoutRoot, containers);
   if (snapshot === null) return [];
   return snapshot.plugins.flatMap((plugin) =>
-    // Claude slash commands of remote plugins do not load (#7218).
+    // Claude slash commands of remote plugins do not load (#7218), and neither do Cursor rules,
+    // which take the same file path.
     (plugin.skillsDirs ?? []).flatMap((root) =>
-      root.command === true
+      root.command === true || root.rule !== undefined
         ? []
         : [
             {
@@ -401,6 +405,7 @@ async function buildRemotePluginScanCandidates(
               singleSkillName: root.name,
               skillsOnlyPlugin: plugin.skillsOnly,
               claudePackagePlugin: plugin.claudeFallback,
+              cursorPackagePlugin: plugin.cursorFallback,
               pluginFs: snapshot.fs,
               hostFs,
             },
@@ -480,8 +485,10 @@ async function buildPluginScanCandidates(args: {
         pluginName: plugin.name,
         singleSkillName: root.name,
         commandSkill: root.command,
+        ruleFile: root.rule,
         skillsOnlyPlugin: plugin.skillsOnly,
         claudePackagePlugin: plugin.claudeFallback,
+        cursorPackagePlugin: plugin.cursorFallback,
         importedSkills,
         skillConsent,
         pluginConsent: plugin.componentConsent,
@@ -803,14 +810,19 @@ async function lookupCandidateSkillDir(
   return canonicalIsDirectory ? skillDir : candidateSkillDir(candidate, resolvedRoot, alias);
 }
 
-/** The Markdown file of skill `name` in `skillDir`: SKILL.md, or a Claude command's `<name>.md`. */
+function candidateFileKind(
+  candidate: Pick<AgentSkillScanCandidate, "commandSkill" | "ruleFile">
+): PluginSkillFileKind {
+  return { command: candidate.commandSkill, rule: candidate.ruleFile };
+}
+
 function candidateSkillFile(
-  candidate: Pick<AgentSkillScanCandidate, "runtime" | "commandSkill">,
+  candidate: Pick<AgentSkillScanCandidate, "runtime" | "commandSkill" | "ruleFile">,
   skillDir: string,
   name: SkillName
 ): string {
   return candidate.runtime.normalizePath(
-    pluginSkillFileName(name, candidate.commandSkill),
+    pluginSkillFileName(name, candidateFileKind(candidate)),
     skillDir
   );
 }
@@ -991,6 +1003,7 @@ async function readSkillDescriptorFromDir(
     skillConsent?: PluginSkillConsentGate;
     /** A Claude command: read `<name>.md` as SKILL.md text (plugin skills only). */
     commandSkill?: true | undefined;
+    ruleFile?: string | undefined;
   }
 ): Promise<AgentSkillDescriptor | null> {
   // Every invalid-skill diagnostic for this directory shares the same identity
@@ -1020,7 +1033,7 @@ async function readSkillDescriptorFromDir(
         maxBytes: MAX_FILE_SIZE,
         label: `plugin skill '${directoryName}' SKILL.md`,
       });
-      content = pluginSkillMarkdown(directoryName, result.content, options.commandSkill);
+      content = pluginSkillMarkdown(directoryName, result.content, candidateFileKind(options));
       byteSize = result.byteSize;
     } catch (err) {
       const message = getErrorMessage(err);
@@ -1263,6 +1276,7 @@ export async function discoverAgentSkills(
           hostFs: scan.hostFs,
           skillConsent: scan.skillConsent,
           commandSkill: scan.commandSkill,
+          ruleFile: scan.ruleFile,
         }
       );
       if (!descriptor) continue;
@@ -1378,10 +1392,14 @@ export interface ResolvedAgentSkill {
    * of its own, so the `skill://` resolver runs no script for it.
    */
   commandSkill?: true | undefined;
+  /** A Cursor rule (cursorRules.ts): like a command, `skillDir` is its rules folder. */
+  ruleFile?: string | undefined;
   /** The skill's plugin is skills-only (AgentPluginInfo.skillsOnly): the resolver runs no script. */
   skillsOnlyPlugin?: true | undefined;
   /** The skill's plugin is a Claude Code package (AgentPluginInfo.claudeFallback): no script runs. */
   claudePackagePlugin?: true | undefined;
+  /** The skill's plugin is a Cursor package (AgentPluginInfo.cursorFallback): no script runs. */
+  cursorPackagePlugin?: true | undefined;
 }
 
 /** Stamp a plugin skill's provenance on its read result (see ResolvedAgentSkill.pluginName). */
@@ -1393,8 +1411,10 @@ function withPluginName(
     | "pluginConsent"
     | "pluginApprovedCopies"
     | "commandSkill"
+    | "ruleFile"
     | "skillsOnlyPlugin"
     | "claudePackagePlugin"
+    | "cursorPackagePlugin"
   >
 ): ResolvedAgentSkill | null {
   if (resolved == null || candidate.pluginName == null) return resolved;
@@ -1404,8 +1424,10 @@ function withPluginName(
     pluginConsent: candidate.pluginConsent,
     pluginApprovedCopies: candidate.pluginApprovedCopies,
     ...(candidate.commandSkill === true ? { commandSkill: true } : {}),
+    ...(candidate.ruleFile !== undefined ? { ruleFile: candidate.ruleFile } : {}),
     ...(candidate.skillsOnlyPlugin === true ? { skillsOnlyPlugin: true } : {}),
     ...(candidate.claudePackagePlugin === true ? { claudePackagePlugin: true } : {}),
+    ...(candidate.cursorPackagePlugin === true ? { cursorPackagePlugin: true } : {}),
   };
 }
 
@@ -1434,13 +1456,12 @@ async function readAgentSkillFromDir(
   scope: AgentSkillScope,
   pluginRoot: string | undefined,
   skillConsent: PluginSkillConsentGate | undefined,
-  /** A Claude command: read `<name>.md` as SKILL.md text (plugin skills only). */
-  commandSkill: true | undefined,
+  fileKind: Pick<AgentSkillScanCandidate, "commandSkill" | "ruleFile">,
   pluginFs: PluginFs | undefined,
   /** The candidate's host filesystem (AgentSkillScanCandidate.hostFs). */
   hostFs: PluginFs
 ): Promise<ResolvedAgentSkill | null> {
-  const skillFilePath = candidateSkillFile({ runtime, commandSkill }, skillDir, directoryName);
+  const skillFilePath = candidateSkillFile({ runtime, ...fileKind }, skillDir, directoryName);
 
   let content: string;
   let byteSize: number;
@@ -1454,7 +1475,7 @@ async function readAgentSkillFromDir(
       maxBytes: MAX_FILE_SIZE,
       label: `plugin skill '${directoryName}' SKILL.md`,
     });
-    content = pluginSkillMarkdown(directoryName, result.content, commandSkill);
+    content = pluginSkillMarkdown(directoryName, result.content, candidateFileKind(fileKind));
     byteSize = result.byteSize;
   } else {
     ({ content, byteSize } = await readRuntimeSkillFile(runtime, skillFilePath));
@@ -1560,7 +1581,7 @@ async function readCandidateSkill(
         candidate.scope,
         candidate.pluginRoot,
         candidate.skillConsent,
-        candidate.commandSkill,
+        candidate,
         candidate.pluginFs,
         candidate.hostFs
       ),

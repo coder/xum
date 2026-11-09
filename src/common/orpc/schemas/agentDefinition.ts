@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import { ThinkingLevelSchema } from "../../types/thinking";
+import { CacheTtlSchema } from "../../config/schemas/providersConfig";
 
 export const AgentDefinitionScopeSchema = z.enum(["built-in", "project", "global"]);
 
@@ -27,6 +28,8 @@ const AgentDefinitionSubagentSchema = z
     // When true, do not run the project's .xum/init hook for this sub-agent.
     // NOTE: This skips only the hook execution, not runtime provisioning (e.g. SSH sync, Docker setup).
     skip_init_hook: z.boolean().optional(),
+    // A hint in the task tool's agent list, not enforced: the parent still picks run_in_background.
+    background_hint: z.boolean().optional(),
   })
   .strip();
 
@@ -35,6 +38,10 @@ const AgentDefinitionAiDefaultsSchema = z
     // Model identifier: full string (e.g. "anthropic:claude-sonnet-4-5") or abbreviation (e.g. "sonnet")
     model: z.string().min(1).optional(),
     thinkingLevel: ThinkingLevelSchema.optional(),
+    // Anthropic prompt-cache TTL; Settings > Agents overrides it, and it overrides the global TTL.
+    cacheTtl: CacheTtlSchema.optional(),
+    // Resolve these AI settings through this agent's chain instead of `base`'s (tools keep `base`).
+    settingsBase: AgentIdSchema.optional(),
   })
   .strip();
 
@@ -98,13 +105,37 @@ export const AgentDefinitionDescriptorSchema = z
     uiSelectable: z.boolean(),
     uiColor: z.string().min(1).optional(),
     subagentRunnable: z.boolean(),
+    backgroundHint: z.boolean().optional(),
     // Base agent ID for inheritance (e.g., "exec", "plan", or custom agent)
     base: AgentIdSchema.optional(),
+    // The applied ai.settingsBase; absent when unset or ignored, so AI-settings walks follow `base`.
+    aiSettingsBase: AgentIdSchema.optional(),
     aiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
+    // The `ai` layers a run of this agent resolves (collectDefinitionLayers): its own, with
+    // same-ID hops merged, which the per-agent AI resolvers rank above base agents' Settings,
+    // then each different-ID base's, child to root. The bases' descriptors cannot stand in: a
+    // same-ID hop hides its base's base, and a global agent's base skips project agents.
+    // Absent when aiDefaults is unmerged (the definition did not resolve).
+    aiLayers: z
+      .object({
+        targetDefinitionAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
+        ancestors: z.array(
+          z.object({
+            agentId: AgentIdSchema,
+            definitionAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
+          })
+        ),
+      })
+      .optional(),
     // Tool configuration (for UI display / inheritance computation)
     tools: AgentDefinitionToolsSchema.optional(),
     // Agent Plugins: contributing plugin name (absent for non-plugin agents)
     pluginName: z.string().min(1).optional(),
+    // Set on a plugin agent that this workspace cannot run (its plugin folder is unreachable
+    // here): why, and the agent file. The `task` tool list leaves it out and the composition
+    // inspector reports it as a diagnostic.
+    unavailableReason: z.string().min(1).optional(),
+    unavailablePath: z.string().min(1).optional(),
   })
   .strict();
 

@@ -30,11 +30,11 @@ import {
 } from "@/browser/utils/workspaceInstructionsStore";
 import { cn } from "@/common/lib/utils";
 import {
+  sumSessionCostUsage,
   useOptionalWorkspaceSidebarState,
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
 import { goalActiveMode, isGoalPendingPersistence } from "@/common/types/goal";
-import { sumUsageHistory, type ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import { SIDE_CHAT_INITIAL_TITLE } from "@/constants/workspaceDefaults";
 
 interface StatsTabLabelProps {
@@ -52,12 +52,7 @@ export const StatsTabLabel: React.FC<StatsTabLabelProps> = ({ workspaceId }) => 
   const usage = useWorkspaceUsage(workspaceId);
 
   const sessionCost = React.useMemo(() => {
-    const parts: ChatUsageDisplay[] = [];
-    if (usage.sessionTotal) parts.push(usage.sessionTotal);
-    if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
-    if (parts.length === 0) return null;
-
-    const aggregated = sumUsageHistory(parts);
+    const aggregated = sumSessionCostUsage(usage);
     if (!aggregated) return null;
 
     const total =
@@ -67,7 +62,7 @@ export const StatsTabLabel: React.FC<StatsTabLabelProps> = ({ workspaceId }) => 
       (aggregated.output.cost_usd ?? 0) +
       (aggregated.reasoning.cost_usd ?? 0);
     return total > 0 ? total : null;
-  }, [usage.sessionTotal, usage.liveCostUsage]);
+  }, [usage]);
 
   return (
     <span className="inline-flex items-center gap-1">

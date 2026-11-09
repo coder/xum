@@ -19,14 +19,13 @@ const INTERACTION: ArtifactInteractionMetadata = {
   id: "i1",
   artifactPath: "forms/plan.html",
   title: "Plan",
-  version: 3,
   action: "send",
   text: "Canary",
   data: { pct: 10 },
 };
 
 const TAG =
-  '<artifact_interaction artifact="forms/plan.html" title="Plan" version="3" action="send">{"text":"Canary"}</artifact_interaction>';
+  '<artifact_interaction artifact="forms/plan.html" title="Plan" action="send">{"text":"Canary"}</artifact_interaction>';
 
 function displayedUser(muxMetadata?: MuxMessageMetadata) {
   const message = createMuxMessage("u1", "user", TAG, {
@@ -49,10 +48,17 @@ describe("messages sent from artifacts", () => {
       displayedUser({ type: "normal", artifactInteraction: INTERACTION }).artifactInteraction
     ).toEqual(INTERACTION);
     // Malformed metadata degrades to an ordinary message instead of a broken pill.
-    const bad: ArtifactInteractionMetadata = { ...INTERACTION, version: -1 };
+    const bad = { ...INTERACTION, text: 7 } as unknown as ArtifactInteractionMetadata;
     expect(
       displayedUser({ type: "normal", artifactInteraction: bad }).artifactInteraction
     ).toBeUndefined();
+  });
+
+  test("metadata written before versions were removed still shows the pill, without the version", () => {
+    const old: ArtifactInteractionMetadata & { version: number } = { ...INTERACTION, version: 3 };
+    expect(displayedUser({ type: "normal", artifactInteraction: old }).artifactInteraction).toEqual(
+      INTERACTION
+    );
   });
 
   test("Edit is hidden for artifact messages but not for typed lookalikes", () => {
@@ -82,7 +88,7 @@ describe("messages sent from artifacts", () => {
       cleanupDom = null;
     });
 
-    test("opens the artifact at the interacted version", () => {
+    test("opens the artifact's live file", () => {
       const opened: Array<CustomEventPayloads[typeof CUSTOM_EVENTS.OPEN_ARTIFACT]> = [];
       const onOpen = (event: Event) =>
         opened.push(
@@ -93,7 +99,7 @@ describe("messages sent from artifacts", () => {
       fireEvent.click(view.getByRole("button", { name: "Open Plan in Artifacts" }));
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onOpen);
       expect(opened).toHaveLength(1);
-      expect(opened[0]).toMatchObject({ workspaceId: "ws", path: "forms/plan.html", versionId: 3 });
+      expect(opened).toEqual([{ workspaceId: "ws", path: "forms/plan.html" }]);
     });
   });
 });

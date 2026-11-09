@@ -297,6 +297,7 @@ import type {
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
   WorkspaceRemoveWarning,
+  WorkspaceBackgroundProcessBlocker,
 } from "@/common/types/workspace";
 import { type DynamicToolPart, isDynamicToolPart } from "@/common/types/toolParts";
 import {
@@ -1037,6 +1038,14 @@ function isDedicatedCoderRuntime(runtimeConfig: RuntimeConfig | undefined): bool
   );
 }
 
+/** What archiving does to the dedicated Coder workspace Xum created for this workspace. */
+function remoteBoxArchiveBehavior(
+  metadata: WorkspaceMetadata | undefined,
+  coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior
+): CoderWorkspaceArchiveBehavior {
+  return isDedicatedCoderRuntime(metadata?.runtimeConfig) ? coderWorkspaceArchiveBehavior : "keep";
+}
+
 /**
  * Whether archiving takes the structural mutation gate (#4476): it deletes the managed checkout,
  * or stops or deletes a dedicated Coder workspace (#4871).
@@ -1048,7 +1057,7 @@ function archiveTakesMutationGate(
 ): boolean {
   return (
     archiveDeletesManagedWorktree(metadata, worktreeArchiveBehavior) ||
-    (isDedicatedCoderRuntime(metadata.runtimeConfig) && coderWorkspaceArchiveBehavior !== "keep")
+    remoteBoxArchiveBehavior(metadata, coderWorkspaceArchiveBehavior) !== "keep"
   );
 }
 // #4476: removal stops this backend's own stream, terminals, MCP servers, init hook and background
@@ -2254,6 +2263,13 @@ export interface WorkspaceServiceEvents {
     removedParentWorkspaceId?: string;
   }) => void;
   activity: (event: { workspaceId: string; activity: WorkspaceActivitySnapshot | null }) => void;
+  /**
+   * A write changed the workspace's session usage (SessionUsageService.onUsageChanged), so a
+   * renderer refetches it and its ancestors' sub-agent projections. A session-usage-delta
+   * reaches only a live session's subscribed chat, and nothing else announces a sub-agent's
+   * in-flight or headless spend.
+   */
+  "usage-changed": (event: { workspaceId: string }) => void;
   /** Request an incremental analytics ingest outside the stream-end path. */
   analyticsIngest: (event: { workspaceId: string }) => void;
   /** An admitted session turn generation ended for good (see TurnAdmissionHost). */
@@ -2889,6 +2905,9 @@ export class WorkspaceService
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
     this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
+    this.sessionUsageService?.onUsageChanged((workspaceId) =>
+      this.emit("usage-changed", { workspaceId })
+    );
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
     // A cleared tombstone means a removed id was re-registered (downgraded
@@ -5268,6 +5287,9 @@ export class WorkspaceService
         this.sendPreflight.hasManualSessionInvisiblePreflight(workspaceId),
       isStopInProgress: () =>
         this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
+      isWorkspaceTurnStopped: async (correlation) =>
+        (await this.agentTaskIntegration?.isWorkspaceTurnStopped(workspaceId, correlation)) ===
+        true,
       getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
       onBeforeTurnCompletion: async () => {
         await this.agentTaskIntegration?.acknowledgeAgentReports(workspaceId);
@@ -7145,11 +7167,13 @@ export class WorkspaceService
     options?: {
       beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
       acknowledgedDescendantIds?: string[];
+      acknowledgedUnknownProcessRecords?: string[];
     }
   ): Promise<
     Result<void> & {
       descendants?: WorkspaceRemovalDescendant[];
       warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
   > {
     return await this.removeLocked(workspaceId, force, options);
@@ -7158,33 +7182,42 @@ export class WorkspaceService
   private async removeLocked(
     workspaceId: string,
     force: boolean,
-    options?: {
+    options: {
       beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
       acknowledgedDescendantIds?: string[];
-    }
+      acknowledgedUnknownProcessRecords?: string[];
+    } = {}
   ): Promise<
     Result<void> & {
       descendants?: WorkspaceRemovalDescendant[];
       warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
   > {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
       const operation = async () => {
-        const decision = options?.beforeRemove == null ? true : await options.beforeRemove();
+        const decision = options.beforeRemove == null ? true : await options.beforeRemove();
         if (decision === false) {
           return Ok(undefined);
         }
         const binding = decision === true ? undefined : decision;
-        const failure = (error: string) => {
+        const failure = (
+          error: string,
+          backgroundProcesses?: WorkspaceBackgroundProcessBlocker[]
+        ) => {
           const descendants =
             this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId);
-          return { ...Err(error), ...(descendants?.length ? { descendants } : {}) };
+          return {
+            ...Err(error),
+            ...(descendants?.length ? { descendants } : {}),
+            backgroundProcesses,
+          };
         };
         let releaseTreeGate: (() => Promise<void>) | undefined;
         // What the acknowledged descendants' forced removals left behind (#5143).
         let descendantWarnings: WorkspaceRemoveWarning[] = [];
         try {
-          if (options?.acknowledgedDescendantIds != null) {
+          if (options.acknowledgedDescendantIds != null) {
             if (this.agentTaskIntegration == null) {
               return failure("Task lifecycle service is unavailable.");
             }
@@ -7201,9 +7234,11 @@ export class WorkspaceService
             ]);
             const gate = await this.acquireStructuralMutationGate(
               [...gatedIds],
-              REMOVAL_OWN_ACTIVITY_POLICY
+              REMOVAL_OWN_ACTIVITY_POLICY,
+              options.acknowledgedUnknownProcessRecords
             );
-            if (!gate.success) return failure(`Cannot remove workspace: ${gate.error}`);
+            if (!gate.success)
+              return failure(`Cannot remove workspace: ${gate.error}`, gate.backgroundProcesses);
             releaseTreeGate = gate.data;
             const descendantsResult =
               await this.agentTaskIntegration.removeAcknowledgedDescendantsWhileTaskTreeLocked(
@@ -7218,9 +7253,11 @@ export class WorkspaceService
             workspaceId,
             force,
             binding,
-            releaseTreeGate != null ? { mutationGateHeld: true } : undefined
+            releaseTreeGate != null
+              ? { mutationGateHeld: true }
+              : { acknowledgedUnknownProcessRecords: options.acknowledgedUnknownProcessRecords }
           );
-          if (!result.success) return failure(result.error);
+          if (!result.success) return failure(result.error, result.backgroundProcesses);
           const warnings = [...descendantWarnings, ...(result.warnings ?? [])];
           return { ...result, ...(warnings.length > 0 ? { warnings } : {}) };
         } catch (error) {
@@ -7235,7 +7272,7 @@ export class WorkspaceService
         }
       };
       // Defer the project-list refresh until the complete descendant cascade ends.
-      return options?.acknowledgedDescendantIds != null
+      return options.acknowledgedDescendantIds != null
         ? await this.config.withDeferredChangeNotifications(operation)
         : await operation();
     });
@@ -7251,7 +7288,12 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     return await this.removeUnlocked(workspaceId, force, binding, options);
   }
 
@@ -7331,7 +7373,12 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     const result = await this.removeSingleWorkspaceUnlocked(workspaceId, force, binding, options);
     // Both removal entrypoints must discard side chats, but only after the parent is gone.
     // Keep this outside the parent's checkout locks and do not reacquire a task-tree lock:
@@ -7347,11 +7394,17 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Only the checkout options reach the runtime.
-    const { mutationGateHeld, ...checkoutOptions } = options ?? {};
-    const runtimeOptions = mutationGateHeld === undefined ? options : checkoutOptions;
+    const { mutationGateHeld, acknowledgedUnknownProcessRecords, ...checkoutOptions } =
+      options ?? {};
+    const runtimeOptions = Object.keys(checkoutOptions).length > 0 ? checkoutOptions : undefined;
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -7415,9 +7468,14 @@ export class WorkspaceService
       if (mutationGateHeld !== true) {
         const gate = await this.acquireStructuralMutationGate(
           workspaceId,
-          REMOVAL_OWN_ACTIVITY_POLICY
+          REMOVAL_OWN_ACTIVITY_POLICY,
+          acknowledgedUnknownProcessRecords
         );
-        if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
+        if (!gate.success)
+          return {
+            ...Err(`Cannot remove workspace: ${gate.error}`),
+            backgroundProcesses: gate.backgroundProcesses,
+          };
         releaseMutationGate = gate.data;
       }
       // #4914: the marker, the deregistration and other backends' task commits all find the row
@@ -11124,8 +11182,12 @@ export class WorkspaceService
   // (the router, EditorService, TaskService) and the tests that spy on it unchanged.
 
   /** See WorkspaceExternalEditors.recordExternalEditorOpen. */
-  recordExternalEditorOpen(workspaceId: string, launchToken: string): Promise<Result<void>> {
-    return this.externalEditors.recordExternalEditorOpen(workspaceId, launchToken);
+  recordExternalEditorOpen(
+    workspaceId: string,
+    launchToken: string,
+    remotePath?: string | null
+  ): Promise<Result<{ remotePath: string } | undefined>> {
+    return this.externalEditors.recordExternalEditorOpen(workspaceId, launchToken, remotePath);
   }
 
   /** See WorkspaceExternalEditors.rollbackRecordedEditorOpen. */
@@ -11203,8 +11265,13 @@ export class WorkspaceService
       // "refuse": also this backend's tracked background processes; "allow": only processes this
       // backend does not track (another backend's, or survivors of a crashed one).
       backgroundProcesses: "refuse" | "allow";
+    },
+    acknowledgedUnknownProcessRecords?: readonly string[]
+  ): Promise<
+    Result<() => Promise<void>> & {
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
-  ): Promise<Result<() => Promise<void>>> {
+  > {
     const targets = new Set(typeof workspaceId === "string" ? [workspaceId] : workspaceId);
     const workspaceIds = [...targets];
     const config = this.config.loadConfigOrDefault();
@@ -11224,15 +11291,24 @@ export class WorkspaceService
     try {
       release = await workspaceUseLeasesFor(this.config).acquireMutationGate(workspaceIds, {
         ignoreOwnKinds: new Map([...targets].map((id) => [id, own.ignoreKinds])),
-        hasRunningBackgroundProcesses: (id) =>
-          own.backgroundProcesses === "refuse" || !targets.has(id)
-            ? this.hasRunningBackgroundBashProcesses(id)
-            : this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(id, {
-                extraRecordDirs: this.extraBgRecordDirsForWorkspace(id),
-              }),
+        hasRunningBackgroundProcesses: (id) => this.hasRunningBackgroundBashProcesses(id),
+        ...(own.backgroundProcesses === "allow"
+          ? {
+              getBackgroundProcessBlockers: (id: string) =>
+                this.getRemovalBackgroundProcessBlockers(
+                  id,
+                  targets,
+                  acknowledgedUnknownProcessRecords
+                ),
+            }
+          : {}),
       });
     } catch (error) {
-      if (error instanceof WorkspaceBusyError) return Err(error.message);
+      if (error instanceof WorkspaceBusyError)
+        return {
+          ...Err(error.message),
+          ...(error.backgroundProcesses ? { backgroundProcesses: error.backgroundProcesses } : {}),
+        };
       throw error;
     }
     // #4909: ignoring this backend's own terminal/editor leases must not let the mutation race an
@@ -11255,6 +11331,31 @@ export class WorkspaceService
       }
     }
     return Ok(release);
+  }
+
+  private async getRemovalBackgroundProcessBlockers(
+    workspaceId: string,
+    targets: ReadonlySet<string>,
+    acknowledgedUnknownProcessRecords?: readonly string[]
+  ): Promise<WorkspaceBackgroundProcessBlocker[]> {
+    // Shared-checkout siblings are not removal targets. Their tracked processes still block removal.
+    if (!targets.has(workspaceId) && (await this.hasRunningBackgroundBashProcesses(workspaceId))) {
+      throw new WorkspaceBusyError(
+        `Workspace ${workspaceId} has a running background process; stop it and try again.`
+      );
+    }
+    const blockers = await this.backgroundProcessManager.getOrphanedBackgroundProcessBlockers(
+      workspaceId,
+      { extraRecordDirs: this.extraBgRecordDirsForWorkspace(workspaceId) }
+    );
+    const acknowledged = new Set(acknowledgedUnknownProcessRecords);
+    // Force never authorizes this bypass. Consent applies only to exact unknown records in removal targets.
+    return blockers.filter(
+      (record) =>
+        record.state !== "unknown" ||
+        !targets.has(workspaceId) ||
+        !acknowledged.has(record.recordPath)
+    );
   }
 
   /**
@@ -11540,6 +11641,30 @@ export class WorkspaceService
   }
 
   /**
+   * The user's archive preflight. It adds the untracked files each sub-agent's snapshot archive
+   * would lose to the target's own, so one dialog confirms the whole cascade: without them the
+   * archive refuses at the first lossy sub-agent and the user has no way to confirm it.
+   */
+  async preflightArchiveWithSubagents(
+    workspaceId: string
+  ): Promise<Result<ArchivePreflightResult>> {
+    const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
+    // A "delete" archive snapshots nothing, and the cascade preflight refuses it for the
+    // model-facing caller only.
+    if (
+      worktreeArchiveBehavior === "delete" ||
+      this.listUnarchivedDescendants(workspaceId).length === 0
+    ) {
+      return await this.preflightArchive(workspaceId);
+    }
+    const cascade = await this.preflightArchiveCascade(workspaceId, worktreeArchiveBehavior);
+    if (!cascade.success) return Err(cascade.error);
+    const { targetPaths, subagents } = cascade.data;
+    if (targetPaths.length === 0 && subagents.length === 0) return Ok({ kind: "ready" });
+    return Ok({ kind: "confirm-lossy-untracked-files", paths: targetPaths, subagents });
+  }
+
+  /**
    * #4477: archiving a parent archives its unarchived sub-agents first, deepest-first, with the
    * parent's worktree archive behavior: "keep" archives them without touching their checkouts,
    * "delete" deletes their checkouts, "snapshot" snapshots them. The Coder archive policy applies
@@ -11720,22 +11845,11 @@ export class WorkspaceService
     const archivedDescendantIds: string[] = [];
     try {
       for (const descendant of descendants) {
-        const result = await this.archiveUnlocked(descendant.workspaceId, undefined, {
-          // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
-          // user-facing archive passes none of them.
-          forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
-          refuseLiveUserActivity: options?.refuseLiveUserActivity,
-          forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
-          worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
-          coderWorkspaceArchiveBehaviorOverride: "keep",
-          mutationGateHeld: true,
-        });
-        const failure = !result.success
-          ? result.error
-          : result.data.kind !== "archived"
-            ? // Its untracked files need their own confirmation: the parent's does not cover them.
-              "its untracked files would be lost by the snapshot archive; archive it on its own to review them"
-            : null;
+        const failure = await this.archiveCascadeDescendant(
+          descendant.workspaceId,
+          worktreeArchiveBehavior,
+          options
+        );
         if (failure != null) {
           return Err(
             `Cannot archive sub-agent ${descendant.title} (${descendant.workspaceId}): ${failure}`
@@ -11761,6 +11875,37 @@ export class WorkspaceService
       // The task-tree lock remains held, so nested removal must not reacquire that lock.
       for (const id of archivedDescendantIds) await this.removeSideChatsOf(id, true);
     }
+  }
+
+  /**
+   * Archive one sub-agent of a cascade under the tree's held gate and pinned behavior. Returns
+   * why it refused, or null once it is archived.
+   */
+  private async archiveCascadeDescendant(
+    descendantId: string,
+    worktreeArchiveBehavior: WorktreeArchiveBehavior,
+    options: ArchiveWorkspaceOptions | undefined
+  ): Promise<string | null> {
+    const result = await this.archiveUnlocked(
+      descendantId,
+      options?.acknowledgedSubagentUntrackedPaths?.[descendantId],
+      {
+        // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
+        // user-facing archive passes none of them.
+        forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
+        refuseLiveUserActivity: options?.refuseLiveUserActivity,
+        forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
+        worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+        coderWorkspaceArchiveBehaviorOverride: "keep",
+        mutationGateHeld: true,
+      }
+    );
+    if (!result.success) return result.error;
+    // Untracked files that the user did not confirm (or that appeared after the confirmation)
+    // refuse; the dialog's retry preflights again and lists them.
+    return result.data.kind === "archived"
+      ? null
+      : "its untracked files would be lost by the snapshot archive and were not confirmed; archive again to review them";
   }
 
   /**
@@ -11978,15 +12123,14 @@ export class WorkspaceService
         options?.coderWorkspaceArchiveBehaviorOverride ??
         this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
         DEFAULT_CODER_ARCHIVE_BEHAVIOR;
-      const isDedicatedCoderWorkspace = isDedicatedCoderRuntime(
-        beforeArchiveMetadata?.runtimeConfig
+      const remoteBoxBehavior = remoteBoxArchiveBehavior(
+        beforeArchiveMetadata,
+        coderWorkspaceArchiveBehavior
       );
-      if (options?.forbidCoderWorkspaceDeletion === true) {
-        if (isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior === "delete") {
-          return Err(
-            'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
-          );
-        }
+      if (options?.forbidCoderWorkspaceDeletion === true && remoteBoxBehavior === "delete") {
+        return Err(
+          'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
+        );
       }
 
       const canSnapshotManagedWorktree =
@@ -12007,8 +12151,7 @@ export class WorkspaceService
       // environment out from under a user's live shell or editor. Mirrors the lifecycle
       // caller's early refusal against the same pinned behavior reads. ("delete" for a
       // dedicated Coder workspace is refused outright above, so non-"keep" here means stop.)
-      const stopsDedicatedCoderWorkspace =
-        isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior !== "keep";
+      const stopsDedicatedCoderWorkspace = remoteBoxBehavior !== "keep";
       if (
         options?.refuseLiveUserActivity === true &&
         (needsSnapshotCapture || stopsDedicatedCoderWorkspace) &&
@@ -20579,6 +20722,19 @@ export class WorkspaceService
   /** Cancel the workspace session's scheduled auto-retry of this goal's automatic turn. */
   abandonGoalAutoRetry(workspaceId: string, goalId: string): void {
     this.sessions.get(workspaceId)?.abandonGoalAutoRetry(goalId);
+  }
+
+  abandonAutoRetry(workspaceId: string, reason: string): void {
+    // Stop paths call this right before their stream stop: a throw must not skip that stop.
+    // A session still in its startup recovery is not registered yet, and that recovery can arm
+    // the stopped turn again.
+    try {
+      (
+        this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
+      )?.abandonAutoRetry(reason);
+    } catch (error: unknown) {
+      log.warn("abandonAutoRetry failed", { workspaceId, reason, error: getErrorMessage(error) });
+    }
   }
 
   async getGoalContinuationKickoffSendOptions(

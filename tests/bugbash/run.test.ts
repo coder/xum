@@ -294,7 +294,7 @@ test("U1: a refusal the launcher returns (after docker started) names its reason
 
 test("U1: a run whose every charter refuses, with no call made, keeps no run folder", async () => {
   const { deps, lines } = fakeLaunch(() => ({
-    error: new Refusal("stale image"),
+    error: new Refusal("rootless Docker is not supported"),
     cleanup: "none",
   }));
   const stop = new AbortController().signal;
@@ -302,7 +302,9 @@ test("U1: a run whose every charter refuses, with no call made, keeps no run fol
   expect(await runBugBash([...charters("a", "b")], env, stop, deps)).toBe(2);
   const runDir = lines.find((line) => line.includes(" -> "))!.split(" -> ")[1];
   expect(fs.existsSync(runDir)).toBe(false);
-  expect(lines.filter((line) => line.endsWith("refused: stale image"))).toHaveLength(2);
+  expect(
+    lines.filter((line) => line.endsWith("refused: rootless Docker is not supported"))
+  ).toHaveLength(2);
 });
 
 test("U1: Docker is checked once, before the probe and any folder; --preflight stops there", async () => {

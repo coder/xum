@@ -583,7 +583,8 @@ describe("ModelsSection manual model IDs", () => {
   );
 
   // A selected "provider:id" longer than the per-workspace model key would not survive a restart.
-  // Typing over a hundred characters takes several seconds, hence the longer timeout.
+  // Typing over a hundred characters takes several seconds (11 s at a load average of 31, over
+  // 15 s when more test runs share the host), hence the longer timeout.
   test("rejects an ID too long to persist as the selected model, accepts one at the limit", async () => {
     const ui = await setup();
     const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;
@@ -598,7 +599,7 @@ describe("ModelsSection manual model IDs", () => {
       provider: "anthropic",
       models: ["m".repeat(maxIdChars)],
     });
-  }, 15_000);
+  }, 60_000);
 
   test("editing a model rejects an ID too long to persist, accepts one at the limit", async () => {
     const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;

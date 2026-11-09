@@ -3,7 +3,7 @@
 #
 #   build.sh --key    print the inputs key of this checkout
 #   build.sh          build for linux/amd64 into the local Docker, print the image ID
-#   build.sh --push   the manual publish job only: build, push to GHCR, print the image.json record
+#   build.sh --push   the publish workflow only: build, push to GHCR, print the publish record (JSON)
 #
 # The inputs key is the sha256 of three lines: the sha256 of the Dockerfile, the sha256 of this
 # script, and the playwright-core version of @e2e-dev/web in bun.lock. The image carries it as
@@ -14,7 +14,8 @@
 # The build gets an empty context, no cache and no build args from the env. --push always builds
 # fresh: it never checks the registry and never reuses an image. It pushes a new tag, so it
 # overwrites no tag, and it reports the name and digest from its own build output. Two publishes
-# of one inputs key give two digests; the reviewed digest in image.json is what runners trust.
+# of one inputs key give two digests; the publish workflow points the stable tag at one of them
+# and attests it, and runners verify that attestation.
 # Nothing here deletes an image.
 set -euo pipefail
 

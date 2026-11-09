@@ -26,20 +26,22 @@ Xum harness. Where the two differ, follow this skill.
   `tests/bugbash/sandbox/launch.ts`, one container per job.
 - The image `ghcr.io/coder/xum-bugbash-sandbox` (about 1.4 GB, linux/amd64) holds only tools:
   Node 22, Bun, git, the Chromium of `@e2e-dev/web`'s playwright-core, and Xvfb plus libgtk-3
-  for Xum Electron (the Electron binary comes from the mounted node_modules). The runner pulls it only
-  by the digest in `tests/bugbash/sandbox/image.json`. It builds it only in the case below.
+  for Xum Electron (the Electron binary comes from the mounted node_modules).
 - The inputs key (`make bugbash-sandbox-key`) is a hash of the Dockerfile, `build.sh` and the
-  playwright-core version in `bun.lock`. The runner refuses an image whose key differs from the
-  checkout. One exception: with `BUGBASH_SANDBOX_BUILD_STALE=1` (exactly `1`), which only CI's
-  `Test / Bug-bash sandbox` job sets, the self-check and the exact-step repros build the image
-  locally with `build.sh` (local tag, no push, no registry login), check its inputs label, and
-  print a warning (a `::warning::` annotation in GitHub Actions). Explore charters, the MCP Apps
-  suite, the story tests, the agent repros and the preflight of `make bug-bash`,
-  `make mcp-apps-e2e` and `make test-stories` always refuse a stale key.
-- An image change lands in three steps: the PR that changes the Dockerfile, `build.sh` or
-  playwright-core passes CI on a local build. Its merge push runs the workflow "Bug-bash sandbox
+  playwright-core version in `bun.lock`. Every job, in CI and on your machine, looks up the tag
+  `inputs-<key>` anonymously and verifies its attestation on the host with
+  `gh attestation verify` (main's workflow "Bug-bash sandbox image", `refs/heads/main`). gh needs
+  your `gh auth login` or `GH_TOKEN`. The token stays on the host: no job container gets it.
+  A verified image is pulled by digest.
+- Any other outcome (no tag, a lookup error, no gh, no token, a failed verification) logs the
+  reason, builds the image locally with `build.sh` (local tag, no push, no registry login) or
+  reuses that build, and prints a LOCAL IMAGE warning (a `::warning::` annotation in GitHub
+  Actions). Both images must carry the checkout's key as their inputs label. A local build adds
+  no power: each job already runs its checkout's files, `dist/` and `node_modules/`.
+- An image change lands in one PR: the PR that changes the Dockerfile, `build.sh` or
+  playwright-core runs on a local build. Its merge push runs the workflow "Bug-bash sandbox
   image" on main, which publishes the image once for each inputs key (a manual run on main
-  retries a failed publish). Then a reviewed PR updates `image.json` to pin the new digest. An e2e update that keeps playwright-core keeps the key, so the image stays valid.
+  retries a failed publish). An e2e update that keeps playwright-core keeps the key, so the image stays valid.
 - The container gets `--network none`, `--read-only`, `--cap-drop ALL`, no-new-privileges, a
   non-root user, 4 GB memory and tmpfs scratch folders. It reads copies of the git-listed files,
   plus `dist/` and `node_modules/` read-only. An env allowlist passes no credential.
@@ -184,7 +186,7 @@ artifact `stories-reports-<attempt>` and, on a failure, the `results/` folders a
 `stories-evidence-<attempt>` (both kept 7 days), and, except in the merge queue, saves the next seed: `bun
 tests/stories/summary.ts --next-seed <dir>` (the caches of the newest web and Electron story
 jobs, less the seed entries either one deleted, at most 1000 entries and 128 MiB). GitHub scopes a saved cache to its ref, and a queue ref is temporary, so a
-merge-queue run saves none. Only the nightly and on-demand runs on main change what main replays. A PR that changes the sandbox image inputs fails there until main publishes the image.
+merge-queue run saves none. Only the nightly and on-demand runs on main change what main replays. A PR that changes the sandbox image inputs has no verified image yet, so each of its jobs builds the image locally (up to 25 minutes) and warns.
 After the PR lane, pr.yml's `Test / Stories (Haiku) comment` job posts the same page as one PR
 comment, which each push edits (`tests/stories/prComment.ts`; `--dry-run` prints the body). It
 runs the base commit's copy with no install scripts, writes only while the run's commit is still
@@ -222,8 +224,8 @@ removes only those whose launcher is provably dead on this boot, and exits 3 whe
 for one. Check that container's `xum.bugbash.owner` and `xum.bugbash.checkout` labels with
 `docker inspect`, then `docker rm -f <id>` it. A SIGKILLed launcher also leaves
 `$TMPDIR/xum-bugbash-sandbox/<checkout>/<job>` and a `xum-bugbash-docker-*` folder in `$TMPDIR`:
-remove both by hand. A run with `BUGBASH_SANDBOX_BUILD_STALE=1` on a stale key leaves a local
-image of about 1.4 GB: remove it with `docker image rm xum-bugbash-sandbox:inputs-<key>`.
+remove both by hand. A run without a verified image leaves a local image
+of about 1.4 GB: remove it with `docker image rm xum-bugbash-sandbox:inputs-<key>`.
 
 ## 5. Triage and verify
 

@@ -360,7 +360,7 @@ test("moved lock calls keep their options", async () => {
     await oneChildReport(record.names); // the subagent artifact indexes, the turn publication lock
     await oneInitAndPlan(record.names); // the init record lock seen by two backends, plan migration
     await oneWorkspaceRefine(record.names); // a full clear under the refine serialization lock
-    await oneArtifactAndRun(record.names); // pins, artifact versions, workflow run locks, rollback, journal
+    await oneArtifactAndRun(record.names); // pins, artifact records, workflow run locks, rollback, journal
   });
 
   const actual = record.normalized();

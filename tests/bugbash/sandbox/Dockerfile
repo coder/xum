@@ -3,7 +3,7 @@
 # an empty build context, and no cache.
 #
 # The image is published by the main branch only (.github/workflows/bugbash-sandbox-image.yml),
-# and runners pull it by the digest in image.json. The base images are pinned by digest. The
+# and runners pull it by the digest of its attested stable tag. The base images are pinned by digest. The
 # Debian apt mirror and the Playwright download CDN are not pinned: the build trusts them, and
 # the published digest fixes the bytes after the build.
 FROM oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288 AS bun
@@ -26,9 +26,10 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright NPM_CONFIG_UPDATE_NOTIFIER=false \
 # git: startApp.ts seeds a git repo for the demo project.
 # xvfb, libgtk-3-0: Xum Electron for the Electron stories (tests/stories/electron). ldd on the
 # Electron binary in this image found only libgtk-3 missing; Xvfb gives it a display.
+# jq: the Cursor ralph-loop plugin's hooks run it, as in Cursor (repros/cursorStopHookLoop.e2e.ts).
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
-    xvfb libgtk-3-0 \
+    xvfb libgtk-3-0 jq \
  && rm -rf /var/lib/apt/lists/*
 # The Chromium build that this playwright-core drives. e2e looks for both the full browser and
 # the headless shell, and `install chromium` gets both.

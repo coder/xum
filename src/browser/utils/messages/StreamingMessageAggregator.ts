@@ -47,7 +47,7 @@ import {
   parseSubagentReportEnvelope,
 } from "@/common/utils/subagentReportEnvelope";
 import { findOpenAskUserQuestions } from "@/browser/utils/messages/openAskUserQuestions";
-import { completeInProgressTodoItems } from "@/common/utils/todoList";
+import { completeInProgressTodoItems, isTodoListFinished } from "@/common/utils/todoList";
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/agentSkillReadToolResult";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 
@@ -154,6 +154,19 @@ function isDisplayOnlyCompletedSubagentReport(message: MuxMessage): boolean {
   }
 
   return isCompletedSubagentReportEnvelope(getTextPartContent(message.parts));
+}
+
+/**
+ * A user row that starts a turn. Plan-review records, in-turn notices, Token Budget warnings and
+ * display-only sub-agent report cards are user rows that start none (see handleMuxMessage).
+ */
+function startsUserTurn(message: MuxMessage): boolean {
+  return (
+    !isPlanReviewRecordMessage(message) &&
+    !isInTurnHiddenNoticeRow(message) &&
+    !isContextBudgetWarningMessage(message) &&
+    !isDisplayOnlyCompletedSubagentReport(message)
+  );
 }
 
 // Maximum number of messages to display in the DOM for performance
@@ -716,9 +729,12 @@ export class StreamingMessageAggregator {
   >();
 
   // Current TODO list (updated when todo_write succeeds)
-  // Incomplete lists persist across streams and reloads; fully completed lists clear
-  // once the final stream finishes so stale plans do not linger in the UI.
+  // Incomplete lists persist across streams and reloads; a finished list stays until the next
+  // user turn starts, so its chip reads 5/5 after its turn.
   private currentTodos: TodoItem[] = [];
+  // The list came from the window seed and no row or tool result has written one since. The seed
+  // is the session's list now, so during a turn it may be an earlier turn's finished plan.
+  private todosFromWindowSeed = false;
 
   // Current agent status (updated when status_set is called)
   // Unlike todos, this persists after stream completion to show last activity
@@ -1047,6 +1063,10 @@ export class StreamingMessageAggregator {
     return this.currentTodos;
   }
 
+  private clearFinishedTodos(): void {
+    if (isTodoListFinished(this.currentTodos)) this.currentTodos = [];
+  }
+
   /**
    * Get the current set of agent-flagged Assisted Review hunks.
    * Updated whenever `review_pane_update` succeeds.
@@ -1112,7 +1132,7 @@ export class StreamingMessageAggregator {
    * - Transient agentStatus (from displayStatus) - restored to persisted value
    *
    * Preserves:
-   * - currentTodos (incomplete lists stay visible; handleStreamEnd may clear fully completed lists)
+   * - currentTodos (a finished plan stays too, until the next user turn starts)
    */
   private cleanupStreamState(messageId: string): void {
     // Clear optimistic interrupt flag if this stream was being interrupted.
@@ -1254,7 +1274,7 @@ export class StreamingMessageAggregator {
         }
       }
       this.establishedOldestHistorySequence = minSeq;
-      this.applyWindowSeed(hasActiveStream);
+      this.applyWindowSeed();
     }
 
     const overwrittenMessageIds: string[] = [];
@@ -1319,7 +1339,11 @@ export class StreamingMessageAggregator {
     hasActiveStream: boolean,
     opts?: { skipDerivedState?: boolean }
   ): void {
-    let shouldClearCompletedTodosOnIdleReplay = false;
+    // A finished plan clears when a later user turn starts, as it does live. Rows replayed here
+    // set the list in order; a list from before them (the window seed, or a live stream's) may
+    // also clear when idle, since then every replayed turn came after it. With a stream active,
+    // the seed may hold that stream's own writes, which no replayed row precedes.
+    let todosFromReplay = false;
     if (!opts?.skipDerivedState) {
       // Replay historical messages in order to reconstruct derived state
       for (const message of chronologicalMessages) {
@@ -1334,11 +1358,16 @@ export class StreamingMessageAggregator {
           if (isTranscriptVisibleUserRow(message)) {
             this.clearPendingInitialUserMessage();
           }
+          if (
+            startsUserTurn(message) &&
+            (todosFromReplay || (!hasActiveStream && this.activeStreams.size === 0))
+          ) {
+            this.clearFinishedTodos();
+          }
           continue;
         }
 
         if (message.role === "assistant") {
-          let assistantUpdatedTodos = false;
           for (const part of message.parts) {
             if (isDynamicToolPart(part) && part.state === "output-available") {
               // Replay deliberately omits the live context so historical
@@ -1351,13 +1380,9 @@ export class StreamingMessageAggregator {
                 hasSuccessResult(part.output) &&
                 parseTodoWriteInput(part.input)
               ) {
-                assistantUpdatedTodos = true;
+                todosFromReplay = true;
               }
             }
-          }
-
-          if (!hasActiveStream && assistantUpdatedTodos) {
-            shouldClearCompletedTodosOnIdleReplay = message.metadata?.partial !== true;
           }
         }
       }
@@ -1370,19 +1395,6 @@ export class StreamingMessageAggregator {
         this.agentStatus = persistedStatus;
         this.lastStatusUrl = persistedStatus.url;
       }
-    }
-
-    // Mirror live stream-end cleanup for idle reloads: a completed plan should not reappear
-    // just because we reconstructed it from historical tool output after a successful final stream.
-    if (
-      !opts?.skipDerivedState &&
-      !hasActiveStream &&
-      this.activeStreams.size === 0 &&
-      shouldClearCompletedTodosOnIdleReplay &&
-      this.currentTodos.length > 0 &&
-      this.currentTodos.every((todo) => todo.status === "completed")
-    ) {
-      this.currentTodos = [];
     }
 
     this.invalidateCache();
@@ -1549,7 +1561,7 @@ export class StreamingMessageAggregator {
     this.loadedSkillsCache = [];
     this.skillLoadErrors.clear();
     this.skillLoadErrorsCache = [];
-    this.applyWindowSeed(hasActiveStream);
+    this.applyWindowSeed();
     this.agentStatus = undefined;
     this.lastStatusUrl = undefined;
 
@@ -1575,12 +1587,11 @@ export class StreamingMessageAggregator {
   }
 
   /** Reset todos and review pins to the window seed; replayed rows then override them. */
-  private applyWindowSeed(hasActiveStream: boolean): void {
-    const todos = this.windowSeed?.todos ?? [];
-    // Owner rule: when idle, an all-completed list stays hidden, as after a live stream-end.
-    const idle = !hasActiveStream && this.activeStreams.size === 0;
-    const next = idle && todos.every((todo) => todo.status === "completed") ? [] : todos;
+  private applyWindowSeed(): void {
+    // A finished seed list stays until a replayed user turn clears it (replayDerivedState).
+    const next = this.windowSeed?.todos ?? [];
     if (!this.todosEqual(this.currentTodos, next)) this.currentTodos = next;
+    this.todosFromWindowSeed = next.length > 0;
     this.assistedReviewHunks = [...(this.windowSeed?.assistedReview ?? [])];
   }
 
@@ -2470,16 +2481,9 @@ export class StreamingMessageAggregator {
       // Clean up stream-scoped state for this stream.
       this.cleanupStreamState(data.messageId);
     }
-    // Keep incomplete plans available across stream boundaries, but clear a fully completed
-    // plan once the workspace has no active streams so finished work does not linger.
-    if (
-      this.activeStreams.size === 0 &&
-      this.currentTodos.length > 0 &&
-      this.currentTodos.every((todo) => todo.status === "completed")
-    ) {
-      this.currentTodos = [];
-    }
-
+    // A finished list only the seed knows may be the turn before this one's: unlike one this turn
+    // wrote, it does not outlast this turn (a replayed user row cannot clear it mid-stream).
+    if (this.todosFromWindowSeed && this.activeStreams.size === 0) this.clearFinishedTodos();
     // Assistant message is now stable (completed or reconnected) - invalidate all caches.
     this.markMessageDirty(data.messageId);
   }
@@ -2828,6 +2832,15 @@ export class StreamingMessageAggregator {
     }
   }
 
+  private applyTodoWrite(input: unknown): void {
+    const args = parseTodoWriteInput(input);
+    // Guard against malformed historical data.
+    if (!args) return;
+    this.todosFromWindowSeed = false;
+    // Update only on real changes to prevent flicker from equivalent-but-new todo array references.
+    if (!this.todosEqual(this.currentTodos, args.todos)) this.currentTodos = args.todos;
+  }
+
   /**
    * Process a completed tool call's result to update derived state.
    * Called for both live tool-call-end events and historical tool parts.
@@ -2853,16 +2866,9 @@ export class StreamingMessageAggregator {
     liveContext?: { timestamp: number }
   ): void {
     // Update TODO state if this was a successful todo_write.
-    // We still reconstruct from history so interrupted/incomplete plans survive reloads;
-    // final completed plans are cleared later when the last active stream ends.
-    if (toolName === "todo_write" && hasSuccessResult(output)) {
-      const args = parseTodoWriteInput(input);
-      if (args && !this.todosEqual(this.currentTodos, args.todos)) {
-        // Guard against malformed historical data and update only on real changes
-        // to prevent flicker from equivalent-but-new todo array references.
-        this.currentTodos = args.todos;
-      }
-    }
+    // We still reconstruct from history so plans survive reloads; a finished plan clears when
+    // the next user turn starts.
+    if (toolName === "todo_write" && hasSuccessResult(output)) this.applyTodoWrite(input);
 
     // Update Assisted Review state when review_pane_update succeeds.
     // The tool returns the resulting list directly (already merged + deduped
@@ -3349,6 +3355,12 @@ export class StreamingMessageAggregator {
       // progress update. It intentionally starts no new parent turn, so preserve the idle lifecycle
       // instead of briefly presenting the card as an interrupted user request.
       return;
+    }
+
+    // A finished plan's chip reads 5/5 after its turn and clears once the next turn starts. A
+    // message sent mid-turn leaves it: that turn has not ended yet.
+    if (this.activeStreams.size === 0) {
+      this.clearFinishedTodos();
     }
 
     // Reset terminal lifecycle snapshots from the previous turn immediately so

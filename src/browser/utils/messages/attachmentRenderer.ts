@@ -118,15 +118,15 @@ function renderReadFilesReference(attachment: ReadFilesReferenceAttachment): str
 
 /**
  * SECURITY AUDIT: same channel as renderReadFilesReference above. Artifact paths are file names
- * the agent (or repo content it copied) chose, and labels are model-written text, so neither is
- * rendered here: only the count, derived from list length. artifact_list returns the names and
- * versions through a normal tool result when the model needs them.
+ * the agent (or repo content it copied) chose, and titles are model-written text, so neither is
+ * rendered here: only the count, derived from list length. artifact_list returns the names
+ * through a normal tool result when the model needs them.
  */
 function renderArtifactsIndex(attachment: ArtifactsIndexAttachment): string {
   const count = attachment.artifacts.length;
   return (
-    `${count} artifact${count === 1 ? " has" : "s have"} published versions in ` +
-    `$XUM_SCRATCH_DIR/artifacts; call artifact_list for names and versions.`
+    `${count} artifact${count === 1 ? " has" : "s have"} been published in ` +
+    `$XUM_SCRATCH_DIR/artifacts; call artifact_list for names.`
   );
 }
 

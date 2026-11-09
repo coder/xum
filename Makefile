@@ -42,6 +42,59 @@ XUM_VITE_ALLOWED_HOSTS ?= $(or $(MUX_VITE_ALLOWED_HOSTS),$(VITE_ALLOWED_HOSTS))
 XUM_BACKEND_HOST ?= $(or $(MUX_BACKEND_HOST),$(BACKEND_HOST),127.0.0.1)
 XUM_BACKEND_PORT ?= $(or $(MUX_BACKEND_PORT),$(BACKEND_PORT),3000)
 
+# `make dev-server` starts the backend with auth on: any local account can reach a loopback port,
+# and an open backend runs commands as you. Make generates one random token per run, so nodemon
+# restarts keep it, and exports it to the recipe's processes. It stays in the environment (argv is
+# visible to every local account) and in <XUM_ROOT>/server.lock (mode 0600). The browser sends it
+# through the Vite proxy as `/?token=<token>` once; the proxy adds nothing, so the Vite port is no
+# way around auth. XUM_DEV_SERVER_AUTH_TOKEN picks the token. The ambient XUM_SERVER_AUTH_TOKEN is
+# never reused: agent shells export the real server's token. XUM_DEV_SERVER_NO_AUTH=1 restores the
+# open backend, for hosts where you are the only account. Keep XUM_ROOT outside the checkout: Vite
+# serves the checkout to anyone who can reach its port, and public/ without any file checks.
+ifeq ($(XUM_DEV_SERVER_NO_AUTH),1)
+override DEV_SERVER_AUTH_FLAG := --no-auth
+else
+override DEV_SERVER_AUTH_FLAG :=
+# Only when dev-server is a goal: `:=` runs node at parse time, and every make invocation parses this.
+ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
+# `override` beats `make -e`; `$(value ...)` keeps a chosen token's dollar signs from being expanded.
+override export XUM_SERVER_AUTH_TOKEN := $(or $(value XUM_DEV_SERVER_AUTH_TOKEN),$(shell node -p "require('crypto').randomBytes(32).toString('hex')"))
+ifeq ($(XUM_SERVER_AUTH_TOKEN),)
+$(error could not generate the dev-server auth token: is node on PATH?)
+endif
+endif
+endif
+
+# While nodemon restarts the backend, its TCP port is free for any local account to bind, and the
+# browser's reconnect URL carries the token. So Vite reaches the backend over a Unix socket in a
+# private folder (`xum server --unix-socket` makes it 0700 and refuses a folder that is not yours):
+# no other account can create the socket's name. The TCP port stays for the CLI and scripts, which
+# read the lockfile. The path is short on purpose (sun_path holds about 100 bytes) and has the
+# backend host and port in its name (a TCP address can be bound once, so no two running backends
+# share it), so parallel dev servers do not collide. XUM_BACKEND_SOCKET picks another.
+# The recipe reads the path from the environment (`"$XUM_BACKEND_SOCKET"`), never from the command
+# text: it crosses three shells, and a path with spaces or quotes must stay one argument.
+# Windows has no such folder and keeps TCP for the Vite hop.
+ifneq ($(OS),Windows_NT)
+ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
+ifndef XUM_BACKEND_SOCKET
+# scripts/devServerSocketPath.ts: another account can create the default folder first, and the
+# backend refuses a folder that is not ours, so a folder that is not safely ours is replaced by a
+# fresh private one next to it (and says so). It creates the folder (0700) when it is missing, so
+# that no other account takes the name while make builds, and a dry run does the same.
+shq = '$(subst ','\'',$(1))'
+XUM_BACKEND_SOCKET := $(shell bun scripts/devServerSocketPath.ts $(call shq,$(or $(XDG_RUNTIME_DIR),/tmp)/xum-dev-$(shell id -u)) $(call shq,b$(XUM_BACKEND_PORT)-$(subst /,_,$(subst :,_,$(XUM_BACKEND_HOST))).sock))
+ifeq ($(XUM_BACKEND_SOCKET),)
+$(error no private folder for the dev-server socket (the reason is above, or bun is not on PATH): set XUM_BACKEND_SOCKET to a socket path in a folder that only you can write to, or XDG_RUNTIME_DIR to such a folder)
+endif
+endif
+export XUM_BACKEND_SOCKET
+endif
+else
+# The Windows recipe starts the backend on TCP only: an ambient path must not reach the Vite proxy.
+override XUM_BACKEND_SOCKET :=
+endif
+
 # Use PATH-resolved bash for portability across different systems.
 # - Windows: /usr/bin/bash doesn't exist in Chocolatey's make environment or GitHub Actions
 # - NixOS: /bin/bash doesn't exist, bash is in /nix/store/...
@@ -90,14 +143,15 @@ include fmt.mk
 
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
-.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
+.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config check-no-css-zoom typecheck static-check static-check-full
 .PHONY: crap crap-check test-crap-scripts tree-sitter-grammars dry-check test-dry-scripts mutate-check test-mutate-scripts
+.PHONY: formal-check
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-host-proof test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
-.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
+.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook test-storybook-webkit test-storybook-paint-fixtures storybook-budget
 .PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
@@ -189,26 +243,29 @@ dev-server: node_modules/.installed build-main ## Start server mode with hot rel
 	@echo "Starting dev-server..."
 	@echo "  Backend (IPC/WebSocket): http://$(XUM_BACKEND_HOST):$(XUM_BACKEND_PORT)"
 	@echo "  Frontend (with HMR):     http://$(XUM_VITE_HOST):$(XUM_VITE_PORT)"
+	@echo "  Auth:                    $(if $(DEV_SERVER_AUTH_FLAG),DISABLED (XUM_DEV_SERVER_NO_AUTH=1). Any local account can control this backend.,token required (not printed). It is in server.lock under XUM_ROOT. Open the frontend with /?token=<token>.)"
 	@echo ""
 	@echo "For remote access: make dev-server XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host>"
 	@# On Windows, use npm run because bunx doesn't correctly pass arguments
 	@npm x concurrently -k \
 		"nodemon --watch src --watch tsconfig.main.json --watch tsconfig.json --ext ts,tsx,json,js --ignore dist --ignore node_modules scripts/build-main-watch.js" \
 		'npx esbuild src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
-		"set NODE_ENV=development&& nodemon --watch dist/cli/index.js --watch dist/cli/server.js --delay 500ms dist/cli/index.js server --no-auth --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)" \
+		"set NODE_ENV=development&& nodemon --watch dist/cli/index.js --watch dist/cli/server.js --delay 500ms dist/cli/index.js server $(DEV_SERVER_AUTH_FLAG) --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)" \
 		"set XUM_VITE_HOST=$(XUM_VITE_HOST)&& set XUM_VITE_PORT=$(XUM_VITE_PORT)&& set XUM_VITE_ALLOWED_HOSTS=$(XUM_VITE_ALLOWED_HOSTS)&& set XUM_BACKEND_HOST=$(XUM_BACKEND_HOST)&& set XUM_BACKEND_PORT=$(XUM_BACKEND_PORT)&& vite"
 else
 dev-server: node_modules/.installed build-main ## Start server mode with hot reload. Use XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host> for remote access
 	@echo "Starting dev-server..."
 	@echo "  Backend (IPC/WebSocket): http://$(XUM_BACKEND_HOST):$(XUM_BACKEND_PORT)"
 	@echo "  Frontend (with HMR):     http://$(XUM_VITE_HOST):$(XUM_VITE_PORT)"
+	@echo "  Auth:                    $(if $(DEV_SERVER_AUTH_FLAG),DISABLED (XUM_DEV_SERVER_NO_AUTH=1). Any local account can control this backend.,token required (not printed). It is in server.lock under XUM_ROOT. Open the frontend with /?token=<token>.)"
+	@echo "  Vite -> backend:         Unix socket $$XUM_BACKEND_SOCKET"
 	@echo ""
 	@echo "For remote access: make dev-server XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host>"
 	@# Keep tsgo -> tsc-alias sequential to avoid transient unresolved @/ imports in dist during restarts.
 	@bun x concurrently -k \
 		"bun x nodemon --watch src --watch tsconfig.main.json --watch tsconfig.json --ext ts,tsx,json,js --ignore dist --ignore node_modules --exec 'node scripts/build-main-watch.js'" \
 		'$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
-		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server --no-auth --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
+		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server $(DEV_SERVER_AUTH_FLAG) --unix-socket \"\$$XUM_BACKEND_SOCKET\" --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
 		"XUM_VITE_HOST=$(XUM_VITE_HOST) XUM_VITE_PORT=$(XUM_VITE_PORT) XUM_VITE_ALLOWED_HOSTS=$(XUM_VITE_ALLOWED_HOSTS) XUM_BACKEND_HOST=$(XUM_BACKEND_HOST) XUM_BACKEND_PORT=$(XUM_BACKEND_PORT) vite"
 endif
 
@@ -236,14 +293,14 @@ bug-bash: ## Agent bug bash in the bug-bash sandbox: e2e explore charters x mode
 	@bun tests/bugbash/run.ts $(BUGBASH_ARGS)
 
 # The bug-bash sandbox image (tests/bugbash/sandbox/build.sh, #5714). Each prints one value on
-# stdout. Publishing runs only in the manual "Bug-bash sandbox image" workflow on main.
+# stdout. Publishing runs only in the "Bug-bash sandbox image" workflow on main.
 bugbash-sandbox-key: ## Print the inputs key of the bug-bash sandbox image for this checkout
 	@./tests/bugbash/sandbox/build.sh --key
 
 bugbash-sandbox-image: ## Build the bug-bash sandbox image locally (linux/amd64) and print its image ID
 	@./tests/bugbash/sandbox/build.sh
 
-bugbash-sandbox-publish: ## Workflow only: build and push the bug-bash sandbox image, print its image.json record
+bugbash-sandbox-publish: ## Workflow only: build and push the bug-bash sandbox image, print its publish record
 	@./tests/bugbash/sandbox/build.sh --push
 
 # The sandbox self-check (tests/bugbash/sandbox/selfCheckRun.ts, #5714): three jobs through the real
@@ -539,7 +596,7 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 # (.oxlintrc.json, kept in step by check-oxlint-config); static-check-full also runs type-aware
 # ESLint on all files, so CI still catches what oxlint cannot check, including type-aware
 # findings that a change surfaces in files it did not touch.
-STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config lint-shellcheck lint-hadolint
+STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config check-no-css-zoom lint-shellcheck lint-hadolint
 
 static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
 
@@ -570,14 +627,20 @@ crap-check: ## CRAP gate on files changed since BASE (default: merge-base with o
 
 CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --locked --quiet --only-group crap --only-group test python
 
-# tree-sitter-language-pack downloads its grammars from GitHub releases on
-# first use. The script tests are in static-check-full (Required), so retry a
-# transient failure there (seen: HTTP 504) once, before any test uses them.
+# tree-sitter-language-pack downloads its grammars from GitHub releases on first use. The
+# script tests are in static-check-full (Required), so a transient failure there (seen: HTTP
+# 504) must not fail the job before any test uses the grammars. The script checks the pack's
+# manifest and bundle against sha256 pins that it holds, and then calls the pack's download(),
+# which extracts the grammars from them (and fetches them when they are missing). CI sets
+# GRAMMAR_STAGE_DIR to the directory that it caches, which holds only those two files, so a
+# cache hit needs no network (pr.yml's "Restore tree-sitter grammars" step). A cold cache gets
+# a budget of 15 minutes: the 504 outage of 2026-11-08 outlasted the old 3 tries 10 s apart.
+# The default keeps an offline local run short. The script exits 64 on an HTTP 4xx that no
+# retry changes, and on files that do not match the pins. A language added to `LANGUAGES` in
+# the script needs no new key: the key hashes the script.
+GRAMMAR_DOWNLOAD_BUDGET_SECS ?= 60
 tree-sitter-grammars:
-	@for attempt in 1 2 3; do \
-		$(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])' && break; \
-		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
-	done
+	@./scripts/retry.sh --budget-secs $(GRAMMAR_DOWNLOAD_BUDGET_SECS) --max-backoff-secs 60 --fatal-status 64 0 2 env $(CRAP_PYTHON) scripts/ci/download_tree_sitter_grammars.py
 
 test-crap-scripts: tree-sitter-grammars ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
 	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
@@ -611,11 +674,20 @@ test-mutate-scripts: tree-sitter-grammars ## Test the mutation runner and mutate
 	@$(MUTATE_PYTHON) -m pytest -q -p no:cacheprovider scripts/mutate/mutate_report_test.py
 	@bun test ./scripts/mutate/check.test.ts
 
+formal-check: ## Model-check that a Stop ends the auto-retry loop (TLA+/TLC, Java 11+; see .xum/skills/formal-stop-retry)
+	@./.xum/skills/formal-stop-retry/check.sh
+
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
 
 check-oxlint-config: node_modules/.installed ## Fail when .oxlintrc.json applies different rules than eslint.config.mjs to any lint file
 	@node scripts/check-oxlint-config.mjs
+
+# CSS zoom lays out differently in Safari than in Chromium: iPhone Safari painted a Mermaid
+# diagram far outside its frame. TS and TSX are covered by local/no-css-zoom.
+check-no-css-zoom: node_modules/.installed ## Fail when a tracked CSS, HTML or SVG file declares the zoom property
+	@bun test ./scripts/check-no-css-zoom.test.ts
+	@bun scripts/check-no-css-zoom.ts
 
 # <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
 check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
@@ -725,15 +797,19 @@ check-deadcode: node_modules/.installed ## Check for potential dead code (manual
 		|| echo "✓ No obvious dead code found"
 
 ## Testing
-.PHONY: test-codex-comments test-pr-checks test-required-superseded
+.PHONY: test-codex-comments test-pr-checks test-required-superseded test-branch-sync-guard
 test-codex-comments: ## Test Codex comment gates with offline GitHub fixtures
 	@python3 scripts/check_codex_comments_test.py
 
-test-pr-checks: ## Test PR check discovery and readiness with offline GitHub fixtures
+test-pr-checks: ## Test PR check discovery, readiness and the PR state watcher with offline GitHub fixtures
 	@python3 scripts/pr_checks_test.py
+	@python3 scripts/watch_pr_state_test.py
 
 test-required-superseded: ## Test the Required stand-down decision for cancelled duplicate PR runs
 	@python3 scripts/required_superseded_test.py
+
+test-branch-sync-guard: ## Test the wait_pr_* checkout guard against real git clones with offline GitHub fixtures
+	@python3 scripts/branch_sync_guard_test.py
 
 test-integration: node_modules/.installed build-main ## Run all tests (unit + integration)
 	@bun test src
@@ -823,15 +899,22 @@ ensure-mac-sharp-runtime-deps: node_modules/.installed
 		fi; \
 	done
 
+# ELECTRON_ZIP_DIR (CI sets it, from setup-xum's electron-zip input) names the directory of the
+# checksum-checked electron-v<version>-<platform>-<arch>.zip files. electron-builder then unpacks
+# them and downloads nothing: its own download retries nothing, and a github.com 504 failed
+# Build / Linux in five queue runs on 2026-11-08. The directory must hold the zip of every arch
+# the call builds, or electron-builder looks for an unpacked Electron there and fails.
+ELECTRON_DIST_FLAG = $(if $(ELECTRON_ZIP_DIR),-c.electronDist="$(ELECTRON_ZIP_DIR)")
+
 dist-mac: build ## Build macOS distributables (x64 + arm64)
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@if [ -n "$$CSC_LINK" ]; then \
 		echo "🔐 Code signing enabled - using unified build for correct yml..."; \
-		bun x electron-builder --mac --x64 --arm64 --publish never; \
+		bun x electron-builder --mac --x64 --arm64 --publish never $(ELECTRON_DIST_FLAG); \
 	else \
 		echo "Building macOS architectures in parallel..."; \
-		bun x electron-builder --mac --x64 --publish never & pid1=$$! ; \
-		bun x electron-builder --mac --arm64 --publish never & pid2=$$! ; \
+		bun x electron-builder --mac --x64 --publish never $(ELECTRON_DIST_FLAG) & pid1=$$! ; \
+		bun x electron-builder --mac --arm64 --publish never $(ELECTRON_DIST_FLAG) & pid2=$$! ; \
 		wait $$pid1 && wait $$pid2; \
 	fi
 	@# electron-updater skips an update when os.release() (the Darwin version) is below the
@@ -850,12 +933,12 @@ MAC_TARGETS ?=
 dist-mac-x64: build ## Build macOS x64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS x64..."
-	@bun x electron-builder --mac $(MAC_TARGETS) --x64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --x64 --publish never $(ELECTRON_DIST_FLAG)
 
 dist-mac-arm64: build ## Build macOS arm64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS arm64..."
-	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never $(ELECTRON_DIST_FLAG)
 
 install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Applications
 	@app_bundle="$$(bun -e 'import { resolveMacPackagedAppNames } from "./src/common/compat/macPackagedApp.ts"; import pkg from "./package.json"; process.stdout.write(resolveMacPackagedAppNames(pkg.build).appBundleName)')"; \
@@ -865,13 +948,13 @@ install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Appli
 	echo "Installed $$app_bundle to /Applications"
 
 dist-win: build ## Build Windows distributable
-	@bun x electron-builder --win --publish never
+	@bun x electron-builder --win --publish never $(ELECTRON_DIST_FLAG)
 
 dist-linux: build ## Build Linux distributable
-	@bun x electron-builder --linux --publish never
+	@bun x electron-builder --linux --publish never $(ELECTRON_DIST_FLAG)
 
 dist-linux-arm64: build ## Build Linux arm64 distributable
-	@bun x electron-builder --linux --arm64 --publish never
+	@bun x electron-builder --linux --arm64 --publish never $(ELECTRON_DIST_FLAG)
 
 # MAC_ARCH=x64|arm64 validates a single-arch build (dist-mac-<arch>) instead of both.
 check-mac-attach-file-runtime: ## Validate packaged macOS attach_file runtime assets (requires prior dist-mac build)
@@ -936,6 +1019,20 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 	$(check_node_version)
 	@# Storybook story transitions can exceed Jest's default 15s timeout on loaded CI runners.
 	@bun x test-storybook --testTimeout 30000
+
+# The runner opens the Storybook page once for every story file it is given, so only the files
+# that name a tag are visited.
+WEBKIT_STORY_FILES = $(shell grep -rlF -e '"webkit"' -e '"paint-check"' src/browser --include='*.stories.tsx')
+
+test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" or "paint-check" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)
+	$(check_node_version)
+	@test -n "$(WEBKIT_STORY_FILES)" || { echo "No story has the webkit or paint-check tag"; exit 1; }
+	@# paint-fixture stories are built to fail or to pass on purpose, so only test-storybook-paint-fixtures runs them.
+	@bun x test-storybook --browsers webkit --includeTags webkit paint-check --excludeTags paint-fixture --testTimeout 30000 $(WEBKIT_STORY_FILES)
+
+test-storybook-paint-fixtures: node_modules/.installed ## Prove the paint-check runner's guards still fire, with stories built to trip them (requires Storybook to be running or built; STORYBOOK_URL, default http://127.0.0.1:6006)
+	$(check_node_version)
+	@bun scripts/check-paint-check-fixtures.ts
 
 storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (requires Storybook served; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)

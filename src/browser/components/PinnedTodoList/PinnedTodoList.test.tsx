@@ -1,13 +1,12 @@
 import { cleanup, fireEvent, render, type RenderResult } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import {
   useWorkspaceStoreRaw as getWorkspaceStoreRaw,
   type WorkspaceState,
 } from "@/browser/stores/WorkspaceStore";
-import { getPinnedTodoExpandedKey } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
+import { ChatActivityPanelsProvider } from "../ChatPane/chatActivityPanels";
 import { PinnedTodoList } from "./PinnedTodoList";
 
 interface MockWorkspaceState {
@@ -92,12 +91,17 @@ const defaultTodos: TodoItem[] = [
   { content: "Run typecheck", status: "pending" },
 ];
 
+// Rendered where the app renders it: as a chip in the composer's live line.
 function renderPinnedTodoList(workspaceId: string): RenderResult {
-  return render(<PinnedTodoList workspaceId={workspaceId} />);
+  return render(
+    <ChatActivityPanelsProvider>
+      <PinnedTodoList workspaceId={workspaceId} />
+    </ChatActivityPanelsProvider>
+  );
 }
 
 function getHeader(renderResult: RenderResult): HTMLElement {
-  return renderResult.getByRole("button", { name: /todo/i });
+  return renderResult.getByRole("button", { name: /^todo/i });
 }
 
 describe("PinnedTodoList", () => {
@@ -131,18 +135,35 @@ describe("PinnedTodoList", () => {
     workspaceSubscribers.clear();
   });
 
-  test("renders expanded by default when todos exist", () => {
-    seedWorkspaceState("ws-expanded", { todos: defaultTodos });
+  test("opens closed and names the in-progress step on its chip", () => {
+    seedWorkspaceState("ws-closed", { todos: defaultTodos });
 
-    const renderResult = renderPinnedTodoList("ws-expanded");
+    const renderResult = renderPinnedTodoList("ws-closed");
 
-    expect(renderResult.getByText("Add tests")).toBeTruthy();
+    expect(getHeader(renderResult).textContent).toContain("Add tests");
+    expect(renderResult.queryByText("Run typecheck")).toBeNull();
+  });
+
+  test("names the first pending step when nothing is in progress", () => {
+    seedWorkspaceState("ws-pending", {
+      todos: [
+        { content: "Add tests", status: "completed" },
+        { content: "Run typecheck", status: "pending" },
+        { content: "Open PR", status: "pending" },
+      ],
+    });
+
+    const renderResult = renderPinnedTodoList("ws-pending");
+
+    expect(getHeader(renderResult).textContent).toContain("Run typecheck");
+    expect(getHeader(renderResult).textContent).not.toContain("Open PR");
   });
 
   test("spins the HTML wrapper instead of the in-progress SVG", () => {
     seedWorkspaceState("ws-composited-spinner", { todos: defaultTodos });
 
     const renderResult = renderPinnedTodoList("ws-composited-spinner");
+    fireEvent.click(getHeader(renderResult));
     const spinner = renderResult.container.querySelector(".animate-spin");
     const icon = spinner?.querySelector("svg");
 
@@ -156,48 +177,18 @@ describe("PinnedTodoList", () => {
 
     const renderResult = renderPinnedTodoList("ws-empty");
 
-    expect(renderResult.container.firstChild).toBeNull();
+    expect(renderResult.container.querySelector("[data-activity-chip]")).toBeNull();
   });
 
-  test("reads a persisted collapsed state on mount", () => {
-    const workspaceId = "ws-collapsed";
-    seedWorkspaceState(workspaceId, { todos: defaultTodos });
-    globalThis.localStorage.setItem(getPinnedTodoExpandedKey(workspaceId), JSON.stringify(false));
+  test("the chip opens and closes the list", () => {
+    seedWorkspaceState("ws-toggle", { todos: defaultTodos });
 
-    const renderResult = renderPinnedTodoList(workspaceId);
-
-    expect(renderResult.queryByText("Add tests")).toBeNull();
-  });
-
-  test("manual header click collapses and re-expands while persisting state", () => {
-    const workspaceId = "ws-toggle";
-    seedWorkspaceState(workspaceId, { todos: defaultTodos });
-
-    const renderResult = renderPinnedTodoList(workspaceId);
+    const renderResult = renderPinnedTodoList("ws-toggle");
 
     fireEvent.click(getHeader(renderResult));
-    expect(renderResult.queryByText("Add tests")).toBeNull();
-    expect(readPersistedState(getPinnedTodoExpandedKey(workspaceId), true)).toBe(false);
+    expect(renderResult.getByText("Run typecheck")).toBeTruthy();
 
     fireEvent.click(getHeader(renderResult));
-    expect(renderResult.getByText("Add tests")).toBeTruthy();
-    expect(readPersistedState(getPinnedTodoExpandedKey(workspaceId), false)).toBe(true);
-  });
-
-  test("persists expansion state per workspace instead of globally", () => {
-    seedWorkspaceState("ws-a", { todos: defaultTodos });
-    seedWorkspaceState("ws-b", { todos: defaultTodos });
-
-    const firstRender = renderPinnedTodoList("ws-a");
-    fireEvent.click(getHeader(firstRender));
-
-    expect(firstRender.queryByText("Add tests")).toBeNull();
-    expect(readPersistedState(getPinnedTodoExpandedKey("ws-a"), true)).toBe(false);
-    expect(readPersistedState(getPinnedTodoExpandedKey("ws-b"), true)).toBe(true);
-
-    firstRender.unmount();
-    const secondRender = renderPinnedTodoList("ws-b");
-
-    expect(secondRender.getByText("Add tests")).toBeTruthy();
+    expect(renderResult.queryByText("Run typecheck")).toBeNull();
   });
 });

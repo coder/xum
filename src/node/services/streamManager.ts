@@ -5,7 +5,7 @@ import {
   estimateAnchoredRequestTokensForModel,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
-import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { getRequestAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { type ContinuousPrefixSwap } from "./continuousCompactionJournal";
 import type { Scope } from "effect";
 import { type streamText, type stepCountIs } from "ai";
@@ -1014,7 +1014,7 @@ export class StreamManager {
         effectiveThinkingLevel: ThinkingLevelSchema.parse(info.thinkingLevel ?? "off"),
         modelString: info.model,
         providerForMessages: info.metadataModel.split(":", 1)[0],
-        anthropicCacheTtl: getAnthropicCacheTtl(info.request.providerOptions),
+        anthropicCacheTtl: getRequestAnthropicCacheTtl(info.request),
         ...(deferLoadingToolNames.length > 0 ? { deferLoadingToolNames } : {}),
       },
     };

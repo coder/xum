@@ -218,6 +218,21 @@ export function findWorkspaceEntry(
 }
 
 /**
+ * Attempt compare-and-swap for a task-row write made on behalf of one attempt (stream end, report
+ * publication, recovery, terminal failure, resume rollback). Evaluated inside the write's own
+ * editWorkspaceEntry transform: true when the caller captured an attempt and the row now names
+ * another one — another writer (e.g. a second backend) re-admitted it, so the row is theirs and
+ * the write is abandoned. A write with no captured attempt (legacy/pre-identity) is never held
+ * back, which keeps today's behavior for it.
+ */
+export function rowSupersedes(
+  row: Pick<WorkspaceConfigEntry, "taskAttemptId"> | undefined,
+  expectedAttemptId: string | null | undefined
+): boolean {
+  return expectedAttemptId != null && row?.taskAttemptId !== expectedAttemptId;
+}
+
+/**
  * Walk the parentWorkspaceId chain to compute task nesting depth.
  * Detects cycles (max 32 hops).
  */

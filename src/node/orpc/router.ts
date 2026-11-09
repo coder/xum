@@ -67,10 +67,6 @@ import {
   revokeMcpAppViewDomains,
 } from "@/node/services/mcpAppsOperations";
 import {
-  listArtifactVersions,
-  readArtifactVersion,
-} from "@/node/services/artifactVersionsOperations";
-import {
   listPinnedFiles,
   pinFile,
   readPinnedFile,
@@ -844,7 +840,9 @@ export const router = (authToken?: string) => {
       deleteCreation: t
         .input(schemas.drafts.deleteCreation.input)
         .output(schemas.drafts.deleteCreation.output)
-        .handler(({ context, input }) => context.draftService.creation.delete(input.scope.draftId)),
+        .handler(({ context, input }) =>
+          context.draftService.creation.delete(input.scope.draftId, input.ifStored)
+        ),
       importLegacyCreation: t
         .input(schemas.drafts.importLegacyCreation.input)
         .output(schemas.drafts.importLegacyCreation.output)
@@ -1192,7 +1190,11 @@ export const router = (authToken?: string) => {
         .input(schemas.general.recordEditorOpen.input)
         .output(schemas.general.recordEditorOpen.output)
         .handler(async ({ context, input }) =>
-          context.workspaceService.recordExternalEditorOpen(input.workspaceId, input.launchToken)
+          context.workspaceService.recordExternalEditorOpen(
+            input.workspaceId,
+            input.launchToken,
+            input.remotePath
+          )
         ),
       rollbackEditorOpen: t
         .input(schemas.general.rollbackEditorOpen.input)
@@ -1759,14 +1761,6 @@ export const router = (authToken?: string) => {
         .input(schemas.artifacts.capabilities.input)
         .output(schemas.artifacts.capabilities.output)
         .handler(({ context, input }) => getArtifactsCapabilities(context, input)),
-      listVersions: t
-        .input(schemas.artifacts.listVersions.input)
-        .output(schemas.artifacts.listVersions.output)
-        .handler(({ context, input }) => listArtifactVersions(context, input)),
-      readVersion: t
-        .input(schemas.artifacts.readVersion.input)
-        .output(schemas.artifacts.readVersion.output)
-        .handler(({ context, input }) => readArtifactVersion(context, input)),
       listPinned: t
         .input(schemas.artifacts.listPinned.input)
         .output(schemas.artifacts.listPinned.output)
@@ -2147,7 +2141,7 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.preflightArchive.input)
         .output(schemas.workspace.preflightArchive.output)
         .handler(async ({ context, input }) =>
-          context.workspaceService.preflightArchive(input.workspaceId)
+          context.workspaceService.preflightArchiveWithSubagents(input.workspaceId)
         ),
       archive: t
         .input(schemas.workspace.archive.input)
@@ -2155,7 +2149,8 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.archive(
             input.workspaceId,
-            input.acknowledgedUntrackedPaths ?? undefined
+            input.acknowledgedUntrackedPaths ?? undefined,
+            { acknowledgedSubagentUntrackedPaths: input.acknowledgedSubagentUntrackedPaths }
           )
         ),
       unarchive: t
@@ -2567,6 +2562,12 @@ export const router = (authToken?: string) => {
         .output(schemas.workspace.getSessionUsage.output)
         .handler(async ({ context, input }) =>
           context.sessionUsageService.getSessionUsage(input.workspaceId)
+        ),
+      getSubagentUsage: t
+        .input(schemas.workspace.getSubagentUsage.input)
+        .output(schemas.workspace.getSubagentUsage.output)
+        .handler(async ({ context, input }) =>
+          context.sessionUsageService.getOpenSubagentUsage(input.workspaceId)
         ),
       getSessionUsageBatch: t
         .input(schemas.workspace.getSessionUsageBatch.input)

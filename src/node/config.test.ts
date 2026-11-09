@@ -6,7 +6,7 @@ import * as fs from "fs";
 import cjsFs from "fs";
 import * as os from "os";
 import { log } from "@/node/services/log";
-import { Config } from "./config";
+import { CONFIG_TREE_FIELDS, Config, MAX_LOGGED_METADATA_LOAD_FAILURES } from "./config";
 import {
   projectRegistrationLockFilePath,
   withProjectRegistrationLock,
@@ -23,6 +23,7 @@ import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { Workspace } from "@/common/types/project";
 
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
@@ -634,12 +635,15 @@ describe("Config", () => {
     });
 
     it("a config that cannot be serialized rejects the edit (#4444)", async () => {
-      const cyclic: Record<string, unknown> = {};
-      cyclic.self = cyclic;
+      // A BigInt is what JSON.stringify refuses at once. This test once used a cyclic object,
+      // and Bun's indented JSON.stringify of a cycle (the save writes with an indent) spent 3 s of
+      // CPU before it threw, which timed the test out on a loaded host. The edit still has to
+      // reject, whatever makes the config unserializable.
+      const unserializable = { value: 1n };
       const saveError = await config
         .editConfig((value) => ({
           ...value,
-          settingsBackup: cyclic as unknown as NonNullable<typeof value.settingsBackup>,
+          settingsBackup: unserializable as unknown as NonNullable<typeof value.settingsBackup>,
         }))
         .catch((error: unknown) => error);
 
@@ -4423,7 +4427,10 @@ describe("Config", () => {
 
       const metadata = await config.getAllWorkspaceMetadata();
       expect(metadata).toHaveLength(1);
-      expect(metadata[0]?.parentWorkspaceId).toBe("parent");
+      // A legacy row's task tree comes from config alone (CONFIG_TREE_FIELDS): no Xum build wrote
+      // a parent link into a legacy metadata.json, and one read from it would not survive the
+      // read-time migration.
+      expect(metadata[0]?.parentWorkspaceId).toBeUndefined();
       expect(metadata[0]?.bestOf).toBeUndefined();
 
       await flushConfigEdits();
@@ -5504,6 +5511,19 @@ describe("Config", () => {
       expect(new Config(tempDir).loadConfigOrDefault().agentAiDefaults?.exec?.subagent).toEqual(
         profile
       );
+    });
+
+    it("round-trips a per-agent prompt cache TTL without a legacy delegated mirror", async () => {
+      await config.updateAgentAiDefaults({ explore: { cacheTtl: "1h" }, exec: { cacheTtl: "2h" } });
+
+      expect(new Config(tempDir).loadConfigOrDefault().agentAiDefaults).toEqual({
+        explore: { cacheTtl: "1h" },
+      });
+      const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        subagentAiDefaults?: unknown;
+      };
+      // Older builds read the legacy map as a delegated model profile, which has no TTL.
+      expect(raw.subagentAiDefaults).toBeUndefined();
     });
 
     it("preserves explicit gateway-scoped model strings in nested AI defaults", async () => {
@@ -6639,6 +6659,234 @@ describe("Config", () => {
         .projects.get(projectPath)
         ?.workspaces.find((workspace) => workspace.path === workspacePath);
       expect(persisted?.id).toBe("live-generated-id");
+    });
+
+    describe("task-tree fields of a legacy row", () => {
+      // A migrated row reads as current-format, from the row alone. A task-tree value taken from
+      // the legacy metadata.json would hold for one read only, so every build takes them from the
+      // config row (see CONFIG_TREE_FIELDS): before the migration, after it, and after a restart.
+      const projectPath = "/fake/project";
+      const fileTree = {
+        parentWorkspaceId: "file-parent-id",
+        agentId: "explore",
+        taskStatus: "running",
+        taskPrompt: "Survey the repo",
+        taskIsolation: "none",
+        bestOf: { groupId: "file-group", index: 0, total: 2 },
+        delegatedCreationInterrupted: true,
+      } as const;
+      const pick = (source: object | undefined) =>
+        Object.fromEntries(
+          Object.keys(fileTree).map((key) => [key, (source as Record<string, unknown>)[key]])
+        );
+      const absent = pick({});
+      const workspacePath = () => path.join(config.srcDir, "project", "legacy-task");
+      const register = async (
+        row: Partial<Workspace>,
+        file: { id: string; tree?: object } = { id: "legacy-task-id", tree: fileTree }
+      ) => {
+        fs.mkdirSync(workspacePath(), { recursive: true });
+        fs.mkdirSync(path.join(config.sessionsDir, "legacy-task"), { recursive: true });
+        fs.writeFileSync(
+          path.join(config.sessionsDir, "legacy-task", "metadata.json"),
+          JSON.stringify({ id: file.id, name: "legacy-task", ...file.tree })
+        );
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, { workspaces: [{ path: workspacePath(), ...row }] });
+          return cfg;
+        });
+      };
+      const build = async (from: Config) =>
+        (await from.getAllWorkspaceMetadata({ probeCheckouts: false })).find(
+          (metadata) => metadata.id === "legacy-task-id"
+        );
+      const builds = async () => {
+        const first = pick(await build(config));
+        // The queued migration write lands before this no-op edit.
+        await config.editConfig((cfg) => cfg);
+        return [first, pick(await build(new Config(tempDir)))];
+      };
+
+      it("ignores the legacy file's values in every build", async () => {
+        await register({});
+        expect(await builds()).toEqual([absent, absent]);
+      });
+
+      it("ignores a stale file at a reused path in every build", async () => {
+        // A partially migrated row (an id, no name) whose checkout path an old workspace used.
+        await register({ id: "legacy-task-id" }, { id: "removed-workspace-id", tree: fileTree });
+        expect(await builds()).toEqual([absent, absent]);
+      });
+
+      it("serves the config row's values in every build", async () => {
+        const rowTree = { parentWorkspaceId: "row-parent-id", taskStatus: "reported" } as const;
+        await register(rowTree);
+        const expected = { ...absent, ...rowTree };
+        expect(await builds()).toEqual([expected, expected]);
+      });
+
+      it("takes every CONFIG_TREE_FIELDS value from the row in every build", async () => {
+        // One differing value per field in the row and in the file: dropping any field from the
+        // set lets the file's value through on the first build.
+        type TreeField = (typeof CONFIG_TREE_FIELDS)[number];
+        // Every field required, so a field added to the set needs a value here too.
+        const rowValues: Required<Pick<Workspace, TreeField>> = {
+          parentWorkspaceId: "row-parent",
+          agentType: "row-agent-type",
+          agentId: "row-agent",
+          workflowTask: { runId: "row-run", stepId: "row-step" },
+          taskStatus: "reported",
+          taskPendingGuidance: [{ id: "row-g", message: "row", queueDispatchMode: "turn-end" }],
+          taskLaunchError: "row launch error",
+          reportedAt: "2026-02-01T00:00:00.000Z",
+          taskModelString: "anthropic:row-model",
+          taskThinkingLevel: "high",
+          taskPrompt: "row prompt",
+          taskTrunkBranch: "row-trunk",
+          taskIsolation: "none",
+          sideChatParentWorkspaceId: "row-side-chat-parent",
+          taskDesktopOwnerWorkspaceId: "row-desktop-owner",
+          taskSticky: true,
+          taskExecutionId: "row-execution",
+          taskExecutionStatus: "completed",
+        };
+        const fileValues: Required<Pick<Workspace, TreeField>> = {
+          parentWorkspaceId: "file-parent",
+          agentType: "file-agent-type",
+          agentId: "file-agent",
+          workflowTask: { runId: "file-run", stepId: "file-step" },
+          taskStatus: "running",
+          taskPendingGuidance: [{ id: "file-g", message: "file", queueDispatchMode: "tool-end" }],
+          taskLaunchError: "file launch error",
+          reportedAt: "2026-03-01T00:00:00.000Z",
+          taskModelString: "anthropic:file-model",
+          taskThinkingLevel: "low",
+          taskPrompt: "file prompt",
+          taskTrunkBranch: "file-trunk",
+          taskIsolation: "fork",
+          sideChatParentWorkspaceId: "file-side-chat-parent",
+          taskDesktopOwnerWorkspaceId: "file-desktop-owner",
+          taskSticky: false,
+          taskExecutionId: "file-execution",
+          taskExecutionStatus: "running",
+        };
+        await register(rowValues, { id: "legacy-task-id", tree: fileValues });
+        const loadedRow = config
+          .loadConfigOrDefault()
+          .projects.get(projectPath)
+          ?.workspaces.find((workspace) => workspace.path === workspacePath());
+        const fields = (source: object | undefined) =>
+          Object.fromEntries(
+            CONFIG_TREE_FIELDS.map((key) => [key, (source as Record<string, unknown>)[key]])
+          );
+        // The row keeps every value through the config load, so each one differs from the file's.
+        expect(fields(loadedRow)).toEqual(rowValues);
+        const first = fields(await build(config));
+        // The queued migration write lands before this no-op edit.
+        await config.editConfig((cfg) => cfg);
+        const restarted = fields(await build(new Config(tempDir)));
+        expect([first, restarted]).toEqual([rowValues, rowValues]);
+      });
+
+      it("reads a row's own shared-checkout isolation in every build", async () => {
+        // The file holds identity only, as every file a Xum build wrote does: an isolation:none
+        // child must not read as owning its parent's checkout (removal would delete it).
+        const rowTree = { parentWorkspaceId: "row-parent-id", taskIsolation: "none" } as const;
+        await register(rowTree, { id: "legacy-task-id" });
+        const expected = { ...absent, ...rowTree };
+        expect(await builds()).toEqual([expected, expected]);
+      });
+    });
+
+    it("reports an entry built from its config row alone and still lists it in every build", async () => {
+      // A partially migrated row (an id, no name) whose legacy metadata.json does not parse: a
+      // lenient build fills its name and runtime with defaults, so callers that read its checkout
+      // must learn the id (fallbackIds). Builds without that out-parameter still list the entry.
+      const projectPath = "/fake/project";
+      const workspacePath = path.join(config.srcDir, "project", "half-migrated");
+      const healthyPath = path.join(config.srcDir, "project", "healthy");
+      fs.mkdirSync(workspacePath, { recursive: true });
+      fs.mkdirSync(healthyPath, { recursive: true });
+      const sessionDir = path.join(config.sessionsDir, "half-migrated");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(path.join(sessionDir, "metadata.json"), "{ not json");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            { path: workspacePath, id: "half-migrated-id" },
+            { path: healthyPath, id: "healthy-id", name: "healthy" },
+          ],
+        });
+        return cfg;
+      });
+
+      const fallbackIds = new Set<string>();
+      const registry = await config.getAllWorkspaceMetadata({ probeCheckouts: false, fallbackIds });
+      expect(registry.map((metadata) => metadata.id).sort()).toEqual([
+        "half-migrated-id",
+        "healthy-id",
+      ]);
+      expect([...fallbackIds]).toEqual(["half-migrated-id"]);
+      const probed = await config.getAllWorkspaceMetadata({ persistMigrations: false });
+      expect(probed.map((metadata) => metadata.id)).toContain("half-migrated-id");
+      expect((await config.findWorkspaceMetadata("half-migrated-id"))?.id).toBe("half-migrated-id");
+    });
+
+    describe("metadata load failure logs", () => {
+      // Id-less legacy rows whose metadata.json does not parse: every lenient build fails them
+      // again (a degraded build is not memoized), and MCP override reads build once per read.
+      const registerBroken = async (names: readonly string[]) => {
+        for (const name of names) {
+          fs.mkdirSync(path.join(config.srcDir, "project", name), { recursive: true });
+          fs.mkdirSync(path.join(config.sessionsDir, name), { recursive: true });
+          fs.writeFileSync(path.join(config.sessionsDir, name, "metadata.json"), "{ not json");
+        }
+        await config.editConfig((cfg) => {
+          cfg.projects.set("/fake/project", {
+            workspaces: names.map((name) => ({ path: path.join(config.srcDir, "project", name) })),
+          });
+          return cfg;
+        });
+      };
+      const breakAs = (name: string, raw: string) =>
+        fs.writeFileSync(path.join(config.sessionsDir, name, "metadata.json"), raw);
+      const build = () => config.getAllWorkspaceMetadata({ probeCheckouts: false });
+
+      it("logs each distinct failure with its stack once", async () => {
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          // The two rows fail with the same message.
+          await registerBroken(["broken-a", "broken-b"]);
+          await build();
+          await build();
+          expect(errorSpy).toHaveBeenCalledTimes(2);
+          // A new failure of one row logs again.
+          breakAs("broken-a", "[");
+          await build();
+          await build();
+          expect(errorSpy).toHaveBeenCalledTimes(3);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      it("forgets the oldest logged failure past its cap", async () => {
+        // A row whose message changes on every build must not grow the dedupe set without bound.
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await registerBroken(["broken-a"]);
+          for (let failure = 0; failure <= MAX_LOGGED_METADATA_LOAD_FAILURES; failure++) {
+            breakAs("broken-a", `x${failure}`);
+            await build();
+          }
+          expect(errorSpy).toHaveBeenCalledTimes(MAX_LOGGED_METADATA_LOAD_FAILURES + 1);
+          breakAs("broken-a", "x0");
+          await build();
+          expect(errorSpy).toHaveBeenCalledTimes(MAX_LOGGED_METADATA_LOAD_FAILURES + 2);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
     });
   });
 

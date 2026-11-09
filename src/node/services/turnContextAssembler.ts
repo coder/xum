@@ -67,6 +67,7 @@ import { getPlanFileHint, getPlanModeInstruction } from "@/common/utils/ui/modeU
 import { hasStartHerePlanSummary } from "@/common/utils/messages/startHerePlanSummary";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
+  backgroundHintField,
   readAgentDefinition,
   type AgentDefinitionRequestCache,
   resolveAgentBody,
@@ -1651,8 +1652,11 @@ export async function discoverAvailableSubagentsForToolContext(args: {
     return await desktopAvailablePromise;
   };
 
+  // Before resolveAgentFrontmatter: its catch below keeps the descriptor of an agent it cannot
+  // read, which would put an agent that refuses to spawn back into the list (RFC A2).
+  const spawnable = discovered.filter((descriptor) => descriptor.unavailableReason === undefined);
   const resolved = await Promise.all(
-    discovered.map(async (descriptor) => {
+    spawnable.map(async (descriptor) => {
       try {
         const resolvedFrontmatter = await resolveAgentFrontmatter(
           args.runtime,
@@ -1695,6 +1699,7 @@ export async function discoverAvailableSubagentsForToolContext(args: {
           // Important: descriptor.subagentRunnable comes from the agent's own frontmatter only.
           // Re-resolve with inheritance so derived agents inherit runnable: true from their base.
           subagentRunnable: resolvedFrontmatter.subagent?.runnable ?? false,
+          ...backgroundHintField(resolvedFrontmatter),
         };
       } catch (error) {
         // A failed read must not publish unverified sub-agent metadata (#4438, #4827).

@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useState } from "react";
 import { FileInput, Loader2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
+import {
+  useWaitingOnYou,
+  type WaitingOnYouEntry,
+} from "@/browser/components/ChatPane/WaitingOnYou";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useOptionalCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
@@ -25,6 +29,13 @@ export interface LegacyPlanImportNoticeProps {
  * it: Xum never imports it on its own, only when the user asks here or in the command palette.
  * The backend copies it (never replacing an existing plan) and leaves the legacy file in place.
  */
+const LEGACY_PLAN_ENTRY: WaitingOnYouEntry = {
+  icon: FileInput,
+  tab: "Old plan",
+  title: "Plan from an older Xum",
+  detail: "Check it is yours, then import it",
+};
+
 export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (props) => {
   const liveApi = useLiveAPI();
   const registerSource = useOptionalCommandRegistry()?.registerSource;
@@ -34,6 +45,9 @@ export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (pr
   // The notice keeps the reason but drops the button and the palette action, which could only
   // fail again. It goes away with the next mount, which asks the backend again.
   const [vanished, setVanished] = useState(false);
+  // Settled, the notice has nothing left for the user to do: it leaves the "Waiting on you" card
+  // and shows its reason inline.
+  useWaitingOnYou(vanished ? null : LEGACY_PLAN_ENTRY);
   // Synchronous guard: a click and the palette action can both land before the disabled state.
   const inFlightRef = useRef(false);
 

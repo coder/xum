@@ -82,7 +82,7 @@ export async function reviewedComponentConsent(args: {
       if (!directoryName.success) continue;
       let content: string;
       try {
-        content = pluginSkillMarkdown(dirName, await fs.readFile(file, "utf8"), skillsRoot.command);
+        content = pluginSkillMarkdown(dirName, await fs.readFile(file, "utf8"), skillsRoot);
       } catch {
         continue;
       }

@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
+import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { LocalRuntime } from "./LocalRuntime";
 import { setAgentCgroupEnrollmentTargets } from "./agentCgroupEnrollment";
@@ -109,6 +110,35 @@ describe("LocalBaseRuntime.resolvePath", () => {
     const resolved = await runtime.resolvePath(".");
     // Should resolve to absolute path
     expect(path.isAbsolute(resolved)).toBe(true);
+  });
+});
+
+describe("LocalBaseRuntime.exec process identity", () => {
+  it("keeps the child identity after exit", async () => {
+    const stream = await new TestLocalRuntime().exec('printf "%s" "$$"; read -r _; exit 7', {
+      cwd: os.tmpdir(),
+      timeout: 5,
+    });
+    const stdout = readStreamAsString(stream.stdout);
+    const stderr = readStreamAsString(stream.stderr);
+    try {
+      const evidence = stream.localProcess;
+      expect(evidence).toBeDefined();
+      if (!evidence) throw new Error("Missing local process identity");
+      expect(evidence.pid).not.toBe(process.pid);
+      expect(evidence.identity).toEqual({ ...getSelfIdentity(), birth: linuxBirth(evidence.pid) });
+      if (process.platform === "linux") {
+        expect(evidence.identity?.birth).toStartWith("linux-ticks:");
+      }
+      await stream.stdin.close();
+      expect(await stream.exitCode).toBe(7);
+      const shellPid = await stdout;
+      if (process.platform !== "win32") expect(shellPid).toBe(String(evidence.pid));
+      expect(stream.localProcess).toBe(evidence);
+    } finally {
+      await stream.stdin.close().catch(() => undefined);
+      await Promise.all([stream.exitCode, stdout, stderr]);
+    }
   });
 });
 

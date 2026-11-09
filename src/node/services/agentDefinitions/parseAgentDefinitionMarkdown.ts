@@ -4,7 +4,11 @@ import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { formatZodIssues, normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
 import YAML from "yaml";
 import { getErrorMessage } from "@/common/utils/errors";
-import { mapForeignPluginAgentFrontmatter } from "./pluginAgentFormat";
+import {
+  isForeignPluginAgentFormat,
+  isReadonlyForeignPluginAgent,
+  mapForeignPluginAgentFrontmatter,
+} from "./pluginAgentFormat";
 
 export class AgentDefinitionParseError extends Error {
   constructor(message: string) {
@@ -16,6 +20,18 @@ export class AgentDefinitionParseError extends Error {
 export interface ParsedAgentDefinitionMarkdown {
   frontmatter: AgentDefinitionFrontmatter;
   body: string;
+  /**
+   * A plugin agent that the Claude Code or Cursor mapping runs on Explore for `readonly: true` or a
+   * Claude read-only search list.
+   * The schema strips the key, so the install review reads it here (agentFiles.ts).
+   */
+  mappedReadonly: boolean;
+  /**
+   * A plugin agent in Claude Code or Cursor format (the mapping ran). The body of such an agent
+   * names its plugin folder with `${CLAUDE_PLUGIN_ROOT}`; a Xum-format plugin agent body is
+   * never rewritten.
+   */
+  foreign: boolean;
 }
 
 function assertObject(value: unknown, message: string): asserts value is Record<string, unknown> {
@@ -34,6 +50,17 @@ function mapFrontmatterForSource(
   } catch (err) {
     throw new AgentDefinitionParseError(getErrorMessage(err));
   }
+}
+
+function pluginFileFlags(
+  raw: Record<string, unknown>,
+  plugin: { agentId: string } | undefined
+): Pick<ParsedAgentDefinitionMarkdown, "mappedReadonly" | "foreign"> {
+  if (plugin === undefined) return { mappedReadonly: false, foreign: false };
+  return {
+    mappedReadonly: isReadonlyForeignPluginAgent(raw),
+    foreign: isForeignPluginAgentFormat(raw),
+  };
 }
 
 /**
@@ -104,5 +131,5 @@ export function parseAgentDefinitionMarkdown(input: {
     );
   }
 
-  return { frontmatter: parsed.data, body };
+  return { frontmatter: parsed.data, body, ...pluginFileFlags(raw, input.plugin) };
 }

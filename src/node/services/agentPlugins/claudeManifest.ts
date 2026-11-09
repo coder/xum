@@ -51,7 +51,7 @@ export interface NormalizedClaudeManifest {
 }
 
 /** Metadata keys that map one to one onto the Agent Plugins manifest. */
-const CLAUDE_METADATA_KEYS = [
+export const CLAUDE_METADATA_KEYS = [
   "name",
   "version",
   "description",
@@ -203,8 +203,16 @@ const HANDLED_CLAUDE_KEYS = new Set<string>([
   "hooks",
 ]);
 
-/** The metadata half of the manifest (with a synthesized `$schema`), warning on unknown keys. */
-function readMetadata(raw: Record<string, unknown>, warnings: string[]): Record<string, unknown> {
+/**
+ * The metadata half of a Claude or Cursor manifest (with a synthesized `$schema`), warning on each
+ * key that `isKnown` rejects. The Cursor plugin RFC gives Cursor metadata the Claude handling, so
+ * the two formats share this reader.
+ */
+export function readForeignMetadata(
+  raw: Record<string, unknown>,
+  warnings: string[],
+  format: { label: string; isKnown: (key: string) => boolean }
+): Record<string, unknown> {
   const manifest: Record<string, unknown> = { $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0 };
   for (const key of CLAUDE_METADATA_KEYS) {
     if (raw[key] !== undefined) manifest[key] = raw[key];
@@ -212,8 +220,8 @@ function readMetadata(raw: Record<string, unknown>, warnings: string[]): Record<
   if (raw.author !== undefined) manifest.author = readAuthor(raw.author, warnings);
   if (typeof raw.name === "string") manifest.name = claudePluginName(raw.name, warnings);
   for (const key of Object.keys(raw)) {
-    if (HANDLED_CLAUDE_KEYS.has(key) || SILENT_CLAUDE_KEYS.has(key)) continue;
-    warnings.push(`'${key}' is not supported in .claude-plugin/plugin.json; ignoring`);
+    if (format.isKnown(key)) continue;
+    warnings.push(`'${key}' is not supported in ${format.label}; ignoring`);
   }
   return manifest;
 }
@@ -305,7 +313,10 @@ export function normalizeClaudeManifest(
     label: options.label ?? CLAUDE_MANIFEST_LABEL,
     replaceDefaultSkills: options.replaceDefaultSkills ?? false,
   };
-  const manifest = readMetadata(raw, warnings);
+  const manifest = readForeignMetadata(raw, warnings, {
+    label: CLAUDE_MANIFEST_LABEL,
+    isKnown: (key) => HANDLED_CLAUDE_KEYS.has(key) || SILENT_CLAUDE_KEYS.has(key),
+  });
   const agents = agentsFolder(raw.agents, warnings);
   manifest.contributes = {
     ...skillsRoots(raw.skills, warnings, resolved),

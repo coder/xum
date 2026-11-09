@@ -7,6 +7,7 @@ import type { ProjectsConfig } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   AgentDefinitionRequestCache,
@@ -14,6 +15,7 @@ import {
   resolveAgentBody,
 } from "./agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "./agentDefinitions/resolveAgentInheritanceChain";
+import { resolveChainAgentCacheTtl } from "./agentDefinitions/resolveNodeAgentAiSettings";
 import * as agentDefinitionsService from "./agentDefinitions/agentDefinitionsService";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
@@ -1271,4 +1273,163 @@ describe("resolveAgentForStream caller tool policy keeps the advertised tool set
       error: "Tool 'bash' is disabled for this turn.",
     });
   });
+});
+
+describe("resolveAgentForStream agentAiSettingsChain (Cursor model: fast)", () => {
+  async function resolveChild(agentFrontmatter: string) {
+    using tempDir = new DisposableTempDir("agent-resolution-settings-base");
+    const projectPath = path.join(tempDir.path, "project");
+    const agentsRoot = path.join(projectPath, ".xum", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(agentsRoot, "ci-watcher.md"),
+      `---\nname: ci-watcher\nbase: exec\nsubagent:\n  runnable: true\n${agentFrontmatter}---\nWatch CI.\n`
+    );
+    const metadata = createSubagentMetadata({ projectPath, agentId: "ci-watcher" });
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { id: PARENT_WORKSPACE_ID, name: PARENT_WORKSPACE_ID, path: projectPath },
+              {
+                id: CHILD_WORKSPACE_ID,
+                name: CHILD_WORKSPACE_ID,
+                path: projectPath,
+                parentWorkspaceId: PARENT_WORKSPACE_ID,
+                agentId: "ci-watcher",
+                agentType: "ci-watcher",
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = path.join(tempDir.path, "xum-home");
+    try {
+      const result = await resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
+        workspaceId: CHILD_WORKSPACE_ID,
+        metadata,
+        runtime: new LocalRuntime(projectPath),
+        workspacePath: projectPath,
+        requestedAgentId: "exec",
+        disableWorkspaceAgents: false,
+        callerToolPolicy: undefined,
+        cfg,
+        emitError: () => undefined,
+      });
+      if (!result.success) throw new Error("Expected agent resolution to succeed");
+      return result.data;
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }
+
+  test("equals the inheritance chain for an agent without settingsBase", async () => {
+    const agent = await resolveChild("");
+    expect(agent.agentAiSettingsChain).toEqual(agent.agentInheritanceChain);
+  });
+
+  test("runs a fast agent's AI settings through Explore and keeps its own tool policy", async () => {
+    const fast = await resolveChild("ai:\n  settingsBase: explore\n");
+    const plain = await resolveChild("");
+    expect(fast.agentAiSettingsChain.map((hop) => hop.id)).toEqual([
+      "ci-watcher",
+      "explore",
+      "exec",
+    ]);
+    expect(fast.agentInheritanceChain.map((hop) => hop.id)).toEqual(["ci-watcher", "exec"]);
+    // Explore's built-in prompt-cache TTL, with no Settings entry setting one.
+    expect(resolveChainAgentCacheTtl("ci-watcher", undefined, fast.agentAiSettingsChain)).toBe(
+      "5m"
+    );
+    expect(fast.effectiveToolPolicy).toEqual(plain.effectiveToolPolicy);
+  });
+});
+
+describe("resolveAgentForStream with an unreachable foreign plugin agent (plugin install methods RFC, A4)", () => {
+  test("a foreign plugin exec that names its plugin folder, on an SSH workspace, leaves main-chat resolution and a base chain through exec unchanged", async () => {
+    using hostHome = new DisposableTempDir("agent-resolution-unreachable-home");
+    using checkoutDir = new DisposableTempDir("agent-resolution-unreachable-checkout");
+    const checkout = await fs.realpath(checkoutDir.path);
+    const pluginDir = path.join(hostHome.path, "plugins", "egm");
+    await fs.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "egm",
+      })
+    );
+    await fs.writeFile(
+      path.join(pluginDir, "agents", "exec.md"),
+      "---\nname: Plugin Exec\ndescription: Foreign exec\n---\nRead ${CLAUDE_PLUGIN_ROOT}/agents/exec.md\n"
+    );
+    await fs.mkdir(path.join(checkout, ".xum", "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(checkout, ".xum", "agents", "child.md"),
+      "---\nname: Child\nbase: exec\n---\nChild body\n"
+    );
+    const runtime = new HostKeyShellRemoteRuntime(checkout, "agent-resolution-unreachable");
+    const metadata: WorkspaceMetadata = {
+      id: "main-workspace",
+      name: "main-workspace",
+      projectName: path.basename(checkout),
+      projectPath: checkout,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          checkout,
+          {
+            trusted: true,
+            workspaces: [{ id: "main-workspace", name: "main-workspace", path: checkout }],
+          },
+        ],
+      ]),
+    };
+    const resolve = (requestedAgentId: string) =>
+      resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
+        workspaceId: "main-workspace",
+        metadata,
+        runtime,
+        workspacePath: checkout,
+        requestedAgentId,
+        disableWorkspaceAgents: false,
+        callerToolPolicy: undefined,
+        cfg,
+        emitError: () => undefined,
+      });
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = hostHome.path;
+    try {
+      // The main chat resolves the plugin's `exec` with the placeholder as written, because only
+      // a `task` spawn refuses an unreachable folder.
+      const exec = await resolve("exec");
+      expect(exec.success).toBe(true);
+      if (!exec.success) return;
+      expect(exec.data.effectiveAgentId).toBe("exec");
+      expect(exec.data.agentDefinition.scope).toBe("global");
+      expect(exec.data.agentDefinition.body).toContain("${CLAUDE_PLUGIN_ROOT}/agents/exec.md");
+
+      const child = await resolve("child");
+      expect(child.success).toBe(true);
+      if (!child.success) return;
+      expect(child.data.effectiveAgentId).toBe("child");
+      expect(child.data.agentInheritanceChain.map((entry) => `${entry.id}:${entry.scope}`)).toEqual(
+        ["child:project", "exec:global", "exec:built-in"]
+      );
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }, 60_000);
 });

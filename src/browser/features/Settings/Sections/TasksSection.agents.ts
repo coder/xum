@@ -29,6 +29,9 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
     description: "History compaction (internal)",
     uiSelectable: false,
     subagentRunnable: false,
+    aiDefaults: {
+      cacheTtl: "5m",
+    },
   },
   {
     id: "desktop",
@@ -77,6 +80,9 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
     uiSelectable: false,
     subagentRunnable: true,
     base: "exec",
+    aiDefaults: {
+      cacheTtl: "5m",
+    },
   },
   {
     id: "name_workspace",

@@ -59,23 +59,35 @@ export async function listPluginSkillScripts(plugin: {
   skillsDirs?: PluginSkillsRoot[];
   skillsOnly?: true;
   claudeFallback?: true;
+  cursorFallback?: true;
 }): Promise<Array<{ file: string; filePath: string }>> {
   const scripts: Array<{ file: string; filePath: string }> = [];
   // A skills-only package runs no scripts, so none is offered for review either.
   if (plugin.skillsOnly === true) return scripts;
   // A Claude Code package runs no Xum code, so none of its skill scripts is offered for review.
   if (plugin.claudeFallback === true) return scripts;
+  // Nor does a Cursor package.
+  if (plugin.cursorFallback === true) return scripts;
   for (const skillsRoot of plugin.skillsDirs ?? []) {
-    // A Claude command's folder is the commands folder, not a skill folder: no script of its own.
-    if (skillsRoot.command) continue;
-    for (const { name, dir } of await listPluginSkillFolders(skillsRoot)) {
-      // Only a folder the runtime loads as a skill: a valid skill name with a SKILL.md.
-      if (!SkillNameSchema.safeParse(name).success) continue;
-      if (!(await isFileOrLink(path.join(dir, "SKILL.md")))) continue;
-      const filePath = path.join(dir, SKILL_WORKFLOW_ENTRY);
-      if (!(await isFileOrLink(filePath))) continue;
-      scripts.push({ file: pluginSkillScriptKey(plugin.rootPath, filePath), filePath });
-    }
+    scripts.push(...(await skillsRootScripts(plugin.rootPath, skillsRoot)));
+  }
+  return scripts;
+}
+
+async function skillsRootScripts(
+  pluginRoot: string,
+  skillsRoot: PluginSkillsRoot
+): Promise<Array<{ file: string; filePath: string }>> {
+  // A Claude command's folder is the commands folder, not a skill folder: no script of its own.
+  if (skillsRoot.command) return [];
+  const scripts: Array<{ file: string; filePath: string }> = [];
+  for (const { name, dir } of await listPluginSkillFolders(skillsRoot)) {
+    // Only a folder the runtime loads as a skill: a valid skill name with a SKILL.md.
+    if (!SkillNameSchema.safeParse(name).success) continue;
+    if (!(await isFileOrLink(path.join(dir, "SKILL.md")))) continue;
+    const filePath = path.join(dir, SKILL_WORKFLOW_ENTRY);
+    if (!(await isFileOrLink(filePath))) continue;
+    scripts.push({ file: pluginSkillScriptKey(pluginRoot, filePath), filePath });
   }
   return scripts;
 }

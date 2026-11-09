@@ -105,6 +105,12 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     return "devcontainer";
   }
 
+  /** Runtime.mode. A prototype getter, like `location`, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- same as location: Object.create(X.prototype) doubles would read undefined from a readonly field
+  get mode(): "devcontainer" {
+    return "devcontainer";
+  }
+
   private readonly worktreeManager: WorktreeManager;
   private readonly configPath: string;
   /** In-container stops started by aborts and timeouts and not finished yet (#6923). */

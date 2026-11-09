@@ -39,6 +39,11 @@ import { buildShellExport } from "./shellEnv";
 import { hostChildEnv, mergeChildEnv, sanitizeXumChildEnv } from "./childProcessEnv";
 import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import { agentCgroupEnrollmentLineForProject } from "./agentCgroupEnrollment";
+import {
+  getSelfIdentity,
+  linuxBirth,
+  type HolderEvidence,
+} from "@/node/utils/concurrency/processLiveness";
 
 /**
  * Acquire a regular file for ReadFileOptions.requireRegularFile.
@@ -195,6 +200,18 @@ export function localRuntimeTempRoot(): string {
   return process.platform === "win32" ? (process.env.TEMP ?? "C:\\Temp") : "/tmp";
 }
 
+/** Capture host-local evidence without substituting the owner's birth. */
+export function getLocalProcessEvidence(pid: number | undefined): HolderEvidence | undefined {
+  if (pid === undefined) return undefined;
+  return { pid, identity: { ...getSelfIdentity(), birth: linuxBirth(pid) } };
+}
+
+function throwIfAbortedBeforeExec(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new RuntimeErrorClass("Operation aborted before execution", "exec");
+  }
+}
+
 /**
  * Abstract base class for local runtimes (both WorktreeRuntime and LocalRuntime).
  *
@@ -214,6 +231,7 @@ export function localRuntimeTempRoot(): string {
  * - renameWorkspace()
  * - forkWorkspace()
  */
+
 export abstract class LocalBaseRuntime implements Runtime {
   /** Runtime.location. A prototype getter, so subclasses and Object.create doubles inherit it. */
   // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- a readonly field is set by the constructor, so Object.create(X.prototype) doubles (mcpServerManager.test.ts) would read undefined
@@ -232,9 +250,7 @@ export abstract class LocalBaseRuntime implements Runtime {
   async exec(command: string, options: ExecOptions): Promise<ExecStream> {
     const startTime = performance.now();
 
-    if (options.abortSignal?.aborted) {
-      throw new RuntimeErrorClass("Operation aborted before execution", "exec");
-    }
+    throwIfAbortedBeforeExec(options.abortSignal);
 
     // Use the specified working directory (must be a specific workspace path)
     const cwd = options.cwd;
@@ -246,6 +262,9 @@ export abstract class LocalBaseRuntime implements Runtime {
     } catch (err) {
       throw new RuntimeErrorClass(`Working directory does not exist: ${cwd}`, "exec", err);
     }
+    // An abort during the check above fires no listener (none is added until after the spawn), so
+    // without this second check the process would start and run to its end after the abort.
+    throwIfAbortedBeforeExec(options.abortSignal);
 
     const bashPath = getBashPath();
     const spawnCommand = bashPath;
@@ -300,6 +319,8 @@ export abstract class LocalBaseRuntime implements Runtime {
       // Prevent console window from appearing on Windows (WSL bash spawns steal focus otherwise)
       windowsHide: true,
     });
+
+    const localProcess = getLocalProcessEvidence(childProcess.pid);
 
     // Wrap in DisposableProcess for automatic cleanup
     const disposable = new DisposableProcess(childProcess);
@@ -396,7 +417,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       void exitCode.catch(() => undefined).finally(() => clearTimeout(timeoutHandle));
     }
 
-    return { stdout, stderr, stdin, exitCode, duration };
+    return { stdout, stderr, stdin, exitCode, duration, localProcess };
   }
 
   readFile(

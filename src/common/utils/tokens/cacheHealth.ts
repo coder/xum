@@ -89,11 +89,26 @@ export function getCacheHealth(parts: readonly CacheHealthPart[]): CacheHealth {
   };
 }
 
-/** Session cache health: the per-model ledger buckets plus the live stream's usage. */
-export function getSessionCacheHealth(
-  byModel: Readonly<Record<string, ChatUsageDisplay>> | undefined,
-  live: ChatUsageDisplay | undefined
-): CacheHealth {
-  const buckets = Object.values(byModel ?? {});
-  return getCacheHealth([...buckets, ...(live ? [live] : [])].map((usage) => ({ usage })));
+export interface SessionCacheUsage {
+  /** The workspace's ledger: its own turns plus removed sub-agents. */
+  sessionByModel?: Readonly<Record<string, ChatUsageDisplay>>;
+  /** Sub-agents that still exist; a removal moves their buckets into sessionByModel. */
+  subagentByModel?: Readonly<Record<string, ChatUsageDisplay>>;
+  liveCostUsage?: ChatUsageDisplay;
+}
+
+/**
+ * Session cache health of the whole tree: the ledger, open sub-agents and the live stream, so a
+ * sub-agent removal does not change it. Buckets stay separate parts (not merged per model), so an
+ * unpriced bucket that wrote nothing cannot hide a known rewrite cost.
+ * Undefined when no part touched a prompt cache (most non-Anthropic providers report no cache
+ * tokens), where a 0% read share is noise.
+ */
+export function getSessionCacheHealth(usage: SessionCacheUsage): CacheHealth | undefined {
+  const parts = [usage.sessionByModel, usage.subagentByModel].flatMap((byModel) =>
+    Object.values(byModel ?? {})
+  );
+  if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
+  const touched = parts.some((part) => part.cached.tokens + part.cacheCreate.tokens > 0);
+  return touched ? getCacheHealth(parts.map((part) => ({ usage: part }))) : undefined;
 }

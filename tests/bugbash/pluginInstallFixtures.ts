@@ -3,12 +3,14 @@
  *
  * Local git repositories that Settings > Plugins installs from their absolute path: a Claude Code
  * plugin, a Claude Code marketplace, a plain skills repository, an Agent Plugin with skills, a
- * repository with one manifest per agent tool (multi-harness) and a Claude Code plugin next to
- * another tool's plugin.json (claude-foreign-root).
- * Nothing here runs on install or review: the one MCP server stays disabled until the user turns
- * it on (and bin/server only exits 0), Claude hooks never run in Xum, and Xum never loads a Claude
- * plugin's hooks.js or workflows/ (both are inert anyway). Model-driven jobs also set
- * XUM_DISABLE_AGENT_TOOLS=1.
+ * repository with one manifest per agent tool (multi-harness), a Claude Code plugin next to
+ * another tool's plugin.json (claude-foreign-root), a small copy of Cursor's cursor-team-kit
+ * (cursor-team-kit-mini), a repository with both marketplace files (cursor-market) and a Cursor
+ * plugin with one local MCP server (cursor-stdio-mcp).
+ * Nothing here runs on install or review: the MCP servers stay disabled until the user turns them
+ * on (bin/server only exits 0, and server.mjs only echoes its text argument), Claude hooks never
+ * run in Xum, and Xum never loads a Claude plugin's hooks.js or workflows/ (both are inert
+ * anyway). Model-driven jobs also set XUM_DISABLE_AGENT_TOOLS=1.
  *
  * Only local paths install here (the sandbox has no network), so Settings never offers the Skills
  * CLI choice, which takes only remote sources (skillsCliSource.ts). The marketplace's github entry
@@ -265,6 +267,119 @@ function snakeCaseSkills(): Files {
   };
 }
 
+/**
+ * The parts of cursor/plugins' cursor-team-kit that the Cursor plugin RFC maps: two skills, a
+ * `model: fast` background agent, a readonly agent, an always-apply rule and a glob rule.
+ */
+function cursorTeamKitMini(): Files {
+  return {
+    ".cursor-plugin/plugin.json": JSON.stringify({ name: "cursor-team-kit-mini" }, null, 2),
+    "skills/alpha/SKILL.md": skillMd("alpha", "Plans a change before it is written"),
+    "skills/beta/SKILL.md": skillMd("beta", "Checks a change after it is written"),
+    "agents/ci-watcher.md":
+      "---\nname: ci-watcher\ndescription: Watches CI for the current branch and reports the result\n" +
+      "model: fast\nis_background: true\n---\nReport pass or fail for each check.\n",
+    "agents/reviewer.md":
+      "---\nname: reviewer\ndescription: Reviews a diff and lists problems by severity\n" +
+      "readonly: true\n---\nList each problem with its file and line.\n",
+    "rules/a.mdc": "---\ndescription: Rule A\nalwaysApply: true\n---\nKeep imports at the top.\n",
+    "rules/b.mdc": '---\nglobs: "**/*.ts"\n---\nUse exhaustive switches.\n',
+  };
+}
+
+/**
+ * The shape of cursor/plugins: a Cursor and a Claude Code marketplace file that both list
+ * `pstack`, each at its own folder. The two builds have different skills, so a repro can tell
+ * which one was installed. The Cursor file also lists a nested folder without "./", as
+ * cursor/plugins lists `third_party/attio`.
+ */
+function cursorMarket(): Files {
+  const marketplace = (plugins: { name: string; source: string }[]) =>
+    JSON.stringify({ name: "cursor-market", owner: { name: "Bug Bash" }, plugins }, null, 2);
+  return {
+    ".cursor-plugin/marketplace.json": marketplace([
+      { name: "pstack", source: "./pstack" },
+      { name: "notes", source: "third_party/notes" },
+    ]),
+    ".claude-plugin/marketplace.json": marketplace([{ name: "pstack", source: "./claude/pstack" }]),
+    "third_party/notes/.cursor-plugin/plugin.json": JSON.stringify(
+      { name: "notes", version: "1.0.0", description: "A nested Cursor plugin" },
+      null,
+      2
+    ),
+    "third_party/notes/skills/take-notes/SKILL.md": skillMd(
+      "take-notes",
+      "Keeps short notes of a session"
+    ),
+    "pstack/.cursor-plugin/plugin.json": JSON.stringify(
+      { name: "pstack", version: "1.0.0", description: "The Cursor build of pstack" },
+      null,
+      2
+    ),
+    "pstack/skills/plan-first/SKILL.md": skillMd(
+      "plan-first",
+      "Writes a short plan before any code changes"
+    ),
+    "claude/pstack/.claude-plugin/plugin.json": JSON.stringify(
+      { name: "pstack", version: "1.0.0", description: "The Claude Code build of pstack" },
+      null,
+      2
+    ),
+    "claude/pstack/skills/claude-notes/SKILL.md": skillMd(
+      "claude-notes",
+      "Keeps notes the way Claude Code reads them"
+    ),
+  };
+}
+
+const ECHO_SERVER = `import { createInterface } from "node:readline";
+
+const tools = [
+  {
+    name: "echo",
+    description: "Returns its text argument",
+    inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+  },
+];
+const results = {
+  initialize: (params) => ({
+    protocolVersion: params.protocolVersion,
+    capabilities: { tools: {} },
+    serverInfo: { name: "echo", version: "1.0.0" },
+  }),
+  ping: () => ({}),
+  "tools/list": () => ({ tools }),
+  "tools/call": (params) => ({ content: [{ type: "text", text: String(params.arguments?.text) }] }),
+};
+createInterface({ input: process.stdin }).on("line", (line) => {
+  if (line.trim() === "") return;
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  const result = results[request.method];
+  const reply = result
+    ? { result: result(request.params ?? {}) }
+    : { error: { code: -32601, message: "Method not found: " + request.method } };
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, ...reply }) + "\\n");
+});
+`;
+
+/** A Cursor plugin whose one MCP server launches through `${CURSOR_PLUGIN_ROOT}` (RFC CUJ 4b). */
+function cursorStdioMcp(): Files {
+  return {
+    ".cursor-plugin/plugin.json": JSON.stringify(
+      { name: "cursor-stdio-mcp", mcpServers: "./mcp.json" },
+      null,
+      2
+    ),
+    "mcp.json": JSON.stringify(
+      { mcpServers: { echo: { command: "node", args: ["${CURSOR_PLUGIN_ROOT}/server.mjs"] } } },
+      null,
+      2
+    ),
+    "server.mjs": ECHO_SERVER,
+  };
+}
+
 const EXECUTABLE = new Set(["claude-review-kit/bin/server"]);
 
 export function installFixtures(): Record<string, Files> {
@@ -276,6 +391,9 @@ export function installFixtures(): Record<string, Files> {
     "multi-harness": multiHarness(),
     "claude-foreign-root": claudeForeignRoot(),
     "snake-case-skills": snakeCaseSkills(),
+    "cursor-team-kit-mini": cursorTeamKitMini(),
+    "cursor-market": cursorMarket(),
+    "cursor-stdio-mcp": cursorStdioMcp(),
   };
 }
 

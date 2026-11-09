@@ -29,6 +29,23 @@ export class TestTempDir implements Disposable {
 
 export const TEST_GLOBAL_WORKSPACE_ID = "workspace-global";
 
+/**
+ * The background-process wrapper records its exit with `echo $? > exit_code`, so the marker
+ * exists, empty, from the redirect's create until the write, and a slow host can stretch that
+ * gap. A status read in the gap sees an empty marker and reports "running": wait for the code,
+ * not for the file or a fixed time. The poll lasts up to 5 s, so a test that calls it needs its
+ * own timeout.
+ */
+export async function readExitCodeWhenWritten(outputDir: string): Promise<string> {
+  const exitCodePath = path.join(outputDir, "exit_code");
+  let content = "";
+  for (let attempt = 0; attempt < 200 && content.trim() === ""; attempt++) {
+    content = await fsPromises.readFile(exitCodePath, "utf-8").catch(() => "");
+    if (content.trim() === "") await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return content.trim();
+}
+
 export const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],

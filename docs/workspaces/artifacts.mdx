@@ -9,7 +9,7 @@ Artifacts are an experiment. Turn on **Artifacts** in Settings → Experiments.
 
 ## Where artifacts live
 
-The agent writes artifacts to `$XUM_SCRATCH_DIR/artifacts/`. Every file in that folder appears in the tab, but files without a stored version can wait under **Other files** (see [Open the tab](#open-the-tab)). Files outside it do not, unless you open them yourself (see [Open any file](#open-any-file)).
+The agent writes artifacts to `$XUM_SCRATCH_DIR/artifacts/`. Every file in that folder appears in the tab, but files the agent did not publish can wait under **Other files** (see [Open the tab](#open-the-tab)). Files outside it do not, unless you open them yourself (see [Open any file](#open-any-file)).
 
 | Runtime            | Scratch folder                                                            |
 | ------------------ | ------------------------------------------------------------------------- |
@@ -23,12 +23,12 @@ On SSH, Docker and dev container workspaces the scratch folder exists only while
 ## Open the tab
 
 - Press `Ctrl+Shift+K` (`Cmd+Shift+K` on macOS). If the tab already shows, the shortcut moves focus into it. On wide windows, press it again while focus is in the tab to hide the right sidebar.
-- Click an artifact card in the chat. The card shows the file name, its version and its title.
+- Click an artifact card in the chat. The card shows the file name and its title.
 - On narrow windows, where the right sidebar is hidden, the same shortcut shows the sidebar full-screen on the Artifacts tab. Its **Close** button or `Esc` closes it.
 
-The toolbar has a picker for the file, a version menu, and buttons for fullscreen and reload. A dot in the picker marks files that changed since you last looked at them.
+The toolbar has a picker for the file, a pin button, and buttons for fullscreen and reload. A dot in the picker marks files that changed since you last looked at them.
 
-When only some files have a stored version (see [Versions](#versions)), the picker lists those under **Artifacts** first. The rest, such as screenshots that a published page uses, are under **Other files**, which starts collapsed. Choose **Show N other files** to list them. The picker stays open. `J` and `K` skip the hidden files.
+When the agent published only some of the files (see [Publishing](#publishing)), the picker lists those under **Artifacts** first. The rest, such as screenshots that a published page uses, are under **Other files**, which starts collapsed. Choose **Show N other files** to list them. The picker stays open. `J` and `K` skip the hidden files.
 
 | Action                                         | Key (focus in the tab)          |
 | ---------------------------------------------- | ------------------------------- |
@@ -57,21 +57,19 @@ When only some files have a stored version (see [Versions](#versions)), the pick
 
 Files over 10 MB are not rendered. The tab offers to copy their path.
 
-## Versions
+## Publishing
 
-Xum keeps old versions of each artifact, so a later edit does not lose what you saw earlier.
+The tab always shows the file as it is now. When the agent edits the file, the tab follows. Xum keeps no earlier copies. When you delete the file, it leaves the tab.
 
-Xum saves a version only when the agent calls the `artifact` tool. Changed content adds the next version. Identical bytes reuse the latest one. Edits without a publish change only **Latest (live)**.
-
-Pick a version from the version menu. **Latest (live)** follows the file as it changes. Versions are stored with the workspace on your machine, so they survive app restarts and lost containers.
+When the agent calls the `artifact` tool, the chat shows a card for the file, and Xum remembers the file's title, kind and shelf pin. Publishing the same path again updates them. A kind the agent sets (for example `markdown` for a `.txt` file) decides how the tab shows the file.
 
 ## Open any file
 
-Open any workspace file as an artifact from the review panel's file header, from a file path in a tool card, or with **Open File as Artifact…** in the command palette. Opened files appear under **Pinned files** in the picker and update as the file changes. Unpin them from the toolbar.
+Open any file as an artifact from the review panel's file header, from a file path in a tool card, or with **Open File as Artifact…** in the command palette. A path outside the workspace checkout must be absolute, such as a plan or a skill file in your home folder. Dev container workspaces can open only files inside the checkout. Opened files appear under **Pinned files** in the picker and update as the file changes. Unpin them from the toolbar.
 
 ## Shelf
 
-The agent can pin an artifact to a shelf by publishing it with `pin: "project"` or `pin: "global"`. You can pin from the version menu.
+The agent can pin an artifact to a shelf by publishing it with `pin: "project"` or `pin: "global"`. You can pin the file you are viewing with the pin button in the toolbar.
 
 - The **project shelf** shows in every workspace of the same project.
 - The **global shelf** shows in every workspace.
@@ -97,7 +95,7 @@ window.xum.openWorkspace("a1b2c3d4e5"); // switches Xum to that workspace
 - A `send` that comes within a few seconds of your click or key in the artifact, also from a timer, counts as a click. Only one such `send` goes out at once in 5 seconds.
 - A `send` with no recent click or key in the artifact, or the second `send` within those 5 seconds, does not send on its own. Xum shows the text above the artifact with **Send** and **Dismiss**. Only your click or the Send shortcut sends it, and Send waits a moment after the message appears.
 - A sent message arrives as your message, labeled "from artifact". If the agent is busy, it arrives at the next tool step. A message you sent survives an app restart, even if it was still waiting for the agent. A message you have not sent yet does not.
-- `setState` saves a small JSON value for the artifact. A new version keeps it. The agent sees it in `artifact_list`.
+- `setState` saves a small JSON value for the artifact. Publishing the artifact again keeps it. The agent sees it in `artifact_list`.
 - `openWorkspace` switches Xum to the workspace with that ID. A task ID from the `task` tool works too, for a sub-agent or a workspace task. Call it from a click or key handler: Xum ignores it unless you just clicked or typed inside the artifact. For an unknown or archived workspace, nothing switches and Xum shows a short notice above the artifact. The artifact never gets an answer, and no workspace list or title reaches it. Pinned files and shelf copies cannot switch workspaces.
 
 ### Theme variables
@@ -144,7 +142,7 @@ Press `C`, or use the annotate button, to comment on an artifact.
 
 With the keyboard, press `Tab` to move into the artifact text, then extend the selection with `Shift` and the arrow keys. The comment box opens when you release `Shift`. The artifact text is not an editable field, so `Shift` and the arrow keys select text only when a screen reader is running, or, in the browser version of Xum, when caret browsing is on (`F7` in Chrome and Edge). The desktop app has no caret browsing.
 
-Comments attach to your next message, with the artifact, its version and the anchor, so the agent can find the spot.
+Comments attach to your next message, with the artifact and the anchor, so the agent can find the spot.
 
 ## Goal status board
 

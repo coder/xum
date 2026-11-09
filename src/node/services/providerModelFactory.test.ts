@@ -1297,6 +1297,58 @@ describe("ProviderModelFactory GitHub Copilot", () => {
     }
   );
 
+  it.each([
+    [true, "agent"],
+    [undefined, "user"],
+  ] as const)(
+    "a pinned model with agentInitiated=%p sends Copilot X-Initiator %s",
+    async (agentInitiated, expectedInitiator) => {
+      await withTempConfig(async (_config, factory, _oauth, providersConfigStore) => {
+        // Copilot bills X-Initiator "user" as a premium request; headless summaries and titles
+        // pass agentInitiated so their user-role prompts do not.
+        const initiators: Array<string | null> = [];
+        const recordingFetch = (_input: unknown, init?: RequestInit) => {
+          initiators.push(new Headers(init?.headers).get("X-Initiator"));
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "resp_initiator",
+                created_at: 0,
+                model: "gpt-5.3-codex",
+                output: [
+                  {
+                    type: "message",
+                    id: "msg_1",
+                    role: "assistant",
+                    status: "completed",
+                    content: [{ type: "output_text", text: "ok", annotations: [] }],
+                  },
+                ],
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }),
+              { headers: { "Content-Type": "application/json" } }
+            )
+          );
+        };
+        spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
+          "github-copilot": {
+            apiKey: COPILOT_TOKEN,
+            models: ["gpt-5.3-codex"],
+            fetch: recordingFetch,
+          },
+        } as unknown as ProvidersConfig);
+
+        const created = await factory.createModelWithPinnedOptions("github-copilot:gpt-5.3-codex", {
+          agentInitiated,
+        });
+        if (!created.success) throw new Error(created.error.type);
+        await generateText({ model: created.data.model, prompt: "summarize", maxRetries: 0 });
+
+        expect(initiators).toEqual([expectedInitiator]);
+      });
+    }
+  );
+
   it("returns api_key_not_found before checking a stale Copilot model catalog", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
@@ -3282,6 +3334,97 @@ describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
 
     expect(calls).toHaveLength(1);
     expect(JSON.stringify(parseSentBody(calls[0]))).toContain("cache_control");
+  });
+});
+
+describe("wrapFetchWithAnthropicCacheControl — one TTL per request", () => {
+  /** Every marker's ttl in wire order (tools, system, messages): Anthropic's ordering rule. */
+  const markerTtls = (body: unknown): Array<string | undefined> => {
+    const ttls: Array<string | undefined> = [];
+    const walk = (value: unknown): void => {
+      if (Array.isArray(value)) return value.forEach(walk);
+      if (value == null || typeof value !== "object") return;
+      for (const [key, child] of Object.entries(value)) {
+        if (key === "cache_control" || key === "cacheControl") {
+          ttls.push((child as { ttl?: string }).ttl);
+        } else {
+          walk(child);
+        }
+      }
+    };
+    const { tools, system, messages, prompt } = body as Record<string, unknown>;
+    walk([tools, system, messages, prompt]);
+    return ttls;
+  };
+  // Markers of mixed TTLs, as a per-model extra or a continuous-compaction prefix can leave them.
+  const mixedMessagesBody = {
+    tools: [{ name: "bash", cache_control: { type: "ephemeral", ttl: "5m" } }],
+    system: [{ type: "text", text: "sys", cache_control: { type: "ephemeral", ttl: "5m" } }],
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "t1",
+            content: [{ type: "text", text: "out", cache_control: { type: "ephemeral" } }],
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral", ttl: "1h" } }],
+      },
+    ],
+  };
+  const mixedPromptBody = {
+    prompt: [
+      {
+        role: "system",
+        content: "sys",
+        providerOptions: { anthropic: { cacheControl: { type: "ephemeral", ttl: "5m" } } },
+      },
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+    ],
+  };
+  const send = (wrapped: typeof fetch, body: unknown) =>
+    wrapped("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+
+  it("puts the TTL on every marker of both wire forms", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, () => "1h");
+
+    await send(wrapped, mixedMessagesBody);
+    await send(wrapped, mixedPromptBody);
+
+    expect(markerTtls(parseSentBody(calls[0]))).toEqual(["1h", "1h", "1h", "1h"]);
+    // The prompt form's last message gets both the message-level and the part-level marker.
+    expect(markerTtls(parseSentBody(calls[1]))).toEqual(["1h", "1h", "1h"]);
+  });
+
+  it("samples the TTL getter at each request", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    let ttl: "5m" | "1h" = "1h";
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, () => ttl);
+
+    await send(wrapped, mixedMessagesBody);
+    ttl = "5m";
+    await send(wrapped, mixedMessagesBody);
+
+    expect(markerTtls(parseSentBody(calls[0]))).toEqual(["1h", "1h", "1h", "1h"]);
+    expect(markerTtls(parseSentBody(calls[1]))).toEqual(["5m", "5m", "5m", "5m"]);
+  });
+
+  it("leaves existing marker TTLs alone without a TTL", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, () => undefined);
+
+    await send(wrapped, mixedMessagesBody);
+
+    expect(markerTtls(parseSentBody(calls[0]))).toEqual(["5m", "5m", undefined, "1h"]);
   });
 });
 

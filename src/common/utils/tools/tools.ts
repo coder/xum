@@ -1081,7 +1081,7 @@ export async function getToolsForModel(
     ...(config.experiments?.artifacts && config.xumEnv?.XUM_SCRATCH_DIR != null
       ? { artifact_list: createArtifactListTool(config) }
       : {}),
-    // Versions live in the session dir, so publishing also needs one.
+    // Records live in the session dir, so publishing also needs one.
     ...(config.experiments?.artifacts &&
     config.xumEnv?.XUM_SCRATCH_DIR != null &&
     config.workspaceSessionDir != null

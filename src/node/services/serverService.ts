@@ -46,6 +46,8 @@ export interface StartServerOptions {
    * MUX_SERVER_ALLOW_HTTP_ORIGIN for non-CLI server starts.
    */
   allowHttpOrigin?: boolean;
+  /** Also listen on this Unix socket in a private folder (see createOrpcServer). */
+  unixSocketPath?: string;
 }
 
 type NetworkInterfaces = NodeJS.Dict<os.NetworkInterfaceInfo[]>;
@@ -426,6 +428,7 @@ export class ServerService {
       serveStatic,
       staticDir,
       allowHttpOrigin,
+      unixSocketPath: options.unixSocketPath,
     };
 
     const server = await createOrpcServer(serverOptions);

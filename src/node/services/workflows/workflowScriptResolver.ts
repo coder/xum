@@ -185,6 +185,26 @@ function workflowSkillContainment(input: ResolveWorkflowScriptInput, projectSear
   );
 }
 
+/**
+ * A Claude command's skill directory is its plugin's commands folder, and a Cursor rule's is its
+ * rules folder: a script there is not part of the skill. A Skills install loads skills only
+ * (installMethods.ts), and a Claude Code or Cursor package runs no Xum code
+ * (docs/agents/agent-skills.mdx).
+ */
+function noWorkflowScriptsReason(
+  skill: Pick<
+    ResolvedAgentSkill,
+    "commandSkill" | "ruleFile" | "skillsOnlyPlugin" | "claudePackagePlugin" | "cursorPackagePlugin"
+  >
+): string | undefined {
+  if (skill.commandSkill === true) return "is a Claude command";
+  if (skill.ruleFile !== undefined) return "is a Cursor rule";
+  if (skill.skillsOnlyPlugin === true) return "comes from a skills-only plugin install";
+  if (skill.claudePackagePlugin === true) return "comes from a Claude Code plugin";
+  if (skill.cursorPackagePlugin === true) return "comes from a Cursor plugin";
+  return undefined;
+}
+
 async function resolveSkillWorkflowScript(
   input: ResolveWorkflowScriptInput & { scriptPath: string }
 ): Promise<ResolvedWorkflowScript> {
@@ -193,22 +213,9 @@ async function resolveSkillWorkflowScript(
 
   const resolvedSkill = await readWorkflowSkill(input, parsed.skillName);
 
-  // A Claude command's skill directory is its plugin's commands folder: a script there is not
-  // part of the command, and a Claude package runs no Xum workflow code.
-  if (resolvedSkill.commandSkill === true) {
-    throw new Error(`Skill '${parsed.skillName}' is a Claude command and has no workflow scripts`);
-  }
-  // A Skills install loads skills only (installMethods.ts): its skills run no workflow scripts.
-  if (resolvedSkill.skillsOnlyPlugin === true) {
-    throw new Error(
-      `Skill '${parsed.skillName}' comes from a skills-only plugin install and has no workflow scripts`
-    );
-  }
-  // A Claude Code package runs no Xum code (docs/agents/agent-skills.mdx): no workflow scripts.
-  if (resolvedSkill.claudePackagePlugin === true) {
-    throw new Error(
-      `Skill '${parsed.skillName}' comes from a Claude Code plugin and has no workflow scripts`
-    );
+  const refusal = noWorkflowScriptsReason(resolvedSkill);
+  if (refusal !== undefined) {
+    throw new Error(`Skill '${parsed.skillName}' ${refusal} and has no workflow scripts`);
   }
 
   if (resolvedSkill.package.scope === "project" && !input.projectTrusted) {

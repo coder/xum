@@ -26,6 +26,7 @@ import * as core from "./pageTimingCore";
 import { probe, STATIC_VIEW_IDS } from "./pageTimingProbe";
 import * as stats from "./pageTimingStats";
 import { BLOCK_PAIRS, gate, kthLargest, launchPlan, median, type Signal } from "./pageTimingStats";
+import { newServerToken, serverTokenEnv, withServerToken } from "./serverToken";
 
 /** Lighthouse's mobile values, applied as DevTools throttling: real timings, not the simulator's. */
 const viewport = { width: 412, height: 823 };
@@ -105,8 +106,15 @@ async function startServer(tree: string, root: string, home: string, logFile: st
   const { port } = probePort.address() as net.AddressInfo;
   probePort.close();
   const log = fs.openSync(logFile, "w");
-  const env = { PATH: process.env.PATH, HOME: home, XUM_ROOT: root, XUM_DISABLE_TELEMETRY: "1" };
-  const args = `dist/cli/index.js server --no-auth --host 127.0.0.1 --port ${port}`.split(" ");
+  const token = newServerToken();
+  const env = {
+    PATH: process.env.PATH,
+    HOME: home,
+    XUM_ROOT: root,
+    XUM_DISABLE_TELEMETRY: "1",
+    ...serverTokenEnv(token),
+  };
+  const args = `dist/cli/index.js server --host 127.0.0.1 --port ${port}`.split(" ");
   const server = spawn("node", args, {
     cwd: tree,
     env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null" },
@@ -136,7 +144,7 @@ async function startServer(tree: string, root: string, home: string, logFile: st
         throw new Error(`${logFile}: ${String(error)}`);
       });
   };
-  return { origin, stop };
+  return { origin, token, stop };
 }
 
 /** One navigation with a fresh root (and seed), server and browser. Values in seconds. */
@@ -157,7 +165,7 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
       const before = seed && snapshotSeed(seedDir);
       for (const dir of [root, home]) fs.mkdirSync(dir, { recursive: true });
       const server = await startServer(o.tree, root, home, log);
-      const run = await browse(o, `${server.origin}${route}`).finally(server.stop);
+      const run = await browse(o, `${server.origin}${route}`, server.token).finally(server.stop);
       const now = (rel: string) => fs.readFileSync(path.join(seedDir, rel));
       const diff = before && diffSeed(before, seedDir);
       const rewrites = diff ? core.seedRewrites(diff, before, now) : [];
@@ -172,7 +180,8 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
   });
 }
 
-async function browse(o: Parameters<typeof measure>[0], url: string) {
+/** `url` is what the record keeps. The navigation adds the server's token, which stays out of the record. */
+async function browse(o: Parameters<typeof measure>[0], url: string, token: string) {
   const browser = await chromium.launch({ executablePath: o.chrome, headless: true }); // fresh profile
   try {
     const context = await browser.newContext(PHONE.context);
@@ -190,7 +199,7 @@ async function browse(o: Parameters<typeof measure>[0], url: string) {
     await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
     await cdp.send("Network.emulateNetworkConditions", PHONE.network);
     await cdp.send("Emulation.setCPUThrottlingRate", { rate: PHONE.cpuSlowdown });
-    await tab.goto(url, { waitUntil: "load", timeout: 180_000 });
+    await tab.goto(withServerToken(url, token), { waitUntil: "load", timeout: 180_000 });
     const ucsDone = "r.visibleLive !== null && r.elementTiming.some((e) => e.live)";
     const done = o.mode === "ucs" ? ucsDone : "r.ir !== null";
     await tab.waitForFunction(`((r) => !!r && ${done})(window.__pageTiming)`, null, {

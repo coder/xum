@@ -1965,6 +1965,101 @@ describe("agentSkillsService agent plugins", () => {
     expect((await read("deploy")).package.frontmatter.description).toBe("skill wins");
   });
 
+  test("a Cursor rule loads as a skill by its type; a manual rule is user-only; a skill wins", async () => {
+    using tmp = new DisposableTempDir("plugin-cursor-rules");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "kit");
+    await fs.mkdir(path.join(pluginDir, ".cursor-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".cursor-plugin", "plugin.json"),
+      JSON.stringify({ name: "kit" })
+    );
+    const rules = path.join(pluginDir, "rules");
+    await fs.mkdir(rules);
+    await fs.writeFile(
+      path.join(rules, "always.mdc"),
+      "---\ndescription: Keep imports on top\nalwaysApply: true\n---\nNo inline imports.\n"
+    );
+    await fs.writeFile(
+      path.join(rules, "typed.mdc"),
+      '---\ndescription: TypeScript only\nglobs: "**/*.ts"\n---\nUse strict types.\n'
+    );
+    await fs.writeFile(path.join(rules, "manual.md"), "Run the checklist.\n");
+    await fs.writeFile(path.join(rules, "deploy.mdc"), "---\nalwaysApply: true\n---\nRule body\n");
+    await writeSkill(path.join(pluginDir, "skills"), "deploy", "skill wins");
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+
+    const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots, runtimeFactory });
+
+    const kit = skills.filter((skill) => skill.pluginName === "kit");
+    expect(kit.map((skill) => [skill.name, skill.description, skill.advertise])).toEqual([
+      ["always", "Keep imports on top", undefined],
+      ["deploy", "skill wins", undefined],
+      ["manual", "Run the checklist.", false],
+      ["typed", "TypeScript only\n\nApplies to files matching: **/*.ts", undefined],
+    ]);
+    const read = async (name: string) =>
+      readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots, runtimeFactory });
+    const always = await read("always");
+    expect(always.package.body).toBe("No inline imports.\n");
+    expect(always.package.frontmatter.metadata).toEqual({ "cursor-rule-type": "always-apply" });
+    expect((await read("typed")).package.frontmatter.metadata).toEqual({
+      "cursor-rule-type": "glob",
+    });
+    expect((await read("deploy")).package.frontmatter.description).toBe("skill wins");
+  });
+
+  test("a managed Cursor rule loads as reviewed; a rule type change needs a review, prose does not", async () => {
+    using tmp = new DisposableTempDir("plugin-cursor-rule-consent");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "kit");
+    await fs.mkdir(path.join(pluginDir, ".cursor-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".cursor-plugin", "plugin.json"),
+      JSON.stringify({ name: "kit" })
+    );
+    await fs.mkdir(path.join(pluginDir, "rules"));
+    const rule = path.join(pluginDir, "rules", "imports.mdc");
+    const writeRule = (frontmatter: string, body: string) =>
+      fs.writeFile(rule, `---\ndescription: Keep imports on top\n${frontmatter}---\n${body}\n`);
+    await writeRule("alwaysApply: true\n", "No inline imports.");
+    await fs.writeFile(
+      path.join(tmp.path, "plugins.json"),
+      JSON.stringify({
+        plugins: [
+          createTestPluginInstallEntry(
+            "kit",
+            undefined,
+            await reviewedComponentConsent({ pluginDir })
+          ),
+        ],
+      })
+    );
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    const loaded = async () =>
+      (await discoverAgentSkills(runtime, tmp.path, { roots, runtimeFactory })).skills
+        .filter((skill) => skill.pluginName === "kit")
+        .map((skill) => skill.name);
+
+    expect(await loaded()).toEqual(["imports"]);
+    await writeRule("alwaysApply: true\n", "Never inline imports.");
+    expect(await loaded()).toEqual(["imports"]);
+    await writeRule("", "Never inline imports.");
+    expect(await loaded()).toEqual([]);
+  });
+
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {
     using tmp = new DisposableTempDir("plugin-selected-skills");
     const container = path.join(tmp.path, "plugins");

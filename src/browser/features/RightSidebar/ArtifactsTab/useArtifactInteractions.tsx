@@ -18,8 +18,8 @@ interface StateWrites {
 /**
  * Per-artifact `setState` writes (by workspace and path): one request in flight, newer states
  * replace the queued one, so concurrent saves cannot land out of order and the last state the
- * frame sent wins. `drained` settles when the queue empties: a frame rebuild (new version,
- * version switch, Reload) reads the server only after this tab's own writes have landed, so the
+ * frame sent wins. `drained` settles when the queue empties: a frame rebuild (a rewrite of
+ * the file, Reload) reads the server only after this tab's own writes have landed, so the
  * server stays the one source of truth and no read can return a pre-write state.
  *
  * While Xum reconnects the API is null: writes then wait here, and the next hook that has a
@@ -32,31 +32,18 @@ let connectedClient: APIClient | null = null;
 
 const OFFLINE_SEND_ERROR = "Xum is reconnecting. Send again once it is back.";
 
-/** The artifact on screen: `version` null is the live file, `latestVersion` its newest copy. */
 export interface ArtifactInteractionTarget {
   path: string;
-  version: number | null;
-  latestVersion: number | null;
-  /** `latestVersion` is from before a failed refresh: it keys the state, but Send does not use it. */
-  latestVersionStale?: boolean;
+  readKey?: string | null;
   /** Bumped when the panel remounts the viewer (Reload): the new frame needs the newest state. */
   reloadTick?: number;
-}
-
-/**
- * The version shown when the artifact asked, not whichever one is selected at Send time. A live
- * view is pinned to its newest stored version now: null would resolve at Send time and credit a
- * version published while the strip was open.
- */
-function shownVersion(target: ArtifactInteractionTarget): number | null {
-  return target.version ?? (target.latestVersionStale === true ? null : target.latestVersion);
 }
 
 /**
  * Host side of artifact interactions for the Artifacts panel (M5b): a clicked send goes out at
  * once, any other send fills one pending confirm strip per artifact (sends arriving while a strip
  * is shown or a send is in flight are ignored), the persisted `window.xum.state` of the
- * artifact (one state for all its versions), and the handlers the viewer passes to the frame.
+ * artifact, and the handlers the viewer passes to the frame.
  * Returns `handlers: undefined` when nothing interactive is selected (pinned files, MCP Apps views). `handleKeyDown` runs the strip's
  * shortcuts; the panel calls it for keys pressed inside the panel, and it returns true when it
  * handled the key.
@@ -91,12 +78,12 @@ export function useArtifactInteractions(
     sending: boolean;
     error: string | null;
   }>({ path: "", sending: false, error: null });
-  // The state is per artifact, but a new version, a version switch or Reload rebuilds the frame,
-  // so the key still changes then: the rebuild must read the newest state, not the first load's.
+  // The state is per artifact, but a rewrite of the file or Reload rebuilds the frame, so the key
+  // still changes then: the rebuild must read the newest state, not the first load's.
   const stateKey =
     target == null
       ? null
-      : `${target.path}\u0000${target.version ?? `live:${target.latestVersion ?? 0}`}\u0000${target.reloadTick ?? 0}`;
+      : `${target.path}\u0000${target.readKey ?? ""}\u0000${target.reloadTick ?? 0}`;
   // `ok` false: the read failed and the frame was built with no state; the next client retries.
   const [loadedState, setLoadedState] = useState<{
     key: string;
@@ -171,7 +158,6 @@ export function useArtifactInteractions(
       .sendInteraction({
         workspaceId,
         path: forPath,
-        version: pending.version,
         text: pending.text,
         ...(pending.data !== undefined ? { data: pending.data } : {}),
       })
@@ -196,7 +182,7 @@ export function useArtifactInteractions(
       // artifact can send again after Send, Dismiss or a delivered click send.
       if (pendingPathsRef.current.has(target.path)) return;
       pendingPathsRef.current.add(target.path);
-      const pending = { id: newConfirmPromptId(), text, data, version: shownVersion(target) };
+      const pending = { id: newConfirmPromptId(), text, data };
       // The user's own click asked for this send: a second confirm click added nothing.
       if (origin === "click") {
         deliver(target.path, pending);

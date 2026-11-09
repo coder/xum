@@ -1,5 +1,9 @@
 import type { CompletedMessagePart } from "@/common/types/stream";
-import { TURN_STOP_PROMPT_MAX_CHARS } from "@/node/services/agentPlugins/promptHooks";
+import {
+  joinTurnStopReasons,
+  TURN_STOP_PROMPT_MAX_CHARS,
+} from "@/node/services/agentPlugins/promptHooks";
+import type { TurnStopContinueReason } from "@/node/services/events/eventSpine";
 import { isSuccessfulToolResult } from "@/node/services/aiServiceEventGuards";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
@@ -75,28 +79,32 @@ export function resumedStreamStartedByUserMessage(input: {
 
 export interface TurnStopContinuation {
   prompt: string;
+  /** The hookKey of each hook whose reason text is in the prompt, each once (none for nudges). */
+  hookKeys: string[];
+  /** Those hooks' plugins, each once, in chain order. */
+  pluginNames: string[];
 }
 
 /**
- * The turn.stop continuation from the plugin hooks' prompt and Xum's nudges (TODO first, then the
- * status page), or null for none.
+ * The turn.stop continuation from the plugin hooks' reasons and Xum's nudges (TODO first, then
+ * the status page), or null for none.
  */
 export function mergeTurnStopContinuation(input: {
-  hookPrompt: string | null;
+  hookReasons: readonly TurnStopContinueReason[];
   nudges: readonly string[];
 }): TurnStopContinuation | null {
-  if (input.nudges.length === 0) {
-    return input.hookPrompt == null ? null : { prompt: input.hookPrompt };
-  }
   // Every continuation, a nudge included, keeps the turn's tools: a nudge limited to todo_write
   // left work the model could do open until the next user message ("Gating and pushing needs
   // bash, and this turn has only todo_write"), so the nudged turn may continue normally.
   const nudgePrompt = input.nudges.join(TURN_END_NUDGE_SEPARATOR);
-  if (input.hookPrompt == null) return { prompt: nudgePrompt };
   // The joined prompt keeps the cap: the plugin's part is cut, so the nudges always arrive whole.
   const hookRoom =
-    TURN_STOP_PROMPT_MAX_CHARS - TURN_END_NUDGE_SEPARATOR.length - nudgePrompt.length;
-  return {
-    prompt: `${input.hookPrompt.slice(0, hookRoom)}${TURN_END_NUDGE_SEPARATOR}${nudgePrompt}`,
-  };
+    input.nudges.length === 0
+      ? TURN_STOP_PROMPT_MAX_CHARS
+      : TURN_STOP_PROMPT_MAX_CHARS - TURN_END_NUDGE_SEPARATOR.length - nudgePrompt.length;
+  const hooks = joinTurnStopReasons(input.hookReasons, hookRoom);
+  const prompt = [hooks.prompt, nudgePrompt]
+    .filter((part) => part.length > 0)
+    .join(TURN_END_NUDGE_SEPARATOR);
+  return prompt.length > 0 ? { ...hooks, prompt } : null;
 }

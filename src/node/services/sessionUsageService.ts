@@ -9,7 +9,7 @@ import { withTargetMutationLock } from "@/node/services/refinement/targetMutatio
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
-import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
+import { addModelUsage, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getAssistantMessageModelUsages } from "@/common/utils/tokens/messageModelUsages";
 import {
@@ -20,7 +20,9 @@ import {
 import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import {
   ChatUsageDisplaySchema,
-  SessionUsageTokenStatsCacheSchema,
+  isInheritedForkRow,
+  RolledUpChildEntrySchema,
+  SessionUsageFileSchema,
 } from "@/common/orpc/schemas/chatStats";
 import {
   getSelfIdentity,
@@ -28,6 +30,7 @@ import {
   parseProcessIdentity,
 } from "@/node/utils/concurrency/processLiveness";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import { buildAgentTaskIndex } from "@/node/services/agentTaskIndex";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
 import type { MuxMessage } from "@/common/types/message";
@@ -70,6 +73,22 @@ export interface SessionUsageTokenStatsCacheV1 {
   topFilePaths?: Array<{ path: string; tokens: number }>;
   /** Exact inputs of this count; lets the backend serve it without re-reading history. */
   source?: { historyReceipt: string; inputsKey: string };
+}
+
+export interface SubagentSubtreeUsage {
+  /** Usage per model, summed over the open (not yet rolled up) workspaces of one subtree. */
+  byModel: Record<string, ChatUsageDisplay>;
+  /** Open workspaces of the subtree that have any usage. */
+  workspaceCount: number;
+}
+
+export interface OpenSubagentUsage {
+  /**
+   * One entry per direct child, covering that child and its open descendants. Keyed by child so
+   * the store can drop a child its own copy of the parent ledger already counts: the two reads
+   * are separate calls, and a removal can roll the child up between them.
+   */
+  children: Record<string, SubagentSubtreeUsage>;
 }
 
 export interface SessionUsageFile {
@@ -184,16 +203,149 @@ async function readInFlightUsageFile(
   }
 }
 
-function addModelUsage(
-  byModel: Record<string, ChatUsageDisplay>,
-  model: string,
-  usage: ChatUsageDisplay
-): void {
-  const existing = byModel[model];
-  const sum = existing ? sumUsageHistory([existing, usage]) : usage;
-  assert(sum, "addModelUsage: sum of two usages must exist");
-  byModel[model] = sum;
+interface DescendantTask {
+  id: string;
+  parentId: string;
+  /** The direct child of the root whose subtree holds this task. */
+  subtreeId: string;
 }
+
+function listDescendantTasks(
+  childrenByParent: ReadonlyMap<string, readonly string[]>,
+  rootId: string
+): DescendantTask[] {
+  const descendants: DescendantTask[] = [];
+  const seen = new Set<string>([rootId]);
+  const queue: Array<{ id: string; subtreeId?: string }> = [{ id: rootId }];
+  for (let parent = queue.shift(); parent !== undefined; parent = queue.shift()) {
+    for (const childId of childrenByParent.get(parent.id) ?? []) {
+      if (seen.has(childId)) continue;
+      seen.add(childId);
+      const subtreeId = parent.subtreeId ?? childId;
+      descendants.push({ id: childId, parentId: parent.id, subtreeId });
+      queue.push({ id: childId, subtreeId });
+    }
+  }
+  return descendants;
+}
+
+function getOpenDescendantModelUsage(
+  descendant: DescendantTask,
+  views: ReadonlyMap<string, SessionUsageFile | undefined>
+): Array<[string, ChatUsageDisplay]> {
+  // Mid-removal: the parent's ledger already holds this descendant's roll-up.
+  if (views.get(descendant.parentId)?.rolledUpFrom?.[descendant.id]) return [];
+  return Object.entries(views.get(descendant.id)?.byModel ?? {});
+}
+
+function sumOpenDescendantUsage(
+  descendants: readonly DescendantTask[],
+  views: ReadonlyMap<string, SessionUsageFile | undefined>
+): OpenSubagentUsage {
+  const children: Record<string, SubagentSubtreeUsage> = {};
+  for (const descendant of descendants) {
+    const entries = getOpenDescendantModelUsage(descendant, views);
+    if (entries.length === 0) continue;
+    const subtree = (children[descendant.subtreeId] ??= { byModel: {}, workspaceCount: 0 });
+    subtree.workspaceCount++;
+    for (const [model, usage] of entries) {
+      addModelUsage(subtree.byModel, model, usage);
+    }
+  }
+  return { children };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const RolledUpFromEntrySchema = z.union([z.literal(true), RolledUpChildEntrySchema]);
+
+/**
+ * A malformed entry still says the child's usage was merged: it stays as the legacy `true`
+ * marker, so a retried roll-up does not count the child twice. A falsy one never said so.
+ */
+function keepRolledUpChildren(value: unknown): SessionUsageFile["rolledUpFrom"] {
+  if (!isPlainObject(value)) return undefined;
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([childId, entry]) => {
+      const parsed = RolledUpFromEntrySchema.safeParse(entry);
+      if (parsed.success) return [[childId, parsed.data]];
+      return entry ? [[childId, true as const]] : [];
+    })
+  );
+}
+
+interface ParsedLedger {
+  ledger: SessionUsageFile;
+  /**
+   * settledInFlightKeys is present but not a list of keys. It is the only record of which
+   * in-flight files the ledger already counts, so the ledger is kept without it and the reader
+   * counts no orphaned file (markOrphansSettled).
+   */
+  settledKeysCorrupt: boolean;
+}
+
+/**
+ * The one parser of session-usage.json, for locked and lock-free reads. A part in a wrong
+ * shape is dropped (a model entry, lastRequest, tokenStatsCache, rolledUpFrom) and the rest
+ * is kept: a rebuild from history would lose spend that history lacks, such as rolled-up
+ * children. Undefined when nothing usable is left (no byModel object, no valid entry in a
+ * non-empty one, or not version 1); the locked reads then rebuild from history, as for a parse
+ * error.
+ */
+function parseLedgerKeepingValidParts(raw: unknown): ParsedLedger | undefined {
+  if (!isPlainObject(raw) || !isPlainObject(raw.byModel)) return undefined;
+  const modelEntries = Object.entries(raw.byModel);
+  // Use the parsed values, not the raw ones: the schema repairs some fields (a null
+  // longContextTokens becomes undefined) that would still throw when usages are summed.
+  const byModel = Object.fromEntries(
+    modelEntries.flatMap(([model, usage]) => {
+      const entry = ChatUsageDisplaySchema.safeParse(usage);
+      return entry.success ? [[model, entry.data]] : [];
+    })
+  );
+  // No valid entry left of a non-empty byModel: nothing to keep, so history is the better source.
+  if (modelEntries.length > 0 && Object.keys(byModel).length === 0) return undefined;
+  const rolledUpFrom = keepRolledUpChildren(raw.rolledUpFrom);
+  const parsed = SessionUsageFileSchema.safeParse({
+    ...raw,
+    byModel,
+    lastRequest: SessionUsageFileSchema.shape.lastRequest.safeParse(raw.lastRequest).data,
+    rolledUpFrom,
+    tokenStatsCache: SessionUsageFileSchema.shape.tokenStatsCache.safeParse(raw.tokenStatsCache)
+      .data,
+  });
+  if (!parsed.success) return undefined;
+  const keys = SettledInFlightKeysSchema.safeParse(raw.settledInFlightKeys);
+  return {
+    // Fields this version does not know stay (from raw), so its writes keep what a newer Xum
+    // stored. The schema's records drop a "__proto__" key, so the entries parsed above stay.
+    ledger: {
+      ...raw,
+      ...parsed.data,
+      byModel,
+      rolledUpFrom,
+      settledInFlightKeys: keys.data,
+    },
+    settledKeysCorrupt: !keys.success,
+  };
+}
+
+/** The fork marker of an unusable ledger, so its repair keeps the fork's boundary. */
+function readForkBoundary(text: string): number | undefined {
+  try {
+    const raw: unknown = JSON.parse(text);
+    return isPlainObject(raw)
+      ? SessionUsageFileSchema.shape.forkedAt.parse(raw.forkedAt)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The schema strips settledInFlightKeys, but the view reads it into a Set. */
+const SettledInFlightKeysSchema = z.array(z.string()).optional();
 
 function withSettledInFlightKey(file: SessionUsageFile, key: string): void {
   const keys = (file.settledInFlightKeys ?? []).filter((existing) => existing !== key);
@@ -250,6 +402,7 @@ export class SessionUsageService {
   private readonly inFlightOwnerId = randomUUID();
   /** In-flight keys of streams this process is still running, per workspace. */
   private readonly liveInFlightKeys = new Map<string, Set<string>>();
+  private readonly usageChangedListeners: Array<(workspaceId: string) => void> = [];
 
   constructor(
     config: Config,
@@ -266,8 +419,23 @@ export class SessionUsageService {
     this.historyService = historyService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
   }
-  /** Usage rebuild needs every epoch for accurate totals. */
-  private async collectFullHistory(workspaceId: string): Promise<MuxMessage[]> {
+  /**
+   * Called after each write that changes a workspace's usage totals: its ledger (a settled
+   * stream, headless usage, a sub-agent rolled up into it, a reset or rebuild) or a running
+   * stream's in-flight file.
+   */
+  onUsageChanged(listener: (workspaceId: string) => void): void {
+    this.usageChangedListeners.push(listener);
+  }
+
+  private notifyUsageChanged(workspaceId: string): void {
+    for (const listener of this.usageChangedListeners) {
+      listener(workspaceId);
+    }
+  }
+
+  /** Usage rebuild needs every epoch for accurate totals. Undefined when history cannot be read. */
+  private async collectFullHistory(workspaceId: string): Promise<MuxMessage[] | undefined> {
     const messages: MuxMessage[] = [];
     const result = await this.historyService.iterateFullHistoryUnderLock(
       workspaceId,
@@ -278,7 +446,7 @@ export class SessionUsageService {
     );
     if (!result.success) {
       log.warn(`Failed to iterate history for ${workspaceId}: ${result.error}`);
-      return [];
+      return undefined;
     }
     return messages;
   }
@@ -428,16 +596,119 @@ export class SessionUsageService {
     return { byModel: {}, version: 1 };
   }
 
+  /**
+   * The ledger for a locked write: empty when missing, rebuilt from history when unusable.
+   * Throws on a read error (EIO...): the file can still hold spend that a write would lose.
+   */
   private async readFile(workspaceId: string): Promise<SessionUsageFile> {
+    return (await this.readLedgerForWrite(workspaceId)).ledger;
+  }
+
+  /** readFile, plus the assistant messages a repair from history counted. */
+  private async readLedgerForWrite(
+    workspaceId: string
+  ): Promise<{ ledger: SessionUsageFile; countedMessageIds: ReadonlySet<string> }> {
+    const empty = { ledger: this.createEmptyUsageFile(), countedMessageIds: new Set<string>() };
+    const text = await this.readLedgerText(workspaceId);
+    if (text === undefined) return empty;
+    const content = await this.parseLedgerText(workspaceId, text);
+    if (content !== "unusable") return { ledger: content, countedMessageIds: new Set() };
+    log.warn(`session-usage.json unusable for ${workspaceId}, rebuilding`);
+    return (await this.repairLedgerFromHistory(workspaceId, readForkBoundary(text))) ?? empty;
+  }
+
+  /** The ledger file's text, undefined when missing. Throws on any other read error. */
+  private async readLedgerText(workspaceId: string): Promise<string | undefined> {
     try {
-      const data = await this.files.promises.readFile(this.getFilePath(workspaceId), "utf-8");
-      return JSON.parse(data) as SessionUsageFile;
+      return await this.files.promises.readFile(this.getFilePath(workspaceId), "utf-8");
     } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-        return this.createEmptyUsageFile();
-      }
+      if (isErrnoWithCode(error, "ENOENT")) return undefined;
       throw error;
     }
+  }
+
+  /**
+   * Every ledger read parses here. Throws when the settled keys are corrupt and the in-flight
+   * files cannot be listed (markOrphansSettled).
+   */
+  private async parseLedgerText(
+    workspaceId: string,
+    text: string
+  ): Promise<SessionUsageFile | "unusable"> {
+    let parsed: ParsedLedger | undefined;
+    try {
+      parsed = parseLedgerKeepingValidParts(JSON.parse(text));
+    } catch {
+      return "unusable";
+    }
+    if (!parsed) return "unusable";
+    if (parsed.settledKeysCorrupt) {
+      await this.markOrphansSettled(workspaceId, parsed.ledger);
+    }
+    return parsed.ledger;
+  }
+
+  /**
+   * The settled keys are unreadable, so the ledger may already count any in-flight file a dead
+   * stream left: count none of them (never twice), and the next fold deletes them. An
+   * unreadable file can be one too. Only this process's running streams are known to be
+   * uncounted, and their settle still records their usage.
+   */
+  private async markOrphansSettled(workspaceId: string, ledger: SessionUsageFile): Promise<void> {
+    const entries = await this.readInFlightEntries(workspaceId);
+    // A write now would drop the markers of files no one can see: fail, and retry later.
+    if (!entries) throw new Error(`in-flight usage files of ${workspaceId} cannot be listed`);
+    for (const entry of entries) {
+      const ownRunning = this.liveInFlightKeys.get(workspaceId)?.has(entry.key) ?? false;
+      if (entry.unreadable ? !ownRunning : this.isOrphan(workspaceId, entry)) {
+        withSettledInFlightKey(ledger, entry.key);
+      }
+    }
+  }
+
+  /**
+   * Rebuilds the ledger from history and writes it; undefined when there is nothing to keep.
+   * A fork's rows from its parent stay out and its marker stays (`forkedAt`). Also returns the
+   * assistant messages it counted, so a settle of one of them is not added again.
+   */
+  private async repairLedgerFromHistory(
+    workspaceId: string,
+    forkedAt?: number
+  ): Promise<{ ledger: SessionUsageFile; countedMessageIds: ReadonlySet<string> } | undefined> {
+    // The repair overwrites the ledger, so it fails, and the next read retries, while history
+    // or an in-flight file cannot be read: it would drop that spend or the settled key of a file
+    // its history already counts (markInFlightFilesCountedByHistory).
+    const history = await this.collectFullHistory(workspaceId);
+    if (!history) throw new Error(`history of ${workspaceId} cannot be read`);
+    const messages = history.filter(
+      (msg) => !isInheritedForkRow(msg.metadata?.timestamp, forkedAt)
+    );
+    if (messages.length === 0 && forkedAt === undefined) return undefined;
+    const entries = await this.readInFlightEntries(workspaceId);
+    if (!entries || entries.some((entry) => entry.unreadable)) {
+      throw new Error(`in-flight usage files of ${workspaceId} cannot be read`);
+    }
+    const repaired = await this.rebuildFromMessagesInternal(workspaceId, messages);
+    repaired.forkedAt = forkedAt;
+    await this.writeFile(workspaceId, repaired);
+    log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
+    // Through the parser like every read: a legacy history row can hold a malformed usage.
+    const rebuilt = parseLedgerKeepingValidParts(repaired);
+    assert(rebuilt && !rebuilt.settledKeysCorrupt, "a ledger rebuilt from history always parses");
+    // The repaired totals can differ from what lock-free readers showed (an ancestor's
+    // projection rebuilds without the fork boundary, the archived list shows none). Notify
+    // only once the ledger parses: the refetch this starts then repairs nothing. A ledger
+    // that fails the assert would be repaired, and notified, again on every refetch.
+    this.notifyUsageChanged(workspaceId);
+    const countedMessageIds = new Set(
+      messages
+        .filter(
+          (msg) =>
+            msg.role === "assistant" && getAssistantMessageModelUsages(msg.metadata).length > 0
+        )
+        .map((msg) => msg.id)
+    );
+    return { ledger: rebuilt.ledger, countedMessageIds };
   }
 
   private async writeFile(workspaceId: string, data: SessionUsageFile): Promise<void> {
@@ -469,15 +740,26 @@ export class SessionUsageService {
        * and mark the key settled in one ledger write, then delete the stream's file.
        */
       settlesInFlightKey?: string;
+      /**
+       * The assistant message this usage belongs to. A repair of an unusable ledger counts
+       * the messages already in history, so it is not added again.
+       */
+      messageId?: string;
     }
   ): Promise<void> {
     const settlesKey = options?.settlesInFlightKey;
     return this.fileLocks.withLock(workspaceId, async () => {
-      const current = await this.readFile(workspaceId);
+      const { ledger: current, countedMessageIds } = await this.readLedgerForWrite(workspaceId);
       const entries = await this.readInFlightEntries(workspaceId);
       const { filesToDelete } = this.foldOrphanedInFlightUsage(workspaceId, current, entries);
-      // CRITICAL: Accumulate, don't overwrite
-      addModelUsage(current.byModel, model, usage);
+      // CRITICAL: Accumulate, don't overwrite. A key a rebuild already settled is counted
+      // through its final message in history (markInFlightFilesCountedByHistory).
+      const countedByRebuild =
+        (settlesKey !== undefined && current.settledInFlightKeys?.includes(settlesKey) === true) ||
+        (options?.messageId !== undefined && countedMessageIds.has(options.messageId));
+      if (!countedByRebuild) {
+        addModelUsage(current.byModel, model, usage);
+      }
       if (options?.skipLastRequestUpdate !== true) {
         current.lastRequest = { model, usage, timestamp: Date.now() };
       }
@@ -492,6 +774,7 @@ export class SessionUsageService {
         filesToDelete.push(this.getInFlightFilePath(workspaceId, settlesKey));
       }
       await this.deleteFiles(filesToDelete);
+      this.notifyUsageChanged(workspaceId);
     });
   }
 
@@ -532,6 +815,7 @@ export class SessionUsageService {
         if (!wasLive) this.forgetLiveKey(workspaceId, key);
         throw error;
       }
+      this.notifyUsageChanged(workspaceId);
     });
   }
 
@@ -543,6 +827,7 @@ export class SessionUsageService {
       // usage that was meant to be dropped (a restart then counts it: it was billed).
       await this.files.promises.rm(filePath, { force: true });
       this.forgetLiveKey(workspaceId, key);
+      this.notifyUsageChanged(workspaceId);
     });
   }
 
@@ -786,23 +1071,7 @@ export class SessionUsageService {
         return;
       }
 
-      let current: SessionUsageFile;
-      try {
-        current = await this.readFile(workspaceId);
-      } catch {
-        // Parse errors or other read failures - best-effort rebuild.
-        log.warn(
-          `session-usage.json unreadable for ${workspaceId}, rebuilding before token stats cache update`
-        );
-        const messages = await this.collectFullHistory(workspaceId);
-        if (messages.length > 0) {
-          await this.rebuildFromMessagesInternal(workspaceId, messages);
-          current = await this.readFile(workspaceId);
-        } else {
-          current = this.createEmptyUsageFile();
-        }
-      }
-
+      const current = await this.readFile(workspaceId);
       current.tokenStatsCache = cache;
       await this.writeFile(workspaceId, current);
     });
@@ -814,8 +1083,7 @@ export class SessionUsageService {
   ): Promise<SessionUsageTokenStatsCacheV1 | undefined> {
     try {
       const raw = await this.files.promises.readFile(this.getFilePath(workspaceId), "utf-8");
-      const file = JSON.parse(raw) as Partial<SessionUsageFile>;
-      return SessionUsageTokenStatsCacheSchema.safeParse(file.tokenStatsCache).data;
+      return parseLedgerKeepingValidParts(JSON.parse(raw))?.ledger.tokenStatsCache;
     } catch {
       return undefined;
     }
@@ -854,31 +1122,14 @@ export class SessionUsageService {
     }
 
     return this.fileLocks.withLock(parentWorkspaceId, async () => {
-      let current: SessionUsageFile;
-      try {
-        current = await this.readFile(parentWorkspaceId);
-      } catch {
-        // Parse errors or other read failures - best-effort rebuild.
-        log.warn(
-          `session-usage.json unreadable for ${parentWorkspaceId}, rebuilding before roll-up`
-        );
-        const messages = await this.collectFullHistory(parentWorkspaceId);
-        if (messages.length > 0) {
-          await this.rebuildFromMessagesInternal(parentWorkspaceId, messages);
-          current = await this.readFile(parentWorkspaceId);
-        } else {
-          current = this.createEmptyUsageFile();
-        }
-      }
+      const current = await this.readFile(parentWorkspaceId);
 
       if (current.rolledUpFrom?.[childWorkspaceId]) {
         return { didRollUp: false };
       }
 
       for (const [model, usage] of entries) {
-        const existing = current.byModel[model];
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+        addModelUsage(current.byModel, model, usage);
       }
 
       let totalTokens = 0;
@@ -945,6 +1196,7 @@ export class SessionUsageService {
         },
       };
       await this.writeFile(parentWorkspaceId, current);
+      this.notifyUsageChanged(parentWorkspaceId);
 
       return { didRollUp: true };
     });
@@ -987,33 +1239,20 @@ export class SessionUsageService {
     });
   }
 
-  /** The settled ledger (rebuilt from history when missing or corrupt). Caller holds the lock. */
+  /**
+   * The settled ledger, rebuilt from history when missing or unusable; undefined for an empty
+   * session. A read error throws and writes nothing: the file can still hold spend that history
+   * lacks, and the next read retries. Caller holds the lock.
+   */
   private async readSettledLedgerLocked(
     workspaceId: string
   ): Promise<SessionUsageFile | undefined> {
-    try {
-      const filePath = this.getFilePath(workspaceId);
-      const data = await this.files.promises.readFile(filePath, "utf-8");
-      return JSON.parse(data) as SessionUsageFile;
-    } catch (error) {
-      // File missing or corrupted - try to rebuild from messages
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-        const messages = await this.collectFullHistory(workspaceId);
-        if (messages.length > 0) {
-          await this.rebuildFromMessagesInternal(workspaceId, messages);
-          return this.readFile(workspaceId);
-        }
-        return undefined; // Truly empty session
-      }
-      // Parse error - try rebuild
-      log.warn(`session-usage.json corrupted for ${workspaceId}, rebuilding`);
-      const messages = await this.collectFullHistory(workspaceId);
-      if (messages.length > 0) {
-        await this.rebuildFromMessagesInternal(workspaceId, messages);
-        return this.readFile(workspaceId);
-      }
-      return undefined;
-    }
+    const text = await this.readLedgerText(workspaceId);
+    if (text === undefined) return (await this.repairLedgerFromHistory(workspaceId))?.ledger;
+    const content = await this.parseLedgerText(workspaceId, text);
+    if (content !== "unusable") return content;
+    log.warn(`session-usage.json corrupted for ${workspaceId}, rebuilding`);
+    return (await this.repairLedgerFromHistory(workspaceId, readForkBoundary(text)))?.ledger;
   }
 
   /**
@@ -1026,6 +1265,7 @@ export class SessionUsageService {
   async resetSessionUsage(workspaceId: string, forkedAt?: number): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
       await this.writeFile(workspaceId, { ...this.createEmptyUsageFile(), forkedAt });
+      this.notifyUsageChanged(workspaceId);
     });
   }
 
@@ -1041,36 +1281,125 @@ export class SessionUsageService {
     // should already have session-usage.json; skip rebuild to keep batch fast)
     await Promise.all(
       workspaceIds.map(async (workspaceId) => {
-        let settled: SessionUsageFile | undefined;
-        try {
-          const filePath = this.getFilePath(workspaceId);
-          const data = await this.files.promises.readFile(filePath, "utf-8");
-          settled = JSON.parse(data) as SessionUsageFile;
-        } catch {
-          settled = undefined;
-        }
-        // Lock-free and read-only: killed streams are added to the view, not folded.
-        const entries = await this.readInFlightEntries(workspaceId);
-        const { view, addedCount } = this.addRunningStreamsToView(
-          workspaceId,
-          settled ?? this.createEmptyUsageFile(),
-          entries,
-          false
-        );
-        results[workspaceId] = settled === undefined && addedCount === 0 ? undefined : view;
+        results[workspaceId] = await this.readUsageViewLockFree(workspaceId, false);
       })
     );
     return results;
   }
 
   /**
+   * Usage of a workspace's sub-agents (and their sub-agents) that still exist.
+   *
+   * A sub-agent's spend reaches its parent's ledger only when the sub-agent workspace is
+   * removed (rollUpUsageIntoParent), so sub-agents that report and stay around hid most
+   * delegated spend from the parent's Costs tab. The UI adds this projection to the parent's cost.
+   *
+   * Counted once: each open descendant's ledger already holds its own removed children, and
+   * open grandchildren are visited separately. Running streams are included because no other
+   * source shows a sub-agent's in-progress spend to the parent.
+   */
+  async getOpenSubagentUsage(workspaceId: string): Promise<OpenSubagentUsage> {
+    assert(workspaceId.trim().length > 0, "getOpenSubagentUsage requires workspaceId");
+    const index = buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const descendants = listDescendantTasks(index.childrenByParent, workspaceId);
+    if (descendants.length === 0) {
+      return { children: {} };
+    }
+    const ids = [workspaceId, ...descendants.map((d) => d.id)];
+    // The root's view only supplies rolledUpFrom, which a history rebuild never has.
+    const views = new Map(
+      await Promise.all(
+        ids.map(
+          async (id) =>
+            [
+              id,
+              id === workspaceId
+                ? await this.readUsageViewLockFree(id, true).catch(() => undefined)
+                : await this.readProjectionView(id),
+            ] as const
+        )
+      )
+    );
+    return sumOpenDescendantUsage(descendants, views);
+  }
+
+  /**
+   * A missing or unusable ledger is rebuilt from history like a locked read would, but only in
+   * memory: writing it could recreate the session folder of a sub-agent that is being removed.
+   */
+  private async readProjectionView(workspaceId: string): Promise<SessionUsageFile | undefined> {
+    // Decide on the settled ledger, not the view: a view of only a running stream would
+    // skip the rebuild and hide every settled turn. Any read failure counts as missing, so
+    // one sub-agent cannot reject the whole projection and hide its siblings' spend.
+    const settled = await this.readSettledLedgerLockFree(workspaceId);
+    if (settled) {
+      return this.readUsageViewLockFree(workspaceId, true, settled).catch(() => settled);
+    }
+    try {
+      // collectFullHistory requires the workspace lock (in memory; it creates no files).
+      return await this.fileLocks.withLock(workspaceId, async () => {
+        // An empty history still runs: a running stream's in-flight file must count.
+        const messages = (await this.collectFullHistory(workspaceId)) ?? [];
+        const { view: rebuilt } = this.addRunningStreamsToView(
+          workspaceId,
+          await this.rebuildFromMessagesInternal(workspaceId, messages),
+          await this.readInFlightEntries(workspaceId),
+          true
+        );
+        return rebuilt;
+      });
+    } catch (error) {
+      log.warn("Failed to rebuild sub-agent usage for the projection", { workspaceId, error });
+      return undefined;
+    }
+  }
+
+  private async readSettledLedgerLockFree(
+    workspaceId: string
+  ): Promise<SessionUsageFile | undefined> {
+    try {
+      const text = await this.readLedgerText(workspaceId);
+      const content =
+        text === undefined ? undefined : await this.parseLedgerText(workspaceId, text);
+      return content === "unusable" ? undefined : content;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async readUsageViewLockFree(
+    workspaceId: string,
+    includeOwnLiveStreams: boolean,
+    settledLedger?: SessionUsageFile
+  ): Promise<SessionUsageFile | undefined> {
+    const settled = settledLedger ?? (await this.readSettledLedgerLockFree(workspaceId));
+    // Lock-free and read-only: killed streams are added to the view, not folded.
+    const entries = await this.readInFlightEntries(workspaceId);
+    const { view, addedCount } = this.addRunningStreamsToView(
+      workspaceId,
+      settled ?? this.createEmptyUsageFile(),
+      entries,
+      includeOwnLiveStreams
+    );
+    return settled === undefined && addedCount === 0 ? undefined : view;
+  }
+
+  /**
    * Rebuild session usage from messages (for migration/recovery).
    * Internal version - called within lock.
    */
+  private async rebuildAndWriteLedger(workspaceId: string, messages: MuxMessage[]): Promise<void> {
+    await this.writeFile(
+      workspaceId,
+      await this.rebuildFromMessagesInternal(workspaceId, messages)
+    );
+    log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
+  }
+
   private async rebuildFromMessagesInternal(
     workspaceId: string,
     messages: MuxMessage[]
-  ): Promise<void> {
+  ): Promise<SessionUsageFile> {
     const result: SessionUsageFile = this.createEmptyUsageFile();
     let lastAssistantUsage: { model: string; usage: ChatUsageDisplay } | undefined;
 
@@ -1092,10 +1421,7 @@ export class SessionUsageService {
       usage: ChatUsageDisplay,
       metadataModel?: string
     ): void => {
-      const model = usageBucketKey(rawModel, metadataModel);
-      const existing = result.byModel[model];
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-      result.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+      addModelUsage(result.byModel, usageBucketKey(rawModel, metadataModel), usage);
     };
 
     const messageIdsWithUsage = new Set<string>();
@@ -1137,14 +1463,14 @@ export class SessionUsageService {
     }
 
     await this.markInFlightFilesCountedByHistory(workspaceId, result, messageIdsWithUsage);
-
-    await this.writeFile(workspaceId, result);
-    log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
+    return result;
   }
 
   /**
-   * A leftover in-flight file whose message reached history with usage (its final ledger
-   * write failed after the message was saved) is already counted by a rebuild: mark it settled.
+   * An in-flight file whose message reached history with usage is already counted by a
+   * rebuild: mark it settled. Its stream can be gone (the final ledger write failed after the
+   * message was saved) or still running: stream end commits the final message to history
+   * before its settle takes the lock, so a rebuild can run in between.
    */
   private async markInFlightFilesCountedByHistory(
     workspaceId: string,
@@ -1153,7 +1479,7 @@ export class SessionUsageService {
   ): Promise<void> {
     for (const entry of (await this.readInFlightEntries(workspaceId)) ?? []) {
       const messageId = entry.file?.messageId;
-      if (messageId && messageIdsWithUsage.has(messageId) && this.isOrphan(workspaceId, entry)) {
+      if (messageId && messageIdsWithUsage.has(messageId)) {
         withSettledInFlightKey(rebuilt, entry.key);
       }
     }
@@ -1164,7 +1490,8 @@ export class SessionUsageService {
    */
   async rebuildFromMessages(workspaceId: string, messages: MuxMessage[]): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
-      await this.rebuildFromMessagesInternal(workspaceId, messages);
+      await this.rebuildAndWriteLedger(workspaceId, messages);
+      this.notifyUsageChanged(workspaceId);
     });
   }
 }

@@ -582,6 +582,36 @@ describe("TaskService child goals", () => {
     expect(t.sends()).toHaveLength(0);
   });
 
+  // #4545: a workflow claim retired the attempt while its stream ran, so the replacement owns the
+  // outcome. The final prose is not published, and this attempt's waiters end now.
+  test("a final report on a retired attempt is not published and rejects its waiters", async () => {
+    const t = await setup();
+    const waiter = t.taskService
+      .waitForAgentReport(childId, { timeoutMs: 5_000, requestingWorkspaceId: parentId })
+      .then(
+        () => "resolved",
+        (error: unknown) => `rejected: ${error instanceof Error ? error.message : String(error)}`
+      );
+    await t.editChild((workspace) => {
+      workspace.taskAttemptRetiredBy = {
+        runId: "wfr_retired",
+        stepId: "summarize",
+        inputHash: "hash-1",
+        childTaskId: "replacement-child",
+        attemptId: "att_00000000000000c1",
+        mode: "no-report",
+        at: "2026-10-01T00:00:00.000Z",
+      };
+    });
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(await waiter).toContain("retired this task attempt");
+    expect(t.child()?.taskStatus).toBe("running");
+    expect(await t.parentReports()).toHaveLength(0);
+    expect(t.sends()).toHaveLength(0);
+  });
+
   test("a user pause during arbitration publishes the report and starts no goal turn", async () => {
     const t = await setup();
     await t.setChildGoal();
@@ -1208,10 +1238,10 @@ describe("TaskService child goals", () => {
     expect(seeded.success).toBe(true);
     expect(await t.taskService.markInterruptedTaskRunning(childId)).toBe(true);
     const internal = t.taskService as unknown as {
-      ownedAttemptByTaskId: Map<string, { receiptEligible: boolean }>;
-      streamEndDecisionsByTaskId: Map<string, Array<{ outcome: string }>>;
+      attemptLedger: { ownedAttemptByTaskId: Map<string, { receiptEligible: boolean }> };
+      streamEndLedger: { streamEndDecisionsByTaskId: Map<string, Array<{ outcome: string }>> };
     };
-    expect(internal.ownedAttemptByTaskId.get(childId)?.receiptEligible).toBe(true);
+    expect(internal.attemptLedger.ownedAttemptByTaskId.get(childId)?.receiptEligible).toBe(true);
     await t.setChildGoal();
     const realWait = t.goals.waitForStreamAccountingReceipt.bind(t.goals);
     spyOn(t.goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
@@ -1220,9 +1250,9 @@ describe("TaskService child goals", () => {
     t.goals.beginStreamAccountingReceipt(childId, "assistant-1");
     await streamEnd(t.taskService, t.proseEnd("assistant-1"));
     expect(t.child()?.taskStatus).toBe("running");
-    expect(internal.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
-      "pending",
-    ]);
+    expect(
+      internal.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)
+    ).toEqual(["pending"]);
     return { t, internal };
   }
 
@@ -1239,7 +1269,7 @@ describe("TaskService child goals", () => {
       data: { stoppedTaskIds: [childId] },
     });
     expect(t.taskService.isWorkspaceStopInProgress(childId)).toBe(false);
-    expect(internal.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+    expect(internal.streamEndLedger.streamEndDecisionsByTaskId.has(childId)).toBe(false);
     expect(t.child()?.taskStatus).toBe("interrupted");
   });
 
@@ -1259,7 +1289,7 @@ describe("TaskService child goals", () => {
     await waitForCondition(() => !t.taskService.isWorkspaceStopInProgress(childId), {
       timeoutMs: 1_000,
     });
-    expect(internal.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+    expect(internal.streamEndLedger.streamEndDecisionsByTaskId.has(childId)).toBe(false);
   });
 
   // #6920 control: a terminate whose removal succeeds. The removal deregisters the workspace and
@@ -1309,7 +1339,7 @@ describe("TaskService child goals", () => {
     expect(await waiter).toBe("rejected: Task terminated");
     expect(rejectWaiters.mock.calls.filter((call) => call[0] === childId)).toHaveLength(1);
     await waitForCondition(() => !t.taskService.isWorkspaceStopInProgress(childId));
-    expect(internal.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+    expect(internal.streamEndLedger.streamEndDecisionsByTaskId.has(childId)).toBe(false);
     expect(removeQueuedMessagesByDedupeKeyPrefix).not.toHaveBeenCalled();
     expect(t.sends()).toHaveLength(0);
     expect(await t.parentReports()).toHaveLength(0);
@@ -1342,7 +1372,7 @@ describe("TaskService child goals", () => {
       await waitForCondition(() => !t.taskService.isWorkspaceStopInProgress(childId), {
         timeoutMs: 1_000,
       });
-      expect(internal.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+      expect(internal.streamEndLedger.streamEndDecisionsByTaskId.has(childId)).toBe(false);
     }
   );
 
@@ -1361,9 +1391,12 @@ describe("TaskService child goals", () => {
 
     expect(report.reportMarkdown).toBe("Report from another backend.");
     expect(t.child()?.taskStatus).toBe("reported");
-    await waitForCondition(() => !internal.streamEndDecisionsByTaskId.has(childId), {
-      timeoutMs: 1_000,
-    });
+    await waitForCondition(
+      () => !internal.streamEndLedger.streamEndDecisionsByTaskId.has(childId),
+      {
+        timeoutMs: 1_000,
+      }
+    );
     // Settled, not continued: no goal turn, recovery prompt or report send for the child.
     expect(t.sends()).toHaveLength(0);
   });
@@ -1476,9 +1509,9 @@ describe("TaskService child goals", () => {
 
     expect(waited).toBe("still waiting");
     expect(t.child()?.taskStatus).toBe("running");
-    expect(internal.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
-      "pending",
-    ]);
+    expect(
+      internal.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)
+    ).toEqual(["pending"]);
   });
 
   // #7003 legacy artifacts over an interrupted row keep today's self-heal: adopted as the report.
@@ -1514,9 +1547,12 @@ describe("TaskService child goals", () => {
 
     expect(report.reportMarkdown).toBe("Legacy report.");
     expect(t.child()?.taskStatus).toBe("reported");
-    await waitForCondition(() => !internal.streamEndDecisionsByTaskId.has(childId), {
-      timeoutMs: 1_000,
-    });
+    await waitForCondition(
+      () => !internal.streamEndLedger.streamEndDecisionsByTaskId.has(childId),
+      {
+        timeoutMs: 1_000,
+      }
+    );
   });
 
   // #7003: another backend's `reported` for the deferred stream's own attempt lands, and then any
@@ -1524,7 +1560,7 @@ describe("TaskService child goals", () => {
   // must settle the decision as indeterminate (held follow-ups refused), not as nonreport.
   test("a deferral re-run after another backend reported its attempt settles as indeterminate", async () => {
     const { t, internal } = await deferStreamEndOfOwnedAttempt();
-    const decision = internal.streamEndDecisionsByTaskId.get(childId)?.[0];
+    const decision = internal.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.[0];
     expect(decision?.outcome).toBe("pending");
     await t.editChild((workspace) => {
       workspace.taskStatus = "reported";
@@ -1535,9 +1571,12 @@ describe("TaskService child goals", () => {
       t.taskService as unknown as { notifyAttemptSettlementListeners: (taskId: string) => void }
     ).notifyAttemptSettlementListeners(childId);
 
-    await waitForCondition(() => !internal.streamEndDecisionsByTaskId.has(childId), {
-      timeoutMs: 1_000,
-    });
+    await waitForCondition(
+      () => !internal.streamEndLedger.streamEndDecisionsByTaskId.has(childId),
+      {
+        timeoutMs: 1_000,
+      }
+    );
     expect(decision?.outcome).toBe("indeterminate");
     expect(t.sends()).toHaveLength(0);
   });
@@ -1566,10 +1605,10 @@ describe("TaskService child goals", () => {
 
     const listeners = (
       t.taskService as unknown as {
-        attemptSettlementListenersByTaskId: Map<string, Set<() => void>>;
+        attemptLedger: { attemptSettlementListenersByTaskId: Map<string, Set<() => void>> };
         notifyAttemptSettlementListeners: (taskId: string) => void;
       }
-    ).attemptSettlementListenersByTaskId;
+    ).attemptLedger.attemptSettlementListenersByTaskId;
     expect(listeners.get(childId)?.size).toBe(1);
     (
       t.taskService as unknown as { notifyAttemptSettlementListeners: (taskId: string) => void }
@@ -1579,9 +1618,9 @@ describe("TaskService child goals", () => {
 
     expect(listeners.get(childId)?.size).toBe(1);
     expect(t.child()?.taskStatus).toBe("running");
-    expect(internal.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
-      "pending",
-    ]);
+    expect(
+      internal.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)
+    ).toEqual(["pending"]);
   });
 
   // #7003: a row moved to awaiting_report while the stream end is deferred (no notify on that
@@ -1597,9 +1636,12 @@ describe("TaskService child goals", () => {
       t.taskService as unknown as { notifyAttemptSettlementListeners: (taskId: string) => void }
     ).notifyAttemptSettlementListeners(childId);
 
-    await waitForCondition(() => !internal.streamEndDecisionsByTaskId.has(childId), {
-      timeoutMs: 1_000,
-    });
+    await waitForCondition(
+      () => !internal.streamEndLedger.streamEndDecisionsByTaskId.has(childId),
+      {
+        timeoutMs: 1_000,
+      }
+    );
     await t.untilStatus("reported");
     expect(t.child()?.taskStatus).toBe("reported");
     // The parent's delivery lands after the status write.
@@ -1630,6 +1672,28 @@ describe("TaskService child goals", () => {
     await t.untilSends(1);
     expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual(["goal_continuation"]);
     expect(t.staleAtSend).toEqual([false]);
+    expect(await t.parentReports()).toHaveLength(0);
+  });
+
+  // The last goal arbitration (no final report) defers too: handleStreamEnd returns "deferred"
+  // so the ledger hands the stream to deferChildStreamEnd instead of asking for the report now.
+  test("unsettled accounting defers a stream end without a report; its settlement continues the goal", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    const realWait = t.goals.waitForStreamAccountingReceipt.bind(t.goals);
+    spyOn(t.goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
+      realWait(workspaceId, messageId, 20)
+    );
+    t.goals.beginStreamAccountingReceipt(childId, "assistant-1");
+
+    await streamEnd(t.taskService, t.workEnd("assistant-1"));
+    // Deferred: no recovery prompt and no goal turn yet.
+    expect(t.sends()).toHaveLength(0);
+    expect(t.child()?.taskStatus).toBe("running");
+
+    t.goals.settleStreamAccountingReceipt(childId, "assistant-1");
+    await t.untilSends(1);
+    expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual(["goal_continuation"]);
     expect(await t.parentReports()).toHaveLength(0);
   });
 

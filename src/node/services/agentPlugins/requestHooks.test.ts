@@ -5,7 +5,7 @@ import type { Config } from "@/node/config";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { codexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
 import { agentPluginHookService } from "./hookService";
-import { prepareWorkspaceRequestHooks } from "./requestHooks";
+import { cursorWorkspaceRoots, prepareWorkspaceRequestHooks } from "./requestHooks";
 
 const spies: Array<{ mockRestore: () => void }> = [];
 afterEach(() => spies.splice(0).forEach((spy) => spy.mockRestore()));
@@ -115,4 +115,89 @@ test("the per-call gate reads the workspace's projects again, so a project added
   // A workspace that is gone runs no hook.
   current = null;
   expect(codexArgs?.isProjectTrusted()).toBe(false);
+});
+
+test("a side chat registers its hooks as a side chat, so no Cursor command hook runs in it", async () => {
+  // The service refuses every hook for `sideChat: true` (codexHookService.test.ts); this is the
+  // link that sets it. A side chat shares the main chat's checkout, and a hook there would run
+  // commands beside the main chat's work.
+  const config = {
+    rootDir: "/xum",
+    sessionsDir: "/xum/sessions",
+    loadConfigOrDefault: () => ({ projects: new Map() }),
+    findWorkspace: () => ({}),
+  } as unknown as Config;
+  const workspace: WorkspaceMetadata = {
+    id: "ws-main",
+    name: "ws-main",
+    projectName: "primary",
+    projectPath: "/repo/primary",
+    runtimeConfig: { type: "local" },
+  };
+  const calls: EnsureCodexHooksArgs[] = [];
+  spies.push(
+    spyOn(agentPluginHookService, "ensureWorkspaceHooksForRequest").mockResolvedValue(undefined),
+    spyOn(codexPluginHookService, "ensureWorkspaceHooks").mockImplementation((args) => {
+      calls.push(args);
+      return Promise.resolve();
+    })
+  );
+
+  for (const metadata of [
+    workspace,
+    { ...workspace, id: "ws-side", sideChatParentWorkspaceId: "ws-main" },
+  ]) {
+    await prepareWorkspaceRequestHooks({
+      config,
+      metadata,
+      hostCheckoutRoot: null,
+      journal: sharedDurableEventJournal(`/xum/sessions/${metadata.id}`),
+    });
+  }
+
+  // The Cursor roots come from the workspace's projects (one here, so the call's folder).
+  expect(calls[0].cursorWorkspaceRoots?.("/src/ws-main")).toEqual(["/src/ws-main"]);
+  // Both get a host runtime (local), so only the flag keeps the side chat's hooks off.
+  expect(
+    calls.map((args) => [args.workspaceId, args.sideChat, args.cursorHookRuntime !== undefined])
+  ).toEqual([
+    ["ws-main", false, true],
+    ["ws-side", true, true],
+  ]);
+});
+
+test("Cursor workspace_roots name each project's folder in a multi-project workspace", () => {
+  // A multi-project workspace runs in its container, which links each project under its name.
+  const single: WorkspaceMetadata = {
+    id: "ws-one",
+    name: "ws-one",
+    projectName: "primary",
+    projectPath: "/repo/primary",
+    runtimeConfig: { type: "local" },
+  };
+  const multi: WorkspaceMetadata = {
+    ...single,
+    id: "ws-two",
+    projects: [
+      { projectPath: "/repo/primary", projectName: "primary" },
+      { projectPath: "/repo/secondary", projectName: "secondary" },
+    ],
+  };
+  let current: { projects?: WorkspaceMetadata["projects"] } | null = {};
+  const config = { findWorkspace: () => current } as unknown as Config;
+
+  expect(cursorWorkspaceRoots(config, single, "/src/ws-one")).toEqual(["/src/ws-one"]);
+  expect(cursorWorkspaceRoots(config, multi, "/c/ws-two")).toEqual([
+    "/c/ws-two/primary",
+    "/c/ws-two/secondary",
+  ]);
+  // Read again on each call: a project added mid-session counts.
+  current = {
+    projects: [...(multi.projects ?? []), { projectPath: "/repo/third", projectName: "third" }],
+  };
+  expect(cursorWorkspaceRoots(config, multi, "/c/ws-two")).toEqual([
+    "/c/ws-two/primary",
+    "/c/ws-two/secondary",
+    "/c/ws-two/third",
+  ]);
 });

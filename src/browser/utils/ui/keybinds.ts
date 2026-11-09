@@ -571,9 +571,17 @@ export const KEYBINDS = {
    */
   STOP_COMPUTER_USE: { key: "Escape", ctrl: true, shift: true },
 
-  // Expand the background processes strip and focus its first row; again (or Esc) collapses it.
-  // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords.
-  FOCUS_BACKGROUND_PROCESSES: { key: "J", ctrl: true, shift: true },
+  // Open the live line's background bashes, TODO, sub-agents or reviews panel and focus it; again
+  // (or Esc) closes it. All four share one modifier pair so the chips' chords read as one family.
+  // Ctrl/Cmd+Alt, like NEW_SIDEBAR_TAB: Ctrl/Cmd+Shift has no free letters left for them, and
+  // Ctrl+Alt+T is GNOME's terminal. Matched by `code`: Option+letter is a dead key on macOS.
+  // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords
+  // (its secondary side bar toggle takes the "bash" mnemonic letter).
+  // The settings backup chords reuse these keys only inside the Settings dialog.
+  FOCUS_BACKGROUND_PROCESSES: { key: "j", code: "KeyJ", ctrl: true, alt: true },
+  OPEN_TODO_PANEL: { key: "o", code: "KeyO", ctrl: true, alt: true },
+  OPEN_SUB_AGENTS_PANEL: { key: "a", code: "KeyA", ctrl: true, alt: true },
+  OPEN_REVIEWS_PANEL: { key: "r", code: "KeyR", ctrl: true, alt: true },
   // Scoped to a focused row of the background processes strip.
   BACKGROUND_PROCESS_NEXT: { key: "ArrowDown" },
   BACKGROUND_PROCESS_PREV: { key: "ArrowUp" },
@@ -640,9 +648,9 @@ export const KEYBINDS = {
   FIT_ARTIFACT_IMAGE: { key: "0" },
   /** Show an image artifact at actual size (100%) */
   ACTUAL_SIZE_ARTIFACT_IMAGE: { key: "1" },
-  /** Pin the shown artifact version to the project shelf */
+  /** Pin the shown artifact to the project shelf */
   PIN_ARTIFACT_TO_PROJECT_SHELF: { key: "p" },
-  /** Pin the shown artifact version to the global shelf */
+  /** Pin the shown artifact to the global shelf */
   PIN_ARTIFACT_TO_GLOBAL_SHELF: { key: "P", shift: true },
   /** Unpin the selected shelf entry */
   UNPIN_SHELF_ENTRY: { key: "u" },
@@ -772,6 +780,10 @@ export const KEYBINDS = {
   // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
   SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
   SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS: { key: "u", code: "KeyU", ctrl: true, alt: true },
+  // Not Ctrl+Alt+P (PIN_WORKSPACE) or Ctrl+Alt+L (the lock-screen key on several desktops).
+  SETTINGS_BACKUP_TOGGLE_PLUGINS: { key: "x", code: "KeyX", ctrl: true, alt: true },
+  SETTINGS_BACKUP_REVIEW_PLUGINS: { key: "y", code: "KeyY", ctrl: true, alt: true },
+  SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL: { key: "z", code: "KeyZ", ctrl: true, alt: true },
 
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },

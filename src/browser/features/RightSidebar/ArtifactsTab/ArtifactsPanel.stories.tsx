@@ -207,10 +207,15 @@ function listingFor(files: Record<string, ArtifactReadResult>): ArtifactListing 
 function renderPanel(
   selectedPath: string,
   files: Record<string, ArtifactReadResult> = FILES,
-  options: { allowCdn?: boolean; workspaceId?: string; sendInteractionError?: string } = {}
+  options: {
+    allowCdn?: boolean;
+    workspaceId?: string;
+    sendInteractionError?: string;
+    onSetState?: (input: { path: string; state: unknown }) => void;
+  } = {}
 ) {
   const workspaceId = options.workspaceId ?? WORKSPACE_ID;
-  writeArtifactSelection(workspaceId, { scope: "artifact", path: selectedPath, version: null });
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: selectedPath });
   return (
     <APIProvider
       client={createMockORPCClient({
@@ -218,6 +223,7 @@ function renderPanel(
           listing: listingFor(files),
           files,
           sendInteractionError: options.sendInteractionError,
+          onSetState: options.onSetState,
         },
         userPreferences: { ui: { artifactsAllowCdnScripts: options.allowCdn ?? true } },
       })}
@@ -358,7 +364,6 @@ function renderGallery() {
     writeArtifactSelection(`${WORKSPACE_ID}-${renderer.path}`, {
       scope: "artifact",
       path: renderer.path,
-      version: null,
     });
   }
   return (
@@ -565,40 +570,12 @@ export const SendStripAndAnnotate: Story = {
   },
 };
 
-/** Toolbar version menu, open: "Latest (live)" plus stored versions, newest first. */
-function renderVersionMenu() {
-  const workspaceId = `${WORKSPACE_ID}-versions`;
-  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md", version: null });
-  const now = Date.now();
-  const at = (minutesAgo: number) => now - minutesAgo * 60_000;
-  const base = { sha256: "sha", size: MARKDOWN.length, path: "report.md" } as const;
+function renderPinMenu() {
+  const workspaceId = `${WORKSPACE_ID}-pin-menu`;
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md" });
   return (
     <APIProvider
-      client={createMockORPCClient({
-        artifacts: {
-          listing: listingFor(FILES),
-          files: FILES,
-          versions: {
-            "report.md": [
-              {
-                ...base,
-                version: 3,
-                label: "Weekly report, final",
-                source: "publish",
-                createdAtMs: at(4),
-              },
-              { ...base, version: 2, label: null, source: "turn-end", createdAtMs: at(95) },
-              {
-                ...base,
-                version: 1,
-                label: "First draft",
-                source: "publish",
-                createdAtMs: at(60 * 26),
-              },
-            ],
-          },
-        },
-      })}
+      client={createMockORPCClient({ artifacts: { listing: listingFor(FILES), files: FILES } })}
     >
       <div className="bg-background flex h-screen justify-end">
         <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
@@ -609,22 +586,22 @@ function renderVersionMenu() {
   );
 }
 
-export const VersionMenuOpen: Story = {
+export const PinMenuOpen: Story = {
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
-  render: renderVersionMenu,
+  render: renderPinMenu,
   play: async ({ canvasElement }) => {
     await waitForMarkdown(canvasElement);
     const canvas = within(canvasElement);
-    await userEvent.click(await canvas.findByRole("button", { name: "Version: Latest (live)" }));
-    const menu = await canvas.findByRole("menu", { name: "Artifact versions" });
-    await within(menu).findByText("Turn snapshot");
+    await userEvent.click(await canvas.findByRole("button", { name: "Pin to shelf" }));
+    const menu = await canvas.findByRole("menu", { name: "Pin to shelf" });
+    await within(menu).findByRole("menuitem", { name: "Pin to global shelf" });
   },
 };
 
 /** Picker open on the Shelf group (M5c): project then global entries, with who pinned them. */
 function renderShelfPicker() {
   const workspaceId = `${WORKSPACE_ID}-shelf`;
-  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md", version: null });
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md" });
   const now = Date.now();
   const entry = (
     scope: "project" | "global",
@@ -639,7 +616,6 @@ function renderShelfPicker() {
     title,
     kind: getArtifactKind(file),
     size: 2048,
-    version: 2,
     sourceWorkspaceId: "ws-other",
     sourcePath: file,
     pinnedAtMs: now - minutesAgo * 60_000,
@@ -698,13 +674,13 @@ export const ShelfPickerLaptop: Story = {
 
 /**
  * Picker with one published report and 12 screenshots the agent kept next to it (only the
- * report has stored versions). The screenshots are newer, yet the report leads and they wait
+ * report was published). The screenshots are newer, yet the report leads and they wait
  * under a collapsed "Other files" group.
  */
 function renderOtherFilesPicker() {
   const workspaceId = `${WORKSPACE_ID}-other-files`;
   // No stored selection, so the story also shows the default pick.
-  writeArtifactSelection(workspaceId, { scope: "artifact", path: null, version: null });
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: null });
   const files: Record<string, ArtifactReadResult> = {};
   for (let n = 1; n <= 11; n++) {
     const path = `img/step-${String(n).padStart(2, "0")}.png`;
@@ -713,7 +689,7 @@ function renderOtherFilesPicker() {
   files["img/chart.png"] = FILES["img/chart.png"];
   files["report.md"] = FILES["report.md"];
   const listing = listingFor(files);
-  if (listing.available) listing.versionedPaths = ["report.md"];
+  if (listing.available) listing.publishedPaths = ["report.md"];
   return (
     <APIProvider
       client={createMockORPCClient({
@@ -885,6 +861,7 @@ const assertNavigatedAway = async (canvasElement: HTMLElement) => {
 };
 
 export const NavigateAwayLocation: Story = {
+  tags: ["webkit"],
   parameters: { pixel: PIXEL_DISABLED },
   render: () =>
     renderPanel("away.html", { "away.html": ok("away.html", navigateAwayHtml("location")) }),
@@ -896,6 +873,163 @@ export const NavigateAwayLink: Story = {
   render: () =>
     renderPanel("away.html", { "away.html": ok("away.html", navigateAwayHtml("link")) }),
   play: ({ canvasElement }) => assertNavigatedAway(canvasElement),
+};
+
+// An artifact that sets its route in its own load handler. WebKit fires the iframe's load event
+// again about 100 ms later, possibly before the host bound the document's port. The document is
+// still the one Xum built, so the artifact must stay open, and its bridge must still work.
+const HASH_ON_LOAD_HTML = `<!doctype html><html><head><script>
+  window.addEventListener("message", function (event) {
+    if (event.data && event.data.xumOnLoadTest === "save") window.xum.setState({ route: location.hash });
+  });
+  window.addEventListener("load", function () {
+    location.hash = "#/s/onload";
+    parent.postMessage({ xumOnLoadTest: "hashed" }, "*");
+  });
+</script></head><body><p>hash on load</p></body></html>`;
+
+// What the artifact reported, and each load of the artifact frame, in arrival order.
+const hashOnLoadEvents: string[] = [];
+const hashOnLoadStates: unknown[] = [];
+/** WebKit fires the iframe's load event for a fragment change; Chromium fires none. */
+const firesFragmentLoad = () => !navigator.userAgent.includes("Chrome/");
+export const HashOnLoadStaysOpen: Story = {
+  tags: ["webkit"],
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    hashOnLoadEvents.length = 0;
+    hashOnLoadStates.length = 0;
+    const onMessage = (event: MessageEvent) => {
+      const message = (event.data as { xumOnLoadTest?: unknown } | null)?.xumOnLoadTest;
+      if (typeof message === "string") hashOnLoadEvents.push(message);
+    };
+    // A capturing listener on the document: load does not bubble, and the frame's first load
+    // can come before the play runs.
+    const onLoad = (event: Event) => {
+      const target = event.target;
+      if (target instanceof HTMLIFrameElement && target.dataset.testid === "artifact-frame") {
+        hashOnLoadEvents.push("load");
+      }
+    };
+    window.addEventListener("message", onMessage);
+    document.addEventListener("load", onLoad, true);
+    return () => {
+      window.removeEventListener("message", onMessage);
+      document.removeEventListener("load", onLoad, true);
+    };
+  },
+  render: () =>
+    renderPanel(
+      "on-load.html",
+      { "on-load.html": ok("on-load.html", HASH_ON_LOAD_HTML) },
+      {
+        workspaceId: `${WORKSPACE_ID}-on-load`,
+        onSetState: (input) => hashOnLoadStates.push(input.state),
+      }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("artifact-frame");
+    if (!(frame instanceof HTMLIFrameElement)) throw new Error("Story bug: no artifact iframe");
+    const notice = () => canvas.queryByText(/This artifact navigated away/);
+    // The frame's first load, then (WebKit only) the extra load of the route change.
+    const loadsToWaitFor = firesFragmentLoad() ? 2 : 1;
+    const routeChangeLoaded = () =>
+      hashOnLoadEvents.includes("hashed") &&
+      hashOnLoadEvents.filter((event) => event === "load").length >= loadsToWaitFor;
+    // Those loads, or the notice that closed the frame at one of them.
+    await waitFor(() => expect(routeChangeLoaded() || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
+    await expect(notice()).toBeNull();
+    frame.contentWindow?.postMessage({ xumOnLoadTest: "save" }, "*");
+    await waitFor(() => expect(hashOnLoadStates.length > 0 || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
+    await expect(notice()).toBeNull();
+    await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
+    await expect(hashOnLoadStates).toEqual([{ route: "#/s/onload" }]);
+  },
+};
+
+// A hash router (superblink's map nodes set location.hash). WebKit fires the iframe's load event
+// again for every fragment change and history traversal. Chromium does for history.back() only
+// when it returns to the srcdoc's own first entry. The document is still the one Xum built, so the
+// artifact must stay open with its bridge. The play starts the routes once it listens for the
+// frame's loads, and asks for the save after the last one, which both engines fire.
+const HASH_ROUTER_HTML = `<!doctype html><html><head><script>
+  // Each step waits for the last one's events, and for WebKit's load about 100 ms after them.
+  function later(step) { setTimeout(step, 500); }
+  window.addEventListener("message", function (event) {
+    var test = event.data && event.data.xumRouteTest;
+    if (test === "save") window.xum.setState({ route: location.hash });
+    if (test !== "go") return;
+    location.hash = "#/s/gamma";
+    later(function () {
+      history.back();
+      later(function () {
+        history.pushState(null, "", "about:srcdoc#/p");
+        parent.postMessage({ xumRouteTest: "back" }, "*");
+        // A task later, so the story sees "back" before the traversal's load.
+        setTimeout(function () { history.back(); }, 50);
+      });
+    });
+  });
+  window.addEventListener("load", function () {
+    parent.postMessage({ xumRouteTest: "ready" }, "*");
+  });
+</script></head><body><p>hash router</p></body></html>`;
+
+// Route messages from the artifact and the frame's loads, in arrival order.
+const routeEvents: string[] = [];
+const routeStates: unknown[] = [];
+export const HashRouterStaysOpen: Story = {
+  tags: ["webkit"],
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    routeEvents.length = 0;
+    routeStates.length = 0;
+    const handler = (event: MessageEvent) => {
+      const message = (event.data as { xumRouteTest?: unknown } | null)?.xumRouteTest;
+      if (typeof message === "string") routeEvents.push(message);
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  },
+  render: () =>
+    renderPanel(
+      "router.html",
+      { "router.html": ok("router.html", HASH_ROUTER_HTML) },
+      {
+        workspaceId: `${WORKSPACE_ID}-router`,
+        onSetState: (input) => routeStates.push(input.state),
+      }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("artifact-frame");
+    if (!(frame instanceof HTMLIFrameElement)) throw new Error("Story bug: no artifact iframe");
+    frame.addEventListener("load", () => routeEvents.push("load"));
+    await waitFor(() => expect(routeEvents).toContain("ready"));
+    frame.contentWindow?.postMessage({ xumRouteTest: "go" }, "*");
+    const notice = () => canvas.queryByText(/This artifact navigated away/);
+    const loadedAfterBack = () => {
+      const back = routeEvents.indexOf("back");
+      return back !== -1 && routeEvents.includes("load", back);
+    };
+    // The load that follows history.back(), or the notice that closed the frame before it.
+    await waitFor(() => expect(loadedAfterBack() || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
+    frame.contentWindow?.postMessage({ xumRouteTest: "save" }, "*");
+    await waitFor(() => expect(routeStates.length > 0 || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
+    await expect(notice()).toBeNull();
+    await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
+    // Back on the srcdoc's own entry, which has no fragment.
+    await expect(routeStates).toEqual([{ route: "" }]);
+  },
 };
 
 // The frame forwards Escape over the bridge, so Escape pressed inside a fullscreen HTML
@@ -960,7 +1094,7 @@ export const BridgeEscapeExitsFullscreen: Story = {
 };
 
 // Fullscreen has no focus trap, so when the viewer is swapped out from under a focused control
-// (here a selection change; in the app also a poll that finds a new version), focus would fall
+// (here a selection change; in the app also a poll that finds a rewritten file), focus would fall
 // to <body> and Escape would miss the panel. A real browser is needed: happy-dom holds
 // MutationObserver callbacks through a WeakRef, so long-lived observers die on GC there.
 const SWAP_WORKSPACE_ID = `${WORKSPACE_ID}-fullscreen-swap`;
@@ -1348,5 +1482,76 @@ export const McpAppViewNavigateAway: Story = {
     const canvas = within(canvasElement);
     await canvas.findByText(/This artifact navigated away/, undefined, { timeout: 10000 });
     await expect(canvas.queryByTestId("mcp-app-frame")).toBeNull();
+  },
+};
+
+// Xum's own thread is blocked for 6 s right after a check. WebKit runs the frame on that thread,
+// so the document cannot answer meanwhile, and WebKit then ran the overdue deadline before the
+// document's answer: a live artifact closed. A deadline that fires late only extends the check
+// (frameDocumentChannel.ts). The play blocks the thread in a load listener that runs after the
+// host's own, which sent the check.
+const HOST_FREEZE_MS = 6000;
+const HOST_FREEZE_HTML = `<!doctype html><html><head><script>
+  window.addEventListener("message", function (event) {
+    var test = event.data && event.data.xumFreezeTest;
+    if (test === "save") window.xum.setState({ saved: true });
+    if (test !== "go") return;
+    // A traversal to the srcdoc's own first entry: both engines fire the iframe's load for it.
+    history.pushState(null, "", "about:srcdoc#/p");
+    setTimeout(function () { history.back(); }, 50);
+  });
+  window.addEventListener("load", function () {
+    parent.postMessage({ xumFreezeTest: "ready" }, "*");
+  });
+</script></head><body><p>host freeze</p></body></html>`;
+
+const freezeEvents: string[] = [];
+const freezeStates: unknown[] = [];
+export const HostFreezeKeepsArtifactOpen: Story = {
+  tags: ["webkit"],
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    freezeEvents.length = 0;
+    freezeStates.length = 0;
+    const handler = (event: MessageEvent) => {
+      const message = (event.data as { xumFreezeTest?: unknown } | null)?.xumFreezeTest;
+      if (typeof message === "string") freezeEvents.push(message);
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  },
+  render: () =>
+    renderPanel(
+      "freeze.html",
+      { "freeze.html": ok("freeze.html", HOST_FREEZE_HTML) },
+      {
+        workspaceId: `${WORKSPACE_ID}-freeze`,
+        onSetState: (input) => freezeStates.push(input.state),
+      }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("artifact-frame");
+    if (!(frame instanceof HTMLIFrameElement)) throw new Error("Story bug: no artifact iframe");
+    await waitFor(() => expect(freezeEvents).toContain("ready"));
+    let froze = false;
+    frame.addEventListener("load", () => {
+      if (froze) return;
+      froze = true;
+      const end = performance.now() + HOST_FREEZE_MS;
+      while (performance.now() < end) {
+        // The app's thread is blocked, as by a long render or a stalled main process call.
+      }
+      frame.contentWindow?.postMessage({ xumFreezeTest: "save" }, "*");
+    });
+    frame.contentWindow?.postMessage({ xumFreezeTest: "go" }, "*");
+    const notice = () => canvas.queryByText(/This artifact navigated away/);
+    // The save after the freeze, or the notice that closed the frame instead.
+    await waitFor(() => expect(freezeStates.length > 0 || notice() != null).toBe(true), {
+      timeout: 20000,
+    });
+    await expect(notice()).toBeNull();
+    await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
+    await expect(freezeStates).toEqual([{ saved: true }]);
   },
 };

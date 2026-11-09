@@ -1935,11 +1935,17 @@ describe("TaskService", () => {
       beginOwnedTaskAttempt(
         taskId: string,
         source: string,
-        identity: { attemptId: string | undefined; receiptEligible: boolean }
+        identity: {
+          attemptId: string | undefined;
+          receiptEligible: boolean;
+          inheritedReport: boolean;
+        }
       ): unknown;
       settleOwnedTaskAttempt(taskId: string, attempt: unknown, source: string): void;
-      ownedAttemptByTaskId: Map<string, unknown>;
-      attemptSettlementByTaskId: Map<string, { attempt: unknown; source: string }>;
+      attemptLedger: {
+        ownedAttemptByTaskId: Map<string, unknown>;
+        attemptSettlementByTaskId: Map<string, { attempt: unknown; source: string }>;
+      };
     }
 
     /** Queued admission: returns at once and hands onAccepted to the test once armed. */
@@ -1974,7 +1980,7 @@ describe("TaskService", () => {
         await setDelegatedExec(config, { modelString: MODEL_B });
         const busy = admitQueued(workspaceService, childId);
         const ledger = taskService as unknown as AttemptLedger;
-        const previousAttempt = ledger.ownedAttemptByTaskId.get(childId);
+        const previousAttempt = ledger.attemptLedger.ownedAttemptByTaskId.get(childId);
         const store = workspaceTurnManagerInternals(taskService).taskHandleStore;
         const originalUpsert = store.upsertWorkspaceTurn.bind(store);
         let reactivationAttempt: unknown;
@@ -1988,13 +1994,14 @@ describe("TaskService", () => {
             child.taskExecutionStatus === "running"
           ) {
             // The claim-and-settings write is committed; the next acceptance step fails.
-            reactivationAttempt = ledger.ownedAttemptByTaskId.get(childId);
+            reactivationAttempt = ledger.attemptLedger.ownedAttemptByTaskId.get(childId);
             if (variant === "settled meanwhile") {
               ledger.settleOwnedTaskAttempt(childId, reactivationAttempt, "test-settlement");
             } else if (variant === "successor meanwhile") {
               successor = ledger.beginOwnedTaskAttempt(childId, "test-successor", {
                 attemptId: undefined,
                 receiptEligible: false,
+                inheritedReport: false,
               });
             }
             throw new Error("handle store disk full");
@@ -2011,7 +2018,7 @@ describe("TaskService", () => {
           // Existing settlement settled the claimed mirror to a terminal status.
           expect(child?.taskExecutionStatus).toBeDefined();
           expect(isActiveWorkspaceTurnTaskStatus(child?.taskExecutionStatus)).toBe(false);
-          const owned = ledger.ownedAttemptByTaskId.get(childId);
+          const owned = ledger.attemptLedger.ownedAttemptByTaskId.get(childId);
           if (variant === "no settlement") {
             // A published attempt is never rolled back (#4308): the refused reactivation's
             // attempt stays owned until a Stop settles it.
@@ -2019,7 +2026,7 @@ describe("TaskService", () => {
             expect(owned).toBe(reactivationAttempt);
           } else if (variant === "settled meanwhile") {
             expect(owned).toBe(reactivationAttempt);
-            expect(ledger.attemptSettlementByTaskId.get(childId)?.attempt).toBe(
+            expect(ledger.attemptLedger.attemptSettlementByTaskId.get(childId)?.attempt).toBe(
               reactivationAttempt
             );
           } else {
@@ -2193,7 +2200,7 @@ describe("TaskService", () => {
           report: { reportMarkdown: string },
           attempt: unknown
         ): Promise<unknown>;
-        ownedAttemptByTaskId: Map<string, unknown>;
+        attemptLedger: { ownedAttemptByTaskId: Map<string, unknown> };
       };
 
       expect(
@@ -2207,7 +2214,7 @@ describe("TaskService", () => {
         childId,
         findWorkspaceEntry(config.loadConfigOrDefault(), childId),
         { reportMarkdown: "done" },
-        internal.ownedAttemptByTaskId.get(childId)
+        internal.attemptLedger.ownedAttemptByTaskId.get(childId)
       );
       const report = await readSubagentReportArtifact(
         path.join(config.sessionsDir, parentId),

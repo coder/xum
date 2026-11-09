@@ -571,6 +571,45 @@ describe("resolveWorkflowScript", () => {
       ).rejects.toThrow("comes from a Claude Code plugin");
     });
 
+    test("a Cursor package runs no workflow code: no workflows/, rule or skill script", async () => {
+      using tempDir = new TestTempDir("workflow-script-cursor-plugin");
+      const container = path.join(tempDir.path, ".mux", "plugins");
+      const pluginDir = path.join(container, "kit");
+      await fs.mkdir(path.join(pluginDir, ".cursor-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, ".cursor-plugin", "plugin.json"),
+        JSON.stringify({ name: "kit" })
+      );
+      await writeWorkflowFile(path.join(pluginDir, "workflows"), "release.js");
+      // A script next to the rule: the rule's skill directory is the rules folder.
+      await writeWorkflowFile(path.join(pluginDir, "rules"), "workflow.js");
+      await fs.writeFile(path.join(pluginDir, "rules", "review.mdc"), "Review\n");
+      const skillDir = path.join(pluginDir, "skills", "flow");
+      await writeWorkflowFile(skillDir, "SKILL.md", "---\nname: flow\ndescription: d\n---\nBody\n");
+      await writeWorkflowFile(skillDir, "workflow.js");
+      const input = {
+        runtime: new LocalRuntime(tempDir.path),
+        workspacePath: tempDir.path,
+        projectTrusted: true,
+        roots: pluginRoots(tempDir, container),
+        runtimeFactory,
+      };
+
+      await expect(
+        resolveWorkflowScript({ ...input, scriptPath: "plugin://kit/release.js", runtimeFactory })
+      ).rejects.toThrow("not found");
+      await expect(
+        resolveWorkflowScript({
+          ...input,
+          scriptPath: "skill://review/workflow.js",
+          runtimeFactory,
+        })
+      ).rejects.toThrow("is a Cursor rule");
+      await expect(
+        resolveWorkflowScript({ ...input, scriptPath: "skill://flow/workflow.js", runtimeFactory })
+      ).rejects.toThrow("comes from a Cursor plugin");
+    });
+
     test("plugin workflows retain a global fallback after rejecting an outward project alias", async () => {
       using tempDir = new TestTempDir("workflow-plugin-global-alias");
       const project = path.join(tempDir.path, "checkout");

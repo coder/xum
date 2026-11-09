@@ -468,6 +468,7 @@ exit 0
     const unregister = registerCodexPluginHooks(eventSpine, {
       workspaceId: "parse-ws",
       pluginName: "guard",
+      pluginInstanceId: "guard",
       order: 0,
       hooks: [
         {

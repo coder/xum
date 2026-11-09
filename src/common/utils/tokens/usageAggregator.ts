@@ -7,6 +7,8 @@
  * Separated from tokenStatsCalculator.ts to keep tokenizer in main process only.
  */
 
+import assert from "@/common/utils/assert";
+
 export interface ChatUsageComponent {
   tokens: number;
   cost_usd?: number; // undefined if model pricing unknown
@@ -232,6 +234,27 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
   }
 
   return sum;
+}
+
+/**
+ * Adds `usage` to `byModel[model]` in place. Model keys come from persisted files, so a key
+ * named after an Object.prototype member ("toString", "__proto__") must neither read the
+ * inherited value as earlier usage nor, for "__proto__", replace the object's prototype.
+ */
+export function addModelUsage(
+  byModel: Record<string, ChatUsageDisplay>,
+  model: string,
+  usage: ChatUsageDisplay
+): void {
+  const existing = Object.hasOwn(byModel, model) ? byModel[model] : undefined;
+  const sum = existing ? sumUsageHistory([existing, usage]) : usage;
+  assert(sum, "addModelUsage: sum of two usages must exist");
+  Object.defineProperty(byModel, model, {
+    value: sum,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
 }
 
 /**

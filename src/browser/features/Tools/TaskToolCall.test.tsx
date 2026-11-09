@@ -245,6 +245,53 @@ describe("TaskToolCall", () => {
     expect(settings?.textContent).not.toContain("thinking: low");
   });
 
+  test("labels best-of candidates by their group index when a middle candidate failed to spawn", () => {
+    // The partial result lists only the spawned candidates, so candidate 2's slot is missing.
+    const groupId = "task-group:parent:call-1";
+    const spawned = [0, 2].map((index) =>
+      createWorkspaceMetadata({
+        id: `task-child-${index + 1}`,
+        bestOf: { groupId, index, total: 3 },
+      })
+    );
+    workspaceContextMock = {
+      workspaceMetadata: new Map(spawned.map((workspace) => [workspace.id, workspace])),
+    };
+
+    const bestOfArgs = {
+      subagent_type: "explore",
+      prompt: "Compare three approaches.",
+      title: "Best of 3",
+      run_in_background: true,
+      n: 3,
+    };
+    const AgentTaskToolCall = getToolComponent("task", bestOfArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={bestOfArgs}
+          result={{
+            status: "running",
+            taskIds: ["task-child-1", "task-child-3"],
+            tasks: [
+              { taskId: "task-child-1", status: "running" },
+              { taskId: "task-child-3", status: "running" },
+            ],
+            note: "Grouped task creation spawned 2 of 3 task(s); 1 failed: workspace creation failed.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task"));
+
+    const text = view.container.textContent ?? "";
+    expect(text).toContain("candidate 1");
+    expect(text).toContain("candidate 3");
+    expect(text).not.toContain("candidate 2");
+  });
+
   test("prefers linked report settings over the spawn snapshot after cleanup", () => {
     // Workspace already cleaned up; the task_await-linked report carries the exec
     // settings while the spawn result kept the stale plan-phase ones.

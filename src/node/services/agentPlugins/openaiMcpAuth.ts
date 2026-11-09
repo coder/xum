@@ -325,17 +325,19 @@ function codexEnvVarName(item: unknown): string | undefined {
  */
 function readCodexEnvVars(
   value: unknown,
-  type: unknown
+  type: unknown,
+  suppliedNames: readonly string[]
 ): { forwardEnv?: string[]; error?: string; warnings?: string[] } {
   if (type !== "stdio") return { error: "'env_vars' applies only to stdio servers" };
   if (!Array.isArray(value)) return { error: "'env_vars' must be an array of variable names" };
+  const supplied = new Set(suppliedNames.map(envNameKey));
   const names: string[] = [];
   for (const [index, item] of value.entries()) {
     const name = codexEnvVarName(item);
     if (name === undefined)
       return { error: `'env_vars[${index}]' must be a variable name or { name, source: "local" }` };
     // Same §9.2 rule as `env`: the client supplies the reserved variables itself.
-    if (isReservedPluginEnvName(name))
+    if (isReservedPluginEnvName(name) || supplied.has(envNameKey(name)))
       return { error: `'env_vars[${index}]' must not name reserved variable '${name}'` };
     names.push(name);
   }
@@ -380,7 +382,8 @@ function portableCodexType(entry: Record<string, unknown>): unknown {
 function stdioOrEnvVarsResult(
   rest: Record<string, unknown>,
   oauthFields: Record<string, unknown>,
-  envVars: unknown
+  envVars: unknown,
+  suppliedNames: readonly string[]
 ): ReturnType<typeof translateCodexMcpEntry> | undefined {
   const named = Object.keys(oauthFields).filter((name) => oauthFields[name] !== undefined);
   const warnings =
@@ -388,7 +391,7 @@ function stdioOrEnvVarsResult(
       ? [`OAuth settings apply only to remote servers; ignoring ${named.join(", ")}`]
       : [];
   if (envVars != null) {
-    const read = readCodexEnvVars(envVars, rest.type);
+    const read = readCodexEnvVars(envVars, rest.type, suppliedNames);
     return { entry: rest, ignored: [], ...read, warnings: [...warnings, ...(read.warnings ?? [])] };
   }
   return rest.type === "stdio" ? { entry: rest, ignored: [], warnings } : undefined;
@@ -402,9 +405,13 @@ function stdioOrEnvVarsResult(
  * and `oauth_resource` become an OpenAI `auth` block (an existing inline
  * `auth` wins). Callback settings are only NAMED in `ignored`. The secret
  * value is dropped here; `hasClientSecret` tells the caller to point the
- * OAuth service at the file (see readPluginClientSecret).
+ * OAuth service at the file (see readPluginClientSecret). `env_vars` must not
+ * forward a name in `suppliedNames` either: the caller's dialect supplies it.
  */
-export function translateCodexMcpEntry(entry: Record<string, unknown>): {
+export function translateCodexMcpEntry(
+  entry: Record<string, unknown>,
+  suppliedNames: readonly string[] = []
+): {
   entry: Record<string, unknown>;
   ignored: string[];
   warnings: string[];
@@ -421,7 +428,12 @@ export function translateCodexMcpEntry(entry: Record<string, unknown>): {
   const type = portableCodexType(rest);
   if (type !== undefined) rest.type = type;
   if (rest.cwd !== undefined) rest.cwd = portableCodexCwd(rest.cwd);
-  const early = stdioOrEnvVarsResult(rest, { oauth, scopes, oauth_resource: resource }, envVars);
+  const early = stdioOrEnvVarsResult(
+    rest,
+    { oauth, scopes, oauth_resource: resource },
+    envVars,
+    suppliedNames
+  );
   if (early !== undefined) return early;
 
   const auth: Record<string, unknown> = {};

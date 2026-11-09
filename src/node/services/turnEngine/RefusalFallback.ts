@@ -12,7 +12,7 @@ import { hasTokenUsage } from "@/common/types/message";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
-import { applyCacheControl, getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { applyCacheControl, getRequestAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getErrorMessage } from "@/common/utils/errors";
 import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
@@ -153,7 +153,10 @@ export function canReuseFallbackPrefix(
 /** The fallback request's system messages plus the swap's conversation prefix. */
 export function buildFallbackPrefix(
   consumedSwap: ContinuousPrefixSwap,
-  nextRequest: Pick<StreamRequestConfig, "messages" | "cacheEnabled" | "providerOptions">
+  nextRequest: Pick<
+    StreamRequestConfig,
+    "messages" | "cacheEnabled" | "providerOptions" | "anthropicCacheTtl"
+  >
 ): ModelMessage[] {
   const conversation = stripMessageCacheControl(
     consumedSwap.prefix.filter((message) => message.role !== "system")
@@ -164,7 +167,7 @@ export function buildFallbackPrefix(
       ? applyCacheControl(
           conversation,
           "anthropic:prefix",
-          getAnthropicCacheTtl(nextRequest.providerOptions)
+          getRequestAnthropicCacheTtl(nextRequest)
         )
       : conversation),
   ];
@@ -521,6 +524,7 @@ export class RefusalFallback {
       system: prepared.system,
       tools: prepared.tools,
       providerOptions: prepared.providerOptions,
+      anthropicCacheTtl: prepared.anthropicCacheTtl,
       maxOutputTokens: fallbackState.original.maxOutputTokens,
       callSettingsOverrides: prepared.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,

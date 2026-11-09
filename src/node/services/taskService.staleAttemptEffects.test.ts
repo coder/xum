@@ -41,7 +41,7 @@ const A = "att_00000000000000a1";
 const B = "att_00000000000000b1";
 
 interface Internals {
-  admittedSendsByTaskId: Map<string, Set<{ attemptId: string; state: string }>>;
+  attemptLedger: { admittedSendsByTaskId: Map<string, Set<{ attemptId: string; state: string }>> };
   workspaceEventLocks: MutexMap<string>;
 }
 const internals = (service: TaskService) => service as unknown as Internals;
@@ -117,7 +117,7 @@ describe("stale attempt effects after another backend admits a successor (#4414)
       ): Promise<Result<void>> => {
         await beforeSend?.();
         const taskService = ledger.taskService!;
-        const sends = internals(taskService).admittedSendsByTaskId;
+        const sends = internals(taskService).attemptLedger.admittedSendsByTaskId;
         const callerToken = internal?.turnAdmission;
         if (callerToken != null) {
           // A caller-minted token: the real host refuses it at its admission gates once stale.

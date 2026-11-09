@@ -37,6 +37,7 @@ import {
   BackgroundProcessManager,
   SPAWN_NAME_LOCK_FILENAME,
 } from "@/node/services/backgroundProcessManager";
+import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
@@ -1430,6 +1431,67 @@ describe("bash tool", () => {
     }
   });
 
+  describe("interactive TUI launches", () => {
+    function createSpiedBashTool() {
+      const tempDir = new TestTempDir("test-bash-tui");
+      const config = createTestToolConfig(process.cwd());
+      config.runtimeTempDir = tempDir.path;
+      const exec = spyOn(config.runtime, "exec").mockImplementation(() =>
+        Promise.resolve(createExecStream("ran\n"))
+      );
+      return {
+        tool: createBashTool(config),
+        exec,
+        [Symbol.dispose]() {
+          exec.mockRestore();
+          tempDir[Symbol.dispose]();
+        },
+      };
+    }
+
+    it.each([
+      "view",
+      "  vim notes.md  ",
+      "/usr/bin/top",
+      "vim 'notes&draft'",
+      'view "report(1).txt"',
+      "vim notes\\;draft",
+    ])("rejects %p without spawning it", async (script) => {
+      using testEnv = createSpiedBashTool();
+
+      const result = (await testEnv.tool.execute!(
+        { script, run_in_background: false, display_name: "test" },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(result).toMatchObject({ success: false, exitCode: -1, wall_duration_ms: 0 });
+      expect(testEnv.exec).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      "top -l 1",
+      "vim -es -c q file",
+      "vim +q file",
+      "top | head",
+      "view < f",
+      "vim 'a' | tee 'b'",
+      'vim "it\'s" | tee "b\'s"',
+      "nano f",
+      "./top",
+      "bin/view notes.md",
+    ])("still runs %s", async (script) => {
+      using testEnv = createSpiedBashTool();
+
+      const result = (await testEnv.tool.execute!(
+        { script, run_in_background: false, display_name: "test" },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(testEnv.exec).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+    });
+  });
+
   describe("script sanitization", () => {
     const shouldRewriteNullRedirects = process.platform === "win32";
 
@@ -1564,38 +1626,42 @@ describe("bash tool", () => {
     }
   });
 
-  it("should use default timeout (3s) when timeout_secs is undefined", async () => {
-    using testEnv = createTestBashTool();
-    const tool = testEnv.tool;
-    const args = {
-      script: "echo hello",
-      timeout_secs: undefined,
-    };
-
-    const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
-
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.output).toBe("hello");
-      expect(result.exitCode).toBe(0);
+  it("should bound a foreground call whose timeout_secs is omitted with the default deadline", async () => {
+    // timeout_secs is optional, so an omitted value must still reach the runtime as a deadline.
+    // 60 is the mode and median of the values models pass when they pass one; a shorter default
+    // would cut ordinary git, bun and make work off mid-run.
+    using tempDir = new TestTempDir("test-bash-timeout");
+    const deadlines: Array<number | undefined> = [];
+    class DeadlineRecordingRuntime extends LocalRuntime {
+      override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+        deadlines.push(options.timeout);
+        return super.exec(command, options);
+      }
     }
-  });
+    const config = createTestToolConfig(process.cwd(), {
+      runtime: new DeadlineRecordingRuntime(process.cwd()),
+    });
+    config.runtimeTempDir = tempDir.path;
+    // Trusted: an untrusted repo runs an extra git-automation probe per call.
+    config.trusted = true;
+    const tool = createBashTool(config);
 
-  it("should use default timeout (3s) when timeout_secs is omitted", async () => {
-    using testEnv = createTestBashTool();
-    const tool = testEnv.tool;
-    const args = {
-      script: "echo hello",
-      // timeout_secs omitted entirely
-    };
+    const omitted = (await tool.execute!(
+      { script: "echo hello", display_name: "test" },
+      mockToolCallOptions
+    )) as BashToolResult;
 
-    const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
+    expect(omitted.success).toBe(true);
+    expect(deadlines.at(-1)).toBe(60);
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.output).toBe("hello");
-      expect(result.exitCode).toBe(0);
-    }
+    deadlines.length = 0;
+    const explicit = (await tool.execute!(
+      { script: "echo hello", timeout_secs: 7, display_name: "test" },
+      mockToolCallOptions
+    )) as BashToolResult;
+
+    expect(explicit.success).toBe(true);
+    expect(deadlines.at(-1)).toBe(7);
   });
 
   // Note: Zero and negative timeout_secs are rejected by Zod schema validation
@@ -2384,6 +2450,42 @@ describe("bash tool - background execution", () => {
     tempDir[Symbol.dispose]();
   });
 
+  it("should pass an absent background timeout through as no auto-terminate deadline", async () => {
+    // The foreground default must not leak into a background spawn: BackgroundProcessManager arms
+    // auto-termination only for a number, so a dev server started without timeout_secs keeps
+    // running until task_stop. The schema also allows null now, which must not become a deadline.
+    using tempDir = new TestTempDir("test-bash-bg-timeout");
+    const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg"));
+    const workspaceId = path.basename(tempDir.path);
+    const config = createTestToolConfig(tempDir.path, { workspaceId });
+    config.backgroundProcessManager = manager;
+    const spawn = spyOn(manager, "spawn");
+    const tool = createBashTool(config);
+
+    try {
+      for (const [timeout_secs, display_name] of [
+        [undefined, "bg-no-timeout"],
+        [null, "bg-null-timeout"],
+        [3600, "bg-explicit-timeout"],
+      ] as const) {
+        const result = (await tool.execute!(
+          { script: "sleep 30", run_in_background: true, display_name, timeout_secs },
+          mockToolCallOptions
+        )) as BashToolResult;
+        expect(result.success).toBe(true);
+      }
+
+      expect(spawn.mock.calls.map(([, , , options]) => options.timeoutSecs)).toEqual([
+        undefined,
+        undefined,
+        3600,
+      ]);
+    } finally {
+      await manager.terminateAll();
+      fs.rmSync(`/tmp/mux-bashes/${workspaceId}`, { recursive: true, force: true });
+    }
+  });
+
   it("should start background process and return process ID", async () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 
@@ -2655,6 +2757,16 @@ console.log("ready");
 
     const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
     expect(pid).toBeGreaterThan(1);
+    if (!result.success || !("backgroundProcessId" in result)) throw new Error("Migration failed");
+    const migrated = await manager.getProcess(result.backgroundProcessId);
+    expect(migrated?.pid).toBe(pid);
+    const identity = { ...getSelfIdentity(), birth: linuxBirth(pid) };
+    expect(migrated?.identity).toEqual(identity);
+    const meta = JSON.parse(
+      fs.readFileSync(path.join(migrated!.outputDir, "meta.json"), "utf8")
+    ) as { pid: number; identity: unknown };
+    expect(meta.pid).toBe(pid);
+    expect(meta.identity).toEqual(identity);
     await manager.cleanup(config.workspaceId!);
 
     // cleanup() joins the exit, so the process is gone as soon as it returns.

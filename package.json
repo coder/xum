@@ -1,6 +1,6 @@
 {
   "name": "@coder/xum",
-  "version": "0.32.0",
+  "version": "0.32.1",
   "desktopName": "xum.desktop",
   "description": "xum - coding agent multiplexer",
   "author": "Coder",
@@ -227,11 +227,12 @@
     "geist": "^1.8.1",
     "http-server": "^14.1.1",
     "jest": "30.2.0",
+    "katex": "0.16.47",
     "memfs": "4.80.0",
-    "mermaid": "^11.17.2",
     "mitata": "1.0.34",
     "nodemon": "^3.1.14",
     "oxlint": "1.88.0",
+    "pele": "1.9.0",
     "playwright": "^1.64.1",
     "playwright-core": "1.64.1",
     "postcss": "^8.5.31",
@@ -261,7 +262,7 @@
     "vite-plugin-top-level-await": "^1.6.0"
   },
   "optionalDependencies": {
-    "electron": "^44.9.0",
+    "electron": "^44.10.0",
     "robotjs": "^0.9.1"
   },
   "files": [
@@ -369,6 +370,7 @@
   },
   "patchedDependencies": {
     "@ai-sdk/xai@4.0.37": "patches/@ai-sdk%2Fxai@4.0.37.patch",
-    "trpc-cli@0.12.4": "patches/trpc-cli@0.12.4.patch"
+    "trpc-cli@0.12.4": "patches/trpc-cli@0.12.4.patch",
+    "react-remove-scroll@2.7.2": "patches/react-remove-scroll@2.7.2.patch"
   }
 }

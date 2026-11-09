@@ -2,6 +2,10 @@ import React, { useState } from "react";
 import type { QueuedMessage as QueuedMessageType } from "@/common/types/message";
 import { AlertCircle, Check, ChevronDown, Clock3, Loader2, Pencil, Send } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
+import {
+  useInWaitingOnYouSheet,
+  type WaitingOnYouEntry,
+} from "@/browser/components/ChatPane/WaitingOnYou";
 import { SEND_DISPATCH_MODES } from "@/browser/features/ChatInput/sendDispatchModes";
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import { ArtifactInteractionPill } from "@/browser/features/Messages/ArtifactInteractionPill";
@@ -40,6 +44,28 @@ function deriveQueuedPreview(message: QueuedMessageType): QueuedPreview {
   };
 }
 
+function queueStatusLabel(message: QueuedMessageType): string {
+  return (message.queueDispatchMode ?? "tool-end") === "turn-end"
+    ? "Sends after this turn"
+    : "Sends after this step";
+}
+
+/** The queued message as the "Waiting on you" sheet lists it on phones. */
+export function queuedMessageEntry(message: QueuedMessageType): WaitingOnYouEntry {
+  const preview = deriveQueuedPreview(message);
+  return {
+    icon: Clock3,
+    tab: "Queued",
+    title: `Queued · ${queueStatusLabel(message).toLowerCase()}`,
+    detail: preview.sanitizedText.trim() || preview.fallbackLabel,
+  };
+}
+
+/** Scrolls the sheet so all of the dispatch menu shows, as it opens below the row there. */
+function revealDispatchMenu(menu: HTMLDivElement | null): void {
+  menu?.scrollIntoView({ block: "nearest" });
+}
+
 /** The queued card's Edit; blocked while another message is being edited (#5934). */
 function QueuedEditButton(props: { onEdit: () => void; blocked: boolean }) {
   return (
@@ -65,10 +91,10 @@ function QueuedEditButton(props: { onEdit: () => void; blocked: boolean }) {
 export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<"mode" | "send-now" | null>(null);
+  const inSheet = useInWaitingOnYouSheet();
   const preview = deriveQueuedPreview(props.message);
   const queueDispatchMode = props.message.queueDispatchMode ?? "tool-end";
-  const queueStatusLabel =
-    queueDispatchMode === "turn-end" ? "Sends after this turn" : "Sends after this step";
+  const statusLabel = queueStatusLabel(props.message);
   const isActionPending = pendingAction != null;
 
   const handleDispatchModeChange = (mode: QueueDispatchMode) => {
@@ -182,14 +208,20 @@ export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
                   <Clock3 className="text-pending size-3 shrink-0" />
                 )}
                 <span className="text-foreground shrink-0">Queued</span>
-                <span className="truncate">{queueStatusLabel}</span>
+                <span className="truncate">{statusLabel}</span>
                 <ChevronDown className="size-3 shrink-0" />
               </button>
 
               {isMenuOpen && (
                 <div
+                  ref={inSheet ? revealDispatchMenu : undefined}
                   role="menu"
-                  className="bg-separator border-border-light absolute right-0 bottom-full z-[1020] mb-1 min-w-[12rem] rounded-md border p-1.5 shadow-md"
+                  className={cn(
+                    "bg-separator border-border-light absolute right-0 z-[1020] min-w-[12rem] rounded-md border p-1.5 shadow-md",
+                    // The phone sheet scrolls: above the row, the menu would run off the top of
+                    // the sheet under a short message, out of reach; below it, it stays in reach.
+                    inSheet ? "top-full mt-1" : "bottom-full mb-1"
+                  )}
                   data-component="QueuedMessageDispatchMenu"
                 >
                   {SEND_DISPATCH_MODES.map((entry) => (

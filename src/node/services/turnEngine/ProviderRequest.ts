@@ -26,7 +26,7 @@ import type { Instructions, LanguageModel, ModelMessage, Tool } from "ai";
 import type { ResolvedCallSettingsOverrides } from "@/common/config/schemas/modelParameters";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
-import { supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
+import { supportsAnthropicCache, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import assert from "@/common/utils/assert";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
@@ -67,6 +67,7 @@ export interface StreamRequestOptions {
   system: Instructions | undefined;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
+  anthropicCacheTtl?: AnthropicCacheTtl;
   maxOutputTokens?: number;
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
@@ -307,6 +308,7 @@ export class ProviderRequest {
       system,
       tools,
       providerOptions,
+      anthropicCacheTtl,
       maxOutputTokens,
       callSettingsOverrides,
       toolPolicy,
@@ -363,6 +365,7 @@ export class ProviderRequest {
       // execute() handlers inside this stream so shared mutable state cannot race.
       tools: withSequentialExecution(tools, onToolExecutionStart),
       providerOptions: finalProviderOptions,
+      anthropicCacheTtl,
       headers,
       maxOutputTokens: effectiveMaxOutputTokens,
       streamCallSettings:

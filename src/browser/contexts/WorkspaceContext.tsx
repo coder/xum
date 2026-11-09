@@ -163,7 +163,10 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
   ) => Promise<{ success: boolean; error?: string; data?: ArchivePreflightResult }>;
   archiveWorkspace: (
     workspaceId: string,
-    options?: { acknowledgedUntrackedPaths?: string[] }
+    options?: {
+      acknowledgedUntrackedPaths?: string[];
+      acknowledgedSubagentUntrackedPaths?: Record<string, string[]>;
+    }
   ) => Promise<{ success: boolean; error?: string; data?: ArchiveWorkspaceResult }>;
   unarchiveWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
   /**
@@ -1416,7 +1419,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const archiveWorkspace = useCallback(
     async (
       workspaceId: string,
-      options?: { acknowledgedUntrackedPaths?: string[] }
+      options?: {
+        acknowledgedUntrackedPaths?: string[];
+        acknowledgedSubagentUntrackedPaths?: Record<string, string[]>;
+      }
     ): Promise<{ success: boolean; error?: string; data?: ArchiveWorkspaceResult }> => {
       if (!liveApi) return { success: false, error: "API not connected" };
 
@@ -1428,7 +1434,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           () =>
             liveApi.workspace.archive({
               workspaceId,
-              acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
+              ...options,
             })
         );
         if (result.success) {

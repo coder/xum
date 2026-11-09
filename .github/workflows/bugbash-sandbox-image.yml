@@ -7,9 +7,9 @@
 # key has that tag pushes nothing. Otherwise it builds fresh, pushes, attests that build's own
 # digest, and only then points the stable tag at the same digest. Nothing here deletes an image.
 #
-# Runners still trust only the digest in image.json: a person copies it from the job summary into
-# image.json in a pull request (no workflow writes to the repo). Until that PR merges, runners
-# refuse a checkout whose image inputs changed (stale inputs key).
+# Runners (tests/bugbash/sandbox/runner.ts) look up the stable tag of their checkout's key and
+# accept it only with this workflow's attestation from main. Without one they build the image
+# from their own checkout, so a pull request that changes an image input passes before the merge.
 name: Bug-bash sandbox image
 
 on:
@@ -65,7 +65,7 @@ jobs:
       contents: read
       # Push ghcr.io/coder/xum-bugbash-sandbox. Only this job, only on main.
       packages: write
-      # Build provenance for audit (the runner trusts the digest in image.json).
+      # Build provenance: runners verify it before they use the stable tag's digest.
       id-token: write
       attestations: write
     steps:
@@ -94,21 +94,23 @@ jobs:
             cat "$RUNNER_TEMP/inspect.err" >&2
             exit 1
           fi
-          make -s bugbash-sandbox-publish > image.json
-          # The subject of the attestation is this build's own output (image.json). Assignments, not
-          # $(...) inside echo: a failed jq must fail the step, or an empty digest would skip Attest.
-          image=$(jq -er .image image.json)
-          digest=$(jq -er .digest image.json)
+          record="$RUNNER_TEMP/publish.json"
+          make -s bugbash-sandbox-publish > "$record"
+          # The subject of the attestation is this build's own output (the publish record).
+          # Assignments, not $(...) inside echo: a failed jq must fail the step, or an empty
+          # digest would skip Attest.
+          image=$(jq -er .image "$record")
+          digest=$(jq -er .digest "$record")
           {
             echo "image=$image"
             echo "digest=$digest"
             echo "tag=$tag"
           } >> "$GITHUB_OUTPUT"
           {
-            echo '### tests/bugbash/sandbox/image.json'
+            echo '### Publish record'
             echo
             echo '```json'
-            cat image.json
+            cat "$record"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Attest
@@ -119,6 +121,9 @@ jobs:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+          # Runners verify the attestation bundle in GHCR and read no artifact storage record.
+          # Creating one needs artifact-metadata: write, and without it the action warns.
+          create-storage-record: false
       # The stable tag marks the key as published, so it comes only after the attestation: a failed
       # Attest leaves no tag, and a re-run builds and attests again instead of skipping the key.
       - name: Tag inputs-<key>

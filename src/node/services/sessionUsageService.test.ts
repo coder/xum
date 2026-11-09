@@ -1,9 +1,16 @@
 import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
-import { SessionUsageService, type SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
+import {
+  SessionUsageService,
+  type SessionUsageFile,
+  type SessionUsageTokenStatsCacheV1,
+} from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
+import { z } from "zod";
+import { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
+import { workspace as workspaceApi } from "@/common/orpc/schemas/api";
 import {
   getTotalCost,
   sumUsageHistory,
@@ -42,6 +49,10 @@ function createUsageWithCosts(
     reasoning: { tokens: 0 },
   };
 }
+
+/** Model keys a plain object inherits a value for. */
+const PROTOTYPE_MEMBER_KEYS = ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"];
+
 describe("SessionUsageService", () => {
   let service: SessionUsageService;
   let config: Config;
@@ -372,6 +383,40 @@ describe("SessionUsageService", () => {
       expect(newEntry.agentType).toBe("explore");
       expect(newEntry.model).toBe(model);
     });
+    it("rebuilds an unreadable parent ledger from history before rolling up", async () => {
+      const model = "claude-sonnet-4-20250514";
+      const projectPath = "/tmp/mux-session-usage-test-project";
+      await config.addWorkspace(projectPath, {
+        id: "parent-rebuild",
+        name: "parent-rebuild-branch",
+        projectName: "test-project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        "parent-rebuild",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.writeFile(
+        path.join(config.sessionsDir, "parent-rebuild", "session-usage.json"),
+        "{ not json"
+      );
+
+      await service.rollUpUsageIntoParent("parent-rebuild", "child-rebuild", {
+        [model]: createUsage(7, 3),
+      });
+
+      const after = JSON.parse(
+        await fs.readFile(
+          path.join(config.sessionsDir, "parent-rebuild", "session-usage.json"),
+          "utf-8"
+        )
+      ) as { byModel: Record<string, ChatUsageDisplay> };
+      expect(after.byModel[model].input.tokens).toBe(107);
+    });
   });
   describe("recordUsage", () => {
     it("should accumulate usage for same model (not overwrite)", async () => {
@@ -419,6 +464,21 @@ describe("SessionUsageService", () => {
       expect(result?.byModel[nestedToolModel]).toEqual(nestedToolUsage);
       expect(result?.lastRequest?.model).toBe(nestedToolModel);
       expect(result?.lastRequest?.usage).toEqual(nestedToolUsage);
+    });
+
+    it("accumulates model keys named after Object.prototype members", async () => {
+      const workspaceId = "test-workspace";
+      for (const model of PROTOTYPE_MEMBER_KEYS) {
+        await service.recordUsage(workspaceId, model, createUsage(1, 1));
+        await service.recordUsage(workspaceId, model, createUsage(2, 2));
+      }
+
+      const result = await service.getSessionUsage(workspaceId);
+
+      for (const model of PROTOTYPE_MEMBER_KEYS) {
+        expect(Object.hasOwn(result!.byModel, model)).toBe(true);
+        expect(result!.byModel[model].input.tokens).toBe(3);
+      }
     });
 
     it("should update lastRequest with each recordUsage call", async () => {
@@ -536,14 +596,14 @@ describe("SessionUsageService", () => {
       expect((record.usage as Record<string, unknown>).inputTokens).toBe(40);
     });
 
-    it("still appends the analytics sidecar when the usage ledger is corrupt", async () => {
+    it("still appends the analytics sidecar when the usage ledger is unreadable", async () => {
       const workspaceId = "test-workspace";
       const model = "anthropic:claude-sonnet-4-20250514";
       const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(sessionDir, { recursive: true });
-      // Corrupt ledger: readFile throws on bad JSON (non-ENOENT), which must
+      // Unreadable ledger (a directory at its path): the read throws, which must
       // not block the sidecar — headless spend has no chat-row fallback.
-      await fs.writeFile(path.join(sessionDir, "session-usage.json"), "{not json");
+      await fs.mkdir(path.join(sessionDir, "session-usage.json"));
 
       const recorded = await service.recordHeadlessUsage(
         workspaceId,
@@ -664,6 +724,114 @@ describe("SessionUsageService", () => {
       >;
       expect(record.model).toBe("anthropic:claude-sonnet-4-20250514");
       expect(record.metadataModel).toBe("anthropic:claude-sonnet-4-20250514");
+    });
+  });
+
+  describe("onUsageChanged", () => {
+    it("reports every write that changes a workspace's usage, and no read", async () => {
+      const projectPath = "/tmp/mux-session-usage-test-project";
+      const model = "claude-sonnet-4-20250514";
+      const parentId = "notify-parent";
+      const childId = "notify-child";
+      for (const [id, parentWorkspaceId] of [
+        [parentId, undefined],
+        [childId, parentId],
+      ] as const) {
+        await config.addWorkspace(projectPath, {
+          id,
+          name: id,
+          projectName: "test-project",
+          projectPath,
+          runtimeConfig: { type: "local" },
+          parentWorkspaceId,
+        });
+      }
+      const changed: string[] = [];
+      service.onUsageChanged((workspaceId) => changed.push(workspaceId));
+      const usage = createUsage(10, 5);
+
+      await service.recordInFlightUsage(childId, "step-key", "message-1", model, usage);
+      await service.recordUsage(childId, model, usage, { settlesInFlightKey: "step-key" });
+      await service.recordInFlightUsage(childId, "dropped-key", "message-2", model, usage);
+      await service.discardInFlightUsage(childId, "dropped-key");
+      await service.recordHeadlessUsage(childId, model, {
+        inputTokens: 3,
+        outputTokens: 1,
+        totalTokens: 4,
+      });
+      await service.rollUpUsageIntoParent(parentId, childId, { [model]: usage });
+      await service.resetSessionUsage(childId);
+      await service.rebuildFromMessages(childId, []);
+      expect(changed).toEqual([
+        childId,
+        childId,
+        childId,
+        childId,
+        childId,
+        parentId,
+        childId,
+        childId,
+      ]);
+
+      changed.length = 0;
+      await service.getSessionUsage(parentId);
+      await service.getOpenSubagentUsage(parentId);
+      // The parent's ledger already has this child: the second roll-up writes nothing.
+      await service.rollUpUsageIntoParent(parentId, childId, { [model]: usage });
+      expect(changed).toEqual([]);
+    });
+
+    it("reports a read that repairs an unusable ledger, once", async () => {
+      const workspaceId = "notify-repair";
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model: "claude-sonnet-4-20250514",
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.writeFile(
+        path.join(config.sessionsDir, workspaceId, "session-usage.json"),
+        "{ invalid json"
+      );
+      const changed: string[] = [];
+      service.onUsageChanged((id) => changed.push(id));
+
+      await service.getSessionUsage(workspaceId);
+      // The repaired ledger is usable: the refetch a notification starts writes nothing.
+      await service.getSessionUsage(workspaceId);
+
+      expect(changed).toEqual([workspaceId]);
+    });
+
+    it("does not report a repair whose rebuilt ledger fails to parse", async () => {
+      const workspaceId = "notify-repair-unparseable";
+      // Object-valued token fields: the rebuild keeps them, and the parser rejects them.
+      const malformedUsage = { inputTokens: { n: 1 }, outputTokens: 50, totalTokens: 150 };
+      // History is untrusted on read, so the test writes a shape the types forbid.
+      const metadata = {
+        model: "claude-sonnet-4-20250514",
+        usage: malformedUsage,
+      } as unknown as Parameters<typeof createMuxMessage>[3];
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "assistant", "Hello", metadata)
+      );
+      await fs.writeFile(
+        path.join(config.sessionsDir, workspaceId, "session-usage.json"),
+        "{ invalid json"
+      );
+      const changed: string[] = [];
+      service.onUsageChanged((id) => changed.push(id));
+
+      const error = await service.getSessionUsage(workspaceId).then(
+        () => undefined,
+        (readError: unknown) => readError
+      );
+      expect(String(error)).toContain("a ledger rebuilt from history always parses");
+
+      // A notify here starts a refetch that repairs, fails and notifies again, forever.
+      expect(changed).toEqual([]);
     });
   });
 
@@ -797,6 +965,265 @@ describe("SessionUsageService", () => {
     }
   });
 
+  describe("getOpenSubagentUsage", () => {
+    const projectPath = "/tmp/mux-session-usage-test-project";
+    const model = "claude-sonnet-4-20250514";
+
+    async function addWorkspace(id: string, parentWorkspaceId?: string): Promise<void> {
+      await config.addWorkspace(projectPath, {
+        id,
+        name: `${id}-branch`,
+        projectName: "test-project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId,
+      });
+    }
+
+    it("sums open descendants once, skipping rolled-up and unrelated workspaces", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await addWorkspace("grandchild", "child");
+      await addWorkspace("removing", "root");
+      await addWorkspace("other-root");
+      await addWorkspace("other-child", "other-root");
+
+      await service.recordUsage("root", model, createUsageWithCosts(100, 50, 1, 2));
+      await service.recordUsage("child", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      await service.recordUsage("grandchild", model, createUsageWithCosts(20, 2, 0.3, 0.4));
+      // A removed grandchild rolled into "child": it counts once, through child's ledger.
+      await service.rollUpUsageIntoParent("child", "removed-grandchild", {
+        [model]: createUsageWithCosts(5, 5, 0.5, 0.5),
+      });
+      // "removing" is mid-removal: rolled into root but still in config.
+      await service.recordUsage("removing", model, createUsageWithCosts(40, 4, 4, 4));
+      await service.rollUpUsageIntoParent("root", "removing", {
+        [model]: createUsageWithCosts(40, 4, 4, 4),
+      });
+      await service.recordUsage("other-child", model, createUsageWithCosts(1000, 1000, 9, 9));
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      // One entry per direct child: "child" covers itself and "grandchild".
+      expect(Object.keys(result.children)).toEqual(["child"]);
+      const subtree = result.children.child;
+      expect(subtree.workspaceCount).toBe(2);
+      const usage = subtree.byModel[model];
+      expect(usage.input.tokens).toBe(10 + 5 + 20);
+      expect(usage.output.tokens).toBe(1 + 5 + 2);
+      expect(getTotalCost(usage)).toBeCloseTo(0.1 + 0.2 + 0.5 + 0.5 + 0.3 + 0.4, 10);
+    });
+
+    it("drops only the malformed entries of a sub-agent ledger", async () => {
+      await addWorkspace("root");
+      await addWorkspace("broken", "root");
+      await addWorkspace("healthy", "root");
+      await service.recordUsage("healthy", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      // Valid JSON with one corrupt model entry: it would fail the IPC output schema and hide
+      // every sub-agent's usage with it.
+      await fs.mkdir(path.join(config.sessionsDir, "broken"), { recursive: true });
+      await fs.writeFile(
+        path.join(config.sessionsDir, "broken", "session-usage.json"),
+        JSON.stringify({ byModel: { [model]: createUsage(3, 3), "bad:model": null }, version: 1 })
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(Object.keys(result.children).sort()).toEqual(["broken", "healthy"]);
+      expect(Object.keys(result.children.broken.byModel)).toEqual([model]);
+      expect(result.children.broken.byModel[model].input.tokens).toBe(3);
+      expect(result.children.healthy.byModel[model].input.tokens).toBe(10);
+    });
+
+    it("keeps a sub-agent ledger with corrupt settled keys, counting no orphaned stream", async () => {
+      await addWorkspace("root");
+      await addWorkspace("broken", "root");
+      await addWorkspace("healthy", "root");
+      await service.recordUsage("healthy", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      // The ledger may already count this file: the keys that would say so are unreadable.
+      await service.recordInFlightUsage("broken", "orphan", "msg-x", model, createUsage(60, 0));
+      service.releaseInFlightUsage("broken", "orphan");
+      await fs.writeFile(
+        path.join(config.sessionsDir, "broken", "session-usage.json"),
+        JSON.stringify({
+          byModel: { [model]: createUsage(3, 3) },
+          settledInFlightKeys: {},
+          version: 1,
+        })
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(Object.keys(result.children).sort()).toEqual(["broken", "healthy"]);
+      expect(result.children.broken.byModel[model].input.tokens).toBe(3);
+      expect(result.children.healthy.byModel[model].input.tokens).toBe(10);
+    });
+
+    it("sums a sub-agent ledger whose entry has a null long-context share", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await addWorkspace("grandchild", "child");
+      await service.recordUsage("grandchild", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      await fs.mkdir(path.join(config.sessionsDir, "child"), { recursive: true });
+      await fs.writeFile(
+        path.join(config.sessionsDir, "child", "session-usage.json"),
+        JSON.stringify({
+          byModel: { [model]: { ...createUsage(3, 3), longContextTokens: null } },
+          version: 1,
+        })
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      // Both land in the child's subtree, so the sum must merge the repaired entry.
+      expect(result.children.child.byModel[model].input.tokens).toBe(13);
+    });
+
+    it("rebuilds a missing sub-agent ledger from history without writing it", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await historyService.appendToHistory(
+        "child",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      const ledgerPath = path.join(config.sessionsDir, "child", "session-usage.json");
+      await fs.rm(ledgerPath, { force: true });
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.children.child.byModel[model].input.tokens).toBe(100);
+      expect(existsSync(ledgerPath)).toBe(false);
+    });
+
+    it("rebuilds a missing ledger from history when a stream is running", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await historyService.appendToHistory(
+        "child",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.rm(path.join(config.sessionsDir, "child", "session-usage.json"), { force: true });
+      await service.recordInFlightUsage("child", "stream-key", "msg2", model, createUsage(7, 0));
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.children.child.byModel[model].input.tokens).toBe(107);
+    });
+
+    it("still shows a running stream while the sub-agent's history cannot be read", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await service.recordInFlightUsage("child", "stream-key", "msg2", model, createUsage(7, 0));
+      const iterateSpy = spyOn(historyService, "iterateFullHistoryUnderLock").mockResolvedValue({
+        success: false,
+        error: "EIO",
+      });
+      try {
+        const result = await service.getOpenSubagentUsage("root");
+        expect(result.children.child.byModel[model].input.tokens).toBe(7);
+      } finally {
+        iterateSpy.mockRestore();
+      }
+    });
+
+    it("sums model keys named after Object.prototype members", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await addWorkspace("grandchild", "child");
+      const byModel = Object.fromEntries(
+        PROTOTYPE_MEMBER_KEYS.map((key) => [key, createUsage(3, 3)])
+      );
+      for (const id of ["child", "grandchild"]) {
+        await fs.mkdir(path.join(config.sessionsDir, id), { recursive: true });
+        await fs.writeFile(
+          path.join(config.sessionsDir, id, "session-usage.json"),
+          JSON.stringify({ byModel, version: 1 })
+        );
+      }
+      await service.recordInFlightUsage(
+        "child",
+        "stream-key",
+        "msg1",
+        "valueOf",
+        createUsage(7, 0)
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      // The ledger schema drops a "__proto__" key; every other key is summed.
+      const subtree = result.children.child.byModel;
+      const inputTokens = (key: string) => subtree[key].input.tokens;
+      expect(inputTokens("toString")).toBe(6);
+      expect(inputTokens("constructor")).toBe(6);
+      expect(inputTokens("hasOwnProperty")).toBe(6);
+      expect(inputTokens("valueOf")).toBe(13);
+    });
+
+    it("counts a running stream of a sub-agent with an empty history and no ledger", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await service.recordInFlightUsage("child", "stream-key", "msg1", model, createUsage(7, 0));
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.children.child.byModel[model].input.tokens).toBe(7);
+    });
+
+    it("counts a stream once when its final message reached history before it settled", async () => {
+      // Stream end commits the final message to history, then settles the in-flight key in a
+      // separate lock turn: a projection read can run in between.
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await service.recordInFlightUsage("child", "stream-key", "msg1", model, createUsage(60, 0));
+      await historyService.appendToHistory(
+        "child",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.rm(path.join(config.sessionsDir, "child", "session-usage.json"), { force: true });
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.children.child.byModel[model].input.tokens).toBe(100);
+    });
+
+    it("returns nothing for a workspace without sub-agents", async () => {
+      await addWorkspace("lonely");
+      await service.recordUsage("lonely", model, createUsage(1, 1));
+
+      expect(await service.getOpenSubagentUsage("lonely")).toEqual({ children: {} });
+    });
+  });
+
+  describe("getSessionUsageBatch", () => {
+    it("drops a malformed field of a ledger and keeps the rest", async () => {
+      const model = "claude-sonnet-4-20250514";
+      await service.recordUsage("good", model, createUsage(5, 5));
+      await service.recordUsage("bad", model, createUsage(1, 1));
+      const badPath = path.join(config.sessionsDir, "bad", "session-usage.json");
+      const bad = JSON.parse(await fs.readFile(badPath, "utf-8")) as Record<string, unknown>;
+      await fs.writeFile(badPath, JSON.stringify({ ...bad, lastRequest: null }));
+
+      const result = await service.getSessionUsageBatch(["good", "bad"]);
+
+      // The batch passes its IPC output schema only when no entry is malformed.
+      expect(
+        z.record(z.string(), SessionUsageFileSchema.optional()).safeParse(result).success
+      ).toBe(true);
+      expect(result.bad?.lastRequest).toBeUndefined();
+      expect(result.bad?.byModel[model].input.tokens).toBe(1);
+      expect(result.good?.byModel[model].input.tokens).toBe(5);
+    });
+  });
+
   describe("getSessionUsage", () => {
     it("should rebuild from messages when file missing (ENOENT)", async () => {
       const workspaceId = "test-workspace";
@@ -825,6 +1252,432 @@ describe("SessionUsageService", () => {
       expect(result).toBeDefined();
       // Should have rebuilt and summed the usage
       expect(result!.byModel["claude-sonnet-4-20250514"]).toBeDefined();
+    });
+
+    it("counts a stream once when a rebuild ran between its history commit and its settle", async () => {
+      const workspaceId = "test-workspace";
+      const model = "claude-sonnet-4-20250514";
+      await service.recordInFlightUsage(
+        workspaceId,
+        "stream-key",
+        "msg1",
+        model,
+        createUsage(60, 0)
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.rm(path.join(config.sessionsDir, workspaceId, "session-usage.json"), {
+        force: true,
+      });
+      // The rebuild counts the final message from history and writes the ledger.
+      expect((await service.getSessionUsage(workspaceId))?.byModel[model].input.tokens).toBe(100);
+
+      await service.recordUsage(workspaceId, model, createUsage(100, 50), {
+        settlesInFlightKey: "stream-key",
+      });
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result?.byModel[model].input.tokens).toBe(100);
+      expect(result?.lastRequest?.usage.input.tokens).toBe(100);
+    });
+  });
+
+  describe("a workspace's own ledger in a wrong shape", () => {
+    const workspaceId = "shape-workspace";
+    const model = "claude-sonnet-4-20250514";
+    const getSessionUsageOutput = workspaceApi.getSessionUsage.output;
+    // The ledger holds 100 input tokens, 40 of them rolled up from a removed child; history,
+    // which lacks the child, holds 300. A rebuild from history reads 300, a kept ledger 100.
+    const ledger = {
+      byModel: { [model]: createUsage(100, 0) },
+      rolledUpFrom: { child: { totalTokens: 40, rolledUpAtMs: 1 } },
+      version: 1,
+    };
+
+    const writeLedger = async (raw: unknown) => {
+      const dir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "session-usage.json"), JSON.stringify(raw));
+    };
+    const inputTokens = (file: { byModel: Record<string, ChatUsageDisplay> } | undefined) =>
+      Object.values(file?.byModel ?? {}).reduce((sum, usage) => sum + usage.input.tokens, 0);
+    /** What the Costs tab gets: the IPC output schema must accept it. */
+    const readThroughIpc = async () => {
+      const parsed = getSessionUsageOutput.safeParse(await service.getSessionUsage(workspaceId));
+      expect(parsed.error).toBeUndefined();
+      return parsed.data;
+    };
+
+    beforeEach(async () => {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 300, outputTokens: 0, totalTokens: 300 },
+        })
+      );
+    });
+
+    const unusable: Array<[string, unknown]> = [
+      ["a null byModel", { ...ledger, byModel: null }],
+      ["a string byModel", { ...ledger, byModel: "x" }],
+      ["an array byModel", { ...ledger, byModel: [] }],
+      ["only invalid model entries", { ...ledger, byModel: { a: null, b: 5 } }],
+      ["version 2", { ...ledger, version: 2 }],
+      ["no version", { byModel: ledger.byModel }],
+      ["a JSON null", null],
+      ["a JSON array", [ledger]],
+    ];
+    for (const [name, raw] of unusable) {
+      it(`rebuilds a ledger with ${name} from history`, async () => {
+        await writeLedger(raw);
+        expect(inputTokens(await readThroughIpc())).toBe(300);
+        // The repaired ledger is on disk: the next read does not rebuild again.
+        const iterateSpy = spyOn(historyService, "iterateFullHistoryUnderLock");
+        try {
+          expect(inputTokens(await readThroughIpc())).toBe(300);
+          expect(iterateSpy).not.toHaveBeenCalled();
+        } finally {
+          iterateSpy.mockRestore();
+        }
+      });
+
+      it(`records usage after a ledger with ${name}, keeping the spend history has`, async () => {
+        await writeLedger(raw);
+        await service.recordUsage(workspaceId, model, createUsage(7, 0));
+        expect(inputTokens(await readThroughIpc())).toBe(307);
+      });
+    }
+
+    const kept = ledger.rolledUpFrom;
+    // The third column is the rolledUpFrom a read returns.
+    const partlyBad: Array<[string, Record<string, unknown>, SessionUsageFile["rolledUpFrom"]]> = [
+      ["a null model entry", { ...ledger, byModel: { ...ledger.byModel, bad: null } }, kept],
+      [
+        "a model entry in a wrong shape",
+        { ...ledger, byModel: { ...ledger.byModel, bad: 5 } },
+        kept,
+      ],
+      ["a null rolledUpFrom", { ...ledger, rolledUpFrom: null }, undefined],
+      ["a string rolledUpFrom", { ...ledger, rolledUpFrom: "child" }, undefined],
+      ["an array rolledUpFrom", { ...ledger, rolledUpFrom: ["child"] }, undefined],
+      [
+        "a malformed rolledUpFrom entry",
+        { ...ledger, rolledUpFrom: { child: 5 } },
+        { child: true },
+      ],
+      ["a malformed lastRequest", { ...ledger, lastRequest: { model: 1 } }, kept],
+      ["a malformed tokenStatsCache", { ...ledger, tokenStatsCache: 5 }, kept],
+      ["an object settledInFlightKeys", { ...ledger, settledInFlightKeys: {} }, kept],
+      ["a null settledInFlightKeys", { ...ledger, settledInFlightKeys: null }, kept],
+      ["non-string settledInFlightKeys", { ...ledger, settledInFlightKeys: [1, 2] }, kept],
+    ];
+    for (const [name, raw, rolledUpFrom] of partlyBad) {
+      // History can be shorter than the ledger (rolled-up children, edited history): a
+      // rebuild would lose that spend, so only the bad part is dropped.
+      it(`keeps the valid spend of a ledger with ${name}`, async () => {
+        await writeLedger(raw);
+        const result = await readThroughIpc();
+        expect(inputTokens(result)).toBe(100);
+        expect(result?.rolledUpFrom).toEqual(rolledUpFrom);
+      });
+
+      it(`records usage after a ledger with ${name}, keeping its valid spend`, async () => {
+        await writeLedger(raw);
+        await service.recordUsage(workspaceId, model, createUsage(7, 0));
+        expect(inputTokens(await readThroughIpc())).toBe(107);
+      });
+    }
+
+    it("keeps the rolled-up children of a partly bad ledger, so a retried roll-up counts once", async () => {
+      await config.addWorkspace("/tmp/mux-session-usage-test-project", {
+        id: workspaceId,
+        name: "shape-branch",
+        projectName: "test-project",
+        projectPath: "/tmp/mux-session-usage-test-project",
+        runtimeConfig: { type: "local" },
+      });
+      await writeLedger({
+        ...ledger,
+        byModel: { ...ledger.byModel, bad: null },
+        rolledUpFrom: { child: { totalTokens: "40" }, falsy: null },
+      });
+
+      const retry = await service.rollUpUsageIntoParent(workspaceId, "child", {
+        [model]: createUsage(40, 0),
+      });
+
+      expect(retry.didRollUp).toBe(false);
+      const result = await readThroughIpc();
+      expect(inputTokens(result)).toBe(100);
+      // A malformed entry still says the child was counted; a falsy one never did.
+      expect(result?.rolledUpFrom).toEqual({ child: true });
+    });
+
+    it("keeps the fields a newer Xum stored when it repairs and records", async () => {
+      await writeLedger({ ...ledger, byModel: { ...ledger.byModel, bad: null }, future: [1] });
+
+      await service.recordUsage(workspaceId, model, createUsage(7, 0));
+
+      const onDisk = JSON.parse(
+        await fs.readFile(path.join(config.sessionsDir, workspaceId, "session-usage.json"), "utf-8")
+      ) as Record<string, unknown>;
+      expect(onDisk.future).toEqual([1]);
+      expect(Object.keys(onDisk.byModel as object)).toEqual([model]);
+    });
+
+    it("records a settle once when the repair from history already counts its message", async () => {
+      await writeLedger({ ...ledger, byModel: null });
+
+      // msg1 is in history (300 tokens): its settle must not add it again.
+      await service.recordUsage(workspaceId, model, createUsage(300, 0), { messageId: "msg1" });
+      await service.recordUsage(workspaceId, model, createUsage(7, 0), { messageId: "msg2" });
+
+      expect(inputTokens(await readThroughIpc())).toBe(307);
+    });
+
+    it("fails a repair while the in-flight files cannot be listed", async () => {
+      // A file at the directory's path: listing it fails, as an EIO would.
+      const inFlightDir = path.join(config.sessionsDir, workspaceId, "session-usage.in-flight");
+      await fs.writeFile(inFlightDir, "");
+      await writeLedger({ ...ledger, byModel: null });
+
+      const result = await service.getSessionUsage(workspaceId).then(
+        () => "resolved",
+        () => "rejected"
+      );
+
+      expect(result).toBe("rejected");
+      const onDisk = JSON.parse(
+        await fs.readFile(path.join(config.sessionsDir, workspaceId, "session-usage.json"), "utf-8")
+      ) as { byModel: unknown };
+      expect(onDisk.byModel).toBeNull();
+      await fs.rm(inFlightDir);
+      expect(inputTokens(await readThroughIpc())).toBe(300);
+    });
+
+    it("fails a repair while an in-flight file cannot be read", async () => {
+      // A directory at the file's path: reading it fails, as an EIO would.
+      const stuck = path.join(config.sessionsDir, workspaceId, "session-usage.in-flight", "k.json");
+      await fs.mkdir(stuck, { recursive: true });
+      await writeLedger({ ...ledger, byModel: null });
+
+      const result = await service.getSessionUsage(workspaceId).then(
+        () => "resolved",
+        () => "rejected"
+      );
+
+      expect(result).toBe("rejected");
+      await fs.rm(stuck, { recursive: true });
+      expect(inputTokens(await readThroughIpc())).toBe(300);
+    });
+
+    it("fails a read of an unreadable ledger without rebuilding it", async () => {
+      await writeLedger(ledger);
+      const readSpy = spyOn(historyService.files.promises, "readFile").mockRejectedValueOnce(
+        Object.assign(new Error("EIO"), { code: "EIO" })
+      );
+      try {
+        const result = await service.getSessionUsage(workspaceId).then(
+          () => "resolved",
+          () => "rejected"
+        );
+        expect(result).toBe("rejected");
+      } finally {
+        readSpy.mockRestore();
+      }
+
+      // Not rebuilt from history (300): the ledger keeps its rolled-up spend.
+      expect(inputTokens(await readThroughIpc())).toBe(100);
+    });
+
+    it("keeps a fork's boundary when it rebuilds an unusable ledger", async () => {
+      const forkedAt = Date.now() - 1_000;
+      // beforeEach's msg1 has no timestamp (the fork's own); this one came from the parent.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("inherited", "assistant", "Hi", {
+          model,
+          timestamp: forkedAt - 1,
+          usage: { inputTokens: 5_000, outputTokens: 0, totalTokens: 5_000 },
+        })
+      );
+      await writeLedger({ byModel: null, forkedAt, version: 1 });
+
+      await service.recordUsage(workspaceId, model, createUsage(7, 0));
+
+      const result = await readThroughIpc();
+      expect(inputTokens(result)).toBe(307);
+      expect(result?.forkedAt).toBe(forkedAt);
+    });
+
+    it("keeps a fork's boundary on a read, even with no rows of its own", async () => {
+      const forkedAt = Date.now() - 1_000;
+      const inherited = createMuxMessage("inherited", "assistant", "Hi", {
+        model,
+        timestamp: forkedAt - 1,
+        usage: { inputTokens: 5_000, outputTokens: 0, totalTokens: 5_000 },
+      });
+      const forkOnlyId = "fork-only-inherited";
+      await historyService.appendToHistory(forkOnlyId, inherited);
+      await fs.writeFile(
+        path.join(config.sessionsDir, forkOnlyId, "session-usage.json"),
+        JSON.stringify({ byModel: "x", forkedAt, version: 1 })
+      );
+      await historyService.appendToHistory(workspaceId, inherited);
+      await writeLedger({ byModel: "x", forkedAt, version: 1 });
+
+      const own = getSessionUsageOutput.parse(await service.getSessionUsage(workspaceId));
+      const none = getSessionUsageOutput.parse(await service.getSessionUsage(forkOnlyId));
+
+      expect([inputTokens(own), own?.forkedAt]).toEqual([300, forkedAt]);
+      expect([inputTokens(none), none?.forkedAt]).toEqual([0, forkedAt]);
+    });
+
+    it("fails a repair while history cannot be read, and repairs on the next try", async () => {
+      await writeLedger({ ...ledger, byModel: null });
+      const iterateSpy = spyOn(historyService, "iterateFullHistoryUnderLock").mockResolvedValue({
+        success: false,
+        error: "EIO",
+      });
+      try {
+        // An empty history would rebuild to nothing: the write would drop the 300 tokens.
+        const result = await service.recordUsage(workspaceId, model, createUsage(7, 0)).then(
+          () => "resolved",
+          () => "rejected"
+        );
+        expect(result).toBe("rejected");
+      } finally {
+        iterateSpy.mockRestore();
+      }
+
+      await service.recordUsage(workspaceId, model, createUsage(7, 0));
+      expect(inputTokens(await readThroughIpc())).toBe(307);
+    });
+
+    describe("with corrupt settled keys", () => {
+      const corrupt = { ...ledger, settledInFlightKeys: {} };
+      const inFlightDir = () =>
+        path.join(config.sessionsDir, workspaceId, "session-usage.in-flight");
+      const deadOrphan = JSON.stringify({
+        version: 1,
+        owner: { pid: 2147483000, id: "dead" },
+        messageId: "msg-x",
+        model,
+        usage: createUsage(60, 0),
+        updatedAt: 1,
+      });
+
+      it("counts no unreadable in-flight file once it becomes readable", async () => {
+        // A directory at the file's path: reading it fails, as an EIO would.
+        await fs.mkdir(path.join(inFlightDir(), "stuck.json"), { recursive: true });
+        await writeLedger(corrupt);
+        await service.recordUsage(workspaceId, model, createUsage(7, 0));
+
+        await fs.rm(path.join(inFlightDir(), "stuck.json"), { recursive: true });
+        await fs.writeFile(path.join(inFlightDir(), "stuck.json"), deadOrphan);
+
+        expect(inputTokens(await readThroughIpc())).toBe(107);
+      });
+
+      it("still records a running stream's settle while its file is unreadable", async () => {
+        await service.recordInFlightUsage(workspaceId, "live", "msg-x", model, createUsage(60, 0));
+        await fs.rm(path.join(inFlightDir(), "live.json"));
+        await fs.mkdir(path.join(inFlightDir(), "live.json"));
+        await writeLedger(corrupt);
+
+        await service.recordUsage(workspaceId, model, createUsage(60, 0), {
+          settlesInFlightKey: "live",
+        });
+
+        expect(inputTokens(await readThroughIpc())).toBe(160);
+      });
+
+      it("fails a read or write while the in-flight files cannot be listed", async () => {
+        // A file at the directory's path: listing it fails, as an EIO would.
+        await fs.mkdir(path.join(config.sessionsDir, workspaceId), { recursive: true });
+        await fs.writeFile(inFlightDir(), "");
+        await writeLedger(corrupt);
+
+        const settled = (promise: Promise<unknown>) =>
+          promise.then(
+            () => "resolved",
+            () => "rejected"
+          );
+        expect(await settled(service.recordUsage(workspaceId, model, createUsage(7, 0)))).toBe(
+          "rejected"
+        );
+        expect(await settled(service.getSessionUsage(workspaceId))).toBe("rejected");
+        await config.addWorkspace("/tmp/mux-session-usage-test-project", {
+          id: workspaceId,
+          name: "shape-branch",
+          projectName: "test-project",
+          projectPath: "/tmp/mux-session-usage-test-project",
+          runtimeConfig: { type: "local" },
+        });
+        const cache: SessionUsageTokenStatsCacheV1 = {
+          version: 1,
+          computedAt: 1,
+          model,
+          tokenizerName: "claude",
+          history: { messageCount: 1 },
+          consumers: [],
+          totalTokens: 0,
+        };
+        expect(await settled(service.setTokenStatsCache(workspaceId, cache))).toBe("rejected");
+        expect(
+          await settled(
+            service.rollUpUsageIntoParent(workspaceId, "other-child", {
+              [model]: createUsage(1, 0),
+            })
+          )
+        ).toBe("rejected");
+
+        // The ledger was neither rebuilt nor written without its markers.
+        await fs.rm(inFlightDir());
+        await service.recordUsage(workspaceId, model, createUsage(7, 0));
+        expect(inputTokens(await readThroughIpc())).toBe(107);
+      });
+
+      it("counts no orphaned in-flight file, since the ledger may already hold it", async () => {
+        await service.recordInFlightUsage(
+          workspaceId,
+          "orphan",
+          "msg-x",
+          model,
+          createUsage(60, 0)
+        );
+        service.releaseInFlightUsage(workspaceId, "orphan");
+        await writeLedger(corrupt);
+
+        expect(inputTokens(await readThroughIpc())).toBe(100);
+        expect(
+          existsSync(
+            path.join(config.sessionsDir, workspaceId, "session-usage.in-flight", "orphan.json")
+          )
+        ).toBe(false);
+        await service.recordUsage(workspaceId, model, createUsage(7, 0));
+        expect(inputTokens(await readThroughIpc())).toBe(107);
+      });
+
+      it("still records a running stream's settle", async () => {
+        await service.recordInFlightUsage(workspaceId, "live", "msg-x", model, createUsage(60, 0));
+        await writeLedger(corrupt);
+
+        const live = getSessionUsageOutput.parse(
+          await service.getSessionUsage(workspaceId, { includeLiveStreams: true })
+        );
+        expect(inputTokens(live)).toBe(160);
+        await service.recordUsage(workspaceId, model, createUsage(60, 0), {
+          settlesInFlightKey: "live",
+        });
+        expect(inputTokens(await readThroughIpc())).toBe(160);
+      });
     });
   });
 

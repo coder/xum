@@ -10,4 +10,6 @@ preload = ["./tests/setup.ts"]
 minimumReleaseAge = 604800
 # happy-dom 21.0.4 (2026-10-20) fixes 3 high alerts (#7384). Remove the entry after 2026-10-27, when
 # it is a week old.
-minimumReleaseAgeExcludes = ["happy-dom"]
+# electron 44.10.0 (2026-10-27) bundles Node 24.22.1, the CVE-2026-111497 fix (#7358). Remove the
+# entry after 2026-11-03, when it is a week old.
+minimumReleaseAgeExcludes = ["happy-dom", "electron"]

@@ -2879,6 +2879,7 @@ describe("createCodeExecutionTool", () => {
       const unregister = registerCodexPluginHooks(eventSpine, {
         workspaceId,
         pluginName: "guard",
+        pluginInstanceId: "guard",
         order: 0,
         hooks: [
           {

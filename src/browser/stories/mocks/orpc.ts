@@ -19,9 +19,9 @@ import type {
   ArtifactListing,
   ArtifactReadResult,
   ArtifactShelfListing,
-  ArtifactVersion,
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
+import { EMPTY_BACKUP_PLUGIN_REPORT, type BackupPluginReport } from "@/common/orpc/schemas/backup";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { McpAppToolCallResult, McpAppView } from "@/common/orpc/schemas/mcpApps";
 import type { APIClient } from "@/browser/contexts/API";
@@ -153,6 +153,11 @@ type MockBackupData<Route extends Exclude<MockBackupRoute, "getSettings">> = Ext
   MockBackupRouteOutput<Route>,
   { success: true }
 >["data"];
+/** A fixture may leave out the plugin report: the mock then reports a backup with no plugin list. */
+type MockBackupFixture<Route extends "preview" | "restore"> = Omit<
+  MockBackupData<Route>,
+  "plugins"
+> & { plugins?: BackupPluginReport };
 type MockBackupSettings = NonNullable<MockBackupRouteOutput<"getSettings">>;
 
 export interface MockORPCClientOptions {
@@ -174,6 +179,8 @@ export interface MockORPCClientOptions {
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
     hooks?: Record<string, AgentPluginHooks>;
+    /** Returned by agentPlugins.containerLocation; defaults to `~/.mux/plugins`. */
+    containerLocation?: string;
     /** Returned by agentPlugins.pendingSignOuts; omit for no record. */
     pendingSignOuts?: AgentPluginPendingSignOuts;
     /**
@@ -238,18 +245,12 @@ export interface MockORPCClientOptions {
   memoryConsolidationStatus?: MemoryConsolidationStatusPayload;
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
-  /**
-   * Artifacts tab: listing for artifacts.list and read results keyed by relative path. The
-   * mock's artifact id is the path, so version contents are keyed by `${path}@${version}`.
-   */
+  /** Artifacts tab: listing for artifacts.list and read results keyed by relative path. */
   artifacts?: {
     listing: ArtifactListing;
     files: Record<string, ArtifactReadResult>;
     /** artifacts.capabilities answer; omitted means unknown (null). */
     agentBrowserAvailable?: boolean | null;
-    /** Stored versions per artifact path, newest first. */
-    versions?: Record<string, ArtifactVersion[]>;
-    versionFiles?: Record<string, ArtifactReadResult>;
     pinned?: PinnedArtifactFile[];
     pinnedFiles?: Record<string, ArtifactReadResult>;
     /** Shelf (M5c) listing and read results keyed by `${scope}:${name}`. */
@@ -259,6 +260,8 @@ export interface MockORPCClientOptions {
     states?: Record<string, unknown>;
     /** When set, artifacts.sendInteraction fails with this error (the strip's error state). */
     sendInteractionError?: string;
+    /** Gets every artifacts.setState call (window.xum.setState reached the host). */
+    onSetState?: (input: { path: string; state: unknown }) => void;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
   /** When set, mcpApps.listViewDomains fails with this error (Settings' load error). */
@@ -446,9 +449,9 @@ export interface MockORPCClientOptions {
   };
   backupSettings?: MockBackupSettings | null;
   backupValidation?: MockBackupData<"validate">;
-  backupPreview?: MockBackupData<"preview">;
+  backupPreview?: MockBackupFixture<"preview">;
   backupPush?: MockBackupData<"push">;
-  backupRestore?: MockBackupData<"restore">;
+  backupRestore?: MockBackupFixture<"restore">;
   /** Per-workspace runtime statuses for RuntimeStatusStore stories */
   runtimeStatuses?: Map<string, "running" | "stopped" | "unknown" | "unsupported">;
 }
@@ -816,15 +819,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     empty: false,
     credential: "gh",
   };
-  const backupPreviewResult: MockBackupData<"preview"> = backupPreview ?? {
-    pushChanges: [],
-    restoreChanges: [],
-    localOnlyFiles: [],
-    redactions: [],
-    commandApprovals: [],
-    projectImports: [],
-    projectBundleSkipped: false,
-    pushError: null,
+  const backupPreviewResult: MockBackupData<"preview"> = {
+    plugins: EMPTY_BACKUP_PLUGIN_REPORT,
+    ...(backupPreview ?? {
+      pushChanges: [],
+      restoreChanges: [],
+      localOnlyFiles: [],
+      redactions: [],
+      commandApprovals: [],
+      projectImports: [],
+      projectBundleSkipped: false,
+      pushError: null,
+    }),
   };
   const backupPushResult: MockBackupData<"push"> = backupPush ?? {
     commit: "abc1234",
@@ -832,14 +838,17 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     credential: backupValidationResult.credential,
     redactions: [],
   };
-  const backupRestoreResult: MockBackupData<"restore"> = backupRestore ?? {
-    commit: "def5678",
-    snapshotPath: "/tmp/mux-backup-snapshot",
-    changedFiles: [],
-    localOnlyFiles: [],
-    projectImportResults: [],
-    projectBundleSkipped: false,
-    unapprovedProjectImports: [],
+  const backupRestoreResult: MockBackupData<"restore"> = {
+    plugins: EMPTY_BACKUP_PLUGIN_REPORT,
+    ...(backupRestore ?? {
+      commit: "def5678",
+      snapshotPath: "/tmp/mux-backup-snapshot",
+      changedFiles: [],
+      localOnlyFiles: [],
+      projectImportResults: [],
+      projectBundleSkipped: false,
+      unapprovedProjectImports: [],
+    }),
   };
 
   const mockStats: ChatStats = {
@@ -1362,7 +1371,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     },
     agentPlugins: {
       list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
-      containerLocation: () => Promise.resolve("~/.mux/plugins"),
+      containerLocation: () =>
+        Promise.resolve(agentPluginsMock?.containerLocation ?? "~/.mux/plugins"),
       listForSettings: () =>
         Promise.resolve({
           list: { success: true as const, data: agentPluginsMock?.items ?? [] },
@@ -1408,6 +1418,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           hooks.hooks = hooks.hooks.map((hook) =>
             hook.key === input.key ? { ...hook, review: input.state ?? "new" } : hook
           );
+          // As the backend: the first trust's file review is shown only until a hook is trusted.
+          if (input.state === "trusted") delete hooks.fileReview;
         }
         return Promise.resolve({ success: true as const, data: undefined });
       },
@@ -2333,6 +2345,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       getSessionUsage: (input: { workspaceId: string }) =>
         Promise.resolve(sessionUsage.get(input.workspaceId)),
+      getSubagentUsage: () => Promise.resolve({ children: {} }),
       getSessionUsageBatch: (input: { workspaceIds: string[] }) => {
         const result: Record<string, MockSessionUsage | undefined> = {};
         for (const id of input.workspaceIds) {
@@ -2566,24 +2579,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       capabilities: () =>
         Promise.resolve({ agentBrowserAvailable: artifacts.agentBrowserAvailable ?? null }),
-      listVersions: (input: { workspaceId: string; path: string }) =>
-        Promise.resolve({
-          success: true as const,
-          data: {
-            artifactId: input.path,
-            path: input.path,
-            pin: null,
-            versions: artifacts.versions?.[input.path] ?? [],
-          },
-        }),
-      readVersion: (input: { workspaceId: string; artifactId: string; version: number }) => {
-        const file = artifacts.versionFiles?.[`${input.artifactId}@${input.version}`];
-        return Promise.resolve(
-          file
-            ? { success: true as const, data: file }
-            : { success: false as const, error: `Version not found: v${input.version}` }
-        );
-      },
       listPinned: () =>
         Promise.resolve({
           success: true as const,
@@ -2616,15 +2611,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             : { success: false as const, error: `Shelf entry not found: ${input.name}` }
         );
       },
-      pinToShelf: (input: { artifactId: string }) =>
-        Promise.resolve({ success: true as const, data: { name: input.artifactId } }),
+      pinToShelf: (input: { path: string }) =>
+        Promise.resolve({ success: true as const, data: { name: input.path } }),
       unpinShelf: () => Promise.resolve({ success: true as const, data: undefined }),
       getState: (input: { workspaceId: string; path: string }) =>
         Promise.resolve({
           success: true as const,
           data: { state: artifacts.states?.[input.path] ?? null },
         }),
-      setState: () => Promise.resolve({ success: true as const, data: undefined }),
+      setState: (input: { path: string; state: unknown }) => {
+        artifacts.onSetState?.({ path: input.path, state: input.state });
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       sendInteraction: () =>
         Promise.resolve(
           artifacts.sendInteractionError != null

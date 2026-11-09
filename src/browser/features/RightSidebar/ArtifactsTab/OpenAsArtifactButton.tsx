@@ -9,12 +9,12 @@ import { cn } from "@/common/lib/utils";
 import { pinAndOpenArtifact } from "./openArtifact";
 
 /**
- * "Open as artifact" for a checkout file (Review headers, file_read/file_edit cards): pins the
+ * "Open as artifact" for a file (Review headers, file_read/file_edit cards): pins the
  * file and shows it live in the Artifacts tab. Renders nothing while the experiment is off.
  */
 export function OpenAsArtifactButton(props: {
   workspaceId: string | undefined;
-  /** Absolute inside the checkout, or relative to it (or to the tool cwd, see `relativeTo`). */
+  /** Absolute, or relative to the checkout (or to the tool cwd, see `relativeTo`). */
   path: string;
   /**
    * File tool cards pass "tool-cwd": their relative paths resolve from the tool's cwd (a

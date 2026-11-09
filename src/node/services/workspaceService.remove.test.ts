@@ -1416,6 +1416,7 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
       const usageByWorkspace = new Map<string, Record<string, unknown>>();
       const rollupCalls: Array<{ parent: string; child: string; byModel: object }> = [];
       const sessionUsageService = {
+        onUsageChanged: () => undefined,
         getSessionUsage: (workspaceId: string) =>
           Promise.resolve({ byModel: usageByWorkspace.get(workspaceId) ?? {} }),
         rollUpUsageIntoParent: (parent: string, child: string, byModel: object) => {
@@ -1492,6 +1493,7 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
       };
       const usageRollups: Array<{ parent: string; child: string; byModel: object }> = [];
       const sessionUsageService = {
+        onUsageChanged: () => undefined,
         getSessionUsage: () => Promise.resolve({ byModel: { ...childUsage } }),
         rollUpUsageIntoParent: (parent: string, child: string, byModel: object) => {
           usageRollups.push({ parent, child, byModel });

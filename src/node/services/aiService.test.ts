@@ -37,6 +37,7 @@ import { createTestToolConfig } from "./tools/testHelpers";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import {
   collectDeferLoadingToolNames,
@@ -87,6 +88,7 @@ import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
 import { resolveCompactionInputBudgetTokens } from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
+import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 import type { OnTurnStartStage } from "./turnRequestBuilder";
 import { TokenBudgetStrategy } from "./contextManagement/strategies/tokenBudget";
 import type { ContextManagementDependencies } from "./contextManagement/contextManagementService";
@@ -362,6 +364,7 @@ function resolvedAgentResultFor(
       agentDiscoveryPath: metadata.projectPath,
       isSubagentWorkspace: false,
       agentInheritanceChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
+      agentAiSettingsChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
       agentIsPlanLike: false,
       effectiveMode: "exec",
       taskSettings: DEFAULT_TASK_SETTINGS,
@@ -1562,6 +1565,47 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(engineOptions.abortSignal?.aborted).toBe(true);
     expect(engineOptions.abortSignal?.reason).toBe("startup");
     expect(engineOptions.stopFence).toBe(stopFence);
+  });
+
+  // A ledger read error (EIO, EMFILE) only costs the MUX_COSTS_USD env var, never the send.
+  it.each([
+    {
+      name: "sets MUX_COSTS_USD from the session ledger",
+      getSessionUsage: () =>
+        Promise.resolve({
+          version: 1 as const,
+          byModel: {
+            "openai:gpt-5.2": {
+              input: { tokens: 1, cost_usd: 1.25 },
+              cached: { tokens: 0 },
+              cacheCreate: { tokens: 0 },
+              output: { tokens: 1, cost_usd: 0.5 },
+              reasoning: { tokens: 0 },
+            },
+          },
+        }),
+      expected: "1.75",
+    },
+    {
+      name: "starts the turn without MUX_COSTS_USD when the ledger read fails",
+      getSessionUsage: () => Promise.reject(new Error("EIO: i/o error, read")),
+      expected: undefined,
+    },
+  ])("$name", async ({ getSessionUsage, expected }) => {
+    using xumHome = new DisposableTempDir("ai-service-session-costs");
+    const metadata = createLocalWorkspaceMetadata("session-costs", xumHome.path);
+    const sessionUsageService = { getSessionUsage: mock(getSessionUsage) };
+    const harness = createHarness(xumHome.path, metadata, {
+      sessionUsageService: sessionUsageService as unknown as SessionUsageService,
+    });
+
+    await startTestStream(harness, metadata.id);
+
+    expect(sessionUsageService.getSessionUsage).toHaveBeenCalledWith(metadata.id);
+    expect(harness.startStreamCalls).toHaveLength(1);
+    const { xumEnv } = getToolConfigFromHarness(harness) as { xumEnv?: Record<string, string> };
+    expect(xumEnv?.MUX_COSTS_USD).toBe(expected);
+    expect(xumEnv?.XUM_COSTS_USD).toBe(expected);
   });
 
   describe("startup transport failures (#4438)", () => {
@@ -6813,6 +6857,40 @@ describe("discoverAvailableSubagentsForToolContext", () => {
     }
   });
 
+  it("lists a background hint that a derived agent inherits from its base", async () => {
+    using project = new DisposableTempDir("available-subagents-background-hint");
+    using xumHome = new DisposableTempDir("available-subagents-background-hint-home");
+    const agentsRoot = path.join(project.path, ".mux", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(agentsRoot, "watcher.md"),
+      "---\nname: Watcher\nbase: exec\nsubagent:\n  background_hint: true\n---\nBody\n"
+    );
+    await fs.writeFile(
+      path.join(agentsRoot, "ci-watcher.md"),
+      "---\nname: CI Watcher\ndescription: Watches CI\nbase: watcher\n---\nBody\n"
+    );
+
+    const availableSubagents = await discoverAvailableSubagentsForToolContext({
+      runtime: new LocalRuntime(project.path),
+      workspacePath: project.path,
+      cfg: new Config(xumHome.path).loadConfigOrDefault(),
+      roots: {
+        projectRoots: [agentsRoot],
+        globalRoot: path.join(project.path, "empty-global-agents"),
+      },
+      runtimeFactory: nodeRuntimeFactory,
+    });
+    const taskTool = createTaskTool({
+      ...createTestToolConfig(project.path, { workspaceId: "test-workspace" }),
+      availableSubagents,
+    });
+
+    expect(String(taskTool.description).split("\n")).toContain(
+      "- ci-watcher: Watches CI [meant to run in the background (run_in_background=true)]"
+    );
+  });
+
   it("filters the desktop agent when capability is unavailable", async () => {
     using project = new DisposableTempDir("available-subagents-desktop");
     using xumHome = new DisposableTempDir("available-subagents-desktop-home");
@@ -6973,4 +7051,266 @@ describe("AIService runtimes", () => {
       await testHistory.cleanup();
     }
   });
+});
+
+describe("per-agent prompt cache TTL", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  interface WireInput {
+    globalCacheTtl?: "5m" | "1h";
+    agentAiDefaults?: AgentAiDefaults;
+    modelString?: string;
+    /** Project agent definitions by agent ID. */
+    projectAgents?: Record<string, string>;
+  }
+
+  /**
+   * An AIService with real agent resolution, message preparation and Anthropic model creation,
+   * whose provider fetch records each serialized request body instead of sending it.
+   */
+  async function createWireHarness(xumHomePath: string, input: WireInput) {
+    const projectPath = path.join(xumHomePath, "project");
+    const agentsDir = path.join(projectPath, ".xum", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    for (const [agentId, source] of Object.entries(input.projectAgents ?? {})) {
+      await fs.writeFile(path.join(agentsDir, `${agentId}.md`), source);
+    }
+    const workspaceId = "workspace-agent-cache-ttl";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const {
+      config,
+      historyService,
+      initStateManager,
+      providersConfigStore,
+      streamManager,
+      service,
+    } = createBasicAIService(xumHomePath);
+    const startStreamCalls: TurnExecutionOptions[] = [];
+    const { resolveAndCreateModelSpy } = stubCommonStreamMessageDependencies({
+      service,
+      streamManager,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+      startStreamCalls,
+      useRequestedModelString: true,
+      allTools: {
+        bash: tool({ description: "b", inputSchema: jsonSchema({ type: "object" }) }),
+      },
+    });
+    // Real agent resolution and message preparation: the final wire body is under test.
+    spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+    spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
+    resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    if (input.agentAiDefaults) await config.updateAgentAiDefaults(input.agentAiDefaults);
+    const bodies: unknown[] = [];
+    const recordingFetch: RecordingFetch = (_input, init) => {
+      if (typeof init?.body !== "string") throw new Error("Expected serialized request body");
+      bodies.push(JSON.parse(init.body));
+      // Only inspect serialized requests; never contact a provider.
+      return Promise.resolve(new Response("{}", { status: 400 }));
+    };
+    const modelString = input.modelString ?? KNOWN_MODELS.SONNET.id;
+    const provider = modelString.split(":", 1)[0];
+    // The provider-config fetch is the base fetch the Anthropic cache wrapper wraps.
+    spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
+      anthropic: {
+        apiKey: "test-key",
+        fetch: recordingFetch,
+        ...(input.globalCacheTtl != null ? { cacheTtl: input.globalCacheTtl } : {}),
+      },
+      ...(provider === "anthropic"
+        ? {}
+        : { [provider]: { apiKey: "test-key", fetch: recordingFetch } }),
+    });
+    return { config, service, workspaceId, modelString, startStreamCalls, bodies };
+  }
+
+  /** Every cache marker's ttl on a recorded body, in Anthropic's order: tools, system, messages. */
+  function markerTtls(body: unknown): Array<string | undefined> {
+    const ttls: Array<string | undefined> = [];
+    const walk = (value: unknown): void => {
+      if (Array.isArray(value)) return value.forEach(walk);
+      if (value == null || typeof value !== "object") return;
+      for (const [key, child] of Object.entries(value)) {
+        if (key === "cache_control") ttls.push((child as { ttl?: string }).ttl);
+        else walk(child);
+      }
+    };
+    const json = body as Record<string, unknown>;
+    walk([json.tools, json.system, json.messages]);
+    return ttls;
+  }
+
+  /**
+   * Streams one turn of `agentId` through real agent resolution and real Anthropic model
+   * creation, then sends the request the turn built. Returns every cache marker's ttl on the
+   * final wire body and the ttl the turn envelope recorded.
+   */
+  async function sendTurn(
+    input: WireInput & { agentId: string }
+  ): Promise<{ wireTtls: Array<string | undefined>; envelopeTtl: string | undefined }> {
+    using xumHome = new DisposableTempDir("ai-service-agent-cache-ttl");
+    const { config, service, workspaceId, modelString, startStreamCalls, bodies } =
+      await createWireHarness(xumHome.path, input);
+
+    {
+      const result = await service.streamMessage({
+        messages: [createMuxMessage("user-message", "user", "hello")],
+        workspaceId,
+        modelString,
+        thinkingLevel: "off",
+        agentId: input.agentId,
+      });
+      expect(result.success).toBe(true);
+      const request = startStreamCalls[0];
+      expect(request.initialMetadata?.agentId).toBe(input.agentId);
+      await generateText({
+        model: request.model,
+        system: request.system,
+        messages: request.messages,
+        // Like StepPreparation: the assembler sends the cached system prompt as messages.
+        allowSystemInMessages: true,
+        tools: request.tools,
+        providerOptions: request.providerOptions as Parameters<
+          typeof generateText
+        >[0]["providerOptions"],
+        headers: request.headers,
+        maxRetries: 0,
+      }).catch(() => undefined);
+    }
+
+    expect(bodies).toHaveLength(1);
+    const envelope = (
+      await new DurableEventJournal(path.join(config.sessionsDir, workspaceId)).read()
+    ).findLast((event) => event.kind === "turn-envelope");
+    if (envelope?.kind !== "turn-envelope") throw new Error("expected a turn envelope");
+    return { wireTtls: markerTtls(bodies[0]), envelopeTtl: envelope.data.anthropicCacheTtl };
+  }
+
+  /** Sends one headless continuous-compaction summary, a Compact run, and returns its markers' ttls. */
+  async function summarizeHead(input: WireInput): Promise<Array<string | undefined>> {
+    using xumHome = new DisposableTempDir("ai-service-compact-cache-ttl");
+    const { config, service, workspaceId, modelString, bodies } = await createWireHarness(
+      xumHome.path,
+      input
+    );
+    const options = { model: modelString, thinkingLevel: "off" as const };
+    // The recording fetch answers 400, so the summary fails once its request is recorded.
+    await summarizeContinuousCompaction({
+      workspaceId,
+      config,
+      aiService: service,
+      head: [createMuxMessage("head", "user", "Preserve the root cause")],
+      receiptRows: [],
+      signal: new AbortController().signal,
+      context: {
+        enabled: true,
+        model: modelString,
+        contextWindowTokens: 200_000,
+        thresholdPercent: 70,
+      },
+      baseOptions: { ...options, agentId: "exec" },
+      compactOptions: { ...options, agentId: "compact" },
+    }).catch(() => undefined);
+    expect(bodies).toHaveLength(1);
+    return markerTtls(bodies[0]);
+  }
+
+  const cases: Array<{
+    name: string;
+    input: Parameters<typeof sendTurn>[0];
+    expected: "5m" | "1h";
+  }> = [
+    {
+      name: "Explore keeps its built-in 5m under a global 1h",
+      input: { agentId: "explore", globalCacheTtl: "1h" },
+      expected: "5m",
+    },
+    {
+      name: "an Explore Settings value wins over its built-in 5m",
+      input: { agentId: "explore", agentAiDefaults: { explore: { cacheTtl: "1h" } } },
+      expected: "1h",
+    },
+    {
+      name: "Exec without a Settings value follows the global TTL",
+      input: { agentId: "exec", globalCacheTtl: "1h" },
+      expected: "1h",
+    },
+    {
+      name: "an agent with settingsBase explore takes Explore's built-in 5m under a global 1h",
+      input: {
+        agentId: "ci-watcher",
+        globalCacheTtl: "1h",
+        projectAgents: {
+          "ci-watcher":
+            "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: explore\n---\nWatch CI.\n",
+        },
+      },
+      expected: "5m",
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(testCase.name, async () => {
+      const { wireTtls, envelopeTtl } = await sendTurn(testCase.input);
+      // Tool, system and last-message markers at least, all on one TTL.
+      expect(wireTtls.length).toBeGreaterThanOrEqual(3);
+      expect(new Set(wireTtls)).toEqual(new Set([testCase.expected]));
+      expect(envelopeTtl).toBe(testCase.expected);
+    });
+  }
+
+  it("a non-Anthropic model ignores the agent's TTL", async () => {
+    const { wireTtls, envelopeTtl } = await sendTurn({
+      agentId: "explore",
+      modelString: KNOWN_MODELS.GPT.id,
+    });
+    expect(wireTtls).toEqual([]);
+    expect(envelopeTtl).toBeUndefined();
+  });
+
+  const summaryCases: Array<{ name: string; input: WireInput; expected: "5m" | "1h" }> = [
+    {
+      name: "a continuous-compaction summary keeps Compact's built-in 5m under a global 1h",
+      input: { globalCacheTtl: "1h" },
+      expected: "5m",
+    },
+    {
+      name: "a Compact Settings value reaches continuous-compaction summaries",
+      input: { agentAiDefaults: { compact: { cacheTtl: "1h" } } },
+      expected: "1h",
+    },
+    // OpenRouter has no Anthropic cache fetch wrapper: message preparation writes its markers.
+    {
+      name: "a Compact Settings value reaches summaries on a gateway route",
+      input: {
+        agentAiDefaults: { compact: { cacheTtl: "1h" } },
+        modelString: "openrouter:anthropic/claude-sonnet-4-5",
+      },
+      expected: "1h",
+    },
+    {
+      name: "a summary on a gateway route follows the global TTL when no Compact layer sets one",
+      input: {
+        globalCacheTtl: "1h",
+        modelString: "openrouter:anthropic/claude-sonnet-4-5",
+        projectAgents: {
+          compact: "---\nname: Compact\ndescription: Custom compaction\n---\n\nSummarize.\n",
+        },
+      },
+      expected: "1h",
+    },
+  ];
+
+  for (const testCase of summaryCases) {
+    it(testCase.name, async () => {
+      const wireTtls = await summarizeHead(testCase.input);
+      expect(wireTtls.length).toBeGreaterThan(0);
+      expect(new Set(wireTtls)).toEqual(new Set([testCase.expected]));
+    });
+  }
 });

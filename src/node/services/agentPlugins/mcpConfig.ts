@@ -32,6 +32,15 @@ import {
 import { serverConsentFingerprint } from "./componentConsent";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
 import {
+  CURSOR_IGNORED_FIELDS,
+  cursorValuePlaceholder,
+  folderAliases,
+  ignoredFieldReason,
+  needsValuesReason,
+  xumStdioEntry,
+  type McpDialect,
+} from "./mcpDialects";
+import {
   envNameKey,
   isReservedPluginEnvName,
   PLUGIN_MCP_CONFIG_PARSE_ERROR,
@@ -295,8 +304,8 @@ interface NormalizeContext {
 
 /**
  * The variables Xum supplies to a plugin server's environment: the placeholder names of its
- * dialect (PLUGIN_ROOT and PLUGIN_DATA, plus the two Claude names for a Claude `.mcp.json`,
- * because Claude Code exports them and Claude servers read them).
+ * dialect (PLUGIN_ROOT and PLUGIN_DATA, plus the dialect's folder aliases, because Claude Code
+ * and Cursor export them and their servers read them).
  */
 function suppliedPluginEnv(vars: PluginPlaceholderValues): Record<string, string> {
   return Object.fromEntries(
@@ -332,45 +341,20 @@ function stdioEnvError(
   return undefined;
 }
 
-const CLAUDE_ROOT_COMMAND_PREFIX = "${CLAUDE_PLUGIN_ROOT}/";
-
-/**
- * A Claude-dialect stdio entry in Xum's spelling:
- * - A command of exactly `${CLAUDE_PLUGIN_ROOT}/<path>` becomes `./<path>`, so it goes through
- *   the same `./` checks (containment, a file, executable). Every other form, including a quoted
- *   or absolute one, stays unchanged and classifyCommandToken refuses it.
- * - A cwd anchored at `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is anchored at the
- *   matching Xum name, so the cwd form and containment checks apply unchanged.
- * Args and env values expand the Claude names through the placeholder values instead.
- */
-function claudeStdioEntry(entry: Record<string, unknown>): Record<string, unknown> {
-  const { command, cwd } = entry;
-  const rewritten = { ...entry };
-  if (
-    typeof command === "string" &&
-    command.startsWith(CLAUDE_ROOT_COMMAND_PREFIX) &&
-    command.length > CLAUDE_ROOT_COMMAND_PREFIX.length
-  ) {
-    rewritten.command = `./${command.slice(CLAUDE_ROOT_COMMAND_PREFIX.length)}`;
-  }
-  if (typeof cwd === "string") {
-    rewritten.cwd = cwd.replace(
-      /^\$\{CLAUDE_(PLUGIN_(?:ROOT|DATA))\}(?=\/|$)/,
-      (_match, name: string) => `\${${name}}`
-    );
-  }
-  return rewritten;
-}
-
-/** Placeholder values for a plugin's MCP file: the Claude names expand only in its dialect. */
 function pluginPlaceholderValues(
   plugin: AgentPluginInfo,
   dataPath: string
 ): PluginPlaceholderValues {
-  const vars = { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath };
-  return plugin.mcpConfigDialect === "claude"
-    ? { ...vars, CLAUDE_PLUGIN_ROOT: plugin.rootPath, CLAUDE_PLUGIN_DATA: dataPath }
-    : vars;
+  const folders = { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath };
+  return {
+    ...folders,
+    ...Object.fromEntries(
+      Object.entries(folderAliases(plugin.mcpConfigDialect)).map(([alias, folder]) => [
+        alias,
+        folders[folder],
+      ])
+    ),
+  };
 }
 
 /** Validate + normalize one stdio entry; returns null (with error) when invalid. */
@@ -643,12 +627,42 @@ async function normalizeServerEntry(
   if (entry.type !== "stdio")
     return { error: `unknown server 'type' ${JSON.stringify(entry.type)}` };
   const result = await normalizeStdioEntry(
-    ctx.plugin.mcpConfigDialect === "claude" ? claudeStdioEntry(entry) : entry,
+    xumStdioEntry(entry, folderAliases(ctx.plugin.mcpConfigDialect)),
     ctx
   );
   if ("info" in result && translated.forwardEnv !== undefined)
     result.info.forwardEnv = translated.forwardEnv;
   return result;
+}
+
+function dialectEntrySkip(
+  rawEntry: Record<string, unknown>,
+  dialect: McpDialect | undefined
+): string | undefined {
+  // Claude Code skips a remote entry without `type` as a configuration error, so Xum does not
+  // infer a transport for it as the Codex dialect does.
+  if (dialect === "claude" && rawEntry.type === undefined && rawEntry.url !== undefined)
+    return "a 'url' entry needs a 'type' ('http' or 'sse') in a Claude .mcp.json";
+  if (dialect !== "cursor") return undefined;
+  const placeholder = cursorValuePlaceholder(rawEntry);
+  return placeholder === undefined ? undefined : needsValuesReason(placeholder);
+}
+
+function translateDialectEntry(
+  rawEntry: Record<string, unknown>,
+  dialect: McpDialect | undefined
+): ReturnType<typeof translateCodexMcpEntry> {
+  if (dialect === undefined)
+    return { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };
+  if (dialect !== "cursor") return translateCodexMcpEntry(rawEntry);
+  const dropped = CURSOR_IGNORED_FIELDS.filter((field) => rawEntry[field] !== undefined);
+  const droppedKeys = new Set<string>(dropped);
+  const entry = Object.fromEntries(
+    Object.entries(rawEntry).filter(([key]) => !droppedKeys.has(key))
+  );
+  const translated = translateCodexMcpEntry(entry, Object.keys(folderAliases("cursor")));
+  translated.warnings.push(...dropped.map(ignoredFieldReason));
+  return translated;
 }
 
 /**
@@ -736,13 +750,11 @@ export async function loadPluginMcpServers(
   // Codex packages ship `.mcp.json` in their own dialect (no `$schema`,
   // `type: "http"`, `oauth`/`scopes`/`oauth_resource`). Discovery marks it
   // from the lexical selection (a contained symlink keeps the dialect); a
-  // root mcp.json stays strict. A Claude `.mcp.json` has the Codex shape, plus
-  // the Claude names for the two plugin variables (normalizeStdioEntry).
-  // Both dialects ("codex" and "claude") have the Codex shape.
-  const codexDialect = plugin.mcpConfigDialect !== undefined;
+  // root mcp.json stays strict.
+  const codexShape = plugin.mcpConfigDialect !== undefined;
   // Codex also accepts a flat `{ "<server>": {...} }` map without `mcpServers`.
   const doc: Record<string, unknown> =
-    codexDialect && !("mcpServers" in raw)
+    codexShape && !("mcpServers" in raw)
       ? (({ $schema, ...servers }) => ({
           ...($schema !== undefined ? { $schema } : {}),
           mcpServers: servers,
@@ -757,7 +769,7 @@ export async function loadPluginMcpServers(
   }
   if (
     doc.$schema !== AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 &&
-    !(codexDialect && doc.$schema === undefined)
+    !(codexShape && doc.$schema === undefined)
   ) {
     // Discovery only admits 1.0.0 manifests, so any other value is either an
     // unsupported version or a version mismatch with plugin.json — both
@@ -803,22 +815,12 @@ export async function loadPluginMcpServers(
       continue;
     }
     const { rawEntry } = shape;
-    // Claude Code skips a remote entry without `type` as a configuration error, so Xum does not
-    // infer a transport for it as the Codex dialect does.
-    if (
-      plugin.mcpConfigDialect === "claude" &&
-      rawEntry.type === undefined &&
-      rawEntry.url !== undefined
-    ) {
-      reportEntry(
-        "warning",
-        "a 'url' entry needs a 'type' ('http' or 'sse') in a Claude .mcp.json"
-      );
+    const dialectSkip = dialectEntrySkip(rawEntry, plugin.mcpConfigDialect);
+    if (dialectSkip !== undefined) {
+      reportEntry("warning", dialectSkip);
       continue;
     }
-    const codex = codexDialect
-      ? translateCodexMcpEntry(rawEntry)
-      : { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };
+    const codex = translateDialectEntry(rawEntry, plugin.mcpConfigDialect);
     const entry = codex.entry;
 
     // §7.2.2 rules 3-4: invalid entries and unknown transports are skipped

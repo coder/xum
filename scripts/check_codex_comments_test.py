@@ -28,6 +28,15 @@ USAGE_LIMIT_NOTICES = (
 )
 # A PR head no fixture board was written for.
 NEWER_HEAD = "b" * 40
+# Hang guard for one gate run, not a speed requirement: with MUX_CODEX_WAIT_POLL_SECS=0 a run ends
+# when its fixture ends (one test instead waits for a --wait-for-review deadline of 1 s), so only
+# a loop that never ends reaches this bound. The four gate test targets take 70 to 112 s together
+# in CI (93 s at the median of 33 PR runs), and the pr.yml step that runs them stops at 15 minutes,
+# so a hang in every run cannot hold the job for hours. On a host that other agents load, a run
+# took 5 s at the median and 13.5 s at the longest of 373 runs, and the 15 s this replaced then
+# failed the test with TimeoutExpired, which says nothing about the gate. The bound is about 9
+# times the longest run seen there.
+GATE_RUN_TIMEOUT_SECS = 120
 
 
 def board_head(body):
@@ -40,10 +49,26 @@ def board_for(body, head):
     return body.replace(board_head(body), head)
 
 
-def comment(body, author=BOT, created_at=AFTER, minimized=False):
+RUNNING_LABEL = "🔄 Running"
+COMPLETED_LABEL = "✅ Completed"
+HEADING = "\n## Codex Review Summary\n"
+FOLD = re.compile(r"\n<details>\n<summary><strong>Codex Review Summary</strong>: (.+?)</summary>\n")
+
+
+def collapsed(body, label):
+    """A heading board folded into one <details> block, as Codex posts it since 2026-11-06
+    (collapsed_* fixtures): the heading becomes a summary line with an overall status,
+    and a closing tag follows the help text."""
+    assert body.count(HEADING) == 1, body
+    folded = f"\n<details>\n<summary><strong>Codex Review Summary</strong>: {label}</summary>\n"
+    return body.replace(HEADING, folded, 1) + "\n\n</details>"
+
+
+def comment(body, author=BOT, created_at=AFTER, minimized=False, association="MEMBER"):
     return {
         "id": "comment",
         "author": {"login": author},
+        "authorAssociation": association,
         "body": body,
         "createdAt": created_at,
         "isMinimized": minimized,
@@ -92,6 +117,28 @@ def snapshot(comments=(), threads=(), reactions=(), more=False, head=None):
     }
 
 
+def gate_verdicts(bodies, head):
+    """check_codex_comments.sh's verdict for each body posted alone by Codex, with no review
+    threads (0 clean, 10 still running, 1 blocking) and the bodies it would show, computed by
+    its own jq classifier in one process."""
+    program = """include "codex_comments";
+      (([] | codex_resolved_finding_commits($bot)) + {clean_security_receipt: false}) as $cleared
+      | .[]
+      | [{author: {login: $bot}, authorAssociation: "MEMBER", isMinimized: false, body: .}]
+      | codex_blocking_comments($bot; $head; []; $cleared) as $blocking
+      | ($blocking | codex_pending_count($bot; $head; []; $cleared)) as $pending
+      | {exit: (if ($blocking | length) == 0 then 0
+          elif $pending == ($blocking | length) then 10 else 1 end),
+        shown: [$blocking[].body]}"""
+    result = subprocess.run(
+        ["jq", "-c", "-L", str(SCRIPTS / "lib"), "--arg", "bot", BOT, "--arg", "head", head, program],
+        input=json.dumps(bodies), text=True, capture_output=True, timeout=60, check=True,
+    )
+    verdicts = [json.loads(line) for line in result.stdout.splitlines()]
+    assert len(verdicts) == len(bodies), result.stderr
+    return verdicts
+
+
 class CodexGateTest(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory(prefix="codex-comments-test-")
@@ -103,6 +150,11 @@ class CodexGateTest(unittest.TestCase):
         gh.write_text("""#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+if args[:2] == ['pr', 'comment']:
+    # The only write the scripts may make: a Codex review request (wait_pr_codex.sh).
+    with open(os.environ['CODEX_GATE_POSTS'], 'a') as posts:
+        posts.write(args[args.index('--body') + 1] + '\\0')
+    sys.exit(0)
 assert args[:2] == ['api', 'graphql'], args
 query = next(arg[6:] for arg in args if arg.startswith('query='))
 cursor = next((arg[7:] for arg in args if arg.startswith('cursor=')), 'null')
@@ -151,6 +203,8 @@ else:
             round_marker.unlink()
         calls = self.directory / "calls"
         calls.write_text("")
+        self.posts = self.directory / "posts"
+        self.posts.write_text("")
         cache_file = self.directory / "cache.json"
         if cache is not None:
             cache_file.write_text(json.dumps(cache))
@@ -164,6 +218,7 @@ else:
                 "PATH": str(self.directory) + os.pathsep + os.environ["PATH"],
                 "CODEX_GATE_FIXTURE": str(fixture),
                 "CODEX_GATE_CALLS": str(calls),
+                "CODEX_GATE_POSTS": str(self.posts),
                 "MUX_GH_OWNER": "fixture",
                 "MUX_GH_REPO": "fixture",
                 "MUX_SKIP_FETCH_SYNC": "1",
@@ -178,7 +233,7 @@ else:
         if wait is not None:
             args += ["--wait-for-review", str(wait)]
         result = subprocess.run(
-            args, env=env, text=True, capture_output=True, timeout=15, check=False
+            args, env=env, text=True, capture_output=True, timeout=GATE_RUN_TIMEOUT_SECS, check=False
         )
         self.assertTrue(
             calls.read_text(), "a cached verdict must still re-query GitHub"
@@ -280,8 +335,9 @@ else:
         unresolved = '"has_unresolved_findings":false'
         for case, changed, expected in (
             ("observed", body, 0),
-            # Codex sends null while a review runs; a completed review must say false.
-            ("completed, null findings", body.replace(unresolved, '"has_unresolved_findings":null', 1), 1),
+            # A finished code review of this head may say null (coder/xum#7734): its findings are
+            # threads and finding comments, which block on their own.
+            ("completed, null findings", body.replace(unresolved, '"has_unresolved_findings":null', 1), 0),
             ("running, null findings", body.replace(
                 unresolved + ',"status":"completed"}', '"has_unresolved_findings":null,"status":"running"}', 1), 10),
             ("code unresolved", body.replace(unresolved, '"has_unresolved_findings":true', 1), 1),
@@ -302,6 +358,184 @@ else:
             for cached in (False, True):
                 with self.subTest(case=case, cached=cached):
                     data = snapshot([comment(changed)], head=head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
+    def test_null_security_flags_pass_only_with_a_clean_receipt_for_this_head(self):
+        # Since 2026-10-28 Codex can finish a security review with null findings flags
+        # (coder/xum#7727, observed on #7722). That is clean only beside a clean receipt
+        # for the current head and with no open Codex thread; every other null blocks.
+        board = FIXTURES["review_state_null_security_summary"]["body"]
+        receipt = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        head = board_head(board)
+        older_receipt = receipt.replace("`" + head[:10] + "`", "`" + "c" * 10 + "`")
+        self.assertNotEqual(older_receipt, receipt)
+        code_marker = "\n\n<!-- codex-code-review-finding:v1 -->"
+        open_thread = thread("[P2] Open" + code_marker, commit=head)
+        advisory = board.replace(
+            "\n\n\n\n<details>",
+            "\n\n### Security findings\n\n#### Advisory findings (1)\n\n"
+            "- 🟡 [Leak](https://github.com/coder/xum/pull/7722#discussion_r1) · **Medium**"
+            "\n\n\n\n<details>",
+            1,
+        )
+        self.assertNotEqual(advisory, board)
+        running = board.replace(
+            '"has_unresolved_findings":null,"status":"completed"}}',
+            '"has_unresolved_findings":null,"status":"running"}}',
+        ).replace('"status":"completed"} -->', '"status":"running"} -->')
+        self.assertNotEqual(running, board)
+        for case, comments, threads, pr_head, expected in (
+            ("clean receipt for this head", [board, receipt], [], head, 0),
+            # Pending, not failed: a push-triggered run posts no receipt (coder/xum#7731).
+            ("no receipt", [board], [], head, 10),
+            ("open Codex thread", [board, receipt], [open_thread], head, 1),
+            ("receipt for an older head", [board, older_receipt], [], head, 10),
+            # Unknown, not "older review in progress": null flags are clean only for this head.
+            ("board and receipt for an older head", [board, receipt], [], NEWER_HEAD, 1),
+            ("advisory section", [advisory, receipt], [], head, 1),
+            ("merge gate on", [board.replace('"mergeGateEnabled":false', '"mergeGateEnabled":true'), receipt],
+             [], head, 1),
+            ("running, null findings", [running, receipt], [], head, 10),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body) for body in comments], threads, head=pr_head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+        with self.subTest("a minimized receipt does not count"):
+            data = snapshot([comment(board), comment(receipt, minimized=True)], head=head)
+            self.assert_gate(10, data)
+        with self.subTest("the CI wait ends once the receipt lands"):
+            pending = snapshot([comment(board)], head=head)
+            self.assert_gate(0, [pending, snapshot([comment(board), comment(receipt)], head=head)], wait=60)
+            self.assertEqual(self.comment_rounds, 2)
+        with self.subTest("a finding still fails while the receipt is pending"):
+            data = snapshot([comment(board)], [open_thread], head=head)
+            self.assert_gate(1, data, wait=60)
+
+    def test_null_security_flags_pass_beside_cleared_advisories(self):
+        # Codex keeps listing an advisory after its thread is resolved, beside null
+        # security flags (observed on #7859). A cleared bullet must not block that board.
+        board = FIXTURES["review_state_null_security_advisory_summary"]["body"]
+        head = board_head(board)
+        clean = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        receipt = re.sub(r"\*\*Reviewed commit:\*\* `[0-9a-f]+`", f"**Reviewed commit:** `{head[:10]}`", clean)
+        self.assertNotEqual(receipt, clean)
+        discussion = "4433878221"
+        link = f"(https://github.com/coder/xum/pull/7859#discussion_r{discussion})"
+        unlinked = board.replace("[Let Stop preempt grouped task creation]" + link, "Let Stop preempt grouped task creation")
+        self.assertNotEqual(unlinked, board)
+        undercounted = board.replace("#### Advisory findings (1)", "#### Advisory findings (2)")
+        self.assertNotEqual(undercounted, board)
+        bulletless = re.sub(r"\n- 🟡 [^\n]*", "", board)
+        self.assertNotEqual(bulletless, board)
+        bullet = re.search(r"\n- 🟡 [^\n]*", board).group(0)
+        outside = bulletless.replace("\n### Security findings", bullet + "\n\n### Security findings")
+        self.assertNotEqual(outside, bulletless)
+        borrowed = board.replace("#### Advisory findings (1)", "#### Advisory findings (1)\n\n#### Advisory findings (0)")
+        self.assertNotEqual(borrowed, board)
+        headless = re.sub(r"\n#### Advisory findings \(1\)\n", "", bulletless)
+        self.assertNotEqual(headless, bulletless)
+        # Round 4 on #7860: the findings heading must open the inventory, not follow it.
+        misplaced = board.replace("### Security findings\n\n", "").replace(bullet, bullet + "\n\n### Security findings")
+        self.assertNotEqual(misplaced, board)
+        loading = re.sub(
+            r"#### Advisory findings \(1\)\n\n- 🟡 [^\n]*",
+            "Finding details are still loading. Check the individual review comments.",
+            board,
+        )
+        self.assertNotEqual(loading, board)
+        marked = board.replace(bullet, bullet + " · **Resolved**")
+        self.assertNotEqual(marked, board)
+
+        def advisory(resolved, marker="<!-- codex-security-review-finding:v1 -->\n"):
+            return thread(
+                marker + "[P2] Let Stop preempt grouped task creation",
+                resolved=resolved,
+                discussion=discussion,
+                commit=head,
+            )
+
+        code_thread = thread(
+            "[P2] Let Stop preempt grouped task creation\n\n<!-- codex-code-review-finding:v1 -->",
+            resolved=True,
+            discussion=discussion,
+            commit=head,
+        )
+
+        for case, comments, threads, pr_head, expected in (
+            ("resolved advisory", [board, receipt], [advisory(True)], head, 0),
+            ("unresolved advisory", [board, receipt], [advisory(False)], head, 1),
+            ("bullet without a thread link", [unlinked, receipt], [advisory(True)], head, 1),
+            ("fewer bullets than the declared count", [undercounted, receipt], [advisory(True)], head, 1),
+            ("declared advisory without a bullet", [bulletless, receipt], [advisory(True)], head, 1),
+            ("bullet outside the advisory section", [outside, receipt], [advisory(True)], head, 1),
+            ("bullet under another advisory header", [borrowed, receipt], [advisory(True)], head, 1),
+            ("findings heading without an advisory header", [headless, receipt], [advisory(True)], head, 1),
+            ("findings heading after the inventory", [misplaced, receipt], [advisory(True)], head, 1),
+            ("finding details still loading", [loading, receipt], [advisory(True)], head, 1),
+            ("bullet linking a resolved code-review thread", [board, receipt], [code_thread], head, 1),
+            ("bullet linking a resolved thread without a marker", [board, receipt], [advisory(True, "")], head, 1),
+            ("Resolved marker without a thread", [marked, receipt], [], head, 0),
+            ("no receipt", [board], [advisory(True)], head, 10),
+            ("board for another head", [board, receipt], [advisory(True)], NEWER_HEAD, 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body) for body in comments], threads, head=pr_head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
+    def test_missing_security_receipt_is_requested_once_per_head(self):
+        board = FIXTURES["review_state_null_security_summary"]["body"]
+        receipt = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        head = board_head(board)
+        review = comment("@codex review", "maintainer", BEFORE)
+        posted = "@codex security review\n\nHead: " + head
+        approval = comment("Codex Review: Didn't find any major issues. Nice work!", created_at=AFTER)
+        for case, comments, posts, expected in (
+            ("no request names the head", [review, comment(board)], 1, 10),
+            # A request that names another head (an earlier push) does not count.
+            ("request for an older head", [review, comment(posted.replace(head, "c" * 40), "maintainer"),
+                                           comment(board)], 1, 10),
+            ("request names the head", [review, comment(posted, "maintainer"), comment(board)], 0, 10),
+            # Anyone can comment on a public PR: only a member's request counts.
+            ("outsider's request names the head",
+             [review, comment(posted, "outsider", association="NONE"), comment(board)], 1, 10),
+            ("an approval does not end the wait", [review, comment(board), approval], 1, 10),
+            ("receipt present", [review, comment(board), comment(receipt), approval], 0, 0),
+            # No receipt will come after a usage-limit notice: fail, never pass the security half.
+            ("usage limits after the head's request",
+             [review, comment(posted, "maintainer", REQUEST), comment(board), comment(USAGE_LIMIT_NOTICES[0])], 0, 1),
+            ("usage limits before the head's request",
+             [review, comment(USAGE_LIMIT_NOTICES[0], created_at=BEFORE), comment(posted, "maintainer", REQUEST),
+              comment(board)], 0, 10),
+        ):
+            with self.subTest(case=case):
+                result = self.run_gate(snapshot(comments, head=head), "wait_pr_codex.sh")
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertEqual(self.posts.read_text().split("\0")[:-1], [posted] * posts)
+
+    def test_null_code_review_flags_pass_only_for_this_head(self):
+        # Since 2026-10-29 Codex can finish a code review with null flags (coder/xum#7734,
+        # observed on #7732). Its findings are threads and finding comments, which block alone.
+        clean = FIXTURES["review_state_summary"]["body"]
+        head = board_head(clean)
+        code_flags = '"has_any_findings":true,"has_unresolved_findings":false,"status":"completed"},"security'
+        self.assertIn(code_flags, clean)
+        null_flags = code_flags.replace('"has_unresolved_findings":false', '"has_unresolved_findings":null')
+        null_code = clean.replace(code_flags, null_flags, 1)
+        code_marker = "\n\n<!-- codex-code-review-finding:v1 -->"
+        self.assertNotEqual(null_code, clean)
+        for case, comments, threads, expected in (
+            ("clean", [null_code], [], 0),
+            ("open Codex thread", [null_code], [thread("[P2] Open" + code_marker, commit=head)], 1),
+            ("Codex finding comment", [null_code, "**P1** Validate the caller" + code_marker], [], 1),
+            ("older commit", [null_code.replace('"code_review":{"commit_sha":"' + head, '"code_review":{"commit_sha":"' + "c" * 40, 1)],
+             [], 1),
+            ("running", [null_code.replace(null_flags, null_flags.replace("completed", "running"), 1)], [], 10),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body) for body in comments], threads, head=head)
                     self.assert_gate(expected, data, cache=data if cached else None)
 
     def test_resolved_codex_threads_clear_unresolved_review_state(self):
@@ -527,6 +761,178 @@ else:
         ):
             with self.subTest(name):
                 self.assert_gate(1, data)
+
+    def test_collapsed_board_reads_like_its_heading_form(self):
+        # Since 2026-11-06 Codex can fold its board into one <details> block. The gate read
+        # that form as unknown, so --wait-for-review failed at once on a running review.
+        # Folding must not change a verdict, except that a Running summary line never lets
+        # a board count as completed.
+        def folded_verdict(expected, label):
+            return 10 if label == RUNNING_LABEL and expected == 0 else expected
+
+        real = {name: f for name, f in FIXTURES.items() if FOLD.search(f["body"])}
+        self.assertIn("collapsed_running_summary", real)
+        for name, fixture in real.items():
+            label = FOLD.search(fixture["body"]).group(1)
+            heading = FOLD.sub(HEADING, fixture["body"], 1).removesuffix("\n\n</details>")
+            with self.subTest(real=name):
+                # The helper below folds a board exactly the way Codex does.
+                self.assertEqual(collapsed(heading, label), fixture["body"])
+                result = self.run_gate(snapshot([comment(heading)]))
+                self.assertEqual(
+                    folded_verdict(result.returncode, label),
+                    fixture["expected_exit_code"],
+                    result.stdout + result.stderr,
+                )
+        for name, fixture in FIXTURES.items():
+            if HEADING not in fixture["body"]:
+                continue
+            for label in (COMPLETED_LABEL, RUNNING_LABEL):
+                with self.subTest(heading=name, label=label):
+                    self.assert_gate(
+                        folded_verdict(fixture["expected_exit_code"], label),
+                        snapshot([comment(collapsed(fixture["body"], label))]),
+                    )
+
+        board = FIXTURES["heading_completed_summary"]["body"]
+        receipt = comment(FIXTURES["heading_completed_summary_receipt"]["body"])
+        for label, expected in ((None, 0), (COMPLETED_LABEL, 0), (RUNNING_LABEL, 10)):
+            with self.subTest("a completed board beside its security receipt", label=label):
+                body = board if label is None else collapsed(board, label)
+                self.assert_gate(expected, snapshot([comment(body), receipt]))
+        findings = FIXTURES["collapsed_running_findings_summary"]["body"]
+        advisory = re.search(r"#discussion_r([0-9]+)\)", findings).group(1)
+        with self.subTest("a resolved advisory clears its bullet on a collapsed board"):
+            resolved = thread("[P2] Advisory", resolved=True, discussion=advisory)
+            self.assert_gate(10, snapshot([comment(findings)], [resolved]))
+
+        # Only that exact fold is read; anything around it still blocks (text inserted into its
+        # tag lines: test_text_inserted_around_the_fold_never_reads_as_a_board).
+        clean = collapsed(FIXTURES["summary"]["body"], COMPLETED_LABEL)
+        self.assert_gate(0, snapshot([comment(clean)]))
+        finding = "[P1] Validate the caller before reading credentials"
+        for case, body in (
+            ("unknown summary status", clean.replace(COMPLETED_LABEL, "⚠️ Findings")),
+            ("failed summary status", clean.replace(COMPLETED_LABEL, "❌ Failed")),
+            ("text before the table", clean.replace("</summary>\n", "</summary>\n\n" + finding + "\n", 1)),
+            ("no closing tag", clean.removesuffix("\n\n</details>")),
+            ("two closing tags", clean + "\n\n</details>"),
+            ("text after the closing tag", clean + "\n\n" + finding),
+            ("a closing tag without the fold", FIXTURES["summary"]["body"] + "\n\n</details>"),
+        ):
+            with self.subTest(case):
+                self.assertNotEqual(body, clean)
+                self.assert_gate(1, snapshot([comment(body)]))
+
+    def test_text_inserted_around_the_fold_never_reads_as_a_board(self):
+        # Each regex position that tolerated extra text let a hidden finding pass (verifier
+        # mutants on #7975). So a finding goes into every character gap of the fold's three tag
+        # lines, and onto a line of its own at eight boundaries: before the marker, after the
+        # marker, after the review state, before the fold, between the details and summary
+        # lines, after the summary line, after the help text and before the closing tag. It also
+        # goes in place of the blank line before the closing tag, at the end of the help text,
+        # at the end of the marker line, of the review state line and of the security line (after
+        # the last character of each, before its newline), after the fold and onto the marker's
+        # line. It goes in as plain text, as an attribute and as an HTML comment, since tolerance
+        # written for any of those shapes could hide it. The template carries the three metadata
+        # lines (marker, review state, security) that real folds have once the security review
+        # has started. Every such body must block at once and show the finding: never read
+        # completed (0) or running (10). One jq process applies the gate's own classifier to
+        # all of them, since a gate run per body took minutes; the real gate checks one body per
+        # position kind.
+        finding = "[P1] Validate the caller before reading credentials"
+        shapes = {
+            "text": finding,
+            "attribute": f' data-note="{finding}"',
+            "comment": f"<!-- {finding} -->",
+        }
+        end = "\n\n</details>"
+        cases, gate_cases = [], []
+        for label, exact in ((COMPLETED_LABEL, 0), (RUNNING_LABEL, 10)):
+            fold = collapsed(FIXTURES["review_state_summary"]["body"], label)
+            opening = fold.index("\n<details>\n<summary><strong>") + 1
+            summary = opening + len("<details>\n")
+            summary_end = fold.index("</summary>\n", summary) + len("</summary>")
+            closing = len(fold) - len("</details>")
+            marker_end = fold.index("\n") + 1
+            state_end = fold.index("\n", marker_end) + 1
+            self.assertTrue(fold[marker_end:].startswith("<!-- codex-review-state:v1 "))
+            self.assertTrue(fold[state_end:].startswith("<!-- codex-security-review:v1 "))
+            self.assertTrue(fold.endswith(end))
+            inserted = {}
+            for shape, text in shapes.items():
+                for line, start, stop in (
+                    ("details line", opening, summary - 1),
+                    ("summary line", summary, summary_end),
+                    ("closing line", closing, len(fold)),
+                ):
+                    for gap in range(start, stop + 1):
+                        inserted[f"{label}, {shape}, {line} gap {gap - start}"] = (
+                            fold[:gap] + text + fold[gap:]
+                        )
+                own_line = {
+                    "before the marker": 0,
+                    "after the marker": marker_end,
+                    "after the review state": state_end,
+                    "before the fold": opening,
+                    "between the details and summary lines": summary,
+                    "after the summary line": summary_end + 1,
+                    "after the help text": closing - 1,
+                    "before the closing tag": closing,
+                }
+                for where, at in own_line.items():
+                    inserted[f"{label}, {shape}, line {where}"] = fold[:at] + text + "\n" + fold[at:]
+                for where, at in (
+                    ("end of the marker line", marker_end - 1),
+                    ("end of the review state line", state_end - 1),
+                    ("end of the security line", fold.index("\n", state_end)),
+                ):
+                    inserted[f"{label}, {shape}, {where}"] = fold[:at] + text + fold[at:]
+                inserted[f"{label}, {shape}, in place of the blank line"] = (
+                    fold[: -len(end)] + "\n" + text + "\n</details>"
+                )
+                inserted[f"{label}, {shape}, end of the help text"] = fold[: -len(end)] + text + end
+                inserted[f"{label}, {shape}, line after the fold"] = fold + "\n" + text
+                inserted[f"{label}, {shape}, marker's line"] = text + " " + fold
+            cases.append((f"{label}, exact fold", fold, exact))
+            cases += [(case, body, 1) for case, body in inserted.items()]
+            gate_cases += [(f"{label}, exact fold", fold, exact)] + [
+                (case, inserted[case], 1)
+                for case in (
+                    f"{label}, text, details line gap 0",
+                    f"{label}, text, summary line gap 20",
+                    f"{label}, text, closing line gap {len('</details>')}",
+                    f"{label}, text, line before the marker",
+                    f"{label}, attribute, details line gap {len('<details')}",
+                    f"{label}, comment, line after the summary line",
+                    f"{label}, text, line after the review state",
+                )
+            ]
+        verdicts = gate_verdicts([body for _, body, _ in cases], board_head(cases[0][1]))
+        for (case, body, expected), verdict in zip(cases, verdicts):
+            with self.subTest(case):
+                self.assertEqual(verdict["exit"], expected, body)
+                if expected == 1:
+                    self.assertIn(finding, "".join(verdict["shown"]))
+        # The real gate agrees with the classifier on each kind of position.
+        for case, body, expected in gate_cases:
+            with self.subTest("gate: " + case):
+                result = self.assert_gate(expected, snapshot([comment(body)]))
+                if expected == 1:
+                    self.assertIn(finding, result.stdout)
+
+    def test_a_collapsed_running_board_waits_out_an_earlier_failure_notice(self):
+        # coder/xum#7966: CI saw Codex's collapsed running board beside the failure notice of
+        # an earlier attempt and failed at once. A rerun after the review finished passed.
+        failure = comment(FIXTURES["review_failure_unknown_error"]["body"], created_at=BEFORE)
+        receipt = comment(FIXTURES["heading_completed_summary_receipt"]["body"])
+        running = snapshot([comment(FIXTURES["collapsed_running_summary"]["body"]), failure])
+        later = snapshot([comment(FIXTURES["heading_running_summary"]["body"]), failure])
+        done = snapshot([comment(FIXTURES["heading_completed_summary"]["body"]), failure, receipt])
+        result = self.assert_gate(10, running)
+        self.assertIn("has not finished reviewing", result.stdout)
+        self.assert_gate(0, [running, later, done], wait=60)
+        self.assertEqual(self.comment_rounds, 3)
 
     def test_wait_for_review_gives_up_and_never_hides_findings(self):
         running = snapshot([comment(FIXTURES["running_summary"]["body"])])

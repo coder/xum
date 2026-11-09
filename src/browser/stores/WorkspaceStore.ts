@@ -91,18 +91,18 @@ import { MapStore } from "./MapStore";
 import { createDisplayUsage, recomputeUsageCosts } from "@/common/utils/tokens/displayUsage";
 import { getCacheHealth, type TurnCacheHealth } from "@/common/utils/tokens/cacheHealth";
 import { getAssistantMessageModelUsages } from "@/common/utils/tokens/messageModelUsages";
-import { deriveTodoStatus } from "@/common/utils/todoList";
+import { deriveTodoStatus, isTodoListFinished } from "@/common/utils/todoList";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import { isDurableCompactionBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import { WorkspaceConsumerManager } from "./WorkspaceConsumerManager";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
-import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
+import { addModelUsage, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
 import type { z } from "zod";
-import type { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
+import { isInheritedForkRow, type SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import {
   applyLiveBashOutputEvent,
@@ -111,7 +111,7 @@ import {
 } from "@/browser/utils/messages/liveBashOutputBuffer";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { getAutoRetryKey, getPinnedTodoExpandedKey } from "@/common/constants/storage";
+import { getAutoRetryKey } from "@/common/constants/storage";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
@@ -127,6 +127,7 @@ import {
 
 /** Stable empty reference returned when a workspace has no assisted hunks; keeps useSyncExternalStore snapshot identity stable. */
 const EMPTY_ASSISTED_REVIEW: AssistedReviewHunk[] = [];
+const EMPTY_TODOS: TodoItem[] = [];
 
 export function mergeTimelineEvents(
   preferred: TimelineEvent[],
@@ -393,6 +394,7 @@ export interface WorkspaceUsageState {
   };
   /** Last message's context usage (last step only, for context window display) */
   lastContextUsage?: ChatUsageDisplay;
+  /** Tokens of sessionTotal only (no open sub-agents or live stream); displays use sumSessionTokens. */
   totalTokens: number;
   /** Live context usage during streaming (last step's inputTokens = current context window) */
   liveUsage?: ChatUsageDisplay;
@@ -406,6 +408,66 @@ export interface WorkspaceUsageState {
   liveMetadataModel?: string;
   /** Prompt-cache health of the most recent completed assistant turns, newest first. */
   recentTurnCacheHealth?: TurnCacheHealth[];
+  /**
+   * Usage of sub-agents that still exist. Their spend reaches sessionTotal only when they are
+   * removed, so cost displays add this to show what the whole tree has spent so far.
+   */
+  subagentTotal?: ChatUsageDisplay;
+  subagentByModel?: Record<string, ChatUsageDisplay>;
+  /** Open sub-agent workspaces counted in subagentTotal. */
+  subagentCount?: number;
+}
+
+/** trailing: another refresh was asked for while this fetch ran. */
+interface SubagentUsageFetch {
+  trailing: boolean;
+}
+
+type SubagentUsageByChild = Awaited<
+  ReturnType<RouterClient<AppRouter>["workspace"]["getSubagentUsage"]>
+>;
+
+type ActivitySubscriptionEvent =
+  Awaited<
+    ReturnType<RouterClient<AppRouter>["workspace"]["activity"]["subscribe"]>
+  > extends AsyncIterable<infer TEvent>
+    ? TEvent
+    : never;
+
+function sumSubtreesNotRolledUp(
+  children: SubagentUsageByChild["children"],
+  rolledUpFrom: Readonly<Record<string, unknown>>
+): { byModel: Record<string, ChatUsageDisplay>; count: number } {
+  const byModel: Record<string, ChatUsageDisplay> = {};
+  let count = 0;
+  for (const [childId, subtree] of Object.entries(children)) {
+    if (rolledUpFrom[childId]) continue;
+    count += subtree.workspaceCount;
+    for (const [model, usage] of Object.entries(subtree.byModel)) {
+      addModelUsage(byModel, model, usage);
+    }
+  }
+  return { byModel, count };
+}
+
+/**
+ * A child already in the ledger's rolledUpFrom is dropped here, on every read, not when the
+ * projection arrives: the projection and the ledger are separate fetches, and a removal can
+ * roll the child up between them (or a delta can add it later), which would count it twice.
+ */
+function getSubagentUsageFields(
+  data: SubagentUsageByChild | undefined,
+  ledger: { rolledUpFrom?: Readonly<Record<string, unknown>> } | undefined
+): Pick<WorkspaceUsageState, "subagentTotal" | "subagentByModel" | "subagentCount"> {
+  const { byModel, count } = sumSubtreesNotRolledUp(
+    data?.children ?? {},
+    ledger?.rolledUpFrom ?? {}
+  );
+  const models = Object.values(byModel);
+  if (models.length === 0) {
+    return {};
+  }
+  return { subagentByModel: byModel, subagentTotal: sumUsageHistory(models), subagentCount: count };
 }
 
 /**
@@ -443,15 +505,6 @@ function getTurnCacheHealth(
   const turnUsages = getAssistantMessageModelUsages(metadata);
   if (turnUsages.length === 0) return undefined;
   return { messageId: msg.id, timestamp: metadata.timestamp, ...getCacheHealth(turnUsages) };
-}
-
-/**
- * True for a row a fork copied from its parent: at or before the ledger's `forkedAt`.
- * Rows without a timestamp, and workspaces without the marker (old forks, non-forks),
- * count as the workspace's own.
- */
-function isInheritedForkRow(timestamp: number | undefined, forkedAt: number | undefined): boolean {
-  return timestamp !== undefined && forkedAt !== undefined && timestamp <= forkedAt;
 }
 
 /** Turns shown in the Costs tab's prompt-cache table; bounds work per usage bump. */
@@ -696,8 +749,14 @@ function getBufferedReplayedStreamMessageId(events: WorkspaceChatMessage[]): str
 // cached-rows-plus-dock-shimmer catch-up UI.
 const STALE_TRANSCRIPT_SKELETON_TIMEOUT_MS = 10_000;
 
+// One getSubagentUsage fetch runs per workspace at a time, so one that never settles (a stalled
+// backend read) would hold back every later refresh: past this deadline it fails and the
+// trailing fetch runs. A projection read normally takes milliseconds.
+const SUBAGENT_USAGE_FETCH_TIMEOUT_MS = 30_000;
+
 export interface WorkspaceStoreOptions {
   staleTranscriptSkeletonTimeoutMs?: number;
+  subagentUsageFetchTimeoutMs?: number;
 }
 
 function createInitialChatTransientState(): WorkspaceChatTransientState {
@@ -732,21 +791,6 @@ function isIteratorValidationFailed(error: unknown): error is Error {
     error instanceof Error &&
     (error as { code?: unknown }).code === "ASYNC_ITERATOR_OBJECT_VALIDATION_FAILED"
   );
-}
-
-/**
- * Auto-collapse the pinned TODO panel when a workspace's stream stops.
- * Lives in the store (not the component) because PinnedTodoList is only
- * mounted for the active workspace — background workspaces would miss
- * the transition. Callers supply the authoritative hasTodos value: the
- * live aggregator for active workspaces, the backend snapshot for background ones.
- */
-function collapsePinnedTodoOnStreamStop(workspaceId: string, hasTodos: boolean): void {
-  if (!hasTodos) {
-    return;
-  }
-
-  updatePersistedState(getPinnedTodoExpandedKey(workspaceId), false);
 }
 
 const EMPTY_ACTIVE_WORKFLOW_RUN_IDS: string[] = [];
@@ -877,6 +921,26 @@ function isCostsIncludedEntry(
   return hasTokens;
 }
 
+function repriceUsageByModel(
+  byModel: Record<string, ChatUsageDisplay>,
+  config: ProvidersConfigMap
+): void {
+  for (const [model, entry] of Object.entries(byModel)) {
+    if (!model.includes(":") || isCostsIncludedEntry(entry, model, config)) continue;
+    const resolved = resolveModelForMetadata(model, config);
+    // `byModel` is a session-long aggregate, so tiered models cannot be safely repriced from
+    // the summed token totals alone. recomputeUsageCosts() keeps their recorded costs.
+    byModel[model] = recomputeUsageCosts(entry, resolved, { aggregatedUsage: true });
+  }
+}
+
+/** The projection has no fingerprint to compare, so it is repriced on every apply. */
+function repriceSubagentUsage(data: SubagentUsageByChild, config: ProvidersConfigMap): void {
+  for (const subtree of Object.values(data.children)) {
+    repriceUsageByModel(subtree.byModel, config);
+  }
+}
+
 /**
  * Recompute cost aggregates for a single session-usage entry so session totals
  * and last-request costs reflect the current model mapping.
@@ -893,13 +957,7 @@ function repriceSessionUsage(
   if (usage.tokenStatsCache?.providersConfigVersion !== providersConfigFingerprint) {
     usage.tokenStatsCache = undefined;
   }
-  for (const [model, entry] of Object.entries(usage.byModel)) {
-    if (!model.includes(":") || isCostsIncludedEntry(entry, model, config)) continue;
-    const resolved = resolveModelForMetadata(model, config);
-    // `byModel` is a session-long aggregate, so tiered models cannot be safely repriced from
-    // the summed token totals alone. recomputeUsageCosts() keeps their recorded costs.
-    usage.byModel[model] = recomputeUsageCosts(entry, resolved, { aggregatedUsage: true });
-  }
+  repriceUsageByModel(usage.byModel, config);
   if (
     usage.lastRequest &&
     !isCostsIncludedEntry(usage.lastRequest.usage, usage.lastRequest.model, config)
@@ -1108,6 +1166,7 @@ export class WorkspaceStore {
   // Lightweight activity snapshots from workspace.activity.list/subscribe.
   private workspaceActivity = new Map<string, WorkspaceActivitySnapshot>();
   private readonly staleSkeletonTimeoutMs: number;
+  private readonly subagentUsageFetchTimeoutMs: number;
   // Per-workspace bound on the stale-cache skeleton for the current subscribe attempt.
   private staleSkeletonDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
   // Recency timestamp observed when a workspace transitions into streaming=true.
@@ -1189,6 +1248,9 @@ export class WorkspaceStore {
 
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
   private sessionUsageRequestVersion = new Map<string, number>();
+  private subagentUsage = new Map<string, SubagentUsageByChild>();
+  /** The getSubagentUsage fetch in flight per workspace. */
+  private subagentUsageFetches = new Map<string, SubagentUsageFetch>();
 
   // Global callback for navigating to a workspace (set by App, used for notification clicks)
   private navigateToWorkspaceCallback: ((workspaceId: string) => void) | null = null;
@@ -1321,16 +1383,12 @@ export class WorkspaceStore {
             byModel: {},
             version: 1 as const,
           };
-          const existing = current.byModel[normalizedModel];
           // CRITICAL: Accumulate, don't overwrite (same logic as backend)
-          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-          current.byModel[normalizedModel] = existing ? sumUsageHistory([existing, usage])! : usage;
+          addModelUsage(current.byModel, normalizedModel, usage);
           current.lastRequest = { model: normalizedModel, usage, timestamp: Date.now() };
           this.sessionUsage.set(workspaceId, current);
         }
       }
-
-      collapsePinnedTodoOnStreamStop(workspaceId, aggregator.getCurrentTodos().length > 0);
 
       // Flush any pending debounced bump before final bump to avoid double-bump
       this.cancelPendingIdleBump(workspaceId);
@@ -1360,8 +1418,6 @@ export class WorkspaceStore {
         );
       }
 
-      collapsePinnedTodoOnStreamStop(workspaceId, aggregator.getCurrentTodos().length > 0);
-
       // Flush any pending debounced bump before final bump to avoid double-bump
       this.cancelPendingIdleBump(workspaceId);
       this.cancelPendingStreamingBump(workspaceId);
@@ -1372,6 +1428,10 @@ export class WorkspaceStore {
     "tool-call-start": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       this.states.bump(workspaceId);
+      // The aggregator counts the tool's input tokens here. Without this bump a reader that
+      // cached the stats before this event shows the old count until the next delta, so the
+      // "~N tokens" readout depended on whether React rendered between the two events.
+      this.streamingStatsStore.bump(workspaceId);
     },
     "tool-call-execution-start": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1455,19 +1515,31 @@ export class WorkspaceStore {
     "session-usage-delta": (workspaceId, _aggregator, data) => {
       const usageDelta = data as Extract<WorkspaceChatMessage, { type: "session-usage-delta" }>;
 
+      // A self delta's write (headless spend) also sent usage-changed for this workspace, and
+      // the ledger refetch for it shows the spend. Adding it here could count it twice (that
+      // refetch can land first), and refetching again would supersede that refetch.
+      const childId = usageDelta.sourceWorkspaceId;
+      if (childId === workspaceId) {
+        return;
+      }
       const current = this.sessionUsage.get(workspaceId) ?? {
         byModel: {},
         version: 1 as const,
       };
-
-      for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
-        const existing = current.byModel[model];
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+      // A child's delta is its one-time roll-up. A ledger fetched after the roll-up already
+      // holds it, and adding it again would count it twice; recording it in rolledUpFrom also
+      // drops it from the projection.
+      if (!current.rolledUpFrom?.[childId]) {
+        for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
+          addModelUsage(current.byModel, model, usage);
+        }
       }
-
+      current.rolledUpFrom = { ...current.rolledUpFrom, [childId]: true };
       this.sessionUsage.set(workspaceId, current);
       this.usageStore.bump(workspaceId);
+      // A ledger fetch still in flight read the file before the roll-up and would overwrite
+      // this merge: refetch, so the newer response wins (it also refreshes the projection).
+      this.refreshSessionUsage(workspaceId);
     },
     "usage-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1602,6 +1674,8 @@ export class WorkspaceStore {
     this.onModelUsed = onModelUsed;
     this.staleSkeletonTimeoutMs =
       options?.staleTranscriptSkeletonTimeoutMs ?? STALE_TRANSCRIPT_SKELETON_TIMEOUT_MS;
+    this.subagentUsageFetchTimeoutMs =
+      options?.subagentUsageFetchTimeoutMs ?? SUBAGENT_USAGE_FETCH_TIMEOUT_MS;
 
     // Initialize consumer calculation manager
     this.consumerManager = new WorkspaceConsumerManager(
@@ -1639,6 +1713,7 @@ export class WorkspaceStore {
 
     const requestVersion = (this.sessionUsageRequestVersion.get(workspaceId) ?? 0) + 1;
     this.sessionUsageRequestVersion.set(workspaceId, requestVersion);
+    this.refreshSubagentUsage(workspaceId);
 
     client.workspace
       .getSessionUsage({ workspaceId })
@@ -1685,6 +1760,119 @@ export class WorkspaceStore {
       });
   }
 
+  private refreshSubagentUsage(workspaceId: string): void {
+    const client = this.client;
+    if (!client || !this.isWorkspaceRegistered(workspaceId)) {
+      return;
+    }
+    // One fetch per workspace at a time: a burst of usage changes from many sub-agents asks
+    // again while it runs, and one trailing fetch then reads all of them.
+    const inFlight = this.subagentUsageFetches.get(workspaceId);
+    if (inFlight) {
+      inFlight.trailing = true;
+      return;
+    }
+    const request = { trailing: false };
+    this.subagentUsageFetches.set(workspaceId, request);
+    // No gate on known children: a parent registers before its children do, so frontend
+    // metadata cannot tell that a workspace has none.
+    client.workspace
+      .getSubagentUsage(
+        { workspaceId },
+        { signal: AbortSignal.timeout(this.subagentUsageFetchTimeoutMs) }
+      )
+      .then((data) => this.applySubagentUsage(workspaceId, request, data))
+      .catch((error) => {
+        console.warn(`Failed to fetch sub-agent usage for ${workspaceId}:`, error);
+      })
+      .finally(() => {
+        // A removal or client change dropped this fetch; a newer one owns the slot.
+        if (this.subagentUsageFetches.get(workspaceId) !== request) return;
+        this.subagentUsageFetches.delete(workspaceId);
+        if (request.trailing) {
+          this.refreshSubagentUsage(workspaceId);
+        }
+      });
+  }
+
+  private applySubagentUsage(
+    workspaceId: string,
+    request: SubagentUsageFetch,
+    data: SubagentUsageByChild
+  ): void {
+    // A removal or client change dropped this fetch: the workspace can be a new incarnation
+    // with its own fetch.
+    if (this.subagentUsageFetches.get(workspaceId) !== request) {
+      return;
+    }
+    if (this.providersConfig) {
+      repriceSubagentUsage(data, this.providersConfig);
+    }
+    this.subagentUsage.set(workspaceId, data);
+    this.usageStore.bump(workspaceId);
+  }
+
+  /**
+   * The backend sends usage-changed on every write to a workspace's usage files: a stream's
+   * finished step or its settle, headless usage, a sub-agent rolled up into it. Its own ledger
+   * and every ancestor's sub-agent projection can have changed.
+   */
+  private refreshUsageAfterChange(workspaceId: string): void {
+    if (this.isUsageShown(workspaceId) && !this.isOwnStreamLive(workspaceId)) {
+      this.refreshSessionUsage(workspaceId);
+    }
+    this.refreshAncestorSubagentUsage(workspaceId);
+  }
+
+  /**
+   * The workspace's chat shows its own stream live: its stream-end adds the stream's usage, and
+   * every terminal event refetches the ledger (finalizeUsageStats, stream-error). A usage-change
+   * refetch before that can already hold the settled stream, and stream-end would add it again.
+   */
+  private isOwnStreamLive(workspaceId: string): boolean {
+    return (
+      this.isOnChatSubscriptionActive(workspaceId) &&
+      this.aggregators.get(workspaceId)?.getActiveStreamMessageId() !== undefined
+    );
+  }
+
+  /**
+   * A nested sub-agent rolls into its own parent's ledger, and no session-usage-delta reaches the
+   * higher ancestors, so their projections are refetched here.
+   */
+  private refreshAncestorSubagentUsage(workspaceId: string): void {
+    for (const ancestorId of this.listAncestorIds(workspaceId)) {
+      if (this.isUsageShown(ancestorId)) {
+        this.refreshSubagentUsage(ancestorId);
+      }
+    }
+  }
+
+  private isUsageShown(workspaceId: string): boolean {
+    return this.isWorkspaceOnScreen(workspaceId) || this.usageStore.hasKeySubscribers(workspaceId);
+  }
+
+  private listAncestorIds(workspaceId: string): string[] {
+    const ancestors: string[] = [];
+    const seen = new Set<string>([workspaceId]);
+    let parentId = this.workspaceMetadata.get(workspaceId)?.parentWorkspaceId;
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      ancestors.push(parentId);
+      parentId = this.workspaceMetadata.get(parentId)?.parentWorkspaceId;
+    }
+    return ancestors;
+  }
+
+  private repriceAllUsage(config: ProvidersConfigMap, fingerprint: number): void {
+    for (const [, usage] of this.sessionUsage) {
+      repriceSessionUsage(usage, config, fingerprint);
+    }
+    for (const [, usage] of this.subagentUsage) {
+      repriceSubagentUsage(usage, config);
+    }
+  }
+
   private async refreshProvidersConfig(client: RouterClient<AppRouter>): Promise<void> {
     // Version counter prevents an older, slower response from overwriting a newer one.
     // We bump eagerly so concurrent requests each get unique versions, then only apply
@@ -1713,9 +1901,7 @@ export class WorkspaceStore {
         // so mapped-model changes take effect on next access.
         this.consumerManager.invalidateAll();
 
-        for (const [, usage] of this.sessionUsage) {
-          repriceSessionUsage(usage, config, nextFingerprint);
-        }
+        this.repriceAllUsage(config, nextFingerprint);
       }
 
       // Bump usage-store subscribers AFTER repricing so observers see
@@ -1819,6 +2005,8 @@ export class WorkspaceStore {
     this.client = client;
     this.clientChangeController.abort();
     this.clientChangeController = new AbortController();
+    // A fetch on the old client may never settle; it must not block the new client's fetches.
+    this.subagentUsageFetches.clear();
 
     this.bumpAllUsageStoreEntries();
 
@@ -2330,7 +2518,8 @@ export class WorkspaceStore {
    * Get current live streaming stats for a workspace, or null if no stream is active.
    *
    * Cached per MapStore version: changes only when {@link streamingStatsStore} is
-   * bumped (stream-start + every coalesced delta + every terminal stream event).
+   * bumped (stream-start + every coalesced delta + every tool-call-start + every terminal
+   * stream event).
    * Reading uses Date.now() at the bump point, so the trailing-window TPS is
    * always current relative to the latest delta.
    */
@@ -2765,7 +2954,10 @@ export class WorkspaceStore {
       const agentStatus = resolveSidebarAgentStatus({
         useAggregatorState,
         activity,
-        todos: aggregatorTodos,
+        // A finished plan stays in the TODO chip until the next turn starts. Between turns the
+        // sidebar keeps the agent's own status (its status_set, or the AI summary) instead of
+        // the plan's last step, as when the plan cleared at the turn's end.
+        todos: canInterrupt || !isTodoListFinished(aggregatorTodos) ? aggregatorTodos : EMPTY_TODOS,
         // A plain getter: reading it for inactive workspaces too has no side effect.
         aggregatorAgentStatus: aggregator.getAgentStatus(),
       });
@@ -3663,6 +3855,7 @@ export class WorkspaceStore {
       return {
         sessionTotal,
         sessionByModel,
+        ...getSubagentUsageFields(this.subagentUsage.get(workspaceId), sessionData),
         lastRequest,
         lastContextUsage,
         totalTokens,
@@ -3964,6 +4157,8 @@ export class WorkspaceStore {
     // - Clear liveUsage once the active stream ends
     // - Pick up lastContextUsage changes from merged message metadata
     this.usageStore.bump(workspaceId);
+    // Usage changes were skipped while the stream was live (isOwnStreamLive).
+    this.refreshSessionUsage(workspaceId);
 
     // Always schedule consumer calculation (tool calls, text, etc. need tokenization)
     // Even streams without usage metadata need token counts recalculated
@@ -4098,12 +4293,6 @@ export class WorkspaceStore {
 
     const stoppedStreamingSnapshot =
       previous?.streaming === true && snapshot?.streaming === false ? snapshot : null;
-    // Activity snapshots only collapse for background workspaces — active workspaces
-    // already collapse from onChat stream-end/stream-abort, which is faster and authoritative.
-    // Firing here too would let a late async snapshot override the user re-expanding the panel.
-    if (stoppedStreamingSnapshot && !this.isOnChatSubscriptionActive(workspaceId)) {
-      collapsePinnedTodoOnStreamStop(workspaceId, stoppedStreamingSnapshot.hasTodos === true);
-    }
     // The pinned side chat is on screen with a live onChat loop, so like the routed chat it
     // gets completion from onChat stream-end, never an activity-driven background notification.
     const isBackgroundStreamingStop =
@@ -4168,6 +4357,7 @@ export class WorkspaceStore {
     snapshots: Record<string, WorkspaceActivitySnapshot>,
     skipWorkspaceIds?: ReadonlySet<string>
   ): void {
+    this.refreshShownUsageAfterResubscribe();
     const seenWorkspaceIds = new Set<string>();
 
     for (const [workspaceId, snapshot] of Object.entries(snapshots)) {
@@ -4369,8 +4559,7 @@ export class WorkspaceStore {
         if (event.type === "heartbeat") return;
         queueMicrotask(() => {
           if (signal.aborted || attemptSignal.aborted) return;
-          this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
-          this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
+          this.applyActivityEvent(event);
         });
       },
       onUnexpectedEnd: () =>
@@ -4385,6 +4574,40 @@ export class WorkspaceStore {
         }
       },
     });
+  }
+
+  private applyActivityEvent(
+    event: Exclude<ActivitySubscriptionEvent, { type: "heartbeat" }>
+  ): void {
+    if (event.type === "usage-changed") {
+      // Not tracked for a list retry: the list's activity for this id is still the newest.
+      this.refreshUsageAfterChange(event.workspaceId);
+      return;
+    }
+    this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
+    this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
+  }
+
+  /**
+   * A resubscribed activity subscription does not replay the usage-changed events it missed,
+   * so every shown workspace refetches its usage as for a change of its own. The first list
+   * needs none: registration and activation fetch.
+   */
+  private refreshShownUsageAfterResubscribe(): void {
+    if (!this.activityAuthoritative) {
+      return;
+    }
+    for (const workspaceId of this.workspaceMetadata.keys()) {
+      if (!this.isUsageShown(workspaceId)) {
+        continue;
+      }
+      // The ledger waits for a live own stream's end (isOwnStreamLive); the projection does not.
+      if (this.isOwnStreamLive(workspaceId)) {
+        this.refreshSubagentUsage(workspaceId);
+      } else {
+        this.refreshSessionUsage(workspaceId);
+      }
+    }
   }
 
   /**
@@ -4755,6 +4978,9 @@ export class WorkspaceStore {
     // Store metadata for name lookup
     this.workspaceMetadata.set(workspaceId, metadata);
     this.derived.bump("workspaces");
+    // A new sub-agent changes its ancestors' open sub-agents, and its usage may have changed
+    // before this parent link was known (listAncestorIds found no ancestors then).
+    this.refreshAncestorSubagentUsage(workspaceId);
 
     // Backend guarantees createdAt via config.ts - this should never be undefined
     assert(
@@ -4858,6 +5084,9 @@ export class WorkspaceStore {
    * Remove a workspace and clean up subscriptions.
    */
   removeWorkspace(workspaceId: string): void {
+    // Before the metadata goes: the ancestor walk reads this workspace's parent link.
+    this.refreshAncestorSubagentUsage(workspaceId);
+
     // Clean up consumer manager state
     this.consumerManager.removeWorkspace(workspaceId);
 
@@ -4927,6 +5156,8 @@ export class WorkspaceStore {
     this.preReplayUsageSnapshot.delete(workspaceId);
     this.sessionUsage.delete(workspaceId);
     this.sessionUsageRequestVersion.delete(workspaceId);
+    this.subagentUsage.delete(workspaceId);
+    this.subagentUsageFetches.delete(workspaceId);
 
     this.ensureOnChatSubscriptions();
     this.derived.bump("recency");
@@ -5569,6 +5800,8 @@ export class WorkspaceStore {
       this.releaseStreamingMessageChannel(workspaceId);
       this.states.bump(workspaceId);
       this.streamingStatsStore.bump(workspaceId);
+      // Usage changes were skipped while the stream was live (isOwnStreamLive).
+      this.refreshSessionUsage(workspaceId);
       return;
     }
 
@@ -6090,6 +6323,31 @@ export function removeEphemeralMessage(workspaceId: string, messageId: string): 
     aggregator.removeMessage(messageId);
     store.bumpState(workspaceId);
   }
+}
+
+/**
+ * Session cost usage as the cost displays show it: the persisted ledger (own turns plus removed
+ * sub-agents), open sub-agents, and the running stream.
+ */
+export function sumSessionCostUsage(usage: WorkspaceUsageState): ChatUsageDisplay | undefined {
+  const parts: ChatUsageDisplay[] = [];
+  if (usage.sessionTotal) parts.push(usage.sessionTotal);
+  if (usage.subagentTotal) parts.push(usage.subagentTotal);
+  if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
+  return parts.length > 0 ? sumUsageHistory(parts) : undefined;
+}
+
+/** Token count of sumSessionCostUsage, so every session token display shows the same tree total. */
+export function sumSessionTokens(usage: WorkspaceUsageState): number {
+  const total = sumSessionCostUsage(usage);
+  if (!total) return 0;
+  return (
+    total.input.tokens +
+    total.cached.tokens +
+    total.cacheCreate.tokens +
+    total.output.tokens +
+    total.reasoning.tokens
+  );
 }
 
 /**

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { isToolEnabledByConfigs } from "@/common/utils/agentTools";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
 import {
   AgentDefinitionParseError,
@@ -70,6 +71,17 @@ Body
     expect(result.frontmatter.subagent?.skip_init_hook).toBe(true);
   });
 
+  test("keeps ai.cacheTtl and rejects an unknown TTL like an unknown thinkingLevel", () => {
+    const parse = (ai: string) => {
+      const content = `---\nname: Cached\nai:\n${ai}\n---\nBody\n`;
+      return parseAgentDefinitionMarkdown({ content, byteSize: Buffer.byteLength(content) });
+    };
+
+    expect(parse("  cacheTtl: 1h").frontmatter.ai).toEqual({ cacheTtl: "1h" });
+    expect(() => parse("  cacheTtl: 2h")).toThrow(AgentDefinitionParseError);
+    expect(() => parse("  thinkingLevel: turbo")).toThrow(AgentDefinitionParseError);
+  });
+
   test("throws on missing frontmatter", () => {
     expect(() =>
       parseAgentDefinitionMarkdown({
@@ -107,6 +119,29 @@ Body
     });
   });
 
+  test("keeps the body after the closing delimiter exactly", () => {
+    const content = "---\nname: a\n---\nline one\nline two\n";
+    const result = parseAgentDefinitionMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+    });
+    expect(result.body).toBe("line one\nline two\n");
+  });
+
+  test("accepts a file of exactly the size cap and rejects one byte more", () => {
+    const content = "---\nname: a\n---\nBody\n";
+    const parse = (byteSize: number) => parseAgentDefinitionMarkdown({ content, byteSize });
+    expect(parse(MAX_FILE_SIZE).frontmatter.name).toBe("a");
+    expect(() => parse(MAX_FILE_SIZE + 1)).toThrow(AgentDefinitionParseError);
+  });
+
+  test("a closing delimiter right after the opening one is an empty frontmatter, not a missing one", () => {
+    const content = "---\n---\nBody\n";
+    expect(() =>
+      parseAgentDefinitionMarkdown({ content, byteSize: Buffer.byteLength(content, "utf-8") })
+    ).toThrow("must be a mapping");
+  });
+
   describe("plugin source (Claude Code / Cursor format)", () => {
     function parse(frontmatter: string, source?: "plugin") {
       // The fixture file is agents/file-id.md.
@@ -128,7 +163,7 @@ Body
         description: "Delegate",
         base: "exec",
         ui: { hidden: true },
-        subagent: { runnable: true },
+        subagent: { runnable: true, background_hint: true },
         prompt: { append: false },
       });
     });
@@ -245,11 +280,40 @@ Body
       ]);
       // A denylist of tools Xum does not have removes nothing: the agent keeps Exec's tools.
       expect(parse("name: a\ndisallowedTools: Grep", "plugin").tools).toBeUndefined();
+      expect(parse("name: a\ndisallowedTools: LS", "plugin").tools).toBeUndefined();
+    });
+
+    test("Grep, Glob and LS grant the bash tools only in a read-only search list", () => {
+      const sample = [
+        "file_read",
+        "attach_file",
+        "bash",
+        "bash_output",
+        "file_edit_insert",
+        "task",
+      ];
+      const toolsOf = (frontmatter: string) => {
+        const { tools } = parse(frontmatter, "plugin");
+        return sample.filter((tool) =>
+          isToolEnabledByConfigs(tool, [{ add: [".*"] }, ...(tools != null ? [tools] : [])])
+        );
+      };
+      expect(toolsOf("name: a\ntools: Read, Grep, Glob")).toEqual([
+        "file_read",
+        "attach_file",
+        "bash",
+        "bash_output",
+      ]);
+      expect(toolsOf("name: a\ntools: Grep")).toEqual(["bash", "bash_output"]);
+      expect(toolsOf("name: a\ntools: LS")).toEqual(["bash", "bash_output"]);
+      expect(toolsOf("name: a\ntools: Read, Grep, Edit")).toEqual(["file_read", "attach_file"]);
     });
 
     test("an allowlist that resolves to no Xum tool skips the agent", () => {
       for (const frontmatter of [
-        "name: a\ntools: Grep, Glob",
+        // Grep and Glob grant the bash tools only in a search list, and Bash is denied here.
+        "name: a\ntools: Grep, Glob\ndisallowedTools: Bash",
+        "name: a\ntools: LSP, Monitor",
         "name: a\ntools: []",
         "name: a\ntools: Read\ndisallowedTools: Read",
         // Xum cannot narrow a tool to some of its calls, so it does not grant a specifier.
@@ -304,6 +368,45 @@ Body
       expect(parse("name: a\ndescription: d\nis_background: true")).toEqual({
         name: "a",
         description: "d",
+      });
+    });
+
+    describe("foreign flag", () => {
+      const foreignOf = (frontmatter: string, source?: "plugin") => {
+        const content = `---\n${frontmatter}\n---\nBody\n`;
+        return parseAgentDefinitionMarkdown({
+          content,
+          byteSize: Buffer.byteLength(content, "utf-8"),
+          ...(source != null ? { plugin: { agentId: "file-id" } } : {}),
+        }).foreign;
+      };
+
+      test("is true for a Claude Code or Cursor format plugin agent", () => {
+        expect(foreignOf("name: a\ntools: Read, Grep", "plugin")).toBe(true);
+        expect(foreignOf("name: a\nreadonly: true", "plugin")).toBe(true);
+        expect(foreignOf("description: only foreign keys", "plugin")).toBe(true);
+      });
+
+      test("is false for a Xum-format plugin agent", () => {
+        expect(foreignOf("name: a\nbase: exec", "plugin")).toBe(false);
+        expect(foreignOf("name: a\ntools:\n  add: [file_read]", "plugin")).toBe(false);
+      });
+
+      test("is false for a file that is not a plugin agent, whatever its keys", () => {
+        expect(foreignOf("name: a\nreadonly: true")).toBe(false);
+        expect(foreignOf("name: a\nis_background: true")).toBe(false);
+      });
+
+      test("mappedReadonly is false for a file that is not a plugin agent", () => {
+        const content = "---\nname: a\nreadonly: true\n---\nBody\n";
+        const parse = (plugin?: { agentId: string }) =>
+          parseAgentDefinitionMarkdown({
+            content,
+            byteSize: Buffer.byteLength(content, "utf-8"),
+            ...(plugin != null ? { plugin } : {}),
+          }).mappedReadonly;
+        expect(parse()).toBe(false);
+        expect(parse({ agentId: "file-id" })).toBe(true);
       });
     });
   });

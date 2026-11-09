@@ -1,6 +1,7 @@
-import type { RuntimeConfig } from "@/common/types/runtime";
+import type { RuntimeConfig, RuntimeMode } from "@/common/types/runtime";
 import type { RuntimeStatusEvent as StreamRuntimeStatusEvent } from "@/common/types/stream";
 import type { Result } from "@/common/types/result";
+import type { HolderEvidence } from "@/node/utils/concurrency/processLiveness";
 
 /**
  * Runtime abstraction for executing tools in different environments.
@@ -93,6 +94,8 @@ export type BackgroundMonitorProbeResult<T> =
 export interface BackgroundHandle {
   /** Output directory containing output.log, meta.json, exit_code */
   readonly outputDir: string;
+  /** Host-local process evidence retained after exit. */
+  readonly localProcess?: HolderEvidence;
 
   /**
    * Get the exit code if the process has exited.
@@ -165,6 +168,8 @@ export interface BackgroundOutputRead {
  * Streaming result from executing a command
  */
 export interface ExecStream {
+  /** Host-local child identity for later migration and liveness checks. */
+  localProcess?: HolderEvidence;
   /** Standard output stream */
   stdout: ReadableStream<Uint8Array>;
   /** Standard error stream */
@@ -495,6 +500,19 @@ export interface Runtime {
    * MultiProjectRuntime and object doubles leave it absent, as instanceof is false for them.
    */
   readonly location?: RuntimeLocation;
+  /**
+   * The runtime type of a workspace config (`ssh`, `docker`, `devcontainer`), for text that names
+   * the runtime to a user or a model. SSHRuntime (and CoderSSHRuntime), DockerRuntime and
+   * DevcontainerRuntime give it as prototype getters, like `location`. Other runtimes and
+   * doubles leave it absent: fall back to `location`.
+   */
+  readonly mode?: RuntimeMode;
+  /**
+   * The runtimes this one delegates to (MultiProjectRuntime: one per project), for code that
+   * must look through a wrapper without importing its class. Such a wrapper leaves `location`
+   * and `mode` absent: its answer is its projects' answers.
+   */
+  readonly wrappedRuntimes?: readonly Runtime[];
   /**
    * Execute a bash command with streaming I/O.
    * cwd and pathEnv values are host-namespace paths translated by the adapter.

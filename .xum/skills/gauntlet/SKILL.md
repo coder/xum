@@ -100,7 +100,11 @@ mutate-check: 2 survived, 7 killed, 0 uncovered, 0 without a test, 0 not run
 ```
 
 - Tests: the colocated test first, then the nearest other unit tests that
-  import the file directly, at most 10. Each test file runs in its own
+  import the file directly, at most 10. When more files import it (a large
+  service), the run picks suites that may not reach the changed function, so
+  its survivors say little: run the mutants by hand against the suites that
+  drive the function, and report each survivor as killed, equivalent or a gap.
+  Each test file runs in its own
   `bun test` process, in a private copy of the tracked files. The first
   failing file kills the mutant. A timeout (10x the file's own time, at
   least 2 s) also kills it.

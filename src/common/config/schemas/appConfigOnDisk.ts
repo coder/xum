@@ -6,6 +6,7 @@ import { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablemen
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { CODER_ARCHIVE_BEHAVIORS } from "../coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "../worktreeArchiveBehavior";
+import { CacheTtlSchema } from "./providersConfig";
 import { UserPreferencesSchema } from "./userPreferences";
 import { TaskSettingsSchema } from "./taskSettings";
 import { AgentResourceLimitsSchema } from "./agentResourceLimits";
@@ -48,6 +49,9 @@ export const AgentAiDefaultsEntrySchema = z.object({
   autoModelRouting: z.boolean().optional(),
   autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
+  // Anthropic prompt-cache TTL for this agent's runs (interactive and delegated alike);
+  // absent inherits the base chain, then the global providers.jsonc anthropic.cacheTtl.
+  cacheTtl: CacheTtlSchema.optional(),
   subagent: AgentAiSubagentProfileSchema.optional(),
 });
 

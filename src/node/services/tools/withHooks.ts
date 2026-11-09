@@ -263,6 +263,7 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
     assert(!c.blocked, `tool.execute terminal reached with blocked context (${toolName})`);
     // Middleware may have rewritten args; execute with the current ones.
     c.result = await input.execute(c.args as TArgs);
+    c.terminalResult = c.result;
     c.executed = true;
   });
 

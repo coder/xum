@@ -868,29 +868,24 @@ function isWireDeferLoadingTool(tool: Record<string, unknown>): boolean {
 }
 
 /**
- * Remove every cache marker the request pipeline may have serialized:
- * `cache_control` on system/message/tool entries and nested content parts,
- * plus prompt-form providerOptions.anthropic.cacheControl. ZDR enforcement
- * happens HERE, at the wire, so no upstream eligibility check is load-bearing
- * for the global anthropic disableBetaFeatures flag.
+ * Visits every entry of the request body that can hold a cache marker: system/message/tool
+ * entries and their nested content parts (tool_result content included), with the entry's
+ * prompt-form providerOptions.anthropic record when it has one.
  */
-function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void {
-  const stripEntry = (entry: unknown): void => {
-    if (entry == null || typeof entry !== "object" || Array.isArray(entry)) {
+function forEachAnthropicCacheMarkerHolder(
+  json: Record<string, unknown>,
+  visit: (record: Record<string, unknown>, anthropicOptions?: Record<string, unknown>) => void
+): void {
+  const visitEntry = (entry: unknown): void => {
+    if (!isRecord(entry) || Array.isArray(entry)) {
       return;
     }
-    const record = entry as Record<string, unknown>;
-    delete record.cache_control;
-    const providerOptions = record.providerOptions;
-    if (providerOptions != null && typeof providerOptions === "object") {
-      const anthropicOptions = (providerOptions as Record<string, unknown>).anthropic;
-      if (anthropicOptions != null && typeof anthropicOptions === "object") {
-        delete (anthropicOptions as Record<string, unknown>).cacheControl;
-      }
-    }
-    if (Array.isArray(record.content)) {
-      for (const part of record.content) {
-        stripEntry(part);
+    const providerOptions = entry.providerOptions;
+    const anthropicOptions = isRecord(providerOptions) ? providerOptions.anthropic : undefined;
+    visit(entry, isRecord(anthropicOptions) ? anthropicOptions : undefined);
+    if (Array.isArray(entry.content)) {
+      for (const part of entry.content) {
+        visitEntry(part);
       }
     }
   };
@@ -899,10 +894,70 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
     const value = json[key];
     if (Array.isArray(value)) {
       for (const entry of value) {
-        stripEntry(entry);
+        visitEntry(entry);
       }
     }
   }
+}
+
+/**
+ * Remove every cache marker the request pipeline may have serialized:
+ * `cache_control` on system/message/tool entries and nested content parts,
+ * plus prompt-form providerOptions.anthropic.cacheControl. ZDR enforcement
+ * happens HERE, at the wire, so no upstream eligibility check is load-bearing
+ * for the global anthropic disableBetaFeatures flag.
+ */
+function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void {
+  forEachAnthropicCacheMarkerHolder(json, (record, anthropicOptions) => {
+    delete record.cache_control;
+    if (anthropicOptions) delete anthropicOptions.cacheControl;
+  });
+}
+
+/**
+ * Puts one TTL on every existing cache marker. Anthropic rejects a request whose ttl=1h marker
+ * follows a ttl=5m one (order: tools, system, messages), so a marker serialized upstream with
+ * another TTL (a per-model extra, a continuous-compaction prefix) must not keep it. An identical
+ * prefix still reads its cache entry across a TTL change, so this costs no cache hit.
+ */
+function setAnthropicCacheMarkerTtl(json: Record<string, unknown>, cacheTtl: AnthropicCacheTtl) {
+  const retag = (holder: Record<string, unknown>, key: string) => {
+    if (isRecord(holder[key])) holder[key] = mergeAnthropicCacheControl(holder[key], cacheTtl);
+  };
+  retag(json, "cache_control");
+  forEachAnthropicCacheMarkerHolder(json, (record, anthropicOptions) => {
+    retag(record, "cache_control");
+    if (anthropicOptions) retag(anthropicOptions, "cacheControl");
+  });
+}
+
+type AnthropicCacheTtlSource =
+  | AnthropicCacheTtl
+  | null
+  | undefined
+  | (() => AnthropicCacheTtl | null | undefined);
+
+/** The last wire-shaping step: strip every marker (ZDR), or put the TTL on every marker. */
+function finalizeAnthropicCacheMarkers(
+  json: Record<string, unknown>,
+  injectCacheControl: boolean,
+  cacheTtlSource: AnthropicCacheTtlSource
+): void {
+  if (!injectCacheControl) {
+    stripAnthropicCacheControlMarkers(json);
+    return;
+  }
+  const cacheTtl = typeof cacheTtlSource === "function" ? cacheTtlSource() : cacheTtlSource;
+  if (cacheTtl) setAnthropicCacheMarkerTtl(json, cacheTtl);
+}
+
+/** The running agent's TTL wins over the configured one, read per request (see CreateModelOptions). */
+function wireAnthropicCacheTtl(
+  configured: AnthropicCacheTtl | undefined,
+  opts: CreateModelOptions | undefined
+): AnthropicCacheTtlSource {
+  const getOverride = opts?.getAnthropicCacheTtlOverride;
+  return getOverride ? () => getOverride() ?? configured : configured;
 }
 
 /**
@@ -986,7 +1041,8 @@ async function fetchRecordingPromptCacheWire(
  */
 export function wrapFetchWithAnthropicCacheControl(
   baseFetch: typeof fetch,
-  cacheTtl?: AnthropicCacheTtl | null,
+  /** A getter is sampled at each request, so a per-agent TTL can change between turns. */
+  cacheTtl?: AnthropicCacheTtlSource,
   options?: {
     injectCacheControl?: boolean;
     /**
@@ -1018,13 +1074,9 @@ export function wrapFetchWithAnthropicCacheControl(
     try {
       json = JSON.parse(init.body) as Record<string, unknown>;
 
-      if (!injectCacheControl) {
-        stripAnthropicCacheControlMarkers(json);
-      }
-
       // Inject cache_control on the last non-deferred tool if tools array exists.
-      // If the SDK already populated cache_control, preserve it but override ttl
-      // when a higher-level cacheTtl is configured. Anthropic rejects
+      // If the SDK already populated cache_control, preserve it (the final pass
+      // sets a configured TTL on every marker). Anthropic rejects
       // cache_control on a defer_loading tool (#5262), so none may keep one.
       if (injectCacheControl && Array.isArray(json.tools) && json.tools.length > 0) {
         const tools = json.tools.filter(isRecord);
@@ -1033,7 +1085,7 @@ export function wrapFetchWithAnthropicCacheControl(
         }
         const lastTool = tools.findLast((tool) => !isWireDeferLoadingTool(tool));
         if (lastTool) {
-          lastTool.cache_control = mergeAnthropicCacheControl(lastTool.cache_control, cacheTtl);
+          lastTool.cache_control = mergeAnthropicCacheControl(lastTool.cache_control);
         }
       }
 
@@ -1057,10 +1109,7 @@ export function wrapFetchWithAnthropicCacheControl(
         if (Array.isArray(json.prompt)) {
           const providerOpts = (lastMsg.providerOptions ?? {}) as Record<string, unknown>;
           const anthropicOpts = (providerOpts.anthropic ?? {}) as Record<string, unknown>;
-          anthropicOpts.cacheControl = mergeAnthropicCacheControl(
-            anthropicOpts.cacheControl,
-            cacheTtl
-          );
+          anthropicOpts.cacheControl = mergeAnthropicCacheControl(anthropicOpts.cacheControl);
           providerOpts.anthropic = anthropicOpts;
           lastMsg.providerOptions = providerOpts;
         }
@@ -1069,9 +1118,11 @@ export function wrapFetchWithAnthropicCacheControl(
         const content = lastMsg.content;
         if (Array.isArray(content) && content.length > 0) {
           const lastPart = content[content.length - 1] as Record<string, unknown>;
-          lastPart.cache_control = mergeAnthropicCacheControl(lastPart.cache_control, cacheTtl);
+          lastPart.cache_control = mergeAnthropicCacheControl(lastPart.cache_control);
         }
       }
+
+      finalizeAnthropicCacheMarkers(json, injectCacheControl, cacheTtl);
 
       // Update body with modified JSON
       newBody = JSON.stringify(json);
@@ -1733,6 +1784,11 @@ interface CreateModelOptions {
   routeContext?: RouteContext;
   /** Chat-local override, sampled at the next model call without changing other chats or routing. */
   getServiceTierOverride?: () => ServiceTier | undefined;
+  /**
+   * The running agent's Anthropic prompt-cache TTL, sampled at each request on Anthropic wires.
+   * It wins over the global and request-level TTLs; undefined keeps them.
+   */
+  getAnthropicCacheTtlOverride?: () => AnthropicCacheTtl | undefined;
   /** Chat turns only: enables prompt-cache prefix-break detection on Anthropic wires. */
   promptCacheScope?: PromptCacheTurnScope;
   /**
@@ -2046,8 +2102,10 @@ export class ProviderModelFactory {
             cacheTtl: configAnthropicCacheTtl,
           };
         }
-        const effectiveAnthropicCacheTtl =
-          muxProviderOptions?.anthropic?.cacheTtl ?? configAnthropicCacheTtl;
+        const effectiveAnthropicCacheTtl = wireAnthropicCacheTtl(
+          muxProviderOptions?.anthropic?.cacheTtl ?? configAnthropicCacheTtl,
+          opts
+        );
 
         // Capture the chat's speed before non-OpenAI routes strip the OpenAI tier below.
         const chatServiceTier = readChatServiceTier(
@@ -3196,25 +3254,23 @@ export class ProviderModelFactory {
   /** Create a model and its complete request options from one config/route decision. */
   async createModelWithPinnedOptions(
     modelString: string,
-    opts?: {
+    opts: {
       thinkingLevel?: ThinkingLevel;
       providerOptions?: MuxProviderOptions;
-      agentInitiated?: boolean;
-      workspaceId?: string;
-    }
+    } & Pick<
+      CreateModelOptions,
+      "agentInitiated" | "workspaceId" | "getAnthropicCacheTtlOverride"
+    > = {}
   ): Promise<Result<PinnedModelOptions, SendMessageError>> {
+    const { thinkingLevel, providerOptions, ...createOptions } = opts;
     const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const optionsProvidersConfig = this.providerService.getConfig(providersConfig);
-    const optionsMuxProviderOptions = structuredClone(opts?.providerOptions ?? {});
+    const optionsMuxProviderOptions = structuredClone(providerOptions ?? {});
     const result = await this.resolveAndCreateModel(
       modelString,
-      opts?.thinkingLevel,
+      thinkingLevel,
       optionsMuxProviderOptions,
-      {
-        agentInitiated: opts?.agentInitiated,
-        workspaceId: opts?.workspaceId,
-        providersConfig,
-      }
+      { ...createOptions, providersConfig }
     );
     if (!result.success) return result;
 

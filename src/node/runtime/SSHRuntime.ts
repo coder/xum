@@ -521,6 +521,11 @@ const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
 const checkoutGenerations = new Map<string, number>();
 
 export class SSHRuntime extends RemoteRuntime {
+  /** Runtime.mode. A prototype getter, like `location`, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- same as location: Object.create(X.prototype) doubles would read undefined from a readonly field
+  get mode(): "ssh" {
+    return "ssh";
+  }
   private readonly config: SSHRuntimeConfig;
   private readonly transport: SSHTransport;
   private readonly ensureReadyProjectPath?: string;
@@ -1930,6 +1935,14 @@ export class SSHRuntime extends RemoteRuntime {
     }
 
     initLogger.logStep("Creating git bundle...");
+    // Start the remote writer before git: when git exits before anything reads its stdout,
+    // Node discards the unread output, and a slow ssh start uploaded an empty bundle.
+    const remoteAbortController = createAbortController(300_000, abortSignal);
+    const remoteStream = await this.exec(`cat > ${this.quoteForRemote(remoteBundlePath)}`, {
+      cwd: "~",
+      abortSignal: remoteAbortController.signal,
+    });
+
     // Use --branches --tags instead of --all to exclude refs/remotes/origin/*
     // from the bundle. Those tracking refs are from the local machine's last
     // fetch and can be arbitrarily stale — importing them into the shared bare
@@ -1953,12 +1966,6 @@ export class SSHRuntime extends RemoteRuntime {
       for (const line of chunk.split("\n").filter(Boolean)) {
         initLogger.logStderr(line);
       }
-    });
-
-    const remoteAbortController = createAbortController(300_000, abortSignal);
-    const remoteStream = await this.exec(`cat > ${this.quoteForRemote(remoteBundlePath)}`, {
-      cwd: "~",
-      abortSignal: remoteAbortController.signal,
     });
 
     try {
@@ -3255,15 +3262,18 @@ export class SSHRuntime extends RemoteRuntime {
     const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
 
     try {
+      // quoteForRemote expands a leading ~ remotely: a deferred-access runtime (Coder) keeps
+      // the unresolved `~/...` path, and a quoted `~` would make a dirty checkout look missing.
+      const deletedPathArg = this.quoteForRemote(deletedPath);
       // Combine all pre-deletion checks into a single bash script to minimize round trips
       // Exit codes: 0=ok to delete, 1=uncommitted changes, 2=unpushed commits, 3=doesn't exist
       const checkScript = force
         ? // When force=true, only check existence
-          `test -d ${shescape.quote(deletedPath)} || exit 3`
+          `test -d ${deletedPathArg} || exit 3`
         : // When force=false, perform all safety checks
           `
-            test -d ${shescape.quote(deletedPath)} || exit 3
-            cd ${shescape.quote(deletedPath)} || exit 1
+            test -d ${deletedPathArg} || exit 3
+            cd ${deletedPathArg} || exit 1
             git diff --quiet --exit-code && git diff --quiet --cached --exit-code || exit 1
             if git remote | grep -q .; then
               # First, check the original condition: any commits not in any remote

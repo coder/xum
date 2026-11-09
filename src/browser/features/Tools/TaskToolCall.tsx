@@ -529,6 +529,8 @@ interface TaskToolCallProps {
 
 interface TaskToolDisplayEntry {
   taskId: string;
+  /** The child's best-of slot: a partial group result skips the slots that failed to spawn. */
+  candidateIndex?: number;
   status: string;
   title?: string;
   reportMarkdown?: string;
@@ -653,6 +655,12 @@ function getTaskToolWorkspaceTitle(
   metadata: FrontendWorkspaceMetadata | null | undefined
 ): string | undefined {
   return normalizeTaskTitle(metadata?.title) ?? normalizeTaskTitle(metadata?.name) ?? undefined;
+}
+
+function getTaskToolWorkspaceCandidateIndex(
+  metadata: FrontendWorkspaceMetadata | null | undefined
+): number | undefined {
+  return metadata?.bestOf?.index;
 }
 
 function mergeTaskIdsInDisplayOrder(taskIdLists: ReadonlyArray<readonly string[]>): string[] {
@@ -935,7 +943,7 @@ const TaskToolCandidateCard: React.FC<{
 }> = ({ entry, index, total, onOpenTranscript }) => {
   const canViewTranscript = entry.status === "completed";
   const hasReport = hasNonEmptyText(entry.reportMarkdown);
-  const memberLabel = formatTaskGroupMemberLabel(index);
+  const memberLabel = formatTaskGroupMemberLabel(entry.candidateIndex ?? index);
 
   return (
     <div className="bg-code-bg rounded-sm p-2">
@@ -1051,6 +1059,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
 
     return {
       taskId,
+      candidateIndex: getTaskToolWorkspaceCandidateIndex(metadata),
       status:
         derivedStatus ?? (status === "executing" ? "running" : (successResult?.status ?? "queued")),
       title: reportTitle ?? getTaskToolWorkspaceTitle(metadata) ?? title,
