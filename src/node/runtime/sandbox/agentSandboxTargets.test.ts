@@ -185,6 +185,31 @@ describe("buildAgentSandboxPolicy", () => {
     ).toBe(false);
   });
 
+  // Git outside the sandbox follows the whole chain, so a command must not replace a link on it.
+  test("keeps every link on the way from a protected path read-only", async () => {
+    const outside = path.join(root, "outside-hooks");
+    const alias = path.join(repo, "hooks-alias");
+    await fs.mkdir(outside);
+    await fs.rm(path.join(commonDir, "hooks"), { recursive: true });
+    await fs.symlink(outside, alias);
+    await fs.symlink(alias, path.join(commonDir, "hooks"));
+
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+    expect(agentSandboxPolicyAllows(policy, alias, "write")).toBe(false);
+    expect(agentSandboxPolicyAllows(policy, path.join(outside, "pre-commit"), "write")).toBe(false);
+  });
+
+  // A command could point the folder link at another folder, and git would follow it there.
+  test("fails closed when a protected path links through a folder link in a write root", async () => {
+    await fs.mkdir(path.join(repo, "real", "hooks"), { recursive: true });
+    await fs.symlink(path.join(repo, "real"), path.join(repo, "dirlink"));
+    await fs.rm(path.join(commonDir, "hooks"), { recursive: true });
+    await fs.symlink(path.join(repo, "dirlink", "hooks"), path.join(commonDir, "hooks"));
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
+  });
+
   test("opens a PATH folder in the home folder, not the folder around it", async () => {
     const documents = path.join(await fs.realpath(os.homedir()), "Documents");
     const bin = path.join(documents, "bin");
@@ -861,6 +886,18 @@ describe("buildAgentSandboxPolicy", () => {
     // Any existing file outside the write roots and the home folder.
     await fs.symlink("/etc/hosts", path.join(repo, "config-alias"));
     await fs.symlink(path.join(repo, "config-alias"), path.join(xumHome, "config.json"));
+    process.env.XUM_ROOT = xumHome;
+    using _tmpdir = homeOutsideWriteRoots();
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
+  });
+
+  // Seatbelt hides and protects names, so a hard link in the workspace would write Xum's config.
+  test("fails closed on a hidden file with a hard link in the workspace", async () => {
+    const xumHome = path.join(root, "xum-home");
+    await fs.mkdir(xumHome);
+    await fs.writeFile(path.join(xumHome, "config.json"), "{}\n");
+    await fs.link(path.join(xumHome, "config.json"), path.join(repo, "config-alias"));
     process.env.XUM_ROOT = xumHome;
     using _tmpdir = homeOutsideWriteRoots();
 

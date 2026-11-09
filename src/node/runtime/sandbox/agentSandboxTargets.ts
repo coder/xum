@@ -259,9 +259,11 @@ export function buildAgentSandboxPolicy(
         ...homeLinkTargets(home, writeRoots),
         ...configIncludePaths.map(realpathOfNearest),
       ].filter((denied) => isUnderAny(denied, writeRoots)),
-    ].flatMap(withLinkTarget)
+    ].flatMap((denied) => withLinkTargets(denied, writeRoots))
   );
-  assertSingleLinks([...denyWrite, ...automationPaths]);
+  // Every hidden file, also outside the write roots: a hard link to ~/.xum/config.json in the
+  // workspace would write it, and Seatbelt matches names, not files (Codex review).
+  assertSingleLinks([...denyWrite, ...automationPaths, ...nestedDenies]);
   const allowRead = dedupe([
     ...writeRoots,
     ...gitCommonDirs,
@@ -488,20 +490,30 @@ function commonDirOfWorktree(dotGitFile: string): string | undefined {
 }
 
 /**
- * `target`, and where it leads when it or a folder above it is a symlink: Seatbelt and the file
- * tools check the path a write resolves to, so a protected `.git/config` that links to
- * `.git/config.actual` must be denied there too. A dangling link counts: a write through it
- * creates its target.
+ * `target`, each link on the way, and where it leads when it or a folder above it is a symlink:
+ * Seatbelt and the file tools check the path a write resolves to, so a protected `.git/config`
+ * that links to `.git/config.actual` must be denied there too. A dangling link counts: a write
+ * through it creates its target. Git outside the sandbox follows the chain again, so a link on the
+ * way (`.git/hooks` to `/repo/hooks-alias` to `/elsewhere`) stays read-only too, and a link that
+ * is reached through a link in a write root, which a command could replace, fails closed (Codex
+ * review).
  */
-function withLinkTarget(target: string): string[] {
-  let destination = target;
-  try {
-    destination = path.resolve(realpathOfNearest(path.dirname(target)), fs.readlinkSync(target));
-  } catch {
-    // Not a symlink, or missing.
+function withLinkTargets(target: string, writeRoots: readonly string[]): string[] {
+  const chain = [target];
+  let current = target;
+  for (let hop = 0; hop < MAX_LINK_HOPS; hop++) {
+    let link: string;
+    try {
+      link = fs.readlinkSync(current);
+    } catch {
+      break; // Not a symlink, or missing.
+    }
+    const next = path.resolve(realpathOfNearest(path.dirname(current)), link);
+    assertNoPathThroughLink([path.dirname(next)], writeRoots);
+    current = path.join(realpathOfNearest(path.dirname(next)), path.basename(next));
+    chain.push(current);
   }
-  const resolved = realpathOfNearest(destination);
-  return resolved === target ? [target] : [target, resolved];
+  return dedupe([...chain, realpathOfNearest(current)]);
 }
 
 function assertSingleLinks(files: readonly string[]): void {
@@ -583,7 +595,7 @@ function automationEntryLinkTargets(writeRoots: readonly string[]): string[] {
  */
 function linkTargets(links: readonly string[], writeRoots: readonly string[]): string[] {
   assertNoPathThroughLink(links, writeRoots);
-  return links.flatMap((link) => withLinkTarget(link).slice(1));
+  return links.flatMap((link) => withLinkTargets(link, writeRoots).slice(1));
 }
 
 function childLinks(folder: string): string[] {

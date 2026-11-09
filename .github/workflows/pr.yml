@@ -112,10 +112,11 @@ jobs:
             # Queue-only jobs (test-e2e, bugbash-sandbox, build-vscode) still run on a PR that
             # changes their own tests or sources. This workflow and the setup-xum action hold
             # their steps, the Makefile their targets, and bun.lock the playwright-core version
-            # that keys the sandbox image.
+            # that keys the sandbox image. The macOS leg of test-e2e runs the agent sandbox tests.
             e2e_tests:
               - 'tests/e2e/**'
               - 'tests/bugbash/**'
+              - 'src/node/runtime/sandbox/**'
               - 'playwright.config.ts'
               - '.github/workflows/pr.yml'
               - '.github/actions/setup-xum/**'

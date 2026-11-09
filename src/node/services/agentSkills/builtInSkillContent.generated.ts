@@ -4728,6 +4728,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- `~/.cache/huggingface/token`.",
       "- Xum's `server.lock`, `providers.jsonc`, `secrets.json`, `mcp-oauth.json`, and `config.json`, and its `askpass` folder, where your answers to SSH prompts pass.",
       "",
+      "Commands fail to start when one of these files has more than one hard link, because the sandbox hides and protects names, not files, so the other name would open it.",
+      "",
       "These files are not open, because they can hold tokens: `~/.npmrc`, `~/.bunfig.toml`, `~/.pypirc`, `~/.gradle/gradle.properties`, and `~/.m2/settings.xml`. If a build needs one of them, add it to `extraReadPaths` (see [Open more paths](#open-more-paths)).",
       "",
       "Xum reads the instruction files of the workspace, such as `AGENTS.md`, as a command in the sandbox would, because a command could replace one with a link to a key. An instruction file that links to a hidden file loads as empty. To load one that links to a file in your home folder, add that file to `extraReadPaths`.",
