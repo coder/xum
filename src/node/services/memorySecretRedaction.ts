@@ -84,14 +84,15 @@ const ESCAPED_QUOTED_VALUE = String.raw`(?<run>\\{1,${ESCAPE_RUN_MAX}})(?<quote>
 // The value is a quoted run (to its closing quote, or to the end of an unterminated one) or one
 // unquoted word, optionally behind an auth scheme.
 // Markdown emphasis may wrap the name or the separator (`**Password:** x`, `*token*: x`), as notes
-// and model summaries write it: up to 3 `*` on either side of the separator stay with the name, so
-// the value is the word after them, not the `**` that closes the bold (which left the value
-// readable). Each `*` run is taken whole (`(?!\*)`): a backtrack to part of it would make the
-// rest a value, so `**Password:** [redacted]` would be redacted again. `_` emphasis is already
-// part of a name (`__api_key__:`).
+// and model summaries write it, so the value is the word after it, not the `**` that closes the
+// bold (which left the value readable). Before the separator, up to 3 `*` stay with the name, the
+// run taken whole (`(?!\*)`). After it, a run of up to 3 is emphasis only when a space follows,
+// as a closing `**` does: a run glued to the value is the value (`PASSWORD=****secret`). A value
+// never starts with such an emphasis run either, so a second pass over `**Password:** [redacted]`
+// cannot take the `**` as a new value. `_` emphasis is already part of a name (`__api_key__:`).
 // Already-redacted values are skipped so the passes compose, and so are comparisons (`token === x`).
 const SECRET_KEY_VALUE_PATTERN = new RegExp(
-  String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}\*{0,3}(?!\*)(?:\\{0,${ESCAPE_RUN_MAX}}["']\]?)?\s{0,${GAP_MAX}}[:=]\*{0,3}(?!\*)\s{0,${GAP_MAX}})` +
+  String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}\*{0,3}(?!\*)(?:\\{0,${ESCAPE_RUN_MAX}}["']\]?)?\s{0,${GAP_MAX}}[:=](?:\*{1,3}(?=\s)|(?!\*{1,3}\s))\s{0,${GAP_MAX}})` +
     String.raw`(?![=]|\[redacted\])(?:${QUOTED_VALUE}|${ESCAPED_QUOTED_VALUE}|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+)`,
   "gi"
 );

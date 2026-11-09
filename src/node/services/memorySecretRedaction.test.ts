@@ -267,6 +267,12 @@ describe("redactSecretLike", () => {
       "- **No credentials:** the files name where secrets live",
       "- **No credentials:** [redacted] files name where secrets live",
     ],
+    [
+      "stars glued to the value (not emphasis)",
+      "PASSWORD=****secret npm start",
+      "PASSWORD=[redacted] npm start",
+    ],
+    ["a value of stars only", "password=***", "password=[redacted]"],
   ])("redacts the value after Markdown emphasis in %s", (_label, text, expected) => {
     const redacted = redactSecretLike(text);
 
