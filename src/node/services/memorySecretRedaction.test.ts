@@ -690,6 +690,36 @@ describe("redactSecretLike", () => {
         jsonOf({ o: `{"cookie"${GAP}:[" a]b","${SESSION}"],"host":"h"}` }),
         String.raw`{"o":"{\"cookie\"${GAP}:[redacted],\"host\":\"h\"}"}`,
       ],
+      [
+        "backslashes before a raw line break",
+        `Cookie${GAP}: sid=${SESSION}\\\\\nHost: h`,
+        `Cookie${GAP}: [redacted]\nHost: h`,
+      ],
+      [
+        "an escaped bracket in a list",
+        `Set-Cookie${GAP}: [a\\[b] sid=${SESSION}\nHost: h`,
+        `Set-Cookie${GAP}: [redacted]\nHost: h`,
+      ],
+      [
+        "an item cut by a line break",
+        `Set-Cookie${GAP}: ["${SESSION}\\\nb]\nHost: h`,
+        `Set-Cookie${GAP}: [redacted]\nHost: h`,
+      ],
+      [
+        "an item after an item cut by a line break",
+        `Set-Cookie${GAP}: ["${SESSION}\\\n"x[y"]\nHost: h`,
+        `Set-Cookie${GAP}: [redacted]\nHost: h`,
+      ],
+      [
+        "an apostrophe in a list that is not an item's quote",
+        `Set-Cookie${GAP}: [it's x] ${SESSION}\nmore\nlines`,
+        `Set-Cookie${GAP}: [redacted]\nmore\nlines`,
+      ],
+      [
+        "a key quoted behind 31 backslashes",
+        `${"\\".repeat(31)}"cookie${"\\".repeat(31)}"${GAP}: sid=${SESSION}`,
+        `${"\\".repeat(31)}"cookie${"\\".repeat(31)}"${GAP}: [redacted]`,
+      ],
     ])("reads %s where only the reader sees the header", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
@@ -737,6 +767,8 @@ describe("redactSecretLike", () => {
         String.raw`\"cookie\": "a" "Cookie": sid=SEKRIT`,
         String.raw`\"cookie\": [redacted]": [redacted]`,
       ],
+      // The regex leaves `"[redacted]` open; the reader takes the open quote with it.
+      ["an unclosed quoted key value", `{"cookie": "sid=SEKRIT`, '{"cookie": [redacted]'],
     ])("redacts %s and reads the result back unchanged", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
