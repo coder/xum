@@ -79,6 +79,9 @@ const MOVED_CREDENTIAL_STORES = [
   { name: "GOENV", value: "go-env", file: "go-env" },
   { name: "npm_config_userconfig", value: "npmrc", file: "npmrc" },
   { name: "NPM_CONFIG_USERCONFIG", value: "npmrc", file: "npmrc" },
+  { name: "Npm_Config_GlobalConfig", value: "npmrc", file: "npmrc" },
+  { name: "NPM_CONFIG_PREFIX", value: "npm", file: "npm/etc/npmrc" },
+  { name: "PREFIX", value: "npm", file: "npm/etc/npmrc" },
 ];
 
 describe("buildAgentSandboxPolicy", () => {

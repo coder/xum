@@ -70,9 +70,7 @@ export function cacheExecutablePaths(env: NodeJS.ProcessEnv = process.env): stri
         ]);
   return dedupe([
     "~/.npm/_npx",
-    // npm reads its config from the environment in either case.
-    ...fromEnv("npm_config_cache", "_npx"),
-    ...fromEnv("NPM_CONFIG_CACHE", "_npx"),
+    ...npmConfigPaths(env, "cache", "_npx"),
     "~/.cache/uv",
     ...fromEnv("XDG_CACHE_HOME", "uv"),
     ...fromEnv("UV_CACHE_DIR"),
@@ -128,6 +126,24 @@ function envPath(env: NodeJS.ProcessEnv, name: string, ...rest: string[]): strin
     throw new AgentSandboxStartError(`${name} is the relative path ${dir}`);
   }
   return [path.join(dir, ...rest)];
+}
+
+/**
+ * envPath() of each variable that npm reads as its `key` setting: npm matches `npm_config_` in
+ * any case, and lowercases the rest with `-` for each later `_` (@npmcli/config loadEnv()).
+ */
+function npmConfigPaths(env: NodeJS.ProcessEnv, key: string, ...rest: string[]): string[] {
+  const prefix = "npm_config_";
+  return Object.keys(env)
+    .filter(
+      (name) =>
+        name.toLowerCase().startsWith(prefix) &&
+        name
+          .slice(prefix.length)
+          .replace(/(?!^)_/g, "-")
+          .toLowerCase() === key
+    )
+    .flatMap((name) => envPath(env, name, ...rest));
 }
 
 /** Environment for sandboxed commands, under the keys srt adds. */
@@ -291,10 +307,13 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     // the folder. Go runs without it: it ignores an env file it cannot read (measured, Go 1.27).
     "~/Library/Application Support/go/env",
     ...(env.GOENV === "off" ? [] : fromEnv("GOENV")),
-    // npm reads registry tokens from the user config that these name, which can be in an open
-    // folder; ~/.npmrc itself is only closed, so extraReadPaths can open it (Codex review).
-    ...fromEnv("npm_config_userconfig"),
-    ...fromEnv("NPM_CONFIG_USERCONFIG"),
+    // npm reads registry tokens from its user and global config, which the environment can move
+    // into an open folder, the global one also through npm's prefix (Codex review). ~/.npmrc
+    // itself is only closed, so extraReadPaths can open it.
+    ...npmConfigPaths(env, "userconfig"),
+    ...npmConfigPaths(env, "globalconfig"),
+    ...npmConfigPaths(env, "prefix", "etc", "npmrc"),
+    ...fromEnv("PREFIX", "etc", "npmrc"),
     `${XUM_HOME_TOKEN}/server.lock`,
     `${XUM_HOME_TOKEN}/providers.jsonc`,
     `${XUM_HOME_TOKEN}/secrets.json`,
