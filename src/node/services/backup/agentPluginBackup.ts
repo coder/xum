@@ -39,6 +39,7 @@ import { BackupServiceError } from "./backupService";
 import {
   assertManagedTreeWithinLimits,
   BACKUP_MANIFEST_FILE,
+  hidesSecretBehindEscapes,
   isFilesystemError,
   lstatIfExists,
   MAX_BACKUP_FILE_BYTES,
@@ -210,27 +211,33 @@ function sourceLeftOutReason(url: string): string | undefined {
 }
 
 /**
- * The portable entry of one install, or null for a plugin the backup leaves out on purpose (logged
- * by name, and listed in the docs). An install the list cannot hold throws instead.
+ * The paths of the fields a list entry fails on, never their values: the log names the plugin and
+ * the field, and a URL or a ref can carry what the user does not want in a log.
  */
-function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | null {
-  // The plugin is logged by name only, so its absence from the backup is explained.
-  const leftOut = sourceLeftOutReason(install.source.url);
-  if (leftOut !== undefined) {
-    log.info(`Leaving a plugin out of the settings backup: ${leftOut}`, { plugin: install.name });
-    return null;
-  }
+function refusedFields(error: z.ZodError): string {
+  return [...new Set(error.issues.map((issue) => issue.path.join(".")))].join(", ");
+}
+
+/** A plugin left out of the list (logged by its name only) or the entry that goes in. */
+type Listing = { entry: BackupPluginEntry } | { leftOut: string };
+
+/**
+ * What the list does with one install. Anything the installer takes and the list cannot hold is
+ * left out, never a failed push: a ref such as `refs/team`, a URL over 2048 characters, a subfolder
+ * over 1024, more than 512 imported skills. One such plugin would otherwise block every settings
+ * backup that has "Agent plugins" on. A plugin that was listed before and is left out now still
+ * asks for the user's approval, as any removal from the list does (`pluginRemovalOf`).
+ */
+function listingOf({ install, generated }: InstallSnapshot): Listing {
+  const urlReason = sourceLeftOutReason(install.source.url);
+  if (urlReason !== undefined) return { leftOut: urlReason };
   // The registry records the repository a marketplace entry resolved to, and the plugin.json keeps
   // only the entry's name. An entry that points at another repository cannot be rebuilt from this
   // row, and telling it from an entry in the marketplace's own repository needs a registry field.
   // The marker is read for this exclusion alone. A plugin's repository can author its own marker,
   // so it can only remove a plugin from the backup, never choose how a restore installs it.
   if (generated?.kind === "claude-marketplace") {
-    log.info(
-      "Leaving a plugin out of the settings backup: Xum generated it from a Claude Code marketplace entry",
-      { plugin: install.name }
-    );
-    return null;
+    return { leftOut: "Xum generated it from a Claude Code marketplace entry" };
   }
   // Only the fields the schema names: consent, install times and auto-update stay local.
   const parsed = InstallablePluginEntrySchema.safeParse({
@@ -240,14 +247,23 @@ function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | n
     importedComponents: install.importedComponents,
   });
   if (!parsed.success) {
-    // A row the restore side would refuse. Leaving it out would drop the plugin from the backup
-    // without a word, so the push fails, like it does for a registry this build cannot read whole.
-    throw new BackupServiceError(
-      "IO_ERROR",
-      `The installed plugin "${install.name}" cannot be listed in the backup: ${formatZodIssues(parsed.error.issues.slice(0, 2))}. ${AGENT_PLUGINS_OFF_HINT}`
-    );
+    return { leftOut: `the backup list cannot hold its ${refusedFields(parsed.error)}` };
   }
-  return parsed.data;
+  // Every field of the entry as the list will write it (the URL, the ref, the folder, the names).
+  if (hidesSecretBehindEscapes(JSON.stringify(parsed.data))) {
+    return { leftOut: "its list entry hides a token behind percent escapes" };
+  }
+  return { entry: parsed.data };
+}
+
+/** The portable entry of one install, or null for a plugin the list leaves out (see `listingOf`). */
+function entryOf(snapshot: InstallSnapshot): BackupPluginEntry | null {
+  const listing = listingOf(snapshot);
+  if ("entry" in listing) return listing.entry;
+  log.info(`Leaving a plugin out of the settings backup: ${listing.leftOut}`, {
+    plugin: snapshot.install.name,
+  });
+  return null;
 }
 
 /**

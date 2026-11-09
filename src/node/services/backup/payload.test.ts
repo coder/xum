@@ -33,6 +33,7 @@ import {
   collectMcpCommandApprovals,
   collectProjectBundle,
   createBackupPayload,
+  hidesSecretBehindEscapes,
   isFilesystemError,
   localOnlyPayloadFiles,
   mergeBackupPreferences,
@@ -5730,6 +5731,34 @@ describe("sanitizeBackupGitRemote", () => {
     ]) {
       expect(sanitizeBackupGitRemote(remote)).toBeUndefined();
     }
+  });
+});
+
+describe("hidesSecretBehindEscapes", () => {
+  const token = `ghp_${"a".repeat(36)}`;
+
+  // The raw scan finds none of these: the escape ends the word before the token or splits the header.
+  it.each([
+    ["a token after an escaped space", `https://h/%20${token}/r.git`],
+    ["a private key header with escaped spaces", "https://h/-----BEGIN%20PRIVATE%20KEY-----/r.git"],
+    ["an escape of an escape", `https://h/%2520${token}/r.git`],
+    ["three levels of escape", `https://h/%252520${token}/r.git`],
+    ["an escape that is cut short", "https://h/%E0%A4%A/r.git"],
+    ["bytes that are not UTF-8", "https://h/%FF/r.git"],
+    ["a malformed escape next to a valid one", "https://h/%zz%20x"],
+  ])("flags %s", (_label, text) => {
+    expect(hidesSecretBehindEscapes(text)).toBe(true);
+  });
+
+  it.each([
+    ["no escape", "https://h/r.git"],
+    ["an escaped space in a project name", "https://dev.azure.com/org/My%20Project/_git/x"],
+    ["an escaped slash and colon", "https://h/a%2Fb%3Ac/r.git"],
+    ["a UTF-8 letter", "https://h/caf%C3%A9/r.git"],
+    ["a percent sign that starts no escape", "https://h/100%/r.git"],
+    ["an escaped percent sign", "https://h/100%25/r.git"],
+  ])("lets %s through", (_label, text) => {
+    expect(hidesSecretBehindEscapes(text)).toBe(false);
   });
 });
 

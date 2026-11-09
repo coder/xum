@@ -317,21 +317,87 @@ describe("backup of the managed plugin list", () => {
         "source.ref",
       ],
       ["a commit that is not a full id", { lockedSha: "abc123" }, "lockedSha"],
+      [
+        "a ref that starts with refs/ (a branch the installer takes)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "refs/team",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a ref with a bidi character (a branch the installer takes)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "ma\u202Ein",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a ref over 256 characters",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "b".repeat(257),
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a folder over 1024 characters",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "main",
+            refType: "branch",
+            subpath: "a".repeat(1025),
+          },
+        },
+        "source.subpath",
+      ],
+      [
+        "an MCP server name over 256 characters",
+        { importedComponents: { skills: [], mcpServers: ["m".repeat(257)] } },
+        "importedComponents.mcpServers",
+      ],
+      [
+        "a URL that starts with a dash (git would read it as an option)",
+        {
+          source: { type: "git", url: "-ux:touch", ref: "main", refType: "branch" },
+        },
+        "source.url",
+      ],
     ])(
-      "refuses the push for a plugin with %s, naming the plugin and the way out",
+      "leaves out a plugin with %s, logs its name and the field, and still pushes the others",
       async (_label, overrides, field) => {
-        await writeRegistry(muxRoot, [registryRow("alpha"), registryRow("too-big", overrides)]);
+        const info = spyOn(log, "info").mockImplementation(() => undefined);
+        await writeRegistry(muxRoot, [registryRow("alpha"), registryRow("held-back", overrides)]);
         const { payload, managed, request } = await prepare();
 
-        const error = (await captureRejection(
-          payload.exportTo({ ...request, contents: DEFAULT_CONTENTS })
-        )) as { code?: string; message: string };
+        await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
 
-        expect(error.code).toBe("IO_ERROR");
-        expect(error.message).toContain('"too-big"');
-        expect(error.message).toContain(field);
-        expect(error.message).toContain('Turning off "Agent plugins"');
-        expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
+        const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
+        expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha"]);
+        const logged = info.mock.calls.filter(([message]) =>
+          String(message).includes("the backup list cannot hold")
+        );
+        expect(logged).toHaveLength(1);
+        expect(String(logged[0]?.[0])).toContain(field);
+        expect(logged[0]?.[1]).toEqual({ plugin: "held-back" });
+        // The log names the plugin and the field, never a URL, a ref or a name it holds.
+        expect(JSON.stringify(info.mock.calls)).not.toContain("github.com");
+        info.mockRestore();
       }
     );
 
@@ -449,6 +515,72 @@ describe("backup of the managed plugin list", () => {
         .filter(([message]) => String(message).includes("as a percent escape"))
         .map(([, fields]) => (fields as { plugin: string }).plugin);
       expect(logged.sort()).toEqual(Object.keys(escapedUrls).sort());
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin that hides a token behind an allowed percent escape, and logs only its name", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const withUrl = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const hiddenUrls = {
+        // `%20` ends the word before the token, so the raw scan finds no `\bghp_`.
+        "token-after-space": `https://example.com/%20ghp_${"a".repeat(36)}/repo.git`,
+        "key-header": "https://example.com/-----BEGIN%20PRIVATE%20KEY-----/repo.git",
+        // An escape of an escape decodes to the token on a second read.
+        "double-escaped": `https://example.com/%2520ghp_${"b".repeat(36)}/repo.git`,
+        // A malformed escape has no reading to rely on.
+        "malformed-escape": "https://example.com/%E0%A4%A/repo.git",
+      };
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        // A `%20` that hides nothing keeps working, and stays in the list.
+        registryRow("spaced", { source: withUrl("https://dev.azure.com/org/My%20Project/_git/x") }),
+        ...Object.entries(hiddenUrls).map(([name, url]) =>
+          registryRow(name, { source: withUrl(url) })
+        ),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      const exported = await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const text = await fs.readFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "utf-8");
+      const sidecar = JSON.parse(text) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha", "spaced"]);
+      expect(text).not.toContain("ghp_");
+      expect(text).not.toContain("PRIVATE");
+      expect(exported.secretFiles).toEqual([]);
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("hides a token behind percent escapes"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(Object.keys(hiddenUrls).sort());
+      // The log names the plugin only: no URL and no token.
+      const everything = JSON.stringify(info.mock.calls);
+      for (const leak of ["ghp_", "PRIVATE", "example.com"]) expect(everything).not.toContain(leak);
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin that hides a token in its ref or its folder behind an escape", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const source = (extra: Record<string, unknown>) => ({
+        type: "git",
+        url: "https://github.com/example/mono.git",
+        ref: "main",
+        refType: "branch",
+        ...extra,
+      });
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        registryRow("ref-token", { source: source({ ref: `%20ghp_${"a".repeat(36)}` }) }),
+        registryRow("folder-token", {
+          source: source({ subpath: `plugins/%20ghp_${"a".repeat(36)}` }),
+        }),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha"]);
+      expect(JSON.stringify(info.mock.calls)).not.toContain("ghp_");
       info.mockRestore();
     });
 
@@ -1544,6 +1676,38 @@ describe("backup of the managed plugin list", () => {
         ]);
 
         expect(removalOf(refused).names).toEqual(["alpha"]);
+      });
+
+      it("pushes a plugin whose ref the list refuses without it, and asks before it drops one that was listed", async () => {
+        const withRef = (name: string, ref: string) =>
+          registryRow(name, {
+            source: {
+              type: "git",
+              url: `https://github.com/example/${name}.git`,
+              ref,
+              refType: "branch",
+            },
+          });
+        await pushFromFirstMachine([withRef("alpha", "main"), withRef("beta", "main")]);
+
+        // The installer takes both of these refs: a branch named refs/team, and one with a bidi mark.
+        const refused = removalOf(
+          await pushFromSecondMachine([
+            withRef("alpha", "main"),
+            withRef("beta", "refs/team"),
+            withRef("gamma", "ma\u202Ein"),
+          ])
+        );
+        // Only the plugin that was listed is named. `gamma` was never in the backup.
+        expect(refused).toMatchObject({ names: ["beta"], wholeList: false, unreadable: false });
+        expect(await listedNames()).toEqual(["alpha", "beta"]);
+
+        const approved = await pushFromSecondMachine(
+          [withRef("alpha", "main"), withRef("beta", "refs/team"), withRef("gamma", "ma\u202Ein")],
+          { approvedPluginRemovalDigest: refused.approval }
+        );
+        expect(approved.success).toBe(true);
+        expect(await listedNames()).toEqual(["alpha"]);
       });
 
       it("pushes once the approval of that removal comes back with it", async () => {
