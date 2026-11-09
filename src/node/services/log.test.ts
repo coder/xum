@@ -109,10 +109,10 @@ describe("log file sink state machine", () => {
     expect(createWriteStreamSpy).toHaveBeenCalledTimes(2);
   });
 
-  test("__closeFileSinkForTests resolves only after the sink's descriptor is closed", async () => {
+  test("__closeFileSinkForTests resolves only after the descriptor is closed and keeps the sink closed", async () => {
     const originalCreateWriteStream = fs.createWriteStream;
     const createdStreams: fs.WriteStream[] = [];
-    spyOn(fs, "createWriteStream").mockImplementation((...args) => {
+    const createWriteStreamSpy = spyOn(fs, "createWriteStream").mockImplementation((...args) => {
       const stream = originalCreateWriteStream(...args);
       createdStreams.push(stream);
       return stream;
@@ -128,8 +128,16 @@ describe("log file sink state machine", () => {
     await __closeFileSinkForTests();
     expect(stream.closed).toBe(true);
 
+    // A line that arrives while the caller deletes the log folder must not reopen the sink.
+    log.info("line after the sink is closed");
+    expect(createWriteStreamSpy).toHaveBeenCalledTimes(1);
+
     // With no sink open there is nothing to wait for.
     await __closeFileSinkForTests();
+
+    __resetFileSinkForTests();
+    log.info("line after the sink is reset");
+    expect(createWriteStreamSpy).toHaveBeenCalledTimes(2);
   });
 
   test("clearLogFiles rejects when truncate fails", async () => {

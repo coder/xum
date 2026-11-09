@@ -371,13 +371,14 @@ export function __resetFileSinkForTests(): void {
 }
 
 /**
- * @internal Test seam: __resetFileSinkForTests, then wait until the open sink's file descriptor
- * is closed. stream.end() only starts that close. A test that deletes the folder holding the log
- * file awaits this first, because Windows cannot delete a file that a stream holds open.
+ * @internal Test seam: close the file sink and wait until its file descriptor is closed.
+ * stream.end() only starts that close. The sink stays closed, so a log line that arrives while
+ * the caller deletes the folder that holds the log file cannot reopen it (Windows cannot delete a
+ * file that a stream holds open). Call __resetFileSinkForTests afterwards to log to a file again.
  */
 export async function __closeFileSinkForTests(): Promise<void> {
   const openStream = fileSinkState.status === "open" ? fileSinkState.stream : null;
-  __resetFileSinkForTests();
+  closeSink();
   if (openStream === null || openStream.closed) return;
   await new Promise<void>((resolve) => openStream.once("close", resolve));
 }

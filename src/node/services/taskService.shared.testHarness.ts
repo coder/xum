@@ -72,10 +72,12 @@ async function releaseIsolation(): Promise<void> {
   const { home } = isolation;
   isolation = undefined;
   // The log file sink opens inside the isolated home. Wait until its descriptor is closed before
-  // that folder is deleted, because Windows cannot delete an open file. The next log line
-  // reopens the sink under the restored home.
+  // that folder is deleted, because Windows cannot delete an open file. The sink stays closed
+  // while the folder goes, so a late log line cannot reopen it. Then the next log line opens it
+  // under the restored home.
   await __closeFileSinkForTests();
   home.restore();
+  __resetFileSinkForTests();
 }
 
 export async function createTaskServiceTestRoot(): Promise<string> {

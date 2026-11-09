@@ -94,20 +94,27 @@ describe("createTaskServiceTestRoot", () => {
     const isolated = os.homedir();
     const open = spyOn(fs, "createWriteStream");
     const realRmSync = fs.rmSync;
-    let sink: fs.WriteStream | undefined;
     let closedWhenHomeDeleted: boolean | undefined;
     const rmSync = spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (String(target) === isolated) closedWhenHomeDeleted = sink?.closed;
+      // Every sink that was ever opened, including one that a late log line reopened.
+      if (String(target) === isolated) {
+        closedWhenHomeDeleted = open.mock.results.every((result) => {
+          return (result.value as fs.WriteStream).closed;
+        });
+      }
       return realRmSync(target, options);
     });
     try {
       log.info("task service test root: the sink opens inside the isolated home");
       expect(open.mock.calls.length).toBe(1);
       expect(String(open.mock.calls[0][0]).startsWith(isolated)).toBe(true);
-      sink = open.mock.results[0].value as fs.WriteStream;
+      const sink = open.mock.results[0].value as fs.WriteStream;
       expect(sink.closed).toBe(false);
+      // Work that a test leaves running can log while the root is being removed.
+      sink.once("close", () => log.info("task service test root: a late log line"));
       await removeTaskServiceTestRoot(root);
       expect(closedWhenHomeDeleted).toBe(true);
+      expect(open.mock.calls.length).toBe(1);
     } finally {
       rmSync.mockRestore();
       open.mockRestore();
@@ -116,26 +123,43 @@ describe("createTaskServiceTestRoot", () => {
     }
   });
 
-  test("closes a log sink that an earlier test opened under the host home", async () => {
-    __resetFileSinkForTests();
-    // Open the sink as an earlier test would, without touching the host's log folder or file.
+  // Writes one log line and returns the sinks it opened. They point at the null device and the log
+  // folder is not created, so the host's log file and folder stay untouched.
+  function logToNullDevice(message: string): fs.WriteStream[] {
     const openStream = fs.createWriteStream;
     const mkdir = spyOn(fs, "mkdirSync").mockImplementation(() => undefined);
     const open = spyOn(fs, "createWriteStream").mockImplementation(() => openStream(os.devNull));
-    let sink: fs.WriteStream;
     try {
-      log.info("task service test root: a sink that an earlier test opened");
-      expect(open.mock.calls.length).toBe(1);
-      sink = open.mock.results[0].value as fs.WriteStream;
+      log.info(message);
+      return open.mock.results.map((result) => result.value as fs.WriteStream);
     } finally {
       open.mockRestore();
       mkdir.mockRestore();
     }
+  }
+
+  test("closes a log sink that an earlier test opened under the host home", async () => {
+    __resetFileSinkForTests();
+    const sinks = logToNullDevice("task service test root: a sink that an earlier test opened");
+    expect(sinks.length).toBe(1);
     const root = await createTaskServiceTestRoot();
     try {
-      expect(sink.writableEnded).toBe(true);
+      expect(sinks[0].writableEnded).toBe(true);
     } finally {
       await removeTaskServiceTestRoot(root);
+      __resetFileSinkForTests();
+    }
+  });
+
+  test("lets the log sink open again once the root is removed", async () => {
+    __resetFileSinkForTests();
+    const root = await createTaskServiceTestRoot();
+    await removeTaskServiceTestRoot(root);
+    try {
+      expect(
+        logToNullDevice("task service test root: a line after the root was removed").length
+      ).toBe(1);
+    } finally {
       __resetFileSinkForTests();
     }
   });
