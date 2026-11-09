@@ -20,6 +20,7 @@ interface Step {
 }
 interface Job {
   if?: string;
+  "timeout-minutes"?: number;
   needs?: string[];
   outputs?: Record<string, string>;
   steps?: Step[];
@@ -82,6 +83,8 @@ describe("the phone chrome check in pr.yml", () => {
 
     expect(runners).toEqual(["test-phone-chrome"]);
     expect(all["test-phone-chrome"]?.if ?? "").not.toContain("e2e_tests");
+    // A hung job holds its runner until GitHub's 6 h limit.
+    expect(all["test-phone-chrome"]?.["timeout-minutes"]).toBeLessThanOrEqual(30);
     expect(all.changes?.outputs?.phone_chrome).toBe("${{ steps.filter.outputs.phone_chrome }}");
   });
 
@@ -151,14 +154,14 @@ describe("the phone chrome check in pr.yml", () => {
     expect(await pathsThatMissTheJob(fixtures)).toEqual([]);
   });
 
-  test("starts when a PR changes a renderer file, the skeleton, or a helper of the generator", async () => {
+  // One real file for each part of the phone page's inputs, the generator's helpers included.
+  async function phonePageFiles(): Promise<string[]> {
     const source = await readFile(path.join(REPO, GENERATOR), "utf8");
     const helpers = [...source.matchAll(/from "\.\/(\w+)"/g)].map(
       (match) => `scripts/perf/${match[1]}.ts`
     );
     expect(helpers.length).toBeGreaterThan(0);
-
-    const missed = await pathsThatMissTheJob([
+    return [
       GENERATOR,
       ...helpers,
       "src/common/staticWorkspaceView/phoneChrome.generated.ts",
@@ -168,18 +171,44 @@ describe("the phone chrome check in pr.yml", () => {
       "src/browser/styles/globals.css",
       "src/constants/layout.ts",
       "src/vite/reactCompilerConfig.ts",
+      "src/node/orpc/staticWorkspaceView/workspaceViewPage.ts",
       "index.html",
       "vite.config.ts",
       "tsconfig.json",
       "patches/react-remove-scroll@2.7.2.patch",
+      "public/service-worker.js",
+      "scripts/precompress-static.ts",
+      "scripts/stamp-service-worker.ts",
       "package.json",
       "bun.lock",
       "Makefile",
       ".github/workflows/pr.yml",
       ".github/actions/setup-xum/action.yml",
       ".github/actions/setup-playwright/action.yml",
-    ]);
+    ];
+  }
 
-    expect(missed).toEqual([]);
+  test("starts when a PR changes a renderer file, the skeleton, or a helper of the generator", async () => {
+    const files = await phonePageFiles();
+    for (const file of files) expect(await Bun.file(path.join(REPO, file)).exists()).toBe(true);
+
+    expect(await pathsThatMissTheJob(files)).toEqual([]);
+  });
+
+  test("keeps every filter entry tied to a file that only it covers", async () => {
+    const patterns = await phoneChromePatterns();
+    const files = [
+      ...(await phonePageFiles()),
+      ...(await readdir(path.join(REPO, "scripts/perf/fixtures/neutralSeed"))).map(
+        (name) => `scripts/perf/fixtures/neutralSeed/${name}`
+      ),
+    ];
+    const entriesWithoutAFile = patterns.filter((pattern) => {
+      const others = patterns.filter((other) => other !== pattern).map((o) => new Bun.Glob(o));
+      return files.every((file) => others.some((glob) => glob.match(file)));
+    });
+
+    // An entry that is dropped from the filter must turn a case above red.
+    expect(entriesWithoutAFile).toEqual([]);
   });
 });

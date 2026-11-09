@@ -127,7 +127,8 @@ jobs:
             # build-renderer`, 2026-11-09), vite builds it with the config and the packages named
             # here, and the generator brings its own seed and token helpers. Server code (src/node,
             # src/cli) only supplies data that the skeleton turns into slots: the merge queue runs the
-            # job for every merge, so a change there that moves the page still stops at the queue.
+            # job for every group that changes code or CI config (the `tests` filter), so a change
+            # there that moves the page still stops at the queue. A group that changes only docs skips it.
             phone_chrome:
               - 'src/browser/**'
               - 'src/common/**'
@@ -894,11 +895,15 @@ jobs:
     # failure names the element and the command that regenerates the skeleton. This was a step of
     # Test / E2E (linux, 1/4), which a PR runs only when it changes e2e_tests: #7993 changed a class
     # in src/browser, skipped that job, and broke main (skipped counts as passing in Required).
-    # Here a PR runs it when phone_chrome matches, and the merge queue runs it for every merge.
+    # Here a PR runs it when phone_chrome matches, and the merge queue runs it for every group that
+    # changes code or CI config (a group that changes only docs skips it).
     # It does not wait for `tests`: index.html, public/ and patches/ build the page too and are in
     # neither the src nor the config filter, so a PR that changes only them has tests false.
     # Like `tests`, it skips the push that the merge queue's own merge makes on main.
     name: Test / Phone chrome
+    # Five runs took 2 min 13 s to 2 min 32 s (the build is 1 of those minutes). 15 minutes is about
+    # 6 times the longest, and a job that hangs holds a runner until GitHub's 6 h limit without it.
+    timeout-minutes: 15
     needs: [changes]
     if: >-
       github.event.inputs.test_filter == '' &&
