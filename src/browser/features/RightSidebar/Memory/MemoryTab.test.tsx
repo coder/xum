@@ -435,11 +435,12 @@ describe("MemoryTab", () => {
         ...DEFAULT_CONSOLIDATION_STATUS,
         workspaceRecord: {
           ...DEFAULT_CONSOLIDATION_RECORD,
+          ops: [{ command: "create", path: "/memories/workspace/notes.md", applied: true }],
           spentUsd: 1.004,
           note: "stopped at the cost ceiling after $1.00",
         },
         // A record written before the cost was measured has none to show.
-        globalRecord: DEFAULT_CONSOLIDATION_RECORD,
+        globalRecord: { ...DEFAULT_CONSOLIDATION_RECORD, lastRunAt: Date.now() - 60_000 },
         latestHarvestRecord: {
           status: "completed",
           startedAt: Date.now(),
@@ -468,6 +469,52 @@ describe("MemoryTab", () => {
     // A touch screen cannot open the tooltip, so the note must wrap instead of truncating.
     expect(workspaceLine.classList.contains("break-words")).toBe(true);
     expect(workspaceLine.classList.contains("truncate")).toBe(false);
+  });
+
+  test("one run under three scopes counts each scope's changes and shows its cost once", async () => {
+    // One organizer pass writes this same record to every scope it covers.
+    const run: MemoryConsolidationRecordPayload = {
+      ...DEFAULT_CONSOLIDATION_RECORD,
+      spentUsd: 0.9,
+      note: "stopped at the cost ceiling after $0.90",
+    };
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        workspaceRecord: run,
+        projectRecord: run,
+        globalRecord: run,
+      },
+    });
+    const { findByText, getByText, getAllByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(/^Workspace: .* · manual · 0 changes$/);
+    expect(getByText(/^Project: /).textContent).toMatch(/ · 0 changes$/);
+    expect(getByText(/^Global: /).textContent).toMatch(/ · 1 change$/);
+    expect(getAllByText(/\$0\.90$/).map((line) => line.textContent)).toEqual([
+      "Run cost (workspace, project, global): $0.90 · stopped at the cost ceiling after $0.90",
+    ]);
+  });
+
+  test("records from different runs keep their own costs", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        workspaceRecord: { ...DEFAULT_CONSOLIDATION_RECORD, spentUsd: 0.5 },
+        projectRecord: { ...DEFAULT_CONSOLIDATION_RECORD, trigger: "archive", spentUsd: 0.25 },
+        globalRecord: {
+          ...DEFAULT_CONSOLIDATION_RECORD,
+          lastRunAt: DEFAULT_CONSOLIDATION_RECORD.lastRunAt - 60_000,
+          spentUsd: 0.75,
+        },
+      },
+    });
+    const { findByText, getByText, queryByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(/^Workspace: .* · manual · 0 changes · \$0\.50$/);
+    expect(getByText(/^Project: /).textContent).toMatch(/ · archive · 0 changes · \$0\.25$/);
+    expect(getByText(/^Global: /).textContent).toMatch(/ · manual · 1 change · \$0\.75$/);
+    expect(queryByText(/^Run cost/)).toBeNull();
   });
 
   test("keeps the candidate wording for a harvest record written before the analyzer", async () => {
