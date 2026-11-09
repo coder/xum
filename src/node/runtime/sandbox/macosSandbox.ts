@@ -59,7 +59,9 @@ const DENIED_RESOLVED_ADDRESSES = [
 
 /**
  * One srt session serves every workspace. Its own allow list stays empty: each command presents
- * the hosts of its project under its unguessable commandId (registerCommandNetworkLists).
+ * the hosts of its project under its unguessable commandId (registerCommandNetworkLists). It
+ * never sets allowAppleEvents: its `lsopen` and coreservicesd rules let `open` start an app,
+ * which runs outside the sandbox (Codex review). Without both, LaunchServices refuses.
  */
 const BASE_SRT_CONFIG: SandboxRuntimeConfig = {
   network: {

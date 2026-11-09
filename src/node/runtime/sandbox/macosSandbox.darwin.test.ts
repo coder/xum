@@ -575,6 +575,45 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(result.exitCode).not.toBe(0);
     });
 
+    // An app that LaunchServices starts runs outside the sandbox, with the user's full access. It
+    // fails once the profile has srt's allowAppleEvents rules (`lsopen` and coreservicesd).
+    it("does not let open start an app in the workspace", async () => {
+      const workspace = path.join(root, "ws");
+      const outside = path.join(root, "outside");
+      await fs.mkdir(workspace);
+      await fs.mkdir(outside);
+      const marker = path.join(outside, "marker");
+      const policy = explicitPolicy(workspace);
+      const plantApp = async (dir: string, id: string) => {
+        const app = path.join(dir, "Planted.app");
+        await fs.mkdir(path.join(app, "Contents", "MacOS"), { recursive: true });
+        await fs.writeFile(
+          path.join(app, "Contents", "Info.plist"),
+          '<?xml version="1.0"?><plist version="1.0"><dict>' +
+            "<key>CFBundleExecutable</key><string>Planted</string>" +
+            `<key>CFBundleIdentifier</key><string>com.xum.sandbox-test.${id}</string>` +
+            "<key>CFBundlePackageType</key><string>APPL</string>" +
+            "<key>LSBackgroundOnly</key><true/></dict></plist>"
+        );
+        const program = path.join(app, "Contents", "MacOS", "Planted");
+        await fs.writeFile(program, `#!/bin/sh\necho started > '${marker}'\n`, { mode: 0o755 });
+        return app;
+      };
+
+      // Precondition: outside the sandbox, open starts such an app, which writes the marker.
+      const control = await plantApp(outside, `control-${process.pid}`);
+      execFileSync("/usr/bin/open", ["-W", "-g", "-j", control], { stdio: "ignore" });
+      expect(await exists(marker)).toBe(true);
+      await fs.rm(marker);
+
+      const planted = await plantApp(workspace, `planted-${process.pid}`);
+      const direct = await runSandboxed(policy, workspace, `echo x > '${marker}'`);
+      expect(direct.exitCode).not.toBe(0);
+      const opened = await runSandboxed(policy, workspace, `/usr/bin/open -W -g -j '${planted}'`);
+      expect(opened.exitCode).not.toBe(0);
+      expect(await exists(marker)).toBe(false);
+    });
+
     describe("network", () => {
       let server: http.Server;
       let port: number;

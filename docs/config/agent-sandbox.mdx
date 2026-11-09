@@ -84,7 +84,7 @@ These files are not open, because they can hold tokens: `~/.npmrc`, `~/.bunfig.t
 
 Xum reads the instruction files of the workspace, such as `AGENTS.md`, as a command in the sandbox would, because a command could replace one with a link to a key. An instruction file that links to a hidden file loads as empty. To load one that links to a file in your home folder, add that file to `extraReadPaths`.
 
-Unix sockets are closed in all network modes, for example the sockets of Docker, `ssh-agent`, 1Password, and `gpg-agent`. The macOS keychain is closed too.
+Unix sockets are closed in all network modes, for example the sockets of Docker, `ssh-agent`, 1Password, and `gpg-agent`. The macOS keychain is closed too, and `open` cannot start an app, which would run outside the sandbox.
 
 ## Network
 
