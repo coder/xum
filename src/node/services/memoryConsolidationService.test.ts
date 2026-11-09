@@ -3469,7 +3469,7 @@ describe("MemoryConsolidationService", () => {
         expect((await harvestRecords(fixture))["summary-1"]).toEqual(live.record);
       });
 
-      it("leaves another backend's live last attempt pending", async () => {
+      it("fails another backend's last attempt only once that backend died", async () => {
         using fixture = await createFixture();
         const metadata = await seedCompactionEpoch(fixture);
         const second = secondBackend(fixture);
@@ -3477,11 +3477,17 @@ describe("MemoryConsolidationService", () => {
         try {
           // Its dream sweep also writes the sidecar: that write must not end the attempt either.
           await second.service.maybeHarvestThenSweep(metadata);
+          expect((await harvestRecords(fixture))["summary-1"]).toEqual(live.record);
         } finally {
-          await live.release();
+          await live.kill();
         }
 
-        expect((await harvestRecords(fixture))["summary-1"]).toEqual(live.record);
+        await second.service.maybeHarvestThenSweep(metadata);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "failed",
+          attemptCount: HARVEST_MAX_ATTEMPTS,
+        });
+        expect(second.counts.analyzerStreams).toBe(0);
       });
 
       it("retries another backend's pending attempt only once that backend died", async () => {

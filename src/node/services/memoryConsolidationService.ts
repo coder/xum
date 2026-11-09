@@ -1984,16 +1984,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const existingAttemptCount = existing?.attemptCount ?? 0;
       const { progress, attemptState } = harvestResumeState(existing);
 
-      // A last attempt still pending is ended only if its job is dead; decided from the record
-      // and the job lock as they are when the write lands, not from the read above.
-      if (existing?.status !== "completed" && existingAttemptCount >= HARVEST_MAX_ATTEMPTS) {
-        yield* self.saveHarvestRecordEffect(
-          workspaceId,
-          boundaryKey,
-          self.unlessLiveAttempt(workspaceId, staleExhaustedHarvestFailure),
-          projectPath
-        );
-      }
+      yield* self.endDeadLastAttemptEffect(source, existing, projectPath);
 
       if (existing?.status !== "completed" && existingAttemptCount < HARVEST_MAX_ATTEMPTS) {
         const startedAt = Date.now();
@@ -2053,6 +2044,27 @@ export class MemoryConsolidationService extends EventEmitter {
           .pipe(Effect.catch(journalHarvestFailure), Effect.catchDefect(journalHarvestFailure));
       }
     });
+  }
+
+  /**
+   * Fails a last attempt that is still pending once its job is dead (staleExhaustedHarvestFailure).
+   * `existing` is the job's read before its turn, which only spares other jobs the sidecar lock:
+   * the write decides from the record and the job lock as they are when it lands.
+   */
+  private endDeadLastAttemptEffect(
+    source: HarvestSource,
+    existing: MemoryHarvestRecord | undefined,
+    projectPath: string
+  ): Effect.Effect<void> {
+    // A last attempt that went stale reads as failed (normalizeHarvestRecord), so not by status.
+    if (existing === undefined || existing.status === "completed") return Effect.void;
+    if (existing.attemptCount < HARVEST_MAX_ATTEMPTS) return Effect.void;
+    return this.saveHarvestRecordEffect(
+      source.workspaceId,
+      source.boundaryKey,
+      this.unlessLiveAttempt(source.workspaceId, staleExhaustedHarvestFailure),
+      projectPath
+    );
   }
 
   /**
