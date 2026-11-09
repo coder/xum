@@ -822,13 +822,15 @@ else:
         # marker, after the review state, before the fold, between the details and summary
         # lines, after the summary line, after the help text and before the closing tag. It also
         # goes in place of the blank line before the closing tag, at the end of the help text,
-        # after the fold and onto the marker's line. It goes in as plain text, as an attribute
-        # and as an HTML comment, since tolerance written for any of those shapes could hide
-        # it. The template carries the three metadata lines (marker, review state, security)
-        # that real folds have once the security review has started. Every such body must
-        # block at once and show the finding: never read completed (0) or running (10). One jq
-        # process applies the gate's own classifier to all of them, since a gate run per body
-        # took minutes; the real gate checks one body per position kind.
+        # at the end of the marker line, of the review state line and of the security line (after
+        # the last character of each, before its newline), after the fold and onto the marker's
+        # line. It goes in as plain text, as an attribute and as an HTML comment, since tolerance
+        # written for any of those shapes could hide it. The template carries the three metadata
+        # lines (marker, review state, security) that real folds have once the security review
+        # has started. Every such body must block at once and show the finding: never read
+        # completed (0) or running (10). One jq process applies the gate's own classifier to
+        # all of them, since a gate run per body took minutes; the real gate checks one body per
+        # position kind.
         finding = "[P1] Validate the caller before reading credentials"
         shapes = {
             "text": finding,
