@@ -10,7 +10,7 @@ import type { MCPSettingValue, MCPSettingsSnapshot } from "@/common/utils/mcpSet
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type { AgentResourceLimitsState } from "@/common/orpc/schemas/agentResourceLimits";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
-import type { AgentSandboxConfig } from "@/common/config/schemas/agentSandbox";
+import { patchAgentSandbox, type AgentSandboxPatch } from "@/common/config/schemas/agentSandbox";
 import type { AgentSandboxState } from "@/common/orpc/schemas/agentSandbox";
 import type { ExperimentId } from "@/common/constants/experiments";
 import type {
@@ -2758,18 +2758,21 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve(agentResourceLimitsState);
       },
     },
+    // Saves are field patches (null removes a field), applied as the backend does.
     agentSandbox: {
       get: () => Promise.resolve(agentSandboxState),
-      set: (sandbox: AgentSandboxConfig) => {
-        agentSandboxState = { ...agentSandboxState, global: sandbox };
+      set: (patch: AgentSandboxPatch) => {
+        const global = patchAgentSandbox(agentSandboxState.global, patch) ?? {};
+        agentSandboxState = { ...agentSandboxState, global };
         return Promise.resolve(agentSandboxState);
       },
-      setProject: (input: { projectPath: string; sandbox: AgentSandboxConfig }) => {
+      setProject: (input: { projectPath: string; sandbox: AgentSandboxPatch }) => {
         const projects = { ...agentSandboxState.projects };
-        if (Object.keys(input.sandbox).length === 0) {
+        const next = patchAgentSandbox(projects[input.projectPath], input.sandbox);
+        if (next === undefined) {
           delete projects[input.projectPath];
         } else {
-          projects[input.projectPath] = input.sandbox;
+          projects[input.projectPath] = next;
         }
         agentSandboxState = { ...agentSandboxState, projects };
         return Promise.resolve(agentSandboxState);
