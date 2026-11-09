@@ -7,6 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import { readdir, readFile } from "node:fs/promises";
 import * as path from "node:path";
+import { runInNewContext } from "node:vm";
 import { parse } from "yaml";
 
 const REPO = path.resolve(import.meta.dir, "../..");
@@ -56,7 +57,7 @@ function gateRuns(gate: string, scenario: Scenario): boolean {
     tests: String(scenario.tests),
     phoneChrome: String(scenario.phoneChrome),
   };
-  return Boolean(new Function("ctx", `return ${js};`)(ctx));
+  return Boolean(runInNewContext(js, { ctx }));
 }
 
 async function phoneChromePatterns(): Promise<string[]> {
