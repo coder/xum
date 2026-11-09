@@ -15,7 +15,7 @@ Xum runs agent files that plugins of other harnesses ship. A foreign plugin agen
 
 Two related designs have their own RFCs:
 
-1. Install method choice, which lets a plugin repository that ships several manifests install through its Claude or Cursor manifest: [`20261106_plugin-install-method-choice.md`](./20261106_plugin-install-method-choice.md).
+1. Install method choice, which lets a plugin repository that ships several manifests install through its Claude or Cursor manifest: [`rfc/20261106_plugin-install-method-choice.md`](https://github.com/coder/xum/blob/plugin-install-method-choice-parked/rfc/20261106_plugin-install-method-choice.md) on branch `plugin-install-method-choice-parked`.
 2. Spawning a foreign agent by its frontmatter `name` (`egm-design`) or by `<plugin>:<name>`: [`20261105_foreign-plugin-agent-aliases.md`](./20261105_foreign-plugin-agent-aliases.md). Its design did not converge in review.
 
 The motivating plugin is egm ([google/elephant-goldfish-model](https://github.com/google/elephant-goldfish-model)), a design-review plugin whose skills spawn persona reviewer agents. The work shipped as two PRs: [#7938](https://github.com/coder/xum/pull/7938) (A2, A4) and [#7939](https://github.com/coder/xum/pull/7939) (A3).
@@ -39,7 +39,7 @@ The motivating plugin is egm ([google/elephant-goldfish-model](https://github.co
 
 **The `egm-in-xum` skill works around it.** That skill, from the Coder team's `coder/fux-plugins` plugin, tells the agent to spawn a generic `explore` child for each reviewer, with a brief that starts "read this persona file". Every review spawn carries that extra brief text, and every egm update needs the mapping checked again.
 
-**A subfolder install reaches egm's Claude manifest.** egm commits a Claude-only package at `distributions/claude/`, and Xum can install a repository subfolder. Once the two gaps are closed, that install gives egm its agents. A plugin that ships all of its manifests in one folder needs install method choice ([`20261106_plugin-install-method-choice.md`](./20261106_plugin-install-method-choice.md)).
+**A subfolder install reaches egm's Claude manifest.** egm commits a Claude-only package at `distributions/claude/`, and Xum can install a repository subfolder. Once the two gaps are closed, that install gives egm its agents. A plugin that ships all of its manifests in one folder needs install method choice ([`rfc/20261106_plugin-install-method-choice.md`](https://github.com/coder/xum/blob/plugin-install-method-choice-parked/rfc/20261106_plugin-install-method-choice.md) on branch `plugin-install-method-choice-parked`).
 
 ## Goals
 
@@ -71,7 +71,7 @@ None.
 
 ## Technical Plan (Architecture)
 
-The plan changes how Xum runs foreign plugin agents, from every plugin source. Part B, which changes which manifest a managed git install loads, is in [`20261106_plugin-install-method-choice.md`](./20261106_plugin-install-method-choice.md).
+The plan changes how Xum runs foreign plugin agents, from every plugin source. Part B, which changes which manifest a managed git install loads, is in [`rfc/20261106_plugin-install-method-choice.md`](https://github.com/coder/xum/blob/plugin-install-method-choice-parked/rfc/20261106_plugin-install-method-choice.md) on branch `plugin-install-method-choice-parked`.
 
 ### Part A: foreign plugin agents
 
