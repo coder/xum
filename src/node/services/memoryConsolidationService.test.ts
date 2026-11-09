@@ -3578,6 +3578,35 @@ describe("MemoryConsolidationService", () => {
         expect((await fsPromises.stat(sidecarPath)).ino).toBe(written.ino);
       });
 
+      it("journals a failed claim over a dead attempt's record, though its own lock is held", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        const dead = await slowChunkInAnotherBackend(fixture, metadata);
+        await dead.kill();
+        const lockTemp = `${sidecarLockPath(fixture.xumHome)}.tmp-`;
+        const { writeFile } = fsPromises;
+        let failClaim = true;
+        // The claim's sidecar write fails; the failure journal after it gets through.
+        const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(async (file, data) => {
+          if (failClaim && typeof file === "string" && file.startsWith(lockTemp)) {
+            failClaim = false;
+            throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+          }
+          return writeFile(file, data);
+        });
+        try {
+          await fixture.service.maybeHarvestThenSweep(metadata);
+        } finally {
+          writeSpy.mockRestore();
+        }
+
+        expect(failClaim).toBe(false);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "failed",
+          attemptCount: 2,
+        });
+      });
+
       it("takes over the sidecar and analyzer locks of a backend that died holding them", async () => {
         using fixture = await createFixture();
         const metadata = await seedCompactionEpoch(fixture);
