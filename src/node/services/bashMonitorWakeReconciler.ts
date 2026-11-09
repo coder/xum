@@ -593,7 +593,9 @@ export class BashMonitorWakeReconciler {
           signal.kind,
           signal.matchOffset,
           signal.terminal?.settledAt,
+          // Every read fact the prompt renders, so a read that lands before acceptance rebuilds it.
           signal.matchedOutputReadPast,
+          signal.unreadBytes,
         ])
       );
       if (state.dispatch?.signature === signature && !state.dispatch.controller.signal.aborted) {
