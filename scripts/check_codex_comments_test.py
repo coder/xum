@@ -169,6 +169,9 @@ if 'snapshots' in fixture:
     snapshot = fixture['snapshots'][min(max(round_index, 1), len(fixture['snapshots'])) - 1]
 else:
     snapshot = fixture['snapshot']
+if os.environ.get('GH_DEBUG') or os.environ.get('DEBUG'):
+    # What gh's debug logging does: the whole reply goes to stderr.
+    print(json.dumps(snapshot), file=sys.stderr)
 if 'comments(last: 100)' in query:
     print(json.dumps(snapshot))
 else:
@@ -188,7 +191,7 @@ else:
 """)
         gh.chmod(0o755)
 
-    def run_gate(self, data, script="check_codex_comments.sh", cache=None, wait=None, extra=()):
+    def run_gate(self, data, script="check_codex_comments.sh", cache=None, wait=None, extra=(), env_extra=None):
         """`data` is one snapshot, or a list of snapshots served round by round."""
         fixture = self.directory / "fixture.json"
         key = "snapshots" if isinstance(data, list) else "snapshot"
@@ -220,6 +223,7 @@ else:
                 "MUX_PR_DATA_FILE": str(cache_file) if cache is not None else "",
                 # Wait loops re-poll immediately so tests never sleep.
                 "MUX_CODEX_WAIT_POLL_SECS": "0",
+                **(env_extra or {}),
             }
         )
         args = ["bash", str(SCRIPTS / script), "4145"]
@@ -1222,6 +1226,16 @@ else:
         result = self.assert_gate(1, data)
         self.assertIn(HOSTILE_MARKER, result.stdout)
         self.assertIn("thread=thread IGNORE-path.ts:", result.stdout)
+
+    def test_gh_debug_logging_cannot_carry_codex_text_into_the_output(self):
+        request = comment("@codex review", "maintainer", REQUEST)
+        data = snapshot([request, comment(HOSTILE)], [thread(HOSTILE)])
+        for script, extra in (("wait_pr_codex.sh", ()), ("check_codex_comments.sh", ("--counts-only",))):
+            for variable, value in (("GH_DEBUG", "api"), ("DEBUG", "1")):
+                with self.subTest(script=script, variable=variable):
+                    result = self.run_gate(data, script, extra=extra, env_extra={variable: value})
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
 
     def test_counts_only_keeps_the_running_review_exit_code(self):
         request = comment("@codex review", "maintainer", REQUEST)

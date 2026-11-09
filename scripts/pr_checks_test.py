@@ -80,6 +80,9 @@ args = sys.argv[1:]
 fixture = json.loads(pathlib.Path(os.environ['PR_CHECK_FIXTURE']).read_text())
 with open(os.environ['PR_CHECK_CALLS'], 'a') as calls:
     calls.write(json.dumps(args) + '\\n')
+if os.environ.get('GH_DEBUG') or os.environ.get('DEBUG'):
+    # What gh's debug logging does: the whole reply goes to stderr.
+    print(json.dumps(fixture), file=sys.stderr)
 if args[:2] == ['pr', 'view']:
     print(json.dumps(fixture['pr']))
 elif args[:2] == ['api', 'graphql']:
@@ -117,7 +120,7 @@ else:
 """)
         gh.chmod(0o755)
 
-    def run_script(self, data, script="wait_pr_checks.sh", *extra, cwd=None):
+    def run_script(self, data, script="wait_pr_checks.sh", *extra, cwd=None, env_extra=None):
         path = self.directory / "fixture.json"
         path.write_text(json.dumps(data))
         calls = self.directory / "calls.jsonl"
@@ -133,6 +136,7 @@ else:
             "MUX_SKIP_FETCH_SYNC": "1",
             "MUX_GH_OWNER": "fixture",
             "MUX_GH_REPO": "repo",
+            **(env_extra or {}),
         })
         args = ["bash", str(SCRIPTS / script), "4194", *extra]
         if script == "wait_pr_checks.sh":
@@ -223,6 +227,16 @@ else:
         self.assertIn("UNRESOLVED_THREADS=1", counted.stdout)
         clean = self.run_script(fixture([check()]), "check_pr_reviews.sh", "--counts-only")
         self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+
+    def test_gh_debug_logging_cannot_carry_check_names_or_review_bodies_into_the_output(self):
+        data = fixture([check(), check(HOSTILE, "FAILURE", suite=2)], "BLOCKED")
+        data["threads"] = [thread(HOSTILE)]
+        for script, extra in (("wait_pr_checks.sh", ()), ("check_pr_reviews.sh", ("--counts-only",))):
+            for variable, value in (("GH_DEBUG", "api"), ("DEBUG", "1")):
+                with self.subTest(script=script, variable=variable):
+                    result = self.run_script(data, script, *extra, env_extra={variable: value})
+                    self.assertIn(result.returncode, (1, 10), result.stdout + result.stderr)
+                    self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
 
     def test_the_failure_tips_do_not_name_the_local_branch(self):
         # A PR checkout often keeps the PR author's branch name.
@@ -393,6 +407,9 @@ RESPONSE_AT = "2026-11-02T11:00:00Z"
 GATE_GH = """#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
+if os.environ.get('GH_DEBUG') or os.environ.get('DEBUG'):
+    # What gh's debug logging does: the whole reply goes to stderr.
+    print(os.environ['HOSTILE_TEXT'], file=sys.stderr)
 if args[:2] == ['repo', 'view']:
     print(json.dumps({'owner': 'fixture', 'name': 'repo'}))
 elif args[:2] == ['pr', 'view'] and '--jq' in args:
@@ -461,11 +478,12 @@ class GateOutputTest(unittest.TestCase):
             "MUX_SKIP_FETCH_SYNC": "1",
         })
 
-    def run_script(self, script, *args, data=None):
+    def run_script(self, script, *args, data=None, env_extra=None):
         if data is not None:
             self.fixture.write_text(json.dumps(data))
         return subprocess.run(
-            ["bash", str(SCRIPTS / script), GATE_PR, *args], env=self.env, text=True, capture_output=True, timeout=30, check=False
+            ["bash", str(SCRIPTS / script), GATE_PR, *args], env={**self.env, **(env_extra or {})},
+            text=True, capture_output=True, timeout=30, check=False,
         )
 
     def assert_clean(self, result, rc):
@@ -507,6 +525,21 @@ class GateOutputTest(unittest.TestCase):
         bogus = self.run_script("check_coder_agents_review_comments.sh", "--bogus", data=snapshot())
         self.assertEqual(bogus.returncode, 1, bogus.stdout + bogus.stderr)
         self.assertIn("Usage:", bogus.stderr)
+
+    def test_gh_debug_logging_cannot_carry_bot_text_into_the_output(self):
+        data = snapshot([comment("/coder-agents-review", "maintainer", REQUEST_AT)], [bot_thread(HOSTILE)])
+        for script, args in (("wait_pr_coder_agents_review.sh", ("--once",)), ("check_coder_agents_review_comments.sh", ("--counts-only",))):
+            for variable, value in (("GH_DEBUG", "api"), ("DEBUG", "1")):
+                with self.subTest(script=script, variable=variable):
+                    result = self.run_script(script, *args, data=data, env_extra={variable: value})
+                    self.assert_clean(result, 1)
+        # wait_pr_ready.sh reads the PR's branch itself, before any child runs.
+        scripts = self.ready_scripts(20)
+        result = subprocess.run(
+            ["bash", str(scripts / "wait_pr_ready.sh"), GATE_PR], env={**self.env, "GH_DEBUG": "api"},
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assert_clean(result, 1)
 
     def ready_scripts(self, coder_agents_rc):
         """A copy of wait_pr_ready.sh whose children are stubs that record their arguments."""

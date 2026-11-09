@@ -9,6 +9,9 @@
 # print them (wait_pr_ready.sh).
 
 set -euo pipefail
+# gh logs whole replies (check names, comment bodies) to stderr under GH_DEBUG or DEBUG. That would
+# bypass what this script prints, so it runs gh without them.
+unset GH_DEBUG DEBUG
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
   echo "Usage: $0 <pr_number> [--counts-only]" >&2

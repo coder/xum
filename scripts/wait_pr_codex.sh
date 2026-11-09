@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# gh logs whole replies (check names, comment bodies) to stderr under GH_DEBUG or DEBUG. That would
+# bypass what this script prints, so it runs gh without them.
+unset GH_DEBUG DEBUG
 
 # Wait for Codex to respond to a `@codex review` request.
 #

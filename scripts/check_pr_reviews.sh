@@ -8,6 +8,9 @@
 # UNRESOLVED_THREADS=<n> and fixed text instead, for gates that must not print them.
 
 set -euo pipefail
+# gh logs whole replies (check names, comment bodies) to stderr under GH_DEBUG or DEBUG. That would
+# bypass what this script prints, so it runs gh without them.
+unset GH_DEBUG DEBUG
 
 if [ $# -eq 0 ]; then
   echo "Usage: $0 <pr_number> [--counts-only]"
