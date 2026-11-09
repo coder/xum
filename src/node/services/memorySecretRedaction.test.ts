@@ -246,6 +246,34 @@ describe("redactSecretLike", () => {
     expect(redactSecretLike(text)).toBe(expected);
   });
 
+  // Markdown emphasis around the name or the separator is how notes and model summaries write a
+  // pair. The value is the word after the emphasis: taking the closing `**` as the value left the
+  // credential readable and broke the Markdown.
+  it.each([
+    [
+      "bold around the name and colon",
+      "**Password:** hunter2-correct-horse",
+      "**Password:** [redacted]",
+    ],
+    [
+      "bold around the name only",
+      "**Password**: hunter2-correct-horse",
+      "**Password**: [redacted]",
+    ],
+    ["italics around the name", "*token*: abcdef123456 next", "*token*: [redacted] next"],
+    ["a bold label in a list", "- **Secret:** abc123def456", "- **Secret:** [redacted]"],
+    [
+      "a bold label in prose (fails closed, Markdown intact)",
+      "- **No credentials:** the files name where secrets live",
+      "- **No credentials:** [redacted] files name where secrets live",
+    ],
+  ])("redacts the value after Markdown emphasis in %s", (_label, text, expected) => {
+    const redacted = redactSecretLike(text);
+
+    expect(redacted).toBe(expected);
+    expect(redactSecretLike(redacted)).toBe(redacted);
+  });
+
   // Text that went through JSON.stringify once more is the same text with every quote and backslash
   // escaped, so redacting it must give the escaped form of what redacting the original gives. The
   // passwords are the shapes that move the value's close: none, an escaped quote, a trailing
@@ -565,6 +593,8 @@ describe("redactSecretLike", () => {
     ["URL schemes with a short userinfo", "://a:".repeat(25_000)],
     ["a keyword followed by whitespace", `token${" ".repeat(100_000)}x`],
     ["account_key", "account_key".repeat(9_000)],
+    ["a keyword and a long run of asterisks", `password${"*".repeat(100_000)}:x`],
+    ["bold keyword labels with no value", "**password:**".repeat(8_000)],
     ["SharedAccessKey", "SharedAccessKey".repeat(6_600)],
     ["shared_access_key_", "shared_access_key_".repeat(5_600)],
     ["SharedAccessKeyName", "SharedAccessKeyName".repeat(5_200)],

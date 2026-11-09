@@ -83,9 +83,15 @@ const ESCAPED_QUOTED_VALUE = String.raw`(?<run>\\{1,${ESCAPE_RUN_MAX}})(?<quote>
 // JSON-escaped text (`\"key\": \"value\"`, the key's closing quote behind a run of backslashes too).
 // The value is a quoted run (to its closing quote, or to the end of an unterminated one) or one
 // unquoted word, optionally behind an auth scheme.
+// Markdown emphasis may wrap the name or the separator (`**Password:** x`, `*token*: x`), as notes
+// and model summaries write it: up to 3 `*` on either side of the separator stay with the name, so
+// the value is the word after them, not the `**` that closes the bold (which left the value
+// readable). Each `*` run is taken whole (`(?!\*)`): a backtrack to part of it would make the
+// rest a value, so `**Password:** [redacted]` would be redacted again. `_` emphasis is already
+// part of a name (`__api_key__:`).
 // Already-redacted values are skipped so the passes compose, and so are comparisons (`token === x`).
 const SECRET_KEY_VALUE_PATTERN = new RegExp(
-  String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}(?:\\{0,${ESCAPE_RUN_MAX}}["']\]?)?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}})` +
+  String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}\*{0,3}(?!\*)(?:\\{0,${ESCAPE_RUN_MAX}}["']\]?)?\s{0,${GAP_MAX}}[:=]\*{0,3}(?!\*)\s{0,${GAP_MAX}})` +
     String.raw`(?![=]|\[redacted\])(?:${QUOTED_VALUE}|${ESCAPED_QUOTED_VALUE}|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+)`,
   "gi"
 );
