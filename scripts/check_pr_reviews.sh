@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Check for unresolved PR review comments
-# Usage: ./scripts/check_pr_reviews.sh <pr_number>
+# Usage: ./scripts/check_pr_reviews.sh <pr_number> [--counts-only]
 # Exits 0 if all resolved, 1 if unresolved comments exist
+#
+# Default output lists each unresolved comment (author and body) and its thread ID: reading
+# them is this script's job. Anyone who can comment writes those bodies. --counts-only prints
+# UNRESOLVED_THREADS=<n> and fixed text instead, for gates that must not print them.
 
 set -euo pipefail
 
 if [ $# -eq 0 ]; then
-  echo "Usage: $0 <pr_number>"
+  echo "Usage: $0 <pr_number> [--counts-only]"
   exit 1
 fi
 
@@ -15,6 +19,18 @@ if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
   echo "❌ PR number must be numeric. Got: '$PR_NUMBER'" >&2
   exit 1
 fi
+shift
+
+COUNTS_ONLY=0
+for arg in "$@"; do
+  if [ "$arg" = "--counts-only" ]; then
+    COUNTS_ONLY=1
+  else
+    echo "❌ Unknown argument: '$arg'" >&2
+    echo "Usage: $0 <pr_number> [--counts-only]" >&2
+    exit 1
+  fi
+done
 
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 UNRESOLVED=""
@@ -221,11 +237,17 @@ if [ "$loaded_from_cache" -eq 1 ]; then
 fi
 
 if [ -n "$UNRESOLVED" ]; then
-  echo "❌ Unresolved review comments found:"
-  echo "$UNRESOLVED" | jq -r '"  \(.user): \(.body)"'
-  echo ""
-  echo "To resolve a comment thread, use:"
-  echo "$UNRESOLVED" | jq -r '"  ./scripts/resolve_pr_comment.sh \(.thread_id)"'
+  if [ "$COUNTS_ONLY" -eq 1 ]; then
+    echo "❌ Unresolved review comments found."
+    echo "UNRESOLVED_THREADS=$(echo "$UNRESOLVED" | jq -s 'length')"
+    echo "Read them with: ./scripts/check_pr_reviews.sh $PR_NUMBER"
+  else
+    echo "❌ Unresolved review comments found:"
+    echo "$UNRESOLVED" | jq -r '"  \(.user): \(.body)"'
+    echo ""
+    echo "To resolve a comment thread, use:"
+    echo "$UNRESOLVED" | jq -r '"  ./scripts/resolve_pr_comment.sh \(.thread_id)"'
+  fi
   echo ""
 
   # Best-effort PR link. If repo context wasn't resolved on this path, fall back to default.

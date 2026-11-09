@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Check for unresolved review comments from coder-agents-review.
-# Usage: ./scripts/check_coder_agents_review_comments.sh <pr_number>
+# Usage: ./scripts/check_coder_agents_review_comments.sh <pr_number> [--counts-only]
 # Exits 0 if all bot-authored review threads are resolved, 1 otherwise.
+#
+# Default output lists each unresolved thread with its path, user and body: reading them is
+# this script's job. The bot quotes PR code, so those bodies carry text that the PR author
+# controls. --counts-only prints the count and fixed text instead, for gates that must not
+# print them (wait_pr_ready.sh).
 
 set -euo pipefail
 
-if [ $# -ne 1 ]; then
-  echo "Usage: $0 <pr_number>" >&2
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  echo "Usage: $0 <pr_number> [--counts-only]" >&2
   exit 1
 fi
 
@@ -14,6 +19,16 @@ PR_NUMBER="$1"
 if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
   echo "❌ PR number must be numeric. Got: '$PR_NUMBER'" >&2
   exit 1
+fi
+
+COUNTS_ONLY=0
+if [ $# -eq 2 ]; then
+  if [ "$2" != "--counts-only" ]; then
+    echo "❌ Unknown argument: '$2'" >&2
+    echo "Usage: $0 <pr_number> [--counts-only]" >&2
+    exit 1
+  fi
+  COUNTS_ONLY=1
 fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -116,7 +131,12 @@ echo "Checking for unresolved coder-agents-review comments in PR #${PR_NUMBER}..
 fetch_unresolved_via_api
 
 if [ -n "$UNRESOLVED" ]; then
-  coder_agents_print_unresolved_threads "$UNRESOLVED"
+  if [ "$COUNTS_ONLY" -eq 1 ]; then
+    echo "❌ Unresolved coder-agents-review threads: $(echo "$UNRESOLVED" | jq -s 'length')"
+    echo "Read them with: ./scripts/check_coder_agents_review_comments.sh $PR_NUMBER"
+  else
+    coder_agents_print_unresolved_threads "$UNRESOLVED"
+  fi
   echo ""
 
   echo "View PR: https://github.com/${OWNER}/${REPO}/pull/$PR_NUMBER"

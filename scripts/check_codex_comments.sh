@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-USAGE="Usage: $0 <pr_number> [--wait-for-review <seconds>]"
+USAGE="Usage: $0 <pr_number> [--wait-for-review <seconds>] [--counts-only]"
+
+# Default output lists every unresolved Codex comment and thread with its body: reading them is
+# this script's job, and CI's Codex Comments job shows them. Codex quotes PR code, so the
+# bodies carry text that the PR author controls. --counts-only prints counts and fixed lines
+# instead, for gates (wait_pr_codex.sh, wait_pr_ready.sh) that must not print them.
 
 # Exit codes: 0 no unresolved Codex comments; 1 unresolved comments or threads;
 # 10 Codex is still reviewing and nothing else blocks (wait_pr_codex.sh keeps
@@ -23,8 +28,13 @@ fi
 # push. Without a wait budget the gate fails on the in-progress summary and nobody
 # re-runs it. The budget only delays the verdict; an unfinished review still fails.
 WAIT_FOR_REVIEW_SECS=0
+COUNTS_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    --counts-only)
+      COUNTS_ONLY=1
+      shift
+      ;;
     --wait-for-review)
       if [ $# -lt 2 ] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
         echo "❌ --wait-for-review requires a non-negative integer number of seconds" >&2
@@ -428,16 +438,20 @@ if [ "$TOTAL_UNRESOLVED" -gt 0 ]; then
   echo ""
   echo "❌ Found ${TOTAL_UNRESOLVED} unresolved comment(s) from Codex in PR #${PR_NUMBER}"
   echo ""
-  echo "Codex comments:"
+  if [ "$COUNTS_ONLY" -eq 1 ]; then
+    echo "Read them with: ./scripts/check_codex_comments.sh $PR_NUMBER"
+  else
+    echo "Codex comments:"
 
-  if [ "$REGULAR_COUNT" -gt 0 ]; then
-    echo "$REGULAR_COMMENTS" | jq -r '.[] | "  - [\(.createdAt)]\n\(.body)\n"'
-  fi
+    if [ "$REGULAR_COUNT" -gt 0 ]; then
+      echo "$REGULAR_COMMENTS" | jq -r '.[] | "  - [\(.createdAt)]\n\(.body)\n"'
+    fi
 
-  if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
-    echo "$UNRESOLVED_THREADS" | jq -r '.[] | "  - [\(.comments.nodes[0].createdAt)] thread=\(.id) \(.comments.nodes[0].path // "comment"):\(.comments.nodes[0].line // "")\n\(.comments.nodes[0].body)\n"'
-    echo ""
-    echo "Resolve review threads with: ./scripts/resolve_pr_comment.sh <thread_id>"
+    if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
+      echo "$UNRESOLVED_THREADS" | jq -r '.[] | "  - [\(.comments.nodes[0].createdAt)] thread=\(.id) \(.comments.nodes[0].path // "comment"):\(.comments.nodes[0].line // "")\n\(.comments.nodes[0].body)\n"'
+      echo ""
+      echo "Resolve review threads with: ./scripts/resolve_pr_comment.sh <thread_id>"
+    fi
   fi
 
   echo ""

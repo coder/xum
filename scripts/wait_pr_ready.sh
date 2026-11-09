@@ -15,6 +15,11 @@ set -euo pipefail
 # It exits immediately on the first terminal failure and succeeds only when
 # all required and active optional gates report success. Pixel review
 # statuses are intentionally ignored by wait_pr_checks.sh.
+#
+# It prints no remote text of its own and forwards each gate's output. The gates print counts
+# and point to the explicit reads: wait_pr_checks.sh <pr> --once --details,
+# check_codex_comments.sh <pr>, check_coder_agents_review_comments.sh <pr>. Steps 5 and 6
+# run those two comment checks with --counts-only for the same reason.
 
 if [ $# -ne 1 ]; then
   echo "Usage: $0 <pr_number>" >&2
@@ -292,7 +297,7 @@ while true; do
     fi
 
     if [ "$CODER_AGENTS_RC" -eq "$RC_PASSED" ]; then
-      if ! CODER_AGENTS_COMMENTS_OUT=$("$CHECK_CODER_AGENTS_COMMENTS_SCRIPT" "$PR_NUMBER" 2>&1); then
+      if ! CODER_AGENTS_COMMENTS_OUT=$("$CHECK_CODER_AGENTS_COMMENTS_SCRIPT" "$PR_NUMBER" --counts-only 2>&1); then
         echo ""
         echo ""
         echo "❌ PR #$PR_NUMBER is not ready."
@@ -314,7 +319,7 @@ while true; do
       CODER_AGENTS_READY_SUMMARY="optional coder-agents-review gate skipped"
     fi
 
-    if CODEX_COMMENTS_OUT=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" 2>&1); then
+    if CODEX_COMMENTS_OUT=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" --counts-only 2>&1); then
       echo ""
       echo ""
       echo "🎉 PR #$PR_NUMBER is ready: Codex gate passed, ${CODER_AGENTS_READY_SUMMARY}, non-visual-review checks passed, and no unresolved Codex comments remain."

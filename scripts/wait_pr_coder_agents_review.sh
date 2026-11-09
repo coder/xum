@@ -404,7 +404,8 @@ classify_bot_text_response() {
     echo "Timestamp: $created_at"
   fi
   echo ""
-  echo "$body"
+  # The bot's text can quote PR code, so this gate points to the read instead of printing it.
+  echo "Read the response with: gh pr view $PR_NUMBER --comments"
   echo ""
   echo "Review the bot response, then reply inline or leave a PR comment summarizing each response before resolving/re-requesting review."
   return 1
@@ -487,7 +488,7 @@ check_coder_agents_status_once() {
     echo ""
     echo "❌ coder-agents-review has ${unresolved_count} unresolved review thread(s)."
     echo ""
-    coder_agents_print_unresolved_threads "$unresolved_threads"
+    echo "Read them with: ./scripts/check_coder_agents_review_comments.sh $PR_NUMBER"
     return 1
   fi
 

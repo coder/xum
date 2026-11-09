@@ -5,6 +5,10 @@ set -euo pipefail
 #
 # Usage: ./scripts/wait_pr_codex.sh <pr_number> [--once]
 #
+# Output carries fixed text, counts, timestamps and GitHub IDs only. Codex comment bodies quote
+# PR code, so an approval prints the comment's time instead of its body, and findings print
+# counts with the explicit read: ./scripts/check_codex_comments.sh <pr_number>
+#
 # Exits:
 #   0 - Codex approved, or reported a usage limit with no outstanding findings
 #   1 - Codex left comments to address OR failed to review for another reason
@@ -354,7 +358,9 @@ record_full_reactions_scan() {
 
 # Sets check_output and check_rc (0 clean, 1 unresolved, 10 review still running).
 run_codex_comments_gate() {
-  if check_output=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" 2>&1); then
+  # --counts-only: the gate prints counts and fixed lines, never a Codex comment body. That keeps
+  # check_output (matched below and printed on failure) free of text that Codex or a PR author wrote.
+  if check_output=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" --counts-only 2>&1); then
     check_rc=0
   else
     check_rc=$?
@@ -381,7 +387,7 @@ CHECK_CODEX_STATUS_ONCE() {
   local all_threads
   local request_at
   local rate_limit_comment
-  local approval_comment
+  local approval_comment_at
   local approval_reaction_at
   local reactions_has_previous
   local all_thumbs_up_reactions
@@ -469,13 +475,14 @@ CHECK_CODEX_STATUS_ONCE() {
     [.[] | select(.createdAt > $request_at and .isMinimized != true and codex_usage_limit($bot))]
     | sort_by(.createdAt) | last // empty | .body // empty')
 
-  approval_comment=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt, body}] | sort_by(.createdAt) | last // empty | .body // empty')
+  # Only the time leaves this jq: the approval comment's body is Codex text.
+  approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
 
-  if [[ -n "$approval_comment" ]]; then
+  if [[ -n "$approval_comment_at" ]]; then
     echo ""
     echo "✅ Codex approved PR #$PR_NUMBER"
     echo ""
-    echo "$approval_comment"
+    echo "Approval comment time: $approval_comment_at"
     return 0
   fi
 

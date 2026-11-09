@@ -2,30 +2,39 @@
 set -euo pipefail
 
 # Wait for PR checks to complete.
-# Usage: ./scripts/wait_pr_checks.sh <pr_number> [--once]
+# Usage: ./scripts/wait_pr_checks.sh <pr_number> [--once] [--details]
+#
+# Default output carries fixed text, counts and GitHub IDs only. Check names, links and
+# descriptions are written by the PR author and by apps that post statuses, so --details
+# is the explicit read that prints them (a table of every failed check, or of every check on
+# a pass). Review comment bodies stay behind ./scripts/check_pr_reviews.sh <pr_number>.
 #
 # Exits:
 #   0 - PR checks and mergeability gates passed
 #   1 - terminal failure (conflicts, failing checks, unresolved comments, etc.)
 #  10 - still waiting for checks/mergeability (only in --once mode)
 
-if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 <pr_number> [--once]"
+if [ $# -lt 1 ] || [ $# -gt 3 ]; then
+  echo "Usage: $0 <pr_number> [--once] [--details]"
   exit 1
 fi
 
 PR_NUMBER=$1
+shift
 MODE="wait"
+DETAILS=0
 
-if [ $# -eq 2 ]; then
-  if [ "$2" = "--once" ]; then
-    MODE="once"
-  else
-    echo "❌ Unknown argument: '$2'" >&2
-    echo "Usage: $0 <pr_number> [--once]" >&2
-    exit 1
-  fi
-fi
+for arg in "$@"; do
+  case "$arg" in
+    --once) MODE="once" ;;
+    --details) DETAILS=1 ;;
+    *)
+      echo "❌ Unknown argument: '$arg'" >&2
+      echo "Usage: $0 <pr_number> [--once] [--details]" >&2
+      exit 1
+      ;;
+  esac
+done
 
 # Polling every 30s reduces GitHub API churn while still giving timely readiness updates.
 POLL_INTERVAL_SECS=30
@@ -173,6 +182,8 @@ CHECK_PR_CHECKS_ONCE() {
   local filtered_count
   local ignored_unready_count
   local ignored_unready_checks
+  local failed_count
+  local pending_count
 
   checks_json=$(fetch_pr_checks "$PR_NUMBER" "$status" 2>&1) || {
     local fetch_status=$?
@@ -192,6 +203,8 @@ CHECK_PR_CHECKS_ONCE() {
   checks=$(echo "$filtered_checks" | jq -r "$jq_defs if length == 0 then \"(no non-visual-review checks reported)\" else .[] | check_line end")
   ignored_unready_count=$(echo "$ignored_checks" | jq "$jq_defs [ .[] | select(is_unready_check) ] | length")
   ignored_unready_checks=$(echo "$ignored_checks" | jq -r "$jq_defs [ .[] | select(is_unready_check) ] | .[]? | check_line")
+  failed_count=$(echo "$filtered_checks" | jq "$jq_defs [ .[] | select(is_failed_check) ] | length")
+  pending_count=$(echo "$filtered_checks" | jq "$jq_defs [ .[] | select(is_pending_check) ] | length")
 
   local has_fail=0
   local has_pending=0
@@ -223,13 +236,18 @@ CHECK_PR_CHECKS_ONCE() {
 
   # Check for failures
   if [ "$has_fail" -eq 1 ]; then
-    echo "❌ Some non-visual-review checks failed:"
-    echo ""
-    echo "$filtered_checks" | jq -r "$jq_defs .[] | select(is_failed_check) | check_line"
-    if [ "$ignored_unready_count" -gt 0 ]; then
+    echo "❌ Some non-visual-review checks failed."
+    echo "FAILED failed=$failed_count pending=$pending_count total=$filtered_count visual_ignored=$ignored_unready_count"
+    if [ "$DETAILS" -eq 1 ]; then
       echo ""
-      echo "ℹ️ Ignoring visual-review unready checks:"
-      echo "$ignored_unready_checks"
+      echo "$filtered_checks" | jq -r "$jq_defs .[] | select(is_failed_check) | check_line"
+      if [ "$ignored_unready_count" -gt 0 ]; then
+        echo ""
+        echo "ℹ️ Ignoring visual-review unready checks:"
+        echo "$ignored_unready_checks"
+      fi
+    else
+      echo "👉 Read the failed checks (name, link, description) with: ./scripts/wait_pr_checks.sh $PR_NUMBER --once --details"
     fi
     echo ""
     echo "💡 To extract detailed logs from the failed run:"
@@ -242,8 +260,8 @@ CHECK_PR_CHECKS_ONCE() {
     echo "   make test"
     echo ""
     echo "💡 To re-run a subset of integration tests faster with workflow_dispatch:"
-    echo "   gh workflow run ci.yml --ref $(git rev-parse --abbrev-ref HEAD) -f test_filter=\"tests/integration/specificTest.test.ts\""
-    echo "   gh workflow run ci.yml --ref $(git rev-parse --abbrev-ref HEAD) -f test_filter=\"-t 'specific test name'\""
+    echo "   gh workflow run ci.yml --ref <branch> -f test_filter=\"tests/integration/specificTest.test.ts\""
+    echo "   gh workflow run ci.yml --ref <branch> -f test_filter=\"-t 'specific test name'\""
     return 1
   fi
 
@@ -251,7 +269,8 @@ CHECK_PR_CHECKS_ONCE() {
   # still BLOCKED. Otherwise wait_pr_ready can spin in pending without surfacing actionable
   # thread IDs to resolve.
   if [ "$has_pass" -eq 1 ] && [ "$has_pending" -eq 0 ] && [ "$has_fail" -eq 0 ]; then
-    if ! reviews_output=$("$CHECK_REVIEWS_SCRIPT" "$PR_NUMBER" 2>&1); then
+    # --counts-only: the child prints UNRESOLVED_THREADS=<n>, not the review comment bodies.
+    if ! reviews_output=$("$CHECK_REVIEWS_SCRIPT" "$PR_NUMBER" --counts-only 2>&1); then
       echo ""
       echo "❌ Unresolved review comments found!"
       echo "   👉 Tip: run ./scripts/check_pr_reviews.sh $PR_NUMBER to list them."
@@ -263,12 +282,15 @@ CHECK_PR_CHECKS_ONCE() {
     # prove why GitHub is BLOCKED (for example, an unsatisfied repository rule).
     if [ "$merge_state" = "CLEAN" ] || { [ "$merge_state" = "UNSTABLE" ] && [ "$ignored_unready_count" -gt 0 ]; }; then
       echo "✅ All non-visual-review checks passed!"
-      echo ""
-      echo "$checks"
-      if [ "$ignored_unready_count" -gt 0 ]; then
+      echo "PASSED checks=$filtered_count visual_ignored=$ignored_unready_count"
+      if [ "$DETAILS" -eq 1 ]; then
         echo ""
-        echo "ℹ️ Ignoring visual-review unready checks:"
-        echo "$ignored_unready_checks"
+        echo "$checks"
+        if [ "$ignored_unready_count" -gt 0 ]; then
+          echo ""
+          echo "ℹ️ Ignoring visual-review unready checks:"
+          echo "$ignored_unready_checks"
+        fi
       fi
       echo ""
       echo "✅ PR checks and mergeability gates passed."
