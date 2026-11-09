@@ -60,7 +60,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "Rules for `bash.monitor`:",
       "",
       "- Keep the regex specific enough to avoid wake storms; use `max_events` for noisy logs.",
-      '- The wake carries no output lines. `task_await({ task_ids: ["bash:<id>"], timeout_secs: 0 })` returns, as a tool result, the output after the process\'s read cursor. Every read of the process moves that cursor, a filtered read or a read from another workspace included, so lines that an earlier read returned or dropped do not come back. The wake says when an earlier filtered read or a read from another workspace already moved past the matched lines.',
+      '- The wake carries no output lines. `task_await({ task_ids: ["bash:<id>"], timeout_secs: 0 })` returns, as a tool result, the output after the process\'s read cursor. Every read of the process moves that cursor, a filtered read or a read from another workspace included, so lines that an earlier read returned or dropped do not come back.',
       "- A monitored process wakes the owner at settlement (exit, kill, timeout) even if the filter never matched, so a watcher script that dies unexpectedly cannot strand the agent. Pass `wake_on_exit: false` only when the exit itself is genuinely uninteresting. Monitors retired by `max_events` stop watching entirely and do not exit-wake, and explicit cancellation (`task_stop`, terminate without flush, workspace cleanup) deliberately produces no settlement wake — do not stop a task and then wait on its wake.",
       "- Do not use `bash.monitor` for GitHub checks, mergeability, review state, deploy APIs, or any state that requires polling separate commands. Use a background task/workflow monitor for those.",
       "",

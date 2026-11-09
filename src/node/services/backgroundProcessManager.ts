@@ -279,8 +279,6 @@ export type MonitorWakeDeliveryState =
       readCursorOffset: number;
       /** End of the output the monitor has scanned; absent once the monitor is dropped. */
       outputThroughOffset?: number;
-      /** See BackgroundProcess.hiddenReadThroughOffset; absent until such a read ran. */
-      hiddenReadThroughOffset?: number;
     };
 
 interface MonitorRetainedMatchBatch {
@@ -290,10 +288,6 @@ interface MonitorRetainedMatchBatch {
   matchedThroughOffset: number;
 }
 
-/**
- * Payload for "output:shown": a read changed what the owner saw (shown frontier or terminal
- * status) or skipped output for good (hidden-read mark). Listeners reconcile the owner's wakes.
- */
 export interface OutputShownPayload {
   processId: string;
   processStartTime: number;
@@ -433,14 +427,6 @@ export interface BackgroundProcess {
    * both still report status/exitCode. Consulted when suppressing settlement wakes.
    */
   terminalStatusShownToAgent: boolean;
-  /**
-   * End of the output consumed by reads that do not mark it shown: filtered reads and reads from
-   * another workspace. Output before this offset that no owner read showed was really skipped:
-   * the shared read cursor passed it, so no later read returns it. Kept apart from
-   * shownThroughOffset, which a non-contiguous owner read cannot advance even though it did show
-   * the owner its bytes.
-   */
-  hiddenReadThroughOffset?: number;
   /**
    * Resolves when the current read that must block same-process monitor delivery settles. This
    * includes unfiltered reads, which may advance shownThroughOffset, and filtered task_await reads,
@@ -2798,9 +2784,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // buffered are still unread.
       readCursorOffset: proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8"),
       ...(proc.monitor != null ? { outputThroughOffset: proc.monitor.lastReadOffset } : {}),
-      ...(proc.hiddenReadThroughOffset != null
-        ? { hiddenReadThroughOffset: proc.hiddenReadThroughOffset }
-        : {}),
     });
   }
 
@@ -2818,46 +2801,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       if (state.status === "settled") return state.shownThroughOffset;
       await state.readSettled;
     }
-  }
-
-  /**
-   * Record what one getOutput read consumed: the owner's shown frontier when the read showed the
-   * owner contiguous output, and the hidden-read mark when it could not count as shown. Returns
-   * whether the hidden-read mark moved.
-   */
-  private markReadProgress(
-    proc: BackgroundProcess,
-    filtered: boolean,
-    consumerIsOwner: boolean,
-    shownRegionStart: number
-  ): boolean {
-    const consumedThrough =
-      proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
-    // Advance the monitor's "shown through" mark only on unfiltered reads. A filtered read may have
-    // dropped matched lines, so it must not count as having shown them. End-of-last-complete-line =
-    // read cursor minus the trailing fragment we just buffered (cleared, hence 0, on exit). Offsets
-    // only grow; Math.max guards against any out-of-order/partial call regressing the mark.
-    //
-    // Contiguity guard: outputBytesRead is a shared cursor that *filtered* reads also advance while
-    // dropping non-matching complete lines. If a prior filtered read consumed lines past our last
-    // shown frontier, this read starts beyond that frontier (shownRegionStart > shownThroughOffset)
-    // and those skipped lines were never shown to the agent. Advancing across that gap would let a
-    // wake for filtered-out output be wrongly suppressed, so only advance when this read's content
-    // is contiguous with the frontier. A gap pins the frontier low (safe: it can only over-wake).
-    if (!filtered && consumerIsOwner && shownRegionStart <= proc.shownThroughOffset) {
-      proc.shownThroughOffset = Math.max(proc.shownThroughOffset, consumedThrough);
-    }
-    // A read that cannot count as showing the owner its output (see above) still moves the shared
-    // cursor. The wake uses this mark to tell the owner when matched output was skipped for good.
-    // A capped filtered read keeps the lines past its cut without the lines it dropped between
-    // them, so consumedThrough is no file offset then: the mark waits for a read that is not capped
-    // (it can only under-report a skip, never claim one that did not happen).
-    const marksHidden = filtered ? proc.lastReadCapped !== true : !consumerIsOwner;
-    const hiddenBefore = proc.hiddenReadThroughOffset ?? 0;
-    if (marksHidden) {
-      proc.hiddenReadThroughOffset = Math.max(hiddenBefore, consumedThrough);
-    }
-    return (proc.hiddenReadThroughOffset ?? 0) > hiddenBefore;
   }
 
   /**
@@ -3005,12 +2948,22 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       proc.terminalStatusShownToAgent = true;
     }
 
-    const hiddenReadAdvanced = this.markReadProgress(
-      proc,
-      Boolean(filter),
-      consumerIsOwner,
-      shownRegionStart
-    );
+    // Advance the monitor's "shown through" mark only on unfiltered reads. A filtered read may have
+    // dropped matched lines, so it must not count as having shown them. End-of-last-complete-line =
+    // read cursor minus the trailing fragment we just buffered (cleared, hence 0, on exit). Offsets
+    // only grow; Math.max guards against any out-of-order/partial call regressing the mark.
+    //
+    // Contiguity guard: outputBytesRead is a shared cursor that *filtered* reads also advance while
+    // dropping non-matching complete lines. If a prior filtered read consumed lines past our last
+    // shown frontier, this read starts beyond that frontier (shownRegionStart > shownThroughOffset)
+    // and those skipped lines were never shown to the agent. Advancing across that gap would let a
+    // wake for filtered-out output be wrongly suppressed, so only advance when this read's content
+    // is contiguous with the frontier. A gap pins the frontier low (safe: it can only over-wake).
+    if (!filter && consumerIsOwner && shownRegionStart <= proc.shownThroughOffset) {
+      const shownThrough =
+        proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
+      proc.shownThroughOffset = Math.max(proc.shownThroughOffset, shownThrough);
+    }
 
     log.debug(
       `BackgroundProcessManager.getOutput: read through offset ${proc.outputBytesRead}, returnedChars=${page.output.length}, capped=${capped}`
@@ -3018,15 +2971,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     if (
       proc.shownThroughOffset > shownThroughOffsetBeforeRead ||
-      (proc.terminalStatusShownToAgent && !terminalStatusShownBeforeRead) ||
-      hiddenReadAdvanced
+      (proc.terminalStatusShownToAgent && !terminalStatusShownBeforeRead)
     ) {
       // A wake can queue between sequential task_await reads. Notify the workspace after each
       // frontier advance so it can retract that queued wake before the next turn accepts it.
       // The terminal-shown transition emits too: a filtered post-exit read or a zero-output exit
-      // never advances the offset, yet must still retract a queued settlement wake. A read that
-      // skipped output emits as well, so a wake not yet accepted is rebuilt with that fact (the
-      // only listener reconciles the owner's wakes).
+      // never advances the offset, yet must still retract a queued settlement wake.
       this.emit("output:shown", proc.workspaceId, {
         processId: proc.id,
         processStartTime: proc.startTime,

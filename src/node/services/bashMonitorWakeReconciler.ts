@@ -29,9 +29,13 @@ const RECONCILE_RETRY_MAX_MS = 2_000;
 const BASH_MONITOR_OUTPUT_NOT_COPIED =
   "Xum does not copy process output into this message. A task_await read returns it as a tool result.";
 
-/** Every read shares one cursor per process, so a read that did not mark output shown can pass it. */
-export const BASH_MONITOR_READ_PAST_NOTE =
-  "An earlier filtered read, or a read from another workspace, already moved the read cursor past the matched output, so task_await cannot return it.";
+/**
+ * Every read shares one cursor per process, filtered reads and reads from other workspaces
+ * included, so output that one of them passed does not come back. Xum cannot always tell whether
+ * that happened to the matched output, so every wake that names a read says it, true either way.
+ */
+export const BASH_MONITOR_EARLIER_READ_NOTE =
+  "If an earlier read (a filtered read or a read from another workspace) already moved past the matched output, task_await cannot return it.";
 
 export type BashMonitorPendingWakeKind = "match" | "monitor-lost" | "settled";
 
@@ -65,8 +69,6 @@ export type BashMonitorWakeDeliveryState =
       readCursorOffset?: number;
       /** End of the output the monitor has scanned. */
       outputThroughOffset?: number;
-      /** End of the output that filtered or cross-workspace reads consumed. */
-      hiddenReadThroughOffset?: number;
     };
 
 export interface BashMonitorWakeReconcilerProcessManager {
@@ -145,8 +147,6 @@ interface DerivedSignal {
   matchOffset?: number;
   /** Output bytes past the shared read cursor, when the process is still in memory. */
   unreadBytes?: number;
-  /** The read cursor passed the matched output that no owner read marked shown. */
-  matchedOutputReadPast: boolean;
   terminal?: BashMonitorTerminalSummary;
   lost?: WakeLostSummary;
   taskAwaitable: boolean;
@@ -217,27 +217,13 @@ function latestMatchOffset(snapshot: BashMonitorProcessSnapshot): number | undef
   return offsets.length > 0 ? Math.max(...offsets) : undefined;
 }
 
-/** What the wake may say about the shared read cursor: numbers only, never output. */
-function readCursorFacts(
-  matchOffset: number | undefined,
+/** What the wake may say about the shared read cursor: a byte count, never output. */
+function unreadBytesFact(
   readState: SettledDeliveryState | undefined
-): Pick<DerivedSignal, "unreadBytes" | "matchedOutputReadPast"> {
+): Pick<DerivedSignal, "unreadBytes"> {
   const cursor = readState?.readCursorOffset;
-  if (readState == null || cursor == null) return { matchedOutputReadPast: false };
-  return {
-    ...(readState.outputThroughOffset != null
-      ? { unreadBytes: Math.max(0, readState.outputThroughOffset - cursor) }
-      : {}),
-    // Only a read that did not show the owner its output can skip it: an owner read that came
-    // after a filtered one returned its bytes but could not advance shownThroughOffset (see
-    // getOutput's contiguity guard). Definite case only: the whole latest match lies behind that
-    // read; when only part of it does, the next read still returns the latest matched line.
-    matchedOutputReadPast:
-      matchOffset != null &&
-      readState.hiddenReadThroughOffset != null &&
-      readState.shownThroughOffset < matchOffset &&
-      matchOffset <= readState.hiddenReadThroughOffset,
-  };
+  if (cursor == null || readState?.outputThroughOffset == null) return {};
+  return { unreadBytes: Math.max(0, readState.outputThroughOffset - cursor) };
 }
 
 function describeTerminal(terminal: BashMonitorTerminalSummary): string {
@@ -266,7 +252,6 @@ function describeReadState(signal: DerivedSignal): string {
   if (!outputReadable(signal)) return "";
   const parts: string[] = [];
   if (signal.unreadBytes != null) parts.push(`Unread output: ${signal.unreadBytes} bytes`);
-  if (signal.matchedOutputReadPast) parts.push(`Note: ${BASH_MONITOR_READ_PAST_NOTE}`);
   // Only a wake with new matched output may suggest the monitor filter: it drops the other lines
   // for good, so on a settlement-only wake it would discard the final log the agent needs.
   if (
@@ -341,11 +326,13 @@ function buildPrompt(signals: readonly DerivedSignal[]): string {
     "This is a condition-driven wake-up. Continue from this event.",
     BASH_MONITOR_OUTPUT_NOT_COPIED,
   ];
+  let namesRead = false;
   // A read call for a live process with nothing unread would return nothing.
   const liveMatches = matchSignals.filter(
     (signal) => signal.terminal == null && signal.unreadBytes !== 0
   );
   if (liveMatches.length > 0) {
+    namesRead = true;
     closingParts.push(
       `Read the new output with \`${taskAwaitCall(liveMatches.map((signal) => signal.taskId))}\`.`
     );
@@ -355,6 +342,7 @@ function buildPrompt(signals: readonly DerivedSignal[]): string {
     closingParts.push("The settled process(es) produce no further wakes.");
     const awaitable = settled.filter((signal) => signal.taskAwaitable);
     if (awaitable.length > 0) {
+      namesRead = true;
       closingParts.push(
         `Read the final output and status with \`${taskAwaitCall(awaitable.map((signal) => signal.taskId))}\`.`
       );
@@ -365,11 +353,13 @@ function buildPrompt(signals: readonly DerivedSignal[]): string {
   if (runtimeLostSignals.length > 0) {
     const awaitable = runtimeLostSignals.filter(outputReadable);
     if (awaitable.length > 0) {
+      namesRead = true;
       closingParts.push(
         `Use \`${taskAwaitCall(awaitable.map((signal) => signal.taskId))}\` to inspect current output. A failed monitor cannot be re-attached to a running process; terminate and relaunch only if condition-driven wakes are still needed.`
       );
     }
   }
+  if (namesRead) closingParts.push(BASH_MONITOR_EARLIER_READ_NOTE);
   if (restartLostSignals.length > 0) {
     closingParts.push(
       "Monitors lost after restart produce no further wakes and their task IDs are not awaitable. Relaunch the script with the bash tool only if the work is still needed."
@@ -599,8 +589,7 @@ export class BashMonitorWakeReconciler {
           signal.kind,
           signal.matchOffset,
           signal.terminal?.settledAt,
-          // Every read fact the prompt renders, so a read that lands before acceptance rebuilds it.
-          signal.matchedOutputReadPast,
+          // The read fact the prompt renders, so a read that lands before acceptance rebuilds it.
           signal.unreadBytes,
         ])
       );
@@ -1001,7 +990,7 @@ export class BashMonitorWakeReconciler {
       createdAt: snapshot.createdAt,
       kind: "match",
       ...(matchOffset != null ? { matchOffset } : {}),
-      ...readCursorFacts(matchOffset, readState),
+      ...unreadBytesFact(readState),
       ...(snapshot.terminal?.wakeOnExit === true ? { terminal: snapshot.terminal } : {}),
       // Narrowed on purpose: the registry row can still hold failure text and matched lines.
       ...(snapshot.lost != null

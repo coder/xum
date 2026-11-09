@@ -9,7 +9,7 @@ import assert from "@/common/utils/assert";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { BackgroundProcessManager } from "./backgroundProcessManager";
 import {
-  BASH_MONITOR_READ_PAST_NOTE,
+  BASH_MONITOR_EARLIER_READ_NOTE,
   BashMonitorWakeReconciler,
   type BashMonitorWakeDispatch,
 } from "./bashMonitorWakeReconciler";
@@ -96,7 +96,7 @@ describe("bash monitor wake and the shared read cursor", () => {
     return Number(found[1]);
   }
 
-  test("a filtered owner read moves the cursor past the matched line, and the wake says so", async () => {
+  test("a filtered owner read moves the cursor past the matched line, and the wake offers no read", async () => {
     const marker = `MARKER_FILTERED_${runId}`;
     const processId = await spawnMonitored(
       "cursor-filtered",
@@ -109,11 +109,12 @@ describe("bash monitor wake and the shared read cursor", () => {
 
     const prompt = await wakePrompt();
     expect(prompt).not.toContain(marker);
-    expect(prompt).toContain(BASH_MONITOR_READ_PAST_NOTE);
     expect(unreadBytes(prompt)).toBe(0);
+    expect(prompt).not.toContain("task_await({");
+    expect(prompt).not.toContain(BASH_MONITOR_EARLIER_READ_NOTE);
   });
 
-  test("a read from another workspace moves the owner's cursor, and the wake says so", async () => {
+  test("a read from another workspace moves the owner's cursor, and the wake offers no read", async () => {
     const marker = `MARKER_PARENT_${runId}`;
     const processId = await spawnMonitored(
       "cursor-parent",
@@ -126,10 +127,12 @@ describe("bash monitor wake and the shared read cursor", () => {
 
     const prompt = await wakePrompt();
     expect(prompt).not.toContain(marker);
-    expect(prompt).toContain(BASH_MONITOR_READ_PAST_NOTE);
+    expect(unreadBytes(prompt)).toBe(0);
+    expect(prompt).not.toContain("task_await({");
+    expect(prompt).not.toContain(BASH_MONITOR_EARLIER_READ_NOTE);
   });
 
-  test("an owner read after a filtered one returns the match, and the wake says nothing was skipped", async () => {
+  test("an owner read after a filtered one returns the match, and the wake offers no read", async () => {
     const marker = `MARKER_GAP_${runId}`;
     const gate = path.join(root, "gate-open");
     const processId = await spawnMonitored(
@@ -152,62 +155,12 @@ describe("bash monitor wake and the shared read cursor", () => {
 
     const prompt = await wakePrompt();
     expect(prompt).not.toContain(marker);
-    expect(prompt).not.toContain(BASH_MONITOR_READ_PAST_NOTE);
     expect(unreadBytes(prompt)).toBe(0);
     // Nothing is unread, so the wake offers no read that would return nothing.
     expect(prompt).not.toContain("task_await({");
   });
 
-  test("a read from another workspace after the wake was built rebuilds the wake before acceptance", async () => {
-    const marker = `MARKER_LATE_${runId}`;
-    const processId = await spawnMonitored("cursor-late", `printf 'RESULT ${marker}\\n'; sleep 30`);
-    await waitForCondition(() => snapshotOf(processId)?.match != null, { timeoutMs: 5_000 });
-    const rebuilt: Array<Promise<void>> = [];
-    manager.on("output:shown", (workspaceId) => {
-      if (workspaceId === owner) rebuilt.push(reconciler.reconcile(owner));
-    });
-
-    await reconciler.reconcile(owner);
-    expect(dispatches).toHaveLength(1);
-    expect(dispatches[0].prompt).not.toContain(BASH_MONITOR_READ_PAST_NOTE);
-
-    // The owner has not accepted the wake yet when another workspace reads the process.
-    expect(await read(processId, parent)).toContain(marker);
-    await waitForCondition(() => rebuilt.length > 0, { timeoutMs: 5_000 });
-    await Promise.all(rebuilt);
-
-    expect(dispatches).toHaveLength(2);
-    expect(dispatches[0].cancelSignal.aborted).toBe(true);
-    expect(dispatches[1].prompt).toContain(BASH_MONITOR_READ_PAST_NOTE);
-  });
-
-  test("a capped filtered read that keeps the matched line is not reported as read past", async () => {
-    const marker = `MARKER_COMPACTED_${runId}`;
-    // The kept lines fill more than one read page, the matched line is kept past the cut, and
-    // the dropped lines after it make the kept buffer much shorter than the span it came from.
-    const processId = await spawnMonitored(
-      "cursor-compacted",
-      `for i in $(seq 1 200); do printf 'keep %0100d\\n' $i; done; echo 'RESULT ${marker} keep'; for i in $(seq 1 400); do printf 'drop %0100d\\n' $i; done; sleep 30`
-    );
-    await waitForCondition(
-      async () => {
-        const proc = await manager.getProcess(processId);
-        const size = proc
-          ? await fs.stat(path.join(proc.outputDir, "output.log")).then((info) => info.size)
-          : 0;
-        return size > 60_000 && snapshotOf(processId)?.match != null;
-      },
-      { timeoutMs: 5_000 }
-    );
-
-    expect(await read(processId, owner, "keep")).not.toContain(marker);
-
-    const prompt = await wakePrompt();
-    expect(prompt).not.toContain(BASH_MONITOR_READ_PAST_NOTE);
-    expect(await read(processId, owner, "keep")).toContain(marker);
-  });
-
-  test("a matched line that a capped read left buffered is not reported as read past", async () => {
+  test("a matched line that a capped read left buffered is still returned by the next read", async () => {
     const marker = `MARKER_BUFFERED_${runId}`;
     const processId = await spawnMonitored(
       "cursor-buffered",
@@ -220,7 +173,6 @@ describe("bash monitor wake and the shared read cursor", () => {
     expect(firstPage).not.toContain(marker);
 
     const prompt = await wakePrompt();
-    expect(prompt).not.toContain(BASH_MONITOR_READ_PAST_NOTE);
     expect(unreadBytes(prompt)).toBeGreaterThan(0);
     expect(await read(processId, owner, ".")).toContain(marker);
   });
@@ -236,9 +188,9 @@ describe("bash monitor wake and the shared read cursor", () => {
 
     const prompt = await wakePrompt();
     expect(prompt).not.toContain(marker);
-    expect(prompt).not.toContain(BASH_MONITOR_READ_PAST_NOTE);
     expect(unreadBytes(prompt)).toBeGreaterThan(fillerBytes);
     expect(prompt).toContain(`filter: ${JSON.stringify("^RESULT ")}`);
+    expect(prompt).toContain(BASH_MONITOR_EARLIER_READ_NOTE);
 
     const firstPage = await read(processId, owner);
     expect(Buffer.byteLength(firstPage, "utf8")).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);

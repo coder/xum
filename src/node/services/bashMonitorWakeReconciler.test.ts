@@ -12,7 +12,7 @@ import type {
   BashMonitorTerminalSummary,
 } from "@/node/services/bashMonitorRegistryStore";
 import {
-  BASH_MONITOR_READ_PAST_NOTE,
+  BASH_MONITOR_EARLIER_READ_NOTE,
   BashMonitorWakeReconciler,
   type BashMonitorProcessSnapshot,
   type BashMonitorWakeDeliveryState,
@@ -933,6 +933,7 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[0].prompt).not.toContain("transport failed");
     expect(dispatches[0].prompt).not.toContain("READY before failure");
     expect(dispatches[0].prompt).not.toContain("process was terminated");
+    expect(dispatches[0].prompt).toContain(BASH_MONITOR_EARLIER_READ_NOTE);
     await dispatches[0].onAccepted();
 
     live = [];
@@ -1016,6 +1017,7 @@ describe("BashMonitorWakeReconciler", () => {
       expect(prompt).toContain("Failed operations: readOutput");
       expect(prompt).not.toContain("Unread output:");
       expect(prompt).not.toContain("task_await({");
+      expect(prompt).not.toContain(BASH_MONITOR_EARLIER_READ_NOTE);
       expect(classifyMachineTurnPromptKind(prompt)).toBe("turn.monitor_wake");
       expect(dispatches[0].muxMetadata.records[0]).toMatchObject({
         kind: "monitor-lost",
@@ -1075,6 +1077,7 @@ describe("BashMonitorWakeReconciler", () => {
     expect(prompt).toContain("Unread output: 200 bytes");
     // The settled process that only the registry still knows has no unread size to report.
     expect(prompt.match(/Unread output:/g)).toHaveLength(1);
+    expect(prompt.split(BASH_MONITOR_EARLIER_READ_NOTE)).toHaveLength(2);
   });
 
   test.each([
@@ -1099,49 +1102,7 @@ describe("BashMonitorWakeReconciler", () => {
       expect(prompt).toContain(`Unread output: ${outputThroughOffset} bytes`);
       if (filteredCall == null) expect(prompt).not.toContain("filter:");
       else expect(prompt).toContain(filteredCall);
-      expect(prompt).not.toContain(BASH_MONITOR_READ_PAST_NOTE);
-    }
-  );
-
-  test.each([
-    ["a hidden read passed the whole match", 0, 12, false, true],
-    ["a hidden read stopped inside the match", 0, 11, false, false],
-    ["an owner read showed the match before it settled", 12, 30, true, false],
-    // A filtered read before the match pinned the shown frontier at 0; an owner read then
-    // returned the match. The cursor is past it, but nothing was skipped.
-    ["only an owner read passed the match", 0, 5, false, false],
-  ] as const)(
-    "read-past note when %s: %p",
-    async (_label, shownThroughOffset, hiddenReadThroughOffset, settled, expected) => {
-      live = [
-        liveSnapshot(
-          settled
-            ? {
-                terminal: {
-                  status: "exited",
-                  exitCode: 0,
-                  settledAt: "2026-08-31T13:00:00.000Z",
-                  wakeOnExit: true,
-                  terminalStatusShown: false,
-                },
-                retired: true,
-              }
-            : {}
-        ),
-      ];
-      deliveryState = {
-        status: "settled",
-        shownThroughOffset,
-        terminalStatusShown: false,
-        readCursorOffset: 30,
-        outputThroughOffset: 40,
-        hiddenReadThroughOffset,
-      };
-
-      await reconciler.reconcile(OWNER);
-
-      expect(dispatches).toHaveLength(1);
-      expect(dispatches[0].prompt.includes(BASH_MONITOR_READ_PAST_NOTE)).toBe(expected);
+      expect(prompt).toContain(BASH_MONITOR_EARLIER_READ_NOTE);
     }
   );
 

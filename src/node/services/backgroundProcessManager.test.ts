@@ -2634,10 +2634,7 @@ describe("BackgroundProcessManager", () => {
         if (ancestorRead.success) expect(ancestorRead.status).toBe("exited");
         expect(proc?.terminalStatusShownToAgent).toBe(false);
         expect(proc?.shownThroughOffset).toBe(0);
-        // The read moved the shared cursor, so the owner hears of it, but nothing counts as shown.
-        expect(
-          shownEvents.map((event) => [event.shownThroughOffset, event.terminalStatusShown])
-        ).toEqual([[0, false]]);
+        expect(shownEvents).toHaveLength(0);
 
         // The owner's own read still marks the terminal status shown and emits the retraction.
         const ownerRead = await manager.getOutput(
@@ -2651,8 +2648,8 @@ describe("BackgroundProcessManager", () => {
         );
         expect(ownerRead.success).toBe(true);
         expect(proc?.terminalStatusShownToAgent).toBe(true);
-        expect(shownEvents).toHaveLength(2);
-        expect(shownEvents[1].terminalStatusShown).toBe(true);
+        expect(shownEvents).toHaveLength(1);
+        expect(shownEvents[0].terminalStatusShown).toBe(true);
       });
     });
   });
