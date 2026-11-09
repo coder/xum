@@ -323,6 +323,16 @@ describe("frame document channel: checks", () => {
     expect(missed).toBe(1);
   });
 
+  test("a deadline that fires late exactly at the cap misses at once", async () => {
+    const { blocked, now } = blockedClock();
+    const { channel } = boundChannel(now);
+    let missed = 0;
+    channel.check(() => missed++);
+    blocked.ms = FRAME_DOCUMENT_CHECK_CAP_MS - FRAME_DOCUMENT_CHECK_DEADLINE_MS;
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    expect(missed).toBe(1);
+  });
+
   test("close stops the deadline", async () => {
     const { channel } = boundChannel();
     let missed = 0;

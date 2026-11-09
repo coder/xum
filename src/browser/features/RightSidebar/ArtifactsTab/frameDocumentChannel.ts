@@ -293,7 +293,7 @@ class DocumentChannel implements FrameDocumentChannel {
   };
 
   private armDeadline(dueAt: number, onMissed: () => void) {
-    const timer = setTimeout(() => this.deadlinePassed(onMissed), Math.max(0, dueAt - this.now()));
+    const timer = setTimeout(() => this.deadlinePassed(onMissed), dueAt - this.now());
     return { dueAt, timer };
   }
 
@@ -315,6 +315,8 @@ class DocumentChannel implements FrameDocumentChannel {
    */
   private deadlinePassed(onMissed: () => void): void {
     const pending = this.pending;
+    // mutation-equivalent: close() and an answer clear the timer, and an extension replaces only
+    // the timer that fired, so a firing timer always finds its check pending on an open channel.
     if (pending == null || this.closed) return;
     const now = this.now();
     const capAt = pending.firstSentAt + FRAME_DOCUMENT_CHECK_CAP_MS;
