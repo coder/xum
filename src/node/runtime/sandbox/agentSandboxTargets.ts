@@ -707,12 +707,14 @@ function resolveSshInclude(pattern: string, file: string): string[] {
   ];
 }
 
+/** The entries that are no folder, also through a link: ssh follows a link a wildcard matches. */
 function childFiles(folder: string): string[] {
   try {
     return fs
       .readdirSync(folder, { withFileTypes: true })
-      .filter((entry) => entry.isFile())
-      .map((entry) => path.join(folder, entry.name));
+      .filter((entry) => !entry.isDirectory())
+      .map((entry) => path.join(folder, entry.name))
+      .filter((child) => statIfExists(child)?.isDirectory() !== true);
   } catch {
     return [];
   }

@@ -34,8 +34,8 @@ export function fileToolSandboxContext(config: ToolConfiguration): FileToolSandb
 }
 
 export const GLOBAL_WRITE_SANDBOX_ERROR =
-  "The agent sandbox blocks changes to Xum's global skills and AGENTS.md: every workspace " +
-  "loads them, also one without the sandbox. Only the user can change them while it is on.";
+  "The agent sandbox blocks changes to Xum's global skills, AGENTS.md and global memory: every " +
+  "workspace loads them, also one without the sandbox. Only the user can change them while it is on.";
 
 /**
  * Whether the agent sandbox covers this workspace while its Xum tools write Xum's home (a system
@@ -43,7 +43,14 @@ export const GLOBAL_WRITE_SANDBOX_ERROR =
  * instructions, also one without the sandbox, so a sandboxed agent must not change them.
  */
 export function sandboxBlocksGlobalWrites(config: ToolConfiguration): boolean {
-  if (config.xumScope?.type !== "global") return false;
+  return config.xumScope?.type === "global" && agentSandboxCoversTools(config);
+}
+
+/**
+ * Whether the agent sandbox covers this workspace's commands. The global memory scope is in the
+ * tool description of every workspace, so a sandboxed agent must not change it either.
+ */
+export function agentSandboxCoversTools(config: ToolConfiguration): boolean {
   return agentSandboxApplies(config.runtime, {
     cwd: config.cwd,
     scratchDir: config.xumEnv?.XUM_SCRATCH_DIR,

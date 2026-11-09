@@ -328,10 +328,12 @@ describe("buildAgentSandboxPolicy", () => {
   test("keeps what npx, uvx and bunx run read-only, and the rest of their caches writable", async () => {
     const home = path.join(root, "home");
     const movedUvCache = path.join(root, "uv-cache");
+    const movedNpmCache = path.join(root, "npm-cache");
     const uid = process.getuid?.() ?? 0;
     await fs.mkdir(path.join(home, ".npm", "_npx"), { recursive: true });
-    const savedUvCacheDir = process.env.UV_CACHE_DIR;
+    const saved = { uv: process.env.UV_CACHE_DIR, npm: process.env.npm_config_cache };
     process.env.UV_CACHE_DIR = movedUvCache;
+    process.env.npm_config_cache = movedNpmCache;
     const homedir = spyOn(os, "homedir").mockReturnValue(home);
     try {
       const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
@@ -343,6 +345,7 @@ describe("buildAgentSandboxPolicy", () => {
         path.join(npm, "_npx", "a", "cli.js"),
         path.join(cache, "uv", "environments-v2", "a", "bin", "tool"),
         path.join(movedUvCache, "archive-v0", "a", "tool.py"),
+        path.join(movedNpmCache, "_npx", "a", "cli.js"),
         path.join(home, ".bun", "install", "cache", "a@1.0.0@@@1", "cli.js"),
         path.join(home, "Library", "Caches", "bun", "@t@", "a.pile"),
         path.join(temp, `bunx-${uid}-a@latest`, "node_modules", ".bin", "a"),
@@ -368,8 +371,13 @@ describe("buildAgentSandboxPolicy", () => {
       ]);
     } finally {
       homedir.mockRestore();
-      if (savedUvCacheDir === undefined) delete process.env.UV_CACHE_DIR;
-      else process.env.UV_CACHE_DIR = savedUvCacheDir;
+      for (const [name, value] of [
+        ["UV_CACHE_DIR", saved.uv],
+        ["npm_config_cache", saved.npm],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     }
   });
 
@@ -541,6 +549,33 @@ describe("buildAgentSandboxPolicy", () => {
       expect(writable("CLAUDE.md")).toBe(false);
       expect(writable("AGENTS.md")).toBe(false);
       expect(writable("notes.md")).toBe(true);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  // ssh follows a link that an Include wildcard matches.
+  test("keeps where a link that an ssh Include wildcard matches leads read-only", async () => {
+    const home = path.join(root, "home");
+    const confD = path.join(home, ".ssh", "conf.d");
+    await fs.mkdir(confD, { recursive: true });
+    await fs.writeFile(path.join(home, ".ssh", "config"), "Include conf.d/*\n");
+    await fs.writeFile(path.join(repo, "proxy.conf"), "Host *\n");
+    await fs.symlink(path.join(repo, "proxy.conf"), path.join(confD, "proxy"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+      const writable = (name: string) =>
+        agentSandboxPolicyAllows(policy, path.join(repo, name), "write");
+      expect(writable("proxy.conf")).toBe(false);
+      expect(writable("notes.md")).toBe(true);
+
+      // A command could make the missing target, which ssh would then read.
+      await fs.symlink(path.join(repo, "later.conf"), path.join(confD, "later"));
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(
+        AgentSandboxStartError
+      );
     } finally {
       homedir.mockRestore();
     }

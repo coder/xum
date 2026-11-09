@@ -62,6 +62,9 @@ export function cacheExecutablePaths(env: NodeJS.ProcessEnv = process.env): stri
         ]);
   return dedupe([
     "~/.npm/_npx",
+    // npm reads its config from the environment in either case.
+    ...fromEnv("npm_config_cache", "_npx"),
+    ...fromEnv("NPM_CONFIG_CACHE", "_npx"),
     "~/.cache/uv",
     ...fromEnv("XDG_CACHE_HOME", "uv"),
     ...fromEnv("UV_CACHE_DIR"),
