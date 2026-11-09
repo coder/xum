@@ -2392,6 +2392,13 @@ describe("TaskService", () => {
             taskExecutionStatus: "running",
           }),
           projectWorkspace(projectPath, "other", "other-333"),
+          // A sibling of the parent: it shares the owner `grand` with the child.
+          projectWorkspace(projectPath, "sibling", "sibling-444", {
+            name: "agent_explore_sibling",
+            parentWorkspaceId: grandId,
+            agentType: "explore",
+            taskStatus: "running",
+          }),
         ],
         testTaskSettings(1, 3)
       );
@@ -2436,6 +2443,16 @@ describe("TaskService", () => {
       ).toBeNull();
       expect(
         await taskService.getDescendantTerminalWorkspaceTurnSnapshot(childId, handleId)
+      ).toBeNull();
+      // The owner stores a handle for a sibling of the parent too. The parent is not an
+      // ancestor of that sibling, so it cannot read it although it shares the owner.
+      await handleStore.upsertWorkspaceTurn({
+        ...failedRecord,
+        handleId: "wst_sibling_turn",
+        workspaceId: "sibling-444",
+      });
+      expect(
+        await taskService.getDescendantTerminalWorkspaceTurnSnapshot(parentId, "wst_sibling_turn")
       ).toBeNull();
     });
   });
