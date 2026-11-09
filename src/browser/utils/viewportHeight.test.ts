@@ -212,6 +212,19 @@ describe("iOS standalone viewport", () => {
     expect(appViewportHeight()).toBe("657px");
   });
 
+  test("keeps the full height when the Duo folds while pinch zoomed in", () => {
+    setStandalone(true);
+    setInnerHeight(678);
+    const viewport = installVisualViewport(339, 2);
+    cleanupSync = installViewportHeightSync();
+
+    viewport.nativeHeight = -33554432;
+    viewport.dispatchEvent(new window.Event("resize"));
+
+    expect(window.visualViewport?.height).toBe(339);
+    expect(appViewportHeight()).toBe("678px");
+  });
+
   test("undoes the window scroll iOS adds for the keyboard, but not a zoomed-in pan", () => {
     setStandalone(true);
     setInnerHeight(657);

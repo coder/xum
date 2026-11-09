@@ -37,7 +37,8 @@ function installVisualViewportHeightFix(): () => void {
       configurable: true,
       get: () => {
         const height = Reflect.get(prototype, "height", viewport) as number;
-        return height > 0 ? height : window.innerHeight;
+        // Visual viewport units shrink with pinch zoom, so the stand-in height must too.
+        return height > 0 ? height : window.innerHeight / viewport.scale;
       },
     });
   } catch (error) {
