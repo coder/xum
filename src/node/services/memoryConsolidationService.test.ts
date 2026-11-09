@@ -3700,6 +3700,48 @@ describe("MemoryConsolidationService", () => {
         expect((await harvestRecords(fixture, "ws-sub"))["summary-1"]).toEqual(live.record);
       });
 
+      it("checks the job lock only once it holds the sidecar lock", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        // A pending record whose job died; its owner's lock is free.
+        const dead = await slowChunkInAnotherBackend(fixture, metadata);
+        await dead.release();
+        // Another backend is writing the sidecar: this job's failure journal waits for it.
+        const releaseSidecar = await acquireCrossProcessLock({
+          lockPath: sidecarLockPath(fixture.xumHome),
+          acquireTimeoutMs: 1_000,
+          staleMs: 60_000,
+          timeoutMessage: "test sidecar holder",
+        });
+        const journalWaits = Promise.withResolvers<void>();
+        const { open } = fsPromises;
+        const openSpy = spyOn(fsPromises, "open").mockImplementation((file, flags, mode) => {
+          if (file === sidecarLockPath(fixture.xumHome)) journalWaits.resolve();
+          return open(file, flags, mode);
+        });
+        let releaseJob: (() => Promise<void>) | undefined;
+        try {
+          fixture.setModelUnavailable(true);
+          const failure = fixture.service.maybeHarvestThenSweep(metadata);
+          await journalWaits.promise;
+          // Meanwhile a job of the owner takes its lock: the record is its own from now on.
+          releaseJob = await acquireCrossProcessLock({
+            lockPath: analyzerJobLockPath(fixture.xumHome, "ws-dream"),
+            acquireTimeoutMs: 1_000,
+            staleMs: 60_000,
+            timeoutMessage: "test job holder",
+          });
+          await releaseSidecar();
+          await failure;
+        } finally {
+          openSpy.mockRestore();
+          await releaseSidecar();
+          await releaseJob?.();
+        }
+
+        expect((await harvestRecords(fixture))["summary-1"]).toEqual(dead.record);
+      });
+
       it("keeps a live job's record past the retention cap until that job ends", async () => {
         using fixture = await createFixture();
         const metadata = await seedCompactionEpoch(fixture);
