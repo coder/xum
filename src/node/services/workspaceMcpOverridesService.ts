@@ -4657,8 +4657,9 @@ export class WorkspaceMcpOverridesService {
     const legacyConfig = snapshot.loadLegacyConfig();
     const legacyById = legacyOverridesById(legacyConfig);
     const all = await snapshot.loadAllMetadata();
-    // After the walk: it is what records which entries were built from config.json alone.
-    this.assertNoLegacyValueOnFallbackRow(legacyConfig, snapshot);
+    // After the walk: it records whether the registry is lenient and which entries it built
+    // from config.json alone.
+    this.assertNoUnreachableLegacyValue(legacyConfig, snapshot);
     // Legacy values are pre-migration leftovers, and only a carrier's sharing
     // matters here: canonicalize the carriers, never every registered
     // checkout (one realpath each made saves at 7,550 workspaces take seconds).
@@ -4700,26 +4701,25 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
-   * Refuses every save while a config row that the lenient walk built from config.json alone
-   * still carries a legacy `workspace.mcp` value. Its id (when the row lacks one), its name and
-   * maybe its runtime live only in its unreadable metadata.json, so neither the id lookups nor the
-   * sharer scan above can tell whether it shares the written checkout: a row without a runtime
-   * gets the default one. Wherever it is, its value could survive a clear and migrate back over
-   * the user's write once the file is readable. A healthy registry builds no such row.
+   * On a degraded host, refuses every save while a config row carries a legacy `workspace.mcp`
+   * value that no id lookup above can reach: a row with no id (a null id counts as none, as
+   * config.json accepts it for a legacy row), or one that the lenient walk built from config.json
+   * alone. Such a row's runtime may live only in an unreadable metadata.json (the walk gives a row
+   * without one the default runtime), so the sharer scan cannot tell whether it shares the written
+   * checkout. Wherever it is, its value could survive a clear and migrate back over the user's
+   * write once the file is readable. A healthy registry skips the check, as on main.
    */
-  private assertNoLegacyValueOnFallbackRow(
+  private assertNoUnreachableLegacyValue(
     legacyConfig: ProjectsConfig,
     snapshot: ConfigSnapshot
   ): void {
-    for (const [projectPath, project] of legacyConfig.projects) {
+    if (!snapshot.lenientRegistry) return;
+    for (const project of legacyConfig.projects.values()) {
       for (const row of project.workspaces) {
         if (row.mcp === undefined) continue;
-        // The walk's fallback id: the row's own, else the generated legacy one (a null id
-        // counts as none, as config.json accepts it for a legacy row).
-        const id = row.id ?? this.config.generateLegacyId(projectPath, row.path);
-        if (snapshot.isFallbackEntry(id)) {
+        if (row.id == null || snapshot.isFallbackEntry(row.id)) {
           throw new Error(
-            `The workspace registered at ${row.path} carries legacy MCP settings, and Xum cannot read its metadata.json to tell whether they belong to this checkout; the settings were not saved. Repair that file, then try again.`
+            `The workspace registered at ${row.path} carries legacy MCP settings that Xum cannot match to a workspace id while a workspace's metadata.json is unreadable; the settings were not saved. Repair the unreadable metadata.json, then try again.`
           );
         }
       }

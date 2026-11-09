@@ -3099,8 +3099,8 @@ describe("WorkspaceMcpOverridesService", () => {
       loadAllMetadata: () =>
         config.getAllWorkspaceMetadata({ throwOnError: true, probeCheckouts: false }),
       canonicalize: (_identity: string, filePath: string) => Promise.resolve(filePath),
-      // A strict registry builds no entry from config.json alone.
-      isFallbackEntry: () => false,
+      // A strict registry: the check for legacy values no id can reach does not run.
+      lenientRegistry: false,
     };
     const written = await internals.getRuntimeAndWorkspacePath("ws-ssh-proj-a");
     const plan = await internals.planSharersLegacyRetirement(
@@ -5302,6 +5302,73 @@ describe("WorkspaceMcpOverridesService", () => {
           ).rejects.toThrow(`The workspace registered at ${legacyPath}`);
         }
         expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
+      }
+    );
+
+    it.each(["malformed", "unreadable"] as const)(
+      "refuses an SSH clear before any write while a nameless row on its checkout has a metadata.json that is %s",
+      async (fileState) => {
+        // The row's runtime lives only in that file, so the walk reads it as a host worktree and
+        // the sharer scan never pairs it with the SSH checkout it really shares.
+        const service = new WorkspaceMcpOverridesService(config);
+        const remotePath = "/remote/proj/branch";
+        const ssh = { type: "ssh", host: "127.0.0.1", port: 1, srcBaseDir: "/remote" } as const;
+        const nameless = {
+          id: "nameless-id",
+          path: remotePath,
+          mcp: { enabledServers: ["legacy-server"] },
+        };
+        await config.editConfig((cfg) => {
+          cfg.projects.set("/fake/proj", {
+            workspaces: [
+              { id: "ssh-ws", name: "branch", path: remotePath, runtimeConfig: ssh },
+              nameless as never,
+            ],
+          });
+          return cfg;
+        });
+        const metadataPath = path.join(
+          config.sessionsDir,
+          config.generateLegacyId("/fake/proj", remotePath),
+          "metadata.json"
+        );
+        if (fileState === "malformed") {
+          await fs.mkdir(path.dirname(metadataPath), { recursive: true });
+          await fs.writeFile(metadataPath, "{ not json");
+        } else {
+          await fs.mkdir(metadataPath, { recursive: true });
+        }
+        // No SSH host answers here: both reads find no document, and a removal is only recorded.
+        const internals = service as unknown as {
+          resolveOverridesFor: () => Promise<unknown>;
+          readOpaqueOverrideFields: () => Promise<unknown>;
+          removeOverridesFile: () => Promise<void>;
+        };
+        const resolveSpy = spyOn(internals, "resolveOverridesFor").mockResolvedValue({
+          overrides: {},
+          authoritative: true,
+        });
+        const readSpy = spyOn(internals, "readOpaqueOverrideFields").mockResolvedValue({
+          kind: "fields",
+          fields: {},
+        });
+        const removeSpy = spyOn(internals, "removeOverridesFile").mockResolvedValue(undefined);
+        try {
+          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+          await expect(service.setOverridesForWorkspace("ssh-ws", {})).rejects.toThrow(
+            `The workspace registered at ${remotePath}`
+          );
+          expect(removeSpy).not.toHaveBeenCalled();
+        } finally {
+          resolveSpy.mockRestore();
+          readSpy.mockRestore();
+          removeSpy.mockRestore();
+        }
+        const rows = config.loadConfigOrDefault().projects.get("/fake/proj")?.workspaces ?? [];
+        expect(rows.map((row) => [row.id, row.mcp])).toEqual([
+          ["ssh-ws", undefined],
+          ["nameless-id", { enabledServers: ["legacy-server"] }],
+        ]);
       }
     );
 
