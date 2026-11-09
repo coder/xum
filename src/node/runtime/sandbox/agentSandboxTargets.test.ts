@@ -773,6 +773,19 @@ describe("buildAgentSandboxPolicy", () => {
     expect(readable(["~/.bunfig.toml"])).toBe(true);
   });
 
+  // Xum reads its config through the link, outside the sandbox, so a command could replace the hop.
+  test("fails closed when a file in Xum's home folder links through a link in a write root", async () => {
+    const xumHome = path.join(root, "xum-home");
+    await fs.mkdir(xumHome);
+    // Any existing file outside the write roots and the home folder.
+    await fs.symlink("/etc/hosts", path.join(repo, "config-alias"));
+    await fs.symlink(path.join(repo, "config-alias"), path.join(xumHome, "config.json"));
+    process.env.XUM_ROOT = xumHome;
+    using _tmpdir = homeOutsideWriteRoots();
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
+  });
+
   // A default macOS volume opens `.XUM/MCP.JSONC` as `.xum/mcp.jsonc`.
   test("keeps protected paths read-only in any case", () => {
     const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
