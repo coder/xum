@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -554,6 +555,34 @@ describe("buildAgentSandboxPolicy", () => {
     }
   });
 
+  // ssh reads the system config too, and looks for its relative includes in /etc/ssh.
+  test("keeps what the system ssh config includes read-only", async () => {
+    const systemConfig = path.join(root, "ssh_config");
+    await fs.writeFile(systemConfig, `Include ${repo}/system.conf ../../${repo}/relative.conf\n`);
+    // Only the system config moves; every other call reaches the real function.
+    const redirected = <F extends (...args: never[]) => unknown>(real: F): F =>
+      ((file: unknown, ...rest: unknown[]) =>
+        (real as unknown as (...args: unknown[]) => unknown)(
+          file === "/etc/ssh/ssh_config" ? systemConfig : file,
+          ...rest
+        )) as unknown as F;
+    const { statSync, readFileSync } = fsSync;
+    const stat = spyOn(fsSync, "statSync").mockImplementation(redirected(statSync));
+    const read = spyOn(fsSync, "readFileSync").mockImplementation(redirected(readFileSync));
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+      const writable = (name: string) =>
+        agentSandboxPolicyAllows(policy, path.join(repo, name), "write");
+
+      expect(writable("system.conf")).toBe(false);
+      expect(writable("relative.conf")).toBe(false);
+      expect(writable("notes.md")).toBe(true);
+    } finally {
+      stat.mockRestore();
+      read.mockRestore();
+    }
+  });
+
   // ssh follows a link that an Include wildcard matches.
   test("keeps where a link that an ssh Include wildcard matches leads read-only", async () => {
     const home = path.join(root, "home");
@@ -810,7 +839,8 @@ describe("agentSandboxSettingsFor several projects", () => {
       fallback: { ...SETTINGS, enabled: false },
       byProject: new Map([
         ["/a", a],
-        ["/b", on({ network: "allowlist", allowedHosts: ["y.dev"], extraWritePaths: ["~/.m2"] })],
+        // Host names match in any case.
+        ["/b", on({ network: "allowlist", allowedHosts: ["Y.dev"], extraWritePaths: ["~/.m2"] })],
         ["/open", on({ network: "open", extraWritePaths: ["~/.m2", "~/.gradle"] })],
         ["/loopback", on({ network: "loopback" })],
       ]),

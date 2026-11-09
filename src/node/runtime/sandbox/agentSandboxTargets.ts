@@ -89,7 +89,11 @@ function strictestSettings(
   return {
     enabled: true,
     network,
-    allowedHosts: network === "allowlist" ? shared(hostLists.map((s) => s.allowedHosts)) : [],
+    // Host names match in any case.
+    allowedHosts:
+      network === "allowlist"
+        ? shared(hostLists.map((s) => s.allowedHosts.map((host) => host.toLowerCase())))
+        : [],
     extraWritePaths: shared(list.map((settings) => settings.extraWritePaths)),
     extraReadPaths: shared(list.map((settings) => settings.extraReadPaths)),
   };
@@ -623,14 +627,18 @@ function gitConfigIncludes(roots: readonly string[], gitDirs: readonly string[])
 }
 
 /**
- * The real paths of what `~/.ssh/config` includes, recursively: a `ProxyCommand` there runs
- * outside the sandbox for Xum's own `git fetch`. A pattern with a wildcard in its last name
- * protects every name in its folder that starts like it.
+ * The real paths of what `~/.ssh/config` and the system `/etc/ssh/ssh_config` include,
+ * recursively: a `ProxyCommand` there runs outside the sandbox for Xum's own `git fetch`. A
+ * pattern with a wildcard in its last name protects every name in its folder that starts like it.
  */
 function sshConfigIncludes(): string[] {
-  return configIncludes([expandSandboxPathSpelling("~/.ssh/config")], (file) =>
-    sshIncludePatterns(readConfigText(file), file).flatMap((pattern) =>
-      resolveSshInclude(pattern, file)
+  // ssh looks for a relative include of the user's config in ~/.ssh, of the system's in /etc/ssh.
+  const configs = [expandSandboxPathSpelling("~/.ssh/config"), "/etc/ssh/ssh_config"];
+  return configs.flatMap((config) =>
+    configIncludes([config], (file) =>
+      sshIncludePatterns(readConfigText(file), file).flatMap((pattern) =>
+        resolveSshInclude(pattern, file, path.dirname(config))
+      )
     )
   );
 }
@@ -688,15 +696,15 @@ function resolveGitInclude(value: string, file: string): string {
 }
 
 /**
- * A relative pattern is in `~/.ssh`. A wildcard in the last name protects every name in the
+ * A relative pattern is in `includeDir`. A wildcard in the last name protects every name in the
  * folder that starts like the pattern and reads those files; anywhere else, or a token or
  * variable (`%d`, `${HOME}`), fails closed.
  */
-function resolveSshInclude(pattern: string, file: string): string[] {
+function resolveSshInclude(pattern: string, file: string, includeDir: string): string[] {
   if (/[%$]/.test(pattern) || /^~[^/]/.test(pattern)) throw unreadableConfig(file, pattern);
   const resolved = pattern.startsWith("~/")
     ? path.join(os.homedir(), pattern.slice(2))
-    : path.resolve(expandSandboxPathSpelling("~/.ssh"), pattern);
+    : path.resolve(includeDir, pattern);
   if (!/[*?[]/.test(resolved)) return [resolved];
   const folder = path.dirname(resolved);
   const literal = /^[^*?[]*/.exec(path.basename(resolved))?.[0] ?? "";

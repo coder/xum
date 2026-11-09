@@ -99,7 +99,7 @@ export interface ExecOptions {
   sandboxRoots?: string[];
   /**
    * Files the sandbox also opens for reads, like extraReadPaths: the chat transcript that a Cursor
-   * hook gets in `transcript_path`, which is in Xum's home folder.
+   * hook gets in `transcript_path`, which is in Xum's home folder, and a tool hook's payload files.
    */
   sandboxReadPaths?: string[];
   /**
