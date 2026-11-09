@@ -1975,6 +1975,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         !matchesOpenPlanTabKeybind(e) ||
         (container != null && isRightSidebarResponsivelyHidden(container)) ||
         isDialogOpen() ||
+        // The command palette renders no modal dialog but keeps its keystrokes: focusing the
+        // panel behind it would take its typing.
+        isCommandPaletteTarget(e.target) ||
         // Remote desktops, browsers and terminals own their keystrokes.
         isTerminalFocused(e.target) ||
         isDesktopViewportFocused(e.target) ||

@@ -20,6 +20,7 @@ import { Checkbox } from "../Checkbox/Checkbox";
 import {
   formatKeybind,
   isBrowserViewportFocused,
+  isCommandPaletteTarget,
   isDesktopViewportFocused,
   isDialogOpen,
   isEditableElement,
@@ -28,6 +29,7 @@ import {
   matchesKeybind,
   matchesOpenPlanTabKeybind,
 } from "@/browser/utils/ui/keybinds";
+import { openPlanTab } from "@/browser/utils/openPlanTab";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
@@ -455,13 +457,18 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         !matchesOpenPlanTabKeybind(e) ||
         isDialogOpen() ||
         !isTimelineSidebarHidden() ||
+        // The command palette renders no modal dialog but keeps its keystrokes.
+        isCommandPaletteTarget(e.target) ||
         isTerminalFocused(e.target) ||
         isDesktopViewportFocused(e.target)
       ) {
         return;
       }
       e.preventDefault();
-      open();
+      // Through the event, so RightSidebar asks the panel for focus as after the wide-layout
+      // shortcut: the full-screen view alone would focus the tab label, outside the panel's
+      // single-key shortcuts. The listener below shows the view.
+      openPlanTab(workspaceId, { focus: true });
     };
     const onOpenPlanTab = (event: Event) => {
       const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
