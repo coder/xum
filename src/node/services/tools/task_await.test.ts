@@ -2203,6 +2203,44 @@ describe("task_await tool", () => {
     });
   });
 
+  it("reads a failed handle the caller owns directly, without the ancestry read", async () => {
+    using tempDir = new TestTempDir("test-task-await-owned-handle");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const failed = {
+      kind: "workspace_turn",
+      handleId: "wst_owned_failed",
+      ownerWorkspaceId: "parent-workspace",
+      workspaceId: "child-workspace",
+      turnId: "turn-failed",
+      status: "error",
+      error: "Provider said: boom",
+      createdAt: "2026-06-19T00:00:00.000Z",
+      updatedAt: "2026-06-19T00:00:10.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    } as const;
+    const readThroughAncestry = mock(() => Promise.resolve(null));
+    const taskServices = createFakeTaskServices({
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+      getWorkspaceTurnSnapshot: mock(
+        (ownerWorkspaceId: string): Promise<WorkspaceTurnTaskHandleRecord | null> =>
+          Promise.resolve(ownerWorkspaceId === "parent-workspace" ? failed : null)
+      ),
+      getDescendantTerminalWorkspaceTurnSnapshot: readThroughAncestry,
+      markWorkspaceTurnTerminalAttentionConsumed: mock(() => Promise.resolve()),
+    });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["wst_owned_failed"], timeout_secs: 0 }, mockToolCallOptions)
+    );
+
+    expect(result).toEqual({
+      results: [{ status: "error", taskId: "wst_owned_failed", error: "Provider said: boom" }],
+    });
+    expect(readThroughAncestry).not.toHaveBeenCalled();
+  });
+
   it("lets an ancestor that does not own a failed handle read its stored error", async () => {
     using tempDir = new TestTempDir("test-task-await-non-owner-handle");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
