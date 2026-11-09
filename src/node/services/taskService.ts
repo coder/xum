@@ -892,6 +892,16 @@ export interface OwnedTaskAttempt {
    * the snapshot. False → this attempt can never produce a cross-process receipt.
    */
   receiptEligible: boolean;
+  /**
+   * The row still read a completed report (`reported`, or `interrupted` with a report time) once
+   * the CAS that published this attempt had written it. A reactivation keeps its predecessor's
+   * terminal status, and a reawakening of a settled reported task keeps it too, so the new attempt
+   * runs on a row that reads reported and that report says nothing about the attempt. A
+   * reawakening of an interrupted row sets it `running` in the same CAS: the value is false then.
+   * In-memory only, read from that CAS (never from the row afterwards, where the report may be
+   * this attempt's own).
+   */
+  readonly inheritedReport: boolean;
 }
 
 /** In-process settlement ledger entry; see AttemptLedger.attemptSettlementByTaskId. */
@@ -986,6 +996,8 @@ interface ReactivationPlan {
 /** What the identity CAS wrote: set inside its config edit, read after it. */
 interface ReactivationCommit {
   committedProven: boolean;
+  /** Whether the row this CAS wrote still reads a completed report (OwnedTaskAttempt.inheritedReport). */
+  inheritedReport: boolean;
   published: boolean;
 }
 
@@ -1100,6 +1112,13 @@ export interface StreamEndDecision {
   readonly attempt: OwnedTaskAttempt | undefined;
   readonly attemptId: string;
   readonly messageId: string;
+  /**
+   * The row's completed report predates this attempt (OwnedTaskAttempt.inheritedReport; always
+   * false for an attempt this process does not own, which has no publishing CAS to read). Only a
+   * report that is not inherited contradicts a `nonreport` decision (see
+   * StreamEndLedger.resolveStreamEndDecision).
+   */
+  readonly inheritedReport: boolean;
   outcome: "pending" | "nonreport" | "published" | "indeterminate";
   /**
    * The session's turn generation the stream ended in (undefined when none was live, or once it
@@ -4081,11 +4100,16 @@ export class TaskService implements AgentTaskIntegration {
     this.taskStopLatch.rebindCapturedTurn(workspaceId, previous, next);
   }
 
-  /** Tests call this; AttemptLedger owns the attempt identity. */
+  /**
+   * Tests call this; AttemptLedger owns the attempt identity. A reservation or launch begins on a
+   * row that has never reported (not yet written, `starting` or `running`), so it passes
+   * `inheritedReport: false`; only the reawakening and reactivation CAS can keep a completed row,
+   * and they pass what they wrote.
+   */
   private beginOwnedTaskAttempt(
     taskId: string,
     source: string,
-    identity: { attemptId: string | undefined; receiptEligible: boolean; abortSignal?: AbortSignal }
+    identity: Parameters<AttemptLedger["beginOwnedTaskAttempt"]>[2]
   ): OwnedTaskAttempt {
     return this.attemptLedger.beginOwnedTaskAttempt(taskId, source, identity);
   }
@@ -7430,6 +7454,7 @@ export class TaskService implements AgentTaskIntegration {
           this.beginOwnedTaskAttempt(plan.taskId, "reservation", {
             attemptId: plan.attemptId,
             receiptEligible: true,
+            inheritedReport: false,
             ...(run.signal != null ? { abortSignal: run.signal } : {}),
           }),
         ];
@@ -8458,6 +8483,7 @@ export class TaskService implements AgentTaskIntegration {
       this.beginOwnedTaskAttempt(plan.taskId, "launch", {
         attemptId: launchAttemptId,
         receiptEligible: launchReceiptEligible,
+        inheritedReport: false,
       });
     }
   }
@@ -9533,6 +9559,7 @@ export class TaskService implements AgentTaskIntegration {
     launch.launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
       attemptId: launch.attemptId,
       receiptEligible: true,
+      inheritedReport: false,
     });
     if (checkout.sourceRuntimeConfigUpdate != null) {
       // Ensure UI gets the updated runtimeConfig for the parent workspace.
@@ -10516,7 +10543,11 @@ export class TaskService implements AgentTaskIntegration {
     plan: ReactivationPlan
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     const { taskId } = plan.params;
-    const commit: ReactivationCommit = { committedProven: false, published: false };
+    const commit: ReactivationCommit = {
+      committedProven: false,
+      inheritedReport: false,
+      published: false,
+    };
     {
       // Critical section (see markInterruptedTaskRunning): the identity CAS, the row check and
       // the ownership install run under the global mutex every cascade's Phase A holds, so no
@@ -10597,6 +10628,9 @@ export class TaskService implements AgentTaskIntegration {
     }
     commit.committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
     if (!commit.committedProven) ws.taskAttemptUnproven = true;
+    // Read here, from the row this CAS wrote: after the commit, a report on the row may be
+    // another backend's report of the fresh attempt.
+    commit.inheritedReport = hasCompletedAgentReport(ws);
     commit.published = true;
   }
 
@@ -10646,6 +10680,7 @@ export class TaskService implements AgentTaskIntegration {
     this.beginOwnedTaskAttempt(taskId, "reactivation", {
       attemptId: reactivationAttemptId,
       receiptEligible: commit.committedProven,
+      inheritedReport: commit.inheritedReport,
     });
     // Live until createWorkspaceTurn returns; its send's admission is the evidence after that.
     this.attemptLedger.beginReawakening(taskId, reactivationAttemptId);
@@ -18871,7 +18906,7 @@ export class TaskService implements AgentTaskIntegration {
     const { taskId } = request;
     this.attemptLedger.publishAttemptRotation(taskId, launch.attemptId);
     if (this.attemptLedger.ownedAttempt(taskId)?.attemptId !== launch.attemptId) {
-      this.beginOwnedTaskAttempt(taskId, "launch", launch);
+      this.beginOwnedTaskAttempt(taskId, "launch", { ...launch, inheritedReport: false });
     }
     plans.push(this.buildQueuedTaskLaunchPlan(request, launch.attemptId, launchLease));
   }
@@ -19225,6 +19260,7 @@ export class TaskService implements AgentTaskIntegration {
     }
     let published = false;
     let committedProven = false;
+    let inheritedReport = false;
     await this.editActiveWorkspaceEntry(
       workspaceId,
       (ws) => {
@@ -19244,6 +19280,9 @@ export class TaskService implements AgentTaskIntegration {
         // downgrade the proof; a proven admission never carries it.
         committedProven = plan.lineage.proven && ws.taskAttemptUnproven !== true;
         if (!committedProven) ws.taskAttemptUnproven = true;
+        // Read here, from the row this CAS wrote: after the commit, a report on the row may be
+        // another backend's report of the fresh attempt.
+        inheritedReport = hasCompletedAgentReport(ws);
         published = true;
       },
       { allowMissing: true }
@@ -19254,7 +19293,7 @@ export class TaskService implements AgentTaskIntegration {
       // and the row moved under this decision (another writer's resume, a stop, a claim).
       return { kind: "refused", message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE };
     }
-    return this.publishReawakenAttempt(plan, committedProven);
+    return this.publishReawakenAttempt(plan, committedProven, inheritedReport);
   }
 
   /**
@@ -19291,7 +19330,8 @@ export class TaskService implements AgentTaskIntegration {
   /** After the CAS: own the fresh attempt only if the durable row still names it. */
   private publishReawakenAttempt(
     plan: ReawakenPlan,
-    committedProven: boolean
+    committedProven: boolean,
+    inheritedReport: boolean
   ): ReawakenRefusal | { kind: "committed" } {
     const { workspaceId, attemptId } = plan;
     // The row names a new attempt now: the earlier attempt's cached report is not its (#7003).
@@ -19321,6 +19361,7 @@ export class TaskService implements AgentTaskIntegration {
     this.beginOwnedTaskAttempt(workspaceId, "reawaken", {
       attemptId,
       receiptEligible: committedProven,
+      inheritedReport,
     });
     // Live until the caller's send binds to it (its admission is the evidence after that).
     this.attemptLedger.beginReawakening(workspaceId, attemptId);

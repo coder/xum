@@ -14,7 +14,8 @@
 // token and the replacement of control characters still run over everything this process prints or
 // writes, as a second layer: a container's stdout and stderr land in the Docker daemon's log.
 //
-// Exit codes: 0 captured. 1 failed. 3 the page shows "<name> failed to load." (as `idle`).
+// Exit codes: 0 captured. 1 failed. 3 the page shows "<name> failed to load." or the boot screen's
+// "Xum could not load" (as `idle`).
 // 4 WebKit did not launch here: the caller tries the next mode.
 import { createRequire } from "node:module";
 import * as fs from "node:fs";
@@ -226,7 +227,7 @@ try {
   const has = (bit) => state !== undefined && (state & bit) !== 0;
   if (has(STATE.chunkFailed)) {
     say(
-      "the page shows '<name> failed to load.': a module fetch from Vite failed. Run the command again."
+      "the page shows '<name> failed to load.' or 'Xum could not load': a module fetch from Vite failed. Run the command again."
     );
     exitCode = EXIT_CHUNK_FAILED;
   } else if (has(STATE.connectionError) || has(STATE.authPrompt)) {

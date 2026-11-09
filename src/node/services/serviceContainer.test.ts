@@ -3,6 +3,7 @@ import { EventEmitter } from "events";
 import { log } from "./log";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { AgentSession } from "./agentSession";
 import * as fs from "fs";
 import * as os from "os";
@@ -1345,6 +1346,10 @@ describe("ServiceContainer", () => {
     expect(services.appFiberScope.state._tag).toBe("Closed");
   });
 
+  // Real work, end to end: a container, a real stream, durable history writes and the analytics
+  // worker's DuckDB shutdown (about 0.2 s of its own). It takes 0.1 to 0.4 s of CPU alone and
+  // 5.2 to 7.0 s with eight busy processes per core, so the default 5 s limit failed it while
+  // nothing was wrong.
   it.each([false, true])(
     "dispose() joins engine and session policy before bridge teardown (session=%s)",
     async (throughSession) => {
@@ -1523,7 +1528,8 @@ describe("ServiceContainer", () => {
             part.type === "text" && part.text === "hello from a stream shutdown must not lose"
         )
       ).toBe(true);
-    }
+    },
+    20_000
   );
 
   it("joins cleanup enqueued by a closing session callback before dependency teardown", async () => {
@@ -1649,6 +1655,18 @@ describe("ServiceContainer", () => {
     // IdleCompactionService.checkAllWorkspaces reads the config synchronously
     // at the start of every check.
     const loadConfigSpy = spyOn(services.config, "loadConfigOrDefault");
+    // HeartbeatService's first tick reads the extension metadata file and then the config, so it
+    // makes a loadConfigOrDefault call of its own. That read is real I/O: with a warm disk cache
+    // the call landed 0.3 to 0.5 ms after the clock advance below, racing the count (CI read 2).
+    // Hold the read until the count is asserted, so the count is the idle worker's alone.
+    const snapshotGate = Promise.withResolvers<void>();
+    const snapshotsSpy = spyOn(
+      ExtensionMetadataService.prototype,
+      "getAllSnapshots"
+    ).mockImplementation(async () => {
+      await snapshotGate.promise;
+      return new Map();
+    });
     // HeartbeatService's observable lifecycle contract: the scheduler fiber is
     // held in `startupTimeout` during the startup delay and moves to
     // `checkInterval` once ticking (same shape heartbeatService.test.ts pins).
@@ -1657,21 +1675,29 @@ describe("ServiceContainer", () => {
       checkInterval: unknown;
     };
 
-    services.idleCompactionService.start();
-    services.heartbeatService.start();
-    expect(loadConfigSpy).not.toHaveBeenCalled();
-    expect(heartbeatInternals.startupTimeout).not.toBeNull();
-    expect(heartbeatInternals.checkInterval).toBeNull();
+    try {
+      services.idleCompactionService.start();
+      services.heartbeatService.start();
+      expect(loadConfigSpy).not.toHaveBeenCalled();
+      expect(heartbeatInternals.startupTimeout).not.toBeNull();
+      expect(heartbeatInternals.checkInterval).toBeNull();
 
-    // Both workers wait one minute before their first tick.
-    await runtime.runPromise(TestClock.adjust(Duration.minutes(1)));
+      // Both workers wait one minute before their first tick.
+      await runtime.runPromise(TestClock.adjust(Duration.minutes(1)));
 
-    expect(loadConfigSpy).toHaveBeenCalledTimes(1);
-    expect(heartbeatInternals.startupTimeout).toBeNull();
-    expect(heartbeatInternals.checkInterval).not.toBeNull();
+      expect(loadConfigSpy).toHaveBeenCalledTimes(1);
+      // The held read is the heartbeat's first tick, so exactly one tick started on the clock.
+      expect(snapshotsSpy).toHaveBeenCalledTimes(1);
+      expect(heartbeatInternals.startupTimeout).toBeNull();
+      expect(heartbeatInternals.checkInterval).not.toBeNull();
 
-    services.heartbeatService.stop();
-    services.idleCompactionService.stop();
+      services.heartbeatService.stop();
+      services.idleCompactionService.stop();
+    } finally {
+      // Let the held tick finish against the stopped service, and give later tests the real read.
+      snapshotGate.resolve();
+      snapshotsSpy.mockRestore();
+    }
   });
 
   it("serves every DI-built ORPC context field through its tag (one instance each)", () => {

@@ -14,7 +14,13 @@ const PARENT = "parent-a";
 const ATTEMPT = "att_00000000000000a1";
 
 function ownedAttempt(receiptEligible = true): OwnedTaskAttempt {
-  return { generation: 1, source: "test", attemptId: ATTEMPT, receiptEligible };
+  return {
+    generation: 1,
+    source: "test",
+    attemptId: ATTEMPT,
+    receiptEligible,
+    inheritedReport: false,
+  };
 }
 
 function send(state: AdmittedSend["state"], attemptId = ATTEMPT): AdmittedSend {
@@ -22,7 +28,14 @@ function send(state: AdmittedSend["state"], attemptId = ATTEMPT): AdmittedSend {
 }
 
 function streamEnd(outcome: StreamEndDecision["outcome"]): StreamEndDecision {
-  return { attempt: undefined, attemptId: ATTEMPT, messageId: "msg-1", outcome, turn: undefined };
+  return {
+    attempt: undefined,
+    attemptId: ATTEMPT,
+    messageId: "msg-1",
+    inheritedReport: false,
+    outcome,
+    turn: undefined,
+  };
 }
 
 /** A config whose only workspace is TASK, with this execution mirror. */

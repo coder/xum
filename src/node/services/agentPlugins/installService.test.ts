@@ -4058,7 +4058,10 @@ describe("AgentPluginInstallService", () => {
         expect(await discovered()).toBe(0);
         await fsPromises.rm(record);
         await oauth.dispose();
-      }
+      },
+      // The setup installs and updates a plugin over git (about 40 git processes), which took
+      // 3 to 5 s on a loaded host against the default 5 s.
+      20_000
     );
 
     test("the retry wait ignores a wall-clock jump (#6627)", async () => {
@@ -7966,7 +7969,9 @@ describe("AgentPluginInstallService", () => {
       expect(consented.lockedSha).toBe(insideHead);
       expect(await installedTree()).toContain("skills/sneak/SKILL.md");
       expect(await stagingLeftovers()).toEqual([]);
-    });
+      // Seven previews, installs and updates stage the plugin over git (about a dozen git
+      // processes each), which took 5 s or more on a loaded host.
+    }, 20_000);
 
     test("a subpath that disappears upstream fails the update without touching the install", async () => {
       const preview = await service.preview({ input: monoUrl, subpath });
