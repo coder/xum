@@ -26,7 +26,7 @@ A sub-project has the setting of its parent project, because its workspaces work
 
 A multi-project workspace uses the strictest setting of its projects, because its commands can change each checkout. The sandbox is on when it is on for one of the projects. Commands can then use only the network mode, hosts, and extra paths that each project with the sandbox on allows. Host names match in any case.
 
-Agent tools cannot change the sandbox setting.
+Agent tools cannot change the sandbox setting. While the setting is on, globally or for one project, the agent's config tool cannot write Xum's config or providers at all, also on another operating system, where commands run without the sandbox.
 
 ## What commands can write
 
@@ -80,13 +80,13 @@ Everything else in `/Users`, `/Volumes`, your home folder (also when it is not i
 - `~/.cache/huggingface/token` (or where `XDG_CACHE_HOME`, `HF_HOME` or `HF_TOKEN_PATH` moves it).
 - `~/.local/share/uv/credentials` (or where `XDG_DATA_HOME` or `UV_CREDENTIALS_DIR` moves it), where `uv auth login` keeps its tokens, so uv in the sandbox cannot use them.
 - `~/Library/Application Support/go/env` (or where `GOENV` moves it), where `go env -w` keeps its settings, which can hold a password in `GOPROXY`. Go in the sandbox runs without them, so set what a build needs, such as `GOPRIVATE` or `GOFLAGS`, in the environment instead.
-- Xum's `server.lock`, `providers.jsonc`, `secrets.json`, `mcp-oauth.json`, and `config.json`, and its `askpass` folder, where your answers to SSH prompts pass.
+- Xum's `server.lock`, `providers.jsonc`, `secrets.json`, `mcp-oauth.json`, and `config.json`, and its `askpass` folder, where your answers to SSH prompts pass. `xum run` and `xum workflow` keep their copy of `config.json`, `providers.jsonc` and `secrets.json` in a temp folder, and that copy is hidden too, with the files whose names start with one of these names and a dot, such as the temp file that Xum writes before it replaces one.
 
 Commands fail to start when one of these files has more than one hard link, because the sandbox hides and protects names, not files, so the other name would open it.
 
 These files are not open, because they can hold tokens: `~/.npmrc`, `~/.bunfig.toml`, `~/.pypirc`, `~/.gradle/gradle.properties`, and `~/.m2/settings.xml`. If a build needs one of them, add it to `extraReadPaths` (see [Open more paths](#open-more-paths)).
 
-Xum reads the instruction files of the workspace, such as `AGENTS.md`, as a command in the sandbox would, because a command could replace one with a link to a key. An instruction file that links to a hidden file loads as empty. To load one that links to a file in your home folder, add that file to `extraReadPaths`.
+Xum reads the instruction files of the workspace, such as `AGENTS.md`, as a command in the sandbox would, because a command could replace one with a link to a key. An instruction file that links to a hidden file loads as empty. To load one that links to a file in your home folder, add that file to `extraReadPaths`. Xum reads the plan file of plan mode the same way, so a plan file that a command replaced with a link to a hidden file cannot be proposed.
 
 Unix sockets are closed in all network modes, for example the sockets of Docker, `ssh-agent`, 1Password, and `gpg-agent`. The macOS keychain is closed too, and `open` cannot start an app, which would run outside the sandbox.
 

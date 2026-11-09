@@ -314,7 +314,7 @@ async function createWorkflowContext(options: {
   const realConfig = realStores.config;
   // Constructed before the try, so the cleanup can always dispose it; a service that never
   // started has nothing to stop.
-  const agentSandbox = new AgentSandboxService(realConfig);
+  const agentSandbox = new AgentSandboxService(realConfig, { privateConfigRoot: tempDir.path });
   let services: WorkflowServices | undefined;
   let session: AgentSession | undefined;
   let codexOauthService: CodexOauthService | undefined;

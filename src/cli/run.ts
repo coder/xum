@@ -634,7 +634,7 @@ async function main(): Promise<number> {
   const agentResourceLimits = new AgentResourceLimitsService(realConfig);
   await agentResourceLimits.start();
   // Likewise the agent sandbox setting, so `xum run` commands get the sandbox Settings saved.
-  const agentSandbox = new AgentSandboxService(realConfig);
+  const agentSandbox = new AgentSandboxService(realConfig, { privateConfigRoot: config.rootDir });
   await agentSandbox.start();
   sandboxApprovalManager.denyAllRequests();
 

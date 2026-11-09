@@ -4,7 +4,9 @@ import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
 import {
+  agentSandboxPolicyAllows,
   agentSandboxSettingsFor,
+  buildAgentSandboxPolicy,
   setAgentSandboxTargets,
 } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { waitForCondition } from "@/node/services/testDispatchHelpers";
@@ -96,6 +98,38 @@ describe("AgentSandboxService", () => {
     await config.editConfig((current) => ({ ...current, agentSandbox: { enabled: true } }));
 
     await waitForCondition(() => agentSandboxSettingsFor(OTHER) !== null);
+  });
+
+  // `xum run` and `xum workflow` copy the keys into a temp folder, where commands can write.
+  it("hides the private config copy of a CLI run from commands, but not its sessions", async () => {
+    const savedRoot = process.env.XUM_ROOT;
+    // Outside the temp write roots, where the policy fails closed on Xum's home folder.
+    process.env.XUM_ROOT = path.join(path.parse(os.tmpdir()).root, `xum-sandbox-${process.pid}`);
+    const runRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "xum-run-")));
+    try {
+      await fs.writeFile(path.join(runRoot, "secrets.json"), "{}");
+      await config.updateAgentSandbox({ enabled: true });
+      service = new AgentSandboxService(config, { privateConfigRoot: runRoot });
+      await service.start();
+      const policy = buildAgentSandboxPolicy(agentSandboxSettingsFor(undefined)!, {
+        cwd: rootDir,
+      });
+      const allows = (parts: string[], access: "read" | "write") =>
+        agentSandboxPolicyAllows(policy, path.join(runRoot, ...parts), access);
+
+      for (const name of ["secrets.json", "providers.jsonc", "config.json"]) {
+        // writeFileAtomic() writes a sibling temp file and renames it over the file.
+        for (const file of [name, `${name}.0123456789ab`]) {
+          expect(allows([file], "read")).toBe(false);
+          expect(allows([file], "write")).toBe(false);
+        }
+      }
+      expect(allows(["sessions", "ws", "scratch", "notes"], "write")).toBe(true);
+    } finally {
+      if (savedRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = savedRoot;
+      await fs.rm(runRoot, { recursive: true, force: true });
+    }
   });
 
   it("keeps the sandbox on when a hand edit breaks another field of config.json", async () => {

@@ -826,6 +826,61 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(result.stdout).toContain("READ_DENIED");
     });
 
+    it("hides a token file that a background command's environment names", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(workspace);
+      await fs.writeFile(path.join(workspace, "hf-token"), "hf_secret");
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+
+      const result = await spawnProcess(
+        new LocalRuntime(workspace),
+        'cat "$HF_TOKEN_PATH" || echo READ_DENIED',
+        {
+          cwd: workspace,
+          workspaceId: `sandbox-test-${path.basename(root)}`,
+          processId: "bg-token",
+          env: { HF_TOKEN_PATH: path.join(workspace, "hf-token") },
+        }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      try {
+        await waitForExitCode(result.handle);
+        const output = await fs.readFile(path.join(result.outputDir, "output.log"), "utf8");
+        expect(output).not.toContain("hf_secret");
+        expect(output).toContain("READ_DENIED");
+      } finally {
+        await result.handle.dispose();
+        await fs.rm(result.outputDir, { recursive: true, force: true });
+      }
+    });
+
+    // `xum run` keeps its copy of the keys in the temp folder, a write root.
+    it("hides and protects the hidden files, and the siblings a trailing * names", async () => {
+      const workspace = path.join(root, "ws");
+      const runRoot = path.join(root, "run");
+      await fs.mkdir(workspace);
+      await fs.mkdir(runRoot);
+      await fs.writeFile(path.join(runRoot, "secrets.json"), "plain_secret");
+      await fs.writeFile(path.join(runRoot, "secrets.json.0123456789ab"), "temp_secret");
+      const secrets = path.join(runRoot, "secrets.json");
+      setAgentSandboxTargets({
+        fallback: BASE_SETTINGS,
+        byProject: new Map(),
+        hiddenFiles: [secrets, `${secrets}.*`],
+      });
+
+      const result = await execBuffered(
+        new LocalRuntime(workspace),
+        `cat "${secrets}" "${secrets}.0123456789ab"; echo x > "${secrets}.new" || echo WRITE_DENIED`,
+        { cwd: workspace, timeout: 10 }
+      );
+
+      expect(result.stdout).not.toContain("_secret");
+      expect(result.stdout).toContain("WRITE_DENIED");
+      expect(await exists(`${secrets}.new`)).toBe(false);
+    });
+
     it("runs background bash in the sandbox", async () => {
       const workspace = path.join(root, "ws");
       await fs.mkdir(workspace);

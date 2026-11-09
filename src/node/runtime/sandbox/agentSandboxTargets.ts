@@ -38,6 +38,12 @@ export interface AgentSandboxTargets {
   fallback: ResolvedAgentSandboxSettings;
   /** The merged setting of each project with an override of its own, keyed by its config path. */
   byProject: ReadonlyMap<string, ResolvedAgentSandboxSettings>;
+  /**
+   * Files outside Xum's home folder that hold its keys and settings, hidden and read-only like
+   * it: `xum run` and `xum workflow` keep a private copy in a temp folder, which commands can
+   * read and write (Codex review). An entry can end in `*`.
+   */
+  hiddenFiles?: readonly string[];
 }
 
 let sandboxTargets: AgentSandboxTargets | null = null;
@@ -190,7 +196,7 @@ export function buildAgentSandboxPolicy(
   const home = realpathOfNearest(os.homedir());
   const cwd = workspaceRootOrThrow(realpathOfNearest(input.cwd), home);
   const envs = policyEnvs(input);
-  const nestedDenies = dedupe(pathsFromEnvs(envs, nestedDenyReadPaths).map(expandSandboxPath));
+  const nestedDenies = nestedDenyPaths(envs);
   const extraWriteRoots = outsideNestedDenies(
     settings.extraWritePaths.map(expandSandboxPath),
     nestedDenies
@@ -343,6 +349,7 @@ function assertNoPathThroughLink(spelled: readonly string[], writeRoots: readonl
   for (const entry of spelled.map(expandSandboxPathSpelling)) {
     const resolved = realpathOfNearest(entry);
     // A root itself, as spelled (a cache folder that is a link) or resolved, is not inside another.
+    // A workspace or scratch root that is a link still fails closed: its `.git` is checked too.
     const otherRoots = writeRoots.filter((root) => root !== resolved && root !== entry);
     if (realpathOutside(entry, otherRoots) !== resolved) {
       throw new AgentSandboxStartError(
@@ -405,6 +412,15 @@ function policyEnvs(input: AgentSandboxPolicyInput): NodeJS.ProcessEnv[] {
     throw new AgentSandboxStartError(`HOME is ${home} for this command, not ${ownHome}`);
   }
   return [process.env, input.env];
+}
+
+/** The credential files that the environments name, and the hidden files of the targets. */
+function nestedDenyPaths(envs: readonly NodeJS.ProcessEnv[]): string[] {
+  return dedupe(
+    [...pathsFromEnvs(envs, nestedDenyReadPaths), ...(sandboxTargets?.hiddenFiles ?? [])].map(
+      expandSandboxPath
+    )
+  );
 }
 
 function pathsFromEnvs(
@@ -1038,7 +1054,7 @@ function isAtOrUnderDeny(spelledTarget: string, spelledDeny: string): boolean {
 }
 
 function readAllowed(policy: AgentSandboxPolicy, target: string): boolean {
-  if (!isUnderAny(target, policy.denyRead)) return true;
+  if (!policy.denyRead.some((denied) => isAtOrUnderDeny(target, denied))) return true;
   return isUnderAny(target, policy.allowRead) && !isUnderNestedDeny(policy, target);
 }
 
@@ -1048,7 +1064,7 @@ function isUnderAny(target: string, roots: readonly string[]): boolean {
 
 function isUnderNestedDeny(policy: AgentSandboxPolicy, target: string): boolean {
   return policy.denyRead.some(
-    (denied) => isNestedDeny(denied, policy) && isPathAtOrUnder(foldCase(target), foldCase(denied))
+    (denied) => isNestedDeny(denied, policy) && isAtOrUnderDeny(target, denied)
   );
 }
 

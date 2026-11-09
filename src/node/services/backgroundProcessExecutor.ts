@@ -337,6 +337,8 @@ export async function spawnProcess(
   // The outer spawn shell exports the translated pathEnv (and cwd var) before
   // the wrapper runs; wrapper-level env exports would overwrite those
   // translations, so pathEnv-owned keys are stripped from the wrapper env.
+  // The spawn shell gets this env too, so the sandbox policy hides the files that the project's
+  // secrets name, such as HF_TOKEN_PATH (Codex review).
   const wrapperEnv: Record<string, string> = { ...options.env, ...NON_INTERACTIVE_ENV_VARS };
   for (const key of [...Object.keys(options.pathEnv ?? {}), BACKGROUND_CWD_ENV]) {
     delete wrapperEnv[key];
@@ -363,6 +365,7 @@ export async function spawnProcess(
     // No timeout - the spawn command backgrounds the process and returns immediately
     const result = await execBuffered(runtime, spawnCommand, {
       cwd: FALLBACK_CWD,
+      env: wrapperEnv,
       pathEnv: { ...options.pathEnv, [BACKGROUND_CWD_ENV]: options.cwd },
       // The command starts in FALLBACK_CWD and cd's into the workspace, which the sandbox opens.
       sandboxRoots: backgroundSandboxRoots(options),

@@ -5,7 +5,8 @@ import {
 } from "@/common/config/schemas/agentSandbox";
 import type { AgentSandboxState, AgentSandboxSupport } from "@/common/orpc/schemas/agentSandbox";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { Config, ProjectsConfig } from "@/node/config";
+import * as path from "node:path";
+import { configFilePath, type Config, type ProjectsConfig } from "@/node/config";
 import {
   anyAgentSandboxEnabled,
   setAgentSandboxTargets,
@@ -24,8 +25,19 @@ import { log } from "@/node/services/log";
  */
 export class AgentSandboxService {
   private unsubscribe: (() => void) | undefined;
+  private readonly hiddenFiles: readonly string[];
 
-  constructor(private readonly config: Config) {}
+  /**
+   * `privateConfigRoot`: where `xum run` and `xum workflow` keep their copy of the keys and
+   * settings. It is in the temp folder, which sandboxed commands can read and write.
+   */
+  constructor(
+    private readonly config: Config,
+    options: { privateConfigRoot?: string } = {}
+  ) {
+    this.hiddenFiles =
+      options.privateConfigRoot === undefined ? [] : privateConfigFiles(options.privateConfigRoot);
+  }
 
   async start(): Promise<void> {
     this.unsubscribe ??= this.config.onConfigChanged(() => {
@@ -71,6 +83,7 @@ export class AgentSandboxService {
     setAgentSandboxTargets({
       fallback: resolveAgentSandboxSettings(config.agentSandbox, undefined),
       byProject: projectAgentSandboxSettings(config),
+      hiddenFiles: this.hiddenFiles,
     });
     if (!anyAgentSandboxEnabled() || !isAgentSandboxSupported()) return;
     try {
@@ -79,6 +92,15 @@ export class AgentSandboxService {
       log.warn("The agent sandbox could not start", { reason: getErrorMessage(error) });
     }
   }
+}
+
+/** Also the temp files that writeFileAtomic() renames over each one, and config.json's backups. */
+function privateConfigFiles(rootDir: string): string[] {
+  return [
+    configFilePath(rootDir),
+    path.join(rootDir, "providers.jsonc"),
+    path.join(rootDir, "secrets.json"),
+  ].flatMap((file) => [file, `${file}.*`]);
 }
 
 /** The resolved setting of each project with an override. */
