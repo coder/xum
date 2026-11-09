@@ -2817,6 +2817,39 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
+   * Record what one getOutput read consumed: the owner's shown frontier when the read showed the
+   * owner contiguous output, and the hidden-read mark when it could not count as shown.
+   */
+  private markReadProgress(
+    proc: BackgroundProcess,
+    filtered: boolean,
+    consumerIsOwner: boolean,
+    shownRegionStart: number
+  ): void {
+    const consumedThrough =
+      proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
+    // Advance the monitor's "shown through" mark only on unfiltered reads. A filtered read may have
+    // dropped matched lines, so it must not count as having shown them. End-of-last-complete-line =
+    // read cursor minus the trailing fragment we just buffered (cleared, hence 0, on exit). Offsets
+    // only grow; Math.max guards against any out-of-order/partial call regressing the mark.
+    //
+    // Contiguity guard: outputBytesRead is a shared cursor that *filtered* reads also advance while
+    // dropping non-matching complete lines. If a prior filtered read consumed lines past our last
+    // shown frontier, this read starts beyond that frontier (shownRegionStart > shownThroughOffset)
+    // and those skipped lines were never shown to the agent. Advancing across that gap would let a
+    // wake for filtered-out output be wrongly suppressed, so only advance when this read's content
+    // is contiguous with the frontier. A gap pins the frontier low (safe: it can only over-wake).
+    if (!filtered && consumerIsOwner && shownRegionStart <= proc.shownThroughOffset) {
+      proc.shownThroughOffset = Math.max(proc.shownThroughOffset, consumedThrough);
+    }
+    // A read that cannot count as showing the owner its output (see above) still moves the shared
+    // cursor. The wake uses this mark to tell the owner when matched output was skipped for good.
+    if (filtered || !consumerIsOwner) {
+      proc.hiddenReadThroughOffset = Math.max(proc.hiddenReadThroughOffset ?? 0, consumedThrough);
+    }
+  }
+
+  /**
    * Get incremental output from a background process.
    * Returns only NEW output since the last call (tracked per process).
    * @param processId Process ID to get output from
@@ -2961,29 +2994,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       proc.terminalStatusShownToAgent = true;
     }
 
-    // Advance the monitor's "shown through" mark only on unfiltered reads. A filtered read may have
-    // dropped matched lines, so it must not count as having shown them. End-of-last-complete-line =
-    // read cursor minus the trailing fragment we just buffered (cleared, hence 0, on exit). Offsets
-    // only grow; Math.max guards against any out-of-order/partial call regressing the mark.
-    //
-    // Contiguity guard: outputBytesRead is a shared cursor that *filtered* reads also advance while
-    // dropping non-matching complete lines. If a prior filtered read consumed lines past our last
-    // shown frontier, this read starts beyond that frontier (shownRegionStart > shownThroughOffset)
-    // and those skipped lines were never shown to the agent. Advancing across that gap would let a
-    // wake for filtered-out output be wrongly suppressed, so only advance when this read's content
-    // is contiguous with the frontier. A gap pins the frontier low (safe: it can only over-wake).
-    if (!filter && consumerIsOwner && shownRegionStart <= proc.shownThroughOffset) {
-      const shownThrough =
-        proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
-      proc.shownThroughOffset = Math.max(proc.shownThroughOffset, shownThrough);
-    }
-    // A read that cannot count as showing the owner its output (see above) still moves the shared
-    // cursor. The wake uses this mark to tell the owner when matched output was skipped for good.
-    if (filter || !consumerIsOwner) {
-      const consumedThrough =
-        proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
-      proc.hiddenReadThroughOffset = Math.max(proc.hiddenReadThroughOffset ?? 0, consumedThrough);
-    }
+    this.markReadProgress(proc, Boolean(filter), consumerIsOwner, shownRegionStart);
 
     log.debug(
       `BackgroundProcessManager.getOutput: read through offset ${proc.outputBytesRead}, returnedChars=${page.output.length}, capped=${capped}`
