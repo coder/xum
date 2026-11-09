@@ -68,11 +68,16 @@ function createLocalFileReader(files: HostFiles): FileReader {
  * ~/.ssh/id_rsa, and the read puts the file in its prompt. Such a file reads as empty: it still
  * exists, so CLAUDE.md does not take AGENTS.md's place.
  */
-function withSandboxGate(reader: FileReader, runtime: Runtime, directory: string): FileReader {
+function withSandboxGate(
+  reader: FileReader,
+  runtime: Runtime,
+  directory: string,
+  sandboxEnv: NodeJS.ProcessEnv | undefined
+): FileReader {
   let gate: FileToolSandboxGate | undefined;
   return {
     readFile: async (filePath: string) => {
-      gate ??= fileToolSandboxGate(runtime, directory);
+      gate ??= fileToolSandboxGate(runtime, directory, { env: sandboxEnv });
       try {
         await gate(filePath, "read");
       } catch (error) {
@@ -88,11 +93,16 @@ function withSandboxGate(reader: FileReader, runtime: Runtime, directory: string
 /**
  * Create a FileReader for Runtime-based access (supports SSH), behind the runtime's sandbox.
  */
-function createRuntimeFileReader(runtime: Runtime, directory: string): FileReader {
+function createRuntimeFileReader(
+  runtime: Runtime,
+  directory: string,
+  sandboxEnv: NodeJS.ProcessEnv | undefined
+): FileReader {
   return withSandboxGate(
     { readFile: (filePath: string) => readFileString(runtime, filePath) },
     runtime,
-    directory
+    directory,
+    sandboxEnv
   );
 }
 
@@ -287,13 +297,17 @@ export async function readInstructionSet(
   /** The host files of the read (phase 5: the agent loop passes its own). Absent: the Node layer. */
   files: HostFiles = nodeHostFiles,
   /** The workspace runtime whose agent sandbox the read follows, where its agent can write. */
-  sandboxRuntime?: Runtime
+  sandboxRuntime?: Runtime,
+  /** The project's secrets, for that sandbox (AgentSandboxPolicyInput.env). */
+  sandboxEnv?: NodeJS.ProcessEnv
 ): Promise<InstructionSet | null> {
   if (!directory) return null;
   const resolvedDirectory = path.resolve(directory);
   const reader = createLocalFileReader(files);
   return readInstructionSetWith(
-    sandboxRuntime ? withSandboxGate(reader, sandboxRuntime, resolvedDirectory) : reader,
+    sandboxRuntime
+      ? withSandboxGate(reader, sandboxRuntime, resolvedDirectory, sandboxEnv)
+      : reader,
     resolvedDirectory,
     scope,
     projectName
@@ -344,10 +358,12 @@ export async function readInstructionSetFromRuntime(
   runtime: Runtime,
   directory: string,
   scope: InstructionScope,
-  projectName?: string
+  projectName?: string,
+  /** The project's secrets, for the runtime's agent sandbox (AgentSandboxPolicyInput.env). */
+  sandboxEnv?: NodeJS.ProcessEnv
 ): Promise<InstructionSet | null> {
   return readInstructionSetWith(
-    createRuntimeFileReader(runtime, directory),
+    createRuntimeFileReader(runtime, directory, sandboxEnv),
     directory,
     scope,
     projectName

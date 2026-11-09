@@ -390,7 +390,15 @@ function assertNothingOpenInNestedDeny(
  * outside the sandbox with the project's secrets (Codex review).
  */
 function policyEnvs(input: AgentSandboxPolicyInput): NodeJS.ProcessEnv[] {
-  return input.env === undefined ? [process.env] : [process.env, input.env];
+  if (input.env === undefined) return [process.env];
+  // Git, npm and the MCP servers that Xum starts with the project's secrets read their settings
+  // in HOME, and the policy protects them in Xum's home only (Codex review).
+  const home = input.env.HOME;
+  const ownHome = process.env.HOME ?? os.homedir();
+  if (home !== undefined && path.resolve(home) !== path.resolve(ownHome)) {
+    throw new AgentSandboxStartError(`HOME is ${home} for this command, not ${ownHome}`);
+  }
+  return [process.env, input.env];
 }
 
 function pathsFromEnvs(

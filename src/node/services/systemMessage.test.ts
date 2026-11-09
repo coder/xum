@@ -1402,6 +1402,48 @@ OpenAI-only instructions.
   });
 });
 
+// Bash adds the project's secrets to its environment, where one can move a credential file.
+describe("loadWorkspaceInstructionSources under the agent sandbox", () => {
+  test("withholds an instruction file that links to a file the project's secrets name", async () => {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "instr-env-")));
+    try {
+      const token = path.join(root, "hf-token");
+      await fs.writeFile(token, "hf_secret");
+      await fs.symlink(token, path.join(root, "AGENTS.md"));
+      const runtime = new LocalRuntime(root);
+      runtime.agentSandboxPolicy = (input) => ({
+        writeRoots: [root],
+        gitCommonDirs: [],
+        denyWrite: [],
+        denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+        allowRead: [root],
+        network: "allowlist",
+        allowedHosts: [],
+        allowLocalBinding: true,
+      });
+
+      const sources = await loadWorkspaceInstructionSources(
+        {
+          id: "ws",
+          name: "ws",
+          projectName: "p",
+          projectPath: root,
+          runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+        },
+        runtime,
+        root,
+        undefined,
+        false,
+        { files: createMemoryHost().files, sandboxEnv: { HF_TOKEN_PATH: token } }
+      );
+
+      expect(sources.context.map((set) => set.combinedContent).join("")).not.toContain("hf_secret");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("loadWorkspaceInstructionSources host", () => {
   test("reads the global instructions through the host files and paths it is given", async () => {
     // The agent loop passes its HostFiles and HostPaths (phase 5), so a memory host gives the

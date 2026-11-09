@@ -2661,6 +2661,16 @@ export class TurnRequestBuilder {
       sideChat: isSideChat,
       compaction: isCompactionRequest,
     });
+    const projectSecrets = isMultiProject(metadata)
+      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
+      : secretsForWorkspace(
+          this.dependencies.secretsStore,
+          this.dependencies.config,
+          metadata.projectPath,
+          metadata.runtimeConfig
+        );
+    // Bash and the file tools get these too, so the instruction reads follow the same sandbox.
+    const projectSecretsRecord = await secretsToRecord(projectSecrets);
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
@@ -2674,6 +2684,7 @@ export class TurnRequestBuilder {
         instructionHost: {
           files: this.dependencies.hostServices.hostFiles,
           paths: this.dependencies.hostServices.hostPaths,
+          sandboxEnv: projectSecretsRecord,
         },
         metadata,
         workspacePath,
@@ -2723,15 +2734,6 @@ export class TurnRequestBuilder {
     const skillIndexSection = skillIndexSectionFor(availableSkills);
     let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
-
-    const projectSecrets = isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : secretsForWorkspace(
-          this.dependencies.secretsStore,
-          this.dependencies.config,
-          metadata.projectPath,
-          metadata.runtimeConfig
-        );
 
     const streamToken = this.dependencies.streamManager.generateStreamToken();
 
@@ -2881,7 +2883,6 @@ export class TurnRequestBuilder {
       costsUsd: sessionCostsUsd,
       scratchDir,
     });
-    const projectSecretsRecord = await secretsToRecord(projectSecrets);
     Object.assign(
       xumEnv,
       await this.bashAiProxyEnv(

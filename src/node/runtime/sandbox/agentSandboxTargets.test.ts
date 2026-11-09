@@ -1014,6 +1014,16 @@ describe("buildAgentSandboxPolicy", () => {
     expect(writable("notes.md")).toBe(true);
   });
 
+  // Git, npm and the MCP servers that Xum starts with the project's secrets read their settings
+  // in HOME, which the policy protects in Xum's home only.
+  test("fails closed when the command's environment moves HOME", () => {
+    const policyWithHome = (home: string | undefined) => () =>
+      buildAgentSandboxPolicy(SETTINGS, { cwd: repo, env: { HOME: home } });
+
+    expect(policyWithHome(path.join(repo, "home"))).toThrow(AgentSandboxStartError);
+    expect(policyWithHome(process.env.HOME)).not.toThrow();
+  });
+
   // `go env -w GOPROXY=https://user:password@host` writes the password there.
   test("hides Go's env file in the Go folder that stays open", async () => {
     const home = path.join(root, "home");
