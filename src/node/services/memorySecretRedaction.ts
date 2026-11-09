@@ -321,9 +321,10 @@ function settleValue(
 function readValue(text: string, header: CookieHeader): { start: number; end: number } {
   const { valueStart: start, frame } = header;
   const run = runLength(text, start);
-  const endsAtOnce = frameEnd(text, start, run, frame);
-  if (endsAtOnce !== -1) return { start, end: endsAtOnce };
   const opener = text.charAt(start + run);
+  // A quote here opens the value, before any frame test: read as the frame's close, it would leave
+  // `'Cookie: ' sid=S'` an empty value with the pair after it readable. The cost: the value of an
+  // empty header in a quoted argument (`-H "Cookie: " url`) runs to the end of the line.
   if (QUOTE.test(opener)) {
     const contentStart = start + run + 1;
     const stop = (pos: number, posRun: number): number => frameEnd(text, pos, posRun, frame);
@@ -331,6 +332,8 @@ function readValue(text: string, header: CookieHeader): { start: number; end: nu
     // A quoted key keeps its value's opening quote, so the quotes around the marker stay paired.
     return settleValue(text, header, header.keyForm ? contentStart : start, unit);
   }
+  const endsAtOnce = frameEnd(text, start, run, frame);
+  if (endsAtOnce !== -1) return { start, end: endsAtOnce };
   if (run === 0 && opener === "[") {
     return settleValue(text, header, start, readList(text, start + 1, frame));
   }

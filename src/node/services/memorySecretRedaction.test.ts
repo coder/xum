@@ -571,6 +571,21 @@ describe("redactSecretLike", () => {
         `Set-Cookie: [it's x] ${SESSION}\nmore\nlines`,
         "Set-Cookie: [redacted]\nmore\nlines",
       ],
+      // A quote at a value's start opens it, even where it could close the frame around it.
+      [
+        "a quoted value after a single-quoted argument's colon",
+        `echo 'Cookie: ' sid=${SESSION}'`,
+        "echo 'Cookie: [redacted]",
+      ],
+      ["a single-quoted value at the start", `'Cookie: ' sid=${SESSION}`, "'Cookie: [redacted]"],
+      ["a quoted value in an assignment", `x="Cookie: " sid=${SESSION}"`, 'x="Cookie: [redacted]'],
+      ["a quoted value before a comma", `"Cookie: ",${SESSION}"`, '"Cookie: [redacted]'],
+      // The fail-closed cost: an empty header in a quoted argument loses the rest of its line.
+      [
+        "an empty header in a quoted argument",
+        `curl -H "Cookie: " https://example.com/${SESSION}`,
+        'curl -H "Cookie: [redacted]',
+      ],
     ])("redacts the whole value with %s", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
@@ -652,6 +667,37 @@ describe("redactSecretLike", () => {
         `Set-Cookie: ["${SESSION}\\\n"x[y"]\nHost: h`,
         "Set-Cookie: [redacted]\nHost: h",
       ],
+      [
+        "backslashes before a raw line break",
+        `Cookie: sid=${SESSION}\\\\\nHost: h`,
+        "Cookie: [redacted]\nHost: h",
+      ],
+      [
+        "an escaped line break two strings deep",
+        jsonOf({ out: jsonOf({ h: `Cookie: sid=${SESSION}\nHost: h` }) }),
+        String.raw`{"out":"{\"h\":\"Cookie: [redacted]\\nHost: h\"}"}`,
+      ],
+      [
+        "an unclosed list in a string at depth one",
+        String.raw`{"o":"{\"h\":\"Set-Cookie: [a, ${SESSION}\"}"}`,
+        String.raw`{"o":"{\"h\":\"Set-Cookie: [redacted]\"}"}`,
+      ],
+      [
+        "a quoted key's list of escaped items with a `]` in one",
+        jsonOf({ o: jsonOf({ "set-cookie": ["a]b", `sid=${SESSION}`] }) }),
+        String.raw`{"o":"{\"set-cookie\":[redacted]}"}`,
+      ],
+      // An item's quote before a blank opens it: read as its close, ` a]` would end the list.
+      [
+        "a list item that opens with a blank",
+        jsonOf({ cookie: [" a]b", SESSION], host: "h" }),
+        '{"cookie":[redacted],"host":"h"}',
+      ],
+      [
+        "an escaped list item that opens with a blank",
+        jsonOf({ o: jsonOf({ cookie: [" a]b", SESSION], host: "h" }) }),
+        String.raw`{"o":"{\"cookie\":[redacted],\"host\":\"h\"}"}`,
+      ],
     ])("ends the value at its frame in %s", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
@@ -696,7 +742,6 @@ describe("redactSecretLike", () => {
       ["an empty header", "Cookie:\nHost: example.com"],
       ["an empty header with a gap", "Cookie:   \nHost: example.com"],
       ["an empty quoted value", '{"cookie": "", "a": 1}'],
-      ["an empty header in a quoted argument", 'curl -H "Cookie: " https://example.com'],
       ["another key at the start of the text", "X: 1"],
       ["a name inside a word at the start of the text", "xCookie: 1"],
       ["a color code's letters without its escape", "Cookie x1b[0m: 1"],
