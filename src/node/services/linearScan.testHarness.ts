@@ -24,12 +24,21 @@ import { expect } from "bun:test";
  */
 export const SIZE_STEP = 4;
 export const MAX_COST_RATIO = 8;
-/** Floor for the smaller cost, so the timer's resolution on a near-free scan cannot trip the ratio. */
+/** Floor for the smaller sample, so the timer's resolution cannot trip the ratio (see REPS below). */
 export const MIN_BASE_MS = 1;
 /** Ceiling for a shape that runs in the fast path of the engine (the others cost 6 ms or less). */
 export const FAST_SCAN_MS = 50;
 /** Ceiling for a shape past such a jump at scale 1 (they cost up to 115 ms today). */
 export const SLOW_SCAN_MS = 500;
+
+// A sample is REPS scans of one text, not one scan, so that it costs at least MIN_SAMPLE_MS: a
+// scan of 0.06 ms that turned quadratic would cost 1 ms, and the floor above would hide it. The
+// scans of the small text that calibrate REPS (the fastest of CALIBRATION_RUNS) also warm up the
+// regex engine. Both sizes use the same REPS, so their ratio is the ratio of one scan each. A
+// shape of 0.01 ms or less gets MAX_REPS, and the floor applies again.
+export const CALIBRATION_RUNS = 3;
+const MIN_SAMPLE_MS = 2;
+const MAX_REPS = 200;
 
 // One run measures both sizes. A shape that costs a few milliseconds measures within 40% of its
 // cost on a busy host (cores shared with other processes slow a sample down, or not, at random),
@@ -59,18 +68,29 @@ export function expectLinearScan(
 ): void {
   const small = build(1);
   const large = build(SIZE_STEP);
+  let onceMs = Number.POSITIVE_INFINITY;
+  for (let call = 0; call < CALIBRATION_RUNS; call++) {
+    onceMs = Math.min(
+      onceMs,
+      measure(() => scan(small))
+    );
+  }
+  const reps = Math.ceil(MIN_SAMPLE_MS / Math.max(onceMs, MIN_SAMPLE_MS / MAX_REPS));
+  const scanReps = (text: string) => () => {
+    for (let rep = 0; rep < reps; rep++) scan(text);
+  };
   let fastestSmallMs = Number.POSITIVE_INFINITY;
   let fastestLargeMs = Number.POSITIVE_INFINITY;
   const ratios: number[] = [];
   for (let run = 0; run < MAX_RUNS; run++) {
     if (run >= MIN_RUNS && run * (fastestSmallMs + fastestLargeMs) >= RUN_BUDGET_MS) break;
-    const smallRun = measure(() => scan(small));
-    const largeRun = measure(() => scan(large));
+    const smallRun = measure(scanReps(small));
+    const largeRun = measure(scanReps(large));
     fastestSmallMs = Math.min(fastestSmallMs, smallRun);
     fastestLargeMs = Math.min(fastestLargeMs, largeRun);
     ratios.push(largeRun / Math.max(smallRun, MIN_BASE_MS));
   }
-  expect(fastestSmallMs).toBeLessThan(ceilingMs);
+  expect(fastestSmallMs / reps).toBeLessThan(ceilingMs);
   // The lower median: with two runs it is the smaller ratio, as the fastest sample was before.
   ratios.sort((a, b) => a - b);
   expect(ratios[(ratios.length - 1) >> 1]).toBeLessThan(MAX_COST_RATIO);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { expectLinearScan, SLOW_SCAN_MS } from "./linearScan.testHarness";
+import { CALIBRATION_RUNS, expectLinearScan, SLOW_SCAN_MS } from "./linearScan.testHarness";
 
 // Two regex scans of "aaa...": `/a+$/` reads the text once per call (a thousand calls make it
 // cost a few milliseconds), and `/a*b/` has no "b" to find, so it restarts from every position
@@ -27,10 +27,21 @@ describe("expectLinearScan", () => {
     expect(() => expectLinearScan(linear, build, 0.001)).toThrow();
   });
 
-  // The costs below are scripted, so the scan never runs and these two tests cannot flake. Run i
-  // costs `smalls[i]` at the small size and `larges[i]` at the large size.
-  const scripted = (smalls: number[], larges: number[]) => {
-    const costs = smalls.flatMap((small, run) => [small, larges[run]]);
+  it("rejects a scan of 20 microseconds whose cost grows with the square of the text", () => {
+    // 100 characters: a scan costs far less than the 1 ms floor of the ratio, and 400 characters
+    // cost 16 times as much. Only a sample of many scans makes that visible.
+    const buildSmall = (scale: number) => "a".repeat(100 * scale);
+    expect(() => expectLinearScan(quadratic, buildSmall, SLOW_SCAN_MS)).toThrow();
+  });
+
+  // The costs below are scripted, so the scan never runs and these tests cannot flake. The first
+  // CALIBRATION_RUNS costs are those of the calibration scans (`onceMs` each). Then run i costs
+  // `smalls[i]` at the small size and `larges[i]` at the large size.
+  const scripted = (onceMs: number, smalls: number[], larges: number[]) => {
+    const costs = [
+      ...Array<number>(CALIBRATION_RUNS).fill(onceMs),
+      ...smalls.flatMap((small, run) => [small, larges[run]]),
+    ];
     return () => {
       const cost = costs.shift();
       if (cost === undefined) throw new Error("the harness measured more runs than were scripted");
@@ -46,7 +57,7 @@ describe("expectLinearScan", () => {
     const smalls = [1.1, 2.5, 2.6, 2.4, 2.5, 1.3, 2.5, 2.7, 2.4, 2.5, 2.6, 2.5, 2.5, 2.6, 2.5];
     const larges = [10, 10, 11, 9.8, 10, 10, 10, 10.5, 9.6, 10, 12, 10, 10, 11, 10];
     expect(() =>
-      expectLinearScan(noScan, build, SLOW_SCAN_MS, scripted(smalls, larges))
+      expectLinearScan(noScan, build, SLOW_SCAN_MS, scripted(3, smalls, larges))
     ).not.toThrow();
   });
 
@@ -54,6 +65,8 @@ describe("expectLinearScan", () => {
     // The run with a small cost of 6 makes a ratio of 6.7. The median of the ratios it reads is 16.
     const smalls = [2.5, 6, 2.4, 3.2, 2.5, 2.7, 2.5, 2.6, 2.4, 2.5];
     const larges = [40, 40, 39, 46, 40, 43, 40, 38, 38, 40];
-    expect(() => expectLinearScan(noScan, build, SLOW_SCAN_MS, scripted(smalls, larges))).toThrow();
+    expect(() =>
+      expectLinearScan(noScan, build, SLOW_SCAN_MS, scripted(3, smalls, larges))
+    ).toThrow();
   });
 });
