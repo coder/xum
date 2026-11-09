@@ -342,6 +342,18 @@ function ptcRanForTools(ptcEnabled: boolean, tools: Record<string, Tool>): boole
   return ptcEnabled && tools.code_execution !== undefined;
 }
 
+/**
+ * Headless callers (`xum run`, ACP) turn off ask_user_question because no user can answer it; no
+ * user can answer a sandbox approval card there either. A sub-agent has no user either: its own
+ * denial of ask_user_question is in the agent policy, not the caller's `toolPolicy`, so without
+ * this its approval card waited forever (Codex review).
+ */
+function hasNoInteractiveUser(isSubagentWorkspace: boolean, toolPolicy?: ToolPolicy): boolean {
+  return (
+    isSubagentWorkspace || applyToolPolicyToNames(["ask_user_question"], toolPolicy).length === 0
+  );
+}
+
 /** Options used to prepare and execute a turn. */
 export interface StreamMessageOptions {
   messages: MuxMessage[];
@@ -3105,9 +3117,7 @@ export class TurnRequestBuilder {
       // - read: plan file is readable in all agents (useful context)
       // - write: allowed in all agents; plan agents still lock other edits to the exact plan path
       planFileOnly: agentIsPlanLike,
-      // Headless callers (`xum run`, ACP) turn off ask_user_question because no user can answer
-      // it; no user can answer a sandbox approval card there either.
-      noInteractiveUser: applyToolPolicyToNames(["ask_user_question"], toolPolicy).length === 0,
+      noInteractiveUser: hasNoInteractiveUser(isSubagentWorkspace, toolPolicy),
       emitChatEvent: (event) => {
         // Defensive: tools should only emit events for the workspace they belong to.
         if ("workspaceId" in event && event.workspaceId !== workspaceId) {

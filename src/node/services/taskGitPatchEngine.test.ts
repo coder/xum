@@ -12,6 +12,8 @@ import {
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { setAgentSandboxTargets } from "@/node/runtime/sandbox/agentSandboxTargets";
+import { isAgentSandboxSupported } from "@/node/runtime/sandbox/macosSandbox";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function initGitRepo(repoPath: string): void {
@@ -932,6 +934,88 @@ describe("task git patch engine", () => {
     expect(status).toContain(" M notes.txt");
     expect(status).toContain("?? temp.log");
   }, 20_000);
+
+  // Once the dry-run worktree exists, the sandbox keeps its metadata in the main .git read-only,
+  // so a sandboxed `git worktree remove` and `prune` left both behind after every dry run.
+  it.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
+    "removes the dry-run worktree while the macOS agent sandbox is on",
+    async () => {
+      // Real path: Seatbelt matches real paths only, and os.tmpdir() is under the /var symlink.
+      const realRoot = await fsPromises.realpath(rootDir);
+      const childRepo = path.join(realRoot, "child-sandboxed-dry-run");
+      const targetRepo = path.join(realRoot, "target-sandboxed-dry-run");
+      for (const repo of [childRepo, targetRepo]) {
+        await fsPromises.mkdir(repo, { recursive: true });
+        initGitRepo(repo);
+      }
+      await commitFile(childRepo, "README.md", "hello", "base");
+      await commitFile(targetRepo, "README.md", "hello", "base");
+      const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+      await commitFile(childRepo, "README.md", "hello\nchild", "child change");
+      const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+      const sessionDir = path.join(realRoot, "session-sandboxed-dry-run");
+      await fsPromises.mkdir(sessionDir, { recursive: true });
+      const childTaskId = "child-task-sandboxed-dry-run";
+      await writePatchArtifact({
+        sessionDir,
+        workspaceId: "test-workspace",
+        childTaskId,
+        projectArtifacts: [
+          await buildReadyProjectArtifact({
+            sessionDir,
+            childTaskId,
+            storageKey: "target",
+            projectPath: targetRepo,
+            projectName: "target",
+            childRepo,
+            baseSha,
+            headSha,
+          }),
+        ],
+      });
+      const runtimeTempDir = path.join(realRoot, "runtime-tmp-sandboxed-dry-run");
+
+      setAgentSandboxTargets({
+        fallback: {
+          enabled: true,
+          network: "loopback",
+          allowedHosts: [],
+          extraWritePaths: [],
+          extraReadPaths: [],
+        },
+        byProject: new Map(),
+      });
+      try {
+        const dryRun = await taskGitPatchEngine.applyPatch(
+          {
+            sessionLocks: nodeSessionLocks,
+            workspaceId: "test-workspace",
+            cwd: targetRepo,
+            runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+            runtimeTempDir,
+            workspaceSessionDir: sessionDir,
+          },
+          { task_id: childTaskId, dry_run: true, three_way: true },
+          {}
+        );
+        expect(dryRun.success).toBe(true);
+      } finally {
+        setAgentSandboxTargets(null);
+      }
+
+      const worktrees = execSync("git worktree list --porcelain", {
+        cwd: targetRepo,
+        encoding: "utf-8",
+      });
+      expect(worktrees.match(/^worktree /gm)).toHaveLength(1);
+      expect(
+        await fsPromises.readdir(path.join(targetRepo, ".git", "worktrees")).catch(() => [])
+      ).toEqual([]);
+      expect(await fsPromises.readdir(runtimeTempDir).catch(() => [])).toEqual([]);
+    },
+    30_000
+  );
 
   it("rejects staged unrelated changes before git am", async () => {
     const childRepo = path.join(rootDir, "child-staged-unrelated");
