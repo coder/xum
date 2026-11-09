@@ -1,5 +1,9 @@
 import { useLayoutEffect, useRef } from "react";
-import { FRAME_DOCUMENT_CHECK_DEADLINE_MS } from "@/common/constants/artifactInteractions";
+import {
+  FRAME_DOCUMENT_CHECK_CAP_MS,
+  FRAME_DOCUMENT_CHECK_DEADLINE_MS,
+  FRAME_DOCUMENT_CHECK_LATE_MS,
+} from "@/common/constants/artifactInteractions";
 import assert from "@/common/utils/assert";
 
 /**
@@ -211,7 +215,8 @@ export interface FrameDocumentChannel {
   /**
    * Asks the bound document to answer a fresh value over its port. `onMissed` runs when
    * FRAME_DOCUMENT_CHECK_DEADLINE_MS passes, from the first check no answer has cleared, without
-   * an answer to the latest check.
+   * an answer to the latest check. A deadline timer that fires late (the app's thread was
+   * blocked) extends the deadline, up to FRAME_DOCUMENT_CHECK_CAP_MS after that first check.
    */
   check: (onMissed: () => void) => void;
   /** Closes the port and stops the deadline. */
@@ -229,11 +234,21 @@ class DocumentChannel implements FrameDocumentChannel {
   private closed = false;
   private receiver: FrameDocumentReceiver | null = null;
   private readonly allowMessage = createBridgeRateLimiter();
-  // The latest check no answer has cleared, and the deadline the first of them started. An
-  // answer to an older check (sent just before the document died) clears nothing.
-  private pending: { value: string; deadline: ReturnType<typeof setTimeout> } | null = null;
+  // The latest check no answer has cleared, when the first of them went out (the cap counts from
+  // there), and its deadline. An answer to an older check (sent just before the document died)
+  // clears nothing.
+  private pending: {
+    value: string;
+    firstSentAt: number;
+    dueAt: number;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
 
-  constructor(private readonly nonce: string) {}
+  constructor(
+    private readonly nonce: string,
+    /** Monotonic milliseconds: a deadline timer's lateness is measured on it. */
+    private readonly now: () => number
+  ) {}
 
   acceptOpen = (event: Pick<MessageEvent, "data" | "ports">): boolean => {
     if (this.port != null || this.closed) return false;
@@ -256,27 +271,69 @@ class DocumentChannel implements FrameDocumentChannel {
     if (this.closed) return;
     assert(this.port != null, "only a bound frame document channel can check its document");
     const value = newFrameDocumentNonce();
-    // A later load keeps the deadline: a page that reloads itself cannot push it out.
-    const deadline =
-      this.pending?.deadline ??
-      setTimeout(() => {
-        this.pending = null;
-        if (!this.closed) onMissed();
-      }, FRAME_DOCUMENT_CHECK_DEADLINE_MS);
-    this.pending = { value, deadline };
+    if (this.pending == null) {
+      const sentAt = this.now();
+      this.pending = {
+        value,
+        firstSentAt: sentAt,
+        ...this.armDeadline(sentAt + FRAME_DOCUMENT_CHECK_DEADLINE_MS, onMissed),
+      };
+    } else {
+      // A later load keeps the deadline: a page that reloads itself cannot push it out.
+      this.pending.value = value;
+    }
     this.port.postMessage({ [FRAME_DOCUMENT_MARKER]: 1, type: "check", value });
   };
 
   close = (): void => {
     this.closed = true;
     this.port?.close();
-    if (this.pending != null) clearTimeout(this.pending.deadline);
+    if (this.pending != null) clearTimeout(this.pending.timer);
     this.pending = null;
   };
 
+  private armDeadline(dueAt: number, onMissed: () => void) {
+    const timer = setTimeout(() => this.deadlinePassed(onMissed), dueAt - this.now());
+    return { dueAt, timer };
+  }
+
+  /**
+   * The pending check's deadline timer fired. On time, the document missed it: the frame closes.
+   *
+   * Late by more than FRAME_DOCUMENT_CHECK_LATE_MS, the app's own thread was blocked, so the
+   * deadline says nothing about the document. WebKit runs the frame on that thread too: after a
+   * 6 s block right after a check, it ran the overdue timer before the document's queued answer,
+   * and a live artifact closed. So the pending check gets one more deadline, from now, but never
+   * later than FRAME_DOCUMENT_CHECK_CAP_MS after its first unanswered check. No fresh check goes
+   * out: only an answer to the latest value clears it, as before.
+   *
+   * SECURITY AUDIT: a page the frame navigated to cannot answer, so this only delays its close. A
+   * dead document's timer fires on time and closes it at the deadline. A page that keeps the
+   * shared thread busy (WebKit, in-process Chromium) makes every deadline late, and stays shown,
+   * without the bridge, until the cap passes and its next block ends (24.5 s measured in WebKit
+   * with 6 s blocks, against 12.4 s with no extension). It freezes the whole app meanwhile.
+   */
+  private deadlinePassed(onMissed: () => void): void {
+    const pending = this.pending;
+    // mutation-equivalent: a firing timer always finds its check pending on an open channel.
+    // close() and an answer clear the timer, and an extension replaces only the one that fired.
+    if (pending == null || this.closed) return;
+    const now = this.now();
+    const capAt = pending.firstSentAt + FRAME_DOCUMENT_CHECK_CAP_MS;
+    if (now - pending.dueAt > FRAME_DOCUMENT_CHECK_LATE_MS && now < capAt) {
+      Object.assign(
+        pending,
+        this.armDeadline(Math.min(now + FRAME_DOCUMENT_CHECK_DEADLINE_MS, capAt), onMissed)
+      );
+      return;
+    }
+    this.pending = null;
+    onMissed();
+  }
+
   private answered(value: unknown): void {
     if (this.pending == null || value !== this.pending.value) return;
-    clearTimeout(this.pending.deadline);
+    clearTimeout(this.pending.timer);
     this.pending = null;
   }
 
@@ -297,8 +354,11 @@ class DocumentChannel implements FrameDocumentChannel {
   }
 }
 
-export function createFrameDocumentChannel(nonce: string): FrameDocumentChannel {
-  return new DocumentChannel(nonce);
+export function createFrameDocumentChannel(
+  nonce: string,
+  now: () => number = () => performance.now()
+): FrameDocumentChannel {
+  return new DocumentChannel(nonce, now);
 }
 
 /**
