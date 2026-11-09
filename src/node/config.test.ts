@@ -4034,6 +4034,39 @@ describe("Config", () => {
       }
     );
 
+    it("editConfigIfChanged fails when another writer replaces config.json after its locked read, with or without waiting for the lock", async () => {
+      // A write's save refuses to replace bytes that the edit did not read (#5929). An edit
+      // that changes nothing writes nothing, so it must make that check itself: a settings clear
+      // otherwise reported success while a replaced config.json carried a legacy enable.
+      await config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
+      const configFile = path.join(tempDir, "config.json");
+      const outside = JSON.stringify({ projects: [], heartbeatDefaultIntervalMs: 420_000 });
+      // The transform runs after the edit's locked read: replace the file as an older build would.
+      const replaceOutside = (): typeof CONFIG_UNCHANGED => {
+        fs.writeFileSync(`${configFile}.outside`, outside);
+        fs.renameSync(`${configFile}.outside`, configFile);
+        return CONFIG_UNCHANGED;
+      };
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(config.editConfigIfChanged(replaceOutside)).rejects.toThrow(/changed on disk/);
+
+      // Another process holds the lock: the edit reads once it has waited for it.
+      const fresh = new Config(tempDir);
+      fresh.loadConfigOrDefault();
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      const waiting = fresh.editConfigIfChanged(replaceOutside);
+      // Long enough for the edit to step out of the queue and wait for the lock.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await otherProcess[Symbol.asyncDispose]();
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(waiting).rejects.toThrow(/changed on disk/);
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(outside);
+    });
+
     it("editConfigIfChanged fails before its transform runs when config.json does not exist", async () => {
       // The registry lives in config.json, so an edit that finds none has nothing it can answer
       // "unchanged" for: a settings clear would report success for a file nobody read.

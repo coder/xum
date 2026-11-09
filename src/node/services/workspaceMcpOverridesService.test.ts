@@ -1802,6 +1802,74 @@ describe("WorkspaceMcpOverridesService", () => {
       }
     );
 
+    it.each(saveKinds)(
+      "a settings $kind fails when another writer replaces config.json after the legacy clear's locked read",
+      async ({ kind, overrides }) => {
+        // The clear read config.json under the lock and found no legacy value to clear, so it
+        // wrote nothing. A downgraded Xum replaced the file right after that read, with a legacy
+        // value that enables the server. Main's clear writes, and its save refuses a file it did
+        // not read: the save fails and the server stays disabled.
+        const id = `replaced-after-read-${kind}`;
+        const dir = path.join(tempDir, id);
+        await registerLocalWorkspaces(config, [{ dir, id }]);
+        await fs.mkdir(path.join(dir, ".xum"), { recursive: true });
+        await fs.writeFile(
+          path.join(dir, ".xum", "mcp.local.jsonc"),
+          JSON.stringify({ disabledServers: ["consent-sensitive"] })
+        );
+        config.loadConfigOrDefault();
+        const service = new WorkspaceMcpOverridesService(config);
+        const configFile = path.join(config.rootDir, "config.json");
+        const realRead = nodeFs.readFileSync;
+        let armed = false;
+        let replaced = 0;
+        const readSpy = spyOn(nodeFs, "readFileSync").mockImplementation(((
+          ...args: Parameters<typeof nodeFs.readFileSync>
+        ) => {
+          const bytes = realRead(...args);
+          if (armed && String(args[0]) === configFile) {
+            armed = false;
+            replaced++;
+            const outside = JSON.parse(String(bytes)) as {
+              projects: Array<[string, { workspaces: Array<Record<string, unknown>> }]>;
+            };
+            for (const [, project] of outside.projects) {
+              for (const entry of project.workspaces) {
+                if (entry.id === id) entry.mcp = { enabledServers: ["consent-sensitive"] };
+              }
+            }
+            nodeFs.writeFileSync(`${configFile}.outside`, JSON.stringify(outside));
+            nodeFs.renameSync(`${configFile}.outside`, configFile);
+          }
+          return bytes;
+        }) as typeof nodeFs.readFileSync);
+        const spy = spyLegacyClears({
+          before: () => {
+            armed = replaced === 0;
+          },
+        });
+        let outcome: string;
+        try {
+          outcome = await service
+            .setOverridesForWorkspace(id, overrides, {
+              publish: () => Promise.resolve(),
+              hasSnapshot: () => false,
+            })
+            .then(
+              () => "saved",
+              (error: unknown) => String(error)
+            );
+        } finally {
+          spy.mockRestore();
+          readSpy.mockRestore();
+        }
+        expect(replaced).toBe(1);
+        expect(outcome).toMatch(/changed on disk/);
+        const { overrides: effective } = await service.getOverridesForWorkspace(id);
+        expect(effective.enabledServers ?? []).not.toContain("consent-sensitive");
+      }
+    );
+
     it("a sharer's legacy value that another process sets again during the save is still retired", async () => {
       // The save retires a sharer's legacy value under the config lock as well. Another process
       // clears that value after the writer's own clear, and sets a new one before it releases

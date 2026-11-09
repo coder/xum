@@ -3682,7 +3682,8 @@ export class Config {
    * a config.json missing under the lock) fails the edit before `fn` runs. editConfig's lenient
    * read hands `fn` defaults instead, which hold nothing to change, so CONFIG_UNCHANGED would
    * report success for a file nobody read (a settings clear then left a legacy enabled server in
-   * config.json). So CONFIG_UNCHANGED only ever answers the parsed config.json.
+   * config.json). So CONFIG_UNCHANGED only ever answers the parsed config.json. It also fails
+   * when config.json was replaced after that read, as a write's save does (#5929).
    */
   async editConfigIfChanged(fn: ConfigEditTransform): Promise<void> {
     return this.enqueueGatedConfigEdit(fn, /* strictRead */ true);
@@ -4158,6 +4159,15 @@ export class Config {
         })
       );
     };
+    // A transform that changes nothing writes nothing, so the save's check that config.json is
+    // still the file this edit read (#5929) runs here instead. A file that a manual editor or an
+    // older build replaced after the read fails the edit as that save would: a legacy clear then
+    // reported success while the replaced file carried a legacy enable.
+    const assertReadUnchanged = (): void => {
+      const expectedStatKey = readStatKey;
+      assert(expectedStatKey !== undefined, "config edit skipped its write without a fresh read");
+      self.assertConfigFileUnchanged(expectedStatKey);
+    };
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
       lock: ProjectRegistrationLockHandle
@@ -4201,7 +4211,9 @@ export class Config {
               },
               catch: (error) => error,
             });
-            if (newConfig === CONFIG_UNCHANGED) return;
+            if (newConfig === CONFIG_UNCHANGED) {
+              return yield* Effect.try({ try: assertReadUnchanged, catch: (error) => error });
+            }
             return yield* write(newConfig, registrationLock.lock);
           }
           // The gate runs here, before any lock work, so an unreadable config is refused for
@@ -4232,7 +4244,8 @@ export class Config {
               // CONFIG_UNCHANGED writes nothing, so it needs no write gate: editConfigIfChanged's
               // strict read has already failed the edit on a config.json it could not read.
               const newConfig = transform();
-              if (newConfig !== CONFIG_UNCHANGED) await Effect.runPromise(write(newConfig, lock));
+              if (newConfig === CONFIG_UNCHANGED) assertReadUnchanged();
+              else await Effect.runPromise(write(newConfig, lock));
             },
             catch: (error) => error,
           });
