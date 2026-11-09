@@ -224,6 +224,15 @@ describe("the AppImage tool wiring", () => {
     );
   });
 
+  test("the electron-builder cache key moves with the script, as an exact hit saves nothing", async () => {
+    const action = parse(await readFile(ACTION, "utf8")) as {
+      runs: { steps: { name?: string; with?: { key?: string } }[] };
+    };
+    const cache = action.runs.steps.find((step) => step.name === "Cache electron-builder");
+
+    expect(cache?.with?.key).toContain("scripts/ci/prefetch-appimage-tool.sh");
+  });
+
   test("Build / Linux asks setup-xum for the tool", async () => {
     const workflow = parse(await readFile(PR_WORKFLOW, "utf8")) as {
       jobs: Record<string, { steps: { uses?: string; with?: Record<string, unknown> }[] }>;

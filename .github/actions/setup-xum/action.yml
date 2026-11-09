@@ -111,6 +111,10 @@ runs:
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-
 
+    # The key hashes scripts/ci/prefetch-appimage-tool.sh too: an exact hit is never saved again,
+    # so an entry from before that script held no AppImage tool for good, and every job that hit it
+    # downloaded the tool. A change to the script (a new tool version or pin) moves the key, and the
+    # first job on the new key saves the tool at its end.
     - name: Cache electron-builder
       if: ${{ inputs.skip-build-caches != 'true' }}
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -119,7 +123,7 @@ runs:
           ~/.cache/electron-builder
           ~/Library/Caches/electron-builder
           ~/AppData/Local/electron-builder/Cache
-        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock', 'scripts/ci/prefetch-appimage-tool.sh') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-builder-
 
@@ -183,10 +187,11 @@ runs:
 
     # electron-builder builds an AppImage with app-builder, which downloads appimage-12.0.1.7z from
     # github.com and retries nothing. The `Cache electron-builder` step above holds the unpacked
-    # tool after a job that built an AppImage, but its key hashes the lockfiles only, so a cold or
-    # stale cache sends the next job to that download. This step runs after the restore, on a hit
-    # too (it does nothing when the tool is there), and leaves the tool in the directory that the
-    # cache saves at the end of the job. Only the callers that build an AppImage ask for it.
+    # tool after a job that built an AppImage, but a cold or stale cache sends the next job to that
+    # download (a restore-keys hit holds whatever an older job saved). This step runs after the
+    # restore, on a hit too (it does nothing when the tool is there), and leaves the tool in the
+    # directory that the cache saves at the end of the job. Only the callers that build an AppImage
+    # ask for it.
     - name: Fetch the AppImage tool
       if: ${{ inputs.appimage-tool == 'true' }}
       shell: bash
