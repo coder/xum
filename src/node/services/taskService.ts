@@ -911,7 +911,9 @@ export interface InheritedReport {
    * The row's status then. Only a row that read `interrupted` can be reported again: a report
    * writes `reported`, finalizeAgentTaskReport ends early on a row that reads it, and an adopted
    * artifact needs a row without a completed report. So a `reported` row's report is never
-   * replaced, and an `interrupted` row's is replaced exactly when the row reads `reported`.
+   * replaced, and an `interrupted` row's is replaced exactly when the row reads `reported`. Known
+   * limit: a failure can turn a `reported` row `interrupted` (it keeps its report time), and
+   * another backend's report of the attempt then goes unseen, as the row reads `reported` again.
    */
   readonly taskStatus: "reported" | "interrupted";
 }
