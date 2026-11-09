@@ -11,7 +11,11 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 
-import { shouldRunIntegrationTests } from "../../testUtils";
+import {
+  DUMMY_PROVIDER_CONFIG,
+  getProviderConfigOrDummy,
+  shouldRunIntegrationTests,
+} from "../../testUtils";
 import { setupProviders } from "../../ipc/setup";
 import { createAppHarness } from "../harness";
 
@@ -136,7 +140,11 @@ describeIntegration("Thinking level persistence", () => {
   test("keeps XHIGH preference when switching away and back", async () => {
     const harness = await createAppHarness({
       branchPrefix: "thinking",
-      beforeRenderEnvironment: (env) => setupProviders(env, { deepseek: { apiKey: "dummy" } }),
+      beforeRenderEnvironment: (env) =>
+        setupProviders(env, {
+          deepseek: DUMMY_PROVIDER_CONFIG,
+          openai: getProviderConfigOrDummy("OPENAI_API_KEY"),
+        }),
     });
 
     try {

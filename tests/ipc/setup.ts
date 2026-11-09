@@ -26,9 +26,6 @@ import {
   DUMMY_PROVIDER_CONFIG,
 } from "../testUtils";
 
-/** Providers that CI configures through its keys and that keyless UI suites rely on. */
-const DUMMY_SEEDED_PROVIDERS = ["anthropic", "openai"] as const;
-
 export interface TestEnvironment {
   config: Config;
   services: ServiceContainer;
@@ -63,7 +60,9 @@ function createMockBrowserWindow(): BrowserWindow {
 /**
  * Create a test environment with temporary config and service container
  */
-export async function createTestEnvironment(): Promise<TestEnvironment> {
+export async function createTestEnvironment(
+  options: { seedDummyProviders?: boolean } = {}
+): Promise<TestEnvironment> {
   // Create temporary directory for test config
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-test-"));
 
@@ -109,23 +108,22 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
     orpc,
   };
 
-  // CI has provider keys in the environment (Anthropic and OpenAI among them), so the UI finds
-  // them configured and this seeds nothing. A run without them has two gaps: ProjectPage shows
-  // its configure prompt instead of the creation composer, and the model picker lists no GPT
-  // model and compaction has no larger-context OpenAI model to suggest. Seed each of the two
-  // providers that is missing, on a dummy that cannot reach the API. Each is checked alone: a run
-  // that has only an xAI key still lacks both.
-  if (shouldRunIntegrationTests()) {
-    const configured = services.providerService.getConfig();
-    const missing = DUMMY_SEEDED_PROVIDERS.filter(
-      (provider) => !configured[provider]?.isConfigured
-    );
-    if (missing.length > 0) {
-      await setupProviders(
-        env,
-        Object.fromEntries(missing.map((provider) => [provider, DUMMY_PROVIDER_CONFIG]))
-      );
-    }
+  // CI has provider keys in the environment, so the UI finds configured providers and this seeds
+  // nothing. A run without keys has none: ProjectPage then shows its configure prompt instead of
+  // the creation composer, and compaction has no larger-context OpenAI model to suggest. Give
+  // that run both providers, on a dummy that cannot reach the API. It seeds only when nothing is
+  // configured: tests such as sendMessage.errors delete one provider's key and expect that
+  // provider unconfigured while another stays configured. A suite that needs one specific
+  // provider seeds it itself (getProviderConfigOrDummy).
+  if (
+    shouldRunIntegrationTests() &&
+    options.seedDummyProviders !== false &&
+    !Object.values(services.providerService.getConfig()).some((provider) => provider?.isConfigured)
+  ) {
+    await setupProviders(env, {
+      anthropic: DUMMY_PROVIDER_CONFIG,
+      openai: DUMMY_PROVIDER_CONFIG,
+    });
   }
 
   return env;
@@ -352,7 +350,7 @@ export async function setupWorkspaceWithoutProvider(branchPrefix?: string): Prom
   // Create dedicated temp git repo for this test
   const tempGitRepo = await createTempGitRepo();
 
-  const env = await createTestEnvironment();
+  const env = await createTestEnvironment({ seedDummyProviders: false });
 
   // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty prefix falls back to the default
   const branchName = generateBranchName(branchPrefix || "noapi");

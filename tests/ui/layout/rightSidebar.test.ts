@@ -377,9 +377,15 @@ describeIntegration("RightSidebar (UI)", () => {
 
     try {
       const launcher = await findSidebarPanel(sidebar, "-panel-new");
-      await waitFor(() => {
-        expect(within(launcher).getByRole("button", { name: "Browser" })).toBeTruthy();
-      });
+      // The launcher offers the tool once the app's config snapshot reads the experiment on. That
+      // snapshot is refetched after the render, and a loaded host takes longer than waitFor's 1 s
+      // default: this wait failed on main under CPU load. The Artifacts tests wait the same way.
+      await waitFor(
+        () => {
+          expect(within(launcher).getByRole("button", { name: "Browser" })).toBeTruthy();
+        },
+        { timeout: 10_000 }
+      );
       expect(sidebar.querySelector('[role="tab"][aria-controls*="browser"]')).toBeNull();
     } finally {
       await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: null });
