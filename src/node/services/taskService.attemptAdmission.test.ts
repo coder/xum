@@ -550,6 +550,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         source: "reawaken",
         attemptId: entry!.taskAttemptId,
         receiptEligible: false,
+        // The CAS set the row `running`: it carries no report for the attempt to inherit.
+        inheritedReport: null,
       });
       expect(svc.attemptLedger.currentAttemptIdByTaskId.get(taskId)).toBe(entry!.taskAttemptId);
 
@@ -568,6 +570,30 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         error: { code: "send_failed", message: retiredAttemptMessage(claim) },
       });
       expect(entryOf(config, retired)?.taskAttemptId).toBe(claim.attemptId);
+    });
+
+    // The reawakening CAS sets an interrupted row `running` before it reads what the row carries, so
+    // a stale report time on that row is no report for the new attempt to inherit.
+    test("reawaken: an interrupted row that still holds a report time is set running and inherits no report", async () => {
+      const taskId = "reawaken-stale-report-time";
+      const { config } = await setupTree([
+        {
+          id: taskId,
+          overrides: {
+            taskStatus: "interrupted",
+            taskAttemptId: "att_00000000000000ab",
+            reportedAt: "2026-10-01T00:00:00.000Z",
+          },
+        },
+      ]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      expect(entryOf(config, taskId)).toMatchObject({
+        taskStatus: "running",
+        reportedAt: "2026-10-01T00:00:00.000Z",
+      });
+      expect(svc.attemptLedger.ownedAttemptByTaskId.get(taskId)?.inheritedReport).toBeNull();
     });
 
     test("reawaken lineage: this process's settled attempt proves the successor; a receipt proves an unowned one; unreadable never does", async () => {
@@ -744,10 +770,13 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(continuedAttemptId).not.toBe(reportedAttemptId);
       // Lineage: the completed attempt is neither settled by this process nor by a receipt.
       expect(continued?.taskAttemptUnproven).toBe(true);
+      // The report stays on the row, and its time is what the new attempt inherits.
+      expect(continued?.reportedAt).toBeString();
       expect(svc.attemptLedger.ownedAttemptByTaskId.get(taskId)).toMatchObject({
         source: "reawaken",
         attemptId: continuedAttemptId,
         receiptEligible: false,
+        inheritedReport: { reportedAt: continued?.reportedAt },
       });
       // The historical report still decides the task's outcome for its ancestors.
       expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("reported");
