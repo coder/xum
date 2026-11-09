@@ -167,6 +167,36 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[1].cancelSignal.aborted).toBe(false);
   });
 
+  test("a settlement-only wake with a long unread log never suggests the monitor filter", async () => {
+    live = [
+      liveSnapshot({
+        match: undefined,
+        terminal: {
+          status: "exited",
+          exitCode: 1,
+          settledAt: "2026-08-31T13:10:00.000Z",
+          wakeOnExit: true,
+          terminalStatusShown: false,
+        },
+        retired: true,
+      }),
+    ];
+    deliveryState = {
+      status: "settled",
+      shownThroughOffset: 0,
+      terminalStatusShown: false,
+      readCursorOffset: 0,
+      outputThroughOffset: 50_000,
+    };
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].prompt).toContain("Unread output: 50000 bytes");
+    expect(dispatches[0].prompt).not.toContain("filter:");
+    expect(dispatches[0].prompt).toContain('task_ids: ["bash:proc"]');
+  });
+
   test("a read that changes the unread size before acceptance rebuilds the wake", async () => {
     live = [liveSnapshot()];
     deliveryState = {

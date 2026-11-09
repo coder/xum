@@ -267,7 +267,13 @@ function describeReadState(signal: DerivedSignal): string {
   const parts: string[] = [];
   if (signal.unreadBytes != null) parts.push(`Unread output: ${signal.unreadBytes} bytes`);
   if (signal.matchedOutputReadPast) parts.push(`Note: ${BASH_MONITOR_READ_PAST_NOTE}`);
-  if (signal.unreadBytes != null && signal.unreadBytes > BASH_MAX_TOTAL_BYTES) {
+  // Only a wake with new matched output may suggest the monitor filter: it drops the other lines
+  // for good, so on a settlement-only wake it would discard the final log the agent needs.
+  if (
+    signal.kind === "match" &&
+    signal.unreadBytes != null &&
+    signal.unreadBytes > BASH_MAX_TOTAL_BYTES
+  ) {
     const filterArgs =
       `, filter: ${JSON.stringify(signal.filter)}` +
       (signal.filterExclude ? ", filter_exclude: true" : "");
