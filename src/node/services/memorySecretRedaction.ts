@@ -139,8 +139,10 @@ interface HintState {
   frame: Frame;
   /** Line markers passed since `frame` was set. */
   markers: number;
-  /** Where the last ANSI CSI sequence ends: a header name may start there. */
+  /** Where the last ANSI CSI sequence ends: a header name may start there if `csiStartsName`. */
   csiEnd: number;
+  /** A name could start where that sequence began, so its color codes hide no word before it. */
+  csiStartsName: boolean;
   /** Where the last replacement ended: what follows there follows `[redacted]`. */
   redactedEnd: number;
   /** The quote of the string open at each depth, by the run that escapes it there. */
@@ -378,12 +380,20 @@ function skipGap(text: string, at: number): number {
 
 /**
  * A name starts after a non-word character, so `getCookie:` and `X-Cookie:` are not headers; after
- * an escaped line break or tab behind the letter of its escape, and where a color code ends.
+ * an escaped line break or tab behind the letter of its escape. Where color codes end, it starts
+ * only if it could start where they began: `get\x1b[0mCookie:` still reads `getCookie:`.
  */
-function startsName(text: string, at: number, csiEnd: number): boolean {
+function startsName(text: string, at: number, state: HintState): boolean {
+  if (at === state.csiEnd) return state.csiStartsName;
   const before = text.charAt(at - 1);
-  if (at === csiEnd || !WORD_CHAR.test(before)) return true;
+  if (!WORD_CHAR.test(before)) return true;
   return ESCAPED_SPACE.test(before) && text.charAt(at - 2) === "\\";
+}
+
+// Run before `csiEnd` moves, so a code right after another inherits what came before both.
+function noteCsi(text: string, start: number, end: number, state: HintState): void {
+  state.csiStartsName = startsName(text, start, state);
+  state.csiEnd = end;
 }
 
 function matchName(text: string, at: number): number | null {
@@ -401,7 +411,7 @@ function keyFrame(quote: string, run: number): Frame {
 
 function matchHeader(text: string, at: number, state: HintState): CookieHeader | null {
   const nameEnd = matchName(text, at);
-  if (nameEnd === null || !startsName(text, at, state.csiEnd)) return null;
+  if (nameEnd === null || !startsName(text, at, state)) return null;
   const keyRun = runLength(text, nameEnd);
   const keyQuote = text.charAt(nameEnd + keyRun);
   const keyForm = QUOTE.test(keyQuote) && keyRun <= ESCAPE_RUN_MAX;
@@ -448,7 +458,7 @@ function advanceRun(text: string, at: number, state: HintState): number {
   const run = runLength(text, at);
   const csiEnd = readEscapedCsi(text, at + run);
   if (csiEnd !== -1) {
-    state.csiEnd = csiEnd;
+    noteCsi(text, at, csiEnd, state);
     // mutation-equivalent: stepping back lands inside the color code, which only moves forward
     return at + run;
   }
@@ -470,7 +480,7 @@ function advanceHint(text: string, at: number, state: HintState): number {
   if (char === "\\") return advanceRun(text, at, state);
   const csiEnd = char === ESC ? readCsi(text, at) : -1;
   if (QUOTE.test(char)) noteQuote(text, at, char, 0, state);
-  else if (csiEnd !== -1) state.csiEnd = csiEnd;
+  else if (csiEnd !== -1) noteCsi(text, at, csiEnd, state);
   else if (LINE_MARKER.test(char) && state.markers < LINE_MARKER_MAX) state.markers++;
   else state.frame = null;
   return at + 1;
@@ -483,6 +493,8 @@ function redactCookieHeaders(text: string, onRemoved: (removed: string) => void)
     markers: 0,
     // mutation-equivalent: index 0 starts a name anyway
     csiEnd: -1,
+    // mutation-equivalent: read only where a color code ends, and none has yet
+    csiStartsName: false,
     // mutation-equivalent: a quote at index 0 opens a frame anyway
     redactedEnd: -1,
     openQuotes: new Map(),

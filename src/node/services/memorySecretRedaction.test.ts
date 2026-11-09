@@ -521,6 +521,16 @@ describe("redactSecretLike", () => {
         `Cookie\x1b[?2~\x1b[ @: sid=${SESSION}`,
         "Cookie\x1b[?2~\x1b[ @: [redacted]",
       ],
+      [
+        "color codes at a line start before the name",
+        `Host: h\n\x1b[1m\x1b[31mCookie\x1b[0m: sid=${SESSION}`,
+        "Host: h\n\x1b[1m\x1b[31mCookie\x1b[0m: [redacted]",
+      ],
+      [
+        "escaped color codes after an escaped line break",
+        jsonOf({ o: `Host: h\n\x1b[1m\x1b[31mCookie: sid=${SESSION}` }),
+        String.raw`{"o":"Host: h\n\u001b[1m\u001b[31mCookie: [redacted]"}`,
+      ],
       // `C` and `S` end a color code too: the name still starts there.
       ["a name that ends a color code", `\x1b[Cookie: sid=${SESSION}`, "\x1b[Cookie: [redacted]"],
       [
@@ -690,6 +700,11 @@ describe("redactSecretLike", () => {
       ["another key at the start of the text", "X: 1"],
       ["a name inside a word at the start of the text", "xCookie: 1"],
       ["a color code's letters without its escape", "Cookie x1b[0m: 1"],
+      // Without its color codes the text reads `getCookie:` and `X-Cookie:`, which are no headers.
+      ["a color code inside a word", "get\x1b[0mCookie: preference"],
+      ["color codes inside a header name", "X-\x1b[1m\x1b[31mCookie: docs"],
+      ["escaped color codes inside a word", jsonOf({ o: "get\x1b[0mCookie: preference" })],
+      ["escaped color codes inside a header name", jsonOf({ o: "X-\x1b[1m\x1b[31mCookie: docs" })],
     ])("leaves %s as it is", (_label, text) => {
       expect(redactSecretLike(text)).toBe(text);
       expect(containsSecretLike(text)).toBe(false);
