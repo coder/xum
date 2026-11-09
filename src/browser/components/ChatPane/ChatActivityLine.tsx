@@ -70,7 +70,7 @@ export function ChatActivityLine(props: ChatActivityLineProps) {
           // row, not on this wrapper, so a line that renders nothing takes no space: the row is
           // `hidden` until a turn is live or a chip shows. The query has to keep matching the phone
           // rule in globals.css that sets the 44px touch floor (src/constants/layout.ts holds it).
-          className="[@media(max-width:768px)_and_(pointer:coarse)]:pb-1.5"
+          className="[@media(max-width:768px)_and_(pointer:coarse)]:pb-2"
         />
       </ChatActivityPanelsProvider>
     </ChatDockSurface>
