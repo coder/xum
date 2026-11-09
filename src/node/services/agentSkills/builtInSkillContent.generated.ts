@@ -4727,6 +4727,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- `~/.config/git/credentials` (or where `XDG_CONFIG_HOME` moves it).",
       "- `~/.cache/huggingface/token` (or where `XDG_CACHE_HOME`, `HF_HOME` or `HF_TOKEN_PATH` moves it).",
       "- `~/.local/share/uv/credentials` (or where `XDG_DATA_HOME` or `UV_CREDENTIALS_DIR` moves it), where `uv auth login` keeps its tokens, so uv in the sandbox cannot use them.",
+      "- `~/Library/Application Support/go/env` (or where `GOENV` moves it), where `go env -w` keeps its settings, which can hold a password in `GOPROXY`. Go in the sandbox runs without them, so set what a build needs, such as `GOPRIVATE` or `GOFLAGS`, in the environment instead.",
       "- Xum's `server.lock`, `providers.jsonc`, `secrets.json`, `mcp-oauth.json`, and `config.json`, and its `askpass` folder, where your answers to SSH prompts pass.",
       "",
       "Commands fail to start when one of these files has more than one hard link, because the sandbox hides and protects names, not files, so the other name would open it.",

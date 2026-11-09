@@ -251,7 +251,7 @@ export const HOME_READ_PATHS: readonly string[] = [
   "~/.cargo",
   "~/.rustup",
   "~/go",
-  // Go reads its env file here (measured on macOS 27.2).
+  // Go reads its env file here (measured on macOS 27.2); nestedDenyReadPaths() hides the file.
   "~/Library/Application Support/go",
   "~/.nvm",
   "~/.volta",
@@ -287,6 +287,10 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     ...uvCredentialStore("~/.local/share/uv/credentials"),
     ...fromEnv("XDG_DATA_HOME", "uv", "credentials").flatMap(uvCredentialStore),
     ...fromEnv("UV_CREDENTIALS_DIR").flatMap(uvCredentialStore),
+    // `go env -w` keeps its values there, a GOPROXY with a password too, and HOME_READ_PATHS opens
+    // the folder. Go runs without it: it ignores an env file it cannot read (measured, Go 1.27).
+    "~/Library/Application Support/go/env",
+    ...(env.GOENV === "off" ? [] : fromEnv("GOENV")),
     `${XUM_HOME_TOKEN}/server.lock`,
     `${XUM_HOME_TOKEN}/providers.jsonc`,
     `${XUM_HOME_TOKEN}/secrets.json`,

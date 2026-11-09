@@ -928,6 +928,7 @@ describe("buildAgentSandboxPolicy", () => {
     { name: "XDG_DATA_HOME", value: "data", file: "data/uv/credentials/credentials.toml" },
     { name: "CARGO_HOME", value: "cargo", file: "cargo/credentials.toml" },
     { name: "HF_TOKEN_PATH", value: "hf-token", file: "hf-token" },
+    { name: "GOENV", value: "go-env", file: "go-env" },
   ])("hides the credential store where $name moves it", ({ name, value, file }) => {
     const saved = process.env[name];
     process.env[name] = path.join(repo, value);
@@ -939,6 +940,36 @@ describe("buildAgentSandboxPolicy", () => {
     } finally {
       if (saved === undefined) delete process.env[name];
       else process.env[name] = saved;
+    }
+  });
+
+  // `go env -w GOPROXY=https://user:password@host` writes the password there.
+  test("hides Go's env file in the Go folder that stays open", async () => {
+    const home = path.join(root, "home");
+    const goDir = path.join(home, "Library", "Application Support", "go");
+    await fs.mkdir(path.join(goDir, "telemetry"), { recursive: true });
+    await fs.writeFile(path.join(goDir, "env"), "GOPROXY=https://alice:secret@proxy.example\n");
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+      expect(agentSandboxPolicyAllows(policy, path.join(goDir, "env"), "read")).toBe(false);
+      expect(agentSandboxPolicyAllows(policy, path.join(goDir, "telemetry"), "read")).toBe(true);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  // GOENV=off turns Go's env file off; it is not a relative path.
+  test("starts with GOENV=off", () => {
+    const saved = process.env.GOENV;
+    process.env.GOENV = "off";
+    try {
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).not.toThrow();
+    } finally {
+      if (saved === undefined) delete process.env.GOENV;
+      else process.env.GOENV = saved;
     }
   });
 
