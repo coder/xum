@@ -12,7 +12,7 @@ import {
 import { execBuffered } from "@/node/utils/runtime/helpers";
 
 import { LocalRuntime } from "./LocalRuntime";
-import type { InitLogger, Runtime } from "./Runtime";
+import type { ExecOptions, InitLogger, Runtime } from "./Runtime";
 
 const SUBMODULE_SYNC_TIMEOUT_SECS = 60;
 const SUBMODULE_UPDATE_TIMEOUT_SECS = 600;
@@ -39,6 +39,7 @@ interface BaseSubmoduleSyncArgs {
 
 interface RuntimeSubmoduleSyncArgs extends BaseSubmoduleSyncArgs {
   runtime: Runtime;
+  sandbox?: ExecOptions["sandbox"];
 }
 
 function buildGitExecutionEnv(options?: {
@@ -78,12 +79,14 @@ async function runSubmoduleCommand(args: {
   command: string;
   timeout: number;
   fallbackError: string;
+  sandbox?: ExecOptions["sandbox"];
 }): Promise<void> {
   const result = await execBuffered(args.runtime, args.command, {
     cwd: args.workspacePath,
     timeout: args.timeout,
     abortSignal: args.abortSignal,
     env: args.env,
+    sandbox: args.sandbox,
   });
 
   if (result.exitCode !== 0) {
@@ -142,6 +145,7 @@ async function discoverRuntimeGitFilterConfigKeys(
     cwd: args.workspacePath,
     timeout: GITMODULES_PROBE_TIMEOUT_SECS,
     abortSignal: args.abortSignal,
+    sandbox: args.sandbox,
     env: {
       ...buildGitExecutionEnv({ env: args.env, trusted: args.trusted }),
       LC_ALL: "C",
@@ -163,6 +167,7 @@ async function assertSubmodulesInitialized(
     timeout: GITMODULES_PROBE_TIMEOUT_SECS,
     abortSignal: args.abortSignal,
     env,
+    sandbox: args.sandbox,
   });
   if (result.exitCode !== 0) {
     throw new Error(result.stderr || result.stdout || "git submodule status failed");
@@ -200,6 +205,7 @@ async function runSubmoduleMaterialization(args: RuntimeSubmoduleSyncArgs): Prom
       command: SUBMODULE_SYNC_COMMAND,
       timeout: SUBMODULE_SYNC_TIMEOUT_SECS,
       fallbackError: "git submodule sync failed",
+      sandbox: args.sandbox,
     });
     await runSubmoduleCommand({
       runtime: args.runtime,
@@ -209,6 +215,7 @@ async function runSubmoduleMaterialization(args: RuntimeSubmoduleSyncArgs): Prom
       command: hooksAllowed ? SUBMODULE_UPDATE_COMMAND : SUBMODULE_UPDATE_NO_FETCH_COMMAND,
       timeout: SUBMODULE_UPDATE_TIMEOUT_SECS,
       fallbackError: "git submodule update failed",
+      sandbox: args.sandbox,
     });
   } catch (error) {
     throw formatSubmoduleSyncError(error);
@@ -270,6 +277,11 @@ export async function syncLocalGitSubmodules(args: BaseSubmoduleSyncArgs): Promi
   await runSubmoduleMaterialization({
     ...args,
     runtime: new LocalRuntime(args.workspacePath),
+    // Xum's own checkout, like `git worktree add`, which runs outside the agent sandbox: under it,
+    // `git submodule sync` and `update --init` cannot write .git/config and .git/modules, so the
+    // new worktree would fail (Codex review). The env above keeps untrusted repos from running
+    // hooks and filters, and the inherited PATH finds git-lfs and the like.
+    sandbox: "off",
   });
 }
 

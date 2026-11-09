@@ -84,12 +84,14 @@ export interface ExecOptions {
   forcePTY?: boolean;
   /**
    * Runs the command outside the macOS agent sandbox (local runtimes only). "off" is for MCP
-   * servers, which the user configured and which start outside the sandbox, and a bash call the
-   * user approved to run outside it once. "internal" is for fixed Xum-internal scripts that never
-   * run agent or repo code (plan file moves, temp cleanup, skill path probes): while the sandbox
-   * applies they take bash and their tools from the system folders, because the inherited PATH
-   * can hold a folder that sandboxed commands write. Agent-reachable paths (bash, background
-   * bash, tool hooks, the init hook, web_fetch) never set it otherwise.
+   * servers, which the user configured and which start outside the sandbox, a bash call the
+   * user approved to run outside it once, and the git that materializes submodules when Xum
+   * creates a worktree, which needs the user's PATH (git-lfs). "internal" is for fixed
+   * Xum-internal scripts that never run agent or repo code (plan file moves, temp cleanup, skill
+   * path probes): while the sandbox applies they take bash and their tools from the system
+   * folders, because the inherited PATH can hold a folder that sandboxed commands write.
+   * Agent-reachable paths (bash, background bash, tool hooks, the init hook, web_fetch) never set
+   * it otherwise.
    */
   sandbox?: "off" | "internal";
   /**

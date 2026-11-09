@@ -14,6 +14,7 @@ import { spawnProcess } from "@/node/services/backgroundProcessExecutor";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createTestToolConfig, mockToolCallOptions } from "@/node/services/tools/testHelpers";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { syncLocalGitSubmodules } from "@/node/runtime/submoduleSync";
 import {
   agentSandboxPolicyAllows,
   buildAgentSandboxPolicy,
@@ -227,6 +228,41 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(result.stdout).toContain("CONFIG_DENIED");
       expect(await exists(path.join(commonDir, "hooks", "pre-commit"))).toBe(false);
       expect(await fs.readFile(path.join(commonDir, "config"), "utf8")).not.toContain("evil");
+    });
+
+    // Xum's own checkout, like `git worktree add`: under the sandbox, `git submodule sync` and
+    // `update --init` could not write .git/config and .git/modules.
+    it("materializes the submodules of a new worktree while the sandbox is on", async () => {
+      const sub = path.join(root, "sub");
+      const repo = path.join(root, "repo");
+      const worktree = path.join(root, "wt");
+      for (const dir of [sub, repo]) {
+        await fs.mkdir(dir);
+        git(dir, "init", "-q", "-b", "main");
+      }
+      await fs.writeFile(path.join(sub, "SKILL.md"), "payload\n");
+      git(sub, "add", ".");
+      git(sub, ...GIT_IDENTITY.split(" "), "commit", "-q", "-m", "init");
+      git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "vendor");
+      git(repo, ...GIT_IDENTITY.split(" "), "commit", "-q", "-m", "add submodule");
+      git(repo, "worktree", "add", "-q", "-b", "feature", worktree, "main");
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+
+      await syncLocalGitSubmodules({
+        workspacePath: worktree,
+        initLogger: {
+          logStep: () => undefined,
+          logStdout: () => undefined,
+          logStderr: () => undefined,
+          logComplete: () => undefined,
+        },
+        env: { GIT_ALLOW_PROTOCOL: "file" },
+        trusted: true,
+      });
+
+      expect(await fs.readFile(path.join(worktree, "vendor", "SKILL.md"), "utf8")).toBe(
+        "payload\n"
+      );
     });
 
     it("keeps .git/hooks and .git/config of a repository in the workspace read-only", async () => {
