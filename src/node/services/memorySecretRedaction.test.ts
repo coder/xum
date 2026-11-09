@@ -276,6 +276,16 @@ describe("redactSecretLike", () => {
   it.each([
     ["a mask", "password=***", "password=[redacted]"],
     [
+      "a mask before an existing marker",
+      "password=*** [redacted]",
+      "password=[redacted] [redacted]",
+    ],
+    [
+      "a closing run whose opener is wider",
+      "***password:** [redacted]",
+      "***password:[redacted] [redacted]",
+    ],
+    [
       "unpaired runs on the line",
       "*note password=*** npm start",
       "*note password=[redacted] npm start",

@@ -165,9 +165,16 @@ function runRedactionPasses(text: string, onRemoved: (removed: string) => void):
       // The pattern has named groups, so the last three arguments are offset, text and groups.
       const offset = rest[rest.length - 3] as number;
       const text = rest[rest.length - 2] as string;
+      // Only the label form: the same run opens right before the name (as EMPHASIS_LABEL_PATTERN
+      // requires), so the marker after it is one the label pass wrote. Stars with no opener are a
+      // value, as before (`password=*** [redacted]`).
+      const opener = offset - value.length;
       const closesRedactedLabel =
         LABEL_CLOSE_BEFORE_MARKER.test(value) &&
-        MARKER_AFTER_LABEL.test(text.slice(offset + match.length));
+        MARKER_AFTER_LABEL.test(text.slice(offset + match.length)) &&
+        opener >= 0 &&
+        text.slice(opener, offset) === value &&
+        !/[*\w]/.test(text.charAt(opener - 1));
       if (closesRedactedLabel) return match;
       onRemoved(value);
       return `${prefix}${REDACTED}`;
