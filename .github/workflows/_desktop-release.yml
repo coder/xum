@@ -35,7 +35,12 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
+      # electron-builder unpacks the checked Electron zips (both arches: `make dist-mac` builds x64
+      # and arm64) instead of downloading them without retries.
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: darwin-x64 darwin-arm64
 
       - name: Patch package.json version
         if: inputs.version_override != ''
@@ -102,7 +107,11 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
+      # electron-builder unpacks the checked Electron zip instead of downloading it without retries.
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: linux-x64
 
       - name: Patch package.json version
         if: inputs.version_override != ''
@@ -115,7 +124,7 @@ jobs:
         run: bun run build
 
       - name: Package and publish for Linux
-        run: bun x electron-builder --linux --publish always
+        run: bun x electron-builder --linux --publish always ${ELECTRON_ZIP_DIR:+-c.electronDist="$ELECTRON_ZIP_DIR"}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -156,6 +165,9 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: linux-arm64
 
       - name: Patch package.json version
         if: inputs.version_override != ''
@@ -168,7 +180,7 @@ jobs:
         run: bun run build
 
       - name: Package for Linux arm64
-        run: bun x electron-builder --linux --arm64 --publish never
+        run: bun x electron-builder --linux --arm64 --publish never ${ELECTRON_ZIP_DIR:+-c.electronDist="$ELECTRON_ZIP_DIR"}
 
       - name: Create legacy mux artifact aliases
         run: ./scripts/create-legacy-mux-artifact-aliases.sh
@@ -202,6 +214,9 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: win32-x64
 
       - name: Add MSYS2 make to PATH
         shell: pwsh
@@ -237,7 +252,12 @@ jobs:
           gcp_service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Package and publish for Windows (.exe)
-        run: bun x electron-builder --win --publish always
+        # This step runs in PowerShell: pass the zip directory (ELECTRON_ZIP_DIR, from setup-xum) on.
+        # The argument is an array: splatting a string passes its characters one by one.
+        run: |
+          $extra = @()
+          if ($env:ELECTRON_ZIP_DIR) { $extra = @("-c.electronDist=$env:ELECTRON_ZIP_DIR") }
+          bun x electron-builder --win --publish always @extra
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # EV signing environment variables (used by custom sign script if configured)

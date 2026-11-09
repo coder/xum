@@ -1,12 +1,11 @@
 /**
- * Prove that four guards of the paint-check runner (.storybook/test-runner.ts) still fire: the
- * diagram wait, the error marker, the viewport check and the paint-outside check.
+ * Prove that the guards of the paint-check runner (.storybook/test-runner.ts) still fire.
  *
- * Why this exists: every real paint-check story is valid, so deleting one of those guards from the
- * runner leaves them all green. The stories in src/browser/stories/PaintCheckFixtures.stories.tsx
- * are built to trip one guard each. This runs them through the real runner (the same
- * test-storybook that `make test-storybook` runs) and requires each one to fail with its message,
- * or to pass.
+ * Why this exists: every real paint-check story is valid, so deleting a guard from the runner
+ * leaves them all green. The stories in src/browser/stories/PaintCheckFixtures.stories.tsx are
+ * built to trip a guard each, or to pass on purpose. This runs them through the real runner (the
+ * same test-storybook that `make test-storybook` runs) and requires each one to fail with its
+ * message, or to pass.
  *
  * Usage (Storybook must be built and served, like `make test-storybook`; STORYBOOK_URL names a
  * server other than http://127.0.0.1:6006):
@@ -17,9 +16,17 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { PAINT_CHECK_RENDER_TIMEOUT_ENV } from "../src/constants/mermaid";
 
 const FIXTURE_TAG = "paint-fixture";
 const FIXTURE_FILE = "src/browser/stories/PaintCheckFixtures.stories.tsx";
+
+// The fixture with a frame that never draws waits this long for it. The other fixtures render in
+// well under a second, so the margin is wide, and a real run waits the runner's default instead.
+const FIXTURE_RENDER_TIMEOUT_MS = 5_000;
+
+// The runner's viewport check fails a diagram that is off screen, hidden, covered or clipped.
+const VIEWPORT_CHECK_MESSAGE = "must change pixels inside its box";
 
 /**
  * Story export name -> a piece of the runner's failure message, or null for a story that must
@@ -28,8 +35,14 @@ const FIXTURE_FILE = "src/browser/stories/PaintCheckFixtures.stories.tsx";
  */
 export const FIXTURES: ReadonlyMap<string, string | null> = new Map([
   ["BrokenChartNextToGoodChart", "must show a rendered Mermaid diagram"],
-  ["DiagramOutsideTheViewport", "never overlaps the viewport"],
+  ["DiagramNextToAFrameThatNeverDraws", "must show a rendered Mermaid diagram"],
+  ["DiagramOutsideTheViewport", VIEWPORT_CHECK_MESSAGE],
+  ["DiagramInHiddenParent", VIEWPORT_CHECK_MESSAGE],
+  ["DiagramUnderAnOverlay", VIEWPORT_CHECK_MESSAGE],
+  ["DiagramClippedAway", VIEWPORT_CHECK_MESSAGE],
+  ["DiagramBelowTheFoldInHiddenParent", VIEWPORT_CHECK_MESSAGE],
   ["DiagramPaintsOutsideItsBox", "paint only inside its box"],
+  ["DiagramBelowTheFoldSeenWhenScrolled", null],
   ["DiagramMountsWhenTheRunnerWaits", null],
 ]);
 
@@ -108,6 +121,26 @@ export function fixtureProblems(report: unknown): string[] {
   return problems;
 }
 
+/** What spawnSync returns. A process that never started has no output: Node leaves it null or unset. */
+export interface RunResult {
+  status: number | null;
+  signal: string | null;
+  error?: Error;
+  stdout?: string | null;
+  stderr?: string | null;
+}
+
+const outputOf = (run: RunResult) => `${run.stdout ?? ""}${run.stderr ?? ""}`;
+
+/** Why a run left no report. A run that never started has no exit status, only an error. */
+export function noReportMessage(run: RunResult): string {
+  const ending: string[] = [];
+  if (run.error) ending.push(`error: ${run.error.message}`);
+  if (run.signal) ending.push(`signal ${run.signal}`);
+  if (run.status !== null) ending.push(`exit ${run.status}`);
+  return `test-storybook wrote no readable report (${ending.join(", ") || "no exit status"}):\n${outputOf(run)}`;
+}
+
 function main(): number {
   // From the environment, not a flag: Make passes it on without a shell reading its characters.
   const url = process.env.STORYBOOK_URL || "http://127.0.0.1:6006";
@@ -115,7 +148,8 @@ function main(): number {
   const reportFile = join(dir, "report.json");
   try {
     // Node, as in `make test-storybook` (bun x runs the package's node bin). The run exits 1,
-    // because two fixtures fail on purpose: only the report says whether it did what it should.
+    // because the fixtures built to fail do fail: only the report says whether each did what it
+    // should.
     const run = spawnSync(
       "node",
       [
@@ -133,19 +167,25 @@ function main(): number {
         ],
         ...["--json", "--outputFile", reportFile, FIXTURE_FILE],
       ],
-      { encoding: "utf8", timeout: 5 * 60_000 }
+      {
+        encoding: "utf8",
+        timeout: 5 * 60_000,
+        env: {
+          ...process.env,
+          [PAINT_CHECK_RENDER_TIMEOUT_ENV]: String(FIXTURE_RENDER_TIMEOUT_MS),
+        },
+      }
     );
-    const log = `${run.stdout}${run.stderr}`;
     let report: unknown;
     try {
       report = JSON.parse(readFileSync(reportFile, "utf8"));
     } catch {
-      console.error(`test-storybook wrote no readable report (exit ${run.status}):\n${log}`);
+      console.error(noReportMessage(run));
       return 1;
     }
     const problems = fixtureProblems(report);
     if (problems.length > 0) {
-      console.error(`${problems.join("\n\n")}\n\nThe runner's output:\n${log}`);
+      console.error(`${problems.join("\n\n")}\n\nThe runner's output:\n${outputOf(run)}`);
       return 1;
     }
     console.log(`Paint-check fixtures: all ${FIXTURES.size} failed or passed as expected.`);

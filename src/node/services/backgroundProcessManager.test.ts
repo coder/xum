@@ -12,6 +12,7 @@ import {
   type MonitorStoppedPayload,
   type OutputShownPayload,
 } from "./backgroundProcessManager";
+import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
 import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -159,6 +160,8 @@ describe("BackgroundProcessManager", () => {
     runtime = new LocalRuntime(process.cwd());
   });
 
+  // Stopping each leftover process runs shell commands, so this cleanup passes the 5 s hook
+  // default on a busy host (the failure reads "a beforeEach/afterEach hook timed out").
   afterEach(async () => {
     await Promise.all(probeHandles.splice(0).map((handle) => handle.terminate()));
     // Cleanup: terminate all processes
@@ -173,7 +176,7 @@ describe("BackgroundProcessManager", () => {
     await fs
       .rm(`/tmp/mux-bashes/${testWorkspaceId2}`, { recursive: true, force: true })
       .catch(() => undefined);
-  });
+  }, 30_000);
 
   describe("spawn", () => {
     it("should spawn a background process and return process ID and outputDir", async () => {
@@ -309,8 +312,9 @@ describe("BackgroundProcessManager", () => {
 
       expect(result.success).toBe(true);
       if (result.success) {
-        // Wait a moment for output to be written
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        // The wrapper writes the exit code after the command's output, so wait for it:
+        // a fixed delay lost that race on a busy host.
+        expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
         const outputPath = path.join(result.outputDir, "output.log");
         const output = await fs.readFile(outputPath, "utf-8");
@@ -319,7 +323,7 @@ describe("BackgroundProcessManager", () => {
         expect(output).toContain("hello");
         expect(output).toContain("world");
       }
-    });
+    }, 30_000);
 
     it("should write meta.json with process info", async () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
@@ -761,11 +765,14 @@ describe("BackgroundProcessManager", () => {
     });
 
     it("stops monitoring after maxEvents without killing the process", async () => {
-      const eventPromise = waitForMonitorMatch(manager);
+      // spawn() resolves only after it releases its name lock, and the monitor's first poll can
+      // run before that. A script that prints at once can match and retire the monitor (maxEvents)
+      // before the assert below, so the script waits for a gate file the test writes after it.
+      const gate = path.join(bgOutputDir, "start-printing");
       const result = await manager.spawn(
         runtime,
         testWorkspaceId,
-        "for i in 1 2 3; do echo ERR$i; sleep 0.05; done; sleep 2",
+        `while [ ! -e ${shellQuote(gate)} ]; do sleep 0.02; done; for i in 1 2 3; do echo ERR$i; sleep 0.05; done; sleep 2`,
         {
           cwd: process.cwd(),
           displayName: "monitor-max-events",
@@ -786,6 +793,8 @@ describe("BackgroundProcessManager", () => {
       expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(1);
       expect(manager.getActiveMonitorCount(testWorkspaceId2)).toBe(0);
 
+      const eventPromise = waitForMonitorMatch(manager);
+      await fs.writeFile(gate, "");
       const event = await eventPromise;
       expect(event.payload.lines).toEqual(["ERR1"]);
       expect(event.payload.totalMatches).toBe(1);
@@ -1200,6 +1209,8 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    // Two poll windows of up to 2 s against a remote monitor that polls once a second put the
+    // body close to the 5 s default.
     it("retires a real runtime monitor only after both transport probes fail", async () => {
       const outputProbeFailure = { value: false, calls: 0 };
       const exitProbeFailure = { value: false, calls: 0 };
@@ -1250,8 +1261,10 @@ describe("BackgroundProcessManager", () => {
         outputProbeFailure.value = false;
         exitProbeFailure.value = false;
       }
-    });
+    }, 30_000);
 
+    // Two poll windows of up to 2 s against a remote monitor that polls once a second put the
+    // body close to the 5 s default.
     it("retires a real runtime monitor after both probes resolve nonzero", async () => {
       const outputProbeFailure = { value: false, calls: 0, exitCode: 255 };
       const exitProbeFailure = { value: false, calls: 0, exitCode: 255 };
@@ -1302,7 +1315,7 @@ describe("BackgroundProcessManager", () => {
         outputProbeFailure.value = false;
         exitProbeFailure.value = false;
       }
-    });
+    }, 30_000);
 
     describe("armed/stopped registry events", () => {
       function recordEvents(target: BackgroundProcessManager): {
@@ -1351,6 +1364,7 @@ describe("BackgroundProcessManager", () => {
         });
       });
 
+      // Three spawns and two poll windows of up to 3 s each pass the 5 s default on a busy host.
       it("emits monitor:stopped on natural exit, maxEvents, and terminate", async () => {
         const events = recordEvents(manager);
 
@@ -1403,7 +1417,7 @@ describe("BackgroundProcessManager", () => {
           processId: terminated.processId,
           reason: "canceled",
         });
-      });
+      }, 30_000);
 
       it("suppresses monitor:stopped after beginShutdown so registry records survive restarts", async () => {
         const events = recordEvents(manager);
@@ -1722,7 +1736,7 @@ describe("BackgroundProcessManager", () => {
       // A filtered task_await / bash_output read advances outputBytesRead past every complete line
       // but returns only lines matching its own filter. A pending monitor match for "ERR" must still
       // wake on natural exit: the error line was never shown to the agent.
-      const eventPromise = waitForMonitorMatch(manager);
+      const eventPromise = waitForMonitorMatch(manager, 6_000);
 
       const result = await manager.spawn(
         runtime,
@@ -1772,7 +1786,7 @@ describe("BackgroundProcessManager", () => {
       expect(event.payload.lines[0]).toBe("ERR boom");
       expect(event.payload.matchedThroughOffset).toBeDefined();
       expect(event.payload.terminal?.status).toBe("exited");
-    });
+    }, 15_000);
 
     it(
       "does not advance the shown frontier across lines a prior filtered read consumed",
@@ -1846,8 +1860,10 @@ describe("BackgroundProcessManager", () => {
       expect(event.payload.lines[0]).toBe("FAILED");
     });
 
+    // bun's startup alone can pass the 2 s default match wait and the 5 s test timeout on a
+    // busy host.
     it("matches long complete lines when the token appears after the prompt cap", async () => {
-      const eventPromise = waitForMonitorMatch(manager);
+      const eventPromise = waitForMonitorMatch(manager, 20_000);
       const result = await manager.spawn(
         runtime,
         testWorkspaceId,
@@ -1868,14 +1884,16 @@ describe("BackgroundProcessManager", () => {
       const event = await eventPromise;
       expect(event.payload.lines[0]).toContain("FAILED tail");
       expect(event.payload.lines[0]).toContain("truncated");
-    });
+    }, 30_000);
 
     it("bounds incomplete monitor lines while a process keeps running", async () => {
       const longByteCount = 1_100_000;
+      // The process outlives the polling below (afterEach stops it): its exit flushes the
+      // incomplete line, so a poll that came after it would read an empty buffer.
       const result = await manager.spawn(
         runtime,
         testWorkspaceId,
-        `bun -e "process.stdout.write('A'.repeat(${longByteCount})); setTimeout(() => {}, 2000)"`,
+        `bun -e "process.stdout.write('A'.repeat(${longByteCount})); setTimeout(() => {}, 60000)"`,
         {
           cwd: process.cwd(),
           displayName: "monitor-incomplete-bound",
@@ -1891,17 +1909,19 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
+      // bun's startup and the monitor's first read both stretch under host load: wait on a
+      // deadline, not on a fixed number of polls.
+      const deadline = Date.now() + 20_000;
       let incompleteLineBytes = 0;
-      for (let attempt = 0; attempt < 20; attempt++) {
+      while (incompleteLineBytes === 0 && Date.now() < deadline) {
         const proc = await manager.getProcess(result.processId);
         incompleteLineBytes = Buffer.byteLength(proc?.monitor?.incompleteLineBuffer ?? "", "utf8");
-        if (incompleteLineBytes > 0) break;
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        if (incompleteLineBytes === 0) await new Promise((resolve) => setTimeout(resolve, 50));
       }
 
       expect(incompleteLineBytes).toBeGreaterThan(0);
       expect(incompleteLineBytes).toBeLessThanOrEqual(1_000_000);
-    });
+    }, 30_000);
 
     it("retains matched lines until the reconciler acknowledges their offset", async () => {
       const eventPromise = waitForMonitorMatch(manager);
@@ -2359,11 +2379,20 @@ describe("BackgroundProcessManager", () => {
         manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
         manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
-        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'bye\\n'", {
-          cwd: process.cwd(),
-          displayName: "settle-shutdown-midflight",
-          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
-        });
+        // The script waits for a gate file so the tail-read spy below is installed before the
+        // monitor can settle. A script that exits at once can settle first (a busy host is enough),
+        // and then the test waits for a tail read that already happened.
+        const gate = path.join(bgOutputDir, "settle-gate");
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          `while [ ! -e ${shellQuote(gate)} ]; do sleep 0.02; done; printf 'bye\\n'`,
+          {
+            cwd: process.cwd(),
+            displayName: "settle-shutdown-midflight",
+            monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+          }
+        );
         expect(result.success).toBe(true);
         if (!result.success) return;
 
@@ -2388,6 +2417,7 @@ describe("BackgroundProcessManager", () => {
           return realGetOutputFileSize();
         });
 
+        await fs.writeFile(gate, "");
         await tailReadStartedPromise;
         manager.beginShutdown();
         releaseTail();
@@ -2580,11 +2610,20 @@ describe("BackgroundProcessManager", () => {
         manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
         manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
-        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'out\\n'", {
-          cwd: process.cwd(),
-          displayName: "settle-cancel-race",
-          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
-        });
+        // The script waits for a gate file so the tail-read spy below is installed before the
+        // monitor can settle. A script that exits at once can settle first (a busy host is enough),
+        // and then the test waits for a tail read that already happened.
+        const gate = path.join(bgOutputDir, "settle-gate");
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          `while [ ! -e ${shellQuote(gate)} ]; do sleep 0.02; done; printf 'out\\n'`,
+          {
+            cwd: process.cwd(),
+            displayName: "settle-cancel-race",
+            monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+          }
+        );
         expect(result.success).toBe(true);
         if (!result.success) return;
 
@@ -2609,6 +2648,7 @@ describe("BackgroundProcessManager", () => {
           return realGetOutputFileSize();
         });
 
+        await fs.writeFile(gate, "");
         await tailReadStartedPromise;
         // Explicit cancel (task_stop path) while the settlement helper awaits the tail read.
         await manager.terminate(result.processId, { monitorDisposition: "discard" });
@@ -2620,6 +2660,7 @@ describe("BackgroundProcessManager", () => {
         expect(stoppedEvents[0]).toMatchObject({ processId: result.processId, reason: "canceled" });
       });
 
+      // It polls for up to 4 s before its final 300 ms wait, so it has its own timeout.
       it("emits no settlement wakes during shutdown", async () => {
         const matchEvents: MonitorMatchPayload[] = [];
         const stoppedEvents: MonitorStoppedPayload[] = [];
@@ -2648,7 +2689,7 @@ describe("BackgroundProcessManager", () => {
         // the next startup delivers the monitor-lost notice instead.
         expect(matchEvents).toHaveLength(0);
         expect(stoppedEvents).toHaveLength(0);
-      });
+      }, 15_000);
 
       it("marks terminalStatusShown on a filtered post-exit read without advancing the offset", async () => {
         const shownEvents: OutputShownPayload[] = [];
@@ -3715,7 +3756,9 @@ describe("BackgroundProcessManager", () => {
           text += read.output;
           if (!read.note?.includes("continues the current line")) text += "\n";
           // At most the read window of raw bytes stays in memory (decoded: no more UTF-16 units).
-          const retained = (await manager.getProcess(processId))?.incompleteLineBuffer ?? "";
+          // peekProcess: getProcess would also probe the exit marker, one more exec per page on a
+          // remote runtime, and this check only reads a field of the tracked process.
+          const retained = manager.peekProcess(processId)?.incompleteLineBuffer ?? "";
           expect(retained.length).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES + 3);
           if (read.note?.includes("more bytes are unread")) continue;
           // Paging is not polling: the last read gets no polling advice.
@@ -3799,6 +3842,8 @@ describe("BackgroundProcessManager", () => {
         const FILTERED_SCAN_CHUNK_BYTES = 1024 * 1024;
         const headNote = "was filtered on its first";
 
+        // It drains a 2 MB log one 16 KB page at a time, about 130 reads that are each checked, so
+        // the body takes seconds when the host is busy and has its own timeout.
         it("reads a large log one page at a time, and its pages rebuild it exactly", async () => {
           const raw = mixedLog(2 * 1024 * 1024);
           const { processId } = await spawnWithLog(raw);
@@ -3812,8 +3857,10 @@ describe("BackgroundProcessManager", () => {
             expect(limit).toBeDefined();
             expect(limit).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
           }
-        });
+        }, 30_000);
 
+        // The drain makes about 170 shell execs (each read on a remote runtime runs a few): about a
+        // second alone and several times that on a busy host, so this test has its own timeout.
         it("reads a large remote log once, and its pages rebuild it exactly", async () => {
           const tailReads = { calls: 0, bytes: 0 };
           const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), { tailReads });
@@ -3824,7 +3871,7 @@ describe("BackgroundProcessManager", () => {
           // What tail sent back: each byte about once (plus a few to finish a character per read).
           expect(tailReads.bytes).toBeGreaterThanOrEqual(raw.length);
           expect(tailReads.bytes).toBeLessThan(raw.length * 1.05);
-        });
+        }, 60_000);
 
         // A line longer than the read window is decided on its head, and its tail, which
         // matches differently, follows that decision; the note says so. A line that fits in the
@@ -3863,7 +3910,8 @@ describe("BackgroundProcessManager", () => {
         });
 
         // A sparse filter over a remote log far larger than the window: one call scans it all
-        // in a few large reads, instead of returning one empty window per call.
+        // in a few large reads, instead of returning one empty window per call. It moves 4 MB
+        // through a remote runtime's exec streams, so it has its own timeout.
         it("scans a large remote log for a sparse filter in one call", async () => {
           const tailReads = { calls: 0, bytes: 0 };
           const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), { tailReads });
@@ -3883,7 +3931,7 @@ describe("BackgroundProcessManager", () => {
           // Each byte once, plus at most 3 per read to finish a character.
           expect(tailReads.bytes).toBeGreaterThanOrEqual(raw.length);
           expect(tailReads.bytes).toBeLessThanOrEqual(raw.length + 3 * tailReads.calls);
-        });
+        }, 30_000);
 
         // Blank lines are kept by filter_exclude: while it waits for a line that is not blank,
         // they stay in the window and come back with that line, as when a read held the whole log.
@@ -4005,14 +4053,15 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       const output = await manager.getOutput(result.processId);
       expect(output.success).toBe(true);
       if (!output.success) return;
 
       expect(output.output).toContain("error message");
-    });
+    }, 30_000);
 
     it("should return error for non-existent process", async () => {
       const output = await manager.getOutput("bash_nonexistent");
@@ -4056,7 +4105,8 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       // Filter for INFO lines only
       const output = await manager.getOutput(result.processId, "INFO");
@@ -4066,7 +4116,7 @@ describe("BackgroundProcessManager", () => {
       expect(output.output).toContain("INFO: message");
       expect(output.output).toContain("INFO: another");
       expect(output.output).not.toContain("DEBUG");
-    });
+    }, 30_000);
 
     it("should exclude matching lines when filter_exclude is true", async () => {
       const result = await manager.spawn(
@@ -4079,7 +4129,8 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       // Exclude DEBUG lines (invert filter)
       const output = await manager.getOutput(result.processId, "DEBUG", true);
@@ -4089,7 +4140,7 @@ describe("BackgroundProcessManager", () => {
       expect(output.output).toContain("INFO: message");
       expect(output.output).toContain("INFO: another");
       expect(output.output).not.toContain("DEBUG");
-    });
+    }, 30_000);
 
     it("should return error when filter_exclude is true but no filter provided", async () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "echo hello", {
@@ -4244,8 +4295,8 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // Wait for output to be written
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       const peek = await manager.peekOutput(result.processId, { fromOffset: 0 });
       expect(peek.success).toBe(true);
@@ -4257,7 +4308,7 @@ describe("BackgroundProcessManager", () => {
       expect(output.success).toBe(true);
       if (!output.success) return;
       expect(output.output).toContain("hello");
-    });
+    }, 30_000);
   });
 
   describe("integration: spawn and getOutput", () => {
@@ -4325,8 +4376,8 @@ describe("BackgroundProcessManager", () => {
       // CRITICAL: outputDir from spawn MUST match outputDir from getProcess
       expect(proc!.outputDir).toBe(result.outputDir);
 
-      // Wait for output to be written
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       // Verify file exists at the expected path
       const outputPath = path.join(result.outputDir, "output.log");
@@ -4339,7 +4390,7 @@ describe("BackgroundProcessManager", () => {
       if (output.success) {
         expect(output.output).toContain("verify test");
       }
-    });
+    }, 30_000);
 
     it("should work when spawned via bash tool and read via bash_output tool", async () => {
       // This simulates the exact flow in the real system:
@@ -5083,15 +5134,14 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // Wait for process to exit
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       const output = await manager.getOutput(result.processId, undefined, undefined, 0.5);
       expect(output.success).toBe(true);
       if (!output.success) return;
       expect(output.output).toContain("no newline at end");
       expect(output.status).not.toBe("running");
-    });
+    }, 15_000);
   });
 
   describe("polling detection", () => {

@@ -627,14 +627,17 @@ crap-check: ## CRAP gate on files changed since BASE (default: merge-base with o
 
 CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --locked --quiet --only-group crap --only-group test python
 
-# tree-sitter-language-pack downloads its grammars from GitHub releases on
-# first use. The script tests are in static-check-full (Required), so a transient failure
-# there (seen: HTTP 504) must not fail the job before any test uses the grammars. CI caches
-# the pack's directory, which makes this a no-op, and sets the budget to 15 minutes for a cold
-# cache: the 504 outage of 2026-11-08 outlasted the old 3 tries 10 s apart. The default
-# keeps an offline local run short. The script exits 64 on an HTTP 4xx that no retry changes.
-# A language added to its list needs a new key prefix in pr.yml's "Restore tree-sitter
-# grammars" step.
+# tree-sitter-language-pack downloads its grammars from GitHub releases on first use. The
+# script tests are in static-check-full (Required), so a transient failure there (seen: HTTP
+# 504) must not fail the job before any test uses the grammars. The script checks the pack's
+# manifest and bundle against sha256 pins that it holds, and then calls the pack's download(),
+# which extracts the grammars from them (and fetches them when they are missing). CI sets
+# GRAMMAR_STAGE_DIR to the directory that it caches, which holds only those two files, so a
+# cache hit needs no network (pr.yml's "Restore tree-sitter grammars" step). A cold cache gets
+# a budget of 15 minutes: the 504 outage of 2026-11-08 outlasted the old 3 tries 10 s apart.
+# The default keeps an offline local run short. The script exits 64 on an HTTP 4xx that no
+# retry changes, and on files that do not match the pins. A language added to `LANGUAGES` in
+# the script needs no new key: the key hashes the script.
 GRAMMAR_DOWNLOAD_BUDGET_SECS ?= 60
 tree-sitter-grammars:
 	@./scripts/retry.sh --budget-secs $(GRAMMAR_DOWNLOAD_BUDGET_SECS) --max-backoff-secs 60 --fatal-status 64 0 2 env $(CRAP_PYTHON) scripts/ci/download_tree_sitter_grammars.py
@@ -896,15 +899,22 @@ ensure-mac-sharp-runtime-deps: node_modules/.installed
 		fi; \
 	done
 
+# ELECTRON_ZIP_DIR (CI sets it, from setup-xum's electron-zip input) names the directory of the
+# checksum-checked electron-v<version>-<platform>-<arch>.zip files. electron-builder then unpacks
+# them and downloads nothing: its own download retries nothing, and a github.com 504 failed
+# Build / Linux in five queue runs on 2026-11-08. The directory must hold the zip of every arch
+# the call builds, or electron-builder looks for an unpacked Electron there and fails.
+ELECTRON_DIST_FLAG = $(if $(ELECTRON_ZIP_DIR),-c.electronDist="$(ELECTRON_ZIP_DIR)")
+
 dist-mac: build ## Build macOS distributables (x64 + arm64)
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@if [ -n "$$CSC_LINK" ]; then \
 		echo "🔐 Code signing enabled - using unified build for correct yml..."; \
-		bun x electron-builder --mac --x64 --arm64 --publish never; \
+		bun x electron-builder --mac --x64 --arm64 --publish never $(ELECTRON_DIST_FLAG); \
 	else \
 		echo "Building macOS architectures in parallel..."; \
-		bun x electron-builder --mac --x64 --publish never & pid1=$$! ; \
-		bun x electron-builder --mac --arm64 --publish never & pid2=$$! ; \
+		bun x electron-builder --mac --x64 --publish never $(ELECTRON_DIST_FLAG) & pid1=$$! ; \
+		bun x electron-builder --mac --arm64 --publish never $(ELECTRON_DIST_FLAG) & pid2=$$! ; \
 		wait $$pid1 && wait $$pid2; \
 	fi
 	@# electron-updater skips an update when os.release() (the Darwin version) is below the
@@ -923,12 +933,12 @@ MAC_TARGETS ?=
 dist-mac-x64: build ## Build macOS x64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS x64..."
-	@bun x electron-builder --mac $(MAC_TARGETS) --x64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --x64 --publish never $(ELECTRON_DIST_FLAG)
 
 dist-mac-arm64: build ## Build macOS arm64 distributable only
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS arm64..."
-	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never
+	@bun x electron-builder --mac $(MAC_TARGETS) --arm64 --publish never $(ELECTRON_DIST_FLAG)
 
 install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Applications
 	@app_bundle="$$(bun -e 'import { resolveMacPackagedAppNames } from "./src/common/compat/macPackagedApp.ts"; import pkg from "./package.json"; process.stdout.write(resolveMacPackagedAppNames(pkg.build).appBundleName)')"; \
@@ -938,17 +948,13 @@ install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Appli
 	echo "Installed $$app_bundle to /Applications"
 
 dist-win: build ## Build Windows distributable
-	@bun x electron-builder --win --publish never
+	@bun x electron-builder --win --publish never $(ELECTRON_DIST_FLAG)
 
-# ELECTRON_ZIP_DIR (CI sets it, from setup-xum's electron-zip input) names the directory of the
-# checksum-checked electron-v<version>-linux-x64.zip. electron-builder then unpacks that zip and
-# downloads nothing: its own download retries nothing, and a github.com 504 failed Build / Linux
-# in five queue runs on 2026-11-08.
 dist-linux: build ## Build Linux distributable
-	@bun x electron-builder --linux --publish never $(if $(ELECTRON_ZIP_DIR),-c.electronDist=$(ELECTRON_ZIP_DIR))
+	@bun x electron-builder --linux --publish never $(ELECTRON_DIST_FLAG)
 
 dist-linux-arm64: build ## Build Linux arm64 distributable
-	@bun x electron-builder --linux --arm64 --publish never
+	@bun x electron-builder --linux --arm64 --publish never $(ELECTRON_DIST_FLAG)
 
 # MAC_ARCH=x64|arm64 validates a single-arch build (dist-mac-<arch>) instead of both.
 check-mac-attach-file-runtime: ## Validate packaged macOS attach_file runtime assets (requires prior dist-mac build)
@@ -1021,10 +1027,10 @@ WEBKIT_STORY_FILES = $(shell grep -rlF -e '"webkit"' -e '"paint-check"' src/brow
 test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" or "paint-check" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)
 	$(check_node_version)
 	@test -n "$(WEBKIT_STORY_FILES)" || { echo "No story has the webkit or paint-check tag"; exit 1; }
-	@# paint-fixture stories are built to fail (one to pass), so only test-storybook-paint-fixtures runs them.
+	@# paint-fixture stories are built to fail or to pass on purpose, so only test-storybook-paint-fixtures runs them.
 	@bun x test-storybook --browsers webkit --includeTags webkit paint-check --excludeTags paint-fixture --testTimeout 30000 $(WEBKIT_STORY_FILES)
 
-test-storybook-paint-fixtures: node_modules/.installed ## Prove the runner's diagram wait, error marker, viewport check and paint-outside check still fire, with stories built to trip them (requires Storybook to be running or built; STORYBOOK_URL, default http://127.0.0.1:6006)
+test-storybook-paint-fixtures: node_modules/.installed ## Prove the paint-check runner's guards still fire, with stories built to trip them (requires Storybook to be running or built; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)
 	@bun scripts/check-paint-check-fixtures.ts
 
