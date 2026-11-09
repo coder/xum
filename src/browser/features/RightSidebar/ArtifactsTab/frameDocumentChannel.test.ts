@@ -134,6 +134,25 @@ describe("frame document channel: MCP App view document", () => {
     expect(next.events).toEqual([]);
   });
 
+  // The document's first script hands over exactly one port: its own end of the channel.
+  test("an open announcement binds only with exactly one port", async () => {
+    const channel = createFrameDocumentChannel("ab12");
+    const received: unknown[] = [];
+    channel.setReceiver({ message: (data) => received.push(data), leave: () => undefined });
+    const open = { xumFrameDocument: 1, type: "open", nonce: "ab12" };
+    const first = new MessageChannel();
+    const second = new MessageChannel();
+    expect(channel.acceptOpen({ data: open, ports: [] })).toBe(false);
+    expect(channel.acceptOpen({ data: open, ports: [first.port2, second.port2] })).toBe(false);
+    first.port1.postMessage({ from: "two ports" });
+    const document = new MessageChannel();
+    expect(channel.acceptOpen({ data: open, ports: [document.port2] })).toBe(true);
+    document.port1.postMessage({ from: "one port" });
+    await tick();
+    expect(received).toEqual([{ from: "one port" }]);
+    for (const port of [first.port1, second.port1, document.port1]) port.close();
+  });
+
   test("an unloading document closes its frame; a closed channel carries nothing", async () => {
     const channel = createFrameDocumentChannel("ab12");
     const received: unknown[] = [];
