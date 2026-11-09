@@ -62,3 +62,31 @@ export function getApiKey(keyName: string): string {
 
   return value;
 }
+
+/**
+ * Placeholder for a provider key in tests that need a configured provider but never reach it
+ * (the mock AI router, or a simulated stream).
+ */
+export const DUMMY_API_KEY = "test-key-for-ui-tests";
+
+/**
+ * A configured provider that cannot be reached: the dummy key plus a base URL on the loopback
+ * discard port, where nothing listens. A feature that calls the provider anyway (title generation
+ * on a creation send) is refused at once, and nothing leaves the host, so a run without keys never
+ * sends the dummy key to a real API.
+ */
+export const DUMMY_PROVIDER_CONFIG = {
+  apiKey: DUMMY_API_KEY,
+  baseUrl: "http://127.0.0.1:9/v1",
+};
+
+/**
+ * The environment's key for a provider when it has one (CI), else DUMMY_PROVIDER_CONFIG. Lets a
+ * suite that only needs a configured provider run without keys, while a run with keys keeps using
+ * them. A suite that calls the provider must keep `getApiKey`/`validateApiKeys`: the dummy cannot
+ * answer.
+ */
+export function getProviderConfigOrDummy(keyName: string): { apiKey: string; baseUrl?: string } {
+  const value = process.env[keyName];
+  return value === undefined || value === "" ? DUMMY_PROVIDER_CONFIG : { apiKey: value };
+}

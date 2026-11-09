@@ -18,7 +18,13 @@ import type { OrpcSource } from "./helpers";
 import type { ORPCContext } from "../../src/node/orpc/context";
 import type { RuntimeConfig } from "../../src/common/types/runtime";
 import { createOrpcTestClient, type OrpcTestClient } from "./orpcTestClient";
-import { shouldRunIntegrationTests, validateApiKeys, getApiKey } from "../testUtils";
+import {
+  shouldRunIntegrationTests,
+  validateApiKeys,
+  getApiKey,
+  DUMMY_API_KEY,
+  DUMMY_PROVIDER_CONFIG,
+} from "../testUtils";
 
 export interface TestEnvironment {
   config: Config;
@@ -66,10 +72,11 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   // are configured. For non-integration tests, seed a dummy provider so the UI can render.
   //
   // For integration tests (TEST_INTEGRATION=1), do NOT write dummy keys here (they would override
-  // real env-backed credentials used by tests like name generation).
+  // real env-backed credentials used by tests like name generation). They get one below, and only
+  // when the environment configures no provider.
   if (!shouldRunIntegrationTests()) {
     stores.providersConfigStore.saveProvidersConfig({
-      anthropic: { apiKey: "test-key-for-ui-tests" },
+      anthropic: { apiKey: DUMMY_API_KEY },
     });
   }
 
@@ -91,13 +98,30 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   const orpcContext: ORPCContext = services.toORPCContext();
   const orpc = createOrpcTestClient(orpcContext);
 
-  return {
+  const env: TestEnvironment = {
     config,
     services,
     mockWindow,
     tempDir,
     orpc,
   };
+
+  // CI has provider keys in the environment (Anthropic and OpenAI among them), so the UI finds
+  // configured providers and this seeds nothing. A run without keys has none: ProjectPage then
+  // shows its configure prompt instead of the creation composer, the model picker lists no GPT
+  // model, and compaction has no larger-context OpenAI model to suggest. Give that run the same
+  // two providers, on a dummy that cannot reach the API.
+  if (
+    shouldRunIntegrationTests() &&
+    !Object.values(services.providerService.getConfig()).some((provider) => provider?.isConfigured)
+  ) {
+    await setupProviders(env, {
+      anthropic: DUMMY_PROVIDER_CONFIG,
+      openai: DUMMY_PROVIDER_CONFIG,
+    });
+  }
+
+  return env;
 }
 
 /**
