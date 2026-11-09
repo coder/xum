@@ -308,6 +308,15 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "openai:daybreak-red-latest": "openai/gpt-5",
 };
 
+/**
+ * Ids of retired first-class models. The model catalogue keeps offering them so users can
+ * still find a model a newer built-in replaced, even when only models-extra describes it
+ * (Fable 5.1 and Mythos 5.1 are not in LiteLLM's models.json).
+ */
+export const RETIRED_KNOWN_MODEL_IDS: readonly string[] = Object.keys(
+  LEGACY_TOKENIZER_MODEL_OVERRIDES
+);
+
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   ...LEGACY_TOKENIZER_MODEL_OVERRIDES,
   // Spread current models last so a returning id always wins over its legacy entry.
