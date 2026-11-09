@@ -180,11 +180,29 @@ describe("buildAgentSandboxPolicy", () => {
   test("does not open where a cache folder that is a symlink points", async () => {
     const home = path.join(root, "home");
     await fs.mkdir(home);
-    await fs.symlink(home, path.join(home, ".npm"));
+    await fs.symlink(home, path.join(home, ".cargo-registry"));
+    await fs.mkdir(path.join(home, ".cargo"));
+    await fs.symlink(home, path.join(home, ".cargo", "registry"));
     const homedir = spyOn(os, "homedir").mockReturnValue(home);
     using _tmpdir = homeOutsideWriteRoots();
     try {
       expect(buildAgentSandboxPolicy(SETTINGS, { cwd: repo }).writeRoots).not.toContain(home);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  // npx outside the sandbox runs ~/.npm/_npx through the link, which a command can replace.
+  test("fails closed when the npm cache folder is a symlink", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(path.join(home, "npm-cache"), { recursive: true });
+    await fs.symlink(path.join(home, "npm-cache"), path.join(home, ".npm"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
+    try {
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(
+        AgentSandboxStartError
+      );
     } finally {
       homedir.mockRestore();
     }
@@ -764,11 +782,14 @@ describe("buildAgentSandboxPolicy", () => {
     ).toThrow(AgentSandboxStartError);
   });
 
-  // Xum and its git use these as spelled, outside the sandbox, so a command could replace the link.
+  // Xum, its git, npx and uvx use these as spelled, outside the sandbox, so a command could
+  // replace the link.
   test.each([
     // Any existing folder and file outside the write roots and the home folder.
     { name: "XUM_ROOT", target: "/usr" },
     { name: "GIT_CONFIG_GLOBAL", target: "/etc/hosts" },
+    { name: "npm_config_cache", target: "/usr" },
+    { name: "UV_CACHE_DIR", target: "/usr" },
   ])("fails closed when $name is a link in a write root", async ({ name, target }) => {
     const alias = path.join(repo, "alias");
     await fs.symlink(target, alias);

@@ -220,9 +220,10 @@ export function buildAgentSandboxPolicy(
   }
   const readableSpellings = [...AUTOMATION_READ_PATHS, ...gitGlobalConfigFiles()];
   const automationSpellings = [...readableSpellings, ...HIDDEN_AUTOMATION_PATHS];
-  // Xum and its git use these as spelled, outside the sandbox, so a command could replace a link
-  // to one in a write root (Codex review): fail closed.
-  assertNoPathThroughLink([getXumHome(), ...automationSpellings], writeRoots);
+  const cacheSpellings = cacheExecutablePaths();
+  // Xum, its git and the npx, uvx and bunx of MCP servers use these as spelled, outside the
+  // sandbox, so a command could replace a link to one in a write root (Codex review): fail closed.
+  assertNoPathThroughLink([getXumHome(), ...automationSpellings, ...cacheSpellings], writeRoots);
   const linkedEntries = automationEntryLinkTargets(writeRoots);
   const readableAutomation = [...readableSpellings.map(expandSandboxPath), ...linkedEntries];
   const automationPaths = [...automationSpellings.map(expandSandboxPath), ...linkedEntries];
@@ -254,7 +255,7 @@ export function buildAgentSandboxPolicy(
       ...[
         ...nestedDenies,
         ...automationPaths,
-        ...cacheExecutablePaths().map(expandSandboxPath),
+        ...cacheSpellings.map(expandSandboxPath),
         ...homeLinkTargets(home, writeRoots),
         ...configIncludePaths.map(realpathOfNearest),
       ].filter((denied) => isUnderAny(denied, writeRoots)),
