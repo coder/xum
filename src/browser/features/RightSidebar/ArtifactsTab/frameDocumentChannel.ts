@@ -3,6 +3,7 @@ import {
   FRAME_DOCUMENT_CHECK_CAP_MS,
   FRAME_DOCUMENT_CHECK_DEADLINE_MS,
   FRAME_DOCUMENT_CHECK_LATE_MS,
+  FRAME_DOCUMENT_HEARTBEAT_MS,
 } from "@/common/constants/artifactInteractions";
 import assert from "@/common/utils/assert";
 
@@ -215,8 +216,8 @@ export interface FrameDocumentChannel {
   /**
    * Asks the bound document to answer a fresh value over its port. `onMissed` runs when
    * FRAME_DOCUMENT_CHECK_DEADLINE_MS passes, from the first check no answer has cleared, without
-   * an answer to the latest check. A deadline timer that fires late (the app's thread was
-   * blocked) extends the deadline, up to FRAME_DOCUMENT_CHECK_CAP_MS after that first check.
+   * an answer to the latest check. A deadline whose window saw the app's thread blocked is
+   * extended instead, up to FRAME_DOCUMENT_CHECK_CAP_MS after that first check.
    */
   check: (onMissed: () => void) => void;
   /** Closes the port and stops the deadline. */
@@ -228,6 +229,15 @@ export interface FrameDocumentChannel {
  * frame, across host rebuilds (the document announces itself once). Rate limited per document,
  * so a burst of an earlier document cannot drop this one's messages.
  */
+interface PendingCheck {
+  value: string;
+  firstSentAt: number;
+  dueAt: number;
+  timer: ReturnType<typeof setTimeout>;
+  blocked: boolean;
+  heartbeat: ReturnType<typeof setTimeout>;
+}
+
 class DocumentChannel implements FrameDocumentChannel {
   // Bound once by the document's open announcement; the port is never replaced.
   private port: MessagePort | null = null;
@@ -235,14 +245,10 @@ class DocumentChannel implements FrameDocumentChannel {
   private receiver: FrameDocumentReceiver | null = null;
   private readonly allowMessage = createBridgeRateLimiter();
   // The latest check no answer has cleared, when the first of them went out (the cap counts from
-  // there), and its deadline. An answer to an older check (sent just before the document died)
-  // clears nothing.
-  private pending: {
-    value: string;
-    firstSentAt: number;
-    dueAt: number;
-    timer: ReturnType<typeof setTimeout>;
-  } | null = null;
+  // there), its deadline, and whether the heartbeat saw the app's thread blocked since that
+  // deadline was armed. An answer to an older check (sent just before the document died) clears
+  // nothing.
+  private pending: PendingCheck | null = null;
 
   constructor(
     private readonly nonce: string,
@@ -276,6 +282,8 @@ class DocumentChannel implements FrameDocumentChannel {
       this.pending = {
         value,
         firstSentAt: sentAt,
+        blocked: false,
+        heartbeat: this.beatAfter(() => this.pending),
         ...this.armDeadline(sentAt + FRAME_DOCUMENT_CHECK_DEADLINE_MS, onMissed),
       };
     } else {
@@ -288,9 +296,31 @@ class DocumentChannel implements FrameDocumentChannel {
   close = (): void => {
     this.closed = true;
     this.port?.close();
-    if (this.pending != null) clearTimeout(this.pending.timer);
-    this.pending = null;
+    this.clearPending();
   };
+
+  private clearPending(): void {
+    if (this.pending == null) return;
+    clearTimeout(this.pending.timer);
+    clearTimeout(this.pending.heartbeat);
+    this.pending = null;
+  }
+
+  /**
+   * One beat of the heartbeat that runs while a check is pending: a beat that fires more than
+   * FRAME_DOCUMENT_CHECK_LATE_MS late marks the pending check's window as blocked.
+   */
+  private beatAfter(current: () => PendingCheck | null): ReturnType<typeof setTimeout> {
+    const dueAt = this.now() + FRAME_DOCUMENT_HEARTBEAT_MS;
+    return setTimeout(() => {
+      const pending = current();
+      // mutation-equivalent: clearPending() stops the heartbeat with its check, so a beat always
+      // finds that check still pending.
+      if (pending == null) return;
+      if (this.now() - dueAt > FRAME_DOCUMENT_CHECK_LATE_MS) pending.blocked = true;
+      pending.heartbeat = this.beatAfter(current);
+    }, FRAME_DOCUMENT_HEARTBEAT_MS);
+  }
 
   private armDeadline(dueAt: number, onMissed: () => void) {
     const timer = setTimeout(() => this.deadlinePassed(onMissed), dueAt - this.now());
@@ -298,20 +328,24 @@ class DocumentChannel implements FrameDocumentChannel {
   }
 
   /**
-   * The pending check's deadline timer fired. On time, the document missed it: the frame closes.
+   * The pending check's deadline timer fired. If the app's thread ran freely since the deadline
+   * was armed, the document missed it: the frame closes.
    *
-   * Late by more than FRAME_DOCUMENT_CHECK_LATE_MS, the app's own thread was blocked, so the
-   * deadline says nothing about the document. WebKit runs the frame on that thread too: after a
-   * 6 s block right after a check, it ran the overdue timer before the document's queued answer,
-   * and a live artifact closed. So the pending check gets one more deadline, from now, but never
-   * later than FRAME_DOCUMENT_CHECK_CAP_MS after its first unanswered check. No fresh check goes
-   * out: only an answer to the latest value clears it, as before.
+   * If the thread was blocked meanwhile (the deadline timer, or a beat of the heartbeat, fired
+   * more than FRAME_DOCUMENT_CHECK_LATE_MS late), the deadline says nothing about the document.
+   * WebKit runs the frame on that thread too. After a 6 s block right after a check, it ran the
+   * overdue timer before the document's queued answer. An artifact that runs chained 2.5 s tasks
+   * answers two tasks after a check, and its answer reaches the host one task later, so the
+   * deadline fired on time at a task boundary with the answer still on its way. In both cases a
+   * live artifact closed. So the pending check gets one more deadline, from now, but never later
+   * than FRAME_DOCUMENT_CHECK_CAP_MS after its first unanswered check. No fresh check goes out:
+   * only an answer to the latest value clears it, as before.
    *
    * SECURITY AUDIT: a page the frame navigated to cannot answer, so this only delays its close. A
-   * dead document's timer fires on time and closes it at the deadline. A page that keeps the
-   * shared thread busy (WebKit, in-process Chromium) makes every deadline late, and stays shown,
-   * without the bridge, until the cap passes and its next block ends (24.5 s measured in WebKit
-   * with 6 s blocks, against 12.4 s with no extension). It freezes the whole app meanwhile.
+   * dead document closes at the first deadline whose window saw no block. A page that keeps the
+   * shared thread busy (WebKit, in-process Chromium) makes every window blocked, and stays shown,
+   * without the bridge, until the cap passes and its current block ends (24.5 s measured in
+   * WebKit with 6 s blocks, against 12.4 s with no extension). It freezes the whole app meanwhile.
    */
   private deadlinePassed(onMissed: () => void): void {
     const pending = this.pending;
@@ -320,21 +354,23 @@ class DocumentChannel implements FrameDocumentChannel {
     if (pending == null || this.closed) return;
     const now = this.now();
     const capAt = pending.firstSentAt + FRAME_DOCUMENT_CHECK_CAP_MS;
-    if (now - pending.dueAt > FRAME_DOCUMENT_CHECK_LATE_MS && now < capAt) {
+    const blocked = pending.blocked || now - pending.dueAt > FRAME_DOCUMENT_CHECK_LATE_MS;
+    if (blocked && now < capAt) {
+      // The next window asks again: a block it does not see cannot extend it.
+      pending.blocked = false;
       Object.assign(
         pending,
         this.armDeadline(Math.min(now + FRAME_DOCUMENT_CHECK_DEADLINE_MS, capAt), onMissed)
       );
       return;
     }
-    this.pending = null;
+    this.clearPending();
     onMissed();
   }
 
   private answered(value: unknown): void {
     if (this.pending == null || value !== this.pending.value) return;
-    clearTimeout(this.pending.timer);
-    this.pending = null;
+    this.clearPending();
   }
 
   private receive(data: unknown): void {
