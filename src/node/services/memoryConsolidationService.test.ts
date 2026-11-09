@@ -3574,7 +3574,7 @@ describe("MemoryConsolidationService", () => {
           if (file === jobLockPath) retryWaits.resolve();
           return open(file, flags, mode);
         });
-        let run: Promise<Result<MemoryConsolidationRecord, string>> | undefined;
+        let run: ReturnType<MemoryConsolidationService["maybeRun"]> | undefined;
         try {
           run = fixture.service.maybeRun("ws-dream", "manual");
           await Promise.race([run, retryWaits.promise]);
