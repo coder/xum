@@ -18,7 +18,9 @@ const PREFETCH = path.resolve(import.meta.dir, "prefetch-electron-zip.cjs");
 const ELECTRON = path.resolve(import.meta.dir, "../../node_modules/electron");
 
 // The stub library: HOOK_MODE=reject fails the download with a real HTTPError of status
-// HOOK_STATUS (HOOK_MODE=network: a plain error with no status), and a call ends the process.
+// HOOK_STATUS (HOOK_MODE=network: a plain error with no status). Otherwise it returns a zip
+// path for the platform and arch asked for, all in one directory (HOOK_ZIPS=split: one per
+// arch, HOOK_ZIPS=windows: Windows paths).
 const HOOK = `
 const Module = require("node:module");
 const load = Module._load;
@@ -29,7 +31,12 @@ Module._load = function (request, ...rest) {
     downloadArtifact(options) {
       process.stdout.write("OPTIONS " + JSON.stringify(options) + "\\n");
       if (process.env.HOOK_MODE === "network") return Promise.reject(new Error("socket hang up"));
-      if (process.env.HOOK_MODE !== "reject") return Promise.resolve("/cache/electron.zip");
+      if (process.env.HOOK_MODE !== "reject") {
+        const file = "electron-" + options.platform + "-" + options.arch + ".zip";
+        if (process.env.HOOK_ZIPS === "windows") return Promise.resolve("C:\\\\cache\\\\abc\\\\" + file);
+        if (process.env.HOOK_ZIPS === "split") return Promise.resolve("/cache/" + options.arch + "/" + file);
+        return Promise.resolve("/cache/abc/" + file);
+      }
       loadingReal = true;
       const { HTTPError } = Module.createRequire(process.env.ELECTRON_DIR + "/")("@electron/get");
       loadingReal = false;
@@ -66,8 +73,12 @@ afterEach(async () => {
   await rm(project, { recursive: true, force: true });
 });
 
-async function node(script: string, env: Record<string, string> = {}): Promise<RunResult> {
-  const proc = Bun.spawn(["node", "-r", hook, script], {
+async function node(
+  script: string,
+  env: Record<string, string> = {},
+  args: string[] = []
+): Promise<RunResult> {
+  const proc = Bun.spawn(["node", "-r", hook, script, ...args], {
     cwd: project,
     env: {
       ...process.env,
@@ -86,12 +97,19 @@ async function node(script: string, env: Record<string, string> = {}): Promise<R
   return { exitCode, stdout, stderr };
 }
 
+function allDownloadOptions(result: RunResult): Record<string, unknown>[] {
+  return result.stdout
+    .split("\n")
+    .filter((l) => l.startsWith("OPTIONS "))
+    .map((line) => JSON.parse(line.slice("OPTIONS ".length)) as Record<string, unknown>);
+}
+
 function downloadOptions(result: RunResult): Record<string, unknown> {
-  const line = result.stdout.split("\n").find((l) => l.startsWith("OPTIONS "));
-  if (line === undefined) {
+  const [first] = allDownloadOptions(result);
+  if (first === undefined) {
     throw new Error(`no downloadArtifact call in: ${result.stdout}${result.stderr}`);
   }
-  return JSON.parse(line.slice("OPTIONS ".length)) as Record<string, unknown>;
+  return first;
 }
 
 function cacheKey(options: Record<string, unknown>): Record<string, unknown> {
@@ -106,10 +124,51 @@ test("asks @electron/get for the zip with the options install.js uses", async ()
   expect(cacheKey(downloadOptions(prefetch))).toEqual(cacheKey(downloadOptions(installer)));
 });
 
-test("reports the zip it fetched", async () => {
+test("reports the zip it fetched, and the directory that holds it", async () => {
   const result = await node(PREFETCH);
   expect(result.exitCode).toBe(0);
-  expect(result.stdout).toContain("Electron zip ready: /cache/electron.zip");
+  expect(result.stdout).toContain(
+    `Electron zip ready: /cache/abc/electron-${process.platform}-${process.arch}.zip`
+  );
+  expect(result.stdout).toContain("Electron zip dir: /cache/abc\n");
+});
+
+test("fetches one zip per target named, for that platform and arch, with the same options otherwise", async () => {
+  const result = await node(PREFETCH, {}, ["darwin-x64", "darwin-arm64"]);
+  expect(result.exitCode).toBe(0);
+  const calls = allDownloadOptions(result);
+  expect(calls.map((c) => [c.platform, c.arch])).toEqual([
+    ["darwin", "x64"],
+    ["darwin", "arm64"],
+  ]);
+  // Only the platform and arch differ between the calls.
+  const [x64, arm64] = calls.map((call) => ({ ...call, platform: undefined, arch: undefined }));
+  expect(arm64).toEqual(x64);
+  expect(result.stdout).toContain("Electron zip ready: /cache/abc/electron-darwin-x64.zip");
+  expect(result.stdout).toContain("Electron zip ready: /cache/abc/electron-darwin-arm64.zip");
+  expect(result.stdout.match(/^Electron zip dir: .*$/gm)).toEqual(["Electron zip dir: /cache/abc"]);
+});
+
+test("prints a Windows zip's directory with forward slashes", async () => {
+  const result = await node(PREFETCH, { HOOK_ZIPS: "windows" }, ["win32-x64"]);
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toContain("Electron zip dir: C:/cache/abc\n");
+});
+
+test("exits 64 when the targets' zips are not in one directory", async () => {
+  const result = await node(PREFETCH, { HOOK_ZIPS: "split" }, ["linux-x64", "linux-arm64"]);
+  expect(result.exitCode).toBe(64);
+  expect(result.stderr).toContain("different directories");
+  expect(result.stdout).not.toContain("Electron zip dir:");
+});
+
+test("exits 64 on a target that is not <platform>-<arch>, before any download", async () => {
+  for (const bad of ["darwin", "darwin-armv7", "freebsd-x64", "darwin-x64;ls"]) {
+    const result = await node(PREFETCH, {}, ["linux-x64", bad]);
+    expect(result.exitCode).toBe(64);
+    expect(result.stderr).toContain(bad);
+    expect(allDownloadOptions(result)).toEqual([]);
+  }
 });
 
 test("exits 1 with the download's error on a failure a retry can fix", async () => {

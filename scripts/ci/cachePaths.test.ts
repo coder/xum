@@ -67,14 +67,16 @@ function lines(value: unknown): string[] {
 }
 
 // A path as the runner sees it: `~` is the home directory, and the one expression in use
-// (`${{ env.electron_config_cache }}`) is read from the line that sets it in the same file.
+// (`${{ env.electron_config_cache }}`) is read from the line that sets it in the same file. That
+// line writes the home directory as `$home` (a variable of the step: cygpath's form of $HOME on
+// Windows) or as `$HOME`.
 function resolvePath(raw: string, fileText: string): string {
   if (raw === "${{ env.electron_config_cache }}") {
-    const line = /electron_config_cache=(\S+?)"? >>/.exec(fileText);
+    const line = /electron_config_cache=(\S+?)"?$/m.exec(fileText);
     if (line === null) {
       throw new Error("electron_config_cache is not set in the file that uses it");
     }
-    return resolvePath(line[1].replace("$HOME", "~"), fileText);
+    return resolvePath(line[1].replace(/^\$(HOME|home)/, "~"), fileText);
   }
   if (raw.startsWith("${{ runner.temp }}/")) {
     return path.posix.normalize(RUNNER_TEMP + raw.slice("${{ runner.temp }}".length));
@@ -307,6 +309,9 @@ describe("the download caches of the CI tools", () => {
   });
 
   test.each(Object.entries(KEYED_BY))("the key of %s hashes %s", (prefix, file) => {
+    // A restore step and a save step. Without this a prefix that GUARDED lacks leaves the loop
+    // below empty, and the test passes without checking anything.
+    expect(stepsOf(prefix)).toHaveLength(2);
     for (const step of stepsOf(prefix)) {
       expect(step.key).toContain(`hashFiles('${file}')`);
     }

@@ -7,7 +7,7 @@
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally: bun test ./scripts/ci/wiring.test.ts
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { appBuilderPath } from "app-builder-bin";
@@ -18,7 +18,7 @@ setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const REPO = path.resolve(import.meta.dir, "../..");
 const ACTION = path.join(REPO, ".github/actions/setup-xum/action.yml");
-const PR_WORKFLOW = path.join(REPO, ".github/workflows/pr.yml");
+const WORKFLOWS = path.join(REPO, ".github/workflows");
 
 let work: string;
 
@@ -55,10 +55,15 @@ function env(extra: Record<string, string> = {}): Record<string, string> {
   return { PATH: `${work}:${process.env.PATH ?? ""}`, ...extra };
 }
 
-async function setupActionSteps(): Promise<{ name?: string; if?: string; run?: string }[]> {
-  const action = parse(await readFile(ACTION, "utf8")) as {
-    runs: { steps: { name?: string; if?: string; run?: string }[] };
-  };
+interface ActionStep {
+  name?: string;
+  if?: string;
+  run?: string;
+  with?: Record<string, unknown>;
+}
+
+async function setupActionSteps(): Promise<ActionStep[]> {
+  const action = parse(await readFile(ACTION, "utf8")) as { runs: { steps: ActionStep[] } };
   return action.runs.steps;
 }
 
@@ -132,81 +137,307 @@ describe("setup-xum: Download Electron zip", () => {
   });
 });
 
-describe("setup-xum: Locate Electron zip", () => {
-  async function locate(
-    zipExists: boolean,
-    exits: number[] = []
-  ): Promise<{ result: RunResult; githubEnv: string }> {
-    const zip = path.join(work, "zips", "abc", "electron-v1.2.3-linux-x64.zip");
-    if (zipExists) {
-      await mkdir(path.dirname(zip), { recursive: true });
-      await writeFile(zip, "zip");
+describe("setup-xum: Point Electron downloads at their own cache", () => {
+  async function point(
+    env: Record<string, string>,
+    cygpath?: string
+  ): Promise<{ result: RunResult; lines: string[] }> {
+    // The host's own platform and arch, as `node -p` prints them.
+    await stub("node", [], "echo darwin-arm64");
+    if (cygpath !== undefined) {
+      await writeExecutable(path.join(work, "cygpath"), `echo ${cygpath}`);
     }
-    // Only the run that succeeds finds the zip.
-    await stub(
-      "node",
-      exits,
-      `[ "$n" = ${exits.length + 1} ] && echo "Electron zip ready: ${zip}"`
-    );
     const githubEnv = path.join(work, "github-env");
     await writeFile(githubEnv, "");
-    const result = await runStep(await setupStep("Locate Electron zip"), { GITHUB_ENV: githubEnv });
+    const result = await runStep(await setupStep("Point Electron downloads at their own cache"), {
+      HOME: "/home/ci",
+      GITHUB_ENV: githubEnv,
+      ...env,
+    });
+    const lines = (await readFile(githubEnv, "utf8")).split("\n").filter((line) => line !== "");
+    return { result, lines };
+  }
+
+  test("names the host's zip when the caller names none", async () => {
+    const { result, lines } = await point({ TARGETS_INPUT: "" });
+    expect(result.exitCode).toBe(0);
+    expect(lines).toEqual([
+      "electron_config_cache=/home/ci/.cache/xum-electron-zip",
+      "ELECTRON_ZIP_TARGETS=darwin-arm64",
+      "ELECTRON_ZIP_SLUG=darwin-arm64",
+    ]);
+  });
+
+  test("passes the caller's targets on, and keys the cache by them", async () => {
+    const { lines } = await point({ TARGETS_INPUT: "darwin-x64 darwin-arm64" });
+    expect(lines).toContain("ELECTRON_ZIP_TARGETS=darwin-x64 darwin-arm64");
+    expect(lines).toContain("ELECTRON_ZIP_SLUG=darwin-x64_darwin-arm64");
+  });
+
+  test("gives node a Windows path where cygpath exists (MSYS paths read as C:\\c\\Users\\...)", async () => {
+    const { lines } = await point({ TARGETS_INPUT: "" }, "C:/Users/runneradmin");
+    expect(lines[0]).toBe("electron_config_cache=C:/Users/runneradmin/.cache/xum-electron-zip");
+  });
+});
+
+describe("setup-xum: Download Electron zip targets", () => {
+  test("fetches the targets the job asked for, and the host's zip when it asked for none", async () => {
+    await stub("node", []);
+    const step = await setupStep("Download Electron zip");
+    await runStep(step, { ELECTRON_ZIP_TARGETS: "darwin-x64 darwin-arm64" });
+    await runStep(step, { ELECTRON_ZIP_TARGETS: "" });
+    expect(await runs("node")).toEqual([
+      "scripts/ci/prefetch-electron-zip.cjs darwin-x64 darwin-arm64",
+      "scripts/ci/prefetch-electron-zip.cjs",
+    ]);
+  });
+});
+
+describe("setup-xum: Locate Electron zip", () => {
+  const dir = () => path.join(work, "zips", "abc");
+
+  // Each target has a zip in `dir()` (a file unless `missing` names it). The stub prints what the
+  // real prefetch prints, on the run that succeeds only.
+  async function locate(
+    options: {
+      targets?: string[];
+      missing?: string[];
+      exits?: number[];
+      silent?: boolean;
+      noDir?: boolean;
+    } = {}
+  ): Promise<{ result: RunResult; githubEnv: string }> {
+    const {
+      targets = ["linux-x64"],
+      missing = [],
+      exits = [],
+      silent = false,
+      noDir = false,
+    } = options;
+    const zips = targets.map((target) => path.join(dir(), `electron-v1.2.3-${target}.zip`));
+    await mkdir(dir(), { recursive: true });
+    for (const [index, zip] of zips.entries()) {
+      if (!missing.includes(targets[index])) await writeFile(zip, "zip");
+    }
+    const lines = zips.map((zip) => `echo "Electron zip ready: ${zip}"`);
+    const dirLine = noDir ? [] : [`echo "Electron zip dir: ${dir()}"`];
+    const printed = silent ? [] : [...lines, ...dirLine];
+    const onSuccess = printed.length === 0 ? "true" : printed.join("; ");
+    await stub("node", exits, `[ "$n" = ${exits.length + 1} ] && { ${onSuccess}; true; }`);
+    const githubEnv = path.join(work, "github-env");
+    await writeFile(githubEnv, "");
+    const result = await runStep(await setupStep("Locate Electron zip"), {
+      GITHUB_ENV: githubEnv,
+      ELECTRON_ZIP_TARGETS: targets.join(" "),
+      TMPDIR: work,
+    });
     return { result, githubEnv: await readFile(githubEnv, "utf8") };
   }
 
-  test("exports the directory of the zip for make dist-linux", async () => {
-    const { result, githubEnv } = await locate(true);
+  test("exports the directory of the zip for electron-builder", async () => {
+    const { result, githubEnv } = await locate();
     expect(result.exitCode).toBe(0);
-    expect(githubEnv).toBe(`ELECTRON_ZIP_DIR=${path.join(work, "zips", "abc")}\n`);
+    expect(githubEnv).toBe(`ELECTRON_ZIP_DIR=${dir()}\n`);
   });
 
-  test("fails when the zip is not where the prefetch said", async () => {
-    const { result, githubEnv } = await locate(false);
+  test("asks for every target the job named, and exports their one directory", async () => {
+    const targets = ["darwin-x64", "darwin-arm64"];
+    const { result, githubEnv } = await locate({ targets });
+    expect(result.exitCode).toBe(0);
+    expect(await runs("node")).toEqual([
+      `scripts/ci/prefetch-electron-zip.cjs ${targets.join(" ")}`,
+    ]);
+    expect(githubEnv).toBe(`ELECTRON_ZIP_DIR=${dir()}\n`);
+  });
+
+  test("fails when a zip is not where the prefetch said", async () => {
+    const { result, githubEnv } = await locate({
+      targets: ["darwin-x64", "darwin-arm64"],
+      missing: ["darwin-arm64"],
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toContain("electron-v1.2.3-darwin-arm64.zip");
+    expect(githubEnv).toBe("");
+  });
+
+  test("fails when the prefetch names no zip", async () => {
+    const { result, githubEnv } = await locate({ silent: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(githubEnv).toBe("");
+  });
+
+  test("fails when the prefetch names zips but no directory", async () => {
+    const { result, githubEnv } = await locate({ noDir: true });
     expect(result.exitCode).not.toBe(0);
     expect(githubEnv).toBe("");
   });
 
   test("retries a failed prefetch, as the download step does", async () => {
-    const { result, githubEnv } = await locate(true, [1]);
+    const { result, githubEnv } = await locate({ exits: [1] });
     expect(result.exitCode).toBe(0);
     expect(await runs("node")).toHaveLength(2);
-    expect(githubEnv).toBe(`ELECTRON_ZIP_DIR=${path.join(work, "zips", "abc")}\n`);
+    expect(githubEnv).toBe(`ELECTRON_ZIP_DIR=${dir()}\n`);
+  });
+
+  test("leaves the retries' output in the log when the prefetch fails", async () => {
+    const { result, githubEnv } = await locate({ exits: [64] });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toContain("::group::Attempt 1");
+    expect(result.stdout).toContain("::error::Attempt 1 failed with exit 64");
+    expect(githubEnv).toBe("");
   });
 });
 
-// The scripts above only run when the workflow calls them. These two checks pin the calls:
-// a dropped input or an inverted condition turns the Electron zip steps off or on silently, and
-// Build / Linux then falls back to app-builder's own download, which retries nothing.
+// The scripts above only run when the workflow calls them. These checks pin the calls: a
+// dropped input or an inverted condition turns the Electron zip steps off or on silently, and the
+// build then falls back to app-builder's own download, which retries nothing.
 describe("the Electron zip wiring", () => {
-  test("setup-xum runs every Electron zip step only when the caller asks for the zip", async () => {
+  // The exact `if` of each step, which a test of "contains the gate" would let drift: a step that
+  // loses its cache-hit clause downloads on every hit, and an `|| true` runs it for every job.
+  const GATE = "${{ inputs.electron-zip == 'true' }}";
+  const GATE_ON_MISS =
+    "${{ inputs.electron-zip == 'true' && steps.cache-electron-zip.outputs.cache-hit != 'true' }}";
+
+  test("setup-xum runs every Electron zip step only when the caller asks, and the download only on a miss", async () => {
     const steps = (await setupActionSteps()).filter((step) =>
       /Electron zip|Point Electron downloads/.test(step.name ?? "")
     );
-    expect(steps.map((step) => step.name)).toEqual([
-      "Point Electron downloads at their own cache",
-      "Restore Electron zip",
-      "Download Electron zip",
-      "Save Electron zip",
-      "Locate Electron zip",
+    expect(steps.map((step) => [step.name, step.if])).toEqual([
+      ["Point Electron downloads at their own cache", GATE],
+      ["Restore Electron zip", GATE],
+      ["Download Electron zip", GATE_ON_MISS],
+      ["Save Electron zip", GATE_ON_MISS],
+      ["Locate Electron zip", GATE],
     ]);
-    for (const step of steps) {
-      expect(step.if).toContain("inputs.electron-zip == 'true'");
+  });
+
+  test("the cache key names the zips, so jobs that need other zips do not share an entry", async () => {
+    const restore = (await setupActionSteps()).find((step) => step.name === "Restore Electron zip");
+    expect(restore?.with?.key).toContain("${{ env.ELECTRON_ZIP_SLUG }}");
+  });
+
+  interface Job {
+    name?: string;
+    steps: { name?: string; uses?: string; run?: string; with?: Record<string, unknown> }[];
+  }
+
+  async function jobsWithElectronBuilder(): Promise<Map<string, Job>> {
+    const found = new Map<string, Job>();
+    for (const file of (await readdir(WORKFLOWS)).filter((name) => name.endsWith(".yml"))) {
+      const workflow = parse(await readFile(path.join(WORKFLOWS, file), "utf8")) as {
+        jobs?: Record<string, Job>;
+      };
+      for (const [id, job] of Object.entries(workflow.jobs ?? {})) {
+        if (
+          job.steps?.some((step) => /bun x electron-builder|make\s+"?dist/.test(step.run ?? ""))
+        ) {
+          found.set(`${file}#${id}`, job);
+        }
+      }
+    }
+    return found;
+  }
+
+  // Every job that builds with electron-builder, and the zips it needs: the zip of each arch it
+  // builds. electron-builder looks for an unpacked Electron in the directory when a zip is not
+  // there, so a missing arch fails the build instead of downloading. No entry: this runner's own.
+  const ELECTRON_BUILDS: Record<string, string | undefined> = {
+    "pr.yml#build-linux": undefined,
+    "pr.yml#build-macos": "darwin-${{ matrix.arch }}",
+    "pr.yml#build-windows": "win32-x64",
+    "_desktop-release.yml#build-macos": "darwin-x64 darwin-arm64",
+    "_desktop-release.yml#build-linux": "linux-x64",
+    "_desktop-release.yml#build-linux-arm64": "linux-arm64",
+    "_desktop-release.yml#build-windows": "win32-x64",
+  };
+
+  test("every job that builds with electron-builder is in the table below", async () => {
+    const jobs = await jobsWithElectronBuilder();
+    expect([...jobs.keys()].sort()).toEqual(Object.keys(ELECTRON_BUILDS).sort());
+  });
+
+  test.each(Object.entries(ELECTRON_BUILDS))(
+    "%s unpacks the checked zips of its arches (%s)",
+    async (key, targets) => {
+      const job = (await jobsWithElectronBuilder()).get(key);
+      expect(job).toBeDefined();
+      const setup = job?.steps.filter((step) => step.uses === "./.github/actions/setup-xum") ?? [];
+      expect(setup).toHaveLength(1);
+      expect(setup[0].with?.["electron-zip"]).toBe("true");
+      expect(setup[0].with?.["electron-zip-targets"]).toBe(targets);
+    }
+  );
+
+  // `make dist-*` passes the directory itself (tested below). A step that runs electron-builder
+  // directly must pass it, or electron-builder downloads its own zip. Bash expands the flag only
+  // when the variable is set. The Windows step runs in PowerShell, which builds the argument first.
+  const BASH_FLAG = '${ELECTRON_ZIP_DIR:+-c.electronDist="$ELECTRON_ZIP_DIR"}';
+  const DIRECT_CALLS: Record<string, string[]> = {
+    "_desktop-release.yml#build-linux": [
+      `bun x electron-builder --linux --publish always ${BASH_FLAG}`,
+    ],
+    "_desktop-release.yml#build-linux-arm64": [
+      `bun x electron-builder --linux --arm64 --publish never ${BASH_FLAG}`,
+    ],
+    "_desktop-release.yml#build-windows": [
+      '$extra = @("-c.electronDist=$env:ELECTRON_ZIP_DIR")',
+      "bun x electron-builder --win --publish always @extra",
+    ],
+  };
+
+  test("a step that runs electron-builder directly hands it the zip directory", async () => {
+    const direct = new Map<string, string>();
+    for (const [key, job] of await jobsWithElectronBuilder()) {
+      for (const step of job.steps) {
+        if (step.run?.includes("bun x electron-builder")) direct.set(key, step.run);
+      }
+    }
+    expect([...direct.keys()].sort()).toEqual(Object.keys(DIRECT_CALLS).sort());
+    for (const [key, run] of direct) {
+      const lines = run.split("\n").map((line) => line.trim());
+      for (const expected of DIRECT_CALLS[key]) {
+        expect(lines.some((line) => line.includes(expected))).toBe(true);
+      }
+    }
+  });
+});
+
+describe("make dist-*: the zip directory reaches every electron-builder call", () => {
+  // `make -n` prints the recipe without running it. -o build leaves the build alone.
+  async function electronBuilderLines(target: string, zipDir: string): Promise<string[]> {
+    const result = await runScript(["make", "-n", target, "-o", "build"], {
+      cwd: REPO,
+      env: env({ ELECTRON_ZIP_DIR: zipDir }),
+    });
+    expect(result.exitCode).toBe(0);
+    return result.stdout.split("\n").filter((line) => line.includes("bun x electron-builder"));
+  }
+
+  const TARGETS: [string, number][] = [
+    ["dist-mac", 3],
+    ["dist-mac-x64", 1],
+    ["dist-mac-arm64", 1],
+    ["dist-win", 1],
+    ["dist-linux", 1],
+    ["dist-linux-arm64", 1],
+  ];
+
+  test.each(TARGETS)("%s hands every call (%d) the zip directory", async (target, calls) => {
+    const lines = await electronBuilderLines(target, "/zips/abc");
+    expect(lines).toHaveLength(calls);
+    for (const line of lines) {
+      expect(line).toMatch(/-c\.electronDist="?\/zips\/abc"?(\s|;|&|$)/);
     }
   });
 
-  test("Build / Linux asks setup-xum for the Electron zip", async () => {
-    const workflow = parse(await readFile(PR_WORKFLOW, "utf8")) as {
-      jobs: Record<
-        string,
-        { name?: string; steps: { uses?: string; with?: Record<string, unknown> }[] }
-      >;
-    };
-    const job = workflow.jobs["build-linux"];
-    expect(job?.name).toBe("Build / Linux");
-    const setup = job.steps.filter((step) => step.uses === "./.github/actions/setup-xum");
-    expect(setup).toHaveLength(1);
-    expect(setup[0].with?.["electron-zip"]).toBe("true");
-  });
+  test.each(TARGETS)(
+    "%s leaves electron-builder to download where no directory is set",
+    async (target) => {
+      for (const line of await electronBuilderLines(target, "")) {
+        expect(line).not.toContain("electronDist");
+      }
+    }
+  );
 });
 
 // scripts/ci/prefetch-appimage-tool.sh only runs when the workflow calls it, and it only helps
@@ -243,7 +474,7 @@ describe("the AppImage tool wiring", () => {
   });
 
   test("Build / Linux asks setup-xum for the tool", async () => {
-    const workflow = parse(await readFile(PR_WORKFLOW, "utf8")) as {
+    const workflow = parse(await readFile(path.join(WORKFLOWS, "pr.yml"), "utf8")) as {
       jobs: Record<string, { steps: { uses?: string; with?: Record<string, unknown> }[] }>;
     };
     const setup = workflow.jobs["build-linux"]?.steps.filter(
