@@ -546,6 +546,21 @@ describe("redactSecretLike", () => {
         `Set-Cookie: [it's x] ${SESSION}\nmore\nlines`,
         "Set-Cookie: [redacted]\nmore\nlines",
       ],
+      // A quote at a value's start opens it, even where it could close the frame around it.
+      [
+        "a quoted value after a single-quoted argument's colon",
+        `echo 'Cookie: ' sid=${SESSION}'`,
+        "echo 'Cookie: [redacted]",
+      ],
+      ["a single-quoted value at the start", `'Cookie: ' sid=${SESSION}`, "'Cookie: [redacted]"],
+      ["a quoted value in an assignment", `x="Cookie: " sid=${SESSION}"`, 'x="Cookie: [redacted]'],
+      ["a quoted value before a comma", `"Cookie: ",${SESSION}"`, '"Cookie: [redacted]'],
+      // The fail-closed cost: an empty header in a quoted argument loses the rest of its line.
+      [
+        "an empty header in a quoted argument",
+        `curl -H "Cookie: " https://example.com/${SESSION}`,
+        'curl -H "Cookie: [redacted]',
+      ],
     ])("redacts the whole value with %s", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
@@ -671,7 +686,6 @@ describe("redactSecretLike", () => {
       ["an empty header", "Cookie:\nHost: example.com"],
       ["an empty header with a gap", "Cookie:   \nHost: example.com"],
       ["an empty quoted value", '{"cookie": "", "a": 1}'],
-      ["an empty header in a quoted argument", 'curl -H "Cookie: " https://example.com'],
       ["another key at the start of the text", "X: 1"],
       ["a name inside a word at the start of the text", "xCookie: 1"],
       ["a color code's letters without its escape", "Cookie x1b[0m: 1"],
