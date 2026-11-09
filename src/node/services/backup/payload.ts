@@ -125,7 +125,7 @@ const JSON_FILE_PATH = /\.jsonc?$/i;
  * not parse would be skipped whole. The scanner never throws and does not recurse.
  */
 function jsonStringsMatchSecretPattern(text: string): boolean {
-  const scanner = jsonc.createScanner(text, true);
+  const scanner = jsonc.createScanner(text);
   for (let token = scanner.scan(); token !== jsonc.SyntaxKind.EOF; token = scanner.scan()) {
     if (token === jsonc.SyntaxKind.StringLiteral && matchesSecretPattern(scanner.getTokenValue())) {
       return true;
