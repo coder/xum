@@ -48,6 +48,18 @@ async function install(args: string[], cpu: string): Promise<RunResult> {
   });
 }
 
+// The files that curl was told to write (-o), one per download.
+async function curlOutputs(): Promise<string[]> {
+  const calls = await readFile(path.join(work, "curl-calls"), "utf8").catch(() => "");
+  return calls
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => {
+      const words = line.split(" ");
+      return words[words.indexOf("-o") + 1] ?? "";
+    });
+}
+
 async function curlUrls(): Promise<string[]> {
   const calls = await readFile(path.join(work, "curl-calls"), "utf8").catch(() => "");
   return calls
@@ -67,7 +79,7 @@ describe("install-release-tools.sh", () => {
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toContain("does not match the pinned sha256");
       expect(await readdir(bin).catch(() => [])).toEqual([]);
-      expect(await readdir(path.join(work, "assets")).catch(() => [])).toEqual([]);
+      expect(await readdir(path.join(work, "assets", set)).catch(() => [])).toEqual([]);
     }
   );
 
@@ -89,6 +101,19 @@ describe("install-release-tools.sh", () => {
     expect(x86).toHaveLength(1);
     expect(x86[0]).toMatch(/\/curl-linux-x86_64-musl-[\d.]+\.tar\.xz$/);
   });
+
+  test.each(TOOL_SETS)(
+    "%s: downloads into a directory of its own, and touches no other",
+    async (set) => {
+      await install([set, path.join(work, "bin")], "x86_64");
+      const outputs = await curlOutputs();
+      expect(outputs.length).toBeGreaterThan(0);
+      for (const output of outputs) {
+        expect(path.dirname(output)).toBe(path.join(work, "assets", set));
+      }
+      expect(await readdir(path.join(work, "assets"))).toEqual([set]);
+    }
+  );
 
   test("refuses an unknown tool set and a wrong command line", async () => {
     expect((await install(["nope", path.join(work, "bin")], "x86_64")).exitCode).toBe(2);

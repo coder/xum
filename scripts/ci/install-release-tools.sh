@@ -3,11 +3,14 @@
 #
 # Usage: scripts/ci/install-release-tools.sh <shfmt-hadolint|static-curl> <bin-dir>
 #
-# Each asset goes through download-verified.sh into $RELEASE_ASSETS_DIR (default
-# ~/.cache/xum-release-assets). The workflows cache that directory under a key that holds this
-# file's hash, so a changed pin or checksum starts a fresh cache. A cache hit skips the
-# download, because the asset already matches its checksum. A GitHub release outage then
-# fails a job only when the cache is cold (retry.sh covers that case).
+# Each asset goes through download-verified.sh into <assets>/<tool set>, where <assets> is
+# $RELEASE_ASSETS_DIR (default ~/.cache/xum-release-assets). Each tool set has a directory of
+# its own, and the workflows cache that directory alone (never <assets>) under a key that holds
+# this file's hash, so a changed pin or checksum starts a fresh cache. No two caches share a
+# path (scripts/ci/cachePaths.test.ts). A cache hit skips the download, because the asset
+# already matches its checksum, and download-verified.sh checks that on every hit, so a cache
+# entry never supplies unpinned bytes. A GitHub release outage then fails a job only when the
+# cache is cold (retry.sh covers that case).
 #
 # A version bump needs new checksums for every asset of that tool below. Never copy them from
 # the release page: download each asset yourself, run `sha256sum` on it, and check that the
@@ -18,9 +21,10 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-assets=${RELEASE_ASSETS_DIR:-$HOME/.cache/xum-release-assets}
+assets_root=${RELEASE_ASSETS_DIR:-$HOME/.cache/xum-release-assets}
 
-# fetch <url> <sha256> <asset-file-name>
+# fetch <url> <sha256> <asset-file-name>: into $assets, which is the tool set's own directory
+# (set where the tool set is chosen, at the end of this file)
 fetch() {
   "$here/download-verified.sh" "$1" "$2" "$assets/$3"
 }
@@ -79,8 +83,14 @@ if (($# != 2)); then
   exit 2
 fi
 case "$1" in
-  shfmt-hadolint) install_shfmt_hadolint "$2" ;;
-  static-curl) install_static_curl "$2" ;;
+  shfmt-hadolint)
+    assets=$assets_root/shfmt-hadolint
+    install_shfmt_hadolint "$2"
+    ;;
+  static-curl)
+    assets=$assets_root/static-curl
+    install_static_curl "$2"
+    ;;
   *)
     echo "install-release-tools.sh: unknown tool set '$1'" >&2
     exit 2
