@@ -392,7 +392,7 @@ describe("redactSecretLike", () => {
       [
         "a value behind a long gap",
         `Cookie:${" ".repeat(60)}sid=${SESSION}\nHost: example.com`,
-        `Cookie:${" ".repeat(60)}[redacted]\nHost: example.com`,
+        `Cookie:${" ".repeat(48)}[redacted]\nHost: example.com`,
       ],
     ])("redacts %s and keeps what is around it", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
@@ -480,7 +480,8 @@ describe("redactSecretLike", () => {
       [
         "a `]` inside a list item",
         jsonOf({ "set-cookie": ["a=foo]bar", `sid=${SESSION}`] }),
-        '{"set-cookie":[redacted]}',
+        // The regex pass ends the list at that `]`; what follows reads as more value.
+        '{"set-cookie":[redacted]',
       ],
       ["a quoted pair", `Cookie: sid="${SESSION}"\nHost: h`, "Cookie: [redacted]\nHost: h"],
       [
@@ -499,7 +500,7 @@ describe("redactSecretLike", () => {
       [
         "a pair after a quoted key's value",
         `"cookie": "a"; sid=${SESSION}`,
-        '"cookie": "[redacted]',
+        '"cookie": [redacted]',
       ],
       [
         "a pair after escaped quotes in a quoted argument",
@@ -625,7 +626,6 @@ describe("redactSecretLike", () => {
         String.raw`{"o":"{\"p\":\"{\\\"cookie\\\": [redacted]\",\"q\":\"keep\"}"}`,
       ],
       ["a pair after a quoted key's list", `"cookie": [a] sid=${SESSION}`, '"cookie": [redacted]'],
-      ["a nested list", jsonOf({ "set-cookie": [["a"], SESSION] }), '{"set-cookie":[redacted]}'],
       [
         "an escaped bracket in a list",
         `Set-Cookie: [a\\[b] sid=${SESSION}\nHost: h`,
@@ -647,38 +647,117 @@ describe("redactSecretLike", () => {
         `Cookie: sid=${SESSION}\\\\\nHost: h`,
         "Cookie: [redacted]\nHost: h",
       ],
-      [
-        "an escaped line break two strings deep",
-        jsonOf({ out: jsonOf({ h: `Cookie: sid=${SESSION}\nHost: h` }) }),
-        String.raw`{"out":"{\"h\":\"Cookie: [redacted]\\nHost: h\"}"}`,
-      ],
-      [
-        "an unclosed list in a string at depth one",
-        String.raw`{"o":"{\"h\":\"Set-Cookie: [a, ${SESSION}\"}"}`,
-        String.raw`{"o":"{\"h\":\"Set-Cookie: [redacted]\"}"}`,
-      ],
-      [
-        "a quoted key's list of escaped items with a `]` in one",
-        jsonOf({ o: jsonOf({ "set-cookie": ["a]b", `sid=${SESSION}`] }) }),
-        String.raw`{"o":"{\"set-cookie\":[redacted]}"}`,
-      ],
-      // An item's quote before a blank opens it: read as its close, ` a]` would end the list.
-      [
-        "a list item that opens with a blank",
-        jsonOf({ cookie: [" a]b", SESSION], host: "h" }),
-        '{"cookie":[redacted],"host":"h"}',
-      ],
-      [
-        "an escaped list item that opens with a blank",
-        jsonOf({ o: jsonOf({ cookie: [" a]b", SESSION], host: "h" }) }),
-        String.raw`{"o":"{\"cookie\":[redacted],\"host\":\"h\"}"}`,
-      ],
     ])("ends the value at its frame in %s", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
       expect(redacted).toBe(expected);
       expect(redacted).not.toContain(SESSION);
       expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
+    // The regex pass runs first and its marker can hide the structure after it, so these rows put
+    // more blanks before the colon than the regex reads: only the reader sees the header.
+    const GAP = " ".repeat(49);
+    it.each([
+      [
+        "a nested list",
+        `{"set-cookie"${GAP}:[["a"],"${SESSION}"]}`,
+        `{"set-cookie"${GAP}:[redacted]}`,
+      ],
+      [
+        "an escaped line break two strings deep",
+        jsonOf({ out: jsonOf({ h: `Cookie${GAP}: sid=${SESSION}\nHost: h` }) }),
+        String.raw`{"out":"{\"h\":\"Cookie${GAP}: [redacted]\\nHost: h\"}"}`,
+      ],
+      [
+        "an unclosed list in a string at depth one",
+        String.raw`{"o":"{\"h\":\"Set-Cookie${GAP}: [a, ${SESSION}\"}"}`,
+        String.raw`{"o":"{\"h\":\"Set-Cookie${GAP}: [redacted]\"}"}`,
+      ],
+      [
+        "a quoted key's list of escaped items with a `]` in one",
+        jsonOf({ o: `{"set-cookie"${GAP}:["a]b","sid=${SESSION}"]}` }),
+        String.raw`{"o":"{\"set-cookie\"${GAP}:[redacted]}"}`,
+      ],
+      // An item's quote before a blank opens it: read as its close, ` a]` would end the list.
+      [
+        "a list item that opens with a blank",
+        `{"cookie"${GAP}:[" a]b","${SESSION}"],"host":"h"}`,
+        `{"cookie"${GAP}:[redacted],"host":"h"}`,
+      ],
+      [
+        "an escaped list item that opens with a blank",
+        jsonOf({ o: `{"cookie"${GAP}:[" a]b","${SESSION}"],"host":"h"}` }),
+        String.raw`{"o":"{\"cookie\"${GAP}:[redacted],\"host\":\"h\"}"}`,
+      ],
+    ])("reads %s where only the reader sees the header", (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toBe(expected);
+      expect(redacted).not.toContain(SESSION);
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
+    // The reader runs on what the regex pass left, so a header the regex ended early can no longer
+    // carry the next one away (the reader's frame ran from an escaped key to the next key's quote),
+    // and a second pass changes nothing.
+    it.each([
+      [
+        "a JSON string with a cookie key before a headers object",
+        String.raw`s = "{\"cookie\": 1}"; h = {"cookie": "sid=SEKRIT"}`,
+        String.raw`s = "{\"cookie\": [redacted]": "[redacted]"}`,
+      ],
+      [
+        "a null cookie key before a headers object",
+        String.raw`body = "{\"cookie\": null}"; headers = {"Cookie": "sid=SEKRIT"}`,
+        String.raw`body = "{\"cookie\": [redacted]": "[redacted]"}`,
+      ],
+      [
+        "two declarations",
+        String.raw`const a = "{\"cookie\": 1}"; const b = {"set-cookie": "sid=SEKRIT"};`,
+        String.raw`const a = "{\"cookie\": [redacted]": "[redacted]"};`,
+      ],
+      [
+        "a quoted name after a list",
+        "'Cookie: [a] Cookie': sid=SEKRIT",
+        "'Cookie: [redacted]': [redacted]",
+      ],
+      [
+        "an escaped key before a quoted name",
+        String.raw`{\"Cookie\": a "Set-Cookie": sid=SEKRIT`,
+        String.raw`{\"Cookie\": [redacted]": [redacted]`,
+      ],
+      [
+        "an escaped key with two quoted values",
+        String.raw`{\"cookie\": "a" "x": 1}`,
+        String.raw`{\"cookie\": [redacted]": 1}`,
+      ],
+      [
+        "an escaped key before a quoted cookie key",
+        String.raw`\"cookie\": "a" "Cookie": sid=SEKRIT`,
+        String.raw`\"cookie\": [redacted]": [redacted]`,
+      ],
+    ])("redacts %s and reads the result back unchanged", (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toBe(expected);
+      expect(redacted).not.toContain("SEKRIT");
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
+    // As the regex pass does, an empty value is redacted, but taking out nothing adds no credential
+    // the write guard should count, so a note that quotes an empty header stays writable.
+    it.each([
+      ["an empty header", "Cookie:\nHost: example.com", "Cookie:[redacted]\nHost: example.com"],
+      [
+        "an empty header with a gap",
+        "Cookie:   \nHost: example.com",
+        "Cookie:   [redacted]\nHost: example.com",
+      ],
+      ["an empty quoted value", '{"cookie": "", "a": 1}', '{"cookie": "[redacted]", "a": 1}'],
+    ])("redacts %s and counts nothing as added", (_label, text, expected) => {
+      expect(redactSecretLike(text)).toBe(expected);
+      expect(addsSecretLike("", text)).toBe(false);
     });
 
     // Five more layers of JSON escape a key's quote with 31 backslashes, the most a key may have.
@@ -713,10 +792,6 @@ describe("redactSecretLike", () => {
       ["a list", '{"set-cookie": [redacted], "a": 1}'],
       ["Go's map print", "map[Accept:[*/*] Cookie:[redacted]"],
       ["a header with blanks after the marker", "Cookie: [redacted] \nHost: example.com"],
-      // An empty value holds no credential, so a note that quotes an empty header stays writable.
-      ["an empty header", "Cookie:\nHost: example.com"],
-      ["an empty header with a gap", "Cookie:   \nHost: example.com"],
-      ["an empty quoted value", '{"cookie": "", "a": 1}'],
       ["another key at the start of the text", "X: 1"],
       ["a name inside a word at the start of the text", "xCookie: 1"],
       ["a color code's letters without its escape", "Cookie x1b[0m: 1"],

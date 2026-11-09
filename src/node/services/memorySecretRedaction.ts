@@ -92,6 +92,26 @@ const SECRET_KEY_VALUE_PATTERN = new RegExp(
 
 // A session cookie is a bearer credential that has no keyword and no token shape of its own, so the
 // header is the only thing that marks it. The value of a `Cookie` / `Set-Cookie` header goes, and
+// the header name stays. A header's value ends at its line break (raw, or the escape of one in
+// JSON text: `\n`, `\r`) or at the quote that closes it (a JSON string, a `curl -H "..."`), so the
+// body takes everything but those, and a backslash that does not start an escape. The header may
+// also be a JSON key (`"cookie": "a=b"`, its opening quote kept so the quotes stay paired), whose
+// value may be an array (`"set-cookie": ["a=b", "c=d"]`, Node's shape), read to its `]`.
+// A name starts after a non-word character, so `getCookie:` and `X-Cookie:` are not headers; after
+// an escaped line break it starts behind the letter of `\n`. A prose line that begins with
+// `cookie:` is redacted to its end: the name and the colon are all this rule can see.
+// Linear: the body and the array never fail and never backtrack, as `QUOTED_VALUE` is (a run of
+// body characters is one step); the name, the key's quote and the gaps are bounded, and the value
+// is read once, since the match ends it.
+const COOKIE_HEADER_PATTERN = new RegExp(
+  String.raw`(?:(?<![\w-])|(?<=\\[nr]))` +
+    String.raw`((?:Set-)?Cookie(?:\\{0,${ESCAPE_RUN_MAX}}["'])?[ \t]{0,${GAP_MAX}}:[ \t]{0,${GAP_MAX}})` +
+    String.raw`(?:\[[^\]]*\]?|((?:\\{0,${ESCAPE_RUN_MAX}}["'])?)(?:[^\r\n"'\\]+|\\(?![nr"']))*)`,
+  "gi"
+);
+
+// A session cookie is a bearer credential that has no keyword and no token shape of its own, so the
+// header is the only thing that marks it. The value of a `Cookie` / `Set-Cookie` header goes, and
 // the header name stays. A hand-written forward reader, not a regex: one rule holds it together,
 // a value is never ended by its own content, only by the end of its frame (a raw line, a quoted
 // string, a JSON string at some depth). Each content-based end a regex tried (a quote, a `]`, a `;`
@@ -313,6 +333,26 @@ function settleValue(
   return { start, end: readToFrameEnd(text, unit.next, header.frame) };
 }
 
+function readQuotedValue(
+  text: string,
+  header: CookieHeader,
+  run: number,
+  quote: string
+): { start: number; end: number } {
+  const { valueStart: start, frame } = header;
+  const contentStart = start + run + 1;
+  const stop = (pos: number, posRun: number): number => frameEnd(text, pos, posRun, frame);
+  const unit = readQuoted(text, contentStart, { quote, run }, stop);
+  const value = settleValue(text, header, start, unit);
+  if (!header.keyForm || unit.kind !== "closed" || value.end !== unit.end) return value;
+  // A quoted key's value that ends at its own close goes with both its quotes. A kept quote pair
+  // around the marker would not read back the same: the regex pass eats all but one backslash of
+  // a close quote's run (`\\"`), and a lone kept quote would close at the frame's quote after it.
+  // The pair around the marker alone is what the regex pass writes, and it stays.
+  const marker = text.slice(contentStart, unit.end) === REDACTED;
+  return marker ? { start: unit.next, end: unit.next } : { start, end: unit.next };
+}
+
 function readValue(text: string, header: CookieHeader): { start: number; end: number } {
   const { valueStart: start, frame } = header;
   const run = runLength(text, start);
@@ -320,13 +360,7 @@ function readValue(text: string, header: CookieHeader): { start: number; end: nu
   // A quote here opens the value, before any frame test: read as the frame's close, it would leave
   // `'Cookie: ' sid=S'` an empty value with the pair after it readable. The cost: the value of an
   // empty header in a quoted argument (`-H "Cookie: " url`) runs to the end of the line.
-  if (QUOTE.test(opener)) {
-    const contentStart = start + run + 1;
-    const stop = (pos: number, posRun: number): number => frameEnd(text, pos, posRun, frame);
-    const unit = readQuoted(text, contentStart, { quote: opener, run }, stop);
-    // A quoted key keeps its value's opening quote, so the quotes around the marker stay paired.
-    return settleValue(text, header, header.keyForm ? contentStart : start, unit);
-  }
+  if (QUOTE.test(opener)) return readQuotedValue(text, header, run, opener);
   const endsAtOnce = frameEnd(text, start, run, frame);
   if (endsAtOnce !== -1) return { start, end: endsAtOnce };
   if (run === 0 && opener === "[") {
@@ -470,17 +504,31 @@ function redactCookieHeaders(text: string, onRemoved: (removed: string) => void)
 function runRedactionPasses(text: string, onRemoved: (removed: string) => void): string {
   // First, while the value is still whole: a standalone pattern that redacts the head of a cookie
   // would end the value there and leave its tail readable.
-  let redacted = redactCookieHeaders(text, onRemoved);
+  let redacted = text.replace(
+    COOKIE_HEADER_PATTERN,
+    (match: string, prefix: string, opener: string | undefined) => {
+      // mutation-equivalent: `opener` is undefined or a string, and "" or undefined both add nothing
+      const kept = `${prefix}${opener ?? ""}`;
+      const removed = match.slice(kept.length);
+      // Taking out nothing, or a marker for itself, removes no credential the guard should count.
+      if (removed !== "" && removed !== REDACTED) onRemoved(removed);
+      return `${kept}${REDACTED}`;
+    }
+  );
   for (const pattern of STANDALONE_SECRET_PATTERNS) {
     redacted = redacted.replace(pattern, (match: string) => {
       onRemoved(match);
       return REDACTED;
     });
   }
-  return redacted.replace(SECRET_KEY_VALUE_PATTERN, (match: string, prefix: string) => {
+  redacted = redacted.replace(SECRET_KEY_VALUE_PATTERN, (match: string, prefix: string) => {
     onRemoved(match.slice(prefix.length));
     return `${prefix}${REDACTED}`;
   });
+  // Last, on what the passes above left: the reader only replaces spans of their output with the
+  // marker, so it never brings back a character they took out. It adds the rest of a value that
+  // the regex ended early (at a quote, a `]` or a marker inside it), and never redacts less.
+  return redactCookieHeaders(redacted, onRemoved);
 }
 
 /** Replaces common credential shapes with `[redacted]`. */
