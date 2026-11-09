@@ -140,6 +140,19 @@ describe("log file sink state machine", () => {
     expect(createWriteStreamSpy).toHaveBeenCalledTimes(2);
   });
 
+  test("__closeFileSinkForTests also waits for a clear that is in flight", async () => {
+    log.info("line before the clear");
+    let cleared = false;
+    // clearLogFiles takes the stream out of the open state at once and finishes in the sink queue.
+    const clearing = clearLogFiles().then(() => {
+      cleared = true;
+    });
+
+    await __closeFileSinkForTests();
+    expect(cleared).toBe(true);
+    await clearing;
+  });
+
   test("clearLogFiles rejects when truncate fails", async () => {
     const openSyncSpy = spyOn(fs, "openSync").mockImplementation(() => {
       throw new Error("truncate failed");

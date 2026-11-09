@@ -3,7 +3,8 @@ import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
-import { __resetFileSinkForTests, log } from "@/node/services/log";
+import * as path from "path";
+import { __resetFileSinkForTests, getLogFilePath, log } from "@/node/services/log";
 import {
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
@@ -118,6 +119,42 @@ describe("createTaskServiceTestRoot", () => {
     } finally {
       rmSync.mockRestore();
       open.mockRestore();
+      await removeTaskServiceTestRoot(root);
+      __resetFileSinkForTests();
+    }
+  });
+
+  // A rotation takes its stream out of the open state at once and renames the log files later, in
+  // the sink queue. The home must not be deleted before that rename, and the rotation must not
+  // reopen the sink in the deleted home afterwards.
+  test("waits for a log rotation that is in flight before it deletes the isolated home", async () => {
+    __resetFileSinkForTests();
+    const root = await createTaskServiceTestRoot();
+    const isolated = os.homedir();
+    const logFile = getLogFilePath();
+    const realRmSync = fs.rmSync;
+    // The rotation shifts the log files with renameSync once its stream is done.
+    const rename = spyOn(fs, "renameSync");
+    let renamedWhenHomeDeleted: boolean | undefined;
+    const rmSync = spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target) === isolated) renamedWhenHomeDeleted = rename.mock.calls.length > 0;
+      return realRmSync(target, options);
+    });
+    try {
+      // The sink starts from the size of the file that it finds, and it rotates at 10 MiB. A sparse
+      // file of that size makes the first log line rotate, with no 10 MiB write.
+      await fsPromises.mkdir(path.dirname(logFile), { recursive: true });
+      await fsPromises.writeFile(logFile, "");
+      await fsPromises.truncate(logFile, 10 * 1024 * 1024);
+      log.info("task service test root: this line rotates the log");
+      expect(rename.mock.calls.length).toBe(0);
+      await removeTaskServiceTestRoot(root);
+      expect(renamedWhenHomeDeleted).toBe(true);
+      // A rotation that resumed later would recreate the folder that was just deleted.
+      expect(await fsPromises.stat(isolated).catch(() => null)).toBeNull();
+    } finally {
+      rmSync.mockRestore();
+      rename.mockRestore();
       await removeTaskServiceTestRoot(root);
       __resetFileSinkForTests();
     }
