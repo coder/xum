@@ -2,8 +2,8 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as os from "os";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
-import { existsSync, rmSync } from "node:fs";
-import { execFileSync, execSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { execFileSync, execSync, spawnSync } from "node:child_process";
 import * as disposableExec from "@/node/utils/disposableExec";
 import type { InitLogger } from "@/node/runtime/Runtime";
 import * as submoduleSync from "@/node/runtime/submoduleSync";
@@ -2700,17 +2700,12 @@ describe("WorktreeManager.deleteWorkspace", () => {
   }, 20_000);
 
   it("force-delete fallback does not execute shell payloads embedded in branch names", async () => {
-    const fixture = await createWorktreeManagerFixture({
-      tempDirPrefix: "worktree-manager-delete-",
-    });
     // The payload names its sentinel by absolute path, and that path becomes part of the branch
     // name. Git refuses a name with a component that starts with a dot or holds a character such as
-    // `~` or `:`, and a path with a shell operator (`&`, `;`) breaks the payload, so on such a host
-    // the create below failed, or the sentinel could never appear, and this test never reached the
-    // deletion it covers. Pick the first temp directory for which git accepts the whole branch name
-    // and a shell that expands the name creates the sentinel (a control: an absent sentinel below
-    // could otherwise mean that the payload cannot run here, not that the deletion kept it from
-    // running).
+    // `~` or `:`, and a path with a shell operator (`&`, `;`) splits the payload into other
+    // commands. On such a host the create below failed, or the sentinel could never appear, and
+    // this test never reached the deletion it covers. Pick the first temp directory for which git
+    // accepts the whole branch name and a shell reads the name as one `touch` of the sentinel path.
     const payloadFor = (dir: string) => {
       const sentinelPath = path.join(
         dir,
@@ -2723,21 +2718,26 @@ describe("WorktreeManager.deleteWorkspace", () => {
         execFileSync("git", ["check-ref-format", "--branch", payload.branchName], {
           stdio: "ignore",
         });
-        execFileSync("sh", ["-c", `: ${payload.branchName}`], { stdio: "ignore" });
-        return existsSync(payload.sentinelPath);
+        // `touch` is a function that prints what it got, so a path that the shell splits wrongly
+        // cannot leave a stray file behind.
+        const { stderr } = spawnSync(
+          "sh",
+          ["-c", `touch() { printf '%s\\n' "$#" "$@" >&2; }; : ${payload.branchName}`],
+          { encoding: "utf8" }
+        );
+        return stderr === `1\n${payload.sentinelPath}\n`;
       } catch {
         return false;
-      } finally {
-        rmSync(payload.sentinelPath, { force: true });
       }
     };
     const payload = [os.tmpdir(), "/tmp"].map(payloadFor).find(payloadRuns);
     if (payload === undefined) {
-      throw new Error(
-        "Expected a temp directory that git accepts in a branch name and sh can write"
-      );
+      throw new Error("Expected a temp directory that git and sh accept in a branch name");
     }
     const { sentinelPath, branchName } = payload;
+    const fixture = await createWorktreeManagerFixture({
+      tempDirPrefix: "worktree-manager-delete-",
+    });
 
     let execFileAsyncSpy: { mockRestore: () => void } | null = null;
 
