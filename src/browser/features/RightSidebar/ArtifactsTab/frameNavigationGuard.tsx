@@ -38,8 +38,8 @@ type FrameLifecycle =
  * 1. A destination page whose load never completes, after artifact code blocked the leave on
  *    purpose, stays shown (without the bridge) until the user leaves the tab: no load, no check.
  * 2. A navigation can carry one request with whatever the artifact put in its URL.
- * 3. When the leave is missing, a destination page shows (without the bridge) for up to the
- *    deadline after its load.
+ * 3. When the leave is missing, a destination page shows (without the bridge) from its commit
+ *    until the deadline after its load completes.
  * 4. The srcdoc document's open announcement must reach the host before any load or message of
  *    a destination page; the first script posts it before any artifact or view script runs.
  * 5. An MCP App view holds its own port, so it can break its own channel (close it, answer

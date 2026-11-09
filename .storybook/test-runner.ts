@@ -769,10 +769,20 @@ async function assertLiveLineClearsTheComposer(page: StoryPage) {
   }
 }
 
-// Each guard below has a story built to trip it, except those that
-// src/browser/stories/PaintCheckFixtures.stories.tsx lists by name as not covered. `make
-// test-storybook-paint-fixtures` runs those stories through this file. A message that changes needs
-// its new text in scripts/check-paint-check-fixtures.ts.
+// Only the guards named here have a story built to trip them (src/browser/stories/
+// PaintCheckFixtures.stories.tsx, run through this file by `make test-storybook-paint-fixtures`).
+// A guard that is not named here has no story. A message that changes needs its new text in
+// scripts/check-paint-check-fixtures.ts.
+// - waitForRenderedDiagrams, the error marker: BrokenChartNextToGoodChart
+// - waitForRenderedDiagrams, every frame holds a drawing: DiagramNextToAFrameThatNeverDraws
+// - waitForRenderedDiagrams, the poll for a diagram that mounts late: DiagramMountsWhenTheRunnerWaits
+// - compareWithHidden, ink outside the box at rest: DiagramPaintsOutsideItsBox
+// - compareWithHidden, hiding changes no pixel inside the box at rest: DiagramOutsideTheViewport,
+//   DiagramInHiddenParent, DiagramUnderAnOverlay and DiagramClippedAway
+// - assertNoDiagramInkOutsideItsBox, the scrolled view counts the pixels it changes:
+//   DiagramBelowTheFoldSeenWhenScrolled
+// - assertNoDiagramInkOutsideItsBox, the scrolled view credits no diagram that nobody sees:
+//   DiagramBelowTheFoldInHiddenParent
 const PAINT_CHECK_TAG = "paint-check";
 const NO_DIAGRAM_MESSAGE = `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`;
 const DEFAULT_DIAGRAM_RENDER_TIMEOUT_MS = 15_000;
