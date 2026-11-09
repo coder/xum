@@ -264,7 +264,8 @@ jobs:
       # test never writes a cache under ~/.cache). The script checks both files against the
       # sha256 pins in itself on every run (hit or miss), then rebuilds the pack's own directory
       # from them. The key hashes that script, so a changed pin starts a fresh cache, and a
-      # language added to the Makefile's list needs no new key. The step below downloads them
+      # language added to `LANGUAGES` in that script changes its hash and needs no other key
+      # change. The step below downloads them
       # (15 minutes of retries on a cold cache), and the save follows at once, ahead of the long
       # make run. A hit whose files fail the pins is discarded and downloaded again (the log
       # shows `::warning::`). A cache entry cannot be replaced, so that bad entry keeps its key
@@ -1275,7 +1276,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # electron-builder unpacks the checked Electron zip of this job's arch (the runner is
+      # arm64, so the x64 job needs the darwin-x64 zip) instead of downloading it without retries.
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: darwin-${{ matrix.arch }}
       - name: Setup code signing
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: ./scripts/setup-macos-signing.sh
@@ -1312,7 +1318,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # electron-builder unpacks the checked Electron zip instead of downloading it without retries.
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: win32-x64
       - name: Add MSYS2 make to PATH
         shell: pwsh
         run: |

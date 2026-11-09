@@ -6,9 +6,13 @@ inputs:
     required: false
     default: "false"
   electron-zip:
-    description: "Cache the Electron zip that jobs launching Electron download, and fetch it with retries on a cache miss"
+    description: "Cache the Electron zip that jobs launching Electron download, and fetch it with retries on a cache miss. Exports ELECTRON_ZIP_DIR, the directory of the checked zips, for electron-builder's electronDist"
     required: false
     default: "false"
+  electron-zip-targets:
+    description: "With electron-zip: the zips to fetch, as space-separated <platform>-<arch> (darwin-x64, darwin-arm64, linux-arm64, win32-x64). Empty means this runner's own platform and arch. Name every arch that electron-builder builds in the job: it needs the zip of each"
+    required: false
+    default: ""
   appimage-tool:
     description: "Put electron-builder's AppImage tool into its cache, downloaded with retries and a pinned checksum, so that electron-builder downloads nothing"
     required: false
@@ -141,13 +145,26 @@ runs:
     # Electron version or checksum starts a fresh cache, and there is no restore-keys fallback
     # to bring old zips back. The key does not start with `<os>-<arch>-electron-`, the
     # restore-keys prefix of the two Electron caches above, so their prefix lookups cannot
-    # return it (scripts/ci/cachePaths.test.ts). @electron/get checks the zip against
+    # return it (scripts/ci/cachePaths.test.ts). @electron/get checks each zip against
     # checksums.json on every use, so a restored entry never supplies unpinned bytes. On a
-    # miss the zip is downloaded here, retrying for 15 minutes, and saved at once.
+    # miss the zips are downloaded here, retrying for 15 minutes, and saved at once.
+    # The zips to fetch (ELECTRON_ZIP_TARGETS) are part of the cache key (ELECTRON_ZIP_SLUG): two
+    # jobs on one runner type that need other zips, such as the two macOS arches, must not share
+    # an entry. On Windows $HOME is an MSYS path that node reads as C:\c\Users\..., so cygpath
+    # gives the C:/Users/... form there and changes nothing elsewhere.
     - name: Point Electron downloads at their own cache
       if: ${{ inputs.electron-zip == 'true' }}
       shell: bash
-      run: echo "electron_config_cache=$HOME/.cache/xum-electron-zip" >> "$GITHUB_ENV"
+      env:
+        TARGETS_INPUT: ${{ inputs.electron-zip-targets }}
+      run: |
+        home=$(cygpath -m "$HOME" 2>/dev/null || echo "$HOME")
+        targets=${TARGETS_INPUT:-$(node -p 'process.platform + "-" + process.arch')}
+        {
+          echo "electron_config_cache=$home/.cache/xum-electron-zip"
+          echo "ELECTRON_ZIP_TARGETS=$targets"
+          echo "ELECTRON_ZIP_SLUG=${targets// /_}"
+        } >> "$GITHUB_ENV"
 
     - name: Restore Electron zip
       if: ${{ inputs.electron-zip == 'true' }}
@@ -155,14 +172,16 @@ runs:
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ env.electron_config_cache }}
-        key: xum-electron-zip-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/electron/checksums.json') }}
+        key: xum-electron-zip-${{ runner.os }}-${{ runner.arch }}-${{ env.ELECTRON_ZIP_SLUG }}-${{ hashFiles('node_modules/electron/checksums.json') }}
 
     # The 15 minute budget fits both callers: E2E has no job time limit, and a Stories run
     # (4 to 5 minutes warm) stops at 50 minutes in the merge queue.
     - name: Download Electron zip
       if: ${{ inputs.electron-zip == 'true' && steps.cache-electron-zip.outputs.cache-hit != 'true' }}
       shell: bash
-      run: ./scripts/retry.sh --budget-secs 900 --max-backoff-secs 60 --fatal-status 64 0 2 node scripts/ci/prefetch-electron-zip.cjs
+      run: |
+        # shellcheck disable=SC2086 # ELECTRON_ZIP_TARGETS is a space-separated list
+        ./scripts/retry.sh --budget-secs 900 --max-backoff-secs 60 --fatal-status 64 0 2 node scripts/ci/prefetch-electron-zip.cjs $ELECTRON_ZIP_TARGETS
 
     # Saved at once: a later failing step in the job must not discard a zip that took minutes.
     - name: Save Electron zip
@@ -176,19 +195,31 @@ runs:
     # Build / Linux failed five queue runs on a github.com 504 (2026-11-08) although its caches hit:
     # none held that zip in app-builder's layout. electron-builder's `electronDist` can name a
     # directory that holds electron-v<version>-<platform>-<arch>.zip, and then unpacks that zip and
-    # downloads nothing. This step finds the directory of the zip above (@electron/get checks the
+    # downloads nothing. This step finds the directory of the zips above (@electron/get checks each
     # cached file against checksums.json again, with no network) and exports it as ELECTRON_ZIP_DIR,
-    # which `make dist-linux` passes on.
+    # which the Makefile's dist targets and the release workflow pass on. The prefetch's output
+    # (retry.sh's attempt groups, its retry warnings and its final ::error::) goes to the log as it
+    # happens: with `tee`, because a failed command substitution would show none of it.
     - name: Locate Electron zip
       if: ${{ inputs.electron-zip == 'true' }}
       shell: bash
       run: |
-        zip=$(./scripts/retry.sh --budget-secs 900 --max-backoff-secs 60 --fatal-status 64 0 2 node scripts/ci/prefetch-electron-zip.cjs | sed -n 's/^Electron zip ready: //p')
-        if [ ! -f "$zip" ]; then
-          echo "::error::the Electron zip is not in the cache: '$zip'"
+        out=$(mktemp "${TMPDIR:-/tmp}/electron-zip.XXXXXX")
+        # shellcheck disable=SC2086 # ELECTRON_ZIP_TARGETS is a space-separated list
+        ./scripts/retry.sh --budget-secs 900 --max-backoff-secs 60 --fatal-status 64 0 2 node scripts/ci/prefetch-electron-zip.cjs $ELECTRON_ZIP_TARGETS | tee "$out"
+        dir=$(sed -n 's/^Electron zip dir: //p' "$out")
+        zips=$(sed -n 's/^Electron zip ready: //p' "$out")
+        if [ -z "$dir" ] || [ -z "$zips" ]; then
+          echo "::error::the Electron zip prefetch named no zip"
           exit 1
         fi
-        echo "ELECTRON_ZIP_DIR=$(dirname "$zip")" >> "$GITHUB_ENV"
+        while IFS= read -r zip; do
+          if [ ! -f "$zip" ]; then
+            echo "::error::the Electron zip is not in the cache: '$zip'"
+            exit 1
+          fi
+        done <<< "$zips"
+        echo "ELECTRON_ZIP_DIR=$dir" >> "$GITHUB_ENV"
 
     # electron-builder builds an AppImage with app-builder, which downloads appimage-12.0.1.7z from
     # github.com and retries nothing. The `Cache electron-builder` step above holds the unpacked
