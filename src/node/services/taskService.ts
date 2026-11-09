@@ -16538,25 +16538,20 @@ export class TaskService implements AgentTaskIntegration {
     const descendants = new Set(
       this.listDescendantAgentTaskIdsFromIndex(index, ancestorWorkspaceId)
     );
-    // The owner is an ancestor of some descendant, so probe each such ancestor once.
-    const owners = new Set<string>();
-    for (const childId of descendants) {
-      for (const owner of this.listAncestorWorkspaceIdsUsingParentById(index.parentById, childId)) {
-        owners.add(owner);
-      }
-    }
     const workspaceTurnManager = this.getWorkspaceTurnManager();
-    for (const ownerWorkspaceId of owners) {
+    // The owner is an ancestor of some descendant, so probe each such ancestor once.
+    for (const ownerWorkspaceId of this.listAncestorsOfWorkspaces(index.parentById, descendants)) {
       // Probe without consuming: the record counts as read only once it is known to be a
       // descendant's.
       const probe = await workspaceTurnManager.getWorkspaceTurnSnapshot(ownerWorkspaceId, handleId);
       if (probe == null) continue;
       if (
-        !descendants.has(probe.workspaceId) ||
-        !this.listAncestorWorkspaceIdsUsingParentById(index.parentById, probe.workspaceId).includes(
-          ownerWorkspaceId
-        ) ||
-        isActiveWorkspaceTurnTaskStatus(probe.status)
+        !this.isTerminalTurnOfDescendantUnder(
+          index.parentById,
+          descendants,
+          ownerWorkspaceId,
+          probe
+        )
       ) {
         return null;
       }
@@ -16568,6 +16563,43 @@ export class TaskService implements AgentTaskIntegration {
       return record == null ? null : { ownerWorkspaceId, record };
     }
     return null;
+  }
+
+  /** Every ancestor of one of `workspaceIds`: the workspaces that can own a handle for one. */
+  private listAncestorsOfWorkspaces(
+    parentById: Map<string, string>,
+    workspaceIds: Iterable<string>
+  ): Set<string> {
+    const ancestors = new Set<string>();
+    for (const workspaceId of workspaceIds) {
+      for (const ancestor of this.listAncestorWorkspaceIdsUsingParentById(
+        parentById,
+        workspaceId
+      )) {
+        ancestors.add(ancestor);
+      }
+    }
+    return ancestors;
+  }
+
+  /**
+   * Whether `record`, stored under `ownerWorkspaceId`, is a finished turn of one of `descendants`
+   * that its owner can own: the child is a descendant of the reading ancestor, the owner is an
+   * ancestor of that child, and the turn is not active.
+   */
+  private isTerminalTurnOfDescendantUnder(
+    parentById: Map<string, string>,
+    descendants: ReadonlySet<string>,
+    ownerWorkspaceId: string,
+    record: WorkspaceTurnTaskHandleRecord
+  ): boolean {
+    return (
+      descendants.has(record.workspaceId) &&
+      this.listAncestorWorkspaceIdsUsingParentById(parentById, record.workspaceId).includes(
+        ownerWorkspaceId
+      ) &&
+      !isActiveWorkspaceTurnTaskStatus(record.status)
+    );
   }
 
   private hasLiveRunningExecution(workspace: WorkspaceConfigEntry, workspaceId: string): boolean {
