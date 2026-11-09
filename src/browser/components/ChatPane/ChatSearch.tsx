@@ -18,7 +18,7 @@ import {
   paneHandlesKeyEvent,
   type ChatPaneScope,
 } from "@/browser/utils/ui/keybinds";
-import { findChatSearchMatches } from "./chatSearchMatches";
+import { findChatSearchMatches, type ChatSearchMatch } from "./chatSearchMatches";
 
 interface ChatSearchProps {
   workspaceId: string;
@@ -123,17 +123,19 @@ export function ChatSearch(props: ChatSearchProps) {
 
 function useChatSearchReveal(
   workspaceId: string,
-  messageId: string | undefined,
+  match: ChatSearchMatch | undefined,
   query: string,
   setError: (error: string) => void
 ) {
   const store = useWorkspaceStoreRaw();
+  const messageId = match?.messageId;
+  const displayedMessageId = match?.displayedMessageId;
   useEffect(() => {
     if (!messageId) return;
     let cancelled = false;
     revealTimelineTarget({
       workspaceId,
-      getTarget: () => ({ messageId }),
+      getTarget: () => ({ messageId, displayedMessageId }),
       workspaceStore: store,
       pinTarget: pinTimelineRevealTarget,
       // Only the explicit button loads older pages. Results already belong to loaded history.
@@ -150,7 +152,7 @@ function useChatSearchReveal(
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, messageId, query, store, setError]);
+  }, [workspaceId, messageId, displayedMessageId, query, store, setError]);
 }
 
 function ChatSearchResults(props: {
@@ -169,7 +171,7 @@ function ChatSearchResults(props: {
     matches.findIndex((match) => match.messageId === selectedMessageId)
   );
   const selectedMatch = matches[selectedIndex];
-  useChatSearchReveal(props.workspaceId, selectedMatch?.messageId, query, setError);
+  useChatSearchReveal(props.workspaceId, selectedMatch, query, setError);
 
   const navigate = (direction: number) => {
     if (matches.length === 0) return;

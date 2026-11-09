@@ -318,6 +318,8 @@ export interface CustomEventPayloads {
     workspaceId: string;
     messageId?: string;
     toolCallId?: string;
+    /** Narrow a history message to its matching displayed row. */
+    displayedMessageId?: string;
     /** Search can close while the transcript still mounts the target row. */
     isCancelled?: () => boolean;
   };

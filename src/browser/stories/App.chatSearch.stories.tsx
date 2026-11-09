@@ -44,6 +44,21 @@ function setup(selectedWorkspace = workspace, hasOlderHistory = false) {
         const createMessage = index % 2 === 0 ? createUserMessage : createAssistantMessage;
         emit(createMessage(`search-${index}`, text, { historySequence: index + 1 }));
       }
+      const multipart = createAssistantMessage("search-multipart", "An unrelated opening.", {
+        historySequence: 101,
+      });
+      multipart.parts.push(
+        { type: "reasoning", text: "An intermediate step." },
+        { type: "text", text: "The multipart search marker appears in this row." }
+      );
+      emit(multipart);
+      emit(
+        createUserMessage("search-plan", "The plan preview search marker.", {
+          historySequence: 102,
+          synthetic: true,
+          muxMetadata: { type: "plan-display", path: "/tmp/plan.md" },
+        })
+      );
       emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory });
     },
   });
@@ -148,6 +163,24 @@ const searchChat: AppStory["play"] = async ({ canvasElement, step }) => {
     await expect(await canvas.findByRole("searchbox", { name: "Search chat" })).toHaveFocus();
     await userEvent.keyboard("{Escape}");
     await expect(control!).toHaveFocus();
+  });
+
+  await step("Search reveals the matching reply part and visible plan preview", async () => {
+    await userEvent.keyboard("{Control>}f{/Control}");
+    const input = await canvas.findByRole("searchbox", { name: "Search chat" });
+    await userEvent.type(input, "multipart search marker");
+    await waitFor(() =>
+      expect(
+        transcript.querySelector('[data-displayed-message-id="search-multipart-2"]')
+      ).toHaveClass("timeline-reveal-highlight")
+    );
+    await expect(
+      transcript.querySelector('[data-displayed-message-id="search-multipart-0"]')
+    ).not.toHaveClass("timeline-reveal-highlight");
+    await userEvent.keyboard("{Control>}f{/Control}");
+    await userEvent.keyboard("plan preview search marker");
+    await waitFor(() => expect(row("search-plan")).toHaveClass("timeline-reveal-highlight"));
+    await userEvent.keyboard("{Escape}");
   });
 
   // Leave a matching result open for visual checks.

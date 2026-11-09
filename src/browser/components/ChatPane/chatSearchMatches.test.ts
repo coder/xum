@@ -118,12 +118,44 @@ describe("findChatSearchMatches", () => {
     ).toEqual(["summary"]);
   });
 
-  it("joins text parts and keeps a preview on the matching line", () => {
-    const message = createMuxMessage("parts", "assistant", "Unrelated line\nA nee", undefined, [
-      { type: "text", text: "dle reply.\nAnother line." },
+  it("searches visible plan previews", () => {
+    const plan = createMuxMessage("plan", "assistant", "Build the needle index", {
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: { type: "plan-display", path: "/tmp/plan.md" },
+    });
+    expect(findChatSearchMatches([plan], "needle").map((match) => match.messageId)).toEqual([
+      "plan",
     ]);
-    const [match] = findChatSearchMatches([message], "needle");
-    expect(match.match).toBe("needle");
-    expect(match.after).toBe(" reply.");
+  });
+
+  it("joins adjacent text parts within the same displayed row", () => {
+    const message = createMuxMessage("parts", "assistant", "A nee", undefined, [
+      { type: "text", text: "dle reply." },
+    ]);
+    expect(findChatSearchMatches([message], "needle").map((match) => match.messageId)).toEqual([
+      "parts",
+    ]);
+  });
+
+  it("targets the matching displayed row and keeps its preview on the matching line", () => {
+    const message = createMuxMessage("parts", "assistant", "An unrelated opening.", undefined, [
+      { type: "reasoning", text: "An intermediate step." },
+      { type: "text", text: "A needle reply.\nAnother line." },
+      { type: "text", text: "A later needle reply." },
+    ]);
+    const matches = findChatSearchMatches([message], "needle");
+    expect(matches).toHaveLength(1);
+    expect(matches[0].displayedMessageId).toBe("parts-2");
+    expect(matches[0].match).toBe("needle");
+    expect(matches[0].after).toBe(" reply.");
+  });
+
+  it("does not invent a text match across separate displayed rows", () => {
+    const message = createMuxMessage("parts", "assistant", "nee", undefined, [
+      { type: "reasoning", text: "An intermediate step." },
+      { type: "text", text: "dle" },
+    ]);
+    expect(findChatSearchMatches([message], "needle")).toEqual([]);
   });
 });

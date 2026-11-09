@@ -94,6 +94,32 @@ describe("revealTimelineTarget", () => {
     }
   });
 
+  it("pins the matching row instead of revealing a loaded sibling from the same history message", async () => {
+    const store = createStore({ messages: [{ ...makeUserMessage("parts"), id: "parts-0" }] });
+    const target = { messageId: "parts", displayedMessageId: "parts-1" };
+    const pinTarget = mock(() => {
+      store.state.messages.push({ ...makeUserMessage("parts"), id: "parts-1" });
+    });
+    const events: Event[] = [];
+    const listener = (event: Event) => events.push(event);
+    window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    try {
+      expect(
+        await revealTimelineTarget({
+          workspaceId,
+          getTarget: () => target,
+          workspaceStore: store,
+          pinTarget,
+        })
+      ).toBe("revealed");
+      expect(pinTarget).toHaveBeenCalledWith(workspaceId, target);
+      expect(events).toHaveLength(1);
+      expect((events[0] as CustomEvent).detail).toEqual({ workspaceId, ...target });
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    }
+  });
+
   it("keeps cancellation available after dispatch while the target still mounts", async () => {
     const store = createStore({ messages: [makeUserMessage("prompt-1")] });
     let cancelled = false;

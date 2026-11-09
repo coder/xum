@@ -1,4 +1,4 @@
-import type { MuxMessage } from "@/common/types/message";
+import type { DisplayedMessage, MuxMessage } from "@/common/types/message";
 import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import { isWorkflowResultMessage } from "@/common/utils/workflowRunMessages";
 import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
@@ -6,6 +6,7 @@ import { buildDisplayedMessagesForMessage } from "@/browser/utils/messages/displ
 
 export interface ChatSearchMatch {
   messageId: string;
+  displayedMessageId: string;
   match: string;
   after: string;
 }
@@ -19,19 +20,37 @@ function isHiddenChatSearchMessage(message: MuxMessage): boolean {
   );
 }
 
-function getChatSearchText(message: MuxMessage): string {
-  // Search the displayed text, not model-facing command expansions or persisted summary labels.
+type ChatSearchRow = Extract<DisplayedMessage, { type: "user" | "assistant" | "plan-display" }>;
+
+function getChatSearchRows(message: MuxMessage): ChatSearchRow[] {
+  // Search displayed text, not model-facing command expansions or persisted summary labels.
   return buildDisplayedMessagesForMessage({
     message,
     hasActiveStream: false,
     isContextBoundaryMessage: () => false,
-  })
-    .flatMap((row) => {
-      if (row.type === "assistant") return [row.content];
-      if (row.type === "user" && row.agentPeerTriggerPayload == null) return [row.content];
-      return [];
-    })
-    .join(message.role === "assistant" ? "" : "\n");
+  }).filter(
+    (row): row is ChatSearchRow =>
+      row.type === "assistant" ||
+      row.type === "plan-display" ||
+      (row.type === "user" && row.agentPeerTriggerPayload == null)
+  );
+}
+
+function findFirstMatchingRow(message: MuxMessage, pattern: RegExp): ChatSearchMatch | undefined {
+  for (const row of getChatSearchRows(message)) {
+    const match = pattern.exec(row.content);
+    if (!match) continue;
+    // Keep the row ID: several text rows can share one history message.
+    const matchEnd = match.index + match[0].length;
+    const lineEnd = row.content.indexOf("\n", matchEnd);
+    return {
+      messageId: message.id,
+      displayedMessageId: row.id,
+      match: match[0],
+      after: row.content.slice(matchEnd, lineEnd === -1 ? undefined : lineEnd),
+    };
+  }
+  return undefined;
 }
 
 /** Search message text, including rows that the transcript does not mount. */
@@ -47,16 +66,8 @@ export function findChatSearchMatches(
   for (const sourceMessage of messages) {
     const message = restoreContextBudgetRejectedMessageForDisplay(sourceMessage);
     if (isHiddenChatSearchMessage(message)) continue;
-    const text = getChatSearchText(message);
-    const match = pattern.exec(text);
-    if (!match) continue;
-    // Start at the match so a long prefix cannot hide the result preview.
-    const lineEnd = text.indexOf("\n", match.index + match[0].length);
-    matches.push({
-      messageId: message.id,
-      match: match[0],
-      after: text.slice(match.index + match[0].length, lineEnd === -1 ? undefined : lineEnd),
-    });
+    const match = findFirstMatchingRow(message, pattern);
+    if (match) matches.push(match);
   }
   return matches;
 }

@@ -23,6 +23,8 @@ export type TimelineRevealResult = "revealed" | "not-found" | "not-loaded" | "er
 export interface TimelineRevealTarget {
   messageId?: string;
   toolCallId?: string;
+  /** Narrow a history message to its matching displayed row. */
+  displayedMessageId?: string;
 }
 
 /** Discard pending reveals after navigation, search cancellation, or return to the transcript tail. */
@@ -42,6 +44,9 @@ function isRevealTargetLoaded(
   workspaceState: Pick<WorkspaceState, "messages">,
   target: TimelineRevealTarget
 ): boolean {
+  if (target.displayedMessageId) {
+    return workspaceState.messages.some((message) => message.id === target.displayedMessageId);
+  }
   if (target.toolCallId) {
     return workspaceState.messages.some(
       (message) => message.type === "tool" && message.toolCallId === target.toolCallId

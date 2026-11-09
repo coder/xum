@@ -302,6 +302,11 @@ function findTranscriptRevealElement(
   scrollContainer: HTMLElement,
   anchor: CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR]
 ): HTMLElement | undefined {
+  if (anchor.displayedMessageId) {
+    return Array.from(
+      scrollContainer.querySelectorAll<HTMLElement>("[data-displayed-message-id]")
+    ).find((element) => element.dataset.displayedMessageId === anchor.displayedMessageId);
+  }
   if (anchor.toolCallId) {
     const toolElement = Array.from(
       scrollContainer.querySelectorAll<HTMLElement>("[data-tool-call-id]")
@@ -320,6 +325,9 @@ function findTimelineRevealMessageIndex(
   messages: readonly DisplayedMessage[],
   anchor: CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR]
 ): number {
+  if (anchor.displayedMessageId) {
+    return messages.findIndex((message) => message.id === anchor.displayedMessageId);
+  }
   if (anchor.toolCallId) {
     const toolIndex = messages.findIndex(
       (message) => message.type === "tool" && message.toolCallId === anchor.toolCallId
