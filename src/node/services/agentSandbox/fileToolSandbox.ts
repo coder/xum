@@ -16,6 +16,8 @@ export interface FileToolSandboxContext {
   scratchDir?: string;
   /** The PATH that bash starts with: its folders under ~ are open for reads, as they are for bash. */
   pathEnv?: string;
+  /** The environment that bash starts with, the project's secrets included. */
+  env?: NodeJS.ProcessEnv;
   /** Xum-managed paths (and what is under them) the file tools read and write outside the policy. */
   exemptPaths?: readonly string[];
   /** Xum-managed paths the file tools only read outside the policy. */
@@ -23,9 +25,11 @@ export interface FileToolSandboxContext {
 }
 
 export function fileToolSandboxContext(config: ToolConfiguration): FileToolSandboxContext {
+  const execEnv = localExecEnv(mergeSecretsOverXumEnv(config.xumEnv, config.secrets));
   return {
     scratchDir: config.xumEnv?.XUM_SCRATCH_DIR,
-    pathEnv: localExecEnv(mergeSecretsOverXumEnv(config.xumEnv, config.secrets)).path,
+    pathEnv: execEnv.path,
+    env: execEnv.env,
     // Xum keeps plan files under <xumHome>/plans and bash overflow output in runtimeTempDir, both
     // outside the policy; plan mode writes the plan file and the agent reads the rest.
     exemptPaths: config.planFilePath ? [config.planFilePath] : [],
@@ -88,6 +92,7 @@ export function fileToolSandboxGate(
     cwd,
     scratchDir: context.scratchDir,
     pathEnv: context.pathEnv,
+    env: context.env,
   });
   if (policy == null) return allowAll;
   return async (resolvedPath, access) => {

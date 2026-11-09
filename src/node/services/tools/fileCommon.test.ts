@@ -282,6 +282,35 @@ describe("fileCommon", () => {
       expect(outcome).toBe("allowed");
     });
 
+    // A project secret can move a credential store into the workspace, as it does for bash.
+    it("builds the policy from the environment that bash starts with", async () => {
+      using temp = new TestTempDir("file-sandbox");
+      const fixture = await sandboxFixture(temp);
+      const token = path.join(fixture.workspace, "hf-token");
+      fixture.runtime.agentSandboxPolicy = (input) => ({
+        ...fixture.policy,
+        denyRead: [...fixture.policy.denyRead, input.env?.HF_TOKEN_PATH ?? fixture.home],
+      });
+      const config: ToolConfiguration = {
+        ...createTestToolConfig(fixture.workspace, { runtime: fixture.runtime }),
+        // Not the workspace, whose reads it would exempt.
+        runtimeTempDir: path.join(fixture.home, "outputs"),
+        secrets: { HF_TOKEN_PATH: token },
+      };
+
+      const outcome = await resolvePathWithinCwd(
+        token,
+        fixture.workspace,
+        fixture.runtime,
+        "read",
+        fileToolSandboxContext(config)
+      ).then(
+        () => "allowed",
+        (error: unknown) => String(error)
+      );
+      expect(outcome).toMatch(/The agent sandbox blocks reads/);
+    });
+
     it("checks nothing when no sandbox applies", async () => {
       using temp = new TestTempDir("file-sandbox");
       const fixture = await sandboxFixture(temp);

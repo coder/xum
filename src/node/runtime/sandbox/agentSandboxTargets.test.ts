@@ -70,6 +70,15 @@ afterEach(() => {
   else process.env.XUM_ROOT = savedRoot;
 });
 
+// Where a credential store moves when `name` is `<workspace>/<value>`.
+const MOVED_CREDENTIAL_STORES = [
+  { name: "UV_CREDENTIALS_DIR", value: "uv-creds", file: "uv-creds/credentials.toml" },
+  { name: "XDG_DATA_HOME", value: "data", file: "data/uv/credentials/credentials.toml" },
+  { name: "CARGO_HOME", value: "cargo", file: "cargo/credentials.toml" },
+  { name: "HF_TOKEN_PATH", value: "hf-token", file: "hf-token" },
+  { name: "GOENV", value: "go-env", file: "go-env" },
+];
+
 describe("buildAgentSandboxPolicy", () => {
   let root: string;
   let repo: string;
@@ -515,6 +524,36 @@ describe("buildAgentSandboxPolicy", () => {
     );
   });
 
+  // Git reads the config of the repository that a workspace folder is in, and of each submodule.
+  test("keeps what the enclosing repository's git config includes read-only", async () => {
+    const workspace = path.join(repo, "sub");
+    await fs.mkdir(workspace);
+    git(repo, "config", "include.path", path.join(workspace, "repo.gitconfig"));
+
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: workspace });
+
+    expect(agentSandboxPolicyAllows(policy, path.join(workspace, "repo.gitconfig"), "write")).toBe(
+      false
+    );
+    expect(agentSandboxPolicyAllows(policy, path.join(workspace, "notes.md"), "write")).toBe(true);
+  });
+
+  test("keeps what a submodule's git config includes read-only, also under a name with a /", async () => {
+    const submodule = path.join(commonDir, "modules", "vendor", "lib");
+    const nested = path.join(submodule, "modules", "deep");
+    for (const gitDir of [submodule, nested]) {
+      await fs.mkdir(gitDir, { recursive: true });
+      await fs.writeFile(path.join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+    }
+    await fs.writeFile(path.join(submodule, "config"), `[include]\n\tpath = ${repo}/lib.inc\n`);
+    await fs.writeFile(path.join(nested, "config"), `[include]\n\tpath = ${repo}/deep.inc\n`);
+
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+    expect(agentSandboxPolicyAllows(policy, path.join(repo, "lib.inc"), "write")).toBe(false);
+    expect(agentSandboxPolicyAllows(policy, path.join(repo, "deep.inc"), "write")).toBe(false);
+  });
+
   test("fails closed on a git include path that it cannot read as git does", () => {
     git(repo, "config", "include.path", '../"git config"');
 
@@ -923,24 +962,56 @@ describe("buildAgentSandboxPolicy", () => {
   });
 
   // A credential store that Xum's environment moves into the workspace is open there otherwise.
-  test.each([
-    { name: "UV_CREDENTIALS_DIR", value: "uv-creds", file: "uv-creds/credentials.toml" },
-    { name: "XDG_DATA_HOME", value: "data", file: "data/uv/credentials/credentials.toml" },
-    { name: "CARGO_HOME", value: "cargo", file: "cargo/credentials.toml" },
-    { name: "HF_TOKEN_PATH", value: "hf-token", file: "hf-token" },
-    { name: "GOENV", value: "go-env", file: "go-env" },
-  ])("hides the credential store where $name moves it", ({ name, value, file }) => {
-    const saved = process.env[name];
-    process.env[name] = path.join(repo, value);
-    try {
-      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+  test.each(MOVED_CREDENTIAL_STORES)(
+    "hides the credential store where $name moves it",
+    ({ name, value, file }) => {
+      const saved = process.env[name];
+      process.env[name] = path.join(repo, value);
+      try {
+        const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+        expect(agentSandboxPolicyAllows(policy, path.join(repo, file), "read")).toBe(false);
+        expect(agentSandboxPolicyAllows(policy, path.join(repo, file), "write")).toBe(false);
+      } finally {
+        if (saved === undefined) delete process.env[name];
+        else process.env[name] = saved;
+      }
+    }
+  );
+
+  // Bash and the file tools overlay the project's secrets onto Xum's environment.
+  test.each(MOVED_CREDENTIAL_STORES)(
+    "hides the credential store where the command's $name moves it",
+    ({ name, value, file }) => {
+      const policy = buildAgentSandboxPolicy(SETTINGS, {
+        cwd: repo,
+        env: { [name]: path.join(repo, value) },
+      });
 
       expect(agentSandboxPolicyAllows(policy, path.join(repo, file), "read")).toBe(false);
       expect(agentSandboxPolicyAllows(policy, path.join(repo, file), "write")).toBe(false);
-    } finally {
-      if (saved === undefined) delete process.env[name];
-      else process.env[name] = saved;
     }
+  );
+
+  // Xum runs `git submodule update` outside the sandbox with the project's secrets.
+  test("keeps the git config that the command's environment names read-only", async () => {
+    await fs.writeFile(path.join(repo, "global.gitconfig"), "[include]\n\tpath = more.gitconfig\n");
+    const policy = buildAgentSandboxPolicy(SETTINGS, {
+      cwd: repo,
+      env: {
+        XDG_CONFIG_HOME: path.join(repo, "xdg"),
+        GIT_CONFIG_GLOBAL: path.join(repo, "global.gitconfig"),
+        GIT_CONFIG_SYSTEM: path.join(repo, "system.gitconfig"),
+      },
+    });
+    const writable = (...parts: string[]) =>
+      agentSandboxPolicyAllows(policy, path.join(repo, ...parts), "write");
+
+    expect(writable("xdg", "git", "config")).toBe(false);
+    expect(writable("global.gitconfig")).toBe(false);
+    expect(writable("more.gitconfig")).toBe(false);
+    expect(writable("system.gitconfig")).toBe(false);
+    expect(writable("notes.md")).toBe(true);
   });
 
   // `go env -w GOPROXY=https://user:password@host` writes the password there.
@@ -1060,6 +1131,17 @@ describe("buildAgentSandboxPolicy credential files", () => {
     const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: os.tmpdir() });
 
     expect(agentSandboxPolicyAllows(policy, answer, "read")).toBe(false);
+  });
+
+  // Seatbelt applies a nested deny only strictly inside an open folder.
+  test.each([
+    { open: "the workspace", input: () => ({ cwd: askpassSessionsRoot() }) },
+    {
+      open: "the scratch folder",
+      input: () => ({ cwd: os.tmpdir(), scratchDir: path.join(askpassSessionsRoot(), "s") }),
+    },
+  ])("fail closed when $open is in the SSH prompt folder", ({ input }) => {
+    expect(() => buildAgentSandboxPolicy(SETTINGS, input())).toThrow(AgentSandboxStartError);
   });
 });
 

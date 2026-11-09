@@ -156,6 +156,11 @@ export interface AgentSandboxPolicyInput {
    * to pick the setting (agentSandboxSettingsFor()).
    */
   otherProjectPaths?: readonly string[];
+  /**
+   * The command's environment, with the project's secrets. The credential stores and git config
+   * files it moves are protected like those that Xum's own environment moves.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -184,7 +189,8 @@ export function buildAgentSandboxPolicy(
 ): AgentSandboxPolicy {
   const home = realpathOfNearest(os.homedir());
   const cwd = workspaceRootOrThrow(realpathOfNearest(input.cwd), home);
-  const nestedDenies = nestedDenyReadPaths().map(expandSandboxPath);
+  const envs = policyEnvs(input);
+  const nestedDenies = dedupe(pathsFromEnvs(envs, nestedDenyReadPaths).map(expandSandboxPath));
   const extraWriteRoots = outsideNestedDenies(
     settings.extraWritePaths.map(expandSandboxPath),
     nestedDenies
@@ -222,9 +228,10 @@ export function buildAgentSandboxPolicy(
       `the extra write path ${extraRootInXumHome} is inside Xum's home folder ${xumHome}`
     );
   }
-  const readableSpellings = [...AUTOMATION_READ_PATHS, ...gitGlobalConfigFiles()];
+  const gitGlobalConfigs = pathsFromEnvs(envs, gitGlobalConfigFiles);
+  const readableSpellings = [...AUTOMATION_READ_PATHS, ...gitGlobalConfigs];
   const automationSpellings = [...readableSpellings, ...HIDDEN_AUTOMATION_PATHS];
-  const cacheSpellings = cacheExecutablePaths();
+  const cacheSpellings = pathsFromEnvs(envs, cacheExecutablePaths);
   // Xum, its git and the npx, uvx and bunx of MCP servers use these as spelled, outside the
   // sandbox, so a command could replace a link to one in a write root (Codex review): fail closed.
   assertNoPathThroughLink([getXumHome(), ...automationSpellings, ...cacheSpellings], writeRoots);
@@ -237,7 +244,7 @@ export function buildAgentSandboxPolicy(
     [cwd, ...extraWorkspaceRoots].flatMap((root) => findGitCommonDir(root) ?? [])
   );
   const configIncludePaths = [
-    ...gitConfigIncludes([...workspaceRoots, ...extraWriteRoots], gitCommonDirs),
+    ...gitConfigIncludes([...workspaceRoots, ...extraWriteRoots], gitCommonDirs, gitGlobalConfigs),
     ...sshConfigIncludes(),
   ];
   // Git and ssh open these as spelled, and git follows a `.git` link to whatever git folder a
@@ -285,6 +292,7 @@ export function buildAgentSandboxPolicy(
       nestedDenies
     ),
   ]);
+  assertNothingOpenInNestedDeny(allowRead, nestedDenies);
   return {
     writeRoots,
     gitCommonDirs,
@@ -358,6 +366,38 @@ function workspaceRootOrThrow(root: string, home: string): string {
  */
 function outsideNestedDenies(paths: readonly string[], nestedDenies: readonly string[]): string[] {
   return paths.filter((target) => !isUnderAny(target, nestedDenies));
+}
+
+/**
+ * The same holds for a workspace, scratch folder, toolchain or PATH folder: one at or inside a
+ * nested deny (a workspace in <xumHome>/askpass) fails closed (Codex review).
+ */
+function assertNothingOpenInNestedDeny(
+  openPaths: readonly string[],
+  nestedDenies: readonly string[]
+): void {
+  for (const target of openPaths) {
+    const denied = nestedDenies.find((deny) => isPathAtOrUnder(foldCase(target), foldCase(deny)));
+    if (denied !== undefined) {
+      throw new AgentSandboxStartError(`${target} is inside ${denied}, which the sandbox hides`);
+    }
+  }
+}
+
+/**
+ * Xum's own environment and, when it has one, the command's. Xum's git, npx and uvx read the
+ * first outside the sandbox; the command reads the second, and so does the git that Xum runs
+ * outside the sandbox with the project's secrets (Codex review).
+ */
+function policyEnvs(input: AgentSandboxPolicyInput): NodeJS.ProcessEnv[] {
+  return input.env === undefined ? [process.env] : [process.env, input.env];
+}
+
+function pathsFromEnvs(
+  envs: readonly NodeJS.ProcessEnv[],
+  pathsOf: (env: NodeJS.ProcessEnv) => string[]
+): string[] {
+  return dedupe(envs.flatMap((env) => pathsOf(env)));
 }
 
 function protectedPathsUnder(root: string): string[] {
@@ -481,9 +521,9 @@ function findGitCommonDir(root: string): string | undefined {
  */
 function commonDirOfWorktree(dotGitFile: string): string | undefined {
   try {
-    const match = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGitFile, "utf8"));
-    if (!match) return undefined;
-    const gitDir = fs.realpathSync(path.resolve(path.dirname(dotGitFile), match[1]));
+    const pointer = gitDirPointer(dotGitFile);
+    if (pointer === undefined) return undefined;
+    const gitDir = fs.realpathSync(pointer);
     const commonDir = path.dirname(path.dirname(gitDir));
     if (path.basename(path.dirname(gitDir)) !== "worktrees") return undefined;
     if (!isFile(path.join(commonDir, "HEAD"))) return undefined;
@@ -494,6 +534,12 @@ function commonDirOfWorktree(dotGitFile: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** The git folder that the `.git` file `dotGitFile` names, as spelled; throws when unreadable. */
+function gitDirPointer(dotGitFile: string): string | undefined {
+  const match = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGitFile, "utf8"));
+  return match ? path.resolve(path.dirname(dotGitFile), match[1]) : undefined;
 }
 
 /**
@@ -618,15 +664,22 @@ function childLinks(folder: string): string[] {
 
 /**
  * The real paths of the files that git config includes (`include.path`, and
- * `includeIf.<condition>.path` whatever the condition), from the global config and the config of
- * each repository in `roots` and `gitDirs`, recursively as git reads them. Git takes them as
- * config, so a command that writes one can set `core.hooksPath` for git outside the sandbox,
- * Xum's own `git worktree add` in a trusted project included.
+ * `includeIf.<condition>.path` whatever the condition), from `globalConfigs` and the config of
+ * each repository in `roots` and `gitDirs` and of their submodules, recursively as git reads
+ * them. Git takes them as config, so a command that writes one can set `core.hooksPath` for git
+ * outside the sandbox, Xum's own `git worktree add` and `git submodule update` in a trusted project
+ * included.
  */
-function gitConfigIncludes(roots: readonly string[], gitDirs: readonly string[]): string[] {
-  const repoGitDirs = [...roots.map((root) => path.join(root, ".git")), ...gitDirs];
+function gitConfigIncludes(
+  roots: readonly string[],
+  gitDirs: readonly string[],
+  globalConfigs: readonly string[]
+): string[] {
+  const repoGitDirs = dedupe([...roots.flatMap(repositoryGitDirs), ...gitDirs]).flatMap(
+    (gitDir) => [gitDir, ...submoduleGitDirs(path.join(gitDir, "modules"), 1)]
+  );
   const configFiles = [
-    ...gitGlobalConfigFiles(),
+    ...globalConfigs,
     ...repoGitDirs.flatMap((gitDir) => [
       path.join(gitDir, "config"),
       ...[gitDir, ...childDirs(path.join(gitDir, "worktrees"))].map((dir) =>
@@ -639,6 +692,52 @@ function gitConfigIncludes(roots: readonly string[], gitDirs: readonly string[])
       resolveGitInclude(value, file)
     )
   );
+}
+
+/**
+ * The git folder of the repository that `root` is in, as git finds it: the nearest `.git` folder
+ * at or above `root` (a workspace can be a folder of a repository), or the folder that a `.git`
+ * file there names (a submodule's is in its superproject's `modules`), with the folder its
+ * `commondir` names. Following a pointer only adds files to protect.
+ */
+function repositoryGitDirs(root: string): string[] {
+  for (let current = root; ; current = path.dirname(current)) {
+    const dotGit = path.join(current, ".git");
+    const stat = statIfExists(dotGit);
+    if (stat?.isDirectory() === true) return [dotGit];
+    if (stat?.isFile() === true) return pointedGitDirs(dotGit);
+    if (path.dirname(current) === current) return [];
+  }
+}
+
+function pointedGitDirs(dotGitFile: string): string[] {
+  try {
+    const gitDir = gitDirPointer(dotGitFile);
+    if (gitDir === undefined) return [];
+    const commonDir = path.join(gitDir, "commondir");
+    if (!isFile(commonDir)) return [gitDir];
+    return [gitDir, path.resolve(gitDir, fs.readFileSync(commonDir, "utf8").trim())];
+  } catch {
+    return [];
+  }
+}
+
+// Git nests submodules without a limit; past this depth the policy fails closed.
+const MAX_SUBMODULE_DEPTH = 16;
+
+/**
+ * The git folders of the submodules in a `modules` folder, and of theirs. A submodule's name can
+ * hold a `/`, so a folder without a HEAD is part of a name. `.git/modules` is read-only, so the
+ * folders there are the ones git made.
+ */
+function submoduleGitDirs(modules: string, depth: number): string[] {
+  return childDirs(modules).flatMap((dir) => {
+    if (depth > MAX_SUBMODULE_DEPTH) {
+      throw new AgentSandboxStartError(`${dir} nests submodules deeper than the sandbox reads`);
+    }
+    if (!isFile(path.join(dir, "HEAD"))) return submoduleGitDirs(dir, depth + 1);
+    return [dir, ...submoduleGitDirs(path.join(dir, "modules"), depth + 1)];
+  });
 }
 
 /**

@@ -809,6 +809,23 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(await tokenSeen("off")).toBe("test-token");
     });
 
+    // Bash overlays the project's secrets onto the command's environment.
+    it("hides a token file that the command's environment names", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(workspace);
+      await fs.writeFile(path.join(workspace, "hf-token"), "hf_secret");
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+
+      const result = await execBuffered(
+        new LocalRuntime(workspace),
+        'cat "$HF_TOKEN_PATH" || echo READ_DENIED',
+        { cwd: workspace, env: { HF_TOKEN_PATH: path.join(workspace, "hf-token") }, timeout: 10 }
+      );
+
+      expect(result.stdout).not.toContain("hf_secret");
+      expect(result.stdout).toContain("READ_DENIED");
+    });
+
     it("runs background bash in the sandbox", async () => {
       const workspace = path.join(root, "ws");
       await fs.mkdir(workspace);

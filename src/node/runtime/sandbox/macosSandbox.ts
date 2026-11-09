@@ -144,6 +144,8 @@ export interface WrapForAgentSandboxOptions {
   readPaths?: readonly string[];
   /** ExecOptions.sandboxProjectPaths: their settings apply too (agentSandboxSettingsFor()). */
   otherProjectPaths?: readonly string[];
+  /** The command's environment (AgentSandboxPolicyInput.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -169,6 +171,7 @@ export async function wrapForAgentSandbox(
     scratchDir: options.scratchDir,
     pathEnv: options.pathEnv,
     readPaths: options.readPaths,
+    env: options.env,
   });
   return wrapWithPolicy(policy, script, options);
 }

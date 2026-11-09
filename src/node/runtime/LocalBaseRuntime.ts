@@ -431,6 +431,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       scratchDir: callerEnv.XUM_SCRATCH_DIR,
       pathEnv: effectivePath,
       otherProjectPaths: options.sandboxProjectPaths,
+      env: childEnv,
     });
 
     const childProcess = spawnWithSandbox(
@@ -849,6 +850,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       abortSignal,
       // No scratchDir: the init hook gets none from Xum, so an XUM_SCRATCH_DIR here is a secret.
       pathEnv: hookEnv.PATH,
+      env: hookEnv,
     });
     if (!wrap.ok) return;
 
