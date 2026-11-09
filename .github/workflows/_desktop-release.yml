@@ -253,9 +253,10 @@ jobs:
 
       - name: Package and publish for Windows (.exe)
         # This step runs in PowerShell: pass the zip directory (ELECTRON_ZIP_DIR, from setup-xum) on.
+        # The argument is an array: splatting a string passes its characters one by one.
         run: |
           $extra = @()
-          if ($env:ELECTRON_ZIP_DIR) { $extra = "-c.electronDist=$env:ELECTRON_ZIP_DIR" }
+          if ($env:ELECTRON_ZIP_DIR) { $extra = @("-c.electronDist=$env:ELECTRON_ZIP_DIR") }
           bun x electron-builder --win --publish always @extra
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

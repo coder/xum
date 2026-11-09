@@ -377,7 +377,7 @@ describe("the Electron zip wiring", () => {
       `bun x electron-builder --linux --arm64 --publish never ${BASH_FLAG}`,
     ],
     "_desktop-release.yml#build-windows": [
-      '$extra = "-c.electronDist=$env:ELECTRON_ZIP_DIR"',
+      '$extra = @("-c.electronDist=$env:ELECTRON_ZIP_DIR")',
       "bun x electron-builder --win --publish always @extra",
     ],
   };
