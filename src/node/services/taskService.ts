@@ -57,7 +57,7 @@ import {
   type WorkspaceTurnHost,
 } from "@/node/services/taskWorkspaceSeam";
 export type { TaskKind } from "@/node/services/taskWorkspaceSeam";
-export { ForegroundWaitBackgroundedError } from "@/node/services/taskWaiters";
+export { ForegroundWaitBackgroundedError, TaskNotFoundError } from "@/node/services/taskWaiters";
 import {
   ACTIVE_AGENT_TASK_STATUSES,
   buildAgentTaskIndex,
@@ -111,6 +111,7 @@ import { TaskStopLatch } from "@/node/services/taskStopLatch";
 import { StreamEndLedger } from "@/node/services/streamEndLedger";
 import { PeerSendParking } from "@/node/services/peerSendParking";
 import {
+  TaskNotFoundError,
   TaskWaiters,
   type PendingTaskStartWaiter,
   type PendingTaskWaiter,
@@ -16098,7 +16099,7 @@ export class TaskService implements AgentTaskIntegration {
       throw persistedFailure;
     }
 
-    throw new Error("Task not found");
+    throw new TaskNotFoundError();
   }
 
   /** An interrupted task: its persisted report, else a wait while its stream still runs. */
@@ -16172,7 +16173,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     const persistedFailure = await this.readPersistedFailureForWait(request);
-    settle.reject(persistedFailure ?? new Error("Task not found"));
+    settle.reject(persistedFailure ?? new TaskNotFoundError());
   }
 
   /** The row is still interrupted: settle with its persisted report, else wait while it streams. */

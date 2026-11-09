@@ -43,6 +43,7 @@ import {
   type AgentTaskTimestamps,
   type TaskService,
 } from "@/node/services/taskService";
+import { TaskNotFoundError, WorkspaceTurnNotFoundError } from "@/node/services/taskWaiters";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 
 const DEFAULT_TASK_AWAIT_TIMEOUT_MS = 600_000;
@@ -50,25 +51,6 @@ const WORKFLOW_AWAIT_POLL_INTERVAL_MS = 250;
 // Shared fallback used when a workspace-turn record errored without a specific message,
 // so every error-status await result path reports identical text.
 const WORKSPACE_TURN_DEFAULT_ERROR = "Workspace turn failed";
-// What a wait rejects with when the task is unknown (TaskService.waitForAgentReport and
-// WorkspaceTurnManager.waitForWorkspaceTurn). Match these exactly, never the words: a failed
-// task's own error text rejects through the same catch (model_not_found, "its definition was not
-// found", SSH "repository not found"), and a words match would turn that text into a bare
-// not_found. The failure row in the parent names task_await as the only way to read that text.
-const TASK_NOT_FOUND_MESSAGE = "Task not found";
-const WORKSPACE_TURN_NOT_FOUND_MESSAGE = "Workspace turn not found or out of scope";
-
-/**
- * Whether a rejected wait means the task is unknown. The sentinel alone is not proof: a failed
- * task whose own error text is the same string still exists, and its text must come back.
- */
-function isUnknownTaskRejection(
-  taskService: TaskService,
-  message: string,
-  taskId: string
-): boolean {
-  return message === TASK_NOT_FOUND_MESSAGE && taskService.getAgentTaskStatus(taskId) == null;
-}
 
 /**
  * A handle is stored under its owner. An ancestor of the handle's child that does not own it (the
@@ -832,12 +814,12 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                 ...workspaceTurnIdentityFields(latest.workspaceId),
               };
             }
-            const latest = await getWorkspaceTurnSnapshotForAwait().catch(() => null);
-            // The sentinel means the handle is gone. A failed turn that quotes the same words
-            // still has a stored record, and its text is read below.
-            if (message === WORKSPACE_TURN_NOT_FOUND_MESSAGE && latest == null) {
+            // Match the class, never the text: a failed turn can quote the same words, and its
+            // stored text is read below.
+            if (error instanceof WorkspaceTurnNotFoundError) {
               return { status: "invalid_scope" as const, taskId };
             }
+            const latest = await getWorkspaceTurnSnapshotForAwait().catch(() => null);
             if (latest?.status === "completed") {
               await markWorkspaceTurnTerminalAttentionConsumed(latest);
               return completedWorkspaceTurnResult(latest);
@@ -917,7 +899,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             };
           } catch (error: unknown) {
             const message = getErrorMessage(error);
-            if (isUnknownTaskRejection(taskService, message, taskId)) {
+            if (error instanceof TaskNotFoundError) {
               return { status: "not_found" as const, taskId };
             }
             return { status: "error" as const, taskId, error: message };
@@ -976,7 +958,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           }
 
           const message = getErrorMessage(error);
-          if (isUnknownTaskRejection(taskService, message, taskId)) {
+          if (error instanceof TaskNotFoundError) {
             return { status: "not_found" as const, taskId };
           }
           if (/timed out/i.test(message)) {

@@ -20,6 +20,7 @@ import type { StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { parseSubagentFailureEnvelope } from "@/common/utils/subagentFailureEnvelope";
 import { formatSubagentFailureUserMessage } from "@/node/services/taskWorkspaceSeam";
+import { WorkspaceTurnNotFoundError } from "@/node/services/taskWaiters";
 import assert from "node:assert";
 import {
   createAIServiceMocks,
@@ -313,8 +314,7 @@ describe("WorkspaceTurnManager", () => {
     ).toBeUndefined();
   });
 
-  test("waiting on an unknown handle rejects with the exact message that task_await maps to invalid_scope", async () => {
-    // task_await matches this string exactly (never the words), so the producer is pinned here.
+  test("waiting on an unknown handle rejects with the WorkspaceTurnNotFoundError that task_await maps to invalid_scope", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const { taskService } = createWorkspaceTurnManagerHarness(config);
@@ -330,7 +330,9 @@ describe("WorkspaceTurnManager", () => {
         (rejection: unknown) => rejection
       );
 
-    expect(error).toBeInstanceOf(Error);
+    // task_await matches the class (never the text), so the producer is pinned here.
+    expect(error).toBeInstanceOf(WorkspaceTurnNotFoundError);
+    // Other waiters (task_stop) still match the message text.
     expect((error as Error).message).toBe("Workspace turn not found or out of scope");
   });
 

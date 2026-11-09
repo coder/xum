@@ -12,6 +12,26 @@ export class ForegroundWaitBackgroundedError extends Error {
   }
 }
 
+/**
+ * What a wait rejects with when the task or workspace turn it waits on does not exist. The
+ * messages are protocol text that other waiters (workflows, `task_stop`) still match, but
+ * `task_await` tells these apart by class and never by text: a failed task's own error text can be
+ * any string, including these messages, and it must reach the parent as that text.
+ */
+export class TaskNotFoundError extends Error {
+  constructor() {
+    super("Task not found");
+    this.name = "TaskNotFoundError";
+  }
+}
+
+export class WorkspaceTurnNotFoundError extends Error {
+  constructor() {
+    super("Workspace turn not found or out of scope");
+    this.name = "WorkspaceTurnNotFoundError";
+  }
+}
+
 /** The report a pending waiter resolves with. */
 export interface PendingTaskWaiterReport {
   reportMarkdown: string;

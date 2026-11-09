@@ -12,6 +12,7 @@ import {
 } from "@/common/utils/tools/toolDefinitions";
 import type { WorkflowRunRecord, WorkflowRunStatus } from "@/common/types/workflow";
 import { createTaskAwaitTool } from "./task_await";
+import { TaskNotFoundError, WorkspaceTurnNotFoundError } from "@/node/services/taskWaiters";
 import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { getSubagentGitPatchArtifactsFilePath } from "@/node/services/subagentGitPatchArtifacts";
@@ -1993,7 +1994,7 @@ describe("task_await tool", () => {
         return Promise.reject(new Error("Timed out waiting for agent_report"));
       }
       if (taskId === "missing") {
-        return Promise.reject(new Error("Task not found"));
+        return Promise.reject(new TaskNotFoundError());
       }
       return Promise.reject(new Error("Boom"));
     });
@@ -2022,7 +2023,7 @@ describe("task_await tool", () => {
   // After the failure row stopped carrying the child's error text, task_await is the only way the
   // parent reads it. Common terminal failures hold the words "not found" (model_not_found, "its
   // definition was not found", SSH "repository not found"): those must come back as text, and
-  // only TaskService's own unknown-task rejection maps to not_found.
+  // only the unknown-task errors (by class, never by text) map to not_found and invalid_scope.
   describe("error text that holds the words 'not found'", () => {
     const modelNotFound = "The model `claude-x` was not found for this API key";
 
@@ -2103,10 +2104,12 @@ describe("task_await tool", () => {
     it("returns a failed task's text even when that text is the unknown-task sentinel", async () => {
       using tempDir = new TestTempDir("test-task-await-sentinel-collision");
       const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
-      // The task exists (its status is known), so the rejection is its own error text.
+      // The task has no status (it was removed, and a persisted failure keeps it in scope), and
+      // the rejection is its own error text, which is only the same words as the unknown-task
+      // error.
       const taskServices = createFakeTaskServices({
         isDescendantAgentTask: mock(() => Promise.resolve(true)),
-        getAgentTaskStatus: mock(() => "interrupted" as const),
+        getAgentTaskStatus: mock(() => null),
         waitForAgentReport: mock(() => Promise.reject(new Error("Task not found"))),
       });
       const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
@@ -2157,7 +2160,7 @@ describe("task_await tool", () => {
       });
     });
 
-    it("keeps mapping the exact unknown-task rejections to not_found and invalid_scope", async () => {
+    it("maps the unknown-task errors to not_found and invalid_scope", async () => {
       using tempDir = new TestTempDir("test-task-await-unknown-task");
       const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
       const goneSnapshots: WorkspaceTurnTaskHandleRecord[] = [
@@ -2177,16 +2180,14 @@ describe("task_await tool", () => {
       const taskServices = createFakeTaskServices({
         isDescendantAgentTask: mock(() => Promise.resolve(true)),
         getAgentTaskStatus: mock(() => null),
-        waitForAgentReport: mock(() => Promise.reject(new Error("Task not found"))),
+        waitForAgentReport: mock(() => Promise.reject(new TaskNotFoundError())),
         listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
         // The turn exists when the wait starts and is gone when the wait rejects.
         getWorkspaceTurnSnapshot: mock(
           (): Promise<WorkspaceTurnTaskHandleRecord | null> =>
             Promise.resolve(goneSnapshots.shift() ?? null)
         ),
-        waitForWorkspaceTurn: mock(() =>
-          Promise.reject(new Error("Workspace turn not found or out of scope"))
-        ),
+        waitForWorkspaceTurn: mock(() => Promise.reject(new WorkspaceTurnNotFoundError())),
       });
       const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 

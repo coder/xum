@@ -26,6 +26,7 @@ import {
   type WorkspaceTurnHost,
   type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
+import { WorkspaceTurnNotFoundError } from "@/node/services/taskWaiters";
 import type { HistoryService } from "@/node/services/historyService";
 import type { HistoryControlRow } from "@/node/services/historyScanner";
 import { findLastRetryUserMessage, retriedWorkspaceTurn } from "@/node/services/retryUserMessage";
@@ -3497,7 +3498,7 @@ export class WorkspaceTurnManager {
         const record = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
         if (settled) return;
         if (record == null) {
-          waiterEntry.reject(new Error("Workspace turn not found or out of scope"));
+          waiterEntry.reject(new WorkspaceTurnNotFoundError());
           return;
         }
         if (record.status === "completed") {

@@ -26,6 +26,7 @@ import {
 } from "@/node/services/taskHandleStore";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { createTaskAwaitTool } from "@/node/services/tools/task_await";
+import { TaskNotFoundError } from "@/node/services/taskWaiters";
 import { createTestToolConfig, mockToolCallOptions } from "@/node/services/tools/testHelpers";
 import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/agentAiDefaults";
 import type { ThinkingLevel } from "@/common/types/thinking";
@@ -2535,8 +2536,8 @@ describe("TaskService", () => {
     });
   });
 
-  test("an unknown task rejects with the exact message that task_await maps to not_found", async () => {
-    // task_await matches this string exactly (never the words), so the producer is pinned here.
+  test("an unknown task rejects with the TaskNotFoundError that task_await maps to not_found", async () => {
+    // task_await matches the class (never the text), so the producer is pinned here.
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
     await saveWorkspaces(
@@ -2554,8 +2555,78 @@ describe("TaskService", () => {
         (rejection: unknown) => rejection
       );
 
-    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(TaskNotFoundError);
+    // Other waiters (workflows, task_stop) still match the message text.
     expect((error as Error).message).toBe("Task not found");
+  });
+
+  test("a wait whose task row vanished while it was starting rejects with TaskNotFoundError", async () => {
+    // The second place that throws the unknown-task error: the pending wait's own setup, which
+    // re-reads the row. It is reachable only through that race, so the test calls the step.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [projectWorkspace(projectPath, "parent", "parent-111")],
+      testTaskSettings(1, 3)
+    );
+    const { taskService } = createTaskServiceHarness(config);
+    const settle = { resolve: mock(), reject: mock() };
+
+    await (
+      taskService as unknown as {
+        settleGoneReportWait: (
+          request: { taskId: string; requestingWorkspaceId: string; timeoutMs: number },
+          settle: { resolve: (report: unknown) => void; reject: (error: Error) => void }
+        ) => Promise<void>;
+      }
+    ).settleGoneReportWait(
+      { taskId: "no-such-task", requestingWorkspaceId: "parent-111", timeoutMs: 10 },
+      settle
+    );
+
+    expect(settle.resolve).not.toHaveBeenCalled();
+    expect(settle.reject).toHaveBeenCalledTimes(1);
+    expect(settle.reject.mock.calls[0][0]).toBeInstanceOf(TaskNotFoundError);
+  });
+
+  test("task_await returns a removed child's failure text even when that text is the unknown-task message", async () => {
+    // The persisted failure keeps the removed child in scope. Its text equals the message of
+    // TaskNotFoundError, so only the class tells the two apart.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [projectWorkspace(projectPath, "parent", "parent-111")],
+      testTaskSettings(1, 3)
+    );
+    const { taskService, workspaceTurnManager } = createTaskServiceHarness(config);
+    await upsertSubagentFailureArtifact({
+      locks: nodeSessionLocks,
+      workspaceId: "parent-111",
+      workspaceSessionDir: path.join(config.sessionsDir, "parent-111"),
+      childTaskId: "removed-child",
+      parentWorkspaceId: "parent-111",
+      ancestorWorkspaceIds: ["parent-111"],
+      errorType: "api",
+      errorMessage: "Task not found",
+    });
+    const tool = createTaskAwaitTool({
+      ...createTestToolConfig(rootDir, { workspaceId: "parent-111" }),
+      taskService,
+      workspaceTurnManager,
+    });
+
+    for (const timeout_secs of [0, 5]) {
+      const result: unknown = await Promise.resolve(
+        tool.execute!({ task_ids: ["removed-child"], timeout_secs }, mockToolCallOptions)
+      );
+      expect(result).toEqual({
+        results: [{ status: "error", taskId: "removed-child", error: "Task not found" }],
+      });
+    }
   });
 
   // reasoning_rejected joins model_refusal in RUNNING_TASK_TERMINAL_STREAM_ERRORS:
