@@ -947,6 +947,14 @@ describe("BashMonitorWakeReconciler", () => {
             retired: true,
           }),
         ];
+        // The process is still in memory, but its output read failed: no read facts apply.
+        deliveryState = {
+          status: "settled",
+          shownThroughOffset: 0,
+          terminalStatusShown: false,
+          readCursorOffset: 0,
+          outputThroughOffset: 50_000,
+        };
       }
 
       await reconciler.reconcile(OWNER);
@@ -956,6 +964,8 @@ describe("BashMonitorWakeReconciler", () => {
       expect(prompt).not.toContain(hostile);
       expect(prompt).toContain("Task ID: bash:dead");
       expect(prompt).toContain("Failed operations: readOutput");
+      expect(prompt).not.toContain("Unread output:");
+      expect(prompt).not.toContain("task_await({");
       expect(classifyMachineTurnPromptKind(prompt)).toBe("turn.monitor_wake");
       expect(dispatches[0].muxMetadata.records[0]).toMatchObject({
         kind: "monitor-lost",

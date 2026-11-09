@@ -129,6 +129,24 @@ describe("bash monitor wake and the shared read cursor", () => {
     expect(prompt).toContain(BASH_MONITOR_READ_PAST_NOTE);
   });
 
+  test("a matched line that a capped read left buffered is not reported as read past", async () => {
+    const marker = `MARKER_BUFFERED_${runId}`;
+    const processId = await spawnMonitored(
+      "cursor-buffered",
+      `head -c 30000 /dev/zero | tr '\\0' 'x' | fold -w 99; echo; echo 'RESULT ${marker}'; sleep 30`
+    );
+    await waitForCondition(() => snapshotOf(processId)?.match != null, { timeoutMs: 5_000 });
+
+    // A filtered read scans past one page and keeps what it cannot return in memory.
+    const firstPage = await read(processId, owner, ".");
+    expect(firstPage).not.toContain(marker);
+
+    const prompt = await wakePrompt();
+    expect(prompt).not.toContain(BASH_MONITOR_READ_PAST_NOTE);
+    expect(unreadBytes(prompt)).toBeGreaterThan(0);
+    expect(await read(processId, owner, ".")).toContain(marker);
+  });
+
   test("output past one read page before the match: the wake gives the unread size and the filtered read", async () => {
     const marker = `MARKER_PAGED_${runId}`;
     const fillerBytes = 40_000;
