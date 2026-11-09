@@ -18,6 +18,7 @@ import {
   MEMORY_ANALYZER_OP_BUDGET,
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
+  MEMORY_CONSOLIDATION_TIMEOUT_MS,
 } from "@/common/constants/memory";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
@@ -3374,15 +3375,25 @@ describe("MemoryConsolidationService", () => {
         });
       });
 
-      it("leaves another backend's live attempt alone when this job fails before its turn", async () => {
-        using fixture = await createFixture();
-        const metadata = await seedCompactionEpoch(fixture);
-        const live: MemoryHarvestRecordPayload = {
+      /**
+       * Another backend's job of ws-dream, in a slow chunk: it holds the owner's job lock, and it
+       * last saved its record more than a timeout ago (a chunk waits up to one timeout for the
+       * dream lock and streams up to another). Kill makes the holder die with the lock held.
+       */
+      async function slowChunkInAnotherBackend(
+        fixture: Fixture,
+        metadata: CompactionCompletionMetadata,
+        others: Record<string, MemoryHarvestRecordPayload> = {},
+        attemptCount = 1
+      ) {
+        const longAgo = Date.now() - 2 * MEMORY_CONSOLIDATION_TIMEOUT_MS;
+        const record: MemoryHarvestRecordPayload = {
           status: "pending",
-          startedAt: Date.now(),
-          progressAt: Date.now(),
-          attemptCount: 1,
-          nextChunk: 1,
+          startedAt: longAgo,
+          progressAt: longAgo,
+          // Its first chunk: no cursor yet, so a job behind it takes its floor from the records.
+          attemptCount,
+          nextChunk: 0,
           boundaryKey: "summary-1",
           compactionEpoch: 1,
           acceptedCandidates: 0,
@@ -3391,14 +3402,106 @@ describe("MemoryConsolidationService", () => {
         };
         await fsPromises.writeFile(
           path.join(fixture.xumHome, "memory-consolidation.json"),
-          JSON.stringify({ harvestsByWorkspace: { "ws-dream": { "summary-1": live } } })
+          JSON.stringify({
+            harvestsByWorkspace: { "ws-dream": { ...others, "summary-1": record } },
+          })
         );
+        const lockPath = analyzerJobLockPath(fixture.xumHome, "ws-dream");
+        const release = await acquireCrossProcessLock({
+          lockPath,
+          acquireTimeoutMs: 1_000,
+          staleMs: 60_000,
+          timeoutMessage: "test holder",
+        });
+        const kill = async () => {
+          // Its record stays, with a token this process no longer holds: the holder is gone.
+          const holder = await fsPromises.readFile(lockPath, "utf-8");
+          await release();
+          await fsPromises.writeFile(lockPath, holder);
+        };
+        return { record, release, kill };
+      }
+
+      const analyzerPrompts = (fixture: Fixture) =>
+        fixture.modelPrompts.filter((prompt) => prompt.includes("just-compacted transcript epoch"));
+
+      it("leaves another backend's live attempt alone when this job fails before its turn", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        const live = await slowChunkInAnotherBackend(fixture, metadata);
         // The job fails before its turn, so without the job lock: its failure must not replace
         // the record that the other backend's attempt keeps updating.
         fixture.setModelUnavailable(true);
-        await fixture.service.maybeHarvestThenSweep(metadata);
+        try {
+          await fixture.service.maybeHarvestThenSweep(metadata);
+        } finally {
+          await live.release();
+        }
 
-        expect((await harvestRecords(fixture))["summary-1"]).toEqual(live);
+        expect((await harvestRecords(fixture))["summary-1"]).toEqual(live.record);
+      });
+
+      it("leaves another backend's live attempt alone when earlier runs read every row", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        const second = secondBackend(fixture);
+        const readAll = (row: string): MemoryHarvestRecordPayload => ({
+          status: "completed",
+          startedAt: 1,
+          completedAt: 1,
+          attemptCount: 1,
+          boundaryKey: `open:${row}`,
+          compactionEpoch: 1,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+        });
+        const live = await slowChunkInAnotherBackend(fixture, metadata, {
+          "open:pref-1": readAll("pref-1"),
+          "open:compact-request": readAll("compact-request"),
+        });
+        try {
+          await second.service.maybeHarvestThenSweep(metadata);
+        } finally {
+          await live.release();
+        }
+
+        expect(second.counts.analyzerStreams).toBe(0);
+        expect((await harvestRecords(fixture))["summary-1"]).toEqual(live.record);
+      });
+
+      it("leaves another backend's live last attempt pending", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        const second = secondBackend(fixture);
+        const live = await slowChunkInAnotherBackend(fixture, metadata, {}, HARVEST_MAX_ATTEMPTS);
+        try {
+          // Its dream sweep also writes the sidecar: that write must not end the attempt either.
+          await second.service.maybeHarvestThenSweep(metadata);
+        } finally {
+          await live.release();
+        }
+
+        expect((await harvestRecords(fixture))["summary-1"]).toEqual(live.record);
+      });
+
+      it("retries another backend's pending attempt only once that backend died", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        const live = await slowChunkInAnotherBackend(fixture, metadata);
+        try {
+          expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+          expect(analyzerPrompts(fixture)).toEqual([]);
+          expect((await harvestRecords(fixture))["summary-1"]).toEqual(live.record);
+        } finally {
+          await live.kill();
+        }
+
+        expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+        expect(analyzerPrompts(fixture)).toHaveLength(1);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          attemptCount: 2,
+        });
       });
 
       it("neither writes the sidecar nor announces a change for a save that changes nothing", async () => {
@@ -5860,13 +5963,9 @@ describe("staleExhaustedHarvestFailure", () => {
     );
   });
 
-  it("leaves a record that a retry or a live run still owns", () => {
+  it("leaves a record that a retry still owns", () => {
     expect(staleExhaustedHarvestFailure(undefined)).toBeUndefined();
-    // Alive: its last sign of life is inside the timeout.
-    expect(
-      staleExhaustedHarvestFailure(pendingRecord({ progressAt: Date.now() - 1000 }))
-    ).toBeUndefined();
-    // Stale, but an attempt is left.
+    // An attempt is left.
     expect(
       staleExhaustedHarvestFailure(pendingRecord({ attemptCount: HARVEST_MAX_ATTEMPTS - 1 }))
     ).toBeUndefined();
