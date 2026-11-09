@@ -10,6 +10,7 @@ import * as crossProcessLock from "@/node/utils/main/crossProcessLock";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
+  ARTIFACT_SHELF_BACKUP_DIR,
   BACKUP_SCHEMA_VERSION,
   BACKUP_SCHEMA_VERSION_LITERAL_HEADERS,
   BackupCommandApprovalRequiredError,
@@ -3870,6 +3871,80 @@ describe("backup payload", () => {
       reportSecrets: true,
     });
     expect(scanBackupFilesForSecrets(payload.files, CONTENTS)).toContain("AGENTS.md");
+  });
+
+  describe("secrets inside JSON string escapes", () => {
+    // Built from repeated letters so no test line is a credential. Each token matches one
+    // SECRET_PATTERNS entry that starts with `\b`.
+    const TOKENS = [
+      `sk-${"a".repeat(20)}`,
+      `ghp_${"a".repeat(36)}`,
+      `github_pat_${"a".repeat(22)}`,
+      `AKIA${"A".repeat(16)}`,
+      `AIza${"a".repeat(35)}`,
+      `xoxb-${"a".repeat(12)}`,
+    ];
+    const TOKEN = TOKENS[1];
+    // The file text holds a backslash and a letter or digit right before the token, which is
+    // a word character, so `\b` finds no boundary in the raw text.
+    const ESCAPES = ["\\n", "\\t", "\\r", "\\u0020", "\\u000a"];
+    // An auto-published JSON file: shelf entry metadata is not held for review by path.
+    const META_PATH = `${ARTIFACT_SHELF_BACKUP_DIR}/entry/meta.json`;
+
+    function scan(filePath: string, text: string): string[] {
+      return scanBackupFilesForSecrets([{ path: filePath, content: Buffer.from(text) }], CONTENTS);
+    }
+
+    it.each(ESCAPES)("flags a token after the %s escape in a JSON string value", (escape) => {
+      expect(scan(META_PATH, `{"title":"x${escape}${TOKEN}"}`)).toEqual([META_PATH]);
+      expect(scan(META_PATH, `{"title":"x${escape}${"a".repeat(36)}"}`)).toEqual([]);
+    });
+
+    it.each(TOKENS)("flags the escaped form of every pattern: %#", (token) => {
+      expect(scan(META_PATH, `{"title":"x\\n${token}"}`)).toEqual([META_PATH]);
+    });
+
+    it("flags a token in an object key and at any depth", () => {
+      expect(scan(META_PATH, JSON.stringify({ [`x\n${TOKEN}`]: 1 }))).toEqual([META_PATH]);
+      expect(scan(META_PATH, JSON.stringify({ a: [{ b: { c: [`x\t${TOKEN}`] } }] }))).toEqual([
+        META_PATH,
+      ]);
+    });
+
+    it("flags a token in a duplicate key's earlier value that a parse would drop", () => {
+      const text = `{"title":"x\\n${TOKEN}","title":"clean","__proto__":"x\\n${TOKEN}"}`;
+      expect(scan(META_PATH, text)).toEqual([META_PATH]);
+      expect(scan(META_PATH, `{"title":"x\\n${"a".repeat(36)}","title":"clean"}`)).toEqual([]);
+    });
+
+    it("decodes a .jsonc file that has comments and a trailing comma", () => {
+      const withToken = `// notes\n{ /* c */ "servers": { "api": { "url": "https://example.com/mcp", "note": "x\\n${TOKEN}", }, }, }\n`;
+      expect(scan("mcp.jsonc", withToken)).toEqual(["mcp.jsonc"]);
+      expect(scan("mcp.jsonc", withToken.replace(TOKEN, "a".repeat(36)))).toEqual([]);
+    });
+
+    it("still decodes a JSON file that does not parse", () => {
+      expect(scan(META_PATH, `{"title":"x\\n${TOKEN}"`)).toEqual([META_PATH]);
+    });
+
+    it("blocks a push whose preferences.json holds an escaped token", async () => {
+      // `terminalFontConfig.fontFamily` is free text that reaches preferences.json, which
+      // `JSON.stringify` writes with the newline as the two characters backslash and `n`.
+      const error = await captureRejection(
+        createBackupPayload({
+          muxRoot,
+          contents: CONTENTS,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          preferences: {
+            appearance: { terminalFontConfig: { fontFamily: `x\n${TOKEN}`, fontSize: 12 } },
+          },
+        })
+      );
+      expect((error as Error).message).toContain(
+        "Backup contains possible secrets in: preferences.json"
+      );
+    });
   });
 
   it("refuses to back up a file hard-linked to one outside the collected set", async () => {
