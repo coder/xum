@@ -2616,7 +2616,7 @@ export class Config {
     options?: {
       throwOnError?: boolean;
       keepSnapshot?: boolean;
-      /** A missing config.json throws its ENOENT instead of reading as defaults. */
+      /** A missing config.json fails the read like an unreadable one (see readConfigBytes). */
       requireFile?: boolean;
     },
     key?: string
@@ -2625,25 +2625,13 @@ export class Config {
     // second read could preserve a concurrent writer's replacement instead of the bytes that
     // actually failed parsing.
     let rawBytes: Buffer | undefined;
-    let missing: unknown;
     // An edit's fresh read stores nothing, so the snapshot of the unchanged file stays valid
     // for readers until the save's rename; dropping it made every reader during the edit parse
     // the same bytes again. It is still key-guarded: a miss as soon as the file changes.
     const kept = options?.keepSnapshot ? this.configSnapshot : undefined;
     this.configSnapshot = undefined;
     try {
-      try {
-        rawBytes = fs.readFileSync(this.configFile);
-      } catch (readError) {
-        // No existsSync probe: it also returns false for EACCES/ENOTDIR/EIO,
-        // which would silently select the fresh-install default while the
-        // config is merely transiently unreadable — in strict mode that
-        // empty view feeds destructive "not in config" decisions. Route
-        // non-ENOENT failures through the shared failure path below
-        // (throwOnError callers rethrow); only ENOENT means missing.
-        if (!isEnoentError(readError)) throw readError;
-        missing = readError;
-      }
+      rawBytes = this.readConfigBytes(options?.requireFile);
       if (rawBytes !== undefined) {
         const parsedValue: unknown = JSON.parse(rawBytes.toString("utf-8"));
         if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
@@ -2682,9 +2670,6 @@ export class Config {
       this.handleConfigLoadFailure(rawBytes, error);
       if (options?.throwOnError) throw error;
     }
-    // Thrown outside the try: a missing file is not a corrupt one, so it records no load
-    // failure, and it has no bytes for the edit gate to protect.
-    if (options?.requireFile && missing !== undefined) throw missing;
 
     // Return default config
     return {
@@ -2710,6 +2695,23 @@ export class Config {
         taskSettingsDefaultsRaised: true,
       },
     };
+  }
+
+  /**
+   * config.json's bytes, or undefined when it does not exist. No existsSync probe: it also
+   * returns false for EACCES/ENOTDIR/EIO, which would silently select the fresh-install default
+   * while the config is merely transiently unreadable — in strict mode that empty view feeds
+   * destructive "not in config" decisions. Non-ENOENT failures throw into the caller's shared
+   * failure path (throwOnError callers rethrow); only ENOENT means missing, and with
+   * `requireFile` (editConfigIfChanged) it throws too.
+   */
+  private readConfigBytes(requireFile: boolean | undefined): Buffer | undefined {
+    try {
+      return fs.readFileSync(this.configFile);
+    } catch (readError) {
+      if (requireFile || !isEnoentError(readError)) throw readError;
+      return undefined;
+    }
   }
 
   private validateConfigStructure(parsed: Partial<AppConfigOnDisk>): void {

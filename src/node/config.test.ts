@@ -3974,7 +3974,7 @@ describe("Config", () => {
           state.injected++;
           throw new SyntaxError("injected parse failure");
         }
-        return realParse(text, reviver);
+        return realParse(text, reviver) as unknown;
       }) as typeof JSON.parse);
       return {
         state,
@@ -3998,7 +3998,7 @@ describe("Config", () => {
         await config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
         const injection = injectConfigReadFault(fault);
         let transformed = 0;
-        const unchanged = () => {
+        const unchanged = (): typeof CONFIG_UNCHANGED => {
           transformed++;
           return CONFIG_UNCHANGED;
         };

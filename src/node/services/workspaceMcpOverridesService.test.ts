@@ -1771,7 +1771,7 @@ describe("WorkspaceMcpOverridesService", () => {
             injected++;
             throw new SyntaxError("injected parse failure");
           }
-          return realParse(text, reviver);
+          return realParse(text, reviver) as unknown;
         }) as typeof JSON.parse);
         const spy = spyLegacyClears({
           before: () => {
