@@ -291,6 +291,10 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     // the folder. Go runs without it: it ignores an env file it cannot read (measured, Go 1.27).
     "~/Library/Application Support/go/env",
     ...(env.GOENV === "off" ? [] : fromEnv("GOENV")),
+    // npm reads registry tokens from the user config that these name, which can be in an open
+    // folder; ~/.npmrc itself is only closed, so extraReadPaths can open it (Codex review).
+    ...fromEnv("npm_config_userconfig"),
+    ...fromEnv("NPM_CONFIG_USERCONFIG"),
     `${XUM_HOME_TOKEN}/server.lock`,
     `${XUM_HOME_TOKEN}/providers.jsonc`,
     `${XUM_HOME_TOKEN}/secrets.json`,

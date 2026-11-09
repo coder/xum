@@ -77,6 +77,8 @@ const MOVED_CREDENTIAL_STORES = [
   { name: "CARGO_HOME", value: "cargo", file: "cargo/credentials.toml" },
   { name: "HF_TOKEN_PATH", value: "hf-token", file: "hf-token" },
   { name: "GOENV", value: "go-env", file: "go-env" },
+  { name: "npm_config_userconfig", value: "npmrc", file: "npmrc" },
+  { name: "NPM_CONFIG_USERCONFIG", value: "npmrc", file: "npmrc" },
 ];
 
 describe("buildAgentSandboxPolicy", () => {

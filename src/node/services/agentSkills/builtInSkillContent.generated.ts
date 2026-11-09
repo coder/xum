@@ -4728,6 +4728,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- `~/.cache/huggingface/token` (or where `XDG_CACHE_HOME`, `HF_HOME` or `HF_TOKEN_PATH` moves it).",
       "- `~/.local/share/uv/credentials` (or where `XDG_DATA_HOME` or `UV_CREDENTIALS_DIR` moves it), where `uv auth login` keeps its tokens, so uv in the sandbox cannot use them.",
       "- `~/Library/Application Support/go/env` (or where `GOENV` moves it), where `go env -w` keeps its settings, which can hold a password in `GOPROXY`. Go in the sandbox runs without them, so set what a build needs, such as `GOPRIVATE` or `GOFLAGS`, in the environment instead.",
+      "- The npm user config that `npm_config_userconfig` or `NPM_CONFIG_USERCONFIG` names, because it can hold registry tokens. Without them, `~/.npmrc` is only closed (see below).",
       "- Xum's `server.lock`, `providers.jsonc`, `secrets.json`, `mcp-oauth.json`, and `config.json`, and its `askpass` folder, where your answers to SSH prompts pass. `xum run` and `xum workflow` keep their copy of `config.json`, `providers.jsonc` and `secrets.json` in a temp folder, and that copy is hidden too, with the files whose names start with one of these names and a dot, such as the temp file that Xum writes before it replaces one.",
       "",
       "Commands fail to start when one of these files has more than one hard link, because the sandbox hides and protects names, not files, so the other name would open it.",
