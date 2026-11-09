@@ -343,11 +343,11 @@ export abstract class LocalBaseRuntime implements Runtime {
   /**
    * The bash and the env of a call that opts out of an agent sandbox that applies: approved bash
    * calls, MCP servers and Xum's own commands. Bash sources the file that BASH_ENV names before
-   * the script, and a sandboxed command can write that file in the workspace. Xum's own scripts
-   * also skip the inherited PATH, which can hold a folder that sandboxed commands write (an
-   * activated <workspace>/.venv/bin), and the exported bash functions (`BASH_FUNC_rm%%`), which
-   * bash defines whatever BASH_ENV and PATH are and which can run such a file (Codex review), so a
-   * planted `rm` or `bash` never runs unsandboxed.
+   * the script, and it defines the exported bash functions (`BASH_FUNC_git%%`) whatever BASH_ENV
+   * and PATH are, and either can run a file that a sandboxed command wrote in the workspace (Codex
+   * review), so no opt-out keeps them. Xum's fixed scripts also skip the inherited PATH, which can
+   * hold a folder that sandboxed commands write (an activated <workspace>/.venv/bin), so a planted
+   * `rm` or `bash` never runs unsandboxed.
    */
   private sandboxOptOut(
     cwd: string,
@@ -360,15 +360,14 @@ export abstract class LocalBaseRuntime implements Runtime {
       otherProjectPaths: options.sandboxProjectPaths,
     });
     if (!applies) return inherited;
-    if (options.sandbox === "off")
-      return { ...inherited, env: (env) => ({ ...env, BASH_ENV: "" }) };
+    const withoutBashStartup = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({
+      ...Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("BASH_FUNC_"))),
+      BASH_ENV: "",
+    });
+    if (options.sandbox === "off") return { ...inherited, env: withoutBashStartup };
     return {
       bashPath: "/bin/bash",
-      env: (env) => ({
-        ...Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("BASH_FUNC_"))),
-        BASH_ENV: "",
-        PATH: SYSTEM_PATH,
-      }),
+      env: (env) => ({ ...withoutBashStartup(env), PATH: SYSTEM_PATH }),
     };
   }
 

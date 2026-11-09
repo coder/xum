@@ -352,7 +352,7 @@ describe("LocalBaseRuntime.exec sandbox opt-out", () => {
   });
 
   // Bash defines an exported function whatever PATH is, and it can run a file in the workspace.
-  it("drops exported bash functions from Xum's own opt-out commands only", async () => {
+  it("drops exported bash functions from every opt-out command while the sandbox applies", async () => {
     const run = async (runtime: LocalBaseRuntime, sandbox: "off" | "internal") => {
       const stream = await runtime.exec("rm -f ./xum-missing-file; echo ran", {
         cwd: os.tmpdir(),
@@ -365,7 +365,8 @@ describe("LocalBaseRuntime.exec sandbox opt-out", () => {
     };
 
     expect(await run(new SandboxedRuntime(true), "internal")).toBe("ran\n");
-    expect(await run(new SandboxedRuntime(true), "off")).toBe("planted\nran\n");
+    expect(await run(new SandboxedRuntime(true), "off")).toBe("ran\n");
+    expect(await run(new SandboxedRuntime(false), "off")).toBe("planted\nran\n");
   });
 });
 
