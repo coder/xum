@@ -273,6 +273,8 @@ describe("redactSecretLike", () => {
       "PASSWORD=[redacted] npm start",
     ],
     ["a value of stars only", "password=***", "password=[redacted]"],
+    ["stars then a command, no opener", "password=*** npm start", "password=[redacted] npm start"],
+    ["a list bullet is no opener", "* password=*** npm start", "* password=[redacted] npm start"],
   ])("redacts the value after Markdown emphasis in %s", (_label, text, expected) => {
     const redacted = redactSecretLike(text);
 
@@ -601,6 +603,8 @@ describe("redactSecretLike", () => {
     ["account_key", "account_key".repeat(9_000)],
     ["a keyword and a long run of asterisks", `password${"*".repeat(100_000)}:x`],
     ["bold keyword labels with no value", "**password:**".repeat(8_000)],
+    ["many separators after one opening run", `**x ${"password:".repeat(10_000)}`],
+    ["opening runs before keyword pairs", "*a password=b ".repeat(7_000)],
     ["SharedAccessKey", "SharedAccessKey".repeat(6_600)],
     ["shared_access_key_", "shared_access_key_".repeat(5_600)],
     ["SharedAccessKeyName", "SharedAccessKeyName".repeat(5_200)],
