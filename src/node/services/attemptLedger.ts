@@ -11,7 +11,6 @@ import {
   retiredAttemptMessage,
 } from "@/constants/agentMessaging";
 import { Err, Ok, type Result } from "@/common/types/result";
-import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { TaskAttemptOutcome, TaskAttemptSettlement } from "@/common/types/tasks";
 import type { Config, ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
@@ -325,23 +324,29 @@ export class AttemptLedger {
    * A new attempt begins in this process (reservation commit, launch, reawakening, reactivation).
    * Replaces the owned identity and drops any settlement of the previous attempt SYNCHRONOUSLY,
    * before the admission that follows — current ownership always wins over a stale settlement.
+   * `identity.inheritedReport` comes from the CAS that published the attempt: this method never
+   * reads the row, whose report may by now be another backend's report of the fresh attempt.
    */
   beginOwnedTaskAttempt(
     taskId: string,
     source: string,
-    identity: { attemptId: string | undefined; receiptEligible: boolean; abortSignal?: AbortSignal }
+    identity: {
+      attemptId: string | undefined;
+      receiptEligible: boolean;
+      inheritedReport: boolean;
+      abortSignal?: AbortSignal;
+    }
   ): OwnedTaskAttempt {
     assert(taskId.length > 0, "beginOwnedTaskAttempt: taskId must be non-empty");
     if (identity.attemptId != null) {
       assertTaskAttemptId(identity.attemptId, "beginOwnedTaskAttempt");
     }
-    const row = findWorkspaceEntry(this.deps.config().loadConfigOrDefault(), taskId)?.workspace;
     const attempt: OwnedTaskAttempt = {
       generation: (this.ownedAttemptByTaskId.get(taskId)?.generation ?? 0) + 1,
       source,
       attemptId: identity.attemptId,
       receiptEligible: identity.receiptEligible,
-      inheritedReport: row != null && hasCompletedAgentReport(row),
+      inheritedReport: identity.inheritedReport,
       ...(identity.abortSignal != null ? { abortSignal: identity.abortSignal } : {}),
     };
     this.ownedAttemptByTaskId.set(taskId, attempt);
