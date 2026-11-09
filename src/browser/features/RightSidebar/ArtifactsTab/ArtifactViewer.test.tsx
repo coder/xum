@@ -278,6 +278,53 @@ describe("ArtifactViewer renderers", () => {
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
   });
 
+  /** Counts the artifact iframe's load events from before it mounts (capture on document). */
+  function countFrameLoads() {
+    const loads = { count: 0 };
+    const listener = (event: Event) => {
+      if (event.target instanceof window.HTMLIFrameElement) loads.count += 1;
+    };
+    document.addEventListener("load", listener, true);
+    return { loads, stop: () => document.removeEventListener("load", listener, true) };
+  }
+
+  // Before the bind, the document's first load is the document the host built; the next one
+  // is the frame leaving it. happy-dom fires the first load on its own, as browsers do.
+  test("a frame whose document never bound closes at its second load", async () => {
+    const counter = countFrameLoads();
+    try {
+      const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+      const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+      await waitFor(() => expect(counter.loads.count).toBe(1));
+      expect(view.queryByText(/This artifact navigated away/) == null).toBe(true);
+      fireEvent.load(frame);
+      expect(counter.loads.count).toBe(2);
+      expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+    } finally {
+      counter.stop();
+    }
+  });
+
+  // Reload mounts a new iframe with the same srcdoc: its first load starts a new lifecycle and
+  // does not count as one more load of the document that navigated away.
+  test("Reload starts a fresh lifecycle: the new frame's first load keeps it open", async () => {
+    const counter = countFrameLoads();
+    try {
+      const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+      const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+      fireEvent.load(frame);
+      fireEvent.click(await view.findByRole("button", { name: "Reload" }));
+      const reloaded = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+      await waitFor(() => expect(counter.loads.count).toBe(3));
+      await deliverFrameMessages();
+      expect(reloaded === frame).toBe(false);
+      expect(view.queryByText(/This artifact navigated away/) == null).toBe(true);
+      expect(view.queryByTestId("artifact-frame") === reloaded).toBe(true);
+    } finally {
+      counter.stop();
+    }
+  });
+
   // WebKit fires the iframe's load event again when the artifact sets location.hash, and Chromium
   // does for a history.back() to the srcdoc's first entry. The document is still the one Xum built.
   test("a frame stays open with its bridge across loads of the same document", async () => {
