@@ -875,6 +875,47 @@ export const NavigateAwayLink: Story = {
   play: ({ canvasElement }) => assertNavigatedAway(canvasElement),
 };
 
+// An artifact that sets its route in its own load handler. WebKit fires the iframe's load event
+// again about 100 ms later, possibly before the host bound the document's port. The document is
+// still the one Xum built, so the artifact must stay open, and its bridge must still work.
+const HASH_ON_LOAD_HTML = `<!doctype html><html><head><script>
+  window.addEventListener("load", function () {
+    location.hash = "#/s/onload";
+    // After WebKit's extra load and the host's check of the document.
+    setTimeout(function () { window.xum.setState({ route: location.hash }); }, 800);
+  });
+</script></head><body><p>hash on load</p></body></html>`;
+
+const hashOnLoadStates: unknown[] = [];
+export const HashOnLoadStaysOpen: Story = {
+  tags: ["webkit"],
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    hashOnLoadStates.length = 0;
+  },
+  render: () =>
+    renderPanel(
+      "on-load.html",
+      { "on-load.html": ok("on-load.html", HASH_ON_LOAD_HTML) },
+      {
+        workspaceId: `${WORKSPACE_ID}-on-load`,
+        onSetState: (input) => hashOnLoadStates.push(input.state),
+      }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("artifact-frame");
+    const notice = () => canvas.queryByText(/This artifact navigated away/);
+    // The save, or the notice that closed the frame before it.
+    await waitFor(() => expect(hashOnLoadStates.length > 0 || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
+    await expect(notice()).toBeNull();
+    await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
+    await expect(hashOnLoadStates).toEqual([{ route: "#/s/onload" }]);
+  },
+};
+
 // A hash router (superblink's map nodes set location.hash). WebKit fires the iframe's load event
 // again for every fragment change and history traversal. Chromium does for history.back() only
 // when it returns to the srcdoc's own first entry. The document is still the one Xum built, so the
