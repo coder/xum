@@ -178,6 +178,23 @@ describe("iOS standalone viewport", () => {
     expect(window.visualViewport?.height).toBe(-33554432);
   });
 
+  test("still syncs the height when the visual viewport height cannot be corrected", () => {
+    setStandalone(true);
+    setInnerHeight(678);
+    const viewport = Object.preventExtensions(installVisualViewport(678));
+    const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      cleanupSync = installViewportHeightSync();
+
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      viewport.nativeHeight = 324;
+      viewport.dispatchEvent(new window.Event("resize"));
+      expect(appViewportHeight()).toBe("324px");
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   test("keeps the full height while pinch zoomed in", () => {
     setStandalone(true);
     setInnerHeight(657);
