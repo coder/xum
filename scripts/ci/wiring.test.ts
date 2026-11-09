@@ -442,6 +442,12 @@ describe("make dist-*: the zip directory reaches every electron-builder call", (
 // while it fetches what app-builder asks for. These checks pin the call, and the pin: an
 // electron-builder bump that moves app-builder to another AppImage tool would leave the cache
 // holding a tool that app-builder never reads, and Build / Linux would download the new one with no retry.
+interface WorkflowStep {
+  uses?: string;
+  run?: string;
+  with?: Record<string, unknown>;
+}
+
 describe("the AppImage tool wiring", () => {
   test("setup-xum fetches the tool only when the caller asks, after it restores the electron-builder cache", async () => {
     const steps = await setupActionSteps();
@@ -472,11 +478,10 @@ describe("the AppImage tool wiring", () => {
   });
 
   test("every job that builds an AppImage asks setup-xum for the tool", async () => {
-    type Step = { uses?: string; run?: string; with?: Record<string, unknown> };
     const builders: string[] = [];
     for (const file of (await readdir(WORKFLOWS)).filter((name) => name.endsWith(".yml"))) {
       const workflow = parse(await readFile(path.join(WORKFLOWS, file), "utf8")) as {
-        jobs?: Record<string, { steps?: Step[] }>;
+        jobs?: Record<string, { steps?: WorkflowStep[] }>;
       };
       for (const [id, job] of Object.entries(workflow.jobs ?? {})) {
         const steps = job.steps ?? [];
