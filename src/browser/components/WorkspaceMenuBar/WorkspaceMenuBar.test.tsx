@@ -933,6 +933,44 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       expect(shown).toEqual(["artifacts"]);
     });
 
+    it("the Plan shortcut shows the Plan tab and asks its panel for focus, but not from the palette", () => {
+      narrow();
+      const requests: unknown[] = [];
+      const record = (event: Event) => requests.push((event as CustomEvent<unknown>).detail);
+      window.addEventListener(CUSTOM_EVENTS.OPEN_PLAN_TAB, record);
+      const palette = document.createElement("div");
+      palette.setAttribute("cmdk-root", "");
+      const paletteInput = document.createElement("input");
+      palette.append(paletteInput);
+      document.body.append(palette);
+      const { shown } = renderRecording();
+      // Happy DOM reports AltGraph whenever Alt is down, which the shortcut ignores as AltGr text.
+      const press = (target: Element | Window) => {
+        const event = new window.KeyboardEvent("keydown", {
+          key: "L",
+          code: "KeyL",
+          ctrlKey: true,
+          altKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        });
+        Object.defineProperty(event, "getModifierState", { value: () => false });
+        act(() => {
+          fireEvent(target, event);
+        });
+      };
+
+      press(paletteInput);
+      press(window);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_PLAN_TAB, record);
+      palette.remove();
+
+      expect(shown).toEqual(["plan"]);
+      // RightSidebar focuses the panel on this request, as after the wide-layout shortcut.
+      expect(requests).toEqual([{ workspaceId, focus: true }]);
+    });
+
     it("leave keys alone while the sidebar is visible or a modal is open", () => {
       stubMatchMedia(() => false);
       const { shown, view } = renderRecording();
