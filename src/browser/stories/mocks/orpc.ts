@@ -179,6 +179,8 @@ export interface MockORPCClientOptions {
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
     hooks?: Record<string, AgentPluginHooks>;
+    /** Returned by agentPlugins.containerLocation; defaults to `~/.mux/plugins`. */
+    containerLocation?: string;
     /** Returned by agentPlugins.pendingSignOuts; omit for no record. */
     pendingSignOuts?: AgentPluginPendingSignOuts;
     /**
@@ -1369,7 +1371,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     },
     agentPlugins: {
       list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
-      containerLocation: () => Promise.resolve("~/.mux/plugins"),
+      containerLocation: () =>
+        Promise.resolve(agentPluginsMock?.containerLocation ?? "~/.mux/plugins"),
       listForSettings: () =>
         Promise.resolve({
           list: { success: true as const, data: agentPluginsMock?.items ?? [] },
