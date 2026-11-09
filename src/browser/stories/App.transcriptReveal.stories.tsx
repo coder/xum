@@ -211,6 +211,19 @@ export const TailFirstSwitchPhone: AppStory = {
       ).toBeLessThanOrEqual(IPHONE_16E.width)
     );
     await revealTailFirst(context);
+    // Reuse this transcript scene for search instead of adding duplicate phone snapshots.
+    const canvas = within(context.canvasElement);
+    canvas.getByTestId("message-window").focus();
+    await userEvent.keyboard("{Control>}f{/Control}");
+    await userEvent.type(
+      await canvas.findByRole("searchbox", { name: "Search chat" }),
+      rowText(LARGE_ROWS - 1)
+    );
+    await waitFor(() =>
+      expect(canvas.getByRole("status", { name: "Matching messages" })).toHaveTextContent("1 / 1")
+    );
+    const search = canvas.getByRole("search", { name: "Chat search" });
+    await expect(search.scrollWidth).toBeLessThanOrEqual(search.clientWidth);
   },
 };
 

@@ -55,14 +55,26 @@ function isRevealTargetLoaded(
     : false;
 }
 
+interface TimelineRevealOptions {
+  workspaceId: string;
+  getTarget: () => TimelineRevealTarget;
+  workspaceStore: TimelineRevealStore;
+  pinTarget: (workspaceId: string, target: TimelineRevealTarget) => void;
+  maxHistoryPages?: number;
+  isCancelled?: () => boolean;
+  /** Keep cancellation active after dispatch while the transcript mounts the target. */
+  cancelPendingReveal?: boolean;
+}
+
 function dispatchTimelineReveal(
-  workspaceId: string,
-  target: TimelineRevealTarget,
-  isCancelled: (() => boolean) | undefined
+  options: TimelineRevealOptions,
+  target: TimelineRevealTarget
 ): void {
+  // Other callers end their load operation after dispatch. Search also owns the pending scroll.
+  const isCancelled = options.cancelPendingReveal ? options.isCancelled : undefined;
   window.dispatchEvent(
     createCustomEvent(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, {
-      workspaceId,
+      workspaceId: options.workspaceId,
       ...target,
       ...(isCancelled ? { isCancelled } : {}),
     })
@@ -70,14 +82,9 @@ function dispatchTimelineReveal(
 }
 
 /** Loads, pins, and reveals a timeline target in the transcript. */
-export async function revealTimelineTarget(options: {
-  workspaceId: string;
-  getTarget: () => TimelineRevealTarget;
-  workspaceStore: TimelineRevealStore;
-  pinTarget: (workspaceId: string, target: TimelineRevealTarget) => void;
-  maxHistoryPages?: number;
-  isCancelled?: () => boolean;
-}): Promise<TimelineRevealResult> {
+export async function revealTimelineTarget(
+  options: TimelineRevealOptions
+): Promise<TimelineRevealResult> {
   const { workspaceId, getTarget, workspaceStore, pinTarget, isCancelled } = options;
   const maxHistoryPages = options.maxHistoryPages ?? DEFAULT_MAX_REVEAL_HISTORY_PAGES;
   const cancelled = () => isCancelled?.() === true;
@@ -91,7 +98,7 @@ export async function revealTimelineTarget(options: {
       if (cancelled()) {
         return "cancelled";
       }
-      dispatchTimelineReveal(workspaceId, target, isCancelled);
+      dispatchTimelineReveal(options, target);
       return "revealed";
     }
     if (cancelled()) {
@@ -105,7 +112,7 @@ export async function revealTimelineTarget(options: {
       if (cancelled()) {
         return "cancelled";
       }
-      dispatchTimelineReveal(workspaceId, target, isCancelled);
+      dispatchTimelineReveal(options, target);
       return "revealed";
     }
   }
@@ -140,7 +147,7 @@ export async function revealTimelineTarget(options: {
         if (cancelled()) {
           return "cancelled";
         }
-        dispatchTimelineReveal(workspaceId, target, isCancelled);
+        dispatchTimelineReveal(options, target);
         return "revealed";
       }
     }

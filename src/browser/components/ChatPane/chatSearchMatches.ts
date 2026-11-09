@@ -2,10 +2,7 @@ import type { MuxMessage } from "@/common/types/message";
 import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import { isWorkflowResultMessage } from "@/common/utils/workflowRunMessages";
 import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
-import {
-  buildDisplayedMessagesForMessage,
-  getTextPartContent,
-} from "@/browser/utils/messages/displayedMessageBuilder";
+import { buildDisplayedMessagesForMessage } from "@/browser/utils/messages/displayedMessageBuilder";
 
 export interface ChatSearchMatch {
   messageId: string;
@@ -23,18 +20,18 @@ function isHiddenChatSearchMessage(message: MuxMessage): boolean {
 }
 
 function getChatSearchText(message: MuxMessage): string {
-  if (message.role === "assistant") return getTextPartContent(message.parts);
-  if (message.role !== "user") return "";
-  // Commands show their typed text, not the expanded instructions sent to the model.
+  // Search the displayed text, not model-facing command expansions or persisted summary labels.
   return buildDisplayedMessagesForMessage({
     message,
     hasActiveStream: false,
     isContextBoundaryMessage: () => false,
   })
-    .flatMap((row) =>
-      row.type === "user" && row.agentPeerTriggerPayload == null ? [row.content] : []
-    )
-    .join("\n");
+    .flatMap((row) => {
+      if (row.type === "assistant") return [row.content];
+      if (row.type === "user" && row.agentPeerTriggerPayload == null) return [row.content];
+      return [];
+    })
+    .join(message.role === "assistant" ? "" : "\n");
 }
 
 /** Search message text, including rows that the transcript does not mount. */

@@ -80,6 +80,7 @@ describe("revealTimelineTarget", () => {
         getTarget: () => ({ messageId: "prompt-1" }),
         workspaceStore: store,
         pinTarget,
+        isCancelled: () => false,
       });
       expect(result).toBe("revealed");
       expect(pinTarget).not.toHaveBeenCalled();
@@ -107,6 +108,7 @@ describe("revealTimelineTarget", () => {
         workspaceStore: store,
         pinTarget: () => undefined,
         isCancelled: () => cancelled,
+        cancelPendingReveal: true,
       });
       expect(shouldDiscardTimelineReveal(events[0].detail, workspaceId, false)).toBe(false);
       cancelled = true;

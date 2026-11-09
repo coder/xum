@@ -106,6 +106,18 @@ describe("findChatSearchMatches", () => {
     expect(findChatSearchMatches([trigger], "needle")).toEqual([]);
   });
 
+  it("searches displayed summaries without their model-facing prefixes", () => {
+    const summary = createMuxMessage("summary", "assistant", "Goal cleared: ship the search", {
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: { type: "goal-cleared-summary" },
+    });
+    expect(findChatSearchMatches([summary], "Goal cleared")).toEqual([]);
+    expect(
+      findChatSearchMatches([summary], "ship the search").map((match) => match.messageId)
+    ).toEqual(["summary"]);
+  });
+
   it("joins text parts and keeps a preview on the matching line", () => {
     const message = createMuxMessage("parts", "assistant", "Unrelated line\nA nee", undefined, [
       { type: "text", text: "dle reply.\nAnother line." },

@@ -6,7 +6,12 @@ import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import { collapseLeftSidebar, collapseRightSidebar, selectWorkspace } from "./helpers/uiState";
 
-export default { ...appMeta, title: "App/ChatSearch" };
+// The existing transcript phone scene covers search snapshots. Keep these behavior stories play-only.
+export default {
+  ...appMeta,
+  title: "App/ChatSearch",
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+};
 
 const workspace = createWorkspace({
   id: "ws-chat-search",
@@ -42,6 +47,27 @@ function setup(selectedWorkspace = workspace, hasOlderHistory = false) {
       emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory });
     },
   });
+}
+
+async function verifySearchComposition(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  const input = canvas.getByRole("searchbox", { name: "Search chat" });
+  const status = canvas.getByRole("status", { name: "Matching messages" });
+  const selectedResult = status.textContent;
+  for (const key of ["Enter", "Escape"]) {
+    for (const composition of [{ isComposing: true }, { keyCode: 229 }]) {
+      const event = new KeyboardEvent("keydown", {
+        key,
+        bubbles: true,
+        cancelable: true,
+        ...composition,
+      });
+      input.dispatchEvent(event);
+      await expect(event.defaultPrevented).toBe(false);
+      await expect(canvas.getByRole("searchbox", { name: "Search chat" })).toBe(input);
+      await expect(status.textContent).toBe(selectedResult);
+    }
+  }
 }
 
 const searchChat: AppStory["play"] = async ({ canvasElement, step }) => {
@@ -92,6 +118,10 @@ const searchChat: AppStory["play"] = async ({ canvasElement, step }) => {
     );
   });
 
+  await step("IME Enter and Escape keep the search selection and input", async () => {
+    await verifySearchComposition(canvasElement);
+  });
+
   await step("Find selects the query, and missing queries disable navigation", async () => {
     await userEvent.keyboard("{Control>}f{/Control}");
     const input = canvas.getByRole("searchbox", { name: "Search chat" });
@@ -107,7 +137,20 @@ const searchChat: AppStory["play"] = async ({ canvasElement, step }) => {
     await expect(transcript).toHaveFocus();
   });
 
-  // Leave a matching result open for the desktop and phone snapshots.
+  await step("Find also opens from chat footer controls", async () => {
+    const footer = canvas.getByTestId("workspace-footer-bar");
+    const control = Array.from(footer.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.getClientRects().length > 0 && !button.disabled
+    );
+    await expect(control).toBeDefined();
+    control!.focus();
+    await userEvent.keyboard("{Control>}f{/Control}");
+    await expect(await canvas.findByRole("searchbox", { name: "Search chat" })).toHaveFocus();
+    await userEvent.keyboard("{Escape}");
+    await expect(control!).toHaveFocus();
+  });
+
+  // Leave a matching result open for visual checks.
   await userEvent.keyboard("{Control>}f{/Control}");
   await userEvent.type(await canvas.findByRole("searchbox", { name: "Search chat" }), "needle");
   await waitFor(() => expect(row("search-1")).toHaveClass("timeline-reveal-highlight"));
@@ -193,7 +236,9 @@ export const SearchChatPhone: AppStory = {
   render: () => <AppWithMocks setup={setupPhone} />,
   decorators: [Phone],
   globals: { viewport: { value: "mobile1", isRotated: false } },
-  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+  parameters: {
+    pixel: { ...PIXEL_DISABLED, matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
+  },
   play: async (context) => {
     await searchChat(context);
     const search = within(context.canvasElement).getByRole("search", { name: "Chat search" });

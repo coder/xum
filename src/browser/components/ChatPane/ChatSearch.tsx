@@ -31,10 +31,10 @@ function isChatSearchTarget(
   paneScope: ChatPaneScope,
   target: EventTarget | null
 ): boolean {
-  const root = transcriptRef.current?.parentElement;
+  const root = transcriptRef.current;
   if (!root || root.closest('[aria-hidden="true"], [inert]')) return false;
-  // The review panel, terminals, and other panes keep their own Find shortcuts.
-  const chatRoot = paneScope === "main" ? root.closest("main") : root;
+  // Include the main chat footer. The review panel and terminals keep their own Find shortcuts.
+  const chatRoot = paneScope === "main" ? root.closest("main")?.parentElement : root.parentElement;
   return !(target instanceof Node && target !== document.body && !chatRoot?.contains(target));
 }
 
@@ -104,6 +104,7 @@ export function ChatSearch(props: ChatSearchProps) {
       aria-label="Chat search"
       className="bg-surface-primary border-border-light shrink-0 border-b px-3 py-2"
       onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing || event.keyCode === 229) return;
         if (matchesKeybind(event, KEYBINDS.CANCEL)) {
           event.preventDefault();
           stopKeyboardPropagation(event);
@@ -138,6 +139,7 @@ function useChatSearchReveal(
       // Only the explicit button loads older pages. Results already belong to loaded history.
       maxHistoryPages: 0,
       isCancelled: () => cancelled,
+      cancelPendingReveal: true,
     })
       .then((result) => {
         if (!cancelled && result !== "revealed") setError("Cannot reveal this message.");
@@ -237,6 +239,8 @@ function ChatSearchControls(props: {
         value={props.query}
         onChange={(event) => props.onQueryChange(event.target.value)}
         onKeyDown={(event) => {
+          // IME confirmation and cancellation must not navigate or close search.
+          if (event.nativeEvent.isComposing || event.keyCode === 229) return;
           if (matchesKeybind(event, KEYBINDS.NEXT_CHAT_SEARCH_RESULT)) {
             event.preventDefault();
             stopKeyboardPropagation(event);
