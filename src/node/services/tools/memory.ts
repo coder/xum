@@ -171,7 +171,7 @@ export async function executeMemoryCommand(
   input: MemoryCommandInput,
   checkWriteAccess: (virtualPath: string) => MemoryToolResult | null,
   toolCallId?: string,
-  // `MemoryWriteOptions` (rejectSecretLike) is handed on to the content-writing commands whole, so
+  // `MemoryWriteOptions` (rejectSecretLike) is handed on to every mutating command whole, so
   // reading it adds no branch here.
   options?: MemoryWriteOptions & {
     /**
@@ -280,7 +280,7 @@ export async function executeMemoryCommand(
             toolCallId,
             options?.expectedTargetFingerprint,
             options?.abortSignal,
-            { rejectPinned: options?.rejectPinned }
+            options
           ))
         );
       }
@@ -300,7 +300,7 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.abortSignal,
-            { rejectPinned: options?.rejectPinned }
+            options
           ))
         );
       }

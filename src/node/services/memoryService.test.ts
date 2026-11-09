@@ -5807,6 +5807,160 @@ describe("MemoryService refinement journal", () => {
     expect(events).toHaveLength(1);
   });
 
+  describe("credential-like rows of guarded mutations", () => {
+    const TOKEN = `ghp_${"a1B2".repeat(9)}`;
+    const GUARDED = { rejectSecretLike: true };
+
+    function physicalOf(fixture: MemoryFixture, name: string): string {
+      return path.join(fixture.xumHome, "memory", "global", name);
+    }
+
+    it("keeps full inverses for unguarded mutations of a file holding a credential", async () => {
+      using fixture = await createFixture();
+      const original = `token=${TOKEN}\n`;
+      await fixture.service.create(fixture.ctx, "/memories/global/a.md", original, "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/b.md", original, "agent");
+      await fixture.service.strReplace(fixture.ctx, "/memories/global/a.md", TOKEN, "x", "agent");
+      await fixture.service.deletePath(fixture.ctx, "/memories/global/b.md", "agent");
+
+      const events = await readRefinementEvents(sessionDirOf(fixture));
+      expect(events).toHaveLength(4);
+      await applyRefinementInverse(sessionDirOf(fixture), events[2].data.inverse);
+      await applyRefinementInverse(sessionDirOf(fixture), events[3].data.inverse);
+      expect(await fsPromises.readFile(physicalOf(fixture, "a.md"), "utf-8")).toBe(original);
+      expect(await fsPromises.readFile(physicalOf(fixture, "b.md"), "utf-8")).toBe(original);
+    });
+
+    it("journals no row for a cleanup, so rolling back the file's earlier row refuses", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, "/memories/global/a.md", `t=${TOKEN}\n`, "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/b.md", `t=${TOKEN}\n`, "agent");
+      // An edit beside a credential it leaves is not journaled either: its pre-image holds it.
+      const inserted = await fixture.service.insert(
+        fixture.ctx,
+        "/memories/global/a.md",
+        0,
+        "# deploy",
+        "agent",
+        undefined,
+        undefined,
+        undefined,
+        GUARDED
+      );
+      const edited = await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/a.md",
+        TOKEN,
+        "(in 1Password)",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+      const deleted = await fixture.service.deletePath(
+        fixture.ctx,
+        "/memories/global/b.md",
+        "agent",
+        undefined,
+        undefined,
+        undefined,
+        GUARDED
+      );
+      expect([inserted.success, edited.success, deleted.success]).toEqual([true, true, true]);
+
+      const events = await readRefinementEvents(sessionDirOf(fixture));
+      expect(
+        events.map((event) => MemoryRefinementActionSchema.parse(event.data.action).op)
+      ).toEqual(["create", "create"]);
+      const rollback = (id: string) =>
+        rollbackRefinement({
+          sessionDir: sessionDirOf(fixture),
+          id,
+          evidence: { toolName: "test", actor: "user" },
+        });
+      const [editedFile, deletedFile] = [
+        await rollback(events[0].id),
+        await rollback(events[1].id),
+      ];
+      expect(editedFile.success).toBe(false);
+      if (!editedFile.success) expect(editedFile.error).toContain("was modified after");
+      expect(deletedFile.success).toBe(false);
+      if (!deletedFile.success) expect(deletedFile.error).toContain("but it is gone");
+      expect(await fsPromises.readFile(physicalOf(fixture, "a.md"), "utf-8")).toBe(
+        "# deploy\nt=(in 1Password)\n"
+      );
+    });
+
+    it("refuses a guarded create or rename that adds a credential-like name", async () => {
+      // A name is stored text: a guarded write must not add a credential by name while the journal
+      // skip below drops its row.
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, "/memories/global/old.md", "x\n", "agent");
+      const renamed = await fixture.service.rename(
+        fixture.ctx,
+        "/memories/global/old.md",
+        `/memories/global/${TOKEN}.md`,
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+      const created = await fixture.service.create(
+        fixture.ctx,
+        `/memories/global/new-${TOKEN}.md`,
+        "z\n",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+      const validated = await fixture.service.validateMutation(
+        fixture.ctx,
+        {
+          command: "rename",
+          path: "/memories/global/old.md",
+          new_path: `/memories/global/${TOKEN}.md`,
+        },
+        GUARDED
+      );
+
+      expect([renamed.success, created.success, validated.ok]).toEqual([false, false, false]);
+      expect(await pathExists(physicalOf(fixture, "old.md"))).toBe(true);
+      expect(await pathExists(physicalOf(fixture, `new-${TOKEN}.md`))).toBe(false);
+      // Only the unguarded setup create is journaled.
+      expect(await readRefinementEvents(sessionDirOf(fixture))).toHaveLength(1);
+    });
+
+    it("journals no row for a guarded cleanup of a credential-like name", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, `/memories/global/${TOKEN}.md`, "x\n", "agent");
+      await fixture.service.create(fixture.ctx, `/memories/global/d/${TOKEN}.md`, "y\n", "agent");
+      // Renaming the credential away and deleting a directory that holds one add no name; their
+      // rows would keep the old one.
+      const renamed = await fixture.service.rename(
+        fixture.ctx,
+        `/memories/global/${TOKEN}.md`,
+        "/memories/global/api-key-location.md",
+        "agent",
+        undefined,
+        undefined,
+        GUARDED
+      );
+      const deleted = await fixture.service.deletePath(
+        fixture.ctx,
+        "/memories/global/d",
+        "agent",
+        undefined,
+        undefined,
+        undefined,
+        GUARDED
+      );
+      expect([renamed.success, deleted.success]).toEqual([true, true]);
+
+      expect(await readRefinementEvents(sessionDirOf(fixture))).toHaveLength(2);
+    });
+  });
+
   it("does not fail the mutation when the journal is unavailable", async () => {
     using fixture = await createFixture();
     // Occupy the session dir path with a FILE so journal appends cannot mkdir.

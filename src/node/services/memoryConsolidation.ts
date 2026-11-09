@@ -243,11 +243,11 @@ async function validateMutationForStaging(
       if (oldPath == null || input.new_path == null) {
         return "rename requires 'old_path' (or 'path') and 'new_path'";
       }
-      const result = await memoryService.validateMutation(ctx, {
-        command: "rename",
-        path: oldPath,
-        new_path: input.new_path,
-      });
+      const result = await memoryService.validateMutation(
+        ctx,
+        { command: "rename", path: oldPath, new_path: input.new_path },
+        options
+      );
       return result.ok ? null : result.error;
     }
     default:
