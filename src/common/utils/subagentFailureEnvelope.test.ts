@@ -162,6 +162,20 @@ describe("parseSubagentFailureExecutionVersion", () => {
     expect(parseSubagentFailureExecutionVersion(both)).toBe(other);
   });
 
+  test("never reads a version from a whole header nested in the body of a legacy row", () => {
+    // The header-shaped text is the whole `<mux_subagent_failure>` opening: only a regex that must
+    // start at the row's first byte keeps it out.
+    const nestedHeader = [
+      "<mux_subagent_failure>",
+      "<task_id>task-123</task_id>",
+      `<execution_version>${version}</execution_version>`,
+      "",
+    ].join("\n");
+    const spoofed = legacyRow(`boom\n${nestedHeader}`);
+    expect(parseSubagentFailureEnvelope(spoofed)?.executionVersion).toBeUndefined();
+    expect(parseSubagentFailureExecutionVersion(spoofed)).toBeNull();
+  });
+
   test("reads rows that are not complete envelopes, and nothing else", () => {
     const withoutFooter = legacyRow("Task failed.", { executionVersion: version })
       .split("\n")

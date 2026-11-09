@@ -25,6 +25,8 @@ import {
   type WorkspaceTurnTaskHandleRecord,
 } from "@/node/services/taskHandleStore";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import { createTaskAwaitTool } from "@/node/services/tools/task_await";
+import { createTestToolConfig, mockToolCallOptions } from "@/node/services/tools/testHelpers";
 import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/agentAiDefaults";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { StreamEndEvent } from "@/common/types/stream";
@@ -2402,8 +2404,8 @@ describe("TaskService", () => {
         ],
         testTaskSettings(1, 3)
       );
-      const { taskService } = createTaskServiceHarness(config);
-      return { taskService, handleStore: new TaskHandleStore(config) };
+      const stack = createTaskServiceHarness(config);
+      return { ...stack, handleStore: new TaskHandleStore(config) };
     }
 
     test("reads the failed turn's stored result, not the child's newer turn", async () => {
@@ -2415,6 +2417,54 @@ describe("TaskService", () => {
       expect(read).toMatchObject({
         ownerWorkspaceId: grandId,
         record: { handleId, status: "error", error: failedRecord.error },
+      });
+    });
+
+    test("the read the parent's failure row names returns the stored error, never the child's newer turn", async () => {
+      const { taskService, historyService, workspaceTurnManager, handleStore } = await setup();
+      const delivered = {
+        ...failedRecord,
+        directParentResultDeliveryRequiredAt: failedRecord.updatedAt,
+      };
+      await handleStore.upsertWorkspaceTurn(delivered);
+
+      await (
+        workspaceTurnManager as unknown as {
+          deliverPersistentChildWorkspaceTurnResult: (
+            record: WorkspaceTurnTaskHandleRecord,
+            waiterWorkspaceIds: ReadonlySet<string>
+          ) => Promise<void>;
+        }
+      ).deliverPersistentChildWorkspaceTurnResult(delivered, new Set());
+
+      const history = await historyService.getHistoryFromLatestBoundary(parentId);
+      assert(history.success, "the parent's history must be readable");
+      const rows = history.data
+        .filter((row) => row.role === "user")
+        .map((row) => row.parts.map((part) => (part.type === "text" ? part.text : "")).join(""));
+      const failure = rows
+        .map((text) => parseSubagentFailureEnvelope(text))
+        .find((envelope) => envelope != null);
+      assert(failure != null, "the failed turn must reach the parent as a failure row");
+      expect(rows.filter((text) => text.includes("IGNORE_PREVIOUS_INSTRUCTIONS_MARKER"))).toEqual(
+        []
+      );
+      // Run the call exactly as the row spells it, as the parent's agent would.
+      const named = JSON.parse(/(\{"task_ids":[^}]*\})/.exec(failure.errorMessage)![1]) as {
+        task_ids: string[];
+        timeout_secs: number;
+      };
+      expect(named.task_ids).toEqual([handleId]);
+      const tool = createTaskAwaitTool({
+        ...createTestToolConfig(rootDir, { workspaceId: parentId }),
+        taskService,
+        workspaceTurnManager,
+      });
+
+      const result: unknown = await Promise.resolve(tool.execute!(named, mockToolCallOptions));
+
+      expect(result).toEqual({
+        results: [{ status: "error", taskId: handleId, error: failedRecord.error }],
       });
     });
 

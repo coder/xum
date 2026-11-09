@@ -473,6 +473,37 @@ describe("WorkspaceTurnManager", () => {
       ).toHaveLength(1);
     });
 
+    test("a failure row without its footer that names the delivery version in its header still counts as delivered", async () => {
+      const setup = await setupDelivery();
+      const record = failedRecord(setup.parentId);
+      // A row cut short before its footer does not parse as a complete envelope, yet its header
+      // says which delivery it is.
+      const cutShortRow = [
+        "<mux_subagent_failure>",
+        `<task_id>${childTaskId}</task_id>`,
+        `<execution_version>${handleId}:error:${record.updatedAt}</execution_version>`,
+        "<agent_type>explore</agent_type>",
+        "<error_type>workspace_turn_error</error_type>",
+        "<error_message>",
+        "This sub-agent turn failed.",
+      ].join("\n");
+      expect(parseSubagentFailureEnvelope(cutShortRow)).toBeNull();
+      await setup.historyService.appendToHistory(
+        setup.parentId,
+        createMuxMessage("cut-short-delivery", "user", cutShortRow, {
+          timestamp: Date.now(),
+          synthetic: true,
+          uiVisible: true,
+        })
+      );
+
+      const userTexts = await deliver(setup, record);
+
+      expect(userTexts.filter((text) => text.startsWith("<mux_subagent_failure>"))).toEqual([
+        cutShortRow,
+      ]);
+    });
+
     test("a row that names the delivery version in its header still counts as delivered", async () => {
       const setup = await setupDelivery();
       const record = failedRecord(setup.parentId);
