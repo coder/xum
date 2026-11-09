@@ -533,17 +533,19 @@ function formatRunCostParts(record: MemoryConsolidationRecordPayload): string[] 
 }
 
 /** A pass writes one record to each scope it covers; its time and trigger identify the pass. */
-function consolidationRunKey(record: MemoryConsolidationRecordPayload | null): string | null {
-  return record === null ? null : `${record.lastRunAt}:${record.trigger}`;
+function consolidationRunKey(record: MemoryConsolidationRecordPayload): string {
+  return `${record.lastRunAt}:${record.trigger}`;
 }
 
 interface ConsolidationScopeLine {
   label: string;
   scope: MemoryScope;
   record: MemoryConsolidationRecordPayload | null;
+  unavailable?: boolean;
 }
 
 function formatScopeRecord(line: ConsolidationScopeLine, withRunCost: boolean): string {
+  if (line.unavailable === true) return "unavailable";
   if (line.record === null) return "never";
   const count = countScopeChanges(line.record, line.scope);
   return [
@@ -554,42 +556,62 @@ function formatScopeRecord(line: ConsolidationScopeLine, withRunCost: boolean): 
   ].join(" · ");
 }
 
+/** The run that two or more scope lines show; with three lines, at most one run can. */
+function findSharedRun(
+  lines: ConsolidationScopeLine[]
+): { record: MemoryConsolidationRecordPayload; scopes: MemoryScope[] } | null {
+  for (const line of lines) {
+    if (line.record === null) continue;
+    const key = consolidationRunKey(line.record);
+    const scopes = lines
+      .filter((other) => other.record !== null && consolidationRunKey(other.record) === key)
+      .map((other) => other.scope);
+    if (scopes.length > 1) return { record: line.record, scopes };
+  }
+  return null;
+}
+
+function formatSharedRunLine(shared: ReturnType<typeof findSharedRun>): string | null {
+  if (shared === null) return null;
+  const parts = formatRunCostParts(shared.record);
+  return parts.length === 0 ? null : `Run cost (${shared.scopes.join(", ")}): ${parts.join(" · ")}`;
+}
+
 /**
  * The scope status lines, plus one line for the cost and note of a run that more than one scope
- * line shows: repeated on each line, three scopes of a $0.90 run read as $2.70. With three lines,
- * at most one run covers two or more of them. A run on one line keeps its cost on that line.
+ * line shows: repeated on each line, three scopes of a $0.90 run read as $2.70. A run on one
+ * line keeps its cost on that line.
  */
-function formatConsolidationScopes(status: MemoryConsolidationStatusPayload | null): {
+function formatConsolidationScopes(status: MemoryConsolidationStatusPayload): {
   scopeLines: Array<{ label: string; text: string }>;
   sharedRunLine: string | null;
 } {
   const lines: ConsolidationScopeLine[] = [
-    { label: "Workspace", scope: "workspace", record: status?.workspaceRecord ?? null },
+    { label: "Workspace", scope: "workspace", record: status.workspaceRecord },
     {
       label: "Project",
       scope: "project",
-      record: status?.projectAvailable === false ? null : (status?.projectRecord ?? null),
+      record: status.projectAvailable ? status.projectRecord : null,
+      unavailable: !status.projectAvailable,
     },
-    { label: "Global", scope: "global", record: status?.globalRecord ?? null },
+    { label: "Global", scope: "global", record: status.globalRecord },
   ];
-  const keys = lines.map((line) => consolidationRunKey(line.record));
-  const sharedKey = keys.find((key, i) => key !== null && keys.indexOf(key) !== i) ?? null;
-  const scopeLines = lines.map((line, i) => ({
+  const shared = findSharedRun(lines);
+  const scopeLines = lines.map((line) => ({
     label: line.label,
-    text:
-      line.scope === "project" && status?.projectAvailable === false
-        ? "unavailable"
-        : formatScopeRecord(line, keys[i] !== sharedKey),
+    text: formatScopeRecord(line, shared?.scopes.includes(line.scope) !== true),
   }));
-  const sharedRecord = sharedKey === null ? null : lines[keys.indexOf(sharedKey)].record;
-  const sharedCost = sharedRecord === null ? [] : formatRunCostParts(sharedRecord);
-  const sharedScopes = lines.filter((_, i) => keys[i] === sharedKey).map((line) => line.scope);
-  const sharedRunLine =
-    sharedCost.length === 0
-      ? null
-      : `Run cost (${sharedScopes.join(", ")}): ${sharedCost.join(" · ")}`;
-  return { scopeLines, sharedRunLine };
+  return { scopeLines, sharedRunLine: formatSharedRunLine(shared) };
 }
+
+/** Before the first status read: every scope reads "never", as no run is known yet. */
+const NO_CONSOLIDATION_STATUS: MemoryConsolidationStatusPayload = {
+  workspaceRecord: null,
+  projectRecord: null,
+  globalRecord: null,
+  latestHarvestRecord: null,
+  projectAvailable: true,
+};
 
 function formatHarvestRecord(record: MemoryHarvestRecordPayload | null): string {
   if (record === null) return "never";
@@ -660,7 +682,9 @@ function ConsolidationFooter(props: {
     }
   };
 
-  const { scopeLines, sharedRunLine } = formatConsolidationScopes(status);
+  const { scopeLines, sharedRunLine } = formatConsolidationScopes(
+    status ?? NO_CONSOLIDATION_STATUS
+  );
   const harvestLabel = formatHarvestRecord(status?.latestHarvestRecord ?? null);
   const harvestError =
     status?.latestHarvestRecord?.status === "failed" ? status.latestHarvestRecord.error : undefined;
