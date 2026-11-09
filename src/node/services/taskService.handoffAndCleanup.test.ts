@@ -2333,9 +2333,37 @@ describe("TaskService", () => {
     expect(failureRows[0]).toMatchObject({ taskId: childId, errorType: "authentication" });
 
     // The text is still there to read: task_await returns what this wait rejects with.
-    await expect(
-      taskService.waitForAgentReport(childId, { timeoutMs: 10, requestingWorkspaceId: parentId })
-    ).rejects.toThrow(MARKER);
+    const waitError = await taskService
+      .waitForAgentReport(childId, { timeoutMs: 10, requestingWorkspaceId: parentId })
+      .then(
+        () => null,
+        (error: unknown) => error
+      );
+    expect(waitError).toBeInstanceOf(Error);
+    expect((waitError as Error).message).toContain(MARKER);
+  });
+
+  test("an unknown task rejects with the exact message that task_await maps to not_found", async () => {
+    // task_await matches this string exactly (never the words), so the producer is pinned here.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [projectWorkspace(projectPath, "parent", "parent-111")],
+      testTaskSettings(1, 3)
+    );
+    const { taskService } = createTaskServiceHarness(config);
+
+    const error = await taskService
+      .waitForAgentReport("no-such-task", { timeoutMs: 10, requestingWorkspaceId: "parent-111" })
+      .then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("Task not found");
   });
 
   // reasoning_rejected joins model_refusal in RUNNING_TASK_TERMINAL_STREAM_ERRORS:

@@ -313,6 +313,27 @@ describe("WorkspaceTurnManager", () => {
     ).toBeUndefined();
   });
 
+  test("waiting on an unknown handle rejects with the exact message that task_await maps to invalid_scope", async () => {
+    // task_await matches this string exactly (never the words), so the producer is pinned here.
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const { taskService } = createWorkspaceTurnManagerHarness(config);
+
+    const error = await taskService
+      .waitForWorkspaceTurn("wst_missing", {
+        requestingWorkspaceId: parentId,
+        backgroundOnMessageQueued: false,
+        timeoutMs: 5_000,
+      })
+      .then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("Workspace turn not found or out of scope");
+  });
+
   describe("a persistent child's failed turn, delivered to its direct parent", () => {
     // The error text comes from a provider, a remote host or a model, and can quote the repo.
     const MARKER = "IGNORE_PREVIOUS_INSTRUCTIONS_MARKER";
