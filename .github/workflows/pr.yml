@@ -38,6 +38,7 @@ jobs:
       nix_deps: ${{ steps.filter.outputs.nix_deps }}
       docker: ${{ steps.filter.outputs.docker }}
       e2e_tests: ${{ steps.filter.outputs.e2e_tests }}
+      phone_chrome: ${{ steps.filter.outputs.phone_chrome }}
       vscode: ${{ steps.filter.outputs.vscode }}
       # Shared job gates, computed once instead of repeated in every job.
       # tests: code or CI config changed, and this isn't the merge queue's post-merge
@@ -121,6 +122,31 @@ jobs:
               - 'Makefile'
               - 'package.json'
               - 'bun.lock'
+            # Test / Phone chrome: what the live phone page is built from. The renderer bundle holds
+            # src/browser, src/common and src/constants (read from the sourcemaps of `make
+            # build-renderer`, 2026-11-09), vite builds it with the config and the packages named
+            # here, and the generator brings its own seed and token helpers. Server code (src/node,
+            # src/cli) only supplies data that the skeleton turns into slots: the merge queue runs the
+            # job for every merge, so a change there that moves the page still stops at the queue.
+            phone_chrome:
+              - 'src/browser/**'
+              - 'src/common/**'
+              - 'src/constants/**'
+              - 'src/vite/**'
+              - 'index.html'
+              - 'vite*.ts'
+              - 'public/**'
+              - 'package.json'
+              - 'bun.lock'
+              - 'Makefile'
+              - 'scripts/perf/generatePhoneChrome.ts'
+              - 'scripts/perf/neutralSeed.ts'
+              - 'scripts/perf/serverToken.ts'
+              - 'scripts/precompress-static.ts'
+              - 'scripts/stamp-service-worker.ts'
+              - '.github/workflows/pr.yml'
+              - '.github/actions/setup-xum/**'
+              - '.github/actions/setup-playwright/**'
             vscode:
               - 'vscode/**'
             nix_deps:
@@ -833,12 +859,6 @@ jobs:
           SHARD: ${{ matrix.shard }}
           # No provider secrets here, so the repros' app uses the mock AI.
           BUGBASH_REPROS: ${{ matrix.shard == '1/4' && '1' || '0' }}
-      # The static workspace view's phone skeleton must match the live page (#5971). On drift, the
-      # failure names the element and the command that regenerates the skeleton.
-      # It reuses the `make build` of `make test-e2e` above.
-      - name: Check the phone chrome skeleton
-        if: matrix.os == 'linux' && matrix.shard == '1/4'
-        run: make check-phone-chrome
       - name: Run tests
         if: matrix.os == 'macos'
         env:
@@ -864,6 +884,33 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 14
+
+  test-phone-chrome:
+    # The static workspace view's phone skeleton must match the live page (#5971). On drift, the
+    # failure names the element and the command that regenerates the skeleton. This was a step of
+    # Test / E2E (linux, 1/4), which a PR runs only when it changes e2e_tests: #7993 changed a class
+    # in src/browser, skipped that job, and broke main (skipped counts as passing in Required).
+    # Here a PR runs it when phone_chrome matches, and the merge queue runs it for every merge.
+    name: Test / Phone chrome
+    needs: [changes]
+    if: >-
+      needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == '' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.phone_chrome == 'true')
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-xum
+        with:
+          skip-build-caches: "true"
+      # Bound browser setup; Playwright downloads can stall after progress reaches 100%.
+      - uses: ./.github/actions/setup-playwright
+        timeout-minutes: 10
+      # check-phone-chrome drives the built tree (`xum server` and the renderer), as its recipe
+      # says. These are the build prerequisites of its sibling generate-phone-chrome.
+      - run: make build-main build-renderer build-static
+      - run: make check-phone-chrome
 
   bugbash-sandbox:
     # The bug-bash sandbox (#5714, #5931): its self-check (isolation, proxy and export refusals,
@@ -1346,6 +1393,7 @@ jobs:
       - test-storybook
       - test-windows
       - test-e2e
+      - test-phone-chrome
       - bugbash-sandbox
       - smoke-server
       - smoke-docker

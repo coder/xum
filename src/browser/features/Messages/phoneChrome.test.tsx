@@ -8,7 +8,7 @@ import {
 } from "@/common/staticWorkspaceView/phoneChrome";
 import { PHONE_CHROME_JSON } from "@/common/staticWorkspaceView/phoneChrome.generated";
 
-// The live-page parity check is `make check-phone-chrome` (CI, linux E2E shard 1). These checks
+// The live-page parity check is `make check-phone-chrome` (CI, Test / Phone chrome). These checks
 // are the contract of the checked-in capture: what a later early script may rely on.
 const skeleton = JSON.parse(PHONE_CHROME_JSON) as PhoneChrome;
 
