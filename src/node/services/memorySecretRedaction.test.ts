@@ -506,6 +506,21 @@ describe("redactSecretLike", () => {
         `curl -H "Cookie: a=\\"x\\"; sid=${SESSION}" url`,
         'curl -H "Cookie: [redacted]" url',
       ],
+      [
+        "color codes around the name",
+        `\x1b[1mCookie\x1b[0m: sid=${SESSION}`,
+        "\x1b[1mCookie\x1b[0m: [redacted]",
+      ],
+      [
+        "escaped color codes around the name",
+        jsonOf({ o: `\x1b[1mCookie\x1b[0m: sid=${SESSION}` }),
+        String.raw`{"o":"\u001b[1mCookie\u001b[0m: [redacted]"}`,
+      ],
+      [
+        "color codes of every byte class between the name and its colon",
+        `Cookie\x1b[?2~\x1b[ @: sid=${SESSION}`,
+        "Cookie\x1b[?2~\x1b[ @: [redacted]",
+      ],
       // `C` and `S` end a color code too: the name still starts there.
       ["a name that ends a color code", `\x1b[Cookie: sid=${SESSION}`, "\x1b[Cookie: [redacted]"],
       [
@@ -823,7 +838,10 @@ describe("redactSecretLike", () => {
       "cookie names behind escaped breaks of long runs",
       `\\n${"\\".repeat(31)}nCookie`.repeat(2_500),
     ],
+    ["cookie names behind color codes", "\x1b[1mCookie".repeat(12_000)],
+    ["cookie headers behind escaped color codes", "\\u001b[0mCookie:".repeat(6_000)],
     ["nested cookie list openers", `${"Cookie: [".repeat(10_000)}]`],
+    ["a cookie name and a gap of color codes with no colon", `Cookie${"\x1b[0m".repeat(30_000)}`],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
     // Each scan gets the whole budget: `containsSecretLike` is a second pass of the same redaction,

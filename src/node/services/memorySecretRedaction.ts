@@ -139,12 +139,15 @@ interface HintState {
   frame: Frame;
   /** Line markers passed since `frame` was set. */
   markers: number;
+  /** Where the last ANSI CSI sequence ends: a header name may start there. */
+  csiEnd: number;
   /** Where the last replacement ended: what follows there follows `[redacted]`. */
   redactedEnd: number;
   /** The quote of the string open at each depth, by the run that escapes it there. */
   openQuotes: Map<number, string>;
 }
 
+const ESC = "\x1b";
 const BACKSLASH = 92;
 const QUOTE = /["']/;
 const LINE_BREAK = /[\r\n]/;
@@ -332,13 +335,54 @@ function readValue(text: string, header: CookieHeader): { start: number; end: nu
   return { start, end: readToFrameEnd(text, start, frame) };
 }
 
+function isBetween(code: number, low: number, high: number): boolean {
+  return code >= low && code <= high;
+}
+
+/** Where an ANSI CSI sequence whose `[` is at `at` ends, or -1. */
+function readCsiBody(text: string, at: number): number {
+  if (text.charAt(at) !== "[") return -1;
+  let end = at + 1;
+  // Parameter and intermediate bytes, then one final byte.
+  while (isBetween(text.charCodeAt(end), 0x20, 0x3f)) end++;
+  // mutation-equivalent: a CSI end before the index reads as none, and `[` clears the frame anyway
+  return isBetween(text.charCodeAt(end), 0x40, 0x7e) ? end + 1 : -1;
+}
+
+/** Where a CSI sequence that a backslash run escapes (`\u001b[`, `\x1b[`, `\033[`) ends, or -1. */
+function readEscapedCsi(text: string, afterRun: number): number {
+  const head = text.slice(afterRun, afterRun + 5).toLowerCase();
+  if (head.startsWith("u001b")) return readCsiBody(text, afterRun + 5);
+  return /^(?:x1b|033)/.test(head) ? readCsiBody(text, afterRun + 3) : -1;
+}
+
+/** Where a CSI sequence, raw or escaped, that starts at `at` ends, or -1. */
+function readCsi(text: string, at: number): number {
+  if (text.charAt(at) === ESC) return readCsiBody(text, at + 1);
+  const run = runLength(text, at);
+  return run > 0 ? readEscapedCsi(text, at + run) : -1;
+}
+
+/** Spaces, tabs and color codes between a name and its colon (`\x1b[1mCookie\x1b[0m:`). */
+function skipGap(text: string, at: number): number {
+  for (let end = at; ; ) {
+    if (BLANK.test(text.charAt(end))) {
+      end++;
+      continue;
+    }
+    const csiEnd = readCsi(text, end);
+    if (csiEnd === -1) return end;
+    end = csiEnd;
+  }
+}
+
 /**
  * A name starts after a non-word character, so `getCookie:` and `X-Cookie:` are not headers; after
- * an escaped line break or tab behind the letter of its escape.
+ * an escaped line break or tab behind the letter of its escape, and where a color code ends.
  */
-function startsName(text: string, at: number): boolean {
+function startsName(text: string, at: number, csiEnd: number): boolean {
   const before = text.charAt(at - 1);
-  if (!WORD_CHAR.test(before)) return true;
+  if (at === csiEnd || !WORD_CHAR.test(before)) return true;
   return ESCAPED_SPACE.test(before) && text.charAt(at - 2) === "\\";
 }
 
@@ -357,11 +401,11 @@ function keyFrame(quote: string, run: number): Frame {
 
 function matchHeader(text: string, at: number, state: HintState): CookieHeader | null {
   const nameEnd = matchName(text, at);
-  if (nameEnd === null || !startsName(text, at)) return null;
+  if (nameEnd === null || !startsName(text, at, state.csiEnd)) return null;
   const keyRun = runLength(text, nameEnd);
   const keyQuote = text.charAt(nameEnd + keyRun);
   const keyForm = QUOTE.test(keyQuote) && keyRun <= ESCAPE_RUN_MAX;
-  const colon = skipBlanks(text, keyForm ? nameEnd + keyRun + 1 : nameEnd);
+  const colon = skipGap(text, keyForm ? nameEnd + keyRun + 1 : nameEnd);
   if (text.charAt(colon) !== ":") return null;
   const frame = keyForm ? keyFrame(keyQuote, keyRun) : state.frame;
   return { valueStart: skipBlanks(text, colon + 1), frame, keyForm };
@@ -402,6 +446,12 @@ function escapedBreakFrame(run: number, state: HintState): Frame {
 
 function advanceRun(text: string, at: number, state: HintState): number {
   const run = runLength(text, at);
+  const csiEnd = readEscapedCsi(text, at + run);
+  if (csiEnd !== -1) {
+    state.csiEnd = csiEnd;
+    // mutation-equivalent: stepping back lands inside the color code, which only moves forward
+    return at + run;
+  }
   const char = text.charAt(at + run);
   if (QUOTE.test(char)) noteQuote(text, at, char, run, state);
   else if (ESCAPED_SPACE.test(char)) setHint(state, escapedBreakFrame(run, state));
@@ -414,9 +464,13 @@ function advanceRun(text: string, at: number, state: HintState): number {
 
 /** Moves past the character (or backslash run) at `at` and updates the frame hint for it. */
 function advanceHint(text: string, at: number, state: HintState): number {
+  // A color code keeps the frame it sits in; a name may still start inside it (`\x1b[Cookie:`).
+  if (at < state.csiEnd) return at + 1;
   const char = text.charAt(at);
   if (char === "\\") return advanceRun(text, at, state);
+  const csiEnd = char === ESC ? readCsi(text, at) : -1;
   if (QUOTE.test(char)) noteQuote(text, at, char, 0, state);
+  else if (csiEnd !== -1) state.csiEnd = csiEnd;
   else if (LINE_MARKER.test(char) && state.markers < LINE_MARKER_MAX) state.markers++;
   else state.frame = null;
   return at + 1;
@@ -427,6 +481,8 @@ function redactCookieHeaders(text: string, onRemoved: (removed: string) => void)
     frame: null,
     // mutation-equivalent: with no frame yet, markers count for nothing
     markers: 0,
+    // mutation-equivalent: index 0 starts a name anyway
+    csiEnd: -1,
     // mutation-equivalent: a quote at index 0 opens a frame anyway
     redactedEnd: -1,
     openQuotes: new Map(),
