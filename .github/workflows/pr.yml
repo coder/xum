@@ -1322,7 +1322,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # The four test targets take 70 to 112 s here (93 s at the median of 33 PR runs). Each gate run
+      # in them has a 120 s hang guard (scripts/check_codex_comments_test.py), so a gate that hung
+      # on every run would hold the job until GitHub's 6 h limit without a step limit. 15 minutes is
+      # about 8 times the longest run seen.
       - name: Test PR readiness gates
+        timeout-minutes: 15
         run: make test-codex-comments test-pr-checks test-required-superseded test-branch-sync-guard
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
