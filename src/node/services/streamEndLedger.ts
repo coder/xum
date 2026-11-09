@@ -210,8 +210,9 @@ export class StreamEndLedger {
       attempt,
       attemptId,
       messageId,
-      // An attempt this process does not own has no snapshot of the row from when it began, so a
-      // reported row is never read as inherited: the continuation is refused, never assumed.
+      // An attempt this process does not own has no record of what the CAS that published it left
+      // on the row, so a reported row is never read as inherited: the continuation is refused,
+      // never assumed.
       inheritedReport: attempt?.inheritedReport ?? false,
       outcome: "pending",
       turn: this.deps.workspaceService().getActiveTurnGeneration(taskId),
