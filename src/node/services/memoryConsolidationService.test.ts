@@ -2010,6 +2010,35 @@ describe("MemoryConsolidationService", () => {
     expect(status.latestHarvestRecord?.attemptCount).toBe(3);
   });
 
+  it("shows a stale last attempt as failed but writes the stored record back unchanged", async () => {
+    using fixture = await createFixture();
+    const metadata = await seedCompactionEpoch(fixture);
+    const longAgo = Date.now() - 2 * MEMORY_CONSOLIDATION_TIMEOUT_MS;
+    const stored: MemoryHarvestRecordPayload = {
+      status: "pending",
+      startedAt: longAgo,
+      progressAt: longAgo,
+      attemptCount: HARVEST_MAX_ATTEMPTS,
+      boundaryKey: "summary-1",
+      compactionEpoch: 1,
+      acceptedCandidates: 0,
+      skippedCandidates: 0,
+      completionMetadata: metadata,
+    };
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({ harvestsByWorkspace: { "ws-dream": { "summary-1": stored } } })
+    );
+
+    // The run journals itself in the sidecar; only a job that finds its owner's lock free may
+    // end the attempt, so the write keeps the record as stored.
+    expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+    expect((await harvestRecords(fixture))["summary-1"]).toEqual(stored);
+    expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord?.status).toBe(
+      "failed"
+    );
+  });
+
   it("debounces automatic triggers but lets manual and archive runs through", async () => {
     using fixture = await createFixture();
     expect((await fixture.service.maybeRun("ws-dream", "compaction")).success).toBe(true);
