@@ -65,6 +65,8 @@ export type BashMonitorWakeDeliveryState =
       readCursorOffset?: number;
       /** End of the output the monitor has scanned. */
       outputThroughOffset?: number;
+      /** End of the output that filtered or cross-workspace reads consumed. */
+      hiddenReadThroughOffset?: number;
     };
 
 export interface BashMonitorWakeReconcilerProcessManager {
@@ -226,10 +228,15 @@ function readCursorFacts(
     ...(readState.outputThroughOffset != null
       ? { unreadBytes: Math.max(0, readState.outputThroughOffset - cursor) }
       : {}),
-    // Definite case only: the whole latest match lies behind the cursor. When only part of it
-    // does, the next read still returns the latest matched line.
+    // Only a read that did not show the owner its output can skip it: an owner read that came
+    // after a filtered one returned its bytes but could not advance shownThroughOffset (see
+    // getOutput's contiguity guard). Definite case only: the whole latest match lies behind that
+    // read; when only part of it does, the next read still returns the latest matched line.
     matchedOutputReadPast:
-      matchOffset != null && readState.shownThroughOffset < matchOffset && matchOffset <= cursor,
+      matchOffset != null &&
+      readState.hiddenReadThroughOffset != null &&
+      readState.shownThroughOffset < matchOffset &&
+      matchOffset <= readState.hiddenReadThroughOffset,
   };
 }
 
@@ -328,7 +335,10 @@ function buildPrompt(signals: readonly DerivedSignal[]): string {
     "This is a condition-driven wake-up. Continue from this event.",
     BASH_MONITOR_OUTPUT_NOT_COPIED,
   ];
-  const liveMatches = matchSignals.filter((signal) => signal.terminal == null);
+  // A read call for a live process with nothing unread would return nothing.
+  const liveMatches = matchSignals.filter(
+    (signal) => signal.terminal == null && signal.unreadBytes !== 0
+  );
   if (liveMatches.length > 0) {
     closingParts.push(
       `Read the new output with \`${taskAwaitCall(liveMatches.map((signal) => signal.taskId))}\`.`

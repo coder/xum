@@ -279,6 +279,8 @@ export type MonitorWakeDeliveryState =
       readCursorOffset: number;
       /** End of the output the monitor has scanned; absent once the monitor is dropped. */
       outputThroughOffset?: number;
+      /** See BackgroundProcess.hiddenReadThroughOffset; absent until such a read ran. */
+      hiddenReadThroughOffset?: number;
     };
 
 interface MonitorRetainedMatchBatch {
@@ -427,6 +429,14 @@ export interface BackgroundProcess {
    * both still report status/exitCode. Consulted when suppressing settlement wakes.
    */
   terminalStatusShownToAgent: boolean;
+  /**
+   * End of the output consumed by reads that do not mark it shown: filtered reads and reads from
+   * another workspace. Output before this offset that no owner read showed was really skipped:
+   * the shared read cursor passed it, so no later read returns it. Kept apart from
+   * shownThroughOffset, which a non-contiguous owner read cannot advance even though it did show
+   * the owner its bytes.
+   */
+  hiddenReadThroughOffset?: number;
   /**
    * Resolves when the current read that must block same-process monitor delivery settles. This
    * includes unfiltered reads, which may advance shownThroughOffset, and filtered task_await reads,
@@ -2784,6 +2794,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // buffered are still unread.
       readCursorOffset: proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8"),
       ...(proc.monitor != null ? { outputThroughOffset: proc.monitor.lastReadOffset } : {}),
+      ...(proc.hiddenReadThroughOffset != null
+        ? { hiddenReadThroughOffset: proc.hiddenReadThroughOffset }
+        : {}),
     });
   }
 
@@ -2963,6 +2976,13 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       const shownThrough =
         proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
       proc.shownThroughOffset = Math.max(proc.shownThroughOffset, shownThrough);
+    }
+    // A read that cannot count as showing the owner its output (see above) still moves the shared
+    // cursor. The wake uses this mark to tell the owner when matched output was skipped for good.
+    if (filter || !consumerIsOwner) {
+      const consumedThrough =
+        proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
+      proc.hiddenReadThroughOffset = Math.max(proc.hiddenReadThroughOffset ?? 0, consumedThrough);
     }
 
     log.debug(

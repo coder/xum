@@ -129,6 +129,35 @@ describe("bash monitor wake and the shared read cursor", () => {
     expect(prompt).toContain(BASH_MONITOR_READ_PAST_NOTE);
   });
 
+  test("an owner read after a filtered one returns the match, and the wake says nothing was skipped", async () => {
+    const marker = `MARKER_GAP_${runId}`;
+    const gate = path.join(root, "gate-open");
+    const processId = await spawnMonitored(
+      "cursor-gap",
+      `printf 'noise one\\n'; while [ ! -f '${gate}' ]; do sleep 0.05; done; printf 'RESULT ${marker}\\n'; sleep 30`
+    );
+    // The filtered read drops `noise one` before the matched line exists, so it skips nothing
+    // the monitor matched. It still leaves the owner's shown frontier behind the cursor.
+    await waitForCondition(
+      async () => {
+        await read(processId, owner, "^zzz");
+        return ((await manager.getProcess(processId))?.outputBytesRead ?? 0) > 0;
+      },
+      { timeoutMs: 5_000 }
+    );
+    await fs.writeFile(gate, "");
+    await waitForCondition(() => snapshotOf(processId)?.match != null, { timeoutMs: 5_000 });
+
+    expect(await read(processId, owner)).toContain(marker);
+
+    const prompt = await wakePrompt();
+    expect(prompt).not.toContain(marker);
+    expect(prompt).not.toContain(BASH_MONITOR_READ_PAST_NOTE);
+    expect(unreadBytes(prompt)).toBe(0);
+    // Nothing is unread, so the wake offers no read that would return nothing.
+    expect(prompt).not.toContain("task_await({");
+  });
+
   test("a matched line that a capped read left buffered is not reported as read past", async () => {
     const marker = `MARKER_BUFFERED_${runId}`;
     const processId = await spawnMonitored(

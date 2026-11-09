@@ -1054,12 +1054,15 @@ describe("BashMonitorWakeReconciler", () => {
   );
 
   test.each([
-    ["the cursor passed the whole match", 0, 12, false, true],
-    ["the cursor stopped inside the match", 0, 11, false, false],
+    ["a hidden read passed the whole match", 0, 12, false, true],
+    ["a hidden read stopped inside the match", 0, 11, false, false],
     ["an owner read showed the match before it settled", 12, 30, true, false],
+    // A filtered read before the match pinned the shown frontier at 0; an owner read then
+    // returned the match. The cursor is past it, but nothing was skipped.
+    ["only an owner read passed the match", 0, 5, false, false],
   ] as const)(
     "read-past note when %s: %p",
-    async (_label, shownThroughOffset, readCursorOffset, settled, expected) => {
+    async (_label, shownThroughOffset, hiddenReadThroughOffset, settled, expected) => {
       live = [
         liveSnapshot(
           settled
@@ -1080,8 +1083,9 @@ describe("BashMonitorWakeReconciler", () => {
         status: "settled",
         shownThroughOffset,
         terminalStatusShown: false,
-        readCursorOffset,
+        readCursorOffset: 30,
         outputThroughOffset: 40,
+        hiddenReadThroughOffset,
       };
 
       await reconciler.reconcile(OWNER);
