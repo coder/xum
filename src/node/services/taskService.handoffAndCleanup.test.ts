@@ -2765,7 +2765,8 @@ describe("TaskService", () => {
     expect(messagesAfterFirstFailure).toHaveLength(1);
     expect(messagesAfterFirstFailure[0]).toContain(childAId);
     expect(messagesAfterFirstFailure[0]).toContain("model_refusal");
-    expect(messagesAfterFirstFailure[0]).toContain(refusalMessage);
+    // The row is user-role: it holds Xum's sentence, and the refusal text stays with the waiters.
+    expect(messagesAfterFirstFailure[0]).not.toContain(refusalMessage);
 
     // Last background child refuses with no foreground waiter: its failure is appended too,
     // and the idle parent resumes once from the durable failure rows.
