@@ -70,10 +70,11 @@ export function getApiKey(keyName: string): string {
 export const DUMMY_API_KEY = "test-key-for-ui-tests";
 
 /**
- * A configured provider that cannot be reached: the dummy key plus a base URL on the loopback
- * discard port, where nothing listens. A feature that calls the provider anyway (title generation
- * on a creation send) is refused at once, and nothing leaves the host, so a run without keys never
- * sends the dummy key to a real API.
+ * A configured provider that cannot be reached: the dummy key plus a base URL on port 9 of the
+ * loopback address. `fetch` refuses port 9 as a bad port before it opens a socket, so even a host
+ * that runs the discard service never sees the request. A feature that calls the provider anyway
+ * (title generation on a creation send) fails at once, and a run without keys never sends the
+ * dummy key to a real API.
  */
 export const DUMMY_PROVIDER_CONFIG = {
   apiKey: DUMMY_API_KEY,

@@ -26,6 +26,9 @@ import {
   DUMMY_PROVIDER_CONFIG,
 } from "../testUtils";
 
+/** Providers that CI configures through its keys and that keyless UI suites rely on. */
+const DUMMY_SEEDED_PROVIDERS = ["anthropic", "openai"] as const;
+
 export interface TestEnvironment {
   config: Config;
   services: ServiceContainer;
@@ -107,18 +110,22 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   };
 
   // CI has provider keys in the environment (Anthropic and OpenAI among them), so the UI finds
-  // configured providers and this seeds nothing. A run without keys has none: ProjectPage then
-  // shows its configure prompt instead of the creation composer, the model picker lists no GPT
-  // model, and compaction has no larger-context OpenAI model to suggest. Give that run the same
-  // two providers, on a dummy that cannot reach the API.
-  if (
-    shouldRunIntegrationTests() &&
-    !Object.values(services.providerService.getConfig()).some((provider) => provider?.isConfigured)
-  ) {
-    await setupProviders(env, {
-      anthropic: DUMMY_PROVIDER_CONFIG,
-      openai: DUMMY_PROVIDER_CONFIG,
-    });
+  // them configured and this seeds nothing. A run without them has two gaps: ProjectPage shows
+  // its configure prompt instead of the creation composer, and the model picker lists no GPT
+  // model and compaction has no larger-context OpenAI model to suggest. Seed each of the two
+  // providers that is missing, on a dummy that cannot reach the API. Each is checked alone: a run
+  // that has only an xAI key still lacks both.
+  if (shouldRunIntegrationTests()) {
+    const configured = services.providerService.getConfig();
+    const missing = DUMMY_SEEDED_PROVIDERS.filter(
+      (provider) => !configured[provider]?.isConfigured
+    );
+    if (missing.length > 0) {
+      await setupProviders(
+        env,
+        Object.fromEntries(missing.map((provider) => [provider, DUMMY_PROVIDER_CONFIG]))
+      );
+    }
   }
 
   return env;
