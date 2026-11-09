@@ -32,6 +32,7 @@ import {
   resolveHeadlessAgentSettings,
   resolveHeadlessAgentBody,
   resolveHeadlessAgentDefinition,
+  sidecarLockPath,
   staleExhaustedHarvestFailure,
 } from "./memoryConsolidationService";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
@@ -3181,6 +3182,104 @@ describe("MemoryConsolidationService", () => {
       } finally {
         await releaseForeign();
       }
+    });
+
+    describe("two backends on one root", () => {
+      /** Saves a completed harvest record under `boundaryKey` through `service`'s sidecar write. */
+      function saveHarvestRecord(
+        service: MemoryConsolidationService,
+        boundaryKey: string
+      ): Promise<void> {
+        const internals = service as unknown as {
+          saveHarvestRecordEffect: (
+            workspaceId: string,
+            boundaryKey: string,
+            record: MemoryHarvestRecordPayload,
+            projectPath: string
+          ) => Effect.Effect<void>;
+        };
+        const record: MemoryHarvestRecordPayload = {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey,
+          compactionEpoch: 1,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+        };
+        return Effect.runPromise(
+          internals.saveHarvestRecordEffect("ws-dream", boundaryKey, record, "")
+        );
+      }
+
+      it("keeps both backends' sidecar writes when one lands inside the other's read-modify-write", async () => {
+        using fixture = await createFixture();
+        const second = secondBackend(fixture);
+        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+        await fsPromises.writeFile(sidecarPath, "{}");
+        const firstRead = Promise.withResolvers<void>();
+        const resumeFirst = Promise.withResolvers<void>();
+        const secondWaits = Promise.withResolvers<void>();
+        let paused = false;
+        const { readFile, open } = fsPromises;
+        // The first save stops after it read the sidecar and before it writes it back.
+        const readSpy = spyOn(fsPromises, "readFile").mockImplementation((async (
+          ...args: Parameters<typeof readFile>
+        ) => {
+          const text = await readFile(...args);
+          if (args[0] === sidecarPath && !paused) {
+            paused = true;
+            firstRead.resolve();
+            await resumeFirst.promise;
+          }
+          return text;
+        }) as typeof readFile);
+        // The second save reads the lock record of the first while it waits for the lock.
+        const openSpy = spyOn(fsPromises, "open").mockImplementation((file, flags, mode) => {
+          if (file === sidecarLockPath(fixture.xumHome) && paused) secondWaits.resolve();
+          return open(file, flags, mode);
+        });
+        try {
+          const first = saveHarvestRecord(fixture.service, "summary-1");
+          await firstRead.promise;
+          const behind = saveHarvestRecord(second.service, "summary-2");
+          // Unlocked, the second save writes now and the first then writes over it.
+          await Promise.race([behind, secondWaits.promise]);
+          resumeFirst.resolve();
+          await Promise.all([first, behind]);
+        } finally {
+          resumeFirst.resolve();
+          readSpy.mockRestore();
+          openSpy.mockRestore();
+        }
+        expect(Object.keys(await harvestRecords(fixture)).sort()).toEqual([
+          "summary-1",
+          "summary-2",
+        ]);
+      });
+
+      it("takes over the sidecar lock of a backend that died holding it", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        const lockPaths = [sidecarLockPath(fixture.xumHome)];
+        for (const lockPath of lockPaths) {
+          // A real holder record whose token this process no longer holds: its holder is gone.
+          const release = await acquireCrossProcessLock({
+            lockPath,
+            acquireTimeoutMs: 1_000,
+            staleMs: 60_000,
+            timeoutMessage: "test holder",
+          });
+          const record = await fsPromises.readFile(lockPath, "utf-8");
+          await release();
+          await fsPromises.writeFile(lockPath, record);
+        }
+
+        expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+        expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+        for (const lockPath of lockPaths) expect(await pathExists(lockPath)).toBe(false);
+      });
     });
 
     it("skips the run, without a stream or a journal row, when the dream lock cannot be taken", async () => {

@@ -15,8 +15,8 @@
  * the wire `Result<_, string>` skip/record union, and the public Promise
  * methods are thin `Effect.runPromise` facades so pre-Effect callers keep
  * working unchanged. Two kinds of locks deliberately stay outside Effect
- * (wrap-around-locks): the sidecar `MutexMap` critical sections remain
- * callback-owned Promise seams with byte-identical interiors, and the
+ * (wrap-around-locks): the sidecar critical section (mutateSidecar) remains
+ * a callback-owned Promise seam, and the
  * per-workspace `inFlight` / `harvestInFlight` reservation maps remain
  * synchronous check-and-reserve seams in `maybeRun` / `maybeHarvestThenSweep`
  * (see those methods for why the reservation must not sit behind an await).
@@ -327,6 +327,11 @@ export function dreamStreamLockPath(rootDir: string): string {
   return path.join(rootDir, "locks", "memory-dream-stream.lock");
 }
 
+/** Cross-process half of the sidecar's MutexMap (see mutateSidecar), beside the dream lock. */
+export function sidecarLockPath(rootDir: string): string {
+  return path.join(rootDir, "locks", "memory-consolidation-sidecar.lock");
+}
+
 /** The skip reason of a run the debounce window refused (callers match on "debounced"). */
 const DEBOUNCED_SKIP_REASON =
   "debounced: a recent consolidation run already covered this workspace";
@@ -635,7 +640,7 @@ function finalizeHarvestRecordForRemoval(record: MemoryHarvestRecord): MemoryHar
 
 export class MemoryConsolidationService extends EventEmitter {
   private readonly sidecarPath: string;
-  /** Serializes sidecar read-modify-write cycles (journal persistence only). */
+  /** Serializes this backend's sidecar read-modify-write cycles (see mutateSidecar). */
   private readonly locks = new MutexMap<string>();
   /**
    * Per-workspace run lock holding the active run's promise. Reserved
@@ -771,8 +776,8 @@ export class MemoryConsolidationService extends EventEmitter {
   }
 
   /**
-   * Promise facade over {@link loadEffect}; the sidecar MutexMap critical
-   * sections call this so their interiors stay plain Promise seams.
+   * Promise facade over {@link loadEffect}; the sidecar critical section
+   * (mutateSidecar) calls this so its interior stays a plain Promise seam.
    */
   private load(): Promise<ConsolidationSidecarFile> {
     return Effect.runPromise(this.loadEffect());
@@ -845,9 +850,37 @@ export class MemoryConsolidationService extends EventEmitter {
   }
 
   /**
-   * Journal mutation. The sidecar read-modify-write stays a callback-owned
-   * MutexMap Promise seam with a byte-identical interior (wrap-around-locks);
-   * the pipeline is uninterruptible so the durable write can never be
+   * The sidecar's one read-modify-write path: `mutate` edits the file as read under both locks and
+   * returns whether it changed it; nothing is written otherwise. The MutexMap orders this backend's
+   * writers, the file lock orders them against another backend on the same root, whose write
+   * would otherwise land between our read and our write and be lost. LOCK ORDER: the MutexMap,
+   * then the file lock. The file lock is not reentrant within a process, so a writer holding it
+   * while it waits for the MutexMap would wedge the in-process writer ahead of it, which polls for
+   * the file lock until it times out. Readers take neither: writeFileAtomic renames into place.
+   */
+  private mutateSidecar(mutate: (file: ConsolidationSidecarFile) => boolean): Promise<boolean> {
+    return this.locks.withLock(this.sidecarPath, async () => {
+      const release = await acquireCrossProcessLock({
+        lockPath: sidecarLockPath(this.config.rootDir),
+        // A holder reads, edits and renames one small file. A live holder is never taken over
+        // (fail closed): after this wait the save fails like a failed write.
+        acquireTimeoutMs: 30_000,
+        staleMs: 60_000,
+        timeoutMessage: "Another Xum process is writing memory-consolidation.json.",
+      });
+      try {
+        const file = await this.load();
+        if (!mutate(file)) return false;
+        await writeFileAtomic(this.sidecarPath, JSON.stringify(file, null, 2));
+        return true;
+      } finally {
+        await release();
+      }
+    });
+  }
+
+  /**
+   * Journal mutation. The pipeline is uninterruptible so the durable write can never be
    * separated from the status invalidation below.
    */
   private saveRecordEffect(
@@ -860,13 +893,12 @@ export class MemoryConsolidationService extends EventEmitter {
     return Effect.uninterruptible(
       Effect.gen(function* () {
         yield* Effect.promise(() =>
-          self.locks.withLock(self.sidecarPath, async () => {
-            const file = await self.load();
+          self.mutateSidecar((file) => {
             file.workspaces[workspaceId] = record;
             if (projectPath !== "") {
               file.projects[projectPath] = record;
             }
-            await writeFileAtomic(self.sidecarPath, JSON.stringify(file, null, 2));
+            return true;
           })
         );
         // The sidecar write does not touch memory files, so open Memory tabs need
@@ -887,8 +919,7 @@ export class MemoryConsolidationService extends EventEmitter {
     return Effect.uninterruptible(
       Effect.gen(function* () {
         const saved = yield* Effect.promise(() =>
-          self.locks.withLock(self.sidecarPath, async () => {
-            const file = await self.load();
+          self.mutateSidecar((file) => {
             file.harvestsByWorkspace[workspaceId] ??= {};
             const existing = file.harvestsByWorkspace[workspaceId][boundaryKey];
             // A terminal record is never reopened: removal finalization
@@ -902,7 +933,6 @@ export class MemoryConsolidationService extends EventEmitter {
             }
             file.harvestsByWorkspace[workspaceId][boundaryKey] = record;
             pruneHarvestRecords(file.harvestsByWorkspace[workspaceId]);
-            await writeFileAtomic(self.sidecarPath, JSON.stringify(file, null, 2));
             return true;
           })
         );
@@ -1080,8 +1110,7 @@ export class MemoryConsolidationService extends EventEmitter {
     // (cancelInFlightConsolidation's drain is bounded) may still be recording
     // outcomes, and a completion landing between an unlocked read and this
     // write must not be overwritten with a failure.
-    const finalized = await this.locks.withLock(this.sidecarPath, async () => {
-      const file = await this.load();
+    const finalized = await this.mutateSidecar((file) => {
       const records = file.harvestsByWorkspace[workspaceId];
       if (records === undefined) return false;
       let changed = false;
@@ -1090,7 +1119,6 @@ export class MemoryConsolidationService extends EventEmitter {
         records[boundaryKey] = finalizeHarvestRecordForRemoval(record);
         changed = true;
       }
-      if (changed) await writeFileAtomic(this.sidecarPath, JSON.stringify(file, null, 2));
       return changed;
     });
     if (!finalized) return;
