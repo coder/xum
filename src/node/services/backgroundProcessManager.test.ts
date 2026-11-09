@@ -12,6 +12,7 @@ import {
   type MonitorStoppedPayload,
   type OutputShownPayload,
 } from "./backgroundProcessManager";
+import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
 import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -768,7 +769,7 @@ describe("BackgroundProcessManager", () => {
       const result = await manager.spawn(
         runtime,
         testWorkspaceId,
-        `while [ ! -e '${gate}' ]; do sleep 0.02; done; for i in 1 2 3; do echo ERR$i; sleep 0.05; done; sleep 2`,
+        `while [ ! -e ${shellQuote(gate)} ]; do sleep 0.02; done; for i in 1 2 3; do echo ERR$i; sleep 0.05; done; sleep 2`,
         {
           cwd: process.cwd(),
           displayName: "monitor-max-events",
@@ -2371,7 +2372,7 @@ describe("BackgroundProcessManager", () => {
         const result = await manager.spawn(
           runtime,
           testWorkspaceId,
-          `while [ ! -e '${gate}' ]; do sleep 0.02; done; printf 'bye\\n'`,
+          `while [ ! -e ${shellQuote(gate)} ]; do sleep 0.02; done; printf 'bye\\n'`,
           {
             cwd: process.cwd(),
             displayName: "settle-shutdown-midflight",
@@ -2602,7 +2603,7 @@ describe("BackgroundProcessManager", () => {
         const result = await manager.spawn(
           runtime,
           testWorkspaceId,
-          `while [ ! -e '${gate}' ]; do sleep 0.02; done; printf 'out\\n'`,
+          `while [ ! -e ${shellQuote(gate)} ]; do sleep 0.02; done; printf 'out\\n'`,
           {
             cwd: process.cwd(),
             displayName: "settle-cancel-race",
