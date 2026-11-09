@@ -7003,11 +7003,23 @@ describe("WorkspaceMcpOverridesService", () => {
         },
       ]);
       await fs.writeFile(configFile, JSON.stringify(raw));
-
-      const failures = await service.prunePluginOverrideKeysForWorkspaces(
-        [stale.workspaceId, legacy.workspaceId, "ws-odd"],
-        prefix
+      // The lenient walk reads only the registry: a probe of each checkout would cost one stat
+      // per registered workspace, outside the scan's per-checkout bound.
+      const probes = spyOn(
+        config as unknown as { checkoutExists: (...args: unknown[]) => Promise<boolean> },
+        "checkoutExists"
       );
+
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces(
+          [stale.workspaceId, legacy.workspaceId, "ws-odd"],
+          prefix
+        );
+        expect(probes).not.toHaveBeenCalled();
+      } finally {
+        probes.mockRestore();
+      }
 
       expect(failures).toEqual([]);
       expect(await enabledOf(stale.workspacePath)).toEqual(["other"]);
@@ -7221,6 +7233,64 @@ describe("WorkspaceMcpOverridesService", () => {
       expect((firstLockedReadAt ?? 0) - (lateReadAt ?? 0)).toBeLessThan(2_500);
     }, 60_000);
 
+    it("prunePluginOverrideKeysForWorkspaces does not read a workspace whose turn comes at the instant its scan's window closes", async () => {
+      // The window ends the scan at its close, inclusive: a workspace that the scan reaches then
+      // is unscanned, and fails with its tombstone. The clock is frozen so that a turn can land
+      // on the close itself: 16 checkouts never answer, the first timeout opens the window, and
+      // the first late workspace's read moves the clock to the close.
+      const service = new WorkspaceMcpOverridesService(config);
+      const dead: Array<{ workspaceId: string; workspacePath: string }> = [];
+      for (let index = 0; index < 16; index++) {
+        dead.push(await registerWorkspace(`close-dead-${index}`));
+      }
+      const first = await registerWorkspace("close-first-late");
+      const second = await registerWorkspace("close-second-late");
+      const deadDocs = new Set(dead.map((workspace) => docOf(workspace.workspacePath)));
+      const frozen = Date.now();
+      let skewMs = 0;
+      let lockedReads = 0;
+      const realStat = fsPromisesModule.stat;
+      const scanned = new Set<string>();
+      const nowSpy = spyOn(Date, "now").mockImplementation(() => frozen + skewMs);
+      const statSpy = spyOn(fsPromisesModule, "stat").mockImplementation((async (
+        target: string,
+        ...rest: unknown[]
+      ) => {
+        if (
+          target === first.workspacePath &&
+          (rest[0] as { bigint?: boolean } | undefined)?.bigint === true &&
+          skewMs === 0
+        ) {
+          // The window closes 30 s after the first timeout, which the frozen clock put at now.
+          skewMs = 30_000;
+        }
+        if (!deadDocs.has(target)) {
+          return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+        }
+        if (scanned.has(target)) {
+          // Under the locks: spend the sweep's budget at once.
+          if (lockedReads++ === 0) skewMs += 31_000;
+        } else {
+          scanned.add(target);
+        }
+        return new Promise(() => undefined);
+      }) as typeof fsPromisesModule.stat);
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces(
+          [...dead, first, second].map((workspace) => workspace.workspaceId),
+          prefix
+        );
+      } finally {
+        statSpy.mockRestore();
+        nowSpy.mockRestore();
+      }
+
+      expect(skewMs).toBeGreaterThanOrEqual(30_000);
+      const secondFailure = failures.find((failure) => failure.workspaceId === second.workspaceId);
+      expect(String(secondFailure?.error)).toMatch(/stopped reading MCP overrides/);
+    }, 60_000);
+
     it("prunePluginOverrideKeysForWorkspaces stops publishing once its budget is spent, and evicts every cache instead", async () => {
       // Past the budget, each workspace's publication still ran under a 0 ms deadline with
       // its own eviction: 300 workspaces and a slow publisher held the locks twice the budget.
@@ -7353,23 +7423,29 @@ describe("WorkspaceMcpOverridesService", () => {
       const service = new WorkspaceMcpOverridesService(config);
       const naming = await registerWorkspace("opaque-names-key");
       const unrelated = await registerWorkspace("opaque-unrelated");
+      // Locked for its document, with a legacy value of its own: only that value decides it,
+      // not the opaque value of another workspace.
+      const bystander = await registerWorkspace("opaque-bystander");
+      await writeDoc(bystander.workspacePath, [staleKey, "other"]);
       await config.editConfig((cfg) => {
         for (const project of cfg.projects.values()) {
           for (const entry of project.workspaces) {
             if (entry.id === naming.workspaceId) entry.mcp = `enable ${staleKey}` as never;
             if (entry.id === unrelated.workspaceId) entry.mcp = "newer shape" as never;
+            if (entry.id === bystander.workspaceId) entry.mcp = { enabledServers: ["shots"] };
           }
         }
         return cfg;
       });
 
       const failures = await service.prunePluginOverrideKeysForWorkspaces(
-        [naming.workspaceId, unrelated.workspaceId],
+        [naming.workspaceId, unrelated.workspaceId, bystander.workspaceId],
         prefix
       );
 
       expect(failures.map((failure) => failure.workspaceId)).toEqual([naming.workspaceId]);
       expect(String(failures[0].error)).toMatch(/legacy MCP settings value/);
+      expect(await enabledOf(bystander.workspacePath)).toEqual(["other"]);
     });
   });
 

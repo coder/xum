@@ -5277,6 +5277,8 @@ export class WorkspaceMcpOverridesService {
     const failed = new Set<string>();
     await mapWithConcurrency([...idsByKey], CHECKOUT_IO_CONCURRENCY, async ([key, keyIds]) => {
       try {
+        // mutation-equivalent: past the deadline, 0 ms and 1 ms both give a key one more try: a
+        // free lock is taken at once and a held one fails, so the barrier's outcome is the same
         const release = await this.acquireCheckoutLock(key, Math.max(0, deadline - Date.now()));
         await release();
       } catch (error) {
@@ -5450,6 +5452,9 @@ export class WorkspaceMcpOverridesService {
       const probe = await probeOverridesFile(resolved.runtime, filePath);
       if (probe.kind === "absent") continue;
       scan.documented.add(resolved.metadata.id);
+      // mutation-equivalent: the read below refuses what this skips, so the workspace is a
+      // candidate either way: a larger file throws at the limit, a file the probe could not stat
+      // throws at its open
       if (probe.kind === "indeterminate" || probe.size > MAX_PRUNED_OVERRIDES_BYTES) return true;
       // SECURITY: no lock guards this read, and the probe above follows symlinks. A checkout
       // can track the document as a symlink to a device such as /dev/zero (size 0), which a
