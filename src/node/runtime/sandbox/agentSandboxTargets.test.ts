@@ -111,13 +111,16 @@ describe("buildAgentSandboxPolicy", () => {
     await fs.rm(root, { recursive: true, force: true });
   });
 
-  // An open git folder is writable, so a sandboxed command can rewrite its commondir file.
-  test("a rewritten commondir file does not move the git folder it opens", async () => {
-    const elsewhere = path.join(root, "elsewhere");
+  // Git outside the sandbox takes the config and hooks of the folder that commondir names.
+  test("fails closed when a worktree's commondir file names another git folder", async () => {
+    expect(buildAgentSandboxPolicy(SETTINGS, { cwd: worktree }).gitCommonDirs).toEqual([commonDir]);
+    const elsewhere = path.join(worktree, "elsewhere");
     await fs.mkdir(elsewhere);
     await fs.writeFile(path.join(commonDir, "worktrees", "wt", "commondir"), `${elsewhere}\n`);
 
-    expect(buildAgentSandboxPolicy(SETTINGS, { cwd: worktree }).gitCommonDirs).toEqual([commonDir]);
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: worktree })).toThrow(
+      AgentSandboxStartError
+    );
   });
 
   test("a .git file without a matching back pointer opens no git folder", async () => {
@@ -160,6 +163,24 @@ describe("buildAgentSandboxPolicy", () => {
       expect(agentSandboxPolicyAllows(policy, target, "write")).toBe(false);
     }
     expect(agentSandboxPolicyAllows(policy, path.join(linked, "index"), "write")).toBe(true);
+  });
+
+  // Git outside the sandbox runs the script that a hook links to.
+  test("keeps the scripts that git hooks link to read-only", async () => {
+    const script = path.join(worktree, "scripts", "post-checkout");
+    await fs.mkdir(path.dirname(script));
+    await fs.writeFile(script, "#!/bin/sh\n");
+    await fs.symlink(script, path.join(commonDir, "hooks", "post-checkout"));
+    await fs.symlink("../../scripts/pre-commit", path.join(commonDir, "hooks", "pre-commit"));
+
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: worktree });
+    expect(agentSandboxPolicyAllows(policy, script, "write")).toBe(false);
+    expect(
+      agentSandboxPolicyAllows(policy, path.join(repo, "scripts", "pre-commit"), "write")
+    ).toBe(false);
+    expect(agentSandboxPolicyAllows(policy, path.join(worktree, "scripts", "x"), "write")).toBe(
+      true
+    );
   });
 
   // Git outside the sandbox follows a .git file, or a commondir file in a git folder, to the
@@ -370,6 +391,25 @@ describe("buildAgentSandboxPolicy", () => {
     git(repo, "config", "include.path", path.join(repo, "git.inc"));
 
     expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
+  });
+
+  // bunx for an MCP server outside the sandbox runs what such a folder holds, through the link.
+  test("fails closed when a bunx temp folder is a link in a write root", async () => {
+    const temp = path.join(root, "tmp");
+    const uid = process.getuid?.() ?? 0;
+    await fs.mkdir(temp);
+    await fs.mkdir(path.join(temp, `bunx-${uid}-a@latest`));
+    const tmpdir = spyOn(os, "tmpdir").mockReturnValue(temp);
+    try {
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).not.toThrow();
+
+      await fs.symlink(path.join(repo, "pkg"), path.join(temp, `bunx-${uid}-b@latest`));
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(
+        AgentSandboxStartError
+      );
+    } finally {
+      tmpdir.mockRestore();
+    }
   });
 
   // Git that Xum runs outside the sandbox runs a credential.helper from the global config.

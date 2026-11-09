@@ -235,6 +235,7 @@ export function buildAgentSandboxPolicy(
   // Xum, its git and the npx, uvx and bunx of MCP servers use these as spelled, outside the
   // sandbox, so a command could replace a link to one in a write root (Codex review): fail closed.
   assertNoPathThroughLink([getXumHome(), ...automationSpellings, ...cacheSpellings], writeRoots);
+  assertNoGlobLinks(cacheSpellings);
   const linkedEntries = automationEntryLinkTargets(writeRoots);
   const readableAutomation = [...readableSpellings.map(expandSandboxPath), ...linkedEntries];
   const automationPaths = [...automationSpellings.map(expandSandboxPath), ...linkedEntries];
@@ -243,8 +244,12 @@ export function buildAgentSandboxPolicy(
   const gitCommonDirs = dedupe(
     [cwd, ...extraWorkspaceRoots].flatMap((root) => findGitCommonDir(root) ?? [])
   );
+  const repoGitDirs = repositoryAndSubmoduleGitDirs(
+    [...workspaceRoots, ...extraWriteRoots],
+    gitCommonDirs
+  );
   const configIncludePaths = [
-    ...gitConfigIncludes([...workspaceRoots, ...extraWriteRoots], gitCommonDirs, gitGlobalConfigs),
+    ...gitConfigIncludes(repoGitDirs, gitGlobalConfigs),
     ...sshConfigIncludes(),
   ];
   // Git and ssh open these as spelled, and git follows a `.git` link to whatever git folder a
@@ -268,6 +273,7 @@ export function buildAgentSandboxPolicy(
         ...automationPaths,
         ...cacheSpellings.map(expandSandboxPath),
         ...homeLinkTargets(home, writeRoots),
+        ...hookLinkTargets(repoGitDirs, writeRoots),
         ...configIncludePaths.map(realpathOfNearest),
       ].filter((denied) => isUnderAny(denied, writeRoots)),
     ].flatMap((denied) => withLinkTargets(denied, writeRoots))
@@ -523,22 +529,45 @@ function findGitCommonDir(root: string): string | undefined {
 /**
  * `<common>` (a real path) for a `.git` file that points at `<common>/worktrees/<name>`, when
  * that folder points back at the `.git` file and `<common>` holds a HEAD. A sandboxed command can
- * rewrite the `commondir` file in an open git folder and write `.git` files in a temp folder, so
- * neither may choose the folder this opens. A submodule's `.git` file points elsewhere (no
- * back pointer), so a submodule checkout gets no git folder: git there cannot write.
+ * write `.git` files in a temp folder, so it may not choose the folder this opens. A submodule's
+ * `.git` file points elsewhere (no back pointer), so a submodule checkout gets no git folder: git
+ * there cannot write.
  */
 function commonDirOfWorktree(dotGitFile: string): string | undefined {
+  const gitDir = linkedWorktreeGitDir(dotGitFile);
+  if (gitDir === undefined) return undefined;
+  const commonDir = path.dirname(path.dirname(gitDir));
+  // Git takes the config and hooks of the folder that `commondir` names. The policy keeps the
+  // file read-only, but one rewritten before the sandbox started would leave the folder that git
+  // uses open (Codex review).
+  if (namedCommonDir(gitDir) !== commonDir) {
+    throw new AgentSandboxStartError(`${gitDir}/commondir does not name ${commonDir}`);
+  }
+  return commonDir;
+}
+
+/** The real path of `<common>/worktrees/<name>` that `dotGitFile` points at and back from. */
+function linkedWorktreeGitDir(dotGitFile: string): string | undefined {
   try {
     const pointer = gitDirPointer(dotGitFile);
     if (pointer === undefined) return undefined;
     const gitDir = fs.realpathSync(pointer);
-    const commonDir = path.dirname(path.dirname(gitDir));
     if (path.basename(path.dirname(gitDir)) !== "worktrees") return undefined;
-    if (!isFile(path.join(commonDir, "HEAD"))) return undefined;
+    if (!isFile(path.join(path.dirname(path.dirname(gitDir)), "HEAD"))) return undefined;
     const backPointer = fs.readFileSync(path.join(gitDir, "gitdir"), "utf8").trim();
     const pointsBack =
       fs.realpathSync(path.resolve(gitDir, backPointer)) === fs.realpathSync(dotGitFile);
-    return pointsBack ? commonDir : undefined;
+    return pointsBack ? gitDir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The real path of the folder that `<gitDir>/commondir` names, or undefined when unreadable. */
+function namedCommonDir(gitDir: string): string | undefined {
+  try {
+    const named = fs.readFileSync(path.join(gitDir, "commondir"), "utf8").trim();
+    return fs.realpathSync(path.resolve(gitDir, named));
   } catch {
     return undefined;
   }
@@ -659,6 +688,23 @@ function linkTargets(links: readonly string[], writeRoots: readonly string[]): s
   return links.flatMap((link) => withLinkTargets(link, writeRoots).slice(1));
 }
 
+/**
+ * Fails closed on a link that a cache entry ending in `*` matches (the `bunx-<uid>-*` folders in
+ * the temp folders, which bunx makes as folders): bunx outside the sandbox runs what it leads to,
+ * and Seatbelt checks a write at that path, not at the link (Codex review).
+ */
+function assertNoGlobLinks(spelled: readonly string[]): void {
+  for (const glob of spelled.filter((entry) => entry.endsWith("*"))) {
+    const prefix = path.basename(glob).slice(0, -1);
+    const link = childLinks(expandSandboxPathSpelling(path.dirname(glob))).find((entry) =>
+      path.basename(entry).startsWith(prefix)
+    );
+    if (link !== undefined) {
+      throw new AgentSandboxStartError(`${link} is a link, which bunx outside the sandbox follows`);
+    }
+  }
+}
+
 function childLinks(folder: string): string[] {
   try {
     return fs
@@ -673,19 +719,14 @@ function childLinks(folder: string): string[] {
 /**
  * The real paths of the files that git config includes (`include.path`, and
  * `includeIf.<condition>.path` whatever the condition), from `globalConfigs` and the config of
- * each repository in `roots` and `gitDirs` and of their submodules, recursively as git reads
- * them. Git takes them as config, so a command that writes one can set `core.hooksPath` for git
- * outside the sandbox, Xum's own `git worktree add` and `git submodule update` in a trusted project
- * included.
+ * each git folder in `repoGitDirs`, recursively as git reads them. Git takes them as config, so a
+ * command that writes one can set `core.hooksPath` for git outside the sandbox, Xum's own
+ * `git worktree add` and `git submodule update` in a trusted project included.
  */
 function gitConfigIncludes(
-  roots: readonly string[],
-  gitDirs: readonly string[],
+  repoGitDirs: readonly string[],
   globalConfigs: readonly string[]
 ): string[] {
-  const repoGitDirs = dedupe([...roots.flatMap(repositoryGitDirs), ...gitDirs]).flatMap(
-    (gitDir) => [gitDir, ...submoduleGitDirs(path.join(gitDir, "modules"), 1)]
-  );
   const configFiles = [
     ...globalConfigs,
     ...repoGitDirs.flatMap((gitDir) => [
@@ -700,6 +741,28 @@ function gitConfigIncludes(
       resolveGitInclude(value, file)
     )
   );
+}
+
+/** The git folders of the repositories that `roots` are in, `gitDirs`, and their submodules'. */
+function repositoryAndSubmoduleGitDirs(
+  roots: readonly string[],
+  gitDirs: readonly string[]
+): string[] {
+  return dedupe([...roots.flatMap(repositoryGitDirs), ...gitDirs]).flatMap((gitDir) => [
+    gitDir,
+    ...submoduleGitDirs(path.join(gitDir, "modules"), 1),
+  ]);
+}
+
+/**
+ * Where the hooks in each git folder's `hooks` link to (`.git/hooks/post-checkout` to
+ * `scripts/post-checkout` in the workspace): git outside the sandbox runs them, Xum's own
+ * `git worktree add` and `git submodule update` in a trusted project included (Codex review).
+ */
+function hookLinkTargets(gitDirs: readonly string[], writeRoots: readonly string[]): string[] {
+  return gitDirs
+    .flatMap((gitDir) => childLinks(path.join(gitDir, "hooks")))
+    .flatMap((link) => withLinkTargets(link, writeRoots).slice(1));
 }
 
 /**
