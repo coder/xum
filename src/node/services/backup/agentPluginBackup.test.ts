@@ -664,6 +664,42 @@ describe("backup of the managed plugin list", () => {
       info.mockRestore();
     });
 
+    it("leaves out a plugin that hides a token behind a JSON escape in a component name", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const token = `ghp_${"a".repeat(36)}`;
+      const imported = (skills: string[], mcpServers: string[]) => ({
+        importedComponents: { skills, mcpServers },
+      });
+      // The installer takes these names. JSON writes the first character as `\n`, `\t` or `\u0001`,
+      // so the token has no word boundary in the file the publish-time scan reads.
+      const hidden = {
+        "server-newline": imported([], [`\n${token}`]),
+        "skill-tab": imported([`\t${token}`], []),
+        "server-control": imported([], [`\u0001${token}`]),
+      };
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        // Control characters that hide nothing stay listed.
+        registryRow("multi-line", imported(["two\nlines"], ["a\tb"])),
+        ...Object.entries(hidden).map(([name, overrides]) => registryRow(name, overrides)),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      const exported = await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const text = await fs.readFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "utf-8");
+      const sidecar = JSON.parse(text) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha", "multi-line"]);
+      expect(text).not.toContain("ghp_");
+      expect(exported.secretFiles).toEqual([]);
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("control character"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(Object.keys(hidden).sort());
+      expect(JSON.stringify(info.mock.calls)).not.toContain("ghp_");
+      info.mockRestore();
+    });
+
     it("leaves out a plugin that hides a token in its ref or its folder behind an escape", async () => {
       const info = spyOn(log, "info").mockImplementation(() => undefined);
       const source = (extra: Record<string, unknown>) => ({

@@ -39,8 +39,8 @@ import { BackupServiceError } from "./backupService";
 import {
   assertManagedTreeWithinLimits,
   BACKUP_MANIFEST_FILE,
-  hidesSecretBehindEscapes,
   isFilesystemError,
+  jsonValueHidesSecret,
   lstatIfExists,
   MAX_BACKUP_FILE_BYTES,
   resolveContainedPath,
@@ -249,9 +249,12 @@ function listingOf({ install, generated }: InstallSnapshot): Listing {
   if (!parsed.success) {
     return { leftOut: `the backup list cannot hold its ${refusedFields(parsed.error)}` };
   }
-  // Every field of the entry as the list will write it (the URL, the ref, the folder, the names).
-  if (hidesSecretBehindEscapes(JSON.stringify(parsed.data))) {
-    return { leftOut: "its list entry hides a token behind percent escapes" };
+  // Every string of the entry (the URL, the ref, the folder, the names), as itself and decoded: not
+  // the JSON text it is written as, where `\n` or `\t` before a token takes away its word boundary.
+  if (jsonValueHidesSecret(parsed.data)) {
+    return {
+      leftOut: "its list entry hides a token behind percent escapes or a control character",
+    };
   }
   return { entry: parsed.data };
 }

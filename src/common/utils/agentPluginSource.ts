@@ -222,8 +222,12 @@ export function httpsFormOfSshUrl(url: string): string | undefined {
  * It reads the URL as written. A host name that DNS points at this machine (for example
  * `localtest.me` or `ip6-localhost`) still passes, because Xum cannot look the name up before git
  * does (DNS rebinding): the limit `assertMarketplaceMayName` states for a remote marketplace's
- * sources. A review of such a row contacts that host over https, with no SSH key and no credential
- * unless git already stores one for that host name, and nothing installs without the user's consent.
+ * sources. A review of such a row contacts that host over https with no SSH key, but with any
+ * credential that git or `~/.netrc` holds for that host name (a netrc `default` entry matches every
+ * host): the same as for a remote marketplace's https sources and for a URL typed into Settings →
+ * Plugins. The preview starts only after the user selects Review and install (or its shortcut), and
+ * for each next plugin after the user installs or skips the one before. Nothing installs without the
+ * user's consent.
  */
 export const PLAIN_HTTPS_URL =
   /^https:\/\/[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*(?::[0-9]{1,5})?\/[A-Za-z0-9._~/-]+$/;
@@ -238,9 +242,9 @@ export const PLAIN_HTTPS_URL =
  * SECURITY: the list is repository-controlled. A preview of an ssh or scp source makes git sign in
  * with the user's SSH agent to whatever host the list names, before any consent to that plugin
  * (a remote marketplace may name only https sources for the same reason), so a review previews
- * the https form, which signs in with nothing but the credentials git holds for that host. The
- * preview is at the pinned commit, and a commit id names its content, so a repository that serves
- * it serves the same code.
+ * the https form, which uses no SSH key, only a credential that git or `~/.netrc` holds for that
+ * host (see `PLAIN_HTTPS_URL` for the limit). The preview is at the pinned commit, and a commit id
+ * names its content, so a repository that serves it serves the same code.
  */
 export function reviewUrlOf(url: string): string | undefined {
   const candidate = url.startsWith("https://") ? url : httpsFormOfSshUrl(url);

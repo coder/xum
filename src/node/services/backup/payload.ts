@@ -127,6 +127,26 @@ export function hidesSecretBehindEscapes(text: string): boolean {
   return forms === undefined || forms.some(matchesSecretPattern);
 }
 
+/**
+ * True when any string of a JSON value, a value or an object key at any depth, hides a secret: it
+ * matches a pattern as the string is, or after its percent escapes are decoded
+ * (`hidesSecretBehindEscapes`). The publish-time scan reads the JSON text a value is written as,
+ * and JSON writes a control character as an escape: `"\nghp_..."` has no word boundary before the
+ * token, so the scan passes it while a reader of the decoded string sees the token. Checking the
+ * strings themselves leaves nothing for a JSON escape to hide behind.
+ */
+export function jsonValueHidesSecret(value: unknown): boolean {
+  if (typeof value === "string")
+    return matchesSecretPattern(value) || hidesSecretBehindEscapes(value);
+  if (Array.isArray(value)) return value.some(jsonValueHidesSecret);
+  if (value !== null && typeof value === "object") {
+    return Object.entries(value).some(
+      ([key, entry]) => jsonValueHidesSecret(key) || jsonValueHidesSecret(entry)
+    );
+  }
+  return false;
+}
+
 export interface BackupFile {
   path: string;
   content: Buffer;

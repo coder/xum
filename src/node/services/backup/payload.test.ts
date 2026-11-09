@@ -35,6 +35,7 @@ import {
   createBackupPayload,
   hidesSecretBehindEscapes,
   isFilesystemError,
+  jsonValueHidesSecret,
   localOnlyPayloadFiles,
   mergeBackupPreferences,
   matchedProjectWrites,
@@ -5766,6 +5767,59 @@ describe("hidesSecretBehindEscapes", () => {
     ["a space escaped three times", "https://h/My%252520Project/r.git"],
   ])("lets %s through", (_label, text) => {
     expect(hidesSecretBehindEscapes(text)).toBe(false);
+  });
+});
+
+describe("jsonValueHidesSecret", () => {
+  const token = `ghp_${"a".repeat(36)}`;
+  const publishScan = (value: unknown) =>
+    scanBackupFilesForSecrets(
+      [{ path: "agent-plugins/manifest.json", content: Buffer.from(JSON.stringify(value)) }],
+      resolveBackupContents({})
+    );
+
+  // JSON writes each of these first characters as an escape, so the token has no word boundary in
+  // the text the publish-time scan reads. The strings themselves have one.
+  it.each([
+    ["a newline", "\n"],
+    ["a tab", "\t"],
+    ["a carriage return", "\r"],
+    ["a control character written as \\u00XX", "\u0001"],
+    ["a lone surrogate", "\ud800"],
+  ])("finds a token after %s that the scan of the JSON text passes", (_label, prefix) => {
+    const value = { importedComponents: { skills: [], mcpServers: [`${prefix}${token}`] } };
+
+    expect(publishScan(value)).toEqual([]);
+    expect(jsonValueHidesSecret(value)).toBe(true);
+  });
+
+  it("finds a token in an object key, at any depth", () => {
+    const value = { a: [{ b: { [`\n${token}`]: 1 } }] };
+
+    expect(publishScan(value)).toEqual([]);
+    expect(jsonValueHidesSecret(value)).toBe(true);
+  });
+
+  it("finds a token that a percent escape hides, in a value or a key", () => {
+    expect(jsonValueHidesSecret({ url: `https://h/%20${token}/r.git` })).toBe(true);
+    expect(jsonValueHidesSecret({ [`%20${token}`]: "x" })).toBe(true);
+  });
+
+  it("finds a token that nothing hides", () => {
+    expect(jsonValueHidesSecret([{ name: token }])).toBe(true);
+  });
+
+  it("lets values through that hold no token", () => {
+    const value = {
+      name: "pstack",
+      url: "https://dev.azure.com/org/My%20Project/_git/x",
+      importedComponents: { skills: ["review\ntwo\tlines"], mcpServers: [] },
+      count: 3,
+      nothing: null,
+      flag: false,
+    };
+
+    expect(jsonValueHidesSecret(value)).toBe(false);
   });
 });
 
