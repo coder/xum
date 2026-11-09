@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { FIXTURES, fixtureProblems, type JestReport } from "./check-paint-check-fixtures";
+import {
+  FIXTURES,
+  fixtureProblems,
+  noReportMessage,
+  type JestReport,
+} from "./check-paint-check-fixtures";
 
 type Outcome = JestReport["testResults"][number]["assertionResults"][number];
 
@@ -79,5 +84,39 @@ describe("fixtureProblems", () => {
       expect(problems).toHaveLength(1);
       expect(problems[0]).toContain("not Jest's --json shape");
     }
+  });
+});
+
+describe("noReportMessage", () => {
+  test("names why node could not start, not null output", () => {
+    // What spawnSync returns when node is not on PATH: no status, no signal, no output.
+    const message = noReportMessage({
+      status: null,
+      signal: null,
+      error: new Error("spawnSync node ENOENT"),
+      stdout: null,
+      stderr: null,
+    });
+    expect(message).toContain("spawnSync node ENOENT");
+    expect(message).not.toMatch(/null|undefined/);
+  });
+
+  test("names the signal and error of a run that the timeout killed", () => {
+    const message = noReportMessage({
+      status: null,
+      signal: "SIGTERM",
+      error: new Error("spawnSync node ETIMEDOUT"),
+      stdout: "partial output",
+      stderr: "",
+    });
+    expect(message).toContain("signal SIGTERM");
+    expect(message).toContain("ETIMEDOUT");
+    expect(message).toContain("partial output");
+  });
+
+  test("names the exit status and the output of a run that left no report", () => {
+    const message = noReportMessage({ status: 1, signal: null, stdout: "out", stderr: "err" });
+    expect(message).toContain("exit 1");
+    expect(message).toContain("outerr");
   });
 });
