@@ -1,4 +1,7 @@
-import { fileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
+import {
+  agentSandboxCoversTools,
+  fileToolSandboxContext,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { withExecutionScope } from "./tools/withExecutionScope";
 import { getArtifactShelfRoot } from "@/node/services/artifactShelf";
@@ -3361,6 +3364,7 @@ export class TurnRequestBuilder {
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
             locks: this.dependencies.historyService.locks,
+            blocksGlobalWrites: () => agentSandboxCoversTools(toolsForModelConfig),
           },
         });
         if (options.recordTimings) {
