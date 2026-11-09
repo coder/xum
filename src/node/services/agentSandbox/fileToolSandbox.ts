@@ -127,8 +127,12 @@ async function isExempt(
     ...(access === "read" ? (context.readExemptPaths ?? []) : []),
   ];
   for (const entry of exempt) {
-    const real = await realPathFollowingLinks(runtime.normalizePath(entry, cwd));
-    if (real !== undefined && isPathAtOrUnder(realPath, real)) return true;
+    // The entry as spelled, not where a link at it points: a plan file that links to
+    // ~/.ssh/config would exempt that file (Codex review).
+    const spelled = runtime.normalizePath(entry, cwd);
+    const parent = await realPathFollowingLinks(path.dirname(spelled));
+    if (parent === undefined) continue;
+    if (isPathAtOrUnder(realPath, path.join(parent, path.basename(spelled)))) return true;
   }
   return false;
 }

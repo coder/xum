@@ -37,6 +37,25 @@ function homeOutsideWriteRoots(): Disposable {
   return { [Symbol.dispose]: () => tmpdir.mockRestore() };
 }
 
+/** Reads `standIn` where the policy reads the system file `system`; every other call is real. */
+function redirectSystemFile(system: string, standIn: string): Disposable {
+  const redirected = <F extends (...args: never[]) => unknown>(real: F): F =>
+    ((file: unknown, ...rest: unknown[]) =>
+      (real as unknown as (...args: unknown[]) => unknown)(
+        file === system ? standIn : file,
+        ...rest
+      )) as unknown as F;
+  const { statSync, readFileSync } = fsSync;
+  const stat = spyOn(fsSync, "statSync").mockImplementation(redirected(statSync));
+  const read = spyOn(fsSync, "readFileSync").mockImplementation(redirected(readFileSync));
+  return {
+    [Symbol.dispose]: () => {
+      stat.mockRestore();
+      read.mockRestore();
+    },
+  };
+}
+
 const savedRoot = process.env.XUM_ROOT;
 // Outside every write root, so a test that moves the home folder into a temp folder does not
 // move Xum's home folder there too, where the policy fails closed. It need not exist.
@@ -602,28 +621,27 @@ describe("buildAgentSandboxPolicy", () => {
   test("keeps what the system ssh config includes read-only", async () => {
     const systemConfig = path.join(root, "ssh_config");
     await fs.writeFile(systemConfig, `Include ${repo}/system.conf ../../${repo}/relative.conf\n`);
-    // Only the system config moves; every other call reaches the real function.
-    const redirected = <F extends (...args: never[]) => unknown>(real: F): F =>
-      ((file: unknown, ...rest: unknown[]) =>
-        (real as unknown as (...args: unknown[]) => unknown)(
-          file === "/etc/ssh/ssh_config" ? systemConfig : file,
-          ...rest
-        )) as unknown as F;
-    const { statSync, readFileSync } = fsSync;
-    const stat = spyOn(fsSync, "statSync").mockImplementation(redirected(statSync));
-    const read = spyOn(fsSync, "readFileSync").mockImplementation(redirected(readFileSync));
-    try {
-      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
-      const writable = (name: string) =>
-        agentSandboxPolicyAllows(policy, path.join(repo, name), "write");
+    using _redirect = redirectSystemFile("/etc/ssh/ssh_config", systemConfig);
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+    const writable = (name: string) =>
+      agentSandboxPolicyAllows(policy, path.join(repo, name), "write");
 
-      expect(writable("system.conf")).toBe(false);
-      expect(writable("relative.conf")).toBe(false);
-      expect(writable("notes.md")).toBe(true);
-    } finally {
-      stat.mockRestore();
-      read.mockRestore();
-    }
+    expect(writable("system.conf")).toBe(false);
+    expect(writable("relative.conf")).toBe(false);
+    expect(writable("notes.md")).toBe(true);
+  });
+
+  // Git reads the system config in every repository too, Xum's own git included.
+  test("keeps what the system git config includes read-only", async () => {
+    const systemConfig = path.join(root, "gitconfig");
+    await fs.writeFile(systemConfig, `[include]\n\tpath = ${repo}/system.gitconfig\n`);
+    using _redirect = redirectSystemFile("/etc/gitconfig", systemConfig);
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+    const writable = (name: string) =>
+      agentSandboxPolicyAllows(policy, path.join(repo, name), "write");
+
+    expect(writable("system.gitconfig")).toBe(false);
+    expect(writable("notes.md")).toBe(true);
   });
 
   // ssh follows a link that an Include wildcard matches.

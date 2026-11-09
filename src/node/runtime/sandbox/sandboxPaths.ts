@@ -89,11 +89,26 @@ export function cacheExecutablePaths(env: NodeJS.ProcessEnv = process.env): stri
 }
 
 /**
+ * The system config of the gits that macOS users run: Apple's and Nix's in /etc, Homebrew's and
+ * MacPorts' in their prefix, and the defaults that Apple's git ships with and also reads.
+ */
+const GIT_SYSTEM_CONFIG_FILES: readonly string[] = [
+  "/etc/gitconfig",
+  "/opt/homebrew/etc/gitconfig",
+  "/usr/local/etc/gitconfig",
+  "/opt/local/etc/gitconfig",
+  "/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig",
+  "/Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig",
+];
+
+/**
  * The config files that git reads in every repository, also where Xum's environment moves them:
- * Xum's own git runs outside the sandbox with that environment and runs what they name.
+ * Xum's own git runs outside the sandbox with that environment and runs what they name, and what
+ * they include (Codex review).
  */
 export function gitGlobalConfigFiles(env: NodeJS.ProcessEnv = process.env): string[] {
   return [
+    ...GIT_SYSTEM_CONFIG_FILES,
     ...["~/.gitconfig", "~/.config/git/config"].map(expandSandboxPathSpelling),
     ...envPath(env, "XDG_CONFIG_HOME", "git", "config"),
     ...envPath(env, "GIT_CONFIG_GLOBAL"),

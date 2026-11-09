@@ -236,6 +236,25 @@ describe("fileCommon", () => {
       });
     }
 
+    it("blocks writes through a plan file that is a link out of the plan folder", async () => {
+      using temp = new TestTempDir("file-sandbox");
+      const fixture = await sandboxFixture(temp);
+      const planFile = path.join(fixture.home, "plans", "plan.md");
+      await fs.symlink(path.join(fixture.home, "secret", "config"), planFile);
+
+      const outcome = await resolvePathWithinCwd(
+        planFile,
+        fixture.workspace,
+        fixture.runtime,
+        "write",
+        fixture.sandbox
+      ).then(
+        () => "allowed",
+        (error: unknown) => String(error)
+      );
+      expect(outcome).toMatch(/The agent sandbox blocks writes/);
+    });
+
     // Bash opens the folders on its PATH under ~ for reads, so the file tools must too.
     it("allows reads of a folder on the PATH that bash starts with", async () => {
       using temp = new TestTempDir("file-sandbox");
