@@ -195,7 +195,7 @@ export class FileChangeTracker {
           // Open nonblocking, classify with fstat on the acquired handle (a stat-then-read
           // check races a swap of the path), and read regular files from that same handle.
           // Non-regular files produce no attachment and keep their baseline, so a later
-          // regular edit is still diffed against the content the agent last saw.
+          // regular edit is still compared with the content the agent last saw.
           // This reads the host filesystem for every runtime (the tracker never goes through
           // the runtime), so the guard covers all of them. O_NONBLOCK is undefined on Windows.
           //
