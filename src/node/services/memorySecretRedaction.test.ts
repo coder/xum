@@ -3,10 +3,12 @@ import { describe, expect, it } from "bun:test";
 import { addsSecretLike, containsSecretLike, redactSecretLike } from "./memorySecretRedaction";
 
 // The linear-time check in `redactSecretLike` below: CPU limit for one scan at 100 KB (linear scans
-// take up to about 120 ms here), the most that doubling the text may cost, and the CPU time under
-// which a scan is too short to time (its ratio is noise).
+// take up to about 120 ms here), how many scans of each size are timed (the cheapest counts), the
+// most that doubling the text may cost, and the CPU time under which a scan is too short to time
+// (its ratio is noise).
 const MAX_SCAN_CPU_MS = 2_000;
-const MAX_GROWTH_FOR_DOUBLED_TEXT = 3;
+const SCANS_PER_SIZE = 5;
+const MAX_GROWTH_FOR_DOUBLED_TEXT = 3.3;
 const GROWTH_FLOOR_MS = 10;
 
 describe("redactSecretLike", () => {
@@ -569,9 +571,22 @@ describe("redactSecretLike", () => {
   // shape), so five shapes take 50 to 120 ms of CPU at 100 KB and still grow linearly. A fixed 100 ms bound
   // failed on that, with no load. So each scan runs on the text at 100 KB and at 200 KB, both past
   // the step, and the check uses CPU time, which a busy host inflates much less than wall time.
-  // The second scan must cost under 3 times the first (a floor keeps timer noise out of the ratio
+  // The second scan must cost under 3.3 times the first (a floor keeps timer noise out of the ratio
   // for scans of a few milliseconds). A scan over 2 s at 100 KB fails at once: a quadratic one takes
   // many seconds there.
+  //
+  // Each size is timed in 5 rounds, the two sizes in turns, and the cheapest run of each size
+  // counts. A busy host adds time to some runs and not to others, and a stall of a second or two
+  // can hit a whole batch of runs. With the cheapest of 2 runs per size, 8 of 4,800 ratios of
+  // linear scans passed 3 (up to 3.8). With the cheapest of 5 runs per size, one size after the
+  // other, no ratio passed 2.9 in the same 4,800, but a stall that hit 8 parallel copies of this
+  // test failed 8 of 107 runs. Timing the sizes in turns puts such a stall into the samples of
+  // both: 328 of 328 runs passed with 8 copies running in parallel beside 16 busy loops, while
+  // the host's one-minute load average went from 14 to 148. The scratch edits that make a scan
+  // quadratic fail it: the JWT lookbehind as `\b` and the PEM end without `|$` in 5 of 5 runs
+  // each (ratios 3.9 to 4.6 where it reports one, or the 60 s test limit), and the name suffix
+  // without its bound in 9 shapes per run (past the 2 s cap). The limit of 3.3 sits between the
+  // linear and the quadratic ratios.
   it.each<[label: string, build: (repetitions: number) => string, size: number]>([
     // [label, the text for `n` repetitions of the shape, the repetitions of a 100 KB write]
     ["token", (n) => "token".repeat(n), 20_000],
@@ -667,20 +682,28 @@ describe("redactSecretLike", () => {
     (_label, build, size) => {
       redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
       const cpuMs = (scan: (text: string) => unknown, text: string): number => {
-        let cheapest = Infinity;
-        for (let run = 0; run < 2; run++) {
-          const before = process.cpuUsage();
-          scan(text);
-          const used = process.cpuUsage(before);
-          cheapest = Math.min(cheapest, (used.user + used.system) / 1000);
-        }
-        return cheapest;
+        const before = process.cpuUsage();
+        scan(text);
+        const used = process.cpuUsage(before);
+        return (used.user + used.system) / 1000;
       };
       // Each scan gets its own check: `containsSecretLike` is a second pass of the same redaction.
       for (const scan of [redactSecretLike, containsSecretLike]) {
-        const base = cpuMs(scan, build(size));
+        const text = build(size);
+        const doubledText = build(2 * size);
+        let base = Infinity;
+        let doubled = Infinity;
+        // The two sizes are timed in turns, so a stall of the host that lasts a second or two
+        // slows samples of both and the cheapest of each still comes from a quiet moment.
+        for (let round = 0; round < SCANS_PER_SIZE; round++) {
+          const baseMs = cpuMs(scan, text);
+          expect(baseMs).toBeLessThan(2 * MAX_SCAN_CPU_MS); // a run that long needs no more rounds
+          const doubledMs = cpuMs(scan, doubledText);
+          base = Math.min(base, baseMs);
+          doubled = Math.min(doubled, doubledMs);
+          if (doubledMs > 4 * MAX_SCAN_CPU_MS) break;
+        }
         expect(base).toBeLessThan(MAX_SCAN_CPU_MS);
-        const doubled = cpuMs(scan, build(2 * size));
         expect(doubled).toBeLessThan(MAX_GROWTH_FOR_DOUBLED_TEXT * Math.max(base, GROWTH_FLOOR_MS));
       }
     },
