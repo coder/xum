@@ -5805,8 +5805,15 @@ describe("jsonValueHidesSecret", () => {
     expect(jsonValueHidesSecret({ [`%20${token}`]: "x" })).toBe(true);
   });
 
-  it("finds a token that nothing hides", () => {
-    expect(jsonValueHidesSecret([{ name: token }])).toBe(true);
+  it("leaves a token that the scan of the JSON text finds to the scan, which holds the file for review", () => {
+    const value = [{ name: token }, { url: `https://h/${token}/r.git` }];
+
+    expect(publishScan(value)).toEqual(["agent-plugins/manifest.json"]);
+    expect(jsonValueHidesSecret(value)).toBe(false);
+  });
+
+  it("still finds the hidden token in an entry that also holds a token the scan finds", () => {
+    expect(jsonValueHidesSecret([{ a: token }, { b: `\n${token}` }])).toBe(true);
   });
 
   it("lets values through that hold no token", () => {

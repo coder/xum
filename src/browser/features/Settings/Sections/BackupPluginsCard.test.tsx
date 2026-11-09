@@ -364,6 +364,7 @@ describe("reviewBackedUpPlugins", () => {
     ["a bare query mark", "https://github.com/o/r?x"],
     ["an at sign in the path", "https://github.com/o/r@x"],
     ["a backslash in the host", "https://github.com\\attacker.example/o/r"],
+    ["a backslash in the path", "https://example.com/a\\b"],
     ["a port over five digits", "https://github.com:123456/r"],
   ])("hands over no plugin whose https URL has %s", (_label, url) => {
     reviewBackedUpPlugins({

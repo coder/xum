@@ -242,6 +242,9 @@ describe("reviewUrlOf", () => {
     ["a bare query mark", "https://github.com/o/r?x"],
     ["an at sign in the path", "https://github.com/o/r@x"],
     ["a backslash in the host", "https://github.com\\attacker.example/o/r"],
+    // libcurl and git read a backslash as a slash or as part of a user part, WHATWG as a slash.
+    ["a backslash in the path", "https://example.com/a\\b"],
+    ["a backslash that starts the path", "https://example.com\\a/b"],
     ["a port over five digits", "https://github.com:123456/r"],
     ["an ssh source whose https form is on this machine", "git@127.0.0.1:example/repo.git"],
     ["an ssh URL whose https form is localhost", "ssh://git@localhost/example/repo.git"],
