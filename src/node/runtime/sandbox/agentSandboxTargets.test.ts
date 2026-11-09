@@ -498,6 +498,54 @@ describe("buildAgentSandboxPolicy", () => {
     }
   });
 
+  // Xum's own git fetch runs a ProxyCommand from it outside the sandbox.
+  test("keeps ~/.ssh/config read-only in a write root", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(path.join(home, ".ssh"), { recursive: true });
+    await fs.writeFile(path.join(home, ".ssh", "config"), "Host *\n");
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
+    try {
+      const policy = buildAgentSandboxPolicy(
+        { ...SETTINGS, extraWritePaths: ["~/.ssh"] },
+        { cwd: repo }
+      );
+      const writable = (name: string) =>
+        agentSandboxPolicyAllows(policy, path.join(home, ".ssh", name), "write");
+
+      expect(writable("config")).toBe(false);
+      expect(writable("known_hosts")).toBe(true);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  // Xum reads them into the prompt outside the sandbox, so a command could swap the target for a
+  // link to a key.
+  test("keeps a global instruction file that links into a write root read-only", async () => {
+    const home = path.join(root, "home");
+    const xumHome = path.join(root, "xum-home");
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.mkdir(xumHome);
+    for (const name of ["CLAUDE.md", "AGENTS.md"]) await fs.writeFile(path.join(repo, name), "");
+    await fs.symlink(path.join(repo, "CLAUDE.md"), path.join(home, ".claude", "CLAUDE.md"));
+    await fs.symlink(path.join(repo, "AGENTS.md"), path.join(xumHome, "AGENTS.md"));
+    process.env.XUM_ROOT = xumHome;
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+      const writable = (name: string) =>
+        agentSandboxPolicyAllows(policy, path.join(repo, name), "write");
+
+      expect(writable("CLAUDE.md")).toBe(false);
+      expect(writable("AGENTS.md")).toBe(false);
+      expect(writable("notes.md")).toBe(true);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
   // OpenSSH reads `a\ b` and `a" b"` as the one name `a b`.
   test("fails closed on an ssh Include argument that is escaped or quoted in part", async () => {
     const home = path.join(root, "home");

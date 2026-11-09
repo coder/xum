@@ -17,6 +17,7 @@ import {
   PROTECTED_GIT_DIR_PATHS,
   PROTECTED_LINKED_WORKTREE_PATHS,
   PROTECTED_WRITE_PATHS,
+  XUM_HOME_TOKEN,
   cacheExecutablePaths,
   dedupe,
   expandSandboxPath,
@@ -539,16 +540,17 @@ function childDirs(folder: string): string[] {
   }
 }
 
-// Beside the home folder's own dot entries.
-const HOME_LINK_FOLDERS: readonly string[] = ["~/.config", "~/.ssh"];
+// Beside the home folder's own dot entries. Xum reads the global instruction files in ~/.claude
+// and its home folder into the prompt (systemMessage.ts).
+const HOME_LINK_FOLDERS: readonly string[] = ["~/.config", "~/.ssh", "~/.claude", XUM_HOME_TOKEN];
 // ssh stops at 16 (READCONF_MAX_DEPTH), git at 10; following more only protects more.
 const MAX_INCLUDE_DEPTH = 16;
 const CONFIG_MAX_BYTES = 1024 * 1024;
 
 /**
- * The link targets of the dot entries in the home folder, and of the entries of `~/.config` and
- * `~/.ssh`. A dotfiles checkout links them into a workspace, and git, ssh, npx, bunx and the shell
- * read them outside the sandbox, Xum's own `git fetch` included. Not a target at or above a write
+ * The link targets of the dot entries in the home folder, and of the entries of HOME_LINK_FOLDERS.
+ * A dotfiles checkout links them into a workspace, and git, ssh, npx, bunx and the shell read them
+ * outside the sandbox, Xum's own `git fetch` and prompt included. Not a target at or above a write
  * root (`~/.dotfiles` linking to the checkout itself): that would close the whole root.
  */
 function homeLinkTargets(home: string, writeRoots: readonly string[]): string[] {

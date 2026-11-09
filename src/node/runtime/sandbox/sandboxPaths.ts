@@ -11,7 +11,7 @@ import { getXumHome } from "@/common/constants/paths";
  * a rule for /tmp (a symlink to /private/tmp) would match nothing.
  */
 
-const XUM_HOME_TOKEN = "<xumHome>";
+export const XUM_HOME_TOKEN = "<xumHome>";
 
 /** Temp folders every sandboxed command may write. */
 export function tempWritePaths(): string[] {
@@ -195,10 +195,11 @@ export const AUTOMATION_READ_PATHS: readonly string[] = [
 ];
 
 /**
- * Automation that stays closed for reads, as ~/.npmrc does: bunx for MCP servers runs the preload
- * that it names, and it can hold a registry token. extraReadPaths can open it.
+ * Automation that stays closed for reads: bunx for MCP servers runs the preload that
+ * ~/.bunfig.toml names, which can hold a registry token as ~/.npmrc can, and Xum's own `git fetch`
+ * runs a ProxyCommand from ~/.ssh/config, whose folder stays closed. extraReadPaths can open them.
  */
-export const HIDDEN_AUTOMATION_PATHS: readonly string[] = ["~/.bunfig.toml"];
+export const HIDDEN_AUTOMATION_PATHS: readonly string[] = ["~/.bunfig.toml", "~/.ssh/config"];
 
 // Open under ~ for each command, with the workspace, its scratch folder, the main .git of a
 // worktree, all write paths and extraReadPaths.
