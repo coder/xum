@@ -2,8 +2,8 @@
  * Integration test for file change notification injection.
  *
  * Tests that when a tracked file (like a plan file) is modified externally,
- * the change is detected and injected as a synthetic user message with
- * <system-file-update> tags into the message stream sent to the LLM.
+ * the change is detected and a synthetic user message with <system-file-update>
+ * tags, which names the file but not the change, joins the message stream sent to the LLM.
  *
  * This tests the cache-preserving approach where file changes are communicated
  * via user messages rather than system message modifications.
@@ -182,11 +182,12 @@ describeIntegration("File Change Notification Integration", () => {
           const textPart = fileChangeMessage.parts?.find((p) => p.type === "text");
           expect(textPart?.text).toContain("<system-file-update>");
           expect(textPart?.text).toContain("</system-file-update>");
-          expect(textPart?.text).toContain("was modified");
-          // Should contain the diff showing the changes
-          expect(textPart?.text).toContain("Modified plan content");
-          expect(textPart?.text).toContain("Step 2");
-          expect(textPart?.text).toContain("New step added");
+          expect(textPart?.text).toContain("changed on disk");
+          // The notice is a user-role row, so it names the file and copies none of the change:
+          // the agent reads the new content through file_read, which returns a tool result.
+          expect(textPart?.text).toContain(workspaceName);
+          expect(textPart?.text).not.toContain("Modified plan content");
+          expect(textPart?.text).not.toContain("New step added");
         }
       }
     } finally {

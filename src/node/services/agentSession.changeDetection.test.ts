@@ -8,10 +8,10 @@ import { computeDiff } from "@/node/utils/diff";
 /**
  * Tests for external file change detection via FileChangeTracker.
  *
- * Pattern: timestamp-based polling with diff injection
+ * Pattern: timestamp-based polling with a content-free notice
  * 1. Track file state (content + mtime) when reading/writing files
  * 2. Poll before each LLM query to detect external modifications
- * 3. Compute diff and inject as context attachment if changed
+ * 3. Report the changed file's name (never its content or diff) if the content changed
  */
 
 describe("AgentSession change detection", () => {
@@ -70,12 +70,9 @@ describe("AgentSession change detection", () => {
       // Check for changes - should detect the modification
       const { attachments } = await tracker.getChangedAttachments();
 
-      expect(attachments).toHaveLength(1);
-      expect(attachments[0].type).toBe("edited_text_file");
-      expect(attachments[0].filename).toBe(testFile);
-      expect(attachments[0].snippet).toContain("Do something better");
-      expect(attachments[0].snippet).toContain("Step 2");
-      expect(attachments[0].snippet).toContain("New step");
+      // toEqual: the attachment names the file and carries nothing else, so the changed
+      // content cannot reach the user-role notice built from it.
+      expect(attachments).toEqual([{ type: "edited_text_file", filename: testFile }]);
     });
 
     it("should update stored state only after commit()", async () => {
@@ -104,7 +101,7 @@ describe("AgentSession change detection", () => {
       // instead of silently dropping it.
       const retryCheck = await tracker.getChangedAttachments();
       expect(retryCheck.attachments).toHaveLength(1);
-      expect(retryCheck.attachments[0].snippet).toBe(firstCheck.attachments[0].snippet);
+      expect(retryCheck.attachments).toEqual(firstCheck.attachments);
 
       // After commit() (notification durably persisted), the change is
       // acknowledged and no longer reported.
@@ -185,34 +182,6 @@ describe("AgentSession change detection", () => {
       expect(attachments).toHaveLength(0);
     });
 
-    it("should produce valid unified diff format", async () => {
-      const tracker = new FileChangeTracker();
-      const testFile = join(tmpDir, "plan.md");
-      const originalContent = "line 1\nline 2\nline 3\nline 4\nline 5";
-
-      await writeFile(testFile, originalContent);
-      const originalMtime = await getMtime(testFile);
-
-      await tracker.record(testFile, { content: originalContent, timestamp: originalMtime });
-
-      // Modify middle line
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      const modifiedContent = "line 1\nline 2\nmodified line 3\nline 4\nline 5";
-      await writeFile(testFile, modifiedContent);
-      const newMtime = Date.now() + 1000;
-      await utimes(testFile, newMtime / 1000, newMtime / 1000);
-
-      const { attachments } = await tracker.getChangedAttachments();
-
-      expect(attachments).toHaveLength(1);
-      const diff = attachments[0].snippet;
-
-      // Verify unified diff format
-      expect(diff).toContain("@@");
-      expect(diff).toContain("-line 3");
-      expect(diff).toContain("+modified line 3");
-    });
-
     it("should detect changes when tracked through symlink path and modified through real path", async () => {
       const tracker = new FileChangeTracker();
       const realWorkspaceDir = join(tmpDir, "workspace-real");
@@ -239,7 +208,6 @@ describe("AgentSession change detection", () => {
 
       expect(attachments).toHaveLength(1);
       expect(attachments[0].filename).toBe(canonicalFilePath);
-      expect(attachments[0].snippet).toContain(modifiedContent);
     });
 
     it("should treat symlink and real paths as the same tracked file", async () => {
@@ -272,7 +240,6 @@ describe("AgentSession change detection", () => {
       const { attachments } = await tracker.getChangedAttachments();
       expect(attachments).toHaveLength(1);
       expect(attachments[0].filename).toBe(canonicalFilePath);
-      expect(attachments[0].snippet).toContain(modifiedContent);
     });
 
     it("should expose count and paths getters", async () => {

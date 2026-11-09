@@ -15,11 +15,12 @@ export interface FileState {
 
 /**
  * Attachment for files that were edited externally between messages.
+ *
+ * Deliberately carries no content or diff: see createFileChangeNotificationMessage.
  */
 export interface EditedFileAttachment {
   type: "edited_text_file";
   filename: string;
-  snippet: string; // diff of changes
 }
 
 /**
@@ -44,12 +45,30 @@ interface DetectedChange {
 }
 
 /**
+ * A file name inside the notice, as a JSON string. JSON escapes quotes and newlines, so the name
+ * cannot start a new line of the notice. `<` is escaped too (as in artifactBridge's inline JSON),
+ * so a name that holds `</system-file-update>` cannot close the frame early.
+ */
+function quoteFilename(filename: string): string {
+  return JSON.stringify(filename).replace(/</g, "\\u003c");
+}
+
+/**
  * Build the durable <system-file-update> notification for externally edited files.
  *
  * Appended to chat.jsonl at turn start — BEFORE the request is built from
  * history — so the provider request stays a pure function of the session log
  * (anything model-visible must exist as a durable history row first). There is
  * intentionally no request-time injection path for these notifications.
+ *
+ * The row is user-role, and the model replays it as the user's own words on every later
+ * request until compaction. Any process can write a tracked file (a formatter, the agent's
+ * own bash, `git pull`, another agent in a shared checkout), so the row names the file and
+ * copies none of its content. The agent reads the content through `file_read`, which returns
+ * it as a tool result. The row also does not say who made the change: Xum cannot know.
+ * The file name stays in the row (the agent needs it to read the file), escaped by
+ * quoteFilename. Keep the `file-change-` id, the `<system-file-update>` prefix and
+ * `synthetic: true`: the renderer hides the row by them, and older clients do the same.
  */
 export function createFileChangeNotificationMessage(
   changedFileAttachments: EditedFileAttachment[]
@@ -59,9 +78,11 @@ export function createFileChangeNotificationMessage(
   const notice = changedFileAttachments
     .map(
       (att) =>
-        `Note: ${att.filename} was modified, either by the user or by a linter.\n` +
-        `This change was intentional, so make sure to take it into account as you proceed ` +
-        `(i.e., don't revert it unless the user asks you to). Here are the relevant changes:\n${att.snippet}`
+        `Note: ${quoteFilename(att.filename)} changed on disk after Xum last recorded it ` +
+        `(your last edit of it, or the user's @-mention of it).\n` +
+        `Xum cannot tell who changed it, so it does not copy the change into this message. ` +
+        `Read the file with file_read before you edit it again. ` +
+        `Do not revert the change unless the user asks you to.`
     )
     .join("\n\n");
 
@@ -79,7 +100,7 @@ export function createFileChangeNotificationMessage(
 /**
  * Tracks file content state and detects external modifications.
  *
- * Used to append diffs of externally-edited files as durable history rows
+ * Used to append notices of externally-edited files as durable history rows
  * before each LLM query.
  */
 export class FileChangeTracker {
@@ -196,14 +217,15 @@ export class FileChangeTracker {
             if (currentMtime <= trackedState.timestamp) return null; // No change
 
             const currentContent = await handle.readFile("utf-8");
-            const diff = computeDiff(trackedState.content, currentContent);
-            if (!diff) return null; // Content identical despite mtime change
+            // Only whether the content changed matters: the diff text is never used (it would put
+            // process-written text in a user-role row), so the notice fires exactly when it did.
+            // A null diff means the content is identical despite the mtime change.
+            if (!computeDiff(trackedState.content, currentContent)) return null;
 
             return {
               attachment: {
                 type: "edited_text_file",
                 filename: canonicalPath,
-                snippet: diff,
               },
               canonicalPath,
               detectedState: { content: currentContent, timestamp: currentMtime },

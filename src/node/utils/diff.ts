@@ -1,6 +1,7 @@
 /**
  * Simple line-based diff utility for detecting external file edits.
- * Uses timestamp-based polling with diff injection.
+ * Uses timestamp-based polling. FileChangeTracker calls computeDiff only to learn whether the content
+ * changed: the diff text is never copied into the model's context (the notice names the file only).
  */
 
 /**

@@ -622,14 +622,14 @@ describe.skipIf(process.platform === "win32")(
 
       expect(detection.attachments.map((a) => path.basename(a.filename))).toEqual(["notes.md"]);
       // The FIFO was skipped without advancing its baseline: a later regular file at that path
-      // still diffs against the content the agent last saw.
+      // is compared with the content the agent last saw. Identical bytes are no change, so a
+      // baseline that the FIFO had moved would report a change here.
       const planPath = path.join(dir, "plan.md");
       await fs.rm(planPath);
       fifoPath = undefined;
-      await fs.writeFile(planPath, "# plan v2\n");
+      await fs.writeFile(planPath, "# plan\n");
       const after = await tracker.getChangedAttachments();
-      expect(after.attachments).toHaveLength(1);
-      expect(after.attachments[0].snippet).toContain("-# plan");
+      expect(after.attachments).toHaveLength(0);
     });
 
     test("control: a regular file at a tracked path is read and reported", async () => {
