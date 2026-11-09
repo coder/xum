@@ -1084,6 +1084,28 @@ function pruneLegacyValuesIn(
   }
   return uneditable;
 }
+/**
+ * Ids of the workspaces whose config.json entry carries a legacy `workspace.mcp` value that may
+ * name `keyPrefix` keys (see legacyValueMayNameKey): the legacy values a plugin sweep must prune.
+ * A value that cannot name the key is no candidate: when any value made its workspace one, a
+ * registry of 7,550 workspaces with one in five carrying an unrelated value locked about 1,500
+ * workspaces that held nothing to prune.
+ */
+function idsWithLegacyValuesNamingKey(config: ProjectsConfig, keyPrefix: string): Set<string> {
+  const ids = new Set<string>();
+  for (const projectConfig of config.projects.values()) {
+    for (const workspace of projectConfig.workspaces) {
+      // legacyValueMayNameKey answers yes for anything it cannot parse, an absent value included.
+      if (
+        workspace.id !== undefined &&
+        workspace.mcp !== undefined &&
+        legacyValueMayNameKey(workspace.mcp, keyPrefix)
+      )
+        ids.add(workspace.id);
+    }
+  }
+  return ids;
+}
 /** Ids of the workspaces whose config.json entry still carries a legacy `workspace.mcp` value. */
 function idsWithLegacyOverrides(config: ProjectsConfig): Set<string> {
   const ids = new Set<string>();
@@ -1602,9 +1624,9 @@ function groupMetadataById(
  * Each host-local workspace's part in a plugin sweep, as one string per id: what the scan's
  * verdict on it rests on. That is its checkout (where its documents live and which workspaces
  * share them), project, parent (what it inherits), runtime and isolation, and whether its
- * config.json entry carries a legacy `workspace.mcp` value (`legacyIds`; a value makes it a
- * candidate). Fields that change often and decide nothing here, such as its title or task
- * status, are left out.
+ * config.json entry carries a legacy `workspace.mcp` value that may name the swept key
+ * (`legacyIds`; such a value makes it a candidate). Fields that change often and decide nothing
+ * here, such as its title or task status, are left out.
  */
 function sweepIdentitiesById(
   registry: readonly FrontendWorkspaceMetadata[],
@@ -1615,14 +1637,15 @@ function sweepIdentitiesById(
   for (const [id, entries] of groupMetadataById([...registry], /* hostLocalOnly */ true)) {
     const identity = entries
       .map((metadata) =>
+        // JSON.stringify writes an absent field in an array as null.
         JSON.stringify([
           metadata.projectPath,
           checkoutOf(metadata),
-          metadata.parentWorkspaceId ?? null,
+          metadata.parentWorkspaceId,
           metadata.runtimeConfig,
-          metadata.taskIsolation ?? null,
-          metadata.projects ?? null,
-          metadata.subProjectPath ?? null,
+          metadata.taskIsolation,
+          metadata.projects,
+          metadata.subProjectPath,
         ])
       )
       .sort()
@@ -5174,7 +5197,7 @@ export class WorkspaceMcpOverridesService {
       );
       const changed = this.changedSinceScan(
         registry,
-        idsWithLegacyOverrides(snapshot.loadLegacyConfig()),
+        idsWithLegacyValuesNamingKey(snapshot.loadLegacyConfig(), keyPrefix),
         plan
       );
       if (locked === undefined) {
@@ -5272,9 +5295,10 @@ export class WorkspaceMcpOverridesService {
    * — a dead mount costs the scan that bound, not the sweep's lock hold) and name the
    * CANDIDATES: workspaces whose documents may carry `keyPrefix`, plus every workspace
    * the scan could not read (timeout, error, too large, not registered host-local), plus
-   * every workspace with a legacy config.json `workspace.mcp` value (it decides in place of
-   * an absent or empty document, so it can bring a key along). Then close the set over what
-   * a prune of a candidate reaches (see sweepClosure): those workspaces are the ones to lock.
+   * every workspace with a legacy config.json `workspace.mcp` value that may name the key (it
+   * decides in place of an absent or empty document, so it can bring the key along). Then close
+   * the set over what a prune of a candidate reaches (see sweepClosure): those workspaces are
+   * the ones to lock.
    * A scan that meets a checkout that does not answer stops within a fixed window (see
    * SweepScan): the workspaces it did not read by then are UNSCANNED.
    */
@@ -5293,7 +5317,9 @@ export class WorkspaceMcpOverridesService {
     // mutation-equivalent: callers sweep host-local ids; an off-host entry that was scanned would
     // fail to read or hold no key, and the sweep reports the id as not found either way
     const entriesById = groupMetadataById(registry, /* hostLocalOnly */ true);
-    const legacyIds = idsWithLegacyOverrides(snapshot.loadLegacyConfig());
+    const legacyConfig = snapshot.loadLegacyConfig();
+    const legacyIds = idsWithLegacyValuesNamingKey(legacyConfig, keyPrefix);
+    const withLegacyValue = idsWithLegacyOverrides(legacyConfig);
     const ids = [...new Set(workspaceIds.map((id) => id.trim()))];
     const candidateIds = new Set<string>();
     const unscanned = new Set<string>();
@@ -5303,7 +5329,11 @@ export class WorkspaceMcpOverridesService {
     };
     await mapWithConcurrency(ids, CHECKOUT_IO_CONCURRENCY, async (id) => {
       const entries = entriesById.get(id);
-      // A legacy value, or an id the registry does not list, is a candidate without a read.
+      // A legacy value that cannot name the key is read like a document that holds none: the
+      // sweep owes the epoch for it (documentedIds) and does not lock it.
+      if (withLegacyValue.has(id)) scan.documented.add(id);
+      // A legacy value that may name the key, or an id the registry does not list, is a
+      // candidate without a read.
       if (legacyIds.has(id) || entries === undefined) {
         candidateIds.add(id);
       } else if (Date.now() >= scan.closesAt) {

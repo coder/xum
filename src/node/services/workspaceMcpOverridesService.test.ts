@@ -6,6 +6,7 @@ import * as nodeFs from "node:fs";
 import { parse as jsoncParse, type ParseError as JsoncParseError } from "jsonc-parser";
 import * as os from "os";
 import * as path from "path";
+import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { Config, type ProjectsConfig } from "@/node/config";
 import { withProjectRegistrationFileLock } from "@/node/config/projectRegistrationLock";
 import { log } from "@/node/services/log";
@@ -5167,6 +5168,44 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(shared("ws-ssh-alias-a", "ws-ssh-alias-c")).toHaveLength(0);
   });
 
+  it("a workspace lock takes the lock file that other Xum builds take for it", async () => {
+    // Two builds on one host (a desktop app and `xum run`, or an older and a newer one) contend
+    // only when they name the same lock file, so its name is a compatibility contract. This
+    // literal is the name main derives for an id the registry does not list.
+    const service = new WorkspaceMcpOverridesService(config);
+    const release = await service.acquireWorkspaceLock("ws-never-registered");
+    try {
+      const lockFile = path.join(
+        config.rootDir,
+        "mcp-overrides-locks",
+        "5fb68fec6a7f045d346e86befcb271ba.lock"
+      );
+      expect(nodeFs.existsSync(lockFile)).toBe(true);
+    } finally {
+      await release();
+    }
+  });
+
+  it("a workspace lock reads only the registry: it probes no checkout", async () => {
+    // Every save takes this lock, and the plugin sweep's barrier takes it for every workspace.
+    // A probing enumeration stats each registered checkout: one stat per workspace per lock at
+    // 7,550 workspaces, and a wait on any stalled mount.
+    const service = new WorkspaceMcpOverridesService(config);
+    const subject = await registerWorkspace("probe-free-subject");
+    await registerWorkspace("probe-free-other");
+    const probes = spyOn(
+      config as unknown as { checkoutExists: (...args: unknown[]) => Promise<boolean> },
+      "checkoutExists"
+    );
+    try {
+      const release = await service.acquireWorkspaceLock(subject.workspaceId);
+      await release();
+      expect(probes).not.toHaveBeenCalled();
+    } finally {
+      probes.mockRestore();
+    }
+  });
+
   it("an id registered on several checkouts locks every one of them", async () => {
     // Corrupted config can list one stable id under several entries; the
     // plugin sweep prunes every host-local checkout carrying it, so the
@@ -5728,6 +5767,56 @@ describe("WorkspaceMcpOverridesService", () => {
       expect((await reader.getOverridesForWorkspace(legacy.workspaceId)).overrides).toEqual({
         enabledServers: ["other"],
       });
+    });
+
+    it("prunePluginOverrideKeysForWorkspaces locks a workspace for its legacy config.json value only when the value may name the key", async () => {
+      // Every legacy value made its workspace a candidate: at 7,550 workspaces with one in five
+      // carrying an unrelated value, the sweep locked about 1,500 workspaces and one install
+      // ran out of its budget. The scan reads a legacy value as it reads a document.
+      const service = new WorkspaceMcpOverridesService(config);
+      const unrelated = await registerWorkspace("legacy-unrelated");
+      const unrelatedWithDoc = await registerWorkspace("legacy-unrelated-keyed-doc");
+      const keyed = await registerWorkspace("legacy-keyed");
+      await writeDoc(unrelatedWithDoc.workspacePath, [staleKey, "other"]);
+      const legacyValues = new Map<string, WorkspaceMCPOverrides>([
+        [unrelated.workspaceId, { enabledServers: ["shots"] }],
+        [unrelatedWithDoc.workspaceId, { enabledServers: ["shots"] }],
+        [keyed.workspaceId, { enabledServers: [staleKey, "other"] }],
+      ]);
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const entry of project.workspaces) {
+            const value = legacyValues.get(entry.id ?? "");
+            if (value !== undefined) entry.mcp = value;
+          }
+        }
+        return cfg;
+      });
+      const everyone = [unrelated, unrelatedWithDoc, keyed];
+      const tracked = await trackLockedWorkspaces(service, everyone);
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces(
+          everyone.map((workspace) => workspace.workspaceId),
+          prefix
+        );
+      } finally {
+        tracked.restore();
+      }
+
+      expect(failures).toEqual([]);
+      expect([...tracked.locked].sort()).toEqual(
+        [unrelatedWithDoc.workspaceId, keyed.workspaceId].sort()
+      );
+      expect(await enabledOf(unrelatedWithDoc.workspacePath)).toEqual(["other"]);
+      const stored = new Map(
+        [...config.loadConfigOrDefault().projects.values()]
+          .flatMap((project) => project.workspaces)
+          .map((entry) => [entry.id, entry.mcp])
+      );
+      expect(stored.get(unrelated.workspaceId)).toEqual({ enabledServers: ["shots"] });
+      expect(stored.get(unrelatedWithDoc.workspaceId)).toEqual({ enabledServers: ["shots"] });
+      expect(stored.get(keyed.workspaceId)).toEqual({ enabledServers: ["other"] });
     });
 
     it("prunePluginOverrideKeysForWorkspaces prunes the key from a legacy config.json value next to a document", async () => {
@@ -6501,6 +6590,20 @@ describe("WorkspaceMcpOverridesService", () => {
         },
       },
       {
+        writer: "multi-project change",
+        change: async (subject: { workspaceId: string }) => {
+          await config.editConfig((cfg) => {
+            for (const [projectPath, project] of cfg.projects) {
+              for (const entry of project.workspaces) {
+                if (entry.id !== subject.workspaceId) continue;
+                entry.projects = [{ projectPath, projectName: path.basename(projectPath) }];
+              }
+            }
+            return cfg;
+          });
+        },
+      },
+      {
         writer: "project move",
         change: async (subject: { workspaceId: string; workspacePath: string }) => {
           await config.editConfig((cfg) => {
@@ -6576,6 +6679,36 @@ describe("WorkspaceMcpOverridesService", () => {
         expect(String(failures[0].error)).toMatch(/changed or vanished in the registry/);
       }
     );
+
+    it("prunePluginOverrideKeysForWorkspaces fails no off-host workspace whose entry changes during its scan", async () => {
+      // The sweep neither reads nor prunes an off-host checkout (plugin servers never run
+      // there), so a change to its entry decides nothing: failing it kept a tombstone the
+      // sweep had no way to retire.
+      const service = new WorkspaceMcpOverridesService(config);
+      const subject = await registerWorkspace("offhost-change-subject");
+      await writeDoc(subject.workspacePath, ["shots"]);
+      const remote = (name: string) => ({
+        path: `/remote/${name}`,
+        id: "ws-offhost-changed",
+        name,
+        runtimeConfig: { type: "ssh" as const, host: "unreachable.invalid", srcBaseDir: "/remote" },
+      });
+      const setRemote = (name: string) =>
+        config.editConfig((cfg) => {
+          cfg.projects.set("/fake/offhost-changed", { workspaces: [remote(name)] });
+          return cfg;
+        });
+      await setRemote("before");
+
+      const failures = await sweepWithChangeDuringScan(
+        service,
+        [subject.workspaceId],
+        docOf(subject.workspacePath),
+        () => setRemote("after")
+      );
+
+      expect(failures).toEqual([]);
+    });
 
     it("prunePluginOverrideKeysForWorkspaces fails a workspace that a fork or create registers during its scan", async () => {
       // Registered after the scan's registry read, so the scan never read its documents: a fork
@@ -6716,9 +6849,9 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(index.get(projectPath)?.length).toBe(5_000);
     });
 
-    it("sweepClosure follows every checkout of a duplicated id to its aliases", async () => {
+    it("sweepClosure follows every checkout of a duplicated id to its aliases, and back", async () => {
       // A corrupted config can list one id on two checkouts. Each checkout's aliases share its
-      // document, so the walk reaches them from either entry.
+      // document, so the walk reaches them from either entry, and the id from either alias.
       const projects = ["dup-checkout-a", "dup-checkout-b"].map((name) => path.join(tempDir, name));
       await config.editConfig((cfg) => {
         for (const [index, projectPath] of projects.entries()) {
@@ -6743,13 +6876,14 @@ describe("WorkspaceMcpOverridesService", () => {
       });
       const registry = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
 
-      const members = sweepClosure(
-        registry,
-        ["ws-dup-checkouts"],
-        (metadata) => metadata.projectPath
-      );
+      const checkoutOf = (metadata: { projectPath: string }) => metadata.projectPath;
+      const everyone = ["ws-dup-checkouts", "ws-dup-twin-0", "ws-dup-twin-1"];
 
-      expect([...members].sort()).toEqual(["ws-dup-checkouts", "ws-dup-twin-0", "ws-dup-twin-1"]);
+      expect([...sweepClosure(registry, ["ws-dup-checkouts"], checkoutOf)].sort()).toEqual(
+        everyone
+      );
+      // From an alias of either checkout, too: the second entry shares its checkout as well.
+      expect([...sweepClosure(registry, ["ws-dup-twin-1"], checkoutOf)].sort()).toEqual(everyone);
     });
 
     it("prunePluginOverrideKeysForWorkspaces fails only a workspace whose runtime cannot be built, and prunes the others", async () => {
@@ -7091,11 +7225,10 @@ describe("WorkspaceMcpOverridesService", () => {
       // Past the budget, each workspace's publication still ran under a 0 ms deadline with
       // its own eviction: 300 workspaces and a slow publisher held the locks twice the budget.
       const service = new WorkspaceMcpOverridesService(config);
-      const workspaces = [
-        await registerWorkspace("spent-a"),
-        await registerWorkspace("spent-b"),
-        await registerWorkspace("spent-c"),
-      ];
+      const workspaces: Array<{ workspaceId: string; workspacePath: string }> = [];
+      for (const name of ["a", "b", "c", "d", "e", "f"]) {
+        workspaces.push(await registerWorkspace(`spent-${name}`));
+      }
       for (const workspace of workspaces) {
         await writeDoc(workspace.workspacePath, [staleKey, "other"]);
       }
@@ -7126,12 +7259,17 @@ describe("WorkspaceMcpOverridesService", () => {
 
       // The prunes landed, so the rest are clean: their next serve reads the pruned documents.
       expect(failures).toEqual([]);
-      // No workspace's own publication: one eviction of every cache when the budget is found
-      // spent, under the locks, and the sweep's usual one after them.
-      expect(publishedAfterBudget).toEqual([
-        [ALL_WORKSPACES_TARGET, null],
-        [ALL_WORKSPACES_TARGET, null],
-      ]);
+      // No workspace's own publication after the budget: only evictions of every cache, and
+      // their number does not grow with the workspaces left. One comes when the loop finds the
+      // budget spent, under the locks, and one is the sweep's usual one after them. The fan-out
+      // of the publication that spent the budget can add a third, depending on where in it the
+      // budget ran out. Five workspaces were left: a loop that went on evicting for each of
+      // them, under the locks, adds four more.
+      expect(publishedAfterBudget.length).toBeGreaterThanOrEqual(2);
+      expect(publishedAfterBudget.length).toBeLessThanOrEqual(3);
+      for (const publication of publishedAfterBudget) {
+        expect(publication).toEqual([ALL_WORKSPACES_TARGET, null]);
+      }
       for (const workspace of workspaces) {
         expect(await enabledOf(workspace.workspacePath)).toEqual(["other"]);
       }
