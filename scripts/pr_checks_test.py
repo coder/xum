@@ -105,7 +105,7 @@ elif args[:2] == ['api', 'graphql']:
             sys.exit(1)
     elif 'reviewThreads' in query:
         print(json.dumps({'data': {'repository': {'pullRequest': {'reviewThreads': {
-            'nodes': fixture.get('threads', []), 'pageInfo': {'hasNextPage': False, 'endCursor': None}
+            'nodes': fixture.get('threads', []), 'pageInfo': {'hasNextPage': fixture.get('threads_has_next', False), 'endCursor': None}
         }}}}}))
     else:
         raise AssertionError(query)
@@ -174,13 +174,42 @@ else:
                 failed = check(name, "FAILURE", suite=2, workflow=workflow)
                 result = self.assert_gate(1, fixture([check(), failed], "BLOCKED"), "--details")
                 self.assertIn(failed["detailsUrl"], result.stdout)
+        # A link is not an identity either: a PR author can set the details URL of its own check run.
+        linked = check("Lint", "FAILURE", suite=2)
+        linked["detailsUrl"] = "https://pixel.coder.com/@coder/mux/builds/1"
+        result = self.assert_gate(1, fixture([check(), linked], "BLOCKED"), "--details")
+        self.assertIn(linked["detailsUrl"], result.stdout)
 
     def test_pixels_own_job_and_status_stay_optional(self):
         job = check("Visual Regression Testing", "FAILURE", suite=2, workflow="Pixel")
-        self.assert_gate(0, fixture([check(), job, pixel()], "UNSTABLE"))
+        result = self.assert_gate(0, fixture([check(), job, pixel()], "UNSTABLE"))
+        # The job and the pending status are both ignored, and the line says so.
+        self.assertIn("PASSED checks=1 visual_ignored=2", result.stdout.splitlines())
         status = pixel()
         status.update(context="pixel / x", state="FAILURE", targetUrl="https://ci.example/x")
-        self.assert_gate(0, fixture([check(), status], "UNSTABLE"))
+        result = self.assert_gate(0, fixture([check(), status], "UNSTABLE"))
+        self.assertIn("PASSED checks=1 visual_ignored=1", result.stdout.splitlines())
+        # A status context is also Pixel's when it links to pixel.coder.com, whatever its name.
+        linked = pixel()
+        linked.update(context="Visual", state="FAILURE")
+        result = self.assert_gate(0, fixture([check(), linked], "UNSTABLE"))
+        self.assertIn("PASSED checks=1 visual_ignored=1", result.stdout.splitlines())
+
+    def test_details_lists_the_ignored_visual_checks_and_the_default_does_not(self):
+        heading = "Ignoring visual-review unready checks"
+        ignored = pixel()["targetUrl"]
+        for expected, nodes, merge_state in (
+            (1, [check(), check(conclusion="FAILURE", suite=2), pixel()], "BLOCKED"),
+            (0, [check(), pixel()], "UNSTABLE"),
+        ):
+            with self.subTest(expected=expected):
+                data = fixture(nodes, merge_state)
+                default = self.assert_gate(expected, data)
+                self.assertNotIn(heading, default.stdout)
+                self.assertNotIn(ignored, default.stdout)
+                details = self.assert_gate(expected, data, "--details")
+                self.assertIn(heading, details.stdout)
+                self.assertIn(ignored, details.stdout)
 
     def test_hostile_check_text_is_printed_only_by_details(self):
         def hostile_check(conclusion):
@@ -202,6 +231,30 @@ else:
                 self.assertEqual(sum(row.startswith(("FAILED ", "PASSED ")) for row in result.stdout.splitlines()), 1)
                 self.assertIn(line, result.stdout.splitlines())
                 self.assertIn(HOSTILE_MARKER, self.assert_gate(expected, data, "--details").stdout)
+
+    def test_values_that_the_checks_gate_rejects_are_not_printed_back(self):
+        for field in ("state", "mergeable", "mergeStateStatus", "reviewDecision"):
+            with self.subTest(field=field):
+                data = fixture([check()])
+                data["pr"][field] = HOSTILE
+                result = self.assert_gate(1, data)
+                self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+                self.assertIn("unexpected", result.stdout + result.stderr)
+
+    def test_values_that_the_review_reader_rejects_are_not_printed_back(self):
+        data = fixture([check()])
+        data["threads_has_next"] = HOSTILE
+        result = self.run_script(data, "check_pr_reviews.sh", "--counts-only")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+        self.assertIn("unexpected hasNextPage value", result.stderr)
+        cache = self.directory / "cache.json"
+        cache.write_text(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {
+            "nodes": [], "pageInfo": {"hasPreviousPage": HOSTILE, "hasNextPage": False},
+        }}}}}))
+        result = self.run_script(fixture([check()]), "check_pr_reviews.sh", env_extra={"MUX_PR_DATA_FILE": str(cache)})
+        self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+        self.assertIn("unexpected cached hasPreviousPage value", result.stderr)
 
     def test_the_review_gate_prints_a_count_and_never_a_review_body(self):
         data = fixture([check()])
@@ -415,13 +468,15 @@ if os.environ.get('GH_DEBUG') or os.environ.get('DEBUG'):
     # What gh's debug logging does: the whole reply goes to stderr.
     print(os.environ['HOSTILE_TEXT'], file=sys.stderr)
 if args[:2] == ['repo', 'view']:
-    print(json.dumps({'owner': 'fixture', 'name': 'repo'}))
+    print(os.environ.get('GATE_REPO_VIEW') or json.dumps({'owner': 'fixture', 'name': 'repo'}))
 elif args[:2] == ['pr', 'view'] and '--jq' in args:
-    print('OPEN')
+    print(os.environ.get('GATE_PR_STATE') or 'OPEN')
 elif args[:2] == ['pr', 'view']:
     print(json.dumps({'headRefName': 'x', 'headRefOid': '1' * 40, 'isCrossRepository': True}))
 elif args[:2] == ['api', 'graphql']:
-    print(open(os.environ['GATE_FIXTURE']).read())
+    # The page queries (the ones that take a cursor) are served from their own fixture when there is one.
+    paged = os.environ.get('GATE_PAGE_FIXTURE') and any('$cursor' in arg for arg in args)
+    print(open(os.environ['GATE_PAGE_FIXTURE' if paged else 'GATE_FIXTURE']).read())
 else:
     raise AssertionError(args)
 """
@@ -530,6 +585,106 @@ class GateOutputTest(unittest.TestCase):
         self.assertEqual(bogus.returncode, 1, bogus.stdout + bogus.stderr)
         self.assertIn("Usage:", bogus.stderr)
 
+    def test_a_reply_that_is_not_shaped_like_the_schema_stops_on_fixed_text(self):
+        # jq quotes the start of a value that it fails on, so a connection of another shape used to put
+        # text from the PR into stderr. Each case breaks one read of the two coder-agents-review scripts.
+        def broken(change):
+            # Fresh nodes for every case: a case changes its nodes in place.
+            request = comment("/coder-agents-review", "maintainer", REQUEST_AT)
+            data = snapshot([request, comment("Looks fine.", BOT, RESPONSE_AT)], [bot_thread("A finding.")])
+            change(data["data"]["repository"]["pullRequest"])
+            return data
+
+        # name: (change, scripts that read the broken part)
+        wait, reader = "wait_pr_coder_agents_review.sh", "check_coder_agents_review_comments.sh"
+        cases = {
+            "comments connection": (lambda pr: pr.update(comments=HOSTILE), (wait,)),
+            "comments nodes": (lambda pr: pr["comments"].update(nodes=HOSTILE), (wait,)),
+            "comments node": (lambda pr: pr["comments"].update(nodes=[HOSTILE]), (wait,)),
+            "reviews nodes": (lambda pr: pr["reviews"].update(nodes=HOSTILE), (wait,)),
+            "threads nodes": (lambda pr: pr["reviewThreads"].update(nodes=HOSTILE), (wait, reader)),
+            "thread node": (lambda pr: pr["reviewThreads"].update(nodes=[HOSTILE]), (wait, reader)),
+            "thread comments": (lambda pr: pr["reviewThreads"]["nodes"][0].update(comments={"nodes": HOSTILE}), (wait, reader)),
+            "author": (lambda pr: pr["comments"]["nodes"][1].update(author=HOSTILE), (wait,)),
+            "login": (lambda pr: pr["comments"]["nodes"][1].update(author={"login": {"x": HOSTILE}}), (wait,)),
+            "body": (lambda pr: pr["comments"]["nodes"][1].update(body={"x": HOSTILE}), (wait,)),
+            "thread login": (lambda pr: pr["reviewThreads"]["nodes"][0]["comments"]["nodes"][0].update(author={"login": [HOSTILE]}), (wait, reader)),
+        }
+        for name, (change, readers) in cases.items():
+            data = broken(change)
+            for script, args in ((wait, ("--once",)), (reader, ("--counts-only",))):
+                with self.subTest(case=name, script=script):
+                    result = self.run_script(script, *args, data=data)
+                    self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+                    self.assertNotIn("jq: error", result.stderr)
+                    if script in readers:
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn("are not a list of objects with text fields", result.stderr)
+
+    def test_a_null_node_is_not_a_shape_error(self):
+        # GitHub lists a node that the viewer cannot read as null. The shape check keeps passing it.
+        data = snapshot([comment("/coder-agents-review", "maintainer", REQUEST_AT)], [bot_thread("A finding.")])
+        data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"].append(None)
+        result = self.run_script("check_coder_agents_review_comments.sh", "--counts-only", data=data)
+        self.assertNotIn("not a list of objects", result.stderr)
+        self.assertIn("Unresolved coder-agents-review threads: 1", result.stdout)
+
+    def test_a_page_of_another_shape_stops_on_fixed_text(self):
+        # With an older page, the wait script reads the whole connection page by page. The first reply
+        # is well formed, so a page of another shape is the only thing wrong.
+        request = comment("/coder-agents-review", "maintainer", REQUEST_AT)
+        wait = "wait_pr_coder_agents_review.sh"
+        for name in ("comments", "reviews", "reviewThreads"):
+            with self.subTest(connection=name):
+                first = snapshot([request], [bot_thread("A finding.")])
+                first["data"]["repository"]["pullRequest"][name]["pageInfo"]["hasPreviousPage"] = True
+                page = snapshot([request], [bot_thread("A finding.")])
+                page["data"]["repository"]["pullRequest"][name]["nodes"] = HOSTILE
+                page_file = self.root / "page.json"
+                page_file.write_text(json.dumps(page))
+                result = self.run_script(wait, "--once", data=first, env_extra={"GATE_PAGE_FIXTURE": str(page_file)})
+                self.assert_clean(result, 1)
+                self.assertNotIn("jq: error", result.stderr)
+                self.assertIn(f"The {name} in the GitHub reply are not a list of objects with text fields.", result.stderr)
+
+    def test_values_that_a_script_rejects_are_not_printed_back(self):
+        request = comment("/coder-agents-review", "maintainer", REQUEST_AT)
+
+        def broken(change):
+            data = snapshot([request], [bot_thread("A finding.")])
+            change(data["data"]["repository"]["pullRequest"])
+            return data
+
+        wait, reader = "wait_pr_coder_agents_review.sh", "check_coder_agents_review_comments.sh"
+        cases = {
+            "state": (lambda pr: pr.update(state=HOSTILE), wait),
+            "previous comments page": (lambda pr: pr["comments"]["pageInfo"].update(hasPreviousPage=HOSTILE), wait),
+            "previous reviews page": (lambda pr: pr["reviews"]["pageInfo"].update(hasPreviousPage=HOSTILE), wait),
+            "previous threads page": (lambda pr: pr["reviewThreads"]["pageInfo"].update(hasPreviousPage=HOSTILE), wait),
+            # With an older page, the wait script pages through the connection instead.
+            "next comments page": (lambda pr: pr["comments"]["pageInfo"].update(hasPreviousPage=True, hasNextPage=HOSTILE), wait),
+            "next reviews page": (lambda pr: pr["reviews"]["pageInfo"].update(hasPreviousPage=True, hasNextPage=HOSTILE), wait),
+            "next threads page": (lambda pr: pr["reviewThreads"]["pageInfo"].update(hasPreviousPage=True, hasNextPage=HOSTILE), wait),
+            "reader next threads page": (lambda pr: pr["reviewThreads"]["pageInfo"].update(hasNextPage=HOSTILE), reader),
+        }
+        for name, (change, script) in cases.items():
+            with self.subTest(case=name, script=script):
+                args = ("--once",) if script == wait else ("--counts-only",)
+                result = self.run_script(script, *args, data=broken(change))
+                self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_wait_pr_ready_prints_no_part_of_the_repository_reply(self):
+        result = self.run_script(
+            "wait_pr_ready.sh", data=snapshot(), env_extra={"GATE_REPO_VIEW": json.dumps({"owner": None, "name": HOSTILE})}
+        )
+        self.assert_clean(result, 1)
+        self.assertIn("unable to parse repository owner/name", result.stderr)
+        # A reply that is not JSON ends the script in jq's parse error, which names a position and quotes no value.
+        result = self.run_script("wait_pr_ready.sh", data=snapshot(), env_extra={"GATE_REPO_VIEW": HOSTILE})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+
     def test_gh_debug_logging_cannot_carry_bot_text_into_the_output(self):
         data = snapshot([comment("/coder-agents-review", "maintainer", REQUEST_AT)], [bot_thread(HOSTILE)])
         for script, args in (("wait_pr_coder_agents_review.sh", ("--once",)), ("check_coder_agents_review_comments.sh", ("--counts-only",))):
@@ -561,6 +716,25 @@ class GateOutputTest(unittest.TestCase):
         for path in scripts.glob("*.sh"):
             path.chmod(0o755)
         return scripts
+
+    def test_a_state_that_wait_pr_ready_cannot_classify_is_not_printed(self):
+        scripts = self.ready_scripts(20)
+        # codex passes, the optional gate is skipped and the checks pass: only the PR state is left to read.
+        result = subprocess.run(
+            ["bash", str(scripts / "wait_pr_ready.sh"), GATE_PR], env={**self.env, "GATE_PR_STATE": HOSTILE},
+            text=True, capture_output=True, timeout=30, check=False,
+        )
+        self.assert_clean(result, 1)
+        self.assertIn("unable to classify the state of PR", result.stderr)
+
+    def test_a_review_state_that_the_optional_gate_rejects_is_not_printed(self):
+        request = comment("/coder-agents-review", "maintainer", REQUEST_AT)
+        review = {"author": {"login": BOT}, "body": "", "state": HOSTILE, "createdAt": RESPONSE_AT, "submittedAt": RESPONSE_AT}
+        data = snapshot([request])
+        data["data"]["repository"]["pullRequest"]["reviews"]["nodes"] = [review]
+        result = self.run_script("wait_pr_coder_agents_review.sh", "--once", data=data)
+        self.assert_clean(result, 1)
+        self.assertIn("unexpected coder-agents-review state", result.stderr)
 
     def test_the_final_comment_gates_run_with_counts_only(self):
         # 0 runs the optional bot's comment gate as well; 20 skips it.

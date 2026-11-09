@@ -178,14 +178,22 @@ else:
     field = next(field for field in ['comments', 'reviewThreads', 'reactions']
                  if field + '(first: 100' in query)
     index = 0 if cursor == 'null' else int(cursor)
+    if not isinstance(snapshot['data']['repository']['pullRequest'][field], dict):
+        # A connection of another shape is served as it is.
+        print(json.dumps({'data': {'repository': {'pullRequest': {
+            'headRefOid': snapshot['data']['repository']['pullRequest']['headRefOid'],
+            field: snapshot['data']['repository']['pullRequest'][field]}}}}))
+        sys.exit(0)
     nodes = snapshot['data']['repository']['pullRequest'][field]['nodes']
+    if field == 'reactions' and os.environ.get('CODEX_GATE_REACTIONS_NODES'):
+        nodes = json.loads(os.environ['CODEX_GATE_REACTIONS_NODES'])
     more = index + 1 < len(nodes)
     pull_request = snapshot['data']['repository']['pullRequest']
     print(json.dumps({'data': {'repository': {'pullRequest': {
         'headRefOid': pull_request['headRefOid'],
         field: {
             'nodes': nodes[index:index + 1],
-            'pageInfo': {'hasNextPage': more, 'endCursor': str(index + 1) if more else None}
+            'pageInfo': {'hasNextPage': (os.environ.get('CODEX_GATE_NEXT_PAGE') if field == os.environ.get('CODEX_GATE_NEXT_PAGE_FIELD') else None) or more, 'endCursor': str(index + 1) if more else None}
         }
     }}}}))
 """)
@@ -1236,6 +1244,92 @@ else:
                     result = self.run_gate(data, script, extra=extra, env_extra={variable: value})
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+
+    def test_a_reply_outside_the_schema_never_puts_its_text_into_the_output(self):
+        # GitHub's schema makes `nodes` a list of objects and a login and a body strings. jq quotes the
+        # start of a value that it fails on, and the assertions used to print the value they rejected.
+        # Either way text that a PR author wrote could reach stderr, so the gates stop on fixed text.
+        def broken(change):
+            # Fresh nodes for every case: a case changes its nodes in place.
+            request = comment("@codex review", "maintainer", REQUEST)
+            data = snapshot([request, comment("Codex has finished.")], [thread("[P1] Fix authorization")])
+            change(data["data"]["repository"]["pullRequest"])
+            return data
+
+        shape = "are not a list of objects with text fields"
+        # name: (change, {run: fragment that run prints}). Runs: the poller, the reader and the reader
+        # on the poller's cache. A run that does not read the broken part is not listed.
+        all_runs = ("wait", "check", "cache")
+        cases = {
+            "comments connection": (lambda pr: pr.update(comments=HOSTILE), dict.fromkeys(all_runs, shape)),
+            "comments nodes": (lambda pr: pr["comments"].update(nodes=HOSTILE), dict.fromkeys(all_runs, shape)),
+            "comments node": (lambda pr: pr["comments"].update(nodes=[HOSTILE]), dict.fromkeys(all_runs, shape)),
+            "threads nodes": (lambda pr: pr["reviewThreads"].update(nodes=HOSTILE), dict.fromkeys(all_runs, shape)),
+            "thread node": (lambda pr: pr["reviewThreads"].update(nodes=[HOSTILE]), dict.fromkeys(all_runs, shape)),
+            "thread comments": (lambda pr: pr["reviewThreads"]["nodes"][0].update(comments={"nodes": HOSTILE}), dict.fromkeys(all_runs, shape)),
+            "author": (lambda pr: pr["comments"]["nodes"][0].update(author=HOSTILE), dict.fromkeys(all_runs, shape)),
+            "login": (lambda pr: pr["comments"]["nodes"][0].update(author={"login": {"x": HOSTILE}}), dict.fromkeys(all_runs, shape)),
+            "body": (lambda pr: pr["comments"]["nodes"][0].update(body={"x": HOSTILE}), dict.fromkeys(all_runs, shape)),
+            "previous comments page": (lambda pr: pr["comments"]["pageInfo"].update(hasPreviousPage=HOSTILE), {"cache": "unexpected cached comments hasPreviousPage value"}),
+            "previous threads page": (lambda pr: pr["reviewThreads"]["pageInfo"].update(hasPreviousPage=HOSTILE), {"cache": "unexpected cached reviewThreads hasPreviousPage value"}),
+            "previous reactions page": (lambda pr: pr["reactions"]["pageInfo"].update(hasPreviousPage=HOSTILE), {"wait": "unexpected reactions hasPreviousPage value"}),
+            "head": (lambda pr: pr.update(headRefOid=HOSTILE), {"wait": "PR headRefOid is missing or malformed", "check": "PR headRefOid is missing or malformed"}),
+            "state": (lambda pr: pr.update(state=HOSTILE), {"wait": "unexpected PR state"}),
+        }
+        for name, (change, expected) in cases.items():
+            data = broken(change)
+            for run, script, extra in (
+                ("wait", "wait_pr_codex.sh", ()),
+                ("check", "check_codex_comments.sh", ("--counts-only",)),
+                ("cache", "check_codex_comments.sh", ("--counts-only",)),
+            ):
+                if run == "cache" and name in ("head", "state"):
+                    continue  # a cache with no usable head ends the reader before it queries GitHub
+                with self.subTest(case=name, run=run):
+                    result = self.run_gate(data, script, cache=data if run == "cache" else None, extra=extra)
+                    self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+                    self.assertNotIn("jq: error", result.stderr)
+                    if run in expected:
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn(expected[run], result.stderr)
+
+    def test_a_null_node_is_not_a_shape_error(self):
+        # GitHub lists a node that the viewer cannot read as null. The shape check keeps passing it.
+        request = comment("@codex review", "maintainer", REQUEST)
+        data = snapshot([request, comment("Codex has finished.")], [thread("[P1] Fix authorization")])
+        data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"].append(None)
+        result = self.run_gate(data, "check_codex_comments.sh", extra=("--counts-only",))
+        self.assertNotIn("not a list of objects", result.stderr)
+        self.assertIn("Found 1 unresolved review thread(s) from bot", result.stdout)
+
+    def test_a_page_flag_that_the_gates_reject_is_not_printed_back(self):
+        # The double serves one node per page. CODEX_GATE_NEXT_PAGE_FIELD names the connection whose
+        # hasNextPage the double replaces with a value that is not a boolean.
+        request = comment("@codex review", "maintainer", REQUEST)
+        reply = "in the GitHub reply"
+        for field in ("comments", "reviewThreads"):
+            with self.subTest(script="check_codex_comments.sh", field=field):
+                data = snapshot([request, comment("Codex has finished.")], [thread("[P1] Fix authorization")])
+                env = {"CODEX_GATE_NEXT_PAGE": HOSTILE, "CODEX_GATE_NEXT_PAGE_FIELD": field}
+                result = self.run_gate(data, "check_codex_comments.sh", extra=("--counts-only",), env_extra=env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+                self.assertIn(f"unexpected {field} hasNextPage value {reply}", result.stderr)
+        # wait_pr_codex.sh pages through the reactions when it reads a window with older reactions.
+        with self.subTest(script="wait_pr_codex.sh", field="reactions"):
+            data = snapshot([request, comment("[P1] Fix authorization")])
+            data["data"]["repository"]["pullRequest"]["reactions"]["pageInfo"]["hasPreviousPage"] = True
+            env = {"CODEX_GATE_NEXT_PAGE": HOSTILE, "CODEX_GATE_NEXT_PAGE_FIELD": "reactions"}
+            result = self.run_gate(data, "wait_pr_codex.sh", env_extra=env)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+            self.assertIn(f"unexpected reactions hasNextPage value {reply}", result.stderr)
+            # The page's nodes are checked too, before the flag is read.
+            env = {"CODEX_GATE_REACTIONS_NODES": json.dumps(HOSTILE)}
+            result = self.run_gate(data, "wait_pr_codex.sh", env_extra=env)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+            self.assertIn("are not a list of objects with text fields", result.stderr)
 
     def test_counts_only_keeps_the_running_review_exit_code(self):
         request = comment("@codex review", "maintainer", REQUEST)

@@ -19,10 +19,10 @@ unset GH_DEBUG DEBUG
 # all required and active optional gates report success. Pixel review
 # statuses are intentionally ignored by wait_pr_checks.sh.
 #
-# It prints no remote text of its own and forwards each gate's output. The gates print counts
-# and point to the explicit reads: wait_pr_checks.sh <pr> --once --details,
-# check_codex_comments.sh <pr>, check_coder_agents_review_comments.sh <pr>. Steps 5 and 6
-# run those two comment checks with --counts-only for the same reason.
+# It prints no text from GitHub of its own and forwards each gate's output as it is. The gates
+# print counts and point to the explicit reads (check_codex_comments.sh <pr>,
+# check_coder_agents_review_comments.sh <pr>, gh pr view <pr> --json statusCheckRollup). Steps 5
+# and 6 run those two comment checks with --counts-only for the same reason.
 
 if [ $# -ne 1 ]; then
   echo "Usage: $0 <pr_number>" >&2
@@ -117,8 +117,8 @@ load_repo_context() {
   MUX_GH_REPO=$(echo "$repo_info" | jq -r '.name // empty')
 
   if [[ -z "$MUX_GH_OWNER" || -z "$MUX_GH_REPO" ]]; then
+    # No echo of the reply: it is text from GitHub.
     echo "❌ assertion failed: unable to parse repository owner/name from gh output" >&2
-    echo "$repo_info" >&2
     return 1
   fi
 }
@@ -247,7 +247,7 @@ while true; do
       *)
         echo ""
         echo ""
-        echo "❌ assertion failed: unable to classify PR state '$PR_STATE' for PR #$PR_NUMBER" >&2
+        echo "❌ assertion failed: unable to classify the state of PR #$PR_NUMBER" >&2
         exit 1
         ;;
     esac

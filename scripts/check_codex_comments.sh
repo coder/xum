@@ -63,6 +63,9 @@ fi
 
 BOT_LOGIN_GRAPHQL="chatgpt-codex-connector"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=./lib/reply_shape.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/reply_shape.sh"
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 PR_HEAD_OID=""
 REGULAR_COMMENTS='[]'
@@ -175,7 +178,7 @@ compute_codex_sets_from_arrays() {
 set_pr_head_oid() {
   PR_HEAD_OID="$1"
   if ! [[ "$PR_HEAD_OID" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "❌ assertion failed: PR headRefOid is missing or malformed: '$PR_HEAD_OID'" >&2
+    echo "❌ assertion failed: PR headRefOid is missing or malformed in the GitHub reply" >&2
     exit 1
   fi
 }
@@ -216,7 +219,7 @@ load_result_from_cache() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected cached comments hasPreviousPage value '$comments_has_previous'" >&2
+      echo "❌ assertion failed: unexpected cached comments hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac
@@ -232,15 +235,16 @@ load_result_from_cache() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected cached reviewThreads hasPreviousPage value '$threads_has_previous'" >&2
+      echo "❌ assertion failed: unexpected cached reviewThreads hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac
 
   local cached_comments
   local cached_threads
-  cached_comments=$(jq -c '.data.repository.pullRequest.comments.nodes // []' "$PR_DATA_FILE")
-  cached_threads=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' "$PR_DATA_FILE")
+  # The cache holds the reply as wait_pr_codex.sh read it. A cache of the wrong shape falls back to the API.
+  cached_comments=$(reply_connection_nodes "$(<"$PR_DATA_FILE")" comments) || return 1
+  cached_threads=$(reply_connection_nodes "$(<"$PR_DATA_FILE")" reviewThreads) || return 1
   set_pr_head_oid "$(jq -r '.data.repository.pullRequest.headRefOid // empty' "$PR_DATA_FILE")"
   compute_codex_sets_from_arrays "$cached_comments" "$cached_threads"
   return 0
@@ -291,7 +295,7 @@ fetch_all_comments_via_api() {
       set_pr_head_oid "$(echo "$page_data" | jq -r '.data.repository.pullRequest.headRefOid // empty')"
     fi
 
-    page_comments=$(echo "$page_data" | jq -c '.data.repository.pullRequest.comments.nodes // []')
+    page_comments=$(reply_connection_nodes "$page_data" comments) || return 1
     # Accumulated pages outgrow MAX_ARG_STRLEN, so concatenate via stdin rather than --argjson.
     all_comments=$(printf '%s\n%s' "$all_comments" "$page_comments" | jq -cs '.[0] + .[1]')
 
@@ -310,7 +314,7 @@ fetch_all_comments_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected comments hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected comments hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
@@ -367,7 +371,7 @@ fetch_all_threads_via_api() {
       return 1
     fi
 
-    page_threads=$(echo "$page_data" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []')
+    page_threads=$(reply_connection_nodes "$page_data" reviewThreads) || return 1
     # Same MAX_ARG_STRLEN concern as the comments accumulator above.
     all_threads=$(printf '%s\n%s' "$all_threads" "$page_threads" | jq -cs '.[0] + .[1]')
 
@@ -386,7 +390,7 @@ fetch_all_threads_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected reviewThreads hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected reviewThreads hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac

@@ -47,6 +47,9 @@ SKIP_FETCH_SYNC="${MUX_SKIP_FETCH_SYNC:-0}"
 # shellcheck source=./lib/branch_sync_guard.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/branch_sync_guard.sh"
+# shellcheck source=./lib/reply_shape.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/reply_shape.sh"
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 REACTIONS_SCAN_CACHE_FILE="${MUX_REACTIONS_SCAN_CACHE_FILE:-}"
 if [[ -z "$REACTIONS_SCAN_CACHE_FILE" && -n "$PR_DATA_FILE" ]]; then
@@ -262,7 +265,7 @@ FETCH_ALL_THUMBS_UP_REACTIONS() {
       return 1
     fi
 
-    page_nodes=$(echo "$reactions_page" | jq -c '.data.repository.pullRequest.reactions.nodes // []')
+    page_nodes=$(reply_connection_nodes "$reactions_page" reactions) || return 1
     # Via stdin: accumulated pages can exceed Linux's per-argument limit (MAX_ARG_STRLEN).
     all_reactions=$(printf '%s\n%s' "$all_reactions" "$page_nodes" | jq -cs '.[0] + .[1]')
 
@@ -281,7 +284,7 @@ FETCH_ALL_THUMBS_UP_REACTIONS() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected reactions hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected reactions hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
@@ -412,7 +415,7 @@ CHECK_CODEX_STATUS_ONCE() {
   pr_state=$(echo "$pr_data" | jq -r '.data.repository.pullRequest.state // empty')
   pr_head=$(echo "$pr_data" | jq -r '.data.repository.pullRequest.headRefOid // empty')
   if ! [[ "$pr_head" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "❌ assertion failed: PR headRefOid is missing or malformed: '$pr_head'" >&2
+    echo "❌ assertion failed: PR headRefOid is missing or malformed in the GitHub reply" >&2
     return 1
   fi
 
@@ -432,13 +435,13 @@ CHECK_CODEX_STATUS_ONCE() {
       ;;
     OPEN) ;;
     *)
-      echo "❌ assertion failed: unexpected PR state '$pr_state' for PR #$PR_NUMBER" >&2
+      echo "❌ assertion failed: unexpected PR state in the GitHub reply for PR #$PR_NUMBER" >&2
       return 1
       ;;
   esac
 
-  all_comments=$(echo "$pr_data" | jq '.data.repository.pullRequest.comments.nodes')
-  all_threads=$(echo "$pr_data" | jq '.data.repository.pullRequest.reviewThreads.nodes')
+  all_comments=$(reply_connection_nodes "$pr_data" comments) || return 1
+  all_threads=$(reply_connection_nodes "$pr_data" reviewThreads) || return 1
 
   # Ignore Codex's own comments since they mention "@codex review" in boilerplate.
   request_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" '[.[] | select(.author.login != $bot and (.body | contains("@codex review")))] | sort_by(.createdAt) | last | .createdAt // empty')
@@ -539,7 +542,7 @@ CHECK_CODEX_STATUS_ONCE() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected reactions hasPreviousPage value '$reactions_has_previous'" >&2
+      echo "❌ assertion failed: unexpected reactions hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac

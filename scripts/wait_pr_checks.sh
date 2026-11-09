@@ -10,7 +10,10 @@ unset GH_DEBUG DEBUG
 # Default output carries fixed text, counts and GitHub IDs only. Check names, links and
 # descriptions are written by the PR author and by apps that post statuses, so --details
 # is the explicit read that prints them (a table of every failed check, or of every check on
-# a pass). Review comment bodies stay behind ./scripts/check_pr_reviews.sh <pr_number>.
+# a pass). It prints them only when the run reaches the checks: a requested-changes or
+# review-required state ends it earlier, and gh pr view <pr_number> --json statusCheckRollup
+# lists the checks whatever the state. Review comment bodies stay behind
+# ./scripts/check_pr_reviews.sh <pr_number>.
 #
 # Exits:
 #   0 - PR checks and mergeability gates passed
@@ -110,7 +113,7 @@ CHECK_PR_CHECKS_ONCE() {
       ;;
     OPEN) ;;
     *)
-      echo "❌ assertion failed: unexpected PR state '$pr_state' for PR #$PR_NUMBER" >&2
+      echo "❌ assertion failed: unexpected PR state in the GitHub reply for PR #$PR_NUMBER" >&2
       return 1
       ;;
   esac
@@ -124,7 +127,7 @@ CHECK_PR_CHECKS_ONCE() {
   case "$mergeable" in
     MERGEABLE | CONFLICTING | UNKNOWN) ;;
     *)
-      echo "❌ assertion failed: unexpected mergeable status '$mergeable' for PR #$PR_NUMBER" >&2
+      echo "❌ assertion failed: unexpected mergeable status in the GitHub reply for PR #$PR_NUMBER" >&2
       return 1
       ;;
   esac
@@ -132,7 +135,7 @@ CHECK_PR_CHECKS_ONCE() {
   case "$merge_state" in
     BEHIND | BLOCKED | CLEAN | DIRTY | DRAFT | HAS_HOOKS | UNKNOWN | UNSTABLE) ;;
     *)
-      echo "❌ assertion failed: unexpected merge state '$merge_state' for PR #$PR_NUMBER" >&2
+      echo "❌ assertion failed: unexpected merge state in the GitHub reply for PR #$PR_NUMBER" >&2
       return 1
       ;;
   esac
@@ -140,7 +143,7 @@ CHECK_PR_CHECKS_ONCE() {
   case "$review_decision" in
     "" | APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED) ;;
     *)
-      echo "❌ assertion failed: unexpected review decision '$review_decision' for PR #$PR_NUMBER" >&2
+      echo "❌ assertion failed: unexpected review decision in the GitHub reply for PR #$PR_NUMBER" >&2
       return 1
       ;;
   esac

@@ -139,7 +139,7 @@ load_unresolved_from_cache() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected cached hasPreviousPage value '$has_previous'" >&2
+      echo "❌ assertion failed: unexpected cached hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac
@@ -218,7 +218,7 @@ fetch_unresolved_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac

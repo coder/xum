@@ -38,6 +38,9 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./lib/coder_agents_review.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/coder_agents_review.sh"
+# shellcheck source=./lib/reply_shape.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/reply_shape.sh"
 BOT_LOGIN_REGEX="${CODER_AGENTS_REVIEW_BOT_LOGIN_REGEX:-^coder-agents-review(\[bot\])?$}"
 UNRESOLVED=""
 
@@ -103,7 +106,7 @@ fetch_unresolved_via_api() {
       return 1
     fi
 
-    page_threads=$(echo "$page_data" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []')
+    page_threads=$(reply_connection_nodes "$page_data" reviewThreads) || return 1
     unresolved_page=$(coder_agents_unresolved_threads_from_json "$page_threads" "$BOT_LOGIN_REGEX")
     append_unresolved_records "$unresolved_page"
 
@@ -122,7 +125,7 @@ fetch_unresolved_via_api() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected reviewThreads hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected reviewThreads hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
