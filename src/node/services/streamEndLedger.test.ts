@@ -5,6 +5,7 @@ import type { ProjectsConfig } from "@/node/config";
 import { StreamEndLedger, type StreamEndLedgerDeps } from "@/node/services/streamEndLedger";
 import type {
   AdmittedSend,
+  InheritedReport,
   OwnedTaskAttempt,
   StreamEndTaskOrigin,
 } from "@/node/services/taskService";
@@ -18,8 +19,12 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 const TASK = "task-a";
 const ATTEMPT = "att_00000000000000a1";
 const OTHER = "att_00000000000000b2";
+const PREDECESSOR_REPORTED_AT = "2026-10-01T00:00:00.000Z";
 
-function attempt(attemptId: string = ATTEMPT, inheritedReport = false): OwnedTaskAttempt {
+function attempt(
+  attemptId: string = ATTEMPT,
+  inheritedReport: InheritedReport | null = null
+): OwnedTaskAttempt {
   return { attemptId, receiptEligible: true, inheritedReport } as unknown as OwnedTaskAttempt;
 }
 
@@ -270,13 +275,63 @@ describe("StreamEndLedger decisions", () => {
 
   test("an attempt that began on a reported row (reactivated) inherits the report and continues", () => {
     const t = harness();
-    t.state.config = configWithRow({ taskStatus: "reported", taskAttemptId: ATTEMPT });
-    const owned = attempt(ATTEMPT, true);
+    t.state.config = configWithRow({
+      taskStatus: "reported",
+      reportedAt: PREDECESSOR_REPORTED_AT,
+      taskAttemptId: ATTEMPT,
+    });
+    const owned = attempt(ATTEMPT, { reportedAt: PREDECESSOR_REPORTED_AT });
     const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
     expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
     expect(decision?.outcome).toBe("nonreport");
     // Its next reawaken may still prove a no-report receipt.
     expect(owned.receiptEligible).toBe(true);
+  });
+
+  test.each([
+    {
+      name: "a new report time",
+      reportedAt: "2026-10-01T00:00:09.000Z",
+      inherited: PREDECESSOR_REPORTED_AT,
+    },
+    {
+      name: "a report time on a row that had none",
+      reportedAt: "2026-10-01T00:00:09.000Z",
+      inherited: undefined,
+    },
+    {
+      name: "no report time on a row that had one",
+      reportedAt: undefined,
+      inherited: PREDECESSOR_REPORTED_AT,
+    },
+  ])(
+    "an inherited report that the row has since replaced ($name) turns the decision indeterminate",
+    (c) => {
+      const t = harness();
+      t.state.config = configWithRow({
+        taskStatus: "reported",
+        taskAttemptId: ATTEMPT,
+        ...(c.reportedAt != null ? { reportedAt: c.reportedAt } : {}),
+      });
+      const owned = attempt(ATTEMPT, { reportedAt: c.inherited });
+      const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
+      expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+      expect(decision?.outcome).toBe("indeterminate");
+      expect(owned.receiptEligible).toBe(false);
+    }
+  );
+
+  test("an inherited report on a row without a report time stays inherited until one is written", () => {
+    const t = harness();
+    t.state.config = configWithRow({ taskStatus: "reported", taskAttemptId: ATTEMPT });
+    const decision = t.ledger.registerStreamEndDecision(
+      TASK,
+      "m1",
+      attempt(ATTEMPT, { reportedAt: undefined }),
+      undefined
+    );
+    expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+    expect(decision?.outcome).toBe("nonreport");
   });
 
   test("an unowned stream whose row reads reported is refused, never assumed to continue", () => {

@@ -396,7 +396,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         attemptId: reserved!.taskAttemptId,
         receiptEligible: true,
         // A brand-new task has never reported: a later report of this attempt is its own.
-        inheritedReport: false,
+        inheritedReport: null,
       });
 
       // The launch is a same-attempt send: fenced (token passed to the send), id unchanged.
@@ -466,7 +466,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         source: "launch",
         attemptId: provenEntry!.taskAttemptId,
         receiptEligible: true,
-        inheritedReport: false,
+        inheritedReport: null,
       });
       const markedEntry = entryOf(config, marked);
       expect(markedEntry?.taskAttemptId).toMatch(ATTEMPT_ID);
@@ -476,7 +476,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         source: "launch",
         attemptId: markedEntry!.taskAttemptId,
         receiptEligible: false,
-        inheritedReport: false,
+        inheritedReport: null,
       });
     });
 
@@ -1784,7 +1784,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         source: "launch",
         attemptId: entry!.taskAttemptId,
         receiptEligible: false,
-        inheritedReport: false,
+        inheritedReport: null,
       });
     });
 
@@ -2218,7 +2218,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         source: "launch",
         attemptId: entry!.taskAttemptId,
         receiptEligible: true,
-        inheritedReport: false,
+        inheritedReport: null,
       });
       expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
         kind: "live",

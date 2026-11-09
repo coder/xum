@@ -893,15 +893,30 @@ export interface OwnedTaskAttempt {
    */
   receiptEligible: boolean;
   /**
-   * The row still read a completed report (`reported`, or `interrupted` with a report time) once
-   * the CAS that published this attempt had written it. A reactivation keeps its predecessor's
-   * terminal status, and a reawakening of a settled reported task keeps it too, so the new attempt
-   * runs on a row that reads reported and that report says nothing about the attempt. A
-   * reawakening of an interrupted row sets it `running` in the same CAS: the value is false then.
-   * In-memory only, read from that CAS (never from the row afterwards, where the report may be
-   * this attempt's own).
+   * The report the row still carried (`reported`, or `interrupted` with a report time) once the
+   * CAS that published this attempt had written it, else null. A reactivation keeps its
+   * predecessor's terminal status, and a reawakening of a settled reported task keeps it too, so
+   * the new attempt runs on a row that reads reported and that report says nothing about the
+   * attempt. A reawakening of an interrupted row sets it `running` in the same CAS: null then.
+   * The row's report counts as inherited only while its `reportedAt` is still the one captured
+   * here (see InheritedReport). In-memory only, read from that CAS (never from the row
+   * afterwards, where the report may be this attempt's own).
    */
-  readonly inheritedReport: boolean;
+  readonly inheritedReport: InheritedReport | null;
+}
+
+/** A completed report that a row already carried when the CAS that published an attempt wrote it. */
+export interface InheritedReport {
+  /**
+   * The row's `reportedAt` then. Every report of the row (a publication, an adopted artifact, on
+   * any backend) writes a new one, so a row that reads another value was reported again since.
+   */
+  readonly reportedAt: string | undefined;
+}
+
+/** The report `ws` carries now, or null. Read inside the CAS's config edit, on the row it writes. */
+function readInheritedReport(ws: WorkspaceConfigEntry): InheritedReport | null {
+  return hasCompletedAgentReport(ws) ? { reportedAt: ws.reportedAt } : null;
 }
 
 /** In-process settlement ledger entry; see AttemptLedger.attemptSettlementByTaskId. */
@@ -996,8 +1011,8 @@ interface ReactivationPlan {
 /** What the identity CAS wrote: set inside its config edit, read after it. */
 interface ReactivationCommit {
   committedProven: boolean;
-  /** Whether the row this CAS wrote still reads a completed report (OwnedTaskAttempt.inheritedReport). */
-  inheritedReport: boolean;
+  /** The completed report the row this CAS wrote still carries (OwnedTaskAttempt.inheritedReport). */
+  inheritedReport: InheritedReport | null;
   published: boolean;
 }
 
@@ -1113,12 +1128,12 @@ export interface StreamEndDecision {
   readonly attemptId: string;
   readonly messageId: string;
   /**
-   * The row's completed report predates this attempt (OwnedTaskAttempt.inheritedReport; always
-   * false for an attempt this process does not own, which has no publishing CAS to read). Only a
-   * report that is not inherited contradicts a `nonreport` decision (see
+   * The completed report the row carried when this attempt began (OwnedTaskAttempt.inheritedReport;
+   * always null for an attempt this process does not own, which has no publishing CAS to read).
+   * Only a report that is not this one contradicts a `nonreport` decision (see
    * StreamEndLedger.resolveStreamEndDecision).
    */
-  readonly inheritedReport: boolean;
+  readonly inheritedReport: InheritedReport | null;
   outcome: "pending" | "nonreport" | "published" | "indeterminate";
   /**
    * The session's turn generation the stream ended in (undefined when none was live, or once it
@@ -4103,7 +4118,7 @@ export class TaskService implements AgentTaskIntegration {
   /**
    * Tests call this; AttemptLedger owns the attempt identity. A reservation or launch begins on a
    * row that has never reported (not yet written, `starting` or `running`), so it passes
-   * `inheritedReport: false`; only the reawakening and reactivation CAS can keep a completed row,
+   * `inheritedReport: null`; only the reawakening and reactivation CAS can keep a completed row,
    * and they pass what they wrote.
    */
   private beginOwnedTaskAttempt(
@@ -7454,7 +7469,7 @@ export class TaskService implements AgentTaskIntegration {
           this.beginOwnedTaskAttempt(plan.taskId, "reservation", {
             attemptId: plan.attemptId,
             receiptEligible: true,
-            inheritedReport: false,
+            inheritedReport: null,
             ...(run.signal != null ? { abortSignal: run.signal } : {}),
           }),
         ];
@@ -8483,7 +8498,7 @@ export class TaskService implements AgentTaskIntegration {
       this.beginOwnedTaskAttempt(plan.taskId, "launch", {
         attemptId: launchAttemptId,
         receiptEligible: launchReceiptEligible,
-        inheritedReport: false,
+        inheritedReport: null,
       });
     }
   }
@@ -9559,7 +9574,7 @@ export class TaskService implements AgentTaskIntegration {
     launch.launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
       attemptId: launch.attemptId,
       receiptEligible: true,
-      inheritedReport: false,
+      inheritedReport: null,
     });
     if (checkout.sourceRuntimeConfigUpdate != null) {
       // Ensure UI gets the updated runtimeConfig for the parent workspace.
@@ -10545,7 +10560,7 @@ export class TaskService implements AgentTaskIntegration {
     const { taskId } = plan.params;
     const commit: ReactivationCommit = {
       committedProven: false,
-      inheritedReport: false,
+      inheritedReport: null,
       published: false,
     };
     {
@@ -10630,7 +10645,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!commit.committedProven) ws.taskAttemptUnproven = true;
     // Read here, from the row this CAS wrote: after the commit, a report on the row may be
     // another backend's report of the fresh attempt.
-    commit.inheritedReport = hasCompletedAgentReport(ws);
+    commit.inheritedReport = readInheritedReport(ws);
     commit.published = true;
   }
 
@@ -18906,7 +18921,7 @@ export class TaskService implements AgentTaskIntegration {
     const { taskId } = request;
     this.attemptLedger.publishAttemptRotation(taskId, launch.attemptId);
     if (this.attemptLedger.ownedAttempt(taskId)?.attemptId !== launch.attemptId) {
-      this.beginOwnedTaskAttempt(taskId, "launch", { ...launch, inheritedReport: false });
+      this.beginOwnedTaskAttempt(taskId, "launch", { ...launch, inheritedReport: null });
     }
     plans.push(this.buildQueuedTaskLaunchPlan(request, launch.attemptId, launchLease));
   }
@@ -19260,7 +19275,7 @@ export class TaskService implements AgentTaskIntegration {
     }
     let published = false;
     let committedProven = false;
-    let inheritedReport = false;
+    let inheritedReport: InheritedReport | null = null;
     await this.editActiveWorkspaceEntry(
       workspaceId,
       (ws) => {
@@ -19282,7 +19297,7 @@ export class TaskService implements AgentTaskIntegration {
         if (!committedProven) ws.taskAttemptUnproven = true;
         // Read here, from the row this CAS wrote: after the commit, a report on the row may be
         // another backend's report of the fresh attempt.
-        inheritedReport = hasCompletedAgentReport(ws);
+        inheritedReport = readInheritedReport(ws);
         published = true;
       },
       { allowMissing: true }
@@ -19331,7 +19346,7 @@ export class TaskService implements AgentTaskIntegration {
   private publishReawakenAttempt(
     plan: ReawakenPlan,
     committedProven: boolean,
-    inheritedReport: boolean
+    inheritedReport: InheritedReport | null
   ): ReawakenRefusal | { kind: "committed" } {
     const { workspaceId, attemptId } = plan;
     // The row names a new attempt now: the earlier attempt's cached report is not its (#7003).

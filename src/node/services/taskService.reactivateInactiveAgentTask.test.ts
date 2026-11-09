@@ -214,6 +214,7 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
           runtimeConfig: local,
           parentWorkspaceId: PARENT,
           taskStatus: "reported",
+          reportedAt: AT,
           taskAttemptId: PRIOR,
           title: "Child",
           ...child,
@@ -606,7 +607,8 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
       source: "reactivation",
       attemptId,
       receiptEligible: false,
-      inheritedReport: true,
+      // The predecessor's report stays on the row, and its time is what the attempt inherits.
+      inheritedReport: { reportedAt: AT },
     });
     expect(h.row()?.taskAttemptUnproven).toBe(true);
     expect(h.ledger.currentAttemptIdByTaskId.get(CHILD)).toBe(attemptId);
@@ -709,7 +711,7 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
       source: "reactivation",
       attemptId: h.row()?.taskAttemptId,
       receiptEligible: c.eligible,
-      inheritedReport: true,
+      inheritedReport: { reportedAt: AT },
     });
     expect(h.row()?.taskAttemptUnproven).toBe(c.eligible ? undefined : true);
   });
@@ -755,6 +757,9 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
     expect(await h.send()).toMatchObject(Ok({ delivery: "reactivated" }));
     expect(h.row()?.taskStatus).toBe("running");
     expect(h.ledger.ownedAttempt(CHILD)?.attemptId).toBe(h.row()?.taskAttemptId);
+    // A row that reads running carries no report, whatever stale `reportedAt` it still holds.
+    expect(h.row()?.reportedAt).toBe(AT);
+    expect(h.ledger.ownedAttempt(CHILD)?.inheritedReport).toBeNull();
     expect(h.turns.length).toBe(1);
   });
 });
