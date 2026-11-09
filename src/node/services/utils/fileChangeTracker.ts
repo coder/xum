@@ -1,7 +1,6 @@
 import { constants } from "fs";
 import { open, realpath, stat } from "fs/promises";
 import assert from "@/common/utils/assert";
-import { computeDiff } from "@/node/utils/diff";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { createFileChangeNotificationMessageId } from "@/node/services/utils/messageIds";
 
@@ -217,10 +216,10 @@ export class FileChangeTracker {
             if (currentMtime <= trackedState.timestamp) return null; // No change
 
             const currentContent = await handle.readFile("utf-8");
-            // Only whether the content changed matters: the diff text is never used (it would put
-            // process-written text in a user-role row), so the notice fires exactly when it did.
-            // A null diff means the content is identical despite the mtime change.
-            if (!computeDiff(trackedState.content, currentContent)) return null;
+            // Only whether the content changed matters: the notice names the file and never copies
+            // the change (a diff would put process-written text in a user-role row), so a plain
+            // comparison decides. Identical content despite the mtime change yields no notice.
+            if (currentContent === trackedState.content) return null;
 
             return {
               attachment: {

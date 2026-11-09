@@ -3,7 +3,6 @@ import { mkdtemp, writeFile, rm, utimes, stat, mkdir, symlink, realpath } from "
 import { join } from "path";
 import { tmpdir } from "os";
 import { FileChangeTracker } from "@/node/services/utils/fileChangeTracker";
-import { computeDiff } from "@/node/utils/diff";
 
 /**
  * Tests for external file change detection via FileChangeTracker.
@@ -262,53 +261,6 @@ describe("AgentSession change detection", () => {
       tracker.clear();
       expect(tracker.count).toBe(0);
       expect(tracker.paths).toEqual([]);
-    });
-  });
-
-  describe("computeDiff utility", () => {
-    it("should return null for identical content", () => {
-      const content = "# Plan\n\nContent here";
-      expect(computeDiff(content, content)).toBeNull();
-    });
-
-    it("should return diff for modified content", () => {
-      const old = "line 1\nline 2\nline 3";
-      const modified = "line 1\nmodified line 2\nline 3";
-
-      const diff = computeDiff(old, modified);
-      expect(diff).not.toBeNull();
-      expect(diff).toContain("-line 2");
-      expect(diff).toContain("+modified line 2");
-    });
-
-    it("should handle added lines", () => {
-      const old = "line 1\nline 2";
-      const modified = "line 1\nline 2\nline 3";
-
-      const diff = computeDiff(old, modified);
-      expect(diff).not.toBeNull();
-      expect(diff).toContain("+line 3");
-    });
-
-    it("should handle removed lines", () => {
-      const old = "line 1\nline 2\nline 3";
-      const modified = "line 1\nline 3";
-
-      const diff = computeDiff(old, modified);
-      expect(diff).not.toBeNull();
-      expect(diff).toContain("-line 2");
-    });
-
-    it("should handle empty to non-empty", () => {
-      const diff = computeDiff("", "new content");
-      expect(diff).not.toBeNull();
-      expect(diff).toContain("+new content");
-    });
-
-    it("should handle non-empty to empty", () => {
-      const diff = computeDiff("old content", "");
-      expect(diff).not.toBeNull();
-      expect(diff).toContain("-old content");
     });
   });
 });

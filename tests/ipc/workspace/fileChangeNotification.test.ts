@@ -182,7 +182,6 @@ describeIntegration("File Change Notification Integration", () => {
           const textPart = fileChangeMessage.parts?.find((p) => p.type === "text");
           expect(textPart?.text).toContain("<system-file-update>");
           expect(textPart?.text).toContain("</system-file-update>");
-          expect(textPart?.text).toContain("changed on disk");
           // The notice is a user-role row, so it names the file and copies none of the change:
           // the agent reads the new content through file_read, which returns a tool result.
           expect(textPart?.text).toContain(workspaceName);

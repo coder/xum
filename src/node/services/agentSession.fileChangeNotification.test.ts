@@ -105,8 +105,9 @@ describe("AgentSession file-change notification (turn start)", () => {
     );
     expect(requestNotification).toBeDefined();
     const requestText = requestNotification?.parts.find((p) => p.type === "text")?.text ?? "";
+    // The notice names the file and holds none of its new content (the row is user-role).
     expect(requestText).toContain("plan.md");
-    expect(requestText).toContain("changed on disk");
+    expect(requestText).not.toContain("modified content");
 
     // …and that exact row (same id, same content) is durable in chat.jsonl:
     // the request was built purely from history.
@@ -193,7 +194,8 @@ describe("AgentSession file-change notification (turn start)", () => {
     const notificationRows = historyResult.data.filter((m) => m.id.startsWith("file-change-"));
     expect(notificationRows).toHaveLength(1);
     const notificationText = notificationRows[0].parts.find((p) => p.type === "text")?.text ?? "";
-    expect(notificationText).toContain("changed on disk");
+    expect(notificationText).toContain("plan.md");
+    expect(notificationText).not.toContain("modified content");
   });
 
   test("a hostile change to a tracked file reaches no user-role row and names no author", async () => {
