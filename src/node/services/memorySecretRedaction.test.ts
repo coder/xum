@@ -271,6 +271,34 @@ describe("redactSecretLike", () => {
     expect(containsSecretLike(redacted)).toBe(false);
   });
 
+  // A pair nested after a label keeps the key/value rule's redaction: the label pass runs after it,
+  // so it cannot take the nested pair's name as the label's value and leave its value readable.
+  it.each([
+    ["a quoted value", '**token:** password="secret more"', "**token:** password=[redacted]"],
+    ["a single-quoted value", "**token:** api_key:'abc def'", "**token:** api_key:[redacted]"],
+    [
+      "a JSON-escaped value",
+      String.raw`**token:** secret=\"abc def\"`,
+      "**token:** secret=[redacted]",
+    ],
+    ["a value behind a space", '**token:** password= "x y"', "**token:** [redacted] [redacted]"],
+    [
+      "a value behind a scheme",
+      '**token:** Bearer token="x y"',
+      "**token:** Bearer token=[redacted]",
+    ],
+    [
+      "a separator behind a gap",
+      "**Password:** passwordsecret  =api_key",
+      "**Password:** [redacted]  =[redacted]",
+    ],
+  ])("redacts a pair nested after a label with %s", (_label, text, expected) => {
+    const redacted = redactSecretLike(text);
+
+    expect(redacted).toBe(expected);
+    expect(redactSecretLike(redacted)).toBe(redacted);
+  });
+
   // Stars that are not an exact label stay the key/value rule's, as before: a value of stars is
   // redacted (a prose label's closing run included), and an operator is no separator.
   it.each([

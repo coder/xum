@@ -95,9 +95,10 @@ const SECRET_KEY_VALUE_PATTERN = new RegExp(
 // A bold or italic label (`**Password:** hunter2`, `*token:* "x y"`), as notes and model summaries
 // write a pair: an opening `*` run right before the name, the same run right after the separator,
 // then a space and the value. The key/value rule alone takes the closing `**` as the value and
-// leaves the credential readable, so this pass runs first and redacts the value after the label.
-// It only adds redaction: it takes this exact form (the run widths match through the
-// backreference, and the opener touches the name), and the key/value rule stays as it was.
+// leaves the credential readable. So the key/value rule keeps that closing run (see
+// `isLabelClose`), and this pass then redacts the value after the label. It runs on the key/value
+// rule's output, so everything that rule redacts stays redacted (a nested pair's value too:
+// `**token:** password="a b"`): it only adds redaction.
 const EMPHASIS_LABEL_PATTERN = new RegExp(
   String.raw`((?<![*\w])(?<stars>\*{1,3})${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}[:=]\k<stars>[ \t]{1,${GAP_MAX}})` +
     SECRET_VALUE,
@@ -105,12 +106,20 @@ const EMPHASIS_LABEL_PATTERN = new RegExp(
 );
 
 /**
- * The closing run of a label whose value the pass above redacted: 1 to 3 `*`, then a space and the
- * marker. The key/value rule leaves that run as it is, so a second pass changes nothing. Any other
- * run of stars is a value, as before.
+ * True when the key/value rule's value is a label's closing run: 1 to 3 `*`, the same run right
+ * before the name with no `*` or word character before it, and a space or tab after it. Any other
+ * run of stars is a value, as before (`password=***`).
  */
-const LABEL_CLOSE_BEFORE_MARKER = /^\*{1,3}$/;
-const MARKER_AFTER_LABEL = /^[ \t]+\[redacted\]/;
+function isLabelClose(value: string, valueEnd: number, nameStart: number, text: string): boolean {
+  const opener = nameStart - value.length;
+  return (
+    /^\*{1,3}$/.test(value) &&
+    /[ \t]/.test(text.charAt(valueEnd)) &&
+    opener >= 0 &&
+    text.slice(opener, nameStart) === value &&
+    !/[*\w]/.test(text.charAt(opener - 1))
+  );
+}
 
 // A session cookie is a bearer credential that has no keyword and no token shape of its own, so the
 // header is the only thing that marks it. The value of a `Cookie` / `Set-Cookie` header goes, and
@@ -154,32 +163,25 @@ function runRedactionPasses(text: string, onRemoved: (removed: string) => void):
       return REDACTED;
     });
   }
-  redacted = redacted.replace(EMPHASIS_LABEL_PATTERN, (match: string, prefix: string) => {
-    onRemoved(match.slice(prefix.length));
-    return `${prefix}${REDACTED}`;
-  });
-  return redacted.replace(
+  redacted = redacted.replace(
     SECRET_KEY_VALUE_PATTERN,
     (match: string, prefix: string, ...rest: unknown[]) => {
       const value = match.slice(prefix.length);
       // The pattern has named groups, so the last three arguments are offset, text and groups.
       const offset = rest[rest.length - 3] as number;
       const text = rest[rest.length - 2] as string;
-      // Only the label form: the same run opens right before the name (as EMPHASIS_LABEL_PATTERN
-      // requires), so the marker after it is one the label pass wrote. Stars with no opener are a
-      // value, as before (`password=*** [redacted]`).
-      const opener = offset - value.length;
-      const closesRedactedLabel =
-        LABEL_CLOSE_BEFORE_MARKER.test(value) &&
-        MARKER_AFTER_LABEL.test(text.slice(offset + match.length)) &&
-        opener >= 0 &&
-        text.slice(opener, offset) === value &&
-        !/[*\w]/.test(text.charAt(opener - 1));
-      if (closesRedactedLabel) return match;
+      if (isLabelClose(value, offset + match.length, offset, text)) return match;
       onRemoved(value);
       return `${prefix}${REDACTED}`;
     }
   );
+  return redacted.replace(EMPHASIS_LABEL_PATTERN, (match: string, prefix: string) => {
+    // A bare word that runs into a marker is a nested pair whose value the key/value rule already
+    // took (`**token:** password=[redacted]`): its name stays.
+    if (match.endsWith(REDACTED.slice(0, -1))) return match;
+    onRemoved(match.slice(prefix.length));
+    return `${prefix}${REDACTED}`;
+  });
 }
 
 /** Replaces common credential shapes with `[redacted]`. */
