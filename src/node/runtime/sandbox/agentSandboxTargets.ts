@@ -408,7 +408,12 @@ function policyEnvs(input: AgentSandboxPolicyInput): NodeJS.ProcessEnv[] {
   // in HOME, and the policy protects them in Xum's home only (Codex review).
   const home = input.env.HOME;
   const ownHome = process.env.HOME ?? os.homedir();
-  if (home !== undefined && path.resolve(home) !== path.resolve(ownHome)) {
+  // A relative HOME resolves against Xum's cwd here and against the command's cwd in git, so it
+  // can pass as the real home and still move it (Codex review).
+  if (
+    home !== undefined &&
+    (!path.isAbsolute(home) || path.resolve(home) !== path.resolve(ownHome))
+  ) {
     throw new AgentSandboxStartError(`HOME is ${home} for this command, not ${ownHome}`);
   }
   return [process.env, input.env];

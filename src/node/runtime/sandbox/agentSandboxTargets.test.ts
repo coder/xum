@@ -1062,6 +1062,14 @@ describe("buildAgentSandboxPolicy", () => {
 
     expect(policyWithHome(path.join(repo, "home"))).toThrow(AgentSandboxStartError);
     expect(policyWithHome(process.env.HOME)).not.toThrow();
+    // `.` names the real home only where Xum starts in it; git resolves it in the workspace.
+    const cwd = process.cwd();
+    process.chdir(process.env.HOME ?? os.homedir());
+    try {
+      expect(policyWithHome(".")).toThrow(AgentSandboxStartError);
+    } finally {
+      process.chdir(cwd);
+    }
   });
 
   // `go env -w GOPROXY=https://user:password@host` writes the password there.
