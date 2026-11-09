@@ -13,6 +13,30 @@ export interface ChatSearchMatch {
   after: string;
 }
 
+function isHiddenChatSearchMessage(message: MuxMessage): boolean {
+  // Model-only context has no transcript row to reveal.
+  return (
+    (message.metadata?.synthetic === true && message.metadata.uiVisible !== true) ||
+    isPlanReviewRecordMessage(message) ||
+    isWorkflowResultMessage(message)
+  );
+}
+
+function getChatSearchText(message: MuxMessage): string {
+  if (message.role === "assistant") return getTextPartContent(message.parts);
+  if (message.role !== "user") return "";
+  // Commands show their typed text, not the expanded instructions sent to the model.
+  return buildDisplayedMessagesForMessage({
+    message,
+    hasActiveStream: false,
+    isContextBoundaryMessage: () => false,
+  })
+    .flatMap((row) =>
+      row.type === "user" && row.agentPeerTriggerPayload == null ? [row.content] : []
+    )
+    .join("\n");
+}
+
 /** Search message text, including rows that the transcript does not mount. */
 export function findChatSearchMatches(
   messages: readonly MuxMessage[],
@@ -25,27 +49,8 @@ export function findChatSearchMatches(
   const matches: ChatSearchMatch[] = [];
   for (const sourceMessage of messages) {
     const message = restoreContextBudgetRejectedMessageForDisplay(sourceMessage);
-    if (message.role !== "user" && message.role !== "assistant") continue;
-    // Model-only context has no transcript row to reveal.
-    if (
-      (message.metadata?.synthetic === true && message.metadata.uiVisible !== true) ||
-      isPlanReviewRecordMessage(message) ||
-      isWorkflowResultMessage(message)
-    )
-      continue;
-    // Commands show their typed text, not the expanded instructions sent to the model.
-    const text =
-      message.role === "user"
-        ? buildDisplayedMessagesForMessage({
-            message,
-            hasActiveStream: false,
-            isContextBoundaryMessage: () => false,
-          })
-            .flatMap((row) =>
-              row.type === "user" && row.agentPeerTriggerPayload == null ? [row.content] : []
-            )
-            .join("\n")
-        : getTextPartContent(message.parts);
+    if (isHiddenChatSearchMessage(message)) continue;
+    const text = getChatSearchText(message);
     const match = pattern.exec(text);
     if (!match) continue;
     // Start at the match so a long prefix cannot hide the result preview.

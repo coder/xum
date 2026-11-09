@@ -21,6 +21,7 @@ import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditC
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
 import { AskUserQuestionDock } from "./AskUserQuestionDock";
+import { shouldDiscardTimelineReveal } from "@/browser/utils/timelineReveal";
 import { ChatSearch } from "./ChatSearch";
 import { WaitingOnYouCard, WaitingOnYouProvider, WaitingOnYouSlot } from "./WaitingOnYou";
 import { useAcceptedAnswersVersion } from "@/browser/utils/messages/openAskUserQuestions";
@@ -862,11 +863,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
     // Like pendingScrollTarget: the tail being pinned again supersedes a reveal still waiting.
-    if (
-      pendingTimelineReveal.workspaceId !== workspaceId ||
-      pendingTimelineReveal.isCancelled?.() ||
-      autoScroll
-    ) {
+    if (shouldDiscardTimelineReveal(pendingTimelineReveal, workspaceId, autoScroll)) {
       setPendingTimelineReveal(null);
       return;
     }

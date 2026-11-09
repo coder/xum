@@ -2182,8 +2182,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   // Global keyboard shortcuts (refresh/search)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Chat search claims Find when focus belongs to the chat.
-      if (e.defaultPrevented) return;
       if (matchesKeybind(e, KEYBINDS.REFRESH_REVIEW)) {
         e.preventDefault();
         controllerRef.current?.requestImmediate();

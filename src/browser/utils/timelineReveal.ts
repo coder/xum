@@ -1,4 +1,8 @@
-import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import {
+  CUSTOM_EVENTS,
+  createCustomEvent,
+  type CustomEventPayloads,
+} from "@/common/constants/events";
 import type { HistoryLoadResult, WorkspaceState } from "@/browser/stores/WorkspaceStore";
 
 const DEFAULT_MAX_REVEAL_HISTORY_PAGES = 10;
@@ -19,6 +23,15 @@ export type TimelineRevealResult = "revealed" | "not-found" | "not-loaded" | "er
 export interface TimelineRevealTarget {
   messageId?: string;
   toolCallId?: string;
+}
+
+/** Discard pending reveals after navigation, search cancellation, or return to the transcript tail. */
+export function shouldDiscardTimelineReveal(
+  reveal: CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR],
+  workspaceId: string,
+  autoScroll: boolean
+): boolean {
+  return reveal.workspaceId !== workspaceId || autoScroll || reveal.isCancelled?.() === true;
 }
 
 function hasTimelineRevealTarget(target: TimelineRevealTarget): boolean {

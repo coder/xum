@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
 import type { DisplayedMessage } from "@/common/types/message";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { revealTimelineTarget, type TimelineRevealStore } from "./timelineReveal";
+import {
+  revealTimelineTarget,
+  shouldDiscardTimelineReveal,
+  type TimelineRevealStore,
+} from "./timelineReveal";
 
 const workspaceId = "timeline-reveal-test";
 
@@ -41,6 +45,15 @@ function makeUserMessage(historyId: string): DisplayedMessage {
     historySequence: 1,
   };
 }
+
+describe("shouldDiscardTimelineReveal", () => {
+  it("keeps pending reveals only in the detached transcript that requested them", () => {
+    const reveal = { workspaceId, messageId: "pending" };
+    expect(shouldDiscardTimelineReveal(reveal, workspaceId, false)).toBe(false);
+    expect(shouldDiscardTimelineReveal(reveal, "another-workspace", false)).toBe(true);
+    expect(shouldDiscardTimelineReveal(reveal, workspaceId, true)).toBe(true);
+  });
+});
 
 describe("revealTimelineTarget", () => {
   let cleanupDom: (() => void) | null = null;
@@ -83,9 +96,9 @@ describe("revealTimelineTarget", () => {
   it("keeps cancellation available after dispatch while the target still mounts", async () => {
     const store = createStore({ messages: [makeUserMessage("prompt-1")] });
     let cancelled = false;
-    const events: Array<CustomEvent<{ isCancelled: () => boolean }>> = [];
+    const events: Array<CustomEvent<{ workspaceId: string; isCancelled: () => boolean }>> = [];
     const listener = (event: Event) =>
-      events.push(event as CustomEvent<{ isCancelled: () => boolean }>);
+      events.push(event as CustomEvent<{ workspaceId: string; isCancelled: () => boolean }>);
     window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
     try {
       await revealTimelineTarget({
@@ -95,9 +108,9 @@ describe("revealTimelineTarget", () => {
         pinTarget: () => undefined,
         isCancelled: () => cancelled,
       });
-      expect(events[0].detail.isCancelled()).toBe(false);
+      expect(shouldDiscardTimelineReveal(events[0].detail, workspaceId, false)).toBe(false);
       cancelled = true;
-      expect(events[0].detail.isCancelled()).toBe(true);
+      expect(shouldDiscardTimelineReveal(events[0].detail, workspaceId, false)).toBe(true);
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
     }
