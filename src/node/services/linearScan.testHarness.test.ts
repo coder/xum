@@ -54,14 +54,15 @@ describe("expectLinearScan", () => {
     REAL_SCAN_TIMEOUT_MS
   );
 
-  // The costs below are scripted, so the scan never runs and these tests cannot flake. The first
-  // CALIBRATION_RUNS costs are those of the calibration scans (`onceMs` each). Then run i costs
-  // `smalls[i]` at the small size and `larges[i]` at the large size.
-  const scripted = (onceMs: number, smalls: number[], larges: number[]) => {
-    const costs = [
-      ...Array<number>(CALIBRATION_RUNS).fill(onceMs),
-      ...smalls.flatMap((small, run) => [small, larges[run]]),
-    ];
+  // The costs below are scripted, so the scan never runs and these tests cannot flake. An attempt
+  // costs CALIBRATION_RUNS calibration scans (`onceMs` each), then the small and the large sample
+  // of each run: run i costs `smalls[i]` and `larges[i]`. Calibrating at 3 ms makes 14 runs.
+  const attempt = (onceMs: number, smalls: number[], larges: number[]) => [
+    ...Array<number>(CALIBRATION_RUNS).fill(onceMs),
+    ...smalls.flatMap((small, run) => [small, larges[run]]),
+  ];
+  const scripted = (...attempts: number[][]) => {
+    const costs = attempts.flat();
     return () => {
       const cost = costs.shift();
       if (cost === undefined) throw new Error("the harness measured more runs than were scripted");
@@ -69,24 +70,44 @@ describe("expectLinearScan", () => {
     };
   };
   const noScan = () => undefined;
+  const expectScripted = (...attempts: number[][]) =>
+    expect(() => expectLinearScan(noScan, build, SLOW_SCAN_MS, scripted(...attempts)));
+
+  // Costs of 14 runs at 2.5 ms for the small sample.
+  const linearSmalls = [1.1, 2.5, 2.6, 2.4, 2.5, 1.3, 2.5, 2.7, 2.4, 2.5, 2.6, 2.5, 2.5, 2.6];
+  const linearLarges = [10, 10, 11, 9.8, 10, 10, 10, 10.5, 9.6, 10, 12, 10, 10, 11];
+  const quadraticSmalls = [2.5, 6, 2.4, 3.2, 2.5, 2.7, 2.5, 2.6, 2.4, 2.5, 2.6, 2.5, 2.7, 2.5];
+  const quadraticLarges = [40, 40, 39, 46, 40, 43, 40, 38, 38, 40, 41, 40, 43, 40];
 
   it("accepts a linear scan whose fastest runs are far apart", () => {
     // Every run but two costs 4 times as much at the large size. The fastest small cost (1.1) and
     // the fastest large cost (9.6) make a ratio of 8.7 on their own, and the two runs with a lucky
-    // small cost make 9.1 and 7.7. The median of the 15 ratios is 4.
-    const smalls = [1.1, 2.5, 2.6, 2.4, 2.5, 1.3, 2.5, 2.7, 2.4, 2.5, 2.6, 2.5, 2.5, 2.6, 2.5];
-    const larges = [10, 10, 11, 9.8, 10, 10, 10, 10.5, 9.6, 10, 12, 10, 10, 11, 10];
-    expect(() =>
-      expectLinearScan(noScan, build, SLOW_SCAN_MS, scripted(3, smalls, larges))
-    ).not.toThrow();
+    // small cost make 9.1 and 7.7. The median of the 14 ratios is 4.
+    expectScripted(attempt(3, linearSmalls, linearLarges)).not.toThrow();
   });
 
   it("rejects a scan that costs 16 times as much, with noise in every run", () => {
-    // The run with a small cost of 6 makes a ratio of 6.7. The median of the ratios it reads is 16.
-    const smalls = [2.5, 6, 2.4, 3.2, 2.5, 2.7, 2.5, 2.6, 2.4, 2.5];
-    const larges = [40, 40, 39, 46, 40, 43, 40, 38, 38, 40];
-    expect(() =>
-      expectLinearScan(noScan, build, SLOW_SCAN_MS, scripted(3, smalls, larges))
-    ).toThrow();
+    // The run with a small cost of 6 makes a ratio of 6.7. The median of the ratios is 16.
+    const costs = attempt(3, quadraticSmalls, quadraticLarges);
+    expectScripted(costs, costs).toThrow();
+  });
+
+  it("measures again after a stalled attempt, and accepts a linear scan the second time", () => {
+    // The first attempt reads 13 times the cost at the large size, as a stalled host made it.
+    const stalled = attempt(
+      3,
+      linearSmalls,
+      linearLarges.map((cost) => cost * 3.5)
+    );
+    expectScripted(stalled, attempt(3, linearSmalls, linearLarges)).not.toThrow();
+  });
+
+  it("plans the number of runs from the calibration, so stalled runs cannot shorten it", () => {
+    // Calibrating at 3 ms plans 14 runs. Every sample costs 130 ms, as in a stall: the plan must
+    // not follow the cost of the runs (2 of them cost 260 ms, more than the budget).
+    let calls = 0;
+    const stalled = () => (++calls <= CALIBRATION_RUNS ? 3 : 130);
+    expectLinearScan(noScan, build, SLOW_SCAN_MS, stalled);
+    expect((calls - CALIBRATION_RUNS) / 2).toBeGreaterThan(5);
   });
 });

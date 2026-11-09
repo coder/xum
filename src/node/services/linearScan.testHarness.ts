@@ -45,11 +45,18 @@ const MAX_REPS = 200;
 // and now and then a sample takes 10 to 100 times as long (a scan of 12 ms took 1.2 s of CPU
 // time once). The ratio of one run, or of the fastest sample of each size, reached 7.3 to 11
 // against a limit of 8 on linear scans. The median of the ratios of many runs stayed under 6.
-// The number of runs follows the fastest run so far, not the time spent, so a stalled sample does
-// not end the loop early: a cheap shape gets MAX_RUNS runs, one that costs 100 ms gets MIN_RUNS.
+// The number of runs comes from the calibration, not from the runs themselves: a stall that
+// inflates the first runs must not cut the loop short. A cheap shape gets MAX_RUNS runs, one that
+// costs 100 ms gets MIN_RUNS.
 const MIN_RUNS = 2;
 const MAX_RUNS = 15;
 const RUN_BUDGET_MS = 200;
+
+// A host can stall a whole measurement, not only a sample: at a load of 140 on 32 cores, the two
+// runs of one shape cost 3 and 13 times their usual CPU time, and the ratio read 22. A real
+// quadratic scan reads 12 or more every time it is measured, so the check fails only if a second
+// measurement fails too.
+const ATTEMPTS = 2;
 
 /** CPU time (user + system) that `run` takes: a busy host cannot stretch it. */
 export function cpuMs(run: () => void): number {
@@ -57,6 +64,48 @@ export function cpuMs(run: () => void): number {
   run();
   const used = process.cpuUsage(started);
   return (used.user + used.system) / 1000;
+}
+
+interface Measurement {
+  /** The cost of one scan of the small text: its fastest sample divided by REPS. */
+  smallScanMs: number;
+  /** The median over the runs of the cost of the large sample over the cost of the small one. */
+  ratio: number;
+}
+
+function measureCosts(
+  scan: (text: string) => unknown,
+  small: string,
+  large: string,
+  measure: (run: () => void) => number
+): Measurement {
+  let onceMs = Number.POSITIVE_INFINITY;
+  for (let call = 0; call < CALIBRATION_RUNS; call++) {
+    onceMs = Math.min(
+      onceMs,
+      measure(() => scan(small))
+    );
+  }
+  const scanMs = Math.max(onceMs, MIN_SAMPLE_MS / MAX_REPS);
+  const reps = Math.ceil(MIN_SAMPLE_MS / scanMs);
+  const runs = Math.min(
+    MAX_RUNS,
+    Math.max(MIN_RUNS, Math.ceil(RUN_BUDGET_MS / (reps * scanMs * (1 + SIZE_STEP))))
+  );
+  const scanReps = (text: string) => () => {
+    for (let rep = 0; rep < reps; rep++) scan(text);
+  };
+  let fastestSmallMs = Number.POSITIVE_INFINITY;
+  const ratios: number[] = [];
+  for (let run = 0; run < runs; run++) {
+    const smallRun = measure(scanReps(small));
+    const largeRun = measure(scanReps(large));
+    fastestSmallMs = Math.min(fastestSmallMs, smallRun);
+    ratios.push(largeRun / Math.max(smallRun, MIN_BASE_MS));
+  }
+  // The lower median: with two runs it is the smaller ratio, as the fastest sample was before.
+  ratios.sort((a, b) => a - b);
+  return { smallScanMs: fastestSmallMs / reps, ratio: ratios[(ratios.length - 1) >> 1] };
 }
 
 /** `measure` is a seam for the tests of this file: they feed it costs, and the scan never runs. */
@@ -68,30 +117,11 @@ export function expectLinearScan(
 ): void {
   const small = build(1);
   const large = build(SIZE_STEP);
-  let onceMs = Number.POSITIVE_INFINITY;
-  for (let call = 0; call < CALIBRATION_RUNS; call++) {
-    onceMs = Math.min(
-      onceMs,
-      measure(() => scan(small))
-    );
+  let measurement: Measurement = { smallScanMs: 0, ratio: 0 };
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+    measurement = measureCosts(scan, small, large, measure);
+    if (measurement.smallScanMs < ceilingMs && measurement.ratio < MAX_COST_RATIO) return;
   }
-  const reps = Math.ceil(MIN_SAMPLE_MS / Math.max(onceMs, MIN_SAMPLE_MS / MAX_REPS));
-  const scanReps = (text: string) => () => {
-    for (let rep = 0; rep < reps; rep++) scan(text);
-  };
-  let fastestSmallMs = Number.POSITIVE_INFINITY;
-  let fastestLargeMs = Number.POSITIVE_INFINITY;
-  const ratios: number[] = [];
-  for (let run = 0; run < MAX_RUNS; run++) {
-    if (run >= MIN_RUNS && run * (fastestSmallMs + fastestLargeMs) >= RUN_BUDGET_MS) break;
-    const smallRun = measure(scanReps(small));
-    const largeRun = measure(scanReps(large));
-    fastestSmallMs = Math.min(fastestSmallMs, smallRun);
-    fastestLargeMs = Math.min(fastestLargeMs, largeRun);
-    ratios.push(largeRun / Math.max(smallRun, MIN_BASE_MS));
-  }
-  expect(fastestSmallMs / reps).toBeLessThan(ceilingMs);
-  // The lower median: with two runs it is the smaller ratio, as the fastest sample was before.
-  ratios.sort((a, b) => a - b);
-  expect(ratios[(ratios.length - 1) >> 1]).toBeLessThan(MAX_COST_RATIO);
+  expect(measurement.smallScanMs).toBeLessThan(ceilingMs);
+  expect(measurement.ratio).toBeLessThan(MAX_COST_RATIO);
 }
