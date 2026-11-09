@@ -1070,7 +1070,7 @@ const CodexHooksDisclosure: React.FC<{ hooks: AgentPluginInstallPreview["codexHo
           {props.hooks.map((hook) => {
             const note = hookStatusNote(hook);
             return (
-              <li key={hook.key} className="text-xs break-all">
+              <li key={hook.key} className="text-xs break-words">
                 <span className="text-foreground font-mono">{showOneLineControls(hook.event)}</span>
                 {hook.matcher !== undefined && (
                   <span className="text-muted font-mono">
@@ -1232,6 +1232,17 @@ const ReadonlyAgentNote: React.FC<{ preview: AgentPluginInstallPreview; agent: s
   return <span className="text-muted"> (edit tools removed, {shell})</span>;
 };
 
+/**
+ * A file name inside a line of text. It moves to the next line as a whole instead of splitting at
+ * the card's edge, and wraps inside itself only when it is longer than a line (`break-all` split
+ * every name at phone width).
+ */
+const FileName: React.FC<{ name: string }> = (props) => (
+  <span className="text-foreground inline-block max-w-full font-mono break-words">
+    {props.name}
+  </span>
+);
+
 /** Agents, workflows, slash commands and hooks of a consent preview: the import choice does not cover them. */
 const PreviewDisclosures: React.FC<{
   preview: AgentPluginInstallPreview;
@@ -1249,7 +1260,7 @@ const PreviewDisclosures: React.FC<{
           {props.preview.agents.map((agent, index) => (
             <React.Fragment key={agent}>
               {index > 0 && ", "}
-              <span className="text-foreground font-mono break-all">{agent}</span>
+              <FileName name={agent} />
               <ReadonlyAgentNote preview={props.preview} agent={agent} />
             </React.Fragment>
           ))}{" "}
@@ -1271,9 +1282,12 @@ const PreviewDisclosures: React.FC<{
           Workflows ({props.preview.workflows.length})
         </h4>
         <p className="text-xs">
-          <span className="text-foreground font-mono break-all">
-            {props.preview.workflows.join(", ")}
-          </span>{" "}
+          {props.preview.workflows.map((workflow, index) => (
+            <React.Fragment key={workflow}>
+              {index > 0 && ", "}
+              <FileName name={workflow} />
+            </React.Fragment>
+          ))}{" "}
           <span className="text-muted">
             — executable workflow scripts, invokable after install.
           </span>
@@ -1456,8 +1470,8 @@ const ReviewedDefinitions: React.FC<{
         {props.items.map((item) => (
           <li key={`${item.kind}:${item.name}`} className="text-xs">
             <details>
-              <summary className="text-foreground cursor-pointer break-all">
-                {REVIEWED_KIND_LABEL[item.kind]} <span className="font-mono">{item.name}</span>
+              <summary className="text-foreground cursor-pointer">
+                {REVIEWED_KIND_LABEL[item.kind]} <FileName name={item.name} />
               </summary>
               <pre className="bg-modal-bg border-border-medium mt-1 max-h-64 overflow-auto rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
                 {item.detail}
