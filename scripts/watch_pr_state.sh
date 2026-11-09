@@ -14,7 +14,7 @@
 # Output carries only fixed tokens, counts and GitHub IDs. A failed state reads
 #   failed 2/31 checks, never the check names: names, descriptions and links are written by
 #   the PR author and by apps that post statuses, so they need an explicit read:
-#   ./scripts/wait_pr_checks.sh <pr> --once prints each failed check with its name and link.
+#   gh pr view <pr> --json statusCheckRollup lists the head commit's checks with their names.
 #   A failed read prints GitHub's GraphQL error messages and fixed text, not the reply.
 #
 # Without --queue, checks on the head and merge commit count as in wait_pr_checks.sh:
@@ -40,6 +40,9 @@
 # Exit: 0 every PR ended ready or merged, 1 a PR ended in another final state, 2 usage
 # error, failed or timed-out read, or unknown value, 3 deadline.
 set -euo pipefail
+# gh logs whole replies (check names, descriptions) to stderr under GH_DEBUG or DEBUG. That would
+# bypass what this script prints, so it runs gh without them.
+unset GH_DEBUG DEBUG
 
 POLL_SECS=60
 READ_TIMEOUT_SECS=30
@@ -68,7 +71,7 @@ finish() {
 usage_error() {
   echo "❌ $1" >&2
   echo "Usage: $0 <pr>... [--queue] [--deadline-mins N]" >&2
-  echo "Failed check names are not printed. Read them with: ./scripts/wait_pr_checks.sh <pr> --once" >&2
+  echo "Failed check names are not printed. Read them with: gh pr view <pr> --json statusCheckRollup" >&2
   finish error 2
 }
 
@@ -182,7 +185,9 @@ def checks_state($pr; $p):
       else ["pending", "\($at) checks passed, merge state \($p.mergeStateStatus)"] end
   end;
 
-if (.errors // []) != [] then error("watch_pr_state: GraphQL errors: \(.errors | map(.message | tostring | gsub("[[:cntrl:]]"; " ") | .[0:300]) | join("; "))")
+# gh exits non-zero when a reply holds errors, and poll prints their messages then. A reply that
+# holds errors after an exit 0 is not one this script knows how to read.
+if (.errors // []) != [] then error("watch_pr_state: the reply holds errors but gh exited 0")
 elif (.data.repository | type) != "object" then error("watch_pr_state: no repository in the response")
 else .data.repository end
 | . as $repo

@@ -27,7 +27,14 @@ assert args[2:6] == ['-F', 'owner={owner}', '-F', 'name={repo}'], args
 assert args[6] == '-f' and args[7].startswith('query=') and len(args) == 8, args
 polls = json.loads(pathlib.Path(os.environ['WATCH_FIXTURE']).read_text())
 reply = polls[len(calls.read_text().splitlines()) - 1]
+if os.environ.get('GH_DEBUG') or os.environ.get('DEBUG'):
+    # What gh's debug logging does: the whole reply goes to stderr.
+    print(json.dumps(polls), file=sys.stderr)
 if reply.get('hang'):
+    partial = reply.get('partial')
+    if partial is not None:
+        sys.stdout.write(partial if isinstance(partial, str) else json.dumps(partial))
+        sys.stdout.flush()
     if reply.get('child'):
         import subprocess
         subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], stderr=subprocess.DEVNULL)
@@ -190,9 +197,13 @@ class WatchPrStateTest(unittest.TestCase):
         env["WATCH_HUNG"] = str(self.directory / "hung")
         env["PATH"] = str(self.directory) + os.pathsep + os.environ["PATH"]
         env.update(env_extra)
+        tmp = self.directory / "tmp"
+        tmp.mkdir(exist_ok=True)
+        env["TMPDIR"] = str(tmp)
         result = subprocess.run(
             ["bash", str(SCRIPT), *args], env=env, text=True, capture_output=True, timeout=30, check=False
         )
+        self.assertEqual(list(tmp.iterdir()), [], "the script removes its temp files")
         self.queries = [json.loads(line)[7] for line in files["calls"].read_text().splitlines()]
         self.sleeps = [int(line) for line in files["sleeps"].read_text().split()]
         lines = result.stdout.splitlines()
@@ -292,7 +303,7 @@ class WatchPrStateTest(unittest.TestCase):
         renumbered = queued(101, "QUEUED")
         renumbered["number"] = 999
         for polls, needle in (
-            ([reply(queued(101, "QUEUED"), errors=[{"message": "partial"}])], "partial"),
+            ([reply(queued(101, "QUEUED"), errors=[{"message": "partial"}])], "the reply holds errors but gh exited 0"),
             ([reply(queued(101, state="DRAFTED"))], "unknown state DRAFTED"),
             ([reply(queued(101, "SOMETHING_NEW"))], "unknown queue entry state SOMETHING_NEW"),
             ([reply(weird_event)], "unknown queue event SomeNewEvent"),
@@ -300,6 +311,7 @@ class WatchPrStateTest(unittest.TestCase):
             ([reply(queued(102, "QUEUED"))], "missing from the response"),
             ([{"stdout": {"data": {"repository": {"pr101": renumbered}}}}], "response is for PR #999"),
             ([{"stdout": "err"}], "Could not classify the GitHub response"),
+            ([{"stdout": {"data": {}}}], "no repository in the response"),
         ):
             with self.subTest(needle=needle):
                 result = self.assert_watch(2, polls, "101", "--queue")
@@ -420,7 +432,7 @@ class WatchPrStateTest(unittest.TestCase):
 
     def test_unknown_states_and_contexts_name_counts_only(self):
         for nodes, needle in (
-            ([hostile_status("FUTURE_STATUS"), check(HOSTILE, None, "FUTURE_STATUS"), check()], "unknown check state on 2 of 3 checks"),
+            ([hostile_status("FUTURE_STATUS"), check(HOSTILE, None, "FUTURE_STATUS"), check(), pixel()], "unknown check state on 2 of 4 checks"),
             ([{"__typename": HOSTILE}], "Unknown check context"),
         ):
             with self.subTest(needle=needle):
@@ -444,22 +456,47 @@ class WatchPrStateTest(unittest.TestCase):
             # An HTTP error body that is not GraphQL JSON prints nothing but the fixed text.
             ({"rc": 1, "stdout": f"<html>{HOSTILE}</html>", "stderr": "gh: HTTP 502\n"}, ["gh: HTTP 502", "GitHub read failed"]),
             ({"rc": 1, "stdout": {**data, "errors": [{"extensions": HOSTILE}, HOSTILE, {"message": None}]}}, ["GitHub read failed"]),
+            # A message that is not a string must not hide the messages after it.
+            ({"rc": 1, "stdout": {"errors": [{"message": None}, {"message": "Real message"}]}}, ["GitHub error: Real message"]),
+            # A long message is cut at 300 characters.
+            ({"rc": 1, "stdout": {"errors": [{"message": "A" * 400}]}}, ["GitHub error: " + "A" * 300 + "\n"]),
         ):
-            with self.subTest(needles=needles):
+            with self.subTest(needles=[needle[:40] for needle in needles]):
                 result = self.assert_watch(2, [poll], "101")
                 for needle in needles:
                     self.assertIn(needle, result.stderr)
+                self.assertNotIn("A" * 301, result.stderr)
+                self.assertNotIn("jq:", result.stderr)
                 self.assert_no_hostile_text(result)
                 self.assertEqual(self.result, "RESULT error 101:unread")
 
-    def test_a_jq_type_error_does_not_quote_the_reply(self):
-        # jq's own message for an errors field that is a string quotes the start of the string.
-        for errors in (HOSTILE, [HOSTILE]):
+    def test_a_hung_read_prints_no_part_of_its_reply(self):
+        data = {"data": {"repository": {"pr101": checked(101, [check(HOSTILE, "FAILURE"), hostile_status("FAILURE")])}}}
+        for name, partial in (
+            ("data and errors", {**data, "errors": [{"message": "m1"}]}),
+            ("data only", data),
+            ("text", HOSTILE),
+            ("truncated JSON", '{"data":{"x":"' + HOSTILE),
+        ):
+            with self.subTest(partial=name):
+                result = self.assert_watch(2, [{"hang": True, "partial": partial}], "101")
+                self.assertIn("timed out", result.stderr)
+                self.assert_no_hostile_text(result)
+
+    def test_a_reply_with_errors_after_exit_0_is_not_echoed(self):
+        for errors in (HOSTILE, [HOSTILE], [{"message": HOSTILE}]):
             with self.subTest(errors=errors):
                 result = self.assert_watch(2, [reply(checked(101, [check()]), errors=errors)], "101")
-                self.assertIn("Could not classify the GitHub response", result.stderr)
-                self.assertNotIn("jq: error", result.stderr)
+                self.assertIn("the reply holds errors but gh exited 0", result.stderr)
                 self.assert_no_hostile_text(result)
+
+    def test_gh_debug_logging_cannot_carry_the_reply_into_the_output(self):
+        data = checked(101, [check(HOSTILE, "FAILURE"), hostile_status("FAILURE")], "BLOCKED")
+        for variable in ("GH_DEBUG", "DEBUG"):
+            with self.subTest(variable=variable):
+                result = self.assert_watch(1, [reply(data)], "101", **{variable: "api"})
+                self.assert_no_hostile_text(result)
+                self.assertEqual(self.lines, ["#101 failed head 1111111 failed 2/2 checks"])
 
     def test_only_messages_that_start_with_the_scripts_prefix_survive_the_jq_filter(self):
         stub = self.directory / "jq"
@@ -496,7 +533,7 @@ class WatchPrStateTest(unittest.TestCase):
             with self.subTest(args=args):
                 result = self.assert_watch(2, [], *args)
                 self.assertIn("Usage:", result.stderr)
-                self.assertIn("./scripts/wait_pr_checks.sh <pr> --once", result.stderr)
+                self.assertIn("gh pr view <pr> --json statusCheckRollup", result.stderr)
                 self.assertTrue(self.result.startswith("RESULT error"), self.result)
 
 
