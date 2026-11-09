@@ -14,6 +14,16 @@ HEAD = "1" * 40
 MERGE = "2" * 40
 START = 1_800_000_000
 
+# Hang guard for one script run, not a speed requirement: a run ends when its fixture ends (the gh
+# double answers from the fixture and nothing waits on a clock), so only a loop that never ends
+# reaches this bound. On a host that other agents load (16 busy loops beside three copies of this
+# file, 2026-11-09), a run took 1.7 s at the median and 106.6 s at the longest of 576 runs, and 3
+# of them took more than 30 s. In one pass of this file at a load of 150, 3 runs passed 30 s. The
+# bound is about 3 times the longest run seen. The 30 s this replaced failed these tests with
+# TimeoutExpired, which says nothing about the script. The pr.yml step that runs the gate tests
+# stops at 15 minutes, so a hang in every run cannot hold the job for hours.
+SCRIPT_RUN_TIMEOUT_SECS = 300
+
 # Strict protocol doubles. gh answers poll N with fixture entry N and fails on any call
 # the fixture does not cover. sleep advances the clock that date reads instead of waiting.
 GH = """
@@ -201,7 +211,12 @@ class WatchPrStateTest(unittest.TestCase):
         tmp.mkdir(exist_ok=True)
         env["TMPDIR"] = str(tmp)
         result = subprocess.run(
-            ["bash", str(SCRIPT), *args], env=env, text=True, capture_output=True, timeout=30, check=False
+            ["bash", str(SCRIPT), *args],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=SCRIPT_RUN_TIMEOUT_SECS,
+            check=False,
         )
         self.assertEqual(list(tmp.iterdir()), [], "the script removes its temp files")
         self.queries = [json.loads(line)[7] for line in files["calls"].read_text().splitlines()]
