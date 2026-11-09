@@ -14,7 +14,7 @@ import {
   CACHE_WRITE_PATHS,
   DENY_READ_ROOTS,
   HOME_READ_PATHS,
-  NESTED_DENY_READ_PATHS,
+  nestedDenyReadPaths,
   PROTECTED_GIT_DIR_PATHS,
   PROTECTED_LINKED_WORKTREE_PATHS,
   PROTECTED_WRITE_PATHS,
@@ -121,7 +121,7 @@ export interface AgentSandboxPolicy {
    * Seatbelt as one).
    */
   denyWrite: string[];
-  /** DENY_READ_ROOTS, the home folder, Xum's home folder and NESTED_DENY_READ_PATHS. */
+  /** DENY_READ_ROOTS, the home folder, Xum's home folder and nestedDenyReadPaths(). */
   denyRead: string[];
   /** The write roots, gitCommonDirs, HOME_READ_PATHS, PATH folders under ~ and extraReadPaths. */
   allowRead: string[];
@@ -184,7 +184,7 @@ export function buildAgentSandboxPolicy(
 ): AgentSandboxPolicy {
   const home = realpathOfNearest(os.homedir());
   const cwd = workspaceRootOrThrow(realpathOfNearest(input.cwd), home);
-  const nestedDenies = NESTED_DENY_READ_PATHS.map(expandSandboxPath);
+  const nestedDenies = nestedDenyReadPaths().map(expandSandboxPath);
   const extraWriteRoots = outsideNestedDenies(
     settings.extraWritePaths.map(expandSandboxPath),
     nestedDenies
@@ -192,7 +192,11 @@ export function buildAgentSandboxPolicy(
   const extraWorkspaceRoots = (input.workspaceRoots ?? []).map((root) =>
     workspaceRootOrThrow(realpathOfNearest(root), home)
   );
-  const workspaceRoots = dedupe([cwd, ...extraWorkspaceRoots, ...realpathIfSet(input.scratchDir)]);
+  // Xum makes the scratch folder as a folder, so one that is a link fails closed (Codex review):
+  // its `.git` below leads through it.
+  const scratchSpellings = presentPath(input.scratchDir);
+  const scratchRoots = scratchSpellings.map(expandWriteRoot);
+  const workspaceRoots = dedupe([cwd, ...extraWorkspaceRoots, ...scratchRoots]);
   const writeRoots = dedupe([
     ...workspaceRoots,
     ...tempWritePaths(),
@@ -200,7 +204,7 @@ export function buildAgentSandboxPolicy(
     ...extraWriteRoots,
   ]);
   assertNoPathThroughLink(
-    [input.cwd, ...(input.workspaceRoots ?? []), ...settings.extraWritePaths],
+    [input.cwd, ...(input.workspaceRoots ?? []), ...scratchSpellings, ...settings.extraWritePaths],
     writeRoots
   );
   // Xum runs code from its home folder with full access (the global mcp.jsonc, tool hooks,
@@ -267,7 +271,10 @@ export function buildAgentSandboxPolicy(
   const allowRead = dedupe([
     ...writeRoots,
     ...gitCommonDirs,
-    ...HOME_READ_PATHS.map(expandSandboxPath),
+    // A toolchain folder can link into a write root, where a command can replace the link.
+    ...HOME_READ_PATHS.map((entry) =>
+      realpathOutside(expandSandboxPathSpelling(entry), writeRoots)
+    ),
     ...readableAutomation,
     ...pathFoldersUnderHome(input.pathEnv, home, writeRoots),
     // A command can replace an entry in a write root with a link, so links there are not followed.
@@ -331,8 +338,8 @@ function assertNoPathThroughLink(spelled: readonly string[], writeRoots: readonl
   }
 }
 
-function realpathIfSet(target: string | undefined): string[] {
-  return target === undefined || target.length === 0 ? [] : [realpathOfNearest(target)];
+function presentPath(target: string | undefined): string[] {
+  return target === undefined || target.length === 0 ? [] : [target];
 }
 
 /** `root`, unless it is `/`, `~` or a parent of `~`: the sandbox would open the whole home. */

@@ -904,6 +904,76 @@ describe("buildAgentSandboxPolicy", () => {
     expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
   });
 
+  // The folder is the deny, but the hard-link check reads files.
+  test("fails closed on uv's token file with a hard link in the workspace", async () => {
+    const home = path.join(root, "home");
+    const store = path.join(home, ".local", "share", "uv", "credentials");
+    await fs.mkdir(store, { recursive: true });
+    await fs.writeFile(path.join(store, "credentials.toml"), "\n");
+    await fs.link(path.join(store, "credentials.toml"), path.join(repo, "uv-tokens"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
+    try {
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(
+        AgentSandboxStartError
+      );
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  // A credential store that Xum's environment moves into the workspace is open there otherwise.
+  test.each([
+    { name: "UV_CREDENTIALS_DIR", value: "uv-creds", file: "uv-creds/credentials.toml" },
+    { name: "XDG_DATA_HOME", value: "data", file: "data/uv/credentials/credentials.toml" },
+    { name: "CARGO_HOME", value: "cargo", file: "cargo/credentials.toml" },
+    { name: "HF_TOKEN_PATH", value: "hf-token", file: "hf-token" },
+  ])("hides the credential store where $name moves it", ({ name, value, file }) => {
+    const saved = process.env[name];
+    process.env[name] = path.join(repo, value);
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+      expect(agentSandboxPolicyAllows(policy, path.join(repo, file), "read")).toBe(false);
+      expect(agentSandboxPolicyAllows(policy, path.join(repo, file), "write")).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[name];
+      else process.env[name] = saved;
+    }
+  });
+
+  // Seatbelt follows the link, so a scratch folder that is one would open where it points.
+  test("fails closed when the scratch folder is a symlink", async () => {
+    const elsewhere = path.join(root, "elsewhere");
+    const scratch = path.join(root, "scratch");
+    await fs.mkdir(elsewhere);
+    await fs.symlink(elsewhere, scratch);
+    using _tmpdir = homeOutsideWriteRoots();
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo, scratchDir: scratch })).toThrow(
+      AgentSandboxStartError
+    );
+  });
+
+  // A command can replace the link in the workspace, and the next policy would follow it.
+  test("does not open where a toolchain folder that links into a write root leads", async () => {
+    const home = path.join(root, "home");
+    const ssh = path.join(home, ".ssh");
+    await fs.mkdir(path.join(home, ".local", "share"), { recursive: true });
+    await fs.mkdir(ssh);
+    await fs.symlink(ssh, path.join(repo, "uv-data"));
+    await fs.symlink(path.join(repo, "uv-data"), path.join(home, ".local", "share", "uv"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+      expect(agentSandboxPolicyAllows(policy, path.join(ssh, "id_ed25519"), "read")).toBe(false);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
   // A default macOS volume opens `.XUM/MCP.JSONC` as `.xum/mcp.jsonc`.
   test("keeps protected paths read-only in any case", () => {
     const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });

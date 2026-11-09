@@ -263,25 +263,44 @@ export const HOME_READ_PATHS: readonly string[] = [
   ...AUTOMATION_READ_PATHS,
 ];
 
-// Denied after the allows, so no open folder or extraReadPaths entry exposes them.
-// <xumHome> can be outside ~ (XUM_ROOT), so its files need their own denies.
-// Not open either: ~/.npmrc, ~/.bunfig.toml, ~/.pypirc, ~/.gradle/gradle.properties,
-// ~/.m2/settings.xml. They can hold tokens; the user can add each one to extraReadPaths.
-export const NESTED_DENY_READ_PATHS: readonly string[] = [
-  "~/.cargo/credentials.toml",
-  "~/.cargo/credentials",
-  "~/.config/git/credentials",
-  "~/.cache/huggingface/token",
-  // `uv auth login` keeps index tokens here, inside ~/.local/share/uv, which HOME_READ_PATHS opens.
-  "~/.local/share/uv/credentials",
-  `${XUM_HOME_TOKEN}/server.lock`,
-  `${XUM_HOME_TOKEN}/providers.jsonc`,
-  `${XUM_HOME_TOKEN}/secrets.json`,
-  `${XUM_HOME_TOKEN}/mcp-oauth.json`,
-  `${XUM_HOME_TOKEN}/config.json`,
-  // SSH prompts and their answers, passwords too (askpassSessionsRoot() in sshAskpass.ts).
-  `${XUM_HOME_TOKEN}/askpass`,
-];
+/**
+ * Denied after the allows, so no open folder or extraReadPaths entry exposes them: credential
+ * stores, also where Xum's environment moves them (Codex review), and Xum's own secrets.
+ * <xumHome> can be outside ~ (XUM_ROOT), so its files need their own denies.
+ * Not open either: ~/.npmrc, ~/.bunfig.toml, ~/.pypirc, ~/.gradle/gradle.properties,
+ * ~/.m2/settings.xml. They can hold tokens; the user can add each one to extraReadPaths.
+ */
+export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): string[] {
+  const fromEnv = (name: string, ...rest: string[]) => envPath(env, name, ...rest);
+  return dedupe([
+    "~/.cargo/credentials.toml",
+    "~/.cargo/credentials",
+    ...fromEnv("CARGO_HOME", "credentials.toml"),
+    ...fromEnv("CARGO_HOME", "credentials"),
+    "~/.config/git/credentials",
+    ...fromEnv("XDG_CONFIG_HOME", "git", "credentials"),
+    "~/.cache/huggingface/token",
+    ...fromEnv("XDG_CACHE_HOME", "huggingface", "token"),
+    ...fromEnv("HF_HOME", "token"),
+    ...fromEnv("HF_TOKEN_PATH"),
+    // `uv auth login` keeps index tokens in ~/.local/share/uv, which HOME_READ_PATHS opens.
+    ...uvCredentialStore("~/.local/share/uv/credentials"),
+    ...fromEnv("XDG_DATA_HOME", "uv", "credentials").flatMap(uvCredentialStore),
+    ...fromEnv("UV_CREDENTIALS_DIR").flatMap(uvCredentialStore),
+    `${XUM_HOME_TOKEN}/server.lock`,
+    `${XUM_HOME_TOKEN}/providers.jsonc`,
+    `${XUM_HOME_TOKEN}/secrets.json`,
+    `${XUM_HOME_TOKEN}/mcp-oauth.json`,
+    `${XUM_HOME_TOKEN}/config.json`,
+    // SSH prompts and their answers, passwords too (askpassSessionsRoot() in sshAskpass.ts).
+    `${XUM_HOME_TOKEN}/askpass`,
+  ]);
+}
+
+/** The folder, and its token file by name: the hard-link check only reads files. */
+function uvCredentialStore(dir: string): string[] {
+  return [dir, path.join(dir, "credentials.toml")];
+}
 
 /** `~/x`, `<xumHome>/x` or an absolute path, as the real path Seatbelt matches. */
 export function expandSandboxPath(entry: string): string {
