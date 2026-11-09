@@ -2401,6 +2401,20 @@ describe("TaskService", () => {
             agentType: "explore",
             taskStatus: "running",
           }),
+          // A branch under the parent that has a child of its own, so it is an ancestor of a
+          // descendant of the parent, but not of `child`.
+          projectWorkspace(projectPath, "mid", "mid-555", {
+            name: "agent_explore_mid",
+            parentWorkspaceId: parentId,
+            agentType: "explore",
+            taskStatus: "running",
+          }),
+          projectWorkspace(projectPath, "leaf", "leaf-666", {
+            name: "agent_explore_leaf",
+            parentWorkspaceId: "mid-555",
+            agentType: "explore",
+            taskStatus: "running",
+          }),
         ],
         testTaskSettings(1, 3)
       );
@@ -2481,6 +2495,20 @@ describe("TaskService", () => {
       } finally {
         snapshot.mockRestore();
       }
+    });
+
+    test("cannot read a record stored under an owner that is not an ancestor of its workspace", async () => {
+      const { taskService, handleStore } = await setup();
+      // `child` is under the parent, not under `mid`, so `mid` cannot own a turn of it.
+      await handleStore.upsertWorkspaceTurn({
+        ...failedRecord,
+        handleId: "wst_misowned_turn",
+        ownerWorkspaceId: "mid-555",
+      });
+
+      expect(
+        await taskService.getDescendantTerminalWorkspaceTurnSnapshot(parentId, "wst_misowned_turn")
+      ).toBeNull();
     });
 
     test("cannot read a turn of a workspace it is not an ancestor of", async () => {
