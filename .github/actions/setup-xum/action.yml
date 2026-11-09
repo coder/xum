@@ -9,6 +9,10 @@ inputs:
     description: "Cache the Electron zip that jobs launching Electron download, and fetch it with retries on a cache miss"
     required: false
     default: "false"
+  appimage-tool:
+    description: "Put electron-builder's AppImage tool into its cache, downloaded with retries and a pinned checksum, so that electron-builder downloads nothing"
+    required: false
+    default: "false"
 runs:
   using: "composite"
   steps:
@@ -107,6 +111,12 @@ runs:
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-
 
+    # A cache is saved only when its exact key missed. The callers that build an AppImage
+    # (appimage-tool) therefore use a key family of their own: the other jobs finish sooner and
+    # would save the key first, with no tool in it, and every later AppImage job would hit that
+    # entry and download the tool. The family's key also hashes scripts/ci/prefetch-appimage-tool.sh,
+    # so a new tool version or pin starts a new entry, which the first AppImage job saves with the
+    # tool in it (the job fails when the tool is missing, and a failed job saves nothing).
     - name: Cache electron-builder
       if: ${{ inputs.skip-build-caches != 'true' }}
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -115,7 +125,7 @@ runs:
           ~/.cache/electron-builder
           ~/Library/Caches/electron-builder
           ~/AppData/Local/electron-builder/Cache
-        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ inputs.appimage-tool == 'true' && format('appimage-{0}', hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock', 'scripts/ci/prefetch-appimage-tool.sh')) || hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-builder-
 
@@ -179,3 +189,15 @@ runs:
           exit 1
         fi
         echo "ELECTRON_ZIP_DIR=$(dirname "$zip")" >> "$GITHUB_ENV"
+
+    # electron-builder builds an AppImage with app-builder, which downloads appimage-12.0.1.7z from
+    # github.com and retries nothing. The `Cache electron-builder` step above holds the unpacked
+    # tool after a job that built an AppImage, but a cold or stale cache sends the next job to that
+    # download (a restore-keys hit holds whatever an older job saved). This step runs after the
+    # restore, on a hit too (it does nothing when the tool is there), and leaves the tool in the
+    # directory that the cache saves at the end of the job. Only the callers that build an AppImage
+    # ask for it.
+    - name: Fetch the AppImage tool
+      if: ${{ inputs.appimage-tool == 'true' }}
+      shell: bash
+      run: ./scripts/ci/prefetch-appimage-tool.sh
