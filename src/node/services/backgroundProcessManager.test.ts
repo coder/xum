@@ -312,8 +312,9 @@ describe("BackgroundProcessManager", () => {
 
       expect(result.success).toBe(true);
       if (result.success) {
-        // Wait a moment for output to be written
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        // The wrapper writes the exit code after the command's output, so wait for it:
+        // a fixed delay lost that race on a busy host.
+        expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
         const outputPath = path.join(result.outputDir, "output.log");
         const output = await fs.readFile(outputPath, "utf-8");
@@ -322,7 +323,7 @@ describe("BackgroundProcessManager", () => {
         expect(output).toContain("hello");
         expect(output).toContain("world");
       }
-    });
+    }, 30_000);
 
     it("should write meta.json with process info", async () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
@@ -4052,14 +4053,15 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       const output = await manager.getOutput(result.processId);
       expect(output.success).toBe(true);
       if (!output.success) return;
 
       expect(output.output).toContain("error message");
-    });
+    }, 30_000);
 
     it("should return error for non-existent process", async () => {
       const output = await manager.getOutput("bash_nonexistent");
@@ -4103,7 +4105,8 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       // Filter for INFO lines only
       const output = await manager.getOutput(result.processId, "INFO");
@@ -4113,7 +4116,7 @@ describe("BackgroundProcessManager", () => {
       expect(output.output).toContain("INFO: message");
       expect(output.output).toContain("INFO: another");
       expect(output.output).not.toContain("DEBUG");
-    });
+    }, 30_000);
 
     it("should exclude matching lines when filter_exclude is true", async () => {
       const result = await manager.spawn(
@@ -4126,7 +4129,8 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       // Exclude DEBUG lines (invert filter)
       const output = await manager.getOutput(result.processId, "DEBUG", true);
@@ -4136,7 +4140,7 @@ describe("BackgroundProcessManager", () => {
       expect(output.output).toContain("INFO: message");
       expect(output.output).toContain("INFO: another");
       expect(output.output).not.toContain("DEBUG");
-    });
+    }, 30_000);
 
     it("should return error when filter_exclude is true but no filter provided", async () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "echo hello", {
@@ -4291,8 +4295,8 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // Wait for output to be written
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       const peek = await manager.peekOutput(result.processId, { fromOffset: 0 });
       expect(peek.success).toBe(true);
@@ -4304,7 +4308,7 @@ describe("BackgroundProcessManager", () => {
       expect(output.success).toBe(true);
       if (!output.success) return;
       expect(output.output).toContain("hello");
-    });
+    }, 30_000);
   });
 
   describe("integration: spawn and getOutput", () => {
@@ -4372,8 +4376,8 @@ describe("BackgroundProcessManager", () => {
       // CRITICAL: outputDir from spawn MUST match outputDir from getProcess
       expect(proc!.outputDir).toBe(result.outputDir);
 
-      // Wait for output to be written
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       // Verify file exists at the expected path
       const outputPath = path.join(result.outputDir, "output.log");
@@ -4386,7 +4390,7 @@ describe("BackgroundProcessManager", () => {
       if (output.success) {
         expect(output.output).toContain("verify test");
       }
-    });
+    }, 30_000);
 
     it("should work when spawned via bash tool and read via bash_output tool", async () => {
       // This simulates the exact flow in the real system:
