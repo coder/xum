@@ -30,7 +30,7 @@ describe("expectLinearScan", () => {
   // The costs below are scripted, so the scan never runs and these two tests cannot flake. Run i
   // costs `smalls[i]` at the small size and `larges[i]` at the large size.
   const scripted = (smalls: number[], larges: number[]) => {
-    const costs = smalls.flatMap((small, run) => [small, larges[run]!]);
+    const costs = smalls.flatMap((small, run) => [small, larges[run]]);
     return () => {
       const cost = costs.shift();
       if (cost === undefined) throw new Error("the harness measured more runs than were scripted");
