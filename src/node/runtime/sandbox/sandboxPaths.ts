@@ -13,6 +13,14 @@ import { getXumHome } from "@/common/constants/paths";
 
 export const XUM_HOME_TOKEN = "<xumHome>";
 
+export class AgentSandboxStartError extends Error {
+  // dry-duplicate-ok: each named Error subclass sets its own message and name
+  constructor(reason: string) {
+    super(`The agent sandbox could not start: ${reason}`);
+    this.name = "AgentSandboxStartError";
+  }
+}
+
 /** Temp folders every sandboxed command may write. */
 export function tempWritePaths(): string[] {
   return dedupe(["/private/tmp", expandWriteRoot(os.tmpdir())]);
@@ -93,10 +101,18 @@ export function gitGlobalConfigFiles(env: NodeJS.ProcessEnv = process.env): stri
   ];
 }
 
-/** `env[name]` joined with `rest`, when it is an absolute path. */
+/**
+ * `env[name]` joined with `rest`, when it is set. Git, npm, uv and Bun resolve a relative value
+ * from the folder they run in, and Xum runs its own git in the workspace, which commands can
+ * write (Codex review): fail closed.
+ */
 function envPath(env: NodeJS.ProcessEnv, name: string, ...rest: string[]): string[] {
   const dir = env[name];
-  return dir !== undefined && path.isAbsolute(dir) ? [path.join(dir, ...rest)] : [];
+  if (dir === undefined || dir.length === 0) return [];
+  if (!path.isAbsolute(dir)) {
+    throw new AgentSandboxStartError(`${name} is the relative path ${dir}`);
+  }
+  return [path.join(dir, ...rest)];
 }
 
 /** Environment for sandboxed commands, under the keys srt adds. */
@@ -200,9 +216,18 @@ export const AUTOMATION_READ_PATHS: readonly string[] = [
 /**
  * Automation that stays closed for reads: bunx for MCP servers runs the preload that
  * ~/.bunfig.toml names, which can hold a registry token as ~/.npmrc can, and Xum's own `git fetch`
- * runs a ProxyCommand from ~/.ssh/config, whose folder stays closed. extraReadPaths can open them.
+ * runs a ProxyCommand from ~/.ssh/config, whose folder stays closed. Every workspace, also one
+ * without the sandbox, gets the global instruction files in its prompt (readInstructionSet() and
+ * readClaudeCompatGlobalInstructionSet() in instructionFiles.ts). extraReadPaths can open them.
  */
-export const HIDDEN_AUTOMATION_PATHS: readonly string[] = ["~/.bunfig.toml", "~/.ssh/config"];
+export const HIDDEN_AUTOMATION_PATHS: readonly string[] = [
+  "~/.bunfig.toml",
+  "~/.ssh/config",
+  "~/.claude/CLAUDE.md",
+  ...["AGENTS.md", "AGENT.md", "CLAUDE.md", "AGENTS.local.md"].map(
+    (name) => `${XUM_HOME_TOKEN}/${name}`
+  ),
+];
 
 // Open under ~ for each command, with the workspace, its scratch folder, the main .git of a
 // worktree, all write paths and extraReadPaths.

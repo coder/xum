@@ -555,6 +555,31 @@ describe("buildAgentSandboxPolicy", () => {
     }
   });
 
+  // A write through the other name changes what every workspace gets in its prompt.
+  test.each([
+    { name: "Xum's AGENTS.md", file: (root: string) => path.join(root, "xum-home", "AGENTS.md") },
+    {
+      name: "~/.claude/CLAUDE.md",
+      file: (root: string) => path.join(root, "home", ".claude", "CLAUDE.md"),
+    },
+  ])("fails closed on a hard link to $name", async ({ file }) => {
+    const home = path.join(root, "home");
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.mkdir(path.join(root, "xum-home"));
+    await fs.writeFile(file(root), "");
+    await fs.link(file(root), path.join(repo, "alias.md"));
+    process.env.XUM_ROOT = path.join(root, "xum-home");
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
+    try {
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(
+        AgentSandboxStartError
+      );
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
   // ssh reads the system config too, and looks for its relative includes in /etc/ssh.
   test("keeps what the system ssh config includes read-only", async () => {
     const systemConfig = path.join(root, "ssh_config");
@@ -758,6 +783,23 @@ describe("buildAgentSandboxPolicy", () => {
       else process.env[name] = saved;
     }
   });
+
+  // Git and uv resolve a relative value from where they run, for Xum's own git the workspace.
+  test.each(["GIT_CONFIG_GLOBAL", "XDG_CACHE_HOME"])(
+    "fails closed when %s is a relative path",
+    (name) => {
+      const saved = process.env[name];
+      process.env[name] = "relative";
+      try {
+        expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(
+          AgentSandboxStartError
+        );
+      } finally {
+        if (saved === undefined) delete process.env[name];
+        else process.env[name] = saved;
+      }
+    }
+  );
 
   // It can hold a registry token, as ~/.npmrc can.
   test("keeps ~/.bunfig.toml closed for reads unless extraReadPaths opens it", () => {

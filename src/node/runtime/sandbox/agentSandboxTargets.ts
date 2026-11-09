@@ -7,6 +7,7 @@ import type {
 } from "@/common/config/schemas/agentSandbox";
 import { getXumHome } from "@/common/constants/paths";
 import {
+  AgentSandboxStartError,
   AUTOMATION_ENTRY_ROOTS,
   AUTOMATION_READ_PATHS,
   HIDDEN_AUTOMATION_PATHS,
@@ -28,6 +29,8 @@ import {
   realpathOfNearest,
   tempWritePaths,
 } from "./sandboxPaths";
+
+export { AgentSandboxStartError };
 
 /** The sandbox setting of each project, published by AgentSandboxService. */
 export interface AgentSandboxTargets {
@@ -127,14 +130,6 @@ export interface AgentSandboxPolicy {
   allowedHosts: string[];
   /** Dev servers and the bash AI proxy listen on loopback. */
   allowLocalBinding: true;
-}
-
-export class AgentSandboxStartError extends Error {
-  // dry-duplicate-ok: each named Error subclass sets its own message and name
-  constructor(reason: string) {
-    super(`The agent sandbox could not start: ${reason}`);
-    this.name = "AgentSandboxStartError";
-  }
 }
 
 /** Whether `error` is an AgentSandboxStartError, also as the cause that Runtime.exec() wraps. */
