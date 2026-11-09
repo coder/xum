@@ -606,6 +606,7 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
       source: "reactivation",
       attemptId,
       receiptEligible: false,
+      inheritedReport: true,
     });
     expect(h.row()?.taskAttemptUnproven).toBe(true);
     expect(h.ledger.currentAttemptIdByTaskId.get(CHILD)).toBe(attemptId);
@@ -708,6 +709,7 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
       source: "reactivation",
       attemptId: h.row()?.taskAttemptId,
       receiptEligible: c.eligible,
+      inheritedReport: true,
     });
     expect(h.row()?.taskAttemptUnproven).toBe(c.eligible ? undefined : true);
   });

@@ -29,7 +29,9 @@ const skillMd = (name: string) => `---\nname: ${name}\ndescription: The ${name} 
 
 async function initRepo(dir: string): Promise<void> {
   await fsPromises.mkdir(dir, { recursive: true });
-  await git(dir, "init", "-q", "-b", "main");
+  // An empty --template keeps the host's init.templateDir hooks out of the fixture: they add about
+  // twenty processes to every commit and exist only on some machines.
+  await git(dir, "init", "-q", "--template=", "-b", "main");
   await git(dir, "config", "user.email", "test@example.com");
   await git(dir, "config", "user.name", "Test");
 }
@@ -173,6 +175,10 @@ describe("AgentPluginInstallService marketplaces", () => {
     await fsPromises.rm(tmpRoot, { recursive: true, force: true });
   });
 
+  // The 20 s limits on five tests (the ones that took 3 s or more on a loaded host): previews,
+  // installs and updates stage the plugin with real git, about a dozen git processes each, and these
+  // tests run three to five of them. On a loaded host every process takes 50 to 100 ms, so they
+  // ran 3 to 5 s against the default 5 s. That is the real git work the tests exist to cover.
   test("the preview lists the marketplace; two root entries install as two plugins", async () => {
     const listed = await service.previewSource({ input: marketDir });
     if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
@@ -219,7 +225,7 @@ describe("AgentPluginInstallService marketplaces", () => {
     // A refused entry stays refused when picked directly.
     await expect(previewEntry("pkg")).rejects.toThrow("does not install npm packages");
     await expect(previewEntry("missing")).rejects.toThrow("does not list a plugin named 'missing'");
-  });
+  }, 20_000);
 
   test("a marketplace.json above 1 MiB lists (real catalogs are that big); above the cap it refuses", async () => {
     // anthropics/claude-plugins-community's marketplace.json is about 1.49 MB.
@@ -392,7 +398,7 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(
       await fsPromises.lstat(path.join(xumRoot, "plugins", "tool", "plugin.json")).catch(() => null)
     ).toBeNull();
-  });
+  }, 20_000);
 
   test("a generated entry loads only its listed agents, and older builds only its components", async () => {
     const agent = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\n`;
@@ -704,7 +710,7 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(claude.installBlockedReason).toBe(collision);
     await expect(install(claude)).rejects.toThrow(collision);
     expect(await installedSkills("pstack")).toEqual(["go-deep"]);
-  });
+  }, 20_000);
 
   test("a Cursor entry without a manifest in its folder is refused; install never takes a Cursor entry", async () => {
     await writeCursorMarketplace();
@@ -721,7 +727,7 @@ describe("AgentPluginInstallService marketplaces", () => {
       })
     ).rejects.toThrow("cannot be installed as Cursor marketplace entry");
     expect((await service.list()).map((item) => item.name)).toEqual([]);
-  });
+  }, 20_000);
 
   test("an installed Cursor entry lists its not-applied parts and updates by its folder", async () => {
     await writeCursorMarketplace();
@@ -746,7 +752,7 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(await installedSkills("kit")).toEqual(["format", "lint"]);
     const updated = (await service.list()).find((item) => item.name === "kit");
     expect([updated?.lockedSha, updated?.source?.subpath]).toEqual([head, "kit"]);
-  });
+  }, 20_000);
 
   test("not-applied names show invisible characters as marks", async () => {
     await writeCursorMarketplace();

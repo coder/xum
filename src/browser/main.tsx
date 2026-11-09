@@ -6,6 +6,7 @@ import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/wi
 import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimations";
 import {
   installIosFocusZoomGuard,
+  installIphoneDuoStatusBarStyle,
   installViewportHeightSync,
 } from "@/browser/utils/viewportHeight";
 import { installIosCoverColumn } from "@/browser/utils/iosCoverColumn";
@@ -55,6 +56,12 @@ try {
   installIosFocusZoomGuard();
 } catch {
   // Stopping iOS focus zoom is cosmetic and must never block renderer startup.
+}
+
+try {
+  installIphoneDuoStatusBarStyle();
+} catch {
+  // A web clip status-bar style must never block renderer startup.
 }
 
 initTelemetry();

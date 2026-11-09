@@ -50,6 +50,7 @@ import {
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import { addsSecretLike, containsSecretLike } from "@/node/services/memorySecretRedaction";
 import {
   adoptionTargetPresence,
   adoptionTargetStamp,
@@ -2721,6 +2722,13 @@ export class MemoryService extends EventEmitter {
    * from) whichever workspace made them — the intended v1 scope. When the
    * context has no workspace, there is no session journal; skip (log-only).
    * Never throws: journaling failures must not fail the memory command.
+   *
+   * A guarded write (`rejectSecretLike`) whose row would carry credential-like text is not
+   * journaled either (see refinementHoldsSecretLike): the organizer cleans a credential out of
+   * memory with these commands, and a row would keep it in durable state, the pre-image offloaded
+   * verbatim to the session blob store and a credential-named path in the row. The cost is the
+   * point: the cleanup cannot be rolled back, so nothing can bring the credential back, and a
+   * rollback of an earlier row on the same file refuses on divergence (the file changed after it).
    */
   private async journalRefinement(
     ctx: MemoryScopeContext,
@@ -2728,10 +2736,18 @@ export class MemoryService extends EventEmitter {
     inverse: RefinementInverseDraft,
     actor: MemoryActor,
     toolCallId?: string,
-    postFiles?: RefinementFileCapture[]
+    postFiles?: RefinementFileCapture[],
+    options?: MemoryWriteOptions
   ): Promise<void> {
     if (!ctx.workspaceId) {
       log.debug("[MemoryService] skipping refinement journal: no workspace session", {
+        op: action.op,
+      });
+      return;
+    }
+    if (options?.rejectSecretLike === true && refinementHoldsSecretLike(action, inverse)) {
+      // Only the op: the path itself may be the credential.
+      log.debug("[MemoryService] skipping refinement journal: credential-like row", {
         op: action.op,
       });
       return;
@@ -3078,7 +3094,8 @@ export class MemoryService extends EventEmitter {
     fileText: string,
     actor: MemoryActor,
     toolCallId?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options?: MemoryWriteOptions
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -3104,6 +3121,8 @@ export class MemoryService extends EventEmitter {
             `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
           );
         }
+        assertNoSecretPath(options, virtualPath);
+        assertNoNewSecret(options, "", fileText, virtualPath);
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, fileText);
         // Row is written before the create is acknowledged (mutation → row → ack).
@@ -3113,7 +3132,8 @@ export class MemoryService extends EventEmitter {
           { op: "delete-files", paths: [store.physicalPath(parsed.relPath)] },
           actor,
           toolCallId,
-          [{ path: store.physicalPath(parsed.relPath), content: fileText }]
+          [{ path: store.physicalPath(parsed.relPath), content: fileText }],
+          options
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -3132,7 +3152,8 @@ export class MemoryService extends EventEmitter {
     newStr: string,
     actor: MemoryActor,
     toolCallId?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options?: MemoryWriteOptions
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -3145,6 +3166,7 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
         assertWithinFileSizeCap(updated);
+        assertNoNewSecret(options, content, updated, virtualPath);
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
@@ -3157,7 +3179,8 @@ export class MemoryService extends EventEmitter {
           },
           actor,
           toolCallId,
-          [{ path: store.physicalPath(parsed.relPath), content: updated }]
+          [{ path: store.physicalPath(parsed.relPath), content: updated }],
+          options
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -3174,7 +3197,8 @@ export class MemoryService extends EventEmitter {
     actor: MemoryActor,
     toolCallId?: string,
     expectedFingerprint?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options?: MemoryWriteOptions
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -3198,6 +3222,7 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
         assertWithinFileSizeCap(updated);
+        assertNoNewSecret(options, content, updated, virtualPath);
         await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
@@ -3210,7 +3235,8 @@ export class MemoryService extends EventEmitter {
           },
           actor,
           toolCallId,
-          [{ path: store.physicalPath(parsed.relPath), content: updated }]
+          [{ path: store.physicalPath(parsed.relPath), content: updated }],
+          options
         );
         await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
         this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -3230,7 +3256,8 @@ export class MemoryService extends EventEmitter {
    * usage. Used by refine staging so a proposal the write path would reject
    * can never be staged, rendered, and approved. Advisory by design: no
    * mutation lock is taken (the state can change between staging and apply,
-   * where the real command re-validates authoritatively).
+   * where the real command re-validates authoritatively). `options` takes the
+   * write's own rails, so a dry run refuses what the guarded write would.
    */
   async validateMutation(
     ctx: MemoryScopeContext,
@@ -3239,7 +3266,8 @@ export class MemoryService extends EventEmitter {
       | { command: "str_replace"; path: string; old_str: string; new_str: string }
       | { command: "insert"; path: string; insert_line: number; insert_text: string }
       | { command: "delete"; path: string }
-      | { command: "rename"; path: string; new_path: string }
+      | { command: "rename"; path: string; new_path: string },
+    options?: MemoryWriteOptions
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const result = await this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(command.path);
@@ -3264,6 +3292,8 @@ export class MemoryService extends EventEmitter {
               `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
             );
           }
+          assertNoSecretPath(options, command.path);
+          assertNoNewSecret(options, "", command.file_text, command.path);
           break;
         }
         case "str_replace": {
@@ -3272,17 +3302,26 @@ export class MemoryService extends EventEmitter {
           }
           const store = await this.resolveStore(ctx, scope, parsed.relPath);
           const content = await this.readTextFileForEdit(store, parsed.relPath, command.path);
-          assertWithinFileSizeCap(
-            computeStrReplaceUpdate(content, command.old_str, command.new_str, command.path)
+          const updated = computeStrReplaceUpdate(
+            content,
+            command.old_str,
+            command.new_str,
+            command.path
           );
+          assertWithinFileSizeCap(updated);
+          assertNoNewSecret(options, content, updated, command.path);
           break;
         }
         case "insert": {
           const store = await this.resolveStore(ctx, scope, parsed.relPath);
           const content = await this.readTextFileForEdit(store, parsed.relPath, command.path);
-          assertWithinFileSizeCap(
-            computeInsertUpdate(content, command.insert_line, command.insert_text).updated
+          const { updated } = computeInsertUpdate(
+            content,
+            command.insert_line,
+            command.insert_text
           );
+          assertWithinFileSizeCap(updated);
+          assertNoNewSecret(options, content, updated, command.path);
           break;
         }
         case "delete": {
@@ -3321,6 +3360,7 @@ export class MemoryService extends EventEmitter {
           if (newKind !== null) {
             throw new MemoryCommandError(`Destination ${command.new_path} already exists`);
           }
+          assertNoSecretPath(options, command.new_path);
           break;
         }
       }
@@ -3355,7 +3395,7 @@ export class MemoryService extends EventEmitter {
     toolCallId?: string,
     expectedFingerprint?: string,
     abortSignal?: AbortSignal,
-    options?: { rejectPinned?: boolean }
+    options?: { rejectPinned?: boolean } & MemoryWriteOptions
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -3393,7 +3433,9 @@ export class MemoryService extends EventEmitter {
             { op: "delete", path: toVirtualPath(scope, parsed.relPath) },
             inverse,
             actor,
-            toolCallId
+            toolCallId,
+            undefined,
+            options
           );
         }
         await this.recordDelete(ctx, scope, parsed.relPath);
@@ -3413,7 +3455,7 @@ export class MemoryService extends EventEmitter {
     actor: MemoryActor,
     toolCallId?: string,
     abortSignal?: AbortSignal,
-    options?: { rejectPinned?: boolean }
+    options?: { rejectPinned?: boolean } & MemoryWriteOptions
   ): Promise<MemoryCommandResult> {
     return this.runCommand(ctx, async () => {
       const oldParsed = parseMemoryPath(oldVirtualPath);
@@ -3451,6 +3493,7 @@ export class MemoryService extends EventEmitter {
         if (newKind !== null) {
           throw new MemoryCommandError(`Destination ${newVirtualPath} already exists`);
         }
+        assertNoSecretPath(options, newVirtualPath);
         await this.assertMutationCommittable(ctx, store, abortSignal, oldVirtualPath);
         await store.rename(oldParsed.relPath, newParsed.relPath);
         // Row is written before the rename is acknowledged (mutation → row → ack).
@@ -3467,7 +3510,9 @@ export class MemoryService extends EventEmitter {
             to: store.physicalPath(oldParsed.relPath),
           },
           actor,
-          toolCallId
+          toolCallId,
+          undefined,
+          options
         );
         await this.recordRename(ctx, scope, oldParsed.relPath, newParsed.relPath);
         this.emitChange(ctx, scope, oldParsed.relPath, actor);
@@ -3854,6 +3899,73 @@ function computeInsertUpdate(
   if (insertedLines.at(-1) === "") insertedLines.pop();
   lines.splice(insertLine, 0, ...insertedLines);
   return { updated: lines.join("\n"), insertedLineCount: insertedLines.length };
+}
+
+/** Opt-in rails for a mutating command (create, str_replace, insert, delete, rename). */
+export interface MemoryWriteOptions {
+  /**
+   * Refuse a write whose RESULTING file holds a credential shape the file did not already hold
+   * (see assertNoNewSecret). Checked INSIDE the mutation lock, against the content the write is
+   * about to replace: a check on the new text alone misses a credential that two calls assemble
+   * (`sk-` and a newline, then a replacement that drops the newline), and one run before the lock
+   * would judge a file another writer changes before this one lands.
+   *
+   * Also keeps every guarded mutation (delete and rename too, which write no content) out of the
+   * refinement journal when its row would carry credential-like text (see journalRefinement).
+   */
+  rejectSecretLike?: boolean;
+}
+
+/**
+ * Whether a refinement row would put credential-like text into durable state: the action's
+ * virtual paths, or a file a restore inverse captures (its path and its pre-image, which the
+ * journal offloads verbatim to the session blob store). A create or rename inverse holds only the
+ * physical form of the action's own paths, and a directory delete's restore lists the files under
+ * it, whose names the action does not show. Memory rows never carry `deletePaths`.
+ */
+function refinementHoldsSecretLike(
+  action: MemoryRefinementAction,
+  inverse: RefinementInverseDraft
+): boolean {
+  const texts = [action.path, action.newPath ?? ""];
+  if (inverse.op === "restore-files") {
+    for (const file of inverse.files) texts.push(file.path, file.content);
+  }
+  return texts.some(containsSecretLike);
+}
+
+/**
+ * Refusal rule of `rejectSecretLike`: the result holds a credential value `previous` did not (see
+ * `addsSecretLike`). A file that already held such text (a user's note, a placeholder the detector
+ * flags) stays editable where an edit adds none, since that text is the organizer's to clean, not
+ * a reason to freeze the file; an edit that assembles a new key there, even while it removes an
+ * old one, is still refused. The message never quotes the content: the caller journals it.
+ */
+function assertNoNewSecret(
+  options: MemoryWriteOptions | undefined,
+  previous: string,
+  updated: string,
+  virtualPath: string
+): void {
+  if (options?.rejectSecretLike !== true) return;
+  if (!addsSecretLike(previous, updated)) return;
+  throw new MemoryCommandError(
+    `${virtualPath} was not changed: the file would contain a credential-like value (a key, token, password or private key) after this edit. Memory must never hold secrets; say what the credential is for and where it lives, and leave the value out.`
+  );
+}
+
+/**
+ * Name rule of `rejectSecretLike`: a file name is stored text too (`sk-....md` keeps the key in the
+ * directory listing), so a guarded create or rename refuses a credential-like path it would add.
+ * This keeps the refinement journal's skip (see refinementHoldsSecretLike) to cleanups: a guarded
+ * write cannot add a credential by name while its row is dropped. A delete or a rename's source
+ * names a file that already exists and adds nothing. The message never quotes the path.
+ */
+function assertNoSecretPath(options: MemoryWriteOptions | undefined, addedPath: string): void {
+  if (options?.rejectSecretLike !== true || !containsSecretLike(addedPath)) return;
+  throw new MemoryCommandError(
+    "The path contains a credential-like value, so it was not used. Name the file for what it holds, not for a key, token or password."
+  );
 }
 
 /**

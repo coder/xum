@@ -1,0 +1,105 @@
+diff --git a/dist/es2015/SideEffect.js b/dist/es2015/SideEffect.js
+index 68552f3da275fc1d7c0c596ddaa37eec52cedc72..58af1657d7eee8580e3a90e5d97128ea2122ffa7 100644
+--- a/dist/es2015/SideEffect.js
++++ b/dist/es2015/SideEffect.js
+@@ -19,6 +19,7 @@ export function RemoveScrollSideCar(props) {
+     var shouldPreventQueue = React.useRef([]);
+     var touchStartRef = React.useRef([0, 0]);
+     var activeAxis = React.useRef();
++    var tapSlopLeftRef = React.useRef(false);
+     var id = React.useState(idCounter++)[0];
+     var Style = React.useState(styleSingleton)[0];
+     var lastProps = React.useRef(props);
+@@ -45,6 +46,14 @@ export function RemoveScrollSideCar(props) {
+         var touchStart = touchStartRef.current;
+         var deltaX = 'deltaX' in event ? event.deltaX : touchStart[0] - touch[0];
+         var deltaY = 'deltaY' in event ? event.deltaY : touchStart[1] - touch[1];
++        // xum patch: iOS synthesizes no click for a touch whose move was cancelled, so leave a tap's
++        // jitter alone. Once a gesture leaves the slop it stays a drag.
++        if ('touches' in event && !tapSlopLeftRef.current) {
++            if (deltaX * deltaX + deltaY * deltaY <= 10 * 10) {
++                return false;
++            }
++            tapSlopLeftRef.current = true;
++        }
+         var currentAxis;
+         var target = event.target;
+         var moveDirection = Math.abs(deltaX) > Math.abs(deltaY) ? 'h' : 'v';
+@@ -122,6 +131,7 @@ export function RemoveScrollSideCar(props) {
+     var scrollTouchStart = React.useCallback(function (event) {
+         touchStartRef.current = getTouchXY(event);
+         activeAxis.current = undefined;
++        tapSlopLeftRef.current = false;
+     }, []);
+     var scrollWheel = React.useCallback(function (event) {
+         shouldCancel(event.type, getDeltaXY(event), event.target, shouldCancelEvent(event, props.lockRef.current));
+diff --git a/dist/es2019/SideEffect.js b/dist/es2019/SideEffect.js
+index c0a72030fac42b58916982460517f5e0f57a26c6..b5dcfca22439424a818084cba5a0d4ecb8b00f22 100644
+--- a/dist/es2019/SideEffect.js
++++ b/dist/es2019/SideEffect.js
+@@ -17,6 +17,7 @@ export function RemoveScrollSideCar(props) {
+     const shouldPreventQueue = React.useRef([]);
+     const touchStartRef = React.useRef([0, 0]);
+     const activeAxis = React.useRef();
++    const tapSlopLeftRef = React.useRef(false);
+     const [id] = React.useState(idCounter++);
+     const [Style] = React.useState(styleSingleton);
+     const lastProps = React.useRef(props);
+@@ -43,6 +44,14 @@ export function RemoveScrollSideCar(props) {
+         const touchStart = touchStartRef.current;
+         const deltaX = 'deltaX' in event ? event.deltaX : touchStart[0] - touch[0];
+         const deltaY = 'deltaY' in event ? event.deltaY : touchStart[1] - touch[1];
++        // xum patch: iOS synthesizes no click for a touch whose move was cancelled, so leave a tap's
++        // jitter alone. Once a gesture leaves the slop it stays a drag.
++        if ('touches' in event && !tapSlopLeftRef.current) {
++            if (deltaX * deltaX + deltaY * deltaY <= 10 * 10) {
++                return false;
++            }
++            tapSlopLeftRef.current = true;
++        }
+         let currentAxis;
+         const target = event.target;
+         const moveDirection = Math.abs(deltaX) > Math.abs(deltaY) ? 'h' : 'v';
+@@ -120,6 +129,7 @@ export function RemoveScrollSideCar(props) {
+     const scrollTouchStart = React.useCallback((event) => {
+         touchStartRef.current = getTouchXY(event);
+         activeAxis.current = undefined;
++        tapSlopLeftRef.current = false;
+     }, []);
+     const scrollWheel = React.useCallback((event) => {
+         shouldCancel(event.type, getDeltaXY(event), event.target, shouldCancelEvent(event, props.lockRef.current));
+diff --git a/dist/es5/SideEffect.js b/dist/es5/SideEffect.js
+index a6d45ed0182b8507b75e18665ca4bf768cf40cd3..4e5a0c212c0bf0f6f1fc37074aad24213ad569fd 100644
+--- a/dist/es5/SideEffect.js
++++ b/dist/es5/SideEffect.js
+@@ -24,6 +24,7 @@ function RemoveScrollSideCar(props) {
+     var shouldPreventQueue = React.useRef([]);
+     var touchStartRef = React.useRef([0, 0]);
+     var activeAxis = React.useRef();
++    var tapSlopLeftRef = React.useRef(false);
+     var id = React.useState(idCounter++)[0];
+     var Style = React.useState(react_style_singleton_1.styleSingleton)[0];
+     var lastProps = React.useRef(props);
+@@ -50,6 +51,14 @@ function RemoveScrollSideCar(props) {
+         var touchStart = touchStartRef.current;
+         var deltaX = 'deltaX' in event ? event.deltaX : touchStart[0] - touch[0];
+         var deltaY = 'deltaY' in event ? event.deltaY : touchStart[1] - touch[1];
++        // xum patch: iOS synthesizes no click for a touch whose move was cancelled, so leave a tap's
++        // jitter alone. Once a gesture leaves the slop it stays a drag.
++        if ('touches' in event && !tapSlopLeftRef.current) {
++            if (deltaX * deltaX + deltaY * deltaY <= 10 * 10) {
++                return false;
++            }
++            tapSlopLeftRef.current = true;
++        }
+         var currentAxis;
+         var target = event.target;
+         var moveDirection = Math.abs(deltaX) > Math.abs(deltaY) ? 'h' : 'v';
+@@ -127,6 +136,7 @@ function RemoveScrollSideCar(props) {
+     var scrollTouchStart = React.useCallback(function (event) {
+         touchStartRef.current = (0, exports.getTouchXY)(event);
+         activeAxis.current = undefined;
++        tapSlopLeftRef.current = false;
+     }, []);
+     var scrollWheel = React.useCallback(function (event) {
+         shouldCancel(event.type, (0, exports.getDeltaXY)(event), event.target, shouldCancelEvent(event, props.lockRef.current));
