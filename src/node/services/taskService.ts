@@ -20323,13 +20323,21 @@ export class TaskService implements AgentTaskIntegration {
             acceptSchemaShapedWorkflowReport: acceptsSchemaShapedWorkflowReport,
           })
         : null;
-    const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
+    const proposePlanResult = this.findProposePlanSuccessInParts(event.parts);
+    // The probe reads agent definitions from the user's home, which takes seconds on a host with
+    // many skills. It only decides whether a final response or a propose_plan result is the
+    // stream's terminal report, and a reported row publishes neither. Without the probe the stream
+    // end settles in milliseconds, and a follow-up held or sent meanwhile is not refused as stale
+    // while the stream's decision waits for it.
+    const probeDecidesReport =
+      status !== "reported" && (finalAgentReportArgs != null || proposePlanResult != null);
+    const isPlanLike = probeDecidesReport ? await this.isPlanLikeTaskWorkspace(entry) : false;
     const state: ChildStreamEndState = {
       ...ctx,
       status,
       reportArgs: isPlanLike ? null : finalAgentReportArgs,
       isPlanLike,
-      proposePlanResult: this.findProposePlanSuccessInParts(event.parts),
+      proposePlanResult,
     };
     this.decideNonreportBeforeContinuation(state);
     return this.settleInterruptedOrReportedChild(state);
