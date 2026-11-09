@@ -117,7 +117,7 @@ else:
 """)
         gh.chmod(0o755)
 
-    def run_script(self, data, script="wait_pr_checks.sh", *extra):
+    def run_script(self, data, script="wait_pr_checks.sh", *extra, cwd=None):
         path = self.directory / "fixture.json"
         path.write_text(json.dumps(data))
         calls = self.directory / "calls.jsonl"
@@ -137,7 +137,7 @@ else:
         args = ["bash", str(SCRIPTS / script), "4194", *extra]
         if script == "wait_pr_checks.sh":
             args.append("--once")
-        result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=15, check=False)
+        result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=15, check=False, cwd=cwd)
         self.calls = [json.loads(line) for line in calls.read_text().splitlines()]
         return result
 
@@ -223,6 +223,21 @@ else:
         self.assertIn("UNRESOLVED_THREADS=1", counted.stdout)
         clean = self.run_script(fixture([check()]), "check_pr_reviews.sh", "--counts-only")
         self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+
+    def test_the_failure_tips_do_not_name_the_local_branch(self):
+        # A PR checkout often keeps the PR author's branch name.
+        repo = self.directory / "checkout"
+        repo.mkdir()
+        subprocess.run(["git", "init", "--quiet", "-b", "IGNORE-local-branch", str(repo)], check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "--quiet", "--allow-empty", "-m", "x"],
+            cwd=repo, check=True,
+        )
+        data = fixture([check(), check(conclusion="FAILURE", suite=2)], "BLOCKED")
+        result = self.run_script(data, "wait_pr_checks.sh", cwd=repo)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("--ref <branch>", result.stdout)
+        self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
 
     def test_later_page_failure_is_reported(self):
         data = fixture()
