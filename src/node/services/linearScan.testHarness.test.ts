@@ -14,25 +14,45 @@ const linear = (text: string) => {
 };
 const quadratic = (text: string) => quadraticPattern.test(text);
 
+// The scans here cost about half a second of CPU time each, which a busy host stretches to many
+// seconds of wall time: the default 5 s limit of a test failed 9 of 10 runs at 7x load.
+const REAL_SCAN_TIMEOUT_MS = 60_000;
+
 describe("expectLinearScan", () => {
-  it("accepts a scan whose cost grows with the text", () => {
-    expect(() => expectLinearScan(linear, build, SLOW_SCAN_MS)).not.toThrow();
-  });
+  it(
+    "accepts a scan whose cost grows with the text",
+    () => {
+      expect(() => expectLinearScan(linear, build, SLOW_SCAN_MS)).not.toThrow();
+    },
+    REAL_SCAN_TIMEOUT_MS
+  );
 
-  it("rejects a scan whose cost grows with the square of the text", () => {
-    expect(() => expectLinearScan(quadratic, build, SLOW_SCAN_MS)).toThrow();
-  });
+  it(
+    "rejects a scan whose cost grows with the square of the text",
+    () => {
+      expect(() => expectLinearScan(quadratic, build, SLOW_SCAN_MS)).toThrow();
+    },
+    REAL_SCAN_TIMEOUT_MS
+  );
 
-  it("rejects a linear scan that costs more than its ceiling", () => {
-    expect(() => expectLinearScan(linear, build, 0.001)).toThrow();
-  });
+  it(
+    "rejects a linear scan that costs more than its ceiling",
+    () => {
+      expect(() => expectLinearScan(linear, build, 0.001)).toThrow();
+    },
+    REAL_SCAN_TIMEOUT_MS
+  );
 
-  it("rejects a scan of 20 microseconds whose cost grows with the square of the text", () => {
-    // 100 characters: a scan costs far less than the 1 ms floor of the ratio, and 400 characters
-    // cost 16 times as much. Only a sample of many scans makes that visible.
-    const buildSmall = (scale: number) => "a".repeat(100 * scale);
-    expect(() => expectLinearScan(quadratic, buildSmall, SLOW_SCAN_MS)).toThrow();
-  });
+  it(
+    "rejects a scan of 40 microseconds whose cost grows with the square of the text",
+    () => {
+      // 200 characters: a scan costs 0.04 ms, far less than the 1 ms floor of the ratio, and 800
+      // characters cost 16 times as much. Only a sample of many scans makes that visible.
+      const buildSmall = (scale: number) => "a".repeat(200 * scale);
+      expect(() => expectLinearScan(quadratic, buildSmall, SLOW_SCAN_MS)).toThrow();
+    },
+    REAL_SCAN_TIMEOUT_MS
+  );
 
   // The costs below are scripted, so the scan never runs and these tests cannot flake. The first
   // CALIBRATION_RUNS costs are those of the calibration scans (`onceMs` each). Then run i costs
