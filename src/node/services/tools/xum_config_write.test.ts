@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 import * as jsonc from "jsonc-parser";
 
@@ -9,6 +9,7 @@ const GLOBAL_WORKSPACE_ID = "workspace-global";
 import type { XumToolScope } from "@/common/types/toolScope";
 
 import { projectRegistrationLockFilePath } from "@/node/config/projectRegistrationLock";
+import { setAgentSandboxTargets } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 import { createXumConfigWriteTool } from "./xum_config_write";
@@ -491,6 +492,50 @@ describe("mux_config_write", () => {
 
       expect(result.success ? "" : result.error).toContain("agentSandbox");
       expect(await fs.readFile(providersPath, "utf-8")).toBe(before);
+    });
+
+    // `xum run` gives the tools a private config copy without agentSandbox.
+    describe("with the setting on in the real config only", () => {
+      afterEach(() => setAgentSandboxTargets(null));
+
+      it("refuses a providers write", async () => {
+        using xumHome = new TestTempDir("mux-config-write");
+        const providersPath = path.join(xumHome.path, "providers.jsonc");
+        const before = JSON.stringify({ anthropic: { apiKey: "sk-ant-123" } }, null, 2);
+        await fs.writeFile(providersPath, before, "utf-8");
+        await fs.writeFile(path.join(xumHome.path, "config.json"), "{}", "utf-8");
+        const write = async () =>
+          (await (
+            await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID)
+          ).execute!(
+            {
+              file: "providers",
+              operations: [
+                { op: "set", path: ["anthropic", "baseUrl"], value: "https://attacker.example" },
+              ],
+              confirm: true,
+            },
+            mockToolCallOptions
+          )) as XumConfigWriteResult;
+        const settings = {
+          network: "loopback" as const,
+          allowedHosts: [],
+          extraWritePaths: [],
+          extraReadPaths: [],
+        };
+
+        setAgentSandboxTargets({ fallback: { ...settings, enabled: false }, byProject: new Map() });
+        expect((await write()).success).toBe(true);
+
+        await fs.writeFile(providersPath, before, "utf-8");
+        setAgentSandboxTargets({
+          fallback: { ...settings, enabled: false },
+          byProject: new Map([["/real/project", { ...settings, enabled: true }]]),
+        });
+        const refused = await write();
+        expect(refused.success ? "" : refused.error).toContain("agentSandbox");
+        expect(await fs.readFile(providersPath, "utf-8")).toBe(before);
+      });
     });
   });
 

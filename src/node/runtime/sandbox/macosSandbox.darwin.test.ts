@@ -872,13 +872,17 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
 
       const result = await execBuffered(
         new LocalRuntime(workspace),
-        `cat "${secrets}" "${secrets}.0123456789ab"; echo x > "${secrets}.new" || echo WRITE_DENIED`,
+        `cat "${secrets}" "${secrets}.0123456789ab"; echo x > "${secrets}.new" || echo WRITE_DENIED; ` +
+          // Under another name, the files would not be hidden.
+          `mv "${runRoot}" "${root}/moved" || echo MOVE_DENIED`,
         { cwd: workspace, timeout: 10 }
       );
 
       expect(result.stdout).not.toContain("_secret");
       expect(result.stdout).toContain("WRITE_DENIED");
+      expect(result.stdout).toContain("MOVE_DENIED");
       expect(await exists(`${secrets}.new`)).toBe(false);
+      expect(await exists(secrets)).toBe(true);
     });
 
     it("runs background bash in the sandbox", async () => {

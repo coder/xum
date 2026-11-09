@@ -11,6 +11,7 @@ import {
   withProjectRegistrationFileLock,
   type ProjectRegistrationLockHandle,
 } from "@/node/config/projectRegistrationLock";
+import { anyAgentSandboxEnabled } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { applyMutations } from "@/node/services/tools/shared/configMutationEngine";
 import { REDACTED_SECRET_VALUE } from "@/node/services/tools/shared/configRedaction";
 import {
@@ -115,11 +116,14 @@ async function rewriteConfigDocument(
   // sub-project parentage from the registered paths, a project's trust starts its MCP servers
   // outside the sandbox, and a provider's apiKeyFile and baseUrl make the backend read a file
   // the sandbox hides and send it to any server.
+  // The live setting too: `xum run` and `xum workflow` give the tools a private config copy
+  // without agentSandbox, and take the setting from the real config (Codex review).
   const configDocument =
     args.file === "config"
       ? currentDocument
       : await readConfigDocumentUnvalidated(xumHome, "config");
   if (
+    anyAgentSandboxEnabled() ||
     agentSandboxOnIn(configDocument) ||
     changesAgentSandbox(currentDocument, mutationResult.document)
   ) {
