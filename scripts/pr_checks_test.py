@@ -241,6 +241,70 @@ else:
                 self.assertIn(line, result.stdout.splitlines())
                 self.assertIn(HOSTILE_MARKER, self.assert_gate(expected, data, "--details").stdout)
 
+    def test_a_check_field_of_another_type_prints_fixed_text_not_a_jq_error(self):
+        # GitHub's schema types these fields as strings. @tsv fails on an array or an object, and jq then
+        # quotes the start of the value in its message, so the default output used to carry it.
+        def run_run(field, value):
+            node = check("Lint", "FAILURE", suite=2)
+            node[field] = value
+            return node
+
+        def status(field, value):
+            node = pixel()
+            node.update(context="Ci", state="FAILURE", targetUrl="https://ci.example/x", description="d")
+            node[field] = value
+            return node
+
+        for kind, value in (("array", [HOSTILE]), ("object", {"IGNORE": HOSTILE}), ("false", False)):
+            for label, node in (
+                ("name", run_run("name", value)),
+                ("link", run_run("detailsUrl", value)),
+                ("status context", status("context", value)),
+                ("status link", status("targetUrl", value)),
+                ("status description", status("description", value)),
+            ):
+                with self.subTest(kind=kind, field=label):
+                    data = fixture([check(), node], "BLOCKED")
+                    result = self.assert_gate(1, data)
+                    self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+                    self.assertNotIn("jq: error", result.stderr)
+                    details = self.assert_gate(1, data, "--details")
+                    self.assertNotIn(HOSTILE_MARKER, details.stdout + details.stderr)
+                    self.assertNotIn("jq: error", details.stderr)
+        # A missing name is still printed as <unnamed>, as before: only a value of another type is <not text>.
+        unnamed = check("Lint", "FAILURE", suite=2)
+        unnamed["name"] = None
+        details = self.assert_gate(1, fixture([check(), unnamed], "BLOCKED"), "--details").stdout
+        self.assertIn("<unnamed>", details)
+        self.assertNotIn("<not text>", details)
+        # A state of another type: the gate does not know what the check is, so it keeps waiting. It prints no jq error.
+        for kind, value in (("array", [HOSTILE]), ("object", {"IGNORE": HOSTILE})):
+            with self.subTest(kind=kind, field="status state"):
+                data = fixture([check(), status("state", value)], "BLOCKED")
+                for extra in ((), ("--details",)):
+                    result = self.run_script(data, "wait_pr_checks.sh", *extra)
+                    self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+                    self.assertNotIn("jq: error", result.stderr)
+        # A passing check with such a name is printed the same way, and the default run does not format it.
+        passing = check("Lint", suite=2)
+        passing["name"] = [HOSTILE]
+        result = self.assert_gate(0, fixture([check(), passing]))
+        self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+        self.assertNotIn("jq: error", result.stderr)
+        self.assertIn("<not text>", self.assert_gate(0, fixture([check(), passing]), "--details").stdout)
+
+    def test_a_review_thread_list_of_another_type_is_not_read_as_no_threads(self):
+        # `nodes[]?` skips a value that is no list, so a scalar used to read as "no unresolved threads".
+        for kind, value in (("string", HOSTILE), ("false", False), ("object", {"IGNORE": HOSTILE})):
+            with self.subTest(kind=kind):
+                data = fixture([check()])
+                data["threads"] = value
+                for script, extra in (("check_pr_reviews.sh", ("--counts-only",)), ("wait_pr_checks.sh", ())):
+                    result = self.run_script(data, script, *extra)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+                    self.assertIn("The reviewThreads in the GitHub reply are not a list of objects", result.stdout + result.stderr)
+
     def test_values_that_the_checks_gate_rejects_are_not_printed_back(self):
         for field in ("state", "mergeable", "mergeStateStatus", "reviewDecision"):
             with self.subTest(field=field):
@@ -618,6 +682,8 @@ class GateOutputTest(unittest.TestCase):
             # break and a forged line in it must stop the script.
             "comment time": (lambda pr: pr["comments"]["nodes"][1].update(createdAt=forged), (wait,)),
             "review time": (lambda pr: pr["reviews"]["nodes"].append({"author": {"login": BOT}, "body": "", "state": "APPROVED", "createdAt": forged, "submittedAt": forged}), (wait,)),
+            # `// empty` on a false state read as "no state", and an empty state passes the gate.
+            "review state": (lambda pr: pr["reviews"]["nodes"].append({"author": {"login": BOT}, "body": "[P1] Fix authorization", "state": False, "createdAt": RESPONSE_AT, "submittedAt": RESPONSE_AT}), (wait,)),
             "review submitted time": (lambda pr: pr["reviews"]["nodes"].append({"author": {"login": BOT}, "body": "", "state": "APPROVED", "createdAt": RESPONSE_AT, "submittedAt": forged}), (wait,)),
             "thread comment time": (lambda pr: pr["reviewThreads"]["nodes"][0]["comments"]["nodes"][0].update(createdAt=forged), (wait, reader)),
             "comments nodes": (lambda pr: pr["comments"].update(nodes=HOSTILE), (wait,)),

@@ -10,7 +10,7 @@
 # Prints the compact `nodes` of the pullRequest connection `<connection>` (comments, reviews,
 # reviewThreads or reactions) in `$reply`: an empty list when the connection has none (null or
 # missing nodes). Prints fixed text on stderr and returns 1 for a reply of any other shape: nodes
-# that are not a list, an author login or a body that is not a string, or a createdAt or
+# that are not a list, an author login, a body or a review state that is not a string, or a createdAt or
 # submittedAt that is not a UTC timestamp. The scripts print those times (the approval time, the
 # request time), so a time with a line break and a forged line in it must stop here.
 reply_connection_nodes() {
@@ -25,7 +25,7 @@ reply_connection_nodes() {
   if ! nodes=$(printf '%s' "$reply" | jq -ce --arg name "$name" '
     def text: . == null or type == "string";
     def time: . == null or (type == "string" and test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\\z"));
-    def node_ok: (.author.login | text) and (.body | text) and (.createdAt | time) and (.submittedAt | time);
+    def node_ok: (.author.login | text) and (.body | text) and (.state | text) and (.createdAt | time) and (.submittedAt | time);
     def list_of(f): type == "array" and all(.[]; f);
     def nodes_of: if . == null then [] else . end;
     (.data.repository.pullRequest[$name].nodes | nodes_of)
