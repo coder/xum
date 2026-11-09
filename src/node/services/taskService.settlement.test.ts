@@ -6,8 +6,6 @@ import {
   mock,
   spyOn,
   setDefaultTimeout,
-  beforeAll,
-  afterAll,
   beforeEach,
   afterEach,
 } from "bun:test";
@@ -24,10 +22,6 @@ import {
   type WorkspaceMetadataOptions,
 } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
-import {
-  isolateHostHome,
-  type IsolatedHostHome,
-} from "@/node/services/hostHomeIsolation.testHarness";
 import type { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import {
@@ -46,7 +40,7 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowRunner } from "@/node/services/workflows/WorkflowRunner";
 import { WorkflowTaskServiceAdapter } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { __resetFileSinkForTests, log } from "@/node/services/log";
+import { log } from "@/node/services/log";
 import * as tokenizerModule from "@/node/utils/main/tokenizer";
 import { Ok, Err, type Result } from "@/common/types/result";
 import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
@@ -100,21 +94,6 @@ setDefaultTimeout(30_000);
 // deadline fails tests that are not broken. It stays below the file's test timeout, so a real hang
 // fails with the helper's label instead of as an unlabelled test timeout.
 const POLL_DEADLINE_MS = 20_000;
-
-// Every agent-task reservation resolves its agent definition, which scans the runtime user's
-// global plugin roots (<XUM_ROOT>/plugins and ~/.agents/plugins). Point them at an empty home so
-// these tests neither read nor wait on the plugins installed on the machine that runs them (each
-// installed plugin adds file-system work to every reservation).
-let hostHome: IsolatedHostHome | undefined;
-beforeAll(() => {
-  hostHome = isolateHostHome("task-settlement-host-home");
-});
-afterAll(() => {
-  hostHome?.restore();
-  // The log file sink opens at the first log line, inside the isolated home that restore() just
-  // deleted. Drop it so the next log line reopens under the restored home.
-  __resetFileSinkForTests();
-});
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -2729,7 +2708,16 @@ describe("TaskService", () => {
         const creating = taskService.createMany([spawnArgs(rootId)], {
           abortSignal: controller.signal,
         });
-        await blocked.promise;
+        // A createMany that returns before it reaches the mutex would leave `blocked` pending until
+        // the file's test timeout, and a timed-out test skips this finally, so the spies below
+        // would stay installed for the rest of the file. Fail at once, with a label, instead.
+        const reached = await Promise.race([
+          blocked.promise.then(() => "blocked" as const),
+          creating.then(() => "returned" as const),
+        ]);
+        if (reached !== "blocked") {
+          throw new Error("createMany returned before it blocked on the mutex");
+        }
         warningHandler?.();
         expect(
           warned.some(
