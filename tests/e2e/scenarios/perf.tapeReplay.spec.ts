@@ -168,8 +168,9 @@ test.describe("session tape replay performance profiling", () => {
 
     await expect(transcript).toContainText(TAPE_REPLAY_TEXTS.historyAssistant);
     await expect(transcript).toContainText(TAPE_REPLAY_TEXTS.liveText.trim());
-    // Tool cards render collapsed: expand the replayed bash call to check its recorded script.
-    await transcript.getByText("bash", { exact: true }).first().click();
+    // The bash card's collapsed header shows its command, so the recorded script needs no click.
+    // (Before bash's `timeout_secs` became optional the fixture drew a generic card that showed
+    // only the tool name, and this step clicked "bash" to expand it.)
     await expect(transcript).toContainText(TAPE_REPLAY_TEXTS.markerCommand);
 
     // Streaming and final renders can each request an image, so compare distinct URLs.
