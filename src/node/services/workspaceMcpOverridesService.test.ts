@@ -1703,18 +1703,34 @@ describe("WorkspaceMcpOverridesService", () => {
       }
     );
 
-    const failedReadSaves: Array<{ kind: string; overrides: WorkspaceMCPOverrides }> = [
-      { kind: "clear", overrides: {} },
-      { kind: "write", overrides: { disabledServers: ["consent-sensitive", "other"] } },
-    ];
+    const failedReadSaves: Array<{
+      kind: string;
+      overrides: WorkspaceMCPOverrides;
+      fault: "io" | "missing" | "parse";
+      failure: string;
+    }> = [
+      { fault: "io" as const, failure: "an I/O error" },
+      { fault: "missing" as const, failure: "a missing file" },
+      { fault: "parse" as const, failure: "a JSON parse error" },
+    ].flatMap(({ fault, failure }) => [
+      { kind: "clear", overrides: {}, fault, failure },
+      {
+        kind: "write",
+        overrides: { disabledServers: ["consent-sensitive", "other"] },
+        fault,
+        failure,
+      },
+    ]);
     it.each(failedReadSaves)(
-      "a settings $kind fails when the legacy clear's locked read of config.json fails",
-      async ({ kind, overrides }) => {
+      "a settings $kind fails when the legacy clear's locked read of config.json hits $failure",
+      async ({ kind, overrides, fault }) => {
         // The read under the lock failed, so the clear's transform saw defaults with no
         // workspace and reported nothing to change. The save then reported success: a clear
         // removed the document that disabled the server, and the legacy value that enables it
-        // decided again. Main rejects the save and keeps the server disabled.
-        const id = `failed-read-${kind}`;
+        // decided again. Main rejects the save and keeps the server disabled. A parse error of
+        // valid bytes backs those bytes up, so the write gate let the clear pass even after it
+        // checked the failed read: only a strict read stops it.
+        const id = `failed-read-${kind}-${fault}`;
         const dir = path.join(tempDir, id);
         await registerLocalWorkspaces(config, [{ dir, id }]);
         await config.editConfig((cfg) => {
@@ -1731,18 +1747,32 @@ describe("WorkspaceMcpOverridesService", () => {
         const service = new WorkspaceMcpOverridesService(config);
         const configFile = path.join(config.rootDir, "config.json");
         const realRead = nodeFs.readFileSync;
+        const realParse = JSON.parse;
         let armed = false;
         let injected = 0;
         const readSpy = spyOn(nodeFs, "readFileSync").mockImplementation(((
           ...args: Parameters<typeof nodeFs.readFileSync>
         ) => {
-          if (armed && String(args[0]) === configFile) {
+          if (fault !== "parse" && armed && String(args[0]) === configFile) {
             armed = false;
             injected++;
-            throw Object.assign(new Error("injected EIO"), { code: "EIO" });
+            const code = fault === "io" ? "EIO" : "ENOENT";
+            throw Object.assign(new Error(`injected ${code}`), { code });
           }
           return realRead(...args);
         }) as typeof nodeFs.readFileSync);
+        // Only config.json lists the workspace and its projects.
+        const parseSpy = spyOn(JSON, "parse").mockImplementation(((
+          text: string,
+          reviver?: Parameters<typeof JSON.parse>[1]
+        ) => {
+          if (fault === "parse" && armed && text.includes(id) && text.includes('"projects"')) {
+            armed = false;
+            injected++;
+            throw new SyntaxError("injected parse failure");
+          }
+          return realParse(text, reviver);
+        }) as typeof JSON.parse);
         const spy = spyLegacyClears({
           before: () => {
             armed = injected === 0;
@@ -1762,9 +1792,10 @@ describe("WorkspaceMcpOverridesService", () => {
         } finally {
           spy.mockRestore();
           readSpy.mockRestore();
+          parseSpy.mockRestore();
         }
         expect(injected).toBe(1);
-        expect(outcome).toMatch(/could not be read/);
+        expect(outcome).toMatch(/injected/);
         const { overrides: effective } = await service.getOverridesForWorkspace(id);
         expect(effective.disabledServers).toContain("consent-sensitive");
         expect(effective.enabledServers ?? []).not.toContain("consent-sensitive");

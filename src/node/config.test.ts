@@ -3919,6 +3919,7 @@ describe("Config", () => {
       // Every MCP settings save clears its legacy config.json value through this. An edit that
       // changed nothing still rewrote the whole file: at 7,550 workspaces, each save
       // re-serialized the registry.
+      await config.editConfig((cfg) => cfg);
       const saveConfig = spyOn(
         config as unknown as { saveConfig: (cfg: unknown) => unknown },
         "saveConfig"
@@ -3944,54 +3945,126 @@ describe("Config", () => {
       expect(new Config(tempDir).loadConfigOrDefault().heartbeatDefaultIntervalMs).toBe(360_000);
     });
 
-    it("editConfigIfChanged fails like a write when its locked read of config.json fails, with or without waiting for the lock", async () => {
-      // A failed read hands the transform defaults, which can hold nothing to change. The edit
-      // must still fail as a write does: a settings clear that reported success over an
-      // unread config.json left a legacy enabled server in place.
-      await config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
+    /**
+     * Makes the next read of config.json fail once, once armed: `io` and `missing` throw from
+     * the read itself, `parse` from parsing bytes that are valid.
+     */
+    function injectConfigReadFault(fault: "io" | "missing" | "parse") {
       const configFile = path.join(tempDir, "config.json");
+      const state = { armed: false, injected: 0 };
       const realRead = fs.readFileSync;
-      let armed = false;
-      let injected = 0;
+      const realParse = JSON.parse;
       const readSpy = spyOn(fs, "readFileSync").mockImplementation(((
         ...args: Parameters<typeof fs.readFileSync>
       ) => {
-        if (armed && String(args[0]) === configFile) {
-          armed = false;
-          injected++;
-          throw Object.assign(new Error("injected EIO"), { code: "EIO" });
+        if (fault !== "parse" && state.armed && String(args[0]) === configFile) {
+          state.armed = false;
+          state.injected++;
+          const code = fault === "io" ? "EIO" : "ENOENT";
+          throw Object.assign(new Error(`injected ${code}`), { code });
         }
         return realRead(...args);
       }) as typeof fs.readFileSync);
-      try {
-        // The lock is free: the read under it is the edit's first read of the file.
-        config.loadConfigOrDefault();
-        armed = true;
-        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-        await expect(config.editConfigIfChanged(() => CONFIG_UNCHANGED)).rejects.toThrow(
-          /could not be read/
-        );
-        expect(injected).toBe(1);
+      const parseSpy = spyOn(JSON, "parse").mockImplementation(((
+        text: string,
+        reviver?: Parameters<typeof JSON.parse>[1]
+      ) => {
+        if (fault === "parse" && state.armed && text.includes('"heartbeatDefaultIntervalMs"')) {
+          state.armed = false;
+          state.injected++;
+          throw new SyntaxError("injected parse failure");
+        }
+        return realParse(text, reviver);
+      }) as typeof JSON.parse);
+      return {
+        state,
+        restore: () => {
+          readSpy.mockRestore();
+          parseSpy.mockRestore();
+        },
+      };
+    }
 
-        // Another process holds the lock: the edit reads once it has waited for it.
-        const fresh = new Config(tempDir);
-        fresh.loadConfigOrDefault();
-        const otherProcess = await acquireProcessFileLock({
-          lockPath: projectRegistrationLockFilePath(tempDir),
-          timeoutMs: 5_000,
-          label: "test holder",
-        });
-        const waiting = fresh.editConfigIfChanged(() => CONFIG_UNCHANGED);
-        // Long enough for the edit to step out of the queue and wait for the lock.
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        armed = true;
-        await otherProcess[Symbol.asyncDispose]();
-        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-        await expect(waiting).rejects.toThrow(/could not be read/);
-        expect(injected).toBe(2);
-      } finally {
-        readSpy.mockRestore();
+    it.each([
+      { fault: "io" as const, failure: "an I/O error" },
+      { fault: "missing" as const, failure: "a missing file" },
+      { fault: "parse" as const, failure: "a JSON parse error" },
+    ])(
+      "editConfigIfChanged fails before its transform runs when its locked read of config.json hits $failure, with or without waiting for the lock",
+      async ({ fault }) => {
+        // A lenient read hands the transform defaults, which hold nothing to change: a settings
+        // clear then reported success over a config.json nobody read, and a legacy enabled
+        // server came back. The read under the lock is strict, so the edit fails first.
+        await config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
+        const injection = injectConfigReadFault(fault);
+        let transformed = 0;
+        const unchanged = () => {
+          transformed++;
+          return CONFIG_UNCHANGED;
+        };
+        try {
+          // The lock is free: the read under it is the edit's first read of the file.
+          config.loadConfigOrDefault();
+          injection.state.armed = true;
+          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+          await expect(config.editConfigIfChanged(unchanged)).rejects.toThrow(/injected/);
+          expect(injection.state.injected).toBe(1);
+
+          // Another process holds the lock: the edit reads once it has waited for it.
+          const fresh = new Config(tempDir);
+          fresh.loadConfigOrDefault();
+          const otherProcess = await acquireProcessFileLock({
+            lockPath: projectRegistrationLockFilePath(tempDir),
+            timeoutMs: 5_000,
+            label: "test holder",
+          });
+          const waiting = fresh.editConfigIfChanged(unchanged);
+          // Long enough for the edit to step out of the queue and wait for the lock.
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          injection.state.armed = true;
+          await otherProcess[Symbol.asyncDispose]();
+          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+          await expect(waiting).rejects.toThrow(/injected/);
+          expect(injection.state.injected).toBe(2);
+        } finally {
+          injection.restore();
+        }
+        expect(transformed).toBe(0);
+        expect(new Config(tempDir).loadConfigOrDefault().heartbeatDefaultIntervalMs).toBe(360_000);
       }
+    );
+
+    it("editConfigIfChanged fails before its transform runs when config.json does not exist", async () => {
+      // The registry lives in config.json, so an edit that finds none has nothing it can answer
+      // "unchanged" for: a settings clear would report success for a file nobody read.
+      let transformed = 0;
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        config.editConfigIfChanged(() => {
+          transformed++;
+          return CONFIG_UNCHANGED;
+        })
+      ).rejects.toThrow(/ENOENT/);
+      expect(transformed).toBe(0);
+      expect(fs.existsSync(path.join(tempDir, "config.json"))).toBe(false);
+    });
+
+    it("editConfigIfChanged fails before its transform runs on a config.json that fails structural validation", async () => {
+      // editConfig's lenient read keeps what it can of such a file. An edit that may report
+      // no change must answer the whole file, so it fails instead.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [["", { workspaces: [] }]] })
+      );
+      let transformed = 0;
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        config.editConfigIfChanged(() => {
+          transformed++;
+          return CONFIG_UNCHANGED;
+        })
+      ).rejects.toThrow(/non-empty string path/);
+      expect(transformed).toBe(0);
     });
   });
 

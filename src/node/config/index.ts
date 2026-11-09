@@ -2613,13 +2613,19 @@ export class Config {
   }
 
   private readConfigOrDefault(
-    options?: { throwOnError?: boolean; keepSnapshot?: boolean },
+    options?: {
+      throwOnError?: boolean;
+      keepSnapshot?: boolean;
+      /** A missing config.json throws its ENOENT instead of reading as defaults. */
+      requireFile?: boolean;
+    },
     key?: string
   ): ProjectsConfig {
     // Read as a Buffer and hand the same snapshot to the failure handler: backing up via a
     // second read could preserve a concurrent writer's replacement instead of the bytes that
     // actually failed parsing.
     let rawBytes: Buffer | undefined;
+    let missing: unknown;
     // An edit's fresh read stores nothing, so the snapshot of the unchanged file stays valid
     // for readers until the save's rename; dropping it made every reader during the edit parse
     // the same bytes again. It is still key-guarded: a miss as soon as the file changes.
@@ -2636,6 +2642,7 @@ export class Config {
         // non-ENOENT failures through the shared failure path below
         // (throwOnError callers rethrow); only ENOENT means missing.
         if (!isEnoentError(readError)) throw readError;
+        missing = readError;
       }
       if (rawBytes !== undefined) {
         const parsedValue: unknown = JSON.parse(rawBytes.toString("utf-8"));
@@ -2675,6 +2682,9 @@ export class Config {
       this.handleConfigLoadFailure(rawBytes, error);
       if (options?.throwOnError) throw error;
     }
+    // Thrown outside the try: a missing file is not a corrupt one, so it records no load
+    // failure, and it has no bytes for the edit gate to protect.
+    if (options?.requireFile && missing !== undefined) throw missing;
 
     // Return default config
     return {
@@ -3124,7 +3134,10 @@ export class Config {
       // re-applied on every load, so the identity transform re-reads disk, re-runs them,
       // and persists the migrated form under the queue. One-shot guard: while a persist
       // is in flight, the loads it performs internally must not re-schedule.
-      this.migrationPersist = this.enqueueGatedConfigEdit((migratedConfig) => migratedConfig)
+      this.migrationPersist = this.enqueueGatedConfigEdit(
+        (migratedConfig) => migratedConfig,
+        /* strictRead */ false
+      )
         .catch((error: unknown) => {
           // Keep startup resilient even if persisting migration fails.
           log.warn("Failed to persist migrated config", { error });
@@ -3650,17 +3663,27 @@ export class Config {
     options: { withinRegistrationLock?: ProjectRegistrationLockHandle } = {}
   ): Promise<void> {
     if (options.withinRegistrationLock !== undefined) {
-      return this.enqueueConfigEdit(fn, { kind: "held", lock: options.withinRegistrationLock });
+      return this.enqueueConfigEdit(
+        fn,
+        { kind: "held", lock: options.withinRegistrationLock },
+        /* strictRead */ false
+      );
     }
-    return this.enqueueGatedConfigEdit(fn);
+    return this.enqueueGatedConfigEdit(fn, /* strictRead */ false);
   }
 
   /**
    * editConfig for a transform that may find nothing to change: returning CONFIG_UNCHANGED writes
    * nothing. An edit that changes nothing otherwise still rewrites the whole config.json.
+   *
+   * Its read under the lock is strict: a read that fails for any reason (I/O, JSON, structure, or
+   * a config.json missing under the lock) fails the edit before `fn` runs. editConfig's lenient
+   * read hands `fn` defaults instead, which hold nothing to change, so CONFIG_UNCHANGED would
+   * report success for a file nobody read (a settings clear then left a legacy enabled server in
+   * config.json). So CONFIG_UNCHANGED only ever answers the parsed config.json.
    */
   async editConfigIfChanged(fn: ConfigEditTransform): Promise<void> {
-    return this.enqueueGatedConfigEdit(fn);
+    return this.enqueueGatedConfigEdit(fn, /* strictRead */ true);
   }
 
   /**
@@ -3671,7 +3694,10 @@ export class Config {
    * cross-process lock or a registration another process makes in between is silently
    * dropped by this process's save — even by an edit that never touched the project set.
    */
-  private async enqueueGatedConfigEdit(fn: ConfigEditTransform): Promise<void> {
+  private async enqueueGatedConfigEdit(
+    fn: ConfigEditTransform,
+    strictRead: boolean
+  ): Promise<void> {
     // Straight into the queue, in call order: the edit takes its own hold of the file lock
     // inside its slot, at write time. When the lock is held elsewhere — another process, or
     // a restore, import, or create window in this one — the edit fails the slot before
@@ -3680,7 +3706,7 @@ export class Config {
     // waiting (see lockWaiters). Its first run was discarded: nothing it mutated survives,
     // since loadConfigOrDefault parses fresh bytes on every call.
     try {
-      return await this.enqueueConfigEdit(fn, { kind: "none" });
+      return await this.enqueueConfigEdit(fn, { kind: "none" }, strictRead);
     } catch (error) {
       if (!(error instanceof ProjectRegistrationLockContended)) throw error;
       return error.rerun;
@@ -3692,10 +3718,10 @@ export class Config {
    * for it, and records the chain's new tail. Called synchronously from the edit's queue
    * slot, so the chain order is the slot order.
    */
-  private joinLockWaiters(fn: ConfigEditTransform): Promise<void> {
+  private joinLockWaiters(fn: ConfigEditTransform, strictRead: boolean): Promise<void> {
     const rerun = (this.lockWaiters ?? Promise.resolve()).then(() =>
       withProjectRegistrationFileLock(this.rootDir, (lock) =>
-        this.enqueueConfigEdit(fn, { kind: "held", lock })
+        this.enqueueConfigEdit(fn, { kind: "held", lock }, strictRead)
       )
     );
     // The tail settles either way, so one edit's failure never wedges the ones behind it.
@@ -4079,7 +4105,9 @@ export class Config {
    */
   private enqueueConfigEdit(
     fn: ConfigEditTransform,
-    registrationLock: RegistrationLockState
+    registrationLock: RegistrationLockState,
+    /** See editConfigIfChanged. */
+    strictRead: boolean
   ): Promise<void> {
     // Defer the fiber start to a microtask: Effect.runPromise executes fibers
     // synchronously on the caller's stack until the first async boundary, but the old
@@ -4090,7 +4118,7 @@ export class Config {
     // Effect failures reject this promise with the raw error (v4 runPromise does not
     // wrap causes), so callers observe the same rejections as before.
     return Promise.resolve().then(() =>
-      Effect.runPromise(this.enqueueConfigEditEffect(fn, registrationLock))
+      Effect.runPromise(this.enqueueConfigEditEffect(fn, registrationLock, strictRead))
     );
   }
 
@@ -4104,7 +4132,8 @@ export class Config {
    */
   private enqueueConfigEditEffect(
     fn: ConfigEditTransform,
-    registrationLock: RegistrationLockState
+    registrationLock: RegistrationLockState,
+    strictRead: boolean
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -4119,7 +4148,13 @@ export class Config {
     let readStatKey: string | undefined;
     const transform = (): ProjectsConfig | typeof CONFIG_UNCHANGED => {
       readStatKey = self.readEditStatKey();
-      return fn(self.readConfigOrDefault({ keepSnapshot: true }));
+      return fn(
+        self.readConfigOrDefault({
+          keepSnapshot: true,
+          throwOnError: strictRead,
+          requireFile: strictRead,
+        })
+      );
     };
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
@@ -4187,17 +4222,14 @@ export class Config {
           yield* Effect.tryPromise({
             try: async () => {
               if (self.lockWaiters !== null) {
-                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
+                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn, strictRead));
               }
               await using lock = await tryProjectRegistrationFileLock(self.rootDir);
               if (lock === null)
-                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
+                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn, strictRead));
+              // CONFIG_UNCHANGED writes nothing, so it needs no write gate: editConfigIfChanged's
+              // strict read has already failed the edit on a config.json it could not read.
               const newConfig = transform();
-              // Gated like a write, as in the held branch above: a fresh read that failed
-              // hands the transform defaults, which can hold nothing to change. Skipping the
-              // gate for CONFIG_UNCHANGED let such an edit succeed: a settings clear then
-              // reported success and left a legacy enabled server in config.json.
-              self.assertConfigWritable();
               if (newConfig !== CONFIG_UNCHANGED) await Effect.runPromise(write(newConfig, lock));
             },
             catch: (error) => error,
