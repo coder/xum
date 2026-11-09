@@ -107,11 +107,13 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      # electron-builder unpacks the checked Electron zip instead of downloading it without retries.
+      # electron-builder unpacks the checked Electron zip instead of downloading it without retries,
+      # and finds the AppImage tool in its cache (fetched with retries and a pinned checksum).
       - uses: ./.github/actions/setup-xum
         with:
           electron-zip: "true"
           electron-zip-targets: linux-x64
+          appimage-tool: "true"
 
       - name: Patch package.json version
         if: inputs.version_override != ''
@@ -168,6 +170,7 @@ jobs:
         with:
           electron-zip: "true"
           electron-zip-targets: linux-arm64
+          appimage-tool: "true"
 
       - name: Patch package.json version
         if: inputs.version_override != ''
