@@ -190,6 +190,10 @@ describe("iOS standalone viewport", () => {
       viewport.nativeHeight = 324;
       viewport.dispatchEvent(new window.Event("resize"));
       expect(appViewportHeight()).toBe("324px");
+
+      viewport.nativeHeight = -33554432;
+      viewport.dispatchEvent(new window.Event("resize"));
+      expect(appViewportHeight()).toBe("678px");
     } finally {
       consoleError.mockRestore();
     }

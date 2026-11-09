@@ -8,7 +8,9 @@ function syncViewportHeight(): void {
   // opens or closes. A height read from innerHeight on a resize while it was up stuck, and left a
   // blank band under the shell after it closed. Height times scale ignores pinch zoom.
   const height =
-    viewport != null ? Math.round(viewport.height * viewport.scale) : window.innerHeight;
+    viewport != null && viewport.height > 0
+      ? Math.round(viewport.height * viewport.scale)
+      : window.innerHeight;
   document.documentElement.style.setProperty(APP_VIEWPORT_HEIGHT_PROPERTY, `${height}px`);
   // To reveal the focused field over the keyboard iOS scrolls the window, which moved the whole
   // shell up and hid the header. The shell now fits above the keyboard, so undo that scroll
