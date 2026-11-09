@@ -4726,6 +4726,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- `~/.cargo/credentials` and `~/.cargo/credentials.toml`.",
       "- `~/.config/git/credentials`.",
       "- `~/.cache/huggingface/token`.",
+      "- `~/.local/share/uv/credentials`, where `uv auth login` keeps its tokens, so uv in the sandbox cannot use them.",
       "- Xum's `server.lock`, `providers.jsonc`, `secrets.json`, `mcp-oauth.json`, and `config.json`, and its `askpass` folder, where your answers to SSH prompts pass.",
       "",
       "Commands fail to start when one of these files has more than one hard link, because the sandbox hides and protects names, not files, so the other name would open it.",

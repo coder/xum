@@ -942,6 +942,17 @@ describe("buildAgentSandboxPolicy credential files", () => {
     expect(agentSandboxPolicyAllows(policy, secrets, "write")).toBe(false);
   });
 
+  // ~/.local/share/uv is open for reads, so only the nested deny hides the tokens in it.
+  test("hide uv's login tokens in its open data folder", async () => {
+    const uvData = path.join(await fs.realpath(os.homedir()), ".local", "share", "uv");
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: os.tmpdir() });
+
+    expect(
+      agentSandboxPolicyAllows(policy, path.join(uvData, "credentials", "credentials.toml"), "read")
+    ).toBe(false);
+    expect(agentSandboxPolicyAllows(policy, path.join(uvData, "python", "bin"), "read")).toBe(true);
+  });
+
   // An SSH password that the user types into Xum passes through this folder.
   test("hide the answers to SSH prompts", () => {
     const answer = path.join(askpassSessionsRoot(), "mux-askpass-a", "response.1.txt");

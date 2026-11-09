@@ -272,6 +272,8 @@ export const NESTED_DENY_READ_PATHS: readonly string[] = [
   "~/.cargo/credentials",
   "~/.config/git/credentials",
   "~/.cache/huggingface/token",
+  // `uv auth login` keeps index tokens here, inside ~/.local/share/uv, which HOME_READ_PATHS opens.
+  "~/.local/share/uv/credentials",
   `${XUM_HOME_TOKEN}/server.lock`,
   `${XUM_HOME_TOKEN}/providers.jsonc`,
   `${XUM_HOME_TOKEN}/secrets.json`,
