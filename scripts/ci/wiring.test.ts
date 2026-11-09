@@ -386,7 +386,7 @@ describe("the Electron zip wiring", () => {
     const direct = new Map<string, string>();
     for (const [key, job] of await jobsWithElectronBuilder()) {
       for (const step of job.steps) {
-        if (/bun x electron-builder/.test(step.run ?? "")) direct.set(key, step.run ?? "");
+        if (step.run?.includes("bun x electron-builder")) direct.set(key, step.run);
       }
     }
     expect([...direct.keys()].sort()).toEqual(Object.keys(DIRECT_CALLS).sort());
@@ -407,7 +407,7 @@ describe("make dist-*: the zip directory reaches every electron-builder call", (
       env: env({ ELECTRON_ZIP_DIR: zipDir }),
     });
     expect(result.exitCode).toBe(0);
-    return result.stdout.split("\n").filter((line) => /bun x electron-builder/.test(line));
+    return result.stdout.split("\n").filter((line) => line.includes("bun x electron-builder"));
   }
 
   const TARGETS: [string, number][] = [
