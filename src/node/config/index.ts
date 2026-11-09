@@ -4193,6 +4193,11 @@ export class Config {
               if (lock === null)
                 throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
               const newConfig = transform();
+              // Gated like a write, as in the held branch above: a fresh read that failed
+              // hands the transform defaults, which can hold nothing to change. Skipping the
+              // gate for CONFIG_UNCHANGED let such an edit succeed: a settings clear then
+              // reported success and left a legacy enabled server in config.json.
+              self.assertConfigWritable();
               if (newConfig !== CONFIG_UNCHANGED) await Effect.runPromise(write(newConfig, lock));
             },
             catch: (error) => error,

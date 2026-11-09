@@ -3943,6 +3943,56 @@ describe("Config", () => {
       expect(saveConfig).toHaveBeenCalledTimes(1);
       expect(new Config(tempDir).loadConfigOrDefault().heartbeatDefaultIntervalMs).toBe(360_000);
     });
+
+    it("editConfigIfChanged fails like a write when its locked read of config.json fails, with or without waiting for the lock", async () => {
+      // A failed read hands the transform defaults, which can hold nothing to change. The edit
+      // must still fail as a write does: a settings clear that reported success over an
+      // unread config.json left a legacy enabled server in place.
+      await config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
+      const configFile = path.join(tempDir, "config.json");
+      const realRead = fs.readFileSync;
+      let armed = false;
+      let injected = 0;
+      const readSpy = spyOn(fs, "readFileSync").mockImplementation(((
+        ...args: Parameters<typeof fs.readFileSync>
+      ) => {
+        if (armed && String(args[0]) === configFile) {
+          armed = false;
+          injected++;
+          throw Object.assign(new Error("injected EIO"), { code: "EIO" });
+        }
+        return realRead(...args);
+      }) as typeof fs.readFileSync);
+      try {
+        // The lock is free: the read under it is the edit's first read of the file.
+        config.loadConfigOrDefault();
+        armed = true;
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+        await expect(config.editConfigIfChanged(() => CONFIG_UNCHANGED)).rejects.toThrow(
+          /could not be read/
+        );
+        expect(injected).toBe(1);
+
+        // Another process holds the lock: the edit reads once it has waited for it.
+        const fresh = new Config(tempDir);
+        fresh.loadConfigOrDefault();
+        const otherProcess = await acquireProcessFileLock({
+          lockPath: projectRegistrationLockFilePath(tempDir),
+          timeoutMs: 5_000,
+          label: "test holder",
+        });
+        const waiting = fresh.editConfigIfChanged(() => CONFIG_UNCHANGED);
+        // Long enough for the edit to step out of the queue and wait for the lock.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        armed = true;
+        await otherProcess[Symbol.asyncDispose]();
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+        await expect(waiting).rejects.toThrow(/could not be read/);
+        expect(injected).toBe(2);
+      } finally {
+        readSpy.mockRestore();
+      }
+    });
   });
 
   describe("configFileWriteGeneration", () => {

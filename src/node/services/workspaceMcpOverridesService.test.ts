@@ -1703,6 +1703,74 @@ describe("WorkspaceMcpOverridesService", () => {
       }
     );
 
+    const failedReadSaves: Array<{ kind: string; overrides: WorkspaceMCPOverrides }> = [
+      { kind: "clear", overrides: {} },
+      { kind: "write", overrides: { disabledServers: ["consent-sensitive", "other"] } },
+    ];
+    it.each(failedReadSaves)(
+      "a settings $kind fails when the legacy clear's locked read of config.json fails",
+      async ({ kind, overrides }) => {
+        // The read under the lock failed, so the clear's transform saw defaults with no
+        // workspace and reported nothing to change. The save then reported success: a clear
+        // removed the document that disabled the server, and the legacy value that enables it
+        // decided again. Main rejects the save and keeps the server disabled.
+        const id = `failed-read-${kind}`;
+        const dir = path.join(tempDir, id);
+        await registerLocalWorkspaces(config, [{ dir, id }]);
+        await config.editConfig((cfg) => {
+          const entry = cfg.projects.get(dir)?.workspaces[0];
+          if (entry) entry.mcp = { enabledServers: ["consent-sensitive"] };
+          return cfg;
+        });
+        await fs.mkdir(path.join(dir, ".xum"), { recursive: true });
+        await fs.writeFile(
+          path.join(dir, ".xum", "mcp.local.jsonc"),
+          JSON.stringify({ disabledServers: ["consent-sensitive"] })
+        );
+        config.loadConfigOrDefault();
+        const service = new WorkspaceMcpOverridesService(config);
+        const configFile = path.join(config.rootDir, "config.json");
+        const realRead = nodeFs.readFileSync;
+        let armed = false;
+        let injected = 0;
+        const readSpy = spyOn(nodeFs, "readFileSync").mockImplementation(((
+          ...args: Parameters<typeof nodeFs.readFileSync>
+        ) => {
+          if (armed && String(args[0]) === configFile) {
+            armed = false;
+            injected++;
+            throw Object.assign(new Error("injected EIO"), { code: "EIO" });
+          }
+          return realRead(...args);
+        }) as typeof nodeFs.readFileSync);
+        const spy = spyLegacyClears({
+          before: () => {
+            armed = injected === 0;
+          },
+        });
+        let outcome: string;
+        try {
+          outcome = await service
+            .setOverridesForWorkspace(id, overrides, {
+              publish: () => Promise.resolve(),
+              hasSnapshot: () => false,
+            })
+            .then(
+              () => "saved",
+              (error: unknown) => String(error)
+            );
+        } finally {
+          spy.mockRestore();
+          readSpy.mockRestore();
+        }
+        expect(injected).toBe(1);
+        expect(outcome).toMatch(/could not be read/);
+        const { overrides: effective } = await service.getOverridesForWorkspace(id);
+        expect(effective.disabledServers).toContain("consent-sensitive");
+        expect(effective.enabledServers ?? []).not.toContain("consent-sensitive");
+      }
+    );
+
     it("a sharer's legacy value that another process sets again during the save is still retired", async () => {
       // The save retires a sharer's legacy value under the config lock as well. Another process
       // clears that value after the writer's own clear, and sets a new one before it releases
