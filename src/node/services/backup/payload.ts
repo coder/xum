@@ -117,19 +117,11 @@ const PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/;
 /** Escapes of escapes (`%2567`) are decoded this far, and a text still escaped after that is refused. */
 const MAX_ESCAPE_DECODE_ROUNDS = 3;
 
-function decodeEscapes(text: string): string | null {
-  try {
-    return decodeURIComponent(text);
-  } catch {
-    return null;
-  }
-}
-
 /**
  * True when a text that carries percent escapes matches a secret pattern once they are decoded, or
- * cannot be decoded. The publish-time scan reads a file as written, so an escape right before a
- * token (`%20ghp_...`, `-----BEGIN%20PRIVATE%20KEY-----`) keeps its word boundary or its space away
- * and the scan passes it, while whatever reads the text decoded sees the token. A malformed escape
+ * cannot be decoded. The publish-time scan reads a file as written, so `%20ghp_...` has no word
+ * boundary before the token and `-----BEGIN%20PRIVATE%20KEY-----` has no space in its header: the
+ * scan passes both, while whatever reads the text decoded sees the token. A malformed escape
  * counts as a match: nothing says how a reader would decode that text. A `%` that starts no
  * escape does not.
  */
@@ -137,8 +129,13 @@ export function hidesSecretBehindEscapes(text: string): boolean {
   let current = text;
   for (let round = 0; PERCENT_ESCAPE.test(current); round++) {
     if (round === MAX_ESCAPE_DECODE_ROUNDS) return true;
-    const decoded = decodeEscapes(current);
-    if (decoded === null || matchesSecretPattern(decoded)) return true;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(current);
+    } catch {
+      return true;
+    }
+    if (matchesSecretPattern(decoded)) return true;
     current = decoded;
   }
   return false;
