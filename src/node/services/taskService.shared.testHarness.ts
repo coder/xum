@@ -71,10 +71,11 @@ async function releaseIsolation(): Promise<void> {
   if (isolation === undefined) return;
   const { home } = isolation;
   isolation = undefined;
-  // The log file sink opens inside the isolated home. Wait until its descriptor is closed before
-  // that folder is deleted, because Windows cannot delete an open file. The sink stays closed
-  // while the folder goes, so a late log line cannot reopen it. Then the next log line opens it
-  // under the restored home.
+  // The log file sink opens inside the isolated home. Wait until every descriptor of the sink is
+  // closed (the open stream, and a rotation's or clear's stream that is in flight) before that
+  // folder is deleted, because Windows cannot delete an open file. The sink stays closed while the
+  // folder goes, so a late log line cannot reopen it. Then the next log line opens it under the
+  // restored home.
   await __closeFileSinkForTests();
   home.restore();
   __resetFileSinkForTests();

@@ -4,7 +4,7 @@ import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { __resetFileSinkForTests, getLogFilePath, log } from "@/node/services/log";
+import { __resetFileSinkForTests, clearLogFiles, getLogFilePath, log } from "@/node/services/log";
 import {
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
@@ -86,6 +86,36 @@ describe("createTaskServiceTestRoot", () => {
     }
   });
 
+  // Spies on the deletion of the isolated home. When rm deletes `home`, it records whether every
+  // stream that the log sink opened by then is closed, and how many log files the sink had renamed.
+  function spyOnHomeDeletion(home: string) {
+    const streams = spyOn(fs, "createWriteStream");
+    const renames = spyOn(fs, "renameSync");
+    const realRmSync = fs.rmSync;
+    const atDeletion = { deleted: false, allStreamsClosed: false, renames: 0 };
+    const rmSync = spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target) === home) {
+        atDeletion.deleted = true;
+        // Every sink that was ever opened, including one that a late log line reopened.
+        atDeletion.allStreamsClosed = streams.mock.results.every((result) => {
+          return (result.value as fs.WriteStream).closed;
+        });
+        atDeletion.renames = renames.mock.calls.length;
+      }
+      return realRmSync(target, options);
+    });
+    return {
+      atDeletion,
+      streams,
+      renames,
+      restore() {
+        rmSync.mockRestore();
+        renames.mockRestore();
+        streams.mockRestore();
+      },
+    };
+  }
+
   // The log file sink opens at the first log line, in the home that is current then. Windows cannot
   // delete a file that a stream holds open, and a sink that outlives its home would keep writing
   // to a deleted file instead of the home that is current for a later test.
@@ -93,53 +123,34 @@ describe("createTaskServiceTestRoot", () => {
     __resetFileSinkForTests();
     const root = await createTaskServiceTestRoot();
     const isolated = os.homedir();
-    const open = spyOn(fs, "createWriteStream");
-    const realRmSync = fs.rmSync;
-    let closedWhenHomeDeleted: boolean | undefined;
-    const rmSync = spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      // Every sink that was ever opened, including one that a late log line reopened.
-      if (String(target) === isolated) {
-        closedWhenHomeDeleted = open.mock.results.every((result) => {
-          return (result.value as fs.WriteStream).closed;
-        });
-      }
-      return realRmSync(target, options);
-    });
+    const spy = spyOnHomeDeletion(isolated);
     try {
       log.info("task service test root: the sink opens inside the isolated home");
-      expect(open.mock.calls.length).toBe(1);
-      expect(String(open.mock.calls[0][0]).startsWith(isolated)).toBe(true);
-      const sink = open.mock.results[0].value as fs.WriteStream;
+      expect(spy.streams.mock.calls.length).toBe(1);
+      expect(String(spy.streams.mock.calls[0][0]).startsWith(isolated)).toBe(true);
+      const sink = spy.streams.mock.results[0].value as fs.WriteStream;
       expect(sink.closed).toBe(false);
       // Work that a test leaves running can log while the root is being removed.
       sink.once("close", () => log.info("task service test root: a late log line"));
       await removeTaskServiceTestRoot(root);
-      expect(closedWhenHomeDeleted).toBe(true);
-      expect(open.mock.calls.length).toBe(1);
+      expect(spy.atDeletion.allStreamsClosed).toBe(true);
+      expect(spy.streams.mock.calls.length).toBe(1);
     } finally {
-      rmSync.mockRestore();
-      open.mockRestore();
+      spy.restore();
       await removeTaskServiceTestRoot(root);
       __resetFileSinkForTests();
     }
   });
 
   // A rotation takes its stream out of the open state at once and renames the log files later, in
-  // the sink queue. The home must not be deleted before that rename, and the rotation must not
-  // reopen the sink in the deleted home afterwards.
+  // the sink queue. The home must not be deleted before that rename or before the old stream is
+  // closed, and the rotation must not reopen the sink in the deleted home afterwards.
   test("waits for a log rotation that is in flight before it deletes the isolated home", async () => {
     __resetFileSinkForTests();
     const root = await createTaskServiceTestRoot();
     const isolated = os.homedir();
     const logFile = getLogFilePath();
-    const realRmSync = fs.rmSync;
-    // The rotation shifts the log files with renameSync once its stream is done.
-    const rename = spyOn(fs, "renameSync");
-    let renamedWhenHomeDeleted: boolean | undefined;
-    const rmSync = spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (String(target) === isolated) renamedWhenHomeDeleted = rename.mock.calls.length > 0;
-      return realRmSync(target, options);
-    });
+    const spy = spyOnHomeDeletion(isolated);
     try {
       // The sink starts from the size of the file that it finds, and it rotates at 10 MiB. A sparse
       // file of that size makes the first log line rotate, with no 10 MiB write.
@@ -147,14 +158,34 @@ describe("createTaskServiceTestRoot", () => {
       await fsPromises.writeFile(logFile, "");
       await fsPromises.truncate(logFile, 10 * 1024 * 1024);
       log.info("task service test root: this line rotates the log");
-      expect(rename.mock.calls.length).toBe(0);
+      expect(spy.renames.mock.calls.length).toBe(0);
       await removeTaskServiceTestRoot(root);
-      expect(renamedWhenHomeDeleted).toBe(true);
+      expect(spy.atDeletion.renames).toBeGreaterThan(0);
+      expect(spy.atDeletion.allStreamsClosed).toBe(true);
       // A rotation that resumed later would recreate the folder that was just deleted.
       expect(await fsPromises.stat(isolated).catch(() => null)).toBeNull();
     } finally {
-      rmSync.mockRestore();
-      rename.mockRestore();
+      spy.restore();
+      await removeTaskServiceTestRoot(root);
+      __resetFileSinkForTests();
+    }
+  });
+
+  // A clear also takes its stream out of the open state at once and truncates the log later.
+  test("waits for a log clear that is in flight before it deletes the isolated home", async () => {
+    __resetFileSinkForTests();
+    const root = await createTaskServiceTestRoot();
+    const isolated = os.homedir();
+    const spy = spyOnHomeDeletion(isolated);
+    try {
+      log.info("task service test root: the sink opens inside the isolated home");
+      const clearing = clearLogFiles();
+      await removeTaskServiceTestRoot(root);
+      expect(spy.atDeletion.allStreamsClosed).toBe(true);
+      await clearing;
+      expect(await fsPromises.stat(isolated).catch(() => null)).toBeNull();
+    } finally {
+      spy.restore();
       await removeTaskServiceTestRoot(root);
       __resetFileSinkForTests();
     }
