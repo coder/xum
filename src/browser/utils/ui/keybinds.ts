@@ -477,6 +477,12 @@ export const KEYBINDS = {
   /** Show or hide a workspace's completed sub-agents (only in its actions menu) */
   TOGGLE_COMPLETED_SUB_AGENTS: { key: "a", code: "KeyA", ctrl: true, alt: true, shift: true },
 
+  /** Search the current chat. */
+  SEARCH_CHAT: { key: "f", ctrl: true },
+  /** Navigate matching messages while the chat search input has focus. */
+  NEXT_CHAT_SEARCH_RESULT: { key: "Enter" },
+  PREVIOUS_CHAT_SEARCH_RESULT: { key: "Enter", shift: true },
+
   /** Jump to bottom of chat */
   JUMP_TO_BOTTOM: { key: "G", shift: true },
 

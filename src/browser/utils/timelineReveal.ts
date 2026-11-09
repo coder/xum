@@ -42,11 +42,16 @@ function isRevealTargetLoaded(
     : false;
 }
 
-function dispatchTimelineReveal(workspaceId: string, target: TimelineRevealTarget): void {
+function dispatchTimelineReveal(
+  workspaceId: string,
+  target: TimelineRevealTarget,
+  isCancelled: (() => boolean) | undefined
+): void {
   window.dispatchEvent(
     createCustomEvent(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, {
       workspaceId,
       ...target,
+      ...(isCancelled ? { isCancelled } : {}),
     })
   );
 }
@@ -73,7 +78,7 @@ export async function revealTimelineTarget(options: {
       if (cancelled()) {
         return "cancelled";
       }
-      dispatchTimelineReveal(workspaceId, target);
+      dispatchTimelineReveal(workspaceId, target, isCancelled);
       return "revealed";
     }
     if (cancelled()) {
@@ -87,7 +92,7 @@ export async function revealTimelineTarget(options: {
       if (cancelled()) {
         return "cancelled";
       }
-      dispatchTimelineReveal(workspaceId, target);
+      dispatchTimelineReveal(workspaceId, target, isCancelled);
       return "revealed";
     }
   }
@@ -122,7 +127,7 @@ export async function revealTimelineTarget(options: {
         if (cancelled()) {
           return "cancelled";
         }
-        dispatchTimelineReveal(workspaceId, target);
+        dispatchTimelineReveal(workspaceId, target, isCancelled);
         return "revealed";
       }
     }

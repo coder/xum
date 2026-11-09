@@ -318,6 +318,8 @@ export interface CustomEventPayloads {
     workspaceId: string;
     messageId?: string;
     toolCallId?: string;
+    /** Search can close while the transcript still mounts the target row. */
+    isCancelled?: () => boolean;
   };
   [CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED]: {
     enabled: boolean;

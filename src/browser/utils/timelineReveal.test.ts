@@ -80,6 +80,43 @@ describe("revealTimelineTarget", () => {
     }
   });
 
+  it("keeps cancellation available after dispatch while the target still mounts", async () => {
+    const store = createStore({ messages: [makeUserMessage("prompt-1")] });
+    let cancelled = false;
+    const events: Array<CustomEvent<{ isCancelled: () => boolean }>> = [];
+    const listener = (event: Event) =>
+      events.push(event as CustomEvent<{ isCancelled: () => boolean }>);
+    window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    try {
+      await revealTimelineTarget({
+        workspaceId,
+        getTarget: () => ({ messageId: "prompt-1" }),
+        workspaceStore: store,
+        pinTarget: () => undefined,
+        isCancelled: () => cancelled,
+      });
+      expect(events[0].detail.isCancelled()).toBe(false);
+      cancelled = true;
+      expect(events[0].detail.isCancelled()).toBe(true);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    }
+  });
+
+  it("does not load older pages for a loaded-history-only reveal", async () => {
+    const loadOlderHistory = mock(() => Promise.resolve("loaded" as const));
+    const store = createStore({ hasOlderHistory: true, loadOlderHistory });
+    const result = await revealTimelineTarget({
+      workspaceId,
+      getTarget: () => ({ messageId: "unrenderable" }),
+      workspaceStore: store,
+      pinTarget: () => undefined,
+      maxHistoryPages: 0,
+    });
+    expect(result).toBe("not-loaded");
+    expect(loadOlderHistory).not.toHaveBeenCalled();
+  });
+
   it("pins a target that becomes renderable without loading history", async () => {
     const store = createStore();
     const pinTarget = mock((_workspaceId: string, target: { messageId?: string }) => {
