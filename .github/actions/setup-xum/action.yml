@@ -111,10 +111,12 @@ runs:
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-
 
-    # The key hashes scripts/ci/prefetch-appimage-tool.sh too: an exact hit is never saved again,
-    # so an entry from before that script held no AppImage tool for good, and every job that hit it
-    # downloaded the tool. A change to the script (a new tool version or pin) moves the key, and the
-    # first job on the new key saves the tool at its end.
+    # A cache is saved only when its exact key missed. The callers that build an AppImage
+    # (appimage-tool) therefore use a key family of their own: the other jobs finish sooner and
+    # would save the key first, with no tool in it, and every later AppImage job would hit that
+    # entry and download the tool. The family's key also hashes scripts/ci/prefetch-appimage-tool.sh,
+    # so a new tool version or pin starts a new entry, which the first AppImage job saves with the
+    # tool in it (the job fails when the tool is missing, and a failed job saves nothing).
     - name: Cache electron-builder
       if: ${{ inputs.skip-build-caches != 'true' }}
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -123,7 +125,7 @@ runs:
           ~/.cache/electron-builder
           ~/Library/Caches/electron-builder
           ~/AppData/Local/electron-builder/Cache
-        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock', 'scripts/ci/prefetch-appimage-tool.sh') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ inputs.appimage-tool == 'true' && format('appimage-{0}', hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock', 'scripts/ci/prefetch-appimage-tool.sh')) || hashFiles('bun.lock', 'packages/chat-components/bun.lock', 'vscode/bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-builder-
 

@@ -224,13 +224,20 @@ describe("the AppImage tool wiring", () => {
     );
   });
 
-  test("the electron-builder cache key moves with the script, as an exact hit saves nothing", async () => {
+  test("AppImage callers key the electron-builder cache apart from the other jobs, on the script too", async () => {
+    // A cache saves only on an exact miss, and a job that needs no tool finishes first: with one
+    // shared key it would save the entry without the tool, and every AppImage job would hit it.
     const action = parse(await readFile(ACTION, "utf8")) as {
       runs: { steps: { name?: string; with?: { key?: string } }[] };
     };
-    const cache = action.runs.steps.find((step) => step.name === "Cache electron-builder");
+    const key = action.runs.steps.find((step) => step.name === "Cache electron-builder")?.with?.key;
 
-    expect(cache?.with?.key).toContain("scripts/ci/prefetch-appimage-tool.sh");
+    expect(key).toContain("inputs.appimage-tool == 'true'");
+    // Two hashes: the AppImage callers' (lockfiles and the script) and everyone else's (lockfiles).
+    expect(key?.match(/hashFiles\(([^)]*)\)/g)).toEqual([
+      expect.stringContaining("scripts/ci/prefetch-appimage-tool.sh"),
+      expect.not.stringContaining("scripts/ci/prefetch-appimage-tool.sh"),
+    ]);
   });
 
   test("Build / Linux asks setup-xum for the tool", async () => {
