@@ -20,6 +20,7 @@ export class ForegroundWaitBackgroundedError extends Error {
  */
 export class TaskNotFoundError extends Error {
   constructor() {
+    // dry-duplicate-ok: every fixed-message error class has this shape, and each one is a separate protocol name
     super("Task not found");
     this.name = "TaskNotFoundError";
   }
@@ -27,6 +28,7 @@ export class TaskNotFoundError extends Error {
 
 export class WorkspaceTurnNotFoundError extends Error {
   constructor() {
+    // dry-duplicate-ok: every fixed-message error class has this shape, and each one is a separate protocol name
     super("Workspace turn not found or out of scope");
     this.name = "WorkspaceTurnNotFoundError";
   }
