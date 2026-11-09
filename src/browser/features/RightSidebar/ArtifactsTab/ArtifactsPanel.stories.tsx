@@ -879,19 +879,44 @@ export const NavigateAwayLink: Story = {
 // again about 100 ms later, possibly before the host bound the document's port. The document is
 // still the one Xum built, so the artifact must stay open, and its bridge must still work.
 const HASH_ON_LOAD_HTML = `<!doctype html><html><head><script>
+  window.addEventListener("message", function (event) {
+    if (event.data && event.data.xumOnLoadTest === "save") window.xum.setState({ route: location.hash });
+  });
   window.addEventListener("load", function () {
     location.hash = "#/s/onload";
-    // After WebKit's extra load and the host's check of the document.
-    setTimeout(function () { window.xum.setState({ route: location.hash }); }, 800);
+    parent.postMessage({ xumOnLoadTest: "hashed" }, "*");
   });
 </script></head><body><p>hash on load</p></body></html>`;
 
+// What the artifact reported, and each load of the artifact frame, in arrival order.
+const hashOnLoadEvents: string[] = [];
 const hashOnLoadStates: unknown[] = [];
+/** WebKit fires the iframe's load event for a fragment change; Chromium fires none. */
+const firesFragmentLoad = () => !navigator.userAgent.includes("Chrome/");
 export const HashOnLoadStaysOpen: Story = {
   tags: ["webkit"],
   parameters: { pixel: PIXEL_DISABLED },
   beforeEach: () => {
+    hashOnLoadEvents.length = 0;
     hashOnLoadStates.length = 0;
+    const onMessage = (event: MessageEvent) => {
+      const message = (event.data as { xumOnLoadTest?: unknown } | null)?.xumOnLoadTest;
+      if (typeof message === "string") hashOnLoadEvents.push(message);
+    };
+    // A capturing listener on the document: load does not bubble, and the frame's first load
+    // can come before the play runs.
+    const onLoad = (event: Event) => {
+      const target = event.target;
+      if (target instanceof HTMLIFrameElement && target.dataset.testid === "artifact-frame") {
+        hashOnLoadEvents.push("load");
+      }
+    };
+    window.addEventListener("message", onMessage);
+    document.addEventListener("load", onLoad, true);
+    return () => {
+      window.removeEventListener("message", onMessage);
+      document.removeEventListener("load", onLoad, true);
+    };
   },
   render: () =>
     renderPanel(
@@ -905,8 +930,19 @@ export const HashOnLoadStaysOpen: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     const frame = await canvas.findByTestId("artifact-frame");
+    if (!(frame instanceof HTMLIFrameElement)) throw new Error("Story bug: no artifact iframe");
     const notice = () => canvas.queryByText(/This artifact navigated away/);
-    // The save, or the notice that closed the frame before it.
+    // The frame's first load, then (WebKit only) the extra load of the route change.
+    const loadsToWaitFor = firesFragmentLoad() ? 2 : 1;
+    const routeChangeLoaded = () =>
+      hashOnLoadEvents.includes("hashed") &&
+      hashOnLoadEvents.filter((event) => event === "load").length >= loadsToWaitFor;
+    // Those loads, or the notice that closed the frame at one of them.
+    await waitFor(() => expect(routeChangeLoaded() || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
+    await expect(notice()).toBeNull();
+    frame.contentWindow?.postMessage({ xumOnLoadTest: "save" }, "*");
     await waitFor(() => expect(hashOnLoadStates.length > 0 || notice() != null).toBe(true), {
       timeout: 10000,
     });
