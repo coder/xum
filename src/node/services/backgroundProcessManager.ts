@@ -290,6 +290,10 @@ interface MonitorRetainedMatchBatch {
   matchedThroughOffset: number;
 }
 
+/**
+ * Payload for "output:shown": a read changed what the owner saw (shown frontier or terminal
+ * status) or skipped output for good (hidden-read mark). Listeners reconcile the owner's wakes.
+ */
 export interface OutputShownPayload {
   processId: string;
   processStartTime: number;
