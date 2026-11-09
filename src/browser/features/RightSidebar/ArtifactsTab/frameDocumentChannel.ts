@@ -314,8 +314,7 @@ class DocumentChannel implements FrameDocumentChannel {
     const dueAt = this.now() + FRAME_DOCUMENT_HEARTBEAT_MS;
     return setTimeout(() => {
       const pending = current();
-      // mutation-equivalent: clearPending() stops the heartbeat with its check, so a beat always
-      // finds that check still pending.
+      // clearPending() stops the heartbeat with its check, so a beat always finds it pending.
       if (pending == null) return;
       if (this.now() - dueAt > FRAME_DOCUMENT_CHECK_LATE_MS) pending.blocked = true;
       pending.heartbeat = this.beatAfter(current);
