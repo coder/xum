@@ -596,6 +596,12 @@ describe("installIosCoverColumn", () => {
       expect(drag(-80, 4)).toBe(true);
     });
 
+    test("is left to iOS when a tap drifts sideways", () => {
+      uninstall = installIosCoverColumn();
+
+      expect(drag(-8, 1)).toBe(false);
+    });
+
     test("is left to iOS when it scrolls something", () => {
       wrapInScroller(target, 300);
       uninstall = installIosCoverColumn();

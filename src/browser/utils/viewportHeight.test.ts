@@ -25,9 +25,19 @@ function setInnerHeight(value: number) {
   });
 }
 
-/** A stand-in visual viewport; iOS resizes it, and not the window, for the software keyboard. */
+/**
+ * A stand-in visual viewport; iOS resizes it, and not the window, for the software keyboard. Like
+ * the real one, its height is a getter on the prototype; `nativeHeight` sets what that returns.
+ */
 function installVisualViewport(height: number, scale = 1) {
-  const viewport = Object.assign(new window.EventTarget(), { height, scale });
+  class StubVisualViewport extends window.EventTarget {
+    nativeHeight = height;
+    scale = scale;
+    get height(): number {
+      return this.nativeHeight;
+    }
+  }
+  const viewport = new StubVisualViewport();
   Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
   return viewport;
 }
@@ -130,13 +140,63 @@ describe("iOS standalone viewport", () => {
     const viewport = installVisualViewport(657);
     cleanupSync = installViewportHeightSync();
 
-    viewport.height = 324;
+    viewport.nativeHeight = 324;
     viewport.dispatchEvent(new window.Event("resize"));
     expect(appViewportHeight()).toBe("324px");
 
-    viewport.height = 657;
+    viewport.nativeHeight = 657;
     viewport.dispatchEvent(new window.Event("resize"));
     expect(appViewportHeight()).toBe("657px");
+  });
+
+  test("replaces the bogus visual viewport height iOS reports after the Duo folds", () => {
+    setStandalone(true);
+    setInnerHeight(678);
+    const viewport = installVisualViewport(678);
+    cleanupSync = installViewportHeightSync();
+    expect(window.visualViewport?.height).toBe(678);
+
+    viewport.nativeHeight = 324;
+    expect(window.visualViewport?.height).toBe(324);
+
+    viewport.nativeHeight = -33554432;
+    expect(window.visualViewport?.height).toBe(678);
+    viewport.dispatchEvent(new window.Event("resize"));
+    expect(appViewportHeight()).toBe("678px");
+
+    cleanupSync();
+    cleanupSync = null;
+    expect(window.visualViewport?.height).toBe(-33554432);
+  });
+
+  test("leaves the visual viewport height alone outside iOS standalone", () => {
+    setStandalone(undefined);
+    setInnerHeight(678);
+    installVisualViewport(-33554432);
+    cleanupSync = installViewportHeightSync();
+
+    expect(window.visualViewport?.height).toBe(-33554432);
+  });
+
+  test("still syncs the height when the visual viewport height cannot be corrected", () => {
+    setStandalone(true);
+    setInnerHeight(678);
+    const viewport = Object.preventExtensions(installVisualViewport(678));
+    const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      cleanupSync = installViewportHeightSync();
+
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      viewport.nativeHeight = 324;
+      viewport.dispatchEvent(new window.Event("resize"));
+      expect(appViewportHeight()).toBe("324px");
+
+      viewport.nativeHeight = -33554432;
+      viewport.dispatchEvent(new window.Event("resize"));
+      expect(appViewportHeight()).toBe("678px");
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   test("keeps the full height while pinch zoomed in", () => {
@@ -145,11 +205,24 @@ describe("iOS standalone viewport", () => {
     const viewport = installVisualViewport(657);
     cleanupSync = installViewportHeightSync();
 
-    viewport.height = 328.5;
+    viewport.nativeHeight = 328.5;
     viewport.scale = 2;
     viewport.dispatchEvent(new window.Event("resize"));
 
     expect(appViewportHeight()).toBe("657px");
+  });
+
+  test("keeps the full height when the Duo folds while pinch zoomed in", () => {
+    setStandalone(true);
+    setInnerHeight(678);
+    const viewport = installVisualViewport(339, 2);
+    cleanupSync = installViewportHeightSync();
+
+    viewport.nativeHeight = -33554432;
+    viewport.dispatchEvent(new window.Event("resize"));
+
+    expect(window.visualViewport?.height).toBe(339);
+    expect(appViewportHeight()).toBe("678px");
   });
 
   test("undoes the window scroll iOS adds for the keyboard, but not a zoomed-in pan", () => {
