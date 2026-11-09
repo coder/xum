@@ -32,10 +32,8 @@ import { findLastRetryUserMessage, retriedWorkspaceTurn } from "@/node/services/
 import type { SendIdentity } from "@/node/services/sendIds";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import {
-  SUBAGENT_FAILURE_ENVELOPE_TAG,
-  parseSubagentReportEnvelope,
-} from "@/common/utils/subagentReportEnvelope";
+import { parseSubagentFailureExecutionVersion } from "@/common/utils/subagentFailureEnvelope";
+import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import {
   AGENT_REPORT_PROGRESS_SUPERSEDED_REASON,
@@ -234,8 +232,7 @@ function sameExecutionMirror(a: ExecutionMirror, b: ExecutionMirror): boolean {
 function parseTerminalSubagentExecutionVersion(content: string): string | null {
   const report = parseSubagentReportEnvelope(content);
   if (report?.executionVersion != null) return report.executionVersion;
-  if (!content.startsWith(SUBAGENT_FAILURE_ENVELOPE_TAG)) return null;
-  return /<execution_version>([^\n<]+)<\/execution_version>/.exec(content)?.[1] ?? null;
+  return parseSubagentFailureExecutionVersion(content);
 }
 
 type WorkspaceTurnQueueDispatchMode = "tool-end" | "turn-end";
@@ -2966,7 +2963,12 @@ export class WorkspaceTurnManager {
               : record.finalMessage?.metadata?.finishReason === "tool-calls"
                 ? "workspace_turn_incomplete"
                 : "workspace_turn_error",
-            errorMessage: record.error ?? "Workspace turn failed",
+            // task_await reads a handle only for the workspace that owns it. Another direct parent
+            // reads the failed turn through the child, which resolves through its ancestry.
+            awaitTaskId:
+              record.ownerWorkspaceId === directParentWorkspaceId
+                ? record.handleId
+                : record.workspaceId,
           });
     if (!alreadyDelivered) {
       const message = createMuxMessage(

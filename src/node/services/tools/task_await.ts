@@ -48,6 +48,13 @@ const WORKFLOW_AWAIT_POLL_INTERVAL_MS = 250;
 // Shared fallback used when a workspace-turn record errored without a specific message,
 // so every error-status await result path reports identical text.
 const WORKSPACE_TURN_DEFAULT_ERROR = "Workspace turn failed";
+// What a wait rejects with when the task is unknown (TaskService.waitForAgentReport and
+// WorkspaceTurnManager.waitForWorkspaceTurn). Match these exactly, never the words: a failed
+// task's own error text rejects through the same catch (model_not_found, "its definition was not
+// found", SSH "repository not found"), and a words match would turn that text into a bare
+// not_found. The failure row in the parent names task_await as the only way to read that text.
+const TASK_NOT_FOUND_MESSAGE = "Task not found";
+const WORKSPACE_TURN_NOT_FOUND_MESSAGE = "Workspace turn not found or out of scope";
 
 // Status values for which task_await still treats an agent task as live and
 // should surface the live status (plus an `elapsed_ms` field) instead of
@@ -783,7 +790,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                 ...workspaceTurnIdentityFields(latest.workspaceId),
               };
             }
-            if (/out of scope/i.test(message) || /not found/i.test(message)) {
+            if (message === WORKSPACE_TURN_NOT_FOUND_MESSAGE) {
               return { status: "invalid_scope" as const, taskId };
             }
             const latest = await getWorkspaceTurnSnapshotForAwait().catch(() => null);
@@ -866,7 +873,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             };
           } catch (error: unknown) {
             const message = getErrorMessage(error);
-            if (/not found/i.test(message)) {
+            if (message === TASK_NOT_FOUND_MESSAGE) {
               return { status: "not_found" as const, taskId };
             }
             return { status: "error" as const, taskId, error: message };
@@ -925,7 +932,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           }
 
           const message = getErrorMessage(error);
-          if (/not found/i.test(message)) {
+          if (message === TASK_NOT_FOUND_MESSAGE) {
             return { status: "not_found" as const, taskId };
           }
           if (/timed out/i.test(message)) {

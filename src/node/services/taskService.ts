@@ -14475,7 +14475,7 @@ export class TaskService implements AgentTaskIntegration {
               childWorkspaceId: notification.sourceId,
               agentType: "agent",
               errorType: failure.errorType,
-              errorMessage: failure.errorMessage,
+              awaitTaskId: notification.sourceId,
             })
           : null;
       if (content == null) {
@@ -21776,7 +21776,9 @@ export class TaskService implements AgentTaskIntegration {
   private async maybeResumeParentAfterTerminalChildFailure(
     childWorkspaceId: string,
     childEntry: { projectPath: string; workspace: WorkspaceConfigEntry },
-    failure: { errorType: string; errorMessage: string },
+    // The error text is not an input: the parent's row never carries it (see
+    // formatSubagentFailureUserMessage); the parent reads it through task_await.
+    failure: { errorType: string },
     hadForegroundWaiters: boolean
   ): Promise<void> {
     const parentWorkspaceId = childEntry.workspace.parentWorkspaceId;
@@ -21811,7 +21813,7 @@ export class TaskService implements AgentTaskIntegration {
         childWorkspaceId,
         agentType: coerceNonEmptyString(childEntry.workspace.agentType) ?? "agent",
         errorType: failure.errorType,
-        errorMessage: failure.errorMessage,
+        awaitTaskId: childWorkspaceId,
       }),
       { timestamp: Date.now(), synthetic: true, uiVisible: true }
     );
