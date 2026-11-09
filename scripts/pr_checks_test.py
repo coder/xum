@@ -735,6 +735,23 @@ class GateOutputTest(unittest.TestCase):
                 self.assertNotIn("jq: error", result.stderr)
                 self.assertIn(f"The {name} in the GitHub reply are not a list of objects with text fields", result.stderr)
 
+    def test_a_fractional_utc_time_is_printed_and_other_shapes_stop_the_script(self):
+        request = comment("/coder-agents-review", "maintainer", REQUEST_AT)
+        for time in (RESPONSE_AT[:-1] + ".1Z", RESPONSE_AT[:-1] + ".123456789Z"):
+            with self.subTest(accepted=time):
+                data = snapshot([request, comment("Review failed.", BOT, time)])
+                result = self.run_script("wait_pr_coder_agents_review.sh", "--once", data=data)
+                self.assert_clean(result, 1)
+                self.assertIn(f"Timestamp: {time}", result.stdout)
+                self.assertNotIn("are not a list of objects", result.stderr)
+        for time in (RESPONSE_AT[:-1] + ".1234567890Z", RESPONSE_AT[:-1] + ".Z", RESPONSE_AT[:-1] + ".123+00:00"):
+            with self.subTest(rejected=time):
+                data = snapshot([request, comment("Review failed.", BOT, time)])
+                result = self.run_script("wait_pr_coder_agents_review.sh", "--once", data=data)
+                self.assert_clean(result, 1)
+                self.assertNotIn("Timestamp:", result.stdout)
+                self.assertIn("are not a list of objects with text fields", result.stderr)
+
     def test_values_that_a_script_rejects_are_not_printed_back(self):
         request = comment("/coder-agents-review", "maintainer", REQUEST_AT)
 
