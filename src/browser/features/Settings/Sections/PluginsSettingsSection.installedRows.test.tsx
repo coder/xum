@@ -29,7 +29,7 @@ const managed: AgentPluginListItem = {
   skillCount: 3,
   mcpServerCount: 2,
   importedSkillCount: 0,
-  importedMcpServerCount: 1,
+  importedMcpServerCount: 0,
 };
 
 const handmade: AgentPluginListItem = {
@@ -67,7 +67,7 @@ test("each row counts what it imported, then shows its folder and where it came 
   await view.findByText("kit");
   const counts = view.getAllByText(/skills imported/).map((line) => line.textContent);
   expect(counts).toEqual([
-    "0 of 3 skills imported · 1 of 2 MCP servers imported · ~/.mux/plugins/kit",
+    "0 of 3 skills imported · 0 of 2 MCP servers imported · ~/.mux/plugins/kit",
     "1 of 1 skills imported · 0 of 0 MCP servers imported · ~/.agents/plugins/handmade",
   ]);
   // The commit hash is cut to 12 characters, and a plugin with no source shows no source line.
