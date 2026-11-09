@@ -1,5 +1,14 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
+import {
+  describe,
+  test,
+  expect,
+  mock,
+  setSystemTime,
+  spyOn,
+  beforeEach,
+  afterEach,
+} from "bun:test";
 import * as fsPromises from "fs/promises";
 import { existsSync } from "fs";
 import {
@@ -510,6 +519,64 @@ describe("TaskService", () => {
       expect.any(Function),
       undefined
     );
+  });
+
+  // A row's report is told from another by its report time (StreamEndLedger.rowReportsAttempt), so
+  // adopting a persisted report must change a stale one even when the clock repeats its millisecond.
+  test("adopting a persisted report changes the row's stale report time, even in the same millisecond", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-111";
+    const childId = "child-222";
+    const staleReportedAt = "2026-10-01T00:00:02.000Z";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_explore_child",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "running",
+          reportedAt: staleReportedAt,
+        }),
+      ],
+      testTaskSettings(1, 3)
+    );
+    const { taskService } = createTaskServiceHarness(config);
+    spyOn(
+      (
+        taskService as unknown as {
+          gitPatchArtifactService: { maybeStartGeneration: (...args: unknown[]) => Promise<void> };
+        }
+      ).gitPatchArtifactService,
+      "maybeStartGeneration"
+    ).mockResolvedValue(undefined);
+    await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
+      workspaceId: parentId,
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
+      childTaskId: childId,
+      parentWorkspaceId: parentId,
+      ancestorWorkspaceIds: [parentId],
+      reportMarkdown: "persisted report",
+      title: "persisted title",
+      nowMs: Date.now(),
+    });
+
+    setSystemTime(new Date(staleReportedAt));
+    try {
+      await taskService.waitForAgentReport(childId, {
+        timeoutMs: 10,
+        requestingWorkspaceId: parentId,
+      });
+    } finally {
+      setSystemTime();
+    }
+    expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
+    expect(findWorkspaceInConfig(config, childId)?.reportedAt).toBeString();
+    expect(findWorkspaceInConfig(config, childId)?.reportedAt).not.toBe(staleReportedAt);
   });
 
   test("waitForAgentReport releases its waiter and foreground await when the report read throws", async () => {

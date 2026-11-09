@@ -1,4 +1,14 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  setSystemTime,
+  spyOn,
+  test,
+} from "bun:test";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
@@ -60,6 +70,13 @@ interface Internals {
   };
   taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+  finalizeAgentTaskReport: (
+    childWorkspaceId: string,
+    childEntry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    reportArgs: { reportMarkdown: string },
+    reportedAttempt: undefined,
+    reportedAttemptId: string | undefined
+  ) => Promise<{ finalized: boolean }>;
   editWorkspaceEntry: (
     workspaceId: string,
     updater: (workspace: WorkspaceConfigEntry) => void,
@@ -1260,11 +1277,17 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
   // then changes nothing but the row's `reportedAt` (the status was `reported` already): only
   // that timestamp tells the attempt's own report from the one it inherited.
   const REPORTED_AGAIN_AT = "2026-10-01T00:00:09.000Z";
-  test.each(["reawakening", "reactivation"] as const)(
-    "a report of the fresh attempt that another backend writes onto an already reported row during the %s's stream refuses the held follow-up as indeterminate",
-    async (path) => {
-      const childId = path === "reawakening" ? "holdrereport001" : "holdrereport002";
-      const stack = await createStack(childId, { taskStatus: "reported", reportedAt: REPORTED_AT });
+  test.each([
+    { path: "reawakening", status: "reported" },
+    { path: "reactivation", status: "reported" },
+    // The one shape that a later report can write: finalizeAgentTaskReport ends early on `reported`.
+    { path: "reactivation", status: "interrupted" },
+  ] as const)(
+    "a report of the fresh attempt that another backend writes onto a row that carries a report and reads $status during the $path's stream refuses the held follow-up as indeterminate",
+    async (c) => {
+      const { path } = c;
+      const childId = "holdrereport001";
+      const stack = await createStack(childId, { taskStatus: c.status, reportedAt: REPORTED_AT });
       const { config, taskService, workspaceService, completions, sendOptions } = stack;
       try {
         if (path === "reawakening") {
@@ -1283,7 +1306,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         ).toEqual(Ok(undefined));
         // The row kept the predecessor's report across the CAS and still reads it now.
         expect(entryOf(config, childId)).toMatchObject({
-          taskStatus: "reported",
+          taskStatus: c.status,
           reportedAt: REPORTED_AT,
         });
         await editChildRow(config, childId, (row) => {
@@ -1307,6 +1330,39 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     },
     20_000
   );
+
+  // The row's report time is how a report of the fresh attempt is told from the inherited one, so a
+  // report must change it even when the clock repeats the inherited report's millisecond. Only a
+  // row that reads `interrupted` can be reported again: a `reported` row ends every later report
+  // early (finalizeAgentTaskReport), so its report time never moves.
+  test("a report written in the millisecond of the inherited report time still changes the row's report time", async () => {
+    const childId = "holdsametime001";
+    const stack = await createStack(childId, {
+      taskStatus: "interrupted",
+      reportedAt: REPORTED_AT,
+    });
+    const { config, svc } = stack;
+    try {
+      const entry = findWorkspaceInConfig(config, childId);
+      setSystemTime(new Date(REPORTED_AT));
+      expect(
+        await svc.finalizeAgentTaskReport(
+          childId,
+          { projectPath: entry!.path, workspace: entry! },
+          { reportMarkdown: "done" },
+          undefined,
+          entry!.taskAttemptId
+        )
+      ).toMatchObject({ finalized: true });
+      setSystemTime();
+      expect(entryOf(config, childId)?.taskStatus).toBe("reported");
+      expect(entryOf(config, childId)?.reportedAt).toBeString();
+      expect(entryOf(config, childId)?.reportedAt).not.toBe(REPORTED_AT);
+    } finally {
+      setSystemTime();
+      await stack.cleanup();
+    }
+  }, 20_000);
 
   test("while the decision is pending no drain trigger dispatches the held entry and a direct send in preflight is refused; the hold never blocks the session", async () => {
     const childId = "holdtriggers001";

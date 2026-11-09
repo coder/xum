@@ -260,6 +260,16 @@ export function getIsoNow(): string {
 }
 
 /**
+ * The time a report is written at: never the row's current `reportedAt` (`previous`), even when
+ * the clock repeats a millisecond or stands still. A row's report is told from another by its
+ * `reportedAt` (StreamEndLedger.rowReportsAttempt), so every report must change it.
+ */
+export function getReportedAtAfter(previous: string | undefined): string {
+  const now = getIsoNow();
+  return now === previous ? new Date(Date.parse(now) + 1).toISOString() : now;
+}
+
+/**
  * A removal bound to the task attempt its caller confirmed (#4478): WorkspaceService.remove
  * refuses when the row names another attempt by the time it closes admission.
  */

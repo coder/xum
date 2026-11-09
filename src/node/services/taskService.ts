@@ -38,6 +38,7 @@ import {
   formatSubagentFailureUserMessage,
   formatSubagentReportUserMessage,
   getIsoNow,
+  getReportedAtAfter,
   resolveTaskAgentIdForResume,
   terminalAttentionOutcome,
   type AgentTaskIntegration,
@@ -22979,7 +22980,7 @@ export class TaskService implements AgentTaskIntegration {
         if (superseded) return;
         reportedAttemptId = ws.taskAttemptId;
         ws.taskStatus = "reported";
-        ws.reportedAt = getIsoNow();
+        ws.reportedAt = getReportedAtAfter(ws.reportedAt);
         markChildGoalPauseOwed(ws);
         // Successful completion resets the persisted recovery circuit breaker.
         delete ws.taskRecoveryAttempts;
@@ -23272,7 +23273,7 @@ export class TaskService implements AgentTaskIntegration {
           return;
         }
         workspace.taskStatus = "reported";
-        workspace.reportedAt = getIsoNow();
+        workspace.reportedAt = getReportedAtAfter(workspace.reportedAt);
         markChildGoalPauseOwed(workspace);
         delete workspace.taskRecoveryAttempts;
       },
