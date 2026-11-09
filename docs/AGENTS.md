@@ -146,7 +146,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 
 ## Agent Plugins
 
-- Plugin install-method choice is a Draft (`rfc/20261106_plugin-install-method-choice.md` on branch `plugin-install-method-choice-parked`). Before anyone builds it, its design must cover what every other Xum build does to a plugin whose saved manifest that build does not load: hook trust, OAuth sign-ins, the registry row and updates. Never repair state that another build changed: fail closed and let a reinstall review it.
+- Plugin install-method choice is a Draft (`rfc/20261106_plugin-install-method-choice.md` at commit `4a1cf82e1da83bfabc04c340c8f080e2fc3eb7e4` of branch `plugin-install-method-choice-parked`). Before anyone builds it, its design must cover what every other Xum build does to a plugin whose saved manifest that build does not load: hook trust, OAuth sign-ins, the registry row and updates. Never repair state that another build changed: fail closed and let a reinstall review it.
 
 ## Command Palette & UI Access
 
