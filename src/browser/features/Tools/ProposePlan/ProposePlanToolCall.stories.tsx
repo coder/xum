@@ -21,6 +21,7 @@ const PLAN_TOC_PIXEL_MATRIX = { viewports: ["desktop"] } as const;
  * Tests the plan card rendering with icon action buttons at the bottom.
  */
 export const ProposePlan: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() =>
@@ -96,6 +97,7 @@ graph TD
  * Shows the Implement button (no Continue in Auto).
  */
 export const ProposePlanInPlanMode: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() => {
@@ -174,6 +176,8 @@ graph TD
  */
 export const ProposePlanMobile: AppStory = {
   ...ProposePlan,
+  // Storybook reads tags only from string literals, so the spread does not carry them.
+  tags: ["paint-check"],
   parameters: {
     ...ProposePlan.parameters,
     viewport: { defaultViewport: "mobile1" },
@@ -197,6 +201,7 @@ export const ProposePlanMobile: AppStory = {
  * the TOC alongside the plan.
  */
 export const ProposePlanWithTableOfContents: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() =>

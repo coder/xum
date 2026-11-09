@@ -78,6 +78,11 @@ export function getArtifactsDir(scratchDir: string): string {
   return path.join(scratchDir, ARTIFACTS_DIR_NAME);
 }
 
+/** `dir` plus one separator: a pinned file's folder can be the filesystem root (`/`). */
+function dirPrefix(dir: string): string {
+  return dir.endsWith(path.sep) ? dir : dir + path.sep;
+}
+
 function isMissing(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
   return code === "ENOENT" || code === "ENOTDIR";
@@ -271,8 +276,8 @@ export function parseArtifactRelativePath(
 export type { ArtifactReadOutcome };
 
 /**
- * Raw bytes of one artifact, before they are shaped into the wire result. Version snapshots and
- * pinned files need the bytes themselves (hashing, copying into the version store).
+ * Raw bytes of one artifact, before they are shaped into the wire result. Pinned files and
+ * shelf copies need the bytes themselves.
  * `bytes` holds at most maxBytes; a file that grew past the cap while read is `too_large`.
  */
 export type ArtifactBytesOutcome =
@@ -298,13 +303,16 @@ export interface ArtifactReadOptions extends ArtifactDirAccessOptions {
    * files pass false: their root is the checkout, still pinned to its real path.
    */
   requireArtifactsBasename?: boolean;
+  /** Shape the result as this kind instead of the extension's (the `artifact` tool's override). */
+  kind?: ArtifactKind;
 }
 
 /** Shape a bytes outcome into the read route's result (shared by host and runtime reads). */
 export function toArtifactReadOutcome(
   relPath: string,
   outcome: ArtifactBytesOutcome,
-  maxBytes: number
+  maxBytes: number,
+  kind?: ArtifactKind
 ): ArtifactReadOutcome {
   switch (outcome.status) {
     case "invalid":
@@ -314,12 +322,12 @@ export function toArtifactReadOutcome(
     case "too_large":
       return {
         success: true,
-        data: tooLargeArtifactResult(relPath, outcome.size, outcome.modifiedMs, maxBytes),
+        data: tooLargeArtifactResult(relPath, outcome.size, outcome.modifiedMs, maxBytes, kind),
       };
     case "ok":
       return {
         success: true,
-        data: buildArtifactReadResult(relPath, outcome.bytes, outcome.modifiedMs, maxBytes),
+        data: buildArtifactReadResult(relPath, outcome.bytes, outcome.modifiedMs, maxBytes, kind),
       };
   }
 }
@@ -333,7 +341,8 @@ export async function readArtifactFromDir(
   return toArtifactReadOutcome(
     relPath,
     await readArtifactBytesFromDir(artifactsDir, relPath, maxBytes, options),
-    maxBytes
+    maxBytes,
+    options?.kind
   );
 }
 
@@ -365,7 +374,7 @@ export async function readArtifactBytesFromDir(
     throw error;
   }
   // Symlinked parent folders could still point elsewhere: confine by real path.
-  if (!realTarget.startsWith(realDir + path.sep)) return notFound;
+  if (!realTarget.startsWith(dirPrefix(realDir))) return notFound;
 
   let handle: fs.FileHandle;
   try {
@@ -610,7 +619,7 @@ async function verifyOpenedInsideDir(
     fdPath = undefined;
   }
   if (fdPath !== undefined) {
-    return fdPath === realTarget && fdPath.startsWith(realDir + path.sep);
+    return fdPath === realTarget && fdPath.startsWith(dirPrefix(realDir));
   }
   if (requireDescriptorPath) return false;
   try {

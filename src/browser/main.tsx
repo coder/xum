@@ -6,8 +6,10 @@ import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/wi
 import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimations";
 import {
   installIosFocusZoomGuard,
+  installIphoneDuoStatusBarStyle,
   installViewportHeightSync,
 } from "@/browser/utils/viewportHeight";
+import { installIosCoverColumn } from "@/browser/utils/iosCoverColumn";
 import { removeDroppedCacheKeys } from "@/browser/utils/legacyLocalStorageCleanup";
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 import { initTelemetry } from "@/common/telemetry";
@@ -44,9 +46,22 @@ installWindowOpenLocalhostProxyNormalization();
 installViewportHeightSync();
 
 try {
+  installIosCoverColumn();
+} catch (error) {
+  // Taking back the cover display's status column is cosmetic and must never block startup.
+  console.error("iOS cover column: could not take back the status column", error);
+}
+
+try {
   installIosFocusZoomGuard();
 } catch {
   // Stopping iOS focus zoom is cosmetic and must never block renderer startup.
+}
+
+try {
+  installIphoneDuoStatusBarStyle();
+} catch {
+  // A web clip status-bar style must never block renderer startup.
 }
 
 initTelemetry();

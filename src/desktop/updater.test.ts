@@ -463,6 +463,35 @@ describe("UpdaterService", () => {
       'Cannot find latest-mac.yml in the latest release artifacts (https://github.com/coder/mux/releases/download/v0.18.1-nightly.16/latest-mac.yml): HttpError: 404 "method: GET url: https://github.com/coder/mux/releases/download/v0.18.1-nightly.16/latest-mac.yml\n\nPlease double check that your authentication token is correct.\n" Headers: { ... }\n    at createHttpError (/path/httpExecutor.ts:31:10)';
     const nightlyManifestPendingMessage =
       "Update metadata isn't available yet. The latest release may still be publishing; please try again in a few minutes.";
+    // GitHub's own edge answering a nightly metadata request while its release
+    // route is degraded; this HTML body is what reached the About dialog.
+    const gatewayTimeoutError = `504
+"method: GET url: https://github.com/coder/xum/releases/download/v0.32.2-nightly.194/nightly-mac.yml
+
+Data:
+<html><body><h1>504 Gateway Time-out</h1>
+The server didn't respond in time.
+</body></html>
+"`;
+    // Stable channel: GitHubProvider wraps the failed releases/latest request
+    // and keeps the status only as "HttpError: <code>" text.
+    const wrappedGatewayTimeoutError = `Unable to find latest version on GitHub (https://github.com/coder/xum/releases/latest), please ensure a production release exists: HttpError: 504 Gateway Time-out
+"method: GET url: https://github.com/coder/xum/releases/latest
+"`;
+    // A 503 that is only part of a nightly tag, not the response status.
+    const forbiddenOnNightly503Error = `403 Forbidden
+"method: GET url: https://github.com/coder/xum/releases/download/v0.32.2-nightly.503/nightly-mac.yml
+"`;
+    // A manual check still reports the failure, but in its own words: echoing
+    // GitHub's status line or HTML body is what the gateway handling replaces.
+    function expectRewordedGatewayCheckError(): void {
+      const status = service.getStatus();
+      if (status.type !== "error") {
+        throw new Error(`Expected error status, got: ${status.type}`);
+      }
+      expect(status.phase).toBe("check");
+      expect(status.message).not.toMatch(/504|HttpError|<html/i);
+    }
 
     it("should silently back off on 404 (latest.yml missing) for auto checks", async () => {
       mockAutoUpdater.checkForUpdates.mockImplementation(() => {
@@ -519,6 +548,76 @@ describe("UpdaterService", () => {
         type: "error",
         phase: "check",
         message: nightlyManifestPendingMessage,
+      });
+    });
+
+    it("should silently back off on gateway errors for auto checks", async () => {
+      mockAutoUpdater.checkForUpdates.mockImplementation(() => {
+        setImmediate(() => {
+          mockAutoUpdater.emit("error", new Error(gatewayTimeoutError));
+        });
+        return new Promise(() => {
+          // Never resolves — events drive state
+        });
+      });
+
+      service.checkForUpdates({ source: "auto" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const lastStatus = statusUpdates[statusUpdates.length - 1];
+      expect(lastStatus).toEqual({ type: "idle" });
+      expect(statusUpdates.find((s) => s.type === "error")).toBeUndefined();
+    });
+
+    it("should reword a gateway error on a manual check", async () => {
+      mockAutoUpdater.checkForUpdates.mockImplementation(() => {
+        setImmediate(() => {
+          mockAutoUpdater.emit("error", new Error(gatewayTimeoutError));
+        });
+        return new Promise(() => {
+          // Never resolves — events drive state
+        });
+      });
+
+      service.checkForUpdates({ source: "manual" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expectRewordedGatewayCheckError();
+    });
+
+    it("should reword a wrapped stable-channel gateway error", async () => {
+      mockAutoUpdater.checkForUpdates.mockImplementation(() => {
+        setImmediate(() => {
+          mockAutoUpdater.emit("error", new Error(wrappedGatewayTimeoutError));
+        });
+        return new Promise(() => {
+          // Never resolves — events drive state
+        });
+      });
+
+      service.checkForUpdates({ source: "manual" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expectRewordedGatewayCheckError();
+    });
+
+    it("should surface a non-gateway error whose URL contains a 50x number on auto checks", async () => {
+      mockAutoUpdater.checkForUpdates.mockImplementation(() => {
+        setImmediate(() => {
+          mockAutoUpdater.emit("error", new Error(forbiddenOnNightly503Error));
+        });
+        return new Promise(() => {
+          // Never resolves — events drive state
+        });
+      });
+
+      service.checkForUpdates({ source: "auto" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(statusUpdates[statusUpdates.length - 1]).toEqual({
+        type: "error",
+        phase: "check",
+        message: "403 Forbidden",
       });
     });
 

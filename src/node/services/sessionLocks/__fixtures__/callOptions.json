@@ -54,14 +54,14 @@
     "args": ["ws-record-turn", "turn"]
   },
   {
-    "site": "node/services/artifactVersionStore.ts",
+    "site": "node/services/artifactRecordStore.ts",
     "fn": "acquireCrossProcessLock",
     "args": [
       {
-        "lockPath": "<root:artifact>/sessions/ws-record-artifact/artifact-versions/report.md-a22350b288/index.lock",
+        "lockPath": "<root:artifact>/sessions/ws-record-artifact/artifact-versions/report.md-a22350b288/record.lock",
         "acquireTimeoutMs": 30000,
         "staleMs": 60000,
-        "timeoutMessage": "Another Xum process is recording a version of this artifact.",
+        "timeoutMessage": "Another Xum process is publishing this artifact.",
         "signal": "<AbortSignal>"
       }
     ]

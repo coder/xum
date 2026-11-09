@@ -38,6 +38,8 @@ export interface StreamContextSnapshot {
    * stream's project content and inherits the obligation to re-verify trust.
    */
   routedConsentRejection?: RoutedConsentRejection;
+  /** AgentSession.autoRetryStops when this stream started: a Stop since then arms no retry. */
+  admissionAutoRetryStops?: number;
 }
 
 export interface ContextDispatchRequest {

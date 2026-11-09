@@ -37,6 +37,7 @@ export function useDiscardSideChatOnLeave(
       // Returned to it before the discard could run: it is being viewed again.
       if (sideChatId === currentId) continue;
       pending.delete(sideChatId);
+      // Automatic cleanup cannot accept unknown activity risks. Keep blocked records for explicit removal.
       api.workspace
         .remove({ workspaceId: sideChatId, options: { force: true } })
         .then((result) => {

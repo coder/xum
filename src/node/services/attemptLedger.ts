@@ -324,11 +324,18 @@ export class AttemptLedger {
    * A new attempt begins in this process (reservation commit, launch, reawakening, reactivation).
    * Replaces the owned identity and drops any settlement of the previous attempt SYNCHRONOUSLY,
    * before the admission that follows — current ownership always wins over a stale settlement.
+   * `identity.inheritedReport` comes from the CAS that published the attempt: this method never
+   * reads the row, whose report may by now be another backend's report of the fresh attempt.
    */
   beginOwnedTaskAttempt(
     taskId: string,
     source: string,
-    identity: { attemptId: string | undefined; receiptEligible: boolean; abortSignal?: AbortSignal }
+    identity: {
+      attemptId: string | undefined;
+      receiptEligible: boolean;
+      inheritedReport: boolean;
+      abortSignal?: AbortSignal;
+    }
   ): OwnedTaskAttempt {
     assert(taskId.length > 0, "beginOwnedTaskAttempt: taskId must be non-empty");
     if (identity.attemptId != null) {
@@ -339,6 +346,7 @@ export class AttemptLedger {
       source,
       attemptId: identity.attemptId,
       receiptEligible: identity.receiptEligible,
+      inheritedReport: identity.inheritedReport,
       ...(identity.abortSignal != null ? { abortSignal: identity.abortSignal } : {}),
     };
     this.ownedAttemptByTaskId.set(taskId, attempt);

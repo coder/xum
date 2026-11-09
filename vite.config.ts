@@ -3,13 +3,14 @@ import react from "@vitejs/plugin-react";
 import topLevelAwait from "vite-plugin-top-level-await";
 import svgr from "vite-plugin-svgr";
 import tailwindcss from "@tailwindcss/vite";
+import type { IncomingMessage } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH } from "./src/node/orpc/wsPaths";
 import { novncCompatPlugin } from "./src/vite/novncCompatPlugin";
 import { streamdownShikiLangsPlugin } from "./src/vite/streamdownShikiLangsPlugin";
 import { streamdownRehypeKatexPlugin } from "./src/vite/streamdownRehypeKatexPlugin";
-import { resolveViteDevServerEnv } from "./src/vite/devServerEnv";
+import { isDevServerHostAllowed, resolveViteDevServerEnv } from "./src/vite/devServerEnv";
 // React Compiler automatically optimizes React components through memoization.
 import { reactCompilerConfig } from "./src/vite/reactCompilerConfig";
 
@@ -22,8 +23,15 @@ const {
   previewPort,
   backendHost: backendProxyHost,
   backendPort: backendProxyPort,
+  backendSocket,
   enableTutorialsInSandbox,
 } = resolveViteDevServerEnv(process.env);
+
+// Vite answers a disallowed Host with 403 on HTTP and on its own HMR socket, but its proxy forwards
+// WebSocket upgrades without that check. /orpc/ws is the whole backend API, so apply the check here
+// (`false` makes Vite end the upgrade with 404).
+const rejectDisallowedHost = (req: IncomingMessage) =>
+  isDevServerHostAllowed(req.headers.host, devServerAllowedHosts) ? undefined : false;
 
 const enableTutorialsInSandboxDefine =
   enableTutorialsInSandbox == null ? "null" : JSON.stringify(enableTutorialsInSandbox === "1");
@@ -47,7 +55,15 @@ function formatHostForUrl(host: string): string {
 
 // In dev-server mode we run the backend on a separate local port, but we want the
 // browser UI to talk to it via same-origin paths (single public port).
-const backendProxyTarget = `http://${formatHostForUrl(backendProxyHost)}:${backendProxyPort}`;
+//
+// With a backend socket (`make dev-server` on Linux and macOS) the proxy never uses that port: it is
+// free for any local account to bind while the backend restarts, and the browser's reconnect URL
+// carries the token. The socket sits in a private folder, so only this user's backend can answer.
+// `host` and `port` are placeholders: Node connects to `socketPath` and ignores them.
+const backendProxyTarget =
+  backendSocket !== undefined
+    ? { socketPath: backendSocket, host: "localhost", port: 0 }
+    : `http://${formatHostForUrl(backendProxyHost)}:${backendProxyPort}`;
 
 const alias: Record<string, string> = {
   "@": path.resolve(__dirname, "./src"),
@@ -133,6 +149,12 @@ export default defineConfig(({ mode }) => {
       strictPort: true,
       allowedHosts: devServerAllowedHosts,
 
+      // Vite serves any file under its root at /@fs/<path> to whoever reaches its port, and a
+      // custom XUM_ROOT can sit inside the checkout. The dev backend's token lives in server.lock, and in
+      // server.lock.<pid>.tmp while the server writes it.
+      // `deny` replaces Vite's defaults, so they are repeated first.
+      fs: { deny: [".env", ".env.*", "*.{crt,pem}", "**/.git/**", "**/server.lock*"] },
+
       proxy: {
         "/orpc": {
           target: backendProxyTarget,
@@ -140,16 +162,19 @@ export default defineConfig(({ mode }) => {
           // the public dev-server origin (localhost:5173) instead of 127.0.0.1:3000.
           changeOrigin: false,
           ws: true,
+          bypass: rejectDisallowedHost,
         },
         [BROWSER_BRIDGE_WS_PATH]: {
           target: backendProxyTarget,
           changeOrigin: false,
           ws: true,
+          bypass: rejectDisallowedHost,
         },
         [DESKTOP_WS_PATH]: {
           target: backendProxyTarget,
           changeOrigin: false,
           ws: true,
+          bypass: rejectDisallowedHost,
         },
         "/api": {
           target: backendProxyTarget,
@@ -203,7 +228,9 @@ export default defineConfig(({ mode }) => {
       host: "127.0.0.1",
       port: previewPort,
       strictPort: true,
-      allowedHosts: ["localhost", "127.0.0.1"],
+      // Preview inherits server.proxy, whose ws entries check devServerAllowedHosts, so preview's
+      // own HTTP check must use the same list.
+      allowedHosts: devServerAllowedHosts,
     },
     optimizeDeps: {
       // noVNC ships Babel-style CJS plus top-level await in lib/, which breaks esbuild

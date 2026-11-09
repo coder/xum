@@ -672,7 +672,6 @@ describe("BackupService against a real repository", () => {
       bytes: Buffer.from("backed-up report\n"),
       meta: {
         sourceWorkspaceId: "ws-1",
-        version: 1,
         title: "report.md",
         kind: "markdown",
         pinnedAtMs: 1,

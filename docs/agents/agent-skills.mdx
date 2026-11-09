@@ -218,7 +218,7 @@ A skill can ship scripts and other files next to `SKILL.md`. The skill does not 
 - The `agent_skill_read` result includes `skillDir`, the absolute path of the skill's directory. Plugin skills also get `pluginRoot`, the absolute path of the plugin. Both paths are valid where the workspace's `bash` runs, so the agent can run a bundled script or pass the path to a sub-agent.
 - Xum replaces these placeholders in the skill body. They use the same names as Claude Code, so skills written for Claude Code work unchanged:
   - `${CLAUDE_SKILL_DIR}`: the skill's directory.
-  - `${CLAUDE_PLUGIN_ROOT}`: the plugin's directory. Xum replaces it only in plugin skills.
+  - `${CLAUDE_PLUGIN_ROOT}`: the plugin's directory. Xum replaces it in the body of plugin skills, and in the body of plugin agents in Claude Code or Cursor format (see [Plugin folder and spawn errors](/agents#plugin-folder-and-spawn-errors)). In a skill that is not part of a plugin, it stays as written.
 
 Xum replaces the placeholders when the agent loads a skill with `agent_skill_read` and when you invoke it (`/{skill-name}` or `$skill-name`). For invoked skills, the order is: [arguments](#skill-arguments), then placeholders (except on directive lines), then [dynamic context](#dynamic-context-injection-experiment). A directive such as `` !`sh "${CLAUDE_SKILL_DIR}/scripts/status.sh"` `` therefore runs the bundled script. In directives, Xum does not insert the path into the command: it sets `CLAUDE_SKILL_DIR` and `CLAUDE_PLUGIN_ROOT` as environment variables, and the shell expands them. Quote them, because a path can contain spaces.
 
@@ -241,6 +241,8 @@ Xum reports a directory only when the path is valid where `bash` runs. Otherwise
 | Global and universal skills                        | Path                          | Docker: path. SSH: no path (read on the Xum host)              | No path                 |
 | Plugin skills                                      | Path                          | Global plugins: no path. Project plugins: path (on the remote) | No path                 |
 | Built-in skills (bundled in the app, no directory) | No path                       | No path                                                        | No path                 |
+
+A multi-project workspace gets a path only when every one of its projects is a local or worktree workspace, and then follows the "Local and worktree workspaces" column. With an SSH, Docker or devcontainer project, it gets none.
 
 When you invoke a project skill in the first message of a new worktree workspace, Xum reads the skill from the project's main checkout, because the new worktree can lack it. That copy is not the worktree's, so the placeholders stay literal. If the worktree has the skill, the agent gets its path from `agent_skill_read`.
 

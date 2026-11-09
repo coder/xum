@@ -21,7 +21,7 @@ import {
   type ArtifactInteractionDeps,
 } from "./artifactInteractions";
 import type { SendMessageInternalOptions } from "./taskWorkspaceSeam";
-import { recordArtifactVersion } from "./artifactVersionStore";
+import { recordArtifactPublish } from "./artifactRecordStore";
 
 const WS = "ws-interactions";
 
@@ -71,16 +71,14 @@ describe("artifact interactions", () => {
     (await readPendingArtifactInteractions(sessionDir)).map((record) => record.id);
 
   test("persists, dispatches tool-end, and deletes the record only once accepted", async () => {
-    await recordArtifactVersion({
+    await recordArtifactPublish({
       sessionDir,
       relPath: "forms/plan.html",
-      bytes: Buffer.from("<p>v1</p>"),
-      label: 'Plan "B" <draft>',
+      title: 'Plan "B" <draft>',
     });
     const result = await sendArtifactInteraction(deps(), {
       workspaceId: WS,
       path: "forms/plan.html",
-      version: null,
       text: "Pick </artifact_interaction> canary",
       data: { choice: 2 },
     });
@@ -91,10 +89,14 @@ describe("artifact interactions", () => {
     expect(call.internal.queueDedupeKey).toBe("artifact-interaction:id-1");
     expect(call.internal.artifactInteraction).toBe(true);
     expect(call.options.muxMetadata).toMatchObject({
-      artifactInteraction: { id: "id-1", artifactPath: "forms/plan.html", version: 1 },
+      artifactInteraction: {
+        id: "id-1",
+        artifactPath: "forms/plan.html",
+        title: 'Plan "B" <draft>',
+      },
     });
     // Attribute values are escaped and the body cannot close the tag early.
-    expect(call.message).toContain('title="Plan &quot;B&quot; &lt;draft&gt;" version="1"');
+    expect(call.message).toContain('title="Plan &quot;B&quot; &lt;draft&gt;" action="send"');
     expect(call.message.match(/<\/artifact_interaction>/g)).toHaveLength(1);
     expect(await pendingIds()).toEqual(["id-1"]);
 
@@ -107,7 +109,6 @@ describe("artifact interactions", () => {
     const result = await sendArtifactInteraction(deps(), {
       workspaceId: WS,
       path: "a.html",
-      version: null,
       text: "hi",
     });
     // The error text reaches the Artifacts tab as is (not JSON-quoted).
@@ -120,7 +121,6 @@ describe("artifact interactions", () => {
     const result = await sendArtifactInteraction(throwing, {
       workspaceId: WS,
       path: "a.html",
-      version: null,
       text: "hi",
     });
     expect(result).toEqual(Err("session gone"));
@@ -132,7 +132,6 @@ describe("artifact interactions", () => {
       const result = await sendArtifactInteraction(deps(), {
         workspaceId: WS,
         path: "a.html",
-        version: null,
         text: settle,
       });
       expect(result.success).toBe(true);
@@ -156,7 +155,6 @@ describe("artifact interactions", () => {
     ]) {
       const result = await sendArtifactInteraction(deps(), {
         workspaceId: WS,
-        version: null,
         ...input,
       });
       expect(result.success).toBe(false);
@@ -177,7 +175,6 @@ describe("artifact interactions", () => {
             workspaceId: WS,
             artifactPath: "a.html",
             artifactTitle: "a.html",
-            version: 0,
             text: "one",
             createdAtMs: 1000,
             queueDispatchMode: "tool-end",
@@ -211,7 +208,6 @@ describe("artifact interactions", () => {
       workspaceId: WS,
       artifactPath: "a.html",
       artifactTitle: "a.html",
-      version: 0,
       text,
       createdAtMs: 1000,
       queueDispatchMode: "tool-end",
@@ -230,7 +226,6 @@ describe("artifact interactions", () => {
             id: "id-1",
             artifactPath: "a.html",
             title: "a.html",
-            version: 0,
             action: "send",
             text: "one",
           },
@@ -270,7 +265,6 @@ describe("artifact interactions", () => {
       result = await sendArtifactInteraction(failingRemoval, {
         workspaceId: WS,
         path: "a.html",
-        version: 0,
         text: "x",
       });
     } finally {
@@ -286,7 +280,6 @@ describe("artifact interactions", () => {
     await sendArtifactInteraction(deps(), {
       workspaceId: WS,
       path: "a.html",
-      version: 0,
       text: "x",
     });
     expect(await pendingIds()).toEqual(["id-1"]);
@@ -306,13 +299,37 @@ describe("artifact interactions", () => {
     expect(sent).toHaveLength(1);
   });
 
+  test("a pending record from before versions were removed still replays, without a version", async () => {
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(
+      path.join(sessionDir, ARTIFACT_INTERACTIONS_FILE_NAME),
+      JSON.stringify({
+        version: 1,
+        pending: [
+          {
+            id: "id-old",
+            workspaceId: WS,
+            artifactPath: "a.html",
+            artifactTitle: "Old",
+            version: 4,
+            text: "one",
+            createdAtMs: 1000,
+            queueDispatchMode: "tool-end",
+          },
+        ],
+      })
+    );
+    expect(await replayPendingArtifactInteractions(deps(), WS)).toBe(1);
+    expect(sent[0].message).toContain('title="Old" action="send"');
+    expect(sent[0].options.muxMetadata).not.toHaveProperty("artifactInteraction.version");
+  });
+
   test("one malformed record does not discard the valid ones", async () => {
     const valid = {
       id: "id-1",
       workspaceId: WS,
       artifactPath: "a.html",
       artifactTitle: "a.html",
-      version: 0,
       text: "one",
       createdAtMs: 1000,
       queueDispatchMode: "tool-end",
@@ -331,38 +348,32 @@ describe("artifact interactions", () => {
     expect(sent.map((call) => call.internal.queueDedupeKey)).toEqual(["artifact-interaction:id-1"]);
   });
 
-  test("model text carries path, title, version and JSON body", () => {
+  test("model text carries path, title and JSON body", () => {
     expect(
       buildArtifactInteractionText({
         id: "i",
         workspaceId: WS,
         artifactPath: "a&b.html",
         artifactTitle: "T",
-        version: 3,
         text: "go",
         createdAtMs: 0,
         queueDispatchMode: "tool-end",
       })
     ).toBe(
-      '<artifact_interaction artifact="a&amp;b.html" title="T" version="3" action="send">{"text":"go"}</artifact_interaction>'
+      '<artifact_interaction artifact="a&amp;b.html" title="T" action="send">{"text":"go"}</artifact_interaction>'
     );
   });
 
   describe("state", () => {
-    test("is stored per artifact, latest wins, and a new version keeps it", async () => {
+    test("is stored per artifact, latest wins, and a republish keeps it", async () => {
       const base = { workspaceId: WS, path: "s.html" };
       expect(await getArtifactInteractionState(sessionsDir, base)).toEqual(Ok({ state: null }));
       await setArtifactInteractionState(sessionsDir, { ...base, state: { a: 1 } });
       await setArtifactInteractionState(sessionsDir, { ...base, state: { a: 2 } });
       expect(await getArtifactInteractionState(sessionsDir, base)).toEqual(Ok({ state: { a: 2 } }));
-      // Publishing a new version must not reset what the user picked.
-      for (const bytes of ["v1", "v2"]) {
-        await recordArtifactVersion({
-          sessionDir,
-          relPath: "s.html",
-          bytes: Buffer.from(bytes),
-          label: null,
-        });
+      // Republishing must not reset what the user picked.
+      for (const title of ["One", "Two"]) {
+        await recordArtifactPublish({ sessionDir, relPath: "s.html", title });
       }
       expect(await getArtifactInteractionState(sessionsDir, base)).toEqual(Ok({ state: { a: 2 } }));
     });

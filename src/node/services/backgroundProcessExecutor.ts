@@ -33,7 +33,11 @@ import {
   shellQuote,
 } from "@/node/runtime/backgroundCommands";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
-import { LocalBaseRuntime, localRuntimeTempRoot } from "@/node/runtime/LocalBaseRuntime";
+import {
+  getLocalProcessEvidence,
+  LocalBaseRuntime,
+  localRuntimeTempRoot,
+} from "@/node/runtime/LocalBaseRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
@@ -41,6 +45,7 @@ import { isErrnoWithCode } from "@/node/utils/fs";
 import { getErrorMessage } from "@/common/utils/errors";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import assert from "@/common/utils/assert";
+import type { HolderEvidence } from "@/node/utils/concurrency/processLiveness";
 
 /**
  * Quote a path for shell commands.
@@ -631,6 +636,7 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
  * Output files (output.log, exit_code) are on the runtime's filesystem.
  */
 class RuntimeBackgroundHandle implements BackgroundHandle {
+  readonly localProcess?: HolderEvidence;
   private termination: Promise<void> | undefined;
 
   constructor(
@@ -639,7 +645,11 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     public readonly outputDir: string,
     private readonly quotePath: (p: string) => string,
     private readonly probe: SpawnRecordProbe
-  ) {}
+  ) {
+    if (spawnRecordsAreHostLocal(runtime)) {
+      this.localProcess = getLocalProcessEvidence(pid);
+    }
+  }
 
   private async probeForMonitor<T>(
     probe: () => Promise<T>
@@ -804,7 +814,12 @@ export interface MigrateOptions {
  */
 export type MigrateResult =
   | { success: true; handle: BackgroundHandle; outputDir: string }
-  | { success: false; error: string };
+  | {
+      success: false;
+      error: string;
+      /** Confirms exit after the marker publication attempt when the output directory exists. */
+      exitCode: Promise<number>;
+    };
 
 /**
  * Migrate a foreground process to background tracking.
@@ -835,9 +850,11 @@ export async function migrateToBackground(
     options.processId
   );
 
+  let outputDirCreated = false;
   try {
     // Create output directory
     await fs.mkdir(outputDir, { recursive: true });
+    outputDirCreated = true;
 
     // Write existing output to unified output.log
     await fs.writeFile(outputPath, options.existingOutput.join("\n") + "\n");
@@ -852,8 +869,30 @@ export async function migrateToBackground(
   } catch (error) {
     const errorMessage = errorMsg(error);
     log.debug(`migrateToBackground: Error: ${errorMessage}`);
-    return { success: false, error: `Failed to migrate process: ${errorMessage}` };
+    // Return before exit: the caller starts termination only after migration fails.
+    const exitCode = outputDirCreated
+      ? settleFailedMigration(execStream.exitCode, outputDir)
+      : execStream.exitCode;
+    return { success: false, error: `Failed to migrate process: ${errorMessage}`, exitCode };
   }
+}
+
+function settleFailedMigration(exitCode: Promise<number>, outputDir: string): Promise<number> {
+  const settlement = exitCode.then(async (code) => {
+    try {
+      // Do not create directories or replace another confirmed exit marker.
+      await fs.writeFile(path.join(outputDir, EXIT_CODE_FILENAME), String(code), { flag: "wx" });
+    } catch (error) {
+      if (!isErrnoWithCode(error, "EEXIST")) {
+        // Exit is confirmed. Leave the record unknown when publication fails.
+        log.debug(`Failed migration exit settlement in ${outputDir}: ${errorMsg(error)}`);
+      }
+    }
+    return code;
+  });
+  // The caller can return before exit. Keep rejection observable without an unhandled rejection.
+  void settlement.catch(() => undefined);
+  return settlement;
 }
 
 /**
@@ -866,6 +905,7 @@ export async function migrateToBackground(
  * Both stdout and stderr are written to a unified output.log file.
  */
 class MigratedBackgroundHandle implements BackgroundHandle {
+  readonly localProcess?: HolderEvidence;
   private exitCodeValue: number | null = null;
   private consuming = false;
   private outputFd: fs.FileHandle | null = null;
@@ -886,6 +926,8 @@ class MigratedBackgroundHandle implements BackgroundHandle {
     kill?: () => void
   ) {
     this.execStream = execStream;
+    // Keep the evidence when exit and drain release the stream.
+    this.localProcess = execStream.localProcess;
     this.kill = kill;
   }
 

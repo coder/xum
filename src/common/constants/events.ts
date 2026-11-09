@@ -172,7 +172,7 @@ export const CUSTOM_EVENTS = {
 
   /**
    * Open the Artifacts tab on one artifact (Artifacts M4). Senders persist the selection first.
-   * Detail: { workspaceId: string, path: string, versionId?: number }
+   * Detail: { workspaceId: string, path: string, pinned?: boolean }
    */
   OPEN_ARTIFACT: "mux:openArtifact",
 
@@ -309,10 +309,8 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.OPEN_ARTIFACT]: {
     workspaceId: string;
-    /** Artifacts-relative path, or a checkout-relative path when `pinned`. */
+    /** Artifacts-relative path, or the stored pin path (checkout-relative or absolute) when `pinned`. */
     path: string;
-    /** Version number to show; absent means "Latest (live)". */
-    versionId?: number;
     /** True for pinned workspace files (Concept C). */
     pinned?: boolean;
   };

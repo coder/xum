@@ -25,7 +25,7 @@ import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { markRemotePlanMigratedForDeletion } from "@/node/utils/runtime/planLocation";
 import type { AgentSessionAIService } from "../agentSession";
 import { createAgentSessionHarness } from "../agentSession.testHarness";
-import { recordArtifactVersion } from "../artifactVersionStore";
+import { recordArtifactPublish } from "../artifactRecordStore";
 import {
   awaitPendingBranchSummary,
   startAbandonedBranchSummaryInBackground,
@@ -498,8 +498,8 @@ export async function oneWorkspaceRefine(names: LockNames): Promise<void> {
 }
 
 /**
- * Session-dir stores (pinnedArtifactFiles, artifactVersionStore and
- * WorkflowRunStore tests): a pin, an artifact version, a workflow run with
+ * Session-dir stores (pinnedArtifactFiles, artifactRecordStore and
+ * WorkflowRunStore tests): a pin, an artifact record, a workflow run with
  * its lease, the rollback lock and one journal append.
  */
 export async function oneArtifactAndRun(names: LockNames): Promise<void> {
@@ -509,11 +509,10 @@ export async function oneArtifactAndRun(names: LockNames): Promise<void> {
     names.id(workspaceId);
     const sessionDir = path.join(dir, "sessions", workspaceId);
     await addPinnedPath(sessionDir, "report.md");
-    await recordArtifactVersion({
+    await recordArtifactPublish({
       sessionDir,
       relPath: "report.md",
-      bytes: Buffer.from("# Report\n"),
-      label: null,
+      title: "report.md",
       abortSignal: new AbortController().signal,
     });
     const runs = new WorkflowRunStore({ sessionDir });

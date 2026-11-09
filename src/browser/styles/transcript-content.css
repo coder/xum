@@ -248,20 +248,20 @@
   max-width: 100%;
 }
 
+/* Mermaid.tsx computes the diagram's pixel size from the size Pele measured. Nothing else may
+   size the box: engines disagree on intrinsic sizing, min-content, aspect-ratio transfer from
+   max-height and CSS zoom, and iPhone Safari painted a diagram far outside its frame. */
 .mermaid-container > svg {
-  min-width: min-content;
-  max-width: none;
-  max-height: var(--diagram-max-height, 300px);
-  height: auto;
-  /* Electron is Chromium-only; zoom affects layout/scrollbars, unlike transform. */
-  zoom: var(--diagram-zoom, 1);
+  flex: none;
+  width: var(--diagram-width);
+  height: var(--diagram-height);
 }
 
-/* Mermaid in modal - allow larger sizing */
-.mermaid-modal > svg {
-  max-width: none;
-  width: auto;
-  max-height: 80vh;
+/* The expand dialog's Close button (Mermaid.tsx) takes this class in the desktop app only. The rule
+   lives here, not in globals.css, because vscode/src/webview/webviewCss.test.ts fails when the
+   webview bundle names a class that only globals.css defines. */
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
 }
 
 /* Zoom wrapper for mermaid */

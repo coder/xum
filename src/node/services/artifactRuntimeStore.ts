@@ -31,6 +31,7 @@ import {
  */
 
 const LIST_MAGIC = "XUMARTIFACTS1";
+const REAL_DIR_MAGIC = "XUMREALDIR1";
 const READ_MAGIC = "XUMREAD1";
 const WRITE_MAGIC = "XUMWRITE1";
 const EXEC_TIMEOUT_SECONDS = 30;
@@ -152,6 +153,38 @@ export function parseArtifactListOutput(stdout: string): RuntimeArtifactListing 
   }
 }
 
+/**
+ * Real path of a folder on the runtime (symlinks resolved), or null when it is missing or not a
+ * folder. Pins outside the checkout store it: the read script refuses a symlinked root folder.
+ */
+export async function resolveRealDirOnRuntime(
+  runtime: Runtime,
+  dir: string,
+  abortSignal?: AbortSignal
+): Promise<string | null> {
+  const result = await execBuffered(
+    runtime,
+    `cd -P -- "$XUM_DIR" 2>/dev/null || exit 0\nprintf '${REAL_DIR_MAGIC}\\0'\npwd -P\n`,
+    {
+      cwd: "/",
+      pathEnv: { XUM_DIR: dir },
+      timeout: EXEC_TIMEOUT_SECONDS,
+      abortSignal,
+      maxOutputBytes: READ_OUTPUT_SLACK_BYTES,
+    }
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `Resolving a folder failed (exit ${result.exitCode}): ${result.stderr.trim().slice(0, 500)}`
+    );
+  }
+  // A login banner can come first; pwd ends its line with one newline.
+  const start = result.stdout.indexOf(`${REAL_DIR_MAGIC}\0`);
+  if (start < 0) return null;
+  const real = result.stdout.slice(start + REAL_DIR_MAGIC.length + 1).replace(/\n$/, "");
+  return real.startsWith("/") ? real : null;
+}
+
 export async function listArtifactsOnRuntime(
   runtime: Runtime,
   artifactsDir: string,
@@ -198,21 +231,29 @@ d=$XUM_ARTIFACTS_DIR
 if [ -L "$d" ] || [ ! -d "$d" ]; then xum_missing; fi
 cd -- "$d" 2>/dev/null || xum_missing
 xum_root=$(pwd -P) || xum_missing
-xum_parent=$(cd -P -- "$` +
+xum_up=$` +
     "{d%/*}" +
+    String.raw`
+xum_parent=$(cd -P -- "$` +
+    "{xum_up:-/}" +
     String.raw`" 2>/dev/null && pwd -P) || xum_missing
-if [ "$xum_root" != "$xum_parent/${rootName}" ]; then xum_missing; fi
+if [ "$xum_root" != "$` +
+    "{xum_parent%/}" +
+    String.raw`/${rootName}" ]; then xum_missing; fi
+xum_pre=$` +
+    "{xum_root%/}" +
+    String.raw`/
 for xum_seg in ${dirSegments.join(" ")}; do
   if [ -L "$xum_seg" ] || [ ! -d "$xum_seg" ]; then xum_missing; fi
   cd -- "$xum_seg" 2>/dev/null || xum_missing
 done
-case $(pwd -P) in "$xum_root"/*|"$xum_root") ;; *) xum_missing ;; esac
+case $(pwd -P) in "$xum_pre"*|"$xum_root") ;; *) xum_missing ;; esac
 xum_leaf=${leaf}
 if [ -L "$xum_leaf" ] || [ ! -f "$xum_leaf" ]; then xum_missing; fi
 ${STAT_PRELUDE}
 xum_send() {
   if xum_fd=$(readlink "/proc/$$/fd/3" 2>/dev/null); then
-    case $xum_fd in "$xum_root"/*) ;; *) xum_missing ;; esac
+    case $xum_fd in "$xum_pre"*) ;; *) xum_missing ;; esac
   fi
   if [ -L "$xum_leaf" ]; then xum_missing; fi
   xum_m=$(xum_meta "./$xum_leaf") || xum_missing
@@ -299,7 +340,8 @@ export async function readArtifactOnRuntime(
       abortSignal,
       options
     ),
-    maxBytes
+    maxBytes,
+    options?.kind
   );
 }
 

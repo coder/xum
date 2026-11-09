@@ -797,8 +797,6 @@ export interface ArtifactInteractionMetadata {
   /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
   artifactPath: string;
   title: string;
-  /** Artifact version the user interacted with (0 when the file had no stored version). */
-  version: number;
   action: "send";
   text: string;
   /** Optional JSON payload from the artifact. */

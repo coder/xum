@@ -2,6 +2,7 @@ import { useEffect, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { requireTestModule } from "@/browser/testUtils";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
+import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
@@ -146,7 +147,7 @@ function ConnectingAPIWrapper(props: { children: ReactNode }) {
         retry: () => undefined,
       }}
     >
-      {props.children}
+      <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
     </APIContext.Provider>
   );
 }

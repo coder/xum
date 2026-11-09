@@ -229,10 +229,16 @@ export async function removeWorkspace(
 ) {
   const result = await context.workspaceService.remove(input.workspaceId, input.options?.force, {
     acknowledgedDescendantIds: input.options?.acknowledgedDescendantIds,
+    acknowledgedUnknownProcessRecords: input.options?.acknowledgedUnknownProcessRecords,
   });
   return result.success
     ? { success: true as const, ...(result.warnings ? { warnings: result.warnings } : {}) }
-    : { success: false as const, error: result.error, descendants: result.descendants };
+    : {
+        success: false as const,
+        error: result.error,
+        descendants: result.descendants,
+        backgroundProcesses: result.backgroundProcesses,
+      };
 }
 
 export async function forkWorkspace(context: ORPCContext, input: ForkWorkspaceInput) {

@@ -648,9 +648,9 @@ export const KEYBINDS = {
   FIT_ARTIFACT_IMAGE: { key: "0" },
   /** Show an image artifact at actual size (100%) */
   ACTUAL_SIZE_ARTIFACT_IMAGE: { key: "1" },
-  /** Pin the shown artifact version to the project shelf */
+  /** Pin the shown artifact to the project shelf */
   PIN_ARTIFACT_TO_PROJECT_SHELF: { key: "p" },
-  /** Pin the shown artifact version to the global shelf */
+  /** Pin the shown artifact to the global shelf */
   PIN_ARTIFACT_TO_GLOBAL_SHELF: { key: "P", shift: true },
   /** Unpin the selected shelf entry */
   UNPIN_SHELF_ENTRY: { key: "u" },
@@ -780,6 +780,10 @@ export const KEYBINDS = {
   // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
   SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
   SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS: { key: "u", code: "KeyU", ctrl: true, alt: true },
+  // Not Ctrl+Alt+P (PIN_WORKSPACE) or Ctrl+Alt+L (the lock-screen key on several desktops).
+  SETTINGS_BACKUP_TOGGLE_PLUGINS: { key: "x", code: "KeyX", ctrl: true, alt: true },
+  SETTINGS_BACKUP_REVIEW_PLUGINS: { key: "y", code: "KeyY", ctrl: true, alt: true },
+  SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL: { key: "z", code: "KeyZ", ctrl: true, alt: true },
 
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },

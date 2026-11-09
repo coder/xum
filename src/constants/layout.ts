@@ -30,6 +30,14 @@ export const NARROW_VIEWPORT_MAX_WIDTH_PX = 768;
 // landscape): the composer's live line opens its lists in a bottom sheet there, as on phones.
 export const SHORT_VIEWPORT_MAX_HEIGHT_PX = 500;
 
+// The iPhone Duo cover display keeps a status and camera column on its right edge, as Apple's
+// simulator insets it, at a width where xum shows its phone layout.
+export const SIDE_INSET_PX = 84;
+export const SIDE_INSET_VIEWPORT = { width: 466, height: 700 };
+// Height of the band at the top of that column that iOS draws its clock and status icons in, and
+// that globals.css paints over (`body::after`; CSS cannot read this constant, so it repeats it).
+export const IOS_STATUS_BAND_HEIGHT_PX = 172;
+
 // Keep composer controls aligned without relying on individual component defaults. This is a floor,
 // not a fixed height: mobile raises touch targets to MOBILE_TOUCH_TARGET_PX, and a pill that caps
 // its height would clip the controls inside it instead of growing with them.

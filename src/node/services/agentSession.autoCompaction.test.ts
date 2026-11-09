@@ -25,6 +25,8 @@ import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
 import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
 import { computeSendDigest } from "./sendIds";
+import assert from "@/common/utils/assert";
+import { WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
 
 type CompactionDecisions = Partial<Pick<CompactionMonitor, "checkBeforeSend" | "checkMidStream">>;
 
@@ -935,9 +937,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     await session.dispose();
   });
 
-  test("surfaces nested dispatch failures after mid-stream compaction interrupt", async () => {
-    const workspaceId = "ws-auto-compaction-mid-stream-dispatch-failure";
-
+  /**
+   * Sends a turn whose stream crosses the mid-stream compaction threshold once. The nested
+   * compaction dispatch runs `dispatch` instead of a send; returns once its failure surfaced.
+   */
+  async function runMidStreamCompactionDispatch(
+    workspaceId: string,
+    dispatch: (session: AgentSession) => ReturnType<AgentSession["sendMessage"]>
+  ) {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
@@ -1010,7 +1017,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         return originalSendMessage(...args);
       }
 
-      return Err({ type: "unknown", raw: "mid-stream compaction dispatch failed" });
+      return dispatch(session);
     }) as AgentSession["sendMessage"];
 
     const events: WorkspaceChatMessage[] = [];
@@ -1030,6 +1037,15 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
 
+    return { session, events, stopStream };
+  }
+
+  test("surfaces nested dispatch failures after mid-stream compaction interrupt", async () => {
+    const { session, events, stopStream } = await runMidStreamCompactionDispatch(
+      "ws-auto-compaction-mid-stream-dispatch-failure",
+      () => Promise.resolve(Err({ type: "unknown", raw: "mid-stream compaction dispatch failed" }))
+    );
+
     const streamError = events.find(
       (event): event is Extract<WorkspaceChatMessage, { type: "stream-error" }> =>
         event.type === "stream-error"
@@ -1037,6 +1053,32 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(streamError).toBeDefined();
     expect(streamError?.error).toContain("mid-stream compaction dispatch failed");
     expect(stopStream).toHaveBeenCalledTimes(1);
+
+    await session.dispose();
+  });
+
+  test("a Stop during the mid-stream compaction dispatch arms no retry", async () => {
+    const { session, events } = await runMidStreamCompactionDispatch(
+      "ws-auto-compaction-mid-stream-dispatch-stopped",
+      (stopped) => {
+        // What a workspace-turn interrupt or a hard timeout does while the compaction request is
+        // in preflight: it ends the retry loop, and its stop latch refuses the send with a
+        // retryable error. Neither runs cancelCompaction, so the continuation stays admitted.
+        stopped.abandonAutoRetry("task_stopped");
+        return Promise.resolve(
+          Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE })
+        );
+      }
+    );
+    assert(
+      events.some((event) => event.type === "stream-error"),
+      "the refused dispatch surfaces after its retry decision"
+    );
+
+    expect({
+      pending: session.hasPendingAutoRetry(),
+      armed: events.filter((event) => event.type === "auto-retry-scheduled").length,
+    }).toEqual({ pending: false, armed: 0 });
 
     await session.dispose();
   });

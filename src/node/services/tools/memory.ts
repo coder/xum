@@ -18,6 +18,7 @@ import {
   parseMemoryPath,
   type MemoryScopeContext,
   type MemoryService,
+  type MemoryWriteOptions,
 } from "@/node/services/memoryService";
 
 /**
@@ -194,7 +195,9 @@ export async function executeMemoryCommand(
   input: MemoryCommandInput,
   checkWriteAccess: (virtualPath: string) => MemoryToolResult | null,
   toolCallId?: string,
-  options?: {
+  // `MemoryWriteOptions` (rejectSecretLike) is handed on to every mutating command whole, so
+  // reading it adds no branch here.
+  options?: MemoryWriteOptions & {
     /**
      * Staged refine mutations only (r55 deletes, r58 inserts): staging-time
      * fingerprint of the mutation target, re-verified by MemoryService
@@ -246,7 +249,8 @@ export async function executeMemoryCommand(
             input.file_text,
             "agent",
             toolCallId,
-            options?.abortSignal
+            options?.abortSignal,
+            options
           ))
         );
       }
@@ -263,7 +267,8 @@ export async function executeMemoryCommand(
             input.new_str ?? "",
             "agent",
             toolCallId,
-            options?.abortSignal
+            options?.abortSignal,
+            options
           ))
         );
       }
@@ -284,7 +289,8 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.expectedTargetFingerprint,
-            options?.abortSignal
+            options?.abortSignal,
+            options
           ))
         );
       }
@@ -301,7 +307,7 @@ export async function executeMemoryCommand(
             toolCallId,
             options?.expectedTargetFingerprint,
             options?.abortSignal,
-            { rejectPinned: options?.rejectPinned }
+            options
           ))
         );
       }
@@ -321,7 +327,7 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.abortSignal,
-            { rejectPinned: options?.rejectPinned }
+            options
           ))
         );
       }

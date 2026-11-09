@@ -35,6 +35,18 @@ import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMoni
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
+import type { WorkspaceBackgroundProcessBlocker } from "@/common/types/workspace";
+import {
+  judgeHolder,
+  parseProcessIdentity,
+  type ProcessIdentity,
+} from "@/node/utils/concurrency/processLiveness";
+
+interface SpawnRecordMeta {
+  pid: number;
+  status: string;
+  identity?: ProcessIdentity;
+}
 
 const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
 const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
@@ -82,6 +94,14 @@ function computeTailStartOffset(fileSizeBytes: number, tailBytes: number): numbe
   return Math.max(0, fileSizeBytes - tailBytes);
 }
 
+function parseSpawnRecordIdentity(record: unknown): Pick<SpawnRecordMeta, "identity"> {
+  if (typeof record !== "object" || record === null || !("identity" in record)) return {};
+  if (typeof record.identity !== "object" || record.identity === null) {
+    return {};
+  }
+  return { identity: parseProcessIdentity(Object.fromEntries(Object.entries(record.identity))) };
+}
+
 /**
  * Enforce a byte bound on already-read tail content. Runtime-backed handles degrade a transient
  * size-query failure to 0, which turns an offset-based tail read into a full-file read; the
@@ -113,7 +133,7 @@ export function boundTailContent(
  * Records are written by this app but can be truncated by a crash mid-write; anything
  * malformed is treated as absent rather than trusted.
  */
-export function parseSpawnRecordMeta(raw: string): { pid: number; status: string } | null {
+export function parseSpawnRecordMeta(raw: string): SpawnRecordMeta | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -125,7 +145,7 @@ export function parseSpawnRecordMeta(raw: string): { pid: number; status: string
   const { pid, status } = parsed;
   if (typeof pid !== "number" || !Number.isInteger(pid)) return null;
   if (typeof status !== "string") return null;
-  return { pid, status };
+  return { pid, status, ...parseSpawnRecordIdentity(parsed) };
 }
 
 /**
@@ -162,7 +182,7 @@ const SETTLED_RECORD_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
  * with unique names still accumulate until reboot, as before #4892).
  *
  * Nothing on disk says which backend spawned a record (#4892 rejected an owner field), so:
- * - The exit marker must exist: it is the settlement proof recordRootHoldsOrphan trusts. A
+ * - The exit marker must exist: it is the settlement proof recordRootBlockers trusts. A
  *   SIGKILLed orphan without one keeps blocking its name.
  * - meta.json must read non-running. Every status transition sets the in-memory status before
  *   rewriting meta.json, so the backend that spawned it (if alive) now treats it as settled:
@@ -207,6 +227,7 @@ import { EventEmitter } from "events";
 export interface BackgroundProcessMeta {
   id: string;
   pid: number;
+  identity?: ProcessIdentity;
   script: string;
   startTime: number;
   status: "running" | "exited" | "killed" | "failed";
@@ -410,6 +431,7 @@ interface MonitorSettlementReservation {
 export interface BackgroundProcess {
   id: string; // Process ID (display_name from the bash tool call)
   pid: number; // OS process ID
+  identity?: ProcessIdentity;
   workspaceId: string; // Owning workspace
   outputDir: string; // Directory containing stdout.log, stderr.log, meta.json
   script: string; // Original command
@@ -2430,10 +2452,31 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // Process start time: stored in meta.json, shown and compared with wake origins (#7282).
     const startTime = nodeClock.nowMs();
 
+    const proc: BackgroundProcess = {
+      id: processId,
+      pid,
+      identity: handle.localProcess?.identity,
+      workspaceId,
+      outputDir,
+      script,
+      startTime,
+      status: "running",
+      handle,
+      displayName: config.displayName,
+      isForeground: config.isForeground ?? false,
+      outputBytesRead: 0,
+      shownThroughOffset: 0,
+      terminalStatusShownToAgent: false,
+      outputLock: new AsyncMutex(),
+      getOutputCallCount: 0,
+      incompleteLineBuffer: "",
+    };
+
     // Write meta.json with process info
     const meta: BackgroundProcessMeta = {
       id: processId,
       pid,
+      identity: proc.identity,
       script,
       startTime,
       status: "running",
@@ -2459,52 +2502,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       };
     }
 
-    const proc: BackgroundProcess = {
-      id: processId,
-      pid,
-      workspaceId,
-      outputDir,
-      script,
-      startTime,
-      status: "running",
-      handle,
-      displayName: config.displayName,
-      isForeground: config.isForeground ?? false,
-      outputBytesRead: 0,
-      shownThroughOffset: 0,
-      terminalStatusShownToAgent: false,
-      outputLock: new AsyncMutex(),
-      getOutputCallCount: 0,
-      incompleteLineBuffer: "",
-    };
-
     // Store process in map
     this.processes.set(processId, proc);
 
-    if (config.monitor && !proc.isForeground) {
-      // The fast tick is only affordable when the handle probes host-local record files with
-      // fs (see spawnProcess); devcontainer records need a docker exec per probe, so they
-      // poll at the remote cadence like SSH.
-      const pollIntervalMs = spawnRecordsAreHostLocal(runtime)
-        ? MONITOR_POLL_INTERVAL_MS_LOCAL
-        : MONITOR_POLL_INTERVAL_MS_REMOTE;
-      const armMetadata: MonitorArmedPayload = {
-        processId,
-        taskId: `bash:${processId}`,
-        workspaceId,
-        displayName: config.displayName,
-        filter: config.monitor.filter,
-        filterExclude: config.monitor.exclude,
-        script,
-        // Record time: wall clock until #7282 moves its consumers to HostClock.
-        createdAt: new Date(nodeClock.nowMs()).toISOString(),
-      };
-      proc.monitor = this.createMonitorState(config.monitor, { pollIntervalMs, armMetadata });
-      this.startMonitorTail(proc);
-      // spawn() is the only place monitors are ever armed (registerMigratedProcess never
-      // sets one), so this single emit keeps the persisted armed-monitor registry complete.
-      this.emit("monitor:armed", workspaceId, armMetadata);
-    }
+    this.armSpawnMonitor(proc, config, runtime);
 
     log.debug(
       `Process ${processId} spawned successfully with PID ${pid} (foreground: ${proc.isForeground})`
@@ -2599,7 +2600,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     const proc: BackgroundProcess = {
       id: processId,
-      pid: 0, // Unknown for migrated processes (could be remote)
+      pid: handle.localProcess?.pid ?? 0,
+      identity: handle.localProcess?.identity,
       workspaceId,
       outputDir,
       script,
@@ -2622,7 +2624,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // Write meta.json
     const meta: BackgroundProcessMeta = {
       id: processId,
-      pid: 0,
+      pid: proc.pid,
+      identity: proc.identity,
       script,
       startTime,
       status: "running",
@@ -2681,6 +2684,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const meta: BackgroundProcessMeta = {
       id: proc.id,
       pid: proc.pid,
+      identity: proc.identity,
       script: proc.script,
       startTime: proc.startTime,
       status: proc.status,
@@ -3283,15 +3287,23 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * checkout-deletion hazard this guards is limited to local managed worktrees. Devcontainer
    * records live inside the container under `<workspace>/.xum/tmp` — host-visible through the
    * workspace bind mount — so callers pass that root via extraRecordDirs; its PIDs are
-   * container-namespace and cannot be probed from the host, so any running record there is
-   * treated as live. A recycled PID can cause a false positive, which errs on the safe side —
-   * the model-facing caller routes to user-mediated archive.
+   * container-namespace and cannot be probed from the host, so markerless records remain unknown.
+   * Qualified host identity detects retired processes and PID reuse. Legacy live PIDs still block deletion.
+   * Unknown records also block automatic mutation. Only explicit removal consent can bypass that uncertainty.
    */
   async hasOrphanedRunningBackgroundProcesses(
     workspaceId: string,
     options?: { extraRecordDirs?: string[] }
   ): Promise<boolean> {
-    assert(workspaceId.length > 0, "hasOrphanedRunningBackgroundProcesses requires workspaceId");
+    return (await this.getOrphanedBackgroundProcessBlockers(workspaceId, options)).length > 0;
+  }
+
+  /** Report live and unknown records without deleting evidence or signaling untracked processes. */
+  async getOrphanedBackgroundProcessBlockers(
+    workspaceId: string,
+    options?: { extraRecordDirs?: string[] }
+  ): Promise<WorkspaceBackgroundProcessBlocker[]> {
+    assert(workspaceId.length > 0, "getOrphanedBackgroundProcessBlockers requires workspaceId");
     const candidates: Array<{
       dir: string;
       pidsAreHostNamespace: boolean;
@@ -3324,119 +3336,134 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // /tmp -> /private/tmp) names the shared root again, and rescanning it without the tracked
     // name skip would read this manager's own migrated command as foreign evidence.
     const seen = new Set<string>();
+    const blockers: WorkspaceBackgroundProcessBlocker[] = [];
     for (const root of candidates) {
       const identity = await fsPromises.realpath(root.dir).catch(() => nodePath.resolve(root.dir));
       if (seen.has(identity)) continue;
       seen.add(identity);
-      if (
-        await this.recordRootHoldsOrphan(
+      blockers.push(
+        ...(await this.recordRootBlockers(
           workspaceId,
           root.dir,
           root.pidsAreHostNamespace,
           root.skipTrackedNames
-        )
-      ) {
-        return true;
-      }
+        ))
+      );
     }
-    return false;
+    return blockers;
   }
 
-  /** One record root's scan for hasOrphanedRunningBackgroundProcesses. */
-  private async recordRootHoldsOrphan(
+  private armSpawnMonitor(
+    proc: BackgroundProcess,
+    config: { displayName: string; monitor?: BackgroundProcessMonitorConfig },
+    runtime: Runtime
+  ): void {
+    if (config.monitor && !proc.isForeground) {
+      // The fast tick is only affordable when the handle probes host-local record files with
+      // fs (see spawnProcess); devcontainer records need a docker exec per probe, so they
+      // poll at the remote cadence like SSH.
+      const pollIntervalMs = spawnRecordsAreHostLocal(runtime)
+        ? MONITOR_POLL_INTERVAL_MS_LOCAL
+        : MONITOR_POLL_INTERVAL_MS_REMOTE;
+      const armMetadata: MonitorArmedPayload = {
+        processId: proc.id,
+        taskId: `bash:${proc.id}`,
+        workspaceId: proc.workspaceId,
+        displayName: config.displayName,
+        filter: config.monitor.filter,
+        filterExclude: config.monitor.exclude,
+        script: proc.script,
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        createdAt: new Date(nodeClock.nowMs()).toISOString(),
+      };
+      proc.monitor = this.createMonitorState(config.monitor, { pollIntervalMs, armMetadata });
+      this.startMonitorTail(proc);
+      // spawn() is the only place monitors are ever armed (registerMigratedProcess never
+      // sets one), so this single emit keeps the persisted armed-monitor registry complete.
+      this.emit("monitor:armed", proc.workspaceId, armMetadata);
+    }
+  }
+
+  private async recordRootBlockers(
     workspaceId: string,
     workspaceDir: string,
     pidsAreHostNamespace: boolean,
     skipTrackedNames: boolean
-  ): Promise<boolean> {
+  ): Promise<WorkspaceBackgroundProcessBlocker[]> {
     let entries: Dirent[];
     try {
       entries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
     } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
-        // No spawn records under this root (never spawned there, or cleaned up).
-        return false;
-      }
-      // EACCES/EIO/...: the records exist but cannot be read, so absence of a surviving
-      // process is unprovable — fail closed (the model-facing caller routes to
-      // user-mediated archive).
-      return true;
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) return [];
+      return [
+        {
+          workspaceId,
+          processId: "(process records)",
+          recordPath: workspaceDir,
+          state: "unknown",
+          reason: "The process records cannot be read.",
+        },
+      ];
     }
-    const trackedPids = new Set<number>();
-    const trackedProcessIds = new Set<string>();
-    for (const proc of this.processes.values()) {
-      if (proc.workspaceId === workspaceId) {
-        trackedPids.add(proc.pid);
-        trackedProcessIds.add(proc.id);
-      }
+    const tracked = [...this.processes.values()].filter((proc) => proc.workspaceId === workspaceId);
+    const trackedNames = new Set(tracked.map((proc) => proc.id));
+    const trackedPids = new Set(tracked.map((proc) => proc.pid));
+    const blockers: WorkspaceBackgroundProcessBlocker[] = [];
+    for (const entry of entries.filter((entry) => entry.isDirectory())) {
+      if (skipTrackedNames && trackedNames.has(entry.name)) continue;
+      const recordPath = nodePath.join(workspaceDir, entry.name);
+      const activity = await this.inspectOrphanRecord(
+        recordPath,
+        pidsAreHostNamespace,
+        trackedPids
+      );
+      if (activity != null)
+        blockers.push({ workspaceId, processId: entry.name, recordPath, ...activity });
     }
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      // Tracked processes (directory name = process ID) are covered by the in-memory
-      // live-activity gates, whose statuses refresh via list(); this probe only reports
-      // processes nobody tracks. ID-based so migrated records (pid 0) are matched too.
-      if (skipTrackedNames && trackedProcessIds.has(entry.name)) continue;
-      const processDir = nodePath.join(workspaceDir, entry.name);
-      let meta: { pid: number; status: string } | null = null;
-      try {
-        meta = parseSpawnRecordMeta(
-          await fsPromises.readFile(nodePath.join(processDir, BG_META_FILENAME), "utf-8")
-        );
-      } catch {
-        // Missing/unreadable record: handled with the parse-failure case below.
-      }
-      if (meta == null) {
-        // A record we cannot read or parse cannot prove its process exited: spawn aborts
-        // (and terminates the process, writing the exit marker) when the initial record
-        // fails to persist, and cleanly failed spawns remove their directory — ambiguous
-        // launches (spawn succeeded but the PID echo was garbled) intentionally keep
-        // theirs — so a markerless meta-less record is a crash artifact or untracked
-        // launch whose process may still be alive. Trust only the exit marker; otherwise
-        // fail closed (the model-facing caller routes to user-mediated archive).
-        try {
-          await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
-          continue;
-        } catch {
-          return true;
-        }
-      }
-      if (meta.status !== "running") continue;
-      try {
-        await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
-        continue; // The exit marker settles the record (wrapper trap or migrated handle).
-      } catch {
-        // No exit marker yet — fall through to the PID checks.
-      }
-      if (!pidsAreHostNamespace) {
-        // Container-namespace PID (devcontainer record): nothing on the host can probe it,
-        // and a host kill(pid, 0) would answer for an unrelated host process — treat the
-        // running record as a live orphan (fail closed; over-refusal routes to
-        // user-mediated archive).
-        return true;
-      }
-      if (meta.pid <= 1) {
-        // Migrated processes record pid 0 (exec streams expose no PID) and their exit
-        // marker is written by the in-process handle, not a detached trap. The child can
-        // outlive an unclean shutdown on Unix, and nothing can probe it afterwards — fail
-        // closed rather than skip. Clean shutdowns and natural exits rewrite the record
-        // (status via updateMetaFile, or the exit marker above), so only genuine
-        // unclean-exit survivors reach this branch.
-        return true;
-      }
-      if (trackedPids.has(meta.pid)) continue;
-      try {
-        process.kill(meta.pid, 0);
-        return true; // Alive and untracked: a crash orphan.
-      } catch (error) {
-        if (!isErrnoWithCode(error, "ESRCH")) {
-          // EPERM etc.: the PID exists but is not ours to signal — treat as alive (recycled
-          // PIDs over-refuse, never under-refuse).
-          return true;
-        }
-        // ESRCH: the process is gone (e.g. SIGKILL skipped the exit trap, or a reboot).
-      }
+    return blockers;
+  }
+
+  private async inspectOrphanRecord(
+    recordPath: string,
+    pidsAreHostNamespace: boolean,
+    trackedPids: ReadonlySet<number>
+  ): Promise<Pick<WorkspaceBackgroundProcessBlocker, "state" | "reason"> | undefined> {
+    try {
+      await fsPromises.access(nodePath.join(recordPath, BG_EXIT_CODE_FILENAME));
+      return undefined;
+    } catch {
+      // Only an exit marker or process death proves settlement after a crash.
     }
-    return false;
+    // Empty directories can also belong to a migration that crashes before its first write.
+    const meta = await fsPromises
+      .readFile(nodePath.join(recordPath, BG_META_FILENAME), "utf-8")
+      .then(parseSpawnRecordMeta, () => null);
+    if (meta == null)
+      return {
+        state: "unknown",
+        reason: "Process metadata or exit information is missing or unreadable.",
+      };
+    if (["exited", "killed", "failed"].includes(meta.status)) return undefined;
+    if (meta.status !== "running")
+      return { state: "unknown", reason: "The process status is invalid." };
+    if (!pidsAreHostNamespace)
+      return { state: "unknown", reason: "The process runs in a container PID namespace." };
+    if (meta.pid <= 1)
+      return { state: "unknown", reason: "The process has no recorded operating-system PID." };
+    if (trackedPids.has(meta.pid)) return undefined;
+    return this.inspectOrphanPid(meta);
+  }
+
+  private inspectOrphanPid(
+    meta: SpawnRecordMeta
+  ): Pick<WorkspaceBackgroundProcessBlocker, "state" | "reason"> | undefined {
+    // Orphan records have no live owner token here, even when a restarted backend reuses their PID.
+    const verdict = judgeHolder({ pid: meta.pid, identity: meta.identity }, false);
+    if (verdict.dead) return undefined;
+    return {
+      state: verdict.running ? "running" : "unknown",
+      reason: `Operating-system process ${meta.pid}: ${verdict.why}.`,
+    };
   }
 
   /**
@@ -3564,7 +3591,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     try {
       const tempDir = await runtime.tempDir();
       const root = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
-      // One POSIX-shell pass over the per-process record dirs (see recordRootHoldsOrphan for the
+      // One POSIX-shell pass over the per-process record dirs (see recordRootBlockers for the
       // host-local equivalent of these rules):
       // - exit marker present → settled; missing meta.json (or one without a "status" field,
       //   i.e. torn/unreadable) → unsettled; non-"running" status → settled.

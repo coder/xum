@@ -221,6 +221,23 @@ describe("PortableDesktopExperimentWarning", () => {
     expect(experimentValues[EXPERIMENT_IDS.MEMORY_CONSOLIDATION]).toBe(true);
   });
 
+  test("shows the dream cost ceiling under Memory Consolidation only while that experiment is on", () => {
+    experimentEnabled = false;
+    experimentValues = {
+      [EXPERIMENT_IDS.MEMORY]: true,
+      [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: false,
+    };
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+    expect(view.queryByLabelText("Dream cost ceiling")).toBeNull();
+
+    experimentValues = {
+      [EXPERIMENT_IDS.MEMORY]: true,
+      [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
+    };
+    view.rerender(<ExperimentsSection />);
+    expect(view.getByLabelText("Dream cost ceiling")).toBeTruthy();
+  });
+
   test("shows RLM Mode nested under Programmatic Tool Calling only when PTC is enabled", () => {
     experimentEnabled = false;
     experimentValues = {

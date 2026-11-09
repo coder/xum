@@ -18,6 +18,15 @@ describe("getToolComponent", () => {
     expect(getToolComponent("bash", args, { success: true, output: "ok" })).toBe(BashToolCall);
   });
 
+  test("routes bash args that omit timeout_secs to the real card", () => {
+    // timeout_secs is optional and the handler applies the default, so stored args
+    // without it validate and the row keeps its dedicated card. They used to fail the
+    // required field and lose the card, which only showed up in the ui lane.
+    expect(getToolComponent("bash", { script: "ls" }, { success: true, output: "" })).toBe(
+      BashToolCall
+    );
+  });
+
   test("falls back to generic rendering for removed or unknown tools", () => {
     expect(getToolComponent("workflow_list", {}, undefined)).toBe(GenericToolCall);
     expect(getToolComponent("unknown_tool", {}, undefined)).toBe(GenericToolCall);

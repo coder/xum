@@ -14,7 +14,13 @@ const PARENT = "parent-a";
 const ATTEMPT = "att_00000000000000a1";
 
 function ownedAttempt(receiptEligible = true): OwnedTaskAttempt {
-  return { generation: 1, source: "test", attemptId: ATTEMPT, receiptEligible };
+  return {
+    generation: 1,
+    source: "test",
+    attemptId: ATTEMPT,
+    receiptEligible,
+    inheritedReport: false,
+  };
 }
 
 function send(state: AdmittedSend["state"], attemptId = ATTEMPT): AdmittedSend {
@@ -22,7 +28,14 @@ function send(state: AdmittedSend["state"], attemptId = ATTEMPT): AdmittedSend {
 }
 
 function streamEnd(outcome: StreamEndDecision["outcome"]): StreamEndDecision {
-  return { attempt: undefined, attemptId: ATTEMPT, messageId: "msg-1", outcome, turn: undefined };
+  return {
+    attempt: undefined,
+    attemptId: ATTEMPT,
+    messageId: "msg-1",
+    inheritedReport: false,
+    outcome,
+    turn: undefined,
+  };
 }
 
 /** A config whose only workspace is TASK, with this execution mirror. */
@@ -68,6 +81,7 @@ function createHarness() {
     events.push(`clearQueue:${id}`);
     return { success: true as const, data: undefined };
   });
+  const abandonAutoRetry = mock((_id: string, _reason: string) => undefined);
   const interruptWorkspaceTurn = mock((owner: string, handleId: string, _options?: unknown) => {
     events.push(`interrupt:${owner}:${handleId}`);
     return Promise.resolve({ success: true, data: undefined });
@@ -83,6 +97,7 @@ function createHarness() {
     workspaceService: () => ({
       getActiveTurnGeneration: () => state.activeTurn,
       clearQueue,
+      abandonAutoRetry,
     }),
     turnManager: () =>
       ({
@@ -136,7 +151,7 @@ function createHarness() {
     recheckResumeFailureSettlement: (id) => events.push(`resumeRecheck:${id}`),
   };
   const latch = new TaskStopLatch(deps);
-  return { latch, events, listeners, state, clearQueue, interruptWorkspaceTurn };
+  return { latch, events, listeners, state, clearQueue, abandonAutoRetry, interruptWorkspaceTurn };
 }
 
 /** Phase A + the cascade's durable marker + Phase B's cleanup paid back (no Phase B run). */
@@ -415,7 +430,7 @@ describe("TaskStopLatch release", () => {
     expect(h.latch.hasStopRecord(TASK)).toBe(false);
   });
 
-  test("Phase B clears the queue, stops the captured stream and pays its cleanup back", async () => {
+  test("Phase B clears the queue, ends the auto-retry, stops the captured stream and pays its cleanup back", async () => {
     const h = createHarness();
     h.latch.beginWorkspaceStop(TASK);
     h.latch.markWorkspaceStopPersisted(TASK);
@@ -433,6 +448,7 @@ describe("TaskStopLatch release", () => {
     expect(h.events.slice(0, 2)).toEqual([`clearQueue:${TASK}`, `stopStream:${TASK}:msg-1`]);
     // The user's queued input is handed back, never dropped.
     expect(h.clearQueue).toHaveBeenCalledWith(TASK, { preserveUserInput: true });
+    expect(h.abandonAutoRetry.mock.calls.map(([id]) => id)).toEqual([TASK]);
     expect(onTimeout).not.toHaveBeenCalled();
     expect(h.latch.hasStopRecord(TASK)).toBe(false);
     expect(h.latch.isWorkspaceStopInProgress(TASK)).toBe(false);

@@ -12,7 +12,9 @@ import {
   type MonitorStoppedPayload,
   type OutputShownPayload,
 } from "./backgroundProcessManager";
+import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
+import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
@@ -24,7 +26,11 @@ import * as os from "os";
 import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createBashOutputTool } from "@/node/services/tools/bash_output";
-import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
+import {
+  TestTempDir,
+  createTestToolConfig,
+  readExitCodeWhenWritten,
+} from "@/node/services/tools/testHelpers";
 import type { BashToolResult, BashOutputToolResult } from "@/common/types/tools";
 
 interface ProbeFailureControl {
@@ -231,16 +237,7 @@ describe("BackgroundProcessManager", () => {
         });
         expect(first.success).toBe(true);
         if (!first.success) return;
-        const deadline = Date.now() + 5000;
-        while (Date.now() < deadline) {
-          try {
-            await fs.access(path.join(first.outputDir, "exit_code"));
-            break;
-          } catch {
-            await new Promise((resolve) => setTimeout(resolve, 25));
-          }
-        }
-        await fs.access(path.join(first.outputDir, "exit_code"));
+        expect(await readExitCodeWhenWritten(first.outputDir)).toBe("0");
 
         const second = await otherBackend.spawn(runtime, testWorkspaceId, "sleep 30", {
           cwd: process.cwd(),
@@ -257,7 +254,7 @@ describe("BackgroundProcessManager", () => {
       } finally {
         await otherBackend.cleanup(testWorkspaceId);
       }
-    });
+    }, 15_000);
 
     it("does not prune a recently settled record another backend tracks", async () => {
       // #4893: A has observed its command's exit (meta.json reads exited), so only the age
@@ -326,7 +323,7 @@ describe("BackgroundProcessManager", () => {
     });
 
     it("should write meta.json with process info", async () => {
-      const result = await manager.spawn(runtime, testWorkspaceId, "echo test", {
+      const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
         cwd: process.cwd(),
         displayName: "test",
       });
@@ -339,7 +336,10 @@ describe("BackgroundProcessManager", () => {
 
         expect(meta.id).toBe(result.processId);
         expect(meta.pid).toBeGreaterThan(0);
-        expect(meta.script).toBe("echo test");
+        expect(meta.script).toBe("sleep 60");
+        expect(meta.identity).toEqual({ ...getSelfIdentity(), birth: linuxBirth(meta.pid) });
+        expect((await manager.getProcess(result.processId))?.identity).toEqual(meta.identity);
+        expect(parseSpawnRecordMeta(metaContent)?.identity).toEqual(meta.identity);
         expect(meta.status).toBe("running");
         expect(meta.startTime).toBeGreaterThan(0);
       }
@@ -358,10 +358,16 @@ describe("BackgroundProcessManager", () => {
           displayName: "wall-clock-meta",
         });
         if (!result.success) throw new Error(result.error);
+        const metaPath = path.join(result.outputDir, "meta.json");
+        const initialMeta = parseSpawnRecordMeta(await fs.readFile(metaPath, "utf-8"));
+        expect(initialMeta?.identity).toBeDefined();
         expect(
           await clocked.terminate(result.processId, { monitorDisposition: "discard" })
         ).toEqual({ success: true });
         const proc = await clocked.getProcess(result.processId);
+        expect(parseSpawnRecordMeta(await fs.readFile(metaPath, "utf-8"))?.identity).toEqual(
+          initialMeta?.identity
+        );
         const after = Date.now();
         for (const stamp of [proc?.startTime, proc?.exitTime]) {
           expect(stamp).toBeGreaterThanOrEqual(before);
@@ -756,11 +762,14 @@ describe("BackgroundProcessManager", () => {
     });
 
     it("stops monitoring after maxEvents without killing the process", async () => {
-      const eventPromise = waitForMonitorMatch(manager);
+      // spawn() resolves only after it releases its name lock, and the monitor's first poll can
+      // run before that. A script that prints at once can match and retire the monitor (maxEvents)
+      // before the assert below, so the script waits for a gate file the test writes after it.
+      const gate = path.join(bgOutputDir, "start-printing");
       const result = await manager.spawn(
         runtime,
         testWorkspaceId,
-        "for i in 1 2 3; do echo ERR$i; sleep 0.05; done; sleep 2",
+        `while [ ! -e ${shellQuote(gate)} ]; do sleep 0.02; done; for i in 1 2 3; do echo ERR$i; sleep 0.05; done; sleep 2`,
         {
           cwd: process.cwd(),
           displayName: "monitor-max-events",
@@ -781,6 +790,8 @@ describe("BackgroundProcessManager", () => {
       expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(1);
       expect(manager.getActiveMonitorCount(testWorkspaceId2)).toBe(0);
 
+      const eventPromise = waitForMonitorMatch(manager);
+      await fs.writeFile(gate, "");
       const event = await eventPromise;
       expect(event.payload.lines).toEqual(["ERR1"]);
       expect(event.payload.totalMatches).toBe(1);
@@ -1717,7 +1728,7 @@ describe("BackgroundProcessManager", () => {
       // A filtered task_await / bash_output read advances outputBytesRead past every complete line
       // but returns only lines matching its own filter. A pending monitor match for "ERR" must still
       // wake on natural exit: the error line was never shown to the agent.
-      const eventPromise = waitForMonitorMatch(manager);
+      const eventPromise = waitForMonitorMatch(manager, 6_000);
 
       const result = await manager.spawn(
         runtime,
@@ -1767,7 +1778,7 @@ describe("BackgroundProcessManager", () => {
       expect(event.payload.lines[0]).toBe("ERR boom");
       expect(event.payload.matchedThroughOffset).toBeDefined();
       expect(event.payload.terminal?.status).toBe("exited");
-    });
+    }, 15_000);
 
     it(
       "does not advance the shown frontier across lines a prior filtered read consumed",
@@ -2354,11 +2365,20 @@ describe("BackgroundProcessManager", () => {
         manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
         manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
-        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'bye\\n'", {
-          cwd: process.cwd(),
-          displayName: "settle-shutdown-midflight",
-          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
-        });
+        // The script waits for a gate file so the tail-read spy below is installed before the
+        // monitor can settle. A script that exits at once can settle first (a busy host is enough),
+        // and then the test waits for a tail read that already happened.
+        const gate = path.join(bgOutputDir, "settle-gate");
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          `while [ ! -e ${shellQuote(gate)} ]; do sleep 0.02; done; printf 'bye\\n'`,
+          {
+            cwd: process.cwd(),
+            displayName: "settle-shutdown-midflight",
+            monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+          }
+        );
         expect(result.success).toBe(true);
         if (!result.success) return;
 
@@ -2383,6 +2403,7 @@ describe("BackgroundProcessManager", () => {
           return realGetOutputFileSize();
         });
 
+        await fs.writeFile(gate, "");
         await tailReadStartedPromise;
         manager.beginShutdown();
         releaseTail();
@@ -2575,11 +2596,20 @@ describe("BackgroundProcessManager", () => {
         manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
         manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
-        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'out\\n'", {
-          cwd: process.cwd(),
-          displayName: "settle-cancel-race",
-          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
-        });
+        // The script waits for a gate file so the tail-read spy below is installed before the
+        // monitor can settle. A script that exits at once can settle first (a busy host is enough),
+        // and then the test waits for a tail read that already happened.
+        const gate = path.join(bgOutputDir, "settle-gate");
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          `while [ ! -e ${shellQuote(gate)} ]; do sleep 0.02; done; printf 'out\\n'`,
+          {
+            cwd: process.cwd(),
+            displayName: "settle-cancel-race",
+            monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+          }
+        );
         expect(result.success).toBe(true);
         if (!result.success) return;
 
@@ -2604,6 +2634,7 @@ describe("BackgroundProcessManager", () => {
           return realGetOutputFileSize();
         });
 
+        await fs.writeFile(gate, "");
         await tailReadStartedPromise;
         // Explicit cancel (task_stop path) while the settlement helper awaits the tail read.
         await manager.terminate(result.processId, { monitorDisposition: "discard" });
@@ -2615,6 +2646,7 @@ describe("BackgroundProcessManager", () => {
         expect(stoppedEvents[0]).toMatchObject({ processId: result.processId, reason: "canceled" });
       });
 
+      // It polls for up to 4 s before its final 300 ms wait, so it has its own timeout.
       it("emits no settlement wakes during shutdown", async () => {
         const matchEvents: MonitorMatchPayload[] = [];
         const stoppedEvents: MonitorStoppedPayload[] = [];
@@ -2643,7 +2675,7 @@ describe("BackgroundProcessManager", () => {
         // the next startup delivers the monitor-lost notice instead.
         expect(matchEvents).toHaveLength(0);
         expect(stoppedEvents).toHaveLength(0);
-      });
+      }, 15_000);
 
       it("marks terminalStatusShown on a filtered post-exit read without advancing the offset", async () => {
         const shownEvents: OutputShownPayload[] = [];
@@ -3299,8 +3331,7 @@ describe("BackgroundProcessManager", () => {
       });
 
       if (result.success) {
-        // Wait for process to exit
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(await readExitCodeWhenWritten(result.outputDir)).toBe("42");
 
         const proc = await manager.getProcess(result.processId);
         expect(proc?.status).toBe("exited");
@@ -3314,7 +3345,7 @@ describe("BackgroundProcessManager", () => {
         expect(meta.status).toBe("exited");
         expect(meta.exitCode).toBe(42);
       }
-    });
+    }, 15_000);
 
     it("should keep output files after process exits", async () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "echo test; exit 0", {
@@ -3323,7 +3354,7 @@ describe("BackgroundProcessManager", () => {
       });
 
       if (result.success) {
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
         const proc = await manager.getProcess(result.processId);
         expect(proc?.status).toBe("exited");
@@ -3333,7 +3364,7 @@ describe("BackgroundProcessManager", () => {
         const output = await fs.readFile(outputPath, "utf-8");
         expect(output).toContain("test");
       }
-    });
+    }, 15_000);
 
     it("should preserve killed status after terminate", async () => {
       // Spawn a long-running process
@@ -3711,7 +3742,9 @@ describe("BackgroundProcessManager", () => {
           text += read.output;
           if (!read.note?.includes("continues the current line")) text += "\n";
           // At most the read window of raw bytes stays in memory (decoded: no more UTF-16 units).
-          const retained = (await manager.getProcess(processId))?.incompleteLineBuffer ?? "";
+          // peekProcess: getProcess would also probe the exit marker, one more exec per page on a
+          // remote runtime, and this check only reads a field of the tracked process.
+          const retained = manager.peekProcess(processId)?.incompleteLineBuffer ?? "";
           expect(retained.length).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES + 3);
           if (read.note?.includes("more bytes are unread")) continue;
           // Paging is not polling: the last read gets no polling advice.
@@ -3795,6 +3828,8 @@ describe("BackgroundProcessManager", () => {
         const FILTERED_SCAN_CHUNK_BYTES = 1024 * 1024;
         const headNote = "was filtered on its first";
 
+        // It drains a 2 MB log one 16 KB page at a time, about 130 reads that are each checked, so
+        // the body takes seconds when the host is busy and has its own timeout.
         it("reads a large log one page at a time, and its pages rebuild it exactly", async () => {
           const raw = mixedLog(2 * 1024 * 1024);
           const { processId } = await spawnWithLog(raw);
@@ -3808,8 +3843,10 @@ describe("BackgroundProcessManager", () => {
             expect(limit).toBeDefined();
             expect(limit).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
           }
-        });
+        }, 30_000);
 
+        // The drain makes about 170 shell execs (each read on a remote runtime runs a few): about a
+        // second alone and several times that on a busy host, so this test has its own timeout.
         it("reads a large remote log once, and its pages rebuild it exactly", async () => {
           const tailReads = { calls: 0, bytes: 0 };
           const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), { tailReads });
@@ -3820,7 +3857,7 @@ describe("BackgroundProcessManager", () => {
           // What tail sent back: each byte about once (plus a few to finish a character per read).
           expect(tailReads.bytes).toBeGreaterThanOrEqual(raw.length);
           expect(tailReads.bytes).toBeLessThan(raw.length * 1.05);
-        });
+        }, 60_000);
 
         // A line longer than the read window is decided on its head, and its tail, which
         // matches differently, follows that decision; the note says so. A line that fits in the
@@ -3859,7 +3896,8 @@ describe("BackgroundProcessManager", () => {
         });
 
         // A sparse filter over a remote log far larger than the window: one call scans it all
-        // in a few large reads, instead of returning one empty window per call.
+        // in a few large reads, instead of returning one empty window per call. It moves 4 MB
+        // through a remote runtime's exec streams, so it has its own timeout.
         it("scans a large remote log for a sparse filter in one call", async () => {
           const tailReads = { calls: 0, bytes: 0 };
           const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), { tailReads });
@@ -3879,7 +3917,7 @@ describe("BackgroundProcessManager", () => {
           // Each byte once, plus at most 3 per read to finish a character.
           expect(tailReads.bytes).toBeGreaterThanOrEqual(raw.length);
           expect(tailReads.bytes).toBeLessThanOrEqual(raw.length + 3 * tailReads.calls);
-        });
+        }, 30_000);
 
         // Blank lines are kept by filter_exclude: while it waits for a line that is not blank,
         // they stay in the window and come back with that line, as when a read held the whole log.
@@ -4032,15 +4070,14 @@ describe("BackgroundProcessManager", () => {
       if (!output1.success) return;
       // Status could be running or already exited depending on timing
 
-      // Wait for exit
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       const output2 = await manager.getOutput(result.processId);
       expect(output2.success).toBe(true);
       if (!output2.success) return;
       expect(output2.status).toBe("exited");
       expect(output2.exitCode).toBe(0);
-    });
+    }, 15_000);
 
     it("should filter output with regex when provided", async () => {
       const result = await manager.spawn(
@@ -4432,14 +4469,8 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // Wait for process to exit and exit_code to be written
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
-      // Check exit_code file exists and contains correct value
-      const exitCodePath = path.join(result.outputDir, "exit_code");
-      const exitCodeContent = await fs.readFile(exitCodePath, "utf-8");
-      expect(exitCodeContent.trim()).toBe("42");
-    });
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("42");
+    }, 15_000);
   });
 
   describe("hasOrphanedRunningBackgroundProcesses", () => {
@@ -4471,6 +4502,96 @@ describe("BackgroundProcessManager", () => {
 
     it("returns false when the workspace has no spawn records", async () => {
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("reports empty records as unknown instead of verified running processes", async () => {
+      const recordPath = path.join(workspaceDir, "empty-record");
+      await fs.mkdir(recordPath, { recursive: true });
+
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toMatchObject([
+        {
+          workspaceId: orphanWorkspaceId,
+          processId: "empty-record",
+          recordPath,
+          state: "unknown",
+        },
+      ]);
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+    });
+
+    it("reports live records even when an unknown record appears first", async () => {
+      await fs.mkdir(path.join(workspaceDir, "a-empty-record"), { recursive: true });
+      await writeSpawnRecord("z-survivor", { pid: process.pid, status: "running" });
+
+      const blockers = await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId);
+      expect(blockers).toHaveLength(2);
+      expect(blockers.find((blocker) => blocker.processId === "z-survivor")?.state).toBe("running");
+    });
+
+    it.each([process.ppid, process.pid])("ignores a record after PID reuse (%s)", async (pid) => {
+      if (process.platform !== "linux") return;
+      const recordPath = path.join(workspaceDir, "reused-pid");
+      await fs.mkdir(recordPath, { recursive: true });
+      await fs.writeFile(
+        path.join(recordPath, "meta.json"),
+        JSON.stringify({
+          pid,
+          status: "running",
+          identity: { ...getSelfIdentity(), birth: "linux-ticks:0" },
+        })
+      );
+
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toEqual([]);
+    });
+
+    it("keeps unknown PID-domain evidence unknown even when that host PID exists", async () => {
+      if (process.platform !== "linux") return;
+      await writeSpawnRecord(
+        "unknown-domain",
+        JSON.stringify({
+          pid: process.pid,
+          status: "running",
+          identity: { ...getSelfIdentity(), pidNs: null },
+        })
+      );
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toMatchObject([
+        { processId: "unknown-domain", state: "unknown" },
+      ]);
+    });
+
+    it("clears a record from a retired boot without probing an unrelated host PID", async () => {
+      if (process.platform !== "linux") return;
+      await writeSpawnRecord(
+        "retired-boot",
+        JSON.stringify({
+          pid: process.pid,
+          status: "running",
+          identity: { ...getSelfIdentity(), bootId: "previous-boot" },
+        })
+      );
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toEqual([]);
+    });
+
+    it("reports matching local identity as running", async () => {
+      // This backend owns no orphan command. Use another live process for the running case.
+      await writeSpawnRecord(
+        "matching-identity",
+        JSON.stringify({
+          pid: process.ppid,
+          status: "running",
+          identity: { ...getSelfIdentity(), birth: linuxBirth(process.ppid) },
+        })
+      );
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toMatchObject([
+        { processId: "matching-identity", state: "running" },
+      ]);
+    });
+
+    it("keeps an invalid process status unknown", async () => {
+      await writeSpawnRecord("invalid-status", { pid: process.pid, status: "invalid" });
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toMatchObject([
+        { processId: "invalid-status", state: "unknown" },
+      ]);
     });
 
     it("detects an untracked running record with a live PID", async () => {
@@ -4996,15 +5117,14 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // Wait for process to exit
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       const output = await manager.getOutput(result.processId, undefined, undefined, 0.5);
       expect(output.success).toBe(true);
       if (!output.success) return;
       expect(output.output).toContain("no newline at end");
       expect(output.status).not.toBe("running");
-    });
+    }, 15_000);
   });
 
   describe("polling detection", () => {
@@ -5072,8 +5192,7 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // Wait for process to exit
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await readExitCodeWhenWritten(result.outputDir)).toBe("0");
 
       // Make 3+ calls on exited process
       for (let i = 0; i < 4; i++) {
@@ -5083,6 +5202,6 @@ describe("BackgroundProcessManager", () => {
         // Should not get note since process is not running
         expect(output.note).toBeUndefined();
       }
-    });
+    }, 15_000);
   });
 });

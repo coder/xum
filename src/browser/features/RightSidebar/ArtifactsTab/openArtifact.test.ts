@@ -22,7 +22,7 @@ function recordOpens() {
   const onOpen = (event: Event) => {
     opens.push({
       detail: (event as CustomEvent<OpenDetail>).detail,
-      persisted: (({ scope, path, version }) => [scope, path, version])(readArtifactSelection(WS)),
+      persisted: (({ scope, path }) => [scope, path])(readArtifactSelection(WS)),
     });
   };
   const onToast = (event: Event) => {
@@ -57,22 +57,21 @@ describe("openArtifact", () => {
   });
 
   test("persists the selection before asking for the tab", () => {
-    openArtifact({ workspaceId: WS, path: "charts/q3.html", versionId: 3 });
+    openArtifact({ workspaceId: WS, path: "charts/q3.html" });
     expect(recorder?.opens).toEqual([
       {
-        detail: { workspaceId: WS, path: "charts/q3.html", versionId: 3 },
-        persisted: ["artifact", "charts/q3.html", 3],
+        detail: { workspaceId: WS, path: "charts/q3.html" },
+        persisted: ["artifact", "charts/q3.html"],
       },
     ]);
   });
 
-  test("a pinned file always opens live, dropping a previously selected version", () => {
-    writeArtifactSelection(WS, { version: 7 });
-    openArtifact({ workspaceId: WS, path: "src/app.ts", versionId: 2, pinned: true });
+  test("a pinned file opens with the pinned scope", () => {
+    openArtifact({ workspaceId: WS, path: "src/app.ts", pinned: true });
     expect(recorder?.opens).toEqual([
       {
         detail: { workspaceId: WS, path: "src/app.ts", pinned: true },
-        persisted: ["pinned", "src/app.ts", null],
+        persisted: ["pinned", "src/app.ts"],
       },
     ]);
   });
@@ -142,20 +141,33 @@ describe("artifact selection storage", () => {
     expect(readArtifactSelection("ws-0").path).toBeNull();
     expect(readArtifactSelection("ws-1").path).toBeNull();
     // Touching ws-2 again makes it the newest, so the next new workspace drops ws-3 instead.
-    writeArtifactSelection("ws-2", { version: 4 });
+    writeArtifactSelection("ws-2", { scope: "shelf" });
     writeArtifactSelection("ws-new", { path: "n.md" });
     const map = readPersistedState<Record<string, unknown>>(ARTIFACTS_SELECTION_KEY, {});
     expect(Object.keys(map)).toHaveLength(ARTIFACTS_SELECTION_MAX_WORKSPACES);
     expect(Object.keys(map).slice(-2)).toEqual(["ws-2", "ws-new"]);
     expect(readArtifactSelection("ws-3").path).toBeNull();
-    expect(readArtifactSelection("ws-2")).toEqual({ scope: "artifact", path: "f2.md", version: 4 });
+    expect(readArtifactSelection("ws-2")).toEqual({ scope: "shelf", path: "f2.md" });
   });
 
   test("malformed stored values read as the default selection", () => {
     window.localStorage.setItem(
       ARTIFACTS_SELECTION_KEY,
-      JSON.stringify({ [WS]: { scope: "evil", path: 3, version: -1 } })
+      JSON.stringify({ [WS]: { scope: "evil", path: 3 } })
     );
-    expect(readArtifactSelection(WS)).toEqual({ scope: "artifact", path: null, version: null });
+    expect(readArtifactSelection(WS)).toEqual({ scope: "artifact", path: null });
+  });
+
+  test("a value saved before versions were removed reads without its version", () => {
+    window.localStorage.setItem(
+      ARTIFACTS_SELECTION_KEY,
+      JSON.stringify({ [WS]: { scope: "artifact", path: "a.md", version: 3 } })
+    );
+    expect(readArtifactSelection(WS)).toEqual({ scope: "artifact", path: "a.md" });
+    writeArtifactSelection(WS, { path: "b.md" });
+    expect(readPersistedState<Record<string, unknown>>(ARTIFACTS_SELECTION_KEY, {})[WS]).toEqual({
+      scope: "artifact",
+      path: "b.md",
+    });
   });
 });

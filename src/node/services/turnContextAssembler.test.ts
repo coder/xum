@@ -22,6 +22,7 @@ import {
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { jsonSchema, tool, type Tool } from "ai";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
 import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
@@ -34,6 +35,7 @@ import { extractToolInstructionsFromSources } from "./systemMessage";
 
 import {
   assemblePromptPayload,
+  discoverAvailableSubagentsForToolContext,
   measureVolatileSystemSuffix,
   buildPlanInstructions,
   buildStreamSystemContext,
@@ -1603,7 +1605,7 @@ describe("assemblePromptPayload", () => {
       compactionEpoch: 1,
     });
     const notification = createFileChangeNotificationMessage([
-      { type: "edited_text_file", filename: "src/a.ts", snippet: "@@ -1 +1 @@" },
+      { type: "edited_text_file", filename: "src/a.ts" },
     ]);
     const turn = [
       summary,
@@ -2532,5 +2534,110 @@ describe("buildStreamSystemContext", () => {
     });
 
     expect(result.ancestorPlanFilePaths).toEqual([scoped("child-workspace")]);
+  });
+});
+
+describe("discoverAvailableSubagentsForToolContext plugin folder availability", () => {
+  const cfg: ProjectsConfig = { projects: new Map() };
+  const ROOT = "${CLAUDE_PLUGIN_ROOT}";
+
+  async function writeHostPlugin(home: string): Promise<void> {
+    const pluginDir = path.join(home, "plugins", "egm");
+    await fs.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "egm",
+      })
+    );
+    const agent = (body: string) => `---\nname: Reviewer\ndescription: Reviews\n---\n${body}\n`;
+    await fs.writeFile(path.join(pluginDir, "agents", "persona.md"), agent(`Read ${ROOT}/a.md`));
+    await fs.writeFile(path.join(pluginDir, "agents", "plain.md"), agent("No folder."));
+    // The ID of a built-in agent: where the plugin's copy cannot run, it still holds the ID.
+    await fs.writeFile(path.join(pluginDir, "agents", "explore.md"), agent(`Read ${ROOT}/e.md`));
+  }
+
+  async function listedSubagents(runtime: Runtime, workspacePath: string, home: string) {
+    return await discoverAvailableSubagentsForToolContext({
+      runtime,
+      workspacePath,
+      cfg,
+      roots: {
+        projectRoots: [],
+        globalRoot: path.join(home, "agents"),
+        globalPluginRoots: [path.join(home, "plugins")],
+      },
+      runtimeFactory,
+    });
+  }
+
+  async function listedIds(runtime: Runtime, workspacePath: string, home: string) {
+    const subagents = await listedSubagents(runtime, workspacePath, home);
+    return subagents.filter((agent) => agent.pluginName === "egm").map((agent) => agent.id);
+  }
+
+  test("a local workspace lists a plugin agent that names its plugin folder", async () => {
+    using home = new DisposableTempDir("task-list-folder-local");
+    await writeHostPlugin(home.path);
+    expect((await listedIds(new LocalRuntime(home.path), home.path, home.path)).sort()).toEqual([
+      "explore",
+      "persona",
+      "plain",
+    ]);
+  });
+
+  test("an unavailable plugin agent hides a lower-precedence agent with the same ID from the list", async () => {
+    using home = new DisposableTempDir("task-list-folder-hides");
+    await writeHostPlugin(home.path);
+    await fs.mkdir(path.join(home.path, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(home.path, "agents", "twin.md"),
+      "---\nname: Global twin\nbase: exec\nsubagent:\n  runnable: true\n---\nGlobal twin.\n"
+    );
+    await fs.writeFile(
+      path.join(home.path, "plugins", "egm", "agents", "twin.md"),
+      `---\nname: Plugin twin\n---\nRead ${ROOT}/twin.md\n`
+    );
+    const local = new LocalRuntime(home.path);
+    // A host runtime that reports itself as a devcontainer: it reads the host files, but bash runs
+    // in a container, so the plugin agent is unreachable there, as it is on SSH.
+    const devcontainer = Object.create(local, { location: { value: "devcontainer" } }) as Runtime;
+    // A project plugin outranks a global agent.
+    const roots = {
+      projectRoots: [],
+      projectPluginRoots: [path.join(home.path, "plugins")],
+      globalRoot: path.join(home.path, "agents"),
+    };
+    const twinScopes = async (runtime: Runtime) =>
+      (
+        await discoverAvailableSubagentsForToolContext({
+          runtime,
+          workspacePath: home.path,
+          cfg,
+          roots,
+          runtimeFactory,
+        })
+      )
+        .filter((agent) => agent.id === "twin")
+        .map((agent) => agent.scope);
+
+    expect(await twinScopes(local)).toEqual(["project"]);
+    // The unreachable plugin agent holds the ID: the global agent is not offered in its place.
+    expect(await twinScopes(devcontainer)).toEqual([]);
+  });
+
+  test("a devcontainer workspace leaves out the agent that names a folder it cannot read", async () => {
+    using home = new DisposableTempDir("task-list-folder-devcontainer");
+    await writeHostPlugin(home.path);
+    const devcontainer = new DevcontainerRuntime({
+      srcBaseDir: "/host/src",
+      configPath: ".devcontainer/devcontainer.json",
+    });
+    // Without the filter, resolveAgentFrontmatter's catch would keep the refused agent's descriptor.
+    expect(await listedIds(devcontainer, home.path, home.path)).toEqual(["plain"]);
+    // The unavailable plugin `explore` holds its ID, so the list shows no `explore` at all.
+    const subagents = await listedSubagents(devcontainer, home.path, home.path);
+    expect(subagents.some((agent) => agent.id === "explore")).toBe(false);
   });
 });

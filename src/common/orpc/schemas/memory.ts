@@ -91,6 +91,10 @@ export const MemoryConsolidationRecordSchema = z.object({
   ops: z.array(MemoryConsolidationOpSchema),
   /** Token cost of the run (absent for records persisted before telemetry). */
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
+  /** USD the run cost, priced from what each step reported. Optional so older records parse. */
+  spentUsd: z.number().nonnegative().optional(),
+  /** Why the run ended before the model finished: the cost ceiling stopped it. */
+  note: z.string().optional(),
 });
 export type MemoryConsolidationRecordPayload = z.infer<typeof MemoryConsolidationRecordSchema>;
 
@@ -105,17 +109,85 @@ export const CompactionCompletionMetadataSchema = z.object({
   preservedTailMessageCount: z.number().optional(),
 });
 
+/**
+ * A persisted count that feeds a limit: whole and not negative. A negative `budgetUsed` would add
+ * to the epoch's edit budget instead of spending it (-100 allowed 108 edits), a negative
+ * `attemptCount` would widen `HARVEST_MAX_ATTEMPTS` the same way, and a negative or fractional
+ * chunk cursor starts the run at a chunk that does not exist. A record that fails this is dropped
+ * on load, like any invalid record, so the epoch restarts with a fresh budget that is still
+ * bounded by the limit. The record's other fields cannot be trusted either.
+ */
+const PersistedCountSchema = z.number().int().nonnegative();
+
+/**
+ * One analyzer run over a closed or open compaction epoch (the "harvest"). The two candidate
+ * counts keep their names and stay required so older binaries still parse the record: they hold
+ * the memory edits that landed and the ones the memory tool rejected. `nextChunk` and `ops` are
+ * optional for the same reason, and for records written before the analyzer.
+ */
 export const MemoryHarvestRecordSchema = z.object({
   status: z.enum(["pending", "completed", "failed"]),
   startedAt: z.number(),
+  /**
+   * When the run last finished a chunk. A pending record counts as stale a timeout after this, not
+   * after `startedAt`, so a run of many chunks is not stale while its chunks keep finishing.
+   * Optional so older binaries parse the record and for records that never reached a chunk.
+   */
+  progressAt: z.number().optional(),
   completedAt: z.number().optional(),
-  attemptCount: z.number(),
+  attemptCount: PersistedCountSchema,
   boundaryKey: z.string(),
   compactionEpoch: z.number(),
   acceptedCandidates: z.number(),
   skippedCandidates: z.number(),
+  /** First transcript chunk not yet analyzed; a retry resumes here. */
+  nextChunk: PersistedCountSchema.optional(),
+  /** Every memory command the analyzer ran for this epoch, across attempts. */
+  ops: z.array(MemoryConsolidationOpSchema).optional(),
+  /**
+   * Mutations the epoch's budget has spent, dispatch failures included, which `ops` alone
+   * undercounts. A retry resumes the budget from it, and a new record of the same epoch (an
+   * archive after new rows, the compaction that closes it) starts from the most spent record's.
+   * Optional so older binaries parse the record.
+   */
+  budgetUsed: PersistedCountSchema.optional(),
+  /** How many of the last `ops` came from the chunk `nextChunk`, which no attempt finished. */
+  nextChunkOps: PersistedCountSchema.optional(),
+  /**
+   * The row of this epoch an earlier run (an archive, or the compaction that closed the epoch under
+   * an archive's snapshot) had analyzed up to when the first attempt's analyzer turn began (null:
+   * none), so the run reads the rows after it. A retry reuses it instead of looking again: a run
+   * that completes later must not move the rows under the saved chunk cursor. Absent before an
+   * attempt's turn began, and in older records.
+   */
+  analyzedFloorRowId: z.string().nullish(),
   error: z.string().optional(),
+  /**
+   * Why a completed run did not read every chunk: the epoch's edit budget ran out, so the model
+   * calls of the remaining chunks were skipped. Optional so older binaries parse the record.
+   */
+  note: z.string().optional(),
+  /**
+   * The newest row of the epoch the run read completely (null: none). It is behind the newest row
+   * when the run skipped chunks for its budget: the floor of a later run is this row, not the
+   * newest one. A failed run records the last chunk it read cleanly, whose edits landed. Absent in
+   * older records, which read up to the row their key names (a failed one read nothing known; a
+   * closed epoch's key is its summary, no row, so such a record names none).
+   */
+  readThroughRowId: z.string().nullish(),
+  /**
+   * Tokens of every chunk stream that finished cleanly, across attempts. A pending or failed
+   * record carries them so the retry that completes the epoch adds to them. Optional so older
+   * binaries parse the record.
+   */
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
+  /**
+   * USD the epoch's job has cost across its attempts, priced from what each step reported. A retry
+   * continues from it, so it feeds the cost ceiling like a count feeds a limit: not negative (see
+   * PersistedCountSchema). A job the ceiling stopped completes with a `note` that says so.
+   * Optional so older binaries parse the record.
+   */
+  spentUsd: z.number().nonnegative().optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),
 });
 export type MemoryHarvestRecordPayload = z.infer<typeof MemoryHarvestRecordSchema>;

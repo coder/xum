@@ -26,6 +26,8 @@ import {
 } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useAPI, liveClientOf, type APIClient } from "@/browser/contexts/API";
+import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
+import { confirmAndRemoveWorkspace } from "@/browser/utils/confirmAndRemoveWorkspace";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import {
@@ -1471,6 +1473,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const [isTouchReviewImmersive, setIsTouchReviewImmersive] = React.useState(false);
 
   // API for reading config and managing terminal sessions.
+  const { confirm } = useConfirmDialog();
   const apiState = useAPI();
   const api = apiState.api;
   const liveApi = liveClientOf(apiState);
@@ -2243,8 +2246,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       }
       if (api == null) return;
       closingSideChatTabsRef.current.set(tab, holdsFocus(sidebarContainerRef.current));
-      api.workspace
-        .remove({ workspaceId: id, options: { force: true } })
+      confirmAndRemoveWorkspace({
+        removeWorkspace: (workspaceId, options) => api.workspace.remove({ workspaceId, options }),
+        confirm,
+        workspaceId: id,
+        options: { force: true },
+      })
         .then((result) => {
           if (!result.success) throw new Error(result.error);
           closeSidebarIfLastTabRef.current(tab);
@@ -2264,6 +2271,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       allWorkspaceMetadata,
       api,
       closeSidebarIfLastTabRef,
+      confirm,
       setLayout,
       workspaceId,
       workspaceMetadataLoaded,

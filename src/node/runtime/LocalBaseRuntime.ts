@@ -39,6 +39,11 @@ import { buildShellExport } from "./shellEnv";
 import { hostChildEnv, mergeChildEnv, sanitizeXumChildEnv } from "./childProcessEnv";
 import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import { agentCgroupEnrollmentLineForProject } from "./agentCgroupEnrollment";
+import {
+  getSelfIdentity,
+  linuxBirth,
+  type HolderEvidence,
+} from "@/node/utils/concurrency/processLiveness";
 
 /**
  * Acquire a regular file for ReadFileOptions.requireRegularFile.
@@ -195,6 +200,12 @@ export function localRuntimeTempRoot(): string {
   return process.platform === "win32" ? (process.env.TEMP ?? "C:\\Temp") : "/tmp";
 }
 
+/** Capture host-local evidence without substituting the owner's birth. */
+export function getLocalProcessEvidence(pid: number | undefined): HolderEvidence | undefined {
+  if (pid === undefined) return undefined;
+  return { pid, identity: { ...getSelfIdentity(), birth: linuxBirth(pid) } };
+}
+
 function throwIfAbortedBeforeExec(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw new RuntimeErrorClass("Operation aborted before execution", "exec");
@@ -309,6 +320,8 @@ export abstract class LocalBaseRuntime implements Runtime {
       windowsHide: true,
     });
 
+    const localProcess = getLocalProcessEvidence(childProcess.pid);
+
     // Wrap in DisposableProcess for automatic cleanup
     const disposable = new DisposableProcess(childProcess);
 
@@ -404,7 +417,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       void exitCode.catch(() => undefined).finally(() => clearTimeout(timeoutHandle));
     }
 
-    return { stdout, stderr, stdin, exitCode, duration };
+    return { stdout, stderr, stdin, exitCode, duration, localProcess };
   }
 
   readFile(

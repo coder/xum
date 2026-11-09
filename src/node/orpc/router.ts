@@ -67,10 +67,6 @@ import {
   revokeMcpAppViewDomains,
 } from "@/node/services/mcpAppsOperations";
 import {
-  listArtifactVersions,
-  readArtifactVersion,
-} from "@/node/services/artifactVersionsOperations";
-import {
   listPinnedFiles,
   pinFile,
   readPinnedFile,
@@ -1771,14 +1767,6 @@ export const router = (authToken?: string) => {
         .input(schemas.artifacts.capabilities.input)
         .output(schemas.artifacts.capabilities.output)
         .handler(({ context, input }) => getArtifactsCapabilities(context, input)),
-      listVersions: t
-        .input(schemas.artifacts.listVersions.input)
-        .output(schemas.artifacts.listVersions.output)
-        .handler(({ context, input }) => listArtifactVersions(context, input)),
-      readVersion: t
-        .input(schemas.artifacts.readVersion.input)
-        .output(schemas.artifacts.readVersion.output)
-        .handler(({ context, input }) => readArtifactVersion(context, input)),
       listPinned: t
         .input(schemas.artifacts.listPinned.input)
         .output(schemas.artifacts.listPinned.output)

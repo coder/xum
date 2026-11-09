@@ -21,6 +21,7 @@ import { chromium, type Browser } from "playwright";
 import { PHONE_CHROME_JSON } from "../../src/common/staticWorkspaceView/phoneChrome.generated";
 import { PHONE_CHROME_WIDTHS } from "../../src/common/staticWorkspaceView/phoneChrome";
 import { writeNeutralSeed } from "./neutralSeed";
+import { newServerToken, serverTokenEnv, withServerToken } from "./serverToken";
 
 const OUT = path.join(
   import.meta.dirname,
@@ -33,9 +34,16 @@ async function startServer(root: string, home: string, log: string) {
   await once(probe, "listening");
   const { port } = probe.address() as net.AddressInfo;
   probe.close();
-  const args = `dist/cli/index.js server --no-auth --host 127.0.0.1 --port ${port}`.split(" ");
+  const args = `dist/cli/index.js server --host 127.0.0.1 --port ${port}`.split(" ");
   const fd = fs.openSync(log, "w");
-  const env = { PATH: process.env.PATH, HOME: home, XUM_ROOT: root, XUM_DISABLE_TELEMETRY: "1" };
+  const token = newServerToken();
+  const env = {
+    PATH: process.env.PATH,
+    HOME: home,
+    XUM_ROOT: root,
+    XUM_DISABLE_TELEMETRY: "1",
+    ...serverTokenEnv(token),
+  };
   const server = spawn("node", args, {
     cwd: path.join(import.meta.dirname, "../.."),
     env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null" },
@@ -59,7 +67,7 @@ async function startServer(root: string, home: string, log: string) {
     const tail = fs.readFileSync(log, "utf8").slice(-2000); // the temp folder goes next
     throw new Error(`xum server did not start. Its log ends with:\n${tail}`);
   }
-  return { origin, stop };
+  return { origin, token, stop };
 }
 
 /** Runs in the page: the skeleton of the live DOM. Self-contained, Playwright serializes it. */
@@ -175,7 +183,7 @@ async function main() {
   try {
     const seed = writeNeutralSeed(path.join(tmp, "seed"));
     server = await startServer(seed.root, seed.home, path.join(tmp, "server.log"));
-    const url = `${server.origin}/workspace/${seed.workspaceId}`;
+    const url = withServerToken(`${server.origin}/workspace/${seed.workspaceId}`, server.token);
     browser = await chromium.launch({ executablePath: values.chrome });
     for (const width of PHONE_CHROME_WIDTHS.checked)
       trees.push(await captureAt(browser, url, width));

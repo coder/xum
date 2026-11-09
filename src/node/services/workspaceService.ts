@@ -304,6 +304,7 @@ import type {
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
   WorkspaceRemoveWarning,
+  WorkspaceBackgroundProcessBlocker,
 } from "@/common/types/workspace";
 import { type DynamicToolPart, isDynamicToolPart } from "@/common/types/toolParts";
 import {
@@ -5371,6 +5372,9 @@ export class WorkspaceService
         this.sendPreflight.hasManualSessionInvisiblePreflight(workspaceId),
       isStopInProgress: () =>
         this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
+      isWorkspaceTurnStopped: async (correlation) =>
+        (await this.agentTaskIntegration?.isWorkspaceTurnStopped(workspaceId, correlation)) ===
+        true,
       getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
       onBeforeTurnCompletion: async () => {
         await this.agentTaskIntegration?.acknowledgeAgentReports(workspaceId);
@@ -7333,11 +7337,13 @@ export class WorkspaceService
     options?: {
       beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
       acknowledgedDescendantIds?: string[];
+      acknowledgedUnknownProcessRecords?: string[];
     }
   ): Promise<
     Result<void> & {
       descendants?: WorkspaceRemovalDescendant[];
       warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
   > {
     return await this.removeLocked(workspaceId, force, options);
@@ -7346,33 +7352,42 @@ export class WorkspaceService
   private async removeLocked(
     workspaceId: string,
     force: boolean,
-    options?: {
+    options: {
       beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
       acknowledgedDescendantIds?: string[];
-    }
+      acknowledgedUnknownProcessRecords?: string[];
+    } = {}
   ): Promise<
     Result<void> & {
       descendants?: WorkspaceRemovalDescendant[];
       warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
   > {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
       const operation = async () => {
-        const decision = options?.beforeRemove == null ? true : await options.beforeRemove();
+        const decision = options.beforeRemove == null ? true : await options.beforeRemove();
         if (decision === false) {
           return Ok(undefined);
         }
         const binding = decision === true ? undefined : decision;
-        const failure = (error: string) => {
+        const failure = (
+          error: string,
+          backgroundProcesses?: WorkspaceBackgroundProcessBlocker[]
+        ) => {
           const descendants =
             this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId);
-          return { ...Err(error), ...(descendants?.length ? { descendants } : {}) };
+          return {
+            ...Err(error),
+            ...(descendants?.length ? { descendants } : {}),
+            backgroundProcesses,
+          };
         };
         let releaseTreeGate: (() => Promise<void>) | undefined;
         // What the acknowledged descendants' forced removals left behind (#5143).
         let descendantWarnings: WorkspaceRemoveWarning[] = [];
         try {
-          if (options?.acknowledgedDescendantIds != null) {
+          if (options.acknowledgedDescendantIds != null) {
             if (this.agentTaskIntegration == null) {
               return failure("Task lifecycle service is unavailable.");
             }
@@ -7389,9 +7404,11 @@ export class WorkspaceService
             ]);
             const gate = await this.acquireStructuralMutationGate(
               [...gatedIds],
-              REMOVAL_OWN_ACTIVITY_POLICY
+              REMOVAL_OWN_ACTIVITY_POLICY,
+              options.acknowledgedUnknownProcessRecords
             );
-            if (!gate.success) return failure(`Cannot remove workspace: ${gate.error}`);
+            if (!gate.success)
+              return failure(`Cannot remove workspace: ${gate.error}`, gate.backgroundProcesses);
             releaseTreeGate = gate.data;
             const descendantsResult =
               await this.agentTaskIntegration.removeAcknowledgedDescendantsWhileTaskTreeLocked(
@@ -7406,9 +7423,11 @@ export class WorkspaceService
             workspaceId,
             force,
             binding,
-            releaseTreeGate != null ? { mutationGateHeld: true } : undefined
+            releaseTreeGate != null
+              ? { mutationGateHeld: true }
+              : { acknowledgedUnknownProcessRecords: options.acknowledgedUnknownProcessRecords }
           );
-          if (!result.success) return failure(result.error);
+          if (!result.success) return failure(result.error, result.backgroundProcesses);
           const warnings = [...descendantWarnings, ...(result.warnings ?? [])];
           return { ...result, ...(warnings.length > 0 ? { warnings } : {}) };
         } catch (error) {
@@ -7423,7 +7442,7 @@ export class WorkspaceService
         }
       };
       // Defer the project-list refresh until the complete descendant cascade ends.
-      return options?.acknowledgedDescendantIds != null
+      return options.acknowledgedDescendantIds != null
         ? await this.config.withDeferredChangeNotifications(operation)
         : await operation();
     });
@@ -7439,7 +7458,12 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     return await this.removeUnlocked(workspaceId, force, binding, options);
   }
 
@@ -7519,7 +7543,12 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     const result = await this.removeSingleWorkspaceUnlocked(workspaceId, force, binding, options);
     // Both removal entrypoints must discard side chats, but only after the parent is gone.
     // Keep this outside the parent's checkout locks and do not reacquire a task-tree lock:
@@ -7535,11 +7564,17 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Only the checkout options reach the runtime.
-    const { mutationGateHeld, ...checkoutOptions } = options ?? {};
-    const runtimeOptions = mutationGateHeld === undefined ? options : checkoutOptions;
+    const { mutationGateHeld, acknowledgedUnknownProcessRecords, ...checkoutOptions } =
+      options ?? {};
+    const runtimeOptions = Object.keys(checkoutOptions).length > 0 ? checkoutOptions : undefined;
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -7603,9 +7638,14 @@ export class WorkspaceService
       if (mutationGateHeld !== true) {
         const gate = await this.acquireStructuralMutationGate(
           workspaceId,
-          REMOVAL_OWN_ACTIVITY_POLICY
+          REMOVAL_OWN_ACTIVITY_POLICY,
+          acknowledgedUnknownProcessRecords
         );
-        if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
+        if (!gate.success)
+          return {
+            ...Err(`Cannot remove workspace: ${gate.error}`),
+            backgroundProcesses: gate.backgroundProcesses,
+          };
         releaseMutationGate = gate.data;
       }
       // #4914: the marker, the deregistration and other backends' task commits all find the row
@@ -11417,8 +11457,13 @@ export class WorkspaceService
       // "refuse": also this backend's tracked background processes; "allow": only processes this
       // backend does not track (another backend's, or survivors of a crashed one).
       backgroundProcesses: "refuse" | "allow";
+    },
+    acknowledgedUnknownProcessRecords?: readonly string[]
+  ): Promise<
+    Result<() => Promise<void>> & {
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
-  ): Promise<Result<() => Promise<void>>> {
+  > {
     const targets = new Set(typeof workspaceId === "string" ? [workspaceId] : workspaceId);
     const workspaceIds = [...targets];
     const config = this.config.loadConfigOrDefault();
@@ -11438,15 +11483,24 @@ export class WorkspaceService
     try {
       release = await workspaceUseLeasesFor(this.config).acquireMutationGate(workspaceIds, {
         ignoreOwnKinds: new Map([...targets].map((id) => [id, own.ignoreKinds])),
-        hasRunningBackgroundProcesses: (id) =>
-          own.backgroundProcesses === "refuse" || !targets.has(id)
-            ? this.hasRunningBackgroundBashProcesses(id)
-            : this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(id, {
-                extraRecordDirs: this.extraBgRecordDirsForWorkspace(id),
-              }),
+        hasRunningBackgroundProcesses: (id) => this.hasRunningBackgroundBashProcesses(id),
+        ...(own.backgroundProcesses === "allow"
+          ? {
+              getBackgroundProcessBlockers: (id: string) =>
+                this.getRemovalBackgroundProcessBlockers(
+                  id,
+                  targets,
+                  acknowledgedUnknownProcessRecords
+                ),
+            }
+          : {}),
       });
     } catch (error) {
-      if (error instanceof WorkspaceBusyError) return Err(error.message);
+      if (error instanceof WorkspaceBusyError)
+        return {
+          ...Err(error.message),
+          ...(error.backgroundProcesses ? { backgroundProcesses: error.backgroundProcesses } : {}),
+        };
       throw error;
     }
     // #4909: ignoring this backend's own terminal/editor leases must not let the mutation race an
@@ -11469,6 +11523,31 @@ export class WorkspaceService
       }
     }
     return Ok(release);
+  }
+
+  private async getRemovalBackgroundProcessBlockers(
+    workspaceId: string,
+    targets: ReadonlySet<string>,
+    acknowledgedUnknownProcessRecords?: readonly string[]
+  ): Promise<WorkspaceBackgroundProcessBlocker[]> {
+    // Shared-checkout siblings are not removal targets. Their tracked processes still block removal.
+    if (!targets.has(workspaceId) && (await this.hasRunningBackgroundBashProcesses(workspaceId))) {
+      throw new WorkspaceBusyError(
+        `Workspace ${workspaceId} has a running background process; stop it and try again.`
+      );
+    }
+    const blockers = await this.backgroundProcessManager.getOrphanedBackgroundProcessBlockers(
+      workspaceId,
+      { extraRecordDirs: this.extraBgRecordDirsForWorkspace(workspaceId) }
+    );
+    const acknowledged = new Set(acknowledgedUnknownProcessRecords);
+    // Force never authorizes this bypass. Consent applies only to exact unknown records in removal targets.
+    return blockers.filter(
+      (record) =>
+        record.state !== "unknown" ||
+        !targets.has(workspaceId) ||
+        !acknowledged.has(record.recordPath)
+    );
   }
 
   /**
@@ -20996,6 +21075,19 @@ export class WorkspaceService
   /** Cancel the workspace session's scheduled auto-retry of this goal's automatic turn. */
   abandonGoalAutoRetry(workspaceId: string, goalId: string): void {
     this.sessions.get(workspaceId)?.abandonGoalAutoRetry(goalId);
+  }
+
+  abandonAutoRetry(workspaceId: string, reason: string): void {
+    // Stop paths call this right before their stream stop: a throw must not skip that stop.
+    // A session still in its startup recovery is not registered yet, and that recovery can arm
+    // the stopped turn again.
+    try {
+      (
+        this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
+      )?.abandonAutoRetry(reason);
+    } catch (error: unknown) {
+      log.warn("abandonAutoRetry failed", { workspaceId, reason, error: getErrorMessage(error) });
+    }
   }
 
   async getGoalContinuationKickoffSendOptions(

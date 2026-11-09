@@ -11,6 +11,11 @@ import type { Config } from "@/node/config";
 import { TaskHandleStore } from "@/node/services/taskHandleStore";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
+import {
+  isolateHostHome,
+  type IsolatedHostHome,
+} from "@/node/services/hostHomeIsolation.testHarness";
+import { __closeFileSinkForTests, __resetFileSinkForTests } from "@/node/services/log";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -49,13 +54,47 @@ import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks"
  *   beforeEach(async () => { rootDir = await createTaskServiceTestRoot(); });
  *   afterEach(async () => { await removeTaskServiceTestRoot(rootDir); });
  * so no mutable state is shared across files; helpers below take the root as a parameter.
+ *
+ * The root also isolates the runtime user's home (HOME, USERPROFILE, XUM_ROOT and os.homedir())
+ * from creation to removal. Every agent-task reservation resolves its agent definition, which
+ * scans the global plugin roots (<XUM_ROOT>/plugins and ~/.agents/plugins). Without the isolation
+ * these tests read, and wait on, the plugins installed on the machine that runs them. At most one
+ * root is live at a time: the next root's creation ends the isolation of a root whose removal was
+ * skipped, so the os.homedir() spy never nests, and removing a root ends only its own isolation.
+ *
+ * The os.homedir() override is a spy, so Bun's global mock.restore() also ends it. HOME and
+ * XUM_ROOT stay isolated, but "~" expansion falls back to the real home until the root is removed.
  */
+let isolation: { rootDir: string; home: IsolatedHostHome } | undefined;
+
+async function releaseIsolation(): Promise<void> {
+  if (isolation === undefined) return;
+  const { home } = isolation;
+  isolation = undefined;
+  // The log file sink opens inside the isolated home. Wait until its descriptor is closed before
+  // that folder is deleted, because Windows cannot delete an open file. The sink stays closed
+  // while the folder goes, so a late log line cannot reopen it. Then the next log line opens it
+  // under the restored home.
+  await __closeFileSinkForTests();
+  home.restore();
+  __resetFileSinkForTests();
+}
+
 export async function createTaskServiceTestRoot(): Promise<string> {
-  return await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-"));
+  await releaseIsolation();
+  const rootDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-"));
+  isolation = { rootDir, home: isolateHostHome("task-service-host-home") };
+  // A log sink that an earlier test opened under the host's home would keep writing there.
+  __resetFileSinkForTests();
+  return rootDir;
 }
 
 export async function removeTaskServiceTestRoot(rootDir: string): Promise<void> {
-  await fsPromises.rm(rootDir, { recursive: true, force: true });
+  try {
+    await fsPromises.rm(rootDir, { recursive: true, force: true });
+  } finally {
+    if (isolation?.rootDir === rootDir) await releaseIsolation();
+  }
 }
 
 export async function collectFullHistory(service: HistoryService, workspaceId: string) {

@@ -68,6 +68,7 @@ import {
   type RuntimeMode,
 } from "@/common/types/runtime";
 import {
+  BASH_DEFAULT_TIMEOUT_SECS,
   BASH_HARD_MAX_LINES,
   BASH_MAX_LINE_BYTES,
   BASH_MAX_TOTAL_BYTES,
@@ -76,6 +77,10 @@ import {
 } from "@/common/constants/toolLimits";
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
 import { getDefaultBashDisplayName } from "@/common/utils/tools/bashDisplayName";
+import {
+  describeBrokenBashCommandAlias,
+  MEMORY_TOOL_COMMANDS,
+} from "@/common/utils/tools/bashCommandAlias";
 import { STATUS_PAGE_AGENT_MAX_UPDATE_CHARS } from "@/common/constants/artifacts";
 import {
   ConfigMutationPathSchema,
@@ -2089,22 +2094,18 @@ const AttachFileToolSuccessResultSchema = z
 
 /**
  * Result of the `artifact` tool (Artifacts M4). Deliberately tiny: the chat card renders from it
- * alone, so it survives compaction and older-history paging.
+ * alone, so it survives compaction and older-history paging. Not strict: results stored before
+ * versions were removed also carry `id` and `version`, and their card must still render.
  */
-export const ArtifactToolSuccessResultSchema = z
-  .object({
-    success: z.literal(true),
-    /** Stable artifact id (versions key), see getArtifactId. */
-    id: z.string(),
-    version: z.number().int().positive(),
-    /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
-    path: z.string(),
-    bytes: z.number(),
-    kind: ArtifactKindSchema,
-    title: z.string(),
-    pin: z.enum(["project", "global"]).nullable(),
-  })
-  .strict();
+export const ArtifactToolSuccessResultSchema = z.object({
+  success: z.literal(true),
+  /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
+  path: z.string(),
+  bytes: z.number(),
+  kind: ArtifactKindSchema,
+  title: z.string(),
+  pin: z.enum(["project", "global"]).nullable(),
+});
 export type ArtifactToolSuccessResult = z.infer<typeof ArtifactToolSuccessResultSchema>;
 
 export const ArtifactToolResultSchema = z.union([
@@ -2326,6 +2327,52 @@ function compactTableSchema(createTableSql: string): string {
   return `${match[1]}(${columns.join(", ")})`;
 }
 
+const BashToolArgsObjectSchema = z.object({
+  script: z.string().describe("Bash script to run"),
+  model_intent: z
+    .string()
+    .nullish()
+    .describe(
+      "User-facing purpose shown in collapsed chat: a present-participle phrase under 100 chars (e.g. 'Running the unit tests'), without the command or duration, which Xum shows."
+    ),
+  // The handler applies the default, not zod: a schema-level default would give every
+  // background dev server a timed death, and it must live until stopped. Rejecting an
+  // omitted value instead costs a model step that open-weight models pay constantly.
+  timeout_secs: z
+    .number()
+    .positive()
+    .nullish()
+    .describe(
+      "Seconds: foreground kill deadline, or background max lifetime. " +
+        // Scoped to background starts on purpose: a foreground command the user sends to
+        // background keeps the deadline it already had, so this must not promise an open
+        // lifetime for every background process.
+        `Omitted: foreground gets a ${BASH_DEFAULT_TIMEOUT_SECS}s kill deadline; a command started in the background has no kill deadline. ` +
+        "Start small; raise on retry."
+    ),
+  run_in_background: z
+    .boolean()
+    .nullish()
+    .default(false)
+    .describe(
+      "Run without blocking, for commands over ~5s (builds, dev servers, watchers); not for quick, interactive (no stdin), or real-time-output commands. " +
+        "Returns a taskId (bash:<processId>) at once: task_await reads new output, task_stop stops it, task_list lists it. " +
+        "Lives until timeout_secs, termination, or workspace removal. Without a monitor it never wakes you. " +
+        "Do not task_await it in the same parallel batch as this call, and do not poll task_await while it runs; await only when you need the output."
+    ),
+  monitor: BashMonitorSchema.nullish().describe(
+    "Background only. Each complete output line matching filter wakes this workspace, even after your response; it also wakes once when the process settles (exit, kill, timeout) unless wake_on_exit is false, max_events retired it, or it was cancelled (task_stop). Terminate monitored tasks you no longer need before finishing."
+  ),
+  display_name: z.string().describe("Human-readable process name, e.g. 'Dev Server'"),
+});
+
+// The keys a bash call may carry: its schema fields plus the aliases the preprocess renames.
+const BASH_ACCEPTED_KEYS: ReadonlySet<string> = new Set([
+  ...Object.keys(BashToolArgsObjectSchema.shape),
+  "command",
+  "description",
+]);
+
 export const TOOL_DEFINITIONS = {
   bash: {
     resultSchema: BashToolResultSchema,
@@ -2334,7 +2381,7 @@ export const TOOL_DEFINITIONS = {
       "Large outputs may be auto-filtered; the result's note says what was kept and where the full output was saved. " +
       "On Windows this is Git Bash: discard output with `>/dev/null`, not `>nul`.",
     schema: z.preprocess(
-      (value) => {
+      (value, ctx) => {
         // Compatibility shims for models that emit alias fields:
         // - some models emit `command` instead of `script`
         // - DeepSeek v4 emits `description` instead of `display_name`
@@ -2344,54 +2391,29 @@ export const TOOL_DEFINITIONS = {
         if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
 
         let obj = value as Record<string, unknown>;
+        const brokenAlias = describeBrokenBashCommandAlias(obj, BASH_ACCEPTED_KEYS);
+        if (brokenAlias != null) {
+          ctx.addIssue({ code: "custom", message: brokenAlias, path: ["command"] });
+          return obj;
+        }
         obj = renameAliasField(obj, "command", "script");
         obj = renameAliasField(obj, "description", "display_name");
         // Some models (mostly Haiku 5.5) omit the required display_name.
         // Rejecting the call costs a model step and a retry, so fill it here
         // while the model-visible schema keeps it required. The script-derived
         // name is the same one bash.ts already falls back to.
-        // timeout_secs gets no default on purpose: a short default would start a
-        // long install or build and kill it partway, while a rejection runs
-        // nothing and the model retries with a timeout.
         if (typeof obj.display_name !== "string" && typeof obj.script === "string") {
           obj = { ...obj, display_name: getDefaultBashDisplayName(obj.script) };
         }
         return obj;
       },
-      z
-        .object({
-          script: z.string().describe("Bash script to run"),
-          model_intent: z
-            .string()
-            .nullish()
-            .describe(
-              "User-facing purpose shown in collapsed chat: a present-participle phrase under 100 chars (e.g. 'Running the unit tests'), without the command or duration, which Xum shows."
-            ),
-          timeout_secs: z
-            .number()
-            .positive()
-            .describe(
-              "Seconds: foreground kill deadline, or background max lifetime. Start small; raise on retry."
-            ),
-          run_in_background: z
-            .boolean()
-            .nullish()
-            .default(false)
-            .describe(
-              "Run without blocking, for commands over ~5s (builds, dev servers, watchers); not for quick, interactive (no stdin), or real-time-output commands. " +
-                "Returns a taskId (bash:<processId>) at once: task_await reads new output, task_stop stops it, task_list lists it. " +
-                "Lives until timeout_secs, termination, or workspace removal. Without a monitor it never wakes you. " +
-                "Do not task_await it in the same parallel batch as this call, and do not poll task_await while it runs; await only when you need the output."
-            ),
-          monitor: BashMonitorSchema.nullish().describe(
-            "Background only. Each complete output line matching filter wakes this workspace, even after your response; it also wakes once when the process settles (exit, kill, timeout) unless wake_on_exit is false, max_events retired it, or it was cancelled (task_stop). Terminate monitored tasks you no longer need before finishing."
-          ),
-          display_name: z.string().describe("Human-readable process name, e.g. 'Dev Server'"),
-        })
-        .refine((args) => args.monitor == null || args.run_in_background === true, {
+      BashToolArgsObjectSchema.refine(
+        (args) => args.monitor == null || args.run_in_background === true,
+        {
           path: ["monitor"],
           message: "monitor requires run_in_background=true",
-        })
+        }
+      )
     ),
   },
   file_read: {
@@ -2520,9 +2542,7 @@ export const TOOL_DEFINITIONS = {
         return obj;
       },
       z.object({
-        command: z
-          .enum(["view", "create", "str_replace", "insert", "delete", "rename"])
-          .describe("The memory operation to perform."),
+        command: z.enum(MEMORY_TOOL_COMMANDS).describe("The memory operation to perform."),
         path: z
           .string()
           .nullish()
@@ -3134,14 +3154,14 @@ export const TOOL_DEFINITIONS = {
   artifact: {
     resultSchema: ArtifactToolResultSchema,
     description:
-      "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ as a labeled version in the user's Artifacts tab, shown as a chat card. " +
-      "Republishing a path adds a version (identical bytes add none); unpublished changes add no version.",
+      "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ in the user's Artifacts tab, shown as a chat card. " +
+      "The tab shows the file as it is now, so edit it in place; publish again to show a new card or to change its title, kind or pin.",
     schema: z
       .object({
         path: z.string().describe("Relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it."),
-        title: z.string().nullish().describe("Version label. Default: file name."),
+        title: z.string().nullish().describe("Card title. Default: file name."),
         kind: ArtifactKindSchema.nullish().describe("Viewer; default by file extension."),
-        focus: z.boolean().nullish().describe("Open the Artifacts tab on this version."),
+        focus: z.boolean().nullish().describe("Open the Artifacts tab on this file."),
         pin: z
           .enum(["project", "global"])
           .nullish()

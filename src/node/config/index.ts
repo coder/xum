@@ -9,6 +9,8 @@ import { Effect, Semaphore } from "effect";
 import { ORPCError } from "@orpc/server";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
+import { getErrorMessage } from "@/common/utils/errors";
+import { rememberLogKey } from "@/node/utils/logDedupe";
 import { EXPERIMENT_OVERRIDES_FILE_NAME } from "@/node/services/experimentsService";
 import { ProvidersConfigStore } from "./providersConfigStore";
 import { FileLeaseManager } from "./fileLeaseManager";
@@ -1387,6 +1389,8 @@ const aliasConflictBackupFailures = new Map<string, { message: string }>();
 // keeps changing cannot grow it without bound.
 const loggedAliasBackupFailures = new Map<string, Set<string>>();
 const MAX_LOGGED_ALIAS_BACKUP_FAILURES = 16;
+/** Distinct workspace metadata load failures one Config remembers (see logMetadataLoadFailure). */
+export const MAX_LOGGED_METADATA_LOAD_FAILURES = 64;
 
 /** Record `signature` for `configFile`; true when it was not recorded before. */
 function rememberAliasBackupFailure(configFile: string, signature: string): boolean {
@@ -1395,14 +1399,7 @@ function rememberAliasBackupFailure(configFile: string, signature: string): bool
     seen = new Set();
     loggedAliasBackupFailures.set(configFile, seen);
   }
-  if (seen.has(signature)) return false;
-  seen.add(signature);
-  // A Set iterates in insertion order: drop the oldest signature first.
-  for (const oldest of seen) {
-    if (seen.size <= MAX_LOGGED_ALIAS_BACKUP_FAILURES) break;
-    seen.delete(oldest);
-  }
-  return true;
+  return rememberLogKey(seen, signature, MAX_LOGGED_ALIAS_BACKUP_FAILURES);
 }
 
 /**
@@ -1608,6 +1605,17 @@ export interface WorkspaceMetadataOptions {
    */
   legacyAliasIds?: Set<string>;
   /**
+   * Out-parameter collecting the ids of entries that a lenient build made from the config row
+   * alone, because the entry's own legacy metadata.json could not be read or parsed. Defaults
+   * fill the name and runtime that file holds, so the entry's checkout path may be wrong:
+   * callers that read files in that checkout must not trust such an entry.
+   *
+   * A row with no legacy metadata.json at all is not listed: no file holds another name or
+   * runtime, and the build persists the defaults as the row's own (the read-time migration), so
+   * every reader, the runtime included, resolves the same checkout from them.
+   */
+  fallbackIds?: Set<string>;
+  /**
    * Probe each worktree checkout's existence (fs.access) to classify
    * transcript-only workspaces. Default true. Callers that only need the
    * registry (ids, paths, runtime, parent links) pass false: one stalled
@@ -1637,12 +1645,20 @@ export interface WorkspaceMetadataOptions {
 
 /**
  * Memoized registry-only enumeration for one loaded config snapshot. The
- * build's own alias collection is retained so later callers passing their
- * own `legacyAliasIds` out-parameter still receive every alias.
+ * build's own alias and fallback collections are retained so later callers
+ * passing their own `legacyAliasIds` or `fallbackIds` out-parameter still
+ * receive every id.
  */
 interface WorkspaceMetadataMemoEntry {
   result: Promise<FrontendWorkspaceMetadata[]>;
   legacyAliasIds: Set<string>;
+  fallbackIds: Set<string>;
+}
+
+/** Copies a memo entry's ids into a caller's out-parameter, when it passed one. */
+function addAll(target: Set<string> | undefined, ids: ReadonlySet<string>): void {
+  if (target === undefined) return;
+  for (const id of ids) target.add(id);
 }
 
 /**
@@ -1653,6 +1669,62 @@ interface WorkspaceMetadataMemoEntry {
  */
 interface WorkspaceMetadataBuildOptions extends WorkspaceMetadataOptions {
   degraded?: { value: boolean };
+}
+
+/** A config row field that metadata carries with the same type. */
+type ConfigTreeField = {
+  [K in keyof Workspace & keyof WorkspaceMetadata]: NonNullable<Workspace[K]> extends NonNullable<
+    WorkspaceMetadata[K]
+  >
+    ? K
+    : never;
+}[keyof Workspace & keyof WorkspaceMetadata];
+
+/**
+ * Task-tree fields: the parent link, the agent, the task state and how the task holds its
+ * checkout. A legacy row takes them from its config row alone, as a current-format row does, and
+ * its legacy metadata.json supplies none of them. The last build that wrote such files (v0.3.0-rc.2) wrote only the id, name, project and
+ * createdAt, #303 stopped every write in v0.3.0, and parentWorkspaceId came later (#1219), in
+ * config.json only. Read from the file, a value would hold only until the read-time migration (a
+ * migrated row reads the row alone): a stray file could attach a legacy row to a parent, or detach
+ * one, for a single read. None of these fields is copied from the file either. TaskService reads
+ * them from config rows, except listLegacyTaskVariantWorkspaces: the in-memory variant registry
+ * (rememberLegacyTaskVariantWorkspace) still takes a legacy variant's parent link and taskStatus
+ * from the file, for the first build only.
+ */
+export const CONFIG_TREE_FIELDS = [
+  "parentWorkspaceId",
+  "agentType",
+  "agentId",
+  "workflowTask",
+  "taskStatus",
+  "taskPendingGuidance",
+  "taskLaunchError",
+  "reportedAt",
+  "taskModelString",
+  "taskThinkingLevel",
+  "taskPrompt",
+  "taskTrunkBranch",
+  "taskIsolation",
+  "sideChatParentWorkspaceId",
+  "taskDesktopOwnerWorkspaceId",
+  "taskSticky",
+  "taskExecutionId",
+  "taskExecutionStatus",
+] as const satisfies readonly ConfigTreeField[];
+
+/** Sets each CONFIG_TREE_FIELDS value of `metadata` to the config row's, absent included. */
+function takeTreeFieldsFromConfig(metadata: WorkspaceMetadata, row: Workspace): void {
+  for (const key of CONFIG_TREE_FIELDS) Object.assign(metadata, { [key]: row[key] });
+}
+
+/** Marks a build degraded; `fallbackId` names an entry built from its config row alone. */
+function markDegraded(
+  options: WorkspaceMetadataBuildOptions | undefined,
+  fallbackId?: string
+): void {
+  if (options?.degraded) options.degraded.value = true;
+  if (fallbackId !== undefined) options?.fallbackIds?.add(fallbackId);
 }
 
 /** Symlinks a config.json watch follows before it stops, like the kernel's ELOOP bound. */
@@ -2474,6 +2546,13 @@ export class Config {
     ProjectsConfig,
     Map<string, WorkspaceMetadataMemoEntry>
   >();
+  /**
+   * Metadata load failures already logged with their stack, by checkout path and message. A
+   * degraded entry fails the same way on every lenient build, and MCP override reads build once
+   * per read (the tool-call gate reads on every call), so each distinct failure logs its stack
+   * once and a one-line debug after. Capped (MAX_LOGGED_METADATA_LOAD_FAILURES).
+   */
+  private readonly loggedMetadataLoadFailures = new Set<string>();
   private workspaceIndex = new Map<
     string,
     {
@@ -4729,13 +4808,15 @@ export class Config {
       // Memoize the in-flight promise: the startup burst issues several
       // enumerations before the first one resolves.
       const legacyAliasIds = new Set<string>();
+      const fallbackIds = new Set<string>();
       const degraded = { value: false };
       const result = this.buildWorkspaceMetadata(config, config.projects, {
         ...options,
         legacyAliasIds,
+        fallbackIds,
         degraded,
       });
-      const created: WorkspaceMetadataMemoEntry = { result, legacyAliasIds };
+      const created: WorkspaceMetadataMemoEntry = { result, legacyAliasIds, fallbackIds };
       entry = created;
       memo.set(memoKey, created);
       const forget = () => {
@@ -4754,9 +4835,8 @@ export class Config {
       }, forget);
     }
     const metadata = await entry.result;
-    if (options.legacyAliasIds !== undefined) {
-      for (const aliasId of entry.legacyAliasIds) options.legacyAliasIds.add(aliasId);
-    }
+    addAll(options.legacyAliasIds, entry.legacyAliasIds);
+    addAll(options.fallbackIds, entry.fallbackIds);
     // Fresh array, shared entries (see the probeCheckouts CONTRACT): the copy keeps one
     // caller's in-place filter/sort from leaking into another.
     return metadata.slice();
@@ -4807,15 +4887,25 @@ export class Config {
     return metadata.find((candidate) => candidate.id === workspaceId) ?? null;
   }
 
+  /** See loggedMetadataLoadFailures. */
+  private logMetadataLoadFailure(workspacePath: string, error: unknown): void {
+    const key = `${workspacePath}\0${getErrorMessage(error)}`;
+    if (!rememberLogKey(this.loggedMetadataLoadFailures, key, MAX_LOGGED_METADATA_LOAD_FAILURES)) {
+      log.debug("Failed to load/migrate workspace metadata (stack logged before)", {
+        workspacePath,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    log.error(`Failed to load/migrate workspace metadata:`, error);
+  }
+
   private async buildWorkspaceMetadata(
     config: ProjectsConfig,
     projects: Iterable<[string, ProjectConfig]>,
     options?: WorkspaceMetadataBuildOptions
   ): Promise<FrontendWorkspaceMetadata[]> {
     const probeCheckouts = options?.probeCheckouts ?? true;
-    const markDegraded = () => {
-      if (options?.degraded) options.degraded.value = true;
-    };
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
     // Read-time migrations recorded here are re-applied to a FRESH config snapshot inside
     // editConfig below. Persisting the local `config` snapshot directly (the old
@@ -5033,7 +5123,7 @@ export class Config {
                 // closed — the unreadable alias file may hide a registered
                 // identity.
                 if (legacyMetadataRaw !== undefined && !options?.throwOnError) {
-                  markDegraded();
+                  markDegraded(options);
                   continue;
                 }
                 throw readError;
@@ -5063,7 +5153,7 @@ export class Config {
               if (options?.throwOnError) {
                 throw parseError;
               }
-              markDegraded();
+              markDegraded(options);
             }
             const aliasId = aliasMetadata?.id;
             if (typeof aliasId === "string" && aliasId.length > 0) {
@@ -5104,25 +5194,12 @@ export class Config {
             metadata.aiSettings ??= workspace.aiSettings;
             metadata.heartbeat ??= workspace.heartbeat;
 
-            // Preserve tree/task metadata when present in config (metadata.json won't have it)
-            metadata.parentWorkspaceId ??= workspace.parentWorkspaceId;
-            metadata.agentType ??= workspace.agentType;
-            metadata.agentId ??= workspace.agentId;
-            metadata.workflowTask ??= workspace.workflowTask;
-            metadata.bestOf = isLegacyTaskVariantGroup(metadata.bestOf)
-              ? undefined
-              : (normalizeWorkspaceBestOf(metadata.bestOf) ??
-                normalizeWorkspaceBestOf(workspace.bestOf));
-            metadata.taskStatus ??= workspace.taskStatus;
-            metadata.taskPendingGuidance ??= workspace.taskPendingGuidance;
-            metadata.taskLaunchError ??= workspace.taskLaunchError;
-            metadata.delegatedCreationInterrupted ??=
+            // Tree/task metadata comes from config alone (see CONFIG_TREE_FIELDS), the grouping
+            // and the interrupted-creation mark too.
+            takeTreeFieldsFromConfig(metadata, workspace);
+            metadata.bestOf = normalizeWorkspaceBestOf(workspace.bestOf);
+            metadata.delegatedCreationInterrupted =
               delegatedCreationInterruptedField(workspace).delegatedCreationInterrupted;
-            metadata.reportedAt ??= workspace.reportedAt;
-            metadata.taskModelString ??= workspace.taskModelString;
-            metadata.taskThinkingLevel ??= workspace.taskThinkingLevel;
-            metadata.taskPrompt ??= workspace.taskPrompt;
-            metadata.taskTrunkBranch ??= workspace.taskTrunkBranch;
             // Preserve archived timestamps from config
             metadata.archivedAt ??= workspace.archivedAt;
             metadata.unarchivedAt ??= workspace.unarchivedAt;
@@ -5288,8 +5365,7 @@ export class Config {
           if (options?.throwOnError) {
             throw error;
           }
-          markDegraded();
-          log.error(`Failed to load/migrate workspace metadata:`, error);
+          this.logMetadataLoadFailure(workspace.path, error);
           // Fallback to basic metadata if migration fails
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
           const metadata: WorkspaceMetadata = {
@@ -5347,6 +5423,7 @@ export class Config {
             subProjectPath: workspace.subProjectPath,
           };
 
+          markDegraded(options, metadata.id);
           workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
         }
       }

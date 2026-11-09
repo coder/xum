@@ -67,6 +67,7 @@ const debugStep: DevToolsStep = {
   responseHeaders: null,
   rawResponse: { finishReason: "SAFETY" },
   rawChunks: null,
+  inputTransformations: null,
 };
 
 const toolPolicy: ToolPolicy = [

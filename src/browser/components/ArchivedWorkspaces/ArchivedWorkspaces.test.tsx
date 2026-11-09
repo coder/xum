@@ -15,6 +15,7 @@ import { installDom } from "../../../../tests/ui/dom";
 import * as APIModule from "@/browser/contexts/API";
 import type { APIClient } from "@/browser/contexts/API";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
+import * as ConfirmDialogContextModule from "@/browser/contexts/ConfirmDialogContext";
 import * as TooltipModule from "@/browser/components/Tooltip/Tooltip";
 import * as ForceDeleteModalModule from "@/browser/components/ForceDeleteModal/ForceDeleteModal";
 import * as RuntimeBadgeModule from "@/browser/components/RuntimeBadge/RuntimeBadge";
@@ -117,9 +118,10 @@ describe("ArchivedWorkspaces", () => {
   const removeWorkspaceMock = mock(
     (
       _workspaceId: string,
-      _options?: { force?: boolean; acknowledgedDescendantIds?: string[] }
+      _options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
     ): Promise<WorkspaceRemoveResult> => Promise.resolve({ success: true })
   );
+  const confirmMock = mock(() => Promise.resolve(false));
   let modalProps: ComponentProps<typeof ForceDeleteModalModule.ForceDeleteModal> | undefined;
   const setSelectedWorkspaceMock = mock(() => undefined);
   const onWorkspacesChangedMock = mock(() => undefined);
@@ -127,6 +129,11 @@ describe("ArchivedWorkspaces", () => {
   beforeEach(() => {
     modalProps = undefined;
     cleanupDom = installDom();
+    confirmMock.mockReset();
+    confirmMock.mockResolvedValue(false);
+    spyOn(ConfirmDialogContextModule, "useConfirmDialog").mockImplementation(() => ({
+      confirm: confirmMock,
+    }));
     deleteWorktreeMock.mockClear();
     getSessionUsageBatchMock.mockClear();
     unarchiveWorkspaceMock.mockClear();
@@ -534,6 +541,40 @@ describe("ArchivedWorkspaces", () => {
       expect(deleteWorktreeMock).toHaveBeenCalledTimes(1);
     });
     expect(deleteWorktreeMock).toHaveBeenCalledWith({ workspaceId: child.id });
+  });
+
+  test("Shift-click does not force deletion after the user cancels process recovery", async () => {
+    const workspace = createWorkspace({ id: "unknown-process", name: "unknown-process" });
+    removeWorkspaceMock.mockResolvedValueOnce({
+      success: false,
+      error: "Unknown background process activity",
+      backgroundProcesses: [
+        {
+          workspaceId: workspace.id,
+          processId: "process-1",
+          recordPath: "/sessions/unknown-process/processes/process-1",
+          state: "unknown",
+          reason: "The process record has no metadata.",
+        },
+      ],
+    });
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace unknown-process")), {
+      shiftKey: true,
+    });
+
+    await waitFor(() => expect(modalProps).toBeDefined());
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(removeWorkspaceMock).toHaveBeenCalledTimes(1);
+    expect(onWorkspacesChangedMock).not.toHaveBeenCalled();
   });
 
   test("Shift-click acknowledges reported descendants without a confirmation", async () => {

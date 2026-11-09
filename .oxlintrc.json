@@ -1249,6 +1249,34 @@
       }
     },
     {
+      "files": ["src/browser/**/*.{ts,tsx}", "vscode/src/webview/**/*.{ts,tsx}"],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-css-zoom": "error"
+      }
+    },
+    {
+      "files": [
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "**/*.stories.ts",
+        "**/*.stories.tsx",
+        "src/browser/stories/**",
+        "src/**/*StoryUtils.tsx",
+        "**/*.testHarness.ts",
+        "**/*.hostProof.ts",
+        "src/**/test[A-Z]*.ts"
+      ],
+      "rules": {
+        "local/no-css-zoom": "off"
+      }
+    },
+    {
       "files": [
         "src/node/services/agentSession.ts",
         "src/node/services/aiService.ts",

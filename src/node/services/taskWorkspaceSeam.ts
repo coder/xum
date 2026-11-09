@@ -276,6 +276,8 @@ export interface RemovalAttemptBinding {
 /** keepBranch: remove only the checkout, e.g. undoing a creation that reused a branch (#4819). */
 export interface RemovalCheckoutOptions {
   keepBranch?: boolean;
+  /** Exact unknown record paths the user accepts for this removal only. */
+  acknowledgedUnknownProcessRecords?: string[];
   /**
    * The caller already holds this workspace's structural mutation gate: a parent removal gates
    * its whole sub-agent tree before removing any of it (#4477).
@@ -526,6 +528,8 @@ export interface WorkspaceTurnHost {
     workspaceId: string,
     options?: { cancelReason?: string; preserveUserInput?: boolean }
   ): Result<void>;
+  /** Cancel the session's scheduled or starting auto-retry, as a user Stop does. Never throws. */
+  abandonAutoRetry(workspaceId: string, reason: string): void;
   replaceHistory(
     workspaceId: string,
     summaryMessage: MuxMessage,
@@ -950,6 +954,15 @@ export interface AgentTaskIntegration {
    * WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE while this is true.
    */
   isWorkspaceStopInProgress(workspaceId: string): boolean;
+  /**
+   * Whether an explicit Stop ended the workspace turn that a history row of `workspaceId`
+   * correlates to: its handle is `interrupted` on disk. Startup recovery reads it to keep a
+   * stopped tail stopped. Rejects when the handle cannot be read.
+   */
+  isWorkspaceTurnStopped(
+    workspaceId: string,
+    correlation: WorkspaceTurnTaskCorrelation
+  ): Promise<boolean>;
   /** Monotonic stop generation; an accepted turn captures it at admission for the start fence. */
   getWorkspaceStopEpoch(workspaceId: string): number;
   /**

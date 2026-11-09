@@ -68,6 +68,10 @@ export class MultiProjectRuntime implements Runtime {
     this.postCreateSetup = this.primaryRuntime.postCreateSetup?.bind(this.primaryRuntime);
   }
 
+  get wrappedRuntimes(): readonly Runtime[] {
+    return this.projectRuntimes.map((projectRuntime) => projectRuntime.runtime);
+  }
+
   async ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult> {
     for (const projectRuntime of this.projectRuntimes) {
       const readyResult = await projectRuntime.runtime.ensureReady(options);

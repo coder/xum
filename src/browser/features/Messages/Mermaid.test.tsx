@@ -4,6 +4,8 @@ import { GlobalWindow } from "happy-dom";
 import * as LazyFeatureModule from "@/browser/components/LazyFeature/LazyFeature";
 import { StreamingContext } from "./StreamingContext";
 import { Mermaid, sanitizeMermaidSvg } from "./Mermaid";
+import { DESKTOP_TITLEBAR_HEIGHT_PX } from "@/browser/hooks/useDesktopTitlebar";
+import { MERMAID_ERROR_SELECTOR } from "@/constants/mermaid";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
 import MarkdownIt from "markdown-it";
 import { MarkdownRenderer } from "./MarkdownRenderer";
@@ -12,6 +14,29 @@ import * as PeleModule from "pele";
 import { chromiumMathSerializer } from "../../../../tests/ui/chromiumMathSerializer";
 
 const INVALID_CHART = "graph TD\nA-->";
+
+/** The size Pele measured: the diagram's viewBox. */
+function viewBoxOf(container: Element | null) {
+  const viewBox = container?.querySelector("svg.pele")?.getAttribute("viewBox") ?? "0 0 0 0";
+  const [, , width, height] = viewBox.split(" ").map(Number);
+  return { width, height };
+}
+
+/** The pixel box the stylesheet gives the diagram's <svg>. */
+function boxOf(container: Element | null) {
+  const style = (container as HTMLElement | null)?.style;
+  return {
+    width: style?.getPropertyValue("--diagram-width"),
+    height: style?.getPropertyValue("--diagram-height"),
+  };
+}
+
+function pixels(size: { width: number; height: number }) {
+  return { width: `${size.width}px`, height: `${size.height}px` };
+}
+
+// A top-to-bottom chain: taller than the inline height cap in every container width.
+const TALL_CHART = "graph TD\n" + "ABCDEFGHIJKL".split("").join("-->");
 
 function renderMermaid(props: { chart?: string; isStreaming?: boolean } = {}) {
   return render(
@@ -195,6 +220,28 @@ describe("Mermaid layout stability", () => {
     );
   });
 
+  describe("the Close button of the expand dialog", () => {
+    const topPx = (button: HTMLElement) => Number(/calc\((\d+)px/.exec(button.style.top)?.[1]);
+
+    test("starts below the desktop title bar, which holds the native window controls", async () => {
+      Object.assign(window, { api: { getIsRosetta: () => Promise.resolve(false) } });
+      const view = renderMermaid();
+      fireEvent.click(await view.findByRole("button", { name: "⤢" }));
+      const close = await view.findByRole("button", { name: "Close" });
+      // An 8 px gutter below the bar.
+      expect(topPx(close)).toBe(DESKTOP_TITLEBAR_HEIGHT_PX + 8);
+      expect(close.classList.contains("titlebar-no-drag")).toBe(true);
+    });
+
+    test("keeps an 8 px gutter from the top in a browser", async () => {
+      const view = renderMermaid();
+      fireEvent.click(await view.findByRole("button", { name: "⤢" }));
+      const close = await view.findByRole("button", { name: "Close" });
+      expect(topPx(close)).toBe(8);
+      expect(close.classList.contains("titlebar-no-drag")).toBe(false);
+    });
+  });
+
   test("guest Escape cannot close an expanded host diagram", async () => {
     const view = renderMermaid();
     fireEvent.click(await view.findByRole("button", { name: "⤢" }));
@@ -282,6 +329,7 @@ describe("Mermaid layout stability", () => {
     expect(container?.style.minHeight).toBe("300px");
     expect(view.container.textContent).toContain("Rendering diagram...");
     expect(view.container.textContent).not.toContain("Mermaid Error");
+    expect(view.container.querySelector(MERMAID_ERROR_SELECTOR)).toBeNull();
   });
 
   test("shows parse errors after streaming settles", async () => {
@@ -289,6 +337,9 @@ describe("Mermaid layout stability", () => {
 
     await waitFor(() => expect(view.container.textContent).toContain("Mermaid Error: "));
     expect(view.container.querySelector(".mermaid-container")).toBeNull();
+    expect(view.container.querySelector(MERMAID_ERROR_SELECTOR)?.textContent).toContain(
+      "Mermaid Error: "
+    );
   });
 
   describe("sanitizeMermaidSvg", () => {
@@ -328,7 +379,7 @@ describe("Mermaid layout stability", () => {
     });
   });
 
-  test("zoom controls scale rendered diagrams", async () => {
+  test("zoom controls resize the diagram's pixel box", async () => {
     const view = renderMermaid();
 
     await waitFor(() => {
@@ -337,7 +388,10 @@ describe("Mermaid layout stability", () => {
 
     const container = view.container.querySelector<HTMLElement>(".mermaid-container");
     expect(container).not.toBeNull();
-    expect(container?.style.getPropertyValue("--diagram-zoom")).toBe("1");
+    const natural = viewBoxOf(container);
+    // A small diagram sits at the size Pele measured.
+    expect(natural.height).toBeLessThan(300);
+    expect(boxOf(container)).toEqual(pixels(natural));
 
     const buttons = Array.from(view.container.querySelectorAll("button"));
     const zoomOutButton = buttons.find((button) => button.textContent === "−");
@@ -349,15 +403,94 @@ describe("Mermaid layout stability", () => {
     fireEvent.click(zoomInButton);
 
     await waitFor(() => {
-      expect(container?.style.getPropertyValue("--diagram-zoom")).toBe("1.1");
+      expect(boxOf(container)).toEqual(
+        pixels({ width: Math.round(natural.width * 1.1), height: Math.round(natural.height * 1.1) })
+      );
     });
     expect(window.localStorage.getItem("mermaid-diagram-zoom")).toBe("1.1");
 
     fireEvent.click(zoomOutButton);
 
     await waitFor(() => {
-      expect(container?.style.getPropertyValue("--diagram-zoom")).toBe("1");
+      expect(boxOf(container)).toEqual(pixels(natural));
     });
+  });
+
+  test("the zoom buttons stop at 50% and 300%", async () => {
+    const view = renderMermaid();
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg")).not.toBeNull()
+    );
+    const zoomOut = view.getByRole("button", { name: "−" });
+    const zoomIn = view.getByRole("button", { name: "+" });
+    const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+    const natural = viewBoxOf(container);
+
+    for (let step = 0; step < 5; step++) fireEvent.click(zoomOut);
+    await waitFor(() =>
+      expect(boxOf(container).width).toBe(`${Math.round(natural.width * 0.5)}px`)
+    );
+    expect((zoomOut as HTMLButtonElement).disabled).toBe(true);
+    expect((zoomIn as HTMLButtonElement).disabled).toBe(false);
+
+    for (let step = 0; step < 25; step++) fireEvent.click(zoomIn);
+    await waitFor(() => expect(boxOf(container).width).toBe(`${natural.width * 3}px`));
+    expect((zoomIn as HTMLButtonElement).disabled).toBe(true);
+    expect((zoomOut as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  test("the diagram's svg carries no inline size of its own", async () => {
+    const view = renderMermaid();
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg.pele")).not.toBeNull()
+    );
+    // An inline max-width or height would beat the stylesheet's pixel box and hand the box back
+    // to each engine's intrinsic sizing.
+    const style = view.container.querySelector("svg.pele")?.getAttribute("style") ?? "";
+    expect(style).not.toMatch(
+      /(^|;)\s*(max-width|min-width|width|max-height|min-height|height)\s*:/
+    );
+  });
+
+  test.each([{ width: 0 }, { height: 0 }, { width: Number.NaN }, { height: Infinity }])(
+    "shows a render error when Pele reports the size %o",
+    async (badSize) => {
+      const real = PeleModule.render;
+      const peleRender = spyOn(PeleModule, "render").mockImplementation((chart, options) => ({
+        ...real(chart, options),
+        ...badSize,
+      }));
+      try {
+        const view = renderMermaid();
+        await waitFor(() =>
+          expect(view.container.textContent).toContain(
+            "Mermaid Error: Diagram renderer returned an invalid size"
+          )
+        );
+        expect(view.container.querySelector("svg")).toBeNull();
+      } finally {
+        peleRender.mockRestore();
+      }
+    }
+  );
+
+  test("draws a diagram that Pele measures at one pixel", async () => {
+    const real = PeleModule.render;
+    const peleRender = spyOn(PeleModule, "render").mockImplementation((chart, options) => ({
+      ...real(chart, options),
+      width: 1,
+      height: 1,
+    }));
+    try {
+      const view = renderMermaid();
+      await waitFor(() => expect(view.container.querySelector("svg.pele")).not.toBeNull());
+      expect(boxOf(view.container.querySelector(".mermaid-container"))).toEqual({
+        width: "1px",
+        height: "1px",
+      });
+    } finally {
+      peleRender.mockRestore();
+    }
   });
 
   describe("layout width", () => {
@@ -365,7 +498,7 @@ describe("Mermaid layout stability", () => {
       "flowchart LR\nA[Request]-->B[Parse]-->C[Plan]-->D[Build]-->E[Test]-->F[Ship]";
     let observers: Array<{ callback: ResizeObserverCallback; element: Element | null }>;
     let measuredWidth: number;
-    let dialogWidth: number;
+    let dialogRoom: { width: number; height: number };
     let originalResizeObserver: typeof globalThis.ResizeObserver;
     let originalRequestAnimationFrame: typeof globalThis.requestAnimationFrame;
     let originalCancelAnimationFrame: typeof globalThis.cancelAnimationFrame;
@@ -374,7 +507,7 @@ describe("Mermaid layout stability", () => {
     beforeEach(() => {
       observers = [];
       measuredWidth = 0;
-      dialogWidth = 0;
+      dialogRoom = { width: 0, height: 0 };
       originalResizeObserver = globalThis.ResizeObserver;
       originalRequestAnimationFrame = globalThis.requestAnimationFrame;
       originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
@@ -401,11 +534,10 @@ describe("Mermaid layout stability", () => {
       // unless afterEach restores it.
       measure = spyOn(window.HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
         function (this: HTMLElement) {
-          const width = this.classList.contains("mermaid-modal")
-            ? dialogWidth
-            : this.classList.contains("mermaid-container")
-              ? measuredWidth
-              : 0;
+          if (this.classList.contains("mermaid-modal")) {
+            return new window.DOMRect(0, 0, dialogRoom.width, dialogRoom.height);
+          }
+          const width = this.classList.contains("mermaid-container") ? measuredWidth : 0;
           return new window.DOMRect(0, 0, width, 300);
         }
       );
@@ -427,11 +559,57 @@ describe("Mermaid layout stability", () => {
       }
     }
 
-    function viewBoxOf(container: Element | null) {
-      const viewBox = container?.querySelector("svg.pele")?.getAttribute("viewBox") ?? "0 0 0 0";
-      const [, , width, height] = viewBox.split(" ").map(Number);
-      return { width, height };
+    function resizeDialogRoom(room: { width: number; height: number }) {
+      dialogRoom = room;
+      for (const { callback, element } of observers) {
+        if (!element?.classList.contains("mermaid-modal")) continue;
+        const entry = { target: element, contentRect: room };
+        callback([entry as unknown as ResizeObserverEntry], {} as ResizeObserver);
+      }
     }
+
+    test("Pele lays the diagram out at the container's measured width, if it has one", async () => {
+      const peleRender = spyOn(PeleModule, "render");
+      try {
+        const view = renderMermaid({ chart: WIDE_CHART });
+        const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+        await waitFor(() => expect(viewBoxOf(container).width).toBeGreaterThan(0));
+        const maxWidthOfLastRender = () => peleRender.mock.calls.at(-1)?.[1]?.maxWidth;
+        expect(maxWidthOfLastRender()).toBeUndefined();
+
+        act(() => resizeContainer(1));
+        await waitFor(() => expect(maxWidthOfLastRender()).toBe(1));
+        act(() => resizeContainer(326));
+        await waitFor(() => expect(maxWidthOfLastRender()).toBe(326));
+      } finally {
+        peleRender.mockRestore();
+      }
+    });
+
+    test("a render that a newer width replaced does not overwrite it when it finishes late", async () => {
+      // The render for the unmeasured container waits on the font, and a resize replaces it.
+      const firstFontWait = Promise.withResolvers<void>();
+      let fontWaits = 0;
+      Object.defineProperty(document, "fonts", {
+        value: {
+          get ready() {
+            return fontWaits++ === 0 ? firstFontWait.promise : Promise.resolve();
+          },
+          load: () => Promise.resolve([]),
+        },
+      });
+      const view = renderMermaid({ chart: WIDE_CHART });
+      const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+
+      act(() => resizeContainer(326));
+      await waitFor(() => expect(viewBoxOf(container).width).toBeGreaterThan(0));
+      const narrow = viewBoxOf(container);
+      expect(narrow.width).toBeLessThanOrEqual(326);
+
+      act(() => firstFontWait.resolve());
+      await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+      expect(viewBoxOf(container)).toEqual(narrow);
+    });
 
     test("an unmeasured container renders the diagram's natural layout", async () => {
       const view = renderMermaid({ chart: WIDE_CHART });
@@ -441,7 +619,7 @@ describe("Mermaid layout stability", () => {
       const natural = viewBoxOf(container);
       expect(natural.width).toBeGreaterThan(400);
       expect(natural.width).toBeGreaterThan(natural.height);
-      expect(container?.style.getPropertyValue("--diagram-max-height")).toBe("");
+      expect(boxOf(container)).toEqual(pixels(natural));
     });
 
     test("a narrow container gets a vertical layout and reflows when it widens", async () => {
@@ -453,19 +631,74 @@ describe("Mermaid layout stability", () => {
       const narrow = viewBoxOf(container);
       expect(narrow.width).toBeLessThanOrEqual(326);
       expect(narrow.height).toBeGreaterThan(narrow.width);
-      expect(container?.style.getPropertyValue("--diagram-max-height")).toBe("none");
+      expect(boxOf(container)).toEqual(pixels(narrow));
 
       act(() => resizeContainer(1200));
       await waitFor(() => {
         const wide = viewBoxOf(container);
         expect(wide.width).toBeGreaterThan(wide.height);
       });
-      expect(container?.style.getPropertyValue("--diagram-max-height")).toBe("");
+      expect(boxOf(container)).toEqual(pixels(viewBoxOf(container)));
+    });
+
+    test("only a container wider than the narrow breakpoint caps a tall diagram's height", async () => {
+      measuredWidth = 326;
+      const view = renderMermaid({ chart: TALL_CHART });
+      const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+
+      await waitFor(() => expect(viewBoxOf(container).height).toBeGreaterThan(0));
+      const narrow = viewBoxOf(container);
+      expect(narrow.height).toBeGreaterThan(300);
+      expect(boxOf(container)).toEqual(pixels(narrow));
+
+      act(() => resizeContainer(1200));
+      await waitFor(() => expect(boxOf(container).height).toBe("300px"));
+      const tall = viewBoxOf(container);
+      expect(boxOf(container).width).toBe(`${Math.round((tall.width * 300) / tall.height)}px`);
+    });
+
+    async function openDialog(chart: string) {
+      const view = renderMermaid({ chart });
+      await waitFor(() => expect(view.container.querySelector("svg.pele")).not.toBeNull());
+      fireEvent.click(view.getByRole("button", { name: "⤢" }));
+      const dialog = () => view.container.querySelector<HTMLElement>(".mermaid-modal");
+      await waitFor(() => expect(viewBoxOf(dialog()).width).toBeGreaterThan(0));
+      return dialog;
+    }
+
+    test("the expand dialog fits a tall diagram into the room it measures, and follows it", async () => {
+      dialogRoom = { width: 1000, height: 500 };
+      const dialog = await openDialog(TALL_CHART);
+      const natural = viewBoxOf(dialog());
+      expect(natural.height).toBeGreaterThan(800);
+      expect(boxOf(dialog()).height).toBe("500px");
+      expect(boxOf(dialog()).width).toBe(`${Math.round((natural.width * 500) / natural.height)}px`);
+
+      act(() => resizeDialogRoom({ width: 1000, height: 300 }));
+      await waitFor(() => expect(boxOf(dialog()).height).toBe("300px"));
+
+      act(() => resizeDialogRoom({ width: 1000, height: 2000 }));
+      await waitFor(() => expect(boxOf(dialog())).toEqual(pixels(viewBoxOf(dialog()))));
+    });
+
+    test("the expand dialog fits both axes of a small room", async () => {
+      dialogRoom = { width: 231, height: 100 };
+      const dialog = await openDialog(WIDE_CHART);
+      const natural = viewBoxOf(dialog());
+      expect(natural.height).toBeGreaterThan(100);
+      const box = boxOf(dialog());
+      expect(Number.parseInt(box.width ?? "0")).toBeLessThanOrEqual(231);
+      expect(box.height).toBe("100px");
+    });
+
+    test("the expand dialog draws the natural size while its room is not measured", async () => {
+      const dialog = await openDialog(WIDE_CHART);
+      expect(boxOf(dialog())).toEqual(pixels(viewBoxOf(dialog())));
     });
 
     test("the expand dialog lays the diagram out for its own width", async () => {
       measuredWidth = 326;
-      dialogWidth = 1200;
+      dialogRoom = { width: 1200, height: 800 };
       const view = renderMermaid({ chart: WIDE_CHART });
       const inline = view.container.querySelector<HTMLElement>(".mermaid-container");
       await waitFor(() => expect(viewBoxOf(inline).width).toBeGreaterThan(0));

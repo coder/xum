@@ -102,6 +102,7 @@ import {
 } from "./sidebarTaskGroups";
 import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
+import { confirmAndRemoveWorkspace } from "@/browser/utils/confirmAndRemoveWorkspace";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { useWorkspaceActionKeybinds } from "./useWorkspaceActionKeybinds";
@@ -1272,7 +1273,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       setRemovingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
 
       try {
-        const result = await removeWorkspace(workspaceId, { force: true });
+        const result = await confirmAndRemoveWorkspace({
+          removeWorkspace,
+          confirm: confirmDialog,
+          workspaceId,
+          options: { force: true },
+        });
         if (!result.success) {
           workspaceRemoveError.showError(
             workspaceId,
@@ -1294,7 +1300,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         });
       }
     },
-    [removeWorkspace, workspaceRemoveError, workspaceRemoveWarning]
+    [removeWorkspace, confirmDialog, workspaceRemoveError, workspaceRemoveWarning]
   );
 
   const handleRemoveSection = async (
