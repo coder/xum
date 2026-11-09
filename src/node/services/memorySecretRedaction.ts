@@ -59,7 +59,7 @@ const STANDALONE_SECRET_PATTERNS: RegExp[] = [
 // end it: `{"password":"abc\"DEF"}` (what `JSON.stringify` makes of `abc"DEF`) must lose `DEF` too.
 // Every position can take a character, except a closing delimiter and the end of the text, which
 // end the value. So a match never fails and backtracks into the body, and the scan stays linear.
-const QUOTED_VALUE = String.raw`(["'])(?:\\[\s\S]|(?!\2)[^\\]|\\$)*(?:\2|$)`;
+const QUOTED_VALUE = String.raw`(?<qv>["'])(?:\\[\s\S]|(?!\k<qv>)[^\\]|\\$)*(?:\k<qv>|$)`;
 
 // Text that went through JSON.stringify `d` times writes a quote as `2^d - 1` backslashes and a quote
 // (`\"`, `\\\"`, `\\\\\\\"`), so a pair nested in JSON strings has delimiters of 1, 3, 7, 15 or 31
@@ -84,28 +84,33 @@ const ESCAPED_QUOTED_VALUE = String.raw`(?<run>\\{1,${ESCAPE_RUN_MAX}})(?<quote>
 // The value is a quoted run (to its closing quote, or to the end of an unterminated one) or one
 // unquoted word, optionally behind an auth scheme.
 // Already-redacted values are skipped so the passes compose, and so are comparisons (`token === x`).
+/** A pair's value: quoted, quoted inside JSON-escaped text, or one bare word behind an optional scheme. */
+const SECRET_VALUE = String.raw`(?![=]|\[redacted\])(?:${QUOTED_VALUE}|${ESCAPED_QUOTED_VALUE}|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+)`;
 const SECRET_KEY_VALUE_PATTERN = new RegExp(
   String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}(?:\\{0,${ESCAPE_RUN_MAX}}["']\]?)?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}})` +
-    String.raw`(?![=]|\[redacted\])(?:${QUOTED_VALUE}|${ESCAPED_QUOTED_VALUE}|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+)`,
+    SECRET_VALUE,
   "gi"
 );
 
-// A bold or italic label (`**Password:** hunter2`, `*token:* x`), as notes and model summaries write
-// a pair: an opening `*` run right before the name, the same run right after the separator, then a
-// space and the value. The key/value rule alone takes the closing `**` as the value and leaves the
-// credential readable, so this pass runs first and redacts the value after the label. It only takes
-// this exact form (the run widths match through the backreference, and the opener touches the
-// name), so stars elsewhere (`token*=2`, `*note password=*** x`) are the key/value rule's, as before.
+// A bold or italic label (`**Password:** hunter2`, `*token:* "x y"`), as notes and model summaries
+// write a pair: an opening `*` run right before the name, the same run right after the separator,
+// then a space and the value. The key/value rule alone takes the closing `**` as the value and
+// leaves the credential readable, so this pass runs first and redacts the value after the label.
+// It only adds redaction: it takes this exact form (the run widths match through the
+// backreference, and the opener touches the name), and the key/value rule stays as it was.
 const EMPHASIS_LABEL_PATTERN = new RegExp(
-  String.raw`((?<![*\w])(\*{1,3})${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}[:=]\2[ \t]{1,${GAP_MAX}})` +
-    // A bare value only: QUOTED_VALUE's backreference would point at the star run here. A quoted
-    // value after a bold label stays the key/value rule's, as before.
-    String.raw`(?![=]|\[redacted\])(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+`,
+  String.raw`((?<![*\w])(?<stars>\*{1,3})${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}[:=]\k<stars>[ \t]{1,${GAP_MAX}})` +
+    SECRET_VALUE,
   "gi"
 );
 
-/** A value of 1 to 3 asterisks: a mask (`password: ***`) or the closing run of a bold label. */
-const STARS_ONLY_VALUE = /^\*{1,3}$/;
+/**
+ * The closing run of a label whose value the pass above redacted: 1 to 3 `*`, then a space and the
+ * marker. The key/value rule leaves that run as it is, so a second pass changes nothing. Any other
+ * run of stars is a value, as before.
+ */
+const LABEL_CLOSE_BEFORE_MARKER = /^\*{1,3}$/;
+const MARKER_AFTER_LABEL = /^[ \t]+\[redacted\]/;
 
 // A session cookie is a bearer credential that has no keyword and no token shape of its own, so the
 // header is the only thing that marks it. The value of a `Cookie` / `Set-Cookie` header goes, and
@@ -153,13 +158,21 @@ function runRedactionPasses(text: string, onRemoved: (removed: string) => void):
     onRemoved(match.slice(prefix.length));
     return `${prefix}${REDACTED}`;
   });
-  return redacted.replace(SECRET_KEY_VALUE_PATTERN, (match: string, prefix: string) => {
-    const value = match.slice(prefix.length);
-    // A mask, or the closing run of a bold label whose value the pass above took: no credential.
-    if (STARS_ONLY_VALUE.test(value)) return match;
-    onRemoved(value);
-    return `${prefix}${REDACTED}`;
-  });
+  return redacted.replace(
+    SECRET_KEY_VALUE_PATTERN,
+    (match: string, prefix: string, ...rest: unknown[]) => {
+      const value = match.slice(prefix.length);
+      // The pattern has named groups, so the last three arguments are offset, text and groups.
+      const offset = rest[rest.length - 3] as number;
+      const text = rest[rest.length - 2] as string;
+      const closesRedactedLabel =
+        LABEL_CLOSE_BEFORE_MARKER.test(value) &&
+        MARKER_AFTER_LABEL.test(text.slice(offset + match.length));
+      if (closesRedactedLabel) return match;
+      onRemoved(value);
+      return `${prefix}${REDACTED}`;
+    }
+  );
 }
 
 /** Replaces common credential shapes with `[redacted]`. */

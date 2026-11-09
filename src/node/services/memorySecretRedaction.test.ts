@@ -252,25 +252,42 @@ describe("redactSecretLike", () => {
     ["a bold label", "**Password:** hunter2-correct-horse", "**Password:** [redacted]"],
     ["a bold label in a list", "- **Secret:** abc123def456", "- **Secret:** [redacted]"],
     ["an italic label", "*token:* abcdef123456 next", "*token:* [redacted] next"],
+    [
+      "a bold label with a quoted value",
+      '**Password:** "hunter2 secret" next',
+      "**Password:** [redacted] next",
+    ],
+    [
+      "a bold label with a single-quoted value",
+      "**Password:** 'hunter2'",
+      "**Password:** [redacted]",
+    ],
     ["stars glued to the value", "PASSWORD=****secret npm start", "PASSWORD=[redacted] npm start"],
   ])("redacts the value of %s", (_label, text, expected) => {
     const redacted = redactSecretLike(text);
 
     expect(redacted).toBe(expected);
     expect(redactSecretLike(redacted)).toBe(redacted);
+    expect(containsSecretLike(redacted)).toBe(false);
   });
 
-  // 1 to 3 asterisks hold no credential: a mask, or a closing run whose label is not adjacent to the
-  // name (prose). Stars that are not an exact label (an operator, unpaired runs) stay as before.
+  // Stars that are not an exact label stay the key/value rule's, as before: a value of stars is
+  // redacted (a prose label's closing run included), and an operator is no separator.
   it.each([
-    ["a bold label in prose", "- **No credentials:** the files name where secrets live"],
-    ["a mask", "password=***"],
-    ["a mask before a command", "password=*** npm start"],
-    ["unpaired runs on the line", "*note password=*** npm start"],
-    ["a multiplication assignment", "token*=2; token**=2"],
-  ])("leaves %s as it is", (_label, text) => {
-    expect(redactSecretLike(text)).toBe(text);
-    expect(containsSecretLike(text)).toBe(false);
+    ["a mask", "password=***", "password=[redacted]"],
+    [
+      "unpaired runs on the line",
+      "*note password=*** npm start",
+      "*note password=[redacted] npm start",
+    ],
+    [
+      "a bold label in prose",
+      "- **No credentials:** the files",
+      "- **No credentials:[redacted] the files",
+    ],
+    ["a multiplication assignment", "token*=2; token**=2", "token*=2; token**=2"],
+  ])("keeps the key/value rule for %s", (_label, text, expected) => {
+    expect(redactSecretLike(text)).toBe(expected);
   });
 
   // Text that went through JSON.stringify once more is the same text with every quote and backslash
