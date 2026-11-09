@@ -144,6 +144,10 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - **Startup-time initialization must never crash the app.** Wrap in try-catch, use timeouts, fall back silently.
 - **`server.lock` liveness is decided by process identity** (pid, start time, boot id, PID namespace and platform; `judgeHolder()` in `src/node/utils/concurrency/processLiveness.ts`), except that a lock with this process's own pid is live only if this process wrote it. The `/version` probe (`src/node/services/xumBackendProbe.ts`) covers only what identity cannot decide, for example macOS, Windows, locks from older builds, and identity that is incomplete or unreadable. Do not add more liveness heuristics (timeouts, extra probes, process-state guesses) to `src/node/services/serverLockfile.ts` or the probe. A lock reader never deletes a lock: `acquire()` replaces a stale one, and its owner's `release()` removes it.
 
+## Agent Plugins
+
+- Plugin install-method choice is a Draft (`rfc/20261106_plugin-install-method-choice.md` on branch `plugin-install-method-choice-parked`). Before anyone builds it, its design must cover what every other Xum build does to a plugin whose saved manifest that build does not load: hook trust, OAuth sign-ins, the registry row and updates. Never repair state that another build changed: fail closed and let a reinstall review it.
+
 ## Command Palette & UI Access
 
 - Palette shortcuts are `OPEN_COMMAND_PALETTE` and `OPEN_COMMAND_PALETTE_ACTIONS` (opens in `>` command mode) in `src/browser/utils/ui/keybinds.ts`.
