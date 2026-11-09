@@ -11,15 +11,17 @@ import { lightweightMeta, PIXEL_DISABLED } from "./meta.js";
  * them, and it requires each one to fail with its expected message (or to pass). Without them,
  * deleting a guard from the runner would leave every real paint-check story green.
  *
- * Not covered, by name:
- * - The assert "has no content below it to compare" (paintBelowWhenScrolled). It guards the shape
- *   of a story (text after a diagram that ends below the viewport), not paint, and a real frame's
- *   padding already gives it room, so only a hand-built frame can trip it.
- * - The assert "Both screenshots must have the viewport's size" (differenceOutside). The runner
- *   takes both screenshots in a row, and only the runner sets the viewport, so no story can break
- *   it.
- * - A diagram that mounts after the runner's wait has returned is not checked, so no fixture
- *   mounts one that late.
+ * Only the guards named here are claimed: a guard that no story below names has no fixture. Each
+ * one, with the story that turns red when it is disabled:
+ * - A diagram that fails to render (the error marker): BrokenChartNextToGoodChart.
+ * - A frame that never draws (every frame needs a drawing): DiagramNextToAFrameThatNeverDraws.
+ * - The wait polls until a diagram mounts: DiagramMountsWhenTheRunnerWaits.
+ * - Ink outside the diagram's box at rest: DiagramPaintsOutsideItsBox.
+ * - Hiding the diagram changes no pixel inside its box at rest (the unseen check):
+ *   DiagramOutsideTheViewport, DiagramInHiddenParent, DiagramUnderAnOverlay, DiagramClippedAway.
+ * - The scrolled view of the unseen check counts the pixels that a diagram below the viewport
+ *   changes: DiagramBelowTheFoldSeenWhenScrolled.
+ * - The scrolled view does not count a diagram that nobody sees: DiagramBelowTheFoldInHiddenParent.
  *
  * The fixture run sets a short render timeout for the runner (PAINT_CHECK_RENDER_TIMEOUT_ENV in
  * src/constants/mermaid.ts), so the story whose frame never draws does not wait the runner's whole
@@ -187,8 +189,10 @@ export const DiagramClippedAway: Story = {
 
 /**
  * MUST FAIL like DiagramInHiddenParent. A tall spacer puts the diagram below the viewport, so the
- * runner scrolls it into view to compare, and only that scrolled view of the rule can fail the
- * story: the at-rest view has nothing to change in the viewport either way.
+ * runner also scrolls it into view to compare, and the hidden parent keeps it unseen there too. The
+ * at-rest view fails this story with the same message, so it does not show that the scrolled view
+ * runs (DiagramBelowTheFoldSeenWhenScrolled does). It turns red when the scrolled view credits a
+ * diagram that no pixel shows.
  */
 export const DiagramBelowTheFoldInHiddenParent: Story = {
   render: () => (
@@ -198,6 +202,23 @@ export const DiagramBelowTheFoldInHiddenParent: Story = {
         <div style={{ visibility: "hidden" }}>
           <MarkdownRenderer content={[GOOD_CHART, TEXT_AFTER].join("\n\n")} />
         </div>
+      </div>
+    </div>
+  ),
+};
+
+/**
+ * MUST PASS. The same page as DiagramBelowTheFoldInHiddenParent, but the diagram is visible. A tall
+ * spacer puts it below the viewport, so hiding it at rest changes no pixel the runner can see, and
+ * only the runner's scrolled view can pass the story. The text after the diagram gives that view a
+ * page to compare. Disabling the scrolled view, or dropping its pixels from the count, fails it.
+ */
+export const DiagramBelowTheFoldSeenWhenScrolled: Story = {
+  render: () => (
+    <div className="bg-background min-h-screen p-4">
+      <div style={{ width: 600 }}>
+        <div style={{ height: 1500 }} />
+        <MarkdownRenderer content={[GOOD_CHART, TEXT_AFTER].join("\n\n")} />
       </div>
     </div>
   ),
