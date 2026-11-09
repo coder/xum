@@ -233,6 +233,7 @@
   "patchedDependencies": {
     "@ai-sdk/xai@4.0.37": "patches/@ai-sdk%2Fxai@4.0.37.patch",
     "trpc-cli@0.12.4": "patches/trpc-cli@0.12.4.patch",
+    "react-remove-scroll@2.7.2": "patches/react-remove-scroll@2.7.2.patch",
   },
   "overrides": {
     "@swc/core": "1.15.3",

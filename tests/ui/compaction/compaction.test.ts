@@ -9,12 +9,13 @@
 import "../dom";
 import { waitFor } from "@testing-library/react";
 
-import { preloadTestModules, type TestEnvironment } from "../../ipc/setup";
+import { preloadTestModules, setupProviders, type TestEnvironment } from "../../ipc/setup";
 
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 
 import { fireEvent } from "@testing-library/react";
 import { createAppHarness } from "../harness";
+import { startWaitBudget } from "./waitBudget";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { getAppConfigStore, updateUserPreferences } from "@/browser/stores/AppConfigStore";
@@ -80,6 +81,12 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
 
 const FORCE_THRESHOLD_PERCENT = 10;
 
+// Every long wait in a test draws on a budget that ends before the test's limit (waitBudget.ts).
+// The limits on the `test(...)` calls stay literals (prettier unwraps a test body only for a
+// literal), so keep them in step with these.
+const TEST_LIMIT_MS = 60_000;
+const FORCE_TEST_LIMIT_MS = 120_000;
+
 /**
  * Move the per-model slider the way the UI does (a merge patch to config.json).
  * 10% threshold + 5% force buffer => force compaction triggers at 15%.
@@ -136,9 +143,19 @@ describe("Compaction UI (mock AI router)", () => {
   }, 60_000);
 
   test("auto-compacts after context_exceeded and resumes", async () => {
+    const remainingMs = startWaitBudget(TEST_LIMIT_MS);
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     try {
+      // The UI auto-compacts into the largest-context model of a configured provider (see
+      // getHigherContextCompactionSuggestion), and a model qualifies only with a larger context
+      // than the default model's (OpenAI, Google, Moonshot AI, Meta and Z.ai each list one).
+      // Without such a provider the UI does not auto-compact: it shows the manual "Insert /compact"
+      // button, and this test waits for a summary that never comes. The mock router never calls
+      // the provider, so a dummy key is enough. Seeding it here keeps the test independent of an
+      // ambient OPENAI_API_KEY.
+      await setupProviders(app.env, { openai: { apiKey: "test-key-for-ui-tests" } });
+
       const triggerMessage = "Trigger context error";
       const userDraft = "My draft message that should be preserved";
 
@@ -147,9 +164,9 @@ describe("Compaction UI (mock AI router)", () => {
       // User starts typing while auto-compaction is in progress
       await app.chat.typeWithoutSending(userDraft);
 
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
-      await app.chat.expectTranscriptContains(`Continue with: ${triggerMessage}`, 60_000);
-      await app.chat.expectTranscriptContains(`Mock response: ${triggerMessage}`, 60_000);
+      await app.chat.expectTranscriptContains("Mock compaction summary:", remainingMs());
+      await app.chat.expectTranscriptContains(`Continue with: ${triggerMessage}`, remainingMs());
+      await app.chat.expectTranscriptContains(`Mock response: ${triggerMessage}`, remainingMs());
 
       // Verify user's draft was NOT overwritten by auto-compaction
       await app.chat.expectInputValue(userDraft);
@@ -159,6 +176,7 @@ describe("Compaction UI (mock AI router)", () => {
   }, 60_000);
 
   test("force compaction triggers during streaming", async () => {
+    const remainingMs = startWaitBudget(FORCE_TEST_LIMIT_MS);
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     try {
@@ -178,21 +196,14 @@ describe("Compaction UI (mock AI router)", () => {
       await app.chat.send(triggerMessage);
       await waitForPersistedThreshold(app.env, FORCE_THRESHOLD_PERCENT / 100);
 
-      const compactionAssertionTimeoutMs = 120_000;
-      await app.chat.expectTranscriptContains(
-        "Mock compaction summary:",
-        compactionAssertionTimeoutMs
-      );
-      await app.chat.expectTranscriptContains(
-        "Mock response: Continue",
-        compactionAssertionTimeoutMs
-      );
+      await app.chat.expectTranscriptContains("Mock compaction summary:", remainingMs());
+      await app.chat.expectTranscriptContains("Mock response: Continue", remainingMs());
       // Compaction transcript now renders a single top boundary row.
-      await app.chat.expectTranscriptContains("Compaction boundary", compactionAssertionTimeoutMs);
+      await app.chat.expectTranscriptContains("Compaction boundary", remainingMs());
 
       // Force compaction now prunes to the latest boundary window, so the
       // pre-compaction triggering turn is no longer shown.
-      await app.chat.expectTranscriptNotContains(triggerMessage, compactionAssertionTimeoutMs);
+      await app.chat.expectTranscriptNotContains(triggerMessage, remainingMs());
     } finally {
       await app.dispose();
     }
@@ -239,6 +250,7 @@ describe("Compaction UI (mock AI router)", () => {
   }, 60_000);
 
   test("/compact command sends any foreground bash to background", async () => {
+    const remainingMs = startWaitBudget(TEST_LIMIT_MS);
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     let unregister: (() => void) | undefined;
@@ -271,13 +283,13 @@ describe("Compaction UI (mock AI router)", () => {
       // Send /compact command via the UI (like a user would)
       await app.chat.send("/compact -t 500");
 
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
+      await app.chat.expectTranscriptContains("Mock compaction summary:", remainingMs());
 
       await waitFor(
         () => {
           expect(backgrounded).toBe(true);
         },
-        { timeout: 60_000 }
+        { timeout: remainingMs() }
       );
     } finally {
       unregister?.();
@@ -286,6 +298,7 @@ describe("Compaction UI (mock AI router)", () => {
   }, 60_000);
 
   test("/compact with Ctrl+Enter (turn-end) does NOT auto-background foreground bash", async () => {
+    const remainingMs = startWaitBudget(TEST_LIMIT_MS);
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     let unregister: (() => void) | undefined;
@@ -326,7 +339,7 @@ describe("Compaction UI (mock AI router)", () => {
       const textarea = await getActiveTextarea(app.view.container);
       fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
 
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
+      await app.chat.expectTranscriptContains("Mock compaction summary:", remainingMs());
 
       expect(backgrounded).toBe(false);
     } finally {
@@ -336,6 +349,7 @@ describe("Compaction UI (mock AI router)", () => {
   }, 60_000);
 
   test("force compaction sends any foreground bash to background", async () => {
+    const remainingMs = startWaitBudget(FORCE_TEST_LIMIT_MS);
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     let unregister: (() => void) | undefined;
@@ -371,13 +385,13 @@ describe("Compaction UI (mock AI router)", () => {
       // Queue on a live turn so tool-end input backgrounds Bash before force compaction.
       await app.chat.send("[force] Trigger force compaction");
 
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
+      await app.chat.expectTranscriptContains("Mock compaction summary:", remainingMs());
 
       await waitFor(
         () => {
           expect(backgrounded).toBe(true);
         },
-        { timeout: 60_000 }
+        { timeout: remainingMs() }
       );
     } finally {
       unregister?.();

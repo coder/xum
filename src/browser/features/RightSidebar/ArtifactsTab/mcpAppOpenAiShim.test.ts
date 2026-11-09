@@ -6,9 +6,12 @@ import { Window } from "happy-dom";
 import { installDom } from "../../../../../tests/ui/dom";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import { buildMcpAppCsp, mcpAppPreambleScript } from "./mcpAppCsp";
-import { createMcpAppDocumentChannel } from "./mcpAppDocumentChannel";
+import { createFrameDocumentChannel } from "./frameDocumentChannel";
 import { createMcpAppHost, type McpAppConsentRequest } from "./mcpAppHost";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 interface OpenAi {
   toolInput: unknown;
@@ -95,8 +98,8 @@ async function runView(
   const composer: string[] = [];
   const calls: Array<{ toolName: string; args: unknown }> = [];
   const savedStates: unknown[] = [];
-  // The view document's channel (mcpAppDocumentChannel.ts), as McpAppFrame binds it.
-  const channel = createMcpAppDocumentChannel("00");
+  // The view document's channel (frameDocumentChannel.ts), as McpAppFrame binds it.
+  const channel = createFrameDocumentChannel("00");
   channel.setReceiver({
     message: (message) => {
       posted.push(message as { method?: string; params?: unknown });
