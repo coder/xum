@@ -31,14 +31,16 @@ export const FAST_SCAN_MS = 50;
 /** Ceiling for a shape past such a jump at scale 1 (they cost up to 115 ms today). */
 export const SLOW_SCAN_MS = 500;
 
-// Each run costs both sizes. There are at least MIN_RUNS and at most MAX_RUNS of them, and none
-// past MIN_RUNS once RUN_BUDGET_MS of CPU time is spent: the first run pays for engine warm-up,
-// and any run can pay for the GC or a busy neighbour on the same core (one run of a shape that
-// costs 60 ms measured 8.6 times at 3x load, and its other runs 4 to 5 times). A cheap shape gets
-// many runs, because a few milliseconds are within that noise, and a costly shape gets two.
+// One run measures both sizes. A shape that costs a few milliseconds measures within 40% of its
+// cost on a busy host (cores shared with other processes slow a sample down, or not, at random),
+// and now and then a sample takes 10 to 100 times as long (a scan of 12 ms took 1.2 s of CPU
+// time once). The ratio of one run, or of the fastest sample of each size, reached 7.3 to 11
+// against a limit of 8 on linear scans. The median of the ratios of many runs stayed under 6.
+// The number of runs follows the fastest run so far, not the time spent, so a stalled sample does
+// not end the loop early: a cheap shape gets MAX_RUNS runs, one that costs 100 ms gets MIN_RUNS.
 const MIN_RUNS = 2;
-const MAX_RUNS = 5;
-const RUN_BUDGET_MS = 40;
+const MAX_RUNS = 15;
+const RUN_BUDGET_MS = 200;
 
 /** CPU time (user + system) that `run` takes: a busy host cannot stretch it. */
 export function cpuMs(run: () => void): number {
@@ -48,23 +50,28 @@ export function cpuMs(run: () => void): number {
   return (used.user + used.system) / 1000;
 }
 
+/** `measure` is a seam for the tests of this file: they feed it costs, and the scan never runs. */
 export function expectLinearScan(
   scan: (text: string) => unknown,
   build: (scale: number) => string,
-  ceilingMs: number = FAST_SCAN_MS
+  ceilingMs: number = FAST_SCAN_MS,
+  measure: (run: () => void) => number = cpuMs
 ): void {
   const small = build(1);
   const large = build(SIZE_STEP);
-  let smallMs = Number.POSITIVE_INFINITY;
-  let largeMs = Number.POSITIVE_INFINITY;
-  let spentMs = 0;
-  for (let run = 0; run < MAX_RUNS && (run < MIN_RUNS || spentMs < RUN_BUDGET_MS); run++) {
-    const smallRun = cpuMs(() => scan(small));
-    const largeRun = cpuMs(() => scan(large));
-    smallMs = Math.min(smallMs, smallRun);
-    largeMs = Math.min(largeMs, largeRun);
-    spentMs += smallRun + largeRun;
+  let fastestSmallMs = Number.POSITIVE_INFINITY;
+  let fastestLargeMs = Number.POSITIVE_INFINITY;
+  const ratios: number[] = [];
+  for (let run = 0; run < MAX_RUNS; run++) {
+    if (run >= MIN_RUNS && run * (fastestSmallMs + fastestLargeMs) >= RUN_BUDGET_MS) break;
+    const smallRun = measure(() => scan(small));
+    const largeRun = measure(() => scan(large));
+    fastestSmallMs = Math.min(fastestSmallMs, smallRun);
+    fastestLargeMs = Math.min(fastestLargeMs, largeRun);
+    ratios.push(largeRun / Math.max(smallRun, MIN_BASE_MS));
   }
-  expect(smallMs).toBeLessThan(ceilingMs);
-  expect(largeMs).toBeLessThan(MAX_COST_RATIO * Math.max(smallMs, MIN_BASE_MS));
+  expect(fastestSmallMs).toBeLessThan(ceilingMs);
+  // The lower median: with two runs it is the smaller ratio, as the fastest sample was before.
+  ratios.sort((a, b) => a - b);
+  expect(ratios[(ratios.length - 1) >> 1]).toBeLessThan(MAX_COST_RATIO);
 }
