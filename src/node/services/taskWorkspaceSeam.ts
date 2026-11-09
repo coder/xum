@@ -213,9 +213,9 @@ export function formatSubagentFailureUserMessage(params: {
   errorType: string;
   /**
    * The task ID the body tells the parent to pass to `task_await`. For a row about one workspace
-   * turn it is that turn's handle when the parent owns the handle (that reads exactly the failed
-   * turn). Otherwise it is the child workspace ID, which `task_await` resolves through the
-   * child's ancestry.
+   * turn it is that turn's handle, which reads exactly the failed turn even after the child has
+   * started a newer one (`task_await` lets any ancestor of the child read a terminal handle).
+   * Otherwise it is the child workspace ID.
    */
   awaitTaskId: string;
 }): string {

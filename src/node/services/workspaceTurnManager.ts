@@ -2963,12 +2963,9 @@ export class WorkspaceTurnManager {
               : record.finalMessage?.metadata?.finishReason === "tool-calls"
                 ? "workspace_turn_incomplete"
                 : "workspace_turn_error",
-            // task_await reads a handle only for the workspace that owns it. Another direct parent
-            // reads the failed turn through the child, which resolves through its ancestry.
-            awaitTaskId:
-              record.ownerWorkspaceId === directParentWorkspaceId
-                ? record.handleId
-                : record.workspaceId,
+            // Every direct parent reads the failed turn by its handle: the owner directly, and any
+            // other ancestor of the child through task_await's ancestry read of a terminal handle.
+            awaitTaskId: record.handleId,
           });
     if (!alreadyDelivered) {
       const message = createMuxMessage(

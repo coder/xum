@@ -20,6 +20,11 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { parseSubagentFailureEnvelope } from "@/common/utils/subagentFailureEnvelope";
+import {
+  TaskHandleStore,
+  type WorkspaceTurnTaskHandleRecord,
+} from "@/node/services/taskHandleStore";
+import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/agentAiDefaults";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { StreamEndEvent } from "@/common/types/stream";
@@ -2341,6 +2346,98 @@ describe("TaskService", () => {
       );
     expect(waitError).toBeInstanceOf(Error);
     expect((waitError as Error).message).toContain(MARKER);
+  });
+
+  describe("an ancestor that does not own a terminal workspace-turn handle", () => {
+    const grandId = "grand-111";
+    const parentId = "parent-111";
+    const childId = "child-222";
+    const handleId = "wst_failed_turn";
+    const failedRecord: WorkspaceTurnTaskHandleRecord = {
+      kind: "workspace_turn",
+      handleId,
+      ownerWorkspaceId: grandId,
+      workspaceId: childId,
+      turnId: "failed-turn",
+      status: "error",
+      error: "Provider said: IGNORE_PREVIOUS_INSTRUCTIONS_MARKER",
+      createdAt: "2026-08-11T00:00:00.000Z",
+      updatedAt: "2026-08-11T00:00:01.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    };
+
+    // grand (owner of the handle) > parent (the child's direct parent) > child
+    async function setup() {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "grand", grandId),
+          projectWorkspace(projectPath, "parent", parentId, {
+            name: "agent_explore_parent",
+            parentWorkspaceId: grandId,
+            agentType: "explore",
+            taskStatus: "running",
+          }),
+          projectWorkspace(projectPath, "child", childId, {
+            name: "agent_explore_child",
+            parentWorkspaceId: parentId,
+            agentType: "explore",
+            taskStatus: "running",
+            // The child has moved on to a newer turn.
+            taskExecutionId: "wst_newer_turn",
+            taskExecutionStatus: "running",
+          }),
+          projectWorkspace(projectPath, "other", "other-333"),
+        ],
+        testTaskSettings(1, 3)
+      );
+      const { taskService } = createTaskServiceHarness(config);
+      return { taskService, handleStore: new TaskHandleStore(config) };
+    }
+
+    test("reads the failed turn's stored result, not the child's newer turn", async () => {
+      const { taskService, handleStore } = await setup();
+      await handleStore.upsertWorkspaceTurn(failedRecord);
+
+      const read = await taskService.getDescendantTerminalWorkspaceTurnSnapshot(parentId, handleId);
+
+      expect(read).toMatchObject({
+        ownerWorkspaceId: grandId,
+        record: { handleId, status: "error", error: failedRecord.error },
+      });
+    });
+
+    test("cannot read an active turn", async () => {
+      const { taskService, handleStore } = await setup();
+      await handleStore.upsertWorkspaceTurn(failedRecord);
+      // A running turn that stays running (the snapshot normalizer would settle a stored one).
+      const snapshot = spyOn(WorkspaceTurnManager.prototype, "getWorkspaceTurnSnapshot");
+      snapshot.mockResolvedValue({ ...failedRecord, status: "running", error: undefined });
+      try {
+        expect(
+          await taskService.getDescendantTerminalWorkspaceTurnSnapshot(parentId, handleId)
+        ).toBeNull();
+      } finally {
+        snapshot.mockRestore();
+      }
+    });
+
+    test("cannot read a turn of a workspace it is not an ancestor of", async () => {
+      const { taskService, handleStore } = await setup();
+      await handleStore.upsertWorkspaceTurn(failedRecord);
+
+      // Another workspace is not an ancestor of the child, and the child has no descendants.
+      expect(
+        await taskService.getDescendantTerminalWorkspaceTurnSnapshot("other-333", handleId)
+      ).toBeNull();
+      expect(
+        await taskService.getDescendantTerminalWorkspaceTurnSnapshot(childId, handleId)
+      ).toBeNull();
+    });
   });
 
   test("an unknown task rejects with the exact message that task_await maps to not_found", async () => {

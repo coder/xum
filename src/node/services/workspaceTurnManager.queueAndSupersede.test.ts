@@ -428,15 +428,16 @@ describe("WorkspaceTurnManager", () => {
       expect(awaitedTaskIds(failures[0])).toEqual([handleId]);
     });
 
-    test("names the child workspace for a direct parent that does not own the handle", async () => {
+    test("names the failed turn's handle for a direct parent that does not own it", async () => {
       const setup = await setupDelivery();
 
       const userTexts = await deliver(setup, failedRecord("some-other-owner"));
 
       const failures = userTexts.filter((text) => parseSubagentFailureEnvelope(text) != null);
       expect(failures).toHaveLength(1);
-      // task_await reads a handle only for its owner, so this parent reads through the child.
-      expect(awaitedTaskIds(failures[0])).toEqual([childTaskId]);
+      // Every parent reads the failed turn by its handle: a non-owner ancestor reads a terminal
+      // handle through the child's ancestry, so a newer turn of the child cannot replace it.
+      expect(awaitedTaskIds(failures[0])).toEqual([handleId]);
       expect(userTexts.filter((text) => text.includes(MARKER))).toHaveLength(0);
     });
 

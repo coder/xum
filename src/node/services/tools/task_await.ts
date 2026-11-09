@@ -295,6 +295,10 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       const workspaceId = requireWorkspaceId(config, "task_await");
       const taskService = requireTaskService(config, "task_await");
       const workspaceTurnManager = requireWorkspaceTurnManager(config, "task_await");
+      // The sentinel alone is not proof: a failed task whose own error text is the same string
+      // still exists, and its text must come back.
+      const isUnknownTaskRejection = (message: string, taskId: string): boolean =>
+        message === TASK_NOT_FOUND_MESSAGE && taskService.getAgentTaskStatus(taskId) == null;
 
       const timeoutMs = coerceTimeoutMs(args.timeout_secs);
       // Preserve the documented 600s default when the model sends null
@@ -598,12 +602,32 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           const isAgentContinuation = workspaceTurnTaskId !== taskId;
           const resolveAgentExecution =
             taskService.getDescendantAgentTaskExecutionSnapshot?.bind(taskService);
-          const resolvedExecution =
-            isAgentContinuation && resolveAgentExecution != null
+          const resolveAncestorHandle =
+            taskService.getDescendantTerminalWorkspaceTurnSnapshot?.bind(taskService);
+          // A handle is stored under its owner. An ancestor of the handle's child that does not
+          // own it (the direct parent of a child that a higher ancestor reawakened) reads the
+          // handle's stored result through the child's ancestry, once the turn is terminal. The
+          // failure row names the failed turn's handle for every parent, so this keeps the call
+          // on that turn even after the child runs a newer one.
+          const resolveNonOwnedHandle = async () => {
+            if (resolveAncestorHandle == null) return null;
+            const owned = await workspaceTurnManager.getWorkspaceTurnSnapshot(
+              workspaceId,
+              workspaceTurnTaskId
+            );
+            return owned != null
+              ? null
+              : await resolveAncestorHandle(workspaceId, workspaceTurnTaskId, {
+                  consumingWorkspaceId: workspaceId,
+                });
+          };
+          const resolvedExecution = isAgentContinuation
+            ? resolveAgentExecution != null
               ? await resolveAgentExecution(workspaceId, taskId, {
                   consumingWorkspaceId: workspaceId,
                 })
-              : null;
+              : null
+            : await resolveNonOwnedHandle();
           const workspaceTurnOwnerId = resolvedExecution?.ownerWorkspaceId ?? workspaceId;
           const getWorkspaceTurnSnapshotForAwait = () =>
             workspaceTurnManager.getWorkspaceTurnSnapshot(
@@ -790,10 +814,12 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                 ...workspaceTurnIdentityFields(latest.workspaceId),
               };
             }
-            if (message === WORKSPACE_TURN_NOT_FOUND_MESSAGE) {
+            const latest = await getWorkspaceTurnSnapshotForAwait().catch(() => null);
+            // The sentinel means the handle is gone. A failed turn that quotes the same words
+            // still has a stored record, and its text is read below.
+            if (message === WORKSPACE_TURN_NOT_FOUND_MESSAGE && latest == null) {
               return { status: "invalid_scope" as const, taskId };
             }
-            const latest = await getWorkspaceTurnSnapshotForAwait().catch(() => null);
             if (latest?.status === "completed") {
               await markWorkspaceTurnTerminalAttentionConsumed(latest);
               return completedWorkspaceTurnResult(latest);
@@ -873,7 +899,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             };
           } catch (error: unknown) {
             const message = getErrorMessage(error);
-            if (message === TASK_NOT_FOUND_MESSAGE) {
+            if (isUnknownTaskRejection(message, taskId)) {
               return { status: "not_found" as const, taskId };
             }
             return { status: "error" as const, taskId, error: message };
@@ -932,7 +958,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           }
 
           const message = getErrorMessage(error);
-          if (message === TASK_NOT_FOUND_MESSAGE) {
+          if (isUnknownTaskRejection(message, taskId)) {
             return { status: "not_found" as const, taskId };
           }
           if (/timed out/i.test(message)) {

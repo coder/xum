@@ -16507,6 +16507,69 @@ export class TaskService implements AgentTaskIntegration {
     return null;
   }
 
+  /**
+   * The stored result of a terminal workspace-turn handle for an ancestor of the handle's child
+   * that need not own the handle. A handle is stored under its owner, which is the ancestor that
+   * reawakened the child, so the child's direct parent is not always the owner. The failure row
+   * names the failed turn's handle for every parent, and this lets a non-owner read that exact
+   * turn after the child has moved on to a newer one. Read-only and terminal only: an active
+   * turn is not readable this way, and `ancestorWorkspaceId` must be an ancestor of the child
+   * the record belongs to.
+   */
+  async getDescendantTerminalWorkspaceTurnSnapshot(
+    ancestorWorkspaceId: string,
+    handleId: string,
+    options: { consumingWorkspaceId?: string } = {}
+  ): Promise<{
+    ownerWorkspaceId: string;
+    record: WorkspaceTurnTaskHandleRecord;
+  } | null> {
+    assert(
+      ancestorWorkspaceId.length > 0,
+      "getDescendantTerminalWorkspaceTurnSnapshot: ancestorWorkspaceId must be non-empty"
+    );
+    assert(
+      handleId.length > 0,
+      "getDescendantTerminalWorkspaceTurnSnapshot: handleId must be non-empty"
+    );
+    if (!isWorkspaceTurnTaskId(handleId)) return null;
+
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const descendants = new Set(
+      this.listDescendantAgentTaskIdsFromIndex(index, ancestorWorkspaceId)
+    );
+    // The owner is an ancestor of some descendant, so probe each such ancestor once.
+    const owners = new Set<string>();
+    for (const childId of descendants) {
+      for (const owner of this.listAncestorWorkspaceIdsUsingParentById(index.parentById, childId)) {
+        owners.add(owner);
+      }
+    }
+    const workspaceTurnManager = this.getWorkspaceTurnManager();
+    for (const ownerWorkspaceId of owners) {
+      // Probe without consuming: the record counts as read only once it is known to be a
+      // descendant's.
+      const probe = await workspaceTurnManager.getWorkspaceTurnSnapshot(ownerWorkspaceId, handleId);
+      if (probe == null) continue;
+      if (
+        !descendants.has(probe.workspaceId) ||
+        !this.listAncestorWorkspaceIdsUsingParentById(index.parentById, probe.workspaceId).includes(
+          ownerWorkspaceId
+        ) ||
+        isActiveWorkspaceTurnTaskStatus(probe.status)
+      ) {
+        return null;
+      }
+      const record = await workspaceTurnManager.getWorkspaceTurnSnapshot(
+        ownerWorkspaceId,
+        handleId,
+        options
+      );
+      return record == null ? null : { ownerWorkspaceId, record };
+    }
+    return null;
+  }
+
   private hasLiveRunningExecution(workspace: WorkspaceConfigEntry, workspaceId: string): boolean {
     // A persisted running mirror can outlive its handle after a crash.
     // Require a matching accepted registration to exclude stale mirrors and unaccepted reservations.
