@@ -480,9 +480,13 @@ interface HarvestAttemptState {
   analyzedFloorRowId?: string | null;
 }
 
-/** A save made from the stored record (see saveHarvestRecordEffect); undefined writes nothing. */
+/**
+ * A save made from the stored record (see saveHarvestRecordEffect), and the workspace's records
+ * read with it; undefined writes nothing.
+ */
 type HarvestRecordBuilder = (
-  current: MemoryHarvestRecord | undefined
+  current: MemoryHarvestRecord | undefined,
+  records: Readonly<Record<string, MemoryHarvestRecord>>
 ) => MemoryHarvestRecord | undefined | Promise<MemoryHarvestRecord | undefined>;
 
 /** A job's attempt: shared so the job's failure record carries what the attempt claimed. */
@@ -998,7 +1002,10 @@ export class MemoryConsolidationService extends EventEmitter {
           self.mutateSidecar(async (file) => {
             file.harvestsByWorkspace[workspaceId] ??= {};
             const existing = file.harvestsByWorkspace[workspaceId][boundaryKey];
-            const next = typeof record === "function" ? await record(existing) : record;
+            const next =
+              typeof record === "function"
+                ? await record(existing, file.harvestsByWorkspace[workspaceId])
+                : record;
             if (next === undefined) return false;
             // A terminal record is never reopened: removal finalization
             // (finalizeHarvestsForRemoval) races the bounded cancellation
@@ -2169,22 +2176,46 @@ export class MemoryConsolidationService extends EventEmitter {
         opts.progress.spentUsd = reached.spentUsd;
         opts.progress.usage = reached.usage;
       };
+      const pendingRecord = (progress: HarvestProgress): MemoryHarvestRecord => ({
+        status: "pending",
+        startedAt,
+        // Shown as the run's last sign of life (isStalePendingHarvestRecord); its job lock,
+        // not this time, tells other writers that it is live (unlessLiveAttempt).
+        progressAt: Date.now(),
+        attemptCount: opts.attempt.count,
+        ...harvestRecordIdentity(source),
+        ...harvestAttemptFields(progress, opts.attemptState),
+      });
       const savePending = (progress: HarvestProgress): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(
           workspaceId,
           boundaryKey,
-          {
-            status: "pending",
-            startedAt,
-            // Shown as the run's last sign of life (isStalePendingHarvestRecord); its job lock,
-            // not this time, tells other writers that it is live (unlessLiveAttempt).
-            progressAt: Date.now(),
-            attemptCount: opts.attempt.count,
-            ...harvestRecordIdentity(source),
-            ...harvestAttemptFields(progress, opts.attemptState),
-          },
+          pendingRecord(progress),
           ctx.projectPath
         );
+      // Under the job lock no other attempt at this record is live: the record is read at the
+      // claim, not before the wait, since another backend may have completed it, used up its
+      // attempts or moved its cursor meanwhile. The attempt claims it and resumes there. The read
+      // and the save are one sidecar write: a writer without the job lock lands before it (the
+      // claim counts its attempt) or after it (it finds this job live and defers), never between.
+      // The workspace's records come from that read too (the floor and the budget below).
+      const claim = async (): Promise<Record<string, MemoryHarvestRecord> | undefined> => {
+        let claimedFrom: Record<string, MemoryHarvestRecord> | undefined;
+        await Effect.runPromise(
+          self.saveHarvestRecordEffect(
+            workspaceId,
+            boundaryKey,
+            (current, records) => {
+              if (isSettledUnderJobLock(current)) return undefined;
+              claimedFrom = { ...records };
+              resumeHarvestAttemptFrom(current, opts);
+              return pendingRecord(opts.progress);
+            },
+            ctx.projectPath
+          )
+        );
+        return claimedFrom;
+      };
       const saveUnderJobLock = (record: MemoryHarvestRecord): Promise<void> =>
         Effect.runPromise(
           self.saveHarvestRecordEffect(workspaceId, boundaryKey, record, ctx.projectPath)
@@ -2205,23 +2236,17 @@ export class MemoryConsolidationService extends EventEmitter {
               // spent. A retry keeps its own spend if that is higher. Read once the turn has come,
               // not before the wait: a record of the same epoch that ran ahead (an archive and a
               // compaction of one epoch can overlap) reaches the sidecar only when it completes.
-              const { harvestsByWorkspace } = await self.load();
-              // Under the job lock no other attempt at this record is live: the record is read
-              // here, not before the wait, since another backend may have completed it, used up
-              // its attempts or moved its cursor meanwhile. The attempt claims it and resumes there.
-              const current = harvestsByWorkspace[workspaceId]?.[boundaryKey];
-              if (isSettledUnderJobLock(current)) return;
-              resumeHarvestAttemptFrom(current, opts);
-              await Effect.runPromise(savePending(opts.progress));
+              const records = await claim();
+              if (records === undefined) return;
               opts.attempt.holdsJobLock = true;
               // The floor comes from this read too, for the same reason as the budget below.
-              const floor = floorFrom(harvestsByWorkspace[workspaceId]);
+              const floor = floorFrom(records);
               opts.attemptState.analyzedFloorRowId = floor;
               // Earlier runs read every row while this one waited for its turn: no model call.
               if (nothingLeftAfter(floor)) return saveUnderJobLock(completedRecord(opts.progress));
               opts.progress.budgetUsed = Math.max(
                 budgetSpent(opts.progress),
-                epochBudgetSpent(harvestsByWorkspace[workspaceId], epoch.data.messages)
+                epochBudgetSpent(records, epoch.data.messages)
               );
               const result = await runMemoryHarvest({
                 model: modelResult.data.model,

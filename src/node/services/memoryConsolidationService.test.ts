@@ -3607,6 +3607,82 @@ describe("MemoryConsolidationService", () => {
         });
       });
 
+      it("keeps a claim and another backend's failure before its turn from writing over each other", async () => {
+        using fixture = await createFixture();
+        const metadata = await seedCompactionEpoch(fixture);
+        const log: string[] = [];
+        // The holder: its analysis fails, and its failure record must survive.
+        const holder = secondBackend(fixture, () =>
+          chunkLoggingModel(log, "B", { failChunk: "1/1" })
+        );
+        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+        await fsPromises.writeFile(
+          sidecarPath,
+          JSON.stringify({
+            harvestsByWorkspace: {
+              "ws-dream": {
+                "summary-1": {
+                  status: "failed",
+                  startedAt: 1,
+                  completedAt: 1,
+                  attemptCount: HARVEST_MAX_ATTEMPTS - 1,
+                  boundaryKey: "summary-1",
+                  compactionEpoch: 1,
+                  acceptedCandidates: 0,
+                  skippedCandidates: 0,
+                  completionMetadata: metadata,
+                  error: "provider exploded",
+                },
+              },
+            },
+          })
+        );
+        const jobLockPath = analyzerJobLockPath(fixture.xumHome, "ws-dream");
+        const claimRead = Promise.withResolvers<void>();
+        const resumeClaim = Promise.withResolvers<void>();
+        const failureWaits = Promise.withResolvers<void>();
+        let paused = false;
+        const { readFile, open } = fsPromises;
+        // The holder's claim stops after it read the record under the job lock.
+        const readSpy = spyOn(fsPromises, "readFile").mockImplementation((async (
+          ...args: Parameters<typeof readFile>
+        ) => {
+          const text = await readFile(...args);
+          if (args[0] === sidecarPath && !paused && (await pathExists(jobLockPath))) {
+            paused = true;
+            claimRead.resolve();
+            await resumeClaim.promise;
+          }
+          return text;
+        }) as typeof readFile);
+        // This backend's failure journal waits for the sidecar lock that the claim holds.
+        const openSpy = spyOn(fsPromises, "open").mockImplementation((file, flags, mode) => {
+          if (file === sidecarLockPath(fixture.xumHome) && paused) failureWaits.resolve();
+          return open(file, flags, mode);
+        });
+        try {
+          const claim = holder.service.maybeHarvestThenSweep(metadata);
+          await claimRead.promise;
+          // This backend fails before its turn, without the job lock, on the last attempt.
+          fixture.setModelUnavailable(true);
+          const failure = fixture.service.maybeHarvestThenSweep(metadata);
+          await Promise.race([failure, failureWaits.promise]);
+          resumeClaim.resolve();
+          await Promise.all([claim, failure]);
+        } finally {
+          resumeClaim.resolve();
+          readSpy.mockRestore();
+          openSpy.mockRestore();
+        }
+
+        // Between the claim's read and its save, the failure would take the last attempt and
+        // the holder's records would be refused: its stream ran, but its outcome would be lost.
+        expect(log).toEqual(["B 1/1"]);
+        const record = (await harvestRecords(fixture))["summary-1"];
+        expect(record).toMatchObject({ status: "failed", attemptCount: HARVEST_MAX_ATTEMPTS });
+        expect(record?.error).toContain("harvest stream failed");
+      });
+
       it("takes over the sidecar and analyzer locks of a backend that died holding them", async () => {
         using fixture = await createFixture();
         const metadata = await seedCompactionEpoch(fixture);
