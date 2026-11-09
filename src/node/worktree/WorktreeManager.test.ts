@@ -2,7 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as os from "os";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
 import * as disposableExec from "@/node/utils/disposableExec";
 import type { InitLogger } from "@/node/runtime/Runtime";
@@ -2705,37 +2705,43 @@ describe("WorktreeManager.deleteWorkspace", () => {
     });
     // The payload names its sentinel by absolute path, and that path becomes part of the branch
     // name. Git refuses a name with a component that starts with a dot or holds a character such as
-    // `~` or `:`, so on a host whose TMPDIR is under `~/.mux` the create below failed and this test
-    // never reached the deletion it covers. Pick a temp directory whose path git accepts.
-    const sentinelDir = [os.tmpdir(), "/tmp"].find((dir) => {
+    // `~` or `:`, and a path with a shell operator (`&`, `;`) breaks the payload, so on such a host
+    // the create below failed, or the sentinel could never appear, and this test never reached the
+    // deletion it covers. Pick the first temp directory for which git accepts the whole branch name
+    // and a shell that expands the name creates the sentinel (a control: an absent sentinel below
+    // could otherwise mean that the payload cannot run here, not that the deletion kept it from
+    // running).
+    const payloadFor = (dir: string) => {
+      const sentinelPath = path.join(
+        dir,
+        `mux_injection_test_${Date.now()}_${Math.random().toString(16).slice(2)}`
+      );
+      return { sentinelPath, branchName: `feature/inject-$(touch\${IFS}${sentinelPath})` };
+    };
+    const payloadRuns = (payload: { sentinelPath: string; branchName: string }): boolean => {
       try {
-        execFileSync("git", ["check-ref-format", "--branch", `feature/inject-${dir}`], {
+        execFileSync("git", ["check-ref-format", "--branch", payload.branchName], {
           stdio: "ignore",
         });
-        return true;
+        execFileSync("sh", ["-c", `: ${payload.branchName}`], { stdio: "ignore" });
+        return existsSync(payload.sentinelPath);
       } catch {
         return false;
+      } finally {
+        rmSync(payload.sentinelPath, { force: true });
       }
-    });
-    if (sentinelDir === undefined) {
-      throw new Error("Expected a temp directory whose path git accepts in a branch name");
+    };
+    const payload = [os.tmpdir(), "/tmp"].map(payloadFor).find(payloadRuns);
+    if (payload === undefined) {
+      throw new Error(
+        "Expected a temp directory that git accepts in a branch name and sh can write"
+      );
     }
-    const sentinelPath = path.join(
-      sentinelDir,
-      `mux_injection_test_${Date.now()}_${Math.random().toString(16).slice(2)}`
-    );
-    const branchName = `feature/inject-$(touch\${IFS}${sentinelPath})`;
+    const { sentinelPath, branchName } = payload;
 
     let execFileAsyncSpy: { mockRestore: () => void } | null = null;
 
     try {
-      // Control: a shell that expands the name creates the sentinel. Without it, an absent sentinel
-      // below could mean that the payload cannot run here (an unwritable directory), not that the
-      // deletion kept it from running.
-      execFileSync("sh", ["-c", `: ${branchName}`]);
-      expect(existsSync(sentinelPath)).toBe(true);
-      await fsPromises.rm(sentinelPath, { force: true });
-
       const { projectPath, manager, initLogger } = fixture;
 
       const createResult = await manager.createWorkspace({
