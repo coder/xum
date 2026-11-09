@@ -185,7 +185,9 @@ export async function wrapWithPolicy(
     throw new AgentSandboxStartError(`srt failed to initialize: ${getErrorMessage(error)}`);
   }
   // srt requires an unguessable id: the proxy username is the only thing binding a connection to
-  // a command's allow list.
+  // a command's allow list. It is not a boundary between commands: another sandboxed command can
+  // read it from this command's environment (sysctl KERN_PROCARGS2, which Seatbelt does not
+  // filter), so allow lists that differ by project do not separate projects (docs: Known limits).
   const commandId = randomBytes(16).toString("base64url");
   let wrapped: { argv: string[] };
   try {
