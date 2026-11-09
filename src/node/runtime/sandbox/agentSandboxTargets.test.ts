@@ -82,6 +82,7 @@ const MOVED_CREDENTIAL_STORES = [
   { name: "Npm_Config_GlobalConfig", value: "npmrc", file: "npmrc" },
   { name: "NPM_CONFIG_PREFIX", value: "npm", file: "npm/etc/npmrc" },
   { name: "PREFIX", value: "npm", file: "npm/etc/npmrc" },
+  { name: "PIP_CONFIG_FILE", value: "pip.conf", file: "pip.conf" },
 ];
 
 describe("buildAgentSandboxPolicy", () => {
@@ -1106,6 +1107,19 @@ describe("buildAgentSandboxPolicy", () => {
       else process.env.GOENV = saved;
     }
   });
+
+  // `/dev/null` turns the file off; hiding it would break every command that opens it.
+  test.each(["NPM_CONFIG_USERCONFIG", "PIP_CONFIG_FILE"])(
+    "keeps /dev/null open when the command's %s names it",
+    (name) => {
+      const policy = buildAgentSandboxPolicy(SETTINGS, {
+        cwd: repo,
+        env: { [name]: os.devNull },
+      });
+
+      expect(agentSandboxPolicyAllows(policy, os.devNull, "read")).toBe(true);
+    }
+  );
 
   // Seatbelt follows the link, so a scratch folder that is one would open where it points.
   test("fails closed when the scratch folder is a symlink", async () => {

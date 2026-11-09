@@ -121,7 +121,9 @@ export function gitGlobalConfigFiles(env: NodeJS.ProcessEnv = process.env): stri
  */
 function envPath(env: NodeJS.ProcessEnv, name: string, ...rest: string[]): string[] {
   const dir = env[name];
-  if (dir === undefined || dir.length === 0) return [];
+  // `/dev/null` turns the file off (git, npm, pip): it names nothing to hide, and hiding it
+  // would break every command that opens it.
+  if (dir === undefined || dir.length === 0 || dir === os.devNull) return [];
   if (!path.isAbsolute(dir)) {
     throw new AgentSandboxStartError(`${name} is the relative path ${dir}`);
   }
@@ -314,6 +316,8 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     ...npmConfigPaths(env, "globalconfig"),
     ...npmConfigPaths(env, "prefix", "etc", "npmrc"),
     ...fromEnv("PREFIX", "etc", "npmrc"),
+    // pip runs without a config file that it cannot read (measured, pip 26.2).
+    ...fromEnv("PIP_CONFIG_FILE"),
     `${XUM_HOME_TOKEN}/server.lock`,
     `${XUM_HOME_TOKEN}/providers.jsonc`,
     `${XUM_HOME_TOKEN}/secrets.json`,
