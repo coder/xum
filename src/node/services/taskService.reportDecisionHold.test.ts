@@ -1097,6 +1097,114 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     }
   }
 
+  // The plan-like probe (isPlanLikeTaskWorkspace) reads agent definitions from the user's home,
+  // which takes seconds on a host with many skills. It only decides whether a stream's final
+  // response or propose_plan result is the terminal report, so a stream where it decides nothing
+  // must not wait for it: a follow-up sent while the decision waits is refused as stale.
+  async function endStreamWithPlanProbeBlocked(
+    childId: string,
+    options: {
+      row?: Partial<WorkspaceConfigEntry>;
+      /** The stream's end: a reported row ends on a plain final response. */
+      end: { finishReason?: string };
+      queueFollowUp: boolean;
+    }
+  ) {
+    const stack = await createStack(childId, options.row);
+    const { taskService, svc, workspaceService, child, sendOptions } = stack;
+    const probe = Promise.withResolvers<void>();
+    const isPlanLike = svc.isPlanLikeTaskWorkspace.bind(taskService);
+    spyOn(svc, "isPlanLikeTaskWorkspace").mockImplementation(async (entry) => {
+      if (entry.workspace.id === childId) await probe.promise;
+      return isPlanLike(entry);
+    });
+    try {
+      if (options.row?.taskStatus !== "reported") {
+        expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      }
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      await until(() => stack.completions.length === 1, "the continuation stream");
+      if (options.queueFollowUp) {
+        expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
+          Ok(undefined)
+        );
+      }
+      stack.endStream(0, options.end, true);
+      if (!options.queueFollowUp) await until(() => !child.session.isBusy(), "session idle");
+      return { stack, probe };
+    } catch (error) {
+      probe.resolve();
+      await stack.cleanup();
+      throw error;
+    }
+  }
+  /** True when the follow-up dispatched (a second stream) while the probe was still blocked. */
+  const dispatchedWhileProbeBlocked = (stack: { completions: unknown[] }) =>
+    until(() => stack.completions.length > 1, "the follow-up dispatched").then(
+      () => true,
+      () => false
+    );
+
+  test.each([
+    { name: "a reported row", row: { taskStatus: "reported", reportedAt: REPORTED_AT }, end: {} },
+    {
+      name: "a stream that stopped for tool calls",
+      row: undefined,
+      end: { finishReason: "tool-calls" },
+    },
+  ] as const)(
+    "a stream end on $name runs the held follow-up without waiting for the plan-like probe",
+    async (c) => {
+      const { stack, probe } = await endStreamWithPlanProbeBlocked("holdprobe001", {
+        row: c.row,
+        end: c.end,
+        queueFollowUp: true,
+      });
+      try {
+        expect(await dispatchedWhileProbeBlocked(stack)).toBe(true);
+        expect(stack.heldTexts()).toEqual([]);
+      } finally {
+        probe.resolve();
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
+
+  test("a stream end on a reported row does not refuse a direct send while the plan-like probe is blocked", async () => {
+    const { stack, probe } = await endStreamWithPlanProbeBlocked("holdprobe002", {
+      row: { taskStatus: "reported", reportedAt: REPORTED_AT },
+      end: {},
+      queueFollowUp: false,
+    });
+    try {
+      expect(
+        await stack.workspaceService.sendMessage("holdprobe002", "direct", stack.sendOptions)
+      ).toEqual(Ok(undefined));
+      expect(await dispatchedWhileProbeBlocked(stack)).toBe(true);
+    } finally {
+      probe.resolve();
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  test("a final response on a running row still waits for the plan-like probe, which decides whether it is the report", async () => {
+    const { stack, probe } = await endStreamWithPlanProbeBlocked("holdprobe003", {
+      end: {},
+      queueFollowUp: true,
+    });
+    try {
+      // The probe has not answered: the stream may be a report, so the follow-up stays held.
+      expect(await dispatchedWhileProbeBlocked(stack)).toBe(false);
+      expect(stack.workspaceService.hasQueuedMessages("holdprobe003")).toBe(true);
+    } finally {
+      probe.resolve();
+      await stack.cleanup();
+    }
+  }, 20_000);
+
   test("a stream end that finds its attempt already reported by another writer refuses the held follow-up as indeterminate", async () => {
     const { stack, onCanceled } = await endStreamWithRowEditedInGap("holdlatehandler01", (row) => {
       row.taskStatus = "reported";
