@@ -1,7 +1,7 @@
 // Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
 import "../../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test, vi } from "bun:test";
 import { act, cleanup, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom, stubNarrowViewport } from "../../../../../tests/ui/dom";
@@ -10,15 +10,28 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import { advanceClock } from "@/browser/testFakeClock";
+import { FRAME_DOCUMENT_CHECK_DEADLINE_MS } from "@/common/constants/artifactInteractions";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ARTIFACT_ASSET_LIMITS } from "./artifactAssets";
+import {
+  bootFrameDocument,
+  deliverFrameMessages,
+  frameDocumentOf,
+  postFromFrameDocument,
+  postFromFrameWindow,
+} from "./frameDocument.testHarness";
+import { SandboxedArtifactFrame } from "./SandboxedArtifactFrame";
 import { buildArtifactCsp } from "./artifactCsp";
 import { DIFF_ARTIFACT_MAX_LINES } from "./DiffArtifact";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { ARTIFACT_TABLE_MAX_COLUMNS, ARTIFACT_TABLE_MAX_ROWS } from "./DataTable";
 import { JSON_TREE_MAX_NODES } from "./jsonData";
 import { useAgentBrowserAvailable } from "./useAgentBrowserAvailable";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 function ok(
   path: string,
@@ -42,11 +55,17 @@ let readInputs: Array<{ path: string; maxBytes?: number | null }> = [];
 let agentBrowserAvailable: boolean | null = null;
 let capabilityRequests = 0;
 let readRequests: string[] = [];
+// States the host persisted for an artifact's window.xum.setState.
+let savedStates: unknown[] = [];
 
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
     artifacts: {
       getState: () => Promise.resolve({ success: true as const, data: { state: null } }),
+      setState: (input: { state: unknown }) => {
+        savedStates.push(input.state);
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       listPinned: () =>
         Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
       listShelf: () =>
@@ -122,6 +141,7 @@ describe("ArtifactViewer renderers", () => {
     agentBrowserAvailable = null;
     capabilityRequests = 0;
     readRequests = [];
+    savedStates = [];
   });
 
   afterEach(() => {
@@ -245,25 +265,296 @@ describe("ArtifactViewer renderers", () => {
   test("a frame that navigates away is dropped and gets no bridge until Reload", async () => {
     const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    const frameWindow = frame.contentWindow;
     fireEvent.load(frame);
     // The second load is a navigation (location.href, a clicked link).
     fireEvent.load(frame);
     expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
     expect(view.queryByTestId("artifact-frame")).toBeNull();
-    // Whatever the old window posts now is ignored (F would toggle fullscreen).
-    act(() => {
-      const event = new window.Event("message");
-      Object.defineProperty(event, "data", {
-        value: { xumArtifact: 1, type: "key", key: "F", shiftKey: false },
-      });
-      Object.defineProperty(event, "source", { value: frameWindow });
-      window.dispatchEvent(event);
-    });
+    // Whatever the frame's window posts now is ignored (F would toggle fullscreen).
+    postFromFrameWindow(frame, { xumArtifact: 1, type: "key", key: "F", shiftKey: false });
     expect(view.queryByRole("button", { name: "Exit fullscreen" })).toBeNull();
 
     fireEvent.click(view.getByRole("button", { name: "Reload" }));
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
+  });
+
+  /** Counts the artifact iframe's load events from before it mounts (capture on document). */
+  function countFrameLoads() {
+    const loads = { count: 0 };
+    const listener = (event: Event) => {
+      if (event.target instanceof window.HTMLIFrameElement) loads.count += 1;
+    };
+    document.addEventListener("load", listener, true);
+    return { loads, stop: () => document.removeEventListener("load", listener, true) };
+  }
+
+  // Before the bind, the document's first load is the document the host built; the next one
+  // is the frame leaving it. happy-dom fires the first load on its own, as browsers do.
+  test("a frame whose document never bound closes at its second load", async () => {
+    const counter = countFrameLoads();
+    try {
+      const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+      const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+      await waitFor(() => expect(counter.loads.count).toBe(1));
+      expect(view.queryByText(/This artifact navigated away/) == null).toBe(true);
+      fireEvent.load(frame);
+      expect(counter.loads.count).toBe(2);
+      expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+    } finally {
+      counter.stop();
+    }
+  });
+
+  // Reload mounts a new iframe with the same srcdoc: its first load starts a new lifecycle and
+  // does not count as one more load of the document that navigated away.
+  test("Reload starts a fresh lifecycle: the new frame's first load keeps it open", async () => {
+    const counter = countFrameLoads();
+    try {
+      const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+      const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+      fireEvent.load(frame);
+      fireEvent.click(await view.findByRole("button", { name: "Reload" }));
+      const reloaded = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+      await waitFor(() => expect(counter.loads.count).toBe(3));
+      await deliverFrameMessages();
+      expect(reloaded === frame).toBe(false);
+      expect(view.queryByText(/This artifact navigated away/) == null).toBe(true);
+      expect(view.queryByTestId("artifact-frame") === reloaded).toBe(true);
+    } finally {
+      counter.stop();
+    }
+  });
+
+  // WebKit fires the iframe's load event again when the artifact sets location.hash, and Chromium
+  // does for a history.back() to the srcdoc's first entry. The document is still the one Xum built.
+  test("a frame stays open with its bridge across loads of the same document", async () => {
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const artifact = bootFrameDocument(frame);
+    fireEvent.load(frame);
+    fireEvent.load(frame);
+    fireEvent.load(frame);
+    const shownWithoutNotice = () =>
+      view.queryByText(/This artifact navigated away/) == null &&
+      view.queryByTestId("artifact-frame") === frame;
+    expect(shownWithoutNotice()).toBe(true);
+
+    artifact.win.xum?.setState({ route: "#/s/gamma" });
+    await waitFor(() => expect(savedStates).toEqual([{ route: "#/s/gamma" }]));
+    expect(shownWithoutNotice()).toBe(true);
+  });
+
+  /** The page's frame, shown with no "navigated away" notice. */
+  const shownWithoutNotice = (view: ReturnType<typeof render>, frame: HTMLIFrameElement) =>
+    view.queryByText(/This artifact navigated away/) == null &&
+    view.queryByTestId("artifact-frame") === frame;
+
+  /** Runs `body` on the fake clock (testFakeClock.ts), then back on real timers. */
+  async function onFakeClock(body: () => Promise<void>) {
+    vi.useFakeTimers();
+    try {
+      await body();
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  test("checks the document answers keep its frame open past the check deadline", async () => {
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    bootFrameDocument(frame);
+    await onFakeClock(async () => {
+      fireEvent.load(frame);
+      fireEvent.load(frame);
+      await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS + 1);
+    });
+    expect(shownWithoutNotice(view, frame)).toBe(true);
+  });
+
+  // The document's leave never came: the artifact's own code blocked it before navigating, or
+  // its renderer died. Only the bound document can answer, so the frame still closes.
+  test("a frame whose document misses a check closes at the deadline; loads do not extend it", async () => {
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const artifact = bootFrameDocument(frame);
+    fireEvent.load(frame);
+    await deliverFrameMessages();
+    artifact.kill();
+    await onFakeClock(async () => {
+      // The destination's load, then the same page reloading itself.
+      fireEvent.load(frame);
+      await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS - 1000);
+      fireEvent.load(frame);
+      await advanceClock(999);
+      expect(shownWithoutNotice(view, frame)).toBe(true);
+      await advanceClock(1);
+    });
+    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+    expect(view.queryByTestId("artifact-frame") == null).toBe(true);
+  });
+
+  test("the document's leave closes its frame at once", async () => {
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    bootFrameDocument(frame).dispatch("pagehide");
+    await deliverFrameMessages();
+    expect(view.queryByText(/This artifact navigated away/) != null).toBe(true);
+    expect(view.queryByTestId("artifact-frame") == null).toBe(true);
+  });
+
+  // A page the frame navigated to keeps the frame's window, and may know the nonce.
+  test("only the document's own port reaches the host, and only it hears the host", async () => {
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const windowPosts: unknown[] = [];
+    frame.contentWindow!.postMessage = ((message: unknown) => {
+      windowPosts.push(message);
+    }) as Window["postMessage"];
+    const artifact = bootFrameDocument(frame);
+    const nonce = /nonce: "([0-9a-f]+)"/.exec(frame.getAttribute("srcdoc")!)![1];
+    const forged = new MessageChannel();
+    const forgedReceived: unknown[] = [];
+    forged.port1.onmessage = (event) => forgedReceived.push(event.data);
+    postFromFrameWindow(frame, { xumFrameDocument: 1, type: "open", nonce }, [forged.port2]);
+    postFromFrameWindow(frame, { xumArtifact: 1, type: "send", text: "From the window" });
+    forged.port1.postMessage({ xumArtifact: 1, type: "send", text: "Over a forged port" });
+    // Each load sends a check, and annotate mode goes to the frame: all to the document's port.
+    fireEvent.load(frame);
+    fireEvent.load(frame);
+    const panel = view.getByTestId("artifacts-panel");
+    fireEvent.keyDown(panel, { key: "c" });
+    await deliverFrameMessages();
+    // Annotate mode is kept per workspace: leave it off for the other tests.
+    fireEvent.keyDown(panel, { key: "c" });
+    expect(view.queryByTestId("artifact-send-strip") == null).toBe(true);
+    expect(forgedReceived).toEqual([]);
+    expect(windowPosts).toEqual([]);
+    const types = artifact.received.map((message) => (message as { type?: unknown }).type);
+    expect(types.filter((type) => type === "check")).toHaveLength(2);
+    expect(types).toContain("annotate");
+
+    await artifact.post({ xumArtifact: 1, type: "send", text: "From the document" });
+    const strip = await view.findByTestId("artifact-send-strip");
+    expect(strip.textContent).toContain("From the document");
+    forged.port1.close();
+  });
+
+  test("a theme change reaches the document over its port, never the frame's window", async () => {
+    const client = createTestApiClient({});
+    const frameIn = (theme: "dark" | "light") => (
+      <ThemeProvider forcedTheme={theme}>
+        <APIProvider client={client}>
+          <SandboxedArtifactFrame
+            workspaceId={null}
+            path="page.html"
+            kind="html"
+            content="<p>hi</p>"
+          />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    const view = render(frameIn("dark"));
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const windowPosts: unknown[] = [];
+    frame.contentWindow!.postMessage = ((message: unknown) => {
+      windowPosts.push(message);
+    }) as Window["postMessage"];
+    const artifact = bootFrameDocument(frame);
+    view.rerender(frameIn("light"));
+    await deliverFrameMessages();
+    expect(windowPosts).toEqual([]);
+    expect(artifact.received).toContainEqual(
+      expect.objectContaining({ xumArtifact: 1, type: "theme", theme: "light" })
+    );
+  });
+
+  // The frame's first load usually reaches the host before the document's open announcement,
+  // so a theme or annotate change made before the bind must still reach the document.
+  test("the document gets the current theme and annotate mode when its channel binds", async () => {
+    const client = createTestApiClient({});
+    const frameIn = (theme: "dark" | "light", annotating: boolean) => (
+      <ThemeProvider forcedTheme={theme}>
+        <APIProvider client={client}>
+          <SandboxedArtifactFrame
+            workspaceId={null}
+            path="page.html"
+            kind="html"
+            content="<p>hi</p>"
+            onAnnotate={annotating ? () => undefined : undefined}
+          />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    const view = render(frameIn("dark", false));
+    // happy-dom has fired the srcdoc's one load by now, ahead of the bind, as browsers do.
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    view.rerender(frameIn("light", true));
+    const artifact = bootFrameDocument(frame);
+    await deliverFrameMessages();
+    expect(shownWithoutNotice(view, frame)).toBe(true);
+    expect(artifact.received).toContainEqual(
+      expect.objectContaining({ xumArtifact: 1, type: "theme", theme: "light" })
+    );
+    expect(artifact.received).toContainEqual({ xumArtifact: 1, type: "annotate", enabled: true });
+  });
+
+  test("an open announcement from any other window binds nothing", async () => {
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const nonce = /nonce: "([0-9a-f]+)"/.exec(frame.getAttribute("srcdoc")!)![1];
+    // The app window itself, with the right nonce, ahead of the frame's document.
+    const forged = new MessageChannel();
+    const event = new window.Event("message");
+    Object.defineProperty(event, "data", { value: { xumFrameDocument: 1, type: "open", nonce } });
+    Object.defineProperty(event, "source", { value: window });
+    Object.defineProperty(event, "ports", { value: [forged.port2] });
+    act(() => {
+      window.dispatchEvent(event);
+    });
+    forged.port1.postMessage({ xumArtifact: 1, type: "setState", state: "forged" });
+    await bootFrameDocument(frame).post({ xumArtifact: 1, type: "setState", state: "document" });
+    await waitFor(() => expect(savedStates).toEqual(["document"]));
+    forged.port1.close();
+  });
+
+  test("Reload and new content bind a fresh channel; an old document reaches nothing", async () => {
+    const states: unknown[] = [];
+    const interactions = {
+      initialState: null,
+      requestSend: () => undefined,
+      setState: (state: unknown) => states.push(state),
+    };
+    const frameFor = (content: string) => (
+      <SandboxedArtifactFrame
+        workspaceId={null}
+        path="page.html"
+        kind="html"
+        content={content}
+        interactions={interactions}
+      />
+    );
+    const view = render(frameFor("<p>one</p>"), { wrapper: Wrapper });
+    const first = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const before = bootFrameDocument(first);
+    before.dispatch("pagehide");
+    fireEvent.click(await view.findByRole("button", { name: "Reload" }));
+    const reloaded = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const afterReload = bootFrameDocument(reloaded);
+    await before.post({ xumArtifact: 1, type: "setState", state: "before reload" });
+    await afterReload.post({ xumArtifact: 1, type: "setState", state: "after reload" });
+    expect(states).toEqual(["after reload"]);
+
+    const reloadedSrcDoc = reloaded.getAttribute("srcdoc");
+    view.rerender(frameFor("<p>two</p>"));
+    const rewrittenFrame = await waitFor(() => {
+      const frame = view.getByTestId("artifact-frame");
+      expect(frame.getAttribute("srcdoc") !== reloadedSrcDoc).toBe(true);
+      return frame as HTMLIFrameElement;
+    });
+    const rewritten = bootFrameDocument(rewrittenFrame);
+    await afterReload.post({ xumArtifact: 1, type: "setState", state: "old content" });
+    await rewritten.post({ xumArtifact: 1, type: "setState", state: "new content" });
+    expect(states).toEqual(["after reload", "new content"]);
   });
 
   test("a styled page's reported canvas color replaces the white backdrop", async () => {
@@ -271,19 +562,15 @@ describe("ArtifactViewer renderers", () => {
     const view = renderArtifact("page.html", { "page.html": ok("page.html", html) });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     const postBackdrop = (target: HTMLIFrameElement, color: string | null) =>
-      act(() => {
-        const event = new window.Event("message");
-        Object.defineProperty(event, "data", {
-          value: { xumArtifact: 1, type: "backdrop", color },
-        });
-        Object.defineProperty(event, "source", { value: target.contentWindow });
-        window.dispatchEvent(event);
-      });
+      postFromFrameDocument(target, { xumArtifact: 1, type: "backdrop", color });
     // Until the page reports, the pane shows through: no white flash while a dark page loads.
     expect(frame.className).not.toContain("bg-white");
     expect(frame.style.backgroundColor).toBe("");
+    // The bind sends the theme, which the bridge answers with its own backdrop report.
+    bootFrameDocument(frame);
+    await deliverFrameMessages();
 
-    postBackdrop(frame, "rgb(16, 15, 15)");
+    await postBackdrop(frame, "rgb(16, 15, 15)");
     expect(frame.style.backgroundColor).toBe("rgb(16, 15, 15)");
     // A canvas that is not opaque (legacy or modern alpha syntax), or none, falls back to white.
     // The page paints a translucent canvas over that backing, so the same color there would
@@ -294,13 +581,13 @@ describe("ArtifactViewer renderers", () => {
       "rgba(255, 0, 0, 0.5)",
       "color(srgb 1 0 0 / 0.5)",
     ]) {
-      postBackdrop(frame, "rgb(16, 15, 15)");
-      postBackdrop(frame, notOpaque);
+      await postBackdrop(frame, "rgb(16, 15, 15)");
+      await postBackdrop(frame, notOpaque);
       expect(frame.style.backgroundColor).toBe("");
       expect(frame.className).toContain("bg-white");
     }
-    postBackdrop(frame, "rgb(16, 15, 15)");
-    postBackdrop(frame, null);
+    await postBackdrop(frame, "rgb(16, 15, 15)");
+    await postBackdrop(frame, null);
     expect(frame.style.backgroundColor).toBe("");
     expect(frame.className).toContain("bg-white");
 
@@ -311,18 +598,17 @@ describe("ArtifactViewer renderers", () => {
       "currentcolor",
       "light-dark(red, blue)",
     ]) {
-      postBackdrop(frame, color);
+      await postBackdrop(frame, color);
       expect(frame.style.backgroundColor).toBe("");
     }
 
     // A reloaded frame keeps the last color until its new document reports, so no white flash.
-    postBackdrop(frame, "rgb(16, 15, 15)");
-    fireEvent.load(frame);
-    fireEvent.load(frame);
+    await postBackdrop(frame, "rgb(16, 15, 15)");
+    frameDocumentOf(frame).dispatch("pagehide");
     fireEvent.click(await view.findByRole("button", { name: "Reload" }));
     const reloaded = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     expect(reloaded.style.backgroundColor).toBe("rgb(16, 15, 15)");
-    postBackdrop(reloaded, null);
+    await postBackdrop(reloaded, null);
     expect(reloaded.style.backgroundColor).toBe("");
   });
 
@@ -332,25 +618,21 @@ describe("ArtifactViewer renderers", () => {
     // The artifact's script can post this on load, with no key press: honoring it as a toggle
     // moved the viewer into the dialog, remounted the frame, and the next load toggled back.
     const postFromFrame = (frame: HTMLElement, key: "F" | "Escape") =>
-      act(() => {
-        const event = new window.Event("message");
-        Object.defineProperty(event, "data", {
-          value: { xumArtifact: 1, type: "key", key, shiftKey: key === "F" },
-        });
-        Object.defineProperty(event, "source", {
-          value: (frame as HTMLIFrameElement).contentWindow,
-        });
-        window.dispatchEvent(event);
+      postFromFrameDocument(frame as HTMLIFrameElement, {
+        xumArtifact: 1,
+        type: "key",
+        key,
+        shiftKey: key === "F",
       });
 
-    postFromFrame(await view.findByTestId("artifact-frame"), "F");
+    await postFromFrame(await view.findByTestId("artifact-frame"), "F");
     // Booleans: a failing toBeNull would print the whole happy-dom node.
     expect(view.queryByRole("dialog") == null).toBe(true);
 
     fireEvent.keyDown(panel, { key: "F", shiftKey: true });
     await view.findByRole("dialog");
     const frames = await view.findAllByTestId("artifact-frame");
-    postFromFrame(frames[frames.length - 1], "F");
+    await postFromFrame(frames[frames.length - 1], "F");
     await waitFor(() => expect(view.queryByRole("dialog") == null).toBe(true));
   });
 
@@ -358,15 +640,11 @@ describe("ArtifactViewer renderers", () => {
     const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
     const panel = view.getByTestId("artifacts-panel");
     const postEscape = (frame: HTMLElement) =>
-      act(() => {
-        const event = new window.Event("message");
-        Object.defineProperty(event, "data", {
-          value: { xumArtifact: 1, type: "key", key: "Escape", shiftKey: false },
-        });
-        Object.defineProperty(event, "source", {
-          value: (frame as HTMLIFrameElement).contentWindow,
-        });
-        window.dispatchEvent(event);
+      postFromFrameDocument(frame as HTMLIFrameElement, {
+        xumArtifact: 1,
+        type: "key",
+        key: "Escape",
+        shiftKey: false,
       });
     const latestFrame = async () => {
       const frames = await view.findAllByTestId("artifact-frame");
@@ -382,18 +660,18 @@ describe("ArtifactViewer renderers", () => {
     await view.findByRole("button", { name: "Annotate" });
     fireEvent.keyDown(panel, { key: "c" });
     expect(annotatePressed()).toBe("true");
-    postEscape(await latestFrame());
+    await postEscape(await latestFrame());
     expect(annotatePressed()).toBe("false");
 
     // In fullscreen: the first Escape leaves annotate mode and keeps the dialog open.
     fireEvent.keyDown(panel, { key: "c" });
     fireEvent.keyDown(panel, { key: "F", shiftKey: true });
     await view.findByRole("dialog");
-    postEscape(await latestFrame());
+    await postEscape(await latestFrame());
     expect(annotatePressed()).toBe("false");
     expect(view.queryByRole("dialog") == null).toBe(false);
     // The next one closes fullscreen.
-    postEscape(await latestFrame());
+    await postEscape(await latestFrame());
     await waitFor(() => expect(view.queryByRole("dialog") == null).toBe(true));
   });
 
@@ -408,32 +686,25 @@ describe("ArtifactViewer renderers", () => {
       const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
       await view.findByRole("button", { name: "Annotate" });
       const postC = () =>
-        act(() => {
-          const event = new window.Event("message");
-          Object.defineProperty(event, "data", {
-            value: { xumArtifact: 1, type: "key", key: "C", shiftKey: false },
-          });
-          Object.defineProperty(event, "source", { value: frame.contentWindow });
-          window.dispatchEvent(event);
-        });
+        postFromFrameDocument(frame, { xumArtifact: 1, type: "key", key: "C", shiftKey: false });
       const annotatePressed = () =>
         view
           .getByRole("button", { name: /^(Annotate|Stop annotating)$/ })
           .getAttribute("aria-pressed");
 
       // The artifact's script posting C by itself (no focus in the frame, no activation).
-      postC();
+      await postC();
       expect(annotatePressed()).toBe("false");
       // Focus in the frame alone is not enough: it stays there long after the click.
       act(() => frame.focus());
-      postC();
+      await postC();
       expect(annotatePressed()).toBe("false");
 
       // The user's key press in the frame: focus there and activation live.
       activation = { isActive: true };
-      postC();
+      await postC();
       expect(annotatePressed()).toBe("true");
-      postC();
+      await postC();
       expect(annotatePressed()).toBe("false");
     } finally {
       Reflect.deleteProperty(window.navigator, "userActivation");
@@ -458,33 +729,32 @@ describe("ArtifactViewer renderers", () => {
     globalThis.KeyboardEvent = window.KeyboardEvent;
     try {
       const postChord = (chord: "sidebar" | "agentInterface" | "peek") =>
-        act(() => {
-          const event = new window.Event("message");
-          Object.defineProperty(event, "data", {
-            value: { xumArtifact: 1, type: "sidebarKey", chord, ctrlKey: true, metaKey: false },
-          });
-          Object.defineProperty(event, "source", { value: frame.contentWindow });
-          window.dispatchEvent(event);
+        postFromFrameDocument(frame, {
+          xumArtifact: 1,
+          type: "sidebarKey",
+          chord,
+          ctrlKey: true,
+          metaKey: false,
         });
       const sidebarKey = KEYBINDS.TOGGLE_RIGHT_SIDEBAR.key;
       // The page's script can move focus into its frame (window.focus()) and post the chord from
       // a timer: without the user's activation that must not collapse the sidebar.
       act(() => frame.focus());
-      postChord("sidebar");
+      await postChord("sidebar");
       expect(replayed).toEqual([]);
 
       activation = { isActive: true };
-      postChord("sidebar");
+      await postChord("sidebar");
       expect(replayed).toEqual([sidebarKey]);
       // Only the main pane's status page forwards its chords: here the page's script posted them.
-      postChord("agentInterface");
-      postChord("peek");
+      await postChord("agentInterface");
+      await postChord("peek");
       expect(replayed).toEqual([sidebarKey]);
 
       // A frame that stopped rendering keeps focus in the browser; that focus does not count.
       frame.parentElement!.style.display = "none";
       expect(document.activeElement).toBe(frame);
-      postChord("sidebar");
+      await postChord("sidebar");
       expect(replayed).toEqual([sidebarKey]);
     } finally {
       globalThis.KeyboardEvent = globalKeyboardEvent;

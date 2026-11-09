@@ -179,6 +179,8 @@ export interface MockORPCClientOptions {
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
     hooks?: Record<string, AgentPluginHooks>;
+    /** Returned by agentPlugins.containerLocation; defaults to `~/.mux/plugins`. */
+    containerLocation?: string;
     /** Returned by agentPlugins.pendingSignOuts; omit for no record. */
     pendingSignOuts?: AgentPluginPendingSignOuts;
     /**
@@ -258,6 +260,8 @@ export interface MockORPCClientOptions {
     states?: Record<string, unknown>;
     /** When set, artifacts.sendInteraction fails with this error (the strip's error state). */
     sendInteractionError?: string;
+    /** Gets every artifacts.setState call (window.xum.setState reached the host). */
+    onSetState?: (input: { path: string; state: unknown }) => void;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
   /** When set, mcpApps.listViewDomains fails with this error (Settings' load error). */
@@ -1367,7 +1371,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     },
     agentPlugins: {
       list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
-      containerLocation: () => Promise.resolve("~/.mux/plugins"),
+      containerLocation: () =>
+        Promise.resolve(agentPluginsMock?.containerLocation ?? "~/.mux/plugins"),
       listForSettings: () =>
         Promise.resolve({
           list: { success: true as const, data: agentPluginsMock?.items ?? [] },
@@ -2614,7 +2619,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           success: true as const,
           data: { state: artifacts.states?.[input.path] ?? null },
         }),
-      setState: () => Promise.resolve({ success: true as const, data: undefined }),
+      setState: (input: { path: string; state: unknown }) => {
+        artifacts.onSetState?.({ path: input.path, state: input.state });
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       sendInteraction: () =>
         Promise.resolve(
           artifacts.sendInteractionError != null

@@ -11,6 +11,25 @@ export const ARTIFACT_SEND_TEXT_MAX_CHARS = 4000;
  * post more sends that still pass the gesture gate.
  */
 export const ARTIFACT_CLICK_SEND_WINDOW_MS = 5000;
+/**
+ * How long a frame document has to answer the host's check after an iframe load before the host
+ * closes the frame (frameDocumentChannel.ts). Measured in WebKit 27.2 and Chromium 156: a live
+ * document answers within 7 ms, or after about six chained tasks when it keeps the thread busy
+ * (WebKit, 250 ms tasks: 1.55 s); a one-off long task delays the load, not the answer.
+ */
+export const FRAME_DOCUMENT_CHECK_DEADLINE_MS = 5000;
+/**
+ * A check's deadline timer that fires more than this late means the app's own thread was blocked
+ * (frameDocumentChannel.ts). A healthy host fires timers within tens of milliseconds; after a 6 s
+ * block right after a check, WebKit 27.2 fired the deadline about 1 s late, ahead of the
+ * document's answer.
+ */
+export const FRAME_DOCUMENT_CHECK_LATE_MS = 250;
+/**
+ * The latest the host closes a frame whose check stays unanswered, counted from the first
+ * unanswered check, however often late timers extended its deadline (frameDocumentChannel.ts).
+ */
+export const FRAME_DOCUMENT_CHECK_CAP_MS = 15000;
 /** Serialized JSON size cap for `send` data and `setState` state. */
 export const ARTIFACT_JSON_MAX_BYTES = 16 * 1024;
 /** artifact_list shows at most this much of an artifact's state. */

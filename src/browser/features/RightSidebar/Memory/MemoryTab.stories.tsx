@@ -233,3 +233,25 @@ export const HarvestNoteAtPhoneWidth: Story = {
     await expect(line.getBoundingClientRect().height).toBeGreaterThan(20);
   },
 };
+
+// One organizer pass writes the same record to each scope it covers: each scope line counts its
+// own changes, and the run's cost and ceiling note sit on one line, not on all three.
+export const SharedRunAtPhoneWidth: Story = {
+  parameters: {
+    // The play assertion pins the wrap; a snapshot of the same tab adds budget, not coverage.
+    pixel: { exclude: true },
+  },
+  render: () => {
+    const run = {
+      ...CONSOLIDATION_RECORD,
+      spentUsd: 0.9,
+      note: "stopped at the cost ceiling after $0.90",
+    };
+    return renderTab("375px", { workspaceRecord: run, projectRecord: run, globalRecord: run });
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const line = await canvas.findByText(/^Run cost \(workspace, project, global\)/);
+    await expect(line.scrollWidth).toBeLessThanOrEqual(line.clientWidth);
+  },
+};
