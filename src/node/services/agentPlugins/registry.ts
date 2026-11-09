@@ -3,6 +3,7 @@ import * as path from "node:path";
 import {
   AgentPluginInstallEntrySchema,
   type AgentPluginImportedComponents,
+  type AgentPluginInstallEntry,
 } from "@/common/config/schemas/agentPluginInstalls";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getOwn } from "@/common/utils/getOwn";
@@ -12,6 +13,36 @@ import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 export const PLUGIN_REGISTRY_FILE_NAME = "plugins.json";
+
+/**
+ * The registry rows this build can read, first row per name. A row it cannot parse (a source kind
+ * a newer build wrote, or corruption) degrades to an unmanaged folder in list views and stays in
+ * the raw file. A repeated name is corrupt identity: the first row wins, like `find()` lookups.
+ * Mutations do not use this: they refuse a registry with unreadable or repeated rows.
+ */
+export function parseRegistryEntriesLenient(
+  rawEntries: readonly unknown[]
+): AgentPluginInstallEntry[] {
+  const entries: AgentPluginInstallEntry[] = [];
+  const seenNames = new Set<string>();
+  for (const rawEntry of rawEntries) {
+    const parsed = AgentPluginInstallEntrySchema.safeParse(rawEntry);
+    if (!parsed.success) {
+      log.debug("Skipping unrecognized managed plugin registry entry (preserved on disk)", {
+        entry: rawEntry,
+        error: parsed.error.message,
+      });
+      continue;
+    }
+    if (seenNames.has(parsed.data.name)) {
+      log.warn("Ignoring duplicate managed plugin registry entry", { name: parsed.data.name });
+      continue;
+    }
+    seenNames.add(parsed.data.name);
+    entries.push(parsed.data);
+  }
+  return entries;
+}
 
 /** Shared lossless document read: lenient views recover, strict mutations refuse corruption. */
 export async function readPluginRegistryDocument(

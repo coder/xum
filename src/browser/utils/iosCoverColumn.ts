@@ -36,12 +36,6 @@ const MAX_PHONE_SCREEN_WIDTH_PX = 600;
 const MAX_STATUS_COLUMN_WIDTH_PX = 120;
 /** A touch that moves further than this is a drag, not a tap. */
 const TAP_SLOP_PX = 10;
-/**
- * A drag left of the column picks its axis once it has moved this far, so a vertical scroll whose
- * first move wobbles sideways is not blocked as a sideways pan. A pan that starts before then
- * slips through, and the viewport heals it.
- */
-const PAN_INTENT_SLOP_PX = 6;
 const VIEWPORT_WIDTH = /\bwidth=[^,]*/;
 const VIEWPORT_HEIGHT = /,\s*height=[^,]*/;
 
@@ -457,7 +451,10 @@ class ColumnTouchBridge {
     if (pan.block === null) {
       const dx = touch.clientX - pan.x;
       const dy = touch.clientY - pan.y;
-      if (Math.hypot(dx, dy) < PAN_INTENT_SLOP_PX) return;
+      // iOS still clicks a tap that drifts, so a move within the tap slop must not be cancelled.
+      // Deciding later also keeps a vertical scroll that first wobbles sideways from being blocked;
+      // a pan that starts before then slips through, and the viewport heals it.
+      if (Math.hypot(dx, dy) <= TAP_SLOP_PX) return;
       // Only a sideways drag over nothing that scrolls sideways, in either direction, can only pan
       // the page. A vertical drag is never blocked: the page has no height to pan.
       pan.block = Math.abs(dx) > Math.abs(dy) && !canScrollSideways(event.target);
@@ -600,10 +597,17 @@ export function installIosCoverColumn(): () => void {
   if (!isIosStandaloneWebApp() || meta == null) return () => undefined;
   const viewport = new CoverColumnViewport(meta);
   viewport.sync();
+  // Unfolding fires the window resize while the page still has the cover display's layout, so the
+  // sync there took the column again and kept the 466pt width on the open display. The rest of the
+  // change arrives as visual viewport resizes only, so check on those too.
+  const onResize = (): void => viewport.onResize();
+  const visualViewport = window.visualViewport;
+  visualViewport?.addEventListener("resize", onResize);
   const removers = [
     new ColumnTouchBridge(() => viewport.column).install(),
-    listen("resize", () => viewport.onResize()),
+    listen("resize", onResize),
     listen("scroll", () => viewport.onScroll()),
+    () => visualViewport?.removeEventListener("resize", onResize),
   ];
   return () => {
     for (const remove of removers) remove();

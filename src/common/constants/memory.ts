@@ -80,6 +80,24 @@ export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
 /** Generous step ceiling for the consolidation stream (reads + budgeted mutations). */
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
 /**
+ * Rows of one run's journal that the guarded memory tool fills with refused commands (out of scope,
+ * denied, credential-like, over budget). A refusal spends no budget, and one step can issue many
+ * parallel calls, so without a bound a misbehaving model grows the journal, which is saved in the
+ * run's sidecar record and returned over IPC. 32 is the organizer's step ceiling: a model that
+ * has one command refused per step still gets every refusal journaled. Past it, the last row says
+ * the rest are not recorded. Budgeted commands (applied, dry-run, failed) are at most the op budget
+ * and are always journaled, so the cap never hides a change.
+ */
+export const MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES = 32;
+/**
+ * Longest path (characters, virtual `/memories/...` form) a mutating command may name. The tool
+ * schema bounds no length, and the journal stores the path of every row and quotes it in refusal
+ * notes. 512 is twice the 255-byte name limit of common filesystems and far above any real memory
+ * path (the index shows 200-character descriptions, and names are short); a longer one is refused
+ * before it is parsed or journaled in full.
+ */
+export const MEMORY_CONSOLIDATION_PATH_MAX_CHARS = 512;
+/**
  * Memory analyzer (the harvest of one closed or open compaction epoch): mutating memory
  * commands for the whole epoch. All of its transcript chunks, a retry of the epoch, and
  * every later run of the same epoch (an archive after new rows, the compaction that

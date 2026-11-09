@@ -5,6 +5,7 @@ import * as LazyFeatureModule from "@/browser/components/LazyFeature/LazyFeature
 import { StreamingContext } from "./StreamingContext";
 import { Mermaid, sanitizeMermaidSvg } from "./Mermaid";
 import { DESKTOP_TITLEBAR_HEIGHT_PX } from "@/browser/hooks/useDesktopTitlebar";
+import { MERMAID_ERROR_SELECTOR } from "@/constants/mermaid";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
 import MarkdownIt from "markdown-it";
 import { MarkdownRenderer } from "./MarkdownRenderer";
@@ -328,6 +329,7 @@ describe("Mermaid layout stability", () => {
     expect(container?.style.minHeight).toBe("300px");
     expect(view.container.textContent).toContain("Rendering diagram...");
     expect(view.container.textContent).not.toContain("Mermaid Error");
+    expect(view.container.querySelector(MERMAID_ERROR_SELECTOR)).toBeNull();
   });
 
   test("shows parse errors after streaming settles", async () => {
@@ -335,6 +337,9 @@ describe("Mermaid layout stability", () => {
 
     await waitFor(() => expect(view.container.textContent).toContain("Mermaid Error: "));
     expect(view.container.querySelector(".mermaid-container")).toBeNull();
+    expect(view.container.querySelector(MERMAID_ERROR_SELECTOR)?.textContent).toContain(
+      "Mermaid Error: "
+    );
   });
 
   describe("sanitizeMermaidSvg", () => {

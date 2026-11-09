@@ -1671,6 +1671,53 @@ interface WorkspaceMetadataBuildOptions extends WorkspaceMetadataOptions {
   degraded?: { value: boolean };
 }
 
+/** A config row field that metadata carries with the same type. */
+type ConfigTreeField = {
+  [K in keyof Workspace & keyof WorkspaceMetadata]: NonNullable<Workspace[K]> extends NonNullable<
+    WorkspaceMetadata[K]
+  >
+    ? K
+    : never;
+}[keyof Workspace & keyof WorkspaceMetadata];
+
+/**
+ * Task-tree fields: the parent link, the agent, the task state and how the task holds its
+ * checkout. A legacy row takes them from its config row alone, as a current-format row does, and
+ * its legacy metadata.json supplies none of them. The last build that wrote such files (v0.3.0-rc.2) wrote only the id, name, project and
+ * createdAt, #303 stopped every write in v0.3.0, and parentWorkspaceId came later (#1219), in
+ * config.json only. Read from the file, a value would hold only until the read-time migration (a
+ * migrated row reads the row alone): a stray file could attach a legacy row to a parent, or detach
+ * one, for a single read. None of these fields is copied from the file either. TaskService reads
+ * them from config rows, except listLegacyTaskVariantWorkspaces: the in-memory variant registry
+ * (rememberLegacyTaskVariantWorkspace) still takes a legacy variant's parent link and taskStatus
+ * from the file, for the first build only.
+ */
+export const CONFIG_TREE_FIELDS = [
+  "parentWorkspaceId",
+  "agentType",
+  "agentId",
+  "workflowTask",
+  "taskStatus",
+  "taskPendingGuidance",
+  "taskLaunchError",
+  "reportedAt",
+  "taskModelString",
+  "taskThinkingLevel",
+  "taskPrompt",
+  "taskTrunkBranch",
+  "taskIsolation",
+  "sideChatParentWorkspaceId",
+  "taskDesktopOwnerWorkspaceId",
+  "taskSticky",
+  "taskExecutionId",
+  "taskExecutionStatus",
+] as const satisfies readonly ConfigTreeField[];
+
+/** Sets each CONFIG_TREE_FIELDS value of `metadata` to the config row's, absent included. */
+function takeTreeFieldsFromConfig(metadata: WorkspaceMetadata, row: Workspace): void {
+  for (const key of CONFIG_TREE_FIELDS) Object.assign(metadata, { [key]: row[key] });
+}
+
 /** Marks a build degraded; `fallbackId` names an entry built from its config row alone. */
 function markDegraded(
   options: WorkspaceMetadataBuildOptions | undefined,
@@ -5084,25 +5131,12 @@ export class Config {
             metadata.aiSettings ??= workspace.aiSettings;
             metadata.heartbeat ??= workspace.heartbeat;
 
-            // Preserve tree/task metadata when present in config (metadata.json won't have it)
-            metadata.parentWorkspaceId ??= workspace.parentWorkspaceId;
-            metadata.agentType ??= workspace.agentType;
-            metadata.agentId ??= workspace.agentId;
-            metadata.workflowTask ??= workspace.workflowTask;
-            metadata.bestOf = isLegacyTaskVariantGroup(metadata.bestOf)
-              ? undefined
-              : (normalizeWorkspaceBestOf(metadata.bestOf) ??
-                normalizeWorkspaceBestOf(workspace.bestOf));
-            metadata.taskStatus ??= workspace.taskStatus;
-            metadata.taskPendingGuidance ??= workspace.taskPendingGuidance;
-            metadata.taskLaunchError ??= workspace.taskLaunchError;
-            metadata.delegatedCreationInterrupted ??=
+            // Tree/task metadata comes from config alone (see CONFIG_TREE_FIELDS), the grouping
+            // and the interrupted-creation mark too.
+            takeTreeFieldsFromConfig(metadata, workspace);
+            metadata.bestOf = normalizeWorkspaceBestOf(workspace.bestOf);
+            metadata.delegatedCreationInterrupted =
               delegatedCreationInterruptedField(workspace).delegatedCreationInterrupted;
-            metadata.reportedAt ??= workspace.reportedAt;
-            metadata.taskModelString ??= workspace.taskModelString;
-            metadata.taskThinkingLevel ??= workspace.taskThinkingLevel;
-            metadata.taskPrompt ??= workspace.taskPrompt;
-            metadata.taskTrunkBranch ??= workspace.taskTrunkBranch;
             // Preserve archived timestamps from config
             metadata.archivedAt ??= workspace.archivedAt;
             metadata.unarchivedAt ??= workspace.unarchivedAt;

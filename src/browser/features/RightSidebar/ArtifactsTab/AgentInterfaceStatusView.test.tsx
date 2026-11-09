@@ -25,6 +25,14 @@ import { AgentInterfaceStatusView } from "./AgentInterfaceStatusView";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { useMainPaneAgentInterfaceView } from "./agentInterfaceView";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
+import {
+  deliverFrameMessages,
+  frameDocumentOf,
+  postFromFrameDocument,
+} from "./frameDocument.testHarness";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 function page(content: string): ArtifactReadResult {
   // One fixed mtime: remote runtimes list whole seconds, so a quick rewrite can keep it.
@@ -266,15 +274,8 @@ function MainPane(props: { workspaceId: string }) {
 }
 
 /** The page the main pane's status view shows (the Artifacts panel may show it too). */
-/** Delivers `data` to the host as a message from the page in `frame`. */
-function postFromFrame(frame: HTMLIFrameElement, data: unknown) {
-  act(() => {
-    const event = new window.Event("message");
-    Object.defineProperty(event, "data", { value: data });
-    Object.defineProperty(event, "source", { value: frame.contentWindow });
-    window.dispatchEvent(event);
-  });
-}
+/** Delivers `data` to the host as the page in `frame` sends it: over its document's port. */
+const postFromFrame = postFromFrameDocument;
 
 function shownPage(view: ReturnType<typeof render>): string {
   const statusView = view.queryByTestId("agent-interface-status-view");
@@ -309,59 +310,28 @@ function pressAltChord(
 }
 
 /**
- * Runs the bridge shim from `frame`'s srcdoc against a stand-in window whose posts reach the host
- * as the frame's messages; returns a trusted key press inside the frame.
+ * Boots the document `frame`'s srcdoc holds (its real bridge shim); returns a key press inside
+ * the frame, which resolves once the shim's message reached the host.
  */
 function runFrameShim(frame: HTMLIFrameElement) {
-  const srcdoc = frame.getAttribute("srcdoc") ?? "";
-  const shim = new window.DOMParser().parseFromString(srcdoc, "text/html").querySelector("script");
-  const keydowns: Array<(event: unknown) => void> = [];
-  const frameWindow = {
-    parent: {
-      postMessage: (data: unknown) => {
-        const event = new window.Event("message");
-        Object.defineProperty(event, "data", { value: data });
-        Object.defineProperty(event, "source", { value: frame.contentWindow });
-        window.dispatchEvent(event);
-      },
-    },
-    addEventListener: (type: string, listener: (event: unknown) => void) => {
-      if (type === "keydown") keydowns.push(listener);
-    },
-    setTimeout: (callback: () => void) => callback(),
-  };
-  const frameDocument = {
-    documentElement: { setAttribute: () => undefined },
-    addEventListener: () => undefined,
-    querySelectorAll: () => [],
-  };
-  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
-  const run = new Function("window", "document", "CustomEvent", shim?.textContent ?? "") as (
-    window: unknown,
-    document: unknown,
-    customEvent: unknown
-  ) => void;
-  run(frameWindow, frameDocument, class {});
-  return (
+  const { win } = frameDocumentOf(frame);
+  return async (
     key: string,
     modifiers: { ctrlKey?: boolean; shiftKey?: boolean; altKey?: boolean; code?: string }
   ) => {
-    const event = {
+    const event = new win.KeyboardEvent("keydown", {
       key,
       code: modifiers.code ?? "",
-      target: { nodeType: 1, tagName: "DIV", isContentEditable: false },
-      isTrusted: true,
-      repeat: false,
       ctrlKey: modifiers.ctrlKey ?? false,
       shiftKey: modifiers.shiftKey ?? false,
-      metaKey: false,
       altKey: modifiers.altKey ?? false,
-      // Physical Ctrl+Alt, not AltGr.
-      getModifierState: () => false,
-      defaultPrevented: false,
-      preventDefault: () => undefined,
-    };
-    for (const listener of keydowns) listener(event);
+      bubbles: true,
+      cancelable: true,
+    });
+    // Physical Ctrl+Alt, not AltGr: happy-dom infers AltGraph from any Ctrl+Alt event.
+    Object.defineProperty(event, "getModifierState", { value: () => false });
+    win.document.body.dispatchEvent(event);
+    await deliverFrameMessages();
   };
 }
 
@@ -468,26 +438,19 @@ describe("Agent interface status view", () => {
       await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
       frame = view.getByTestId("artifact-frame") as HTMLIFrameElement;
       const post = (keybind: "normal" | "vim") =>
-        act(() => {
-          const event = new window.Event("message");
-          Object.defineProperty(event, "data", {
-            value: { xumArtifact: 1, type: "interruptKey", keybind },
-          });
-          Object.defineProperty(event, "source", { value: frame?.contentWindow });
-          window.dispatchEvent(event);
-        });
+        postFromFrameDocument(frame!, { xumArtifact: 1, type: "interruptKey", keybind });
 
       // The page's script posting it by itself, even after taking focus with window.focus().
-      post("normal");
+      await post("normal");
       act(() => frame?.focus());
-      post("normal");
+      await post("normal");
       expect(replayed).toEqual([]);
 
       // The user's key press in the page; only the keybind for the Vim setting (off) is replayed.
       activation = { isActive: true };
-      post("vim");
+      await post("vim");
       expect(replayed).toEqual([]);
-      post("normal");
+      await post("normal");
       expect(replayed).toEqual(["Escape"]);
     } finally {
       window.removeEventListener("keydown", onKeyDown);
@@ -512,9 +475,10 @@ describe("Agent interface status view", () => {
       // The press goes through the shim this frame's srcdoc carries (happy-dom runs no frame
       // scripts), so a status page whose shim does not forward the chord fails here.
       const pressInFrame = runFrameShim(frame);
-      act(() =>
-        pressInFrame(KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW.key, { ctrlKey: true, shiftKey: true })
-      );
+      await pressInFrame(KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW.key, {
+        ctrlKey: true,
+        shiftKey: true,
+      });
       await waitFor(() =>
         expect(view.queryByTestId("agent-interface-status-view") === null).toBe(true)
       );
@@ -549,9 +513,9 @@ describe("Agent interface status view", () => {
       const peekShown = () => view.queryByTestId("agent-interface-transcript-peek") != null;
       const { key, code } = KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK;
       const chord = { ctrlKey: true, altKey: true, shiftKey: true, code };
-      act(() => pressInFrame(key, chord));
+      await pressInFrame(key, chord);
       expect(peekShown()).toBe(true);
-      act(() => pressInFrame(key, chord));
+      await pressInFrame(key, chord);
       expect(peekShown()).toBe(false);
     } finally {
       globalThis.KeyboardEvent = globalKeyboardEvent;
@@ -570,7 +534,7 @@ describe("Agent interface status view", () => {
       await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
       const frame = view.getByTestId("artifact-frame") as HTMLIFrameElement;
       act(() => frame.focus());
-      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Run the tests" });
+      await postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Run the tests" });
 
       const strip = await view.findByTestId("artifact-send-strip");
       expect(strip.textContent).toContain("Run the tests");
@@ -597,7 +561,7 @@ describe("Agent interface status view", () => {
     expect(JSON.parse(JSON.parse(embedded ?? '"null"') as string)).toEqual({ step: 1 });
 
     const frame = view.getByTestId("artifact-frame") as HTMLIFrameElement;
-    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
+    await postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
     await waitFor(() => expect(savedStates).toEqual([{ step: 2 }]));
   });
 

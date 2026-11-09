@@ -204,7 +204,8 @@ interface HarvestPiece {
  * not spend the cap on bytes and fill dozens of chunks. The scan reaches a lookahead past the cap,
  * so a secret that starts inside the kept text is matched whole, and what lies past it is never
  * scanned. Text parts are not tool output, but a credential a user pasted or a model echoed sits
- * in them just the same, and the cap is long enough to carry it to the model.
+ * in them just the same, and the cap is long enough to carry it to the model. The compaction
+ * summary is prepared the same way.
  */
 function boundedTextPart(raw: string): RowText {
   const window = takeWithoutMedia(raw, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
@@ -216,6 +217,11 @@ function boundedTextPart(raw: string): RowText {
 function rowTextOfPart(part: MuxMessage["parts"][number]): RowText {
   if (part.type === "text") return boundedTextPart(part.text.trim());
   return { text: neutralizeHarvestText(partToText(part).trim()), cutChars: 0 };
+}
+
+/** What ends a text that `boundedTextPart` cut: how many characters of it were left out. */
+function truncationNote(cutChars: number): string {
+  return `[truncated ${cutChars} more chars for memory harvest]`;
 }
 
 function piecesOfPart(
@@ -234,9 +240,7 @@ function piecesOfPart(
     );
     const isCutEnd = cutChars > 0 && index === count - 1;
     return {
-      text: isCutEnd
-        ? `${segment}\n[truncated ${cutChars} more chars for memory harvest]`
-        : segment,
+      text: isCutEnd ? `${segment}\n${truncationNote(cutChars)}` : segment,
       truncated: isCutEnd,
       part: position,
       segment: `${index + 1} of ${count}`,
@@ -538,6 +542,17 @@ When done, reply with one line: what you changed, or "no changes needed".`;
 const ANALYZER_TOOL_DESCRIPTION =
   "Read and edit the persistent memory that future sessions read. You can read workspace, project and global memory. You can write only under /memories/workspace/. You cannot insert at a line number, delete or rename: add to a file with str_replace (replace a line that is unique in it with that line plus the new text), or create a new file.";
 
+/**
+ * The compaction summary as the analyzer reads it with every chunk: prepared as a text part is (see
+ * `boundedTextPart`), free of data URLs and cut at the part's cap. The summary is model-written text
+ * of the whole epoch, so what a tool printed or the user pasted can come back through it, a screenshot
+ * included, and each chunk's prompt carries it again.
+ */
+function summaryText(summary: MuxMessage): string {
+  const { text, cutChars } = boundedTextPart(summary.parts.map(partToText).join("\n"));
+  return cutChars > 0 ? `${text}\n${truncationNote(cutChars)}` : text;
+}
+
 function buildChunkPrompt(args: {
   summary?: MuxMessage;
   index: number;
@@ -559,9 +574,7 @@ function buildChunkPrompt(args: {
   const summarySection =
     args.summary === undefined
       ? ""
-      : // The summary is model-written text of the whole epoch, so a credential that a tool printed
-        // can come back through it; the transcript's own redaction never saw it.
-        `\nCompaction summary (${args.summary.id}):\n${redactSecretLike(args.summary.parts.map(partToText).join("\n"))}\n`;
+      : `\nCompaction summary (${args.summary.id}):\n${summaryText(args.summary)}\n`;
   // Command and path only, never the text: the files hold it, and re-reading them is the way to
   // see it. Without this note the replay of a failed chunk would apply its edits a second time.
   const landedSection =
@@ -655,15 +668,10 @@ async function analyzeChunk(args: {
       streamError: `memory analysis of chunk ${args.label} was cut short by its timeout or by workspace removal`,
     };
   }
-  // A step that hit the output limit never ran its tool call, yet the stream ends clean: the
-  // cursor would move past a chunk the model only partly analyzed. The meter is the job's, but a
-  // step like that ends its chunk's stream and the run with it, so the flag is this chunk's.
-  if (args.meter.endedAtOutputLimit()) {
-    return {
-      streamError: `memory analysis of chunk ${args.label} ended a step at the model's output limit, so its tool call never ran`,
-    };
-  }
-
+  // The stream completed, so every step in it was billed, one cut off at the output limit
+  // included: the usage is recorded before that step fails the chunk. Telemetry never fails a
+  // chunk, so a sink that throws leaves the chunk without usage for the record.
+  let usage: ChunkOutcome["usage"];
   try {
     // AI SDK 7: top-level `usage` is the all-steps total (old `totalUsage`).
     const totalUsage = await stream.usage;
@@ -671,15 +679,24 @@ async function analyzeChunk(args: {
       totalUsage,
       accumulateStepsProviderMetadata(await stream.steps, args.pricingModel)
     );
-    return {
-      usage: {
-        inputTokens: totalUsage.inputTokens ?? 0,
-        outputTokens: totalUsage.outputTokens ?? 0,
-      },
+    usage = {
+      inputTokens: totalUsage.inputTokens ?? 0,
+      outputTokens: totalUsage.outputTokens ?? 0,
     };
   } catch {
-    return {};
+    usage = undefined;
   }
+  // When the stream's last step hit the output limit, the SDK ran none of its tool calls, yet the
+  // stream ends clean: the cursor would move past a chunk the model only partly analyzed. An
+  // earlier cut-off step does not count: its call comes back to the model as a tool error, and a
+  // later step can retry it (the meter keeps only the last step). The meter is the job's, but a
+  // chunk that ends this way fails and ends the run, so the flag is always this chunk's.
+  if (args.meter.endedAtOutputLimit()) {
+    return {
+      streamError: `memory analysis of chunk ${args.label} ended a step at the model's output limit, so its tool call never ran`,
+    };
+  }
+  return usage === undefined ? {} : { usage };
 }
 
 /**
@@ -715,10 +732,11 @@ export async function runMemoryHarvest(args: {
   chunkTimeoutMs?: number;
   /**
    * Best-effort cost telemetry: headless harvest bypasses the chat cost
-   * pipeline, so the caller records each clean chunk stream's full usage
-   * (with cache-token breakdown) into session-usage.json. providerMetadata
-   * is step-accumulated — Anthropic reports billed cache-write tokens only
-   * there, so dropping it would price cache writes as ordinary input.
+   * pipeline, so the caller records each completed chunk stream's full usage
+   * (with cache-token breakdown) into session-usage.json: a stream that failed or
+   * was aborted has none, one cut off at the output limit was billed and has.
+   * providerMetadata is step-accumulated — Anthropic reports billed cache-write
+   * tokens only there, so dropping it would price cache writes as ordinary input.
    * Called while the chunk holds the stream gate, so it must return at once: a caller
    * with anything slow to do defers it until the run is over.
    */

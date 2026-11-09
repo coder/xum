@@ -10,6 +10,13 @@ import {
   SIDE_INSET_VIEWPORT,
   TABLET_TOUCH_TARGET_PX,
 } from "../src/constants/layout";
+import {
+  MERMAID_ERROR_SELECTOR,
+  MERMAID_PAGE_DIAGRAM_SELECTOR,
+  MERMAID_PAGE_FRAME_SELECTOR,
+  PAINT_CHECK_RENDER_TIMEOUT_ENV,
+  PAINT_CHECK_WAIT_EVENT,
+} from "../src/constants/mermaid";
 
 // Real :hover for the primary-button contrast stories (#6022). A play runs inside the page and
 // cannot set :hover, so only stories under this id prefix get two page-level helpers backed by
@@ -762,8 +769,28 @@ async function assertLiveLineClearsTheComposer(page: StoryPage) {
   }
 }
 
+// Only the guards named here have a story built to trip them (src/browser/stories/
+// PaintCheckFixtures.stories.tsx, run through this file by `make test-storybook-paint-fixtures`).
+// A guard that is not named here has no story. A message that changes needs its new text in
+// scripts/check-paint-check-fixtures.ts.
+// - waitForRenderedDiagrams, the error marker: BrokenChartNextToGoodChart
+// - waitForRenderedDiagrams, every frame holds a drawing: DiagramNextToAFrameThatNeverDraws
+// - waitForRenderedDiagrams, the poll for a diagram that mounts late: DiagramMountsWhenTheRunnerWaits
+// - compareWithHidden, ink outside the box at rest: DiagramPaintsOutsideItsBox
+// - compareWithHidden, hiding changes no pixel inside the box at rest: DiagramOutsideTheViewport,
+//   DiagramInHiddenParent, DiagramUnderAnOverlay and DiagramClippedAway
+// - assertNoDiagramInkOutsideItsBox, the scrolled view counts the pixels it changes:
+//   DiagramBelowTheFoldSeenWhenScrolled
+// - assertNoDiagramInkOutsideItsBox, the scrolled view credits no diagram that nobody sees:
+//   DiagramBelowTheFoldInHiddenParent
 const PAINT_CHECK_TAG = "paint-check";
-const PAGE_DIAGRAMS = ".mermaid-container:not(.mermaid-modal) > svg";
+const NO_DIAGRAM_MESSAGE = `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`;
+const DEFAULT_DIAGRAM_RENDER_TIMEOUT_MS = 15_000;
+// The fixture run shortens this (scripts/check-paint-check-fixtures.ts), so the fixture with a frame
+// that never draws fails without the default wait. A real run leaves the variable unset.
+const requestedRenderTimeoutMs = Number(process.env[PAINT_CHECK_RENDER_TIMEOUT_ENV]);
+const DIAGRAM_RENDER_TIMEOUT_MS =
+  requestedRenderTimeoutMs > 0 ? requestedRenderTimeoutMs : DEFAULT_DIAGRAM_RENDER_TIMEOUT_MS;
 
 interface Box {
   left: number;
@@ -779,8 +806,37 @@ interface Pixels {
   channels: number;
 }
 
+// Known limit (stated in docs/AGENTS.md): the check covers the diagrams that exist when this wait
+// returns. A broken or extra diagram that mounts later is not checked, and nothing here re-checks.
+async function waitForRenderedDiagrams(page: StoryPage) {
+  const args: [string, string, string, number, string] = [
+    MERMAID_PAGE_FRAME_SELECTOR,
+    MERMAID_PAGE_DIAGRAM_SELECTOR,
+    MERMAID_ERROR_SELECTOR,
+    DIAGRAM_RENDER_TIMEOUT_MS,
+    PAINT_CHECK_WAIT_EVENT,
+  ];
+  const rendered = await page.evaluate(async ([frames, diagrams, errors, timeout, waitEvent]) => {
+    // A diagram that fails replaces its whole frame, so the counts below cannot see it.
+    const hasFailed = () => document.querySelector(errors) !== null;
+    const isRendered = () => {
+      const drawn = document.querySelectorAll(diagrams).length;
+      return drawn > 0 && drawn === document.querySelectorAll(frames).length;
+    };
+    // The fixture story that mounts its diagram late waits for this, so it cannot mount early.
+    window.dispatchEvent(new Event(waitEvent));
+    // Not Date.now(): the preview freezes it (.storybook/preview.tsx).
+    const deadline = performance.now() + timeout;
+    while (!isRendered() && !hasFailed() && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return isRendered() && !hasFailed();
+  }, args);
+  assert(rendered, NO_DIAGRAM_MESSAGE);
+}
+
 async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
-  const boxes = await page.$$eval(PAGE_DIAGRAMS, (diagrams) =>
+  const boxes = await page.$$eval(MERMAID_PAGE_DIAGRAM_SELECTOR, (diagrams) =>
     diagrams.map((diagram) => {
       const own = diagram.getBoundingClientRect();
       const container = diagram.parentElement!;
@@ -792,10 +848,7 @@ async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
       return { left, top, right: Math.max(left, right), bottom: Math.max(top, bottom) };
     })
   );
-  assert(
-    boxes.length > 0,
-    `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`
-  );
+  assert(boxes.length > 0, NO_DIAGRAM_MESSAGE);
   return boxes;
 }
 
@@ -807,7 +860,7 @@ async function viewportPixels(page: StoryPage): Promise<Pixels> {
 
 function setDiagramHidden(page: StoryPage, index: number, hidden: boolean) {
   return page.$$eval(
-    PAGE_DIAGRAMS,
+    MERMAID_PAGE_DIAGRAM_SELECTOR,
     (diagrams, [target, hide]) => {
       // Opacity, because a child can set visibility: visible inside a hidden parent.
       (diagrams[target as number] as SVGElement).style.opacity = hide ? "0" : "";
@@ -872,19 +925,38 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels) {
   return { count, sides: [...sides].sort(), bounds };
 }
 
-async function paintOutside(
-  page: StoryPage,
-  index: number,
-  box: Box,
-  shown: Pixels
-): Promise<string[]> {
+/**
+ * Pixels that hiding the diagram changed inside its box, as far as the viewport shows it. A diagram
+ * that is seen changes many; one under a hidden parent, an overlay or a clip changes none, which
+ * leaves nothing outside its box to compare either. Stops counting once it is clearly seen.
+ */
+function differenceInside(box: Box, shown: Pixels, hidden: Pixels) {
+  const right = Math.min(Math.ceil(box.right), shown.width);
+  const bottom = Math.min(Math.ceil(box.bottom), shown.height);
+  let count = 0;
+  for (let y = Math.max(Math.floor(box.top), 0); y < bottom; y++) {
+    for (let x = Math.max(Math.floor(box.left), 0); x < right; x++) {
+      if (pixelDiffers(shown, hidden, (y * shown.width + x) * shown.channels)) count++;
+      if (count >= MIN_INK_PIXELS) return count;
+    }
+  }
+  return count;
+}
+
+/** Hides the diagram and compares the viewport with `shown`: ink outside its box, and ink inside. */
+async function compareWithHidden(page: StoryPage, index: number, box: Box, shown: Pixels) {
   await setDiagramHidden(page, index, true);
   try {
-    const { sides, bounds, count } = differenceOutside(box, shown, await viewportPixels(page));
+    const hidden = await viewportPixels(page);
+    const { sides, bounds, count } = differenceOutside(box, shown, hidden);
     const where = `x ${bounds.left}-${bounds.right}, y ${bounds.top}-${bounds.bottom}`;
-    return count >= MIN_INK_PIXELS
-      ? [`diagram ${index} paints ${sides.join(" and ")} its box (${count} px, ${where})`]
-      : [];
+    return {
+      painted:
+        count >= MIN_INK_PIXELS
+          ? [`diagram ${index} paints ${sides.join(" and ")} its box (${count} px, ${where})`]
+          : [],
+      changedInside: differenceInside(box, shown, hidden),
+    };
   } finally {
     await setDiagramHidden(page, index, false);
   }
@@ -892,7 +964,7 @@ async function paintOutside(
 
 function scrollBelowDiagram(page: StoryPage, index: number, scroll: boolean) {
   return page.$$eval(
-    PAGE_DIAGRAMS,
+    MERMAID_PAGE_DIAGRAM_SELECTOR,
     (diagrams, [target, down]) => {
       const frame = diagrams[target as number].parentElement!.parentElement!;
       if (down) {
@@ -917,7 +989,7 @@ const roomBelow = (box: Box, viewportHeight: number) => viewportHeight - Math.ce
  * For a diagram that ends below the viewport. By now the first screenshot has repaired any stale
  * WebKit layout, so this scrolled view only catches paint that escapes a settled layout.
  */
-async function paintBelowWhenScrolled(page: StoryPage, index: number): Promise<string[]> {
+async function paintBelowWhenScrolled(page: StoryPage, index: number) {
   await scrollBelowDiagram(page, index, true);
   try {
     const box = (await diagramPaintBoxes(page))[index];
@@ -926,7 +998,7 @@ async function paintBelowWhenScrolled(page: StoryPage, index: number): Promise<s
       roomBelow(box, shown.height) >= MIN_BELOW_PX,
       `Diagram ${index} has no content below it to compare: put text after it in the story`
     );
-    return await paintOutside(page, index, box, shown);
+    return await compareWithHidden(page, index, box, shown);
   } finally {
     await scrollBelowDiagram(page, index, false);
   }
@@ -937,7 +1009,7 @@ async function paintBelowWhenScrolled(page: StoryPage, index: number): Promise<s
  * only. WebKit lays the page out again at its next screenshot or resize, which repairs that
  * state, so each diagram is compared against one first screenshot (one that ends below the
  * viewport also gets a scrolled one) and the viewport is left alone: with a diagram hidden, the
- * page outside its box must look the same as with it shown.
+ * page outside its box must look the same as with it shown, and its box must look different.
  */
 async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   // A hovered button shows a tooltip, which fades in and out between two screenshots.
@@ -945,6 +1017,7 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   await page.waitForFunction(() => document.querySelector('[role="tooltip"]') === null, undefined, {
     timeout: 5000,
   });
+  await waitForRenderedDiagrams(page);
   // Wait for fonts and late renders by polling boxes across frames, not by comparing screenshots:
   // a screenshot makes WebKit lay the page out again.
   await page.evaluate(async (selector) => {
@@ -965,20 +1038,35 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
       still = now === last ? still + 1 : 0;
       last = now;
     }
-  }, PAGE_DIAGRAMS);
+  }, MERMAID_PAGE_DIAGRAM_SELECTOR);
   const boxes = await diagramPaintBoxes(page);
   const shown = await viewportPixels(page);
   const painted: string[] = [];
+  const unseen: string[] = [];
   for (const [index, box] of boxes.entries()) {
-    painted.push(...(await paintOutside(page, index, box, shown)));
+    const atRest = await compareWithHidden(page, index, box, shown);
+    painted.push(...atRest.painted);
+    let changedInside = atRest.changedInside;
     if (roomBelow(box, shown.height) < MIN_BELOW_PX) {
-      painted.push(...(await paintBelowWhenScrolled(page, index)));
+      const scrolled = await paintBelowWhenScrolled(page, index);
+      painted.push(...scrolled.painted);
+      changedInside = Math.max(changedInside, scrolled.changedInside);
+    }
+    if (changedInside < MIN_INK_PIXELS) {
+      unseen.push(
+        `diagram ${index} (x ${box.left}-${box.right}, y ${box.top}-${box.bottom}) changed ${changedInside} px when hidden`
+      );
     }
   }
   assert.equal(
     painted.join("; "),
     "",
     "A diagram must paint only inside its box and the container that clips it"
+  );
+  assert.equal(
+    unseen.join("; "),
+    "",
+    "Hiding a diagram must change pixels inside its box: a diagram outside the viewport, under a hidden parent, under an overlay or clipped away is not compared with anything, so show it in the story"
   );
 }
 
@@ -1132,6 +1220,17 @@ const config: TestRunnerConfig = {
     const initialOrder = await tabs.evaluateAll((elements) => elements.map((el) => el.id));
     try {
       await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+      // A swipe has settled at the first scrollend after its touchEnd (`data-swipe-ended` marks
+      // that point), not at any scrollend: Playwright's scroll-into-view before a click and the
+      // previous swipe's fling also end with one, and a fast runner can have the swipe already
+      // listening by then. Counting that event started the next swipe, and in the end the tap on
+      // the last tab, during a fling. A touch that lands on a fling only stops it and sends no
+      // click, so the tab stayed unselected and the wait for it timed out.
+      await row.evaluate((el) => {
+        el.addEventListener("scrollend", () => {
+          if (el.hasAttribute("data-swipe-ended")) el.setAttribute("data-scroll-settled", "");
+        });
+      });
       for (const width of [1200, 375]) {
         // A visible-sidebar tablet and a phone viewport, both with a narrow overflowing strip.
         await page.setViewportSize({ width, height: 900 });
@@ -1163,10 +1262,8 @@ const config: TestRunnerConfig = {
             throw new Error("No tab label available to swipe");
           });
           await row.evaluate((el) => {
+            el.removeAttribute("data-swipe-ended");
             el.removeAttribute("data-scroll-settled");
-            el.addEventListener("scrollend", () => el.setAttribute("data-scroll-settled", ""), {
-              once: true,
-            });
           });
           await client.send("Input.dispatchTouchEvent", {
             type: "touchStart",
@@ -1181,6 +1278,8 @@ const config: TestRunnerConfig = {
               () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
             );
           }
+          // Arm before the touch ends: a scrollend that comes right as the finger lifts counts.
+          await row.evaluate((el) => el.setAttribute("data-swipe-ended", ""));
           await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
           await row.and(page.locator("[data-scroll-settled]")).waitFor({ timeout: 5000 });
           // The tap below lands 20 px into the last tab's visible part: on a phone, a long title

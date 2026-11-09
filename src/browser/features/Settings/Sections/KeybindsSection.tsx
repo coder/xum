@@ -138,6 +138,9 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS: "Toggle MCP stdio commands in backup",
   SETTINGS_BACKUP_TOGGLE_PROJECTS: "Toggle project backup",
   SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS: "Toggle global artifact backup",
+  SETTINGS_BACKUP_TOGGLE_PLUGINS: "Toggle plugin list backup",
+  SETTINGS_BACKUP_REVIEW_PLUGINS: "Review and install backed-up plugins",
+  SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL: "Back up and remove plugins from the backup",
   // Modal-only keybinds; intentionally omitted from KEYBIND_GROUPS.
   CONFIRM_DIALOG_YES: "Confirm dialog action",
   CONFIRM_DIALOG_NO: "Cancel dialog action",
@@ -343,6 +346,9 @@ const KEYBIND_GROUPS: Array<{
       "SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS",
       "SETTINGS_BACKUP_TOGGLE_PROJECTS",
       "SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS",
+      "SETTINGS_BACKUP_TOGGLE_PLUGINS",
+      "SETTINGS_BACKUP_REVIEW_PLUGINS",
+      "SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL",
     ],
   },
   {

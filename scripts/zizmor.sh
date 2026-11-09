@@ -103,18 +103,16 @@ bin_path="${cache_dir}/zizmor"
 if [[ ! -x "$bin_path" ]]; then
   mkdir -p "$cache_dir"
 
-  tmp_dir="$(mktemp -d)"
   archive_name="zizmor-${target}.tar.gz"
   url="https://github.com/zizmorcore/zizmor/releases/download/v${zizmor_version}/${archive_name}"
+  # download-verified.sh retries a github.com 504 for 15 minutes, gives up at once on a 404, and
+  # lets only bytes with the pinned digest reach the archive path. A copy that already matches
+  # (CI can cache this directory) costs no download.
+  archive="${RELEASE_ASSETS_DIR:-$HOME/.cache/xum-release-assets}/zizmor-${zizmor_version}-${target}.tar.gz"
+  ./scripts/ci/download-verified.sh "$url" "$sha256" "$archive"
 
-  curl -fsSL "$url" -o "${tmp_dir}/${archive_name}"
-  if command -v sha256sum >/dev/null 2>&1; then
-    echo "${sha256}  ${tmp_dir}/${archive_name}" | sha256sum -c -
-  else
-    # macOS ships shasum but not always coreutils sha256sum.
-    echo "${sha256}  ${tmp_dir}/${archive_name}" | shasum -a 256 -c -
-  fi
-  tar -xzf "${tmp_dir}/${archive_name}" -C "$tmp_dir"
+  tmp_dir="$(mktemp -d)"
+  tar -xzf "$archive" -C "$tmp_dir"
   mv "${tmp_dir}/zizmor" "$bin_path"
   chmod +x "$bin_path"
   rm -rf "$tmp_dir"

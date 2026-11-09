@@ -11,7 +11,8 @@
  * leave the tail of a long credential readable.
  */
 
-const REDACTED = "[redacted]";
+/** What a redacted value becomes. */
+export const REDACTED = "[redacted]";
 
 /**
  * Callers cut text at a cap. They scan this much past it, so a secret that starts inside the kept
@@ -20,8 +21,10 @@ const REDACTED = "[redacted]";
 export const REDACTION_LOOKAHEAD_CHARS = 512;
 
 // `token` excludes the plural so `max_tokens: 4096` and `input_tokens` stay readable.
-// `AccountKey` is the Azure storage connection string's secret; a key named `bearer` holds the token.
-const SECRET_NAME = String.raw`(?:api[_-]?key|account[_-]?key|secret|token(?!s\b)|bearer|passw(?:or)?d|authorization|credential)`;
+// `AccountKey` is the Azure storage connection string's secret and `SharedAccessKey` the Service Bus
+// and Event Hubs one (its sibling `SharedAccessKeyName` is the policy's name, so it stays readable,
+// as `AccountName` does); a key named `bearer` holds the token.
+const SECRET_NAME = String.raw`(?:api[_-]?key|account[_-]?key|shared[_-]?access[_-]?key(?![_-]?name)|secret|token(?!s\b)|bearer|passw(?:or)?d|authorization|credential)`;
 // Longest run after the name (`secret_access_key`, `token_endpoint_auth_method`) and widest gap
 // of spaces around the separator that still count. Past these a pair is not recognized.
 const NAME_SUFFIX_MAX = 48;
@@ -107,19 +110,58 @@ const COOKIE_HEADER_PATTERN = new RegExp(
   "gi"
 );
 
-/** Replaces common credential shapes with `[redacted]`. */
-export function redactSecretLike(text: string): string {
+/**
+ * The redaction passes, in order, each on the previous pass's output. `onRemoved` hears what each
+ * replacement took out, so a caller can tell credentials apart instead of only counting them.
+ */
+function runRedactionPasses(text: string, onRemoved: (removed: string) => void): string {
   // First, while the value is still whole: a standalone pattern that redacts the head of a cookie
   // would end the value there and leave its tail readable.
   let redacted = text.replace(
     COOKIE_HEADER_PATTERN,
-    (_match, prefix: string, opener: string | undefined) => `${prefix}${opener ?? ""}${REDACTED}`
+    (match: string, prefix: string, opener: string | undefined) => {
+      // mutation-equivalent: `opener` is undefined or a string, and "" or undefined both add nothing
+      const kept = `${prefix}${opener ?? ""}`;
+      onRemoved(match.slice(kept.length));
+      return `${kept}${REDACTED}`;
+    }
   );
-  for (const pattern of STANDALONE_SECRET_PATTERNS) redacted = redacted.replace(pattern, REDACTED);
-  return redacted.replace(
-    SECRET_KEY_VALUE_PATTERN,
-    (_match, prefix: string) => `${prefix}${REDACTED}`
-  );
+  for (const pattern of STANDALONE_SECRET_PATTERNS) {
+    redacted = redacted.replace(pattern, (match: string) => {
+      onRemoved(match);
+      return REDACTED;
+    });
+  }
+  return redacted.replace(SECRET_KEY_VALUE_PATTERN, (match: string, prefix: string) => {
+    onRemoved(match.slice(prefix.length));
+    return `${prefix}${REDACTED}`;
+  });
+}
+
+/** Replaces common credential shapes with `[redacted]`. */
+export function redactSecretLike(text: string): string {
+  return runRedactionPasses(text, () => undefined);
+}
+
+/**
+ * True when `updated` holds a credential shape `previous` did not: the values redaction takes out
+ * of `updated` are not all among (as a multiset) those it takes out of `previous`. Comparing values,
+ * not a count, refuses an edit that drops one credential and assembles another. The accepted cost:
+ * an edit inside a matched span (rewording the rest of a quoted value beside `password:`, trimming a
+ * key) makes a new value and is refused too, though it adds no secret.
+ */
+export function addsSecretLike(previous: string, updated: string): boolean {
+  const held = new Map<string, number>();
+  // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
+  runRedactionPasses(previous, (removed) => held.set(removed, (held.get(removed) ?? 0) + 1));
+  let added = false;
+  runRedactionPasses(updated, (removed) => {
+    // mutation-equivalent: a count of 0 and a missing one both read as 0
+    const left = held.get(removed) ?? 0;
+    if (left === 0) added = true;
+    else held.set(removed, left - 1);
+  });
+  return added;
 }
 
 /** True when `text` holds a credential shape: redacting it would change it. */
