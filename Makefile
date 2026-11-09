@@ -1021,10 +1021,10 @@ WEBKIT_STORY_FILES = $(shell grep -rlF -e '"webkit"' -e '"paint-check"' src/brow
 test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" or "paint-check" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)
 	$(check_node_version)
 	@test -n "$(WEBKIT_STORY_FILES)" || { echo "No story has the webkit or paint-check tag"; exit 1; }
-	@# paint-fixture stories are built to fail (one to pass), so only test-storybook-paint-fixtures runs them.
+	@# paint-fixture stories are built to fail or to pass on purpose, so only test-storybook-paint-fixtures runs them.
 	@bun x test-storybook --browsers webkit --includeTags webkit paint-check --excludeTags paint-fixture --testTimeout 30000 $(WEBKIT_STORY_FILES)
 
-test-storybook-paint-fixtures: node_modules/.installed ## Prove the runner's diagram wait, error marker, viewport check and paint-outside check still fire, with stories built to trip them (requires Storybook to be running or built; STORYBOOK_URL, default http://127.0.0.1:6006)
+test-storybook-paint-fixtures: node_modules/.installed ## Prove the paint-check runner's guards still fire, with stories built to trip them (requires Storybook to be running or built; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)
 	@bun scripts/check-paint-check-fixtures.ts
 

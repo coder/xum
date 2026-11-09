@@ -60,6 +60,11 @@ interface Internals {
   };
   taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+  editWorkspaceEntry: (
+    workspaceId: string,
+    updater: (workspace: WorkspaceConfigEntry) => void,
+    options?: { allowMissing?: boolean }
+  ) => Promise<boolean>;
   isPlanLikeTaskWorkspace: (entry: {
     projectPath: string;
     workspace: WorkspaceConfigEntry;
@@ -161,7 +166,12 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       config,
       projectPath,
       [
-        projectWorkspace(projectPath, "root", rootId, { runtimeConfig: { type: "local" } }),
+        {
+          ...projectWorkspace(projectPath, "root", rootId, { runtimeConfig: { type: "local" } }),
+          // The root receives the reactivated child's terminal wake: its project-dir local
+          // runtime executes in the project root, like the child's below.
+          path: projectPath,
+        },
         {
           ...projectWorkspace(projectPath, childId, childId, {
             parentWorkspaceId: rootId,
@@ -1150,6 +1160,69 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await stack.cleanup();
     }
   }, 20_000);
+
+  // Whether the row's report predates an attempt is decided by the CAS that publishes the attempt,
+  // never by a read after it: another backend can report the fresh attempt between the commit and
+  // the ownership that follows it, and a later read takes that report for the predecessor's. Each
+  // path that mints a fresh attempt on an unreported row gets the report in its own gap.
+  test.each(["reawakening", "reactivation"] as const)(
+    "a report of the fresh attempt that lands between the %s's CAS and its ownership refuses the held follow-up as indeterminate",
+    async (path) => {
+      const childId = path === "reawakening" ? "holdcasgap001" : "holdcasgap002";
+      const stack = await createStack(childId);
+      const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+      const seededAttemptId = entryOf(config, childId)!.taskAttemptId;
+      let landed = false;
+      const reportInGap = async () => {
+        if (landed || entryOf(config, childId)?.taskAttemptId === seededAttemptId) return;
+        landed = true;
+        await editChildRow(config, childId, (row) => {
+          row.taskStatus = "reported";
+          row.reportedAt = REPORTED_AT;
+        });
+      };
+      // Both paths commit their fresh attempt id through editWorkspaceEntry (the reawakening via
+      // editActiveWorkspaceEntry): the report lands right after that commit, before the ownership.
+      const edit = svc.editWorkspaceEntry.bind(taskService);
+      spyOn(svc, "editWorkspaceEntry").mockImplementation(async (id, updater, options) => {
+        const found = await edit(id, updater, options);
+        if (id === childId) await reportInGap();
+        return found;
+      });
+      try {
+        if (path === "reawakening") {
+          expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+          expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+            Ok(undefined)
+          );
+        } else {
+          expect(
+            await taskService.sendMessageToDescendantAgentTask(rootId, childId, "work", "turn-end")
+          ).toMatchObject(Ok({ delivery: "reactivated" }));
+        }
+        expect(landed).toBe(true);
+        await until(() => completions.length === 1, "the continuation stream");
+        const onCanceled = mock((_reason: string) => undefined);
+        expect(
+          await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+        ).toEqual(Ok(undefined));
+        stack.endStream(0, {}, true);
+        await until(
+          () => completions.length > 1 || stack.heldTexts().length > 0,
+          "the follow-up dispatched or held"
+        );
+        await yieldMacrotasks(10);
+        // Never a new turn of the attempt that another backend reported.
+        expect(completions).toHaveLength(1);
+        expect(stack.heldTexts()).toEqual(["follow-up text"]);
+        expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
+        expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+      } finally {
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
 
   // A reactivated child keeps `taskStatus: reported` with a fresh attempt: its row reads reported
   // from the first send on, so a reported row never means that its current attempt reported.
