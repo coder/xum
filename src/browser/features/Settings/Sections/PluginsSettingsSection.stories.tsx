@@ -215,6 +215,14 @@ function pluginCardOf(element: HTMLElement): HTMLElement {
   return card;
 }
 
+/**
+ * The line tops that the text of `range` covers. An inline-block's own client rects hold one box
+ * for all its lines, so measure a range over its text.
+ */
+function renderedLineTops(range: Range): Set<number> {
+  return new Set(Array.from(range.getClientRects()).map((rect) => Math.round(rect.top)));
+}
+
 /** The plain words of `element` (letters and a trailing punctuation mark) that span two lines. */
 function splitProseWords(element: HTMLElement): string[] {
   const split: string[] = [];
@@ -225,8 +233,7 @@ function splitProseWords(element: HTMLElement): string[] {
       const range = document.createRange();
       range.setStart(node, match.index);
       range.setEnd(node, match.index + match[0].length);
-      const lines = new Set(Array.from(range.getClientRects()).map((rect) => Math.round(rect.top)));
-      if (lines.size > 1) split.push(match[0]);
+      if (renderedLineTops(range).size > 1) split.push(match[0]);
     }
   }
   return split;
@@ -2160,10 +2167,11 @@ export const AddPluginFileNamesPhoneViewport: Story = {
       await waitFor(() => {
         for (const name of names) {
           for (const element of canvas.getAllByText(name)) {
-            const lines = new Set(
-              Array.from(element.getClientRects()).map((rect) => Math.round(rect.top))
-            );
-            if (lines.size !== 1) throw new Error(`${name} is split across lines at ${width}`);
+            const range = document.createRange();
+            range.selectNodeContents(element);
+            if (renderedLineTops(range).size !== 1) {
+              throw new Error(`${name} is split across lines at ${width}`);
+            }
           }
         }
         const hook = canvas
