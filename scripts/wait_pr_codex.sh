@@ -373,6 +373,19 @@ run_codex_comments_gate() {
   fi
 }
 
+# An approval comment or a thumbs-up says nothing about review threads that are still unresolved: only
+# the gate reads every thread. So an approval stands unless the gate (run before it) counted one.
+# Regular comments do not block here: an approval comment in the old format counts as one itself,
+# and the CI gate still reads them.
+approval_stands() {
+  if grep -Eq '^Found [1-9][0-9]* unresolved review thread' <<<"$check_output"; then
+    echo ""
+    echo "$check_output"
+    echo "❌ Codex approved PR #$PR_NUMBER, but unresolved Codex review threads remain."
+    return 1
+  fi
+}
+
 # A push-triggered Codex run posts no security receipt (coder/xum#7731), so the gate waits on one.
 # The gate reads every comment and says when a request is needed: once per head, because the
 # request names the head and the gate skips a head that a request already names.
@@ -487,6 +500,7 @@ CHECK_CODEX_STATUS_ONCE() {
   approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
 
   if [[ -n "$approval_comment_at" ]]; then
+    approval_stands || return 1
     echo ""
     echo "✅ Codex approved PR #$PR_NUMBER"
     echo ""
@@ -497,6 +511,7 @@ CHECK_CODEX_STATUS_ONCE() {
   approval_reaction_at=$(echo "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.data.repository.pullRequest.reactions.nodes[]? | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
   if [[ -n "$approval_reaction_at" ]]; then
+    approval_stands || return 1
     echo ""
     echo "✅ Codex approved PR #$PR_NUMBER via thumbs-up on the PR description"
     echo ""
@@ -558,6 +573,7 @@ CHECK_CODEX_STATUS_ONCE() {
     approval_reaction_at=$(echo "$all_thumbs_up_reactions" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
     if [[ -n "$approval_reaction_at" ]]; then
+      approval_stands || return 1
       echo ""
       echo "✅ Codex approved PR #$PR_NUMBER via thumbs-up on the PR description"
       echo ""

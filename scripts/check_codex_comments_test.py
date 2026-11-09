@@ -1347,6 +1347,48 @@ else:
                 self.assertNotIn("PASSED checks=99", result.stdout + result.stderr)
                 self.assertIn("are not a list of objects with text fields", result.stderr)
 
+    def test_an_approval_does_not_outrank_a_review_thread_that_is_still_open(self):
+        # The approval comment and the thumbs-up say nothing about threads that are still unresolved: the
+        # gate reads every thread. An approval used to end the wait with exit 0 although the gate found one.
+        request = comment("@codex review", "maintainer", REQUEST)
+        receipt = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
+        thumbs_up = [{"user": {"login": BOT}, "createdAt": AFTER}]
+        # The thumbs-up is older than the reactions window: the double serves it only from its pages.
+        scanned = snapshot([request, comment("Codex is looking.")], [thread("[P1] Fix authorization")])
+        scanned["data"]["repository"]["pullRequest"]["reactions"]["pageInfo"]["hasPreviousPage"] = True
+        scan_env = {"CODEX_GATE_REACTIONS_NODES": json.dumps(thumbs_up)}
+        blocked = {
+            "comment approval, open thread": (snapshot([request, receipt], [thread("[P1] Fix authorization")]), None),
+            "comment approval, thread from before the request": (snapshot([request, receipt], [thread("[P1] Fix authorization", created_at=BEFORE)]), None),
+            "reaction approval, open thread": (snapshot([request, comment("Codex is looking.")], [thread("[P1] Fix authorization")], reactions=thumbs_up), None),
+            "reaction scan approval, open thread": (scanned, scan_env),
+        }
+        for name, (data, env) in blocked.items():
+            with self.subTest(case=name):
+                result = self.run_gate(data, "wait_pr_codex.sh", env_extra=env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn("✅ Codex approved", result.stdout)
+                self.assertIn("Found 1 unresolved review thread(s) from bot", result.stdout)
+                self.assertIn("Read them with: ./scripts/check_codex_comments.sh 4145", result.stdout)
+                self.assertIn("unresolved Codex review threads remain", result.stdout)
+        # Threads that do not block, and regular comments (the CI gate reads those), leave the approval standing.
+        standing = {
+            "resolved thread": snapshot([request, receipt], [thread("[P1] Fixed", resolved=True)]),
+            "minimized finding": snapshot([request, receipt, comment("[P1] Fix authorization", minimized=True)]),
+            "reaction, resolved thread": snapshot([request, comment("Codex is looking.")], [thread("[P1] Fixed", resolved=True)], reactions=thumbs_up),
+        }
+        for name, data in standing.items():
+            with self.subTest(case=name):
+                result = self.assert_gate(0, data, "wait_pr_codex.sh")
+                self.assertIn("✅ Codex approved PR #4145", result.stdout)
+        # The same scan with the thread resolved approves, so the scan path is the one under test above.
+        resolved_scan = snapshot([request, comment("Codex is looking.")], [thread("[P1] Fixed", resolved=True), thread("[P1] Open elsewhere", resolved=True)])
+        resolved_scan["data"]["repository"]["pullRequest"]["reactions"]["pageInfo"]["hasPreviousPage"] = True
+        with self.subTest(case="reaction scan approval, resolved thread"):
+            result = self.run_gate(resolved_scan, "wait_pr_codex.sh", env_extra=scan_env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("✅ Codex approved PR #4145 via thumbs-up", result.stdout)
+
     def test_an_approval_with_a_forged_time_is_not_printed_or_accepted(self):
         # A time that carries a line break and a forged line used to be echoed after "Approval comment
         # time:" and "Reaction timestamp:". Now the gate stops on fixed text and does not approve.
