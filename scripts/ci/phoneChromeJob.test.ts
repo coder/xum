@@ -5,7 +5,7 @@
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally: bun test ./scripts/ci/phoneChromeJob.test.ts
 import { describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { parse } from "yaml";
 
@@ -31,6 +31,34 @@ async function jobs(): Promise<Record<string, Job>> {
   return workflow.jobs;
 }
 
+interface Scenario {
+  event: "pull_request" | "merge_group" | "push" | "workflow_dispatch";
+  actor?: string;
+  testFilter?: string;
+  tests: boolean;
+  phoneChrome: boolean;
+}
+
+// Runs the job's `if:` for one scenario. The expression uses only names, strings, ==, !=, && and
+// ||, which mean the same in JavaScript, so it is rewritten to read a context object.
+function gateRuns(gate: string, scenario: Scenario): boolean {
+  const js = gate
+    .replace(/github\.event\.inputs\.test_filter/g, "ctx.testFilter")
+    .replace(/github\.event_name/g, "ctx.event")
+    .replace(/github\.actor/g, "ctx.actor")
+    .replace(/needs\.changes\.outputs\.tests/g, "ctx.tests")
+    .replace(/needs\.changes\.outputs\.phone_chrome/g, "ctx.phoneChrome");
+  if (/\b(?:github|needs|inputs)\./.test(js)) throw new Error(`the gate reads a new name: ${gate}`);
+  const ctx = {
+    event: scenario.event,
+    actor: scenario.actor ?? "ThomasK33",
+    testFilter: scenario.testFilter ?? "",
+    tests: String(scenario.tests),
+    phoneChrome: String(scenario.phoneChrome),
+  };
+  return Boolean(new Function("ctx", `return ${js};`)(ctx));
+}
+
 async function phoneChromePatterns(): Promise<string[]> {
   const filter = (await jobs()).changes?.steps?.find((step) => step.id === "filter");
   const filters = parse(filter?.with?.filters ?? "") as Record<string, string[] | undefined>;
@@ -52,14 +80,74 @@ describe("the phone chrome check in pr.yml", () => {
       .map(([id]) => id);
 
     expect(runners).toEqual(["test-phone-chrome"]);
-    const gate = all["test-phone-chrome"]?.if ?? "";
-    expect(gate).toContain("needs.changes.outputs.phone_chrome == 'true'");
-    expect(gate).not.toContain("e2e_tests");
+    expect(all["test-phone-chrome"]?.if ?? "").not.toContain("e2e_tests");
     expect(all.changes?.outputs?.phone_chrome).toBe("${{ steps.filter.outputs.phone_chrome }}");
+  });
+
+  test.each<[name: string, scenario: Scenario, runs: boolean]>([
+    [
+      "a PR that changes a phone page file",
+      { event: "pull_request", tests: true, phoneChrome: true },
+      true,
+    ],
+    // index.html, public/ and patches/ are in no `tests` filter.
+    [
+      "a PR that changes only a file that tests ignores",
+      { event: "pull_request", tests: false, phoneChrome: true },
+      true,
+    ],
+    [
+      "a PR that changes no phone page file",
+      { event: "pull_request", tests: true, phoneChrome: false },
+      false,
+    ],
+    [
+      "a merge queue group with code changes",
+      { event: "merge_group", tests: true, phoneChrome: false },
+      true,
+    ],
+    [
+      "a merge queue group that changes only a file that tests ignores",
+      { event: "merge_group", tests: false, phoneChrome: true },
+      true,
+    ],
+    [
+      "a merge queue group with docs changes only",
+      { event: "merge_group", tests: false, phoneChrome: false },
+      false,
+    ],
+    ["a push to main by a person", { event: "push", tests: true, phoneChrome: false }, true],
+    [
+      "the push that the merge queue makes to main",
+      { event: "push", actor: "github-merge-queue[bot]", tests: false, phoneChrome: true },
+      false,
+    ],
+    [
+      "a manual run on a branch",
+      { event: "workflow_dispatch", tests: true, phoneChrome: false },
+      true,
+    ],
+    [
+      "a manual run with a test filter",
+      { event: "workflow_dispatch", testFilter: "-t x", tests: true, phoneChrome: true },
+      false,
+    ],
+  ])("decides the job for %s", async (_name, scenario, runs) => {
+    const gate = (await jobs())["test-phone-chrome"]?.if ?? "";
+
+    expect(gateRuns(gate, scenario)).toBe(runs);
   });
 
   test("is a job that Required waits for", async () => {
     expect((await jobs()).required?.needs).toContain("test-phone-chrome");
+  });
+
+  test("starts when a PR changes a file that the neutral seed copies into the captured workspace", async () => {
+    const dir = "scripts/perf/fixtures/neutralSeed";
+    const fixtures = (await readdir(path.join(REPO, dir))).map((name) => `${dir}/${name}`);
+    expect(fixtures).toContain(`${dir}/chat.jsonl`);
+
+    expect(await pathsThatMissTheJob(fixtures)).toEqual([]);
   });
 
   test("starts when a PR changes a renderer file, the skeleton, or a helper of the generator", async () => {

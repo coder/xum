@@ -144,6 +144,7 @@ jobs:
               - 'Makefile'
               - 'scripts/perf/generatePhoneChrome.ts'
               - 'scripts/perf/neutralSeed.ts'
+              - 'scripts/perf/fixtures/neutralSeed/**'
               - 'scripts/perf/serverToken.ts'
               - 'scripts/precompress-static.ts'
               - 'scripts/stamp-service-worker.ts'
@@ -894,11 +895,16 @@ jobs:
     # Test / E2E (linux, 1/4), which a PR runs only when it changes e2e_tests: #7993 changed a class
     # in src/browser, skipped that job, and broke main (skipped counts as passing in Required).
     # Here a PR runs it when phone_chrome matches, and the merge queue runs it for every merge.
+    # It does not wait for `tests`: index.html, public/ and patches/ build the page too and are in
+    # neither the src nor the config filter, so a PR that changes only them has tests false.
+    # Like `tests`, it skips the push that the merge queue's own merge makes on main.
     name: Test / Phone chrome
     needs: [changes]
     if: >-
-      needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == '' &&
-      (github.event_name != 'pull_request' || needs.changes.outputs.phone_chrome == 'true')
+      github.event.inputs.test_filter == '' &&
+      (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') &&
+      (needs.changes.outputs.phone_chrome == 'true' ||
+      (github.event_name != 'pull_request' && needs.changes.outputs.tests == 'true'))
     runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
