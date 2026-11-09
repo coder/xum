@@ -238,7 +238,8 @@ else:
                     self.assertIn(result.returncode, (1, 10), result.stdout + result.stderr)
                     self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
                     if script == "wait_pr_checks.sh":
-                        # Debug text on stderr also corrupted the counts, which read the merged stream.
+                        # It reads gh's stderr and stdout as one stream, so debug text breaks its jq.
+                        self.assertEqual(result.stderr, "")
                         self.assertIn("FAILED failed=1 pending=0 total=2 visual_ignored=0", result.stdout)
 
     def test_the_failure_tips_do_not_name_the_local_branch(self):
