@@ -7,9 +7,12 @@ set -euo pipefail
 #
 # Approval is, after the latest request, an approval comment or a thumbs-up reaction, and only
 # while check_codex_comments.sh (the gate) finds nothing that blocks the head. The gate binds the
-# head: it waits while the head's summary board is old or still running, so a reaction or receipt
-# left from an earlier head cannot approve a head that Codex has not finished. A receipt that names
-# another head never approves, since it outlasts a push.
+# head through Codex's summary board: it waits while the head's board is old or still running, so a
+# reaction or receipt left from an earlier head cannot approve a head that Codex has not finished.
+# A receipt that names another head never approves, since it outlasts a push. One exception: a PR
+# with no summary board at all has nothing to bind, so there a thumbs-up, or a receipt with no
+# `Reviewed commit`, counts when nothing blocks (as before this check existed). Codex creates the
+# board at its first review and edits it in place, so a PR that Codex reviewed always has one.
 #
 # Exits:
 #   0 - Codex approved, or reported a usage limit with no outstanding findings

@@ -118,7 +118,9 @@ def connection(nodes, more=False):
     }
 
 
-def snapshot(comments=(), threads=(), reactions=(), more=False, head=None, reactions_more=False):
+def snapshot(comments=(), threads=(), reactions=(), more=False, head=None, older_reactions=()):
+    """`reactions` is the newest-100 window of thumbs-ups. `older_reactions` are the ones before it:
+    the main query reports hasPreviousPage for them, and only the paged scan returns them."""
     # The PR head defaults to the head of the first board in the snapshot, so a
     # fixture board describes the current head unless a test says otherwise.
     if head is None:
@@ -132,7 +134,9 @@ def snapshot(comments=(), threads=(), reactions=(), more=False, head=None, react
                     "headRefOid": head,
                     "comments": connection(list(comments), more),
                     "reviewThreads": connection(list(threads), more),
-                    "reactions": connection(list(reactions), reactions_more),
+                    "reactions": connection(list(reactions), bool(older_reactions)),
+                    # Read by the gh double for the paged scan only: the scripts never ask for it.
+                    "olderReactions": list(older_reactions),
                 }
             }
         }
@@ -202,9 +206,11 @@ else:
     field = next(field for field in ['comments', 'reviewThreads', 'reactions']
                  if field + '(first: 100' in query)
     index = 0 if cursor == 'null' else int(cursor)
-    nodes = snapshot['data']['repository']['pullRequest'][field]['nodes']
-    more = index + 1 < len(nodes)
     pull_request = snapshot['data']['repository']['pullRequest']
+    nodes = pull_request[field]['nodes']
+    if field == 'reactions':
+        nodes = pull_request.get('olderReactions', []) + nodes
+    more = index + 1 < len(nodes)
     print(json.dumps({'data': {'repository': {'pullRequest': {
         'headRefOid': pull_request['headRefOid'],
         field: {
@@ -224,6 +230,7 @@ else:
         if round_marker.exists():
             round_marker.unlink()
         calls = self.directory / "calls"
+        self.calls = calls
         calls.write_text("")
         self.posts = self.directory / "posts"
         self.posts.write_text("")
@@ -263,6 +270,10 @@ else:
         # Polling rounds, not pages: the double serves one node per page.
         self.comment_rounds = int(round_marker.read_text()) if round_marker.exists() else 0
         return result
+
+    def reaction_scan_pages(self):
+        """How many pages of the paged thumbs-up scan the last run asked for."""
+        return self.calls.read_text().count("reactions(first: 100, after: $cursor")
 
     def assert_gate(
         self, expected, data, script="check_codex_comments.sh", cache=None, wait=None
@@ -1232,6 +1243,33 @@ else:
             (BOT, BEFORE, 10),
             ("human-reviewer", AFTER, 10),
             (BOT, AFTER, 0),
+            # GitHub's GraphQL returns the reacting bot's User login with the
+            # [bot] suffix (comment authors come back without it).
+            (BOT + "[bot]", AFTER, 0),
+            (BOT + "[bot]", BEFORE, 10),
+            (BOT + "-impostor[bot]", AFTER, 10),
+        ):
+            # The same reaction in the newest-100 window and on an older page that only the
+            # paged scan reads.
+            for older in (False, True):
+                with self.subTest(author=author, created_at=created_at, older_page=older):
+                    reaction = [{"user": {"login": author}, "createdAt": created_at}]
+                    # A human thumbs-up always follows the window, so the window is never empty.
+                    newest = [{"user": {"login": "human-reviewer"}, "createdAt": AFTER}]
+                    data = snapshot(
+                        [request, comment(FIXTURES["summary"]["body"])],
+                        reactions=newest if older else reaction,
+                        older_reactions=reaction if older else (),
+                    )
+                    self.assert_gate(expected, data, "wait_pr_codex.sh")
+                    self.assertEqual(self.reaction_scan_pages() > 0, older, "the scan reads older pages only")
+
+    def test_approval_comment_requires_the_real_bot_and_a_fresh_comment(self):
+        request = comment("@codex review", "maintainer", REQUEST)
+        for author, created_at, expected in (
+            (BOT, BEFORE, 10),
+            ("human-reviewer", AFTER, 10),
+            (BOT, AFTER, 0),
             (BOT + "-impostor", AFTER, 10),
         ):
             with self.subTest(author=author, created_at=created_at):
@@ -1257,6 +1295,13 @@ else:
             ("7 characters of the head", [request, code_receipt(PR_HEAD[:7])], 1),
             ("9 characters of the head", [request, code_receipt(PR_HEAD[:9])], 1),
             ("the head's start with another end", [request, code_receipt(PR_HEAD[:9] + "f")], 1),
+            # A SHA is read at any length: a long one for another head must not read as "no line"
+            # or as its first 10 characters.
+            ("an earlier head, 11 characters", [request, code_receipt(EARLIER_HEAD[:11])], 1),
+            ("an earlier head, 40 characters", [request, code_receipt(EARLIER_HEAD)], 1),
+            ("11 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f")], 1),
+            ("20 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 10)], 1),
+            ("40 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 30)], 1),
             # Any receipt for the head approves it, whichever receipt is newest.
             (
                 "a later receipt for an earlier head",
@@ -1308,19 +1353,24 @@ else:
                     )
                     result = self.assert_gate(expected, data, "wait_pr_codex.sh")
                     self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
-        # With more than 100 reactions the script pages through all of them: the same rule applies.
-        for case, board_comment, expected in (
-            ("paged: the board's code review of the head finished", comment(flagged("false")), 0),
-            ("paged: the board names an earlier head", comment(board_for(board, EARLIER_HEAD)), 10),
+        # With more than 100 reactions the script pages through all of them, and the same rule
+        # applies. The bot's thumbs-up sits only on an older page: a script that reads just the
+        # newest 100 never sees it. With no board at all the gate is clean, so the reaction
+        # approves, as on main (the no-board exception in the script header).
+        newest = [{"user": {"login": "human-reviewer"}, "createdAt": AFTER}]
+        older = [{"user": {"login": BOT}, "createdAt": AFTER}]
+        for case, comments, expected in (
+            ("paged: no board", [request], 0),
+            ("paged: the board's code review of the head finished", [request, comment(flagged("false"))], 0),
+            ("paged: the board names an earlier head", [request, comment(board_for(board, EARLIER_HEAD))], 10),
+            ("paged: the board shows an unresolved finding", [request, comment(flagged("true"))], 1),
         ):
             with self.subTest(case):
-                data = snapshot(
-                    [request, board_comment],
-                    reactions=[{"user": {"login": BOT}, "createdAt": AFTER}],
-                    head=PR_HEAD,
-                    reactions_more=True,
-                )
-                self.assert_gate(expected, data, "wait_pr_codex.sh")
+                data = snapshot(comments, reactions=newest, older_reactions=older, head=PR_HEAD)
+                result = self.assert_gate(expected, data, "wait_pr_codex.sh")
+                self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
+                # An exit 10 or 1 here comes from the gate, before the scan: only a clean gate pages.
+                self.assertEqual(self.reaction_scan_pages() > 0, expected == 0, "the scan runs for a clean gate")
         with self.subTest("the thumbs-up came before the request"):
             stale = {"user": {"login": BOT}, "createdAt": BEFORE}
             data = snapshot([request, comment(flagged("false"))], reactions=[stale], head=PR_HEAD)
