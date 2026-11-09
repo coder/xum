@@ -334,13 +334,14 @@ describe("TaskService", () => {
       };
       const realRead = internal.interruptTaskRecoveryForInactiveWorkflowOwner.bind(t.taskService);
       let bumps = 0;
-      const read = spyOn(internal, "interruptTaskRecoveryForInactiveWorkflowOwner").mockImplementation(
-        async (...args) => {
-          bumps++;
-          t.taskService.bumpWorkspaceStopEpoch(t.childId);
-          return await realRead(...args);
-        }
-      );
+      const read = spyOn(
+        internal,
+        "interruptTaskRecoveryForInactiveWorkflowOwner"
+      ).mockImplementation(async (...args) => {
+        bumps++;
+        t.taskService.bumpWorkspaceStopEpoch(t.childId);
+        return await realRead(...args);
+      });
 
       try {
         await streamEnd(
