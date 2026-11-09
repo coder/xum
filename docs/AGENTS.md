@@ -57,7 +57,7 @@ description: Agent instructions for AI assistants working on the Xum codebase
 - `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.
 - `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.
 - `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`.
-- To wait on PR checks, a stack or the merge queue, run `./scripts/watch_pr_state.sh <pr>... [--queue]` instead of a hand-written polling loop. It prints each state change, ends on every final state (merged, removed from the queue, closed, failed, ready) and exits 2 on a read it cannot classify.
+- To wait on PR checks, a stack or the merge queue, run `./scripts/watch_pr_state.sh <pr>... [--queue]` instead of a hand-written polling loop. It prints each state change, ends on every final state (merged, removed from the queue, closed, failed, ready) and exits 2 on a read it cannot classify. It prints states, counts and GitHub IDs, not check names: after `failed`, list the head commit's checks with `gh pr view <pr_number> --json statusCheckRollup`.
 
 ## Dependencies & Supply Chain
 

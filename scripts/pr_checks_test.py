@@ -10,6 +10,13 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent
 HEAD = "1" * 40
 MERGE = "2" * 40
+# Hang guard for one script run, not a speed requirement: a run ends when its fixture ends (the
+# gh double answers from the fixture and nothing sleeps), so only a loop that never ends reaches
+# this bound. A run took 2.9 s at the median and 4.7 s at the longest of 41 runs on a host that
+# other agents load; scripts/check_codex_comments_test.py has the same guard and measured its
+# longest run at 13.5 s there. The bound is 120 s so that a loaded host never fails the test with
+# TimeoutExpired, which says nothing about the script.
+SCRIPT_RUN_TIMEOUT_SECS = 120
 
 
 def check(name="Required", conclusion="SUCCESS", suite=1, status="COMPLETED"):
@@ -124,7 +131,9 @@ else:
         args = ["bash", str(SCRIPTS / script), "4194"]
         if script == "wait_pr_checks.sh":
             args.append("--once")
-        result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=15, check=False)
+        result = subprocess.run(
+            args, env=env, text=True, capture_output=True, timeout=SCRIPT_RUN_TIMEOUT_SECS, check=False
+        )
         self.calls = [json.loads(line) for line in calls.read_text().splitlines()]
         return result
 
