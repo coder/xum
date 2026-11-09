@@ -325,13 +325,14 @@ function parseHarvestRecords(
   return parsed;
 }
 
-function pruneHarvestRecords(records: Record<string, MemoryHarvestRecord>): void {
+/** The records past the retention cap, oldest last (see pruneHarvestRecords). */
+function harvestRecordsPastRetention(
+  records: Record<string, MemoryHarvestRecord>
+): Array<[string, MemoryHarvestRecord]> {
   const ranked = Object.entries(records).sort(
     ([, left], [, right]) => harvestRecordTime(right) - harvestRecordTime(left)
   );
-  for (const [boundaryKey] of ranked.slice(HARVEST_RECORD_RETENTION)) {
-    delete records[boundaryKey];
-  }
+  return ranked.slice(HARVEST_RECORD_RETENTION);
 }
 
 /**
@@ -1017,7 +1018,7 @@ export class MemoryConsolidationService extends EventEmitter {
               if (next.status !== "completed") return false;
             }
             file.harvestsByWorkspace[workspaceId][boundaryKey] = next;
-            pruneHarvestRecords(file.harvestsByWorkspace[workspaceId]);
+            await self.pruneHarvestRecords(workspaceId, file.harvestsByWorkspace[workspaceId]);
             return true;
           })
         );
@@ -1053,6 +1054,26 @@ export class MemoryConsolidationService extends EventEmitter {
       const ownerId = this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
       return (await this.isAnalyzerJobLive(ownerId)) ? undefined : build(current);
     };
+  }
+
+  /**
+   * Drops the records past the retention cap, inside the sidecar write that saves one. A pending
+   * record stays while its owner's job is live (isAnalyzerJobLive): it may be that job's, whose
+   * saves would be its only trace, and a later crash would leave recovery nothing to retry. It is
+   * dropped at the first save after that job ends.
+   */
+  private async pruneHarvestRecords(
+    workspaceId: string,
+    records: Record<string, MemoryHarvestRecord>
+  ): Promise<void> {
+    const past = harvestRecordsPastRetention(records);
+    const keepPending =
+      past.some(([, record]) => record.status === "pending") &&
+      (await this.isAnalyzerJobLive(this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId)));
+    for (const [boundaryKey, record] of past) {
+      if (keepPending && record.status === "pending") continue;
+      delete records[boundaryKey];
+    }
   }
 
   private recoverRetryableHarvestsEffect(workspaceId: string): Effect.Effect<void> {
