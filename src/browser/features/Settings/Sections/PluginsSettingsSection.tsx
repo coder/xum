@@ -2121,7 +2121,7 @@ export const PluginsSettingsSection: React.FC = () => {
         <p className="text-muted mb-4 text-xs">
           Install Agent Plugins from git repositories into{" "}
           {containerLocation !== null ? (
-            <code className="text-accent-text">{containerLocation}</code>
+            <code className="text-accent-text break-all">{containerLocation}</code>
           ) : (
             "the managed plugins directory"
           )}
@@ -2311,11 +2311,13 @@ export const PluginsSettingsSection: React.FC = () => {
                   <div className="text-muted mt-2 space-y-0.5 text-[11px]">
                     {/* break-all: locations/sources can contain unbreakable
                         64-char tokens (max-length plugin names) that would
-                        otherwise overflow the card at phone widths. */}
-                    <p className="counter-nums break-all">
+                        otherwise overflow the card at phone widths. The counts
+                        are prose and wrap at spaces. */}
+                    <p className="counter-nums break-words">
                       {item.importedSkillCount ?? item.skillCount} of {item.skillCount} skills
                       imported · {item.importedMcpServerCount ?? item.mcpServerCount} of{" "}
-                      {item.mcpServerCount} MCP servers imported · <code>{item.location}</code>
+                      {item.mcpServerCount} MCP servers imported ·{" "}
+                      <code className="break-all">{item.location}</code>
                     </p>
                     {formatSource(item) && (
                       <p className="break-all">

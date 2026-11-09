@@ -384,6 +384,18 @@ export const InstalledPhoneViewport: Story = {
     if (Math.abs(manage.getBoundingClientRect().left - name.getBoundingClientRect().left) > 1) {
       throw new Error("Wrapped plugin actions are not flush with the card text");
     }
+    // The skill and MCP counts are prose: they wrap at spaces, never inside a word. A word only
+    // splits when the screen's edge falls inside it, and the counts of this fixture fit a 320 px
+    // line, so sweep widths from below that up to 390 px, the width that the Pixel snapshot shows.
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (let width = 200; width <= 390; width += 5) {
+      wrapper.style.width = `${width}px`;
+      for (const counts of canvas.getAllByText(/skills imported/)) {
+        const split = splitProseWords(counts);
+        if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}px`);
+      }
+    }
   },
 };
 
@@ -2099,6 +2111,12 @@ const COMPONENT_FILES = {
   workflows: ["weekly-release-notes.js", "implementation-readiness-report.js", "triage.js"],
 };
 
+/** A separator-free name longer than a phone line: it can only wrap inside its own box. */
+const LONG_FILE_NAME = "implementation_readiness_design_review_orchestrator_agent_v2.md";
+
+/** A configured plugins folder with one segment longer than a phone line. */
+const LONG_PLUGINS_DIRECTORY = `~/.mux/plugins/${"d".repeat(100)}`;
+
 /** A plugin whose agents and workflows have long file names, some with hyphens (break points). */
 const COMPONENT_FILES_PREVIEW: AgentPluginInstallPreview = {
   ...CLAUDE_REPO_PREVIEW,
@@ -2107,7 +2125,7 @@ const COMPONENT_FILES_PREVIEW: AgentPluginInstallPreview = {
   skillsCliSkills: [],
   manifest: { name: "review-kit", version: "1.4.0" },
   mcpServers: [],
-  agents: COMPONENT_FILES.agents,
+  agents: [...COMPONENT_FILES.agents, LONG_FILE_NAME],
   workflows: COMPONENT_FILES.workflows,
   codexHooks: [
     {
@@ -2122,13 +2140,15 @@ const COMPONENT_FILES_PREVIEW: AgentPluginInstallPreview = {
   reviewedComponents: [
     { kind: "agents", name: "implementation_readiness_review.md", detail: "Reviews readiness." },
     { kind: "workflows", name: "implementation-readiness-report.js", detail: "Writes a report." },
+    { kind: "agents", name: LONG_FILE_NAME, detail: "Orchestrates the review." },
   ],
 };
 
 /**
- * File names of agents, workflows and reviewed components, and the words of the hook list, at
- * phone width: each name moves to the next line whole instead of splitting at the card's edge,
- * down to a 320 px screen. Play-only: the other phone stories of this file snapshot the same
+ * File names of agents, workflows and reviewed components, the words of the hook list and the
+ * plugins folder at phone width: each name moves to the next line whole instead of splitting at
+ * the card's edge, a name longer than a line wraps inside its own box, and nothing sticks out of
+ * the screen, down to 320 px. Play-only: the other phone stories of this file snapshot the same
  * panel (Pixel budget).
  */
 export const AddPluginFileNamesPhoneViewport: Story = {
@@ -2141,7 +2161,13 @@ export const AddPluginFileNamesPhoneViewport: Story = {
   },
   render: () => (
     <PluginsSectionStoryShell
-      options={{ agentPlugins: { items: [], preview: COMPONENT_FILES_PREVIEW } }}
+      options={{
+        agentPlugins: {
+          items: [],
+          preview: COMPONENT_FILES_PREVIEW,
+          containerLocation: LONG_PLUGINS_DIRECTORY,
+        },
+      }}
     >
       {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
       <div style={{ width: 390 }}>
@@ -2154,7 +2180,8 @@ export const AddPluginFileNamesPhoneViewport: Story = {
     await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
     await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), "acme/review-kit");
     await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
-    await canvas.findByText("Agents (6)");
+    await canvas.findByText("Agents (7)");
+    const directory = await canvas.findByText(LONG_PLUGINS_DIRECTORY);
     const wrapper = canvasElement.firstElementChild;
     if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
     const names = [
@@ -2180,6 +2207,12 @@ export const AddPluginFileNamesPhoneViewport: Story = {
         if (hook === undefined) throw new Error("The hook list item is missing");
         const split = splitProseWords(hook);
         if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}`);
+        if (wrapper.scrollWidth > wrapper.clientWidth + 1) {
+          throw new Error(`The plugins section is wider than the screen at ${width}`);
+        }
+        if (directory.getBoundingClientRect().right > wrapper.getBoundingClientRect().right + 1) {
+          throw new Error(`The plugins folder sticks out of the screen at ${width}`);
+        }
       });
     }
   },
