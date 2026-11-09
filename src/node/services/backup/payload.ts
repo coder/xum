@@ -108,6 +108,39 @@ const SECRET_PATTERNS = [
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
 ] as const;
 
+function matchesSecretPattern(text: string): boolean {
+  return SECRET_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+const JSON_FILE_PATH = /\.jsonc?$/i;
+
+/**
+ * The patterns start with `\b`, but in a JSON string `\n`, `\t`, `\r` and `\uXXXX` end in a
+ * word character, so a token written after one has no boundary in the raw text and the raw
+ * check misses it. Checking each decoded string (keys and values, at any depth) sees what a
+ * reader of the file sees.
+ *
+ * This reads tokens instead of parsing: `jsonc.parse` keeps only the last of a duplicate key
+ * and drops `__proto__`, so a token in either would escape the check, and a file that does
+ * not parse would be skipped whole. The scanner never throws and does not recurse.
+ */
+function jsonStringsMatchSecretPattern(text: string): boolean {
+  const scanner = jsonc.createScanner(text, true);
+  for (let token = scanner.scan(); token !== jsonc.SyntaxKind.EOF; token = scanner.scan()) {
+    if (token === jsonc.SyntaxKind.StringLiteral && matchesSecretPattern(scanner.getTokenValue())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function fileContentMatchesSecretPattern(filePath: string, content: string): boolean {
+  return (
+    matchesSecretPattern(content) ||
+    (JSON_FILE_PATH.test(filePath) && jsonStringsMatchSecretPattern(content))
+  );
+}
+
 export interface BackupFile {
   path: string;
   content: Buffer;
@@ -1733,7 +1766,7 @@ export function scanBackupFilesForSecrets(
   return files
     .filter((file) => {
       const content = file.content.toString("utf-8");
-      if (SECRET_PATTERNS.some((pattern) => pattern.test(content))) return true;
+      if (fileContentMatchesSecretPattern(file.path, content)) return true;
       if (file.path === "mcp.jsonc" && mcpConfigRequiresPublishApproval(content, mcpOptions)) {
         return true;
       }
