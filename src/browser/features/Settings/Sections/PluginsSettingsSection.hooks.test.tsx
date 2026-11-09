@@ -231,6 +231,7 @@ test("the install preview marks a bidi character in a hook warning", async () =>
     mcpServers: [],
     agents: [],
     readonlyAgents: [],
+    shellRemovedAgents: [],
     workflows: [],
     slashCommands: [],
     reviewedComponents: [],

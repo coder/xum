@@ -1,9 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import {
+  isolateHostHome,
+  type IsolatedHostHome,
+} from "@/node/services/hostHomeIsolation.testHarness";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 // The Node layer: these tests read through host runtimes.
@@ -28,8 +32,16 @@ async function writePluginWithWorkflow(workspacePath: string, pluginName: string
 }
 
 describe("discoverWorkflowScripts (agent plugins)", () => {
-  // Generous timeout: discovery probes every built-in/global skill for a
-  // workflow.js entry, which is slow on machines with many installed skills.
+  // Discovery probes every built-in and global skill for a workflow.js entry, which took 58 to 60 s
+  // per test on a host with many installed skills. An empty home keeps it to the built-ins.
+  let hostHome: IsolatedHostHome | undefined;
+  beforeAll(() => {
+    hostHome = isolateHostHome("workflow-discovery-host-home");
+  });
+  afterAll(() => {
+    hostHome?.restore();
+  });
+
   test("enumerates plugin workflows/ contributions", async () => {
     using tempDir = new TestTempDir("workflow-discovery-plugin");
     await writePluginWithWorkflow(tempDir.path, "my-unique-fixture-plugin");

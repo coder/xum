@@ -2,6 +2,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { AgentIdSchema } from "@/common/schemas/ids";
+import { isToolEnabledByConfigs } from "@/common/utils/agentTools";
 import { parseAgentDefinitionMarkdown } from "@/node/services/agentDefinitions/parseAgentDefinitionMarkdown";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
@@ -12,8 +13,13 @@ export interface PluginAgentFile {
   id: string;
   /** The parsed frontmatter (plugin format mapping applied), as the runtime parses it. */
   frontmatter: unknown;
-  /** Cursor `readonly: true`: the agent runs on Explore's tools (no file edits, shell stays). */
+  /**
+   * Cursor `readonly: true` or a Claude read-only search list: the agent runs on Explore's tools
+   * (no file edits, shell stays).
+   */
   readonly: boolean;
+  /** The mapped tools leave the bash tools enabled. */
+  keepsShell: boolean;
 }
 
 /**
@@ -99,7 +105,7 @@ export function ambiguousPluginAgentIds(
 async function readAgentDefinition(
   filePath: string,
   agentId: string
-): Promise<Pick<PluginAgentFile, "frontmatter" | "readonly"> | undefined> {
+): Promise<Pick<PluginAgentFile, "frontmatter" | "readonly" | "keepsShell"> | undefined> {
   try {
     const stat = await fsPromises.stat(filePath);
     // Size-check BEFORE reading (mirroring runtime discovery): the parse
@@ -117,7 +123,13 @@ async function readAgentDefinition(
       byteSize: stat.size,
       plugin: { agentId },
     });
-    return { frontmatter: parsed.frontmatter, readonly: parsed.mappedReadonly };
+    // mutation-equivalent: `tools` is an object or undefined, never another falsy value
+    const tools = parsed.frontmatter.tools ?? {};
+    return {
+      frontmatter: parsed.frontmatter,
+      readonly: parsed.mappedReadonly,
+      keepsShell: isToolEnabledByConfigs("bash", [{ add: [".*"] }, tools]),
+    };
   } catch {
     return undefined;
   }

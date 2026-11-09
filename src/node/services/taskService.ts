@@ -125,6 +125,10 @@ import {
   resolveAgentDefinition,
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import {
+  formatPluginAgentRefusal,
+  PluginAgentRefusalError,
+} from "@/node/services/agentDefinitions/pluginAgentRefusal";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
@@ -888,6 +892,12 @@ export interface OwnedTaskAttempt {
    * the snapshot. False → this attempt can never produce a cross-process receipt.
    */
   receiptEligible: boolean;
+  /**
+   * The row already read a completed report when this attempt began: a reactivated or reawakened
+   * task keeps its predecessor's terminal status while the new attempt runs. A reported row says
+   * nothing about this attempt then. In-memory only, taken in beginOwnedTaskAttempt.
+   */
+  readonly inheritedReport: boolean;
 }
 
 /** In-process settlement ledger entry; see AttemptLedger.attemptSettlementByTaskId. */
@@ -1096,6 +1106,13 @@ export interface StreamEndDecision {
   readonly attempt: OwnedTaskAttempt | undefined;
   readonly attemptId: string;
   readonly messageId: string;
+  /**
+   * The row's completed report predates this attempt (OwnedTaskAttempt.inheritedReport; always
+   * false for an attempt this process does not own, which has no start to compare). Only a report
+   * that is not inherited contradicts a `nonreport` decision (see
+   * StreamEndLedger.resolveStreamEndDecision).
+   */
+  readonly inheritedReport: boolean;
   outcome: "pending" | "nonreport" | "published" | "indeterminate";
   /**
    * The session's turn generation the stream ended in (undefined when none was live, or once it
@@ -6872,6 +6889,7 @@ export class TaskService implements AgentTaskIntegration {
       const runnableIds = (
         await Promise.all(
           allAgents.map(async (agent) => {
+            if (agent.unavailableReason !== undefined) return null;
             try {
               const frontmatter = await resolveAgentFrontmatter(
                 runtime,
@@ -6929,6 +6947,7 @@ export class TaskService implements AgentTaskIntegration {
         resolveAgentDefinition(runtime, parentWorkspacePath, agentId, {
           projectPluginsTrusted,
           runtimeFactory: nodeRuntimeFactory,
+          refuseUnreachablePluginFolder: true,
         }),
         signal
       );
@@ -6955,6 +6974,9 @@ export class TaskService implements AgentTaskIntegration {
             error
           )
         );
+      }
+      if (error instanceof PluginAgentRefusalError) {
+        return Err(`Task.createMany: ${formatPluginAgentRefusal(error)}`);
       }
       const hint = await this.describeRunnableAgents(reservation);
       return Err(`Task.createMany: unknown agentId (${agentId}). ${hint}`);
@@ -9233,6 +9255,7 @@ export class TaskService implements AgentTaskIntegration {
       const runnableIds = (
         await Promise.all(
           allAgents.map(async (agent) => {
+            if (agent.unavailableReason !== undefined) return null;
             try {
               const frontmatter = await resolveAgentFrontmatter(
                 runtime,
@@ -9284,6 +9307,7 @@ export class TaskService implements AgentTaskIntegration {
       const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId, {
         projectPluginsTrusted,
         runtimeFactory: nodeRuntimeFactory,
+        refuseUnreachablePluginFolder: true,
       });
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
         const hint = await this.describeRunnableTaskAgents(placement);
@@ -9306,6 +9330,10 @@ export class TaskService implements AgentTaskIntegration {
         return Err(
           formatRuntimeUnreachableError(`Task.create: could not verify agentId (${agentId})`, error)
         );
+      }
+      // A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4).
+      if (error instanceof PluginAgentRefusalError) {
+        return Err(`Task.create: ${formatPluginAgentRefusal(error)}`);
       }
       const hint = await this.describeRunnableTaskAgents(placement);
       return Err(`Task.create: unknown agentId (${agentId}). ${hint}`);

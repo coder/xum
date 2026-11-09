@@ -349,6 +349,14 @@
 
   --plan-mode-rgb: 31, 107, 184;
 
+  /* The folded iPhone Duo's cover display keeps an 84 pt status column on the right of its 466 pt
+     width. iOS 27.1 reports it as `env(safe-area-inset-right)`; iOS 27.2 reports nothing and lays
+     the page out without it, and iosCoverColumn.ts lays the page out across it again and sets
+     `--ios-cover-column`. This is the right inset either way, so overlays that keep clear of a
+     right inset keep clear of the column. Shared components (Dialog, toasts) read it, so the
+     webview defines it too. */
+  --safe-area-right: max(env(safe-area-inset-right, 0px), var(--ios-cover-column, 0px));
+
   --font-primary:
     -apple-system, BlinkMacSystemFont, "Geist", system-ui, "Segoe UI", "Roboto", "Helvetica Neue",
     Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";

@@ -19,6 +19,7 @@ import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCod
 import type { BashOutputEvent } from "@/common/types/stream";
 import type { ProjectRef } from "@/common/types/workspace";
 import type { BashToolResult } from "@/common/types/tools";
+import { describeReceivedCommandLine } from "@/common/utils/tools/bashCommandAlias";
 import { resolveBashDisplayName } from "@/common/utils/tools/bashDisplayName";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -543,7 +544,50 @@ function validateScript(script: string, config: ToolConfiguration): BashToolResu
     }
   }
 
+  const interactiveError = rejectInteractiveTui(script);
+  if (interactiveError) return interactiveError;
+
   return null; // Valid
+}
+
+// Programs that wait for a terminal when stdout is a pipe and stdin is closed, as in this tool.
+// Probed on macOS: these hang until the timeout; nano, less, more, man and ed exit at once, so
+// they are not listed.
+const INTERACTIVE_TUI_PROGRAMS = new Set(["vi", "vim", "view", "vimdiff", "nvim", "top", "htop"]);
+// A path names one of those programs only in a system bin directory: a project's own `./top`
+// or `bin/view` can be anything.
+const SYSTEM_BIN_DIRS = new Set(["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]);
+// Pipes, redirects, lists, subshells and expansions make the script more than a bare TUI launch.
+const SHELL_COMPOSITION_CHARS = /[|&;<>()$`\n]/;
+// Quoted and backslash-escaped text is literal to bash, so it composes nothing: `vim 'a&b'` still
+// launches Vim. Double quotes keep `$` and backticks live, but those only build an argument.
+const SHELL_LITERAL_TEXT = /\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*"/g;
+
+function isInteractiveTuiProgram(program: string): boolean {
+  if (!INTERACTIVE_TUI_PROGRAMS.has(path.posix.basename(program))) return false;
+  return !program.includes("/") || SYSTEM_BIN_DIRS.has(path.posix.dirname(program));
+}
+
+/**
+ * Models that mistake bash for another tool send `view <file>` (Vim) and wait the whole
+ * timeout for nothing. Reject only a bare launch: any flag (`top -l 1`, `vim -es`) or `+cmd`
+ * argument, or any shell composition outside quotes, may make the program exit on its own.
+ */
+function rejectInteractiveTui(script: string): BashToolResult | null {
+  const trimmed = script.trim();
+  if (SHELL_COMPOSITION_CHARS.test(trimmed.replace(SHELL_LITERAL_TEXT, ""))) return null;
+  const [program, ...args] = trimmed.split(/\s+/);
+  if (!isInteractiveTuiProgram(program)) return null;
+  if (args.some((arg) => arg.startsWith("-") || arg.startsWith("+"))) return null;
+  return {
+    success: false,
+    error:
+      `${describeReceivedCommandLine("script", trimmed)} starts an interactive program that waits for a terminal; ` +
+      "bash has no terminal, so it would hang until the timeout. " +
+      "To read a file, call file_read; for /memories paths, call the memory tool; otherwise run a non-interactive command line.",
+    exitCode: -1,
+    wall_duration_ms: 0,
+  };
 }
 
 /**
@@ -975,6 +1019,22 @@ async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
 }
 
 /**
+ * Foreground kill deadline. Providers send null for an omitted optional input, so null and absent
+ * both mean the model named no deadline and it gets the shared default.
+ */
+function foregroundTimeoutSecs(requested: number | null | undefined): number {
+  return requested ?? BASH_DEFAULT_TIMEOUT_SECS;
+}
+
+/**
+ * Background max lifetime, in the shape BackgroundProcessManager wants: absence stays absence, so a
+ * dev server started without a timeout outlives the foreground default until it is stopped.
+ */
+function backgroundTimeoutSecs(requested: number | null | undefined): number | undefined {
+  return requested ?? undefined;
+}
+
+/**
  * Bash execution tool factory for AI assistant
  * Creates a bash tool that can execute commands with a configurable timeout
  * @param config Required configuration including working directory
@@ -1158,7 +1218,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
             ...(monitorConfig ? { monitor: monitorConfig } : {}),
-            timeoutSecs: timeout_secs, // Auto-terminate after this duration
+            timeoutSecs: backgroundTimeoutSecs(timeout_secs),
           }
         );
 
@@ -1185,7 +1245,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       }
 
       // Setup execution parameters
-      const effectiveTimeout = timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS;
+      const effectiveTimeout = foregroundTimeoutSecs(timeout_secs);
       const startTime = performance.now();
       const totalBytesRef = { current: 0 }; // Use ref for shared access in line handler
       let overflowReason: string | null = null;

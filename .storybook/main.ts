@@ -1,5 +1,5 @@
 import type { StorybookConfig } from "@storybook/react-vite";
-import { mergeConfig } from "vite";
+import { mergeConfig, type Plugin } from "vite";
 import { readFileSync } from "fs";
 import path from "path";
 
@@ -16,6 +16,21 @@ function bootLoaderStyles(): string {
   return html.slice(start, end);
 }
 
+// BootLoadFailure.stories.tsx renders index.html's own boot screen and script, so it needs the
+// file's source. `index.html?raw` is no way to get it: the dev server answers /index.html with
+// Storybook's own page.
+function indexHtmlSource(): Plugin {
+  const id = "virtual:index-html";
+  return {
+    name: "xum-index-html-source",
+    resolveId: (source) => (source === id ? `\0${id}` : undefined),
+    load: (resolved) =>
+      resolved === `\0${id}`
+        ? `export default ${JSON.stringify(readFileSync(path.join(process.cwd(), "index.html"), "utf8"))};`
+        : undefined,
+  };
+}
+
 const config: StorybookConfig = {
   stories: [
     "../src/browser/stories/**/*.stories.@(ts|tsx)",
@@ -30,6 +45,7 @@ const config: StorybookConfig = {
   },
   viteFinal: async (config) => {
     return mergeConfig(config, {
+      plugins: [indexHtmlSource()],
       // Inherit project aliases. Storybook also needs a stable VERSION module so
       // stories that render chrome-only components (for example the landing-page
       // PR badge path through TitleBar/AboutDialog) do not depend on generated

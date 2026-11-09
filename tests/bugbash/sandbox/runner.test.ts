@@ -33,8 +33,11 @@ bin=$(dirname "$0"); . "$bin/fake.env"
 unregister() { awk -v id="$1" '$1!=id' "$bin/containers" > "$bin/c.tmp"; mv "$bin/c.tmp" "$bin/containers"; }
 echo "$* [home=\${HOME-} cfg=\${DOCKER_CONFIG-}]" >> "$bin/calls.log"
 env | grep -oE '^(GH|XDG|DBUS)_[A-Z_]*' | sed 's/^/docker got /' >> "$bin/calls.log"
+# A client that ignores SIGTERM. The call line above comes before the trap, so a test that signals
+# on it can kill the shell first: it signals on this line, written only once the trap is set.
+ignore_term() { trap '' TERM; echo "term ignored $1" >> "$bin/calls.log"; exec sleep 30; }
 case "$1" in
-  context) if [ "\${CONTEXT-}" = hang ]; then trap '' TERM; exec sleep 30; fi; echo "$HOST" ;;
+  context) if [ "\${CONTEXT-}" = hang ]; then ignore_term context; fi; echo "$HOST" ;;
   info) echo "$INFO" ;;
   images) [ "$IMAGES_RC" = 0 ] || { echo "daemon down" >&2; exit 1; }
     case "$*" in *xum-bugbash-sandbox:inputs-*) echo "$LOCAL" ;; *) echo "$IMAGES" ;; esac ;;
@@ -49,7 +52,7 @@ case "$1" in
       esac; exit 0; fi
     [ "$BUILD" = fail ] && { echo "build failed" >&2; exit 1; }; exit 0 ;;
   pull)
-    if [ "$PULL" = hang ]; then trap '' TERM; exec sleep 30; fi
+    if [ "$PULL" = hang ]; then ignore_term pull; fi
     # A grandchild that holds no pipe: only a signal to the whole group reaches it.
     # The leader ends on SIGTERM, but its grandchild ignores it and holds no pipe (#5878 review).
     if [ "$PULL" = orphan ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; sleep 30; fi
@@ -78,7 +81,7 @@ case "$1" in
     if [ "$RUN" = swap ]; then echo "$id xbb-other other:pid abc" >> "$bin/containers"; else echo "$id $n$l" >> "$bin/containers"; fi
     echo "$id" > "$cid"; echo "created $id" >> "$bin/calls.log"
     case "$RUN" in
-      stuck) trap '' TERM; exec sleep 30 ;;
+      stuck) ignore_term run ;;
       slowcreate|swap) cat >/dev/null; exit 0 ;;
       hang) cat >/dev/null; echo "stdin closed" >> "$bin/calls.log"; unregister "$id"; exit 0 ;;
       badframe) printf 'not a frame\n'; cat >/dev/null; unregister "$id"; exit 0 ;;
@@ -376,7 +379,7 @@ test("a stop ends a running pull; cleanup removes only the owned container, no i
   const stop = new AbortController();
   const s = session(stop);
   const pending = s.ensureImage();
-  while (!calls().includes("pull ")) await Bun.sleep(20);
+  while (!calls().includes("term ignored pull")) await Bun.sleep(20);
   s.own(JOB);
   const stoppedAt = Date.now();
   stop.abort("SIGTERM");
@@ -480,7 +483,7 @@ test("#5877 item 4: a stop during the endpoint lookup leaves no private client f
   const stop = new AbortController();
   const s = session(stop);
   const pending = s.ensureImage();
-  while (!calls().includes("context ")) await Bun.sleep(20);
+  while (!calls().includes("term ignored context")) await Bun.sleep(20);
   stop.abort("SIGINT");
   expect(await failure(pending)).toThrow(Stopped);
   expect(await s.cleanup()).toBe("none");
@@ -515,7 +518,7 @@ test("C1: a stop during the create never signals `docker run`; cleanup removes t
 
 test("C2: a client that ignores the lifeline is killed after the grace period", async () => {
   const { s, stop, job } = await jobSession({ RUN: "stuck" }, 300);
-  while (!calls().includes("created ")) await Bun.sleep(20);
+  while (!calls().includes("term ignored run")) await Bun.sleep(20);
   stop.abort("SIGTERM");
   const started = Date.now();
   await job;
@@ -762,8 +765,8 @@ test("an unknown container state after cleanup outranks the job's result (exit 3
 
 test.each([
   ["before the launch", {}, null],
-  ["during the endpoint lookup", { CONTEXT: "hang" }, "context "],
-  ["during the pull", { IMAGES: "", PULL: "hang" }, "pull "],
+  ["during the endpoint lookup", { CONTEXT: "hang" }, "term ignored context"],
+  ["during the pull", { IMAGES: "", PULL: "hang" }, "term ignored pull"],
   ["while the job runs", { RUN: "hang" }, "run "],
 ])(
   "a stop %s leaves nothing behind",

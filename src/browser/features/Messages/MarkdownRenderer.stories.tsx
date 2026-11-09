@@ -1,8 +1,13 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "storybook/test";
+import { DESKTOP_TITLEBAR_HEIGHT_PX } from "@/browser/hooks/useDesktopTitlebar";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { windowDragsAtEach, withDesktopApi } from "@/browser/stories/helpers/windowDrag";
 import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
+import { expectNoDiagramInkOutsideBox } from "@/browser/stories/storyPlayHelpers";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
+import { SIDE_INSET_VIEWPORT } from "@/constants/layout";
+import { MERMAID_PAGE_DIAGRAM_SELECTOR } from "@/constants/mermaid";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { UserMessageContent } from "./UserMessageContent";
 
@@ -133,7 +138,8 @@ const WIDE_FLOWCHART_CONTENT = mermaidFence(
 
 // A state diagram that Pele lays out at about 2089x1372 px even for a phone-wide column: far
 // larger than any frame it sits in. On iPhone Safari it painted over the paragraphs below it.
-const STATE_DIAGRAM_CONTENT = mermaidFence(`---
+const STATE_DIAGRAM_CONTENT =
+  mermaidFence(`---
 title: "label_low_risk.py: from the checks to the one line it prints"
 ---
 stateDiagram-v2
@@ -222,7 +228,8 @@ stateDiagram-v2
   class s12 bugPath
   class s13 teal
   class s14 pink
-  class s14 breaks`);
+  class s14 breaks`) +
+  "\n\nThis paragraph follows the diagram. On iPhone Safari the diagram painted over text like it.";
 
 // Mirror Pixel's named viewports so each story's globals pin the width that CI snapshots.
 const MERMAID_VIEWPORTS = {
@@ -232,6 +239,14 @@ const MERMAID_VIEWPORTS = {
       name: "Laptop 1200",
       styles: { width: "1200px", height: "900px" },
       type: "desktop",
+    },
+    sideInset: {
+      name: "Side inset",
+      styles: {
+        width: `${SIDE_INSET_VIEWPORT.width}px`,
+        height: `${SIDE_INSET_VIEWPORT.height}px`,
+      },
+      type: "mobile",
     },
   },
 };
@@ -262,8 +277,13 @@ interface DiagramGeometry {
   drawing: { width: number; height: number };
 }
 
-function measureDiagram(canvasElement: HTMLElement): DiagramGeometry {
-  const svg = canvasElement.querySelector<SVGSVGElement>(".mermaid-container > svg.pele");
+const DIALOG_SVG = ".mermaid-modal > svg.pele";
+
+function measureDiagram(
+  canvasElement: HTMLElement,
+  selector = MERMAID_PAGE_DIAGRAM_SELECTOR
+): DiagramGeometry {
+  const svg = canvasElement.querySelector<SVGSVGElement>(selector);
   if (!svg) throw new Error("The diagram has not rendered yet");
   const container = svg.parentElement!;
   const [, , width, height] = (svg.getAttribute("viewBox") ?? "").split(" ").map(Number);
@@ -314,13 +334,13 @@ async function expectDiagramInsideFrame(geometry: DiagramGeometry) {
 /** Waits until the diagram has rendered at the column's width and every box agrees. */
 async function waitForDiagram(
   canvasElement: HTMLElement,
-  expectation: (geometry: DiagramGeometry) => Promise<void>
+  expectation?: (geometry: DiagramGeometry) => Promise<void>
 ) {
   await waitFor(
     async () => {
       const geometry = measureDiagram(canvasElement);
       await expectDiagramInsideFrame(geometry);
-      await expectation(geometry);
+      await expectation?.(geometry);
     },
     { timeout: 10_000 }
   );
@@ -338,6 +358,7 @@ async function expectZoomResizesBox(canvasElement: HTMLElement) {
   const grown = measureDiagram(canvasElement);
   await expect(Math.abs(grown.svg.width - before.width * 1.1)).toBeLessThanOrEqual(PIXEL_TOLERANCE);
   await expectDiagramInsideFrame(grown);
+  await expectNoDiagramInkOutsideBox();
 
   await userEvent.click(controls.getByRole("button", { name: "−" }));
   await waitFor(() =>
@@ -359,9 +380,8 @@ async function playAtDefaultZoom(play: () => Promise<void>) {
 
 /** Below 640 px a left-to-right flowchart turns top-to-bottom and drops the height cap. */
 export const MermaidPhone: Story = {
-  // The browser test run also plays this story in WebKit, which sizes replaced elements and
-  // CSS zoom differently from Chromium (iPhone Safari).
-  tags: ["webkit"],
+  // Storybook reads tags only from string literals, so every Mermaid story repeats this one.
+  tags: ["paint-check"],
   globals: { viewport: { value: "phone390", isRotated: false } },
   parameters: { viewport: MERMAID_VIEWPORTS, pixel: { matrix: { viewports: ["phone"] } } },
   render: () => <MermaidColumn content={WIDE_FLOWCHART_CONTENT} width={PHONE_COLUMN_WIDTH} />,
@@ -384,7 +404,7 @@ export const MermaidPhone: Story = {
 
 /** At 640 px and wider the same flowchart keeps its left-to-right layout. */
 export const MermaidLaptop: Story = {
-  tags: ["webkit"],
+  tags: ["paint-check"],
   globals: { viewport: { value: "laptop1200", isRotated: false } },
   parameters: { viewport: MERMAID_VIEWPORTS, pixel: { matrix: { viewports: ["laptop"] } } },
   render: () => <MermaidColumn content={WIDE_FLOWCHART_CONTENT} width={LAPTOP_COLUMN_WIDTH} />,
@@ -402,7 +422,7 @@ export const MermaidLaptop: Story = {
 
 /** A diagram far wider than a phone keeps its measured size and pans inside its frame. */
 export const MermaidStatePhone: Story = {
-  tags: ["webkit"],
+  tags: ["paint-check"],
   globals: { viewport: { value: "phone390", isRotated: false } },
   parameters: { viewport: MERMAID_VIEWPORTS, pixel: PIXEL_DISABLED },
   render: () => <MermaidColumn content={STATE_DIAGRAM_CONTENT} width={PHONE_COLUMN_WIDTH} />,
@@ -419,7 +439,7 @@ export const MermaidStatePhone: Story = {
 
 /** The same diagram in a laptop-wide column shrinks to fit the width and the height cap. */
 export const MermaidStateLaptop: Story = {
-  tags: ["webkit"],
+  tags: ["paint-check"],
   globals: { viewport: { value: "laptop1200", isRotated: false } },
   parameters: { viewport: MERMAID_VIEWPORTS, pixel: PIXEL_DISABLED },
   render: () => <MermaidColumn content={STATE_DIAGRAM_CONTENT} width={LAPTOP_COLUMN_WIDTH} />,
@@ -433,4 +453,150 @@ export const MermaidStateLaptop: Story = {
       await expectZoomResizesBox(canvasElement);
     });
   },
+};
+
+const PHONE_VIEWPORT = { width: 390, height: 844 };
+const DESKTOP_VIEWPORT = { width: 1200, height: 900 };
+
+/** The layout viewport, which the dialog's fixed overlay normally fills. */
+function layoutViewport() {
+  return {
+    width: document.documentElement.clientWidth,
+    height: document.documentElement.clientHeight,
+  };
+}
+
+/** The part of the page an element shows: the intersection of every box that clips it. */
+function visibleAreaOf(element: Element) {
+  const viewport = layoutViewport();
+  let area = { left: 0, top: 0, right: viewport.width, bottom: viewport.height };
+  for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    if (getComputedStyle(ancestor).overflow === "visible") continue;
+    const box = ancestor.getBoundingClientRect();
+    const left = box.left + ancestor.clientLeft;
+    const top = box.top + ancestor.clientTop;
+    area = {
+      left: Math.max(area.left, left),
+      top: Math.max(area.top, top),
+      right: Math.min(area.right, left + ancestor.clientWidth),
+      bottom: Math.min(area.bottom, top + ancestor.clientHeight),
+    };
+  }
+  return area;
+}
+
+/**
+ * The expand dialog shows the whole diagram: it lies inside what the dialog shows, and it is
+ * as large as the room the dialog leaves it allows on its tighter axis, so it is not shrunk
+ * more than it must be. The room is the measured content box of the diagram's container.
+ */
+async function expectDialogShowsWholeDiagram(canvasElement: HTMLElement) {
+  await waitFor(
+    async () => {
+      const geometry = measureDiagram(canvasElement, DIALOG_SVG);
+      const { svg: box, container, drawing } = geometry;
+      const room = { width: container.clientWidth, height: container.clientHeight };
+      const area = visibleAreaOf(canvasElement.querySelector(DIALOG_SVG)!);
+      await expect(box.left).toBeGreaterThanOrEqual(area.left - 0.5);
+      await expect(box.top).toBeGreaterThanOrEqual(area.top - 0.5);
+      await expect(box.right).toBeLessThanOrEqual(area.right + 0.5);
+      await expect(box.bottom).toBeLessThanOrEqual(area.bottom + 0.5);
+      await expectBoxKeepsDrawingProportions(geometry);
+      await expect(box.width).toBeLessThan(drawing.width);
+      const fillsWidth = Math.abs(box.width - room.width) <= PIXEL_TOLERANCE;
+      const fillsHeight = Math.abs(box.height - room.height) <= PIXEL_TOLERANCE;
+      await expect(fillsWidth || fillsHeight).toBe(true);
+    },
+    { timeout: 10_000 }
+  );
+}
+
+/** Opens the expand dialog on the state chart, checks it, and closes it again. */
+async function playDialog(
+  canvasElement: HTMLElement,
+  viewport: { width: number; height: number },
+  whileOpen?: (close: HTMLElement) => Promise<void>
+) {
+  // The test runner pins this size before it plays the story (.storybook/test-runner.ts).
+  await expect(layoutViewport()).toEqual(viewport);
+  await playAtDefaultZoom(async () => {
+    await waitForDiagram(canvasElement);
+    const controls = within(canvasElement);
+    await userEvent.click(controls.getByRole("button", { name: "⤢" }));
+    await expectDialogShowsWholeDiagram(canvasElement);
+    const close = controls.getByRole("button", { name: "Close" });
+    await whileOpen?.(close);
+    await userEvent.click(close);
+    await waitFor(() => expect(canvasElement.querySelector(".mermaid-modal")).toBeNull());
+  });
+}
+
+/** On a phone, far narrower than the diagram, the expand dialog still shows all of it. */
+export const MermaidStateDialogPhone: Story = {
+  tags: ["paint-check"],
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { viewport: MERMAID_VIEWPORTS, pixel: PIXEL_DISABLED },
+  render: () => <MermaidColumn content={STATE_DIAGRAM_CONTENT} width={PHONE_COLUMN_WIDTH} />,
+  play: ({ canvasElement }) => playDialog(canvasElement, PHONE_VIEWPORT),
+};
+
+/**
+ * On Windows and Linux the desktop app draws the native window controls over the top right of its
+ * title bar, and the bar moves the window. The Close button must start below it, and must not
+ * sit in a drag region.
+ */
+async function expectCloseBelowTitleBar(close: HTMLElement) {
+  const box = close.getBoundingClientRect();
+  // The stand-in bar is a drag region, so the check below can tell a button inside it.
+  await expect(windowDragsAtEach([{ x: box.right - 1, y: 1 }])).toEqual([true]);
+  await expect(box.top).toBeGreaterThanOrEqual(DESKTOP_TITLEBAR_HEIGHT_PX);
+  const corners = [
+    { x: box.left + 1, y: box.top + 1 },
+    { x: box.right - 1, y: box.top + 1 },
+    { x: box.left + 1, y: box.bottom - 1 },
+    { x: box.right - 1, y: box.bottom - 1 },
+    { x: (box.left + box.right) / 2, y: (box.top + box.bottom) / 2 },
+  ];
+  await expect(windowDragsAtEach(corners)).toEqual(corners.map(() => false));
+}
+
+/** In the desktop app the expand dialog's Close button clears the title bar. */
+export const MermaidStateDialogDesktop: Story = {
+  tags: ["paint-check"],
+  beforeEach: withDesktopApi({
+    platform: "linux",
+    isRosetta: false,
+    getIsRosetta: () => Promise.resolve(false),
+  }),
+  globals: { viewport: { value: "laptop1200", isRotated: false } },
+  parameters: { viewport: MERMAID_VIEWPORTS, pixel: PIXEL_DISABLED },
+  render: () => (
+    <>
+      <div
+        className="titlebar-drag"
+        style={{
+          position: "fixed",
+          top: 0,
+          left: 0,
+          right: 0,
+          height: DESKTOP_TITLEBAR_HEIGHT_PX,
+        }}
+      />
+      <MermaidColumn content={STATE_DIAGRAM_CONTENT} width={LAPTOP_COLUMN_WIDTH} />
+    </>
+  ),
+  play: ({ canvasElement }) =>
+    playDialog(canvasElement, DESKTOP_VIEWPORT, expectCloseBelowTitleBar),
+};
+
+/**
+ * A play cannot set env(safe-area-inset-*), so in Chromium the test runner sets a right inset with
+ * CDP and checks the dialog against it (.storybook/test-runner.ts). WebKit plays it with no inset.
+ */
+export const MermaidStateDialogSideInset: Story = {
+  tags: ["paint-check"],
+  globals: { viewport: { value: "sideInset", isRotated: false } },
+  parameters: { viewport: MERMAID_VIEWPORTS, pixel: PIXEL_DISABLED },
+  render: () => <MermaidColumn content={STATE_DIAGRAM_CONTENT} width={340} />,
+  play: ({ canvasElement }) => playDialog(canvasElement, SIDE_INSET_VIEWPORT),
 };

@@ -8,7 +8,6 @@ import * as path from "node:path";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import {
-  AgentPluginInstallEntrySchema,
   AgentPluginComponentConsentSchema,
   AgentPluginImportedComponentsSchema,
   type AgentPluginImportedComponents,
@@ -46,7 +45,7 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { showInvisibleControls, showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
-import type { Config } from "@/node/config";
+import { configFilePath, type Config } from "@/node/config";
 import {
   SkillNameSchema,
   resolveSkillAdvertise,
@@ -69,6 +68,8 @@ import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
   ALL_WORKSPACES_TARGET,
+  isRetryableLockError,
+  OverridesFileTooLargeError,
   type WorkspaceMcpOverridesService,
 } from "@/node/services/workspaceMcpOverridesService";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
@@ -148,6 +149,7 @@ import type { OpenAIPluginInterface } from "./openaiExtension";
 import {
   acquirePluginMutationLock,
   bumpContainerMutationEpoch,
+  MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
   MUTATION_LOCK_FILE,
   containerHasPendingSignOuts,
   pendingSignOutsRecordState,
@@ -160,7 +162,11 @@ import {
   UNINSTALL_JOURNAL_PREFIX,
   UPDATE_JOURNAL_PREFIX,
 } from "./journals";
-import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
+import {
+  PLUGIN_REGISTRY_FILE_NAME,
+  parseRegistryEntriesLenient,
+  readPluginRegistryDocument,
+} from "./registry";
 import { isPlainObject, type AgentPluginManifest } from "./manifest";
 import {
   hashPluginTree,
@@ -269,9 +275,6 @@ const MARKETPLACE_SCAN_CONCURRENCY = 8;
 /** Staging dirs left behind by crashes are reclaimed after this age. */
 const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
 
-/** How long an acquire waits on a live holder before failing (covers a full clone). */
-const MUTATION_LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
-
 /** Bound discovery/settings waits on startup crash-recovery I/O. */
 const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;
 
@@ -331,19 +334,103 @@ async function signOutFailure(
 }
 
 /**
- * Workspace IDs an install-time MCP override error lists. Large configs fail
- * the sweep for hundreds of workspaces at once, and a wall of IDs hid the
- * actual advice; the log keeps one warning per workspace.
+ * Workspace IDs (or override file paths) an install-time MCP override error
+ * lists. Large configs fail the sweep for hundreds of workspaces at once, and
+ * a wall of IDs hid the actual advice; the log keeps one warning per workspace.
  */
 const MAX_LISTED_FAILED_WORKSPACES = 5;
 
+/** config.json cannot be read or parsed: a retry alone cannot help, the user must repair it. */
+class UnreadableConfigError extends Error {}
+
+/** "a, b, c, d, e, and 807 more" for an install error. */
+function listWithRest(items: readonly string[]): string {
+  const shown = items.slice(0, MAX_LISTED_FAILED_WORKSPACES);
+  const rest = items.length - shown.length;
+  return `${shown.join(", ")}${rest > 0 ? `, and ${rest} more` : ""}`;
+}
+
 /** "812 workspaces (a, b, c, d, e, and 807 more)" for an install error. */
 function describeFailedWorkspaces(ids: readonly string[]): string {
+  // mutation-equivalent: both callers check `failed.length > 0` first, so an empty list never gets here
   assert(ids.length > 0, "describeFailedWorkspaces: ids must be non-empty");
-  const shown = ids.slice(0, MAX_LISTED_FAILED_WORKSPACES);
-  const rest = ids.length - shown.length;
   const noun = ids.length === 1 ? "workspace" : "workspaces";
-  return `${ids.length} ${noun} (${shown.join(", ")}${rest > 0 ? `, and ${rest} more` : ""})`;
+  return `${ids.length} ${noun} (${listWithRest(ids)})`;
+}
+
+/**
+ * Why one workspace's override cleanup failed, in the classes a user answers
+ * differently: shrink a file (a retry cannot fix it), wait and retry, or
+ * read the message. Advice that only said "retry" left a user stuck on an
+ * override file over the size limit, and the reason was only in the log.
+ */
+type PruneCause =
+  | { kind: "oversized"; workspaceId: string; filePath: string }
+  | { kind: "busy"; workspaceId: string }
+  | { kind: "other"; workspaceId: string; message: string };
+
+/** Workspaces whose MCP overrides a prune could not clean, and why. */
+interface FailedPrunes {
+  failed: string[];
+  causes: PruneCause[];
+}
+
+function classifyPruneFailure(workspaceId: string, error: unknown): PruneCause {
+  if (error instanceof OverridesFileTooLargeError) {
+    return { kind: "oversized", workspaceId, filePath: error.filePath };
+  }
+  if (isRetryableLockError(error)) {
+    return { kind: "busy", workspaceId };
+  }
+  return { kind: "other", workspaceId, message: getErrorMessage(error) };
+}
+
+function toFailedPrunes(
+  failures: ReadonlyArray<{ workspaceId: string; error: unknown }>
+): FailedPrunes {
+  return {
+    failed: failures.map((failure) => failure.workspaceId),
+    causes: failures.map((failure) => classifyPruneFailure(failure.workspaceId, failure.error)),
+  };
+}
+
+function describeOversizedCauses(causes: readonly PruneCause[]): string[] {
+  const files = new Set<string>();
+  for (const cause of causes) {
+    if (cause.kind === "oversized") files.add(cause.filePath);
+  }
+  if (files.size === 0) return [];
+  return [
+    `Override file over the size limit: ${listWithRest([...files])}. Shrink or remove each, then install again.`,
+  ];
+}
+
+function describeBusyCauses(causes: readonly PruneCause[]): string[] {
+  const busy = causes.filter((cause) => cause.kind === "busy").map((cause) => cause.workspaceId);
+  if (busy.length === 0) return [];
+  return [
+    `Busy with a rename or an MCP settings update: ${listWithRest(busy)}. Retry in a moment.`,
+  ];
+}
+
+function describeOtherCauses(causes: readonly PruneCause[]): string[] {
+  const others = causes.filter((cause) => cause.kind === "other");
+  const [first] = others;
+  if (first === undefined) return [];
+  return [
+    `${others.length} failed for another reason, first in ${first.workspaceId}: ${first.message.replace(/\.?$/, ".")} If that is a time-out (Xum was busy), retry in a moment.`,
+  ];
+}
+
+/** The cause sentences of an install refusal, each led by a space. */
+function describePruneCauses(causes: readonly PruneCause[]): string {
+  return [
+    ...describeOversizedCauses(causes),
+    ...describeBusyCauses(causes),
+    ...describeOtherCauses(causes),
+  ]
+    .map((sentence) => ` ${sentence}`)
+    .join("");
 }
 
 /**
@@ -809,6 +896,25 @@ function unreviewedRows(
   ];
 }
 
+/**
+ * The agent file lists of the install preview. Display only: the names a user reads before
+ * Install show invisible controls (#6629). `shellRemovedAgents` are the read-only agents whose
+ * mapped tools leave no bash tool.
+ */
+function previewAgentLists(agentFiles: readonly PluginAgentFile[]): {
+  agents: string[];
+  readonlyAgents: string[];
+  shellRemovedAgents: string[];
+} {
+  const names = (keep: (agent: PluginAgentFile) => boolean) =>
+    agentFiles.filter(keep).map((agent) => showInvisibleControls(agent.file));
+  return {
+    agents: names(() => true),
+    readonlyAgents: names((agent) => agent.readonly),
+    shellRemovedAgents: names((agent) => agent.readonly && !agent.keepsShell),
+  };
+}
+
 const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
   skills: "Skill",
   mcpServers: "MCP server",
@@ -1202,11 +1308,9 @@ async function runGit(
  * cloneRef checks out after narrowToSubpath has set the sparse pattern.
  */
 function sparseCloneFlags(subpath: string | undefined, url: string): string[] {
-  // --no-local: for a plain local-path source, git's local-clone shortcut
-  // ignores --depth and --filter and copies the whole repository history.
   return subpath === undefined
     ? []
-    : ["--filter=blob:none", "--no-checkout", "--no-local", ...localUploadPackFlags(url)];
+    : ["--filter=blob:none", "--no-checkout", ...localUploadPackFlags(url)];
 }
 
 /** `git fetch` counterpart of sparseCloneFlags (the sparse checkout is set before checkout). */
@@ -1750,6 +1854,77 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
   return lines;
 }
 
+interface SignInKeyEntry {
+  url: string;
+  identityByServerName: Map<string, string>;
+}
+
+function indexSignIns(
+  servers: ReadonlyMap<string, { signIn?: SurfaceSignIn }> | undefined,
+  credentialKey: (url: string) => string | null
+): Map<string, SignInKeyEntry> {
+  const index = new Map<string, SignInKeyEntry>();
+  // mutation-equivalent: a Map is never falsy, so ?? and || agree
+  for (const [serverName, { signIn }] of servers ?? []) {
+    const key = signIn && credentialKey(signIn.url);
+    if (!key || !signIn) continue;
+    // mutation-equivalent: an entry object is never falsy, so ?? and || agree
+    const entry = index.get(key) ?? {
+      url: signIn.url,
+      identityByServerName: new Map<string, string>(),
+    };
+    entry.identityByServerName.set(serverName, signIn.identity);
+    index.set(key, entry);
+  }
+  return index;
+}
+
+/**
+ * Compare an entry with its own previous identity (same name, same key): when two servers share
+ * a URL, another entry already using the new identity must not mask the change. A renamed (or
+ * added) entry has no previous self, and the stored credentials cannot be traced to one entry:
+ * it changed whenever any identity at the key differs.
+ */
+function signInIdentityChanged(
+  before: ReadonlyMap<string, string>,
+  serverName: string,
+  identity: string
+): boolean {
+  const previous = before.get(serverName);
+  return previous !== undefined
+    ? previous !== identity
+    : [...before.values()].some((other) => other !== identity);
+}
+
+/**
+ * The server URLs whose stored credentials an update must sign out: a key whose sign-in identity
+ * changes, and a key the update removes. A removed server keeps its credentials under its URL,
+ * and a later update can add a server at that URL under another identity with no current server
+ * left to show the change, so the removal is the only moment to sign out. A needless sign-out is
+ * acceptable; stale credentials offered under a new identity are not.
+ */
+export function signInResetUrls(
+  current: ReadonlyMap<string, { signIn?: SurfaceSignIn }> | undefined,
+  staged: ReadonlyMap<string, { signIn?: SurfaceSignIn }>,
+  credentialKey: (url: string) => string | null
+): string[] {
+  const before = indexSignIns(current, credentialKey);
+  const after = indexSignIns(staged, credentialKey);
+  const resets: string[] = [];
+  for (const [key, now] of after) {
+    const was = before.get(key);
+    if (
+      was !== undefined &&
+      [...now.identityByServerName].some(([serverName, identity]) =>
+        signInIdentityChanged(was.identityByServerName, serverName, identity)
+      )
+    )
+      resets.push(now.url);
+  }
+  for (const [key, was] of before) if (!after.has(key)) resets.push(was.url);
+  return resets;
+}
+
 const LOGO_MAX_BYTES = 512 * 1024;
 // No SVG: a data-URL <img> cannot run script, but raster-only keeps the
 // renderer away from markup altogether. No GIF: OpenAI does not list it, and it
@@ -2100,35 +2275,8 @@ export class AgentPluginInstallService {
         seenRawNames.add(rawName);
       }
     }
-    const entries: AgentPluginInstallEntry[] = [];
-    const seenNames = new Set<string>();
-    for (const rawEntry of rawEntries) {
-      const parsed = AgentPluginInstallEntrySchema.safeParse(rawEntry);
-      if (!parsed.success) {
-        log.debug("Skipping unrecognized managed plugin registry entry (preserved on disk)", {
-          entry: rawEntry,
-          error: parsed.error.message,
-        });
-        continue;
-      }
-      // Duplicate names are corrupt identity: entry names map 1:1 to
-      // container directories and instance IDs, and raw rewrites match by
-      // name — a mutation would patch EVERY duplicate from the first entry's
-      // source, silently rewriting the others. Mutations (strict) refuse;
-      // views (lenient) keep the first (matching find()-based lookups).
-      if (seenNames.has(parsed.data.name)) {
-        if (mode === "strict") {
-          throw new Error(
-            `The plugin registry (${shortenHome(this.registryFile)}) contains duplicate entries for '${parsed.data.name}'. Repair the file, then retry.`
-          );
-        }
-        log.warn("Ignoring duplicate managed plugin registry entry", { name: parsed.data.name });
-        continue;
-      }
-      seenNames.add(parsed.data.name);
-      entries.push(parsed.data);
-    }
-    return entries;
+    // Strict mode refused every repeated raw name above, so what is left is the lenient parse.
+    return parseRegistryEntriesLenient(rawEntries);
   }
 
   /**
@@ -2737,6 +2885,14 @@ export class AgentPluginInstallService {
         "--depth",
         "1",
         "--single-branch",
+        // --no-local, always: for a plain local-path source, git's local-clone shortcut
+        // (1) ignores --depth and --filter and copies the whole repository history, and
+        // (2) copies or hard-links the source's `objects/` files one by one, so a background
+        // `git repack` of that repository (git runs one detached after a commit) that removes
+        // a loose object between the directory listing and the copy fails the clone with
+        // "failed to copy file to ...: No such file or directory". The transport reads the
+        // source through `git upload-pack`, which git keeps safe against a concurrent repack.
+        "--no-local",
         ...sparseCloneFlags(subpath, url),
         "--branch",
         ref,
@@ -3251,32 +3407,7 @@ export class AgentPluginInstallService {
     // respelled URL (`/mcp` vs `/mcp/`) with a new identity still resets.
     const credentialKey = (url: string): string | null =>
       this.mcpOauthService?.credentialKey(url) ?? null;
-    // Compare each entry with its own previous identity (same name, same key): when two
-    // servers share a URL, another entry already using the new identity must not mask the
-    // change. A renamed (or added) entry has no previous self, and the stored credentials
-    // cannot be traced to one entry: reset whenever any identity at the key differs. A
-    // needless sign-out is acceptable; stale credentials offered under a new identity are not.
-    const currentIdentities = new Map<string, Set<string>>();
-    const currentEntryIdentity = new Map<string, string>();
-    for (const [serverName, server] of current?.servers ?? []) {
-      const key = server.signIn && credentialKey(server.signIn.url);
-      if (!key || !server.signIn) continue;
-      const identities = currentIdentities.get(key) ?? new Set<string>();
-      identities.add(server.signIn.identity);
-      currentIdentities.set(key, identities);
-      currentEntryIdentity.set(`${serverName}\0${key}`, server.signIn.identity);
-    }
-    for (const [serverName, server] of staged.servers) {
-      const key = server.signIn && credentialKey(server.signIn.url);
-      if (!key || !server.signIn) continue;
-      const previous = currentEntryIdentity.get(`${serverName}\0${key}`);
-      const identity = server.signIn.identity;
-      const changed =
-        previous !== undefined
-          ? previous !== identity
-          : [...(currentIdentities.get(key) ?? [])].some((other) => other !== identity);
-      if (changed) signInResets?.push(server.signIn.url);
-    }
+    signInResets?.push(...signInResetUrls(current?.servers, staged.servers, credentialKey));
     // Skill advertisements interpolate into the model-visible skill index on
     // every request, so a new skill — or a reworded description — can inject
     // instructions without the user ever invoking it. Gate both.
@@ -3951,11 +4082,7 @@ export class AgentPluginInstallService {
     assertReviewFits(fileChanges);
     const openaiInterface = await interfaceSummary(plugin, warnings);
     const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
-    // Display only: the names a user reads before Install show invisible controls (#6629).
-    const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
-    const readonlyAgents = agentFiles.flatMap((agent) =>
-      agent.readonly ? [showInvisibleControls(agent.file)] : []
-    );
+    const { agents, readonlyAgents, shellRemovedAgents } = previewAgentLists(agentFiles);
     const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
       showInvisibleControls
     );
@@ -4007,6 +4134,7 @@ export class AgentPluginInstallService {
       fileChanges,
       agents,
       readonlyAgents,
+      shellRemovedAgents,
       workflows,
       slashCommands,
       reviewedComponents,
@@ -5213,8 +5341,8 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Removes `urls` from the pending sign-outs: they finished, or the update rolled back before
-   * the new tree was live. Best effort: a leftover URL only signs the server out once more.
+   * Removes `urls` from the pending sign-outs: they finished, or the update or uninstall rolled
+   * back before it took effect. Best effort: a leftover URL only signs the server out once more.
    */
   private async forgetPendingSignOuts(urls: readonly string[]): Promise<void> {
     if (urls.length === 0) return;
@@ -5226,7 +5354,7 @@ export class AgentPluginInstallService {
     }
   }
 
-  /** Signs out `urls` after an update; the ones that failed stay pending. */
+  /** Signs out `urls` after an update or an uninstall; the ones that failed stay pending. */
   private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
     const done: string[] = [];
     // One deadline for every wait of this update: N hung logouts must not hold the lock N times.
@@ -5537,6 +5665,43 @@ export class AgentPluginInstallService {
     return urls;
   }
 
+  /**
+   * Throws the pending record's own error when an uninstall that will record sign-outs cannot
+   * read it. It runs before anything stops or moves: a failure at the commit would roll the tree
+   * back but not the global MCP enablement.
+   */
+  private async assertPendingSignOutsReadable(urls: readonly string[]): Promise<void> {
+    if (urls.length > 0) await this.readPendingSignOuts();
+  }
+
+  /**
+   * A server that fails to load is not listed. A tree Xum cannot read lists none: it must stay
+   * removable.
+   */
+  private async installedServerUrls(name: string): Promise<string[]> {
+    try {
+      const { plugin } = await discoverAgentPluginAt({
+        pluginDir: this.targetPathFor(name),
+        scope: "global",
+      });
+      // mutation-equivalent: a null plugin throws a TypeError, and the catch also returns []
+      if (plugin?.mcpConfigPath === undefined) return [];
+      const { servers } = await loadPluginMcpServers(plugin, {
+        xumHome: this.config.rootDir,
+        instanceId: this.instanceIdFor(name),
+      });
+      return Object.values(servers).flatMap((info) =>
+        info.transport === "stdio" ? [] : [info.url]
+      );
+    } catch (error) {
+      log.warn("Could not list the MCP servers of a plugin that is being uninstalled", {
+        plugin: name,
+        error: getErrorMessage(error),
+      });
+      return [];
+    }
+  }
+
   /** One plugin tree's remote MCP server URLs; throws when the tree's servers cannot be read. */
   private async pluginTreeServerUrls(dirName: string, installed: boolean): Promise<string[]> {
     // Plugin trees are directories (or links to one), dot-prefixed names included, as discovery
@@ -5756,6 +5921,9 @@ export class AgentPluginInstallService {
       const targetPath = this.targetPathFor(entry.name);
       const instanceId = this.instanceIdFor(entry.name);
       const serverKeyPrefix = buildPluginServerKey(instanceId, "");
+      // Read before the tree moves: its servers' stored sign-ins are keyed by URL and outlive it.
+      const signOutUrls = await this.installedServerUrls(entry.name);
+      await this.assertPendingSignOutsReadable(signOutUrls);
 
       // Enumerate pruning targets BEFORE committing anything: if this fails,
       // the uninstall aborts with the install fully intact (retryable from
@@ -5892,7 +6060,11 @@ export class AgentPluginInstallService {
       } else {
         delete commitEnvelope.pendingOverridePrunes;
       }
+      let recordedSignOuts: string[] = [];
       try {
+        // Recorded before the commit, like an update's: a crash after it leaves the sign-outs for
+        // the next start (#6122).
+        recordedSignOuts = await this.recordPendingSignOuts(signOutUrls);
         // Before the commit, so a failure leaves trust and approved copies cleared (fail closed)
         // rather than kept for a later install under this name.
         await removePluginHookTrust(this.config.rootDir, this.instanceIdFor(entry.name));
@@ -5902,6 +6074,8 @@ export class AgentPluginInstallService {
           rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)
         );
       } catch (error) {
+        // The plugin stays installed: its servers keep their sign-ins.
+        await this.forgetPendingSignOuts(recordedSignOuts);
         const treeRestored = await restoreTree("failed registry write");
         let dataRestored = true;
         if (stagedData) {
@@ -5981,6 +6155,10 @@ export class AgentPluginInstallService {
       if (trashCleaned) {
         await consumeJournal();
       }
+
+      // Signed out before the final stop, like an update: a startup that raced the sign-out is
+      // invalidated too.
+      await this.signOutAndSettle(entry.name, signOutUrls);
 
       // Re-invalidate AFTER the tree is gone: a getToolsForWorkspace call
       // that started right after the pre-rename stop snapshots the new epoch,
@@ -6083,7 +6261,10 @@ export class AgentPluginInstallService {
       // reinstall gate). The shrink is gated on the re-enumeration only, not
       // on the delta persist above: failedPruneIds covers the full union, so
       // a successful shrink IS the durable record for failed delta prunes.
-      const failedPruneIds = await this.pruneWorkspaceOverrides(serverKeyPrefix, pruneIds);
+      const { failed: failedPruneIds } = await this.pruneWorkspaceOverrides(
+        serverKeyPrefix,
+        pruneIds
+      );
       if (pruneIds.length > 0 && postCommitEnumerated) {
         // STRICT re-read for the shrink: a lenient read degrading a transient
         // I/O error or corruption to an empty document would make this write
@@ -6139,7 +6320,27 @@ export class AgentPluginInstallService {
     if (!this.deps.workspaceMcpOverridesService) {
       return [];
     }
-    const allMetadata = await this.config.getAllWorkspaceMetadata();
+    // Strict: the lenient walk reads an unreadable or corrupt config.json as
+    // zero workspaces, and an empty list passes every consent check here.
+    const allMetadata = await this.config
+      .getAllWorkspaceMetadata({ throwOnError: true })
+      .catch((error: unknown) => {
+        // The strict walk also fails on an unrelated id-less legacy entry
+        // whose metadata.json does not parse. That must not block every
+        // install, so fall back to the lenient walk, which degrades that
+        // entry, but only while config.json itself still loads strictly.
+        try {
+          this.config.loadConfigOrDefault({ throwOnError: true });
+        } catch (configError) {
+          throw new UnreadableConfigError(
+            `Xum could not read ${shortenHome(configFilePath(this.config.rootDir))} (${getErrorMessage(configError)}). Repair the file or restore it from a backup, then try again.`
+          );
+        }
+        log.warn("Enumerating workspaces for override pruning from a lenient registry walk", {
+          error: getErrorMessage(error),
+        });
+        return this.config.getAllWorkspaceMetadata();
+      });
     return allMetadata
       .filter((metadata) => {
         const runtimeType = metadata.runtimeConfig.type;
@@ -6159,13 +6360,13 @@ export class AgentPluginInstallService {
   private async pruneWorkspaceOverrides(
     serverKeyPrefix: string,
     workspaceIds: string[]
-  ): Promise<string[]> {
+  ): Promise<FailedPrunes> {
     const overridesService = this.deps.workspaceMcpOverridesService;
     if (!overridesService) {
-      return [];
+      return { failed: [], causes: [] };
     }
     if (workspaceIds.length === 0) {
-      return [];
+      return { failed: [], causes: [] };
     }
     // Raw in-queue patch: preserves unknown fields written by newer
     // builds, throws on unreadable files (tombstone retry), and cannot
@@ -6210,7 +6411,7 @@ export class AgentPluginInstallService {
       // Wholesale failure (lock timeout, unreadable config): no workspace was
       // verified, so every one keeps its tombstone.
       log.warn("Failed to prune plugin MCP overrides", { error: getErrorMessage(error) });
-      return [...workspaceIds];
+      return toFailedPrunes(workspaceIds.map((workspaceId) => ({ workspaceId, error })));
     }
     for (const failure of failures) {
       log.warn("Failed to prune plugin MCP overrides for workspace", {
@@ -6218,7 +6419,7 @@ export class AgentPluginInstallService {
         error: getErrorMessage(failure.error),
       });
     }
-    return failures.map((failure) => failure.workspaceId);
+    return toFailedPrunes(failures);
   }
 
   /**
@@ -6377,12 +6578,15 @@ export class AgentPluginInstallService {
    * because unenumerated delta workspaces cannot be ruled out — callers must
    * then keep the tombstone even when `failed` is empty (an empty SENTINEL
    * tombstone records exactly this "delta workspaces unknown" state, and a
-   * failed re-enumeration cannot rule them out either).
+   * failed re-enumeration cannot rule them out either). `advice` tells the
+   * user what to do about the failed enumeration.
    */
   private async retryPrune(prune: {
     prefix: string;
     workspaceIds: string[];
-  }): Promise<{ enumerated: boolean; failed: string[] }> {
+  }): Promise<
+    ({ enumerated: true } & FailedPrunes) | { enumerated: false; failed: string[]; advice: string }
+  > {
     let liveWorkspaceIds: string[];
     try {
       liveWorkspaceIds = await this.listWorkspaceIdsForOverridePruning();
@@ -6391,11 +6595,15 @@ export class AgentPluginInstallService {
         error: getErrorMessage(error),
       });
       await this.pruneWorkspaceOverrides(prune.prefix, prune.workspaceIds);
-      return { enumerated: false, failed: prune.workspaceIds };
+      return {
+        enumerated: false,
+        failed: prune.workspaceIds,
+        advice: error instanceof UnreadableConfigError ? error.message : "Retry in a moment.",
+      };
     }
     return {
       enumerated: true,
-      failed: await this.pruneWorkspaceOverrides(prune.prefix, liveWorkspaceIds),
+      ...(await this.pruneWorkspaceOverrides(prune.prefix, liveWorkspaceIds)),
     };
   }
 
@@ -6434,16 +6642,17 @@ export class AgentPluginInstallService {
       return;
     }
 
-    const { enumerated, failed } = await this.retryPrune(match);
-    if (!enumerated) {
+    const retried = await this.retryPrune(match);
+    if (!retried.enumerated) {
       // Delta workspaces cannot be ruled out without a live enumeration:
       // keep the tombstone verbatim (even an empty sentinel) and stay
       // blocked — clearing it here would let the reinstall proceed over
       // workspaces the sweep never saw.
       throw new Error(
-        `A previous uninstall of '${name}' could not verify its workspace MCP override cleanup yet (workspace enumeration failed). Retry in a moment.`
+        `A previous uninstall of '${name}' could not verify its workspace MCP override cleanup yet (workspace enumeration failed). ${retried.advice}`
       );
     }
+    const { failed, causes } = retried;
     const remaining = this.updateRawPendingPrunes(
       this.rawPendingPrunes(envelope),
       serverKeyPrefix,
@@ -6452,7 +6661,7 @@ export class AgentPluginInstallService {
     await this.writePendingOverridePrunes(envelope, rawEntries, remaining);
     if (failed.length > 0) {
       throw new Error(
-        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (${describeFailedWorkspaces(failed)}). The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
+        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (${describeFailedWorkspaces(failed)}).${describePruneCauses(causes)} The log has the error for each workspace.`
       );
     }
   }
@@ -6473,18 +6682,19 @@ export class AgentPluginInstallService {
     const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(name), "");
     await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
     await this.deps.mcpConfigService?.pruneEnabledPluginServers(serverKeyPrefix);
-    const { enumerated, failed } = await this.retryPrune({
+    const retried = await this.retryPrune({
       prefix: serverKeyPrefix,
       workspaceIds: [],
     });
-    if (!enumerated) {
+    if (!retried.enumerated) {
       throw new Error(
-        `Could not verify that no workspace holds stale MCP overrides for '${name}' (workspace enumeration failed). Retry in a moment.`
+        `Could not verify that no workspace holds stale MCP overrides for '${name}' (workspace enumeration failed). ${retried.advice}`
       );
     }
+    const { failed, causes } = retried;
     if (failed.length > 0) {
       throw new Error(
-        `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'. The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
+        `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'.${describePruneCauses(causes)} The log has the error for each workspace.`
       );
     }
   }

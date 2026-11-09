@@ -1,5 +1,5 @@
 import type { CSSProperties, ReactNode } from "react";
-import React, { useContext, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
+import React, { useContext, useEffect, useId, useRef, useState } from "react";
 import katex from "katex";
 import { render as renderPele, type MathMarkup, type RenderOptions } from "pele";
 import assert from "@/common/utils/assert";
@@ -7,10 +7,11 @@ import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { DESKTOP_TITLEBAR_HEIGHT_PX, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
-import { MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
+import { MERMAID_ERROR_ATTRIBUTE, MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
 import {
   diagramPixelSize,
   NARROW_DIAGRAM_WIDTH,
@@ -675,8 +676,12 @@ function diagramBoxStyle(diagram: RenderedDiagram | null, frame: DiagramFrame): 
 function useDiagramSvg(chart: string, idPrefix: string) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Zero width (hidden, or not laid out yet) means unknown: render the natural layout.
+  const containerSize = useResizeObserver(containerRef);
   // mutation-equivalent: the width is a number when measured, so ?? and || both give 0 otherwise
-  const containerWidth = useResizeObserver(containerRef)?.width ?? 0;
+  const containerWidth = containerSize?.width ?? 0;
+  // mutation-equivalent: the height is a number when measured, and until then nothing is drawn,
+  // so neither the fallback value nor ?? against || reaches a box
+  const containerHeight = containerSize?.height ?? 0;
   const maxWidth = containerWidth > 0 ? containerWidth : undefined;
   // Keep the source and SVG together while a newer chart is pending or invalid.
   const [rendered, setRendered] = useState<RenderedDiagram | null>(null);
@@ -706,7 +711,7 @@ function useDiagramSvg(chart: string, idPrefix: string) {
     };
   }, [chart, idPrefix, maxWidth]);
 
-  return { containerRef, containerWidth, rendered, error };
+  return { containerRef, containerWidth, containerHeight, rendered, error };
 }
 
 function normalizeDiagramZoom(value: number): number {
@@ -732,6 +737,20 @@ const getButtonStyle = (disabled = false): CSSProperties => ({
   opacity: disabled ? 0.5 : 1,
 });
 
+const CLOSE_BUTTON_INSET_PX = 8;
+
+// The expand dialog is DIALOG_PERCENT of the space inside an overlay that keeps at least
+// DIALOG_OVERLAY_PADDING_PX from every edge of the layout viewport, and further from an edge the
+// device covers (notch, home indicator, a side inset). The drawing sits inside DIALOG_PADDING_PX.
+const DIALOG_OVERLAY_PADDING_PX = 40;
+const DIALOG_PERCENT = 90;
+const DIALOG_PADDING_PX = 24;
+
+// The right side reads --safe-area-right, which also covers the Duo cover display's status column
+// on iOS 27.2 (see globals.css).
+const overlayInset = (side: "top" | "right" | "bottom" | "left") =>
+  `max(${DIALOG_OVERLAY_PADDING_PX}px, ${side === "right" ? "var(--safe-area-right)" : `env(safe-area-inset-${side}, 0px)`})`;
+
 // Modal component for fullscreen diagram view
 const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
   children,
@@ -749,6 +768,8 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
     return () => window.removeEventListener("keydown", handleEscape, { capture: true });
   }, [onClose]);
 
+  const desktop = isDesktopMode();
+
   return (
     <div
       style={{
@@ -762,71 +783,90 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        padding: "40px",
+        paddingTop: overlayInset("top"),
+        paddingRight: overlayInset("right"),
+        paddingBottom: overlayInset("bottom"),
+        paddingLeft: overlayInset("left"),
       }}
       onClick={onClose}
     >
+      {/* A definite size, so the drawing is fitted to the room this box has and never the other
+          way round: a phone cannot scroll an empty dialog, and a tall diagram cannot grow it. */}
       <div
         style={{
           position: "relative",
-          maxWidth: "90%",
-          maxHeight: "90%",
-          overflow: "auto",
+          width: `${DIALOG_PERCENT}%`,
+          height: `${DIALOG_PERCENT}%`,
         }}
         onClick={(e) => e.stopPropagation()}
       >
         {children}
-        <button
-          onClick={onClose}
-          style={{
-            position: "absolute",
-            top: "16px",
-            right: "16px",
-            background: "var(--color-background)",
-            border: "1px solid var(--color-border-subtle)",
-            color: "var(--color-text)",
-            padding: "8px 16px",
-            cursor: "pointer",
-            borderRadius: "4px",
-            fontSize: "14px",
-            fontFamily: "var(--font-primary)",
-          }}
-        >
-          Close
-        </button>
       </div>
+      {/* Outside the dialog's box, so it never covers the drawing the dialog fits to its room.
+          The desktop title bar holds the native window controls and moves the window, so the
+          button starts below it. */}
+      <button
+        className={desktop ? "titlebar-no-drag" : undefined}
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+        style={{
+          position: "absolute",
+          top: `calc(${CLOSE_BUTTON_INSET_PX + (desktop ? DESKTOP_TITLEBAR_HEIGHT_PX : 0)}px + env(safe-area-inset-top, 0px))`,
+          right: `calc(${CLOSE_BUTTON_INSET_PX}px + var(--safe-area-right))`,
+          background: "var(--color-background)",
+          border: "1px solid var(--color-border-subtle)",
+          color: "var(--color-text)",
+          padding: "8px 16px",
+          cursor: "pointer",
+          borderRadius: "4px",
+          fontSize: "14px",
+          fontFamily: "var(--font-primary)",
+        }}
+      >
+        Close
+      </button>
     </div>
   );
 };
 
-function subscribeToViewportResize(onChange: () => void): () => void {
-  window.addEventListener("resize", onChange);
-  return () => window.removeEventListener("resize", onChange);
-}
-
-function useViewportHeight(): number {
-  return useSyncExternalStore(subscribeToViewportResize, () => window.innerHeight);
-}
-
-/** The expand dialog renders its own copy of an already valid chart, at the dialog's width. */
+/**
+ * The expand dialog renders its own copy of an already valid chart, at the dialog's size. The
+ * drawing's room is the measured content box of the padding-free container inside the padded
+ * frame, so it is exactly what the dialog leaves, whatever the overlay does around it.
+ */
 const DialogDiagram: React.FC<{ chart: string; idPrefix: string }> = (props) => {
-  const { containerRef, rendered } = useDiagramSvg(props.chart, props.idPrefix);
-  const viewportHeight = useViewportHeight();
+  const { containerRef, containerWidth, containerHeight, rendered } = useDiagramSvg(
+    props.chart,
+    props.idPrefix
+  );
   return (
     <div
-      ref={containerRef}
-      className="mermaid-container mermaid-modal"
       style={{
+        boxSizing: "border-box",
+        width: "100%",
+        height: "100%",
+        padding: `${DIALOG_PADDING_PX}px`,
         background: "var(--color-code-bg)",
-        padding: "24px",
         borderRadius: "8px",
-        minWidth: "80vw",
-        minHeight: "60vh",
-        ...diagramBoxStyle(rendered, { kind: "dialog", viewportHeight }),
       }}
-      // SECURITY AUDIT: rendered.svg only holds sanitizeMermaidSvg() output.
-      dangerouslySetInnerHTML={{ __html: rendered?.svg ?? "" }}
-    />
+    >
+      <div
+        ref={containerRef}
+        className="mermaid-container mermaid-modal"
+        style={{
+          width: "100%",
+          height: "100%",
+          ...diagramBoxStyle(rendered, {
+            kind: "dialog",
+            room: { width: containerWidth, height: containerHeight },
+          }),
+        }}
+        // SECURITY AUDIT: rendered.svg only holds sanitizeMermaidSvg() output.
+        dangerouslySetInnerHTML={{ __html: rendered?.svg ?? "" }}
+      />
+    </div>
   );
 };
 
@@ -880,6 +920,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   if (error && !isStreaming) {
     return (
       <pre
+        {...{ [MERMAID_ERROR_ATTRIBUTE]: "" }}
         style={{
           color: "var(--color-syntax-error)",
           background: "hsl(from var(--color-syntax-error) h s l / 0.1)",

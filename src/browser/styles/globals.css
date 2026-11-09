@@ -1118,7 +1118,7 @@ body,
     max-width: none !important;
     z-index: 1100 !important;
     border-left: 0 !important;
-    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    padding: env(safe-area-inset-top, 0px) var(--safe-area-right)
       env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
   }
 
@@ -1144,6 +1144,58 @@ body,
   }
 }
 
+/* The OS draws only in a band at the top of that column (measured on a folded Duo, 2.95 px per pt:
+   glyphs at x 398..437, y 87..151 of 466x678) and takes the touches there. Padding the shell by the
+   whole column gives up a fifth of the width for the whole page, so in narrow portrait the shell
+   keeps no right padding, the fixed header keeps its controls left of the column, and the band
+   below the header is painted over. Content below the band uses the full width.
+   Where no side column exists this changes nothing: iPhone and iPad portrait have none, and
+   landscape and wide layouts keep the shell padding, because there a side inset is a full-height
+   notch. .storybook/test-runner.ts asserts the band geometry. */
+@media (orientation: portrait) and (max-width: 768px) {
+  /* The shell's `pr-[env(safe-area-inset-right)]` utility still carries the other layouts;
+     !important is how the narrow-layout rules around here win over utilities. */
+  .mobile-layout {
+    padding-right: 0 !important;
+  }
+
+  /* The header's background spans the display; its controls stop at the column. Its own right
+     padding is px-2. */
+  .mobile-sticky-header {
+    right: 0 !important;
+    padding-right: calc(0.5rem + var(--safe-area-right)) !important;
+  }
+
+  /* On the body, the one element, rather than on the shell: `mobile-layout` is on three nested
+     elements, the reserve is fixed to the viewport edge anyway, and a pseudo-element adds no node to
+     the tree the phone skeleton pins (`make check-phone-chrome`). It paints the shell's own
+     background, which is what the band sits on. */
+  body::after {
+    content: "";
+    position: fixed;
+    /* From the top: the fixed header (z-50) covers its own part. */
+    top: 0;
+    /* IOS_STATUS_BAND_HEIGHT_PX: iosCoverColumn.ts takes no touches in the band. */
+    height: 172px;
+    right: 0;
+    /* Zero wherever there is no side column, so nothing paints. */
+    width: var(--safe-area-right);
+    background-color: var(--color-surface-primary);
+    /* Text that scrolls under the band fades out instead of being cut mid-letter. Both fades stay
+       clear of the glyphs, which start 16px into the column and end 20px above the band's bottom. */
+    -webkit-mask-image:
+      linear-gradient(to right, transparent, #000 16px), linear-gradient(to top, transparent, #000 16px);
+    -webkit-mask-composite: source-in;
+    mask-image:
+      linear-gradient(to right, transparent, #000 16px), linear-gradient(to top, transparent, #000 16px);
+    mask-composite: intersect;
+    /* The OS draws over this band and takes no touches there, so the reserve takes none either. */
+    pointer-events: none;
+    /* Above the page's own content, below the fixed phone header (z-50) and every overlay (1100+). */
+    z-index: 40;
+  }
+}
+
 /* Hide right sidebar when the workspace shell is too narrow to fit
    ChatPane(min 384px) + RightSidebar(min 300px) side-by-side. */
 @container (max-width: 684px) {
@@ -1160,7 +1212,7 @@ body,
     max-width: none !important;
     z-index: 1100 !important;
     border-left: 0 !important;
-    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    padding: env(safe-area-inset-top, 0px) var(--safe-area-right)
       env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
   }
 
@@ -1543,16 +1595,13 @@ html[data-renderer-inactive] *::after {
 }
 /* Desktop titlebar drag regions (Electron only)
  * -webkit-app-region: drag marks areas that can be used to drag the window
- * -webkit-app-region: no-drag marks interactive elements inside drag regions
+ * -webkit-app-region: no-drag marks interactive elements inside drag regions (the
+ * .titlebar-no-drag rule lives in transcript-content.css, shared with the VS Code webview)
  * These styles only apply in Electron; in browser mode they have no effect */
 .titlebar-drag {
   -webkit-app-region: drag;
   /* Prevent text selection while dragging */
   user-select: none;
-}
-
-.titlebar-no-drag {
-  -webkit-app-region: no-drag;
 }
 
 /* Titlebar-safe inset classes — consume the CSS custom properties set by

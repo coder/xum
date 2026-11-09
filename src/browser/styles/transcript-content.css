@@ -257,6 +257,13 @@
   height: var(--diagram-height);
 }
 
+/* The expand dialog's Close button (Mermaid.tsx) takes this class in the desktop app only. The rule
+   lives here, not in globals.css, because vscode/src/webview/webviewCss.test.ts fails when the
+   webview bundle names a class that only globals.css defines. */
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
+}
+
 /* Zoom wrapper for mermaid */
 .markdown-content .react-transform-wrapper {
   position: relative;

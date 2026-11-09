@@ -254,6 +254,8 @@ export async function setWorkspaceMcpOverrides(
                   : context.mcpServerManager.forgetWorkspaceOverrides(target)
               )
             : context.mcpServerManager.applyWorkspaceOverrides(target, persisted),
+        hasSnapshot: (workspaceId) =>
+          context.mcpServerManager.hasWorkspaceOverridesSnapshot(workspaceId),
       }
     );
     return { success: true as const, data: undefined };

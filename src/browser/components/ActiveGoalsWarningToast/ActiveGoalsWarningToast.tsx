@@ -7,7 +7,7 @@ const AUTO_DISMISS_MS = 5_000;
 // cover display's right-hand status column (viewport-fit=cover positions fixed elements against
 // the full screen).
 const wrapperClassName =
-  "pointer-events-none fixed top-[max(1rem,env(safe-area-inset-top,0px))] right-[max(1rem,env(safe-area-inset-right,0px))] z-[10000] max-w-[min(420px,calc(100vw_-_max(1rem,env(safe-area-inset-left,0px))_-_max(1rem,env(safe-area-inset-right,0px))))] [&>*]:pointer-events-auto";
+  "pointer-events-none fixed top-[max(1rem,env(safe-area-inset-top,0px))] right-[max(1rem,var(--safe-area-right))] z-[10000] max-w-[min(420px,calc(100vw_-_max(1rem,env(safe-area-inset-left,0px))_-_max(1rem,var(--safe-area-right))))] [&>*]:pointer-events-auto";
 
 interface ActiveGoalsWarningToastProps {
   activeGoalCount: number;

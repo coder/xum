@@ -430,13 +430,15 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
 
 /**
  * Frame script (a statement, run inside the bridge's IIFE and the MCP App preamble) that makes
- * in-page links (`<a href="#section">`) jump within the artifact instead of navigating away.
+ * in-page links (`<a href="#section">`) jump within the artifact instead of navigating away, and
+ * keeps hash routers working: the fragment follows the link, and `replaceState` takes a `#` URL.
  *
  * Why: a srcdoc frame resolves relative URLs against the parent page, so `#section` becomes
  * `<app URL>#section`: a cross-document navigation to the Xum app, not a fragment jump. The
  * navigation guard (frameNavigationGuard.tsx) then closes the artifact as "navigated away",
  * and the desktop app refuses the navigation (subframeNavigation.ts). CSP `base-uri 'none'`
- * rules out a `<base>` fix.
+ * rules out a `<base>` fix. The same base URL makes `replaceState(null, "", "#/route")` throw a
+ * SecurityError: it resolves to the app's URL, which cannot replace `about:srcdoc`.
  *
  * So a plain left click on a link for this document (`href`, or SVG `xlink:href`, no `download`,
  * no `target` other than `_self`) whose raw value starts with `#` is cancelled, and the script does the browser's fragment steps itself: the target is an id or
@@ -444,10 +446,22 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * decoding, else the top for `#` and `#top`. Closed `<details>` and `hidden="until-found"`
  * ancestors are revealed (#6219). The target is scrolled into view and focused, or, when it
  * cannot take focus, given `tabindex="-1"` until it loses focus, so the next Tab continues
- * after it. A native fragment navigation
+ * after it. When the fragment changed, it is set on the document's own URL (`about:srcdoc#/route`)
+ * with the original `History.prototype.replaceState` before the jump, and `popstate` then
+ * `hashchange` fire in a task after the click's other listeners, as the browser queues them, so
+ * a hash router sees the route. A click on the current fragment
+ * fires neither, though Chromium still fires `popstate` for it. A native fragment navigation
  * (`location.replace("about:srcdoc#x")`, `location.hash`, `<base href="about:srcdoc">`) would
  * do this for free, but WebKit fires the iframe's `load` event for it, which the navigation
- * guard must treat as leaving the document.
+ * guard must treat as leaving the document. `replaceState` fires none in WebKit or Chromium.
+ * It is not `pushState`: a pushed entry makes Back (history.back, or the browser's Back in Xum on
+ * the web) fire the frame's `load` event, and the guard then closes the artifact for it.
+ *
+ * `pushState` and `replaceState` are wrapped so that a string URL whose trimmed value starts
+ * with `#` resolves against the document's URL, not the app's. Other calls pass through. A
+ * `pushState` of the artifact's own still makes Back fire the frame's `load`, as its
+ * `location.hash` and absolute-URL entries already do: that is the navigation guard's to handle,
+ * and this script leaves the guard as it is.
  *
  * It decides when the click reaches window in the bubble phase, after the artifact's element
  * and document handlers, so one of those that calls preventDefault keeps the click. Window
@@ -456,9 +470,11 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * capture phase first. Known limit (#6219), where the click still leaves the document as
  * before: a handler that stops the click's propagation hides it from window.
  *
- * SECURITY AUDIT: it only cancels a navigation and scrolls, focuses or reveals (opens a
- * `<details>`, removes `hidden`) inside the document; it never navigates, so both navigation
- * guards stay as they are.
+ * SECURITY AUDIT: it only cancels a navigation, scrolls, focuses or reveals (opens a
+ * `<details>`, removes `hidden`) inside the document, replaces the document's own URL fragment
+ * (replaceState rejects any other URL) and fires `popstate` and `hashchange` at the window; it
+ * never navigates, so both navigation guards stay as they are. The wrapper only prepends the
+ * document's own URL to a `#` URL, which the absolute `about:srcdoc#...` URL already allowed.
  */
 export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
     var XLINK = "http://www.w3.org/1999/xlink";
@@ -566,12 +582,53 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
         }, { once: true });
       }
     }
+    function withoutFragment(url) {
+      var hash = url.indexOf("#");
+      return hash === -1 ? url : url.slice(0, hash);
+    }
+    var historyProto = window.History && window.History.prototype;
+    var nativeReplaceState = historyProto && historyProto.replaceState;
+    // A "#" URL names this document, but a srcdoc frame resolves it against the app's URL.
+    function inDocument(native) {
+      return function () {
+        var args = Array.prototype.slice.call(arguments);
+        var url = args[2];
+        if (typeof url === "string" && url.trim().charAt(0) === "#") {
+          args[2] = withoutFragment(window.location.href) + url.trim();
+        }
+        return native.apply(this, args);
+      };
+    }
+    if (historyProto) {
+      historyProto.pushState = inDocument(historyProto.pushState);
+      historyProto.replaceState = inDocument(nativeReplaceState);
+    }
+    // The original replaceState: the artifact can patch History.prototype.replaceState. It can throw:
+    // WebKit allows 100 calls in 30 s per frame, so then the link jumps and fires no event.
+    function replaceFragment(fragment) {
+      if (window.location.hash.slice(1) === fragment) return false;
+      try {
+        nativeReplaceState.call(window.history, null, "", withoutFragment(window.location.href) + "#" + fragment);
+      } catch (error) {
+        return false;
+      }
+      return true;
+    }
     window.addEventListener("click", function (event) {
       if (event.defaultPrevented) return;
       var fragment = fragmentOf(event);
       if (fragment === null) return;
       event.preventDefault();
+      var oldURL = window.location.href;
+      var changed = replaceFragment(fragment);
       jump(fragment);
+      if (!changed) return;
+      var newURL = window.location.href;
+      // A task after the click's other listeners, as the browser queues them.
+      window.setTimeout(function () {
+        window.dispatchEvent(new window.PopStateEvent("popstate", { state: null }));
+        window.dispatchEvent(new window.HashChangeEvent("hashchange", { oldURL: oldURL, newURL: newURL }));
+      }, 0);
     });
   })();`;
 
