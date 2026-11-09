@@ -160,6 +160,8 @@ describe("BackgroundProcessManager", () => {
     runtime = new LocalRuntime(process.cwd());
   });
 
+  // Stopping each leftover process runs shell commands, so this cleanup passes the 5 s hook
+  // default on a busy host (the failure reads "a beforeEach/afterEach hook timed out").
   afterEach(async () => {
     await Promise.all(probeHandles.splice(0).map((handle) => handle.terminate()));
     // Cleanup: terminate all processes
@@ -174,7 +176,7 @@ describe("BackgroundProcessManager", () => {
     await fs
       .rm(`/tmp/mux-bashes/${testWorkspaceId2}`, { recursive: true, force: true })
       .catch(() => undefined);
-  });
+  }, 30_000);
 
   describe("spawn", () => {
     it("should spawn a background process and return process ID and outputDir", async () => {
@@ -1206,6 +1208,8 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    // Two poll windows of up to 2 s against a remote monitor that polls once a second put the
+    // body close to the 5 s default.
     it("retires a real runtime monitor only after both transport probes fail", async () => {
       const outputProbeFailure = { value: false, calls: 0 };
       const exitProbeFailure = { value: false, calls: 0 };
@@ -1256,8 +1260,10 @@ describe("BackgroundProcessManager", () => {
         outputProbeFailure.value = false;
         exitProbeFailure.value = false;
       }
-    });
+    }, 30_000);
 
+    // Two poll windows of up to 2 s against a remote monitor that polls once a second put the
+    // body close to the 5 s default.
     it("retires a real runtime monitor after both probes resolve nonzero", async () => {
       const outputProbeFailure = { value: false, calls: 0, exitCode: 255 };
       const exitProbeFailure = { value: false, calls: 0, exitCode: 255 };
@@ -1308,7 +1314,7 @@ describe("BackgroundProcessManager", () => {
         outputProbeFailure.value = false;
         exitProbeFailure.value = false;
       }
-    });
+    }, 30_000);
 
     describe("armed/stopped registry events", () => {
       function recordEvents(target: BackgroundProcessManager): {
@@ -1357,6 +1363,7 @@ describe("BackgroundProcessManager", () => {
         });
       });
 
+      // Three spawns and two poll windows of up to 3 s each pass the 5 s default on a busy host.
       it("emits monitor:stopped on natural exit, maxEvents, and terminate", async () => {
         const events = recordEvents(manager);
 
@@ -1409,7 +1416,7 @@ describe("BackgroundProcessManager", () => {
           processId: terminated.processId,
           reason: "canceled",
         });
-      });
+      }, 30_000);
 
       it("suppresses monitor:stopped after beginShutdown so registry records survive restarts", async () => {
         const events = recordEvents(manager);
@@ -1852,8 +1859,10 @@ describe("BackgroundProcessManager", () => {
       expect(event.payload.lines[0]).toBe("FAILED");
     });
 
+    // bun's startup alone can pass the 2 s default match wait and the 5 s test timeout on a
+    // busy host.
     it("matches long complete lines when the token appears after the prompt cap", async () => {
-      const eventPromise = waitForMonitorMatch(manager);
+      const eventPromise = waitForMonitorMatch(manager, 20_000);
       const result = await manager.spawn(
         runtime,
         testWorkspaceId,
@@ -1874,14 +1883,16 @@ describe("BackgroundProcessManager", () => {
       const event = await eventPromise;
       expect(event.payload.lines[0]).toContain("FAILED tail");
       expect(event.payload.lines[0]).toContain("truncated");
-    });
+    }, 30_000);
 
     it("bounds incomplete monitor lines while a process keeps running", async () => {
       const longByteCount = 1_100_000;
+      // The process outlives the polling below (afterEach stops it): its exit flushes the
+      // incomplete line, so a poll that came after it would read an empty buffer.
       const result = await manager.spawn(
         runtime,
         testWorkspaceId,
-        `bun -e "process.stdout.write('A'.repeat(${longByteCount})); setTimeout(() => {}, 2000)"`,
+        `bun -e "process.stdout.write('A'.repeat(${longByteCount})); setTimeout(() => {}, 60000)"`,
         {
           cwd: process.cwd(),
           displayName: "monitor-incomplete-bound",
@@ -1897,17 +1908,19 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       if (!result.success) return;
 
+      // bun's startup and the monitor's first read both stretch under host load: wait on a
+      // deadline, not on a fixed number of polls.
+      const deadline = Date.now() + 20_000;
       let incompleteLineBytes = 0;
-      for (let attempt = 0; attempt < 20; attempt++) {
+      while (incompleteLineBytes === 0 && Date.now() < deadline) {
         const proc = await manager.getProcess(result.processId);
         incompleteLineBytes = Buffer.byteLength(proc?.monitor?.incompleteLineBuffer ?? "", "utf8");
-        if (incompleteLineBytes > 0) break;
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        if (incompleteLineBytes === 0) await new Promise((resolve) => setTimeout(resolve, 50));
       }
 
       expect(incompleteLineBytes).toBeGreaterThan(0);
       expect(incompleteLineBytes).toBeLessThanOrEqual(1_000_000);
-    });
+    }, 30_000);
 
     it("retains matched lines until the reconciler acknowledges their offset", async () => {
       const eventPromise = waitForMonitorMatch(manager);

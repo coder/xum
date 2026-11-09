@@ -498,6 +498,9 @@ describe("spawnProcess", () => {
       return Object.assign(result.handle, { outputPath });
     }
 
+    // The log spans many pages, and each remote page runs two bash execs (size probe, then tail),
+    // so the wall time grows with host load and passes the 5 s default. The timeout only catches
+    // a hang: the per-page byte bound in the loop checks how much one read returns.
     it.each(["local", "remote"] as const)(
       "reads %s output in bounded pages that decode to the whole log",
       async (kind) => {
@@ -515,7 +518,8 @@ describe("spawnProcess", () => {
         }
         expect(offset).toBe(raw.length);
         expect(text).toBe(decode(raw));
-      }
+      },
+      30_000
     );
 
     // A decoder strips U+FEFF at the start of its input as a byte-order mark, and the offset
