@@ -642,6 +642,37 @@ describe("redactSecretLike", () => {
         `Set-Cookie: ["${SESSION}\\\n"x[y"]\nHost: h`,
         "Set-Cookie: [redacted]\nHost: h",
       ],
+      [
+        "backslashes before a raw line break",
+        `Cookie: sid=${SESSION}\\\\\nHost: h`,
+        "Cookie: [redacted]\nHost: h",
+      ],
+      [
+        "an escaped line break two strings deep",
+        jsonOf({ out: jsonOf({ h: `Cookie: sid=${SESSION}\nHost: h` }) }),
+        String.raw`{"out":"{\"h\":\"Cookie: [redacted]\\nHost: h\"}"}`,
+      ],
+      [
+        "an unclosed list in a string at depth one",
+        String.raw`{"o":"{\"h\":\"Set-Cookie: [a, ${SESSION}\"}"}`,
+        String.raw`{"o":"{\"h\":\"Set-Cookie: [redacted]\"}"}`,
+      ],
+      [
+        "a quoted key's list of escaped items with a `]` in one",
+        jsonOf({ o: jsonOf({ "set-cookie": ["a]b", `sid=${SESSION}`] }) }),
+        String.raw`{"o":"{\"set-cookie\":[redacted]}"}`,
+      ],
+      // An item's quote before a blank opens it: read as its close, ` a]` would end the list.
+      [
+        "a list item that opens with a blank",
+        jsonOf({ cookie: [" a]b", SESSION], host: "h" }),
+        '{"cookie":[redacted],"host":"h"}',
+      ],
+      [
+        "an escaped list item that opens with a blank",
+        jsonOf({ o: jsonOf({ cookie: [" a]b", SESSION], host: "h" }) }),
+        String.raw`{"o":"{\"cookie\":[redacted],\"host\":\"h\"}"}`,
+      ],
     ])("ends the value at its frame in %s", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
