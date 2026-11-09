@@ -510,6 +510,29 @@ export const modelsExtra: Record<string, ModelData> = {
     knowledge_cutoff: "2026-04-30",
   },
 
+  // GPT-6.2 Astra - PROVISIONAL: unreleased (only a leaked `gpt-6.2-astra` label as
+  // of 2026-11-01). Copied from gpt-6-astra above; check every field against the
+  // model page at launch.
+  "gpt-6.2-astra": {
+    max_input_tokens: 1050000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.00001,
+    input_cost_per_token_above_272k_tokens: 0.00002,
+    output_cost_per_token: 0.00005,
+    output_cost_per_token_above_272k_tokens: 0.000075,
+    cache_read_input_token_cost: 0.000001,
+    cache_read_input_token_cost_above_272k_tokens: 0.000002,
+    cache_creation_input_token_cost: 0.0000125,
+    cache_creation_input_token_cost_above_272k_tokens: 0.000025,
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2026-04-30",
+  },
+
   // GPT-6 Sol - Released September 22, 2026; retired by GPT-6.1 Sol (#5258). Above 272K
   // input, the full request costs 2x input/cache and 1.5x output.
   // Ref: https://developers.openai.com/api/docs/models/gpt-6-sol

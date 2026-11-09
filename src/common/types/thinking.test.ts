@@ -139,6 +139,28 @@ describe("openaiSupportsNativeMaxEffort", () => {
     expect(isGpt6AstraModel("gpt-6-astra-2026")).toBe(false);
     expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra-2-mini")).toBe(false);
   });
+
+  test("accepts GPT-6.2 Astra and its dated snapshots, but no other point version", () => {
+    for (const model of [
+      "gpt-6.2-astra",
+      "openai:gpt-6.2-astra",
+      "openrouter:openai/gpt-6.2-astra",
+      "openai:gpt-6.2-astra-2026-11-20",
+      "gpt-6.2-astra-20261120",
+    ]) {
+      expect(isGpt6AstraModel(model)).toBe(true);
+    }
+    for (const model of [
+      "openai:gpt-6.2-astra-mini",
+      "openai:gpt-6.1-astra",
+      "openai:gpt-6.3-astra",
+      "openai:gpt-6.22-astra",
+      "openai:gpt-6.2",
+      "openai:gpt-6.2-astra-2026-preview",
+    ]) {
+      expect(isGpt6AstraModel(model)).toBe(false);
+    }
+  });
 });
 
 describe("openaiSupportsProMode", () => {

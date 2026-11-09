@@ -108,6 +108,16 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("openai:gpt-6-astra", "off")).toBe("low");
   });
 
+  test("gpt-6.2-astra follows Astra: 5 levels (no off), off and unset clamp to low", () => {
+    const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
+    for (const id of ["openai:gpt-6.2-astra", "coder:openai/gpt-6.2-astra-2026-11-20"]) {
+      expect(getThinkingPolicyForModel(id)).toEqual(fiveLevels);
+      expect(enforceThinkingPolicy(id, "off")).toBe("low");
+      expect(resolveEffectiveThinkingLevel(id, undefined)).toBe("low");
+      expect(resolveEffectiveThinkingLevel(id, "max")).toBe("max");
+    }
+  });
+
   test("gpt-6.1-sol follows Astra: 5 levels (no off), off and unset clamp to low", () => {
     const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
     for (const id of ["openai:gpt-6.1-sol", "coder:openai/gpt-6.1-sol"]) {
