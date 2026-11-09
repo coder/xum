@@ -1255,6 +1255,59 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     }
   }, 20_000);
 
+  // The fresh attempt of a reactivated or reawakened reported child inherits the row's report, and
+  // the row reads reported from its first send on. Another backend's report of the fresh attempt
+  // then changes nothing but the row's `reportedAt` (the status was `reported` already): only
+  // that timestamp tells the attempt's own report from the one it inherited.
+  const REPORTED_AGAIN_AT = "2026-10-01T00:00:09.000Z";
+  test.each(["reawakening", "reactivation"] as const)(
+    "a report of the fresh attempt that another backend writes onto an already reported row during the %s's stream refuses the held follow-up as indeterminate",
+    async (path) => {
+      const childId = path === "reawakening" ? "holdrereport001" : "holdrereport002";
+      const stack = await createStack(childId, { taskStatus: "reported", reportedAt: REPORTED_AT });
+      const { config, taskService, workspaceService, completions, sendOptions } = stack;
+      try {
+        if (path === "reawakening") {
+          expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+            Ok(undefined)
+          );
+        } else {
+          expect(
+            await taskService.sendMessageToDescendantAgentTask(rootId, childId, "work", "turn-end")
+          ).toMatchObject(Ok({ delivery: "reactivated" }));
+        }
+        await until(() => completions.length === 1, "the continuation stream");
+        const onCanceled = mock((_reason: string) => undefined);
+        expect(
+          await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+        ).toEqual(Ok(undefined));
+        // The row kept the predecessor's report across the CAS and still reads it now.
+        expect(entryOf(config, childId)).toMatchObject({
+          taskStatus: "reported",
+          reportedAt: REPORTED_AT,
+        });
+        await editChildRow(config, childId, (row) => {
+          row.taskStatus = "reported";
+          row.reportedAt = REPORTED_AGAIN_AT;
+        });
+        stack.endStream(0, {}, true);
+        await until(
+          () => completions.length > 1 || stack.heldTexts().length > 0,
+          "the follow-up dispatched or held"
+        );
+        await yieldMacrotasks(10);
+        // Never a new turn of the attempt that another backend reported.
+        expect(completions).toHaveLength(1);
+        expect(stack.heldTexts()).toEqual(["follow-up text"]);
+        expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
+        expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+      } finally {
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
+
   test("while the decision is pending no drain trigger dispatches the held entry and a direct send in preflight is refused; the hold never blocks the session", async () => {
     const childId = "holdtriggers001";
     const stack = await createStack(childId);
