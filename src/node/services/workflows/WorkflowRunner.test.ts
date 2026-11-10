@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, expect, mock, test } from "bun:test";
 import assert from "@/common/utils/assert";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -503,7 +504,8 @@ describe("WorkflowRunner", () => {
       expect.objectContaining({
         id: "verify",
         agentId: "exec",
-        modelString: "anthropic:claude-fable-5-1",
+        // Derived so the next `fable` alias move needs no test change.
+        modelString: KNOWN_MODELS.FABLE.id,
         thinkingLevel: "high",
       }),
     ]);
