@@ -88,6 +88,13 @@ const MOVED_CREDENTIAL_STORES = [
   { name: "PIP_CONFIG_FILE", value: "pip.conf", file: "pip.conf" },
   { name: "GRADLE_USER_HOME", value: "gradle", file: "gradle/gradle.properties" },
   { name: "DOCKER_CONFIG", value: "docker", file: "docker/config.json" },
+  { name: "AWS_SHARED_CREDENTIALS_FILE", value: "aws-credentials", file: "aws-credentials" },
+  { name: "AWS_CONFIG_FILE", value: "aws-config", file: "aws-config" },
+  { name: "GOOGLE_APPLICATION_CREDENTIALS", value: "sa.json", file: "sa.json" },
+  { name: "CLOUDSDK_CONFIG", value: "gcloud", file: "gcloud/credentials.db" },
+  { name: "AZURE_CONFIG_DIR", value: "azure", file: "azure/msal_token_cache.json" },
+  { name: "GH_CONFIG_DIR", value: "gh", file: "gh/hosts.yml" },
+  { name: "KUBECONFIG", value: "kubeconfig", file: "kubeconfig" },
 ];
 
 describe("buildAgentSandboxPolicy", () => {
@@ -1093,6 +1100,20 @@ describe("buildAgentSandboxPolicy", () => {
     }
   );
 
+  test("hides every file that KUBECONFIG lists, and an AWS file that starts with ~/", () => {
+    const policy = buildAgentSandboxPolicy(SETTINGS, {
+      cwd: repo,
+      env: {
+        KUBECONFIG: [path.join(repo, "kube-a"), path.join(repo, "kube-b")].join(path.delimiter),
+        AWS_SHARED_CREDENTIALS_FILE: "~/.cache/uv/aws-credentials",
+      },
+    });
+
+    expect(agentSandboxPolicyAllows(policy, path.join(repo, "kube-a"), "read")).toBe(false);
+    expect(agentSandboxPolicyAllows(policy, path.join(repo, "kube-b"), "read")).toBe(false);
+    expect(policy.denyRead).toContain(path.join(os.homedir(), ".cache", "uv", "aws-credentials"));
+  });
+
   // Xum runs `git submodule update` outside the sandbox with the project's secrets.
   test("keeps the git config that the command's environment names read-only", async () => {
     await fs.writeFile(path.join(repo, "global.gitconfig"), "[include]\n\tpath = more.gitconfig\n");
@@ -1312,5 +1333,26 @@ describe("agentSandboxSettingsFor several projects", () => {
       extraReadPaths: [],
     });
     expect(agentSandboxSettingsFor("/open", ["/loopback"])?.network).toBe("loopback");
+  });
+
+  test("keeps a path that one project lists inside a folder that the other lists", () => {
+    setAgentSandboxTargets({
+      fallback: { ...SETTINGS, enabled: false },
+      byProject: new Map([
+        ["/a", { ...SETTINGS, extraWritePaths: ["/shared"], extraReadPaths: ["~/tools/x"] }],
+        [
+          "/b",
+          {
+            ...SETTINGS,
+            extraWritePaths: ["/shared/cache", "/other"],
+            extraReadPaths: [path.join(os.homedir(), "tools")],
+          },
+        ],
+      ]),
+    });
+
+    const settings = agentSandboxSettingsFor("/a", ["/b"]);
+    expect(settings?.extraWritePaths).toEqual(["/shared/cache"]);
+    expect(settings?.extraReadPaths).toEqual(["~/tools/x"]);
   });
 });

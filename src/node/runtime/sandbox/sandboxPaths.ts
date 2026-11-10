@@ -137,6 +137,19 @@ function envPath(env: NodeJS.ProcessEnv, name: string, ...rest: string[]): strin
   return [path.join(dir, ...rest)];
 }
 
+/** envPath() for a file that the AWS CLI and SDKs also find by a leading `~/`. */
+function homeOrEnvPath(env: NodeJS.ProcessEnv, name: string): string[] {
+  const value = env[name];
+  return value?.startsWith("~/") === true ? [value] : envPath(env, name);
+}
+
+/** The files that KUBECONFIG lists, separated like PATH. */
+function kubeconfigPaths(env: NodeJS.ProcessEnv): string[] {
+  return (env.KUBECONFIG ?? "")
+    .split(path.delimiter)
+    .flatMap((file) => envPath({ KUBECONFIG: file }, "KUBECONFIG"));
+}
+
 /**
  * envPath() of each variable that npm reads as its `key` setting: npm matches `npm_config_` in
  * any case, and lowercases the rest with `-` for each later `_` (@npmcli/config loadEnv()).
@@ -332,6 +345,15 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     // DOCKER_CONFIG can move into an open folder (Codex review). ~/.docker is not open, and the
     // sandbox closes the Docker socket in any case.
     ...fromEnv("DOCKER_CONFIG", "config.json"),
+    // Cloud and cluster CLIs keep keys and tokens where these name, which can be in an open
+    // folder (Codex review). Their default folders in ~ are not open.
+    ...homeOrEnvPath(env, "AWS_SHARED_CREDENTIALS_FILE"),
+    ...homeOrEnvPath(env, "AWS_CONFIG_FILE"),
+    ...fromEnv("GOOGLE_APPLICATION_CREDENTIALS"),
+    ...fromEnv("CLOUDSDK_CONFIG"),
+    ...fromEnv("AZURE_CONFIG_DIR"),
+    ...fromEnv("GH_CONFIG_DIR", "hosts.yml"),
+    ...kubeconfigPaths(env),
     `${XUM_HOME_TOKEN}/server.lock`,
     `${XUM_HOME_TOKEN}/providers.jsonc`,
     `${XUM_HOME_TOKEN}/secrets.json`,

@@ -103,9 +103,23 @@ function strictestSettings(
       network === "allowlist"
         ? shared(hostLists.map((s) => s.allowedHosts.map((host) => host.toLowerCase())))
         : [],
-    extraWritePaths: shared(list.map((settings) => settings.extraWritePaths)),
-    extraReadPaths: shared(list.map((settings) => settings.extraReadPaths)),
+    extraWritePaths: sharedPaths(list.map((settings) => settings.extraWritePaths)),
+    extraReadPaths: sharedPaths(list.map((settings) => settings.extraReadPaths)),
   };
+}
+
+/**
+ * The paths that every one of `lists` opens: each entry that an entry of every list holds, so
+ * `/shared` and `/shared/cache` share `/shared/cache` (Codex review).
+ */
+function sharedPaths(lists: ReadonlyArray<readonly string[]>): string[] {
+  const holds = (outer: string, inner: string) =>
+    isPathAtOrUnder(expandSandboxPathSpelling(inner), expandSandboxPathSpelling(outer));
+  return dedupe(
+    lists.flatMap((entries) =>
+      entries.filter((entry) => lists.every((other) => other.some((outer) => holds(outer, entry))))
+    )
+  );
 }
 
 /** True when the sandbox could apply to some command, so the srt session should be ready. */
