@@ -5044,13 +5044,131 @@ describe("MemoryConsolidationService", () => {
           MEMORY_CONSOLIDATION_TIMEOUT_MS,
         ]);
         expect(waiter.success).toBe(false);
-        if (!waiter.success) expect(waiter.error).toContain("dream run timeout is off");
+        if (!waiter.success) expect(waiter.error).toContain("longer than this run waits");
 
         await fixture.service.cancelInFlightConsolidation("ws-dream");
         expect((await hanging).success).toBe(false);
       } finally {
         spy.mockRestore();
       }
+    });
+
+    // The waiter's own setting decides its wait, not the holder's: a run that started with the
+    // timeout off and hung must not hold a waiter forever once the user sets a timeout again.
+    it("bounds a waiter behind a run that hung with the timeout off, after a timeout is set", async () => {
+      let hung!: () => void;
+      const started = new Promise<void>((resolve) => (hung = resolve));
+      let calls = 0;
+      using fixture = await createFixture({
+        modelFactory: () => {
+          calls += 1;
+          if (calls > 1) return scriptedModel();
+          return new MockLanguageModelV3({
+            doStream: (options) => {
+              hung();
+              return new Promise((_resolve, reject) => {
+                options.abortSignal?.addEventListener("abort", () =>
+                  reject(new Error("stalled provider call aborted"))
+                );
+              });
+            },
+          });
+        },
+      });
+      await fixture.addWorkspace("ws-other");
+      await setTimeoutMinutes(fixture, 0);
+
+      const timeouts: number[] = [];
+      let fireDeadlines = false;
+      const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+        timeouts.push(ms);
+        return fireDeadlines
+          ? AbortSignal.abort(new DOMException("deadline", "TimeoutError"))
+          : new AbortController().signal;
+      });
+      try {
+        const hanging = fixture.service.maybeRun("ws-dream", "manual");
+        await started;
+        await setTimeoutMinutes(fixture, 30);
+
+        fireDeadlines = true;
+        const waiter = await fixture.service.maybeRun("ws-other", "manual");
+
+        expect(timeouts.at(-1)).toBe(30 * minute);
+        expect(waiter.success).toBe(false);
+        if (!waiter.success) expect(waiter.error).toContain("kept the turn for 30 minutes");
+
+        await fixture.service.cancelInFlightConsolidation("ws-dream");
+        expect((await hanging).success).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    /** Resolves once `promise` settled, or false after `ms` of real time. */
+    async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+      let settled = false;
+      void promise.finally(() => (settled = true));
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return settled;
+    }
+
+    // The lock helper's deadline reads Date.now(), so moving the clock past the constant but not
+    // past the saved timeout shows which wait the run passed.
+    it("waits for another backend's dream for the saved timeout, not the constant", async () => {
+      using fixture = await createFixture();
+      await setTimeoutMinutes(fixture, 30);
+      const releaseForeign = await holdForeignDreamLock(fixture);
+      const start = Date.now();
+      try {
+        const run = fixture.service.maybeRun("ws-dream", "manual");
+        for (let tick = 0; tick < 400 && fixture.modelCalls.length === 0; tick++) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        expect(fixture.modelCalls).toHaveLength(1);
+        // Let the lock wait take its deadline from the real clock first.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+
+        setSystemTime(new Date(start + 6 * minute));
+        expect(await settlesWithin(run, 800)).toBe(false);
+
+        setSystemTime(new Date(start + 31 * minute));
+        const result = await run;
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("Another Xum process is running");
+      } finally {
+        setSystemTime();
+        await releaseForeign();
+      }
+    });
+
+    it("lets an analyzer job wait for another backend's job as long as the saved timeout needs", async () => {
+      using fixture = await createFixture({ modelFactory: () => harvestCandidateModel() });
+      await setTimeoutMinutes(fixture, 30);
+      await appendBulkRows(fixture);
+      const metadata = await seedCompactionEpoch(fixture);
+      const releaseForeign = await acquireCrossProcessLock({
+        lockPath: analyzerJobLockPath(fixture.xumHome, "ws-dream"),
+        acquireTimeoutMs: 1_000,
+        staleMs: 60_000,
+        timeoutMessage: "test holder",
+      });
+      const start = Date.now();
+      let run: Promise<unknown> | undefined;
+      try {
+        run = fixture.service.maybeHarvestThenSweep(metadata);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+
+        // Past the 125 minutes of the default timeout, short of the 425 that 30 minutes needs.
+        setSystemTime(new Date(start + 130 * minute));
+        expect(await settlesWithin(run, 800)).toBe(false);
+      } finally {
+        setSystemTime();
+        await releaseForeign();
+      }
+      await run;
+      // It waited the foreign job out and then ran, instead of failing at the default's wait.
+      expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
     });
   });
 
