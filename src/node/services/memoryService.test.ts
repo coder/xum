@@ -483,6 +483,9 @@ describe("MemoryService", () => {
         "ab\n".repeat(3),
         ambiguousError(4, "1, 2, 3, 4"),
       ],
+      ["matches on a line after the first match's", "ab\nab ab", "ab", ambiguousError(3, "1, 2")],
+      ["matches that all sit on a later line", "x\nab ab ab\nzz", "ab", ambiguousError(3, "2")],
+      ["an old_str that is a run of newlines", "x\n\n\n", "\n", ambiguousError(3, "1, 2, 3")],
       ["text outside ASCII", "\u{1F642} x\n\u{1F642} x", "x", ambiguousError(2, "1, 2")],
     ])("names the matching lines for %s", async (_label, content, oldStr, expected) => {
       using fixture = await createFixture();
@@ -509,63 +512,6 @@ describe("MemoryService", () => {
       const physical = path.join(fixture.xumHome, "memory", "global", "s.md");
       expect(await fsPromises.readFile(physical, "utf-8")).toBe(content);
     });
-
-    // Memory content and old_str are untrusted model input, so refusing an ambiguous old_str on a
-    // file at the size cap must cost time linear in the file however many matches it has and however
-    // long the old_str is. Re-splitting the prefix before each match took 13 s on the first shape,
-    // and an `indexOf(old_str, index + 1)` loop re-compared a long overlapping old_str at every hit,
-    // which took 3.4 s on the third (Bun 1.3.14). The linear pass takes about 10 ms, so the 1 s
-    // budget leaves a loaded host room.
-    it.each([
-      [
-        "a match on every line",
-        "a\n".repeat(MEMORY_MAX_FILE_BYTES / 2),
-        "a",
-        MEMORY_MAX_FILE_BYTES / 2,
-      ],
-      [
-        "a match at every character of one line",
-        "a".repeat(MEMORY_MAX_FILE_BYTES),
-        "a",
-        MEMORY_MAX_FILE_BYTES,
-      ],
-      [
-        "an old_str of half the file that overlaps itself",
-        "a".repeat(MEMORY_MAX_FILE_BYTES),
-        "a".repeat(MEMORY_MAX_FILE_BYTES / 2),
-        MEMORY_MAX_FILE_BYTES / 2 + 1,
-      ],
-    ])(
-      "refuses an ambiguous old_str with %s in linear time",
-      async (_label, content, oldStr, matches) => {
-        using fixture = await createFixture();
-        await fixture.service.create(fixture.ctx, "/memories/global/big.md", content, "agent");
-        await fixture.service.create(fixture.ctx, "/memories/global/warm.md", "a\na", "agent");
-        // Keep the cold load of the command path out of the timing.
-        await fixture.service.strReplace(
-          fixture.ctx,
-          "/memories/global/warm.md",
-          "a",
-          "x",
-          "agent"
-        );
-
-        const started = performance.now();
-        const refused = await fixture.service.strReplace(
-          fixture.ctx,
-          "/memories/global/big.md",
-          oldStr,
-          "x",
-          "agent"
-        );
-        const elapsedMs = performance.now() - started;
-
-        expect(refused.success ? "" : refused.error).toContain(
-          `old_str matches ${matches} locations (lines 1`
-        );
-        expect(elapsedMs).toBeLessThan(1_000);
-      }
-    );
   });
 
   describe("insert", () => {

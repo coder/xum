@@ -3860,7 +3860,7 @@ async function fingerprintPhysicalSubtree(store: MemoryStore, relPath: string): 
  * real write path enforces. Both throw MemoryCommandError with the exact
  * write-path messages.
  */
-function computeStrReplaceUpdate(
+export function computeStrReplaceUpdate(
   content: string,
   oldStr: string,
   newStr: string,
@@ -3994,6 +3994,8 @@ function assertWithinFileSizeCap(content: string, maxFileBytes?: number): void {
   }
 }
 
+const NEWLINE_CODE_UNIT = "\n".charCodeAt(0);
+
 /**
  * Offsets of every occurrence of needle in content, ascending, with overlapping occurrences counted
  * ("aa" in "aaa" occurs twice). Memory content and old_str are untrusted model input, so this is
@@ -4036,24 +4038,25 @@ function borderTable(needle: string): Int32Array {
 }
 
 /**
- * 1-based line numbers, ascending and without repeats, of the lines where the ascending offsets
- * fall. One forward pass: the next newline is kept between offsets, because searching for it again
- * per offset would rescan one long line once per match. Re-splitting the prefix before every match
- * was quadratic: a failed str_replace on a 100 KB file with 51,200 matches took seconds of CPU.
+ * 1-based line numbers, ascending and without repeats, of the lines where the offsets fall.
+ * `offsets` must be strictly ascending and inside content, as findOccurrenceOffsets returns them.
+ * One bounded pass over content: a newline is counted once, whatever the number of matches. Searching
+ * for the next newline per match instead rescans one long line once per match, and re-splitting the
+ * prefix before every match was quadratic: a failed str_replace on a 100 KB file with 51,200
+ * matches took seconds of CPU.
  */
 export function lineNumbersOf(content: string, offsets: readonly number[]): number[] {
   const lines: number[] = [];
   let line = 1;
-  // First newline not yet counted into `line`, or -1 once none is left.
-  let nextNewline = content.indexOf("\n");
-  for (const offset of offsets) {
-    // Only newlines before the offset count: a match that starts with a newline starts on the line
-    // that newline ends.
-    while (nextNewline !== -1 && nextNewline < offset) {
-      line += 1;
-      nextNewline = content.indexOf("\n", nextNewline + 1);
+  let next = 0;
+  for (let position = 0; position < content.length; position++) {
+    if (position === offsets[next]) {
+      if (lines[lines.length - 1] !== line) lines.push(line);
+      next += 1;
     }
-    if (lines[lines.length - 1] !== line) lines.push(line);
+    // Counted after the offset check: a match that starts with a newline starts on the line that
+    // newline ends.
+    if (content.charCodeAt(position) === NEWLINE_CODE_UNIT) line += 1;
   }
   return lines;
 }

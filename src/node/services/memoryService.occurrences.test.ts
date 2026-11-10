@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { findOccurrenceOffsets, lineNumbersOf } from "./memoryService";
+import { computeStrReplaceUpdate, findOccurrenceOffsets, lineNumbersOf } from "./memoryService";
 
 // The two helpers that str_replace used before the linear matcher, copied as they were on main
 // (3cd7f5ce8). They are the oracle: slow on purpose, and plainly right.
@@ -63,6 +63,9 @@ describe("lineNumbersOf", () => {
     ["an offset at a newline", "x\ny\nx\ny", [1, 5], [1, 3]],
     ["an offset after the last newline", "a\nb", [2], [2]],
     ["CRLF line endings", "a\r\nb\r\na", [0, 6], [1, 3]],
+    ["offsets that all sit on a later line", "x\nab ab ab\nzz", [2, 5, 8], [2]],
+    ["a first line, then two offsets on the next", "ab\nab ab", [0, 3, 6], [1, 2]],
+    ["offsets on a run of newlines", "x\n\n\n", [1, 2, 3], [1, 2, 3]],
   ])("numbers the lines of %s", (_label, content, offsets, expected) => {
     expect(lineNumbersOf(content, offsets)).toEqual(expected);
   });
@@ -138,12 +141,23 @@ describe("the linear matcher against main's helpers", () => {
   });
 });
 
-// Memory content and old_str are untrusted model input. A loop of `indexOf(needle, index + 1)`
-// re-compares most of a long overlapping needle at every hit: each of these shapes took 0.7 to 1.7
-// s per pass on main (3.4 s for the first, which Codex measured on #8124). The linear matcher takes a
-// few milliseconds, so the 100 ms budget of the other memory text scanners leaves a loaded host room.
-describe("the linear matcher on long overlapping needles", () => {
+// Memory content and old_str are untrusted model input, and a failed str_replace must cost CPU time
+// linear in the file however many matches it has and however long and overlapping old_str is.
+// Each shape below took seconds on main (0.8 to 1.7 s per pass for the long overlapping ones, which
+// Codex measured at 3.4 s for the first on #8124, and 3 to 14 s for the one-letter ones). The same
+// call takes a few milliseconds now. A per-match newline search on the one-line shape takes about
+// 140 ms. The budget is CPU time of the pure function (the same call the write path makes, with no
+// lock, stat or file read around it), so a loaded host does not stretch it, and it sits between those.
+describe("computeStrReplaceUpdate on a file at the size cap", () => {
   const KIB = 1024;
+  const CPU_BUDGET_MS = 50;
+
+  function cpuMilliseconds(run: () => void): number {
+    const before = process.cpuUsage();
+    run();
+    const used = process.cpuUsage(before);
+    return (used.user + used.system) / 1000;
+  }
 
   it.each([
     [
@@ -158,7 +172,8 @@ describe("the linear matcher on long overlapping needles", () => {
       "a".repeat(25 * KIB),
       75 * KIB + 1,
     ],
-    ["a run of 100 KiB with one letter", "a".repeat(100 * KIB), "a", 100 * KIB],
+    ["a run of 100 KiB with one letter, all on one line", "a".repeat(100 * KIB), "a", 100 * KIB],
+    ["50 KiB of lines with one letter, one match per line", "a\n".repeat(50 * KIB), "a", 50 * KIB],
     [
       "100 KiB of pairs with a 50 KiB run of pairs",
       "ab".repeat(50 * KIB),
@@ -171,14 +186,24 @@ describe("the linear matcher on long overlapping needles", () => {
       "a\n".repeat(25 * KIB),
       25 * KIB + 1,
     ],
-  ])("finds the offsets and lines of %s in linear time", (_label, content, needle, count) => {
-    findOccurrenceOffsets("abc", "b"); // keep the cold start of the matcher out of the timing
-    const started = performance.now();
-    const found = matchLines(content, needle);
-    const elapsedMs = performance.now() - started;
+  ])("refuses %s in linear CPU time", (_label, content, oldStr, count) => {
+    const refusal = { message: "" };
+    const refuse = () => {
+      try {
+        computeStrReplaceUpdate(content, oldStr, "x", "/memories/global/s.md");
+      } catch (error) {
+        refusal.message = error instanceof Error ? error.message : String(error);
+      }
+    };
+    refuse(); // the first run warms the JIT, so the timed ones measure the steady state
+    // The best of up to three runs: a GC thread can add a few milliseconds to one run, and a
+    // quadratic scan is slow in every run.
+    let cpuMs = Number.POSITIVE_INFINITY;
+    for (let attempt = 0; attempt < 3 && cpuMs >= CPU_BUDGET_MS; attempt++) {
+      cpuMs = Math.min(cpuMs, cpuMilliseconds(refuse));
+    }
 
-    expect(found.count).toBe(count);
-    expect(found.lines.length).toBeGreaterThan(0);
-    expect(elapsedMs).toBeLessThan(100);
+    expect(refusal.message).toContain(`old_str matches ${count} locations (lines 1`);
+    expect(cpuMs).toBeLessThan(CPU_BUDGET_MS);
   });
 });
