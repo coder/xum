@@ -187,6 +187,33 @@ describe("buildLayoutReport", () => {
     expect(report.more).toBe(1);
   });
 
+  test("an issue that was only counted in `more` is new when it is finally listed", () => {
+    const eleven = Array.from({ length: LAYOUT_AUDIT_MAX_ISSUES + 1 }, (_, index) =>
+      finding("clipped-text", `p.row-${String(index).padStart(2, "0")}`, 100 - index)
+    );
+    const first = build(pass({ 390: eleven }));
+    expect(first.report.issues).toHaveLength(LAYOUT_AUDIT_MAX_ISSUES);
+    expect(first.report.more).toBe(1);
+    // The agent fixed the ten it was shown. The eleventh has never been shown to it.
+    const second = build(pass({ 390: eleven.slice(-1) }), first.next);
+    expect(second.report.issues.map(shape)).toEqual([[390, "p.row-10", undefined]]);
+    expect(second.report.note).not.toContain("persistent");
+  });
+
+  test("an issue listed once stays remembered while it stands, though a later report cuts it", () => {
+    const old = finding("page-horizontal-overflow", "html", 900);
+    const fresh = Array.from({ length: LAYOUT_AUDIT_MAX_ISSUES }, (_, index) =>
+      finding("clipped-text", `p.new-${index}`, 20)
+    );
+    const listedOnce = build(pass({ 390: [old] }));
+    // Ten new issues sort before the persistent one: this report counts it in `more`.
+    const cut = build(pass({ 390: [old, ...fresh] }), listedOnce.next);
+    expect(cut.report.issues.some((issue) => issue.persistent)).toBe(false);
+    // It was shown on the first publish and has stood since, so it is persistent now.
+    const later = build(pass({ 390: [old] }), cut.next);
+    expect(later.report.issues.map(shape)).toEqual([[390, "html", true]]);
+  });
+
   test("orders by newness, width, rule, size and selector", () => {
     const persistent = finding("clipped-text", "p.old", 500);
     const seeded = build(pass({ 768: [persistent] })).next;

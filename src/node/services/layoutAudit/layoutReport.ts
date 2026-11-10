@@ -2,6 +2,7 @@ import {
   LAYOUT_AUDIT_MAX_ISSUES,
   LAYOUT_AUDIT_MAX_SELECTOR_CHARS,
   LAYOUT_AUDIT_RULES,
+  type LayoutAuditViewportClass,
 } from "@/common/constants/artifactLayoutAudit";
 import type {
   LayoutAuditIssue,
@@ -23,6 +24,7 @@ interface Candidate {
   /** The full selector: it decides ties, and the fingerprint came from it. */
   selector: string;
   fingerprint: string;
+  viewportClass: LayoutAuditViewportClass;
 }
 
 /**
@@ -57,6 +59,7 @@ function toCandidates(outcome: CompleteOutcome, previous: FingerprintSnapshot): 
   const seenBefore = previous[outcome.viewport.viewportClass];
   return [...strongestPerFingerprint(outcome.findings)].map(([fingerprint, finding]) => ({
     fingerprint,
+    viewportClass: outcome.viewport.viewportClass,
     selector: finding.selector,
     issue: {
       rule: finding.rule,
@@ -91,19 +94,32 @@ function toNotChecked(outcome: ViewportOutcome): LayoutAuditNotChecked[] {
 }
 
 /**
- * Memory after this pass: a complete width replaces the set of its class (a complete clean pass
- * clears it), and a width that failed or never settled leaves its class as it was. An unsettled
- * or failed pass is uncertainty, not repair, so it neither confirms nor clears a finding.
+ * Memory after this pass. A width that failed or never settled leaves its class as it was: that
+ * is uncertainty, not repair, so it neither confirms nor clears a finding. A complete width keeps
+ * what the agent was shown at it: the issues LISTED in this report, and the ones remembered
+ * before that are still detected (a once-listed issue that a later report cut off stays
+ * remembered). An issue that was found but only counted in `more` was never shown, so it is not
+ * remembered: it must read as new when it is finally listed. A complete clean pass clears the
+ * class.
  */
 function nextSnapshot(
   complete: readonly CompleteOutcome[],
+  listed: readonly Candidate[],
   previous: FingerprintSnapshot
 ): FingerprintSnapshot {
   const next: FingerprintSnapshot = { ...previous };
   for (const outcome of complete) {
-    next[outcome.viewport.viewportClass] = new Set(
+    const { viewportClass } = outcome.viewport;
+    const detected = new Set(
       outcome.findings.map((finding) => layoutFingerprint(finding.rule, finding.selector))
     );
+    const stillStanding = [...(previous[viewportClass] ?? [])].filter((fingerprint) =>
+      detected.has(fingerprint)
+    );
+    const shownNow = listed
+      .filter((candidate) => candidate.viewportClass === viewportClass)
+      .map((candidate) => candidate.fingerprint);
+    next[viewportClass] = new Set([...stillStanding, ...shownNow]);
   }
   return next;
 }
@@ -123,7 +139,8 @@ export function buildLayoutReport(
   const candidates = complete
     .flatMap((outcome) => toCandidates(outcome, previous))
     .sort(compareCandidates);
-  const issues = candidates.slice(0, LAYOUT_AUDIT_MAX_ISSUES).map((candidate) => candidate.issue);
+  const listed = candidates.slice(0, LAYOUT_AUDIT_MAX_ISSUES);
+  const issues = listed.map((candidate) => candidate.issue);
   const notChecked = outcomes.flatMap(toNotChecked).sort((a, b) => a.viewport - b.viewport);
   const persistentCount = candidates.filter((candidate) => candidate.issue.persistent).length;
   const common = {
@@ -140,6 +157,6 @@ export function buildLayoutReport(
       notChecked.length === 0
         ? { checked: true, ...common }
         : { checked: false, notChecked, ...common },
-    next: nextSnapshot(complete, previous),
+    next: nextSnapshot(complete, listed, previous),
   };
 }
