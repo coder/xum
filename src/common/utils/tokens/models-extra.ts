@@ -157,6 +157,50 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_pdf_input: true,
   },
 
+  // Claude Fable 5.2 - Released November 9, 2026, successor to Fable 5.1 in the
+  // Mythos-class tier. Official pricing: $8/M input, $40/M output (20% below Fable 5.1),
+  // 5-minute cache write $10/M (1.25x input), cache read $0.20/M (0.025x input, the same
+  // multiplier as Fable 5.1). The 1-hour cache write tier ($16/M, 2x input) has no field
+  // (displayUsage derives it from input), and fast mode ($16/$80) is a serviceTierPricing
+  // factor. Native 1M context, 128K max output, effort ladder low..max with native xhigh;
+  // adaptive thinking is always on (default effort high).
+  // https://platform.claude.com/docs/en/models/fable-5-2/overview
+  "claude-fable-5-2": {
+    max_input_tokens: 1000000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.000008, // $8 per million input tokens
+    output_cost_per_token: 0.00004, // $40 per million output tokens
+    cache_creation_input_token_cost: 0.00001, // $10 per million tokens (1.25× input)
+    cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.025× input)
+    litellm_provider: "anthropic",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
+  // Claude Mythos 5.2 - Released November 9, 2026 alongside Fable 5.2: the same model
+  // with some safeguards lifted, for organizations verified through Anthropic's
+  // verification programs. Identical specs and pricing to Fable 5.2 (see above).
+  // https://platform.claude.com/docs/en/models/mythos-5-2/overview
+  "claude-mythos-5-2": {
+    max_input_tokens: 1000000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.000008, // $8 per million input tokens
+    output_cost_per_token: 0.00004, // $40 per million output tokens
+    cache_creation_input_token_cost: 0.00001, // $10 per million tokens (1.25× input)
+    cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.025× input)
+    litellm_provider: "anthropic",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Claude Fable 5.1 - successor to Fable 5 in the Mythos-class tier at the same
   // input/output pricing: $10/M input, $50/M output, cache write 1.25x input. Cache
   // reads are cheaper than Fable 5 at $0.25/M (0.025x input, a quarter of the old
