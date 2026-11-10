@@ -1,13 +1,4 @@
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  setDefaultTimeout,
-  setSystemTime,
-  spyOn,
-  test,
-} from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -224,35 +215,44 @@ describe("checkArtifactLayout", () => {
     expect((await check())?.issues[0]).not.toHaveProperty("persistent");
   });
 
-  test("overlapping publishes of one path are checked one after the other", async () => {
-    await install({ eval: { 390: { kind: "pass", findings: [card] } } });
-    const [first, second] = await Promise.all([check(), check()]);
-    expect(first?.issues[0]).not.toHaveProperty("persistent");
-    expect(second?.issues).toEqual([expect.objectContaining({ persistent: true })]);
-  });
-
-  test("overlapping publishes of one path each get the full budget", async () => {
-    await install({ eval: { 390: { kind: "pass", findings: [card] } } });
+  test("overlapping publishes of one path run at once, and the one that started first does not overwrite the newer memory", async () => {
+    // The first publish's browser run is held until the second publish has finished, so the one
+    // that started first finishes last. If publishes of one path waited for each other, the
+    // second one would wait on the held first and this test would time out.
+    const firstSignal = new AbortController().signal;
+    let releaseFirst: () => void = () => undefined;
+    const firstMayRun = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const runTimeouts: Array<number | undefined> = [];
     // Bound before spyOn: spyOn replaces the method before its argument is evaluated.
     const realExec = runtime.exec.bind(runtime);
-    const runTimeouts: Array<number | undefined> = [];
     const exec = spyOn(runtime, "exec").mockImplementation(async (command, options) => {
       if (command.includes("page_script=")) {
         runTimeouts.push(options.timeout);
-        // The first audit "takes" ten seconds, as measured by the clock the budget reads.
-        if (runTimeouts.length === 1) setSystemTime(new Date(Date.now() + 10_000));
+        if (options.abortSignal === firstSignal) await firstMayRun;
       }
       return realExec(command, options);
     });
     try {
-      const [first, second] = await Promise.all([check(), check()]);
+      await install();
+      const first = check({ abortSignal: firstSignal });
+      const second = await check();
+      expect(second?.issues).toEqual([]);
+
+      // What the held publish will see. It reads the fake only when it runs, after the second.
+      await install({ eval: { 390: { kind: "pass", findings: [card] } } });
+      releaseFirst();
+      expect((await first)?.issues).toEqual([expect.objectContaining({ viewport: 390 })]);
+      // Each publish had its own full budget (20 s less the close reserve), whoever ran first.
       expect(runTimeouts).toHaveLength(2);
-      // Counted from the start of each audit, not from the call: the second one waited.
-      expect(runTimeouts[1]).toBeGreaterThan((runTimeouts[0] ?? 0) - 1);
-      expect(first?.issues[0]).not.toHaveProperty("persistent");
-      expect(second?.issues).toEqual([expect.objectContaining({ persistent: true })]);
+      for (const timeout of runTimeouts) expect(timeout).toBeGreaterThan(16);
+
+      // The second publish started later, so its clean memory stands: the first publish's
+      // finding was never remembered, and it reads as new now.
+      expect((await check())?.issues[0]).not.toHaveProperty("persistent");
     } finally {
-      setSystemTime();
+      releaseFirst();
       exec.mockRestore();
     }
   });
@@ -316,6 +316,71 @@ describe("checkArtifactLayout", () => {
     expect(command).not.toContain("XUM_INTERNAL_TOOL_ENV_PATH");
     expect(options?.pathEnv).toBeUndefined();
   });
+
+  /** Over SSH the artifacts dir may start with `~`, which takes a lookup on the runtime. */
+  const homeRelative = (): AvailableArtifactsLocation => ({
+    kind: "runtime",
+    runtime,
+    dir: "~/.xum/scratch/artifacts",
+  });
+  /** A location whose home directory lookup never answers, like a dead connection. */
+  const hungHome = () => {
+    spyOn(runtime, "resolvePath").mockReturnValue(new Promise<string>(() => undefined));
+    return homeRelative();
+  };
+  const everyWidth = (reason: string) => [390, 768, 1440].map((viewport) => ({ viewport, reason }));
+
+  test("a setup that never settles, with the call already cancelled, returns at once as aborted", async () => {
+    const report = await check({
+      location: hungHome(),
+      budgetMs: 1,
+      abortSignal: AbortSignal.abort(),
+    });
+    expect(notCheckedOf(report)).toEqual(everyWidth("aborted"));
+    expect(report?.issues).toEqual([]);
+  }, 10_000);
+
+  test("a setup that never settles is not checked at any width once the deadline passes", async () => {
+    const started = Date.now();
+    const report = await check({ location: hungHome(), budgetMs: 200 });
+    expect(notCheckedOf(report)).toEqual(everyWidth("timeout"));
+    expect(Date.now() - started).toBeLessThan(5_000);
+  }, 10_000);
+
+  test("a tool_env lookup that never settles is not checked at any width once the deadline passes", async () => {
+    spyOn(runtime, "stat").mockReturnValue(new Promise<never>(() => undefined));
+    const report = await check({ trusted: true, budgetMs: 200 });
+    expect(notCheckedOf(report)).toEqual(everyWidth("timeout"));
+  }, 10_000);
+
+  test("a cancel stops the wait for a setup that never settles", async () => {
+    const controller = new AbortController();
+    const pending = check({ location: hungHome(), abortSignal: controller.signal });
+    controller.abort();
+    expect(notCheckedOf(await pending)).toEqual(everyWidth("aborted"));
+  }, 10_000);
+
+  test("a setup that fails after its deadline leaves no unhandled rejection", async () => {
+    let failLate: (error: Error) => void = () => undefined;
+    spyOn(runtime, "resolvePath").mockReturnValue(
+      new Promise<string>((_, reject) => {
+        failLate = reject;
+      })
+    );
+    const unhandled: unknown[] = [];
+    const record = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", record);
+    try {
+      const report = await check({ location: homeRelative(), budgetMs: 50 });
+      expect(notCheckedOf(report)).toEqual(everyWidth("timeout"));
+      failLate(new Error("ssh down, long after the deadline"));
+      // Unhandled rejections are reported after the microtask queue drains: one macrotask turn.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("unhandledRejection", record);
+    }
+    expect(unhandled).toEqual([]);
+  }, 10_000);
 
   test("an unexpected failure is not checked and never throws", async () => {
     spyOn(runtime, "resolvePath").mockRejectedValue(new Error("ssh down"));

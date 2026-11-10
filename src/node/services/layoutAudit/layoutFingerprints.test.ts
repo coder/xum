@@ -2,16 +2,10 @@ import { describe, expect, test } from "bun:test";
 import {
   LAYOUT_MEMORY_MAX_PATHS,
   layoutFingerprint,
-  withLayoutMemory,
+  startLayoutAudit,
   type FingerprintSnapshot,
-  type LayoutMemory,
+  type LayoutAuditTurn,
 } from "./layoutFingerprints";
-
-/** An audit that needs no await of its own. */
-const audit =
-  <T>(body: (memory: LayoutMemory) => T) =>
-  (memory: LayoutMemory) =>
-    Promise.resolve(body(memory));
 
 const remember = (...values: string[]): FingerprintSnapshot => ({ phone: new Set(values) });
 
@@ -32,164 +26,113 @@ describe("layoutFingerprint", () => {
   });
 });
 
-describe("withLayoutMemory", () => {
-  test("starts with nothing and returns what the audit returns", async () => {
-    const result = await withLayoutMemory(
-      freshDir(),
-      "a.html",
-      audit((memory) => {
-        expect(memory.previous).toEqual({});
-        return "report";
-      })
+/**
+ * Ends an audit with `next` as its memory and returns what it read as `previous`. `remember`
+ * false is an audit that leaves nothing behind (cancelled, or nothing completed).
+ */
+const finish = (turn: LayoutAuditTurn, next: FingerprintSnapshot = {}, remember = true) =>
+  turn.finish((previous) => ({ report: previous, next }), remember);
+
+/** The memory of a path, read by an audit that leaves nothing behind. */
+const memoryOf = (dir: string, relPath: string) =>
+  finish(startLayoutAudit(dir, relPath), {}, false);
+
+describe("startLayoutAudit", () => {
+  test("starts with nothing and returns what build returns", () => {
+    const report = startLayoutAudit(freshDir(), "a.html").finish(
+      (previous) => ({ report: `saw ${Object.keys(previous).length} classes`, next: {} }),
+      true
     );
-    expect(result).toBe("report");
+    expect(report).toBe("saw 0 classes");
   });
 
-  test("hands the next audit of the same path what the last one committed", async () => {
+  test("hands the next audit of the same path what the last one committed", () => {
     const dir = freshDir();
-    await withLayoutMemory(
-      dir,
-      "a.html",
-      audit((memory) => memory.commit(remember("one")))
-    );
-    await withLayoutMemory(
-      dir,
-      "a.html",
-      audit((memory) => expect(memory.previous).toEqual(remember("one")))
-    );
+    finish(startLayoutAudit(dir, "a.html"), remember("one"));
+    expect(memoryOf(dir, "a.html")).toEqual(remember("one"));
   });
 
-  test("keeps paths and session dirs apart", async () => {
+  test("keeps paths and session dirs apart", () => {
     const dir = freshDir();
-    await withLayoutMemory(
-      dir,
-      "a.html",
-      audit((memory) => memory.commit(remember("one")))
-    );
-    await withLayoutMemory(
-      dir,
-      "b.html",
-      audit((memory) => expect(memory.previous).toEqual({}))
-    );
-    await withLayoutMemory(
-      freshDir(),
-      "a.html",
-      audit((memory) => expect(memory.previous).toEqual({}))
-    );
+    finish(startLayoutAudit(dir, "a.html"), remember("one"));
+    expect(memoryOf(dir, "b.html")).toEqual({});
+    expect(memoryOf(freshDir(), "a.html")).toEqual({});
   });
 
-  test("runs overlapping audits of one path one at a time, in call order", async () => {
+  test("an audit that does not remember leaves the memory as it was", () => {
     const dir = freshDir();
-    const events: string[] = [];
-    let releaseFirst: () => void = () => undefined;
-    const firstMayFinish = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-    const first = withLayoutMemory(dir, "a.html", async (memory) => {
-      events.push("first start");
-      await firstMayFinish;
-      memory.commit(remember("from first"));
-      events.push("first end");
-    });
-    const second = withLayoutMemory(
-      dir,
-      "a.html",
-      audit((memory) => {
-        events.push(`second start, saw ${[...(memory.previous.phone ?? [])].join()}`);
-      })
-    );
-    // Another path is not held up by the first audit.
-    await withLayoutMemory(
-      dir,
-      "b.html",
-      audit(() => {
-        events.push("other path");
-      })
-    );
-    releaseFirst();
-    await Promise.all([first, second]);
-    expect(events).toEqual([
-      "first start",
-      "other path",
-      "first end",
-      "second start, saw from first",
-    ]);
+    finish(startLayoutAudit(dir, "a.html"), remember("kept"));
+    finish(startLayoutAudit(dir, "a.html"), remember("dropped"), false);
+    expect(memoryOf(dir, "a.html")).toEqual(remember("kept"));
   });
 
-  test("an audit that throws or does not commit leaves the memory as it was", async () => {
+  test("an audit that started first and finishes last does not overwrite the newer memory", () => {
     const dir = freshDir();
-    await withLayoutMemory(
-      dir,
-      "a.html",
-      audit((memory) => memory.commit(remember("kept")))
-    );
-    const failing = withLayoutMemory(
-      dir,
-      "a.html",
-      audit((): undefined => {
-        throw new Error("boom");
-      })
-    );
-    const failure = await failing.then(
-      () => undefined,
-      (error: unknown) => error
-    );
-    expect(String(failure)).toContain("boom");
-    await withLayoutMemory(
-      dir,
-      "a.html",
-      audit(() => undefined)
-    );
-    await withLayoutMemory(
-      dir,
-      "a.html",
-      audit((memory) => expect(memory.previous).toEqual(remember("kept")))
-    );
+    const early = startLayoutAudit(dir, "a.html");
+    const late = startLayoutAudit(dir, "a.html");
+    finish(late, remember("late"));
+    // The early audit still gets its own report (it read what the late one left), and loses
+    // the commit.
+    expect(finish(early, remember("early"))).toEqual(remember("late"));
+    expect(memoryOf(dir, "a.html")).toEqual(remember("late"));
   });
 
-  test("forgets the path audited longest ago once the bound is passed", async () => {
+  test("an audit that started later overwrites the earlier one's memory", () => {
+    const dir = freshDir();
+    const early = startLayoutAudit(dir, "a.html");
+    const late = startLayoutAudit(dir, "a.html");
+    finish(early, remember("early"));
+    finish(late, remember("late"));
+    expect(memoryOf(dir, "a.html")).toEqual(remember("late"));
+  });
+
+  test("a later audit that left nothing behind does not stop an earlier one from committing", () => {
+    const dir = freshDir();
+    const early = startLayoutAudit(dir, "a.html");
+    const late = startLayoutAudit(dir, "a.html");
+    finish(late, remember("never kept"), false);
+    finish(early, remember("early"));
+    expect(memoryOf(dir, "a.html")).toEqual(remember("early"));
+  });
+
+  test("the start order is kept per path", () => {
+    const dir = freshDir();
+    const early = startLayoutAudit(dir, "a.html");
+    const otherPath = startLayoutAudit(dir, "b.html");
+    finish(otherPath, remember("b"));
+    finish(early, remember("a"));
+    expect(memoryOf(dir, "a.html")).toEqual(remember("a"));
+  });
+
+  test("forgets the path audited longest ago once the bound is passed", () => {
     const dir = freshDir();
     for (let index = 0; index <= LAYOUT_MEMORY_MAX_PATHS; index++) {
-      await withLayoutMemory(
-        dir,
-        `p${index}.html`,
-        audit((memory) => memory.commit(remember(`p${index}`)))
-      );
+      finish(startLayoutAudit(dir, `p${index}.html`), remember(`p${index}`));
     }
-    await withLayoutMemory(
-      dir,
-      "p0.html",
-      audit((memory) => expect(memory.previous).toEqual({}))
-    );
-    await withLayoutMemory(
-      dir,
-      `p${LAYOUT_MEMORY_MAX_PATHS}.html`,
-      audit((memory) => expect(memory.previous).toEqual(remember(`p${LAYOUT_MEMORY_MAX_PATHS}`)))
+    expect(memoryOf(dir, "p0.html")).toEqual({});
+    expect(memoryOf(dir, `p${LAYOUT_MEMORY_MAX_PATHS}.html`)).toEqual(
+      remember(`p${LAYOUT_MEMORY_MAX_PATHS}`)
     );
   });
 
-  test("a path that keeps being audited is not the one forgotten", async () => {
+  test("a path that keeps being audited is not the one forgotten", () => {
     const dir = freshDir();
-    const commitAs = (relPath: string) =>
-      withLayoutMemory(
-        dir,
-        relPath,
-        audit((memory) => memory.commit(remember(relPath)))
-      );
-    await commitAs("busy.html");
+    const commitAs = (relPath: string) => finish(startLayoutAudit(dir, relPath), remember(relPath));
+    commitAs("busy.html");
     for (let index = 0; index < LAYOUT_MEMORY_MAX_PATHS; index++) {
-      await commitAs(`filler${index}.html`);
-      await commitAs("busy.html");
+      commitAs(`filler${index}.html`);
+      commitAs("busy.html");
     }
-    await withLayoutMemory(
-      dir,
-      "busy.html",
-      audit((memory) => expect(memory.previous).toEqual(remember("busy.html")))
-    );
-    await withLayoutMemory(
-      dir,
-      "filler0.html",
-      audit((memory) => expect(memory.previous).toEqual({}))
-    );
+    expect(memoryOf(dir, "busy.html")).toEqual(remember("busy.html"));
+    expect(memoryOf(dir, "filler0.html")).toEqual({});
+  });
+
+  test("an audit that remembers nothing does not move its path in the recency order", () => {
+    const dir = freshDir();
+    for (let index = 0; index < LAYOUT_MEMORY_MAX_PATHS; index++) {
+      finish(startLayoutAudit(dir, `p${index}.html`), remember(`p${index}`));
+    }
+    finish(startLayoutAudit(dir, "newcomer.html"), remember("newcomer"), false);
+    expect(memoryOf(dir, "p0.html")).toEqual(remember("p0"));
   });
 });

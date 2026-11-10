@@ -7,10 +7,11 @@ import type { AvailableArtifactsLocation } from "@/node/services/artifactsOperat
 import { getToolEnvPath } from "@/node/services/hooks";
 import { runLayoutPasses } from "@/node/services/layoutAudit/agentBrowserLayoutRun";
 import { LAYOUT_AUDIT_PAGE_SCRIPT } from "@/node/services/layoutAudit/layoutAuditPageScript.generated";
-import { withLayoutMemory } from "@/node/services/layoutAudit/layoutFingerprints";
+import { startLayoutAudit } from "@/node/services/layoutAudit/layoutFingerprints";
 import { buildLayoutReport } from "@/node/services/layoutAudit/layoutReport";
 import { failedOutcomes, type ViewportOutcome } from "@/node/services/layoutAudit/viewportOutcome";
 import { log } from "@/node/services/log";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 
 export interface ArtifactLayoutInput {
@@ -57,6 +58,12 @@ async function artifactFileUrl(
   return posixFileUrl(`${dir.replace(/\/+$/, "")}/${relPath}`);
 }
 
+/**
+ * Everything before the browser runs (the tool_env lookup, and over SSH the home directory) can
+ * hang on a dead connection. It gets the audit's deadline and its cancel like the run does: a
+ * setup that loses the race is not checked at any width, and its late result or failure is
+ * ignored.
+ */
 async function auditOutcomes(
   input: ArtifactLayoutInput,
   deadlineMs: number
@@ -64,11 +71,20 @@ async function auditOutcomes(
   // The same gate as the probe: the benchmark kill switch also keeps a trusted project's
   // tool_env from running.
   const trusted = input.trusted === true && !projectAutomationDisabled();
+  const setup = await raceWithAbortAndTimeout(
+    Promise.all([
+      trusted ? getToolEnvPath(input.runtime, input.cwd) : null,
+      artifactFileUrl(input.location, input.relPath),
+    ]),
+    { signal: input.abortSignal, timeoutMs: Math.max(deadlineMs - Date.now(), 0) }
+  );
+  if (setup.kind !== "ok") return failedOutcomes(setup.kind);
+  const [toolEnvPath, fileUrl] = setup.value;
   return runLayoutPasses({
     runtime: input.runtime,
     cwd: input.cwd,
-    toolEnvPath: trusted ? await getToolEnvPath(input.runtime, input.cwd) : null,
-    fileUrl: await artifactFileUrl(input.location, input.relPath),
+    toolEnvPath,
+    fileUrl,
     pageScript: LAYOUT_AUDIT_PAGE_SCRIPT,
     deadlineMs,
     abortSignal: input.abortSignal,
@@ -83,26 +99,26 @@ async function auditOutcomes(
  * the agent must not read as "clean". Findings of the same path are compared with the last
  * complete check of it, so the agent can tell a new issue from one it already saw and could not
  * fix. The audit only reports. Nothing here wakes or re-prompts the agent.
+ *
+ * Overlapping publishes of one path run at the same time, each with its own budget from its own
+ * start. The memory commit is the only thing that is ordered: by start, not by finish.
  */
 export async function checkArtifactLayout(
   input: ArtifactLayoutInput
 ): Promise<LayoutAuditReport | undefined> {
   if (input.kind !== "html") return undefined;
+  const turn = startLayoutAudit(input.sessionDir, input.relPath);
   try {
-    return await withLayoutMemory(input.sessionDir, input.relPath, async (memory) => {
-      // Overlapping publishes of one path run one after another, and the budget starts only
-      // once this audit holds its turn: a publish that waited behind an earlier one must not
-      // find the newest content "not checked" because the wait used up its time.
-      const deadlineMs = Date.now() + (input.budgetMs ?? LAYOUT_AUDIT_BUDGET_MS);
-      const { report, next } = buildLayoutReport(
-        await auditOutcomes(input, deadlineMs),
-        memory.previous
-      );
-      // "Persistent" means the agent was shown the issue on an earlier publish. A cancelled
-      // call's report was probably never delivered, so it leaves the memory alone.
-      if (input.abortSignal?.aborted !== true) memory.commit(next);
-      return report;
-    });
+    const outcomes = await auditOutcomes(
+      input,
+      Date.now() + (input.budgetMs ?? LAYOUT_AUDIT_BUDGET_MS)
+    );
+    // "Persistent" means the agent was shown the issue on an earlier publish. A cancelled
+    // call's report was probably never delivered, so it leaves the memory alone.
+    return turn.finish(
+      (previous) => buildLayoutReport(outcomes, previous),
+      input.abortSignal?.aborted !== true
+    );
   } catch (error) {
     log.debug("layout audit failed", { error });
     return buildLayoutReport(failedOutcomes("browser-failed"), {}).report;
