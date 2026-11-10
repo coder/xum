@@ -12,9 +12,10 @@
 #   RESULT <ok|fail|error|timeout> <pr>:<state>...
 #
 # Output carries only fixed tokens, counts and GitHub IDs. A failed state reads
-#   failed 2/31 checks, never the check names: names, descriptions and links are written by
-#   the PR author and by apps that post statuses, so they need an explicit read:
-#   gh pr view <pr> --json statusCheckRollup lists the head commit's checks with their names.
+#   failed 2/31 checks (1 on the merge commit), never the check names: names, descriptions and
+#   links are written by the PR author and by apps that post statuses, so they need an
+#   explicit read: gh pr view <pr> --json statusCheckRollup lists the head commit's checks with
+#   their names, so it does not list the failures that the count puts on the merge commit.
 #   A failed read prints GitHub's GraphQL error messages and fixed text, not the reply.
 #
 # Without --queue, checks on the head and merge commit count as in wait_pr_checks.sh:
@@ -165,9 +166,12 @@ def checks_state($pr; $p):
   elif ($p.headRefOid | type) != "string" or $p.commits.nodes[0].commit.oid != $p.headRefOid
   then fail($pr; "head \($p.headRefOid) is not the last listed commit \($p.commits.nodes[0].commit.oid)")
   else "head \($p.headRefOid[0:7])" as $at
-    | (rollup($pr; $p.commits.nodes[0].commit) + rollup($pr; $p.potentialMergeCommit)) as $all
+    | rollup($pr; $p.potentialMergeCommit) as $merge_checks
+    | (rollup($pr; $p.commits.nodes[0].commit) + $merge_checks) as $all
     | [$all[] | select(is_known_check_state | not)] as $unknown
     | [$all[] | select(is_visual_review_check | not)] as $checks
+    # gh pr view --json statusCheckRollup lists the head commit only, so a failure on the merge commit is counted apart.
+    | [$merge_checks[] | select((is_visual_review_check | not) and is_failed_check)] as $merge_failed
     | if ($unknown | length) > 0
       then fail($pr; "unknown check state on \($unknown | length) of \($all | length) checks; read them with: gh pr view \($pr) --json statusCheckRollup")
       elif $p.mergeable == "CONFLICTING" or $p.mergeStateStatus == "DIRTY" then ["conflicting", $at]
@@ -175,7 +179,7 @@ def checks_state($pr; $p):
       # Codex skips drafts and the queue refuses them, so checks alone do not make one ready.
       elif $p.isDraft then ["draft", $at]
       elif any($checks[]; is_failed_check)
-      then ["failed", "\($at) failed \([$checks[] | select(is_failed_check)] | length)/\($checks | length) checks"]
+      then ["failed", "\($at) failed \([$checks[] | select(is_failed_check)] | length)/\($checks | length) checks (\($merge_failed | length) on the merge commit)"]
       elif any($checks[]; is_pending_check) or (any($checks[]; is_passing_check or is_skipped_check) | not)
       then ["pending", "\($at) \([$checks[] | select(is_pending_check | not)] | length)/\($checks | length) checks done"]
       elif $p.mergeStateStatus == "CLEAN"
