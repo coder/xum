@@ -1099,6 +1099,26 @@ describe("addsSecretLike", () => {
     expect(addsSecretLike(updated, updated)).toBe(false);
   });
 
+  // The same value taken out by the other source excuses nothing. Only the reader sees a name behind
+  // an escaped tab, and only the key/value regex sees `password:`; both take out `SEKRIT`.
+  describe("keeps the regex passes' values apart from the reader's", () => {
+    const byReader = String.raw`a\tCookie: SEKRIT`;
+    const byRegex = "password: SEKRIT";
+
+    it("refuses a value the regex takes out that the previous text held only by the reader", () => {
+      // Main's guard refuses this too: its regex never read the previous text's header.
+      expect(addsSecretLike(byReader, byRegex)).toBe(true);
+    });
+
+    it("refuses a value the reader takes out that the previous text held only by the regex", () => {
+      expect(addsSecretLike(byRegex, byReader)).toBe(true);
+    });
+
+    it("refuses a second regex copy that only a reader copy could cover", () => {
+      expect(addsSecretLike(`${byRegex}\n${byReader}`, `${byRegex}\n${byRegex}`)).toBe(true);
+    });
+  });
+
   it("flags an edit that swaps one credential for another, which keeps their count", () => {
     expect(addsSecretLike(`password: old-secret\nsk-\nABCDEFGHIJKLMNO\n`, `${KEY}\n`)).toBe(true);
   });
