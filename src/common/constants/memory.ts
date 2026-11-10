@@ -111,6 +111,14 @@ export const MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES = 32;
  */
 export const MEMORY_CONSOLIDATION_PATH_MAX_CHARS = 512;
 /**
+ * Longest note (characters) a journal row stores. A failed command's error can be long: a
+ * str_replace whose old_str matches many lines of a large file lists every line number, and an
+ * organizer run can journal up to MEMORY_DREAM_EDIT_LIMIT_MAX failed edits. Every fixed refusal
+ * note quotes at most one path of MEMORY_CONSOLIDATION_PATH_MAX_CHARS and stays whole; a longer
+ * note is cut, with a marker. The tool still returns the whole error to the model.
+ */
+export const MEMORY_CONSOLIDATION_NOTE_MAX_CHARS = 1024;
+/**
  * Memory analyzer (the harvest of one closed or open compaction epoch): mutating memory
  * commands for the whole epoch. All of its transcript chunks, a retry of the epoch, and
  * every later run of the same epoch (an archive after new rows, the compaction that

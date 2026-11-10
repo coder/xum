@@ -11,6 +11,7 @@ import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
   MEMORY_DREAM_EDIT_LIMIT_MAX,
+  MEMORY_CONSOLIDATION_NOTE_MAX_CHARS,
   MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
@@ -637,6 +638,65 @@ describe("consolidation memory tool rails", () => {
         expect(op.note?.length).toBeLessThan(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
       }
       expect(fixture.getMutationCount()).toBe(0);
+    });
+
+    it("bounds every row a run of failed edits journals, and returns each error whole", async () => {
+      // The unlimited budget: each failed str_replace spends an edit and journals a row.
+      using fixture = await createFixture({ guard: { budget: organizerEditBudget(null).budget } });
+      // A near-full-size file in which old_str starts every line: each failed str_replace's error
+      // lists every line number. (Few matches per line: findMatchingLines re-reads the file once
+      // per match.)
+      const line = `x${"-".repeat(126)}\n`;
+      const lines = MEMORY_MAX_FILE_BYTES / line.length - 1;
+      const created = await execute(fixture.tool, {
+        command: "create",
+        path: "/memories/global/big.md",
+        file_text: line.repeat(lines),
+      });
+      expect(created.success).toBe(true);
+
+      const failures = 10;
+      for (let index = 0; index < failures; index++) {
+        const result = await execute(fixture.tool, {
+          command: "str_replace",
+          path: "/memories/global/big.md",
+          old_str: "x",
+          new_str: "y",
+        });
+        expect(result.success).toBe(false);
+        if (result.success) continue;
+        // The model still gets every line number to pick a unique old_str from.
+        expect(result.error).toContain(`matches ${lines} locations`);
+        expect(result.error).toContain(`, ${lines})`);
+        const row = fixture.journal.at(-1);
+        expect(row?.applied).toBe(false);
+        expect(row?.note).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+        expect(result.error.startsWith(row?.note?.slice(0, 200) ?? "-")).toBe(true);
+      }
+
+      expect(fixture.journal).toHaveLength(failures + 1);
+      // Every row stays within what the caps allow (path, newPath and note, plus its JSON keys),
+      // so the journal's size is bounded by its row count.
+      const maxRowChars =
+        2 * MEMORY_CONSOLIDATION_PATH_MAX_CHARS + MEMORY_CONSOLIDATION_NOTE_MAX_CHARS + 100;
+      for (const row of fixture.journal) {
+        expect(JSON.stringify(row).length).toBeLessThanOrEqual(maxRowChars);
+      }
+    }, 30_000);
+
+    it("journals a failed edit's error whole when it fits the note cap", async () => {
+      using fixture = await createFixture();
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "small.md"), "x\nx\n");
+
+      const result = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/small.md",
+        old_str: "x",
+        new_str: "y",
+      });
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(fixture.journal[0]?.note).toBe(result.error);
     });
 
     it("accepts a path of exactly the cap", async () => {
@@ -1467,6 +1527,8 @@ describe("organizerEditBudget", () => {
     [null, MEMORY_DREAM_EDIT_LIMIT_MAX],
     [MEMORY_DREAM_EDIT_LIMIT_MAX + 1, MEMORY_DREAM_EDIT_LIMIT_MAX],
     [1_000_000, MEMORY_DREAM_EDIT_LIMIT_MAX],
+    // NaN would make Math.min NaN, a budget that never refuses.
+    [Number.NaN, MEMORY_CONSOLIDATION_OP_BUDGET],
   ])("gives a limit of %p a budget of %p and a prompt line that says so", (editLimit, limit) => {
     const editBudget = organizerEditBudget(editLimit);
 
