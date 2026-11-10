@@ -77,14 +77,31 @@ function PlanTabBody(props: PlanTabProps) {
   // per workspace. The ref starts from the saved offset, so an unmount before the plan rendered
   // (a slow read, no client) saves it back unchanged; scrolling updates it, unmount saves it,
   // and the restore runs once the plan renders (the body has its height only then). A re-read
-  // keeps the body, so its offset stays.
+  // keeps the body, so its offset stays. A body mounted in a hidden sidebar (the narrow
+  // layout's `display: none`, shown full-screen later without a remount) has no layout box, and
+  // setting scrollTop there does nothing: the restore then waits until the body gets one.
   const bodyRef = useRef<HTMLDivElement>(null);
   const [savedScrollTop] = useState(() =>
     normalizeScrollTop(readPersistedState<unknown>(getPlanTabScrollTopKey(workspaceId), 0))
   );
   const scrollTopRef = useRef(savedScrollTop);
   useEffect(() => {
-    if (hasPlan && bodyRef.current) bodyRef.current.scrollTop = scrollTopRef.current;
+    const body = bodyRef.current;
+    if (!hasPlan || body == null) return;
+    const restore = () => {
+      body.scrollTop = scrollTopRef.current;
+    };
+    if (body.getClientRects().length > 0 || typeof ResizeObserver === "undefined") {
+      restore();
+      return;
+    }
+    const observer = new ResizeObserver(() => {
+      if (body.getClientRects().length === 0) return;
+      observer.disconnect();
+      restore();
+    });
+    observer.observe(body);
+    return () => observer.disconnect();
   }, [hasPlan]);
   useEffect(() => {
     return () => {
