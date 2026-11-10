@@ -39,7 +39,7 @@ describe("parseModelClassValue", () => {
   });
 
   test("accepts full provider:model ids (unlike the composer one-shot parser)", () => {
-    expect(parseModelClassValue("anthropic:claude-fable-5-1+max")).toEqual({
+    expect(parseModelClassValue(`${KNOWN_MODELS.FABLE.id}+max`)).toEqual({
       model: KNOWN_MODELS.FABLE.id,
       thinkingLevel: "max",
     });
@@ -76,7 +76,7 @@ describe("splitModelClassValue / buildModelClassValue", () => {
 describe("resolveSkillModelClassBinding", () => {
   const modelClasses = {
     small: "haiku+0",
-    large: "anthropic:claude-fable-5-1+max",
+    large: `${KNOWN_MODELS.FABLE.id}+max`,
   };
 
   test("binds via frontmatter metadata and resolves numeric thinking to a concrete level", () => {
