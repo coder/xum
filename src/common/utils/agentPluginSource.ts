@@ -90,10 +90,7 @@ function isPlainWin32DrivePath(url: string): boolean {
     .split(/[\\/]/)
     .every(
       (name) =>
-        name === "" ||
-        name === "." ||
-        name === ".." ||
-        (!/[ .]$/.test(name) && !WIN32_DEVICE_NAME.test(name))
+        name === "." || name === ".." || (!/[ .]$/.test(name) && !WIN32_DEVICE_NAME.test(name))
     );
 }
 

@@ -345,6 +345,8 @@ describe("surelyOnThisMachine", () => {
     ["a device name in capitals", "C:/AUX/market"],
     ["a device name and spaces before the extension", "C:/aux .git/market"],
     ["a wildcard", "h:/org/market*.git"],
+    ["a device name after a backslash", "C:\\repos\\aux\\market"],
+    ["a folder that ends in a period after a backslash", "C:\\repos\\a.\\market"],
     ["a name that ends in a period", "C:market."],
     ["a folder that ends in a period", "C:/a./market"],
     ["a name of three periods", "C:/.../market"],
