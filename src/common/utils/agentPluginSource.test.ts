@@ -347,8 +347,8 @@ describe("surelyOnThisMachine", () => {
     // Git reads the host `~h`: the first slash comes after the colon.
     ["a tilde with a colon before its first slash", "~h:org/market.git"],
     ["a colon first", ":market.git"],
-    // A first character of any kind and a colon is an scp host, not a drive: one code point
-    // (`.` without the `u` flag matches half of it) and a newline (`.` without `s` skips it).
+    // A first character that is not a letter reads as an scp host, not as a drive: a code point
+    // outside the BMP, and a newline.
     ["an astral first character", "\u{1F600}:x"],
     ["a newline first", "\n:x"],
   ])("counts %s as remote on every platform", (_label, url) => {
