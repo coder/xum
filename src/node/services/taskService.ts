@@ -2642,8 +2642,15 @@ interface ChildStreamEndContext extends StreamEndAdmission {
 /** A child stream end's context plus what it read once its workspace turn was finalized. */
 interface ChildStreamEndState extends ChildStreamEndContext {
   readonly status: WorkspaceConfigEntry["taskStatus"];
-  /** The stream's final report; always null for a plan-like task. */
+  /**
+   * The stream's final report; null for a plan-like task, and for a reported row, which publishes
+   * none.
+   */
   readonly reportArgs: Awaited<ReturnType<TaskService["resolveFinalAgentReportArgs"]>>;
+  /**
+   * Whether the task is plan-like. Not read (false) where no reader needs the answer: a stream
+   * with neither a final response nor a propose_plan result, and a reported row's final response.
+   */
   readonly isPlanLike: boolean;
   readonly proposePlanResult: ReturnType<TaskService["findProposePlanSuccessInParts"]>;
 }
@@ -20347,13 +20354,26 @@ export class TaskService implements AgentTaskIntegration {
             acceptSchemaShapedWorkflowReport: acceptsSchemaShapedWorkflowReport,
           })
         : null;
-    const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
+    const proposePlanResult = this.findProposePlanSuccessInParts(event.parts);
+    // The probe reads agent definitions from the user's home, which takes seconds on a host with
+    // many skills, and a send that arrives while the stream's decision waits is refused as stale.
+    // So the decision does not wait for it where its answer changes nothing: a stream with neither
+    // a final response nor a propose_plan result, and a reported row's final response. A reported
+    // row publishes no report, so the handler resolves its decision `nonreport` whatever the
+    // answer (the ledger can still turn that into `indeterminate`: see
+    // StreamEndLedger.resolveStreamEndDecision), and it does so before the cleanup of the
+    // reported task, as a plan-like task's final response always did.
+    // The answer still matters to a propose_plan result (the plan hand-off) and to a final
+    // response on any other row (a plan-like task's final response is no report).
+    const probeDecidesReport =
+      proposePlanResult != null || (finalAgentReportArgs != null && status !== "reported");
+    const isPlanLike = probeDecidesReport ? await this.isPlanLikeTaskWorkspace(entry) : false;
     const state: ChildStreamEndState = {
       ...ctx,
       status,
-      reportArgs: isPlanLike ? null : finalAgentReportArgs,
+      reportArgs: isPlanLike || status === "reported" ? null : finalAgentReportArgs,
       isPlanLike,
-      proposePlanResult: this.findProposePlanSuccessInParts(event.parts),
+      proposePlanResult,
     };
     this.decideNonreportBeforeContinuation(state);
     return this.settleInterruptedOrReportedChild(state);
