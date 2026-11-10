@@ -1350,6 +1350,37 @@ describe("ServiceContainer", () => {
     expect(services.appFiberScope.state._tag).toBe("Closed");
   });
 
+  // The desktop's two before-quit handlers run dispose() and shutdown() at once. Sandboxed tool
+  // calls still finalizing in a supervised fiber need srt until they end.
+  it("resets the agent sandbox only after supervised fibers finalize, also alongside shutdown()", async () => {
+    services = new ServiceContainer(stores);
+    const steps: string[] = [];
+    const occupantHeld = Promise.withResolvers<void>();
+    services.runtime.managed.runSync(
+      Effect.forkIn(
+        Effect.never.pipe(
+          Effect.ensuring(
+            Effect.promise(() => occupantHeld.promise).pipe(
+              Effect.andThen(Effect.sync(() => steps.push("occupant-finalized")))
+            )
+          )
+        ),
+        services.appFiberScope
+      )
+    );
+    spyOn(services.agentSandbox, "dispose").mockImplementation(() => {
+      steps.push("sandbox-reset");
+      return Promise.resolve();
+    });
+
+    const disposed = services.dispose();
+    await services.shutdown();
+    occupantHeld.resolve();
+    await disposed;
+
+    expect(steps).toEqual(["occupant-finalized", "sandbox-reset"]);
+  });
+
   // Real work, end to end: a container, a real stream, durable history writes and the analytics
   // worker's DuckDB shutdown (about 0.2 s of its own). It takes 0.1 to 0.4 s of CPU alone and
   // 5.2 to 7.0 s with eight busy processes per core, so the default 5 s limit failed it while

@@ -837,7 +837,8 @@ export class ServiceContainer {
     this.perfFlightRecorder.stop();
     await this.perfCaptures.dispose();
     this.agentResourceLimits.dispose();
-    await this.agentSandbox.dispose();
+    // Not the agent sandbox: the desktop runs this alongside dispose(), which stops srt only once
+    // the supervised fibers (sandboxed tool calls among them) have ended.
     this.idleCompactionService.stop();
     await this.browserBridgeServer.stop();
     await this.bashAiProxy.stop();

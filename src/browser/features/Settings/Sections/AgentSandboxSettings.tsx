@@ -83,11 +83,17 @@ function useAgentSandbox() {
     // API doubles in tests of other settings can omit this namespace.
     if (api?.agentSandbox == null) return;
     const controller = new AbortController();
+    let loaded = false;
     followConfigValue(
       api,
       controller.signal,
       (client) => client.agentSandbox.get(),
-      setState
+      (next) => {
+        setState(next);
+        // Each connection's first load replaces an error from before it, as in the resource limits.
+        if (!loaded) setError(null);
+        loaded = true;
+      }
     ).catch((loadError: unknown) => {
       if (isStreamFailure(loadError, controller.signal)) {
         setError(`Failed to load the agent sandbox setting: ${getErrorMessage(loadError)}`);

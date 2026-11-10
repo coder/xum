@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as SelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import {
   createControllableAsyncIterable,
   createTestApiClient,
@@ -47,6 +48,7 @@ const PHAROS = "/home/user/src/pharos";
 /** The server's saved setting and the saves it receives; it applies each save as the backend does. */
 function createServer(initial: AgentSandboxState) {
   let saved = initial;
+  let loadError: Error | null = null;
   const set = mock((patch: AgentSandboxPatch) => {
     saved = { ...saved, global: patchAgentSandbox(saved.global, patch) ?? {} };
     return Promise.resolve(saved);
@@ -61,13 +63,22 @@ function createServer(initial: AgentSandboxState) {
       return Promise.resolve(saved);
     }
   );
+  const get = () => {
+    const failure = loadError;
+    loadError = null;
+    return failure == null ? Promise.resolve(saved) : Promise.reject(failure);
+  };
   const overrides = (): TestApiOverrides<APIClient> => ({
-    agentSandbox: { get: () => Promise.resolve(saved), set, setProject },
+    agentSandbox: { get, set, setProject },
     config: {
       onConfigChanged: () => Promise.resolve(createControllableAsyncIterable<undefined>().iterable),
     },
   });
-  return { set, setProject, overrides };
+  /** The next load fails with `error`. */
+  const failNextLoad = (error: Error) => {
+    loadError = error;
+  };
+  return { set, setProject, overrides, failNextLoad };
 }
 
 function renderSettings(initial: AgentSandboxState) {
@@ -231,5 +242,31 @@ describe("AgentSandboxSettings", () => {
     await waitFor(() =>
       expect((view.getByRole("button", { name: "On" }) as HTMLButtonElement).disabled).toBe(true)
     );
+  });
+});
+
+describe.each([...GAP_MODES])("AgentSandboxSettings while reconnecting (%s)", (mode) => {
+  test("a load that succeeds after reconnecting clears the failed load's error", async () => {
+    const server = createServer({
+      global: { enabled: true },
+      projects: {},
+      support: { state: "supported" },
+    });
+    server.failNextLoad(new Error("config unreadable"));
+    const harness = createConnectionHarness(mode, server.overrides);
+    const view = render(
+      <harness.Wrapper>
+        <AgentSandboxSettings />
+      </harness.Wrapper>
+    );
+    await view.findByText(/Failed to load the agent sandbox setting: config unreadable/);
+
+    await harness.drop();
+    harness.reconnect();
+
+    const toggle = () =>
+      view.getByRole("switch", { name: "Run agent commands in a sandbox" }) as HTMLButtonElement;
+    await waitFor(() => expect(toggle().disabled).toBe(false));
+    expect(view.queryByText(/Failed to load the agent sandbox setting/)).toBeNull();
   });
 });
