@@ -7,7 +7,7 @@ import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import type { WorkspaceNameState } from "@/browser/hooks/useWorkspaceName";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import {
   mockCoderInfoAvailable,
   mockCoderInfoMissing,
@@ -260,6 +260,8 @@ export const DevcontainerUnavailable: Story = {
  * SSH backend yet, so they stay listed but disabled with the reason.
  */
 export const SshWithoutIsolation: Story = {
+  // The play checks the behavior; a pixel snapshot would only spend the snapshot budget.
+  parameters: { pixel: PIXEL_DISABLED },
   args: {
     initialRuntime: {
       mode: "ssh",
