@@ -5639,6 +5639,16 @@ describe("MemoryConsolidationService", () => {
           )
         ).toEqual({ kind: "failed", error: "consolidation stream failed: cut short" });
       });
+
+      it("fails a provider error while the timeout has not fired, though neither has a reason", () => {
+        // A live signal's reason is undefined, like a provider error's abort reason.
+        expect(
+          organizerRunEnd(
+            { ops: applied, streamError: "provider 500", abortReason: undefined },
+            live()
+          )
+        ).toEqual({ kind: "failed", error: "consolidation stream failed: provider 500" });
+      });
     });
 
     it("cuts the organizer stream at the saved timeout and keeps the record of its edits", async () => {
@@ -5785,16 +5795,22 @@ describe("MemoryConsolidationService", () => {
         // The organizer stream got no timeout.
         expect(timeouts).toEqual([]);
 
+        const start = Date.now();
         const waiter = fixture.service.maybeRun("ws-other", "manual");
+        expect(await settlesWithin(waiter, 800)).toBe(false);
+        // Past the 5-minute floor of the lock wait: a run queued in this process still waits, so
+        // no deadline that reads Date.now() cut its turn.
+        setSystemTime(new Date(start + 6 * minute));
         expect(await settlesWithin(waiter, 800)).toBe(false);
 
         await fixture.service.cancelInFlightConsolidation("ws-dream");
         expect((await hanging).success).toBe(false);
         expect((await waiter).success).toBe(true);
       } finally {
+        setSystemTime();
         spy.mockRestore();
       }
-    });
+    }, 30_000);
 
     /** Resolves once `promise` settled, or false after `ms` of real time. */
     async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
