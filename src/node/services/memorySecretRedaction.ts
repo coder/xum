@@ -49,13 +49,14 @@ const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // Google `X-Goog-Signature`. Only the value goes, and only in query position (after `?` or `&`,
   // `&amp;` too, as in XML listings). `signature` stays out of SECRET_NAME: the memory-write guard
   // reuses it, and prose such as `signature: foo(a, b)` must stay writable. A value that is only the
-  // marker (the marker, then a character that ends a value or the end of the text) is skipped, as
-  // the key/value rule skips it: the value stops before `]`, so a second pass would read `[redacted`
-  // as a value and write `[redacted]]`. `]` does not count as the end here: behind `[redacted]` it
-  // can open more of the value (`[redacted]]SEKRIT`), and every value that goes on past the marker
-  // is redacted as before, so the write guard still refuses it.
+  // marker (the marker, then a character that cannot belong to a query value, or the end of the
+  // text) is skipped, as the key/value rule skips it: the value stops before `]`, so a second pass
+  // would read `[redacted` as a value and write `[redacted]]`. `]` `;` `,` `)` and `}` do not count
+  // as that end: a URL parser keeps them in the value, so behind `[redacted]` they can open more of
+  // it (`[redacted];SEKRIT`). Every value that goes on past the marker is redacted as before, so the
+  // write guard still refuses it.
   new RegExp(
-    String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)(?!\[redacted\](?:[\s"'\\<>&#,;)}]|$))[^\s"'\\<>&#,;)\]}]+`,
+    String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)(?!\[redacted\](?:[\s"'\\<>&#]|$))[^\s"'\\<>&#,;)\]}]+`,
     "gi"
   ),
   // Anchored to the start of a character run: `\b` also matches after `-`, so `eyJ-eyJ-eyJ-...`

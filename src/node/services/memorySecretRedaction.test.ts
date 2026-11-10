@@ -1069,7 +1069,13 @@ describe("redactSecretLike", () => {
       "GET /x?a=1&sig=[redacted] HTTP/1.1",
       "GET /x?a=1&sig=[redacted] HTTP/1.1",
     ],
-    ["a marker in parentheses", "(see ?sig=[redacted])", "(see ?sig=[redacted])"],
+    ["a marker before a fragment", "?sig=[redacted]#frag", "?sig=[redacted]#frag"],
+    ["a marker before a closing tag", "<Url>?sig=[redacted]</Url>", "<Url>?sig=[redacted]</Url>"],
+    [
+      "a marker before an escaped quote",
+      String.raw`{\"u\": \"?sig=[redacted]\"}`,
+      String.raw`{\"u\": \"?sig=[redacted]\"}`,
+    ],
     ["a marker before the next parameter", "?sig=[redacted]&sp=r", "?sig=[redacted]&sp=r"],
     ["a marker before a closing quote", '["?sig=[redacted]"]', '["?sig=[redacted]"]'],
     ["an upper-case marker as the whole value", "?sig=[REDACTED]", "?sig=[REDACTED]"],
@@ -1083,8 +1089,9 @@ describe("redactSecretLike", () => {
   );
 
   // A value that goes on past the marker is not the marker: it is redacted exactly as before, so the
-  // output is main's, and the write guard refuses it. `]` is part of such a value, not its end. The
-  // tail that this pass leaves behind `]` is a known gap, pinned so this change does not move it.
+  // output is main's, and the write guard refuses it. `]` `;` `,` `)` and `}` are part of such a
+  // value, not its end: a URL parser keeps them in the query value. The tail that this pass leaves
+  // behind them is a known gap, pinned so this change does not move it.
   it.each([
     ["a value behind the marker", "?sig=[redacted]SEKRIT", "?sig=[redacted]]SEKRIT"],
     ["a value behind an upper-case marker", "?sig=[REDACTED]x", "?sig=[redacted]]x"],
@@ -1100,6 +1107,15 @@ describe("redactSecretLike", () => {
       "?sig=[redacted]]].xyz",
     ],
     ["a bracket behind the marker", "?sig=[redacted]]", "?sig=[redacted]]]"],
+    [
+      "a semicolon and a value behind the marker",
+      "https://x/?sig=[redacted];SEKRIT",
+      "https://x/?sig=[redacted]];SEKRIT",
+    ],
+    ["a comma and a value behind the marker", "?sig=[redacted],x", "?sig=[redacted]],x"],
+    ["a parenthesis and a value behind the marker", "?sig=[redacted])x", "?sig=[redacted]])x"],
+    ["a brace and a value behind the marker", "?sig=[redacted]}x", "?sig=[redacted]]}x"],
+    ["a parenthesis behind the marker", "(see ?sig=[redacted])", "(see ?sig=[redacted]])"],
     [
       "a key's marker with a tail, as the harvest renderer shows it",
       "https://acct.blob.core.windows.net/c/b?sv=1&sig=sk-ABCDEFGHIJKL%2BSEKRITTAIL%3D",
