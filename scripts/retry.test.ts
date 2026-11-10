@@ -166,7 +166,10 @@ describe.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
       expect(result.exitCode).toBe(0);
       const seconds = (await lines("cuts")).map((cut) => Number(cut.split(" ")[2]));
       expect(seconds).toHaveLength(2);
-      expect(seconds[0]).toBe(9);
+      // bash counts `$SECONDS` in whole seconds, so a tick between the start of retry.sh and the
+      // first cut takes one second off the first budget: 8 or 9, never less or more.
+      expect(seconds[0]).toBeGreaterThanOrEqual(8);
+      expect(seconds[0]).toBeLessThanOrEqual(9);
       expect(seconds[1]).toBeLessThanOrEqual(7);
       expect(seconds[1]).toBeGreaterThan(0);
     });
