@@ -498,23 +498,31 @@ export function resolveEntrySource(
   marketplaceUrl: string,
   entry: ClaudeMarketplaceEntry
 ): ResolvedEntrySource {
-  if (entry.problem !== undefined) throw new Error(entry.problem);
   const rules = MARKETPLACE_FILE_RULES[marketplace.file];
-  const withheld = rules.refusal?.(entry);
-  if (withheld !== undefined) throw new Error(withheld);
-  const refused = REFUSED_SOURCE_REASONS[entry.sourceKind];
-  if (refused !== undefined) throw new Error(refused);
+  assertEntryMayInstall(rules, entry);
   const source = entry.raw.source;
   if (typeof source === "string" || isLocalSource(rules, source)) {
-    const folder = typeof source === "string" ? source : source.path;
-    if (typeof folder !== "string") throw new Error("A 'local' source needs 'path' as a folder.");
-    return { kind: "relative", subpath: rules.folderOf(folder, marketplace) };
+    return { kind: "relative", subpath: rules.folderOf(localSourcePath(source), marketplace) };
   }
   if (!isPlainObject(source)) throw new Error("The entry has no source.");
   if (!rules.objectSources.includes(entry.sourceKind)) {
     throw new Error(`Marketplace source '${String(source.source)}' is not supported.`);
   }
   return remoteEntrySource(source, marketplaceUrl, rules);
+}
+
+/** Throws why an entry cannot install whatever its source resolves to. */
+function assertEntryMayInstall(rules: MarketplaceFileRules, entry: ClaudeMarketplaceEntry): void {
+  if (entry.problem !== undefined) throw new Error(entry.problem);
+  const reason = rules.refusal?.(entry) ?? REFUSED_SOURCE_REASONS[entry.sourceKind];
+  if (reason !== undefined) throw new Error(reason);
+}
+
+/** The path of a plain path source or of a `{source: "local", path}` object. */
+function localSourcePath(source: string | Record<string, unknown>): string {
+  const folder = typeof source === "string" ? source : source.path;
+  if (typeof folder !== "string") throw new Error("A 'local' source needs 'path' as a folder.");
+  return folder;
 }
 
 /** The clone URL of a `github` source `repo` (owner/repo). */
