@@ -4818,6 +4818,8 @@ describe("MemoryConsolidationService", () => {
       [0, "This run has no edit limit."],
     ])("runs an organizer pass for a saved limit of %p with its budget", async (limit, line) => {
       using fixture = await createFixture();
+      // Other preferences, but no memory group unless a limit is saved: the run still reads it.
+      await fixture.config.updateUserPreferences([{ appearance: { vimEnabled: true } }]);
       if (limit !== undefined) {
         await fixture.config.updateUserPreferences([{ memory: { dreamEditLimit: limit } }]);
       }
