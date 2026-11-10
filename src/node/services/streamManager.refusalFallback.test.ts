@@ -21,6 +21,7 @@ import {
   installStreamManagerTestHistory,
   historyService,
   createTestLanguageModel,
+  finishStep,
   REFUSAL_FINISH,
   STOP_FINISH,
   runTurnForTests,
@@ -498,6 +499,87 @@ describe("StreamManager - default refusal fallback chains", () => {
     expect(completion.status).toBe("completed");
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(prepare.mock.calls[0]?.[0]).toBe(sonnet5);
+  });
+});
+
+describe("StreamManager - refusal categories with no recommended fallback", () => {
+  // Anthropic: "For categories with no recommended fallback, such as `reasoning_extraction`, the
+  // refusal stands" (Fable 5.2, "Refusals, fallback, and billing"). The category rides on the
+  // refusing step's provider metadata (`anthropic.stopDetails.category`).
+  const BILLED = { inputTokens: 10, outputTokens: 0, totalTokens: 10 };
+  const refusedWith = (category?: string): ScriptedAttempt => ({
+    chunks: [
+      finishStep(BILLED, {
+        anthropic: { stopDetails: { type: "refusal", ...(category ? { category } : {}) } },
+      }),
+      REFUSAL_FINISH,
+    ],
+    usage: BILLED,
+  });
+
+  test("a reasoning_extraction refusal ends the turn without walking the chain", async () => {
+    const { prepare, chain } = preparedFallback();
+    const usage = createUsageRecorder();
+    const streamManager = createStreamManagerForTests(historyService, {
+      sessionUsageService: usage.sessionUsageService,
+      streamText: scriptedStreamText([refusedWith("reasoning_extraction")]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "ws-no-fallback-category",
+      modelString: KNOWN_MODELS.FABLE.id,
+      modelFallback: { chain, prepare },
+    });
+    expect(prepare).not.toHaveBeenCalled();
+    expect(completion.status).toBe("failed");
+    expect(completion.status === "failed" ? completion.streamError.errorType : null).toBe(
+      "model_refusal"
+    );
+    // The refused attempt is billed in this category: its usage is still recorded once.
+    expect(usage.ledgerKeys()).toEqual([KNOWN_MODELS.FABLE.id]);
+    expect(usage.sidecarRows().map((row) => row.source)).toEqual(["refused_stream"]);
+  });
+
+  test.each(["cyber", "bio", "frontier_llm", "general_harms", undefined])(
+    "a refusal with category %p still falls back",
+    async (category) => {
+      const { prepare, chain } = preparedFallback();
+      const streamManager = createStreamManagerForTests(historyService, {
+        streamText: scriptedStreamText([
+          refusedWith(category),
+          {
+            chunks: [{ type: "text-delta", text: "fallback answer" }, STOP_FINISH],
+            usage: NO_USAGE,
+          },
+        ]),
+      });
+      const { completion } = await runTurnForTests(streamManager, {
+        workspaceId: `ws-fallback-category-${category ?? "none"}`,
+        modelString: KNOWN_MODELS.FABLE.id,
+        modelFallback: { chain, prepare },
+      });
+      expect(completion.status).toBe("completed");
+      expect(prepare).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test("a hop that refuses with reasoning_extraction ends the chain at that hop", async () => {
+    const chain = ["anthropic:claude-opus-5", "anthropic:claude-opus-4-8"];
+    const { prepare } = preparedFallback();
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([refusedWith("cyber"), refusedWith("reasoning_extraction")]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "ws-no-fallback-category-mid-chain",
+      modelString: KNOWN_MODELS.FABLE.id,
+      modelFallback: { chain, prepare },
+    });
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(completion.status).toBe("failed");
+    const partial = await historyService.readPartial("ws-no-fallback-category-mid-chain");
+    expect(partial?.metadata?.modelFallback?.refusedModels).toEqual([
+      KNOWN_MODELS.FABLE.id,
+      chain[0],
+    ]);
   });
 });
 
