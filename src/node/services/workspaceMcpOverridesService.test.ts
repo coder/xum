@@ -5507,8 +5507,9 @@ describe("WorkspaceMcpOverridesService", () => {
       const service = new WorkspaceMcpOverridesService(config);
       const healthy = await registerWorkspace("healthy-beside-legacy");
       await writeEnable(healthy.workspacePath);
-      const real = config.editConfig.bind(config);
-      const editSpy = spyOn(config, "editConfig").mockImplementation((...args) => {
+      // The clear edits through editConfigIfChanged, so it never rewrites an unchanged file.
+      const real = config.editConfigIfChanged.bind(config);
+      const editSpy = spyOn(config, "editConfigIfChanged").mockImplementation((...args) => {
         if (new Error().stack?.includes("clearLegacyOverridesInConfig")) {
           nodeFs.writeFileSync(path.join(tempDir, "config.json"), "{ not json");
           return Promise.reject(new Error("the legacy clear failed"));
