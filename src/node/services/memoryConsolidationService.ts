@@ -86,7 +86,10 @@ import type { MemoryScopeContext, MemoryService } from "@/node/services/memorySe
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { KeyedTurnQueue } from "@/node/utils/concurrency/keyedTurnQueue";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
-import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import {
+  acquireCrossProcessLock,
+  inspectCrossProcessLock,
+} from "@/node/utils/main/crossProcessLock";
 export type MemoryConsolidationRecord = MemoryConsolidationRecordPayload;
 
 type MemoryHarvestRecord = MemoryHarvestRecordPayload;
@@ -281,6 +284,11 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Display only (normalizeHarvestRecord): whether a run is live is the owner's analyzer job lock
+ * (isAnalyzerJobLive), since a live job saves its record only after each chunk, and a chunk can
+ * wait for the dream lock and then stream for a timeout each.
+ */
 function isStalePendingHarvestRecord(record: MemoryHarvestRecord, now = Date.now()): boolean {
   // Each chunk has its own timeout, so a run of several chunks outlives one timeout while it is
   // alive: it is stale once a timeout has passed since its last sign of life, not since it started.
@@ -297,7 +305,9 @@ function normalizeHarvestRecord(record: MemoryHarvestRecord): MemoryHarvestRecor
   return {
     ...record,
     status: "failed",
-    completedAt: record.completedAt ?? Date.now(),
+    // Its last sign of life, not the time of the read: the record stays pending on disk until its
+    // boundary runs again, and each read would otherwise rank it as the newest record.
+    completedAt: record.completedAt ?? record.progressAt ?? record.startedAt,
     error: record.error ?? "stale pending harvest exceeded retry attempts",
   };
 }
@@ -307,7 +317,10 @@ function parseConsolidationRecordMap(value: unknown): Record<string, MemoryConso
   return parsed.success ? parsed.data : {};
 }
 
-function parseHarvestRecords(value: unknown): Record<string, Record<string, MemoryHarvestRecord>> {
+function parseHarvestRecords(
+  value: unknown,
+  normalize: boolean
+): Record<string, Record<string, MemoryHarvestRecord>> {
   if (!isPlainRecord(value)) return {};
   const parsed: Record<string, Record<string, MemoryHarvestRecord>> = {};
   for (const [workspaceId, workspaceRecords] of Object.entries(value)) {
@@ -315,20 +328,23 @@ function parseHarvestRecords(value: unknown): Record<string, Record<string, Memo
     const records: Record<string, MemoryHarvestRecord> = {};
     for (const [boundaryKey, record] of Object.entries(workspaceRecords)) {
       const candidate = MemoryHarvestRecordSchema.safeParse(record);
-      if (candidate.success) records[boundaryKey] = normalizeHarvestRecord(candidate.data);
+      if (candidate.success) {
+        records[boundaryKey] = normalize ? normalizeHarvestRecord(candidate.data) : candidate.data;
+      }
     }
     if (Object.keys(records).length > 0) parsed[workspaceId] = records;
   }
   return parsed;
 }
 
-function pruneHarvestRecords(records: Record<string, MemoryHarvestRecord>): void {
+/** The records past the retention cap, oldest last (see pruneHarvestRecords). */
+function harvestRecordsPastRetention(
+  records: Record<string, MemoryHarvestRecord>
+): Array<[string, MemoryHarvestRecord]> {
   const ranked = Object.entries(records).sort(
     ([, left], [, right]) => harvestRecordTime(right) - harvestRecordTime(left)
   );
-  for (const [boundaryKey] of ranked.slice(HARVEST_RECORD_RETENTION)) {
-    delete records[boundaryKey];
-  }
+  return ranked.slice(HARVEST_RECORD_RETENTION);
 }
 
 /**
@@ -477,41 +493,30 @@ interface HarvestAttemptState {
   analyzedFloorRowId?: string | null;
 }
 
+/**
+ * A save made from the stored record (see saveHarvestRecordEffect), and the workspace's records
+ * read with it; undefined writes nothing.
+ */
+type HarvestRecordBuilder = (
+  current: MemoryHarvestRecord | undefined,
+  records: Readonly<Record<string, MemoryHarvestRecord>>
+) => MemoryHarvestRecord | undefined | Promise<MemoryHarvestRecord | undefined>;
+
 /** A job's attempt: shared so the job's failure record carries what the attempt claimed. */
 interface HarvestAttempt {
   /** The attempt's number; the claim under the job lock sets it from the stored record. */
   count: number;
   /**
    * From the claim to the release of the analyzer job lock. Only then does a job write its own
-   * progress fields; any other write goes by the record on disk (see isLiveHarvestAttempt).
+   * progress fields; any other write goes by the record on disk (see unlessLiveAttempt).
    */
   holdsJobLock: boolean;
-}
-
-/**
- * A pending record whose attempt may still be running in another backend: a writer without the
- * job lock leaves it alone. Under the job lock a pending record is a dead attempt's, whatever
- * its age, since a live one would hold the lock.
- */
-function isLiveHarvestAttempt(record: MemoryHarvestRecord | undefined): boolean {
-  return record?.status === "pending" && !isStalePendingHarvestRecord(record);
 }
 
 /** The number of the attempt after the ones `record` counts. */
 function nextAttemptCount(record: MemoryHarvestRecord | undefined): number {
   // mutation-equivalent: the count is a number, and || differs from ?? only on 0, which maps to 0
   return (record?.attemptCount ?? 0) + 1;
-}
-
-/**
- * A save for a writer without the job lock (see saveHarvestRecordEffect): `build` makes the record
- * from the stored one, since another backend's attempt may have moved it since this job read it,
- * and nothing is written over an attempt that is still live.
- */
-function unlessLiveAttempt(
-  build: (current: MemoryHarvestRecord | undefined) => MemoryHarvestRecord
-): (current: MemoryHarvestRecord | undefined) => MemoryHarvestRecord | undefined {
-  return (current) => (isLiveHarvestAttempt(current) ? undefined : build(current));
 }
 
 /**
@@ -600,17 +605,13 @@ function resumedFloor(earlier: Partial<MemoryHarvestRecord>): string | null | un
 
 /**
  * The failed record that replaces `record` when it is a pending one whose last allowed attempt
- * went stale: nothing may retry it. Undefined for any other record. The rule of
- * normalizeHarvestRecord, applied to the record a job just read.
+ * died: nothing may retry it. Undefined for any other record. The caller writes it only when no
+ * live job holds the owner's lock (isAnalyzerJobLive): the record's age does not tell.
  */
 export function staleExhaustedHarvestFailure(
   record: MemoryHarvestRecord | undefined
 ): MemoryHarvestRecord | undefined {
-  if (
-    record?.status !== "pending" ||
-    !isStalePendingHarvestRecord(record) ||
-    record.attemptCount < HARVEST_MAX_ATTEMPTS
-  ) {
+  if (record?.status !== "pending" || record.attemptCount < HARVEST_MAX_ATTEMPTS) {
     return undefined;
   }
   return {
@@ -829,8 +830,12 @@ export class MemoryConsolidationService extends EventEmitter {
     );
   }
 
-  /** Self-healing load: malformed buckets are dropped independently. */
-  private loadEffect(): Effect.Effect<ConsolidationSidecarFile> {
+  /**
+   * Self-healing load: malformed buckets are dropped independently. `normalize` shows a stale
+   * pending record out of attempts as failed (normalizeHarvestRecord); a read that is written
+   * back (load) never normalizes, or any sidecar write would end a live job's slow last attempt.
+   */
+  private loadEffect(normalize = true): Effect.Effect<ConsolidationSidecarFile> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -845,7 +850,7 @@ export class MemoryConsolidationService extends EventEmitter {
           return {
             workspaces: parseConsolidationRecordMap(json.workspaces),
             projects: parseConsolidationRecordMap(json.projects),
-            harvestsByWorkspace: parseHarvestRecords(json.harvestsByWorkspace),
+            harvestsByWorkspace: parseHarvestRecords(json.harvestsByWorkspace, normalize),
           };
         },
         catch: () => undefined,
@@ -858,11 +863,11 @@ export class MemoryConsolidationService extends EventEmitter {
   }
 
   /**
-   * Promise facade over {@link loadEffect}; the sidecar critical section
+   * Promise facade over {@link loadEffect}, the records as stored; the sidecar critical section
    * (mutateSidecar) calls this so its interior stays a plain Promise seam.
    */
   private load(): Promise<ConsolidationSidecarFile> {
-    return Effect.runPromise(this.loadEffect());
+    return Effect.runPromise(this.loadEffect(false));
   }
 
   getRecord(workspaceId: string): Promise<MemoryConsolidationRecord | null> {
@@ -940,7 +945,9 @@ export class MemoryConsolidationService extends EventEmitter {
    * while it waits for the MutexMap would wedge the in-process writer ahead of it, which polls for
    * the file lock until it times out. Readers take neither: writeFileAtomic renames into place.
    */
-  private mutateSidecar(mutate: (file: ConsolidationSidecarFile) => boolean): Promise<boolean> {
+  private mutateSidecar(
+    mutate: (file: ConsolidationSidecarFile) => boolean | Promise<boolean>
+  ): Promise<boolean> {
     return this.locks.withLock(this.sidecarPath, async () => {
       const release = await acquireCrossProcessLock({
         lockPath: sidecarLockPath(this.config.rootDir),
@@ -952,7 +959,7 @@ export class MemoryConsolidationService extends EventEmitter {
       });
       try {
         const file = await this.load();
-        if (!mutate(file)) return false;
+        if (!(await mutate(file))) return false;
         await writeFileAtomic(this.sidecarPath, JSON.stringify(file, null, 2));
         return true;
       } finally {
@@ -993,24 +1000,27 @@ export class MemoryConsolidationService extends EventEmitter {
   /**
    * `record` may be a function of the stored record, for a writer that does not hold the
    * analyzer job lock: it decides from what is on disk now, and undefined writes nothing.
+   * `underJobLock` says whether the writer holds its owner's analyzer job lock (pruneHarvestRecords).
    */
   private saveHarvestRecordEffect(
     workspaceId: string,
     boundaryKey: string,
-    record:
-      | MemoryHarvestRecord
-      | ((current: MemoryHarvestRecord | undefined) => MemoryHarvestRecord | undefined),
-    projectPath: string
+    record: MemoryHarvestRecord | HarvestRecordBuilder,
+    projectPath: string,
+    underJobLock = false
   ): Effect.Effect<void> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.uninterruptible(
       Effect.gen(function* () {
         const saved = yield* Effect.promise(() =>
-          self.mutateSidecar((file) => {
+          self.mutateSidecar(async (file) => {
             file.harvestsByWorkspace[workspaceId] ??= {};
             const existing = file.harvestsByWorkspace[workspaceId][boundaryKey];
-            const next = typeof record === "function" ? record(existing) : record;
+            const next =
+              typeof record === "function"
+                ? await record(existing, file.harvestsByWorkspace[workspaceId])
+                : record;
             if (next === undefined) return false;
             // A terminal record is never reopened: removal finalization
             // (finalizeHarvestsForRemoval) races the bounded cancellation
@@ -1022,13 +1032,70 @@ export class MemoryConsolidationService extends EventEmitter {
               if (next.status !== "completed") return false;
             }
             file.harvestsByWorkspace[workspaceId][boundaryKey] = next;
-            pruneHarvestRecords(file.harvestsByWorkspace[workspaceId]);
+            await self.pruneHarvestRecords(workspaceId, file.harvestsByWorkspace[workspaceId], {
+              boundaryKey,
+              underJobLock,
+            });
             return true;
           })
         );
         if (saved) self.emitStatusChange(workspaceId, projectPath);
       })
     );
+  }
+
+  /**
+   * Whether a job of `ownerId` may still be running, in this backend or another: its analyzer job
+   * lock is held by a live process. A job writes pending records only under that lock, so a
+   * pending record without a live holder is a dead attempt's, whatever its age; one with a live
+   * holder may be a slow chunk's (its record is saved only after each chunk). An unreadable lock
+   * counts as held (inspectCrossProcessLock fails closed).
+   */
+  private async isAnalyzerJobLive(ownerId: string): Promise<boolean> {
+    const lock = await inspectCrossProcessLock(analyzerJobLockPath(this.config.rootDir, ownerId));
+    return lock.state === "held";
+  }
+
+  /**
+   * A save for a writer without the job lock (see saveHarvestRecordEffect): `build` makes the record
+   * from the stored one, since another backend's attempt may have moved it since this job read it,
+   * and nothing is written over a pending record while its owner's job is live. The lock is read
+   * inside the sidecar lock: a job that takes it later claims the record only after this write.
+   */
+  private unlessLiveAttempt(
+    workspaceId: string,
+    build: (current: MemoryHarvestRecord | undefined) => MemoryHarvestRecord | undefined
+  ): HarvestRecordBuilder {
+    return async (current) => {
+      if (current?.status !== "pending") return build(current);
+      const ownerId = this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
+      return (await this.isAnalyzerJobLive(ownerId)) ? undefined : build(current);
+    };
+  }
+
+  /**
+   * Drops the records past the retention cap, inside the sidecar write that saves one; never the
+   * record just saved (a live job's pending record keeps its start time, and may be past the cap).
+   * A save under the owner's job lock is the owner's only live job: every other pending record is
+   * a dead attempt's and goes like any other. A save without that lock keeps the pending records
+   * while the owner's job is live (isAnalyzerJobLive): one may be that job's, and a later crash
+   * would leave recovery nothing to retry. They go at the first save after that job ends.
+   */
+  private async pruneHarvestRecords(
+    workspaceId: string,
+    records: Record<string, MemoryHarvestRecord>,
+    saved: { boundaryKey: string; underJobLock: boolean }
+  ): Promise<void> {
+    const past = harvestRecordsPastRetention(records);
+    const keepPending =
+      !saved.underJobLock &&
+      past.some(([, record]) => record.status === "pending") &&
+      (await this.isAnalyzerJobLive(this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId)));
+    for (const [boundaryKey, record] of past) {
+      if (boundaryKey === saved.boundaryKey) continue;
+      if (keepPending && record.status === "pending") continue;
+      delete records[boundaryKey];
+    }
   }
 
   private recoverRetryableHarvestsEffect(workspaceId: string): Effect.Effect<void> {
@@ -1056,7 +1123,11 @@ export class MemoryConsolidationService extends EventEmitter {
           // Nothing to read the epoch again from: the open epoch's record has no metadata.
           if (record.completionMetadata === undefined) return false;
           if (record.attemptCount >= HARVEST_MAX_ATTEMPTS) return false;
-          return record.status === "failed" || isStalePendingHarvestRecord(record);
+          // A pending one too, even while a job of the owner holds the lock (it may run another
+          // record, and nothing else would retry this one): the retry waits for that lock, and its
+          // claim then stops on a settled record or resumes a dead one. A retry that gives up
+          // waiting journals its failure without the lock, so it leaves a live record alone.
+          return record.status === "failed" || record.status === "pending";
         })
         .sort((left, right) => left.startedAt - right.startedAt);
 
@@ -1480,7 +1551,10 @@ export class MemoryConsolidationService extends EventEmitter {
    */
   private async runAnalyzerJobTurn(
     ownerId: string,
-    job: { removalSignal: AbortSignal; journalFailure: (error: unknown) => Effect.Effect<void> },
+    job: {
+      removalSignal: AbortSignal;
+      journalFailure: (error: unknown, inJobTurn: true) => Effect.Effect<void>;
+    },
     attempt: () => Promise<void>
   ): Promise<boolean> {
     const signal = job.removalSignal;
@@ -1499,7 +1573,9 @@ export class MemoryConsolidationService extends EventEmitter {
         throw error;
       }
       try {
-        await attempt().catch((error: unknown) => Effect.runPromise(job.journalFailure(error)));
+        await attempt().catch((error: unknown) =>
+          Effect.runPromise(job.journalFailure(error, true))
+        );
         return true;
       } finally {
         await release();
@@ -1961,10 +2037,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const existingAttemptCount = existing?.attemptCount ?? 0;
       const { progress, attemptState } = harvestResumeState(existing);
 
-      const staleFailure = staleExhaustedHarvestFailure(existing);
-      if (staleFailure !== undefined) {
-        yield* self.saveHarvestRecordEffect(workspaceId, boundaryKey, staleFailure, projectPath);
-      }
+      yield* self.endDeadLastAttemptEffect(source, existing, projectPath);
 
       if (existing?.status !== "completed" && existingAttemptCount < HARVEST_MAX_ATTEMPTS) {
         const startedAt = Date.now();
@@ -1989,17 +2062,23 @@ export class MemoryConsolidationService extends EventEmitter {
         // Any failure — a typed throw below, a rejected await, or a defect such
         // as the completed-record save rejecting — journals a failed record, so
         // the fold handles the error channel AND defects identically.
-        const journalHarvestFailure = (error: unknown): Effect.Effect<void> =>
+        const journalHarvestFailure = (error: unknown, inJobTurn = false): Effect.Effect<void> =>
           Effect.gen(function* () {
+            const fromStored = (current: MemoryHarvestRecord | undefined) =>
+              failedRecord(error, nextAttemptCount(current), harvestResumeState(current));
             yield* self.saveHarvestRecordEffect(
               workspaceId,
               boundaryKey,
               attempt.holdsJobLock
                 ? failedRecord(error, attempt.count, { progress, attemptState })
-                : unlessLiveAttempt((current) =>
-                    failedRecord(error, nextAttemptCount(current), harvestResumeState(current))
-                  ),
-              projectPath
+                : // Before its claim, in its turn, the job holds the lock itself: a pending record
+                  // is a dead attempt's, and the lock it would find held is its own.
+                  inJobTurn
+                  ? fromStored
+                  : self.unlessLiveAttempt(workspaceId, fromStored),
+              projectPath,
+              // Every journal under the lock runs in the job's turn, before or after its claim.
+              inJobTurn
             );
             log.warn("[MemoryConsolidation] harvest failed", {
               workspaceId,
@@ -2023,6 +2102,27 @@ export class MemoryConsolidationService extends EventEmitter {
   }
 
   /**
+   * Fails a last attempt that is still pending once its job is dead (staleExhaustedHarvestFailure).
+   * `existing` is the job's read before its turn, which only spares other jobs the sidecar lock:
+   * the write decides from the record and the job lock as they are when it lands.
+   */
+  private endDeadLastAttemptEffect(
+    source: HarvestSource,
+    existing: MemoryHarvestRecord | undefined,
+    projectPath: string
+  ): Effect.Effect<void> {
+    // A last attempt that went stale reads as failed (normalizeHarvestRecord), so not by status.
+    if (existing === undefined || existing.status === "completed") return Effect.void;
+    if (existing.attemptCount < HARVEST_MAX_ATTEMPTS) return Effect.void;
+    return this.saveHarvestRecordEffect(
+      source.workspaceId,
+      source.boundaryKey,
+      this.unlessLiveAttempt(source.workspaceId, staleExhaustedHarvestFailure),
+      projectPath
+    );
+  }
+
+  /**
    * The old try-block of harvestThenSweepLocked; fails with the thrown cause. Runs the analyzer
    * over the epoch and persists a resume cursor after each clean chunk.
    */
@@ -2041,7 +2141,7 @@ export class MemoryConsolidationService extends EventEmitter {
       /** The workspace's records as they stood before this job: the earlier runs of this epoch. */
       earlierRecords: Record<string, MemoryHarvestRecord> | undefined;
       /** The caller's failure journal, for a failure while this attempt holds the job lock. */
-      journalFailure: (error: unknown) => Effect.Effect<void>;
+      journalFailure: (error: unknown, inJobTurn: true) => Effect.Effect<void>;
     }
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
@@ -2095,7 +2195,7 @@ export class MemoryConsolidationService extends EventEmitter {
         return yield* self.saveHarvestRecordEffect(
           workspaceId,
           boundaryKey,
-          unlessLiveAttempt(() => completed),
+          self.unlessLiveAttempt(workspaceId, () => completed),
           ctx.projectPath
         );
       }
@@ -2124,25 +2224,51 @@ export class MemoryConsolidationService extends EventEmitter {
         opts.progress.spentUsd = reached.spentUsd;
         opts.progress.usage = reached.usage;
       };
+      const pendingRecord = (progress: HarvestProgress): MemoryHarvestRecord => ({
+        status: "pending",
+        startedAt,
+        // Shown as the run's last sign of life (isStalePendingHarvestRecord); its job lock,
+        // not this time, tells other writers that it is live (unlessLiveAttempt).
+        progressAt: Date.now(),
+        attemptCount: opts.attempt.count,
+        ...harvestRecordIdentity(source),
+        ...harvestAttemptFields(progress, opts.attemptState),
+      });
       const savePending = (progress: HarvestProgress): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(
           workspaceId,
           boundaryKey,
-          {
-            status: "pending",
-            startedAt,
-            // The sign of life that keeps a run of many chunks from being stale (see
-            // isStalePendingHarvestRecord).
-            progressAt: Date.now(),
-            attemptCount: opts.attempt.count,
-            ...harvestRecordIdentity(source),
-            ...harvestAttemptFields(progress, opts.attemptState),
-          },
-          ctx.projectPath
+          pendingRecord(progress),
+          ctx.projectPath,
+          true
         );
+      // Under the job lock no other attempt at this record is live: the record is read at the
+      // claim, not before the wait, since another backend may have completed it, used up its
+      // attempts or moved its cursor meanwhile. The attempt claims it and resumes there. The read
+      // and the save are one sidecar write: a writer without the job lock lands before it (the
+      // claim counts its attempt) or after it (it finds this job live and defers), never between.
+      // The workspace's records come from that read too (the floor and the budget below).
+      const claim = async (): Promise<Record<string, MemoryHarvestRecord> | undefined> => {
+        let claimedFrom: Record<string, MemoryHarvestRecord> | undefined;
+        await Effect.runPromise(
+          self.saveHarvestRecordEffect(
+            workspaceId,
+            boundaryKey,
+            (current, records) => {
+              if (isSettledUnderJobLock(current)) return undefined;
+              claimedFrom = { ...records };
+              resumeHarvestAttemptFrom(current, opts);
+              return pendingRecord(opts.progress);
+            },
+            ctx.projectPath,
+            true
+          )
+        );
+        return claimedFrom;
+      };
       const saveUnderJobLock = (record: MemoryHarvestRecord): Promise<void> =>
         Effect.runPromise(
-          self.saveHarvestRecordEffect(workspaceId, boundaryKey, record, ctx.projectPath)
+          self.saveHarvestRecordEffect(workspaceId, boundaryKey, record, ctx.projectPath, true)
         );
 
       // One analyzer job at a time per owner store (runAnalyzerJobTurn), and each chunk's stream
@@ -2160,23 +2286,17 @@ export class MemoryConsolidationService extends EventEmitter {
               // spent. A retry keeps its own spend if that is higher. Read once the turn has come,
               // not before the wait: a record of the same epoch that ran ahead (an archive and a
               // compaction of one epoch can overlap) reaches the sidecar only when it completes.
-              const { harvestsByWorkspace } = await self.load();
-              // Under the job lock no other attempt at this record is live: the record is read
-              // here, not before the wait, since another backend may have completed it, used up
-              // its attempts or moved its cursor meanwhile. The attempt claims it and resumes there.
-              const current = harvestsByWorkspace[workspaceId]?.[boundaryKey];
-              if (isSettledUnderJobLock(current)) return;
-              resumeHarvestAttemptFrom(current, opts);
-              await Effect.runPromise(savePending(opts.progress));
+              const records = await claim();
+              if (records === undefined) return;
               opts.attempt.holdsJobLock = true;
               // The floor comes from this read too, for the same reason as the budget below.
-              const floor = floorFrom(harvestsByWorkspace[workspaceId]);
+              const floor = floorFrom(records);
               opts.attemptState.analyzedFloorRowId = floor;
               // Earlier runs read every row while this one waited for its turn: no model call.
               if (nothingLeftAfter(floor)) return saveUnderJobLock(completedRecord(opts.progress));
               opts.progress.budgetUsed = Math.max(
                 budgetSpent(opts.progress),
-                epochBudgetSpent(harvestsByWorkspace[workspaceId], epoch.data.messages)
+                epochBudgetSpent(records, epoch.data.messages)
               );
               const result = await runMemoryHarvest({
                 model: modelResult.data.model,

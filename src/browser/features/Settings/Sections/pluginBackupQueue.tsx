@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import type { APIClient } from "@/browser/contexts/API";
+import { reviewUrlOf } from "@/common/utils/agentPluginSource";
 import { getErrorMessage } from "@/common/utils/errors";
 import type {
   AgentPluginGitSource,
@@ -29,17 +30,31 @@ export interface PluginPreviewRequest {
 }
 
 /**
- * The preview that rebuilds a backed-up install. It asks for the pinned commit, not the branch
- * the plugin tracks, so the review shows the code that was backed up. It names no install method:
- * the preview takes the first one that fits, and the Install as picker offers the others.
+ * The preview that rebuilds a backed-up install, or null when the source has no https address
+ * (`reviewUrlOf`). It asks for the pinned commit, not the branch the plugin tracks, so the review
+ * shows the code that was backed up. It names no install method: the preview takes the first one
+ * that fits, and the Install as picker offers the others.
+ *
+ * SECURITY: this is the one place that turns a backed-up entry into a preview, so it holds the
+ * https-only rule itself instead of trusting the producer of the queue. An ssh source previews at
+ * its https address, and any other non-https source is refused: a preview over ssh would make git
+ * sign in with the user's SSH agent to a host the repository-controlled list names, before any
+ * consent to that plugin.
  */
-export function backupPreviewRequest(entry: BackupPluginEntry): PluginPreviewRequest {
+export function backupPreviewRequest(entry: BackupPluginEntry): PluginPreviewRequest | null {
+  const input = reviewUrlOf(entry.source.url);
+  if (input === undefined) return null;
   return {
-    input: entry.source.url,
+    input,
     ref: entry.lockedSha,
     subpath: entry.source.subpath ?? null,
     method: null,
   };
+}
+
+/** What the panel says for an entry that is not previewed: it stays skippable, nothing is fetched. */
+export function notPreviewedMessage(entry: BackupPluginEntry): string {
+  return `${entry.name} comes from a source that is not https, so a review does not preview it. Skip it, then add its repository yourself in Settings → Plugins.`;
 }
 
 /** What the Add plugin form starts with: the backed-up plugin's source and pinned commit, or nothing. */
@@ -48,8 +63,8 @@ export function seededForm(seed: BackupPluginEntry | undefined): {
   ref: string;
   subpath: string;
 } {
-  if (seed === undefined) return { input: "", ref: "", subpath: "" };
-  const request = backupPreviewRequest(seed);
+  const request = seed === undefined ? null : backupPreviewRequest(seed);
+  if (request === null) return { input: "", ref: "", subpath: "" };
   return { input: request.input, ref: request.ref ?? "", subpath: request.subpath ?? "" };
 }
 
@@ -74,6 +89,10 @@ export function usePreviewOnMount(
   useEffect(() => {
     if (!api || seed === undefined) return;
     const request = backupPreviewRequest(seed);
+    if (request === null) {
+      handlers.onError(notPreviewedMessage(seed));
+      return;
+    }
     let ignore = false;
     handlers.onStart();
     void api.agentPlugins

@@ -13,8 +13,10 @@ unset GH_DEBUG DEBUG
 # counts with the explicit read: ./scripts/check_codex_comments.sh <pr_number>
 #
 # Exits:
-#   0 - Codex approved, or reported a usage limit with no outstanding findings
-#   1 - Codex left comments to address OR failed to review for another reason
+#   0 - Codex approved and the Codex comments gate counted no open review thread, or Codex
+#       reported a usage limit with no outstanding findings
+#   1 - Codex left comments to address, approved while a review thread is open (or while the
+#       gate could not read the threads), OR failed to review for another reason
 #  10 - still waiting for Codex response (only in --once mode)
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -373,6 +375,25 @@ run_codex_comments_gate() {
   fi
 }
 
+# An approval comment or a thumbs-up says nothing about review threads that are still unresolved:
+# only the gate reads every thread. So an approval stands only when the gate (run before it) counted
+# 0 unresolved review threads: every run that read the threads prints the count, and a gate that
+# could not read them (a malformed page, a crash) prints none, which is no proof that none is open.
+# Regular comments do not block an approval here: the gate counts every Codex regular comment except
+# the ones that codex_comment_is_informational (scripts/lib/codex_comments.jq) reads as clean, and a
+# Codex comment that is not a finding must not turn an approval into exit 1. wait_pr_ready.sh runs
+# the gate over them again (its step 6), and CI's Codex Comments job runs on PR pushes, not in the
+# merge queue.
+approval_stands() {
+  if grep -Eq '^Found 0 unresolved review thread' <<<"$check_output"; then
+    return 0
+  fi
+  echo ""
+  echo "$check_output"
+  echo "❌ Codex approved PR #$PR_NUMBER, but the Codex comments gate did not confirm that no review thread is open."
+  return 1
+}
+
 # A push-triggered Codex run posts no security receipt (coder/xum#7731), so the gate waits on one.
 # The gate reads every comment and says when a request is needed: once per head, because the
 # request names the head and the gate skips a head that a request already names.
@@ -487,6 +508,7 @@ CHECK_CODEX_STATUS_ONCE() {
   approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
 
   if [[ -n "$approval_comment_at" ]]; then
+    approval_stands || return 1
     echo ""
     echo "✅ Codex approved PR #$PR_NUMBER"
     echo ""
@@ -497,6 +519,7 @@ CHECK_CODEX_STATUS_ONCE() {
   approval_reaction_at=$(echo "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.data.repository.pullRequest.reactions.nodes[]? | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
   if [[ -n "$approval_reaction_at" ]]; then
+    approval_stands || return 1
     echo ""
     echo "✅ Codex approved PR #$PR_NUMBER via thumbs-up on the PR description"
     echo ""
@@ -558,6 +581,7 @@ CHECK_CODEX_STATUS_ONCE() {
     approval_reaction_at=$(echo "$all_thumbs_up_reactions" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
     if [[ -n "$approval_reaction_at" ]]; then
+      approval_stands || return 1
       echo ""
       echo "✅ Codex approved PR #$PR_NUMBER via thumbs-up on the PR description"
       echo ""
@@ -622,7 +646,7 @@ echo "⏳ Waiting for Codex review on PR #$PR_NUMBER..."
 echo ""
 echo "Tip: after you comment '@codex review', Codex will respond with either:"
 echo "  - review comments / threads to address (script exits 1)"
-echo "  - thumbs-up reaction on the PR description OR an explicit approval comment (script exits 0)"
+echo "  - thumbs-up reaction on the PR description OR an explicit approval comment (script exits 0, or 1 while a review thread is open)"
 echo ""
 
 while true; do
