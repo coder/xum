@@ -513,6 +513,18 @@ describe("the AppImage job detector", () => {
       "bun x electron-builder \\\n  --linux \\\n  --publish always",
       true,
     ],
+    [
+      "electron-builder --linux over several lines on a macOS runner",
+      "macos-15",
+      "bun x electron-builder \\\n  --linux",
+      true,
+    ],
+    [
+      "electron-builder --mac over several lines",
+      linux,
+      "bun x electron-builder \\\n  --mac",
+      false,
+    ],
     ["make dist-linux", linux, "make dist-linux", true],
     ["bun run dist:linux", linux, "bun run dist:linux", true],
     ["a plain make dist on a Linux runner", linux, "make dist", true],
