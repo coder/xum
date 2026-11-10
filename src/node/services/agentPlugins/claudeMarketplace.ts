@@ -439,13 +439,14 @@ function readMarketplaceHeader(
  * pinned to that commit). Throws for a short or malformed sha.
  */
 function sourceRef(source: Record<string, unknown>): string | undefined {
-  if (source.sha !== undefined) {
+  // A null `sha` or `ref` is absent, as Codex's reader treats its optional fields.
+  if (source.sha != null) {
     if (typeof source.sha !== "string" || !isFullCommitSha(source.sha)) {
       throw new Error("'sha' must be a full 40-character commit SHA.");
     }
     return source.sha.toLowerCase();
   }
-  if (source.ref === undefined) return undefined;
+  if (source.ref == null) return undefined;
   const ref = optionalString(source.ref);
   if (ref === undefined) throw new Error("'ref' must be a branch or tag name.");
   return ref;
