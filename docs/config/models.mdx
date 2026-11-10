@@ -109,6 +109,16 @@ that model's fallback chain. Chains apply only to refusals, never to quota,
 auth, or network errors. Edit them under **Settings → Models → Model
 Fallbacks**, or in `~/.xum/config.json` under `modelFallbacks`.
 
+Two cases follow Anthropic's guidance for Claude Fable 5.2:
+
+- Anthropic recommends no fallback for a `reasoning_extraction` refusal: the
+  request asks the model to reproduce its reasoning in the reply. Xum shows the
+  refusal and does not retry on the chain. Change the prompt instead. Every
+  other refusal category, and a refusal with no category, falls back as usual.
+- A fallback attempt never uses Anthropic [Fast mode](/config/providers#anthropic-fast-mode),
+  even when the chat does. Anthropic limits Fast mode to some models and rejects
+  `speed: "fast"` on the others, so the fallback runs at standard speed.
+
 New installs start with these chains:
 
 | Model                         | Falls back to               |

@@ -2519,6 +2519,74 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   });
 
+  // Anthropic limits Fast mode to some models (Opus 5 needs a waitlist) and rejects `speed: "fast"`
+  // elsewhere, so a refusal fallback must not inherit the refused model's Fast pick.
+  it.each([
+    { pick: "the chat's Fast pick", chatTier: "priority" as const, providerSpeed: undefined },
+    { pick: "the provider's Fast preference", chatTier: undefined, providerSpeed: "fast" as const },
+  ])("a refusal fallback never sends Anthropic Fast mode ($pick)", async (c) => {
+    using xumHome = new DisposableTempDir("ai-service-fallback-no-fast");
+    // Coder workspaces export a gateway ANTHROPIC_BASE_URL, which takes Fast mode off the route.
+    const hostBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_BASE_URL;
+    const sourceModel = KNOWN_MODELS.FABLE.id;
+    const fallbackModel = "anthropic:claude-opus-5";
+    await writeMainConfig(xumHome.path, {
+      modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
+    });
+    const metadata = createLocalWorkspaceMetadata("fallback-no-fast", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      anthropic: {
+        apiKey: "test-key",
+        ...(c.providerSpeed != null ? { speed: c.providerSpeed } : {}),
+      },
+    });
+    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    const bodies: Array<{ speed?: string }> = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (typeof init?.body !== "string") throw new Error("Expected serialized request body");
+        bodies.push(JSON.parse(init.body) as { speed?: string });
+        // Only inspect serialized requests; never contact a provider.
+        return Promise.resolve(new Response("{}", { status: 400 }));
+      }, globalThis.fetch)
+    );
+    try {
+      const holder: NonNullable<StreamMessageOptions["activeTurnThinkingOverride"]> = {};
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: sourceModel,
+        thinkingLevel: "off",
+        ...(c.chatTier != null
+          ? { muxProviderOptions: { openai: { serviceTier: c.chatTier } } }
+          : {}),
+        activeTurnThinkingOverride: holder,
+      });
+      expect(result.success).toBe(true);
+      const primary = harness.startStreamCalls[0];
+      const fallback = await primary.modelFallback!.prepare(fallbackModel);
+      if (!fallback.success) throw new Error("Expected prepared fallback");
+      const send = (model: LanguageModel) =>
+        generateText({ model, prompt: "continue", maxRetries: 0 }).catch(() => undefined);
+      // Control: the refused model itself still runs in Fast mode.
+      await send(primary.model);
+      expect(bodies.at(-1)?.speed).toBe("fast");
+      await send(fallback.data.model);
+      expect(bodies.at(-1)).not.toHaveProperty("speed");
+      // A Fast pick made mid-turn does not reach the fallback either.
+      holder.serviceTier = "priority";
+      await send(fallback.data.model);
+      expect(bodies.at(-1)).not.toHaveProperty("speed");
+      expect(bodies).toHaveLength(3);
+    } finally {
+      fetchSpy.mockRestore();
+      if (hostBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+      else process.env.ANTHROPIC_BASE_URL = hostBaseUrl;
+    }
+  });
+
   it.each([false, true])("pins assembly across attempts (budget=%s)", async (tokenBudget) => {
     using xumHome = new DisposableTempDir("ai-pinned-request-assembly");
     const sourceModel = KNOWN_MODELS.SONNET.id;
