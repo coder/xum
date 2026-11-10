@@ -764,6 +764,48 @@ describe("consolidation memory tool rails", () => {
       expect(note).not.toContain("sk-fake");
     });
 
+    describe("a refusal note that redaction lengthens", () => {
+      // A path under the length cap whose `token=a` segments a guarded run redacts one by one: the
+      // scope refusal quotes it, and the redacted note grows past the note cap.
+      const prefix = "/memories/session/";
+      const segments = Math.floor((MEMORY_CONSOLIDATION_PATH_MAX_CHARS - prefix.length - 4) / 8);
+      const expanding = `${prefix}${"token=a&".repeat(segments)}x.md`;
+      const guard = { rejectSecretLike: true, budget: organizerEditBudget(null).budget };
+
+      it("is cut to the note cap", async () => {
+        using fixture = await createFixture({ guard });
+
+        const result = await execute(fixture.tool, {
+          command: "create",
+          path: expanding,
+          file_text: "x\n",
+        });
+
+        expect(expanding.length).toBeLessThanOrEqual(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
+        expect(result.success).toBe(false);
+        expect(fixture.journal).toHaveLength(1);
+        expect(fixture.journal[0]?.note).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      });
+
+      it("keeps the full note whole inside the cap when it takes the last slot", async () => {
+        using fixture = await createFixture({ guard });
+        for (let index = 0; index < MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES - 1; index++) {
+          await execute(fixture.tool, {
+            command: "create",
+            path: `/memories/session/n${index}.md`,
+            file_text: "x\n",
+          });
+        }
+
+        await execute(fixture.tool, { command: "create", path: expanding, file_text: "x\n" });
+
+        expect(fixture.journal).toHaveLength(MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES);
+        const note = fixture.journal.at(-1)?.note ?? "";
+        expect(note).toEndWith("later refusals of this run are not recorded.");
+        expect(note.length).toBeLessThanOrEqual(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      });
+    });
+
     it("journals a failed edit's error whole when it fits the note cap", async () => {
       using fixture = await createFixture();
       await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "small.md"), "x\nx\n");

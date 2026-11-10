@@ -110,7 +110,8 @@ export const MEMORY_DREAM_MAX_STEPS = 400;
  * says the rest are not recorded. Budgeted commands (applied, dry-run, failed) are always
  * journaled, so the cap never hides a change; they are at most the run's budget, which for an
  * organizer run is the user's edit limit and never more than MEMORY_DREAM_EDIT_LIMIT_MAX. One
- * run's journal therefore holds at most that cap plus these 32 rows (plus the one full note).
+ * run's journal therefore holds at most that cap plus these 32 rows; the row that says the rest
+ * are not recorded is one of the 32.
  */
 export const MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES = 32;
 /**
@@ -124,9 +125,10 @@ export const MEMORY_CONSOLIDATION_PATH_MAX_CHARS = 512;
 /**
  * Longest note (characters) a journal row stores. A failed command's error can be long: a
  * str_replace whose old_str matches many lines of a large file lists every line number, and an
- * organizer run can journal up to MEMORY_DREAM_EDIT_LIMIT_MAX failed edits. Every fixed refusal
- * note quotes at most one path of MEMORY_CONSOLIDATION_PATH_MAX_CHARS and stays whole; a longer
- * note is cut, with a marker. The tool still returns the whole error to the model.
+ * organizer run can journal up to MEMORY_DREAM_EDIT_LIMIT_MAX failed edits. A refusal note
+ * quotes at most one path of MEMORY_CONSOLIDATION_PATH_MAX_CHARS, but a guarded run's redaction
+ * can lengthen it past this cap (a path of `token=a&` segments), so every note over it is cut,
+ * with a marker. The tool still returns the whole error to the model.
  */
 export const MEMORY_CONSOLIDATION_NOTE_MAX_CHARS = 1024;
 /**
