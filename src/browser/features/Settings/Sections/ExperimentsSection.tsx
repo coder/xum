@@ -29,6 +29,7 @@ import { ArtifactsExperimentConfig } from "./ArtifactsExperimentConfig";
 import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
 import { MemoryDreamCostCeilingSetting } from "./MemoryDreamCostCeilingSetting";
 import { MemoryDreamEditLimitSetting } from "./MemoryDreamEditLimitSetting";
+import { MemoryDreamRunTimeoutSetting } from "./MemoryDreamRunTimeoutSetting";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
 
@@ -810,6 +811,7 @@ export function ExperimentsSection() {
                     <>
                       <MemoryDreamCostCeilingSetting />
                       <MemoryDreamEditLimitSetting />
+                      <MemoryDreamRunTimeoutSetting />
                     </>
                   )}
                 </ExperimentSettingsPanel>
