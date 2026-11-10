@@ -5,7 +5,6 @@ import {
   httpsFormOfSshUrl,
   isAbbreviatedCommitSha,
   isNormalizedAgentPluginSubpath,
-  MAX_ESCAPE_PASSES,
   normalizeAgentPluginSubpath,
   percentDecodedForms,
   PLAIN_HTTPS_URL,
@@ -73,9 +72,24 @@ describe("isAbbreviatedCommitSha", () => {
     expect(isAbbreviatedCommitSha("ABCDEF1234")).toBe(true);
   });
 
-  test.each(["abc123", "a".repeat(40), "main", "v1.0.0", "abc123g"])("is false for %j", (ref) => {
-    expect(isAbbreviatedCommitSha(ref)).toBe(false);
+  // The upper end: a ref one digit short of a full commit id is still abbreviated, and the
+  // ranges between the ends all read as abbreviated.
+  test.each([20, 21, 38, 39])("is true for %d hex digits", (digits) => {
+    expect(isAbbreviatedCommitSha("a".repeat(digits))).toBe(true);
+    expect(isAbbreviatedCommitSha("F".repeat(digits))).toBe(true);
   });
+
+  test("is true for the shortest abbreviation, and false one digit below it", () => {
+    expect(isAbbreviatedCommitSha("a".repeat(7))).toBe(true);
+    expect(isAbbreviatedCommitSha("a".repeat(6))).toBe(false);
+  });
+
+  test.each(["abc123", "a".repeat(40), "a".repeat(41), "main", "v1.0.0", "abc123g"])(
+    "is false for %j",
+    (ref) => {
+      expect(isAbbreviatedCommitSha(ref)).toBe(false);
+    }
+  );
 });
 
 /** A space escaped `levels` times: `%20`, `%2520`, `%252520`, and so on. */
@@ -103,10 +117,7 @@ describe("hasEscapedUnreservedCharacter", () => {
   test.each([
     ["an escape that is cut short", "https://h/%E0%A4%A/r.git"],
     ["bytes that are not UTF-8", "https://h/%FF/r.git"],
-    [
-      "a space escaped more often than the passes the check makes",
-      `https://h/${escapedSpace(MAX_ESCAPE_PASSES + 1)}`,
-    ],
+    ["a space escaped five times, one more than the check decodes", `https://h/${escapedSpace(5)}`],
   ])("is true for %s: nothing says how a reader decodes it", (_label, url) => {
     expect(hasEscapedUnreservedCharacter(url)).toBe(true);
   });
@@ -120,6 +131,8 @@ describe("hasEscapedUnreservedCharacter", () => {
     ["an escaped percent sign", "https://h/a%25b"],
     ["a space escaped twice", "https://h/My%2520Project"],
     ["a space escaped three times", "https://h/My%252520Project"],
+    // Four levels is the most the check decodes: it reads all four and finds nothing hidden.
+    ["a space escaped four times", `https://h/My${escapedSpace(4)}Project`],
   ])("is false for %s", (_label, url) => {
     expect(hasEscapedUnreservedCharacter(url)).toBe(false);
   });
@@ -140,13 +153,14 @@ describe("percentDecodedForms", () => {
   test.each([
     ["an escape that is cut short", "%E0%A4%A"],
     ["bytes that are not UTF-8", "%FF"],
-    ["more levels than the passes it makes", escapedSpace(MAX_ESCAPE_PASSES + 1)],
+    ["a space escaped five times, one more than it decodes", escapedSpace(5)],
   ])("gives nothing for %s", (_label, text) => {
     expect(percentDecodedForms(text)).toBeUndefined();
   });
 
-  test("decodes as many levels as it makes passes", () => {
-    expect(percentDecodedForms(escapedSpace(MAX_ESCAPE_PASSES))).toHaveLength(MAX_ESCAPE_PASSES);
+  // Four levels decode in full (every level shows), and a fifth is left: its reader is unknown.
+  test("decodes a space escaped four times, one level at a time", () => {
+    expect(percentDecodedForms(escapedSpace(4))).toEqual(["%252520", "%2520", "%20", " "]);
   });
 });
 

@@ -582,7 +582,7 @@ describe("backup of the managed plugin list", () => {
       info.mockRestore();
     });
 
-    it("leaves out a plugin that hides a token behind a double escape, and lists a space escaped twice", async () => {
+    it("leaves out a plugin that hides a token behind an escape of two to four levels, and lists a space escaped up to four times", async () => {
       const info = spyOn(log, "info").mockImplementation(() => undefined);
       const withUrl = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
       const token = "a".repeat(36);
@@ -601,6 +601,18 @@ describe("backup of the managed plugin list", () => {
         registryRow("space-twice-token", {
           source: withUrl(`https://example.com/%2520ghp_${token}/r.git`),
         }),
+        // Four levels is the most the check decodes. A space escaped four times hides nothing and
+        // stays listed. A token behind four levels shows in the fourth form, and is left out.
+        registryRow("spaced-four-levels", {
+          source: withUrl("https://dev.azure.com/org/My%25252520Project/_git/x"),
+        }),
+        registryRow("token-four-levels", {
+          source: withUrl(`https://example.com/%25252520ghp_${token}/r.git`),
+        }),
+        // A fifth level is left after the four passes: nothing says how a reader decodes it.
+        registryRow("space-five-levels", {
+          source: withUrl("https://dev.azure.com/org/My%2525252520Project/_git/x"),
+        }),
       ]);
       const { payload, managed, request } = await prepare();
 
@@ -608,10 +620,20 @@ describe("backup of the managed plugin list", () => {
 
       const text = await fs.readFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "utf-8");
       const sidecar = JSON.parse(text) as { plugins: Array<{ name: string }> };
-      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha", "spaced-twice"]);
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual([
+        "alpha",
+        "spaced-four-levels",
+        "spaced-twice",
+      ]);
       expect(text).not.toContain("ghp_");
       const logged = info.mock.calls.map(([, fields]) => (fields as { plugin: string }).plugin);
-      expect(logged.sort()).toEqual(["g-thrice", "g-twice", "space-twice-token"]);
+      expect(logged.sort()).toEqual([
+        "g-thrice",
+        "g-twice",
+        "space-five-levels",
+        "space-twice-token",
+        "token-four-levels",
+      ]);
       expect(JSON.stringify(info.mock.calls)).not.toContain(token);
       info.mockRestore();
     });

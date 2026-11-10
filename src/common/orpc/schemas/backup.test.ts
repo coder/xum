@@ -241,6 +241,8 @@ describe("BackupPluginEntrySchema", () => {
     ["a ref with an emoji tag character", "ma\u{E0067}in"],
     ["a ref with a no-break space", "ma\u00A0in"],
     ["an abbreviated commit id", "abc1234"],
+    ["a commit id one digit short of a full one", "a".repeat(39)],
+    ["a 20-digit abbreviated commit id", "a".repeat(20)],
     ["an abbreviated commit id in capitals", "ABCDEF1234"],
   ])("refuses %s as a ref", (_label, ref) => {
     expect(BackupPluginEntrySchema.safeParse(withSource({ ref })).success).toBe(false);

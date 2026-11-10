@@ -5747,6 +5747,11 @@ describe("hidesSecretBehindEscapes", () => {
     ["four levels of escape", `https://h/%25252520${token}/r.git`],
     // Still escaped after the passes: nothing says how a reader decodes it.
     ["more levels of escape than the passes", `https://h/%2525252520${token}/r.git`],
+    // The token shows in form 1 (` ghp_...%5f`) and not in form 2 (` ghp_..._`, where the `_` joins
+    // the word): a check of the last form alone would pass it.
+    ["a token visible only in an earlier decoded form", `https://h/%20${token}%255f/r.git`],
+    // A fifth level is left after the four passes: nothing says how a reader decodes it.
+    ["a space escaped five times, which hides no token", "https://h/My%2525252520Project/r.git"],
     ["a letter of the token escaped twice", `https://h/%2567hp_${"a".repeat(36)}/r.git`],
     ["a letter of the token escaped three times", `https://h/%252567hp_${"a".repeat(36)}/r.git`],
     ["an escape that is cut short", "https://h/%E0%A4%A/r.git"],
@@ -5765,6 +5770,8 @@ describe("hidesSecretBehindEscapes", () => {
     ["an escaped percent sign", "https://h/100%25/r.git"],
     ["a space escaped twice", "https://h/My%2520Project/r.git"],
     ["a space escaped three times", "https://h/My%252520Project/r.git"],
+    // The most levels the check decodes: it reads all four forms and finds no token.
+    ["a space escaped four times", "https://h/My%25252520Project/r.git"],
   ])("lets %s through", (_label, text) => {
     expect(hidesSecretBehindEscapes(text)).toBe(false);
   });
