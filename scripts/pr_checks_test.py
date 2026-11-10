@@ -671,6 +671,23 @@ class GateOutputTest(unittest.TestCase):
         self.assertEqual(bogus.returncode, 1, bogus.stdout + bogus.stderr)
         self.assertIn("Usage:", bogus.stderr)
 
+    def test_resolving_a_thread_succeeds_only_when_the_reply_flag_is_the_boolean_true(self):
+        # GitHub's isResolved is a Boolean!. The script compared the printed text with "true", so the string
+        # "true" (and a flag that is merely truthy) read as a confirmation that the thread resolved.
+        def reply(thread):
+            return {"data": {"resolveReviewThread": {"thread": thread}}}
+
+        resolved = self.run_script("resolve_pr_comment.sh", data=reply({"id": "PRRT_fixture", "isResolved": True}))
+        self.assertEqual(resolved.returncode, 0, resolved.stdout + resolved.stderr)
+        self.assertIn(f"Thread {GATE_PR} resolved", resolved.stdout)
+        flags = ("true", "false", False, None, 1, [True], {})
+        for thread in [{"id": "PRRT_fixture", "isResolved": flag} for flag in flags] + [{"id": "PRRT_fixture"}, None]:
+            with self.subTest(thread=thread):
+                result = self.run_script("resolve_pr_comment.sh", data=reply(thread))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"Failed to resolve thread {GATE_PR}", result.stdout)
+                self.assertNotIn(f"Thread {GATE_PR} resolved", result.stdout)
+
     def test_a_reply_that_is_not_shaped_like_the_schema_stops_on_fixed_text(self):
         # jq quotes the start of a value that it fails on, so a connection of another shape used to put
         # text from the PR into stderr. Each case breaks one read of the two coder-agents-review scripts.

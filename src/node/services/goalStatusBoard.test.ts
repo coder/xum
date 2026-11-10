@@ -149,6 +149,29 @@ describe("fetchGoalBoardPrSection", () => {
     expect(html).not.toContain("Last CI run");
   });
 
+  test("a thread counts as resolved only when its flag is the boolean true", async () => {
+    // GitHub's isResolved is a Boolean!. A value of another type must not read as resolved: jq's `not` made
+    // the string "false" and the number 0 resolved.
+    const resolved = [true, true, false, "false", 0, null, {}, "true", 1];
+    const threads = JSON.stringify({ total: resolved.length, resolved });
+    expect(
+      await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads }))
+    ).toMatchObject({ status: { unresolvedThreads: { count: 7, atLeast: false } } });
+  });
+
+  test("a thread reply without the flags leaves the thread count unavailable", async () => {
+    // The shape of an older query (a count computed by jq) is not a list of flags.
+    for (const threads of [
+      JSON.stringify({ total: 3, seen: 3, unresolved: 3 }),
+      JSON.stringify({ total: 3, resolved: "true" }),
+      JSON.stringify({ resolved: [true] }),
+    ]) {
+      expect(
+        await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads }))
+      ).toMatchObject({ kind: "pr", status: { unresolvedThreads: null } });
+    }
+  });
+
   test("no PR omits the section", async () => {
     const pr = await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: '{"no_pr":true}\n' }));
     expect(pr).toEqual({ kind: "none" });
@@ -157,7 +180,8 @@ describe("fetchGoalBoardPrSection", () => {
   });
 
   test("reports checks and unresolved threads; a failed thread query keeps the checks", async () => {
-    const threads = "banner\n" + JSON.stringify({ total: 120, seen: 100, unresolved: 3 });
+    const flags = [...Array.from({ length: 97 }, () => true), false, false, false];
+    const threads = "banner\n" + JSON.stringify({ total: 120, resolved: flags });
     expect(
       await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads }))
     ).toEqual({

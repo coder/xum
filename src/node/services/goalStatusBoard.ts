@@ -319,17 +319,16 @@ export async function fetchGoalBoardPrSection(
     const script =
       `gh api graphql -f query=${shescape.quote(REVIEW_THREADS_QUERY)}` +
       ` -F owner=${shescape.quote(repo[1])} -F name=${shescape.quote(repo[2])} -F number=${number}` +
-      ` --jq '.data.repository.pullRequest.reviewThreads | {total: .totalCount, seen: (.nodes | length), unresolved: ([.nodes[] | select(.isResolved | not)] | length)}'`;
+      ` --jq '.data.repository.pullRequest.reviewThreads | {total: .totalCount, resolved: [.nodes[] | .isResolved]}'`;
     const threads = await runBash(workspaceId, script, GOAL_BOARD_GH_TIMEOUT_SECONDS);
     const counts = threads == null ? null : parseJsonObject(threads);
-    if (
-      counts != null &&
-      typeof counts.unresolved === "number" &&
-      typeof counts.total === "number" &&
-      typeof counts.seen === "number"
-    ) {
+    const flags = counts?.resolved;
+    if (counts != null && typeof counts.total === "number" && Array.isArray(flags)) {
+      // jq hands over the raw flags and the count happens here: GitHub's isResolved is a Boolean!, and a
+      // jq `not` would read the string "false" or the number 0 as resolved. Only `true` is resolved.
+      const unresolved = flags.filter((flag) => flag !== true).length;
       // Only the first 100 threads are fetched; more than that makes the count a lower bound.
-      unresolvedThreads = { count: counts.unresolved, atLeast: counts.total > counts.seen };
+      unresolvedThreads = { count: unresolved, atLeast: counts.total > flags.length };
     }
   }
   return {
