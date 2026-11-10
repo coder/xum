@@ -155,6 +155,17 @@ describe("MemoryDreamEditLimitSetting", () => {
     }
   );
 
+  // A saved 0 is the limit the run uses, not "no value": comparing with the default instead would
+  // write 0 again on every blur of the empty field.
+  test("does not save unlimited again when the field stays empty", async () => {
+    const { input, blur } = await renderSetting({ memory: { dreamEditLimit: 0 } });
+
+    input.focus();
+    await blur();
+
+    expect(writes).toEqual([]);
+  });
+
   test("does not save the limit that is already saved", async () => {
     const { type, blur } = await renderSetting({ memory: { dreamEditLimit: 24 } });
 
