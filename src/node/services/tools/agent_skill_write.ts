@@ -35,6 +35,7 @@ import {
   resolveSkillFilePathForRuntime,
 } from "./runtimeSkillPathUtils";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
+import { mergeSecretsOverXumEnv } from "@/node/runtime/runtimeScratchDir";
 import { assertProjectFileReachable } from "@/node/services/agentSandbox/fileToolSandbox";
 
 interface AgentSkillWriteToolArgs {
@@ -261,6 +262,8 @@ function makeAgentSkillWriteTool(
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
         });
+        // The skill commands run in the sandbox with the environment of bash (Codex review).
+        const commandEnv = mergeSecretsOverXumEnv(config.xumEnv, config.secrets);
 
         // Legacy→canonical migration REWRITES the canonical skill dir, so a
         // host-local migration must hold the same per-root target lock as the
@@ -273,12 +276,12 @@ function makeAgentSkillWriteTool(
         const projectSkillDirs = getProjectSkillDirs(skillCtx, parsedName.data);
         if (projectSkillDirs != null) {
           if (skillCtx.kind === "project-runtime" || config.xumScope == null) {
-            await migrateLegacyProjectSkill(skillCtx, parsedName.data);
+            await migrateLegacyProjectSkill(skillCtx, parsedName.data, commandEnv);
           } else {
             await withTargetMutationLock(
               config.xumScope.xumHome,
               path.resolve(projectSkillDirs[0], ".."),
-              () => migrateLegacyProjectSkill(skillCtx, parsedName.data),
+              () => migrateLegacyProjectSkill(skillCtx, parsedName.data, commandEnv),
               config.sessionLocks
             );
           }

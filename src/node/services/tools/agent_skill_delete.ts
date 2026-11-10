@@ -39,6 +39,7 @@ import {
   validateLocalSkillDirectory,
 } from "./skillFileUtils";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
+import { mergeSecretsOverXumEnv } from "@/node/runtime/runtimeScratchDir";
 import { assertProjectFileReachable } from "@/node/services/agentSandbox/fileToolSandbox";
 
 interface AgentSkillDeleteToolArgs {
@@ -305,6 +306,8 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
         });
+        // The skill commands run in the sandbox with the environment of bash (Codex review).
+        const commandEnv = mergeSecretsOverXumEnv(config.xumEnv, config.secrets);
 
         const targetMode = target ?? "file";
         const projectSkillDirs = getProjectSkillDirs(skillCtx, parsedName.data);
@@ -320,12 +323,12 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
         // never rollbackable).
         if (targetMode !== "skill" && projectSkillDirs != null) {
           if (skillCtx.kind === "project-runtime" || config.xumScope == null) {
-            await migrateLegacyProjectSkill(skillCtx, parsedName.data);
+            await migrateLegacyProjectSkill(skillCtx, parsedName.data, commandEnv);
           } else {
             await withTargetMutationLock(
               config.xumScope.xumHome,
               path.resolve(projectSkillDirs[0], ".."),
-              () => migrateLegacyProjectSkill(skillCtx, parsedName.data),
+              () => migrateLegacyProjectSkill(skillCtx, parsedName.data, commandEnv),
               config.sessionLocks
             );
           }
@@ -375,7 +378,7 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
             const result = await execBuffered(
               skillCtx.runtime,
               `rm -rf ${projectSkillDirs.map(quoteRuntimeProbePath).join(" ")}`,
-              { cwd: boundary, timeout: 10 }
+              { cwd: boundary, timeout: 10, env: commandEnv }
             );
             if (result.exitCode !== 0) {
               return { success: false, error: result.stderr.trim() || "Failed to delete skill" };

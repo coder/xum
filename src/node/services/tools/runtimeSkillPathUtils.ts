@@ -90,9 +90,15 @@ export async function validateProjectSkillDirs(
   return boundary;
 }
 
+/**
+ * `env` is the environment that bash starts with, the project's secrets included: the sandbox
+ * keeps read-only what they name, such as the file that GIT_CONFIG_GLOBAL names, only for a
+ * command that has them, and the copy must not overwrite such a file (Codex review).
+ */
 export async function migrateLegacyProjectSkill(
   context: SkillStorageContext,
-  skillName: string
+  skillName: string,
+  env: Record<string, string>
 ): Promise<readonly [string, string] | null> {
   const skillDirs = getProjectSkillDirs(context, skillName);
   if (skillDirs == null) return null;
@@ -132,7 +138,7 @@ export async function migrateLegacyProjectSkill(
   const result = await execBuffered(
     runtime,
     `exists() { [ -e "$1" ] || [ -L "$1" ]; }; is_manifest() { case "$1" in [Ss][Kk][Ii][Ll][Ll].[Mm][Dd]) return 0 ;; *) return 1 ;; esac; }; overlay() ( SRC_DIR=$1; DST_DIR=$2; SKIP_MANIFEST=$3; for SRC in "$SRC_DIR"/.[!.]* "$SRC_DIR"/..?* "$SRC_DIR"/*; do exists "$SRC" || continue; NAME=\${SRC##*/}; [ "$SKIP_MANIFEST" = true ] && is_manifest "$NAME" && continue; DST=$DST_DIR/$NAME; if [ -d "$SRC" ] && [ ! -L "$SRC" ]; then if [ -L "$DST" ] || { [ -e "$DST" ] && [ ! -d "$DST" ]; }; then rm -rf "$DST" || exit 1; fi; mkdir -p "$DST" && overlay "$SRC" "$DST" false || exit 1; elif [ -L "$SRC" ]; then LINK=$(readlink "$SRC") || exit 1; case "$LINK" in /*|[A-Za-z]:/*|[A-Za-z]:\\\\*|\\\\\\\\*) TARGET=$LINK ;; *) SRC_PARENT=$(cd "$(dirname "$SRC")" && pwd -P) || exit 1; TARGET=$SRC_PARENT/$LINK ;; esac; rm -rf "$DST" && ln -s "$TARGET" "$DST" || exit 1; elif [ -f "$SRC" ]; then rm -rf "$DST" && cp -P "$SRC" "$DST" || exit 1; else exit 1; fi; done ); ROOT=${root}; CAN=${canonical}; LEG=${legacy}; BOUNDARY=${containedRoot}; BACKUP=; KEEP_BACKUP=; mkdir -p "$ROOT" && TMP=$(mktemp -d "$CAN.migrate.XXXXXX") && trap 'rm -rf "$TMP"; if [ -n "$BACKUP" ] && [ -z "$KEEP_BACKUP" ]; then rm -rf "$BACKUP"; fi' EXIT && [ ! -L "$TMP" ] && REAL_BOUNDARY=$(cd "$BOUNDARY" && pwd -P) && REAL_TMP=$(cd "$TMP" && pwd -P) && { case "$REAL_TMP" in "$REAL_BOUNDARY"/*) true ;; *) false ;; esac; } && REAL_LEG=$(cd "$LEG" && pwd -P) && overlay "$REAL_LEG" "$TMP" false && { [ ! -d "$CAN" ] || { REAL_CAN=$(cd "$CAN" && pwd -P) && overlay "$REAL_CAN" "$TMP" true; }; } && if exists "$CAN"; then BACKUP=$(mktemp -d "$CAN.backup.XXXXXX") && [ ! -L "$BACKUP" ] && REAL_BACKUP=$(cd "$BACKUP" && pwd -P) && { case "$REAL_BACKUP" in "$REAL_BOUNDARY"/*) true ;; *) false ;; esac; } && mv "$CAN" "$BACKUP/original" && if mv "$TMP" "$CAN"; then rm -rf "$BACKUP" && BACKUP=; else mv "$BACKUP/original" "$CAN" || KEEP_BACKUP=1; false; fi; else mv "$TMP" "$CAN"; fi`,
-    { cwd: boundary, timeout: 10 }
+    { cwd: boundary, timeout: 10, env }
   );
   if (result.exitCode !== 0)
     throw new Error(result.stderr.trim() || "Legacy skill migration failed");

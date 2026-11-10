@@ -1,12 +1,17 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, it } from "bun:test";
+import { afterAll, afterEach, describe, expect, it } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import type { XumToolScope } from "@/common/types/toolScope";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { setAgentSandboxTargets } from "@/node/runtime/sandbox/agentSandboxTargets";
+import {
+  isAgentSandboxSupported,
+  resetAgentSandboxRuntime,
+} from "@/node/runtime/sandbox/macosSandbox";
 import { createAgentSkillDeleteTool } from "@/node/services/tools/agent_skill_delete";
 import { createAgentSkillWriteTool } from "@/node/services/tools/agent_skill_write";
 import {
@@ -153,3 +158,72 @@ describe("project skill writes and deletes from a sandboxed workspace", () => {
     expect(await fs.stat(manifest).catch(() => null)).not.toBeNull();
   });
 });
+
+// Codex review: the legacy migration copies a skill's files with a command in the sandbox, which
+// keeps a file that a project secret names read-only only for a command that has the secrets.
+describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
+  "project skill commands in the macOS agent sandbox",
+  () => {
+    afterEach(() => setAgentSandboxTargets(null));
+    afterAll(() => resetAgentSandboxRuntime());
+
+    /** A project whose skill "demo" holds the file that the GIT_CONFIG_GLOBAL secret names. */
+    async function projectWithSecretSkillFile(root: string) {
+      const projectRoot = path.join(await fs.realpath(root), "project");
+      const gitConfig = path.join(projectRoot, ".xum", "skills", "demo", "gitconfig");
+      await fs.mkdir(path.dirname(gitConfig), { recursive: true });
+      await fs.writeFile(gitConfig, "[user]\n");
+      setAgentSandboxTargets({
+        fallback: {
+          enabled: true,
+          network: "loopback",
+          allowedHosts: [],
+          extraWritePaths: [],
+          extraReadPaths: [],
+        },
+        byProject: new Map(),
+      });
+      const xumScope: XumToolScope = {
+        type: "project",
+        xumHome: root,
+        projectRoot,
+        projectStorageAuthority: "host-local",
+      };
+      const config = {
+        ...createTestToolConfig(projectRoot, { runtime: new LocalRuntime(projectRoot), xumScope }),
+        secrets: { GIT_CONFIG_GLOBAL: gitConfig },
+      };
+      return { projectRoot, gitConfig, config };
+    }
+
+    it("does not migrate a legacy skill over a file that a project secret names", async () => {
+      using tempDir = new TestTempDir("project-skill-migration-sandbox");
+      const { projectRoot, gitConfig, config } = await projectWithSecretSkillFile(tempDir.path);
+      await writeSkill(path.join(projectRoot, ".mux", "skills"), "demo", {
+        files: { gitconfig: "[core]\n\tfsmonitor = evil\n" },
+      });
+
+      const result = (await createAgentSkillWriteTool(config).execute!(
+        { name: "demo", filePath: "notes.md", content: "notes" },
+        callOptions
+      )) as { success: boolean };
+
+      expect(result.success).toBe(false);
+      expect(await fs.readFile(gitConfig, "utf-8")).toBe("[user]\n");
+    });
+
+    it("does not delete a file that a project secret names with its skill", async () => {
+      using tempDir = new TestTempDir("project-skill-delete-sandbox");
+      const { projectRoot, gitConfig, config } = await projectWithSecretSkillFile(tempDir.path);
+      await writeProjectSkill(projectRoot, "demo");
+
+      const result = (await createAgentSkillDeleteTool(config).execute!(
+        { name: "demo", target: "skill", confirm: true },
+        callOptions
+      )) as { success: boolean };
+
+      expect(result.success).toBe(false);
+      expect(await fs.readFile(gitConfig, "utf-8")).toBe("[user]\n");
+    });
+  }
+);
