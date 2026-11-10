@@ -60,6 +60,13 @@ function modelRejectsPenaltyParameters(modelString: string): boolean {
   return stripModelProviderPrefixes(modelString).startsWith("gemini-4-carbon");
 }
 
+function rejectedCallSettings(modelString: string): readonly string[] {
+  return [
+    ...(modelRejectsSamplingParameters(modelString) ? SAMPLING_CALL_SETTINGS : []),
+    ...(modelRejectsPenaltyParameters(modelString) ? PENALTY_CALL_SETTINGS : []),
+  ];
+}
+
 /**
  * Resolves model parameter overrides from providers.jsonc config.
  *
@@ -135,15 +142,8 @@ export function resolveModelParameterOverrides(
     effectiveModelString ?? canonicalModelString,
     providersConfig
   );
-  if (modelRejectsSamplingParameters(capabilityModelString)) {
-    for (const key of SAMPLING_CALL_SETTINGS) {
-      delete standard[key];
-    }
-  }
-  if (modelRejectsPenaltyParameters(capabilityModelString)) {
-    for (const key of PENALTY_CALL_SETTINGS) {
-      delete standard[key];
-    }
+  for (const key of rejectedCallSettings(capabilityModelString)) {
+    delete standard[key];
   }
 
   return {
