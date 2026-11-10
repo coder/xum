@@ -44,12 +44,20 @@ interface DetectedChange {
 }
 
 /**
- * A file name inside the notice, as a JSON string. JSON escapes quotes and newlines, so the name
- * cannot start a new line of the notice. `<` is escaped too (as in artifactBridge's inline JSON),
- * so a name that holds `</system-file-update>` cannot close the frame early.
+ * A file name inside the notice, as a JSON string. JSON escapes quotes and the C0 control
+ * characters (newline, carriage return, tab), so those cannot start a new line of the notice.
+ * JSON leaves U+0085, U+2028 and U+2029 as they are, and some line splitters read them as line
+ * breaks, so they are escaped too (as mcpAppOpenAiShim does for U+2028 and U+2029). `<` is
+ * escaped as well (as in artifactBridge's inline JSON), so a name that holds
+ * `</system-file-update>` cannot close the frame early.
  */
 function quoteFilename(filename: string): string {
-  return JSON.stringify(filename).replace(/</g, "\\u003c");
+  return JSON.stringify(filename)
+    .replace(/</g, "\\u003c")
+    .replace(
+      /[\u0085\u2028\u2029]/g,
+      (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
+    );
 }
 
 /**
