@@ -4003,15 +4003,31 @@ function countOccurrences(content: string, needle: string): number {
   return count;
 }
 
-/** 1-based line numbers of lines where occurrences of needle start. */
+/**
+ * 1-based line numbers, ascending and without repeats, of the lines where occurrences of needle
+ * start. Memory content is untrusted model input, so this makes ONE forward pass: needle and
+ * newline are each searched once from where their last hit ended, which keeps the cost linear in
+ * content.length however many matches there are. Re-splitting the prefix before every match was
+ * quadratic: a failed str_replace on a 100 KB file with 51,200 matches took seconds of CPU.
+ */
 function findMatchingLines(content: string, needle: string): number[] {
-  const lines = new Set<number>();
+  const lines: number[] = [];
+  let line = 1;
+  // First newline not yet counted into `line`, or -1 once none is left. It is kept between matches:
+  // searching for it again per match would rescan one long line once per match.
+  let nextNewline = content.indexOf("\n");
   let index = content.indexOf(needle);
   while (index !== -1) {
-    lines.add(content.slice(0, index).split("\n").length);
+    // Only newlines before `index` count: a match that starts with a newline starts on the line
+    // that newline ends.
+    while (nextNewline !== -1 && nextNewline < index) {
+      line += 1;
+      nextNewline = content.indexOf("\n", nextNewline + 1);
+    }
+    if (lines[lines.length - 1] !== line) lines.push(line);
     index = content.indexOf(needle, index + 1);
   }
-  return [...lines];
+  return lines;
 }
 
 /** Render a flat file list as an indented tree, capped at maxDepth levels. */

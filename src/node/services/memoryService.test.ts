@@ -439,6 +439,98 @@ describe("MemoryService", () => {
       const physical = path.join(fixture.xumHome, "memory", "global", "s.md");
       expect(await fsPromises.readFile(physical, "utf-8")).toBe("dup\nother\ndup\nmore");
     });
+
+    // The refusal is what a model reads to choose a longer old_str, so its count, line numbers,
+    // order and wording are pinned for each shape a match list can take. A file with a single match
+    // never reaches this text: it is replaced, which "replaces a unique occurrence" covers.
+    const AMBIGUOUS_PATH = "/memories/global/s.md";
+    const ambiguousError = (count: number, lines: string) =>
+      `No replacement was performed: old_str matches ${count} locations (lines ${lines}) in ${AMBIGUOUS_PATH}. Provide a longer, unique old_str.`;
+
+    it.each([
+      ["matches on separate lines", "dup\nother\ndup\nmore", "dup", ambiguousError(2, "1, 3")],
+      ["several matches on one line", "ab ab ab\nzz\nab", "ab", ambiguousError(4, "1, 3")],
+      [
+        "matches spread over many lines",
+        Array.from({ length: 24 }, (_, i) => (i % 3 === 0 ? "hit here" : `line ${i + 1}`)).join(
+          "\n"
+        ),
+        "hit",
+        ambiguousError(8, "1, 4, 7, 10, 13, 16, 19, 22"),
+      ],
+      ["matches that overlap on one line", "aaaa", "aa", ambiguousError(3, "1")],
+      ["matches that overlap across a newline", "a\na\na", "a\na", ambiguousError(2, "1, 2")],
+      ["an old_str that starts with a newline", "x\ny\nx\ny", "\ny", ambiguousError(2, "1, 3")],
+      ["blank lines before the matches", "\n\nfoo\n\nfoo\n", "foo", ambiguousError(2, "3, 5")],
+      ["CRLF line endings", "dup\r\nother\r\ndup\r\nmore\r\n", "dup", ambiguousError(2, "1, 3")],
+      ["a CRLF in old_str", "a\r\nb\r\na\r\nb", "a\r\nb", ambiguousError(2, "1, 3")],
+      [
+        "a last match with no trailing newline",
+        "foo\nbar\nbaz foo",
+        "foo",
+        ambiguousError(2, "1, 3"),
+      ],
+      ["a last line that is the match", "foo\nfoo", "foo", ambiguousError(2, "1, 2")],
+      ["text outside ASCII", "\u{1F642} x\n\u{1F642} x", "x", ambiguousError(2, "1, 2")],
+    ])("names the matching lines for %s", async (_label, content, oldStr, expected) => {
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, AMBIGUOUS_PATH, content, "agent");
+
+      const refused = await fixture.service.strReplace(
+        fixture.ctx,
+        AMBIGUOUS_PATH,
+        oldStr,
+        "x",
+        "agent"
+      );
+      expect(refused).toEqual({ success: false, error: expected });
+
+      // Staging-time validation shares the computation, so it must say the same thing.
+      const validated = await fixture.service.validateMutation(fixture.ctx, {
+        command: "str_replace",
+        path: AMBIGUOUS_PATH,
+        old_str: oldStr,
+        new_str: "x",
+      });
+      expect(validated).toEqual({ ok: false, error: expected });
+
+      const physical = path.join(fixture.xumHome, "memory", "global", "s.md");
+      expect(await fsPromises.readFile(physical, "utf-8")).toBe(content);
+    });
+
+    // Memory content is untrusted model input, so refusing an ambiguous old_str on a file at the
+    // size cap must cost time linear in the file however many matches it has. Re-splitting the
+    // prefix before each match took 13 s on the first shape and 3 s on the second (Bun 1.3.14); the
+    // linear pass takes about a millisecond, so the 1 s budget leaves a loaded host room.
+    it.each([
+      ["a match on every line", "a\n".repeat(MEMORY_MAX_FILE_BYTES / 2), MEMORY_MAX_FILE_BYTES / 2],
+      [
+        "a match at every character of one line",
+        "a".repeat(MEMORY_MAX_FILE_BYTES),
+        MEMORY_MAX_FILE_BYTES,
+      ],
+    ])("refuses an ambiguous old_str with %s in linear time", async (_label, content, matches) => {
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, "/memories/global/big.md", content, "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/warm.md", "a\na", "agent");
+      // Keep the cold load of the command path out of the timing.
+      await fixture.service.strReplace(fixture.ctx, "/memories/global/warm.md", "a", "x", "agent");
+
+      const started = performance.now();
+      const refused = await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/big.md",
+        "a",
+        "x",
+        "agent"
+      );
+      const elapsedMs = performance.now() - started;
+
+      expect(refused.success ? "" : refused.error).toContain(
+        `old_str matches ${matches} locations (lines 1`
+      );
+      expect(elapsedMs).toBeLessThan(1_000);
+    });
   });
 
   describe("insert", () => {
