@@ -10,8 +10,8 @@ import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
  * one: a trusted project's `.xum/tool_env` puts its folder first on PATH. It answers the five
  * calls the layout audit makes (`set viewport`, `open`, `--json eval --stdin`, `close`) and logs
  * every call, so a test sees the exact argv, the opened URLs and the stdin of each eval. For
- * every call it also logs the NAMES of the AGENT_BROWSER_* variables it inherited (never their
- * values) and the content of the file `--config` names.
+ * every call it also logs the NAMES of the AGENT_BROWSER_* variables it inherited, and of
+ * SHELLOPTS and BASHOPTS (never a value), and the content of the file `--config` names.
  */
 
 /** What `eval` prints and returns for one width. The default is a clean, complete pass. */
@@ -59,7 +59,10 @@ export interface FakeAgentBrowser {
    * existed at the time.
    */
   socketDirs(): Promise<Array<{ dir: string; existed: boolean }>>;
-  /** Per call, in order: the names of the AGENT_BROWSER_* variables set in the call's env. */
+  /**
+   * Per call, in order: the names of the AGENT_BROWSER_* variables set in the call's env, and
+   * of SHELLOPTS and BASHOPTS (they carry shell options into a new bash).
+   */
   agentBrowserEnvNames(): Promise<string[][]>;
   /**
    * Per call, in order: the `--config` path, and its content when the file existed then (the
@@ -122,7 +125,7 @@ printf '%s\\037' "$@" >> "$STATE/calls.log"
 printf '\\n' >> "$STATE/calls.log"
 if [ -d "\${AGENT_BROWSER_SOCKET_DIR-}" ]; then existed=yes; else existed=no; fi
 printf '%s %s\\n' "$existed" "\${AGENT_BROWSER_SOCKET_DIR-}" >> "$STATE/socket-dirs.log"
-env | sed -n 's/^\\(AGENT_BROWSER_[A-Za-z0-9_]*\\)=.*/\\1/p' | sort | tr '\\n' ' ' >> "$STATE/env-names.log"
+env | sed -n -e 's/^\\(AGENT_BROWSER_[A-Za-z0-9_]*\\)=.*/\\1/p' -e 's/^\\(SHELLOPTS\\)=.*/\\1/p' -e 's/^\\(BASHOPTS\\)=.*/\\1/p' | sort | tr '\\n' ' ' >> "$STATE/env-names.log"
 printf '\\n' >> "$STATE/env-names.log"
 config=
 previous=

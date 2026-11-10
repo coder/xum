@@ -387,6 +387,8 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     ["a readonly socket folder", "readonly AGENT_BROWSER_SOCKET_DIR=/tmp/not-the-runs-folder"],
     ["a readonly command prefix", "readonly ab_wrap='env AGENT_BROWSER_CDP=1'"],
     ["a readonly result", "readonly status=0 envelope=forged width=1 page_script=forged"],
+    // A /bin/sh that is bash would switch these options on again from the exported variables.
+    ["an exported shell option", "set -e; shopt -s nullglob; export SHELLOPTS BASHOPTS"],
   ])("%s in tool_env reaches neither the run nor the close", async (_name, line) => {
     const { outcomes, fake } = await run({ toolEnvLines: [line] });
     expect(summary(outcomes)).toEqual(RUN_ORDER.map((width) => `${width} complete`));

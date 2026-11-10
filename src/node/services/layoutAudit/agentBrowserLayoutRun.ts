@@ -104,8 +104,8 @@ const FRAME_END = "@@xum-layout-end";
  * found) and nothing else. The scripts below do not run in the shell that sourced it: that shell
  * replaces itself with a new one (see inNewShell), so no shell state tool_env left behind (IFS,
  * a readonly or unexported variable, a function, a shell option) can change what they do. A new
- * shell starts with the default IFS and no readonly variable, so the sweep's `unset` cannot
- * fail. Outside this boundary, because tool_env is trusted project code that can run anything:
+ * shell starts with the default IFS, the default options and no readonly variable, so the
+ * sweep's `unset` cannot fail. Outside this boundary, because tool_env is trusted project code that can run anything:
  * a tool_env that exports the run's own XUM_LAYOUT_* names, or that puts another `env`, `sed`
  * or `agent-browser` on PATH.
  */
@@ -166,9 +166,14 @@ esac
  * the environment crosses an exec. `exec` keeps the process, so a timeout or a cancel still
  * kills the run, and stdin goes straight to the script. /bin/sh, not a name or a variable that
  * tool_env could have changed: the scripts are POSIX sh.
+ *
+ * Where /bin/sh is bash, an exported SHELLOPTS or BASHOPTS would switch the old shell's options
+ * on again in the new one (`set -e; export SHELLOPTS` would end RUN at a failed eval, before
+ * its record, and CLOSE at a failed close, before it removes the folder). The runtime's shell
+ * is bash, so `export -n` takes the export off both.
  */
 function inNewShell(script: string): string {
-  return `exec /bin/sh -c ${shellQuote(script)}\n`;
+  return `export -n SHELLOPTS BASHOPTS 2>/dev/null\nexec /bin/sh -c ${shellQuote(script)}\n`;
 }
 
 export interface LayoutRunInput {
