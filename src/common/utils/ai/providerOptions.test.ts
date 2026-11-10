@@ -537,9 +537,10 @@ describe("buildProviderOptions - Anthropic", () => {
         "claude-sonnet-5-5",
         "claude-haiku-5-5",
         "claude-fable-5-1",
-        // Fable 5.2 and Mythos 5.2 run the prefix check on every account.
+        // Fable 5.2, Mythos 5.2 and Mythos 5.1 run the prefix check on every account.
         "claude-fable-5-2",
         "claude-mythos-5-2",
+        "claude-mythos-5-1",
       ]) {
         expect(thinkingFor(`anthropic:${model}`)).toEqual({
           type: "adaptive",
@@ -660,7 +661,7 @@ describe("buildProviderOptions - Anthropic", () => {
         "claude-opus-5",
         "claude-sonnet-5",
         "claude-fable-5",
-        "claude-mythos-5-1",
+        "claude-mythos-5",
       ]) {
         expect(thinkingFor(`anthropic:${model}`)).not.toHaveProperty("blockBinding");
       }

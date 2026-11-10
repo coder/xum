@@ -479,15 +479,16 @@ export function anthropicSupportsBetweenToolsThinking(modelString: string): bool
  *
  * On enforced accounts, Claude Opus 5.5, Claude Sonnet 5.5, Claude Haiku 5.5, and
  * Claude Fable 5.1 reject a request that replays a block whose prefix has since changed.
- * Claude Fable 5.2 and Claude Mythos 5.2 run the check on every account, whatever its age
- * (https://platform.claude.com/docs/en/models/fable-5-2/whats-new-fable-5-2).
- * Mythos 5.1 is not on the list: "Claude Mythos 5.1 and models before Claude Fable 5.1
- * don't run the prefix check" (#5889). Listing it stripped its history thinking at "off".
+ * Claude Fable 5.2, Claude Mythos 5.2 and Claude Mythos 5.1 run the check on every
+ * account, whatever its age. The preserved-thinking docs (fetched 2026-11-10) list a 400
+ * for Mythos 5.1 on accounts created both before and after August 31, 2026, replacing the
+ * older "Mythos 5.1 ... don't run the prefix check" line that #5957 relied on. Listing a
+ * model that skips the check is harmless on the wire: such models accept `block_binding`.
  * See https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
  */
 export function anthropicBindsThinkingToPrefix(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /claude-(?:opus-5-5|sonnet-5-5|haiku-5-5|fable-5-1|fable-5-2|mythos-5-2)(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(
+  return /claude-(?:opus-5-5|sonnet-5-5|haiku-5-5|fable-5-1|fable-5-2|mythos-5-1|mythos-5-2)(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(
     withoutPrefix
   );
 }
