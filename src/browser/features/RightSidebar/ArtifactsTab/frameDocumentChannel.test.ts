@@ -428,6 +428,24 @@ describe("frame document channel: checks", () => {
     expect(missed).toBe(1);
   });
 
+  // An artifact that keeps the thread busy blocks each window, not only the first one.
+  test("a block in an extended window extends the check again", async () => {
+    const clock = blockingClock();
+    const { channel } = boundChannel(clock.now);
+    let missed = 0;
+    channel.check(() => missed++);
+    await advanceClock(1000);
+    await clock.block(1000);
+    // The first deadline extends the check to two deadlines after it went out.
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS - 1000);
+    await clock.block(1000);
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS - 2000);
+    expect(missed).toBe(0);
+    // The third window sees no block.
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    expect(missed).toBe(1);
+  });
+
   test("a heartbeat late by the threshold or less does not extend the check", async () => {
     const clock = blockingClock();
     const { channel } = boundChannel(clock.now);

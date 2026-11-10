@@ -235,8 +235,6 @@ interface PendingCheck {
   dueAt: number;
   timer: ReturnType<typeof setTimeout>;
   blocked: boolean;
-  /** When the current deadline window began: a beat due before it belongs to an earlier one. */
-  windowStartedAt: number;
   heartbeat: ReturnType<typeof setTimeout>;
 }
 
@@ -285,7 +283,6 @@ class DocumentChannel implements FrameDocumentChannel {
         value,
         firstSentAt: sentAt,
         blocked: false,
-        windowStartedAt: sentAt,
         heartbeat: this.beatAfter(() => this.pending),
         ...this.armDeadline(sentAt + FRAME_DOCUMENT_CHECK_DEADLINE_MS, onMissed),
       };
@@ -319,11 +316,7 @@ class DocumentChannel implements FrameDocumentChannel {
       const pending = current();
       // clearPending() stops the heartbeat with its check, so a beat always finds it pending.
       if (pending == null) return;
-      // A block across a deadline also holds back a beat that fires after the extension; it marks
-      // the window it was due in, not the new one.
-      if (dueAt >= pending.windowStartedAt && this.now() - dueAt > FRAME_DOCUMENT_CHECK_LATE_MS) {
-        pending.blocked = true;
-      }
+      if (this.now() - dueAt > FRAME_DOCUMENT_CHECK_LATE_MS) pending.blocked = true;
       pending.heartbeat = this.beatAfter(current);
     }, FRAME_DOCUMENT_HEARTBEAT_MS);
   }
@@ -363,9 +356,12 @@ class DocumentChannel implements FrameDocumentChannel {
     const capAt = pending.firstSentAt + FRAME_DOCUMENT_CHECK_CAP_MS;
     const blocked = pending.blocked || now - pending.dueAt > FRAME_DOCUMENT_CHECK_LATE_MS;
     if (blocked && now < capAt) {
-      // The next window asks again: a block it does not see cannot extend it.
+      // The next window asks again: a block it does not see cannot extend it. A block across the
+      // deadline can also hold back a beat of the window before until after this; the new window
+      // starts a heartbeat of its own, so that beat never fires.
       pending.blocked = false;
-      pending.windowStartedAt = now;
+      clearTimeout(pending.heartbeat);
+      pending.heartbeat = this.beatAfter(() => this.pending);
       Object.assign(
         pending,
         this.armDeadline(Math.min(now + FRAME_DOCUMENT_CHECK_DEADLINE_MS, capAt), onMissed)
