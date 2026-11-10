@@ -19,10 +19,12 @@ import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
  * rejects `speed: "fast"` and Opus 4.6 silently runs (and bills) at standard
  * speed, so a version-range matcher would expose a toggle that errors or lies.
  * Dated snapshots of the listed models are accepted. Fable 5.2 and Mythos 5.2
- * support it; earlier Fable/Mythos models do not.
+ * support it; earlier Fable/Mythos models do not. Opus 4.8 is left out: Anthropic
+ * removes its Fast mode on 2026-11-30 and then rejects `speed: "fast"` for it, so
+ * Xum stops offering it now instead of erroring from that date.
  */
 export function anthropicSupportsFastMode(modelString: string): boolean {
-  return /^claude-(?:opus-(?:4-8|5|5-5)|fable-5-2|mythos-5-2)(?:-\d{8})?$/.test(
+  return /^claude-(?:opus-(?:5|5-5)|fable-5-2|mythos-5-2)(?:-\d{8})?$/.test(
     stripModelProviderPrefixes(modelString)
   );
 }
