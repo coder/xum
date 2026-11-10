@@ -1521,8 +1521,7 @@ describe("organizerEditBudget", () => {
   async function stopsAt(editBudget: ReturnType<typeof organizerEditBudget>, steps: number) {
     expect(editBudget.stepCeiling).toHaveLength(1);
     const stopWhen = editBudget.stepCeiling[0];
-    const at = (count: number) =>
-      stopWhen({ steps: Array.from({ length: count }) as Parameters<typeof stopWhen>[0]["steps"] });
+    const at = (count: number) => stopWhen({ steps: Array.from({ length: count }) });
     return !(await at(steps - 1)) && (await at(steps));
   }
 
