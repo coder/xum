@@ -287,70 +287,89 @@ describe("reviewUrlOf", () => {
 describe("surelyOnThisMachine", () => {
   const PLATFORMS: NodeJS.Platform[] = ["linux", "darwin", "win32"];
 
+  // Git reads these as a path on every platform: no colon, a slash before the first colon, or file://.
   test.each([
     ["an absolute path", "/srv/repos/market"],
     ["a path under home", "~/market"],
     ["a path with a colon after its first slash", "/srv/repos/a:b"],
+    ["a name with no colon", "market"],
+    ["a backslash path with no colon", "\\\\server\\share\\market"],
     ["a file URL", "file:///srv/repos/market"],
-    ["an ssh URL to localhost", "ssh://localhost/srv/market.git"],
-    [
-      "an ssh URL with a user, a trailing dot and a port",
-      "ssh://git@LOCALHOST.:2222/srv/market.git",
-    ],
-    ["an ssh URL to a loopback IPv4 spelling", "ssh://127.1/srv/market.git"],
-    ["an ssh URL to the IPv6 loopback", "ssh://[::1]/srv/market.git"],
-    ["an ssh URL to an IPv4-mapped loopback in capitals", "ssh://[::FFFF:7F00:1]/srv/market.git"],
-    ["an https URL to a loopback address", "https://127.0.0.1/market.git"],
-    ["an scp URL to a loopback address", "git@127.0.0.1:srv/market.git"],
-    ["an scp URL to localhost with no user", "localhost:srv/market.git"],
-    ["an scp URL to the bracketed IPv6 loopback", "[::1]:srv/market.git"],
   ])("counts %s as this machine on every platform", (_label, url) => {
     for (const platform of PLATFORMS) {
       expect(surelyOnThisMachine(url, platform)).toBe(true);
     }
   });
 
-  // Git for Windows reads a drive as a path. Git on Linux and macOS reads the same string as scp
-  // to the host `C` or `h`, which `ssh` resolves like any other name.
+  // Git for Windows reads one ASCII character and a colon as a drive (`has_dos_drive_prefix`), with
+  // or without a slash. Git on Linux and macOS reads the same string as scp to the host `C` or `h`,
+  // which ssh resolves like any other name.
   test.each([
     ["a drive with a backslash", "C:\\repos\\market"],
     ["a drive with a slash", "C:/repos/market"],
+    ["a drive-relative path", "C:market"],
     ["a one-letter host with a slash", "h:/org/market.git"],
-    ["an NT-namespace path", "\\\\?\\C:\\repos\\market"],
-    // A rooted backslash path is local to Git for Windows; elsewhere the colon comes first, so
-    // git reads the host `\h`.
-    ["a rooted backslash path with a colon", "\\h:org/market.git"],
+    ["a one-letter host with a relative path", "h:org/market.git"],
+    ["a digit as the drive", "0:market"],
   ])("counts %s as this machine on Windows only", (_label, url) => {
     expect(surelyOnThisMachine(url, "win32")).toBe(true);
     expect(surelyOnThisMachine(url, "linux")).toBe(false);
     expect(surelyOnThisMachine(url, "darwin")).toBe(false);
   });
 
+  // Git for Windows reads a drive as a path only when the rest could name a file
+  // (`is_valid_win32_path` in mingw.c). Otherwise it signs in over ssh to the host `C`.
   test.each([
-    ["a one-letter scp host", "h:org/market.git"],
-    ["a drive-relative path", "C:market"],
+    ["a reserved device name", "C:nul"],
+    ["a reserved device name with an extension", "C:repos/CON.git"],
+    ["a numbered device name in a folder", "C:/repos/com1/market"],
+    ["a name that ends in a period", "C:market."],
+    ["a folder that ends in a space", "C:/repos /market"],
+    ["a second colon", "C:a:b"],
+    ["a pipe", "C:a|b"],
+    ["a control character", "C:a\u0001b"],
+  ])("counts %s after a drive as remote on every platform", (_label, url) => {
+    for (const platform of PLATFORMS) {
+      expect(surelyOnThisMachine(url, platform)).toBe(false);
+    }
+  });
+
+  test("counts a drive with a dot or a device-like name inside a longer name as this machine on Windows", () => {
+    for (const url of ["C:./market", "C:../market", "C:/repos/console/market", "C:/repos/nulled"]) {
+      expect(surelyOnThisMachine(url, "win32")).toBe(true);
+    }
+  });
+
+  // A host never counts, loopback included: Xum would have to read the host as git does, and git
+  // decodes, splits and trims a URL in ways that `URL` and a regex do not.
+  test.each([
+    ["an ssh URL to localhost", "ssh://localhost/srv/market.git"],
+    ["an ssh URL to a loopback address", "ssh://git@127.0.0.1:2222/srv/market.git"],
+    ["an ssh URL to the IPv6 loopback", "ssh://[::1]/srv/market.git"],
+    ["an https URL to a loopback address", "https://127.0.0.1/market.git"],
+    ["an scp URL to a loopback address", "git@127.0.0.1:srv/market.git"],
+    ["an scp URL to localhost with no user", "localhost:srv/market.git"],
+    ["an scp URL to the bracketed IPv6 loopback", "[::1]:srv/market.git"],
     ["an scp URL to a named host", "git@h:org/market.git"],
     ["an https URL", "https://github.com/acme/market.git"],
     ["an ssh URL to a named host", "ssh://git@github.com/acme/market.git"],
-    // Xum cannot read these hosts as `URL` does, but git passes them to ssh: a doubt grants nothing.
     ["a port that URL refuses and OpenSSH reads", "ssh://evil.example:+22/market.git"],
     ["a scoped IPv6 address", "ssh://[fe80::1%25eth0]/market.git"],
     ["a host with a character URL refuses", "ssh://evil|host/market.git"],
-    // `URL` reads the host `localhost`. Git hands `localhost#@evil.example` to ssh, which splits
-    // at the last `@` and signs in to evil.example.
+    // Git decodes a scheme URL before it finds the host: ssh signs in to evil.example.
+    ["escapes that hide the host from URL", "ssh://localhost/y%40%5bevil.example%5d/market.git"],
     ["a fragment that hides the host from URL", "ssh://localhost#@evil.example/market.git"],
-    // Git reads the host before the first colon, `evil.example`, and the rest as a path.
     ["an scp URL whose user part holds a colon", "evil.example:c@localhost:market.git"],
-    // An `@[` anywhere makes git read the host up to the next `]`: ssh signs in to fe80::1.
     ["an scp URL with a later bracket", "localhost:c@[fe80::1]:market.git"],
     ["an ssh URL with a bracket in its path", "ssh://localhost/y@[fe80::1]/market.git"],
     // Git reads the host `~h`: the first slash comes after the colon.
     ["a tilde with a colon before its first slash", "~h:org/market.git"],
+    ["a rooted backslash path with a colon", "\\h:org/market.git"],
     ["a colon first", ":market.git"],
-    // A first character that is not a letter reads as an scp host, not as a drive: a code point
-    // outside the BMP, and a newline.
+    // Git for Windows reads one non-ASCII character and a colon as a drive too, but only ASCII counts.
     ["an astral first character", "\u{1F600}:x"],
-    ["a newline first", "\n:x"],
+    ["a first character outside ASCII", "\u00e9:x"],
+    ["a capitalized scheme of a file URL", "FILE:///srv/repos/market"],
   ])("counts %s as remote on every platform", (_label, url) => {
     for (const platform of PLATFORMS) {
       expect(surelyOnThisMachine(url, platform)).toBe(false);
