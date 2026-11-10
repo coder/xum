@@ -22993,7 +22993,7 @@ export class TaskService implements AgentTaskIntegration {
         ws.reportedAt = getIsoNow();
         // Whose report the row carries: the ledger counts it as this attempt's own even after a
         // failure turned the row interrupted and another report turned it back (see InheritedReport).
-        if (ws.taskAttemptId != null) ws.taskReportAttemptId = ws.taskAttemptId;
+        ws.taskReportAttemptId = ws.taskAttemptId;
         markChildGoalPauseOwed(ws);
         // Successful completion resets the persisted recovery circuit breaker.
         delete ws.taskRecoveryAttempts;
@@ -23287,8 +23287,7 @@ export class TaskService implements AgentTaskIntegration {
         }
         workspace.taskStatus = "reported";
         workspace.reportedAt = getIsoNow();
-        if (workspace.taskAttemptId != null)
-          workspace.taskReportAttemptId = workspace.taskAttemptId;
+        workspace.taskReportAttemptId = workspace.taskAttemptId;
         markChildGoalPauseOwed(workspace);
         delete workspace.taskRecoveryAttempts;
       },
