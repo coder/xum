@@ -236,7 +236,11 @@ import {
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
-import { isWorkspaceProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceProjectTrusted,
+  isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
+} from "@/node/utils/projectTrust";
 import {
   resolveTurnAnthropicCacheTtl,
   supportsAnthropicCache,
@@ -1371,7 +1375,11 @@ export class TurnRequestBuilder {
       .catch(() => ({ overrides: undefined, authoritative: false }));
     const projectSecrets = isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+      : secretsForWorkspace(
+          this.dependencies.secretsStore,
+          metadata.projectPath,
+          metadata.runtimeConfig
+        );
     await mcpServerManager.getToolsForWorkspace(
       {
         workspaceId,
@@ -2700,7 +2708,11 @@ export class TurnRequestBuilder {
 
     const projectSecrets = isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+      : secretsForWorkspace(
+          this.dependencies.secretsStore,
+          metadata.projectPath,
+          metadata.runtimeConfig
+        );
 
     const streamToken = this.dependencies.streamManager.generateStreamToken();
 

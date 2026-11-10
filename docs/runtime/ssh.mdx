@@ -50,7 +50,7 @@ Choose **None** as the workspace isolation to work directly in an existing direc
 - Xum syncs nothing into that directory and never checks out branches, moves, or deletes it. Archiving or deleting the workspace leaves it in place.
 - Every workspace with the same directory shares it, like the [Local](/runtime/local) runtime does on your machine.
 - The local project does not need to be a git repository.
-- Project trust covers your local project, not the directory on the host. So Xum treats that directory like an untrusted project: it doesn't run its `.xum/init` hook or tool hooks, and doesn't load its project plugins or MCP servers.
+- Project trust covers your local project, not the directory on the host. So Xum treats that directory like an untrusted project: it doesn't run its `.xum/init` hook or tool hooks, and doesn't load its project plugins or MCP servers. Your project secrets are not passed to commands that run there either.
 
 ## Authentication
 

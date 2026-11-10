@@ -8,7 +8,9 @@ import {
   isProjectTrusted,
   isWorkspaceProjectTrusted,
   isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
 } from "./projectTrust";
+import type { Secret } from "@/common/types/secrets";
 
 function configWithProjects(projects: Map<string, { trusted?: boolean }>): Config {
   return { loadConfigOrDefault: () => ({ projects }) } as unknown as Config;
@@ -83,5 +85,20 @@ describe("SSH+None workspaces are outside project trust", () => {
     expect(isWorkspaceProjectTrusted(config, metadata)).toBe(expected);
     expect(isWorkspaceProjectTrustedIn(projects, metadata)).toBe(expected);
     expect(isWorkspaceTrustedForSharedExecution(metadata, projects)).toBe(expected);
+  });
+
+  test.each([
+    ["SSH+None", sshNone, false],
+    ["SSH worktree", sshWorktree, true],
+    ["local", { type: "local" } satisfies RuntimeConfig, true],
+    ["unset", undefined, true],
+  ] as const)("%s workspace project secrets", (_label, runtimeConfig, expected) => {
+    const projectSecrets: Secret[] = [{ key: "GH_TOKEN", value: "ghp_secret" }];
+    const secretsStore = {
+      getEffectiveSecrets: (path: string) => (path === projectPath ? projectSecrets : []),
+    };
+    expect(secretsForWorkspace(secretsStore, projectPath, runtimeConfig)).toEqual(
+      expected ? projectSecrets : []
+    );
   });
 });

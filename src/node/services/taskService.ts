@@ -118,6 +118,7 @@ import {
 import {
   isProjectTrusted,
   isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
   workspaceDirOutsideProjectTrust,
 } from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
@@ -8752,7 +8753,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     const secrets = await secretsToRecord(
-      this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+      secretsForWorkspace(this.secretsStore, plan.parentMeta.projectPath, plan.taskRuntimeConfig)
     );
     // The sanitize and secrets awaits above leave a window in which the parent can cancel this
     // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
@@ -9823,7 +9824,7 @@ export class TaskService implements AgentTaskIntegration {
     // mutate the live parent workspace — skip it entirely.
     if (!plan.useSharedWorkspace) {
       const secrets = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+        secretsForWorkspace(this.secretsStore, plan.parentMeta.projectPath, plan.taskRuntimeConfig)
       );
       this.registerTaskBackgroundInit(plan, checkout, secrets);
     }

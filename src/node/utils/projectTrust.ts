@@ -1,4 +1,5 @@
-import type { Config } from "@/node/config";
+import type { Config, SecretsStore } from "@/node/config";
+import type { Secret } from "@/common/types/secrets";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { isSshSharedProjectDirRuntime, type RuntimeConfig } from "@/common/types/runtime";
@@ -23,6 +24,21 @@ export type WorkspaceTrustSubject = Pick<WorkspaceMetadata, "kind" | "projectPat
  */
 export function workspaceDirOutsideProjectTrust(runtimeConfig: RuntimeConfig | undefined): boolean {
   return isSshSharedProjectDirRuntime(runtimeConfig);
+}
+
+/**
+ * The project secrets to put in a workspace's process env (bash tool, init, MCP servers).
+ * Secrets were configured for the local project, but an SSH+None workspace runs commands in a
+ * host directory outside project trust: a collaborator-controlled script there (a test runner,
+ * a git hook) would read GH_TOKEN and the like. So that runtime gets no project secrets.
+ */
+export function secretsForWorkspace(
+  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">,
+  projectPath: string,
+  runtimeConfig: RuntimeConfig | undefined
+): Secret[] {
+  if (workspaceDirOutsideProjectTrust(runtimeConfig)) return [];
+  return secretsStore.getEffectiveSecrets(projectPath);
 }
 
 /**

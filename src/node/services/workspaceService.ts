@@ -23,6 +23,7 @@ import {
 } from "@/constants/terminationTimeouts";
 import {
   isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
   workspaceDirOutsideProjectTrust,
 } from "@/node/utils/projectTrust";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -6280,7 +6281,7 @@ export class WorkspaceService
       }
 
       const createEnv = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(owningProjectPath)
+        secretsForWorkspace(this.secretsStore, owningProjectPath, finalRuntimeConfig)
       );
       const maxCollisionRetries = hasSanitizedWorkspaceName
         ? 0
@@ -13771,8 +13772,9 @@ export class WorkspaceService
           return cachedEnv;
         }
 
+        // An SSH+None fork shares the source's host directory, so the source runtime decides.
         const projectEnv = await secretsToRecord(
-          this.secretsStore.getEffectiveSecrets(normalizedRuntimeProjectPath)
+          secretsForWorkspace(this.secretsStore, normalizedRuntimeProjectPath, sourceRuntimeConfig)
         );
         projectEnvCache.set(normalizedRuntimeProjectPath, projectEnv);
         return projectEnv;
@@ -20411,7 +20413,7 @@ export class WorkspaceService
       // Multi-project bash shares one execution environment, so inject the union of repo secrets.
       const projectSecrets = isMultiProject(metadata)
         ? mergeMultiProjectSecrets(metadata, this.secretsStore)
-        : this.secretsStore.getEffectiveSecrets(metadata.projectPath);
+        : secretsForWorkspace(this.secretsStore, metadata.projectPath, metadata.runtimeConfig);
 
       // Create scoped temp directory for this IPC call
       using tempDir = new DisposableTempDir("mux-ipc-bash");
