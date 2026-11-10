@@ -1564,6 +1564,8 @@ else:
             ("11 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f")], 1),
             ("20 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 10)], 1),
             ("40 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 30)], 1),
+            # Longer than a head: the head cannot start it, and it must not read as a prefix of the head.
+            ("41 characters, the head and one more", [request, code_receipt(PR_HEAD + "f")], 1),
             # A SHA in upper case is a SHA: it names its head like the same SHA in lower case.
             ("upper case, 12 characters of the head", [request, code_receipt(PR_HEAD[:12].upper())], 0),
             ("upper case, the whole head", [request, code_receipt(PR_HEAD.upper())], 0),
@@ -1598,6 +1600,19 @@ else:
                     data, "wait_pr_codex.sh", env_extra={"CODEX_GATE_REACTIONS_NODES": json.dumps(served)}
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_a_receipt_for_an_earlier_head_does_not_pass_a_usage_limit_or_an_open_thread(self):
+        # Such a receipt is no approval, so the usage-limit pass (needs no Codex response) and the
+        # open-thread failure (which prints "approved" only for a real approval) do not meet it.
+        request = comment("@codex review", "maintainer", REQUEST)
+        receipt = code_receipt(EARLIER_HEAD[:10])
+        for case, comments, threads in (
+            ("a usage-limit notice", [request, receipt, comment(USAGE_LIMIT_NOTICES[0])], []),
+            ("an open review thread", [request, receipt], [thread("[P1] Fix authorization")]),
+        ):
+            with self.subTest(case=case):
+                result = self.assert_gate(1, snapshot(comments, threads, head=PR_HEAD), "wait_pr_codex.sh")
+                self.assertNotIn("Codex approved", result.stdout)
 
 
 if __name__ == "__main__":
