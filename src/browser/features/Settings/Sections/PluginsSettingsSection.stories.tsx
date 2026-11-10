@@ -223,6 +223,20 @@ function renderedLineTops(range: Range): Set<number> {
   return new Set(Array.from(range.getClientRects()).map((rect) => Math.round(rect.top)));
 }
 
+/** The line tops that the first `text` inside `element` covers. */
+function textLineTops(element: HTMLElement, text: string): Set<number> {
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+    const start = (node.textContent ?? "").indexOf(text);
+    if (start === -1) continue;
+    const range = document.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, start + text.length);
+    return renderedLineTops(range);
+  }
+  throw new Error(`${text} is not inside the element`);
+}
+
 /** The plain words of `element` (letters and a trailing punctuation mark) that span two lines. */
 function splitProseWords(element: HTMLElement): string[] {
   const split: string[] = [];
@@ -418,16 +432,7 @@ export const InstalledPhoneViewport: Story = {
         }
       }
       for (const { commit, line } of commits) {
-        const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
-        let text = walker.nextNode();
-        while (text !== null && !(text.textContent ?? "").includes(commit))
-          text = walker.nextNode();
-        if (text === null) throw new Error(`Commit ${commit} is not on its source line`);
-        const start = (text.textContent ?? "").indexOf(commit);
-        const range = document.createRange();
-        range.setStart(text, start);
-        range.setEnd(text, start + commit.length);
-        if (renderedLineTops(range).size !== 1) {
+        if (textLineTops(line, commit).size !== 1) {
           throw new Error(`Commit ${commit} is split across lines at ${width}px`);
         }
       }
@@ -2191,8 +2196,8 @@ const COMPONENT_FILES_PREVIEW: AgentPluginInstallPreview = {
  * File names of agents, workflows and reviewed components, slash command names, the words of the
  * hook list and the plugins folder at phone width: each name moves to the next line whole instead
  * of splitting at the card's edge, a name longer than a line wraps inside its own box, and
- * nothing sticks out of the screen, down to 320 px. Play-only: the other phone stories of this file snapshot the same
- * panel (Pixel budget).
+ * nothing sticks out of the screen, down to 320 px. Play-only: the other phone stories of this
+ * file snapshot the same panel (Pixel budget).
  */
 export const AddPluginFileNamesPhoneViewport: Story = {
   globals: {
