@@ -116,24 +116,29 @@ describe("SSH+None workspaces need their directory trusted", () => {
   });
 
   test.each([
-    ["SSH+None, directory untrusted", sshNone, false, false],
-    ["SSH+None, directory trusted", sshNone, true, true],
-    ["SSH worktree", sshWorktree, false, true],
-    ["local", { type: "local" } satisfies RuntimeConfig, false, true],
-    ["unset", undefined, false, true],
-  ] as const)("%s workspace project secrets", (_label, runtimeConfig, dirTrusted, expected) => {
-    const projectSecrets: Secret[] = [{ key: "GH_TOKEN", value: "ghp_secret" }];
-    const secretsStore = {
-      getEffectiveSecrets: (path: string) => (path === projectPath ? projectSecrets : []),
-    };
-    const config = configWithProjects(
-      projectsWith({
-        trusted: true,
-        ...(dirTrusted ? { trustedSshDirectories: [directory] } : {}),
-      }) as Map<string, { trusted?: boolean }>
-    );
-    expect(secretsForWorkspace(secretsStore, config, projectPath, runtimeConfig)).toEqual(
-      expected ? projectSecrets : []
-    );
-  });
+    ["SSH+None, directory untrusted", sshNone, true, false, false],
+    ["SSH+None, directory trusted", sshNone, true, true, true],
+    // Revoking project trust keeps the directory entry on disk; it must stop releasing secrets.
+    ["SSH+None, directory trusted but project revoked", sshNone, false, true, false],
+    ["SSH worktree", sshWorktree, true, false, true],
+    ["local", { type: "local" } satisfies RuntimeConfig, true, false, true],
+    ["unset", undefined, true, false, true],
+  ] as const)(
+    "%s workspace project secrets",
+    (_label, runtimeConfig, projectTrusted, dirTrusted, expected) => {
+      const projectSecrets: Secret[] = [{ key: "GH_TOKEN", value: "ghp_secret" }];
+      const secretsStore = {
+        getEffectiveSecrets: (path: string) => (path === projectPath ? projectSecrets : []),
+      };
+      const config = configWithProjects(
+        projectsWith({
+          trusted: projectTrusted,
+          ...(dirTrusted ? { trustedSshDirectories: [directory] } : {}),
+        }) as Map<string, { trusted?: boolean }>
+      );
+      expect(secretsForWorkspace(secretsStore, config, projectPath, runtimeConfig)).toEqual(
+        expected ? projectSecrets : []
+      );
+    }
+  );
 });

@@ -32,6 +32,10 @@ export function isWorkspaceDirTrusted(
 ): boolean {
   if (!isSshSharedProjectDirRuntime(runtimeConfig)) return true;
   if (!projectPath) return false;
+  // Directory trust only counts while the project itself is trusted: revoking project trust keeps
+  // trustedSshDirectories on disk, and callers that check only the directory (secrets) must not
+  // keep vouching for it.
+  if (!isProjectTrustedIn(projects, projectPath)) return false;
   return isWorkspaceDirTrustedBy(
     trustOwnerConfig(projects, projectPath)?.trustedSshDirectories,
     runtimeConfig

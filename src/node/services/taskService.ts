@@ -116,6 +116,7 @@ import {
   type PendingTaskWaiter,
 } from "@/node/services/taskWaiters";
 import {
+  isWorkspaceDirTrusted,
   isWorkspaceProjectTrusted,
   isWorkspaceProjectTrustedIn,
   secretsForWorkspace,
@@ -9697,8 +9698,7 @@ export class TaskService implements AgentTaskIntegration {
       parentMetadata: plan.parentMeta,
       allowCreateFallback: true,
       ...(preferredTrunkBranch != null ? { preferredTrunkBranch } : {}),
-      trusted:
-        this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
+      trusted: this.taskInitTrusted(plan),
       multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
         EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
       ),
@@ -9882,6 +9882,23 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /** Starts a launched task's init in its own checkout (callers skip a shared parent checkout). */
+  /**
+   * Whether a task's init may run repo-controlled code (.xum/init, git hooks). A task forked from
+   * an SSH+None parent shares the parent's host directory, which project trust alone does not
+   * cover, so this is project trust AND that directory's trust (isWorkspaceDirTrusted). For every
+   * other parent runtime the directory check is true.
+   */
+  private taskInitTrusted(plan: {
+    readonly configProjectPath: string;
+    readonly parentRuntimeConfig: RuntimeConfig;
+  }): boolean {
+    const projects = this.config.loadConfigOrDefault().projects;
+    return (
+      (projects.get(plan.configProjectPath)?.trusted ?? false) &&
+      isWorkspaceDirTrusted(projects, plan.configProjectPath, plan.parentRuntimeConfig)
+    );
+  }
+
   private registerTaskBackgroundInit(
     plan: TaskLaunchSource,
     checkout: Omit<TaskLaunchCheckout, "forkedRuntimeConfig">,
@@ -9906,9 +9923,7 @@ export class TaskService implements AgentTaskIntegration {
           env,
           abortSignal: initAbortController.signal,
           skipInitHook: plan.skipInitHook,
-          trusted:
-            this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
-            false,
+          trusted: this.taskInitTrusted(plan),
         },
         plan.taskId,
         workspaceUseLeasesFor(this.config)
