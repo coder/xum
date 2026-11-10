@@ -657,7 +657,7 @@ export function createConsolidationMemoryTool(args: {
  * never below MEMORY_CONSOLIDATION_MAX_STEPS, so a raised limit can be spent. No edit limit means
  * no step ceiling: the run timeout and the cost ceiling end the run.
  */
-export function organizerStepCeiling(editLimit: number | null): StopCondition<ToolSet>[] {
+export function organizerStepCeiling(editLimit: number | null): Array<StopCondition<ToolSet>> {
   if (editLimit === null) return [];
   return [stepCountIs(Math.max(MEMORY_CONSOLIDATION_MAX_STEPS, 4 * editLimit))];
 }
@@ -706,8 +706,7 @@ export async function runMemoryConsolidation(args: {
   editLimit?: number | null;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
-  const editLimit =
-    args.editLimit === undefined ? MEMORY_CONSOLIDATION_OP_BUDGET : args.editLimit;
+  const editLimit = args.editLimit === undefined ? MEMORY_CONSOLIDATION_OP_BUDGET : args.editLimit;
   const journal: MemoryConsolidationOp[] = [];
   const { tool: memoryTool, isBudgetExhausted } = createConsolidationMemoryTool({
     // No limit is an endless budget: tryConsume() never reaches Infinity, and the budget's

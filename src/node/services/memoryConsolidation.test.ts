@@ -1925,7 +1925,14 @@ describe("runMemoryConsolidation", () => {
           }));
           const chunks: LanguageModelV3StreamPart[] =
             calls === 1
-              ? [...creates, { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage }]
+              ? [
+                  ...creates,
+                  {
+                    type: "finish",
+                    finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                    usage,
+                  },
+                ]
               : [{ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage }];
           return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
         },
@@ -1950,7 +1957,9 @@ describe("runMemoryConsolidation", () => {
 
       const result = await run(fixture, scripted.model, { editLimit: null });
 
-      expect(result.ops.filter((op) => op.applied)).toHaveLength(MEMORY_CONSOLIDATION_OP_BUDGET + 4);
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(
+        MEMORY_CONSOLIDATION_OP_BUDGET + 4
+      );
       expect(result.budgetExhausted).toBe(false);
       expect(scripted.prompts[0]).toContain("This run has no edit limit.");
     });
