@@ -1070,6 +1070,24 @@ describe("AgentPluginInstallService marketplaces", () => {
     await expect(previewAgentsEntry("e2e")).rejects.toThrow(
       "The Agent Plugins marketplace entry 'e2e' points to a plugin named 'other'."
     );
+    // A manifest name outside the plugin-name grammar matches in the form Xum loads it.
+    await writeFiles(marketDir, {
+      ".agents/plugins/marketplace.json": JSON.stringify({
+        name: "e2e-market",
+        plugins: [{ name: "my_tool", source: "./tools/my_tool" }],
+      }),
+      "tools/my_tool/.claude-plugin/plugin.json": JSON.stringify({ name: "my_tool" }),
+      "tools/my_tool/skills/lint/SKILL.md": skillMd("lint"),
+    });
+    await commit(marketDir, "an entry name with an underscore");
+    expect((await previewAgentsEntry("my_tool")).manifest.name).toBe("my-tool");
+    await writeFiles(marketDir, {
+      ".agents/plugins/marketplace.json": JSON.stringify({
+        name: "e2e-market",
+        plugins: [{ name: "e2e", source: "./plugins/e2e" }],
+      }),
+    });
+    await commit(marketDir, "back to e2e");
     // The rule is Codex's: a Cursor entry still previews as the plugin its manifest names.
     const cursor = await service.preview({
       input: marketDir,

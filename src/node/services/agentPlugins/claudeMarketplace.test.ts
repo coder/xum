@@ -540,11 +540,15 @@ describe("the Agent Plugins marketplace file", () => {
     for (const path of ["", "./", 3]) {
       expect(resolveEntry({ source: { ...source, path } })).toContain("must name a folder");
     }
-    // A null ref or sha is absent too.
+    // A null ref or sha is absent too: a null sha keeps a given ref.
     expect(resolveEntry({ source: { ...source, ref: null, sha: null } })).toMatchObject({
       kind: "remote",
       ref: undefined,
       subpath: "tools/x",
+    });
+    expect(resolveEntry({ source: { ...source, ref: "release-v2", sha: null } })).toMatchObject({
+      kind: "remote",
+      ref: "release-v2",
     });
     // A null path is absent, as in Codex: the repository root.
     expect(resolveEntry({ source: { ...source, path: null } })).toMatchObject({

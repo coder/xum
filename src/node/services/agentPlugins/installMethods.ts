@@ -601,10 +601,22 @@ export function assertEntryNamesPlugin(
   pluginName: string
 ): void {
   if (ctx === undefined || !MARKETPLACE_FILE_RULES[ctx.file].entryNamesPlugin) return;
-  if (pluginName === ctx.entry.name) return;
+  // Xum keeps a manifest name in the plugin-name grammar (`my_tool` loads as `my-tool`), so the
+  // entry name matches in either form.
+  if (pluginName === ctx.entry.name || pluginName === pluginNameOrUndefined(ctx.entry.name)) {
+    return;
+  }
   throw new Error(
     `The ${AGENT_PLUGIN_INSTALL_METHOD_LABELS[MARKETPLACE_FILE_RULES[ctx.file].selector]} '${ctx.entry.name}' points to a plugin named '${pluginName}'. Xum installs it only under the name the marketplace lists.`
   );
+}
+
+function pluginNameOrUndefined(raw: string): string | undefined {
+  try {
+    return toPluginName(raw);
+  } catch {
+    return undefined;
+  }
 }
 
 /** The error when a marketplace entry's folder fits no method. */
