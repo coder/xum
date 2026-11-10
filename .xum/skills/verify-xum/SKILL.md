@@ -261,8 +261,9 @@ output: it resolves relative paths against its daemon's directory.
 
 agent-browser drives Chromium. Phone users run Safari, which is WebKit, and the two engines lay
 some pages out differently, so a Chromium pass cannot show a WebKit-only defect. Playwright WebKit
-on Linux is still not iOS Safari: it did not reproduce the iPhone Safari Mermaid overflow that led to
-this capture. So a clean `-webkit` capture is not proof for iOS Safari. `webkit-capture` opens a page
+on Linux is still not iOS Safari: a phone-width screenshot of it did not reproduce the exact iPhone
+Safari Mermaid overflow that led to this capture. So a clean `-webkit` capture is not proof for iOS
+Safari. `webkit-capture` opens a page
 of the run in Playwright WebKit at a phone viewport:
 
 ```bash
