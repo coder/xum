@@ -141,6 +141,8 @@ function IsolationPickerStory(props: {
   runtimeAvailabilityState: RuntimeAvailabilityState;
   coderInfo?: CoderInfo | null;
   initialRuntime?: ParsedRuntime;
+  /** Pins a phone-width container; the test-runner plays at desktop size (AGENTS.md). */
+  phoneWidth?: boolean;
 }) {
   const [selectedRuntime, setSelectedRuntime] = useState<ParsedRuntime>(
     props.initialRuntime ?? { mode: RUNTIME_MODE.WORKTREE }
@@ -148,8 +150,11 @@ function IsolationPickerStory(props: {
 
   return (
     <SettingsSectionStory setup={() => setupSettingsStory({})}>
-      <div className="bg-background p-6">
-        <div className="max-w-3xl">
+      <div className={props.phoneWidth ? "bg-background p-2" : "bg-background p-6"}>
+        <div
+          className={props.phoneWidth ? "w-[375px]" : "max-w-3xl"}
+          data-testid="isolation-picker-frame"
+        >
           <CreationControls
             {...DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS}
             selectedRuntime={selectedRuntime}
@@ -201,6 +206,8 @@ export const CoderAvailable: Story = {
 
 /** Coder option is hidden when Coder CLI is missing. */
 export const CoderNotAvailable: Story = {
+  // Its closed-menu snapshot is the same as CoderAvailable's; the play checks the behavior.
+  parameters: { pixel: PIXEL_DISABLED },
   args: {
     coderInfo: mockCoderInfoMissing,
   },
@@ -260,9 +267,12 @@ export const DevcontainerUnavailable: Story = {
  * SSH backend yet, so they stay listed but disabled with the reason.
  */
 export const SshWithoutIsolation: Story = {
-  // The play checks the behavior; a pixel snapshot would only spend the snapshot budget.
-  parameters: { pixel: PIXEL_DISABLED },
+  // The selects share a row and the host and directory inputs wrap below them on phones, so this
+  // story is the phone snapshot of the creation controls.
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
   args: {
+    phoneWidth: true,
     initialRuntime: {
       mode: "ssh",
       host: "devbox.internal",
@@ -277,6 +287,18 @@ export const SshWithoutIsolation: Story = {
     await expect(
       await canvas.findByLabelText("Project directory on host", {}, { timeout: 10000 })
     ).toHaveValue("~/src/my-app");
+
+    // Narrow-layout contract: every control stays inside the phone-width frame.
+    const frame = canvas.getByTestId("isolation-picker-frame").getBoundingClientRect();
+    for (const label of [
+      "Project isolation",
+      "Workspace isolation",
+      "Host",
+      "Project directory on host",
+    ]) {
+      const box = canvas.getByLabelText(label).getBoundingClientRect();
+      await expect(box.right).toBeLessThanOrEqual(frame.right + 1);
+    }
 
     await openIsolationMenu(storyRoot, "Workspace isolation");
     const dockerOption = await within(document.body).findByRole("option", { name: /^Docker/i });

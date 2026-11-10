@@ -1030,13 +1030,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const coderPresetsLoading =
     coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
   // #6033: the trunk branch stays empty until the branch list loads, and the backend refuses
-  // every runtime except local without one, so a creation send must wait for the list. A failed
-  // list keeps it closed too (#6055).
+  // every runtime that builds a checkout without one, so a creation send must wait for the list.
+  // A failed list keeps it closed too (#6055). Local and SSH+None run in an existing directory and
+  // need no trunk, so a local git failure must not block them.
+  const creationRuntimeNeedsTrunk =
+    creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL &&
+    !(
+      creationState.selectedRuntime.mode === RUNTIME_MODE.SSH &&
+      creationState.selectedRuntime.workspaceIsolation === "none"
+    );
   const creationBranchesLoading =
     variant === "creation" &&
     props.kind !== "scratch" &&
     creationState.branchLoad !== "loaded" &&
-    creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
+    creationRuntimeNeedsTrunk;
   const creationDraftNotSaved = variant === "creation" && draft.saveError !== null;
   // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
   useReportCreationSendBlocked(
