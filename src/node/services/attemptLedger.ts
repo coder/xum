@@ -27,6 +27,7 @@ import type {
   AdmittedSend,
   AgentTaskReport,
   AttemptSettlementEntry,
+  InheritedReport,
   OwnedTaskAttempt,
   SettlementReceiptDecision,
   StreamAttemptOrigin,
@@ -333,7 +334,7 @@ export class AttemptLedger {
     identity: {
       attemptId: string | undefined;
       receiptEligible: boolean;
-      inheritedReport: boolean;
+      inheritedReport: InheritedReport | null;
       abortSignal?: AbortSignal;
     }
   ): OwnedTaskAttempt {
