@@ -5150,6 +5150,14 @@ export class WorkspaceMcpOverridesService {
         // deadline (a stat/read finally answering) must not start its
         // rewrite once the caller moved on — settleSideEffects can only
         // join a write that has been registered by then.
+        // The deadline cannot stop a prune that is spent before it starts:
+        // remaining() never drops below 1 ms, and the legacy prune starts its
+        // config.json edit before its first await. Without this check, every
+        // workspace left after the budget still rewrote config.json once, under
+        // the locks.
+        if (sweep.budget.exhausted()) {
+          throw new Error(`pruning workspace ${metadata.id} exceeded the plugin-prune budget`);
+        }
         const step = sweep.snapshot.scoped();
         const result = await withDeadline(
           this.pruneSweptCheckout(metadata, keyPrefix, step, sweep.hasLegacyValue),
@@ -5217,11 +5225,10 @@ export class WorkspaceMcpOverridesService {
     }
     // A value this build cannot edit fails the workspace before any write. The edit reads
     // config.json again, and a value written since this check is checked there.
+    // No cancellation check before the edit: this runs before the caller's deadline can fire
+    // (see pruneSweptWorkspace, which checks the budget before each checkout instead).
     let uneditable = naming.some((value) => prunedLegacyValue(value, keyPrefix) === undefined);
     if (!uneditable) {
-      if (step.cancelled) {
-        throw new Error(`pruning workspace ${workspaceId}'s legacy MCP settings was cancelled`);
-      }
       await step.trackSideEffect(
         this.config.editConfig((config) => {
           uneditable = pruneLegacyValuesIn(config, workspaceId, keyPrefix);
