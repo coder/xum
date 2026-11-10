@@ -165,8 +165,12 @@ function waitForStreamClose(stream: fs.WriteStream): Promise<void> {
     }
 
     stream.once("close", () => resolve());
-    // A failed stream is destroyed, and a stream that failed to open has no descriptor to close.
-    stream.once("error", () => resolve());
+    // A failed stream is destroyed, and 'close' follows its 'error' once the descriptor (if the open
+    // succeeded) is closed, so this waits for it too. Destroy a stream that nothing destroyed, so a
+    // stream that fails without a destroy cannot stall the transition.
+    stream.once("error", () => {
+      if (!stream.destroyed) stream.destroy();
+    });
     stream.end();
   });
 }

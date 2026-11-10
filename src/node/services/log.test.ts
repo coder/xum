@@ -185,7 +185,7 @@ describe("log file sink state machine", () => {
     await clearLogFiles();
   }, 2000);
 
-  test("a clear does not wait forever for a stream that fails", async () => {
+  test("a clear waits for a failed stream to close, and does not wait forever for it", async () => {
     const createdStreams = recordCreatedStreams();
     log.info("line before the stream fails");
     const stream = createdStreams[0];
@@ -201,8 +201,9 @@ describe("log file sink state machine", () => {
     stream.emit("error", new Error("forced log stream failure"));
     await clearing;
 
+    // The clear waited until the failed stream was destroyed and its descriptor closed.
+    expect(stream.closed).toBe(true);
     endSpy.mockRestore();
-    stream.destroy();
   }, 2000);
 
   test("clearLogFiles rejects when truncate fails", async () => {
