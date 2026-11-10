@@ -6,7 +6,7 @@ import * as RealOpenInEditor from "@/browser/utils/openInEditor";
 import { APIContext, APIProvider } from "@/browser/contexts/API";
 import type { ReactElement, ReactNode } from "react";
 import { PlanTab } from "./PlanTab";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import type { APIClient } from "@/browser/contexts/API";
@@ -222,21 +222,22 @@ describe("PlanTab", () => {
     mockApi = { workspace: { getPlanContent: mock(() => Promise.resolve(planResult("# Plan"))) } };
     // The narrow layout hides the sidebar with display: none: no layout box until it shows.
     let visible = false;
-    const realGetClientRects = HTMLElement.prototype.getClientRects;
-    HTMLElement.prototype.getClientRects = function (this: HTMLElement) {
-      return visible || this.dataset.testid !== "plan-tab-body"
-        ? realGetClientRects.call(this)
-        : ([] as unknown as DOMRectList);
-    };
+    const clientRects = spyOn(HTMLElement.prototype, "getClientRects").mockImplementation(function (
+      this: HTMLElement
+    ) {
+      const hidden = !visible && this.dataset.testid === "plan-tab-body";
+      // Only the list length matters: an empty list means no layout box.
+      return (hidden ? [] : [{ width: 100, height: 100 }]) as unknown as DOMRectList;
+    });
     const observed: Array<() => void> = [];
     const RealResizeObserver = globalThis.ResizeObserver;
     globalThis.ResizeObserver = class {
       constructor(private readonly callback: ResizeObserverCallback) {}
-      observe() {
+      observe = () => {
         observed.push(() => this.callback([], this as unknown as ResizeObserver));
-      }
-      unobserve() {}
-      disconnect() {}
+      };
+      unobserve = () => undefined;
+      disconnect = () => undefined;
     } as unknown as typeof ResizeObserver;
     try {
       const view = renderWithApi(<PlanTab workspaceId="workspace-1" />);
@@ -251,7 +252,7 @@ describe("PlanTab", () => {
       act(() => observed.forEach((notify) => notify()));
       expect(body.scrollTop).toBe(120);
     } finally {
-      HTMLElement.prototype.getClientRects = realGetClientRects;
+      clientRects.mockRestore();
       globalThis.ResizeObserver = RealResizeObserver;
     }
   });
