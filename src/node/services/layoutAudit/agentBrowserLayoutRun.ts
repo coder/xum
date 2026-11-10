@@ -7,6 +7,7 @@ import {
   type LayoutAuditViewport,
 } from "@/common/constants/artifactLayoutAudit";
 import { LayoutAuditPagePassSchema } from "@/common/types/artifactLayoutAudit";
+import { shellQuote } from "@/common/utils/shell";
 import { TOOL_ENV_FAILED_EXIT, toolEnvPrelude } from "@/node/services/artifactCapabilities";
 import type { FailedReason, ViewportOutcome } from "@/node/services/layoutAudit/viewportOutcome";
 import { log } from "@/node/services/log";
@@ -99,34 +100,31 @@ const FRAME_END = "@@xum-layout-end";
  * call carries the same flags and the same folder, `close` included, so it addresses the same
  * daemon.
  *
- * The driver neutralizes the inherited variables and the word-splitting state: a tool_env that
- * sets IFS would make the sweep read its newline-separated names as one word, so IFS is unset
- * first (unset, it splits on space, tab and newline). Each of these steps ends the script when
- * it fails, before any agent-browser call and before the run makes its folder: a tool_env that
- * marks IFS or an AGENT_BROWSER_* variable `readonly` makes `unset` fail, and bash then keeps
- * the old value (for a readonly AGENT_BROWSER_SOCKET_DIR it even exports it), so going on would
- * drive a browser with settings the run did not choose. A tool_env that redefines a command such
- * as `env`, `sed` or `agent-browser` is outside that boundary: tool_env is trusted project code
- * that can run anything.
+ * tool_env gives the run its exported environment (PATH above all: that is how agent-browser is
+ * found) and nothing else. The scripts below do not run in the shell that sourced it: that shell
+ * replaces itself with a new one (see inNewShell), so no shell state tool_env left behind (IFS,
+ * a readonly or unexported variable, a function, a shell option) can change what they do. A new
+ * shell starts with the default IFS and no readonly variable, so the sweep's `unset` cannot
+ * fail. Outside this boundary, because tool_env is trusted project code that can run anything:
+ * a tool_env that exports the run's own XUM_LAYOUT_* names, or that puts another `env`, `sed`
+ * or `agent-browser` on PATH.
  */
 const SHELL_COMMON = String.raw`
-unset IFS || exit ${EXIT_SETUP_FAILED}
-for v in $(env | sed -n 's/^\(AGENT_BROWSER_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v" || exit ${EXIT_SETUP_FAILED}; done
-export AGENT_BROWSER_SOCKET_DIR="$XUM_LAYOUT_SOCKET_DIR" || exit ${EXIT_SETUP_FAILED}
+for v in $(env | sed -n 's/^\(AGENT_BROWSER_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
+export AGENT_BROWSER_SOCKET_DIR="$XUM_LAYOUT_SOCKET_DIR"
 ab_wrap=
 ab() { $ab_wrap agent-browser --session "$XUM_LAYOUT_SESSION" --config "$XUM_LAYOUT_SOCKET_DIR/config.json" --idle-timeout ${IDLE_TIMEOUT} "$@"; }
 cd / || exit ${EXIT_SETUP_FAILED}
 `;
 
-// Reads stdin before any step that can exit, so the page script is always consumed. Kept first
-// as a precaution: on LocalRuntime, execBuffered did not fail when a command that exits at once
-// left up to 2 MB of stdin unread (measured), so this order is not known to be needed.
-const READ_STDIN = String.raw`
-page_script=$(cat) || exit ${EXIT_SETUP_FAILED}
-`;
-
+// The page script on stdin is read before the first step that can exit, and drained when there
+// is no agent-browser (the usual way to be "not checked"), so the exec's writer never meets a
+// reader that left. A tool_env that fails ends the exec before that: on LocalRuntime,
+// execBuffered did not fail when a command that exits at once left up to 2 MB of stdin unread
+// (measured).
 const RUN_SCRIPT = String.raw`
-command -v agent-browser >/dev/null 2>&1 || exit ${EXIT_NO_AGENT_BROWSER}
+command -v agent-browser >/dev/null 2>&1 || { cat >/dev/null 2>&1; exit ${EXIT_NO_AGENT_BROWSER}; }
+page_script=$(cat) || exit ${EXIT_SETUP_FAILED}
 ${SHELL_COMMON}
 # Plain mkdir: it fails on a path that already exists, so the run never adopts a folder it did
 # not make, and CLOSE never removes one.
@@ -162,6 +160,16 @@ case "$XUM_LAYOUT_SOCKET_DIR" in
   ${SOCKET_DIR_PARENT}/${SESSION_PREFIX}*) rm -rf -- "$XUM_LAYOUT_SOCKET_DIR" ;;
 esac
 `;
+
+/**
+ * The text that runs `script` in a new shell, in place of the shell that sourced tool_env: only
+ * the environment crosses an exec. `exec` keeps the process, so a timeout or a cancel still
+ * kills the run, and stdin goes straight to the script. /bin/sh, not a name or a variable that
+ * tool_env could have changed: the scripts are POSIX sh.
+ */
+function inNewShell(script: string): string {
+  return `exec /bin/sh -c ${shellQuote(script)}\n`;
+}
 
 export interface LayoutRunInput {
   runtime: Runtime;
@@ -270,7 +278,7 @@ export async function runLayoutPasses(input: LayoutRunInput): Promise<ViewportOu
     XUM_LAYOUT_SOCKET_DIR: `${SOCKET_DIR_PARENT}/${session}`,
   };
   const { prelude, pathEnv } = toolEnvPrelude(input.toolEnvPath);
-  const run = await execOrFail(input.runtime, READ_STDIN + prelude + RUN_SCRIPT, {
+  const run = await execOrFail(input.runtime, prelude + inNewShell(RUN_SCRIPT), {
     cwd: input.cwd,
     pathEnv,
     env: {
@@ -284,7 +292,7 @@ export async function runLayoutPasses(input: LayoutRunInput): Promise<ViewportOu
     maxOutputBytes: MAX_RUN_OUTPUT_BYTES,
   });
   if (!NEVER_LAUNCHED_EXITS.has(run.exitCode)) {
-    await execOrFail(input.runtime, prelude + CLOSE_SCRIPT, {
+    await execOrFail(input.runtime, prelude + inNewShell(CLOSE_SCRIPT), {
       cwd: input.cwd,
       pathEnv,
       env: sessionEnv,

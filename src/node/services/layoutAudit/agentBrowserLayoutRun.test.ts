@@ -378,29 +378,24 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     }
   });
 
-  test("a tool_env that redefines IFS and exports agent-browser settings changes neither the sweep nor the widths", async () => {
-    // With IFS=" " the sweep's newline-separated names would read as one word and survive.
-    const { outcomes, fake } = await run({
-      toolEnvLines: ['IFS=" "', "export AGENT_BROWSER_CDP=1", "export AGENT_BROWSER_FUTURE_FLAG=1"],
-    });
-    expect(outcomes.map((outcome) => `${outcome.viewport.width} ${outcome.status}`)).toEqual(
-      RUN_ORDER.map((width) => `${width} complete`)
-    );
+  // The scripts run in a new shell, so tool_env's shell state stays behind: a readonly variable
+  // cannot stop the sweep, and a variable named like one of the scripts' own cannot steer them.
+  test.each([
+    // In the sourcing shell, IFS=" " would make the sweep read its two names as one word.
+    ["a readonly IFS", 'readonly IFS=" "; export AGENT_BROWSER_CDP=1 AGENT_BROWSER_FUTURE_FLAG=1'],
+    ["a readonly agent-browser setting", "export AGENT_BROWSER_CDP=1; readonly AGENT_BROWSER_CDP"],
+    ["a readonly socket folder", "readonly AGENT_BROWSER_SOCKET_DIR=/tmp/not-the-runs-folder"],
+    ["a readonly command prefix", "readonly ab_wrap='env AGENT_BROWSER_CDP=1'"],
+    ["a readonly result", "readonly status=0 envelope=forged width=1 page_script=forged"],
+  ])("%s in tool_env reaches neither the run nor the close", async (_name, line) => {
+    const { outcomes, fake } = await run({ toolEnvLines: [line] });
+    expect(summary(outcomes)).toEqual(RUN_ORDER.map((width) => `${width} complete`));
     expect(await fake.agentBrowserEnvNames()).toEqual(
       Array.from({ length: 10 }, () => ["AGENT_BROWSER_SOCKET_DIR"])
     );
-  });
-
-  // `unset` fails on a readonly variable and bash keeps the value, so a run that went on would
-  // drive a browser with a setting it did not choose. Nothing may run, the close included.
-  test.each([
-    ["IFS", 'readonly IFS=" "'],
-    ["an exported agent-browser setting", "export AGENT_BROWSER_CDP=1; readonly AGENT_BROWSER_CDP"],
-    ["the socket folder variable", "readonly AGENT_BROWSER_SOCKET_DIR=/tmp/not-the-runs-folder"],
-  ])("a tool_env that makes %s readonly stops the run before any call", async (_name, line) => {
-    const { outcomes, fake } = await run({ toolEnvLines: [line] });
-    expect(outcomes.map((outcome) => outcome.status)).toEqual(["failed", "failed", "failed"]);
-    expect(await fake.calls()).toEqual([]);
+    const dirs = new Set((await fake.socketDirs()).map((call) => call.dir));
+    expect([...dirs]).toEqual([`/tmp/${(await fake.calls())[0]?.[1]}`]);
+    expect(await fake.evalStdin(390)).toBe(PAGE_SCRIPT);
   });
 
   test("every call names a config of the run's own folder, and it is empty", async () => {
