@@ -7,6 +7,7 @@ import {
   applyResolvedProjectDir,
   saveSshDirectoryTrust,
   sshDirectoryTrustRowCopy,
+  withResolvedRememberedProjectDir,
 } from "./sshDirectoryTrustState";
 
 const projectPath = "/repo/app";
@@ -76,7 +77,7 @@ describe("saveSshDirectoryTrust", () => {
   const request = { projectPath, host: "box", projectDir: "~/app", trusted: true };
 
   function depsReturning(result: Result<{ projectDir: string }, string>) {
-    const calls = { resolved: [] as string[], refreshed: 0 };
+    const calls = { resolved: [] as string[], remembered: [] as string[][], refreshed: 0 };
     return {
       calls,
       deps: {
@@ -92,6 +93,8 @@ describe("saveSshDirectoryTrust", () => {
           projectDir: "~/app",
           applyProjectDir: (dir: string) => calls.resolved.push(dir),
         }),
+        rememberResolvedProjectDir: (_path: string, typed: string, resolved: string) =>
+          calls.remembered.push([typed, resolved]),
       },
     };
   }
@@ -106,8 +109,19 @@ describe("saveSshDirectoryTrust", () => {
       unsubscribe();
     }
     expect(calls.resolved).toEqual(["/home/me/app"]);
+    expect(calls.remembered).toEqual([]);
     expect(calls.refreshed).toBe(1);
     expect(published).toBe(1);
+  });
+
+  test("upgrades the remembered directory when the form moved on before the reply", async () => {
+    // Without this, coming back to "~/app" never matches the stored "/home/me/app" entry.
+    const { calls, deps } = depsReturning(Ok({ projectDir: "/home/me/app" }));
+    expect(
+      await saveSshDirectoryTrust({ ...deps, currentSelection: () => null }, request)
+    ).toBeNull();
+    expect(calls.resolved).toEqual([]);
+    expect(calls.remembered).toEqual([["~/app", "/home/me/app"]]);
   });
 
   test("leaves an already-resolved directory alone", async () => {
@@ -129,6 +143,21 @@ describe("saveSshDirectoryTrust", () => {
       api: { setSshDirectoryTrust: () => Promise.reject(new Error("offline")) },
     };
     expect(await saveSshDirectoryTrust(failing, request)).toBe("offline");
+  });
+});
+
+describe("withResolvedRememberedProjectDir", () => {
+  const remembered = { ssh: { host: "box", projectDir: "~/app" } };
+
+  test("replaces the typed spelling with the resolved one, keeping the other options", () => {
+    expect(withResolvedRememberedProjectDir(remembered, "~/app", "/home/me/app")).toEqual({
+      ssh: { host: "box", projectDir: "/home/me/app" },
+    });
+  });
+
+  test("leaves a directory the user has since replaced", () => {
+    expect(withResolvedRememberedProjectDir(remembered, "~/other", "/home/me/other")).toBeNull();
+    expect(withResolvedRememberedProjectDir(remembered, "~/app", "~/app")).toBeNull();
   });
 });
 

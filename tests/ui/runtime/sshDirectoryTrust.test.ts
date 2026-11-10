@@ -143,6 +143,48 @@ describeIntegration("SSH+None directory trust (UI)", () => {
     }
   }, 30_000);
 
+  test("a ~ path trusted while the user switched away still shows trusted on return", async () => {
+    const cleanupDom = installDom();
+    const projectPath = "/Users/dev/ssh-trust-switch";
+    expandProjects([projectPath]);
+    const client = createMockORPCClient({ projects: trustedProject(projectPath), workspaces: [] });
+    const save = client.projects.setSshDirectoryTrust.bind(client.projects);
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    client.projects.setSshDirectoryTrust = async (input) => {
+      await held;
+      return save(input);
+    };
+    const view = renderApp({ apiClient: client });
+
+    try {
+      const { user } = await openSshNoneForm(view, projectPath, "~/app");
+      await user.click(await findButtonEventually(view.container, "Trust directory"));
+      await findButtonEventually(view.container, "Checking devbox…");
+      // Leave SSH x None while the host resolves ~, so the reply finds no field to update.
+      await selectIsolation(view.container, "Workspace isolation", "Worktree");
+      release();
+      await waitFor(() => {
+        const saved = client.projects.list().then((list) => new Map(list).get(projectPath));
+        return saved.then((cfg) => {
+          if (!cfg?.trustedSshDirectories?.length) throw new Error("Trust not saved yet");
+        });
+      });
+
+      await selectIsolation(view.container, "Workspace isolation", "None");
+      await findButtonEventually(view.container, "Untrust");
+      const dirInput = view.container.querySelector<HTMLInputElement>(
+        'input[aria-label="Project directory on host"]'
+      );
+      expect(dirInput?.value).toBe("/home/mock/app");
+    } finally {
+      release();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 30_000);
+
   test("Set as default makes the shown isolation the project's default", async () => {
     const cleanupDom = installDom();
     const projectPath = "/Users/dev/ssh-default-project";

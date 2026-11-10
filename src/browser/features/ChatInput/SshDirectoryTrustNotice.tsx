@@ -3,6 +3,10 @@ import { Loader2, ShieldAlert, ShieldCheck } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
+import {
+  readRuntimeOptionDefaults,
+  updateRuntimeOptionDefaults,
+} from "@/browser/utils/runtimeOptionDefaults";
 import { cn } from "@/common/lib/utils";
 import type { ProjectConfig } from "@/common/types/project";
 import {
@@ -12,6 +16,7 @@ import {
   sshDirectoryTrustRowCopy,
   type PendingSshDirectoryTrust,
   type SshDirectoryTrustSelection,
+  withResolvedRememberedProjectDir,
 } from "./sshDirectoryTrustState";
 
 /**
@@ -65,6 +70,15 @@ export function SshDirectoryTrustNotice(props: {
   );
 }
 
+function rememberResolvedProjectDir(projectPath: string, typed: string, resolved: string) {
+  const next = withResolvedRememberedProjectDir(
+    readRuntimeOptionDefaults(projectPath),
+    typed,
+    resolved
+  );
+  if (next !== null) updateRuntimeOptionDefaults(projectPath, () => next);
+}
+
 /** Saves one trust choice at a time and keeps what is pending and the last failure for the row. */
 function useSshDirectoryTrustSaver(selection: SshDirectoryTrustSelection) {
   const { api } = useAPI();
@@ -91,6 +105,7 @@ function useSshDirectoryTrustSaver(selection: SshDirectoryTrustSelection) {
         api: api.projects,
         refreshProjects,
         currentSelection: () => currentSelectionRef.current,
+        rememberResolvedProjectDir,
       },
       request
     );

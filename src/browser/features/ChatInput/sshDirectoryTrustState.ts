@@ -1,4 +1,9 @@
 import type { APIClient } from "@/browser/contexts/API";
+import {
+  readOptionField,
+  writeOptionField,
+  type RuntimeOptionDefaults,
+} from "@/browser/utils/runtimeOptionDefaults";
 import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import type { ProjectConfig } from "@/common/types/project";
 import { buildRuntimeConfig } from "@/common/types/runtime";
@@ -113,6 +118,21 @@ export function applyResolvedProjectDir(
 }
 
 /**
+ * The remembered runtime options with the SSH directory `typed` replaced by its host-resolved
+ * spelling, or null when they no longer remember `typed` (the user has since used another one).
+ */
+export function withResolvedRememberedProjectDir(
+  remembered: RuntimeOptionDefaults,
+  typed: string,
+  resolved: string
+): RuntimeOptionDefaults | null {
+  if (resolved === typed || readOptionField(remembered, "ssh", "projectDir", "").trim() !== typed) {
+    return null;
+  }
+  return writeOptionField(remembered, "ssh", "projectDir", resolved);
+}
+
+/**
  * Saves the user's trust choice for an SSH+None directory and refreshes what depends on it.
  * Returns the error to show, or null on success; never throws.
  *
@@ -126,6 +146,8 @@ export async function saveSshDirectoryTrust(
     refreshProjects: () => Promise<void>;
     /** Read after the request returns, so the write-back sees the latest selection. */
     currentSelection: () => SshDirectoryTrustSelection | null;
+    /** Replaces the project's remembered SSH directory `typed` with `resolved`, if it holds it. */
+    rememberResolvedProjectDir: (projectPath: string, typed: string, resolved: string) => void;
   },
   request: { projectPath: string; host: string; projectDir: string; trusted: boolean }
 ): Promise<string | null> {
@@ -134,7 +156,14 @@ export async function saveSshDirectoryTrust(
     if (!result.success) {
       return result.error;
     }
-    applyResolvedProjectDir(deps.currentSelection(), request, result.data.projectDir);
+    const resolved = result.data.projectDir;
+    if (!applyResolvedProjectDir(deps.currentSelection(), request, resolved)) {
+      // The form moved on before the reply (another isolation, project or page; resolving ~ over
+      // SSH can take seconds). The field the user comes back to fills from the remembered
+      // directory, so upgrade that one: left as "~/app" it would never match the stored
+      // "/home/me/app" entry and the directory would look untrusted for good.
+      deps.rememberResolvedProjectDir(request.projectPath, request.projectDir, resolved);
+    }
     publishProjectTrustChanged();
     await deps.refreshProjects();
     return null;
