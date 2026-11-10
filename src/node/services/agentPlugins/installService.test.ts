@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -7170,17 +7171,6 @@ describe("AgentPluginInstallService", () => {
         await fsPromises.writeFile(docPath, JSON.stringify({ padding: "x".repeat(1024 * 1024) }));
         return docPath;
       };
-      /** A stale enable of the plugin: the sweep locks only workspaces whose documents may carry its key. */
-      const writeStaleEnable = async (workspaceId: string) => {
-        const docPath = path.join(muxRoot, "checkouts", workspaceId, ".xum", "mcp.local.jsonc");
-        await fsPromises.mkdir(path.dirname(docPath), { recursive: true });
-        await fsPromises.writeFile(
-          docPath,
-          JSON.stringify({
-            enabledServers: [`plugin:${computePluginInstanceId(installPath())}:echo`],
-          })
-        );
-      };
       /** Holds a workspace's lock, and makes each attempt on it cost a whole waiting budget. */
       const holdWorkspaceBusy = async (
         overrides: WorkspaceMcpOverridesService,
@@ -7251,7 +7241,6 @@ describe("AgentPluginInstallService", () => {
         const overrides = realOverridesService();
         const service = serviceWith(overrides);
         await registerLocalWorkspace("ws-1");
-        await writeStaleEnable("ws-1");
         const refuse = await prepareRefusal(gate, service, ["ws-1"]);
         const releaseBusy = await holdWorkspaceBusy(overrides, "ws-1");
         let refusal: string;
@@ -7275,7 +7264,6 @@ describe("AgentPluginInstallService", () => {
         const service = serviceWith(overrides);
         await registerLocalWorkspace("ws-1");
         await registerLocalWorkspace("ws-2");
-        await writeStaleEnable("ws-1");
         const docPath = await writeOversizedDoc("ws-2");
         const refuse = await prepareRefusal("fresh install", service, ["ws-1", "ws-2"]);
         const releaseBusy = await holdWorkspaceBusy(overrides, "ws-1");
@@ -7353,8 +7341,9 @@ describe("AgentPluginInstallService", () => {
 
     test("an uninstall waits for a settings save that validated the plugin's key before the commit", async () => {
       // The save checked the key while the plugin was installed, and it still holds its locks
-      // when the uninstall commits. A sweep that scans without waiting for it reads the
-      // document before the enable lands, and clears the tombstone over a stale enable.
+      // when the uninstall commits. A sweep that read the document before the enable landed
+      // cleared the tombstone over a stale enable. The sweep takes the save's locks first, so it
+      // prunes what the save wrote.
       const overrides = new WorkspaceMcpOverridesService(config);
       const serviceWithOverrides = new AgentPluginInstallService(config, {
         workspaceMcpOverridesService: overrides,
@@ -7438,242 +7427,6 @@ describe("AgentPluginInstallService", () => {
         pendingOverridePrunes?: unknown[];
       };
       expect(envelope.pendingOverridePrunes ?? []).toEqual([]);
-    }, 30_000);
-
-    test("an uninstall waits for a rename that moves a checkout between two of its document reads", async () => {
-      // The sweep's scan reads the clean canonical document, then a rename moves the checkout
-      // under the workspace's lock and rewrites its entry only later. The keyed compatibility
-      // document is absent at the old path then, so the sweep must lock the workspace instead
-      // of reporting it clean, and prune the document at the path the entry names.
-      const overrides = new WorkspaceMcpOverridesService(config);
-      const serviceWithOverrides = new AgentPluginInstallService(config, {
-        workspaceMcpOverridesService: overrides,
-      });
-      const preview = await serviceWithOverrides.preview({ input: remoteDir });
-      await serviceWithOverrides.install({
-        source: preview.source,
-        expectedSha: preview.lockedSha,
-      });
-      const key = buildPluginServerKey(computePluginInstanceId(installPath()), "echo");
-      // A worktree: its checkout is the entry's path, which a rename moves (a local workspace
-      // runs in its project directory).
-      const oldPath = path.join(config.srcDir, "moving-project", "branch");
-      const newPath = path.join(config.srcDir, "moving-project", "renamed");
-      await fsPromises.mkdir(oldPath, { recursive: true });
-      await config.editConfig((cfg) => {
-        cfg.projects.set("/fake/moving-project", {
-          workspaces: [
-            {
-              path: oldPath,
-              id: "ws-moving",
-              name: "branch",
-              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
-            },
-          ],
-        });
-        return cfg;
-      });
-      const compatibilityOf = (checkout: string) => path.join(checkout, ".mux", "mcp.local.jsonc");
-      await fsPromises.mkdir(path.join(oldPath, ".xum"), { recursive: true });
-      await fsPromises.writeFile(
-        path.join(oldPath, ".xum", "mcp.local.jsonc"),
-        JSON.stringify({ enabledServers: ["other"] })
-      );
-      await fsPromises.mkdir(path.dirname(compatibilityOf(oldPath)), { recursive: true });
-      await fsPromises.writeFile(
-        compatibilityOf(oldPath),
-        JSON.stringify({ enabledServers: [key, "kept"] })
-      );
-      // The scan pauses at its first stat of the compatibility document.
-      const realStat = fsPromises.stat;
-      let paused = false;
-      let reached!: () => void;
-      const atStat = new Promise<void>((resolve) => (reached = resolve));
-      let resume!: () => void;
-      const resumed = new Promise<void>((resolve) => (resume = resolve));
-      const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (
-        target: string,
-        ...rest: unknown[]
-      ) => {
-        if (!paused && target === compatibilityOf(oldPath)) {
-          paused = true;
-          reached();
-          await resumed;
-        }
-        return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
-      }) as typeof fsPromises.stat);
-      // The rename rewrites the entry once the sweep waits for a workspace lock, or, when the
-      // sweep never locks the workspace, once the uninstall is done.
-      let finishRename!: () => void;
-      const renameMayFinish = new Promise<void>((resolve) => (finishRename = resolve));
-      let moved = false;
-      const realLink = fsPromises.link;
-      const linkSpy = spyOn(fsPromises, "link").mockImplementation((existing, target) => {
-        if (moved && String(target).includes("mcp-overrides-locks")) finishRename();
-        return realLink(existing, target);
-      });
-      let rename: Promise<void> | undefined;
-      try {
-        const uninstall = serviceWithOverrides.uninstall({
-          name: "demo-plugin",
-          deletePluginData: false,
-        });
-        await atStat;
-        const release = await overrides.acquireWorkspaceLock("ws-moving");
-        await fsPromises.rename(oldPath, newPath);
-        moved = true;
-        rename = renameMayFinish.then(async () => {
-          try {
-            await config.editConfig((cfg) => {
-              for (const project of cfg.projects.values()) {
-                for (const entry of project.workspaces) {
-                  if (entry.id === "ws-moving") {
-                    entry.path = newPath;
-                    entry.name = "renamed";
-                  }
-                }
-              }
-              return cfg;
-            });
-          } finally {
-            await release();
-          }
-        });
-        resume();
-        await uninstall;
-      } finally {
-        resume();
-        finishRename();
-        await rename;
-        linkSpy.mockRestore();
-        statSpy.mockRestore();
-      }
-
-      expect(await registry()).toEqual([]);
-      const compatibility = JSON.parse(
-        await fsPromises.readFile(compatibilityOf(newPath), "utf8")
-      ) as {
-        enabledServers?: string[];
-      };
-      expect(compatibility.enabledServers).toEqual(["kept"]);
-      const envelope = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
-        pendingOverridePrunes?: unknown[];
-      };
-      expect(envelope.pendingOverridePrunes ?? []).toEqual([]);
-    }, 30_000);
-
-    test("an uninstall keeps the tombstone of a workspace whose renamed checkout's old path another directory took before the scan", async () => {
-      // A rename has moved the checkout and not yet rewritten its entry, and another directory
-      // took the old path before the sweep's scan read it. The scan reads that directory from
-      // start to end, so only the barrier, which waits out the rename's lock before the
-      // registry comparison, shows that the entry changed.
-      const overrides = new WorkspaceMcpOverridesService(config);
-      const serviceWithOverrides = new AgentPluginInstallService(config, {
-        workspaceMcpOverridesService: overrides,
-      });
-      const preview = await serviceWithOverrides.preview({ input: remoteDir });
-      await serviceWithOverrides.install({
-        source: preview.source,
-        expectedSha: preview.lockedSha,
-      });
-      const key = buildPluginServerKey(computePluginInstanceId(installPath()), "echo");
-      const oldPath = path.join(config.srcDir, "taken-project", "branch");
-      const newPath = path.join(config.srcDir, "taken-project", "renamed");
-      await fsPromises.mkdir(path.join(oldPath, ".xum"), { recursive: true });
-      await fsPromises.writeFile(
-        path.join(oldPath, ".xum", "mcp.local.jsonc"),
-        JSON.stringify({ enabledServers: [key, "kept"] })
-      );
-      await config.editConfig((cfg) => {
-        cfg.projects.set("/fake/taken-project", {
-          workspaces: [
-            {
-              path: oldPath,
-              id: "ws-taken",
-              name: "branch",
-              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
-            },
-          ],
-        });
-        return cfg;
-      });
-      // The scan pauses at its identity stat of the checkout, before it reads any document.
-      const realStat = fsPromises.stat;
-      let paused = false;
-      let reached!: () => void;
-      const atStat = new Promise<void>((resolve) => (reached = resolve));
-      let resume!: () => void;
-      const resumed = new Promise<void>((resolve) => (resume = resolve));
-      const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (
-        target: string,
-        ...rest: unknown[]
-      ) => {
-        if (
-          !paused &&
-          target === oldPath &&
-          (rest[0] as { bigint?: boolean } | undefined)?.bigint === true
-        ) {
-          paused = true;
-          reached();
-          await resumed;
-        }
-        return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
-      }) as typeof fsPromises.stat);
-      // The rename rewrites the entry once the sweep waits for a workspace lock, or, when the
-      // sweep never takes one, once the uninstall is done.
-      let finishRename!: () => void;
-      const renameMayFinish = new Promise<void>((resolve) => (finishRename = resolve));
-      let moved = false;
-      const realLink = fsPromises.link;
-      const linkSpy = spyOn(fsPromises, "link").mockImplementation((existing, target) => {
-        if (moved && String(target).includes("mcp-overrides-locks")) finishRename();
-        return realLink(existing, target);
-      });
-      let rename: Promise<void> | undefined;
-      try {
-        const uninstall = serviceWithOverrides.uninstall({
-          name: "demo-plugin",
-          deletePluginData: false,
-        });
-        await atStat;
-        const release = await overrides.acquireWorkspaceLock("ws-taken");
-        await fsPromises.rename(oldPath, newPath);
-        await fsPromises.mkdir(oldPath);
-        moved = true;
-        rename = renameMayFinish.then(async () => {
-          try {
-            await config.editConfig((cfg) => {
-              for (const project of cfg.projects.values()) {
-                for (const entry of project.workspaces) {
-                  if (entry.id === "ws-taken") {
-                    entry.path = newPath;
-                    entry.name = "renamed";
-                  }
-                }
-              }
-              return cfg;
-            });
-          } finally {
-            await release();
-          }
-        });
-        resume();
-        await uninstall;
-      } finally {
-        resume();
-        finishRename();
-        await rename;
-        linkSpy.mockRestore();
-        statSpy.mockRestore();
-      }
-
-      expect(await registry()).toEqual([]);
-      const envelope = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
-        pendingOverridePrunes?: Array<{ workspaceIds?: string[] }>;
-      };
-      expect(
-        (envelope.pendingOverridePrunes ?? []).flatMap((tombstone) => tombstone.workspaceIds ?? [])
-      ).toContain("ws-taken");
     }, 30_000);
 
     test("a fresh install sweeps every workspace when an unrelated legacy entry's metadata is malformed", async () => {
@@ -9898,6 +9651,329 @@ describe("AgentPluginInstallService", () => {
     expect(managed).toMatchObject({ managed: true, present: false, version: "1.0.0" });
     const unmanaged = items.find((item) => item.name === "handmade");
     expect(unmanaged).toMatchObject({ managed: false, present: true });
+  });
+
+  // Renames that put a workspace back where it was while an install or uninstall sweeps its
+  // overrides (see workspaceMcpOverridesService.renameRaces.test.ts). The sweep reads documents
+  // only under the lock of every workspace it sweeps, so each case keeps consent.
+  describe("plugin sweeps during a rename that puts a workspace back", () => {
+    const docOf = (p: string) => path.join(p, ".xum", "mcp.local.jsonc");
+    const writeDoc = async (p: string, enabledServers: string[]) => {
+      await fsPromises.mkdir(path.dirname(docOf(p)), { recursive: true });
+      await fsPromises.writeFile(docOf(p), JSON.stringify({ enabledServers }));
+    };
+    const ownText = (p: string) => fsPromises.readFile(docOf(p), "utf8").catch(() => "");
+    const tombstonesFor = async (prefix: string) => {
+      const raw = await fsPromises.readFile(registryFile(), "utf8").catch(() => "{}");
+      return (
+        ((JSON.parse(raw) as { pendingOverridePrunes?: unknown }).pendingOverridePrunes ??
+          []) as Array<{ prefix: string; workspaceIds: string[] }>
+      ).filter((t) => t.prefix === prefix);
+    };
+    const register = async (project: string, name: string) => {
+      const projectPath = `/fake/${project}`;
+      const workspaceId = `ws-${project}-${name}`;
+      const workspacePath = path.join(config.srcDir, project, name);
+      await fsPromises.mkdir(workspacePath, { recursive: true });
+      await config.editConfig((cfg) => {
+        const entry = cfg.projects.get(projectPath) ?? { workspaces: [] };
+        entry.workspaces.push({
+          path: workspacePath,
+          id: workspaceId,
+          name,
+          runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+        });
+        cfg.projects.set(projectPath, entry);
+        return cfg;
+      });
+      return { workspaceId, workspacePath };
+    };
+    const renameEntry = (workspaceId: string, newPath: string) =>
+      config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const entry of project.workspaces) {
+            if (entry.id === workspaceId) {
+              entry.name = path.basename(newPath);
+              entry.path = newPath;
+            }
+          }
+        }
+        return cfg;
+      });
+    const renameCheckout = async (
+      overrides: WorkspaceMcpOverridesService,
+      workspaceId: string,
+      from: string,
+      to: string
+    ) => {
+      const release = await overrides.acquireWorkspaceLock(workspaceId);
+      try {
+        await fsPromises.rename(from, to);
+        await renameEntry(workspaceId, to);
+      } finally {
+        await release();
+      }
+    };
+    const lockFilesOf = async (overrides: WorkspaceMcpOverridesService, workspaceId: string) => {
+      const locksDir = path.join(config.rootDir, "mcp-overrides-locks");
+      const before = new Set(await fsPromises.readdir(locksDir).catch(() => [] as string[]));
+      const release = await overrides.acquireWorkspaceLock(workspaceId);
+      try {
+        return (await fsPromises.readdir(locksDir))
+          .filter((name) => name.endsWith(".lock") && !before.has(name))
+          .map((name) => path.join(locksDir, name));
+      } finally {
+        await release();
+      }
+    };
+    /** As zzABA8004.test.ts sweepWithPhases, around any operation. */
+    const withPhases = async <T>(
+      run: () => Promise<T>,
+      watched: string,
+      lockFiles: ReadonlySet<string>,
+      phase1: () => Promise<void>,
+      phase2: () => Promise<void>,
+      timeline: string[]
+    ): Promise<T> => {
+      const mine = new AsyncLocalStorage<boolean>();
+      const realStat = fsPromises.stat;
+      const realLink = fsPromises.link;
+      let statCount = 0;
+      let trigger: "stat" | "link" | undefined;
+      let phase1Done = false;
+      let phase1Promise: Promise<void> | undefined;
+      let phase2Promise: Promise<void> | undefined;
+      const runPhase2 = () => {
+        phase2Promise ??= mine
+          .run(true, () => phase2())
+          .then(() => {
+            timeline.push("phase2-done");
+          });
+        return phase2Promise;
+      };
+      const runPhase1 = async (via: "stat" | "link") => {
+        trigger = via;
+        timeline.push(`trigger-${via}`);
+        phase1Promise = mine
+          .run(true, () => phase1())
+          .then(() => {
+            phase1Done = true;
+            timeline.push("phase1-done");
+            if (via === "link") void runPhase2();
+          });
+        await Promise.race([phase1Promise, new Promise((r) => setTimeout(r, 1500))]);
+        if (!phase1Done) timeline.push("phase1-blocked");
+      };
+      const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (
+        ...args: Parameters<typeof fsPromises.stat>
+      ) => {
+        if (mine.getStore() === true || String(args[0]) !== watched) return realStat(...args);
+        statCount++;
+        if (trigger === undefined) {
+          await runPhase1("stat");
+          return realStat(...args);
+        }
+        const result = await realStat(...args);
+        if (trigger === "stat" && statCount === 2 && phase1Done) {
+          timeline.push("stat2");
+          await runPhase2();
+        }
+        return result;
+      }) as typeof fsPromises.stat);
+      const linkSpy = spyOn(fsPromises, "link").mockImplementation((async (
+        existing: Parameters<typeof fsPromises.link>[0],
+        target: Parameters<typeof fsPromises.link>[1]
+      ) => {
+        if (mine.getStore() !== true && trigger === undefined && lockFiles.has(String(target))) {
+          await runPhase1("link");
+        }
+        return realLink(existing, target);
+      }) as typeof fsPromises.link);
+      try {
+        return await run();
+      } finally {
+        statSpy.mockRestore();
+        linkSpy.mockRestore();
+        await phase1Promise;
+        if (phase1Done) await runPhase2();
+      }
+    };
+
+    test("a reinstall's retry of a failed prune keeps the tombstone or prunes the document when two workspaces swap names and back", async () => {
+      const overrides = new WorkspaceMcpOverridesService(config);
+      const svc = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overrides,
+      });
+      const preview = await svc.preview({ input: remoteDir });
+      await svc.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const prefix = buildPluginServerKey(
+        computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+        ""
+      );
+      const key = `${prefix}echo`;
+      const w = await register("rg", "w");
+      const y = await register("rg", "y");
+      await writeDoc(w.workspacePath, [key, "keep"]);
+      await writeDoc(y.workspacePath, ["clean"]);
+      // The uninstall cannot read W's document: its prune fails and W keeps a tombstone.
+      await fsPromises.chmod(docOf(w.workspacePath), 0o000);
+      const uninstall = await svc.uninstall({ name: "demo-plugin", deletePluginData: false }).then(
+        () => "resolved",
+        (e: unknown) => `rejected:${String(e).slice(0, 60)}`
+      );
+      const keptAfterUninstall = (await tombstonesFor(prefix)).some((t) =>
+        t.workspaceIds.includes(w.workspaceId)
+      );
+      await fsPromises.chmod(docOf(w.workspacePath), 0o644);
+      const a = w.workspacePath;
+      const tmp = path.join(path.dirname(a), "tmp-name");
+      const c = y.workspacePath;
+      const timeline: string[] = [];
+      const lockFiles = new Set(await lockFilesOf(overrides, w.workspaceId));
+      // The reinstall: its gate retries the pending prune over every live workspace while
+      // two app renames swap Y into W's path and back.
+      const reinstall = await withPhases(
+        () =>
+          svc.install({ source: preview.source, expectedSha: preview.lockedSha }).then(
+            () => "installed",
+            (e: unknown) => `refused:${String(e).slice(0, 80)}`
+          ),
+        a,
+        lockFiles,
+        async () => {
+          await renameCheckout(overrides, w.workspaceId, a, tmp);
+          await renameCheckout(overrides, y.workspaceId, c, a);
+        },
+        async () => {
+          await renameCheckout(overrides, y.workspaceId, a, c);
+          await renameCheckout(overrides, w.workspaceId, tmp, a);
+        },
+        timeline
+      );
+      const wHolds = (await ownText(a)).includes(prefix);
+      const effective = JSON.stringify(
+        await new WorkspaceMcpOverridesService(config).getOverridesForWorkspace(w.workspaceId)
+      );
+      const effectiveHasKey = effective.includes(prefix);
+      // The setup: the uninstall's prune of W failed, so W kept its tombstone.
+      expect({ uninstall, keptAfterUninstall }).toEqual({
+        uninstall: "resolved",
+        keptAfterUninstall: true,
+      });
+      const violation = reinstall === "installed" && (wHolds || effectiveHasKey);
+      expect(violation).toBe(false);
+    }, 30_000);
+
+    test("a fresh install prunes an enable that an earlier plugin at the same path left, when two workspaces swap names and back", async () => {
+      const overrides = new WorkspaceMcpOverridesService(config);
+      const svc = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overrides,
+      });
+      const preview = await svc.preview({ input: remoteDir });
+      // No tombstone exists: the enable was left by an unmanaged plugin at the same path that the
+      // user deleted by hand (assertNoResidualInstanceState's case).
+      const prefix = buildPluginServerKey(
+        computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+        ""
+      );
+      const key = `${prefix}echo`;
+      const w = await register("fi", "w");
+      const y = await register("fi", "y");
+      await writeDoc(w.workspacePath, [key, "keep"]);
+      await writeDoc(y.workspacePath, ["clean"]);
+      const a = w.workspacePath;
+      const tmp = path.join(path.dirname(a), "tmp-name");
+      const c = y.workspacePath;
+      const timeline: string[] = [];
+      const lockFiles = new Set(await lockFilesOf(overrides, w.workspaceId));
+      const install = await withPhases(
+        () =>
+          svc.install({ source: preview.source, expectedSha: preview.lockedSha }).then(
+            () => "installed",
+            (e: unknown) => `refused:${String(e).slice(0, 80)}`
+          ),
+        a,
+        lockFiles,
+        async () => {
+          await renameCheckout(overrides, w.workspaceId, a, tmp);
+          await renameCheckout(overrides, y.workspaceId, c, a);
+        },
+        async () => {
+          await renameCheckout(overrides, y.workspaceId, a, c);
+          await renameCheckout(overrides, w.workspaceId, tmp, a);
+        },
+        timeline
+      );
+      const wHolds = (await ownText(a)).includes(prefix);
+      const effective = JSON.stringify(
+        await new WorkspaceMcpOverridesService(config).getOverridesForWorkspace(w.workspaceId)
+      );
+      const effectiveHasKey = effective.includes(key);
+      const violation = install === "installed" && (wHolds || effectiveHasKey);
+      expect(violation).toBe(false);
+    }, 30_000);
+
+    for (const variant of ["swap", "mkdir"] as const) {
+      test(`an uninstall keeps the tombstone or prunes the document during a ${variant} that puts a workspace back`, async () => {
+        const overrides = new WorkspaceMcpOverridesService(config);
+        const svc = new AgentPluginInstallService(config, {
+          workspaceMcpOverridesService: overrides,
+        });
+        const preview = await svc.preview({ input: remoteDir });
+        await svc.install({ source: preview.source, expectedSha: preview.lockedSha });
+        const prefix = buildPluginServerKey(
+          computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+          ""
+        );
+        const key = `${prefix}echo`;
+        const w = await register("eaba", "w");
+        const y = await register("eaba", "y");
+        await writeDoc(w.workspacePath, [key, "keep"]);
+        await writeDoc(y.workspacePath, ["clean"]);
+        const a = w.workspacePath;
+        const tmp = path.join(path.dirname(a), "tmp-name");
+        const c = y.workspacePath;
+        const timeline: string[] = [];
+        const lockFiles = new Set(await lockFilesOf(overrides, w.workspaceId));
+        const phase1 =
+          variant === "swap"
+            ? async () => {
+                await renameCheckout(overrides, w.workspaceId, a, tmp);
+                await renameCheckout(overrides, y.workspaceId, c, a);
+              }
+            : async () => {
+                await renameCheckout(overrides, w.workspaceId, a, tmp);
+                await fsPromises.mkdir(a);
+              };
+        const phase2 =
+          variant === "swap"
+            ? async () => {
+                await renameCheckout(overrides, y.workspaceId, a, c);
+                await renameCheckout(overrides, w.workspaceId, tmp, a);
+              }
+            : async () => {
+                await fsPromises.rmdir(a);
+                await renameCheckout(overrides, w.workspaceId, tmp, a);
+              };
+        const uninstall = await withPhases(
+          () =>
+            svc.uninstall({ name: "demo-plugin", deletePluginData: false }).then(
+              () => "resolved",
+              (e: unknown) => `rejected:${String(e).slice(0, 80)}`
+            ),
+          a,
+          lockFiles,
+          phase1,
+          phase2,
+          timeline
+        );
+        const tombAfterUninstall = await tombstonesFor(prefix);
+        const wHoldsAfterUninstall = (await ownText(a)).includes(prefix);
+        const violation =
+          uninstall === "resolved" && tombAfterUninstall.length === 0 && wHoldsAfterUninstall;
+        expect(violation).toBe(false);
+      }, 30_000);
+    }
   });
 });
 

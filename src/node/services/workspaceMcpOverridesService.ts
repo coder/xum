@@ -881,42 +881,6 @@ export function isRetryableLockError(error: unknown): boolean {
     (error instanceof Error && error.message === WORKSPACE_LOCK_TIMEOUT_MESSAGE)
   );
 }
-/** What planPluginSweep decided: who may carry the key, whom the sweep locks, and whom it did not read. */
-interface PluginSweepPlan {
-  candidateIds: ReadonlySet<string>;
-  lockedIds: readonly string[];
-  /** Not read before the scan's window closed, and not locked: they fail (see SweepScan). */
-  unscannedIds: readonly string[];
-  /**
-   * Not locked, with a document: they owe the cross-process epoch like a swept workspace with a
-   * document (see pruneResolvedWorkspace). A sweep may have rewritten the document and then
-   * failed its epoch bump; the tombstone's retry finds no key there, so only this signal tells
-   * other processes to drop the pre-prune overrides they cached.
-   */
-  documentedIds: readonly string[];
-  /**
-   * Each workspace's sweep identity in the registry that the scan read (see sweepIdentitiesById).
-   * The scan holds no lock, so the sweep compares it with the registry under the global lock.
-   */
-  scanIdentities: ReadonlyMap<string, string>;
-}
-/**
- * What a plugin sweep's scan (planPluginSweep) shares across its reads, chiefly its time
- * window. A read that runs into its
- * bound found a checkout that does not answer, such as a dead mount. Each more such
- * checkout would cost the scan that bound again, CHECKOUT_IO_CONCURRENCY at a time, with no
- * end, while the install waits on it (holding the plugin mutation queue) and every retry of
- * a tombstone repeats it. So the first such timeout closes the window PUBLICATION_TIMEOUT_MS
- * later: the workspaces the scan has not read by then fail and keep their tombstones. A scan
- * that meets no such checkout has no window: its cost grows with the number of workspaces
- * and the host's load (a unit run of 7,550 took 143 s on a core shared with three busy
- * loops), and a cut there would fail the install that the scan exists to let through.
- */
-interface SweepScan {
-  closesAt: number;
-  /** Workspaces with a document, read or not (see PluginSweepPlan.documentedIds). */
-  documented: Set<string>;
-}
 /** One workspace's result in sweepPluginOverrideKeys. */
 type SweptOutcome =
   | { ok: true; swept: SweptWorkspace; owesEpoch: boolean }
@@ -946,92 +910,6 @@ function groupByCheckout(
     }
   }
   return [...new Set(groupOfId.values())].map((group) => [...group]);
-}
-/**
- * Who a plugin-key sweep locks and prunes (see planPluginSweep): the CANDIDATES (workspaces
- * whose documents may carry the key, or could not be read), plus the workspaces a prune of
- * a candidate reaches. Those are every registry descendant of a member (a child that
- * inherits a candidate's document can copy the inherited enable into its own on a save),
- * and every alias of a member (same host checkout, so same document), until none joins.
- * Off-host descendants stay out: plugin servers never run there, and the publication
- * fan-out evicts their caches without I/O. Seeds are kept even when unregistered (the sweep
- * reports them).
- */
-export function sweepClosure(
-  registry: readonly FrontendWorkspaceMetadata[],
-  seedIds: Iterable<string>,
-  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string,
-  /** Counts the ids the walk queues, seeds left out (tests pin the walk's cost with it). */
-  stats?: { queued: number }
-): Set<string> {
-  const hostLocalEntries = groupMetadataById([...registry], /* hostLocalOnly */ true);
-  const graph: SweepClosureGraph = {
-    childrenByParent: indexChildrenByParent(registry),
-    hostLocalEntries,
-    idsByCheckout: indexIdsByCheckout(hostLocalEntries, checkoutOf),
-    checkoutOf,
-    expandedCheckouts: new Set<string>(),
-  };
-  const registeredIds = new Set(registry.map((metadata) => metadata.id));
-  const members = new Set<string>();
-  const visited = new Set<string>();
-  const queue = [...seedIds];
-  for (let id = queue.pop(); id !== undefined; id = queue.pop()) {
-    if (visited.has(id)) continue;
-    visited.add(id);
-    // A seed or alias is swept; an off-host descendant is only walked through.
-    if (hostLocalEntries.has(id) || !registeredIds.has(id)) {
-      members.add(id);
-    }
-    const edges = sweepClosureEdges(id, graph);
-    if (stats !== undefined) stats.queued += edges.length;
-    queue.push(...edges);
-  }
-  return members;
-}
-/** The registry relations sweepClosure walks. */
-interface SweepClosureGraph {
-  childrenByParent: ReadonlyMap<string, readonly FrontendWorkspaceMetadata[]>;
-  hostLocalEntries: ReadonlyMap<string, readonly FrontendWorkspaceMetadata[]>;
-  idsByCheckout: ReadonlyMap<string, readonly string[]>;
-  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string;
-  /** Checkouts whose aliases the walk already queued. */
-  expandedCheckouts: Set<string>;
-}
-/**
- * Every host-local checkout with the ids registered on it (its aliases), filled into
- * `idsByCheckout`. Each checkout's list grows in place: a copy per insert costs k² for k aliases.
- */
-export function indexIdsByCheckout(
-  hostLocalEntries: ReadonlyMap<string, readonly FrontendWorkspaceMetadata[]>,
-  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string,
-  idsByCheckout = new Map<string, string[]>()
-): Map<string, string[]> {
-  for (const entries of hostLocalEntries.values()) {
-    for (const metadata of entries) {
-      const checkout = checkoutOf(metadata);
-      const ids = idsByCheckout.get(checkout);
-      if (ids === undefined) idsByCheckout.set(checkout, [metadata.id]);
-      else ids.push(metadata.id);
-    }
-  }
-  return idsByCheckout;
-}
-/** The workspaces one closure member reaches: its registry children, then its checkouts' aliases. */
-function sweepClosureEdges(id: string, graph: SweepClosureGraph): string[] {
-  // mutation-equivalent: an array is never falsy, so ?? and || agree
-  const children = (graph.childrenByParent.get(id) ?? []).map((child) => child.id);
-  // mutation-equivalent: an array is never falsy, so ?? and || agree
-  const aliases = (graph.hostLocalEntries.get(id) ?? []).flatMap((metadata) => {
-    const checkout = graph.checkoutOf(metadata);
-    // Each checkout's aliases once: every alias of a checkout reaches the same list, so
-    // queueing it per alias made k aliases cost k² steps.
-    if (graph.expandedCheckouts.has(checkout)) return [];
-    graph.expandedCheckouts.add(checkout);
-    // mutation-equivalent: an array is never falsy, so ?? and || agree
-    return graph.idsByCheckout.get(checkout) ?? [];
-  });
-  return [...children, ...aliases];
 }
 /** Every legacy `workspace.mcp` value registered under `workspaceId`. */
 function legacyOverridesOf(config: ProjectsConfig, workspaceId: string): unknown[] {
@@ -1083,28 +961,6 @@ function pruneLegacyValuesIn(
     }
   }
   return uneditable;
-}
-/**
- * Ids of the workspaces whose config.json entry carries a legacy `workspace.mcp` value that may
- * name `keyPrefix` keys (see legacyValueMayNameKey): the legacy values a plugin sweep must prune.
- * A value that cannot name the key is no candidate: when any value made its workspace one, a
- * registry of 7,550 workspaces with one in five carrying an unrelated value locked about 1,500
- * workspaces that held nothing to prune.
- */
-function idsWithLegacyValuesNamingKey(config: ProjectsConfig, keyPrefix: string): Set<string> {
-  const ids = new Set<string>();
-  for (const projectConfig of config.projects.values()) {
-    for (const workspace of projectConfig.workspaces) {
-      // legacyValueMayNameKey answers yes for anything it cannot parse, an absent value included.
-      if (
-        workspace.id !== undefined &&
-        workspace.mcp !== undefined &&
-        legacyValueMayNameKey(workspace.mcp, keyPrefix)
-      )
-        ids.add(workspace.id);
-    }
-  }
-  return ids;
 }
 /** Ids of the workspaces whose config.json entry still carries a legacy `workspace.mcp` value. */
 function idsWithLegacyOverrides(config: ProjectsConfig): Set<string> {
@@ -1550,18 +1406,6 @@ export class OverridesFileTooLargeError extends Error {
   }
 }
 /**
- * The device and inode of a host checkout's directory (see documentsMayCarryKey), or
- * undefined when it is no directory now; a stat that fails for any reason counts as gone.
- */
-async function checkoutIdentity(workspacePath: string): Promise<string | undefined> {
-  try {
-    const stat = await fsPromises.stat(workspacePath, { bigint: true });
-    return stat.isDirectory() ? `${stat.dev}:${stat.ino}` : undefined;
-  } catch {
-    return undefined;
-  }
-}
-/**
  * Whether a candidate override file exists for the plugin-key prune.
  * Strict: "cannot tell" throws, like a file over MAX_PRUNED_OVERRIDES_BYTES,
  * so the caller keeps its tombstone instead of retiring it unread.
@@ -1618,41 +1462,6 @@ function groupMetadataById(
     }
   }
   return grouped;
-}
-
-/**
- * Each host-local workspace's part in a plugin sweep, as one string per id: what the scan's
- * verdict on it rests on. That is its checkout (where its documents live and which workspaces
- * share them), project, parent (what it inherits), runtime and isolation, and whether its
- * config.json entry carries a legacy `workspace.mcp` value that may name the swept key
- * (`legacyIds`; such a value makes it a candidate). Fields that change often and decide nothing
- * here, such as its title or task status, are left out.
- */
-function sweepIdentitiesById(
-  registry: readonly FrontendWorkspaceMetadata[],
-  checkoutOf: (metadata: FrontendWorkspaceMetadata) => string,
-  legacyIds: ReadonlySet<string>
-): Map<string, string> {
-  const identities = new Map<string, string>();
-  for (const [id, entries] of groupMetadataById([...registry], /* hostLocalOnly */ true)) {
-    const identity = entries
-      .map((metadata) =>
-        // JSON.stringify writes an absent field in an array as null.
-        JSON.stringify([
-          metadata.projectPath,
-          checkoutOf(metadata),
-          metadata.parentWorkspaceId,
-          metadata.runtimeConfig,
-          metadata.taskIsolation,
-          metadata.projects,
-          metadata.subProjectPath,
-        ])
-      )
-      .sort()
-      .join("\n");
-    identities.set(id, `${legacyIds.has(id) ? "legacy" : "-"}\n${identity}`);
-  }
-  return identities;
 }
 
 /**
@@ -4650,8 +4459,6 @@ export class WorkspaceMcpOverridesService {
       ) {
         throw new WorkspaceMcpOverridesConflictError();
       }
-      // Validated and written in one hold of the global lock: a plugin sweep relies on it
-      // (see prunePluginOverrideKeysForWorkspaces).
       await options.validateAgainstCurrent?.(current.overrides, normalized);
     }
 
@@ -5080,32 +4887,21 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
-   * prunePluginOverrideKeys across many workspaces: ONE critical section and ONE
-   * workspace-metadata/config load, over the workspaces that can carry the key.
-   * The Agent Plugin installer sweeps every local/worktree workspace (thousands in
-   * long-lived setups). Resolving each via getAllWorkspaceMetadata() — an uncached
-   * synchronous parse of the whole config.json — made that sweep take ~1s per workspace,
-   * and taking every workspace's lock outlasted the sweep's budget on a busy machine, so
-   * the sweep first SCANS every workspace's override documents outside all locks (see
-   * planPluginSweep) and locks only the candidates and what their prune reaches.
-   * Per-workspace failures are collected (the caller persists a retry tombstone for
-   * them) instead of aborting the sweep; a workspace whose lock stays busy for the whole
-   * budget is one of them. Only wholesale failures (unreadable config) throw.
+   * prunePluginOverrideKeys across many workspaces under ONE lock acquisition
+   * and ONE workspace-metadata/config load. The Agent Plugin installer sweeps
+   * every local/worktree workspace (thousands in long-lived setups); resolving
+   * each workspace via getAllWorkspaceMetadata() — an uncached synchronous
+   * parse of the whole config.json — made that sweep take ~1s per workspace
+   * and the install appear hung. Per-workspace failures are collected (the
+   * caller persists a retry tombstone for them) instead of aborting the sweep;
+   * a workspace whose lock stays busy for the whole budget is one of them.
+   * Only wholesale failures (unreadable config) throw.
    *
-   * Every candidate this reports clean was pruned in the same critical section, never
-   * across two: between two, a dialog save could copy a not-yet-pruned parent's
-   * inherited enable into an already-pruned child. Callers retry by sweeping every live
-   * workspace again, so a tombstone only clears on a call that reports no failure at all.
-   *
-   * Every other workspace is reported clean WITHOUT a lock, and the receiver drops its
-   * cached overrides (publish(null, ALL_WORKSPACES_TARGET)). Its documents carried no key
-   * when scanned, and nothing can add one afterwards that the sweep must still catch:
-   * buildAddedPluginKeyValidator (agentPlugins/mcpConfig.ts, used by the settings save in
-   * workspacePluginOperations.ts) refuses a save that newly adds a plugin key which no
-   * discovered plugin server names, and the plugin being swept is not installed while
-   * the sweep runs (before its install commits, after its uninstall committed). The one
-   * save the validator passes, a child copying the enable it inherits, is covered by
-   * locking and sweeping every descendant of a candidate.
+   * Every workspace this reports clean was pruned in the same critical
+   * section, never across two: between two, a dialog save could copy a
+   * not-yet-pruned parent's inherited enable into an already-pruned child.
+   * Callers retry by sweeping every live workspace again, so a tombstone only
+   * clears on a call that reports no failure at all.
    */
   async prunePluginOverrideKeysForWorkspaces(
     workspaceIds: readonly string[],
@@ -5114,363 +4910,52 @@ export class WorkspaceMcpOverridesService {
   ): Promise<Array<{ workspaceId: string; error: unknown }>> {
     assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
 
-    // A settings save validates a new plugin key against the discovered plugins and writes it
-    // in one hold of the global lock (setOverridesForWorkspace). A save that validated before
-    // the plugin's uninstall committed can still be writing now, and the scan below takes no
-    // lock. So take the global lock once first: every save that held it before has written
-    // its document, which the scan reads, and every later save validates against the
-    // committed uninstall, which refuses the swept plugin's keys.
-    await this.runExclusive(() => Promise.resolve());
-    const plan = await this.planPluginSweep(workspaceIds, keyPrefix);
-    // The barrier (waitOutUnlockedWriters): every writer that held the lock of a workspace
-    // that the sweep will not lock has finished before the registry comparison below.
-    const busy = await this.waitOutUnlockedWriters(workspaceIds, plan);
-    const busyIds = new Set(busy.map((failure) => failure.workspaceId));
     // Every swept workspace's lock first, then the global lock: a rename
     // holding a workspace lock across its checkout move cannot be
-    // interleaved with this sweep's stat of that checkout. With no candidate,
-    // the global lock alone: the registry is still compared with the scan's.
-    const failures =
-      plan.lockedIds.length === 0
-        ? await this.runExclusive(() => this.sweepUnderLocks(plan, keyPrefix, options, undefined))
-        : await this.withWorkspaceLocks(
-            plan.lockedIds,
-            (locked) =>
-              this.runExclusive(() => this.sweepUnderLocks(plan, keyPrefix, options, locked)),
-            WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS,
-            { partialAtDeadline: true }
+    // interleaved with this sweep's stat of that checkout.
+    return this.withWorkspaceLocks(
+      workspaceIds,
+      (locked) =>
+        this.runExclusive(async () => {
+          // ONE budget for the whole sweep — the registry scan, every target's
+          // prune and the cache fan-out afterwards: this runs under every
+          // selected workspace lock AND the global lock, and a single checkout
+          // on a stalled NFS/FUSE mount must not hold unrelated settings writes
+          // past their acquisition timeout. Timed-out targets become
+          // per-workspace failures (the caller keeps their tombstones); a
+          // rewrite already in flight is joined before the locks are released.
+          const budget = createPublicationBudget();
+          const snapshot = new ConfigSnapshot(
+            this.config,
+            false,
+            undefined,
+            /* writerLocksHeld */ true
           );
-    // The workspaces the sweep did not lock (see above): drop what the receiver cached.
-    // The receiver also fences a cold first serve already in flight against this.
-    if (options?.publish) {
-      await options.publish(null, ALL_WORKSPACES_TARGET);
-    }
-    // No lock: the bump is one atomic rename, and these workspaces' documents hold no key.
-    if (plan.documentedIds.length > 0) {
-      try {
-        await this.bumpOverridesEpoch();
-      } catch (error) {
-        failures.push(...plan.documentedIds.map((workspaceId) => ({ workspaceId, error })));
-      }
-    }
-    // Not read, so not known to be clean: they keep their tombstones (see SweepScan).
-    const unscanned = plan.unscannedIds.map((workspaceId) => ({
-      workspaceId,
-      error: new Error(
-        `The plugin sweep stopped reading MCP overrides after a checkout did not respond, before it read workspace ${workspaceId}`
-      ),
-    }));
-    return [
-      ...unscanned,
-      ...busy,
-      ...failures.filter((failure) => !busyIds.has(failure.workspaceId)),
-    ];
-  }
-
-  /**
-   * The part of prunePluginOverrideKeysForWorkspaces under the global lock and the locks of
-   * the scan's candidates (`locked`; undefined when there is none).
-   */
-  private async sweepUnderLocks(
-    plan: PluginSweepPlan,
-    keyPrefix: string,
-    options: PluginSweepOptions | undefined,
-    locked: LockedCheckouts | undefined
-  ): Promise<Array<{ workspaceId: string; error: unknown }>> {
-    // ONE budget for the whole sweep — the registry scan, every target's
-    // prune and the cache fan-out afterwards: this runs under every
-    // selected workspace lock AND the global lock, and a single checkout
-    // on a stalled NFS/FUSE mount must not hold unrelated settings writes
-    // past their acquisition timeout. Timed-out targets become
-    // per-workspace failures (the caller keeps their tombstones); a
-    // rewrite already in flight is joined before the locks are released.
-    const budget = createPublicationBudget();
-    const snapshot = new ConfigSnapshot(this.config, false, undefined, /* writerLocksHeld */ true);
-    try {
-      // The scan read the registry without a lock. A writer (a rename or move, a fork, a
-      // re-parent, a project move, a restore, a delete) may have changed an entry since, so
-      // compare every entry with the scan's. One read: the sweep below reuses it (snapshot).
-      const registry = await withDeadline(
-        snapshot.loadAllMetadataTolerant(plan.lockedIds),
-        budget.remaining(),
-        "workspace enumeration exceeded the plugin-prune budget"
-      );
-      const changed = this.changedSinceScan(
-        registry,
-        idsWithLegacyValuesNamingKey(snapshot.loadLegacyConfig(), keyPrefix),
-        plan
-      );
-      if (locked === undefined) {
-        return changed;
-      }
-      // Workspaces whose checkout identity could not be established, or
-      // whose lock stayed busy, were not locked: they fail (tombstone
-      // kept) instead of being pruned under a fence they do not hold.
-      const unlocked = [...locked.unresolvable, ...locked.busy];
-      const unlockedIds = new Set(unlocked.map((entry) => entry.workspaceId));
-      const failures = await this.sweepPluginOverrideKeys(
-        plan.lockedIds.filter((id) => !unlockedIds.has(id)),
-        locked.keys,
-        keyPrefix,
-        options,
-        budget,
-        snapshot,
-        plan
-      );
-      // A late descendant or alias of a candidate can also be one whose own entry changed.
-      const changedIds = new Set(changed.map((failure) => failure.workspaceId));
-      return [
-        ...changed,
-        ...unlocked.map(({ workspaceId, error }) => ({ workspaceId, error })),
-        ...failures.filter((failure) => !changedIds.has(failure.workspaceId)),
-      ];
-    } finally {
-      await snapshot.settleSideEffects();
-    }
-  }
-
-  /**
-   * The sweep's barrier, between its scan and its locks. A rename or a move holds its
-   * workspace's lock across the checkout move and the entry rewrite. While that rewrite is
-   * pending, the scan cannot tell the old path from another directory made there since, and
-   * the registry comparison under the global lock still sees the old entry. So this takes and
-   * releases each lock key of every workspace that the scan read and the sweep will not lock,
-   * CHECKOUT_IO_CONCURRENCY keys at a time, with the keys derived from one registry read.
-   * Every writer that held one of those locks has then rewritten its entry before the
-   * comparison, which fails that workspace. A writer that starts later moves only documents
-   * that the scan has read in full. Each key is released before the sweep takes its own locks,
-   * so the critical section holds only the candidates' locks.
-   *
-   * Limit: a lock that another writer holds makes the barrier wait for it, up to
-   * WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS for the whole barrier. A workspace whose key stays busy
-   * that long, or whose keys cannot be derived, fails and keeps its tombstone: the barrier
-   * never reports it clean.
-   */
-  private async waitOutUnlockedWriters(
-    workspaceIds: readonly string[],
-    plan: PluginSweepPlan
-  ): Promise<Array<{ workspaceId: string; error: unknown }>> {
-    const skipped = new Set([...plan.lockedIds, ...plan.unscannedIds]);
-    const ids = [...new Set(workspaceIds.map((id) => id.trim()))].filter((id) => !skipped.has(id));
-    if (ids.length === 0) return [];
-    const deadline = Date.now() + WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS;
-    let derived: CheckoutLockKeys;
-    try {
-      derived = await withDeadline(
-        this.checkoutLockKeys(ids),
-        WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS,
-        WORKSPACE_LOCK_TIMEOUT_MESSAGE
-      );
-    } catch (error) {
-      return ids.map((workspaceId) => ({ workspaceId, error }));
-    }
-    const failures: Array<{ workspaceId: string; error: unknown }> = [...derived.unresolvable];
-    // Aliases of one checkout share its keys: each key is taken once, for all of them.
-    const idsByKey = new Map<string, string[]>();
-    for (const [workspaceId, keys] of derived.keys) {
-      for (const key of keys) {
-        const keyIds = idsByKey.get(key);
-        if (keyIds === undefined) idsByKey.set(key, [workspaceId]);
-        else keyIds.push(workspaceId);
-      }
-    }
-    const failed = new Set<string>();
-    await mapWithConcurrency([...idsByKey], CHECKOUT_IO_CONCURRENCY, async ([key, keyIds]) => {
-      try {
-        // mutation-equivalent: past the deadline, 0 ms and 1 ms both give a key one more try: a
-        // free lock is taken at once and a held one fails, so the barrier's outcome is the same
-        const release = await this.acquireCheckoutLock(key, Math.max(0, deadline - Date.now()));
-        await release();
-      } catch (error) {
-        for (const workspaceId of keyIds.filter((id) => !failed.has(id))) {
-          failed.add(workspaceId);
-          failures.push({ workspaceId, error });
-        }
-      }
-    });
-    return failures;
-  }
-
-  /**
-   * First phase of prunePluginOverrideKeysForWorkspaces, OUTSIDE every lock: read each
-   * workspace's override documents (each checkout bounded by HOST_DESCENDANT_TIMEOUT_MS
-   * — a dead mount costs the scan that bound, not the sweep's lock hold) and name the
-   * CANDIDATES: workspaces whose documents may carry `keyPrefix`, plus every workspace
-   * the scan could not read (timeout, error, too large, not registered host-local), plus
-   * every workspace with a legacy config.json `workspace.mcp` value that may name the key (it
-   * decides in place of an absent or empty document, so it can bring the key along). Then close
-   * the set over what a prune of a candidate reaches (see sweepClosure): those workspaces are
-   * the ones to lock.
-   * A scan that meets a checkout that does not answer stops within a fixed window (see
-   * SweepScan): the workspaces it did not read by then are UNSCANNED.
-   */
-  private async planPluginSweep(
-    workspaceIds: readonly string[],
-    keyPrefix: string
-  ): Promise<PluginSweepPlan> {
-    const snapshot = new ConfigSnapshot(this.config);
-    // The scan only narrows what the sweep locks, so when the strict walk fails (one config
-    // row or another entry's metadata is malformed) it reads the registry leniently, as the
-    // lock-key derivation does (checkoutLockKeys): an id that the lenient walk does not list
-    // is a candidate, and the sweep under the locks reads the registry again.
-    const registry = await snapshot
-      .loadAllMetadataTolerant(workspaceIds)
-      .catch(() => this.config.getAllWorkspaceMetadata({ probeCheckouts: false }));
-    // mutation-equivalent: callers sweep host-local ids; an off-host entry that was scanned would
-    // fail to read or hold no key, and the sweep reports the id as not found either way
-    const entriesById = groupMetadataById(registry, /* hostLocalOnly */ true);
-    const legacyConfig = snapshot.loadLegacyConfig();
-    const legacyIds = idsWithLegacyValuesNamingKey(legacyConfig, keyPrefix);
-    const withLegacyValue = idsWithLegacyOverrides(legacyConfig);
-    const ids = [...new Set(workspaceIds.map((id) => id.trim()))];
-    const candidateIds = new Set<string>();
-    const unscanned = new Set<string>();
-    const scan: SweepScan = {
-      closesAt: Number.POSITIVE_INFINITY,
-      documented: new Set<string>(),
-    };
-    await mapWithConcurrency(ids, CHECKOUT_IO_CONCURRENCY, async (id) => {
-      const entries = entriesById.get(id);
-      // A legacy value that cannot name the key is read like a document that holds none: the
-      // sweep owes the epoch for it (documentedIds) and does not lock it.
-      if (withLegacyValue.has(id)) scan.documented.add(id);
-      // A legacy value that may name the key, or an id the registry does not list, is a
-      // candidate without a read.
-      if (legacyIds.has(id) || entries === undefined) {
-        candidateIds.add(id);
-      } else if (Date.now() >= scan.closesAt) {
-        unscanned.add(id);
-      } else if (await this.mayCarryPluginKey(entries, keyPrefix, scan)) {
-        candidateIds.add(id);
-      }
-    });
-    const locked = this.sweepMembers(registry, candidateIds);
-    // An unscanned descendant or alias of a candidate is locked and pruned like the others.
-    const unscannedIds = [...unscanned].filter((id) => !locked.has(id));
-    const documentedIds = [...scan.documented].filter((id) => !locked.has(id));
-    const scanIdentities = sweepIdentitiesById(
-      registry,
-      (metadata) => this.checkoutOf(metadata),
-      legacyIds
-    );
-    return { candidateIds, lockedIds: [...locked], unscannedIds, documentedIds, scanIdentities };
-  }
-
-  private sweepMembers(
-    registry: readonly FrontendWorkspaceMetadata[],
-    candidateIds: ReadonlySet<string>
-  ): Set<string> {
-    return sweepClosure(registry, candidateIds, (metadata) => this.checkoutOf(metadata));
-  }
-
-  /**
-   * The checkout that a sweep groups `metadata` by. An entry whose runtime cannot be built (a
-   * worktree row without its `srcBaseDir`) gets a key of its own: it is no alias of another
-   * entry, the scan reports it unreadable (a candidate), and its lock derivation fails it alone.
-   */
-  private checkoutOf(metadata: FrontendWorkspaceMetadata): string {
-    try {
-      return path.resolve(this.resolveWorkspace(metadata).workspacePath);
-    } catch {
-      return `\0unresolvable\0${metadata.id}\0${metadata.projectPath}\0${metadata.name}`;
-    }
-  }
-
-  /**
-   * The workspaces whose sweep identity (see sweepIdentitiesById) differs between the registry
-   * that the scan read and `registry`, read under the global lock: an entry that changed,
-   * appeared or vanished. The scan's verdict on such a workspace no longer holds (a rename
-   * moves a keyed document away from the path the scan read), so each one that this sweep did
-   * not lock fails and keeps its tombstone. The caller's retry scans the registry again.
-   */
-  private changedSinceScan(
-    registry: readonly FrontendWorkspaceMetadata[],
-    legacyIds: ReadonlySet<string>,
-    plan: PluginSweepPlan
-  ): Array<{ workspaceId: string; error: unknown }> {
-    const current = sweepIdentitiesById(
-      registry,
-      (metadata) => this.checkoutOf(metadata),
-      legacyIds
-    );
-    const lockedIds = new Set(plan.lockedIds);
-    return [...new Set([...plan.scanIdentities.keys(), ...current.keys()])]
-      .filter((id) => !lockedIds.has(id) && plan.scanIdentities.get(id) !== current.get(id))
-      .map((workspaceId) => ({
-        workspaceId,
-        error: new Error(
-          `Workspace ${workspaceId} appeared, changed or vanished in the registry after the plugin sweep read MCP overrides and before it took its locks; it was not pruned`
-        ),
-      }));
-  }
-
-  /** True unless every override document of the workspace's checkouts was read, and none holds `keyPrefix`. */
-  private async mayCarryPluginKey(
-    entries: readonly FrontendWorkspaceMetadata[],
-    keyPrefix: string,
-    scan: SweepScan
-  ): Promise<boolean> {
-    try {
-      for (const metadata of entries) {
-        const carries = await withDeadline(
-          this.documentsMayCarryKey(this.resolveWorkspace(metadata), keyPrefix, scan),
-          Math.min(HOST_DESCENDANT_TIMEOUT_MS, scan.closesAt - Date.now()),
-          `reading the override documents of workspace ${metadata.id} timed out`,
-          () => {
-            scan.closesAt = Math.min(scan.closesAt, Date.now() + PUBLICATION_TIMEOUT_MS);
+          try {
+            // Workspaces whose checkout identity could not be established, or
+            // whose lock stayed busy, were not locked: they fail (tombstone
+            // kept) instead of being pruned under a fence they do not hold.
+            const unlocked = [...locked.unresolvable, ...locked.busy];
+            const unlockedIds = new Set(unlocked.map((entry) => entry.workspaceId));
+            const failures = await this.sweepPluginOverrideKeys(
+              workspaceIds.filter((id) => !unlockedIds.has(id.trim())),
+              locked.keys,
+              keyPrefix,
+              options,
+              budget,
+              snapshot
+            );
+            return [
+              ...unlocked.map(({ workspaceId, error }) => ({ workspaceId, error })),
+              ...failures,
+            ];
+          } finally {
+            await snapshot.settleSideEffects();
           }
-        );
-        if (carries) return true;
-      }
-      return false;
-    } catch {
-      // Unreadable is not clean: the sweep under the locks fails it, or prunes it.
-      return true;
-    }
-  }
-
-  private async documentsMayCarryKey(
-    resolved: ResolvedWorkspace,
-    keyPrefix: string,
-    scan: SweepScan
-  ): Promise<boolean> {
-    const filePaths = this.getOverridesFilePaths(
-      resolved.workspacePath,
-      resolved.metadata.runtimeConfig
+        }),
+      WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS,
+      { partialAtDeadline: true }
     );
-    // A verdict on a checkout holds only for documents read from one directory. A rename or a
-    // move can take the checkout away under that workspace's lock, between two of the reads
-    // below and before its registry entry names the new path: a document read after the move
-    // is absent at the old path while it still exists (a clean canonical document read before
-    // the move then hid a keyed compatibility document). So the checkout's identity is taken
-    // before the first read and compared after the last, whatever the reads found. A checkout
-    // that is gone, or is another directory, makes the workspace a candidate: the sweep waits
-    // for its lock and prunes the checkout that the registry names then.
-    const identity = await checkoutIdentity(resolved.workspacePath);
-    if (identity === undefined) return true;
-    for (const filePath of filePaths) {
-      const probe = await probeOverridesFile(resolved.runtime, filePath);
-      if (probe.kind === "absent") continue;
-      scan.documented.add(resolved.metadata.id);
-      // mutation-equivalent: the read below refuses what this skips, so the workspace is a
-      // candidate either way: a larger file throws at the limit, a file the probe could not stat
-      // throws at its open
-      if (probe.kind === "indeterminate" || probe.size > MAX_PRUNED_OVERRIDES_BYTES) return true;
-      // SECURITY: no lock guards this read, and the probe above follows symlinks. A checkout
-      // can track the document as a symlink to a device such as /dev/zero (size 0), which a
-      // plain read buffers until memory runs out. Read only the checkout's own regular file;
-      // a symlink or other file throws, so the workspace is a candidate, and the prune under
-      // the locks refuses it as it does on main (assertPruneTargetNotSymlinked). The read stops
-      // at the prune limit too: the file can grow after the stat above.
-      const text = await readHostOverrideDocumentNoFollow(
-        filePath,
-        resolved.workspacePath,
-        MAX_PRUNED_OVERRIDES_BYTES
-      );
-      // Every decoded string of the parse tree, so an escaped spelling cannot hide a key.
-      if (documentStringsContain(text, (value) => value.includes(keyPrefix))) return true;
-    }
-    return (await checkoutIdentity(resolved.workspacePath)) !== identity;
   }
 
   /** Body of prunePluginOverrideKeysForWorkspaces, run under its locks. */
@@ -5480,8 +4965,7 @@ export class WorkspaceMcpOverridesService {
     keyPrefix: string,
     options: PluginSweepOptions | undefined,
     budget: PublicationBudget,
-    snapshot: ConfigSnapshot,
-    plan: PluginSweepPlan
+    snapshot: ConfigSnapshot
   ): Promise<Array<{ workspaceId: string; error: unknown }>> {
     // Group, don't index: a corrupted config can list one ID under several
     // entries (different checkouts). Every host-local checkout carrying the
@@ -5498,26 +4982,15 @@ export class WorkspaceMcpOverridesService {
     // Registry-only and bounded like every other enumeration held under
     // the locks: the default enumeration probes each checkout with
     // fs.access, which blocks indefinitely on a stalled mount.
-    const registry = await withDeadline(
-      snapshot.loadAllMetadataTolerant(workspaceIds),
-      budget.remaining(),
-      "workspace enumeration exceeded the plugin-prune budget"
+    const metadataById = groupMetadataById(
+      await withDeadline(
+        snapshot.loadAllMetadataTolerant(workspaceIds),
+        budget.remaining(),
+        "workspace enumeration exceeded the plugin-prune budget"
+      ),
+      /* hostLocalOnly */ true
     );
-    const metadataById = groupMetadataById(registry, /* hostLocalOnly */ true);
-    // The registry as read under the locks: a descendant (or alias) of a candidate that
-    // joined after the scan holds no lock of ours, so it is not pruned. It fails here and
-    // keeps its tombstone; the caller's retry scans it.
-    const lockedIds = new Set(plan.lockedIds);
-    const failures: Array<{ workspaceId: string; error: unknown }> = [
-      ...this.sweepMembers(registry, plan.candidateIds),
-    ]
-      .filter((id) => !lockedIds.has(id))
-      .map((workspaceId) => ({
-        workspaceId,
-        error: new Error(
-          `Workspace ${workspaceId} appeared next to a workspace whose MCP overrides were being pruned, after the sweep chose which workspaces to lock; it was not pruned`
-        ),
-      }));
+    const failures: Array<{ workspaceId: string; error: unknown }> = [];
     const legacyIds = idsWithLegacyOverrides(snapshot.loadLegacyConfig());
     const swept = new Map<string, SweptWorkspace>();
     let anyOwesEpoch = false;
@@ -5567,8 +5040,7 @@ export class WorkspaceMcpOverridesService {
     // keeps its tombstone (retry re-bumps). No document anywhere → nothing to
     // signal (see prunePluginOverrideKeys). A rewrite that landed owes the
     // signal even when every workspace of the sweep failed (a partial rewrite of
-    // a duplicated ID): a sweep over the few candidates has no clean workspace
-    // beside it to carry it.
+    // a duplicated ID).
     if (anyOwesEpoch) {
       try {
         await this.bumpOverridesEpoch();
@@ -5891,10 +5363,10 @@ export class WorkspaceMcpOverridesService {
       await assertPruneTargetNotSymlinked(filePath, workspacePath);
       // Strict read: unreadable/unparseable content must throw so the
       // caller keeps its retry tombstone (mirrors readOverridesFile). Verified
-      // and bounded like the scan's read (readHostOverrideDocumentNoFollow): a
-      // FIFO at this path, which code in the checkout can make, is refused at
-      // once instead of blocking this read, and every lock held, until the
-      // sweep's budget runs out.
+      // and bounded (readHostOverrideDocumentNoFollow): a FIFO at this path,
+      // which code in the checkout can make, is refused at once instead of
+      // blocking this read, and every lock held, until the sweep's budget runs
+      // out.
       const original = await readHostOverrideDocumentNoFollow(
         filePath,
         workspacePath,
