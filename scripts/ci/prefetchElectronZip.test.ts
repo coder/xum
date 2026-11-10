@@ -6,10 +6,13 @@
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally:
 // bun test ./scripts/ci/prefetchElectronZip.test.ts
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { SPAWNING_TEST_TIMEOUT_MS } from "./runScript";
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const PREFETCH = path.resolve(import.meta.dir, "prefetch-electron-zip.cjs");
 const ELECTRON = path.resolve(import.meta.dir, "../../node_modules/electron");

@@ -6,13 +6,15 @@
 // its last scripted run, so a command that retries too often ends instead of waiting for its budget.
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally: bun test ./scripts/ci/wiring.test.ts
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { appBuilderPath } from "app-builder-bin";
 import { parse } from "yaml";
-import { runScript, writeExecutable, type RunResult } from "./runScript";
+import { SPAWNING_TEST_TIMEOUT_MS, runScript, writeExecutable, type RunResult } from "./runScript";
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const REPO = path.resolve(import.meta.dir, "../..");
 const ACTION = path.join(REPO, ".github/actions/setup-xum/action.yml");
