@@ -2491,10 +2491,10 @@ describe("TaskService", () => {
       });
     });
 
-    test("cannot return a turn that an auto-retry revived between its two reads", async () => {
-      // The read validates a snapshot of the stored failure, then reads again with the caller as
-      // the consumer. A retry that starts in between makes the second snapshot `running`, and a
-      // read that returned it would hand the parent a live turn through the terminal-only path.
+    test("cannot return a turn that an auto-retry revived after the probe", async () => {
+      // The probe sees the stored failure. A retry that starts right after it makes the snapshot
+      // that the read returns `running`, and a read that returned it would hand the parent a
+      // live turn through the terminal-only path.
       let retryPending = false;
       const { workspaceService } = createWorkspaceServiceMocks({
         hasPendingAutoRetry: () => retryPending,
@@ -2539,15 +2539,11 @@ describe("TaskService", () => {
         })
       );
       await handleStore.upsertWorkspaceTurn(failedRecord);
-      const realSnapshot = workspaceTurnManager.getWorkspaceTurnSnapshot.bind(workspaceTurnManager);
-      let ownerReads = 0;
-      const snapshot = spyOn(workspaceTurnManager, "getWorkspaceTurnSnapshot");
-      snapshot.mockImplementation(async (owner, handle, options) => {
-        const result = await realSnapshot(owner, handle, options);
-        if (owner === grandId) {
-          ownerReads += 1;
-          if (ownerReads === 1) retryPending = true;
-        }
+      const realStored = workspaceTurnManager.getStoredWorkspaceTurn.bind(workspaceTurnManager);
+      const probe = spyOn(workspaceTurnManager, "getStoredWorkspaceTurn");
+      probe.mockImplementation(async (owner, handle) => {
+        const result = await realStored(owner, handle);
+        if (owner === grandId) retryPending = true;
         return result;
       });
       try {
@@ -2556,10 +2552,10 @@ describe("TaskService", () => {
           handleId
         );
 
-        expect(ownerReads).toBeGreaterThan(1);
+        expect(retryPending).toBe(true);
         expect(read).toBeNull();
       } finally {
-        snapshot.mockRestore();
+        probe.mockRestore();
       }
     });
 
@@ -2596,6 +2592,39 @@ describe("TaskService", () => {
       expect(
         (await handleStore.getWorkspaceTurn(grandId, handleId))?.directParentResultDeliveredAt
       ).toBeDefined();
+    });
+
+    test("a refused read takes no snapshot, so it cannot repair or revive any record", async () => {
+      const { taskService, handleStore } = await setup();
+      // A snapshot can write: it repairs a settled record from history and revives one that is
+      // retrying. The read must take one only after the checks have passed.
+      await handleStore.upsertWorkspaceTurn({
+        ...failedRecord,
+        handleId: "wst_sibling_turn",
+        workspaceId: "sibling-444",
+      });
+      await handleStore.upsertWorkspaceTurn({
+        ...failedRecord,
+        handleId: "wst_misowned_turn",
+        ownerWorkspaceId: "mid-555",
+      });
+      await handleStore.upsertWorkspaceTurn({
+        ...failedRecord,
+        handleId: "wst_active_turn",
+        status: "running",
+        error: undefined,
+      });
+      const snapshot = spyOn(WorkspaceTurnManager.prototype, "getWorkspaceTurnSnapshot");
+      try {
+        for (const refused of ["wst_sibling_turn", "wst_misowned_turn", "wst_active_turn"]) {
+          expect(
+            await taskService.getDescendantTerminalWorkspaceTurnSnapshot(parentId, refused)
+          ).toBeNull();
+        }
+        expect(snapshot).not.toHaveBeenCalled();
+      } finally {
+        snapshot.mockRestore();
+      }
     });
 
     test("cannot read an active turn", async () => {

@@ -16539,11 +16539,11 @@ export class TaskService implements AgentTaskIntegration {
     );
     const workspaceTurnManager = this.getWorkspaceTurnManager();
     // The owner is an ancestor of some descendant, so probe each such ancestor once. A string
-    // that is not a handle ID finds no record under any owner (getWorkspaceTurnSnapshot refuses it).
+    // that is not a handle ID finds no record under any owner (the store refuses it).
     for (const ownerWorkspaceId of this.listAncestorsOfWorkspaces(index.parentById, descendants)) {
-      // Probe without consuming: the record counts as read only once it is known to be a
-      // descendant's.
-      const probe = await workspaceTurnManager.getWorkspaceTurnSnapshot(ownerWorkspaceId, handleId);
+      // Probe the stored record, not a snapshot: a snapshot can repair or revive a stale record
+      // (a write under this owner), and nothing may be written until the checks below pass.
+      const probe = await workspaceTurnManager.getStoredWorkspaceTurn(ownerWorkspaceId, handleId);
       if (probe == null) continue;
       if (
         !this.isTerminalTurnOfDescendantUnder(

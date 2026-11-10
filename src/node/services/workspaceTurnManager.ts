@@ -3936,6 +3936,18 @@ export class WorkspaceTurnManager {
     });
   }
 
+  /**
+   * The record as stored. Unlike getWorkspaceTurnSnapshot it neither repairs nor revives the
+   * record and never marks it consumed, so a caller that is still deciding whether it may read
+   * the handle at all can look at it without writing.
+   */
+  async getStoredWorkspaceTurn(
+    ownerWorkspaceId: string,
+    handleId: string
+  ): Promise<WorkspaceTurnTaskHandleRecord | null> {
+    return await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
+  }
+
   async getWorkspaceTurnSnapshot(
     ownerWorkspaceId: string,
     handleId: string,
