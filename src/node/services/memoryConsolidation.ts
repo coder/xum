@@ -50,6 +50,7 @@ import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
   MEMORY_DREAM_EDIT_LIMIT_MAX,
+  MEMORY_DREAM_MAX_STEPS,
   MEMORY_CONSOLIDATION_NOTE_MAX_CHARS,
   MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   type MemoryScope,
@@ -687,7 +688,9 @@ export function createConsolidationMemoryTool(args: {
  * (the schema drops it too) would make Math.min NaN and the budget endless, so it runs at the
  * default, like an absent limit.
  * The step ceiling is 4 steps for each edit (today's 32 steps for the default 8), never below
- * MEMORY_CONSOLIDATION_MAX_STEPS, so a raised limit can be spent.
+ * MEMORY_CONSOLIDATION_MAX_STEPS, so a raised limit can be spent, and never above
+ * MEMORY_DREAM_MAX_STEPS, which no setting raises: read-only calls spend no edit, so the edit
+ * limit alone does not bound a run's model requests.
  */
 export function organizerEditBudget(editLimit: number | null | undefined): {
   budget: MutationBudget;
@@ -703,7 +706,11 @@ export function organizerEditBudget(editLimit: number | null | undefined): {
   return {
     budget: createMutationBudget(limit),
     promptLine: `You have ${limit} mutating commands this run.`,
-    stepCeiling: [stepCountIs(Math.max(MEMORY_CONSOLIDATION_MAX_STEPS, 4 * limit))],
+    stepCeiling: [
+      stepCountIs(
+        Math.min(MEMORY_DREAM_MAX_STEPS, Math.max(MEMORY_CONSOLIDATION_MAX_STEPS, 4 * limit))
+      ),
+    ],
   };
 }
 

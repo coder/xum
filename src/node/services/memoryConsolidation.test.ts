@@ -11,6 +11,7 @@ import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
   MEMORY_DREAM_EDIT_LIMIT_MAX,
+  MEMORY_DREAM_MAX_STEPS,
   MEMORY_CONSOLIDATION_NOTE_MAX_CHARS,
   MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   MEMORY_MAX_FILE_BYTES,
@@ -1516,26 +1517,39 @@ describe("consolidation memory tool rails", () => {
 });
 
 describe("organizerEditBudget", () => {
-  it.each([
-    [undefined, MEMORY_CONSOLIDATION_OP_BUDGET],
-    [24, 24],
-    [1, 1],
-    [MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_EDIT_LIMIT_MAX],
-    // Only null is unlimited here: the service turns the user's 0 into null before the run.
-    [0, 0],
-    // Unlimited, and any limit over the safety cap, runs at the cap.
-    [null, MEMORY_DREAM_EDIT_LIMIT_MAX],
-    [MEMORY_DREAM_EDIT_LIMIT_MAX + 1, MEMORY_DREAM_EDIT_LIMIT_MAX],
-    [1_000_000, MEMORY_DREAM_EDIT_LIMIT_MAX],
-    // NaN would make Math.min NaN, a budget that never refuses.
-    [Number.NaN, MEMORY_CONSOLIDATION_OP_BUDGET],
-  ])("gives a limit of %p a budget of %p and a prompt line that says so", (editLimit, limit) => {
-    const editBudget = organizerEditBudget(editLimit);
-
-    expect(editBudget.budget.limit).toBe(limit);
-    expect(editBudget.promptLine).toBe(`You have ${limit} mutating commands this run.`);
+  /** Whether the budget's step ceiling stops the run at exactly `steps` steps, not one earlier. */
+  async function stopsAt(editBudget: ReturnType<typeof organizerEditBudget>, steps: number) {
     expect(editBudget.stepCeiling).toHaveLength(1);
-  });
+    const stopWhen = editBudget.stepCeiling[0];
+    const at = (count: number) =>
+      stopWhen({ steps: Array.from({ length: count }) as Parameters<typeof stopWhen>[0]["steps"] });
+    return !(await at(steps - 1)) && (await at(steps));
+  }
+
+  it.each([
+    [undefined, MEMORY_CONSOLIDATION_OP_BUDGET, MEMORY_CONSOLIDATION_MAX_STEPS],
+    [24, 24, 96],
+    [1, 1, MEMORY_CONSOLIDATION_MAX_STEPS],
+    // 4 steps per edit would be 4000: the fixed step ceiling holds, which no setting raises.
+    [MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_MAX_STEPS],
+    // Only null is unlimited here: the service turns the user's 0 into null before the run.
+    [0, 0, MEMORY_CONSOLIDATION_MAX_STEPS],
+    // Unlimited, and any limit over the safety cap, runs at the cap.
+    [null, MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_MAX_STEPS],
+    [MEMORY_DREAM_EDIT_LIMIT_MAX + 1, MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_MAX_STEPS],
+    [1_000_000, MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_MAX_STEPS],
+    // NaN would make Math.min NaN, a budget that never refuses.
+    [Number.NaN, MEMORY_CONSOLIDATION_OP_BUDGET, MEMORY_CONSOLIDATION_MAX_STEPS],
+  ])(
+    "gives a limit of %p a budget of %p, a prompt line that says so, and %p steps",
+    async (editLimit, limit, steps) => {
+      const editBudget = organizerEditBudget(editLimit);
+
+      expect(editBudget.budget.limit).toBe(limit);
+      expect(editBudget.promptLine).toBe(`You have ${limit} mutating commands this run.`);
+      expect(await stopsAt(editBudget, steps)).toBe(true);
+    }
+  );
 
   it("refuses the edit after the safety cap when unlimited", () => {
     const editBudget = organizerEditBudget(null);
@@ -2101,14 +2115,31 @@ describe("runMemoryConsolidation", () => {
       expect(scripted.calls).toHaveLength(96);
     }, 30_000);
 
-    it("never takes fewer steps than the default limit allows", async () => {
+    it.each([
+      ["a limit under the default", 2],
+      ["no limit passed (the default)", undefined],
+    ])("never takes fewer steps than the default limit allows: %s", async (_why, editLimit) => {
       using fixture = await createFixture();
       const scripted = listingModel();
 
-      await run(fixture, scripted.model, { editLimit: 2 });
+      await run(fixture, scripted.model, { editLimit });
 
       expect(scripted.calls).toHaveLength(MEMORY_CONSOLIDATION_MAX_STEPS);
     });
+
+    // Read-only calls spend no edit, so only the fixed step ceiling stops a run that never edits:
+    // no setting raises it, and the cost ceiling is optional. A limit of 1000 is the same budget
+    // (organizerEditBudget's table). Hundreds of model steps: slow on a loaded host, so a long
+    // timeout.
+    it("stops an unlimited read-only run at the fixed step ceiling", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      const result = await run(fixture, scripted.model, { editLimit: null });
+
+      expect(scripted.calls).toHaveLength(MEMORY_DREAM_MAX_STEPS);
+      expect(result.ops).toEqual([]);
+    }, 120_000);
 
     it("lets an unlimited run take more than the default 32 steps", async () => {
       using fixture = await createFixture();
