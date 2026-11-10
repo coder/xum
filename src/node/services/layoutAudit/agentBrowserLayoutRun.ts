@@ -117,13 +117,11 @@ ab() { $ab_wrap agent-browser --session "$XUM_LAYOUT_SESSION" --config "$XUM_LAY
 cd / || exit ${EXIT_SETUP_FAILED}
 `;
 
-// The page script on stdin is read before the first step that can exit, and drained when there
-// is no agent-browser (the usual way to be "not checked"), so the exec's writer never meets a
-// reader that left. A tool_env that fails ends the exec before that: on LocalRuntime,
-// execBuffered did not fail when a command that exits at once left up to 2 MB of stdin unread
-// (measured).
+// A run that ends early (no agent-browser, a tool_env that fails) leaves the page script on
+// stdin unread. The exec is told that this is fine (`stdinMayGoUnread`), so the exit code still
+// says why nothing ran.
 const RUN_SCRIPT = String.raw`
-command -v agent-browser >/dev/null 2>&1 || { cat >/dev/null 2>&1; exit ${EXIT_NO_AGENT_BROWSER}; }
+command -v agent-browser >/dev/null 2>&1 || exit ${EXIT_NO_AGENT_BROWSER}
 page_script=$(cat) || exit ${EXIT_SETUP_FAILED}
 ${SHELL_COMMON}
 # Plain mkdir: it fails on a path that already exists, so the run never adopts a folder it did
@@ -292,6 +290,7 @@ export async function runLayoutPasses(input: LayoutRunInput): Promise<ViewportOu
       XUM_LAYOUT_VIEWPORTS: LAYOUT_AUDIT_VIEWPORTS.flatMap((v) => [v.width, v.height]).join(" "),
     },
     stdin: input.pageScript,
+    stdinMayGoUnread: true,
     timeout: (remainingMs - closeMs) / 1000,
     abortSignal: input.abortSignal,
     maxOutputBytes: MAX_RUN_OUTPUT_BYTES,

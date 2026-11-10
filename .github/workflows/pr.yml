@@ -187,6 +187,7 @@ jobs:
               - 'scripts/generate-builtin-skills.sh'
               - 'scripts/gen_builtin_skills.ts'
               - 'scripts/gen_workflow_runtime_sources.ts'
+              - 'scripts/gen_layout_audit_script.ts'
               - 'scripts/precompress-static.ts'
               - 'scripts/stamp-service-worker.ts'
               - 'scripts/perf/firstLoadJs.ts'
