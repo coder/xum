@@ -1145,6 +1145,40 @@ describe("buildAgentSandboxPolicy", () => {
     }
   );
 
+  // npx for an MCP server opens the npm config that a variable names as spelled, outside the
+  // sandbox, so a command could swap a link on the way to it.
+  test("fails closed when a variable names a config file through a link in a write root", async () => {
+    using _tmpdir = homeOutsideWriteRoots();
+    const outside = path.join(root, "npm-config");
+    await fs.mkdir(outside);
+    await fs.symlink(outside, path.join(repo, "config-link"));
+
+    const policyFor = (userconfig: string) =>
+      buildAgentSandboxPolicy(SETTINGS, { cwd: repo, env: { npm_config_userconfig: userconfig } });
+
+    expect(() => policyFor(path.join(repo, "config-link", "npmrc"))).toThrow(
+      AgentSandboxStartError
+    );
+    expect(() => policyFor(path.join(outside, "npmrc"))).not.toThrow();
+  });
+
+  // A Hugging Face cache on another disk, through a link in ~/.cache, is common.
+  test("builds where a variable names a default token file through a link in a write root", async () => {
+    const home = path.join(root, "home");
+    const disk = path.join(root, "disk");
+    await fs.mkdir(path.join(home, ".cache"), { recursive: true });
+    await fs.mkdir(disk);
+    await fs.symlink(disk, path.join(home, ".cache", "huggingface"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    using _tmpdir = homeOutsideWriteRoots();
+    try {
+      const env = { HF_HOME: path.join(home, ".cache", "huggingface") };
+      expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo, env })).not.toThrow();
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
   // Bash and the file tools overlay the project's secrets onto Xum's environment.
   test.each(MOVED_CREDENTIAL_STORES)(
     "hides $file where the command's $name moves it",

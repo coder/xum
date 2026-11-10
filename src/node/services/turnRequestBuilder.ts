@@ -1,6 +1,7 @@
 import {
   agentSandboxCoversTools,
   fileToolSandboxContext,
+  lazyFileToolSandboxGate,
 } from "@/node/services/agentSandbox/fileToolSandbox";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { withExecutionScope } from "./tools/withExecutionScope";
@@ -2942,6 +2943,7 @@ export class TurnRequestBuilder {
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
               }),
+            // A nested workflow's path comes from the script, which an agent can write.
             resolveWorkflowScript: (scriptPath) =>
               resolveWorkflowScript({
                 scriptPath,
@@ -2951,6 +2953,9 @@ export class TurnRequestBuilder {
                 projectTrusted: getWorkflowProjectTrusted(),
                 skillStorageContext: workflowSkillStorageContext,
                 runtimeFactory: this.dependencies.runtimeFactory,
+                sandboxGate: lazyFileToolSandboxGate(runtime, workspacePath, {
+                  env: projectSecretsRecord,
+                }),
               }),
             assertStoredPluginWorkflowReviewed: (stored) =>
               assertStoredPluginWorkflowReviewed({

@@ -409,6 +409,17 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
 }
 
 /**
+ * The nestedDenyReadPaths() that variables in `env` add or move. Programs that Xum starts outside
+ * the sandbox with that environment, such as npx for an MCP server, open them as spelled.
+ */
+export function movedDenyReadPaths(env: NodeJS.ProcessEnv): string[] {
+  const defaults = new Set(nestedDenyReadPaths({}).map(expandSandboxPathSpelling));
+  return nestedDenyReadPaths(env).filter(
+    (entry) => !defaults.has(expandSandboxPathSpelling(entry))
+  );
+}
+
+/**
  * The Hugging Face token file, and `stored_tokens` next to it, where `hf auth login` keeps every
  * token it saved (HF_STORED_TOKENS_PATH in huggingface_hub's constants.py).
  */

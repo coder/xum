@@ -14,6 +14,7 @@ import {
   CACHE_WRITE_PATHS,
   DENY_READ_ROOTS,
   HOME_READ_PATHS,
+  movedDenyReadPaths,
   nestedDenyReadPaths,
   PROTECTED_GIT_DIR_PATHS,
   PROTECTED_LINKED_WORKTREE_PATHS,
@@ -263,6 +264,10 @@ export function buildAgentSandboxPolicy(
   // Xum, its git and the npx, uvx and bunx of MCP servers use these as spelled, outside the
   // sandbox, so a command could replace a link to one in a write root (Codex review): fail closed.
   assertNoPathThroughLink([getXumHome(), ...automationSpellings, ...cacheSpellings], writeRoots);
+  // So do npx and git with a config file that a variable names, such as npm's userconfig: the
+  // policy protects where it points now (Codex review). A default one through a link stays allowed:
+  // a ~/.cache/huggingface that links to another disk is common, and its files are only tokens.
+  assertNoPathThroughLink(pathsFromEnvs(envs, movedDenyReadPaths), writeRoots);
   assertNoGlobLinks(cacheSpellings);
   const linkedEntries = automationEntryLinkTargets(writeRoots);
   const readableAutomation = [...readableSpellings.map(expandSandboxPath), ...linkedEntries];
