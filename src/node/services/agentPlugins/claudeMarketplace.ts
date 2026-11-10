@@ -281,8 +281,9 @@ function assertMarketplaceMayName(value: string, url: string, marketplaceUrl: st
   // SECURITY: a marketplace fetched from the network must not point Xum at a repository on this
   // machine (a private checkout the user never chose), by path or by a loopback host such as
   // `ssh://localhost/...`. A marketplace on this machine may. A marketplace is on this machine only
-  // as git reads its URL on this platform (`surelyOnThisMachine`; a drive such as `C:/market` only
-  // on Windows, where git reads it as a path): it grants rights, so a doubt must not.
+  // when git reads its URL as a path on this platform (`surelyOnThisMachine`; a drive such as
+  // `C:/market` only on Windows). A host never counts, `localhost` included: it grants rights, so
+  // a doubt must not, and a host that Xum reads is not always the host that git signs in to.
   const marketplaceIsLocal = surelyOnThisMachine(marketplaceUrl, process.platform);
   if (pointsAtThisMachine(url) && !marketplaceIsLocal) {
     throw new Error(

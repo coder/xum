@@ -72,43 +72,39 @@ export function pointsAtThisMachine(url: string): boolean {
   return host === undefined || isLoopbackHost(host);
 }
 
+// Git for Windows reads one ASCII character and a colon as a drive, also without a slash
+// (`C:market`; `has_dos_drive_prefix`). It reads one other character and a colon as a drive too
+// (`subst` can name one), but only ASCII counts here: a doubt grants nothing.
+const WIN32_DRIVE_PREFIX = /^\p{ASCII}:/u;
+
+// What Git for Windows refuses as a path after the drive (`is_valid_win32_path`, mingw.c). It then
+// reads the whole URL as scp to the host named by the drive, so the URL is not local. This refuses a
+// superset: a character of `:<>"|?*`, a control character, a reserved device name (also with an
+// extension or a stream), and a folder or file name that ends in a space or a period.
+const INVALID_WIN32_PATH =
+  /[<>"|?*:\p{Cc}]|(?:^|[\\/])(?:aux|con(?:in\$|out\$)?|com[1-9]|lpt\d|nul|prn) *(?:[.:\\/]|$)|(?:^|[\\/])(?!\.{1,2}(?:[\\/]|$))[^\\/]*[ .](?=[\\/]|$)/iu;
+
 /**
- * True when git reads `url` as a path on this machine: a `file://` URL, or what `url_is_local_not_ssh`
- * (connect.c) calls local, no colon or a slash before the first one. Git for Windows also reads a
- * drive (`C:\repo`, `C:/repo`) and a rooted backslash path (`\\server\share`, `\\?\C:\repo`) as a
- * path. Git on Linux and macOS reads `C:/repo` as ssh to the host `C`, and `~h:org/repo` or
- * `\h:org/repo` as ssh to `~h` or `\h`.
+ * True only when git on `platform` (`process.platform`: common code cannot read it) reads `url` as
+ * a path on this machine: a `file://` URL, or what `url_is_local_not_ssh` (connect.c) calls local,
+ * no colon or a slash before the first one. Git for Windows adds a drive (`C:\repo`, `C:/repo`,
+ * `C:repo`). Git on Linux and macOS reads `C:/repo` as ssh to the host `C`.
+ *
+ * Used for a check that grants rights: a marketplace on this machine may name local paths and ssh
+ * sources. No host counts, loopback included. A host is read before git reads it, and the two can
+ * differ: git decodes a scheme URL first, so `ssh://localhost/y%40%5bevil.example%5d/x` signs in to
+ * evil.example, and an `@[` anywhere moves the host (see git's `host_end`). A path has no host to
+ * misread. `pointsAtThisMachine` leans the other way, which is right when a source is left out: it
+ * counts a first character and a colon as a drive, and a URL that Xum cannot read as this machine.
  */
-function gitReadsAsPath(url: string, platform: NodeJS.Platform): boolean {
+export function surelyOnThisMachine(url: string, platform: NodeJS.Platform): boolean {
   if (url.startsWith("file://")) return true;
   const colon = url.indexOf(":");
   const slash = url.indexOf("/");
   if (colon === -1 || (slash !== -1 && slash < colon)) return true;
-  return platform === "win32" && /^(?:[a-zA-Z]:[\\/]|\\)/.test(url);
-}
-
-// The spellings in which git, OpenSSH and WHATWG `URL` read one host: `scheme://[user@]host[:port]/…`
-// and the scp form `[user@]host:path`, with only plain characters. Anything else has a host that Xum
-// cannot be sure of, such as `ssh://evil.example:+22/x` (OpenSSH takes the port, `URL` refuses it) or
-// `ssh://localhost#@evil.example/x` (`URL` reads localhost, git hands `localhost#@evil.example` to ssh,
-// which splits at the last `@`). A later `@[` is refused too: git then reads the host up to the next `]`
-// (`localhost:c@[fe80::1]:x` signs in to fe80::1). An allowlist, so no spelling gets around it.
-const SCHEME_URL_HOST =
-  /^[a-z][a-z0-9+.-]*:\/\/(?:[\w.-]+@)?([\w.-]+|\[[\da-f:.]+\])(?::\d+)?(?:\/|$)(?![\s\S]*@\[)/i;
-const SCP_URL_HOST = /^(?:[\w.-]+@)?([\w.-]+|\[[\da-f:.]+\]):(?![\s\S]*@\[)/i;
-
-/**
- * `pointsAtThisMachine` for a check that grants rights instead of refusing a source: a marketplace
- * on this machine may name local paths and ssh sources. It answers yes only when git on `platform`
- * (`process.platform`: common code cannot read it) reads `url` as a path or reaches a loopback host
- * that Xum can read. `pointsAtThisMachine` leans the other way, which is right when a source is left
- * out: it counts a first character and a colon as a drive (Git for Windows does), and a URL that
- * Xum cannot read as this machine. Here a doubt grants nothing.
- */
-export function surelyOnThisMachine(url: string, platform: NodeJS.Platform): boolean {
-  if (gitReadsAsPath(url, platform)) return true;
-  const host = (url.includes("://") ? SCHEME_URL_HOST : SCP_URL_HOST).exec(url)?.[1];
-  return host !== undefined && isLoopbackHost(host);
+  return (
+    platform === "win32" && WIN32_DRIVE_PREFIX.test(url) && !INVALID_WIN32_PATH.test(url.slice(2))
+  );
 }
 
 /**
