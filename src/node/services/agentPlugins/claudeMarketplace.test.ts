@@ -1,3 +1,4 @@
+import assert from "node:assert";
 import { describe, expect, test } from "bun:test";
 import type { AgentPluginMarketplaceListing } from "@/common/orpc/schemas/agentPlugins";
 import {
@@ -390,21 +391,85 @@ describe("resolveEntrySource", () => {
     ).toMatchObject({ kind: "remote", url: "ssh://localhost/srv/tool.git" });
   });
 
-  test("a marketplace gets the rights of one on this machine only when it is there on every platform", () => {
-    // Git for Windows reads `h:` as a drive, but git on Linux and macOS signs in over ssh to the
-    // host alias `h`: such a marketplace is remote and names only https sources.
-    for (const marketplaceUrl of ["h:org/market.git", "C:market", "git@h:org/market.git"]) {
-      expect(
-        resolveOnly({ source: "url", url: "git@evil.example:org/x.git" }, { marketplaceUrl })
-      ).toContain("only https");
-      expect(resolveOnly({ source: "url", url: "/home/me/private" }, { marketplaceUrl })).toContain(
-        "path on this machine"
-      );
+  // A marketplace gets the rights of one on this machine only when git reads its URL as local on
+  // the platform Xum runs on. Rights are the two things a remote marketplace lacks: a path on this
+  // machine and a source that is not https.
+  const NAMES_PATH = { source: "url", url: "/home/me/private" };
+  const NAMES_SSH = { source: "url", url: "git@evil.example:org/x.git" };
+
+  function expectRemoteMarketplace(marketplaceUrl: string): void {
+    expect(resolveOnly(NAMES_SSH, { marketplaceUrl })).toContain("only https");
+    expect(resolveOnly(NAMES_PATH, { marketplaceUrl })).toContain("path on this machine");
+  }
+
+  function expectLocalMarketplace(marketplaceUrl: string): void {
+    expect(resolveOnly(NAMES_SSH, { marketplaceUrl })).toMatchObject({
+      kind: "remote",
+      url: "git@evil.example:org/x.git",
+    });
+    expect(resolveOnly(NAMES_PATH, { marketplaceUrl })).toMatchObject({
+      kind: "remote",
+      url: "/home/me/private",
+    });
+  }
+
+  function onPlatform<T>(platform: NodeJS.Platform, run: () => T): T {
+    const original = Object.getOwnPropertyDescriptor(process, "platform");
+    assert(original !== undefined, "process.platform must be an own property");
+    Object.defineProperty(process, "platform", { ...original, value: platform });
+    try {
+      return run();
+    } finally {
+      Object.defineProperty(process, "platform", original);
     }
-    for (const marketplaceUrl of ["C:\\repos\\market", "C:/repos/market", "~/market"]) {
-      expect(
-        resolveOnly({ source: "url", url: "git@gitlab.com:acme/tool.git" }, { marketplaceUrl })
-      ).toMatchObject({ kind: "remote", url: "git@gitlab.com:acme/tool.git" });
+  }
+
+  test("a drive is a marketplace on this machine on Windows only", () => {
+    // Git for Windows reads `h:` as a drive, but git on Linux and macOS signs in over ssh to the
+    // host `h`: there such a marketplace is remote and names only https sources.
+    for (const marketplaceUrl of ["C:\\repos\\market", "C:/repos/market", "h:/org/market.git"]) {
+      onPlatform("win32", () => expectLocalMarketplace(marketplaceUrl));
+      for (const platform of ["linux", "darwin"] as const) {
+        onPlatform(platform, () => expectRemoteMarketplace(marketplaceUrl));
+      }
+    }
+  });
+
+  test("a marketplace that git reads as ssh to a named host is remote on every platform", () => {
+    for (const marketplaceUrl of ["h:org/market.git", "C:market", "git@h:org/market.git"]) {
+      for (const platform of ["linux", "darwin", "win32"] as const) {
+        onPlatform(platform, () => expectRemoteMarketplace(marketplaceUrl));
+      }
+    }
+  });
+
+  test("a marketplace whose host Xum cannot read is remote", () => {
+    // `URL` refuses `:+22`, a zone id and `|`, but OpenSSH takes the port and git signs in to the
+    // host. `#@` and a colon in the user part make `URL` and git read two different hosts.
+    for (const marketplaceUrl of [
+      "ssh://evil.example:+22/market.git",
+      "ssh://[fe80::1%25eth0]/market.git",
+      "ssh://evil|host/market.git",
+      "ssh://localhost#@evil.example/market.git",
+      "evil.example:c@localhost:market.git",
+    ]) {
+      for (const platform of ["linux", "win32"] as const) {
+        onPlatform(platform, () => expectRemoteMarketplace(marketplaceUrl));
+      }
+    }
+  });
+
+  test("a path, a file URL and a loopback host stay a marketplace on this machine", () => {
+    for (const marketplaceUrl of [
+      "/srv/repos/market",
+      "~/market",
+      "file:///srv/repos/market",
+      "ssh://localhost/srv/market.git",
+      "git@127.0.0.1:srv/market.git",
+    ]) {
+      for (const platform of ["linux", "darwin", "win32"] as const) {
+        onPlatform(platform, () => expectLocalMarketplace(marketplaceUrl));
+      }
     }
   });
 });

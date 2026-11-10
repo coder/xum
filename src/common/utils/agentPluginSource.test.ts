@@ -9,6 +9,7 @@ import {
   percentDecodedForms,
   PLAIN_HTTPS_URL,
   reviewUrlOf,
+  surelyOnThisMachine,
 } from "./agentPluginSource";
 
 describe("normalizeAgentPluginSubpath", () => {
@@ -279,6 +280,73 @@ describe("reviewUrlOf", () => {
       "https://github.com/example/repo.git",
     ]) {
       expect(PLAIN_HTTPS_URL.test(reviewUrlOf(url) ?? "")).toBe(true);
+    }
+  });
+});
+
+describe("surelyOnThisMachine", () => {
+  const PLATFORMS: NodeJS.Platform[] = ["linux", "darwin", "win32"];
+
+  test.each([
+    ["an absolute path", "/srv/repos/market"],
+    ["a path under home", "~/market"],
+    ["a path with a colon after its first slash", "/srv/repos/a:b"],
+    ["a file URL", "file:///srv/repos/market"],
+    ["an ssh URL to localhost", "ssh://localhost/srv/market.git"],
+    ["an ssh URL with a user, a trailing dot and a port", "ssh://git@LOCALHOST.:2222/srv/market.git"],
+    ["an ssh URL to a loopback IPv4 spelling", "ssh://127.1/srv/market.git"],
+    ["an ssh URL to the IPv6 loopback", "ssh://[::1]/srv/market.git"],
+    ["an https URL to a loopback address", "https://127.0.0.1/market.git"],
+    ["an scp URL to a loopback address", "git@127.0.0.1:srv/market.git"],
+    ["an scp URL to localhost with no user", "localhost:srv/market.git"],
+    ["an scp URL to the bracketed IPv6 loopback", "[::1]:srv/market.git"],
+  ])("counts %s as this machine on every platform", (_label, url) => {
+    for (const platform of PLATFORMS) {
+      expect(surelyOnThisMachine(url, platform)).toBe(true);
+    }
+  });
+
+  // Git for Windows reads a drive as a path. Git on Linux and macOS reads the same string as scp
+  // to the host `C` or `h`, which `ssh` resolves like any other name.
+  test.each([
+    ["a drive with a backslash", "C:\\repos\\market"],
+    ["a drive with a slash", "C:/repos/market"],
+    ["a one-letter host with a slash", "h:/org/market.git"],
+    ["an NT-namespace path", "\\\\?\\C:\\repos\\market"],
+    // A rooted backslash path is local to Git for Windows; elsewhere the colon comes first, so
+    // git reads the host `\h`.
+    ["a rooted backslash path with a colon", "\\h:org/market.git"],
+  ])("counts %s as this machine on Windows only", (_label, url) => {
+    expect(surelyOnThisMachine(url, "win32")).toBe(true);
+    expect(surelyOnThisMachine(url, "linux")).toBe(false);
+    expect(surelyOnThisMachine(url, "darwin")).toBe(false);
+  });
+
+  test.each([
+    ["a one-letter scp host", "h:org/market.git"],
+    ["a drive-relative path", "C:market"],
+    ["an scp URL to a named host", "git@h:org/market.git"],
+    ["an https URL", "https://github.com/acme/market.git"],
+    ["an ssh URL to a named host", "ssh://git@github.com/acme/market.git"],
+    // Xum cannot read these hosts as `URL` does, but git passes them to ssh: a doubt grants nothing.
+    ["a port that URL refuses and OpenSSH reads", "ssh://evil.example:+22/market.git"],
+    ["a scoped IPv6 address", "ssh://[fe80::1%25eth0]/market.git"],
+    ["a host with a character URL refuses", "ssh://evil|host/market.git"],
+    // `URL` reads the host `localhost`. Git hands `localhost#@evil.example` to ssh, which splits
+    // at the last `@` and signs in to evil.example.
+    ["a fragment that hides the host from URL", "ssh://localhost#@evil.example/market.git"],
+    // Git reads the host before the first colon, `evil.example`, and the rest as a path.
+    ["an scp URL whose user part holds a colon", "evil.example:c@localhost:market.git"],
+    // Git reads the host `~h`: the first slash comes after the colon.
+    ["a tilde with a colon before its first slash", "~h:org/market.git"],
+    ["a colon first", ":market.git"],
+    // A first character of any kind and a colon is an scp host, not a drive: one code point
+    // (`.` without the `u` flag matches half of it) and a newline (`.` without `s` skips it).
+    ["an astral first character", "\u{1F600}:x"],
+    ["a newline first", "\n:x"],
+  ])("counts %s as remote on every platform", (_label, url) => {
+    for (const platform of PLATFORMS) {
+      expect(surelyOnThisMachine(url, platform)).toBe(false);
     }
   });
 });
