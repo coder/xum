@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import { LRUCache } from "lru-cache";
 import type {
   LayoutAuditRule,
   LayoutAuditViewportClass,
@@ -31,8 +32,9 @@ export const LAYOUT_MEMORY_MAX_PATHS = 64;
 
 // In-process only, on purpose: a backend restart forgets what the agent was shown, and the next
 // publish then marks nothing persistent (the safe direction: the agent sees the issue again).
-// Insertion order is the recency order: a commit moves its path to the end.
-const remembered = new Map<string, FingerprintSnapshot>();
+// Only a commit counts as use: a commit makes its path the newest, and reading what a path has
+// remembered (`peek`) leaves the order alone.
+const remembered = new LRUCache<string, FingerprintSnapshot>({ max: LAYOUT_MEMORY_MAX_PATHS });
 
 /**
  * The ordering state of one path. It lives in its own map, not with the memory, and exists
@@ -69,15 +71,6 @@ export interface LayoutAuditTurn {
   ): T;
 }
 
-function commit(key: string, snapshot: FingerprintSnapshot): void {
-  remembered.delete(key);
-  remembered.set(key, snapshot);
-  for (const oldest of remembered.keys()) {
-    if (remembered.size <= LAYOUT_MEMORY_MAX_PATHS) break;
-    remembered.delete(oldest);
-  }
-}
-
 /**
  * Takes this audit's place in the start order of its path. Audits of one path do not wait for
  * each other (a wait would have no deadline of its own): each runs with its own budget, and
@@ -94,10 +87,10 @@ export function startLayoutAudit(sessionDir: string, relPath: string): LayoutAud
   return {
     finish: (build, remember) => {
       try {
-        const { report, next } = build(remembered.get(key) ?? {});
+        const { report, next } = build(remembered.peek(key) ?? {});
         if (remember && startedAs > path.committedStart) {
           path.committedStart = startedAs;
-          commit(key, next);
+          remembered.set(key, next);
         }
         return report;
       } finally {
