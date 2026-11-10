@@ -217,6 +217,45 @@ describe("PlanTab", () => {
     expect(other.getByTestId("plan-tab-body").scrollTop).toBe(0);
   });
 
+  test("restores the scroll offset once a body mounted in a hidden sidebar becomes visible", async () => {
+    updatePersistedState<number>(getPlanTabScrollTopKey("workspace-1"), 120, 0);
+    mockApi = { workspace: { getPlanContent: mock(() => Promise.resolve(planResult("# Plan"))) } };
+    // The narrow layout hides the sidebar with display: none: no layout box until it shows.
+    let visible = false;
+    const realGetClientRects = HTMLElement.prototype.getClientRects;
+    HTMLElement.prototype.getClientRects = function (this: HTMLElement) {
+      return visible || this.dataset.testid !== "plan-tab-body"
+        ? realGetClientRects.call(this)
+        : ([] as unknown as DOMRectList);
+    };
+    const observed: Array<() => void> = [];
+    const RealResizeObserver = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe() {
+        observed.push(() => this.callback([], this as unknown as ResizeObserver));
+      }
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      const view = renderWithApi(<PlanTab workspaceId="workspace-1" />);
+      await waitFor(() => {
+        expect(view.getByTestId("plan-markdown-core").textContent).toContain("# Plan");
+      });
+      const body = view.getByTestId("plan-tab-body");
+      expect(body.scrollTop).toBe(0);
+
+      // Shown full-screen: the same body, now with a layout box.
+      visible = true;
+      act(() => observed.forEach((notify) => notify()));
+      expect(body.scrollTop).toBe(120);
+    } finally {
+      HTMLElement.prototype.getClientRects = realGetClientRects;
+      globalThis.ResizeObserver = RealResizeObserver;
+    }
+  });
+
   test("a saved scroll offset survives an unmount before the plan loaded", () => {
     const key = getPlanTabScrollTopKey("workspace-1");
     updatePersistedState<number>(key, 120, 0);
