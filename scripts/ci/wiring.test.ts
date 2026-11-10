@@ -465,40 +465,73 @@ function runnerLabels(runsOn: unknown): string[] {
   return [];
 }
 
+// The simple commands of a `run` script, each as its words. A trailing backslash joins lines, and
+// `;`, `&&`, `||`, `|`, `&` and a new line end a command. A word that starts with `#` begins a
+// comment. Leading assignments and shell keywords are dropped, and so is an `echo` or `printf`
+// command, whose words are text and not commands. A quoted string is not split, so a command
+// inside `bash -c "..."` is not seen.
+const SHELL_KEYWORDS = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{"]);
+function simpleCommands(run: string): string[][] {
+  return run
+    .replace(/\\\r?\n\s*/g, " ")
+    .split("\n")
+    .flatMap((line) => line.split(/;|&&|\|\||\||&/))
+    .map((part) => {
+      const words: string[] = [];
+      for (const raw of part.trim().split(/\s+/)) {
+        if (raw.startsWith("#")) break;
+        const word = raw.replace(/^(?:\$\(|\(|`)+/, "").replace(/[)`]+$/, "");
+        if (word !== "") words.push(word);
+      }
+      const start = words.findIndex((word) => !/^\w+=/.test(word) && !SHELL_KEYWORDS.has(word));
+      return start === -1 ? [] : words.slice(start);
+    })
+    .filter((words) => words.length > 0 && words[0] !== "echo" && words[0] !== "printf");
+}
+
+const basename = (word: string): string => word.slice(word.lastIndexOf("/") + 1);
+
 // Whether the arguments of one electron-builder call build the Linux AppImage. `--linux` or `-l`
 // (alone or in a cluster such as `-wl`) does. Without a platform option electron-builder builds
 // for the host, so the call builds it on a runner that may be Linux, unless it is another
 // command (`install-app-deps`) or builds no package (`--dir`, `--help`).
-function electronBuilderBuildsAppImage(args: string, mayRunOnLinux: boolean): boolean {
-  if (/(?:^|\s)(?:--linux|-[mwl]*l[mwl]*)(?=\s|$)/.test(args)) return true;
-  const otherPlatform = /(?:^|\s)(?:--mac|--win|-[mwl]+)(?=\s|$)/.test(args);
+function electronBuilderBuildsAppImage(args: string[], mayRunOnLinux: boolean): boolean {
+  if (args.some((arg) => arg === "--linux" || /^-[mwl]*l[mwl]*$/.test(arg))) return true;
+  const otherPlatform = args.some(
+    (arg) => arg === "--mac" || arg === "--win" || /^-[mwl]+$/.test(arg)
+  );
   const buildsNothing =
-    /^\s*(?:install-app-deps|node-gyp-rebuild|create-self-signed-cert|start)\b/.test(args) ||
-    /(?:^|\s)(?:--dir|--help|-h|--version)(?=\s|$)/.test(args);
+    ["install-app-deps", "node-gyp-rebuild", "create-self-signed-cert", "start"].includes(
+      args[0] ?? ""
+    ) || args.some((arg) => ["--dir", "--help", "-h", "--version"].includes(arg));
   return mayRunOnLinux && !otherPlatform && !buildsNothing;
 }
 
-// Whether a job builds the Linux AppImage. A command split over lines with a trailing backslash
-// reads as one, and a comment line is not a command. electron-builder builds it as above, directly
-// or through `make dist-linux` or `bun run dist:linux`, and the unqualified `make dist` (or
-// `bun run dist`) builds for the runner's own OS. `runs-on` is often an expression, so only a
-// runner label that names macOS or Windows rules a job out.
+// Whether a job builds the Linux AppImage. electron-builder builds it as above, directly or through
+// `make dist-linux` or `bun run dist:linux`, and the unqualified `make dist` (or `bun run dist`)
+// builds for the runner's own OS. A command can sit behind a wrapper (`scripts/retry.sh 3 30 make
+// dist`). `runs-on` is often an expression, so only a runner label that names macOS or Windows (in
+// any case) rules a job out.
 function buildsAppImage(job: WorkflowJob): boolean {
   const mayRunOnLinux = !runnerLabels(job["runs-on"]).some((label) =>
     /^(?:macos|windows)\b/i.test(label)
   );
-  return (job.steps ?? []).some((step) => {
-    const lines = (step.run ?? "")
-      .replace(/\\\r?\n\s*/g, " ")
-      .split("\n")
-      .filter((line) => !/^\s*#/.test(line));
-    return lines.some((line) => {
-      if (/make dist-linux|run dist:linux/.test(line)) return true;
-      if (mayRunOnLinux && /(?:make|run) dist(?![-:\w])/.test(line)) return true;
-      const args = /electron-builder(?=\s|$)(.*)/.exec(line)?.[1];
-      return args !== undefined && electronBuilderBuildsAppImage(args, mayRunOnLinux);
-    });
-  });
+  return (job.steps ?? []).some((step) =>
+    simpleCommands(step.run ?? "").some((words) =>
+      words.some((word, i) => {
+        const rest = words.slice(i + 1);
+        if (basename(word) === "make") {
+          return rest.includes("dist-linux") || (mayRunOnLinux && rest.includes("dist"));
+        }
+        if (word === "run")
+          return rest[0] === "dist:linux" || (mayRunOnLinux && rest[0] === "dist");
+        return (
+          basename(word) === "electron-builder" &&
+          electronBuilderBuildsAppImage(rest, mayRunOnLinux)
+        );
+      })
+    )
+  );
 }
 
 // A workflow that builds an AppImage in a form this test does not know would skip the tool check
@@ -582,6 +615,20 @@ describe("the AppImage job detector", () => {
       "make dist",
       true,
     ],
+    ["a plain make dist on a macOS-latest runner", "macOS-latest", "make dist", false],
+    ["a plain make dist on a Windows-2022 runner", "Windows-2022", "make dist", false],
+    ["a plain make dist on a windows-latest runner", "windows-latest", "make dist", false],
+    ["make dist/cli/index.js", linux, "make dist/cli/index.js", false],
+    ["prose that mentions make dist after echo", linux, "echo do not run make dist here", false],
+    ["prose after then", linux, "if true; then echo do not run make dist; fi", false],
+    ["an assignment before echo", linux, "FOO=1 echo run make dist", false],
+    ["make dist in a comment line", linux, "# make dist\ntrue", false],
+    ["make dist in a comment after a command", linux, "true # make dist", false],
+    ["make with a flag before dist", linux, "make -j4 dist", true],
+    ["make dist behind a retry wrapper", linux, "./scripts/retry.sh 3 30 make dist", true],
+    ["make dist after cd and &&", linux, "cd app && make dist", true],
+    ["make dist in a for loop", linux, "for i in 1; do make dist; done", true],
+    ["make dist before a comment", linux, "make dist # build it", true],
   ])("%s", (_name, runsOn, run, builds) => {
     expect(buildsAppImage({ "runs-on": runsOn, steps: [{ run }] })).toBe(builds);
   });
