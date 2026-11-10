@@ -507,6 +507,57 @@ async function fastReadGitHeadsRefs(projectPath: string): Promise<string | null>
  *
  * Extends RemoteRuntime for shared exec/file operations.
  */
+/**
+ * Best-effort script that deletes a removed workspace's orphaned branch from its base repo.
+ *
+ * HEAD neutralization migrates legacy *Xum-owned* base repos whose HEAD still points at a user
+ * branch (the Graphite-poisoning state) so `branch -D` keeps Git's native checked-out-branch guard
+ * instead of refusing because the bare repo "has the branch checked out". The resolved common git
+ * dir is workspace-derived, though: a hand-crafted or legacy worktree can resolve to a real
+ * checkout's `.git`, and rewriting that repo's HEAD would strand the user's checkout on the unborn
+ * internal branch. Managed base repos (canonical and legacy hashed layouts alike) are always named
+ * `.mux-base.git`, so the HEAD rewrite is scoped to them.
+ */
+export function buildOrphanedBranchDeleteScript(params: {
+  baseRepoPath: string;
+  baseRepoPathArg: string;
+  branch: string;
+  noHooksPrefix: string;
+}): string {
+  const lines = [
+    `${params.noHooksPrefix}git -C ${params.baseRepoPathArg} branch -D ${shescape.quote(params.branch)} 2>/dev/null || true`,
+  ];
+  if (path.posix.basename(params.baseRepoPath) === REMOTE_BASE_REPO_DIR) {
+    lines.unshift(
+      `git --git-dir=${params.baseRepoPathArg} symbolic-ref HEAD ${shescape.quote(BASE_REPO_UNBORN_HEAD_REF)} 2>/dev/null || true`
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The staging cleanup reason and the caller-facing error for a fork whose finalize move failed.
+ * MUX_FORK_COLLISION means another fork created the destination first (the pre-check or the
+ * post-hoc nesting detector saw it), which needs a different name rather than a retry.
+ */
+export function describeForkFinalizeFailure(
+  moveResult: { stdout: string; stderr: string },
+  newWorkspacePath: string,
+  labels: { step: string; subject: string }
+): { cleanupReason: string; error: string } {
+  if (moveResult.stdout.includes("MUX_FORK_COLLISION")) {
+    return {
+      cleanupReason: "finalize collision (destination created by another process)",
+      error: `Workspace at ${newWorkspacePath} was created by another process during fork; pick a different name`,
+    };
+  }
+  const output = moveResult.stderr || moveResult.stdout;
+  return {
+    cleanupReason: `${labels.step} failed: ${output.trim()}`,
+    error: `Failed to finalize forked ${labels.subject}: ${output}`,
+  };
+}
+
 /** Trunk-like names SSH cleanups never `branch -D`, even when they look orphaned. */
 const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
 
@@ -3569,27 +3620,14 @@ export class SSHRuntime extends RemoteRuntime {
           !PROTECTED_BRANCHES.includes(branchToDelete) &&
           options?.keepBranch !== true
         ) {
-          // HEAD neutralization migrates legacy *Xum-owned* base repos whose
-          // HEAD still points at a user branch (the Graphite-poisoning state)
-          // so `branch -D` keeps Git's native checked-out-branch guard instead
-          // of refusing because the bare repo "has the branch checked out".
-          // The resolved common git dir is workspace-derived, though: a
-          // hand-crafted or legacy worktree can resolve to a real checkout's
-          // `.git`, and rewriting that repo's HEAD would strand the user's
-          // checkout on the unborn internal branch. Managed base repos
-          // (canonical and legacy hashed layouts alike) are always named
-          // `.mux-base.git`, so scope the HEAD rewrite to them.
-          const isManagedBaseRepo = path.posix.basename(baseRepoPath) === REMOTE_BASE_REPO_DIR;
           await execBuffered(
             this,
-            [
-              ...(isManagedBaseRepo
-                ? [
-                    `git --git-dir=${baseRepoPathArg} symbolic-ref HEAD ${shescape.quote(BASE_REPO_UNBORN_HEAD_REF)} 2>/dev/null || true`,
-                  ]
-                : []),
-              `${nhp}git -C ${baseRepoPathArg} branch -D ${shescape.quote(branchToDelete)} 2>/dev/null || true`,
-            ].join("\n"),
+            buildOrphanedBranchDeleteScript({
+              baseRepoPath,
+              baseRepoPathArg,
+              branch: branchToDelete,
+              noHooksPrefix: nhp,
+            }),
             { cwd: "/tmp", timeout: 10 }
           ).catch(() => undefined);
         }
@@ -3939,21 +3977,13 @@ export class SSHRuntime extends RemoteRuntime {
           { cwd: "/tmp", timeout: 30 }
         );
         if (moveResult.exitCode !== 0) {
-          const collision = moveResult.stdout.includes("MUX_FORK_COLLISION");
-          await removeStagingWorktree(
-            baseRepoPathArg,
-            nhp,
-            collision
-              ? "finalize collision (destination created by another process)"
-              : `worktree move failed: ${(moveResult.stderr || moveResult.stdout).trim()}`
-          );
+          const failure = describeForkFinalizeFailure(moveResult, newWorkspacePath, {
+            step: "worktree move",
+            subject: "worktree",
+          });
+          await removeStagingWorktree(baseRepoPathArg, nhp, failure.cleanupReason);
           stagingHasWorktreeRegistration = false;
-          return {
-            success: false,
-            error: collision
-              ? `Workspace at ${newWorkspacePath} was created by another process during fork; pick a different name`
-              : `Failed to finalize forked worktree: ${moveResult.stderr || moveResult.stdout}`,
-          };
+          return { success: false, error: failure.error };
         }
         stagingHasWorktreeRegistration = false;
       } else {
@@ -3996,21 +4026,15 @@ export class SSHRuntime extends RemoteRuntime {
           timeout: 30,
         });
         if (moveResult.exitCode !== 0) {
-          const collision = moveResult.stdout.includes("MUX_FORK_COLLISION");
+          const failure = describeForkFinalizeFailure(moveResult, newWorkspacePath, {
+            step: "mv",
+            subject: "workspace",
+          });
           // On `MUX_FORK_COLLISION` the inline script has already removed the
           // nested staging dir (if any) and left the winning fork's dest
           // untouched, so `removeStaging` here is a no-op safety net.
-          await removeStaging(
-            collision
-              ? "finalize collision (destination created by another process)"
-              : `mv failed: ${(moveResult.stderr || moveResult.stdout).trim()}`
-          );
-          return {
-            success: false,
-            error: collision
-              ? `Workspace at ${newWorkspacePath} was created by another process during fork; pick a different name`
-              : `Failed to finalize forked workspace: ${moveResult.stderr || moveResult.stdout}`,
-          };
+          await removeStaging(failure.cleanupReason);
+          return { success: false, error: failure.error };
         }
       }
 

@@ -273,6 +273,24 @@ export function isSSHRuntime(
   return config?.type === "ssh";
 }
 
+/** The SSH+None selection (runs in an existing host directory), or null for any other runtime. */
+export function sshNoneRuntimeOf(
+  runtime: ParsedRuntime
+): Extract<ParsedRuntime, { mode: "ssh" }> | null {
+  return runtime.mode === RUNTIME_MODE.SSH && runtime.workspaceIsolation === "none"
+    ? runtime
+    : null;
+}
+
+/**
+ * Whether creating a workspace with this selection builds a checkout from a trunk branch. Local
+ * and SSH+None run in an existing directory and need none, so a local git failure (no branch
+ * list) must not block them.
+ */
+export function parsedRuntimeNeedsTrunk(runtime: ParsedRuntime): boolean {
+  return runtime.mode !== RUNTIME_MODE.LOCAL && sshNoneRuntimeOf(runtime) === null;
+}
+
 /**
  * SSH+None: workspaces run directly in an existing directory on the host. Like project-dir local,
  * the directory is shared by every workspace and is never created, renamed or deleted by Xum.

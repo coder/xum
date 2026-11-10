@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import type { ProjectConfig } from "@/common/types/project";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import {
+  applySshDirectoryTrust,
   isWorkspaceDirTrustedBy,
+  parseSshDirectoryTrustTarget,
+  TRUST_PROJECT_FIRST_ERROR,
   normalizeTrustedSshDirectories,
   withSshDirectoryTrust,
 } from "./sshDirectoryTrust";
@@ -84,5 +88,54 @@ describe("withSshDirectoryTrust", () => {
     expect(withSshDirectoryTrust(once, dir, true)).toEqual([dir]);
     expect(withSshDirectoryTrust(once, dir, false)).toBeUndefined();
     expect(withSshDirectoryTrust(undefined, dir, false)).toBeUndefined();
+  });
+});
+
+describe("parseSshDirectoryTrustTarget", () => {
+  it("trims the host and directory and leaves an absent port out", () => {
+    expect(
+      parseSshDirectoryTrustTarget({ host: " box ", port: null, projectDir: " ~/app " })
+    ).toEqual({ success: true, data: { host: "box", projectDir: "~/app" } });
+    expect(parseSshDirectoryTrustTarget({ host: "box", port: 2222, projectDir: "/app" })).toEqual({
+      success: true,
+      data: { host: "box", port: 2222, projectDir: "/app" },
+    });
+  });
+
+  it("refuses a blank host or directory", () => {
+    expect(parseSshDirectoryTrustTarget({ host: "  ", projectDir: "/app" }).success).toBe(false);
+    expect(parseSshDirectoryTrustTarget({ host: "box", projectDir: " " }).success).toBe(false);
+  });
+});
+
+describe("applySshDirectoryTrust", () => {
+  const dir = { host: "box", projectDir: "/srv/app" };
+  const projectWith = (fields: Partial<ProjectConfig>): ProjectConfig => ({
+    workspaces: [],
+    ...fields,
+  });
+
+  it("adds and removes the directory, dropping the key when none remain", () => {
+    const project = projectWith({ trusted: true });
+    applySshDirectoryTrust(project, "/repo", dir, true);
+    expect(project.trustedSshDirectories).toEqual([dir]);
+
+    applySshDirectoryTrust(project, "/repo", dir, false);
+    expect("trustedSshDirectories" in project).toBe(false);
+  });
+
+  it("refuses to grant trust on an untrusted project, but still allows revoking", () => {
+    const project = projectWith({ trustedSshDirectories: [dir] });
+    expect(() => applySshDirectoryTrust(project, "/repo", dir, true)).toThrow(
+      TRUST_PROJECT_FIRST_ERROR
+    );
+    applySshDirectoryTrust(project, "/repo", dir, false);
+    expect(project.trustedSshDirectories).toBeUndefined();
+  });
+
+  it("fails for a project that is gone", () => {
+    expect(() => applySshDirectoryTrust(undefined, "/repo", dir, false)).toThrow(
+      "Project not found: /repo"
+    );
   });
 });

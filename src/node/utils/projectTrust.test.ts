@@ -5,6 +5,8 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
+  isChildWorkspaceAndParentDirTrustedIn,
+  isInitHookTrusted,
   isProjectTrusted,
   isWorkspaceDirTrusted,
   isWorkspaceProjectTrusted,
@@ -141,4 +143,59 @@ describe("SSH+None workspaces need their directory trusted", () => {
       );
     }
   );
+
+  test.each([
+    ["untrusted project", false, sshWorktree, true, false],
+    ["trusted project, worktree", true, sshWorktree, false, true],
+    ["trusted project, SSH+None directory untrusted", true, sshNone, false, false],
+    ["trusted project, SSH+None directory trusted", true, sshNone, true, true],
+  ] as const)(
+    "init hook trust: %s",
+    (_label, projectTrusted, runtimeConfig, dirTrusted, expected) => {
+      const config = configWithProjects(
+        projectsWith({
+          trusted: true,
+          ...(dirTrusted ? { trustedSshDirectories: [directory] } : {}),
+        }) as Map<string, { trusted?: boolean }>
+      );
+      expect(isInitHookTrusted(config, projectTrusted, projectPath, runtimeConfig)).toBe(expected);
+    }
+  );
+
+  test("init hook trust treats a missing project flag as untrusted without reading config", () => {
+    const config = {
+      loadConfigOrDefault: () => {
+        throw new Error("config must not be read for an untrusted project");
+      },
+    };
+    expect(isInitHookTrusted(config, undefined, projectPath, sshNone)).toBe(false);
+  });
+
+  describe("child workspace and parent directory trust", () => {
+    const entry = (runtimeConfig: RuntimeConfig | undefined) => ({
+      projectPath,
+      workspace: { runtimeConfig },
+    });
+
+    test("needs the child workspace trusted", () => {
+      const projects = projectsWith({ trusted: true });
+      expect(isChildWorkspaceAndParentDirTrustedIn(projects, entry(sshWorktree), null)).toBe(true);
+      expect(isChildWorkspaceAndParentDirTrustedIn(projects, entry(sshNone), null)).toBe(false);
+      expect(
+        isChildWorkspaceAndParentDirTrustedIn(projectsWith({}), entry(sshWorktree), null)
+      ).toBe(false);
+    });
+
+    test("an untrusted SSH+None parent directory keeps project plugins off", () => {
+      const untrustedDir = projectsWith({ trusted: true });
+      expect(
+        isChildWorkspaceAndParentDirTrustedIn(untrustedDir, entry(sshWorktree), entry(sshNone))
+      ).toBe(false);
+
+      const trustedDir = projectsWith({ trusted: true, trustedSshDirectories: [directory] });
+      expect(
+        isChildWorkspaceAndParentDirTrustedIn(trustedDir, entry(sshWorktree), entry(sshNone))
+      ).toBe(true);
+    });
+  });
 });

@@ -1,4 +1,4 @@
-import type { Config, SecretsStore } from "@/node/config";
+import type { Config, SecretsStore, Workspace } from "@/node/config";
 import type { Secret } from "@/common/types/secrets";
 import type { ProjectConfig, ProjectsConfig } from "@/common/types/project";
 import { isWorkspaceDirTrustedBy } from "@/common/utils/sshDirectoryTrust";
@@ -39,6 +39,48 @@ export function isWorkspaceDirTrusted(
   return isWorkspaceDirTrustedBy(
     trustOwnerConfig(projects, projectPath)?.trustedSshDirectories,
     runtimeConfig
+  );
+}
+
+/**
+ * Whether a new checkout's .xum/init hook may run: the caller's project trust flag AND the
+ * directory's trust (isWorkspaceDirTrusted). An SSH+None host directory is not the local project,
+ * so it needs its own trust too. The config is loaded only when the project is trusted.
+ */
+export function isInitHookTrusted(
+  config: Pick<Config, "loadConfigOrDefault">,
+  projectTrusted: boolean | undefined,
+  projectPath: string,
+  runtimeConfig: RuntimeConfig | undefined
+): boolean {
+  return (
+    (projectTrusted ?? false) &&
+    isWorkspaceDirTrusted(config.loadConfigOrDefault().projects, projectPath, runtimeConfig)
+  );
+}
+
+/** A workspace's config entry, as findWorkspaceEntry returns it: the fields trust reads. */
+interface WorkspaceTrustEntry {
+  projectPath: string;
+  workspace: Pick<Workspace, "kind" | "runtimeConfig">;
+}
+
+/**
+ * #6426: project-plugin trust for a read of a child workspace's checkout and its parent's: the
+ * child's workspace trust AND the parent's directory trust. An SSH+None directory on either side
+ * that the user has not trusted keeps project plugins off. A missing parent adds no directory.
+ */
+export function isChildWorkspaceAndParentDirTrustedIn(
+  projects: ProjectsConfig["projects"],
+  child: WorkspaceTrustEntry,
+  parent: WorkspaceTrustEntry | null | undefined
+): boolean {
+  return (
+    isWorkspaceProjectTrustedIn(projects, {
+      kind: child.workspace.kind,
+      projectPath: child.projectPath,
+      runtimeConfig: child.workspace.runtimeConfig,
+    }) && isWorkspaceDirTrusted(projects, parent?.projectPath, parent?.workspace.runtimeConfig)
   );
 }
 

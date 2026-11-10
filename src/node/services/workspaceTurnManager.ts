@@ -97,6 +97,7 @@ import { defaultModel } from "@/common/utils/ai/models";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+import type { ProjectsConfig } from "@/common/types/project";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import { normalizeAgentId } from "@/common/utils/agentIds";
@@ -305,6 +306,35 @@ export function buildWorkspaceAgentContext(
     runtimeConfig: params.runtimeConfig,
     projectPluginsTrusted,
   };
+}
+
+/**
+ * Agent-discovery context for an existing target workspace's checkout. An entry without its own
+ * runtimeConfig runs on its owner's runtime, and trust follows the runtime it really runs on: an
+ * SSH+None directory needs its own trust (isWorkspaceProjectTrustedIn).
+ */
+export function buildTargetWorkspaceAgentContext(
+  projects: ProjectsConfig["projects"],
+  target: { projectPath: string; workspace: WorkspaceConfigEntry },
+  owner: Pick<WorkspaceMetadata, "runtimeConfig" | "name">
+): WorkspaceTurnAgentContext {
+  const runtimeConfig = target.workspace.runtimeConfig ?? owner.runtimeConfig;
+  return buildWorkspaceAgentContext(
+    {
+      runtimeConfig,
+      projectPath: target.projectPath,
+      // Entries created by workspaceService.create always carry a name; the fallback
+      // only satisfies the optional persisted-config type.
+      workspaceName: coerceNonEmptyString(target.workspace.name) ?? owner.name,
+      persistedWorkspacePath: target.workspace.path,
+      subProjectPath: target.workspace.subProjectPath,
+    },
+    isWorkspaceProjectTrustedIn(projects, {
+      kind: target.workspace.kind,
+      projectPath: target.projectPath,
+      runtimeConfig,
+    })
+  );
 }
 
 /**
@@ -1696,23 +1726,7 @@ export class WorkspaceTurnManager {
         );
         const targetContext =
           targetEntry != null
-            ? buildWorkspaceAgentContext(
-                {
-                  runtimeConfig: targetEntry.workspace.runtimeConfig ?? parentMeta.runtimeConfig,
-                  projectPath: targetEntry.projectPath,
-                  // Entries created by workspaceService.create always carry a name; the fallback
-                  // only satisfies the optional persisted-config type.
-                  workspaceName:
-                    coerceNonEmptyString(targetEntry.workspace.name) ?? parentMeta.name,
-                  persistedWorkspacePath: targetEntry.workspace.path,
-                  subProjectPath: targetEntry.workspace.subProjectPath,
-                },
-                isWorkspaceProjectTrustedIn(cfg.projects, {
-                  kind: targetEntry.workspace.kind,
-                  projectPath: targetEntry.projectPath,
-                  runtimeConfig: targetEntry.workspace.runtimeConfig ?? parentMeta.runtimeConfig,
-                })
-              )
+            ? buildTargetWorkspaceAgentContext(cfg.projects, targetEntry, parentMeta)
             : ownerContext;
         const validation = await this.validateWorkspaceTurnAgentIdForTarget({
           cfg,

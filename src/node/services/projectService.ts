@@ -65,7 +65,11 @@ import {
 } from "@/node/config/projectRegistrationLock";
 import { isProjectTrusted, isProjectTrustedIn, trustOwnerPathIn } from "@/node/utils/projectTrust";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
-import { withSshDirectoryTrust } from "@/common/utils/sshDirectoryTrust";
+import {
+  applySshDirectoryTrust,
+  parseSshDirectoryTrustTarget,
+  TRUST_PROJECT_FIRST_ERROR,
+} from "@/common/utils/sshDirectoryTrust";
 
 function orderWorkspacesForCascadeRemoval(
   workspaces: ProjectConfig["workspaces"]
@@ -2169,54 +2173,46 @@ export class ProjectService {
     projectDir: string;
     trusted: boolean;
   }): Promise<Result<{ projectDir: string }, string>> {
-    const host = input.host.trim();
-    const rawProjectDir = input.projectDir.trim();
-    if (host === "" || rawProjectDir === "") {
-      return Err("Enter the SSH host and the project directory first");
+    const target = parseSshDirectoryTrustTarget(input);
+    if (!target.success) {
+      return Err(target.error);
     }
-    const port = input.port ?? undefined;
+    const rawDirectory = target.data;
     const trustOwnerPath = trustOwnerPathIn(
       this.config.loadConfigOrDefault().projects,
       input.projectPath
     );
     if (input.trusted && !isProjectTrusted(this.config, trustOwnerPath)) {
-      return Err("Trust the project before trusting a directory on its SSH host");
+      return Err(TRUST_PROJECT_FIRST_ERROR);
     }
 
-    let projectDir = rawProjectDir;
-    if (!rawProjectDir.startsWith("/")) {
+    let projectDir = rawDirectory.projectDir;
+    if (!projectDir.startsWith("/")) {
       try {
         projectDir = await createRuntime({
           type: "ssh",
-          host,
-          ...(port !== undefined ? { port } : {}),
+          ...rawDirectory,
           // Unused by resolvePath; any valid value.
           srcBaseDir: "~/mux",
           workspaceIsolation: "none",
-          projectDir: rawProjectDir,
-        }).resolvePath(rawProjectDir);
+        }).resolvePath(rawDirectory.projectDir);
       } catch (error) {
-        return Err(`Failed to resolve ${rawProjectDir} on ${host}: ${getErrorMessage(error)}`);
+        return Err(
+          `Failed to resolve ${rawDirectory.projectDir} on ${rawDirectory.host}: ${getErrorMessage(error)}`
+        );
       }
     }
-    const directory = { host, ...(port !== undefined ? { port } : {}), projectDir };
+    const directory = { ...rawDirectory, projectDir };
 
     try {
       await this.config.editConfig((config) => {
-        const project = config.projects.get(trustOwnerPath);
-        if (!project) {
-          throw new Error(`Project not found: ${trustOwnerPath}`);
-        }
-        // Re-checked under the config lock: project trust may have been revoked meanwhile.
-        if (input.trusted && project.trusted !== true) {
-          throw new Error("Trust the project before trusting a directory on its SSH host");
-        }
-        const next = withSshDirectoryTrust(project.trustedSshDirectories, directory, input.trusted);
-        if (next) {
-          project.trustedSshDirectories = next;
-        } else {
-          delete project.trustedSshDirectories;
-        }
+        // Re-checks project trust under the config lock: it may have been revoked meanwhile.
+        applySshDirectoryTrust(
+          config.projects.get(trustOwnerPath),
+          trustOwnerPath,
+          directory,
+          input.trusted
+        );
         return config;
       });
     } catch (error) {

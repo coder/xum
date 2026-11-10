@@ -1070,6 +1070,19 @@ function applyPersistedDefaultIsolation(
   }
 }
 
+/**
+ * The isolation default fields of `record` as config.json stores them: only the keys that
+ * resolve, so a missing default writes neither key.
+ */
+function persistedDefaultIsolationFields(record: {
+  defaultIsolation?: unknown;
+  defaultRuntime?: unknown;
+}): { defaultIsolation?: IsolationChoice; defaultRuntime?: RuntimeEnablementId } {
+  const fields: { defaultIsolation?: IsolationChoice; defaultRuntime?: RuntimeEnablementId } = {};
+  applyPersistedDefaultIsolation(fields, resolvePersistedDefaultIsolation(record));
+  return fields;
+}
+
 function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectConfig {
   // Per-project runtime overrides are optional; keep config.json sparse by persisting only explicit
   // overrides (false enablement + explicit default runtime selections).
@@ -3274,7 +3287,7 @@ export class Config {
 
     const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
     // Migrates legacy configs that only stored the flat defaultRuntime.
-    const resolvedDefaultIsolation = resolvePersistedDefaultIsolation(parsed);
+    const { defaultIsolation, defaultRuntime } = persistedDefaultIsolationFields(parsed);
 
     const userPreferences = dropRemovedWorkspaceNotifications(
       normalizeUserPreferences(parsed.userPreferences),
@@ -3325,8 +3338,8 @@ export class Config {
       stopCoderWorkspaceOnArchive,
       terminalDefaultShell: parseOptionalNonEmptyString(parsed.terminalDefaultShell),
       updateChannel,
-      defaultIsolation: resolvedDefaultIsolation?.defaultIsolation,
-      defaultRuntime: resolvedDefaultIsolation?.defaultRuntime,
+      defaultIsolation,
+      defaultRuntime,
       runtimeEnablement,
       // Validated here rather than trusted: a hand-edited or older-build value that fails the
       // schema would otherwise reach the IPC output validator and fail the whole settings
@@ -3640,13 +3653,7 @@ export class Config {
       }
 
       // Write the canonical pair plus the legacy flat mirror so older builds keep the default.
-      const resolvedDefaultIsolation = resolvePersistedDefaultIsolation(config);
-      if (resolvedDefaultIsolation) {
-        data.defaultIsolation = resolvedDefaultIsolation.defaultIsolation;
-        if (resolvedDefaultIsolation.defaultRuntime) {
-          data.defaultRuntime = resolvedDefaultIsolation.defaultRuntime;
-        }
-      }
+      Object.assign(data, persistedDefaultIsolationFields(config));
 
       if (config.settingsBackup) {
         data.settingsBackup = config.settingsBackup;
@@ -3872,7 +3879,7 @@ export class Config {
         config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR,
       worktreeArchiveBehavior: config.worktreeArchiveBehavior ?? DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
       runtimeEnablement: normalizeRuntimeEnablement(config.runtimeEnablement),
-      defaultIsolation: resolvePersistedDefaultIsolation(config)?.defaultIsolation ?? null,
+      defaultIsolation: persistedDefaultIsolationFields(config).defaultIsolation ?? null,
       agentAiDefaults: config.agentAiDefaults ?? {},
       chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
       llmDebugLogs: config.llmDebugLogs === true,

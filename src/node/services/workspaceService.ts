@@ -23,7 +23,7 @@ import {
 } from "@/constants/terminationTimeouts";
 import {
   isWorkspaceProjectTrustedIn,
-  isWorkspaceDirTrusted,
+  isInitHookTrusted,
   secretsForWorkspace,
 } from "@/node/utils/projectTrust";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -170,6 +170,10 @@ import {
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import {
+  creationRuntimeConfigError,
+  sshProjectDirConfigToResolve,
+} from "@/node/services/utils/workspaceCreationRuntime";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { getLegacyPlanFilePath, sharesPlanDirectory } from "@/common/utils/planStorage";
 import {
@@ -6158,26 +6162,16 @@ export class WorkspaceService
       return Err(initialConflict);
     }
 
-    // SSH+None runs in an existing directory on the host, so it needs that directory's path.
-    if (
-      isSshSharedProjectDirRuntime(finalRuntimeConfig) &&
-      !finalRuntimeConfig.projectDir?.trim()
-    ) {
-      return Err(
-        "Enter the project directory on the SSH host: workspaces without isolation run in it directly"
-      );
+    const normalizedTrunkBranch = trunkBranch?.trim() ?? "";
+    const runtimeConfigError = creationRuntimeConfigError(
+      finalRuntimeConfig,
+      normalizedTrunkBranch
+    );
+    if (runtimeConfigError) {
+      return Err(runtimeConfigError);
     }
 
     const workspaceId = this.config.generateStableId();
-
-    // Project-dir runtimes (local, SSH+None) check out no branch, so they need no trunk branch;
-    // worktree/SSH runtimes require it.
-    const isProjectDirRuntime =
-      finalRuntimeConfig.type === "local" || isSshSharedProjectDirRuntime(finalRuntimeConfig);
-    const normalizedTrunkBranch = trunkBranch?.trim() ?? "";
-    if (!isProjectDirRuntime && normalizedTrunkBranch.length === 0) {
-      return Err("Trunk branch is required for worktree and SSH runtimes");
-    }
 
     let runtime;
     try {
@@ -6200,15 +6194,11 @@ export class WorkspaceService
         }
       }
       // SSH+None: persist the project directory absolute (~ expanded on the host), like srcBaseDir.
-      if (
-        isSshSharedProjectDirRuntime(finalRuntimeConfig) &&
-        finalRuntimeConfig.projectDir != null &&
-        !runtime.createFlags?.deferredRuntimeAccess
-      ) {
-        const projectDir = finalRuntimeConfig.projectDir.trim();
-        const resolvedProjectDir = await runtime.resolvePath(projectDir);
-        if (resolvedProjectDir !== finalRuntimeConfig.projectDir) {
-          finalRuntimeConfig = { ...finalRuntimeConfig, projectDir: resolvedProjectDir };
+      const sshProjectDirConfig = sshProjectDirConfigToResolve(finalRuntimeConfig, runtime);
+      if (sshProjectDirConfig !== null) {
+        const resolvedProjectDir = await runtime.resolvePath(sshProjectDirConfig.projectDir.trim());
+        if (resolvedProjectDir !== sshProjectDirConfig.projectDir) {
+          finalRuntimeConfig = { ...sshProjectDirConfig, projectDir: resolvedProjectDir };
           runtime = createRuntime(finalRuntimeConfig, {
             projectPath: owningProjectPath,
             workspaceId,
@@ -6573,13 +6563,12 @@ export class WorkspaceService
           env: createEnv,
           abortSignal: initAbortController.signal,
           // SSH+None: the host directory is not the local project, so it needs its own trust too.
-          trusted:
-            (projectConfig.trusted ?? false) &&
-            isWorkspaceDirTrusted(
-              this.config.loadConfigOrDefault().projects,
-              owningProjectPath,
-              finalRuntimeConfig
-            ),
+          trusted: isInitHookTrusted(
+            this.config,
+            projectConfig.trusted,
+            owningProjectPath,
+            finalRuntimeConfig
+          ),
         };
         // The deferred checkout's settlement grants or clears the pending default from here on.
         pendingDefaultHandedOff = pendingMaterialization !== undefined;
@@ -13873,13 +13862,12 @@ export class WorkspaceService
           env: secrets,
           abortSignal: initAbortController.signal,
           // SSH+None: the host directory is not the local project, so it needs its own trust too.
-          trusted:
-            (projectConfig.trusted ?? false) &&
-            isWorkspaceDirTrusted(
-              this.config.loadConfigOrDefault().projects,
-              foundProjectPath,
-              forkedRuntimeConfig
-            ),
+          trusted: isInitHookTrusted(
+            this.config,
+            projectConfig.trusted,
+            foundProjectPath,
+            forkedRuntimeConfig
+          ),
         },
         newWorkspaceId,
         workspaceUseLeasesFor(this.config),

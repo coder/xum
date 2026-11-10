@@ -1,6 +1,8 @@
 import type { z } from "zod";
 import type { TrustedSshDirectorySchema } from "@/common/schemas/project";
 import { isSshSharedProjectDirRuntime, type RuntimeConfig } from "@/common/types/runtime";
+import type { ProjectConfig } from "@/common/types/project";
+import { Err, Ok, type Result } from "@/common/types/result";
 
 /**
  * Trust for SSH+None directories. An SSH+None workspace runs directly in an existing directory on
@@ -82,6 +84,53 @@ export function withSshDirectoryTrust(
   );
   const next = trusted ? [...others, directory] : others;
   return next.length > 0 ? next : undefined;
+}
+
+/** The error for granting directory trust on a project that is not trusted itself. */
+export const TRUST_PROJECT_FIRST_ERROR =
+  "Trust the project before trusting a directory on its SSH host";
+
+/**
+ * The directory a trust request names, trimmed, with an absent port left out (as workspaces
+ * persist it); an error when the host or the directory is blank. projectDir may still be relative
+ * or start with `~`: only the host can resolve it.
+ */
+export function parseSshDirectoryTrustTarget(input: {
+  host: string;
+  port?: number | null;
+  projectDir: string;
+}): Result<TrustedSshDirectory, string> {
+  const host = input.host.trim();
+  const projectDir = input.projectDir.trim();
+  if (host === "" || projectDir === "") {
+    return Err("Enter the SSH host and the project directory first");
+  }
+  return Ok({ host, ...(input.port != null ? { port: input.port } : {}), projectDir });
+}
+
+/**
+ * Trust or untrust `directory` on the trust owner's project config, in place. Throws when the
+ * project is gone, or when granting while the project is untrusted: callers run this under the
+ * config lock, where project trust may have been revoked since they last checked.
+ */
+export function applySshDirectoryTrust(
+  project: ProjectConfig | undefined,
+  projectPath: string,
+  directory: TrustedSshDirectory,
+  trusted: boolean
+): void {
+  if (!project) {
+    throw new Error(`Project not found: ${projectPath}`);
+  }
+  if (trusted && project.trusted !== true) {
+    throw new Error(TRUST_PROJECT_FIRST_ERROR);
+  }
+  const next = withSshDirectoryTrust(project.trustedSshDirectories, directory, trusted);
+  if (next) {
+    project.trustedSshDirectories = next;
+  } else {
+    delete project.trustedSshDirectories;
+  }
 }
 
 function isValidPort(port: unknown): port is number {

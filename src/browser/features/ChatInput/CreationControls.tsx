@@ -4,6 +4,7 @@ import {
   buildRuntimeConfig,
   normalizeRuntimeEnablement,
   RUNTIME_MODE,
+  sshNoneRuntimeOf,
   type CoderWorkspaceConfig,
   type ParsedRuntime,
   type RuntimeEnablement,
@@ -466,6 +467,98 @@ function buildRuntimeForChoice(
   return RUNTIME_FOR_CHOICE[choice](context);
 }
 
+/** The SSH+None directory a switch to SSH+None keeps. */
+function nextSshNoneProjectDir(current: ParsedRuntime): string | undefined {
+  const sshNone = sshNoneRuntimeOf(current);
+  // Empty asks the draft settings to refill the project's remembered directory.
+  return sshNone ? sshNone.projectDir : "";
+}
+
+/**
+ * The runtime a pick in either isolation select switches to, or null when the pick cannot apply
+ * (no runtime for the pair, or Coder without its controls). Either select changes one axis; an
+ * unsupported pair snaps to the nearest one the project supports. The pair maps to a runtime
+ * choice, so per-runtime inputs (host, image) carry over.
+ */
+export function runtimeForIsolationChoice(
+  choice: IsolationChoice,
+  context: {
+    runtimeChoiceContext: RuntimeChoiceContext;
+    runtimeEnablement: RuntimeEnablement | undefined;
+    coderAvailable: boolean;
+  }
+): ParsedRuntime | null {
+  // Same rule as the Settings default: skip pairs with no backend and pairs Settings disable,
+  // keeping the picked project isolation when any of its pairs is enabled.
+  const next =
+    (context.runtimeEnablement
+      ? resolveEnabledIsolation(choice, context.runtimeEnablement)
+      : null) ?? nearestSupportedIsolation(choice);
+  const runtimeId = runtimeIdFromIsolation(next);
+  if (runtimeId === null || (runtimeId === "coder" && !context.coderAvailable)) {
+    return null;
+  }
+  const runtime = buildRuntimeForChoice(runtimeId, context.runtimeChoiceContext);
+  if (runtime.mode !== RUNTIME_MODE.SSH || next.workspace !== "none") {
+    return runtime;
+  }
+  return {
+    ...runtime,
+    workspaceIsolation: "none",
+    projectDir: nextSshNoneProjectDir(context.runtimeChoiceContext.selectedRuntime),
+  };
+}
+
+/**
+ * SSH+None asks for the existing directory on the host that its workspaces run in, and offers
+ * that directory's trust.
+ */
+function SshNoneDirectoryControls(props: {
+  runtime: Extract<ParsedRuntime, { mode: "ssh" }>;
+  projectPath: string;
+  userProjects: Map<string, ProjectConfig>;
+  disabled: boolean;
+  hasError: boolean;
+  onSelectedRuntimeChange: (runtime: ParsedRuntime) => void;
+}) {
+  const projectDir = props.runtime.projectDir ?? "";
+  const selectProjectDir = (value: string) =>
+    props.onSelectedRuntimeChange({
+      mode: "ssh",
+      host: props.runtime.host,
+      coder: props.runtime.coder,
+      workspaceIsolation: "none",
+      projectDir: value,
+    });
+  return (
+    <>
+      <div className={SENTENCE_CLAUSE_CLASSES}>
+        <span className="text-muted-foreground shrink-0">in</span>
+        <RuntimeConfigInput
+          id="ssh-project-dir"
+          fieldSpec={RUNTIME_OPTION_FIELDS.sshProjectDir}
+          value={projectDir}
+          onChange={selectProjectDir}
+          disabled={props.disabled}
+          hasError={props.hasError}
+          ariaLabel="Project directory on host"
+          className="min-w-0 flex-1 md:flex-initial"
+          labelClassName="sr-only"
+          inputClassName={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[180px]")}
+        />
+      </div>
+      <SshDirectoryTrustNotice
+        projectPath={props.projectPath}
+        userProjects={props.userProjects}
+        host={props.runtime.host}
+        projectDir={projectDir}
+        disabled={props.disabled}
+        onProjectDirResolved={selectProjectDir}
+      />
+    </>
+  );
+}
+
 function CreationControlsContent(props: CreationControlsProps) {
   usePerfRenderMarker("chat-input.creation-controls");
   const { nameState, runtimeAvailabilityState } = props;
@@ -476,8 +569,7 @@ function CreationControlsContent(props: CreationControlsProps) {
     selectedRuntime.mode === RUNTIME_MODE.SSH && selectedRuntime.coder != null;
   // The two-axis view of the selection; ParsedRuntime stays the source of truth.
   const currentIsolation = isolationFromRuntimeConfig(buildRuntimeConfig(selectedRuntime));
-  const isSshNoneSelected =
-    selectedRuntime.mode === RUNTIME_MODE.SSH && selectedRuntime.workspaceIsolation === "none";
+  const sshNoneRuntime = sshNoneRuntimeOf(selectedRuntime);
   const runtimeChoiceContext: RuntimeChoiceContext = {
     selectedRuntime,
     sshHostFallback: props.sshHostFallback,
@@ -607,32 +699,16 @@ function CreationControlsContent(props: CreationControlsProps) {
   };
   const projectIsolationOptions = buildProjectIsolationOptions(isolationOptionContext);
   const workspaceIsolationOptions = buildWorkspaceIsolationOptions(isolationOptionContext);
-  const currentSshProjectDir =
-    selectedRuntime.mode === RUNTIME_MODE.SSH ? selectedRuntime.projectDir : undefined;
 
-  // Either select changes one axis; an unsupported pair snaps to the nearest one the project
-  // supports. The pair maps to a runtime choice, so per-runtime inputs (host, image) carry over.
   const selectIsolation = (choice: IsolationChoice) => {
-    // Same rule as the Settings default: skip pairs with no backend and pairs Settings disable,
-    // keeping the picked project isolation when any of its pairs is enabled.
-    const next =
-      (props.runtimeEnablement ? resolveEnabledIsolation(choice, props.runtimeEnablement) : null) ??
-      nearestSupportedIsolation(choice);
-    const runtimeId = runtimeIdFromIsolation(next);
-    if (runtimeId === null || (runtimeId === "coder" && !props.coderProps)) {
-      return;
+    const runtime = runtimeForIsolationChoice(choice, {
+      runtimeChoiceContext,
+      runtimeEnablement: props.runtimeEnablement,
+      coderAvailable: props.coderProps != null,
+    });
+    if (runtime !== null) {
+      onSelectedRuntimeChange(runtime);
     }
-    const runtime = buildRuntimeForChoice(runtimeId, runtimeChoiceContext);
-    if (runtime.mode === RUNTIME_MODE.SSH && next.workspace === "none") {
-      onSelectedRuntimeChange({
-        ...runtime,
-        workspaceIsolation: "none",
-        // Empty asks the draft settings to refill the project's remembered directory.
-        projectDir: isSshNoneSelected ? currentSshProjectDir : "",
-      });
-      return;
-    }
-    onSelectedRuntimeChange(runtime);
   };
 
   const handleNameChange = useCallback(
@@ -833,47 +909,14 @@ function CreationControlsContent(props: CreationControlsProps) {
               </div>
             )}
 
-          {selectedRuntime.mode === "ssh" && isSshNoneSelected && (
-            <div className={SENTENCE_CLAUSE_CLASSES}>
-              <span className="text-muted-foreground shrink-0">in</span>
-              <RuntimeConfigInput
-                id="ssh-project-dir"
-                fieldSpec={RUNTIME_OPTION_FIELDS.sshProjectDir}
-                value={selectedRuntime.projectDir ?? ""}
-                onChange={(value) =>
-                  onSelectedRuntimeChange({
-                    mode: "ssh",
-                    host: selectedRuntime.host,
-                    coder: selectedRuntime.coder,
-                    workspaceIsolation: "none",
-                    projectDir: value,
-                  })
-                }
-                disabled={props.disabled}
-                hasError={props.runtimeFieldError === "sshProjectDir"}
-                ariaLabel="Project directory on host"
-                className="min-w-0 flex-1 md:flex-initial"
-                labelClassName="sr-only"
-                inputClassName={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[180px]")}
-              />
-            </div>
-          )}
-          {selectedRuntime.mode === "ssh" && isSshNoneSelected && (
-            <SshDirectoryTrustNotice
+          {sshNoneRuntime && (
+            <SshNoneDirectoryControls
+              runtime={sshNoneRuntime}
               projectPath={props.projectPath}
               userProjects={props.userProjects}
-              host={selectedRuntime.host}
-              projectDir={selectedRuntime.projectDir ?? ""}
               disabled={props.disabled}
-              onProjectDirResolved={(projectDir) =>
-                onSelectedRuntimeChange({
-                  mode: "ssh",
-                  host: selectedRuntime.host,
-                  coder: selectedRuntime.coder,
-                  workspaceIsolation: "none",
-                  projectDir,
-                })
-              }
+              hasError={props.runtimeFieldError === "sshProjectDir"}
+              onSelectedRuntimeChange={onSelectedRuntimeChange}
             />
           )}
 

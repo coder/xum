@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { isWorkspaceProjectTrustedIn, isWorkspaceDirTrusted } from "@/node/utils/projectTrust";
+import { isChildWorkspaceAndParentDirTrustedIn } from "@/node/utils/projectTrust";
 import assert from "node:assert/strict";
 
 import type { Config, ProjectsConfig } from "@/node/config";
@@ -419,17 +419,11 @@ export class GitPatchArtifactService {
     ].filter((context): context is WorkspaceRuntimeContext => context != null);
     // #6426: from the config loaded above (no extra read). Both checkouts are read, so an SSH+None
     // directory on either side that the user has not trusted keeps project plugins off.
-    const projectPluginsTrusted =
-      isWorkspaceProjectTrustedIn(cfg.projects, {
-        kind: childEntry.workspace.kind,
-        projectPath: childEntry.projectPath,
-        runtimeConfig: childEntry.workspace.runtimeConfig,
-      }) &&
-      isWorkspaceDirTrusted(
-        cfg.projects,
-        parentEntry?.projectPath,
-        parentEntry?.workspace.runtimeConfig
-      );
+    const projectPluginsTrusted = isChildWorkspaceAndParentDirTrustedIn(
+      cfg.projects,
+      childEntry,
+      parentEntry
+    );
 
     let shouldGeneratePatch = false;
     for (const childAgentId of childAgentIds) {

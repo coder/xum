@@ -2,11 +2,8 @@ import { useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
-import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import type { ProjectConfig } from "@/common/types/project";
-import { buildRuntimeConfig } from "@/common/types/runtime";
-import { getErrorMessage } from "@/common/utils/errors";
-import { isWorkspaceDirTrustedBy } from "@/common/utils/sshDirectoryTrust";
+import { resolveSshDirectoryTrustNotice, saveSshDirectoryTrust } from "./sshDirectoryTrustState";
 
 /**
  * Trust for the SSH+None directory being configured on the creation form. The directory is not
@@ -28,66 +25,66 @@ export function SshDirectoryTrustNotice(props: {
    */
   onProjectDirResolved: (projectDir: string) => void;
 }) {
+  const { pending, error, saveTrust } = useSshDirectoryTrustSaver(props.onProjectDirResolved);
+  const notice = resolveSshDirectoryTrustNotice(props);
+  if (notice === null) return null;
+
+  return (
+    <SshDirectoryTrustRow
+      trusted={notice.trusted}
+      disabled={props.disabled || pending}
+      error={error}
+      onSetTrust={(trusted) =>
+        void saveTrust({
+          projectPath: props.projectPath,
+          host: notice.host,
+          projectDir: notice.projectDir,
+          trusted,
+        })
+      }
+    />
+  );
+}
+
+/** Saves one trust choice at a time and keeps its pending state and last error for the row. */
+function useSshDirectoryTrustSaver(onProjectDirResolved: (projectDir: string) => void) {
   const { api } = useAPI();
   const { refreshProjects } = useProjectContext();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const host = props.host.trim();
-  const typedDir = props.projectDir.trim();
-  const project = props.userProjects.get(props.projectPath);
-  const owner =
-    project?.parentProjectPath !== undefined
-      ? props.userProjects.get(project.parentProjectPath)
-      : project;
-  if (host === "" || typedDir === "" || owner?.trusted !== true) return null;
-
-  const runtimeConfig = buildRuntimeConfig({
-    mode: "ssh",
-    host,
-    workspaceIsolation: "none",
-    projectDir: typedDir,
-  });
-  const trusted = isWorkspaceDirTrustedBy(owner.trustedSshDirectories, runtimeConfig);
-
-  const setTrust = async (next: boolean) => {
+  const saveTrust = async (request: Parameters<typeof saveSshDirectoryTrust>[1]) => {
     if (!api || pending) return;
     setPending(true);
     setError(null);
-    try {
-      const result = await api.projects.setSshDirectoryTrust({
-        projectPath: props.projectPath,
-        host,
-        projectDir: typedDir,
-        trusted: next,
-      });
-      if (!result.success) {
-        setError(result.error);
-        return;
-      }
-      if (result.data.projectDir !== typedDir) {
-        props.onProjectDirResolved(result.data.projectDir);
-      }
-      publishProjectTrustChanged();
-      await refreshProjects();
-    } catch (err) {
-      setError(getErrorMessage(err));
-    } finally {
-      setPending(false);
-    }
+    setError(
+      await saveSshDirectoryTrust(
+        { api: api.projects, refreshProjects, onProjectDirResolved },
+        request
+      )
+    );
+    setPending(false);
   };
+  return { pending, error, saveTrust };
+}
 
+function SshDirectoryTrustRow(props: {
+  trusted: boolean;
+  disabled: boolean;
+  error: string | null;
+  onSetTrust: (trusted: boolean) => void;
+}) {
   return (
     <div className="flex w-full basis-full flex-wrap items-center gap-x-2 gap-y-1 text-xs">
-      {trusted ? (
+      {props.trusted ? (
         <>
           <span className="text-muted-foreground">Trusted directory</span>
           <Button
             variant="link"
             size="xs"
             className="h-auto px-0"
-            disabled={props.disabled || pending}
-            onClick={() => void setTrust(false)}
+            disabled={props.disabled}
+            onClick={() => props.onSetTrust(false)}
           >
             Untrust
           </Button>
@@ -101,14 +98,14 @@ export function SshDirectoryTrustNotice(props: {
           <Button
             variant="outline"
             size="xs"
-            disabled={props.disabled || pending}
-            onClick={() => void setTrust(true)}
+            disabled={props.disabled}
+            onClick={() => props.onSetTrust(true)}
           >
             Trust directory
           </Button>
         </>
       )}
-      {error !== null && <span className="text-error w-full">{error}</span>}
+      {props.error !== null && <span className="text-error w-full">{props.error}</span>}
     </div>
   );
 }
