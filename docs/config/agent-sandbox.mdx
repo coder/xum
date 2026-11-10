@@ -77,7 +77,7 @@ Everything else in `/Users`, `/Volumes`, your home folder (also when it is not i
 
 - `~/.cargo/credentials` and `~/.cargo/credentials.toml` (or in `CARGO_HOME`).
 - `~/.config/git/credentials` (or where `XDG_CONFIG_HOME` moves it).
-- `~/.cache/huggingface/token` (or where `XDG_CACHE_HOME`, `HF_HOME` or `HF_TOKEN_PATH` moves it).
+- `~/.cache/huggingface/token`, and `stored_tokens` next to it, where `hf auth login` keeps every token it saved (or where `XDG_CACHE_HOME`, `HF_HOME` or `HF_TOKEN_PATH` moves them).
 - `~/.local/share/uv/credentials` (or where `XDG_DATA_HOME` or `UV_CREDENTIALS_DIR` moves it), where `uv auth login` keeps its tokens, so uv in the sandbox cannot use them.
 - `~/Library/Application Support/go/env` (or where `GOENV` moves it), where `go env -w` keeps its settings, which can hold a password in `GOPROXY`. Go in the sandbox runs without them, so set what a build needs, such as `GOPRIVATE` or `GOFLAGS`, in the environment instead.
 - The npm user and global config where a variable moves them, because they can hold registry tokens: `npm_config_userconfig`, `npm_config_globalconfig`, and `npm_config_prefix` or `PREFIX`, which move the global config to `<prefix>/etc/npmrc`. npm reads `npm_config_` in any case. Without them, `~/.npmrc` is only closed (see below). The global config of a Node in an open folder, such as `~/.nvm/versions/node/<version>/etc/npmrc`, stays open, so keep registry tokens in `~/.npmrc`.

@@ -297,10 +297,10 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     ...fromEnv("CARGO_HOME", "credentials"),
     "~/.config/git/credentials",
     ...fromEnv("XDG_CONFIG_HOME", "git", "credentials"),
-    "~/.cache/huggingface/token",
-    ...fromEnv("XDG_CACHE_HOME", "huggingface", "token"),
-    ...fromEnv("HF_HOME", "token"),
-    ...fromEnv("HF_TOKEN_PATH"),
+    ...hfTokenFiles("~/.cache/huggingface/token"),
+    ...fromEnv("XDG_CACHE_HOME", "huggingface", "token").flatMap(hfTokenFiles),
+    ...fromEnv("HF_HOME", "token").flatMap(hfTokenFiles),
+    ...fromEnv("HF_TOKEN_PATH").flatMap(hfTokenFiles),
     // `uv auth login` keeps index tokens in ~/.local/share/uv, which HOME_READ_PATHS opens.
     ...uvCredentialStore("~/.local/share/uv/credentials"),
     ...fromEnv("XDG_DATA_HOME", "uv", "credentials").flatMap(uvCredentialStore),
@@ -326,6 +326,14 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     // SSH prompts and their answers, passwords too (askpassSessionsRoot() in sshAskpass.ts).
     `${XUM_HOME_TOKEN}/askpass`,
   ]);
+}
+
+/**
+ * The Hugging Face token file, and `stored_tokens` next to it, where `hf auth login` keeps every
+ * token it saved (HF_STORED_TOKENS_PATH in huggingface_hub's constants.py).
+ */
+function hfTokenFiles(tokenFile: string): string[] {
+  return [tokenFile, path.join(path.dirname(tokenFile), "stored_tokens")];
 }
 
 /** The folder, and its token file by name: the hard-link check only reads files. */

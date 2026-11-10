@@ -76,6 +76,9 @@ const MOVED_CREDENTIAL_STORES = [
   { name: "XDG_DATA_HOME", value: "data", file: "data/uv/credentials/credentials.toml" },
   { name: "CARGO_HOME", value: "cargo", file: "cargo/credentials.toml" },
   { name: "HF_TOKEN_PATH", value: "hf-token", file: "hf-token" },
+  { name: "HF_TOKEN_PATH", value: "hf/token", file: "hf/stored_tokens" },
+  { name: "HF_HOME", value: "hf", file: "hf/stored_tokens" },
+  { name: "XDG_CACHE_HOME", value: "cache", file: "cache/huggingface/stored_tokens" },
   { name: "GOENV", value: "go-env", file: "go-env" },
   { name: "npm_config_userconfig", value: "npmrc", file: "npmrc" },
   { name: "NPM_CONFIG_USERCONFIG", value: "npmrc", file: "npmrc" },
@@ -484,6 +487,7 @@ describe("buildAgentSandboxPolicy", () => {
         )
       ).toEqual([
         path.join(cache, "huggingface", "token"),
+        path.join(cache, "huggingface", "stored_tokens"),
         path.join(npm, "_npx"),
         path.join(cache, "uv"),
       ]);
@@ -1009,7 +1013,7 @@ describe("buildAgentSandboxPolicy", () => {
 
   // A credential store that Xum's environment moves into the workspace is open there otherwise.
   test.each(MOVED_CREDENTIAL_STORES)(
-    "hides the credential store where $name moves it",
+    "hides $file where $name moves it",
     ({ name, value, file }) => {
       const saved = process.env[name];
       process.env[name] = path.join(repo, value);
@@ -1027,7 +1031,7 @@ describe("buildAgentSandboxPolicy", () => {
 
   // Bash and the file tools overlay the project's secrets onto Xum's environment.
   test.each(MOVED_CREDENTIAL_STORES)(
-    "hides the credential store where the command's $name moves it",
+    "hides $file where the command's $name moves it",
     ({ name, value, file }) => {
       const policy = buildAgentSandboxPolicy(SETTINGS, {
         cwd: repo,
