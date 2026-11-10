@@ -105,6 +105,27 @@ export function fileToolSandboxGate(
 }
 
 /**
+ * fileToolSandboxGate(), built on its first check: most callers (instruction files, agent
+ * definitions, skills) check no path that a command can change. A missing policy rejects.
+ */
+export function lazyFileToolSandboxGate(
+  runtime: Runtime,
+  cwd: string,
+  context: FileToolSandboxContext = {}
+): FileToolSandboxGate {
+  let gate: FileToolSandboxGate | undefined;
+  return async (resolvedPath, access) => {
+    gate ??= fileToolSandboxGate(runtime, cwd, context);
+    await gate(resolvedPath, access);
+  };
+}
+
+/** The lazy gate of a tool, with the environment its bash starts with. */
+export function toolSandboxGate(config: ToolConfiguration): FileToolSandboxGate {
+  return lazyFileToolSandboxGate(config.runtime, config.cwd, fileToolSandboxContext(config));
+}
+
+/**
  * Throws AgentSandboxPathError unless the runtime's sandbox policy lets a sandboxed command
  * reach `resolvedPath`, so file tools follow the same rules as the shell. No check when no
  * sandbox applies. Throws AgentSandboxStartError (fail closed) when the sandbox applies but has

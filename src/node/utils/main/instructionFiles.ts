@@ -9,8 +9,7 @@ import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import {
   AgentSandboxPathError,
-  fileToolSandboxGate,
-  type FileToolSandboxGate,
+  lazyFileToolSandboxGate,
 } from "@/node/services/agentSandbox/fileToolSandbox";
 import { log } from "@/node/services/log";
 import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
@@ -74,10 +73,9 @@ function withSandboxGate(
   directory: string,
   sandboxEnv: NodeJS.ProcessEnv | undefined
 ): FileReader {
-  let gate: FileToolSandboxGate | undefined;
+  const gate = lazyFileToolSandboxGate(runtime, directory, { env: sandboxEnv });
   return {
     readFile: async (filePath: string) => {
-      gate ??= fileToolSandboxGate(runtime, directory, { env: sandboxEnv });
       try {
         await gate(filePath, "read");
       } catch (error) {

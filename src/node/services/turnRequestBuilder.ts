@@ -80,7 +80,7 @@ import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpC
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { isRlmModeEnabled } from "@/node/services/branchSummary";
 import type { ProviderService } from "@/node/services/providerService";
-import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { workspaceSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { type DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { formatMcpAppModelContextSection } from "@/node/services/mcpAppResultStore";
 import type { InitStateManager } from "./initStateManager";
@@ -2295,6 +2295,10 @@ export class TurnRequestBuilder {
     // One cache per request: resolution, plan handoff, prompt body, and
     // sub-agent discovery share definition reads; the next turn starts fresh.
     const agentDefinitionCache = new AgentDefinitionRequestCache();
+    const projectSecrets = workspaceSecrets(metadata, this.dependencies.secretsStore);
+    // Bash and the file tools get these too, so the agent definition and instruction reads
+    // follow the same sandbox.
+    const projectSecretsRecord = await secretsToRecord(projectSecrets);
     const resolveAgentForStreamStartedAt = this.hostClock.nowMs();
     const agentResult = await resolveAgentForStream({
       workspaceId,
@@ -2314,6 +2318,7 @@ export class TurnRequestBuilder {
         onPreStartError?.(event);
       },
       agentDefinitionCache,
+      sandboxEnv: projectSecretsRecord,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
     if (!agentResult.success) {
@@ -2661,16 +2666,6 @@ export class TurnRequestBuilder {
       sideChat: isSideChat,
       compaction: isCompactionRequest,
     });
-    const projectSecrets = isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : secretsForWorkspace(
-          this.dependencies.secretsStore,
-          this.dependencies.config,
-          metadata.projectPath,
-          metadata.runtimeConfig
-        );
-    // Bash and the file tools get these too, so the instruction reads follow the same sandbox.
-    const projectSecretsRecord = await secretsToRecord(projectSecrets);
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};

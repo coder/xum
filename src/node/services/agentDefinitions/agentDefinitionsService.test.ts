@@ -680,6 +680,51 @@ describe("agentDefinitionsService", () => {
     expect(leak.frontmatter.name).toBe("Leak (global)");
   });
 
+  // Codex review: the sandbox also hides a checkout file that a project secret names, so the gate
+  // needs the secrets that the workspace's commands start with.
+  test("skips a project agent that links to a file a project secret names", async () => {
+    using temp = new DisposableTempDir("agent-defs-sandbox-env");
+    const root = await fs.realpath(temp.path);
+    const workspace = path.join(root, "workspace");
+    const projectAgentsRoot = path.join(workspace, ".xum", "agents");
+    const globalAgentsRoot = path.join(root, "global-agents");
+    const token = path.join(workspace, "secrets", "leak.md");
+    await writeAgent(path.dirname(token), "leak", "Secret file");
+    await writeAgent(globalAgentsRoot, "leak", "Leak (global)");
+    await fs.mkdir(projectAgentsRoot, { recursive: true });
+    await fs.symlink(token, path.join(projectAgentsRoot, "leak.md"));
+    const runtime = new LocalRuntime(workspace);
+    runtime.agentSandboxPolicy = (input) => ({
+      writeRoots: [workspace],
+      gitCommonDirs: [],
+      denyWrite: [],
+      denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+      allowRead: [workspace],
+      network: "allowlist",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    });
+    const roots = { projectRoots: [projectAgentsRoot], globalRoot: globalAgentsRoot };
+    const cache = new AgentDefinitionRequestCache();
+    const sandboxEnv = { HF_TOKEN_PATH: token };
+    const read = (env?: NodeJS.ProcessEnv) =>
+      readAgentDefinition(runtime, workspace, AgentIdSchema.parse("leak"), {
+        roots,
+        runtimeFactory,
+        cache,
+        sandboxEnv: env,
+      });
+
+    expect((await read()).frontmatter.name).toBe("Secret file");
+    expect((await read(sandboxEnv)).frontmatter.name).toBe("Leak (global)");
+    const agents = await discoverAgentDefinitions(runtime, workspace, {
+      roots,
+      runtimeFactory,
+      sandboxEnv,
+    });
+    expect(agents.find((a) => a.id === "leak")?.name).toBe("Leak (global)");
+  });
+
   test("SSH workspaces discover host-global agents while keeping project overrides on the remote workspace", async () => {
     using project = new DisposableTempDir("agent-defs-ssh-project");
     using global = new DisposableTempDir("agent-defs-ssh-global");

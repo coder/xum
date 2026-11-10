@@ -414,6 +414,23 @@ export function createFakeWorkspaceTurnManager(
   return methods as WorkspaceTurnManager;
 }
 
+/**
+ * Stubs `runtime`'s macOS agent sandbox policy: `workspace` is open, and the file that the
+ * command environment's HF_TOKEN_PATH names is hidden, as the real policy hides it.
+ */
+export function stubSandboxHidingTokenPath(runtime: LocalRuntime, workspace: string): void {
+  runtime.agentSandboxPolicy = (input) => ({
+    writeRoots: [workspace],
+    gitCommonDirs: [],
+    denyWrite: [],
+    denyRead: input.env?.HF_TOKEN_PATH === undefined ? [] : [input.env.HF_TOKEN_PATH],
+    allowRead: [workspace],
+    network: "allowlist",
+    allowedHosts: [],
+    allowLocalBinding: true,
+  });
+}
+
 export function createTestToolConfig(
   tempDir: string,
   options?: {

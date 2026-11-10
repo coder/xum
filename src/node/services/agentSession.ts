@@ -1065,6 +1065,8 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     options: StreamMessageOptions
   ): Promise<Result<PreparedStreamMessage, SendMessageError>>;
   getProvidersConfig(): ProvidersConfigMap | null;
+  /** AIService.getWorkspaceSandboxEnv. */
+  getWorkspaceSandboxEnv(metadata: WorkspaceMetadata): Promise<Record<string, string>>;
   isExperimentEnabled(experimentId: ExperimentId): boolean;
   buildMemorySessionContext?(
     workspaceId: string,
