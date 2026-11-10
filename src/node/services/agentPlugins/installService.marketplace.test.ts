@@ -632,7 +632,8 @@ describe("AgentPluginInstallService marketplaces", () => {
         ],
       ],
       ["kit", undefined, [["cursor", "kit", true]]],
-      ["bare", undefined, [["cursor", "bare", true]]],
+      // Its folder has no manifest, and a Cursor entry is never one: the preview would refuse it.
+      ["bare", undefined, [["cursor", "bare", false]]],
       ["attio", undefined, [["cursor", "third_party/attio", true]]],
     ]);
   });
@@ -1051,10 +1052,13 @@ describe("AgentPluginInstallService marketplaces", () => {
     const rows = singleBuildRows(listing);
     expect(rows.map((row) => [row.name, row.installable])).toEqual([
       ["held", false],
-      ["bare", true],
+      ["bare", false],
     ]);
     expect(rows[0].reason).toContain("NOT_AVAILABLE");
-    expect(rows[1].reason).toBeUndefined();
+    // The listing refuses what the preview refuses below, with the folder named.
+    expect(rows[1].reason).toBe(
+      "The entry's folder 'plugins/bare' has no plugin manifest, so Xum cannot install it."
+    );
     await expect(previewAgentsEntry("held")).rejects.toThrow("NOT_AVAILABLE");
     await expect(previewAgentsEntry("bare")).rejects.toThrow(
       "The Agent Plugins marketplace entry 'bare' has no plugin manifest in its folder. Xum does not install it."

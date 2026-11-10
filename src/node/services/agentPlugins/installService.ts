@@ -101,6 +101,7 @@ import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles
 import {
   assertEntryNamesPlugin,
   chooseStagedMethod,
+  hasPluginManifest,
   detectInstallMethods,
   generatesManifest,
   isOwnManifestMethod,
@@ -115,6 +116,7 @@ import {
   type SkillsPackageRoot,
 } from "./installMethods";
 import {
+  MARKETPLACE_FILE_RULES,
   MARKETPLACE_RELATIVE_PATHS,
   MAX_CLAUDE_MARKETPLACE_BYTES,
   findMarketplaceEntry,
@@ -3924,9 +3926,11 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * A relative build's skill count: the skills its preview accepts (collectSkills), not the
-   * paths its entry lists. An entry in another repository keeps the count of paths: Xum has not
-   * cloned it. Each build reads its own file's entry.
+   * A relative build as its preview would see it: its folder must exist inside the repository,
+   * a Cursor or Agent Plugins folder needs its own plugin manifest (the entry is never one), and
+   * the skill count is the skills its preview accepts (collectSkills), not the paths its entry
+   * lists. An entry in another repository keeps the count of paths: Xum has not cloned it. Each
+   * build reads its own file's entry.
    */
   private async withAcceptedSkillCount(
     stagedDir: string,
@@ -3938,9 +3942,7 @@ export class AgentPluginInstallService {
     /** Scans of this listing by folder, skills list and plugin name. */
     scans: Map<string, Promise<Set<string>>>
   ): Promise<AgentPluginMarketplaceBuild> {
-    if (build.skillCount === undefined || !build.installable || build.sourceKind !== "relative") {
-      return build;
-    }
+    if (!build.installable || build.sourceKind !== "relative") return build;
     const entry = findMarketplaceEntry(marketplace, name);
     const resolved = resolveEntrySource(marketplace, source.url, entry);
     assert(resolved.kind === "relative", "withAcceptedSkillCount: a relative entry resolves here");
@@ -3958,6 +3960,18 @@ export class AgentPluginInstallService {
         reason: `Xum cannot install the entry's folder '${resolved.subpath ?? "."}': ${why}`,
       };
     }
+    if (
+      !MARKETPLACE_FILE_RULES[build.file].entryIsManifest &&
+      !(await hasPluginManifest(entryDir))
+    ) {
+      // The preview would refuse it (entryInstallMethods), so the listing does not offer it.
+      return {
+        ...build,
+        installable: false,
+        reason: `The entry's folder '${resolved.subpath ?? "."}' has no plugin manifest, so Xum cannot install it.`,
+      };
+    }
+    if (build.skillCount === undefined) return build;
     let manifest: Record<string, unknown>;
     try {
       ({ manifest } = marketplaceManifest({
