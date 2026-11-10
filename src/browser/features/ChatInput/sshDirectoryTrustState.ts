@@ -56,9 +56,10 @@ export function resolveSshDirectoryTrustNotice(input: {
 export type PendingSshDirectoryTrust = "trust" | "untrust" | null;
 
 /**
- * What the trust row says: its status and its button's label. While a trust saves, the label
- * names the host when the host must resolve the path (~ or relative) over SSH, which can take
- * seconds; otherwise the row would just sit there greyed out.
+ * What the trust row says: its status and its button's label. While a trust saves and the host
+ * must resolve the path (~ or relative) over SSH, which can take seconds, the status says so;
+ * otherwise the row would just sit there greyed out. The host goes in the status text, not the
+ * button, so a long host name cannot widen the button and reflow the row.
  */
 export function sshDirectoryTrustRowCopy(input: {
   trusted: boolean;
@@ -72,12 +73,17 @@ export function sshDirectoryTrustRowCopy(input: {
         title: "Untrusted directory",
         detail: "Hooks, MCP servers and project secrets stay off until you trust it.",
       };
+  const resolvesOnHost = input.pending === "trust" && !input.projectDir.startsWith("/");
   const actions: Record<NonNullable<PendingSshDirectoryTrust> | "idle", string> = {
-    trust: input.projectDir.startsWith("/") ? "Trusting…" : `Checking ${input.host}…`,
+    trust: "Trusting…",
     untrust: "Untrusting…",
     idle: input.trusted ? "Untrust" : "Trust directory",
   };
-  return { ...status, action: actions[input.pending ?? "idle"] };
+  return {
+    title: status.title,
+    detail: resolvesOnHost ? `Resolving ${input.projectDir} on ${input.host}…` : status.detail,
+    action: actions[input.pending ?? "idle"],
+  };
 }
 
 /** Identifies the directory a trust row is about, so its last error shows only for that one. */

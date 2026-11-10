@@ -54,7 +54,8 @@ export function SetDefaultIsolationButton(props: SetDefaultIsolationProps) {
       <Button
         variant="ghost"
         size="xs"
-        className="text-muted hover:text-foreground h-6 px-1.5"
+        // h-7 and text-xs match the branch select beside it, so the two share a centre line.
+        className="text-muted hover:text-foreground h-7 px-1.5 text-xs"
         disabled={props.disabled || saver.saving}
         aria-busy={saver.saving}
         aria-keyshortcuts={formatKeybindForAria(KEYBINDS.SET_DEFAULT_ISOLATION)}

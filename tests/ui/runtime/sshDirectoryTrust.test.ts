@@ -112,7 +112,7 @@ describeIntegration("SSH+None directory trust (UI)", () => {
     30_000
   );
 
-  test("shows that the host is being checked while a ~ path resolves", async () => {
+  test("says the host is resolving a ~ path while the trust saves", async () => {
     const cleanupDom = installDom();
     const projectPath = "/Users/dev/ssh-trust-slow";
     expandProjects([projectPath]);
@@ -132,8 +132,11 @@ describeIntegration("SSH+None directory trust (UI)", () => {
     try {
       const { user } = await openSshNoneForm(view, projectPath, "~/app");
       await user.click(await findButtonEventually(view.container, "Trust directory"));
-      const pending = await findButtonEventually(view.container, "Checking devbox…");
+      const pending = await findButtonEventually(view.container, "Trusting…");
       expect(pending.disabled).toBe(true);
+      expect(
+        view.container.querySelector('[data-component="SshDirectoryTrust"]')?.textContent
+      ).toContain("Resolving ~/app on devbox…");
 
       release();
       await findButtonEventually(view.container, "Untrust");
@@ -162,7 +165,7 @@ describeIntegration("SSH+None directory trust (UI)", () => {
     try {
       const { user } = await openSshNoneForm(view, projectPath, "~/app");
       await user.click(await findButtonEventually(view.container, "Trust directory"));
-      await findButtonEventually(view.container, "Checking devbox…");
+      await findButtonEventually(view.container, "Trusting…");
       // Leave SSH x None while the host resolves ~, so the reply finds no field to update.
       await selectIsolation(view.container, "Workspace isolation", "Worktree");
       release();

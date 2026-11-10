@@ -176,9 +176,9 @@ describe("sshDirectoryTrustRowCopy", () => {
   const base = { trusted: false, host: "devbox", projectDir: "~/app" } as const;
 
   test("a trust that resolves the path on the host names the host while it runs", () => {
-    expect(sshDirectoryTrustRowCopy({ ...base, pending: "trust" }).action).toContain("devbox");
+    expect(sshDirectoryTrustRowCopy({ ...base, pending: "trust" }).detail).toContain("devbox");
     expect(
-      sshDirectoryTrustRowCopy({ ...base, projectDir: "/srv/app", pending: "trust" }).action
+      sshDirectoryTrustRowCopy({ ...base, projectDir: "/srv/app", pending: "trust" }).detail
     ).not.toContain("devbox");
   });
 
