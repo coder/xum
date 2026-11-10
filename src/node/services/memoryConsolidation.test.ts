@@ -685,6 +685,35 @@ describe("consolidation memory tool rails", () => {
       }
     }, 30_000);
 
+    it("journals a failed edit's error whole when it is exactly the note cap long", async () => {
+      using fixture = await createFixture();
+      // 130 matching lines make an error of about 700 characters; the path, which the error
+      // quotes once, then pads it to exactly the cap.
+      const content = "x\n".repeat(130);
+      const failedEdit = async (virtualPath: string) => {
+        await execute(fixture.tool, { command: "create", path: virtualPath, file_text: content });
+        const result = await execute(fixture.tool, {
+          command: "str_replace",
+          path: virtualPath,
+          old_str: "x",
+          new_str: "y",
+        });
+        expect(result.success).toBe(false);
+        return result.success ? "" : result.error;
+      };
+      const short = "/memories/global/a.md";
+      const shortError = await failedEdit(short);
+      // Directories of 100 characters keep each name under the filesystem's limit.
+      const dir = `/memories/global/${"d".repeat(100)}/${"e".repeat(100)}/`;
+      const name = "n".repeat(
+        short.length + MEMORY_CONSOLIDATION_NOTE_MAX_CHARS - shortError.length - dir.length - 3
+      );
+      const atCap = await failedEdit(`${dir}${name}.md`);
+
+      expect(atCap).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      expect(fixture.journal.at(-1)?.note).toBe(atCap);
+    });
+
     it("journals a failed edit's error whole when it fits the note cap", async () => {
       using fixture = await createFixture();
       await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "small.md"), "x\nx\n");

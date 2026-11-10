@@ -510,6 +510,7 @@ function journalRefusal(journal: MemoryConsolidationOp[], row: RefusalRow): void
   }
   fullJournals.add(journal);
   // Cut so that the full note itself always fits under the note cap.
+  // mutation-equivalent: every refusal note today is under 960 characters (one path of at most 512 plus fixed text), so this cut never applies; it keeps the full note inside the cap if a longer note is added
   const roomForNote = MEMORY_CONSOLIDATION_NOTE_MAX_CHARS - JOURNAL_FULL_NOTE.length - 1;
   journal.push({ ...row, note: `${clipJournalNote(row.note, roomForNote)} ${JOURNAL_FULL_NOTE}` });
 }
