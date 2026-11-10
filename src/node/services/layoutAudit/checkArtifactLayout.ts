@@ -31,7 +31,7 @@ export interface ArtifactLayoutInput {
   /** Host session dir: with `relPath` it names the artifact the fix-loop memory is kept for. */
   sessionDir: string;
   abortSignal?: AbortSignal;
-  /** Time for the whole audit, run and close. Production leaves it unset. */
+  /** Time for the whole audit, run and close, from when it starts. Production leaves it unset. */
   budgetMs?: number;
 }
 
@@ -91,11 +91,12 @@ export async function checkArtifactLayout(
   input: ArtifactLayoutInput
 ): Promise<LayoutAuditReport | undefined> {
   if (input.kind !== "html") return undefined;
-  // Counted from here, so a publish that waits for an earlier audit of the same path also
-  // stays inside one budget.
-  const deadlineMs = Date.now() + (input.budgetMs ?? LAYOUT_AUDIT_BUDGET_MS);
   try {
     return await withLayoutMemory(input.sessionDir, input.relPath, async (memory) => {
+      // Overlapping publishes of one path run one after another, and the budget starts only
+      // once this audit holds its turn: a publish that waited behind an earlier one must not
+      // find the newest content "not checked" because the wait used up its time.
+      const deadlineMs = Date.now() + (input.budgetMs ?? LAYOUT_AUDIT_BUDGET_MS);
       const { report, next } = buildLayoutReport(
         await auditOutcomes(input, deadlineMs),
         memory.previous

@@ -1,4 +1,13 @@
-import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  setDefaultTimeout,
+  setSystemTime,
+  spyOn,
+  test,
+} from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -212,6 +221,32 @@ describe("checkArtifactLayout", () => {
     const [first, second] = await Promise.all([check(), check()]);
     expect(first?.issues[0]).not.toHaveProperty("persistent");
     expect(second?.issues).toEqual([expect.objectContaining({ persistent: true })]);
+  });
+
+  test("overlapping publishes of one path each get the full budget", async () => {
+    await install({ eval: { 390: { kind: "pass", findings: [card] } } });
+    // Bound before spyOn: spyOn replaces the method before its argument is evaluated.
+    const realExec = runtime.exec.bind(runtime);
+    const runTimeouts: Array<number | undefined> = [];
+    const exec = spyOn(runtime, "exec").mockImplementation(async (command, options) => {
+      if (command.includes("page_script=")) {
+        runTimeouts.push(options.timeout);
+        // The first audit "takes" ten seconds, as measured by the clock the budget reads.
+        if (runTimeouts.length === 1) setSystemTime(new Date(Date.now() + 10_000));
+      }
+      return realExec(command, options);
+    });
+    try {
+      const [first, second] = await Promise.all([check(), check()]);
+      expect(runTimeouts).toHaveLength(2);
+      // Counted from the start of each audit, not from the call: the second one waited.
+      expect(runTimeouts[1]).toBeGreaterThan((runTimeouts[0] ?? 0) - 1);
+      expect(first?.issues[0]).not.toHaveProperty("persistent");
+      expect(second?.issues).toEqual([expect.objectContaining({ persistent: true })]);
+    } finally {
+      setSystemTime();
+      exec.mockRestore();
+    }
   });
 
   test("a name with a space and a # reaches the browser as the one file", async () => {

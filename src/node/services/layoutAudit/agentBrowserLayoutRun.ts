@@ -73,9 +73,9 @@ ab() { agent-browser --namespace ${NAMESPACE} --session "$XUM_LAYOUT_SESSION" --
 cd / || exit ${EXIT_SCRIPT_UNREADABLE}
 `;
 
-// Reads stdin before anything can exit: a script that ends without reading the page script
-// (no agent-browser, a failing tool_env) would turn the write of tens of KB into a broken pipe,
-// and the audit would report the wrong reason.
+// Reads stdin before any step that can exit, so the page script is always consumed. Kept first
+// as a precaution: on LocalRuntime, execBuffered did not fail when a command that exits at once
+// left up to 2 MB of stdin unread (measured), so this order is not known to be needed.
 const READ_STDIN = String.raw`
 page_script=$(cat) || exit ${EXIT_SCRIPT_UNREADABLE}
 `;
