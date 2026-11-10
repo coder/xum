@@ -425,7 +425,7 @@ describe("resolveEntrySource", () => {
   }
 
   test("a drive is a marketplace on this machine on Windows only", () => {
-    // Git for Windows reads one ASCII character and a colon as a drive, but git on Linux and macOS
+    // Git for Windows reads an ASCII letter and a colon as a drive, but git on Linux and macOS
     // signs in over ssh to the host `h`: there such a marketplace is remote and names only https.
     for (const marketplaceUrl of [
       "C:\\repos\\market",
@@ -441,6 +441,28 @@ describe("resolveEntrySource", () => {
     }
   });
 
+  test("a drive that Git for Windows does not read as a valid path is remote everywhere", () => {
+    // Git for Windows then reads the URL as scp to the host `h`, and so does git elsewhere.
+    for (const marketplaceUrl of [
+      "h:/org/market:archive.git",
+      "h:/aux/market.git",
+      "h:/org/market*.git",
+      "C:\\a:b",
+    ]) {
+      for (const platform of ["linux", "win32"] as const) {
+        onPlatform(platform, () => expectRemoteMarketplace(marketplaceUrl));
+      }
+    }
+  });
+
+  test("a network share is a marketplace on this machine only where git reads it as a path", () => {
+    // Git for Windows reads these as a share of another machine.
+    for (const marketplaceUrl of ["\\\\server\\share\\market", "file://server/share/market.git"]) {
+      onPlatform("linux", () => expectLocalMarketplace(marketplaceUrl));
+      onPlatform("win32", () => expectRemoteMarketplace(marketplaceUrl));
+    }
+  });
+
   test("a marketplace at a host is remote on every platform, loopback included", () => {
     // Xum reads no host for this check: git decodes, splits and trims a URL in ways that `URL`
     // does not, so `%40%5b` hides evil.example behind localhost, and `:+22` or `|` hides a host.
@@ -449,11 +471,16 @@ describe("resolveEntrySource", () => {
       "ssh://localhost/srv/market.git",
       "git@127.0.0.1:srv/market.git",
       "https://127.0.0.1/market.git",
+      "ssh://127.evil.example/x",
       "ssh://localhost/y%40%5bevil.example%5d/market.git",
+      "ssh://localhost/x%40[2001:db8::1]/y",
       "ssh://localhost#@evil.example/market.git",
+      "ssh://localhost:65536/x",
       "ssh://evil.example:+22/market.git",
       "evil.example:c@localhost:market.git",
       "ssh://localhost/y@[fe80::1]/market.git",
+      "\\h:org/market.git",
+      "\\\\?\\C:\\repos\\market",
     ]) {
       for (const platform of ["linux", "win32"] as const) {
         onPlatform(platform, () => expectRemoteMarketplace(marketplaceUrl));
