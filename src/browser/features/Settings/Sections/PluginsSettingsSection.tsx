@@ -1233,9 +1233,9 @@ const ReadonlyAgentNote: React.FC<{ preview: AgentPluginInstallPreview; agent: s
 };
 
 /**
- * A file name inside a line of text. It moves to the next line as a whole instead of splitting at
- * the card's edge, and wraps inside itself only when it is longer than a line (`break-all` split
- * every name at phone width).
+ * A file name or slash command name inside a line of text. It moves to the next line as a whole
+ * instead of splitting at the card's edge, and wraps inside itself only when it is longer than a
+ * line (`break-all` split every name at phone width).
  */
 const FileName: React.FC<{ name: string }> = (props) => (
   <span className="text-foreground inline-block max-w-full font-mono break-words">
@@ -1303,7 +1303,7 @@ const PreviewDisclosures: React.FC<{
         <ul className="space-y-1">
           {props.preview.slashCommands.map((command) => (
             <li key={command.name} className="text-xs">
-              <span className="text-foreground font-mono">/{command.name}</span>
+              <FileName name={`/${command.name}`} />
               {command.description && <span className="text-muted"> — {command.description}</span>}
             </li>
           ))}
@@ -2121,7 +2121,7 @@ export const PluginsSettingsSection: React.FC = () => {
         <p className="text-muted mb-4 text-xs">
           Install Agent Plugins from git repositories into{" "}
           {containerLocation !== null ? (
-            <code className="text-accent-text break-all">{containerLocation}</code>
+            <code className="text-accent-text break-words">{containerLocation}</code>
           ) : (
             "the managed plugins directory"
           )}
@@ -2309,18 +2309,18 @@ export const PluginsSettingsSection: React.FC = () => {
                   )}
                   {item.interface && <PluginInterfaceDetails info={item.interface} />}
                   <div className="text-muted mt-2 space-y-0.5 text-[11px]">
-                    {/* break-all: locations/sources can contain unbreakable
-                        64-char tokens (max-length plugin names) that would
-                        otherwise overflow the card at phone widths. The counts
-                        are prose and wrap at spaces. */}
+                    {/* break-words: the counts, the location and the source wrap at
+                        spaces, so a location or a commit id moves to the next line
+                        whole. A word splits only when it is longer than a line (a
+                        max-length plugin name), so nothing overflows the card at phone
+                        widths. */}
                     <p className="counter-nums break-words">
                       {item.importedSkillCount ?? item.skillCount} of {item.skillCount} skills
                       imported · {item.importedMcpServerCount ?? item.mcpServerCount} of{" "}
-                      {item.mcpServerCount} MCP servers imported ·{" "}
-                      <code className="break-all">{item.location}</code>
+                      {item.mcpServerCount} MCP servers imported · <code>{item.location}</code>
                     </p>
                     {formatSource(item) && (
-                      <p className="break-all">
+                      <p className="break-words">
                         {formatSource(item)}
                         {item.lockedSha ? ` · ${item.lockedSha.slice(0, 12)}` : ""}
                       </p>
