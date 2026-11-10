@@ -36,6 +36,8 @@ export interface FakeAgentBrowserScript {
   toolEnvFails?: boolean;
   /** `open` exits 1. */
   openFails?: boolean;
+  /** `close` never answers, like a daemon that is still executing a command. */
+  closeHangs?: boolean;
   eval?: Partial<Record<LayoutAuditViewportWidth, FakeEvalReply>>;
 }
 
@@ -48,6 +50,11 @@ export interface FakeAgentBrowser {
   evalStdin(width: LayoutAuditViewportWidth): Promise<string | undefined>;
   /** True once an eval in `hang` mode has started. */
   hangStarted(): Promise<boolean>;
+  /**
+   * Per call, in order: the AGENT_BROWSER_SOCKET_DIR the call saw, and whether that folder
+   * existed at the time.
+   */
+  socketDirs(): Promise<Array<{ dir: string; existed: boolean }>>;
 }
 
 // The fake ends every argv field with this byte (octal 037 in its printf).
@@ -102,9 +109,11 @@ function fakeScript(stateDir: string): string {
 STATE=${shellQuote(stateDir)}
 printf '%s\\037' "$@" >> "$STATE/calls.log"
 printf '\\n' >> "$STATE/calls.log"
+if [ -d "\${AGENT_BROWSER_SOCKET_DIR-}" ]; then existed=yes; else existed=no; fi
+printf '%s %s\\n' "$existed" "\${AGENT_BROWSER_SOCKET_DIR-}" >> "$STATE/socket-dirs.log"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --namespace|--session|--headed|--idle-timeout) shift 2 ;;
+    --session|--headed|--idle-timeout) shift 2 ;;
     --json) shift ;;
     *) break ;;
   esac
@@ -118,6 +127,9 @@ case "$command" in
   open)
     [ -f "$STATE/open-fails" ] && exit 1
     printf '%s\\n' "$1" >> "$STATE/opened.log"
+    ;;
+  close)
+    [ -f "$STATE/close-hangs" ] && sleep 60 </dev/null
     ;;
   eval)
     width=$(cat "$STATE/viewport")
@@ -161,6 +173,7 @@ export async function installFakeAgentBrowser(
     : `export PATH=${shellQuote(script.missing ? emptyDir : `${binDir}:${process.env.PATH ?? ""}`)}\n`;
   await fs.writeFile(path.join(projectDir, ".xum", "tool_env"), toolEnv);
   if (script.openFails) await fs.writeFile(path.join(stateDir, "open-fails"), "");
+  if (script.closeHangs) await fs.writeFile(path.join(stateDir, "close-hangs"), "");
   for (const { width } of LAYOUT_AUDIT_VIEWPORTS) {
     const reply = script.eval?.[width] ?? { kind: "pass" };
     const { out, exit } = envelopeFor(reply, width);
@@ -179,5 +192,13 @@ export async function installFakeAgentBrowser(
     openedUrls: async () => ((await read("opened.log")) ?? "").split("\n").filter(Boolean),
     evalStdin: (width) => read(`eval-stdin-${width}`),
     hangStarted: async () => (await read("hang-started")) !== undefined,
+    socketDirs: async () =>
+      ((await read("socket-dirs.log")) ?? "")
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => ({
+          existed: line.startsWith("yes "),
+          dir: line.slice(line.indexOf(" ") + 1),
+        })),
   };
 }

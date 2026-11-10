@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import * as crypto from "crypto";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -80,7 +81,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
   /** Subcommand of each call: the first argv field that is not a global flag or its value. */
   const subcommands = (calls: string[][]) =>
     calls.map((argv) => {
-      const flagsWithValue = ["--namespace", "--session", "--headed", "--idle-timeout"];
+      const flagsWithValue = ["--session", "--headed", "--idle-timeout"];
       for (let index = 0; index < argv.length; index++) {
         if (flagsWithValue.includes(argv[index] ?? "")) index += 1;
         else if (argv[index] !== "--json") return argv[index];
@@ -88,10 +89,9 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       return undefined;
     });
 
-  /** Global flags of every call: one session, one namespace, never `--all`. */
+  /** Global flags of every call: one session of its own, never `--all`. */
   const expectOneOwnSession = (calls: string[][]) => {
     const values = (flag: string) => new Set(calls.map((argv) => argv[argv.indexOf(flag) + 1]));
-    expect([...values("--namespace")]).toEqual(["xum-layout"]);
     const sessions = [...values("--session")];
     expect(sessions).toHaveLength(1);
     expect(sessions[0]).toMatch(/^xum-layout-[0-9a-f]{12}$/);
@@ -101,7 +101,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
         "--headed",
         "false",
         "--idle-timeout",
-        "30s",
+        "10s",
       ]);
     }
   };
@@ -307,6 +307,82 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     ]);
     const toolEnvFails = await run({ toolEnvFails: true }, { pageScript: BIG_PAGE_SCRIPT });
     expect(summary(toolEnvFails.outcomes)[0]).toBe("390 failed tool-env-failed");
+  });
+
+  test("a run keeps its session files in a folder of its own and removes it after the close", async () => {
+    const { fake } = await run({});
+    const seen = await fake.socketDirs();
+    const session = (await fake.calls())[0]?.[1];
+    // Every call, the close included, saw the one folder, and it existed while they ran.
+    expect(new Set(seen.map((call) => call.dir))).toEqual(new Set([`/tmp/${session}`]));
+    expect(seen.every((call) => call.existed)).toBe(true);
+    expect(seen).toHaveLength(10);
+    expect(
+      await fs.stat(`/tmp/${session}`).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  test("a hung run still has its folder removed by the close", async () => {
+    const { fake } = await run({ eval: { 390: { kind: "hang" } } }, { budgetMs: 3_000 });
+    const seen = await fake.socketDirs();
+    expect(seen.at(-1)?.existed).toBe(true);
+    expect(
+      await fs.stat(seen[0]?.dir ?? "").then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  // The bound on the close needs `timeout`, which stock macOS lacks (the folder then stays).
+  test.skipIf(Bun.which("timeout") === null)(
+    "a close that never answers is cut short, and the folder is still removed",
+    async () => {
+      const started = Date.now();
+      const { outcomes, fake } = await run({ closeHangs: true });
+      expect(summary(outcomes)).toEqual(["390 complete", "1440 complete", "768 complete"]);
+      const seen = await fake.socketDirs();
+      expect(
+        await fs.stat(seen[0]?.dir ?? "").then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+      // Far below the fake's 60 s hang and the run's 20 s budget.
+      expect(Date.now() - started).toBeLessThan(15_000);
+    }
+  );
+
+  test("a run never adopts a socket folder it did not create", async () => {
+    // A name only this process uses, so parallel runs of this file on one host cannot collide.
+    const bytes = Buffer.alloc(6);
+    bytes.writeUInt32BE(process.pid, 2);
+    const taken = `/tmp/xum-layout-${bytes.toString("hex")}`;
+    const spy = spyOn(crypto, "randomBytes").mockImplementation(((size: number) =>
+      bytes.subarray(0, size)) as typeof crypto.randomBytes);
+    await fs.mkdir(taken);
+    try {
+      const { outcomes, fake } = await run({});
+      expect(summary(outcomes)).toEqual([
+        "390 failed browser-failed",
+        "1440 failed browser-failed",
+        "768 failed browser-failed",
+      ]);
+      // No browser call was made, and no close: the close is what removes the folder.
+      expect(await fake.calls()).toEqual([]);
+      expect(
+        await fs.stat(taken).then(
+          () => true,
+          () => false
+        )
+      ).toBe(true);
+    } finally {
+      spy.mockRestore();
+      await fs.rm(taken, { recursive: true, force: true });
+    }
   });
 
   test("each run uses its own session, and the close names it", async () => {

@@ -9,6 +9,9 @@ import type { Box, LayoutPage, PageMetrics, SettleSignals } from "./layoutPage";
  */
 export type BrowserWindow = Window & typeof globalThis;
 
+/** The timer calls the quiet waits make: those of the window under audit. */
+export type QuietClock = Pick<Window, "setTimeout" | "clearTimeout">;
+
 const noop = () => undefined;
 
 function readMetrics(win: BrowserWindow): PageMetrics {
@@ -77,30 +80,30 @@ export function createBrowserLayoutPage(win: BrowserWindow): LayoutPage {
  * the resize wait and the DOM wait (upstream wrote it twice).
  */
 export function observeUntilQuiet(
+  clock: QuietClock,
   observe: (onChange: () => void) => () => void,
   quietMs: number,
   maxMs: number
 ): Promise<boolean> {
   return new Promise((resolve) => {
-    const timers: { quiet?: ReturnType<typeof setTimeout>; max?: ReturnType<typeof setTimeout> } =
-      {};
+    const timers: { quiet?: number; max?: number } = {};
     let stop: () => void = noop;
     let done = false;
     const finish = (quiet: boolean) => {
       if (done) return;
       done = true;
-      clearTimeout(timers.quiet);
-      clearTimeout(timers.max);
+      clock.clearTimeout(timers.quiet);
+      clock.clearTimeout(timers.max);
       stop();
       resolve(quiet);
     };
     const restartQuietTimer = () => {
-      clearTimeout(timers.quiet);
-      timers.quiet = setTimeout(() => finish(true), quietMs);
+      clock.clearTimeout(timers.quiet);
+      timers.quiet = clock.setTimeout(() => finish(true), quietMs);
     };
     stop = observe(restartQuietTimer);
     restartQuietTimer();
-    timers.max = setTimeout(() => finish(false), maxMs);
+    timers.max = clock.setTimeout(() => finish(false), maxMs);
   });
 }
 
@@ -166,9 +169,9 @@ export function createBrowserSettleSignals(win: BrowserWindow): SettleSignals {
   return {
     fontsReady: () => waitForFonts(win),
     layoutQuiet: (quietMs, maxMs) =>
-      observeUntilQuiet((onChange) => observeResizes(win, onChange), quietMs, maxMs),
+      observeUntilQuiet(win, (onChange) => observeResizes(win, onChange), quietMs, maxMs),
     domQuiet: (quietMs, maxMs) =>
-      observeUntilQuiet((onChange) => observeMutations(win, onChange), quietMs, maxMs),
+      observeUntilQuiet(win, (onChange) => observeMutations(win, onChange), quietMs, maxMs),
     finiteAnimationsSettled: (maxMs) => waitForFiniteAnimations(win, maxMs),
     frames: (count) => waitForFrames(win, count),
     sleep: (ms) => new Promise<void>((resolve) => win.setTimeout(resolve, ms)),

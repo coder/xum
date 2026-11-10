@@ -1,4 +1,4 @@
-import { randomBytes } from "crypto";
+import * as crypto from "crypto";
 import { z } from "zod";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import {
@@ -21,22 +21,30 @@ import { execBuffered, type ExecResult } from "@/node/utils/runtime/helpers";
  *    loads the file anew, evaluates the script and prints one framed record. It stops at the
  *    first failure. Records printed before a timeout or an abort are kept; a record whose end
  *    line is missing is treated as not printed.
- * 2. CLOSE closes this run's session by name, in its own exec with its own time reserve and no
- *    abort signal, so it runs after a timeout or a cancel too. agent-browser's daemon outlives a
- *    killed CLI. Never `close --all`: other sessions on this host are not ours.
+ * 2. CLOSE closes this run's session by name and removes the run's socket folder, in its own
+ *    exec with its own time reserve and no abort signal, so it runs after a timeout or a cancel
+ *    too. agent-browser's daemon outlives a killed CLI. Never `close --all`: other sessions on
+ *    this host are not ours.
+ *
+ * What CLOSE cannot do: a daemon that is still executing a command (a page that never finishes
+ * loading, a script that never returns) does not take the close. agent-browser ends such a
+ * command itself after 25 to 30 s (measured on 0.33.2; AGENT_BROWSER_DEFAULT_TIMEOUT did not
+ * shorten it for `open` or `eval`), and the idle timeout below then shuts the daemon down. So
+ * after a hung page the browser lives up to about half a minute past the audit's result.
  *
  * agent-browser's JSON envelope stays inside this file.
  */
 
-// Run-script exit codes. Each one happens before any browser is launched.
+// Run-script exit codes. Each one happens before any browser is launched, and before the run
+// owns a socket folder (so CLOSE, which removes that folder, is skipped for them).
 const EXIT_NO_AGENT_BROWSER = 127;
-const EXIT_SCRIPT_UNREADABLE = 4;
+const EXIT_SETUP_FAILED = 4;
 /** The exec itself failed (the runtime threw), so there is no real exit code. */
 const EXEC_FAILED_EXIT = -1;
 const NEVER_LAUNCHED_EXITS: ReadonlySet<number> = new Set([
   EXIT_NO_AGENT_BROWSER,
   TOOL_ENV_FAILED_EXIT,
-  EXIT_SCRIPT_UNREADABLE,
+  EXIT_SETUP_FAILED,
 ]);
 
 /** Why a width has no record, by how the run ended. Anything else inherits the last failure. */
@@ -47,11 +55,23 @@ const EXIT_REASONS: Readonly<Partial<Record<number, FailedReason>>> = {
   [TOOL_ENV_FAILED_EXIT]: "tool-env-failed",
 };
 
-/** Not our session, our namespace: its sockets and restore state stay apart from the user's. */
-const NAMESPACE = "xum-layout";
-const SESSION_PREFIX = `${NAMESPACE}-`;
-/** The backstop if CLOSE never lands: the daemon shuts itself down. */
-const IDLE_TIMEOUT = "30s";
+const SESSION_PREFIX = "xum-layout-";
+/**
+ * Each run keeps agent-browser's session files (socket, pid, config) in a folder of its own,
+ * `<parent>/<session>`, and CLOSE removes it. agent-browser leaves a config file behind for every
+ * session name, so in its default folder a unique name per publish would pile up one file per
+ * publish in the user's home. A private folder also keeps the session out of `session list` and
+ * so out of Xum's Browser tab. The parent is short on purpose: a Unix socket path caps at 108 bytes.
+ */
+const SOCKET_DIR_PARENT = "/tmp";
+/**
+ * The backstop when CLOSE does not land (see above): the daemon shuts itself down once it has
+ * been idle this long. A command in flight does not count as idle (an 8 s eval survived a 5 s
+ * idle timeout), and the run's own calls follow each other within milliseconds.
+ */
+const IDLE_TIMEOUT = "10s";
+/** How long CLOSE waits for `close` before it removes the socket folder anyway. */
+const CLOSE_WAIT_SECONDS = 2;
 /** The run prints at most a few records of findings; this bounds a page that floods it. */
 const MAX_RUN_OUTPUT_BYTES = 512 * 1024;
 const MAX_CLOSE_OUTPUT_BYTES = 4096;
@@ -62,27 +82,33 @@ const FRAME_END = "@@xum-layout-end";
 /**
  * Values reach the scripts only through env vars and stdin: nothing from the artifact path or
  * the page is spliced into the shell text, and the page script never travels in argv. The
- * identity and state variables that would change which browser runs, or what it restores, are
- * unset (the flags below win over the rest of the env). `cd /` puts the daemon outside the
- * project and workspace, so Xum's Browser tab never adopts it and no project agent-browser.json
- * applies. Every call carries the same flags, `close` included, so it addresses the same daemon.
+ * identity and state variables that would change which browser runs, where its session files
+ * go, or what it restores, are unset (the flags below win over the rest of the env). `cd /` puts
+ * the daemon outside the project and workspace, so no project agent-browser.json applies. Every
+ * call carries the same flags and the same socket folder, `close` included, so it addresses the
+ * same daemon.
  */
 const SHELL_COMMON = String.raw`
-unset AGENT_BROWSER_SESSION AGENT_BROWSER_SESSION_NAME AGENT_BROWSER_RESTORE AGENT_BROWSER_STATE AGENT_BROWSER_INIT_SCRIPTS AGENT_BROWSER_ENABLE AGENT_BROWSER_HEADED AGENT_BROWSER_PROFILE AGENT_BROWSER_AUTO_CONNECT AGENT_BROWSER_PROVIDER AGENT_BROWSER_ENGINE
-ab() { agent-browser --namespace ${NAMESPACE} --session "$XUM_LAYOUT_SESSION" --headed false --idle-timeout ${IDLE_TIMEOUT} "$@"; }
-cd / || exit ${EXIT_SCRIPT_UNREADABLE}
+unset AGENT_BROWSER_SESSION AGENT_BROWSER_SESSION_NAME AGENT_BROWSER_NAMESPACE AGENT_BROWSER_RESTORE AGENT_BROWSER_STATE AGENT_BROWSER_INIT_SCRIPTS AGENT_BROWSER_ENABLE AGENT_BROWSER_HEADED AGENT_BROWSER_PROFILE AGENT_BROWSER_AUTO_CONNECT AGENT_BROWSER_PROVIDER AGENT_BROWSER_ENGINE
+export AGENT_BROWSER_SOCKET_DIR="$XUM_LAYOUT_SOCKET_DIR"
+ab_wrap=
+ab() { $ab_wrap agent-browser --session "$XUM_LAYOUT_SESSION" --headed false --idle-timeout ${IDLE_TIMEOUT} "$@"; }
+cd / || exit ${EXIT_SETUP_FAILED}
 `;
 
 // Reads stdin before any step that can exit, so the page script is always consumed. Kept first
 // as a precaution: on LocalRuntime, execBuffered did not fail when a command that exits at once
 // left up to 2 MB of stdin unread (measured), so this order is not known to be needed.
 const READ_STDIN = String.raw`
-page_script=$(cat) || exit ${EXIT_SCRIPT_UNREADABLE}
+page_script=$(cat) || exit ${EXIT_SETUP_FAILED}
 `;
 
 const RUN_SCRIPT = String.raw`
 command -v agent-browser >/dev/null 2>&1 || exit ${EXIT_NO_AGENT_BROWSER}
 ${SHELL_COMMON}
+# Plain mkdir: it fails on a path that already exists, so the run never adopts a folder it did
+# not make, and CLOSE never removes one.
+mkdir -m 700 "$XUM_LAYOUT_SOCKET_DIR" || exit ${EXIT_SETUP_FAILED}
 set -- $XUM_LAYOUT_VIEWPORTS
 while [ "$#" -ge 2 ]; do
   width=$1; height=$2; shift 2
@@ -98,9 +124,17 @@ while [ "$#" -ge 2 ]; do
 done
 `;
 
+// The folder is removed whether or not the close worked. A busy daemon does not answer the close
+// (see the top of this file), so where `timeout` exists the wait is cut short and the folder is
+// removed under the daemon, which then exits on its own. Without `timeout` (stock macOS) this
+// exec is killed first, and the folder stays in /tmp with one small config file.
 const CLOSE_SCRIPT = String.raw`
 ${SHELL_COMMON}
+command -v timeout >/dev/null 2>&1 && ab_wrap="timeout ${CLOSE_WAIT_SECONDS}"
 ab close </dev/null >/dev/null 2>&1
+case "$XUM_LAYOUT_SOCKET_DIR" in
+  ${SOCKET_DIR_PARENT}/${SESSION_PREFIX}*) rm -rf -- "$XUM_LAYOUT_SOCKET_DIR" ;;
+esac
 `;
 
 export interface LayoutRunInput {
@@ -204,13 +238,17 @@ export async function runLayoutPasses(input: LayoutRunInput): Promise<ViewportOu
   const remainingMs = Math.max(input.deadlineMs - Date.now(), 0);
   // A third of a short budget, so a test budget still leaves the run most of its time.
   const closeMs = Math.min(LAYOUT_AUDIT_CLOSE_RESERVE_MS, remainingMs / 3);
-  const session = `${SESSION_PREFIX}${randomBytes(6).toString("hex")}`;
+  const session = `${SESSION_PREFIX}${crypto.randomBytes(6).toString("hex")}`;
+  const sessionEnv = {
+    XUM_LAYOUT_SESSION: session,
+    XUM_LAYOUT_SOCKET_DIR: `${SOCKET_DIR_PARENT}/${session}`,
+  };
   const { prelude, pathEnv } = toolEnvPrelude(input.toolEnvPath);
   const run = await execOrFail(input.runtime, READ_STDIN + prelude + RUN_SCRIPT, {
     cwd: input.cwd,
     pathEnv,
     env: {
-      XUM_LAYOUT_SESSION: session,
+      ...sessionEnv,
       XUM_LAYOUT_URL: input.fileUrl,
       XUM_LAYOUT_VIEWPORTS: LAYOUT_AUDIT_VIEWPORTS.flatMap((v) => [v.width, v.height]).join(" "),
     },
@@ -223,7 +261,7 @@ export async function runLayoutPasses(input: LayoutRunInput): Promise<ViewportOu
     await execOrFail(input.runtime, prelude + CLOSE_SCRIPT, {
       cwd: input.cwd,
       pathEnv,
-      env: { XUM_LAYOUT_SESSION: session },
+      env: sessionEnv,
       timeout: closeMs / 1000,
       maxOutputBytes: MAX_CLOSE_OUTPUT_BYTES,
     });

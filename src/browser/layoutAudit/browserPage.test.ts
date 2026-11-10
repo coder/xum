@@ -4,6 +4,7 @@ import {
   createBrowserSettleSignals,
   observeUntilQuiet,
   type BrowserWindow,
+  type QuietClock,
 } from "./browserPage";
 import { createFakeBrowserWindow } from "./fakeLayoutPage.testHarness";
 
@@ -22,50 +23,91 @@ function manualObserver() {
   return { observe, state };
 }
 
+/**
+ * Window timers the test advances by hand, so a stalled test process cannot let a quiet timer
+ * fire between two changes. `advance` runs the timers that fall due, in time order.
+ */
+function manualClock() {
+  const timers = new Map<number, { at: number; run: () => void }>();
+  let now = 0;
+  let nextId = 1;
+  const nextDue = (until: number) =>
+    [...timers].filter(([, timer]) => timer.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+  const clock = {
+    setTimeout: (run: () => void, ms = 0) => {
+      timers.set(nextId, { at: now + ms, run });
+      return nextId++;
+    },
+    clearTimeout: (id?: number) => {
+      if (id !== undefined) timers.delete(id);
+    },
+  };
+  const advance = (ms: number) => {
+    const until = now + ms;
+    for (let due = nextDue(until); due !== undefined; due = nextDue(until)) {
+      now = due[1].at;
+      timers.delete(due[0]);
+      due[1].run();
+    }
+    now = until;
+  };
+  return { clock: clock as unknown as QuietClock, advance, pending: () => timers.size };
+}
+
 describe("observeUntilQuiet", () => {
   test("resolves true once nothing changed for the quiet time, and stops watching once", async () => {
     const { observe, state } = manualObserver();
-    expect(await observeUntilQuiet(observe, 20, 2_000)).toBe(true);
+    const { clock, advance, pending } = manualClock();
+    const quiet = observeUntilQuiet(clock, observe, 180, 2_000);
+    advance(179);
+    expect(state.stops).toBe(0);
+    advance(1);
+    expect(await quiet).toBe(true);
     expect(state.stops).toBe(1);
+    // Both of its timers are gone: nothing is left to fire later.
+    expect(pending()).toBe(0);
   });
 
   test("each change restarts the quiet time", async () => {
     const { observe, state } = manualObserver();
-    let changes = 0;
-    const quiet = observeUntilQuiet(observe, 60, 2_000);
-    // Four changes 15 ms apart: the first quiet timer (60 ms) would expire before the last.
+    const { clock, advance } = manualClock();
+    const quiet = observeUntilQuiet(clock, observe, 180, 2_000);
+    // Four changes 100 ms apart: without a restart the first quiet time would end at 180 ms.
     for (let i = 0; i < 4; i += 1) {
-      await delay(15);
-      changes += 1;
+      advance(100);
       state.onChange();
     }
-    let changesWhenResolved = -1;
-    await quiet.then(() => {
-      changesWhenResolved = changes;
-    });
-    expect(changesWhenResolved).toBe(4);
+    advance(179);
+    expect(state.stops).toBe(0);
+    advance(1);
     expect(await quiet).toBe(true);
   });
 
   test("resolves false when changes keep coming until the maximum wait", async () => {
     const { observe, state } = manualObserver();
-    const ticker = setInterval(() => state.onChange(), 5);
-    try {
-      expect(await observeUntilQuiet(observe, 40, 120)).toBe(false);
-    } finally {
-      clearInterval(ticker);
+    const { clock, advance, pending } = manualClock();
+    const quiet = observeUntilQuiet(clock, observe, 180, 2_000);
+    // A change every 100 ms. The last thing to happen is time reaching the maximum: a stopped
+    // observer reports nothing after that.
+    for (let elapsed = 0; elapsed < 2_000; elapsed += 100) {
+      state.onChange();
+      advance(100);
     }
+    expect(await quiet).toBe(false);
     expect(state.stops).toBe(1);
+    expect(pending()).toBe(0);
   });
 
   test("a change after the wait is over does not restart anything", async () => {
     const { observe, state } = manualObserver();
-    await observeUntilQuiet(observe, 10, 1_000);
-    // A late change starts a quiet timer that must not stop the watcher a second time. Waiting
-    // out a longer quiet time of another watcher lets that timer fire first.
+    const { clock, advance, pending } = manualClock();
+    const quiet = observeUntilQuiet(clock, observe, 180, 2_000);
+    advance(180);
+    await quiet;
     state.onChange();
-    await observeUntilQuiet(manualObserver().observe, 40, 1_000);
+    advance(5_000);
     expect(state.stops).toBe(1);
+    expect(pending()).toBe(0);
   });
 });
 
@@ -268,21 +310,33 @@ describe("createBrowserSettleSignals", () => {
   });
 
   describe("domQuiet", () => {
+    // happy-dom reports mutations in a microtask, so the window's timers can be driven by hand.
+    const settle = async () => {
+      for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    };
+
     test("is quiet when the DOM stays unchanged", async () => {
       using fake = createFakeBrowserWindow({ bodyHtml: "<p>text</p>" });
-      expect(await createBrowserSettleSignals(fake.win).domQuiet(30, 1_000)).toBe(true);
+      const { clock, advance } = manualClock();
+      Object.assign(fake.win, clock);
+      const quiet = createBrowserSettleSignals(fake.win).domQuiet(180, 2_000);
+      advance(180);
+      expect(await quiet).toBe(true);
     });
 
     test("is not quiet while the DOM keeps changing until the maximum wait", async () => {
       using fake = createFakeBrowserWindow({ bodyHtml: "<p>text</p>" });
+      const { clock, advance } = manualClock();
+      Object.assign(fake.win, clock);
       const paragraph = fake.win.document.querySelector("p") as Element;
-      let tick = 0;
-      const ticker = setInterval(() => paragraph.setAttribute("data-tick", String((tick += 1))), 5);
-      try {
-        expect(await createBrowserSettleSignals(fake.win).domQuiet(60, 200)).toBe(false);
-      } finally {
-        clearInterval(ticker);
+      const quiet = createBrowserSettleSignals(fake.win).domQuiet(180, 2_000);
+      // An attribute change every 100 ms: each one must restart the 180 ms quiet time.
+      for (let elapsed = 0; elapsed < 2_000; elapsed += 100) {
+        paragraph.setAttribute("data-tick", String(elapsed));
+        await settle();
+        advance(100);
       }
+      expect(await quiet).toBe(false);
     });
   });
 });
