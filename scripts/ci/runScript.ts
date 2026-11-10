@@ -7,8 +7,10 @@ import { chmod, writeFile } from "node:fs/promises";
 // on a 32-CPU host (load 264) the slowest test took 28.3 s and the median test 3.3 s (672 runs),
 // and with the limit lifted on a host at a load of about 100 four of the six files had a test
 // over 3 s. A test that spawns once still takes a few hundred milliseconds when the host is
-// quiet. The limit is about 4 times the slowest run measured, so a loaded host does not fail a
-// test with a timeout that says nothing about the script, and a test that hangs still fails.
+// quiet. The limit is 4 times the slowest run of that first measurement (28.3 s). A later run on
+// a more loaded host reached 102 s, so the margin there is about 1.2 times. The limit keeps a
+// loaded host from failing a test with a timeout that says nothing about the script, and a test
+// that hangs still fails.
 // `setDefaultTimeout` applies to the file that calls it.
 export const SPAWNING_TEST_TIMEOUT_MS = 120_000;
 
