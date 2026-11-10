@@ -6378,7 +6378,9 @@ describe("WorkspaceMcpOverridesService", () => {
       await config.editConfig((cfg) => {
         for (const project of cfg.projects.values()) {
           for (const entry of project.workspaces) {
-            if (ids.has(entry.id)) entry.mcp = { enabledServers: [staleKey, "other"] };
+            if (entry.id !== undefined && ids.has(entry.id)) {
+              entry.mcp = { enabledServers: [staleKey, "other"] };
+            }
           }
         }
         return cfg;
@@ -6410,8 +6412,13 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(editsAfterBudget).toBe(0);
       const stillNaming = [...config.loadConfigOrDefault().projects.values()]
         .flatMap((project) => project.workspaces)
-        .filter((entry) => ids.has(entry.id) && JSON.stringify(entry.mcp).includes(staleKey))
-        .map((entry) => entry.id);
+        .flatMap((entry) =>
+          entry.id !== undefined &&
+          ids.has(entry.id) &&
+          JSON.stringify(entry.mcp).includes(staleKey)
+            ? [entry.id]
+            : []
+        );
       // Only the edit that spent the budget landed.
       expect(stillNaming).toHaveLength(workspaces.length - 1);
       // Every workspace left fails (its tombstone stays). The one whose edit spent the budget
