@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
+import type { LayoutAuditNotCheckedReason } from "@/common/constants/artifactLayoutAudit";
 import type { LayoutAuditPageFinding, LayoutAuditReport } from "@/common/types/artifactLayoutAudit";
 import type { ExecStream } from "@/node/runtime/Runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -345,7 +346,8 @@ describe("checkArtifactLayout", () => {
     spyOn(runtime, "resolvePath").mockReturnValue(new Promise<string>(() => undefined));
     return homeRelative();
   };
-  const everyWidth = (reason: string) => [390, 768, 1440].map((viewport) => ({ viewport, reason }));
+  const everyWidth = (reason: LayoutAuditNotCheckedReason) =>
+    ([390, 768, 1440] as const).map((viewport) => ({ viewport, reason }));
 
   test("a setup that never settles, with the call already cancelled, returns at once as aborted", async () => {
     const report = await check({
