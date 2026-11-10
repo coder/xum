@@ -176,8 +176,16 @@ describe.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
 
     test("kills a try that ignores the TERM 5 seconds after the cut", async () => {
       await stubTimeout();
-      await retry(["--budget-secs", "9", "0", "0", await command({ succeedOn: 1 })]);
-      expect(await lines("cuts")).toEqual(["-k 5 9"]);
+      // bash counts `$SECONDS` in whole seconds, so a second boundary between the two reads in
+      // retry.sh takes one second off a cut: 8 for 9. A cut is 8 or 9, and of three runs at least one
+      // has no tick, so the largest cut is the whole budget. A cut at the budget minus one never is.
+      for (let run = 0; run < 3; run++) {
+        await retry(["--budget-secs", "9", "0", "0", await command({ succeedOn: 1 })]);
+      }
+      const cuts = await lines("cuts");
+      expect(cuts).toHaveLength(3);
+      for (const cut of cuts) expect(cut).toMatch(/^-k 5 [89]$/);
+      expect(cuts).toContain("-k 5 9");
     });
 
     test("still cuts a try off when nothing is left of the budget", async () => {
