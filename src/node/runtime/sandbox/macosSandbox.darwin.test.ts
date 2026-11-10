@@ -189,6 +189,25 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(await exists(escaped)).toBe(false);
     });
 
+    it("keeps a denied path under a name with glob characters closed", async () => {
+      const workspace = path.join(root, "ws[1]");
+      const config = path.join(workspace, "config");
+      const token = path.join(workspace, "token");
+      await fs.mkdir(workspace);
+      await fs.writeFile(config, "config");
+      await fs.writeFile(token, "token");
+
+      const result = await runSandboxed(
+        explicitPolicy(workspace, { denyWrite: [config], denyRead: [token] }),
+        workspace,
+        ["echo changed > config || echo WRITE_DENIED", "cat token || echo READ_DENIED"].join("; ")
+      );
+
+      expect(result.stdout).toContain("WRITE_DENIED");
+      expect(result.stdout).toContain("READ_DENIED");
+      expect(await fs.readFile(config, "utf8")).toBe("config");
+    });
+
     it("closes a denied root, reopens a carve-out and closes a nested deny again", async () => {
       const workspace = path.join(root, "ws");
       const home = path.join(root, "home");
@@ -811,6 +830,38 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
           expect(output).toContain("UNLISTED=403");
         } finally {
           await result.handle.terminate();
+          await result.handle.dispose();
+          await fs.rm(result.outputDir, { recursive: true, force: true });
+        }
+      });
+
+      it("keeps background bash on its proxy when the project sets one", async () => {
+        const workspace = path.join(root, "ws");
+        await fs.mkdir(workspace);
+        setAgentSandboxTargets({
+          fallback: { ...BASE_SETTINGS, network: "allowlist" },
+          byProject: new Map(),
+        });
+
+        // The loopback server answers any request with a 200, so a curl that goes through it
+        // instead of the sandbox's proxy (which refuses the name with a 403) gets a 200.
+        const result = await spawnProcess(
+          new LocalRuntime(workspace),
+          "curl -sS -m 5 -o /dev/null -w 'UNLISTED=%{http_code}\\n' http://xum-unlisted.invalid/",
+          {
+            cwd: workspace,
+            workspaceId: `sandbox-test-${path.basename(root)}`,
+            processId: "bg-proxy",
+            env: { http_proxy: `http://127.0.0.1:${port}` },
+          }
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        try {
+          expect(await waitForExitCode(result.handle)).toBe(0);
+          const output = await fs.readFile(path.join(result.outputDir, "output.log"), "utf8");
+          expect(output).toContain("UNLISTED=403");
+        } finally {
           await result.handle.dispose();
           await fs.rm(result.outputDir, { recursive: true, force: true });
         }

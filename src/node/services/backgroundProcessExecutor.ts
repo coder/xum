@@ -98,6 +98,20 @@ function backgroundSandboxRoots(options: SpawnOptions): string[] {
 }
 
 /**
+ * The env the background wrapper exports again, none on a host runtime: that runtime starts the
+ * spawn shell with this env, and the macOS agent sandbox changes it there (it puts its own proxy
+ * and temp folders over it, and an opt-out clears BASH_ENV). Exports in the wrapper would bring
+ * the project's values back, so a background command could go around the sandbox's proxy (Codex
+ * review).
+ */
+function wrapperExports(
+  runtime: Runtime,
+  env: Record<string, string>
+): Record<string, string> | undefined {
+  return spawnRecordsAreHostLocal(runtime) ? undefined : env;
+}
+
+/**
  * Xum's own record keeping (spawn records, the kill sequence), not agent code, so it runs
  * outside the macOS agent sandbox: a sandboxed kill cannot signal another sandbox. Writes and
  * deletes of a record do not use it (creating the record folder, writeMeta, a stop's exit code,
@@ -358,15 +372,11 @@ export async function spawnProcess(
     delete wrapperEnv[key];
   }
 
-  // The spawn shell's env carries BASH_ENV on to the script, and an opt-out of the agent sandbox
-  // clears it there: an export in the wrapper would bring it back for an approved call (Codex
-  // review).
-  const { BASH_ENV: _bashEnv, ...wrapperExports } = wrapperEnv;
   const wrapperScript = buildWrapperScript({
     exitCodePath,
     cwd: options.cwd,
     cwdEnvVar: BACKGROUND_CWD_ENV,
-    env: wrapperExports,
+    env: wrapperExports(runtime, wrapperEnv),
   });
 
   const spawnCommand = buildSpawnCommand({
