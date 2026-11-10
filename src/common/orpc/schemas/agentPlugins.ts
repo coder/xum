@@ -298,8 +298,9 @@ export const AgentPluginInstallPreviewSchema = z.object({
   readonlyAgents: z.array(z.string()),
   /**
    * The files of `readonlyAgents` whose mapped tools leave no bash tool (for example a Claude
-   * `disallowedTools: [Bash]`, or a `tools` list without Bash), so the review says the shell is
-   * removed too.
+   * `disallowedTools: [Bash]`, or a `tools` list that grants no bash tool, such as Cursor
+   * `readonly: true` with `tools: [Read]`; a Claude read-only search list keeps bash), so the
+   * review says the shell is removed too.
    */
   shellRemovedAgents: z.array(z.string()),
   /** Executable workflow scripts (workflows/*.js) invokable after install. */
