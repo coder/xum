@@ -4009,6 +4009,7 @@ export function findOccurrenceOffsets(content: string, needle: string): number[]
   if (needle.length > content.length) return offsets;
   const borders = borderTable(needle);
   let matched = 0;
+  // mutation-equivalent: i === content.length reads NaN, which matches no needle unit
   for (let i = 0; i < content.length; i++) {
     const unit = content.charCodeAt(i);
     while (matched > 0 && unit !== needle.charCodeAt(matched)) matched = borders[matched - 1];
@@ -4028,6 +4029,7 @@ function borderTable(needle: string): Int32Array {
   if (needle.length === 0) throw new Error("needle must not be empty");
   const borders = new Int32Array(needle.length);
   let length = 0;
+  // mutation-equivalent: i === needle.length reads NaN, and a write past the Int32Array is ignored
   for (let i = 1; i < needle.length; i++) {
     const unit = needle.charCodeAt(i);
     while (length > 0 && unit !== needle.charCodeAt(length)) length = borders[length - 1];
@@ -4049,6 +4051,7 @@ export function lineNumbersOf(content: string, offsets: readonly number[]): numb
   const lines: number[] = [];
   let line = 1;
   let next = 0;
+  // mutation-equivalent: position === content.length reads NaN, and no offset equals it
   for (let position = 0; position < content.length; position++) {
     if (position === offsets[next]) {
       if (lines[lines.length - 1] !== line) lines.push(line);
