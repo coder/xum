@@ -3929,6 +3929,25 @@ describe("backup payload", () => {
       expect(scan(META_PATH, `{"title":"x\\n${TOKEN}"`)).toEqual([META_PATH]);
     });
 
+    // A skill's .md or .txt file is published without review, and a saved API response or a note
+    // can hold JSON text. The file name does not say how a reader reads the text.
+    it.each([
+      "skills/demo/response.md",
+      "skills/demo/response.txt",
+      "memory/global/response.txt",
+      "AGENTS.md",
+    ])("flags JSON text with an escaped token in %s", (filePath) => {
+      const jsonText = (value: string) => JSON.stringify({ response: `line one\n${value}` });
+      expect(scan(filePath, jsonText(TOKEN))).toEqual([filePath]);
+      expect(scan(filePath, jsonText("a".repeat(36)))).toEqual([]);
+    });
+
+    it("still checks the raw text of a JSONC file, where a comment holds the token", () => {
+      // A comment is not a string token, so only the raw-text check sees this one.
+      expect(scan("mcp.jsonc", `{ /* ${TOKEN} */ "servers": {} }`)).toEqual(["mcp.jsonc"]);
+      expect(scan("mcp.jsonc", `{ /* ${"a".repeat(36)} */ "servers": {} }`)).toEqual([]);
+    });
+
     it("blocks a push whose preferences.json holds an escaped token", async () => {
       // `terminalFontConfig.fontFamily` is free text that reaches preferences.json, which
       // `JSON.stringify` writes with the newline as the two characters backslash and `n`.
