@@ -32,8 +32,8 @@ assert_pr_checkout_synced() {
   head_oid=$(jq -r '.headRefOid // empty' <<<"$pr_head")
   from_fork=$(jq -r '.isCrossRepository' <<<"$pr_head")
   if [[ -z "$head_ref" ]] || ! [[ "$head_oid" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$from_fork" =~ ^(true|false)$ ]]; then
+    # The reply holds the PR's branch name, so print fixed text only.
     echo "❌ assertion failed: gh returned no head branch, head commit or fork flag for PR #$pr_number" >&2
-    echo "$pr_head" >&2
     return 1
   fi
 
@@ -44,7 +44,8 @@ assert_pr_checkout_synced() {
 
   current_branch=$(git rev-parse --abbrev-ref HEAD)
   if [[ "$current_branch" != "$head_ref" ]]; then
-    echo "ℹ️  Skipping the local sync check: this checkout is on '$current_branch', not PR #$pr_number's branch '$head_ref'." >&2
+    # No branch names here: the PR's head branch is written by its author.
+    echo "ℹ️  Skipping the local sync check: this checkout is not on PR #$pr_number's branch." >&2
     return 0
   fi
 

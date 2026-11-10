@@ -1484,3 +1484,74 @@ export const McpAppViewNavigateAway: Story = {
     await expect(canvas.queryByTestId("mcp-app-frame")).toBeNull();
   },
 };
+
+// Xum's own thread is blocked for 6 s right after a check. WebKit runs the frame on that thread,
+// so the document cannot answer meanwhile, and WebKit then ran the overdue deadline before the
+// document's answer: a live artifact closed. A deadline that fires late only extends the check
+// (frameDocumentChannel.ts). The play blocks the thread in a load listener that runs after the
+// host's own, which sent the check.
+const HOST_FREEZE_MS = 6000;
+const HOST_FREEZE_HTML = `<!doctype html><html><head><script>
+  window.addEventListener("message", function (event) {
+    var test = event.data && event.data.xumFreezeTest;
+    if (test === "save") window.xum.setState({ saved: true });
+    if (test !== "go") return;
+    // A traversal to the srcdoc's own first entry: both engines fire the iframe's load for it.
+    history.pushState(null, "", "about:srcdoc#/p");
+    setTimeout(function () { history.back(); }, 50);
+  });
+  window.addEventListener("load", function () {
+    parent.postMessage({ xumFreezeTest: "ready" }, "*");
+  });
+</script></head><body><p>host freeze</p></body></html>`;
+
+const freezeEvents: string[] = [];
+const freezeStates: unknown[] = [];
+export const HostFreezeKeepsArtifactOpen: Story = {
+  tags: ["webkit"],
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    freezeEvents.length = 0;
+    freezeStates.length = 0;
+    const handler = (event: MessageEvent) => {
+      const message = (event.data as { xumFreezeTest?: unknown } | null)?.xumFreezeTest;
+      if (typeof message === "string") freezeEvents.push(message);
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  },
+  render: () =>
+    renderPanel(
+      "freeze.html",
+      { "freeze.html": ok("freeze.html", HOST_FREEZE_HTML) },
+      {
+        workspaceId: `${WORKSPACE_ID}-freeze`,
+        onSetState: (input) => freezeStates.push(input.state),
+      }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("artifact-frame");
+    if (!(frame instanceof HTMLIFrameElement)) throw new Error("Story bug: no artifact iframe");
+    await waitFor(() => expect(freezeEvents).toContain("ready"));
+    let froze = false;
+    frame.addEventListener("load", () => {
+      if (froze) return;
+      froze = true;
+      const end = performance.now() + HOST_FREEZE_MS;
+      while (performance.now() < end) {
+        // The app's thread is blocked, as by a long render or a stalled main process call.
+      }
+      frame.contentWindow?.postMessage({ xumFreezeTest: "save" }, "*");
+    });
+    frame.contentWindow?.postMessage({ xumFreezeTest: "go" }, "*");
+    const notice = () => canvas.queryByText(/This artifact navigated away/);
+    // The save after the freeze, or the notice that closed the frame instead.
+    await waitFor(() => expect(freezeStates.length > 0 || notice() != null).toBe(true), {
+      timeout: 20000,
+    });
+    await expect(notice()).toBeNull();
+    await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
+    await expect(freezeStates).toEqual([{ saved: true }]);
+  },
+};

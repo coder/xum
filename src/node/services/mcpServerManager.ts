@@ -4726,8 +4726,10 @@ export class MCPServerManager {
    * True when this manager holds an override snapshot it could serve: a
    * latest snapshot or recorded request options. False means the next serve
    * of any kind reads overrides from disk — an invalidation marker alone
-   * forces that re-read too — so a plugin-key sweep can skip the
-   * workspace's publication (see PluginSweepOptions.hasSnapshot).
+   * forces that re-read too — so a plugin-key sweep or a settings save can
+   * skip the workspace's publication (see PluginSweepOptions.hasSnapshot).
+   * A first serve already reading disk when such a write lands is fenced by
+   * the overrides epoch instead (assertOverridesEpochUnmovedBeforeStart).
    */
   hasWorkspaceOverridesSnapshot(workspaceId: string): boolean {
     return (

@@ -19,7 +19,7 @@ function ownedAttempt(receiptEligible = true): OwnedTaskAttempt {
     source: "test",
     attemptId: ATTEMPT,
     receiptEligible,
-    inheritedReport: false,
+    inheritedReport: null,
   };
 }
 
@@ -32,7 +32,7 @@ function streamEnd(outcome: StreamEndDecision["outcome"]): StreamEndDecision {
     attempt: undefined,
     attemptId: ATTEMPT,
     messageId: "msg-1",
-    inheritedReport: false,
+    inheritedReport: null,
     outcome,
     turn: undefined,
   };

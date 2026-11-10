@@ -1605,7 +1605,7 @@ describe("assemblePromptPayload", () => {
       compactionEpoch: 1,
     });
     const notification = createFileChangeNotificationMessage([
-      { type: "edited_text_file", filename: "src/a.ts", snippet: "@@ -1 +1 @@" },
+      { type: "edited_text_file", filename: "src/a.ts" },
     ]);
     const turn = [
       summary,
