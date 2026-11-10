@@ -187,6 +187,7 @@ describe("execBuffered when the command stops reading its stdin", () => {
   }
 
   it("fails by default, so a command that needs all of its input cannot pass on a part of it", async () => {
+    // eslint-disable-next-line @typescript-eslint/await-thenable
     await expect(
       execBuffered(runtimeWhoseStdinFails("EPIPE"), "cat > file", { cwd: "/", stdin: "input" })
     ).rejects.toThrow("EPIPE");
@@ -202,6 +203,7 @@ describe("execBuffered when the command stops reading its stdin", () => {
   });
 
   it("still fails on a write error that is not a closed pipe", async () => {
+    // eslint-disable-next-line @typescript-eslint/await-thenable
     await expect(
       execBuffered(runtimeWhoseStdinFails("EIO"), "exit 7", {
         cwd: "/",
