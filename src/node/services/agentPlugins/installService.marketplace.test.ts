@@ -308,7 +308,9 @@ describe("AgentPluginInstallService marketplaces", () => {
         { name: "gone", source: "./plugins/gone", skills: ["./skills/x"] },
         // No skills list, so no skill count: the folder check still runs.
         { name: "gone-bare", source: "./plugins/gone-bare" },
+        { name: "a-file", source: "./notes.txt" },
       ]),
+      "notes.txt": "not a folder\n",
     });
     await commit(marketDir, "an entry without its folder");
     const listed = await service.previewSource({ input: marketDir });
@@ -323,6 +325,7 @@ describe("AgentPluginInstallService marketplaces", () => {
         false,
         "Xum cannot install the entry's folder 'plugins/gone-bare': it does not exist",
       ],
+      ["a-file", false, "Xum cannot install the entry's folder 'notes.txt': 'notes.txt' is a file"],
     ]);
   });
 
@@ -742,7 +745,7 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect((await service.list()).map((item) => item.name)).toEqual([]);
   }, 20_000);
 
-  test("a Cursor entry lists as installable with any manifest its preview reads; a missing folder does not", async () => {
+  test("a Cursor entry lists as installable with any manifest its preview reads; a missing folder, a file or a symlink does not", async () => {
     await writeFiles(marketDir, {
       ".cursor-plugin/marketplace.json": JSON.stringify({
         name: "cursor-market",
@@ -750,8 +753,11 @@ describe("AgentPluginInstallService marketplaces", () => {
           { name: "rooted", source: "rooted" },
           { name: "clauded", source: "clauded" },
           { name: "gone", source: "plugins/gone" },
+          { name: "afile", source: "afile" },
+          { name: "linked", source: "linked" },
         ],
       }),
+      afile: "not a folder\n",
       "rooted/plugin.json": JSON.stringify({
         $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
         name: "rooted",
@@ -760,6 +766,8 @@ describe("AgentPluginInstallService marketplaces", () => {
       "clauded/.claude-plugin/plugin.json": JSON.stringify({ name: "clauded" }),
       "clauded/skills/b/SKILL.md": skillMd("b"),
     });
+    // The preview refuses a symlinked folder even when it holds a manifest (extractSubpath).
+    await fsPromises.symlink("rooted", path.join(marketDir, "linked"));
     await commit(marketDir, "Cursor entries with a root manifest, a Claude manifest and no folder");
     const listing = await listMarketplace();
     expect(
@@ -772,10 +780,17 @@ describe("AgentPluginInstallService marketplaces", () => {
       ["rooted", true, undefined],
       ["clauded", true, undefined],
       ["gone", false, "Xum cannot install the entry's folder 'plugins/gone': it does not exist"],
+      ["afile", false, "Xum cannot install the entry's folder 'afile': 'afile' is a file"],
+      [
+        "linked",
+        false,
+        "Xum cannot install the entry's folder 'linked': 'linked' is a symbolic link",
+      ],
     ]);
-    // The listing offers what the preview installs.
+    // The listing offers what the preview installs, and refuses what it refuses.
     expect((await previewCursorEntry("rooted")).method).toEqual({ kind: "agent-plugin" });
     expect((await previewCursorEntry("clauded")).method).toEqual({ kind: "claude-plugin" });
+    await expect(previewCursorEntry("linked")).rejects.toThrow("is a symbolic link");
   }, 20_000);
 
   test("an installed Cursor entry lists its not-applied parts and updates by its folder", async () => {
