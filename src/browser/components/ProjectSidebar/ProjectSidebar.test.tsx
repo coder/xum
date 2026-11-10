@@ -10,6 +10,7 @@ import { installDom } from "../../../../tests/ui/dom";
 import { EXPANDED_PROJECTS_KEY } from "@/common/constants/storage";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import type * as CreationDraftStoreModuleExports from "@/browser/stores/CreationDraftStore";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import {
   SCRATCH_PROJECT_CONFIG_KEY,
@@ -1261,6 +1262,40 @@ describe("ProjectSidebar flat chat list", () => {
     // is off, while ordinary project drafts still render.
     expect(view.getByTestId("draft-item-draft-single")).toBeTruthy();
     expect(view.queryByTestId("draft-item-draft-multi")).toBeNull();
+  });
+
+  test("a draft row shows the store's latest name, not the one it was listed with", () => {
+    const listed = {
+      draftId: "draft-renamed",
+      projectPath: "/projects/demo-project",
+      subProjectPath: null,
+      createdAt: Date.now(),
+      manualName: "",
+      preview: "",
+    };
+    // Loaded lazily like the other real modules here: its import graph reaches SVG assets.
+    /* eslint-disable @typescript-eslint/no-require-imports */
+    const { getCreationDraftStore } =
+      require("@/browser/stores/CreationDraftStore") as typeof CreationDraftStoreModuleExports;
+    /* eslint-enable @typescript-eslint/no-require-imports */
+    // A save that only changes a row's text keeps the list (CreationDraftStore.updateSummary).
+    const latest = { ...listed, manualName: "renamed" };
+    spyOn(getCreationDraftStore(), "getSummary").mockImplementation((id) =>
+      id === listed.draftId ? latest : undefined
+    );
+    mockWorkspaceActions({ workspaceDraftsByProject: { "/projects/demo-project": [listed] } });
+    setSidebarPreferences({ sidebarFlatMode: true });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map()}
+        workspaceRecency={{}}
+      />
+    );
+
+    expect(view.getByTestId("draft-item-draft-renamed").textContent).toContain("renamed");
   });
 
   test("labels _multi drafts with the multi-project badge instead of the internal key", () => {
