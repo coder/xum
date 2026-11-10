@@ -374,8 +374,9 @@ export function analyzerJobLockPath(rootDir: string, ownerId: string): string {
  * How long a stream waits for the dream exclusion: for the longest healthy holder, an organizer
  * run cut at the user's run timeout or an analyzer chunk cut at MEMORY_CONSOLIDATION_TIMEOUT_MS.
  * With the run timeout off (`null`) a hung organizer stream holds the exclusion until Xum
- * restarts, so waiters keep the constant as a floor: they give up, fail and retry later instead
- * of waiting forever.
+ * restarts, so another backend's waiters keep the constant as a floor: they give up, fail and
+ * retry later instead of waiting forever. Waiters in the holder's own process wait for its turn,
+ * which has no deadline (see runDreamStreamExclusively).
  */
 export function dreamLockWaitMs(runTimeoutMs: number | null): number {
   // mutation-equivalent: a timeout is null or positive, and max() with the constant makes 0 and the constant agree, so ?? and || agree
@@ -1743,10 +1744,10 @@ export class MemoryConsolidationService extends EventEmitter {
           finalPass: trigger === "archive",
           // The user's run timeout (5 minutes unless set): a wedged provider stream must not
           // hold the in-flight lock forever (and stall the sequential launch sweep behind it).
-          // A user who turned it off accepts that risk; waiters still give up (see
-          // runDreamStreamExclusively). Created when this run's turn in the queue arrives (the
-          // call happens inside runDreamStreamExclusively), so it bounds the stream and never
-          // the wait behind other workspaces.
+          // A user who turned it off accepts that risk: runs queued behind a hung one wait
+          // until Xum restarts (see runDreamStreamExclusively). Created when this run's turn in
+          // the queue arrives (the call happens inside runDreamStreamExclusively), so it bounds
+          // the stream and never the wait behind other workspaces.
           // Combined with the removal controller (r60): workspace removal must
           // abort the stream AND flip the tool-level pre-commit checks so a
           // detached mutation cannot land after the session directory is gone.

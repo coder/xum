@@ -63,8 +63,8 @@ export function MemoryDreamRunTimeoutSetting() {
           An organizer run stops after this many minutes. Leave empty for {DEFAULT_MINUTES}. Enter 0
           for no timeout: then only the edit limit (at most {MEMORY_DREAM_EDIT_LIMIT_MAX} edits, 4
           steps each) and the cost ceiling, if set, end a run. A run that hangs holds the memory
-          lock until Xum restarts; other memory runs give up after waiting at least{" "}
-          {DEFAULT_MINUTES} minutes for it and try again later.
+          lock until Xum restarts, and memory analysis and other organizer runs wait behind it until
+          then.
         </div>
         {"error" in parsed && (
           <div role="alert" className="text-error mt-1 text-xs">
