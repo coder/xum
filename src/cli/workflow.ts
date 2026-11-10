@@ -248,7 +248,6 @@ async function disposeWorkflowResources(input: {
       // reaches a torn-down service. A failed setup stops them too.
       { name: "config.stopWatchingConfigFile", run: () => input.config.stopWatchingConfigFile() },
       { name: "agentResourceLimits.dispose", run: () => input.agentResourceLimits?.dispose() },
-      { name: "agentSandbox.dispose", run: () => input.agentSandbox.dispose() },
       ...(services
         ? [
             // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
@@ -273,6 +272,9 @@ async function disposeWorkflowResources(input: {
         name: "backgroundProcessManager.terminateAll",
         run: () => services?.backgroundProcessManager.terminateAll(),
       },
+      // After the agent fibers stop, as in `xum run`: a command that one starts after this
+      // would start srt's proxy and log monitor again (Codex review).
+      { name: "agentSandbox.dispose", run: () => input.agentSandbox.dispose() },
       // Last: release the Effect runtime that owns the core graph; never rejects.
       ...(services
         ? [{ name: "appRuntime.dispose", run: () => disposeAppRuntime(services.runtime.managed) }]

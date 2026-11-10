@@ -262,6 +262,29 @@ describe("buildAgentSandboxPolicy", () => {
     expect(agentSandboxPolicyAllows(policy, path.join(gitDir, "index"), "write")).toBe(true);
   });
 
+  // A command can write `.git` files, so only a git folder that points back (a linked
+  // worktree's) opens for writes; extraWritePaths opens another, but not its hooks or config.
+  test("opens a separate git folder in extraWritePaths, but not its hooks", async () => {
+    using _tmpdir = homeOutsideWriteRoots();
+    const separate = path.join(root, "separate");
+    const gitDir = path.join(root, "separate.git");
+    await fs.mkdir(separate);
+    git(separate, "init", "-q", `--separate-git-dir=${gitDir}`);
+    const index = path.join(gitDir, "index");
+
+    const closed = buildAgentSandboxPolicy(SETTINGS, { cwd: separate });
+    expect(agentSandboxPolicyAllows(closed, index, "write")).toBe(false);
+
+    const policy = buildAgentSandboxPolicy(
+      { ...SETTINGS, extraWritePaths: [gitDir] },
+      { cwd: separate }
+    );
+    expect(agentSandboxPolicyAllows(policy, index, "write")).toBe(true);
+    for (const name of ["hooks/post-checkout", "config"]) {
+      expect(agentSandboxPolicyAllows(policy, path.join(gitDir, name), "write")).toBe(false);
+    }
+  });
+
   test("keeps the folder that a linked commondir names read-only", async () => {
     const separate = path.join(root, "separate");
     const gitDir = path.join(separate, "gitdir");
@@ -277,6 +300,19 @@ describe("buildAgentSandboxPolicy", () => {
     for (const name of ["hooks/post-checkout", "config"]) {
       expect(agentSandboxPolicyAllows(policy, path.join(common, name), "write")).toBe(false);
     }
+  });
+
+  // Git takes the hooks and config of the folder that `commondir` names, in a `.git` folder too.
+  test("keeps the hooks of the folder that a .git folder's commondir names read-only", async () => {
+    const shared = path.join(repo, "shared-git");
+    await fs.mkdir(path.join(shared, "hooks"), { recursive: true });
+    await fs.writeFile(path.join(commonDir, "commondir"), "../shared-git\n");
+
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+    const hook = path.join(shared, "hooks", "post-checkout");
+    expect(agentSandboxPolicyAllows(policy, hook, "write")).toBe(false);
+    expect(agentSandboxPolicyAllows(policy, path.join(shared, "config"), "write")).toBe(false);
   });
 
   test("keeps a protected file that is a symlink read-only where it points", async () => {

@@ -793,10 +793,11 @@ function repositoryAndSubmoduleGitDirs(
   roots: readonly string[],
   gitDirs: readonly string[]
 ): string[] {
-  return dedupe([...roots.flatMap(repositoryGitDirs), ...gitDirs]).flatMap((gitDir) => [
-    gitDir,
-    ...submoduleGitDirs(path.join(gitDir, "modules"), 1),
-  ]);
+  return dedupe(
+    dedupe([...roots.flatMap(repositoryGitDirs), ...gitDirs])
+      .flatMap((gitDir) => [gitDir, ...submoduleGitDirs(path.join(gitDir, "modules"), 1)])
+      .flatMap(withCommonDir)
+  );
 }
 
 /**
@@ -820,7 +821,7 @@ function repositoryGitDirs(root: string): string[] {
   for (let current = root; ; current = path.dirname(current)) {
     const dotGit = path.join(current, ".git");
     const stat = statIfExists(dotGit);
-    if (stat?.isDirectory() === true) return [dotGit];
+    if (stat?.isDirectory() === true) return withCommonDir(dotGit);
     if (stat?.isFile() === true) return pointedGitDirs(dotGit);
     if (path.dirname(current) === current) return [];
   }
@@ -829,13 +830,24 @@ function repositoryGitDirs(root: string): string[] {
 function pointedGitDirs(dotGitFile: string): string[] {
   try {
     const gitDir = gitDirPointer(dotGitFile);
-    if (gitDir === undefined) return [];
-    // Git reads `commondir` through a link too (Codex review).
-    const commonDir = path.join(gitDir, "commondir");
-    if (statIfExists(commonDir)?.isFile() !== true) return [gitDir];
-    return [gitDir, path.resolve(gitDir, fs.readFileSync(commonDir, "utf8").trim())];
+    return gitDir === undefined ? [] : withCommonDir(gitDir);
   } catch {
     return [];
+  }
+}
+
+/**
+ * `gitDir`, and the folder that its `commondir` names: git takes the hooks and config from there,
+ * in a `.git` folder too (Codex review). Git reads `commondir` through a link too.
+ */
+function withCommonDir(gitDir: string): string[] {
+  const commonDir = path.join(gitDir, "commondir");
+  if (statIfExists(commonDir)?.isFile() !== true) return [gitDir];
+  try {
+    return [gitDir, path.resolve(gitDir, fs.readFileSync(commonDir, "utf8").trim())];
+  } catch {
+    // Git cannot read it either, and then stops.
+    return [gitDir];
   }
 }
 
