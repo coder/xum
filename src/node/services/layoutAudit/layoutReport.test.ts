@@ -33,8 +33,14 @@ const finding = (
 
 const complete = (
   width: LayoutAuditViewportWidth,
-  findings: LayoutAuditPageFinding[] = []
-): ViewportOutcome => ({ viewport: viewportOf(width), status: "complete", findings });
+  findings: LayoutAuditPageFinding[] = [],
+  omittedFindings?: number
+): ViewportOutcome => ({
+  viewport: viewportOf(width),
+  status: "complete",
+  findings,
+  ...(omittedFindings === undefined ? {} : { omittedFindings }),
+});
 const unsettled = (width: LayoutAuditViewportWidth): ViewportOutcome => ({
   viewport: viewportOf(width),
   status: "unsettled",
@@ -170,6 +176,53 @@ describe("buildLayoutReport", () => {
     expect(report.more).toBe(5);
     expect(report.issues[0]).toMatchObject({ selector: "p.row-00", overflowPx: 100 });
     expect(LayoutAuditReportSchema.parse(report)).toEqual(report);
+  });
+
+  test("counts the findings the page left out in `more`, on top of the ones the list cuts", () => {
+    const returned = Array.from({ length: 50 }, (_, index) =>
+      finding("clipped-text", `p.row-${String(index).padStart(2, "0")}`, 100 - index)
+    );
+    const { report } = build([complete(390, returned, 1), complete(1440), complete(768)]);
+    expect(report.checked).toBe(true);
+    expect(report.issues).toHaveLength(LAYOUT_AUDIT_MAX_ISSUES);
+    expect(report.more).toBe(50 - LAYOUT_AUDIT_MAX_ISSUES + 1);
+    expect(LayoutAuditReportSchema.parse(report)).toEqual(report);
+  });
+
+  test("reports omitted findings in `more` even when the page returned few of them", () => {
+    const { report } = build([complete(390, [card], 7), complete(1440), complete(768)]);
+    expect(report.issues).toHaveLength(1);
+    expect(report.more).toBe(7);
+  });
+
+  test("clamps a count that would not be a safe integer", () => {
+    const { report } = build([
+      complete(390, [card], Number.MAX_SAFE_INTEGER),
+      complete(1440, [card], Number.MAX_SAFE_INTEGER),
+      complete(768),
+    ]);
+    expect(report.more).toBe(Number.MAX_SAFE_INTEGER);
+    expect(LayoutAuditReportSchema.parse(report)).toEqual(report);
+  });
+
+  test("a width whose pass left findings out forgets nothing, so a finding beyond the cap stays remembered", () => {
+    const beyondCap = finding("clipped-text", "p.beyond-the-cap", 12);
+    const first = build(pass({ 390: [beyondCap] }));
+    // The page saw 51 and returned 50 others: the remembered one is not among them.
+    const others = Array.from({ length: 50 }, (_, index) =>
+      finding("clipped-text", `p.other-${index}`)
+    );
+    const capped = build([complete(390, others, 1), complete(1440), complete(768)], first.next);
+    // It comes back within the cap: it was shown before and never repaired.
+    const back = build(pass({ 390: [beyondCap] }), capped.next);
+    expect(back.report.issues.map(shape)).toEqual([[390, "p.beyond-the-cap", true]]);
+  });
+
+  test("a width that returned everything still forgets what no longer stands", () => {
+    const first = build(pass({ 390: [card] }));
+    const repaired = build(pass({ 390: [finding("clipped-text", "p.other")] }), first.next);
+    const back = build(pass({ 390: [card] }), repaired.next);
+    expect(back.report.issues.map(shape)).toEqual([[390, "div.card > h2", undefined]]);
   });
 
   test("omits `more` when everything is listed", () => {

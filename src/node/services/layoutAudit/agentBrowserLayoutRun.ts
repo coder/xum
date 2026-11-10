@@ -6,7 +6,10 @@ import {
   LAYOUT_AUDIT_VIEWPORTS,
   type LayoutAuditViewport,
 } from "@/common/constants/artifactLayoutAudit";
-import { LayoutAuditPagePassSchema } from "@/common/types/artifactLayoutAudit";
+import {
+  LayoutAuditPagePassSchema,
+  type LayoutAuditPagePass,
+} from "@/common/types/artifactLayoutAudit";
 import { TOOL_ENV_FAILED_EXIT, toolEnvPrelude } from "@/node/services/artifactCapabilities";
 import type { FailedReason, ViewportOutcome } from "@/node/services/layoutAudit/viewportOutcome";
 import { log } from "@/node/services/log";
@@ -192,6 +195,18 @@ function parsePagePass(envelope: string) {
   }
 }
 
+function completeOutcome(
+  viewport: LayoutAuditViewport,
+  pass: LayoutAuditPagePass
+): ViewportOutcome {
+  return {
+    viewport,
+    status: "complete",
+    findings: pass.findings,
+    ...(pass.omittedFindings ? { omittedFindings: pass.omittedFindings } : {}),
+  };
+}
+
 function outcomeOf(viewport: LayoutAuditViewport, record: RunRecord): ViewportOutcome {
   if (record.status !== 0 && record.envelope === "") {
     return { viewport, status: "failed", reason: "browser-failed" };
@@ -202,9 +217,7 @@ function outcomeOf(viewport: LayoutAuditViewport, record: RunRecord): ViewportOu
   if (pass.viewportWidth !== viewport.width) {
     return { viewport, status: "failed", reason: "wrong-viewport" };
   }
-  return pass.complete
-    ? { viewport, status: "complete", findings: pass.findings }
-    : { viewport, status: "unsettled" };
+  return pass.complete ? completeOutcome(viewport, pass) : { viewport, status: "unsettled" };
 }
 
 /** One outcome per width, in run order. Every width without a record is "not checked". */

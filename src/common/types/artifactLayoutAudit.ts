@@ -30,6 +30,11 @@ export const LayoutAuditPagePassSchema = z.object({
   complete: z.boolean(),
   viewportWidth: z.number().finite(),
   findings: z.array(LayoutAuditPageFindingSchema).max(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS),
+  /**
+   * Stable findings the page measured but left out of `findings` because of that cap. Absent
+   * when nothing was left out. Findings that were cut are neither listed nor forgotten.
+   */
+  omittedFindings: z.number().int().nonnegative().optional(),
 });
 export type LayoutAuditPagePass = z.infer<typeof LayoutAuditPagePassSchema>;
 

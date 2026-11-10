@@ -21,6 +21,7 @@ export type FakeEvalReply =
       complete?: boolean;
       viewportWidth?: number;
       findings?: LayoutAuditPageFinding[];
+      omittedFindings?: number;
     }
   /** A value that succeeds in the CLI but is not a page result (the audit must reject it). */
   | { kind: "result"; result: unknown }
@@ -87,6 +88,9 @@ function envelopeFor(reply: FakeEvalReply, width: number): { out: string; exit: 
               complete: reply.complete ?? true,
               viewportWidth: reply.viewportWidth ?? width,
               findings: reply.findings ?? [],
+              ...(reply.omittedFindings === undefined
+                ? {}
+                : { omittedFindings: reply.omittedFindings }),
             },
           },
           error: null,

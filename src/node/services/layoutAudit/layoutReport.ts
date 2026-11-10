@@ -94,13 +94,28 @@ function toNotChecked(outcome: ViewportOutcome): LayoutAuditNotChecked[] {
 }
 
 /**
+ * What stays remembered of a complete width: the fingerprints that are still detected there. A
+ * pass that left findings out (its cap) cannot say which remembered ones no longer stand, so
+ * nothing is dropped from its width.
+ */
+function standingFingerprints(
+  outcome: CompleteOutcome,
+  remembered: ReadonlySet<string>
+): Iterable<string> {
+  if ((outcome.omittedFindings ?? 0) > 0) return remembered;
+  const detected = new Set(
+    outcome.findings.map((finding) => layoutFingerprint(finding.rule, finding.selector))
+  );
+  return [...remembered].filter((fingerprint) => detected.has(fingerprint));
+}
+
+/**
  * Memory after this pass. A width that failed or never settled leaves its class as it was: that
  * is uncertainty, not repair, so it neither confirms nor clears a finding. A complete width keeps
  * what the agent was shown at it: the issues LISTED in this report, and the ones remembered
- * before that are still detected (a once-listed issue that a later report cut off stays
- * remembered). An issue that was found but only counted in `more` was never shown, so it is not
- * remembered: it must read as new when it is finally listed. A complete clean pass clears the
- * class.
+ * before that still stand (a once-listed issue that a later report cut off stays remembered). An
+ * issue that was found but only counted in `more` was never shown, so it is not remembered: it
+ * must read as new when it is finally listed. A complete clean pass clears the class.
  */
 function nextSnapshot(
   complete: readonly CompleteOutcome[],
@@ -110,18 +125,28 @@ function nextSnapshot(
   const next: FingerprintSnapshot = { ...previous };
   for (const outcome of complete) {
     const { viewportClass } = outcome.viewport;
-    const detected = new Set(
-      outcome.findings.map((finding) => layoutFingerprint(finding.rule, finding.selector))
-    );
-    const stillStanding = [...(previous[viewportClass] ?? [])].filter((fingerprint) =>
-      detected.has(fingerprint)
-    );
     const shownNow = listed
       .filter((candidate) => candidate.viewportClass === viewportClass)
       .map((candidate) => candidate.fingerprint);
-    next[viewportClass] = new Set([...stillStanding, ...shownNow]);
+    next[viewportClass] = new Set([
+      ...standingFingerprints(outcome, previous[viewportClass] ?? new Set()),
+      ...shownNow,
+    ]);
   }
   return next;
+}
+
+/**
+ * Issues found and not listed: the candidates cut by the list cap, and the findings the pages
+ * counted but did not return. Clamped like `overflowPx`: the result schema wants a safe integer.
+ */
+function countUnlisted(
+  candidates: readonly Candidate[],
+  listed: readonly Candidate[],
+  complete: readonly CompleteOutcome[]
+): number {
+  const omitted = complete.reduce((sum, outcome) => sum + (outcome.omittedFindings ?? 0), 0);
+  return Math.min(candidates.length - listed.length + omitted, Number.MAX_SAFE_INTEGER);
 }
 
 /**
@@ -143,9 +168,10 @@ export function buildLayoutReport(
   const issues = listed.map((candidate) => candidate.issue);
   const notChecked = outcomes.flatMap(toNotChecked).sort((a, b) => a.viewport - b.viewport);
   const persistentCount = candidates.filter((candidate) => candidate.issue.persistent).length;
+  const unlisted = countUnlisted(candidates, listed, complete);
   const common = {
     issues,
-    ...(candidates.length > issues.length ? { more: candidates.length - issues.length } : {}),
+    ...(unlisted > 0 ? { more: unlisted } : {}),
     note: layoutNote({
       notChecked,
       newCount: candidates.length - persistentCount,

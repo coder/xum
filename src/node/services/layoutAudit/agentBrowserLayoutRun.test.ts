@@ -150,6 +150,17 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     expect(outcomes[1]).toMatchObject({ status: "complete", findings: [finding] });
   });
 
+  test("carries the count of findings the page left out, and only when there were some", async () => {
+    const { outcomes } = await run({
+      eval: {
+        390: { kind: "pass", findings: [finding], omittedFindings: 3 },
+        1440: { kind: "pass", findings: [finding] },
+      },
+    });
+    expect(outcomes[0]).toMatchObject({ status: "complete", omittedFindings: 3 });
+    expect(outcomes[1]).not.toHaveProperty("omittedFindings");
+  });
+
   test("an unsettled pass drops its findings and the run goes on", async () => {
     const { outcomes, fake } = await run({
       eval: { 390: { kind: "pass", complete: false, findings: [finding] } },
@@ -219,6 +230,8 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       "ok",
       { complete: true },
       { complete: true, viewportWidth: 390, findings: [{ rule: "nope" }] },
+      { complete: true, viewportWidth: 390, findings: [], omittedFindings: -1 },
+      { complete: true, viewportWidth: 390, findings: [], omittedFindings: 1.5 },
     ]) {
       const { outcomes } = await run({ eval: { 390: { kind: "result", result } } });
       expect(summary(outcomes)[0]).toBe("390 failed script-failed");
