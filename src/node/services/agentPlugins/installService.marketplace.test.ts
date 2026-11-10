@@ -637,7 +637,7 @@ describe("AgentPluginInstallService marketplaces", () => {
     ]);
   });
 
-  test("each build counts the skills that its own file's entry lists", async () => {
+  test("only a Claude build counts the skills its entry lists; a Cursor entry's paths do not load", async () => {
     await writeFiles(marketDir, {
       ".cursor-plugin/marketplace.json": JSON.stringify({
         name: "cursor-market",
@@ -662,7 +662,8 @@ describe("AgentPluginInstallService marketplaces", () => {
       [
         "kit",
         [
-          ["cursor", 1],
+          // The Cursor entry installs through its folder's manifest, which ignores entry skills.
+          ["cursor", undefined],
           ["claude", 2],
         ],
       ],

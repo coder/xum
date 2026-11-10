@@ -343,7 +343,9 @@ function readEntry(
   }
   const name = optionalString(value.name);
   const description = optionalString(value.description);
-  const skillCount = entrySkillCount(value.skills);
+  // Only an entry that is its own manifest (Claude) loads its `skills`; elsewhere the folder's
+  // manifest decides, so the listing does not count the entry's paths.
+  const skillCount = rules.entryIsManifest ? entrySkillCount(value.skills) : undefined;
   const entry: ClaudeMarketplaceEntry = {
     name: name ?? label,
     ...(description !== undefined ? { description } : {}),
@@ -444,17 +446,27 @@ function readMarketplaceHeader(
  * pinned to that commit). Throws for a short or malformed sha.
  */
 function sourceRef(source: Record<string, unknown>): string | undefined {
-  // A null `sha` or `ref` is absent, as Codex's reader treats its optional fields.
-  if (source.sha != null) {
-    if (typeof source.sha !== "string" || !isFullCommitSha(source.sha)) {
+  const sha = gitSelector(source.sha);
+  if (sha !== undefined) {
+    if (typeof sha !== "string" || !isFullCommitSha(sha)) {
       throw new Error("'sha' must be a full 40-character commit SHA.");
     }
-    return source.sha.toLowerCase();
+    return sha.toLowerCase();
   }
-  if (source.ref == null) return undefined;
-  const ref = optionalString(source.ref);
-  if (ref === undefined) throw new Error("'ref' must be a branch or tag name.");
+  const ref = gitSelector(source.ref);
+  if (ref !== undefined && typeof ref !== "string") {
+    throw new Error("'ref' must be a branch or tag name.");
+  }
   return ref;
+}
+
+/**
+ * A `sha` or `ref` value with a missing, null or blank one read as absent, as Codex's reader
+ * (normalize_optional_git_selector) reads them; a string comes back trimmed.
+ */
+function gitSelector(value: unknown): unknown {
+  if (value == null) return undefined;
+  return typeof value === "string" ? optionalString(value) : value;
 }
 
 /** Throws when a marketplace at `marketplaceUrl` may not name the git source `url` (`value` as written). */

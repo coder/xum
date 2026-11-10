@@ -512,6 +512,25 @@ describe("the Agent Plugins marketplace file", () => {
     ).toEqual({ kind: "relative", subpath: "x" });
   });
 
+  test("entry names use the marketplace grammar, as Codex's plugin ids do; entry skills are not counted", () => {
+    const parsed = agents([{ name: "My_Plugin.v2", source: "./x", skills: ["./skills/a"] }]);
+    expect(parsed.entries[0].problem).toBeUndefined();
+    // The folder's own manifest decides the skills, so the entry's paths are not a count.
+    expect(parsed.entries[0].skillCount).toBeUndefined();
+    const cursor = marketplace(
+      [{ name: "x", source: "./x", skills: ["./a"] }],
+      undefined,
+      "cursor"
+    );
+    expect(cursor.entries[0].skillCount).toBeUndefined();
+    const claude = marketplace(
+      [{ name: "x", source: "./x", skills: ["./a"] }],
+      undefined,
+      "claude"
+    );
+    expect(claude.entries[0].skillCount).toBe(1);
+  });
+
   test("an entry that names the root installs only from a Claude file", () => {
     // A listing exists only when the root has no plugin manifest, so only an entry that is its
     // own manifest (Claude) can install from the root.
@@ -550,6 +569,18 @@ describe("the Agent Plugins marketplace file", () => {
       kind: "remote",
       ref: "release-v2",
     });
+    // So is a blank one, and a ref comes back trimmed.
+    expect(resolveEntry({ source: { ...source, ref: " release-v2 ", sha: " " } })).toMatchObject({
+      kind: "remote",
+      ref: "release-v2",
+    });
+    expect(resolveEntry({ source: { ...source, ref: "", sha: "" } })).toMatchObject({
+      kind: "remote",
+      ref: undefined,
+    });
+    expect(resolveEntry({ source: { ...source, ref: 3 } })).toBe(
+      "'ref' must be a branch or tag name."
+    );
     // A null path is absent, as in Codex: the repository root.
     expect(resolveEntry({ source: { ...source, path: null } })).toMatchObject({
       kind: "remote",
