@@ -432,10 +432,12 @@ describe("the Agent Plugins marketplace file", () => {
     expect(resolveEntry({ source: { source: "local", path: "./plugins/x" } })).toEqual(folder);
     expect(resolveEntry({ source: "./plugins/x" })).toEqual(folder);
     expect(resolveEntry({ source: { source: "local", path: "./plugins/x/" } })).toEqual(folder);
-    expect(resolveEntry({ source: { source: "local", path: "./" } })).toEqual({
-      kind: "relative",
-      subpath: undefined,
-    });
+    // "." and "./" are the root itself, as in Codex.
+    for (const path of ["./", "."]) {
+      const root = { kind: "relative", subpath: undefined };
+      expect(resolveEntry({ source: { source: "local", path } })).toEqual(root);
+      expect(resolveEntry({ source: path })).toEqual(root);
+    }
     // metadata.pluginRoot is not part of this format.
     const parsed = marketplace(
       [{ name: "demo", source: { source: "local", path: "./x" } }],
@@ -453,7 +455,7 @@ describe("the Agent Plugins marketplace file", () => {
   });
 
   test("a path must start with './' and cannot leave the marketplace", () => {
-    for (const path of ["plugins/x", "x", ".", "../x", "/etc/plugins", "~/plugins", ".\\x"]) {
+    for (const path of ["plugins/x", "x", "..", "../x", "/etc/plugins", "~/plugins", ".\\x"]) {
       expect(resolveEntry({ source: { source: "local", path } })).toContain("must start with './'");
       expect(resolveEntry({ source: path })).toContain("must start with './'");
     }
@@ -492,10 +494,43 @@ describe("the Agent Plugins marketplace file", () => {
         subpath: "x",
       });
     }
+    // A products list allows only the products it names (Codex's check), so Codex must be in it.
+    for (const products of [[], ["CHATGPT"], ["atlas", "chatgpt"]]) {
+      expect(resolveEntry({ source: "./x", policy: { products } })).toContain(
+        "policy.products does not list Codex"
+      );
+    }
+    for (const products of [["CODEX"], ["chatgpt", "codex"]]) {
+      expect(resolveEntry({ source: "./x", policy: { products } })).toEqual({
+        kind: "relative",
+        subpath: "x",
+      });
+    }
     // The policy is an Agent Plugins field: another file's entry that carries it is unaffected.
     expect(
       resolveEntry({ source: "./x", policy: { installation: "NOT_AVAILABLE" } }, "claude")
     ).toEqual({ kind: "relative", subpath: "x" });
+  });
+
+  test("a url source keeps its optional path folder, only in this file", () => {
+    const source = { source: "url", url: "https://github.com/acme/mono.git", path: "./tools/x" };
+    expect(resolveEntry({ source })).toEqual({
+      kind: "remote",
+      url: "https://github.com/acme/mono.git",
+      ref: undefined,
+      subpath: "tools/x",
+    });
+    expect(resolveEntry({ source: { ...source, path: "../x" } })).toContain("contains '..'");
+    for (const path of ["", "./", 3]) {
+      expect(resolveEntry({ source: { ...source, path } })).toContain("must name a folder");
+    }
+    // Claude's url source has no path: the repository root, as before.
+    expect(resolveEntry({ source }, "claude")).toEqual({
+      kind: "remote",
+      url: "https://github.com/acme/mono.git",
+      ref: undefined,
+      subpath: undefined,
+    });
   });
 
   test("url and git-subdir sources name another repository, and npm is refused, as in Claude's", () => {

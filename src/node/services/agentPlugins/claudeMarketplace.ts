@@ -166,6 +166,8 @@ interface MarketplaceFileRules {
   entryIsManifest: boolean;
   /** An object `{source: "local", path}` names a folder of the marketplace, as a plain path does. */
   localSource: boolean;
+  /** A `url` source may name a folder of its repository with `path`, as `git-subdir` does. */
+  urlPath: boolean;
   /** The folder a path source names (undefined: the marketplace root). Throws why it is refused. */
   folderOf: (
     source: string,
@@ -216,21 +218,37 @@ function cursorFolder(source: string): string | undefined {
 
 /**
  * The Agent Plugins rule (Codex "Marketplace metadata"): a path is relative to the marketplace
- * root, not to `.agents/plugins/`, and must start with "./" ("./" is the root itself). There is
- * no metadata.pluginRoot.
+ * root, not to `.agents/plugins/`, and must start with "./"; "." and "./" are the root itself, as
+ * in Codex's resolve_local_plugin_source_path. There is no metadata.pluginRoot.
  */
 function agentsFolder(source: string): string | undefined {
-  if (!source.trim().startsWith("./")) {
+  const trimmed = source.trim();
+  if (trimmed === ".") return undefined;
+  if (!trimmed.startsWith("./")) {
     throw new Error(`The path '${source}' must start with './'.`);
   }
   return rootRelative(marketplaceRelativePath(source));
 }
 
+/**
+ * Codex's installability check (find_installable_marketplace_plugin): NOT_AVAILABLE refuses, and
+ * a `policy.products` list allows only the products it names, so an empty list allows none. Xum
+ * reads this file as the Codex host does, so it installs only what Codex would.
+ */
 function agentsPolicyRefusal(entry: ClaudeMarketplaceEntry): string | undefined {
   const policy = entry.raw.policy;
-  return isPlainObject(policy) && policy.installation === "NOT_AVAILABLE"
-    ? "The marketplace marks this plugin policy.installation NOT_AVAILABLE, so Xum does not install it."
-    : undefined;
+  if (!isPlainObject(policy)) return undefined;
+  if (policy.installation === "NOT_AVAILABLE") {
+    return "The marketplace marks this plugin policy.installation NOT_AVAILABLE, so Xum does not install it.";
+  }
+  const products = policy.products;
+  if (
+    Array.isArray(products) &&
+    !products.some((product) => typeof product === "string" && product.toLowerCase() === "codex")
+  ) {
+    return "The marketplace's policy.products does not list Codex, so Xum does not install it.";
+  }
+  return undefined;
 }
 
 function agentsTitle(raw: Record<string, unknown>): string | undefined {
@@ -242,18 +260,21 @@ export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRule
     selector: "cursor-marketplace",
     entryIsManifest: false,
     localSource: false,
+    urlPath: false,
     folderOf: cursorFolder,
   },
   claude: {
     selector: "claude-marketplace",
     entryIsManifest: true,
     localSource: false,
+    urlPath: false,
     folderOf: claudeFolder,
   },
   agents: {
     selector: "agents-marketplace",
     entryIsManifest: false,
     localSource: true,
+    urlPath: true,
     folderOf: agentsFolder,
     refusal: agentsPolicyRefusal,
     title: agentsTitle,
@@ -484,7 +505,7 @@ export function resolveEntrySource(
     return { kind: "relative", subpath: rules.folderOf(folder, marketplace) };
   }
   if (!isPlainObject(source)) throw new Error("The entry has no source.");
-  return remoteEntrySource(source, marketplaceUrl);
+  return remoteEntrySource(source, marketplaceUrl, rules);
 }
 
 /** The clone URL of a `github` source `repo` (owner/repo). */
@@ -499,7 +520,8 @@ function githubUrl(raw: unknown): string {
 /** A `github`, `git-subdir` or `url` source object as a git repository. */
 function remoteEntrySource(
   source: Record<string, unknown>,
-  marketplaceUrl: string
+  marketplaceUrl: string,
+  rules: MarketplaceFileRules
 ): ResolvedEntrySource {
   switch (source.source) {
     case "github":
@@ -517,11 +539,27 @@ function remoteEntrySource(
     }
     case "url": {
       const url = entryGitUrl(source.url, marketplaceUrl);
-      return { kind: "remote", url, ref: sourceRef(source), subpath: undefined };
+      return {
+        kind: "remote",
+        url,
+        ref: sourceRef(source),
+        subpath: urlSourceFolder(rules, source),
+      };
     }
     default:
       throw new Error(`Marketplace source '${String(source.source)}' is not supported.`);
   }
+}
+
+/** The folder a `url` source names with `path` (Codex keeps it); undefined: the repository root. */
+function urlSourceFolder(
+  rules: MarketplaceFileRules,
+  source: Record<string, unknown>
+): string | undefined {
+  if (!rules.urlPath || source.path === undefined) return undefined;
+  const folder = typeof source.path === "string" ? marketplaceRelativePath(source.path) : "";
+  if (folder === "") throw new Error("A 'url' source 'path' must name a folder.");
+  return folder;
 }
 
 /** Display text of an entry source in the listing. */
