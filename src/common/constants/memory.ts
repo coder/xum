@@ -83,13 +83,24 @@ export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
  * model input, so without a cap a misbehaving organizer could make any number of accepted writes
  * in one run, and every accepted write is a journal row that is saved in memory-consolidation.json
  * and returned over IPC (Codex review of #8096). The maintainer chose 1000: far more than one
- * cleanup needs (about 200 oversized files split at roughly 5 edits each), at most 4000 steps (4
- * per edit), and a journal of at most 1032 rows (1000 accepted, 32 refused), about 1.5 MB for one
- * record at the path length limits and far less for real paths.
+ * cleanup needs (about 200 oversized files split at roughly 5 edits each). One run's journal
+ * then holds at most 1032 rows (1000 accepted, 32 refused), each row's text at most two paths of
+ * MEMORY_CONSOLIDATION_PATH_MAX_CHARS and a note of MEMORY_CONSOLIDATION_NOTE_MAX_CHARS: about
+ * 2.2 MB for one record with ASCII text, at most about 12.8 MB if JSON escapes every character,
+ * and far less for real records. MEMORY_DREAM_MAX_STEPS bounds the run's steps separately.
  */
 export const MEMORY_DREAM_EDIT_LIMIT_MAX = 1000;
 /** Generous step ceiling for the consolidation stream (reads + budgeted mutations). */
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
+/**
+ * Most steps one organizer run takes, whatever the user's edit limit: no setting raises it. The
+ * run's step ceiling is 4 steps for each edit of the limit, never below
+ * MEMORY_CONSOLIDATION_MAX_STEPS and never above this. Read-only calls spend no edit, so without
+ * it an unlimited run (or a limit of 1000) could take 4000 model requests, and the cost ceiling is
+ * optional (Codex review of #8096). The maintainer chose 400; one step can make several parallel
+ * edits, so a run can still spend a large limit within it.
+ */
+export const MEMORY_DREAM_MAX_STEPS = 400;
 /**
  * Rows of one run's journal that the guarded memory tool fills with refused commands (out of scope,
  * denied, credential-like, over budget). A refusal spends no budget, and one step can issue many
