@@ -221,7 +221,7 @@ describe("PortableDesktopExperimentWarning", () => {
     expect(experimentValues[EXPERIMENT_IDS.MEMORY_CONSOLIDATION]).toBe(true);
   });
 
-  test.each(["Dream cost ceiling", "Dream edit limit"])(
+  test.each(["Dream cost ceiling", "Dream edit limit", "Dream run timeout"])(
     "shows the %s field under Memory Consolidation only while that experiment is on",
     (label) => {
       experimentEnabled = false;

@@ -426,10 +426,10 @@ function organizerRunSignals(
   return { signal: AbortSignal.any([runTimeout, removalSignal]), runTimeout };
 }
 
-/** Why a stream did not start when the user's run timeout is off and another run kept the turn. */
-const DREAM_TURN_TIMEOUT_MESSAGE = `Another memory run kept the turn for ${
-  MEMORY_CONSOLIDATION_TIMEOUT_MS / 60_000
-} minutes, and the dream run timeout is off.`;
+/** Why a stream did not start: another run kept the in-process turn past this run's wait. */
+function dreamTurnTimeoutMessage(waitMs: number): string {
+  return `Another memory run kept the turn for ${waitMs / 60_000} minutes, longer than this run waits.`;
+}
 
 /** The skip reason of a run the debounce window refused (callers match on "debounced"). */
 const DEBOUNCED_SKIP_REASON =
@@ -473,7 +473,6 @@ function createDeferredUsageRecorder(label: string, workspaceId: string) {
   };
 }
 
-/** Resolves true once `turn` settles, or false if `signal` aborts first (a pre-aborted signal never waits). */
 /**
  * Waits for the in-process dream turn like waitForTurnOrAbort, and also gives up when `deadline`
  * aborts: "deadline" then, "aborted" when `signal` (removal) did.
@@ -481,13 +480,13 @@ function createDeferredUsageRecorder(label: string, workspaceId: string) {
 async function waitForDreamTurn(
   turn: Promise<void>,
   signal: AbortSignal,
-  deadline: AbortSignal | undefined
+  deadline: AbortSignal
 ): Promise<"turn" | "aborted" | "deadline"> {
-  const waitSignal = deadline === undefined ? signal : AbortSignal.any([signal, deadline]);
-  if (await waitForTurnOrAbort(turn, waitSignal)) return "turn";
+  if (await waitForTurnOrAbort(turn, AbortSignal.any([signal, deadline]))) return "turn";
   return signal.aborted ? "aborted" : "deadline";
 }
 
+/** Resolves true once `turn` settles, or false if `signal` aborts first (a pre-aborted signal never waits). */
 function waitForTurnOrAbort(turn: Promise<void>, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
   return new Promise<boolean>((resolve) => {
@@ -1500,15 +1499,15 @@ export class MemoryConsolidationService extends EventEmitter {
     this.dreamStreamTail = previous.then(() => turnDone);
     const runTimeoutMs = resolveDreamRunTimeoutMs(this.config);
     try {
-      // With the user's run timeout off, a hung organizer stream holds this in-process turn until
-      // Xum restarts: give up after the same floor as the lock wait below, so the waiter fails
-      // and its next trigger retries. With a timeout every holder ends, so the wait has no bound.
-      const turnDeadline =
-        runTimeoutMs === null ? AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS) : undefined;
-      const turn = await waitForDreamTurn(previous, signal, turnDeadline);
+      // Every waiter gives up after the same wait as the lock below, whatever the holder's own
+      // setting: a holder that started with the run timeout off and hung holds this in-process
+      // turn until Xum restarts, even after the user sets a timeout again. The waiter then fails
+      // and its next trigger retries; a queue of healthy runs can also make it wait that long.
+      const waitMs = dreamLockWaitMs(runTimeoutMs);
+      const turn = await waitForDreamTurn(previous, signal, AbortSignal.timeout(waitMs));
       if (turn === "aborted") return { outcome: "cancelled" };
       if (turn === "deadline") {
-        return { outcome: "lock-failed", error: DREAM_TURN_TIMEOUT_MESSAGE };
+        return { outcome: "lock-failed", error: dreamTurnTimeoutMessage(waitMs) };
       }
       let releaseLock: () => Promise<void>;
       try {
@@ -1518,7 +1517,7 @@ export class MemoryConsolidationService extends EventEmitter {
           // the constant for an analyzer chunk), so this wait outlasts any healthy holder. A wedged
           // live holder is never taken over (fail closed): this run errors and the next trigger
           // retries. With the run timeout off, the wait keeps the constant as its floor.
-          acquireTimeoutMs: dreamLockWaitMs(runTimeoutMs),
+          acquireTimeoutMs: waitMs,
           staleMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
           timeoutMessage: "Another Xum process is running a memory consolidation.",
           signal,

@@ -3,27 +3,17 @@ import { Input } from "@/browser/components/Input/Input";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   MEMORY_CONSOLIDATION_TIMEOUT_MS,
+  MEMORY_DREAM_EDIT_LIMIT_MAX,
   MEMORY_DREAM_RUN_TIMEOUT_MAX_MINUTES,
 } from "@/common/constants/memory";
+import { parseWholeNumberDraft, type ParsedWholeNumberDraft } from "./wholeNumberDraft";
 
 const DEFAULT_MINUTES = MEMORY_CONSOLIDATION_TIMEOUT_MS / 60_000;
-
-// Digits only: `Number()` alone would also take "0x10", "1e3", "+5" and "2.5".
-const WHOLE_NUMBER_PATTERN = /^\d+$/;
 
 const INVALID_TIMEOUT_MESSAGE = `Enter whole minutes from 0 to ${MEMORY_DREAM_RUN_TIMEOUT_MAX_MINUTES}, or leave empty for ${DEFAULT_MINUTES}.`;
 
 /** What a draft stands for: minutes (undefined when empty, meaning the default), or an error. */
-type ParsedTimeout = { minutes: number | undefined } | { error: string };
-
-function parseTimeout(draft: string): ParsedTimeout {
-  const trimmed = draft.trim();
-  if (trimmed === "") return { minutes: undefined };
-  const minutes = Number(trimmed);
-  return WHOLE_NUMBER_PATTERN.test(trimmed) && minutes <= MEMORY_DREAM_RUN_TIMEOUT_MAX_MINUTES
-    ? { minutes }
-    : { error: INVALID_TIMEOUT_MESSAGE };
-}
+type ParsedTimeout = ParsedWholeNumberDraft<undefined>;
 
 /**
  * What committing a draft saves: minutes, `null` to clear the saved value (an emptied field, which
@@ -32,8 +22,8 @@ function parseTimeout(draft: string): ParsedTimeout {
  */
 function timeoutPatch(parsed: ParsedTimeout, saved: number | undefined): number | null | undefined {
   if ("error" in parsed) return undefined;
-  if ((parsed.minutes ?? DEFAULT_MINUTES) === (saved ?? DEFAULT_MINUTES)) return undefined;
-  return parsed.minutes ?? null;
+  if ((parsed.value ?? DEFAULT_MINUTES) === (saved ?? DEFAULT_MINUTES)) return undefined;
+  return parsed.value ?? null;
 }
 
 /**
@@ -50,7 +40,11 @@ export function MemoryDreamRunTimeoutSetting() {
   // null means not editing: the field shows the saved timeout.
   const [draft, setDraft] = useState<string | null>(null);
   const text = draft ?? String(saved ?? DEFAULT_MINUTES);
-  const parsed = parseTimeout(text);
+  const parsed = parseWholeNumberDraft(text, {
+    max: MEMORY_DREAM_RUN_TIMEOUT_MAX_MINUTES,
+    empty: undefined,
+    error: INVALID_TIMEOUT_MESSAGE,
+  });
 
   const commit = () => {
     setDraft(null);
@@ -67,8 +61,10 @@ export function MemoryDreamRunTimeoutSetting() {
         </label>
         <div className="text-muted mt-0.5 text-xs">
           An organizer run stops after this many minutes. Leave empty for {DEFAULT_MINUTES}. Enter 0
-          for no timeout: then a run that hangs holds the memory lock until Xum restarts, and memory
-          analysis gives up after {DEFAULT_MINUTES} minutes of waiting for it and tries again later.
+          for no timeout: then only the edit limit (at most {MEMORY_DREAM_EDIT_LIMIT_MAX} edits, 4
+          steps each) and the cost ceiling, if set, end a run. A run that hangs holds the memory
+          lock until Xum restarts; other memory runs give up after waiting at least{" "}
+          {DEFAULT_MINUTES} minutes for it and try again later.
         </div>
         {"error" in parsed && (
           <div role="alert" className="text-error mt-1 text-xs">
