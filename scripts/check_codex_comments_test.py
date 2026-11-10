@@ -67,6 +67,14 @@ def receipt_head(body):
     return match.group(1).ljust(40, "0") if match else None
 
 
+def unquoted_receipt(sha, created_at=AFTER):
+    """The clean code-review receipt with its `Reviewed commit` SHA outside backticks."""
+    body = FIXTURES["code_review_no_findings"]["body"]
+    named = REVIEWED_COMMIT.sub(f"**Reviewed commit:** {sha}", body)
+    assert f"commit:** {sha}" in named, sha
+    return comment(named, BOT, created_at)
+
+
 def code_receipt(sha, created_at=AFTER):
     """The clean code-review receipt Codex posts for a review request, naming `sha`."""
     body = FIXTURES["code_review_no_findings"]["body"]
@@ -1556,6 +1564,15 @@ else:
             ("11 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f")], 1),
             ("20 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 10)], 1),
             ("40 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 30)], 1),
+            # A SHA in upper case is a SHA: it names its head like the same SHA in lower case.
+            ("upper case, 12 characters of the head", [request, code_receipt(PR_HEAD[:12].upper())], 0),
+            ("upper case, the whole head", [request, code_receipt(PR_HEAD.upper())], 0),
+            ("upper case, an earlier head", [request, code_receipt(EARLIER_HEAD[:10].upper())], 1),
+            ("upper case, an earlier head, 40 characters", [request, code_receipt(EARLIER_HEAD.upper())], 1),
+            # A label that holds no hex SHA in backticks names no readable commit: not a receipt with no line.
+            ("a reviewed commit that is not hex", [request, code_receipt("zzzzzzzzzz")], 1),
+            ("an empty reviewed commit", [request, code_receipt("")], 1),
+            ("a reviewed commit without backticks", [request, unquoted_receipt(PR_HEAD[:10])], 1),
         ):
             with self.subTest(case=case):
                 result = self.assert_gate(expected, snapshot(comments, head=PR_HEAD), "wait_pr_codex.sh")
