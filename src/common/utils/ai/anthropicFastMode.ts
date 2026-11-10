@@ -1,11 +1,13 @@
 /**
- * Anthropic Fast mode (research preview): `speed: "fast"` on the Messages API
- * for up to 2.5x output tokens/sec at premium pricing. @ai-sdk/anthropic adds the
- * required `fast-mode-2026-02-01` beta header whenever
+ * Anthropic Fast mode: `speed: "fast"` on the Messages API for up to 2.5x output
+ * tokens/sec at premium pricing. It is generally available on Claude Fable 5.2,
+ * Claude Mythos 5.2 and Claude Opus 5.5, and in research preview (behind the
+ * `fast-mode-2026-02-01` beta header, waitlist for Opus 5) on Claude Opus 5 and
+ * Claude Opus 4.8. @ai-sdk/anthropic adds that header whenever
  * `providerOptions.anthropic.speed === "fast"`.
  *
  * Source: https://platform.claude.com/docs/en/build-with-claude/fast-mode
- * (fetched 2026-09-29).
+ * (fetched 2026-11-10).
  */
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { stripModelProviderPrefixes } from "@/common/types/thinking";
