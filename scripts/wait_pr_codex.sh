@@ -13,10 +13,10 @@ unset GH_DEBUG DEBUG
 # counts with the explicit read: ./scripts/check_codex_comments.sh <pr_number>
 #
 # Exits:
-#   0 - Codex approved and the Codex comments gate counted no open review thread, or Codex
-#       reported a usage limit with no outstanding findings
-#   1 - Codex left comments to address, approved while a review thread is open (or while the
-#       gate could not read the threads), OR failed to review for another reason
+#   0 - Codex approved and the Codex comments gate counted no open review thread and no open
+#       comment, or Codex reported a usage limit with no outstanding findings
+#   1 - Codex left comments to address, approved while a review thread or a comment is open (or
+#       while the gate could not read them), OR failed to review for another reason
 #  10 - still waiting for Codex response (only in --once mode)
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -96,8 +96,6 @@ if [[ -n "$REACTIONS_SCAN_CACHE_FILE" ]]; then
     exit 1
   fi
 fi
-
-CODEX_APPROVAL_REGEX="Didn't find any major issues"
 
 if [ "$SKIP_FETCH_SYNC" = "0" ]; then
   assert_pr_checkout_synced "$PR_NUMBER" || exit 1
@@ -375,22 +373,20 @@ run_codex_comments_gate() {
   fi
 }
 
-# An approval comment or a thumbs-up says nothing about review threads that are still unresolved:
-# only the gate reads every thread. So an approval stands only when the gate (run before it) counted
-# 0 unresolved review threads: every run that read the threads prints the count, and a gate that
-# could not read them (a malformed page, a crash) prints none, which is no proof that none is open.
-# Regular comments do not block an approval here: the gate counts every Codex regular comment except
-# the ones that codex_comment_is_informational (scripts/lib/codex_comments.jq) reads as clean, and a
-# Codex comment that is not a finding must not turn an approval into exit 1. wait_pr_ready.sh runs
-# the gate over them again (its step 6), and CI's Codex Comments job runs on PR pushes, not in the
-# merge queue.
+# An approval comment or a thumbs-up says nothing about the findings that are still open: only the
+# gate reads every thread and every regular comment. So an approval stands only when the gate (run
+# before it) counted 0 unresolved review threads and 0 unminimized regular comments. The gate skips
+# the comments that codex_comment_is_informational (scripts/lib/codex_comments.jq) reads as clean, so
+# an approval comment never blocks itself. A gate that could not read the threads or the comments
+# (a malformed page, a crash) printed no count, and that is no proof that none is open.
 approval_stands() {
-  if grep -Eq '^Found 0 unresolved review thread' <<<"$check_output"; then
+  if grep -Eq '^Found 0 unresolved review thread' <<<"$check_output" \
+    && grep -Eq '^Found 0 unminimized regular comment' <<<"$check_output"; then
     return 0
   fi
   echo ""
   echo "$check_output"
-  echo "❌ Codex approved PR #$PR_NUMBER, but the Codex comments gate did not confirm that no review thread is open."
+  echo "❌ Codex approved PR #$PR_NUMBER, but the Codex comments gate did not report 0 open review threads and 0 open comments."
   return 1
 }
 
@@ -505,7 +501,7 @@ CHECK_CODEX_STATUS_ONCE() {
     | sort_by(.createdAt) | last // empty | .body // empty')
 
   # Only the time leaves this jq: the approval comment's body is Codex text.
-  approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
+  approval_comment_at=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" 'include "codex_comments"; [.[] | select(.createdAt > $request_at and codex_approval_comment($bot)) | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
 
   if [[ -n "$approval_comment_at" ]]; then
     approval_stands || return 1
@@ -646,7 +642,7 @@ echo "⏳ Waiting for Codex review on PR #$PR_NUMBER..."
 echo ""
 echo "Tip: after you comment '@codex review', Codex will respond with either:"
 echo "  - review comments / threads to address (script exits 1)"
-echo "  - thumbs-up reaction on the PR description OR an explicit approval comment (script exits 0, or 1 while a review thread is open)"
+echo "  - thumbs-up reaction on the PR description OR an explicit approval comment (script exits 0, or 1 while a review thread or a Codex comment is open)"
 echo ""
 
 while true; do
