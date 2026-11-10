@@ -1461,6 +1461,8 @@ describe("organizerEditBudget", () => {
     [24, 24],
     [1, 1],
     [MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_EDIT_LIMIT_MAX],
+    // Only null is unlimited here: the service turns the user's 0 into null before the run.
+    [0, 0],
     // Unlimited, and any limit over the safety cap, runs at the cap.
     [null, MEMORY_DREAM_EDIT_LIMIT_MAX],
     [MEMORY_DREAM_EDIT_LIMIT_MAX + 1, MEMORY_DREAM_EDIT_LIMIT_MAX],
