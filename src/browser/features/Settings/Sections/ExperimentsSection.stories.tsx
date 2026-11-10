@@ -62,6 +62,8 @@ export const MemorySettingsEnabled: Story = {
     await canvas.findByLabelText("Toggle Memory Consolidation");
     // With consolidation on, its dream cost ceiling sits under it, empty until the user sets one.
     await expect(await canvas.findByLabelText("Dream cost ceiling")).toHaveValue("");
+    // The edit limit shows the default 8 until the user saves another.
+    await expect(await canvas.findByLabelText("Dream edit limit")).toHaveValue("8");
   },
 };
 
