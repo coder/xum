@@ -1,3 +1,4 @@
+import { Laptop } from "lucide-react";
 interface IconProps {
   size?: number;
   className?: string;
@@ -72,6 +73,11 @@ export function LocalIcon({ size = 10, className }: IconProps) {
       <path d="M2 4 L2 13 L14 13 L14 5 L8 5 L7 3 L2 3 L2 4" />
     </svg>
   );
+}
+
+/** Laptop icon for the Local project isolation ("this machine"); LocalIcon means "no isolation". */
+export function LocalMachineIcon({ size = 10, className }: IconProps) {
+  return <Laptop width={size} height={size} className={className} aria-label="This machine" />;
 }
 
 /** Coder logo icon for Coder-backed SSH runtime */

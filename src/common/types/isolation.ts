@@ -95,8 +95,10 @@ export function nearestSupportedIsolation(choice: IsolationChoice): IsolationCho
   if (isIsolationSupported(choice)) {
     return choice;
   }
+  // Prefer the default isolation (worktree), then the first pair the project supports.
+  const candidates = [DEFAULT_ISOLATION.workspace, ...WORKSPACE_ISOLATIONS];
   const workspace =
-    WORKSPACE_ISOLATIONS.find((candidate) =>
+    candidates.find((candidate) =>
       isIsolationSupported({ project: choice.project, workspace: candidate })
     ) ?? DEFAULT_ISOLATION.workspace;
   return { project: choice.project, workspace };

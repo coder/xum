@@ -165,7 +165,7 @@ import type {
   GoalInterventionPolicy,
   QueueDispatchMode,
 } from "./types";
-import { CreationControls } from "./CreationControls";
+import { CreationControls, type RuntimeFieldError } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
@@ -962,8 +962,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? validateCreationRuntime(creationState.selectedRuntime, coderState.presets.length)
       : null;
 
-  const runtimeFieldError =
-    variant === "creation" && hasAttemptedCreateSend ? (creationRuntimeError?.mode ?? null) : null;
+  const runtimeFieldError: RuntimeFieldError | null =
+    variant === "creation" && hasAttemptedCreateSend && creationRuntimeError
+      ? creationRuntimeError.kind === "missingProjectDir"
+        ? "sshProjectDir"
+        : creationRuntimeError.mode
+      : null;
 
   const creationControlsProps =
     variant === "creation" && props.kind !== "scratch"
@@ -975,7 +979,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           selectedRuntime: creationState.selectedRuntime,
           coderConfigFallback: creationState.coderConfigFallback,
           sshHostFallback: creationState.sshHostFallback,
-          defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
           disabled: isSendInFlight,
           projectPath: creationParentProjectPath,
