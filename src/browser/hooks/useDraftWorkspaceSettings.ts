@@ -125,9 +125,12 @@ const buildRuntimeForMode = (
 const isSshNone = (runtime: ParsedRuntime): boolean =>
   runtime.mode === RUNTIME_MODE.SSH && runtime.workspaceIsolation === "none";
 
+// Takes the previous selection as primitives: passing the selected runtime object into a call from
+// the setter makes React Compiler treat it as mutable and drop the selection's memoization.
 const mergeRememberedRuntimeConfig = (
   nextRuntime: ParsedRuntime,
-  previousRuntime: ParsedRuntime,
+  previousMode: RuntimeMode,
+  previousWasSshNone: boolean,
   remembered: RememberedRuntimeValues
 ): ParsedRuntime => {
   // Entering SSH+None (from any other pair) refills the remembered directory; edits within
@@ -135,14 +138,14 @@ const mergeRememberedRuntimeConfig = (
   if (
     nextRuntime.mode === RUNTIME_MODE.SSH &&
     isSshNone(nextRuntime) &&
-    !isSshNone(previousRuntime) &&
+    !previousWasSshNone &&
     !nextRuntime.projectDir?.trim() &&
     remembered.sshProjectDir.trim()
   ) {
     nextRuntime = { ...nextRuntime, projectDir: remembered.sshProjectDir };
   }
 
-  if (nextRuntime.mode === previousRuntime.mode) {
+  if (nextRuntime.mode === previousMode) {
     return nextRuntime;
   }
 
@@ -205,6 +208,40 @@ const buildRuntimeFromChoice = (choice: RuntimeChoice): ParsedRuntime => {
   }
 };
 
+interface SettingsDefaultIsolation {
+  isolation: IsolationChoice;
+  runtimeChoice: RuntimeChoice;
+  sshIsolation: SshWorkspaceIsolation | undefined;
+}
+
+/**
+ * The Settings default for new workspaces in a project: its override, else the global default.
+ * The backend migrates legacy defaultRuntime into defaultIsolation; a pair with no backend yet
+ * falls back to the nearest one on the same project isolation. This is its own hook because
+ * React Compiler treats hook results as frozen: computed inline, the calls below made it drop
+ * the memoized default runtime on every keystroke (#5937, useDraftWorkspaceSettings.compiler.test).
+ */
+function useSettingsDefaultIsolation(projectPath: string): SettingsDefaultIsolation {
+  const { userProjects } = useProjectContext();
+  const projectConfig = userProjects.get(projectPath);
+  const globalDefaultIsolation = useAppConfig((config) => config.defaultIsolation);
+  const hasProjectRuntimeOverrides =
+    projectConfig?.runtimeOverridesEnabled === true ||
+    Boolean(projectConfig?.runtimeEnablement) ||
+    projectConfig?.defaultIsolation !== undefined;
+  const isolation = nearestSupportedIsolation(
+    (hasProjectRuntimeOverrides ? projectConfig?.defaultIsolation : undefined) ??
+      globalDefaultIsolation ??
+      DEFAULT_ISOLATION
+  );
+  return {
+    isolation,
+    runtimeChoice: runtimeIdFromIsolation(isolation) ?? RUNTIME_MODE.WORKTREE,
+    sshIsolation:
+      isolation.project === "ssh" && isolation.workspace === "none" ? "none" : undefined,
+  };
+}
+
 /**
  * Hook to manage all draft workspace settings with centralized persistence
  * Loads saved preferences when projectPath changes, persists all changes automatically
@@ -243,9 +280,6 @@ export function useDraftWorkspaceSettings(
   // Global AI settings (read-only from global state)
   const [thinkingLevel] = useThinkingLevel();
   const [reasoningMode] = useReasoningMode();
-
-  const { userProjects } = useProjectContext();
-  const projectConfig = userProjects.get(projectPath);
 
   const globalDefaultAgentId =
     useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId) ??
@@ -292,28 +326,7 @@ export function useDraftWorkspaceSettings(
 
   const lastRuntimeConfigs = useRuntimeOptionDefaults(projectPath);
 
-  const globalDefaultIsolation = useAppConfig((config) => config.defaultIsolation);
-
-  const hasProjectRuntimeOverrides =
-    projectConfig?.runtimeOverridesEnabled === true ||
-    Boolean(projectConfig?.runtimeEnablement) ||
-    projectConfig?.defaultIsolation !== undefined;
-  // The backend migrates legacy defaultRuntime into defaultIsolation; a pair with no backend yet
-  // falls back to the nearest one on the same project isolation.
-  const settingsDefaultIsolation = nearestSupportedIsolation(
-    (hasProjectRuntimeOverrides ? projectConfig?.defaultIsolation : undefined) ??
-      globalDefaultIsolation ??
-      DEFAULT_ISOLATION
-  );
-  const settingsDefaultRuntime: RuntimeChoice =
-    runtimeIdFromIsolation(settingsDefaultIsolation) ?? RUNTIME_MODE.WORKTREE;
-  const defaultSshIsolation: SshWorkspaceIsolation | undefined =
-    settingsDefaultIsolation.project === "ssh" && settingsDefaultIsolation.workspace === "none"
-      ? "none"
-      : undefined;
-
-  const parsedDefault = buildRuntimeFromChoice(settingsDefaultRuntime);
-  const defaultRuntimeMode: RuntimeMode = parsedDefault?.mode ?? RUNTIME_MODE.WORKTREE;
+  const settingsDefault = useSettingsDefaultIsolation(projectPath);
 
   const readRuntimeConfigFlag = (
     configs: LastRuntimeConfigs,
@@ -369,8 +382,6 @@ export function useDraftWorkspaceSettings(
     "shareCredentials"
   );
 
-  const coderDefaultFromString =
-    parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host === CODER_RUNTIME_PLACEHOLDER;
   const setLastRuntimeConfig = useCallback(
     // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     (mode: RuntimeMode, field: string, value: string | boolean | object | null) => {
@@ -400,6 +411,14 @@ export function useDraftWorkspaceSettings(
     },
     [projectPath]
   );
+
+  const settingsDefaultRuntime = settingsDefault.runtimeChoice;
+  const defaultSshIsolation = settingsDefault.sshIsolation;
+  const parsedDefault = buildRuntimeFromChoice(settingsDefaultRuntime);
+  const defaultRuntimeMode: RuntimeMode = parsedDefault?.mode ?? RUNTIME_MODE.WORKTREE;
+
+  const coderDefaultFromString =
+    parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host === CODER_RUNTIME_PLACEHOLDER;
 
   const defaultSshHost =
     parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host.trim()
@@ -446,6 +465,9 @@ export function useDraftWorkspaceSettings(
   // Until the draft holds a pick it follows the defaults, so options that load after mount apply.
   const selectedRuntime: ParsedRuntime = execution?.runtime ?? defaultRuntime;
 
+  const selectedMode = selectedRuntime.mode;
+  const selectedIsSshNone =
+    selectedRuntime.mode === RUNTIME_MODE.SSH && selectedRuntime.workspaceIsolation === "none";
   const lastSshHost = lastSsh.host;
   const lastSshCoder = lastSsh.coder;
 
@@ -454,7 +476,7 @@ export function useDraftWorkspaceSettings(
     // Construct remembered values only when the user changes runtimes. Keeping
     // this object off the render path lets React Compiler retain the setter
     // identity while unrelated ChatInput draft text changes.
-    const mergedRuntime = mergeRememberedRuntimeConfig(runtime, selectedRuntime, {
+    const mergedRuntime = mergeRememberedRuntimeConfig(runtime, selectedMode, selectedIsSshNone, {
       ssh: { host: lastSshHost, coder: lastSshCoder },
       sshProjectDir: lastSshProjectDir,
       dockerImage: lastDockerImage,
@@ -511,7 +533,7 @@ export function useDraftWorkspaceSettings(
       agentId,
       selectedRuntime,
       // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
-      defaultIsolation: settingsDefaultIsolation,
+      defaultIsolation: settingsDefault.isolation,
       trunkBranch,
     },
     coderConfigFallback,

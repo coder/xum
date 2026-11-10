@@ -340,11 +340,14 @@ describe("useDraftWorkspaceSettings", () => {
 
   test("an SSH+None default runs in the project's remembered directory", async () => {
     const projectPath = "/tmp/project";
-    getAppConfigStore().updateOptimistically({
-      defaultIsolation: { project: "ssh", workspace: "none" },
-    });
+    const sshNoneDefault: IsolationChoice = { project: "ssh", workspace: "none" };
+    getAppConfigStore().updateOptimistically({ defaultIsolation: sshNoneDefault });
     const lastRuntimeConfig = { ssh: { host: "dev@host", projectDir: "~/src/app" } };
-    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
+    const wrapper = createWrapper(
+      projectPath,
+      runtimeConfigPrefs(projectPath, lastRuntimeConfig),
+      sshNoneDefault
+    );
 
     const { result } = renderHook(
       () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
@@ -370,6 +373,10 @@ describe("useDraftWorkspaceSettings", () => {
       () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
       { wrapper }
     );
+    // Remembered options load after mount; the refill reads them.
+    await waitFor(() => {
+      expect(result.current.sshHostFallback).toBe("dev@host");
+    });
 
     act(() => {
       result.current.setSelectedRuntime({ mode: "ssh", host: "dev@host" });

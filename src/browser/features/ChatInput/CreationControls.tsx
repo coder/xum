@@ -297,6 +297,11 @@ function runtimeUnavailableReason(
   if (runtimeId === null) {
     return getUnsupportedIsolationReason(choice);
   }
+  // SSH availability reports on the local repo the worktree pair syncs from; SSH+None runs in an
+  // existing directory on the host, so it has nothing to check here (the backend validates it).
+  if (choice.project === "ssh" && choice.workspace === "none") {
+    return null;
+  }
   // Coder is SSH under the hood; every other choice is its own RuntimeMode.
   const availability = context.availabilityMap?.[runtimeId === "coder" ? "ssh" : runtimeId];
   return availability && !availability.available ? availability.reason : null;
