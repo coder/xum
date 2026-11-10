@@ -3632,6 +3632,89 @@ describe("MemoryConsolidationService", () => {
         expect(Object.keys(after)).toHaveLength(20);
       });
 
+      it("prunes dead jobs' records at each kind of save the job makes under its lock", async () => {
+        const gates = new Map(
+          ["1/3", "2/3", "3/3"].map((chunk) => [chunk, Promise.withResolvers<void>()])
+        );
+        const started: string[] = [];
+        using fixture = await createFixture({
+          modelFactory: () => {
+            const inner = scriptedModel();
+            return new MockLanguageModelV3({
+              doStream: async (options) => {
+                const chunk = /Transcript chunk (\d+\/\d+)/.exec(userPromptText(options))?.[1];
+                if (chunk === undefined) return inner.doStream(options);
+                started.push(chunk);
+                await gates.get(chunk)?.promise;
+                if (chunk === "3/3") return { stream: failingStream() };
+                return inner.doStream(options);
+              },
+            });
+          },
+        });
+        await appendBulkRows(fixture);
+        const metadata = await seedCompactionEpoch(fixture);
+        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+        const longAgo = Date.now() - 2 * MEMORY_CONSOLIDATION_TIMEOUT_MS;
+        const record = (
+          boundaryKey: string,
+          fields: Partial<MemoryHarvestRecordPayload>
+        ): MemoryHarvestRecordPayload => ({
+          status: "completed",
+          startedAt: longAgo,
+          attemptCount: 1,
+          boundaryKey,
+          compactionEpoch: 1,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+          ...fields,
+        });
+        // An open-epoch record whose job died, oldest of all: past the cap at the next save.
+        const deadJob = (boundaryKey: string) =>
+          record(boundaryKey, { status: "pending", startedAt: 1, progressAt: 1 });
+        const initial: Record<string, MemoryHarvestRecordPayload> = {
+          "open:dead-1": deadJob("open:dead-1"),
+        };
+        for (let index = 0; index < 20; index++) {
+          initial[`older-${index}`] = record(`older-${index}`, {
+            completedAt: Date.now() - 60_000 + index,
+          });
+        }
+        await fsPromises.writeFile(
+          sidecarPath,
+          JSON.stringify({ harvestsByWorkspace: { "ws-dream": initial } })
+        );
+        const addDeadJob = async (boundaryKey: string) => {
+          const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
+            harvestsByWorkspace: Record<string, Record<string, MemoryHarvestRecordPayload>>;
+          };
+          sidecar.harvestsByWorkspace["ws-dream"][boundaryKey] = deadJob(boundaryKey);
+          await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+        };
+        const stored = async (boundaryKey: string) => (await harvestRecords(fixture))[boundaryKey];
+
+        const run = fixture.service.maybeHarvestThenSweep(metadata);
+        try {
+          // The claim.
+          await until(() => started.includes("1/3"));
+          expect(await stored("open:dead-1")).toBeUndefined();
+          // A chunk's cursor save.
+          await addDeadJob("open:dead-2");
+          gates.get("1/3")?.resolve();
+          await until(() => started.includes("2/3"));
+          expect(await stored("open:dead-2")).toBeUndefined();
+          // The failure record of a chunk that failed.
+          gates.get("2/3")?.resolve();
+          await until(() => started.includes("3/3"));
+          await addDeadJob("open:dead-3");
+        } finally {
+          for (const gate of gates.values()) gate.resolve();
+        }
+        await run;
+        expect(await stored("open:dead-3")).toBeUndefined();
+        expect(await stored("summary-1")).toMatchObject({ status: "failed", nextChunk: 2 });
+      });
+
       it("never prunes the record a save writes", async () => {
         using fixture = await createFixture();
         const metadata = await seedCompactionEpoch(fixture);
