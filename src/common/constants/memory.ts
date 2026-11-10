@@ -77,6 +77,15 @@ export const MEMORY_VIEW_MAX_DEPTH = 2;
  * from a misbehaving model.
  */
 export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
+/**
+ * Safety cap on the user's dream edit limit: the most mutating commands one organizer run can
+ * make, also when the user chose unlimited (0 or an empty field). Memory contents are untrusted
+ * model input, so without a cap a misbehaving organizer could make any number of accepted writes
+ * in one run, and every accepted write is a journal row that is saved in memory-consolidation.json
+ * and returned over IPC (Codex review of #8096). 256 is 32 times the default: about 50 oversized
+ * files split in one run at roughly 5 edits each, and at most 1024 steps (4 per edit).
+ */
+export const MEMORY_DREAM_EDIT_LIMIT_MAX = 256;
 /** Generous step ceiling for the consolidation stream (reads + budgeted mutations). */
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
 /**

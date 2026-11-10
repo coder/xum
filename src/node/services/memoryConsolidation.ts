@@ -15,7 +15,8 @@
  * - pin protection: pinned files may be edited, never deleted or renamed —
  *   including via a delete/rename of an ancestor directory (subtree check)
  * - op budget: at most MEMORY_CONSOLIDATION_OP_BUDGET mutating commands per
- *   run (reads unlimited), or the user's dream edit limit for an organizer run. Budget is consumed by accepted mutations only
+ *   run (reads unlimited), or the user's dream edit limit for an organizer run, never more than
+ *   MEMORY_DREAM_EDIT_LIMIT_MAX. Budget is consumed by accepted mutations only
  *   (applied, dry-run, and dispatch failures); guard rejections do not
  *   consume it — runaway retries are bounded by the step ceiling instead.
  * - dry-run: mutations are journaled as proposed but not applied
@@ -47,6 +48,7 @@ import {
   MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES,
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_DREAM_EDIT_LIMIT_MAX,
   MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   type MemoryScope,
 } from "@/common/constants/memory";
@@ -655,26 +657,23 @@ export function createConsolidationMemoryTool(args: {
 /**
  * What an organizer run's edit limit sets: the memory tool's budget, the line of the run prompt
  * that states it (dream.md names no number, and a user's own dream definition may not either), and
- * the step ceiling. Absent (the debug CLI) is the default limit; `null` is no limit.
+ * the step ceiling. Absent (the debug CLI) is the default limit; `null` is the user's unlimited.
  *
+ * Unlimited, and any limit over it, runs at MEMORY_DREAM_EDIT_LIMIT_MAX: memory contents are
+ * untrusted model input, so the cap bounds the accepted writes of one run and its journal rows.
+ * The preference schema already refuses a larger value; Math.min guards every other caller.
  * The step ceiling is 4 steps for each edit (today's 32 steps for the default 8), never below
- * MEMORY_CONSOLIDATION_MAX_STEPS, so a raised limit can be spent. No limit is an endless budget
- * and no step ceiling: the run timeout and the cost ceiling end the run. Infinity never reaches a
- * record: tryConsume() never hits it, and the result keeps only `budgetExhausted`.
+ * MEMORY_CONSOLIDATION_MAX_STEPS, so a raised limit can be spent.
  */
 export function organizerEditBudget(editLimit: number | null | undefined): {
   budget: MutationBudget;
   promptLine: string;
   stepCeiling: Array<StopCondition<ToolSet>>;
 } {
-  const limit = editLimit === undefined ? MEMORY_CONSOLIDATION_OP_BUDGET : editLimit;
-  if (limit === null) {
-    return {
-      budget: createMutationBudget(Number.POSITIVE_INFINITY),
-      promptLine: "This run has no edit limit.",
-      stepCeiling: [],
-    };
-  }
+  const limit = Math.min(
+    editLimit === undefined ? MEMORY_CONSOLIDATION_OP_BUDGET : (editLimit ?? Number.POSITIVE_INFINITY),
+    MEMORY_DREAM_EDIT_LIMIT_MAX
+  );
   return {
     budget: createMutationBudget(limit),
     promptLine: `You have ${limit} mutating commands this run.`,
@@ -720,8 +719,9 @@ export async function runMemoryConsolidation(args: {
   /** The run stops once its measured spend reaches this many USD; none when absent. */
   ceilingUsd?: number;
   /**
-   * Mutating commands this run may make: the user's dream edit limit. `null` means no limit.
-   * Absent (the debug CLI) means MEMORY_CONSOLIDATION_OP_BUDGET.
+   * Mutating commands this run may make: the user's dream edit limit. `null` means unlimited, up
+   * to the safety cap MEMORY_DREAM_EDIT_LIMIT_MAX. Absent (the debug CLI) means
+   * MEMORY_CONSOLIDATION_OP_BUDGET.
    */
   editLimit?: number | null;
 }): Promise<MemoryConsolidationResult> {
