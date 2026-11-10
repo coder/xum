@@ -591,6 +591,7 @@ export const SubAgentsOnlyPhone: AppStory = {
     const line = await findLine(canvasElement, 1);
     await assertOneLine(line);
     await assertChipsLeftWithoutDividers(line);
+    await assertStopDrawsLikeAChip(line);
   },
 };
 
@@ -619,6 +620,58 @@ function drawsABox(element: Element): boolean {
   const bordered =
     widths.some((width) => parseFloat(width) > 0) && colors.some((color) => !clear(color));
   return bordered || !clear(style.backgroundColor) || style.backgroundImage !== "none";
+} /** The drawn box of a line control: its tallest box-painting descendant (the touch target itself draws nothing). */
+function drawnBox(control: HTMLElement): Element {
+  const boxes = [...control.querySelectorAll("*")].filter(drawsABox);
+  if (boxes.length === 0) {
+    throw new Error(`${control.getAttribute("aria-label") ?? "control"} draws no box`);
+  }
+  return boxes.reduce((best, box) =>
+    box.getBoundingClientRect().height > best.getBoundingClientRect().height ? box : best
+  );
+}
+
+/** The control's one visible icon: hidden icons (the desktop Swap of the phone icon) report no box. */
+function visibleIcon(control: HTMLElement): Element {
+  const icons = [...control.querySelectorAll("svg")].filter(
+    (icon) => icon.getBoundingClientRect().width > 0
+  );
+  if (icons.length !== 1) {
+    throw new Error(`Expected one visible icon, found ${icons.length}`);
+  }
+  return icons[0];
+}
+
+// Beside chips in a phone-width row, Stop draws exactly like an idle bordered activity chip
+// (Mike: the interrupt control must match the sub-agents and background-bashes pills): the drawn
+// boxes agree on height, corner radius, border width, border color and idle text color, and the
+// icons render at the same size. All of it is read from the rendered boxes, not from class names.
+async function assertStopDrawsLikeAChip(line: HTMLElement) {
+  const chips = shownChips(line);
+  await expect(chips.length).toBeGreaterThan(0);
+  const stop = within(line).getByRole("button", { name: "Stop streaming" });
+  const stopBox = drawnBox(stop);
+  const chipBox = drawnBox(chips[0]);
+  // Half a pixel of play, because the runner's browser lands layout on fractional pixels.
+  await expect(stopBox.getBoundingClientRect().height).toBeCloseTo(
+    chipBox.getBoundingClientRect().height,
+    0
+  );
+  await expect(parseFloat(getComputedStyle(stopBox).borderRadius)).toBeCloseTo(
+    parseFloat(getComputedStyle(chipBox).borderRadius),
+    0
+  );
+  await expect(getComputedStyle(stopBox).borderTopWidth).toBe(
+    getComputedStyle(chipBox).borderTopWidth
+  );
+  await expect(getComputedStyle(stopBox).borderTopColor).toBe(
+    getComputedStyle(chipBox).borderTopColor
+  );
+  await expect(getComputedStyle(stopBox).color).toBe(getComputedStyle(chipBox).color);
+  await expect(visibleIcon(stop).getBoundingClientRect().width).toBeCloseTo(
+    visibleIcon(chips[0]).getBoundingClientRect().width,
+    0
+  );
 }
 
 // The phone line draws each of its controls smaller than the touch box around it, so it reads as a

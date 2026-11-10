@@ -1,5 +1,5 @@
 import React from "react";
-import { CircleStopIcon, Square } from "lucide-react";
+import { CircleStopIcon } from "lucide-react";
 
 import { cn } from "@/common/lib/utils";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
@@ -219,6 +219,8 @@ function ActivityChips(props: {
 }
 
 function CancelControl(props: StreamingBarrierViewProps) {
+  // mutation-equivalent: both operands are plain props of the same render; a null cancelText
+  // still fails the length check, and undefined onCancel still fails the identity check.
   return props.onCancel && props.cancelText.length > 0 ? (
     <TooltipIfPresent tooltip={props.cancelShortcutText} side="top">
       {/* As for the activity chips (ChatActivityChipButton): the button is the touch target and the
@@ -228,30 +230,29 @@ function CancelControl(props: StreamingBarrierViewProps) {
         type="button"
         onClick={props.onCancel}
         // justify-center matters on a phone: the 44px floor makes the button wider than the drawn
-        // circle, and without it the circle sits flush left and the line's right edge reads ragged.
+        // pill, and without it the pill sits flush left and the line's right edge reads ragged.
         className="group/stop inline-flex cursor-pointer items-center justify-center"
         aria-label="Stop streaming"
       >
         <span
           className={cn(
             "text-muted group-hover/stop:text-foreground inline-flex h-6 items-center rounded-sm px-1.5 py-0.5 text-[11px] leading-none font-medium transition-colors duration-200",
-            // Beside chips in a phone-width row: a round icon button (approved phone design),
-            // drawn at 32px inside the button's 44px hit area.
-            "@max-md:group-has-[[data-activity-chip]]/live:text-foreground @max-md:group-has-[[data-activity-chip]]/live:size-8 @max-md:group-has-[[data-activity-chip]]/live:justify-center @max-md:group-has-[[data-activity-chip]]/live:rounded-full @max-md:group-has-[[data-activity-chip]]/live:border @max-md:group-has-[[data-activity-chip]]/live:border-border-medium @max-md:group-has-[[data-activity-chip]]/live:p-0"
+            // Beside chips in a phone-width row: a pill drawn exactly like an idle bordered
+            // activity chip (ChatActivityChipButton), per Mike: the interrupt control should
+            // match the sub-agents and background-bashes pills. Drawn at 32px inside the
+            // button's 44px hit area. The hover text rule repeats the base one under this
+            // variant so it sorts after the variant's text-secondary and still applies here.
+            "@max-md:group-has-[[data-activity-chip]]/live:h-8 @max-md:group-has-[[data-activity-chip]]/live:px-2 @max-md:group-has-[[data-activity-chip]]/live:py-0 @max-md:group-has-[[data-activity-chip]]/live:justify-center @max-md:group-has-[[data-activity-chip]]/live:rounded-lg @max-md:group-has-[[data-activity-chip]]/live:border @max-md:group-has-[[data-activity-chip]]/live:border-border-light @max-md:group-has-[[data-activity-chip]]/live:text-secondary @max-md:group-has-[[data-activity-chip]]/live:group-hover/stop:text-foreground @max-md:group-has-[[data-activity-chip]]/live:group-hover/stop:bg-hover"
           )}
         >
-          <CircleStopIcon
-            className="h-3.5 w-3.5 shrink-0 @max-md:group-has-[[data-activity-chip]]/live:hidden"
-            strokeWidth={2.2}
-          />
-          <Square
-            aria-hidden
-            className="hidden size-3 shrink-0 fill-current @max-md:group-has-[[data-activity-chip]]/live:block"
-          />
+          <CircleStopIcon className="h-3.5 w-3.5 shrink-0" strokeWidth={2.2} />
           {/* Icon-only beside chips in a phone-width row; the aria-label still names it. */}
           <span className="ml-1 leading-none @max-md:group-has-[[data-activity-chip]]/live:hidden">
             Stop
           </span>
+          {/* mutation-equivalent: the shortcut text is a non-empty string whenever the prop is
+              provided, so hiding the badge on "" and on undefined agree; a null badge is not
+              rendered either way (React skips null children). */}
           {props.cancelShortcutText && (
             <span className="border-border-medium text-muted ml-2 hidden items-center rounded border px-1 py-[1px] text-[10px] leading-none @lg:inline-flex">
               {props.cancelShortcutText}
@@ -266,6 +267,8 @@ function CancelControl(props: StreamingBarrierViewProps) {
         "text-muted text-[11px] whitespace-nowrap select-none",
         // Low-priority hints yield to the status label in narrow panes
         // instead of forcing horizontal overflow.
+        // mutation-equivalent: hideHintOnNarrow is boolean per its type, so !x && y and
+        // x || y branch the same way for every value the callers pass.
         props.hideHintOnNarrow && "hidden @md:inline"
       )}
     >
