@@ -1056,7 +1056,11 @@ describe("redactSecretLike", () => {
     ["an XML-escaped ampersand", "?a=1&amp;signature=SEKRIT", "?a=1&amp;signature=[redacted]"],
     ["a Google signature", "?X-Goog-Signature=SEKRIT", "?X-Goog-Signature=[redacted]"],
     ["a value that is the marker already", "?sig=[redacted]", "?sig=[redacted]"],
-    ["a marker after an XML-escaped ampersand", "?a=1&amp;sig=[redacted]", "?a=1&amp;sig=[redacted]"],
+    [
+      "a marker after an XML-escaped ampersand",
+      "?a=1&amp;sig=[redacted]",
+      "?a=1&amp;sig=[redacted]",
+    ],
     ["a marker in an AWS signature", "?X-Amz-Signature=[redacted]", "?X-Amz-Signature=[redacted]"],
     [
       "a marker in a request line",
@@ -1067,11 +1071,14 @@ describe("redactSecretLike", () => {
     ["a marker before the next parameter", "?sig=[redacted]&sp=r", "?sig=[redacted]&sp=r"],
     ["a marker before a closing quote", '["?sig=[redacted]"]', '["?sig=[redacted]"]'],
     ["an upper-case marker as the whole value", "?sig=[REDACTED]", "?sig=[REDACTED]"],
-  ])("redacts a signed URL's signature once and a second pass changes nothing: %s", (_label, text, expected) => {
-    const redacted = redactSecretLike(text);
-    expect(redacted).toBe(expected);
-    expect(redactSecretLike(redacted)).toBe(redacted);
-  });
+  ])(
+    "redacts a signed URL's signature once and a second pass changes nothing: %s",
+    (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+      expect(redacted).toBe(expected);
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    }
+  );
 
   // A value that goes on past the marker is not the marker: it is redacted exactly as before, so the
   // output is main's, and the write guard refuses it. `]` is part of such a value, not its end. The
@@ -1085,7 +1092,11 @@ describe("redactSecretLike", () => {
       "&amp;X-Amz-Signature=[redacted]]SEKRIT",
     ],
     ["a value behind a marker and a bracket", "?sig=[redacted]]SEKRIT", "?sig=[redacted]]]SEKRIT"],
-    ["a dotted tail behind a marker and a bracket", "?sig=[redacted]].xyz", "?sig=[redacted]]].xyz"],
+    [
+      "a dotted tail behind a marker and a bracket",
+      "?sig=[redacted]].xyz",
+      "?sig=[redacted]]].xyz",
+    ],
     ["a bracket behind the marker", "?sig=[redacted]]", "?sig=[redacted]]]"],
     [
       "a key's marker with a tail, as the harvest renderer shows it",
