@@ -5,19 +5,25 @@ description: Run bounded background monitors that wake the agent only when a con
 
 # Background monitors
 
-Use this skill when you need a long-running watcher for CI, mergeability, PR review, deployments, queue state, logs, or any condition where the agent can safely end its turn and be woken when the watcher finishes.
+Use this skill when you need a long-running watcher for CI, mergeability, PR review, deployments, queue state, logs, or any condition where the agent can safely end its turn and be woken when the watcher finishes. A sub-agent cannot end its turn to wait on a raw `bash.monitor` (see Wake timing).
 
-## What wakes the parent
+## What wakes the owner
 
-Xum wakes the owning workspace in these cases:
+Xum wakes the owning workspace (the one that launched the task or process) in these cases:
 
 - A background **task** or **workflow** reaches a terminal state (`completed`, `failed`, `interrupted`, or `error`).
 - A raw background `bash` process is launched with a `monitor` block and a complete output line matches the monitor regex.
 - A monitored `bash` process **settles** (exits, is killed, or hits its `timeout_secs`), even when no line ever matched — unless the monitor was launched with `wake_on_exit: false`, was already retired by `max_events`, or the task was explicitly cancelled (`task_stop` / terminate without flush / workspace cleanup). The settlement wake carries the exit status and a bounded tail of recent output.
 
-Use `bash({ run_in_background: true, monitor: { filter: "FAILED|ERROR", max_events: 1 } })` for line-oriented shell output watchers such as dev servers, watch tests, and log tails. The process keeps running; Xum wakes the parent with the matched lines, and the parent should call `task_await` only if it needs surrounding/full output.
+Use `bash({ run_in_background: true, monitor: { filter: "FAILED|ERROR", max_events: 1 } })` for line-oriented shell output watchers such as dev servers, watch tests, and log tails. The process keeps running; Xum wakes the owner with the matched lines, and the owner should call `task_await` only if it needs surrounding/full output.
 
 Use background `task({ run_in_background: true, ... })` or `workflow_run({ run_in_background: true, ... })` for state polling that is not naturally a single process output stream, such as CI checks, mergeability, PR reviews, deployments, and queue state.
+
+### Wake timing
+
+A monitored `bash` wake never interrupts a turn. Xum sends it as a new turn only when the owner is idle, so an owner that is still mid-turn gets it after the turn ends, however long ago the line matched. A sub-agent task's report or an `agent_report` update is different: by default it ends a busy owner's turn at the next tool boundary and moves a running foreground `bash` to the background.
+
+A sub-agent that waits on a raw `bash.monitor` cannot sit idle waiting for its wake, because its final message is its terminal report. A wake that arrives after that report restarts the sub-agent with a new turn. A sub-agent waits in the foreground instead: a bounded foreground `bash` that runs the watcher until its final line (set `timeout_secs` at least 300 s above the watcher's own deadline: the foreground default is 60 s, and the watcher can run past its deadline by one last read), or `task_await` on the background process. If Xum moves the foreground watcher to the background (its result starts with "Process sent to background"), keep waiting on it with `task_await` until its final line, and start no second watcher. Run watcher scripts only on a checkout you trust. A sub-agent stops its monitors with `task_stop` before its final report.
 
 ## Monitor contract
 
@@ -122,7 +128,7 @@ Heartbeat is still useful as a coarse fallback reminder, but it should not repla
 ## Avoid these traps
 
 - Do not create unbounded `while true` monitors. Every monitor needs a deadline.
-- Do not launch a raw background bash process without `monitor` and assume the parent will be woken automatically.
+- Do not launch a raw background bash process without `monitor` and assume you will be woken automatically.
 - Do not have multiple monitors watch the same idempotency key unless you intentionally want duplicate reports.
 - Do not report every polling iteration. Report convergence, state transitions, failures, or timeout.
 - Do not use monitors to hide work that the current answer depends on; use foreground/default mode or `task_await` when the next decision requires the result.
