@@ -285,7 +285,7 @@ describe("BackgroundProcessManager", () => {
       } finally {
         await otherBackend.cleanup(testWorkspaceId);
       }
-    }, 15_000);
+    });
 
     it("does not prune a recently settled record another backend tracks", async () => {
       // #4893: A has observed its command's exit (meta.json reads exited), so only the age
@@ -3393,7 +3393,7 @@ describe("BackgroundProcessManager", () => {
         expect(meta.status).toBe("exited");
         expect(meta.exitCode).toBe(42);
       }
-    }, 15_000);
+    });
 
     it("should keep output files after process exits", async () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "echo test; exit 0", {
@@ -3412,7 +3412,7 @@ describe("BackgroundProcessManager", () => {
         const output = await fs.readFile(outputPath, "utf-8");
         expect(output).toContain("test");
       }
-    }, 15_000);
+    });
 
     it("should preserve killed status after terminate", async () => {
       // Spawn a long-running process
@@ -4126,7 +4126,7 @@ describe("BackgroundProcessManager", () => {
       if (!output2.success) return;
       expect(output2.status).toBe("exited");
       expect(output2.exitCode).toBe(0);
-    }, 15_000);
+    });
 
     it("should filter output with regex when provided", async () => {
       const result = await manager.spawn(
@@ -4524,7 +4524,7 @@ describe("BackgroundProcessManager", () => {
       if (!result.success) return;
 
       expect(await readExitCodeWhenWritten(result.outputDir)).toBe("42");
-    }, 15_000);
+    });
   });
 
   describe("hasOrphanedRunningBackgroundProcesses", () => {
@@ -5178,7 +5178,7 @@ describe("BackgroundProcessManager", () => {
       if (!output.success) return;
       expect(output.output).toContain("no newline at end");
       expect(output.status).not.toBe("running");
-    }, 15_000);
+    });
   });
 
   describe("polling detection", () => {
@@ -5256,6 +5256,6 @@ describe("BackgroundProcessManager", () => {
         // Should not get note since process is not running
         expect(output.note).toBeUndefined();
       }
-    }, 15_000);
+    });
   });
 });

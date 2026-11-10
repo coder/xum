@@ -178,7 +178,7 @@ describe("bash_output tool", () => {
       await manager.cleanup(TEST_WS);
       tempDir[Symbol.dispose]();
     }
-  });
+  }, 60_000);
 
   it("should filter output with regex", async () => {
     const tempDir = new TestTempDir("test-bash-output");
@@ -428,15 +428,15 @@ describe("bash_output tool", () => {
     if (result.success) {
       expect(result.output).toContain("quick exit");
       expect(result.status).toBe("exited");
-      // Must not wait out the 10 s timeout. One status poll of about a second can pass before the
-      // manager sees the exit, so a bound near that poll fails on a busy host.
-      expect(elapsed).toBeLessThan(5_000);
+      // Must not wait out the 10 s timeout. An idle host returns in 100 to 200 ms, and a slow
+      // status probe on a busy host added about a second, so 500 ms failed there.
+      expect(elapsed).toBeLessThan(2_000);
     }
 
     // Cleanup
     await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
-  });
+  }, 60_000);
 
   it("should wait full timeout duration when no output and process running", async () => {
     const tempDir = new TestTempDir("test-bash-output");
