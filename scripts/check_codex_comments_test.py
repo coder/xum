@@ -1323,6 +1323,30 @@ else:
                         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                         self.assertIn(expected[run], result.stderr)
 
+    def test_a_fractional_utc_time_is_a_time_and_other_shapes_are_not(self):
+        # GitHub's DateTime is ISO-8601 UTC. A fraction of seconds is a time, so the gate must not fail on it.
+        request = comment("@codex review", "maintainer", REQUEST)
+        receipt = FIXTURES["code_review_no_findings_without_commit"]["body"]
+        for time in (AFTER[:-1] + ".1Z", AFTER[:-1] + ".123Z", AFTER[:-1] + ".123456789Z"):
+            with self.subTest(accepted=time):
+                result = self.assert_gate(0, snapshot([request, comment(receipt, created_at=time)]), "wait_pr_codex.sh")
+                self.assertIn(f"Approval comment time: {time}", result.stdout)
+        for time in (
+            AFTER[:-1] + ".1234567890Z",  # more digits than a time has
+            AFTER[:-1] + ".Z",  # a point without digits
+            AFTER[:-1] + ",123Z",  # a comma is not a point
+            AFTER[:-1] + "x123Z",
+            AFTER[:-1] + ".123+00:00",  # an offset is not Z
+            AFTER[:-1] + ".123Z\n",
+            AFTER[:-1] + ".123Z\nPASSED checks=99 visual_ignored=0",
+            "x" + AFTER,
+        ):
+            with self.subTest(rejected=time):
+                result = self.run_gate(snapshot([request, comment(receipt, created_at=time)]), "wait_pr_codex.sh")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn("PASSED checks=99", result.stdout + result.stderr)
+                self.assertIn("are not a list of objects with text fields", result.stderr)
+
     def test_an_approval_with_a_forged_time_is_not_printed_or_accepted(self):
         # A time that carries a line break and a forged line used to be echoed after "Approval comment
         # time:" and "Reaction timestamp:". Now the gate stops on fixed text and does not approve.

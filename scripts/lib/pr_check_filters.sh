@@ -41,14 +41,17 @@ def normalize_check($oid):
     elif is_failed_check then "fail" elif is_passing_check then "pass"
     elif is_skipped_check then "skipping"
     else "pending" end);
+# A field of another type than GitHub's schema gives it (a name that is an array, say) prints as fixed
+# text: @tsv fails on such a value, and jq then quotes the start of it in its message.
+def text_or($default): if . == null then $default elif type == "string" then . else "<not text>" end;
 def check_line:
   [
-    (.name // "<unnamed>"),
-    (.bucket // "<unknown>"),
-    (.state // "<unknown>"),
-    (.link // ""),
-    (.description // ""),
-    (.commit // "")
+    (.name | text_or("<unnamed>")),
+    (.bucket | text_or("<unknown>")),
+    (.state | text_or("<unknown>")),
+    (.link | text_or("")),
+    (.description | text_or("")),
+    (.commit | text_or(""))
   ] | @tsv;
 JQ
 }

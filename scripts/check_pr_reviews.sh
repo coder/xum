@@ -35,6 +35,10 @@ for arg in "$@"; do
   fi
 done
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=./lib/reply_shape.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/reply_shape.sh"
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 UNRESOLVED=""
 
@@ -200,6 +204,8 @@ fetch_unresolved_via_api() {
       return 1
     fi
 
+    # `nodes[]?` below skips a value that is no list, so a reply of another shape would read as "no unresolved threads".
+    reply_connection_nodes "$page_data" reviewThreads >/dev/null || return 1
     unresolved_page=$(echo "$page_data" | jq -r '.data.repository.pullRequest.reviewThreads.nodes[]? | select(.isResolved == false) | {thread_id: .id, user: (.comments.nodes[0].author.login // "unknown"), body: (.comments.nodes[0].body // ""), diff_hunk: (.comments.nodes[0].diffHunk // ""), commit_id: (.comments.nodes[0].commit.oid // "")}')
     append_unresolved_records "$unresolved_page"
 
