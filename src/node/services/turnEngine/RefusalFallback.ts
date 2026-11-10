@@ -15,6 +15,7 @@ import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking
 import { applyCacheControl, getRequestAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getErrorMessage } from "@/common/utils/errors";
+import { readNoFallbackRefusalCategory } from "@/common/utils/messages/refusalFinishReason";
 import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { rebaseAutoThinkingEscalation } from "@/node/services/autoThinkingEscalation";
@@ -377,6 +378,16 @@ export class RefusalFallback {
     // reset. Chains that end in a terminal failure must not drop the final
     // hop's tokens from session usage / cost accounting.
     await this.recordRefusedAttemptUsage(workspaceId, streamInfo, refusedModelForUsage);
+
+    // Anthropic recommends no fallback for some categories: the refusal stands, so the
+    // chain is not walked. The refused attempt's usage was attributed above.
+    const noFallbackCategory = readNoFallbackRefusalCategory(streamInfo.lastStepProviderMetadata);
+    if (noFallbackCategory !== undefined) {
+      return {
+        kind: "terminal",
+        terminalNote: `Model fallback was skipped because Anthropic recommends no fallback for a ${noFallbackCategory} refusal.`,
+      };
+    }
 
     const next = resolveNextFallbackModel(fallbackState, preserveParts, streamInfo.parts);
     if (next.kind === "terminal") {

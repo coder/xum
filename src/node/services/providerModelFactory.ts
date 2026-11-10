@@ -385,12 +385,15 @@ function readChatServiceTier(
 /**
  * Anthropic `speed` for a model that supports Fast mode: pinned from the chat's pick (else the
  * provider preference), and like the OpenAI tier, a mid-turn pick applies to the next call.
+ * None when the caller opts out (refusal-fallback hops): see CreateModelOptions.
  */
 function resolveAnthropicFastMode(
   chatServiceTier: ServiceTier | undefined,
   providerSpeed: unknown,
-  getServiceTierOverride: GetServiceTierOverride | undefined
+  opts: Pick<CreateModelOptions, "getServiceTierOverride" | "withoutAnthropicFastMode"> | undefined
 ): { defaults: { speed?: "fast" }; liveOverrides?: () => { speed?: "fast" } } | undefined {
+  if (opts?.withoutAnthropicFastMode === true) return undefined;
+  const getServiceTierOverride = opts?.getServiceTierOverride;
   const pinned =
     chatServiceTier != null ? chatServiceTier === "priority" : providerSpeed === "fast";
   if (getServiceTierOverride == null) return pinned ? { defaults: { speed: "fast" } } : undefined;
@@ -1785,6 +1788,12 @@ interface CreateModelOptions {
   /** Chat-local override, sampled at the next model call without changing other chats or routing. */
   getServiceTierOverride?: () => ServiceTier | undefined;
   /**
+   * Never send Anthropic `speed: "fast"` (neither the chat's pick nor the provider preference).
+   * Refusal-fallback hops set it: the pick was made for the refused model, Fast mode is limited
+   * to some Anthropic models (Opus 5 needs a waitlist) and the API rejects it elsewhere.
+   */
+  withoutAnthropicFastMode?: boolean;
+  /**
    * The running agent's Anthropic prompt-cache TTL, sampled at each request on Anthropic wires.
    * It wins over the global and request-level TTLs; undefined keeps them.
    */
@@ -2215,11 +2224,7 @@ export class ProviderModelFactory {
             providersConfig: self.providerService.getConfig(providersConfig),
           });
         anthropicFastMode = anthropicFastModeSupported
-          ? resolveAnthropicFastMode(
-              chatServiceTier,
-              providersConfig.anthropic?.speed,
-              opts?.getServiceTierOverride
-            )
+          ? resolveAnthropicFastMode(chatServiceTier, providersConfig.anthropic?.speed, opts)
           : undefined;
 
         // OpenAI-specific: merge global store setting into muxProviderOptions.

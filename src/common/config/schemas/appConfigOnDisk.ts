@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { AgentIdSchema, RuntimeEnablementIdSchema } from "../../schemas/ids";
+import { IsolationChoiceSchema } from "../../schemas/isolation";
 import { ProjectConfigSchema } from "../../schemas/project";
 import { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
@@ -141,6 +142,8 @@ export const AppConfigMigrationsSchema = z
      * source key.
      */
     defaultModelFallbacksSeededFable51: z.boolean().optional(),
+    /** Same one-time re-seed for the fable alias move to Fable 5.2. */
+    defaultModelFallbacksSeededFable52: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
     /** One-time move of task limits still at PREVIOUS_TASK_SETTINGS_DEFAULTS to the new defaults. */
@@ -258,6 +261,9 @@ export const AppConfigOnDiskSchema = z
     terminalDefaultShell: z.string().optional(),
     updateChannel: UpdateChannelSchema.optional(),
     runtimeEnablement: RuntimeEnablementOverridesSchema.optional(),
+    defaultIsolation: IsolationChoiceSchema.optional(),
+    // Legacy mirror of defaultIsolation: older builds read only this flat runtime id, so every
+    // save writes the nearest supported runtime here to keep downgrades working.
     defaultRuntime: RuntimeEnablementIdSchema.optional(),
     // `.catch`: an unusable stored value must not fail the whole config parse. Degrading to
     // "not configured" keeps every other setting loadable and lets the user re-enter this one.

@@ -123,6 +123,8 @@ export class CoderSSHRuntime extends SSHRuntime {
       bgOutputDir: config.bgOutputDir,
       identityFile: config.identityFile,
       port: config.port,
+      workspaceIsolation: config.workspaceIsolation,
+      projectDir: config.projectDir,
     };
 
     super(baseConfig, transport, options);

@@ -116,7 +116,12 @@ import {
   type PendingTaskStartWaiter,
   type PendingTaskWaiter,
 } from "@/node/services/taskWaiters";
-import { isProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceDirTrusted,
+  isWorkspaceProjectTrusted,
+  isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
+} from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import {
@@ -194,6 +199,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   isDockerRuntime,
   isLocalProjectRuntime,
+  isSshSharedProjectDirRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
   type RuntimeConfig,
@@ -899,15 +905,39 @@ export interface OwnedTaskAttempt {
    */
   receiptEligible: boolean;
   /**
-   * The row still read a completed report (`reported`, or `interrupted` with a report time) once
-   * the CAS that published this attempt had written it. A reactivation keeps its predecessor's
-   * terminal status, and a reawakening of a settled reported task keeps it too, so the new attempt
-   * runs on a row that reads reported and that report says nothing about the attempt. A
-   * reawakening of an interrupted row sets it `running` in the same CAS: the value is false then.
-   * In-memory only, read from that CAS (never from the row afterwards, where the report may be
-   * this attempt's own).
+   * The report the row still carried (`reported`, or `interrupted` with a report time) once the
+   * CAS that published this attempt had written it, else null. A reactivation keeps its
+   * predecessor's terminal status, and a reawakening of a settled reported task keeps it too, so
+   * the new attempt runs on a row that reads reported and that report says nothing about the
+   * attempt. A reawakening of an interrupted row sets it `running` in the same CAS: null then.
+   * A later report of the attempt is told from the inherited one by the row's status (see
+   * InheritedReport). In-memory only, read from that CAS (never from the row afterwards, where
+   * the report may be this attempt's own).
    */
-  readonly inheritedReport: boolean;
+  readonly inheritedReport: InheritedReport | null;
+}
+
+/** A completed report that a row already carried when the CAS that published an attempt wrote it. */
+export interface InheritedReport {
+  /**
+   * The row's status then. Only a row that read `interrupted` can be reported again: a report
+   * writes `reported`, finalizeAgentTaskReport ends early on a row that reads it, and an adopted
+   * artifact needs a row without a completed report. So a `reported` row's report is never
+   * replaced, and an `interrupted` row's is replaced exactly when the row reads `reported`. Known
+   * limit: a failure can turn a `reported` row `interrupted` (it keeps its report time), and
+   * another backend's report of the attempt then goes unseen, as the row reads `reported` again.
+   */
+  readonly taskStatus: "reported" | "interrupted";
+}
+
+/** The report `ws` carries now, or null. Read inside the CAS's config edit, on the row it writes. */
+function readInheritedReport(ws: WorkspaceConfigEntry): InheritedReport | null {
+  if (!hasCompletedAgentReport(ws)) return null;
+  assert(
+    ws.taskStatus === "reported" || ws.taskStatus === "interrupted",
+    "a completed report reads reported or interrupted"
+  );
+  return { taskStatus: ws.taskStatus };
 }
 
 /** In-process settlement ledger entry; see AttemptLedger.attemptSettlementByTaskId. */
@@ -1002,8 +1032,8 @@ interface ReactivationPlan {
 /** What the identity CAS wrote: set inside its config edit, read after it. */
 interface ReactivationCommit {
   committedProven: boolean;
-  /** Whether the row this CAS wrote still reads a completed report (OwnedTaskAttempt.inheritedReport). */
-  inheritedReport: boolean;
+  /** The completed report the row this CAS wrote still carries (OwnedTaskAttempt.inheritedReport). */
+  inheritedReport: InheritedReport | null;
   published: boolean;
 }
 
@@ -1119,12 +1149,12 @@ export interface StreamEndDecision {
   readonly attemptId: string;
   readonly messageId: string;
   /**
-   * The row's completed report predates this attempt (OwnedTaskAttempt.inheritedReport; always
-   * false for an attempt this process does not own, which has no publishing CAS to read). Only a
-   * report that is not inherited contradicts a `nonreport` decision (see
+   * The completed report the row carried when this attempt began (OwnedTaskAttempt.inheritedReport;
+   * always null for an attempt this process does not own, which has no publishing CAS to read).
+   * Only a report that is not this one contradicts a `nonreport` decision (see
    * StreamEndLedger.resolveStreamEndDecision).
    */
-  readonly inheritedReport: boolean;
+  readonly inheritedReport: InheritedReport | null;
   outcome: "pending" | "nonreport" | "published" | "indeterminate";
   /**
    * The session's turn generation the stream ended in (undefined when none was live, or once it
@@ -2645,8 +2675,15 @@ interface ChildStreamEndContext extends StreamEndAdmission {
 /** A child stream end's context plus what it read once its workspace turn was finalized. */
 interface ChildStreamEndState extends ChildStreamEndContext {
   readonly status: WorkspaceConfigEntry["taskStatus"];
-  /** The stream's final report; always null for a plan-like task. */
+  /**
+   * The stream's final report; null for a plan-like task, and for a reported row, which publishes
+   * none.
+   */
   readonly reportArgs: Awaited<ReturnType<TaskService["resolveFinalAgentReportArgs"]>>;
+  /**
+   * Whether the task is plan-like. Not read (false) where no reader needs the answer: a stream
+   * with neither a final response nor a propose_plan result, and a reported row's final response.
+   */
   readonly isPlanLike: boolean;
   readonly proposePlanResult: ReturnType<TaskService["findProposePlanSuccessInParts"]>;
 }
@@ -4132,7 +4169,7 @@ export class TaskService implements AgentTaskIntegration {
   /**
    * Tests call this; AttemptLedger owns the attempt identity. A reservation or launch begins on a
    * row that has never reported (not yet written, `starting` or `running`), so it passes
-   * `inheritedReport: false`; only the reawakening and reactivation CAS can keep a completed row,
+   * `inheritedReport: null`; only the reawakening and reactivation CAS can keep a completed row,
    * and they pass what they wrote.
    */
   private beginOwnedTaskAttempt(
@@ -5303,7 +5340,12 @@ export class TaskService implements AgentTaskIntegration {
       return false;
     }
     // #6426: one cached config load per call (not per candidate or per read).
-    const projectPluginsTrusted = isProjectTrusted(this.config, entry.projectPath);
+    // An SSH+None task runs in a host directory that also needs its own trust.
+    const projectPluginsTrusted = isWorkspaceProjectTrusted(this.config, {
+      kind: undefined,
+      projectPath: entry.projectPath,
+      runtimeConfig: entry.workspace.runtimeConfig,
+    });
 
     const workspacePath = coerceNonEmptyString(entry.workspace.path);
     const workspaceName = coerceNonEmptyString(entry.workspace.name) ?? entry.workspace.id;
@@ -7491,7 +7533,7 @@ export class TaskService implements AgentTaskIntegration {
           this.beginOwnedTaskAttempt(plan.taskId, "reservation", {
             attemptId: plan.attemptId,
             receiptEligible: true,
-            inheritedReport: false,
+            inheritedReport: null,
             ...(run.signal != null ? { abortSignal: run.signal } : {}),
           }),
         ];
@@ -8523,7 +8565,7 @@ export class TaskService implements AgentTaskIntegration {
       this.beginOwnedTaskAttempt(plan.taskId, "launch", {
         attemptId: launchAttemptId,
         receiptEligible: launchReceiptEligible,
-        inheritedReport: false,
+        inheritedReport: null,
       });
     }
   }
@@ -8753,7 +8795,12 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     const secrets = await secretsToRecord(
-      this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+      secretsForWorkspace(
+        this.secretsStore,
+        this.config,
+        plan.parentMeta.projectPath,
+        plan.taskRuntimeConfig
+      )
     );
     // The sanitize and secrets awaits above leave a window in which the parent can cancel this
     // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
@@ -9602,7 +9649,7 @@ export class TaskService implements AgentTaskIntegration {
     launch.launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
       attemptId: launch.attemptId,
       receiptEligible: true,
-      inheritedReport: false,
+      inheritedReport: null,
     });
     if (checkout.sourceRuntimeConfigUpdate != null) {
       // Ensure UI gets the updated runtimeConfig for the parent workspace.
@@ -9694,8 +9741,7 @@ export class TaskService implements AgentTaskIntegration {
       parentMetadata: plan.parentMeta,
       allowCreateFallback: true,
       ...(preferredTrunkBranch != null ? { preferredTrunkBranch } : {}),
-      trusted:
-        this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
+      trusted: this.taskInitTrusted(plan),
       multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
         EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
       ),
@@ -9832,7 +9878,12 @@ export class TaskService implements AgentTaskIntegration {
     // mutate the live parent workspace — skip it entirely.
     if (!plan.useSharedWorkspace) {
       const secrets = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+        secretsForWorkspace(
+          this.secretsStore,
+          this.config,
+          plan.parentMeta.projectPath,
+          plan.taskRuntimeConfig
+        )
       );
       this.registerTaskBackgroundInit(plan, checkout, secrets);
     }
@@ -9879,6 +9930,23 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /** Starts a launched task's init in its own checkout (callers skip a shared parent checkout). */
+  /**
+   * Whether a task's init may run repo-controlled code (.xum/init, git hooks). A task forked from
+   * an SSH+None parent shares the parent's host directory, which project trust alone does not
+   * cover, so this is project trust AND that directory's trust (isWorkspaceDirTrusted). For every
+   * other parent runtime the directory check is true.
+   */
+  private taskInitTrusted(plan: {
+    readonly configProjectPath: string;
+    readonly parentRuntimeConfig: RuntimeConfig;
+  }): boolean {
+    const projects = this.config.loadConfigOrDefault().projects;
+    return (
+      (projects.get(plan.configProjectPath)?.trusted ?? false) &&
+      isWorkspaceDirTrusted(projects, plan.configProjectPath, plan.parentRuntimeConfig)
+    );
+  }
+
   private registerTaskBackgroundInit(
     plan: TaskLaunchSource,
     checkout: Omit<TaskLaunchCheckout, "forkedRuntimeConfig">,
@@ -9903,9 +9971,7 @@ export class TaskService implements AgentTaskIntegration {
           env,
           abortSignal: initAbortController.signal,
           skipInitHook: plan.skipInitHook,
-          trusted:
-            this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
-            false,
+          trusted: this.taskInitTrusted(plan),
         },
         plan.taskId,
         workspaceUseLeasesFor(this.config)
@@ -10623,7 +10689,7 @@ export class TaskService implements AgentTaskIntegration {
     const { taskId } = plan.params;
     const commit: ReactivationCommit = {
       committedProven: false,
-      inheritedReport: false,
+      inheritedReport: null,
       published: false,
     };
     {
@@ -10708,7 +10774,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!commit.committedProven) ws.taskAttemptUnproven = true;
     // Read here, from the row this CAS wrote: after the commit, a report on the row may be
     // another backend's report of the fresh attempt.
-    commit.inheritedReport = hasCompletedAgentReport(ws);
+    commit.inheritedReport = readInheritedReport(ws);
     commit.published = true;
   }
 
@@ -10870,6 +10936,7 @@ export class TaskService implements AgentTaskIntegration {
         isWorkspaceProjectTrustedIn(cfg.projects, {
           kind: workspace.kind,
           projectPath: entry.projectPath,
+          runtimeConfig: workspace.runtimeConfig,
         })
       );
     } catch (error) {
@@ -18888,6 +18955,7 @@ export class TaskService implements AgentTaskIntegration {
           projectPluginsTrusted: isWorkspaceProjectTrustedIn(context.config.projects, {
             kind: parentEntry.workspace.kind,
             projectPath: parentEntry.projectPath,
+            runtimeConfig: context.parentRuntimeConfig,
           }),
           runtimeFactory: nodeRuntimeFactory,
         }
@@ -19056,7 +19124,7 @@ export class TaskService implements AgentTaskIntegration {
     const { taskId } = request;
     this.attemptLedger.publishAttemptRotation(taskId, launch.attemptId);
     if (this.attemptLedger.ownedAttempt(taskId)?.attemptId !== launch.attemptId) {
-      this.beginOwnedTaskAttempt(taskId, "launch", { ...launch, inheritedReport: false });
+      this.beginOwnedTaskAttempt(taskId, "launch", { ...launch, inheritedReport: null });
     }
     plans.push(this.buildQueuedTaskLaunchPlan(request, launch.attemptId, launchLease));
   }
@@ -19410,7 +19478,7 @@ export class TaskService implements AgentTaskIntegration {
     }
     let published = false;
     let committedProven = false;
-    let inheritedReport = false;
+    let inheritedReport: InheritedReport | null = null;
     await this.editActiveWorkspaceEntry(
       workspaceId,
       (ws) => {
@@ -19432,7 +19500,7 @@ export class TaskService implements AgentTaskIntegration {
         if (!committedProven) ws.taskAttemptUnproven = true;
         // Read here, from the row this CAS wrote: after the commit, a report on the row may be
         // another backend's report of the fresh attempt.
-        inheritedReport = hasCompletedAgentReport(ws);
+        inheritedReport = readInheritedReport(ws);
         published = true;
       },
       { allowMissing: true }
@@ -19481,7 +19549,7 @@ export class TaskService implements AgentTaskIntegration {
   private publishReawakenAttempt(
     plan: ReawakenPlan,
     committedProven: boolean,
-    inheritedReport: boolean
+    inheritedReport: InheritedReport | null
   ): ReawakenRefusal | { kind: "committed" } {
     const { workspaceId, attemptId } = plan;
     // The row names a new attempt now: the earlier attempt's cached report is not its (#7003).
@@ -20473,13 +20541,26 @@ export class TaskService implements AgentTaskIntegration {
             acceptSchemaShapedWorkflowReport: acceptsSchemaShapedWorkflowReport,
           })
         : null;
-    const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
+    const proposePlanResult = this.findProposePlanSuccessInParts(event.parts);
+    // The probe reads agent definitions from the user's home, which takes seconds on a host with
+    // many skills, and a send that arrives while the stream's decision waits is refused as stale.
+    // So the decision does not wait for it where its answer changes nothing: a stream with neither
+    // a final response nor a propose_plan result, and a reported row's final response. A reported
+    // row publishes no report, so the handler resolves its decision `nonreport` whatever the
+    // answer (the ledger can still turn that into `indeterminate`: see
+    // StreamEndLedger.resolveStreamEndDecision), and it does so before the cleanup of the
+    // reported task, as a plan-like task's final response always did.
+    // The answer still matters to a propose_plan result (the plan hand-off) and to a final
+    // response on any other row (a plan-like task's final response is no report).
+    const probeDecidesReport =
+      proposePlanResult != null || (finalAgentReportArgs != null && status !== "reported");
+    const isPlanLike = probeDecidesReport ? await this.isPlanLikeTaskWorkspace(entry) : false;
     const state: ChildStreamEndState = {
       ...ctx,
       status,
-      reportArgs: isPlanLike ? null : finalAgentReportArgs,
+      reportArgs: isPlanLike || status === "reported" ? null : finalAgentReportArgs,
       isPlanLike,
-      proposePlanResult: this.findProposePlanSuccessInParts(event.parts),
+      proposePlanResult,
     };
     this.decideNonreportBeforeContinuation(state);
     return this.settleInterruptedOrReportedChild(state);
@@ -24499,10 +24580,14 @@ export class TaskService implements AgentTaskIntegration {
 
 /**
  * Removal deletes no checkout for isolation "none" children (they share the parent's) or for
- * project-dir local runtimes (deleteWorkspace is a no-op there), so it cannot lose their files.
+ * project-dir runtimes, local or SSH+None (deleteWorkspace is a no-op there), so it cannot lose
+ * their files.
  */
 function subagentRemovalPreservesCheckout(ws: WorkspaceConfigEntry): boolean {
+  const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
   return (
-    ws.taskIsolation === "none" || isLocalProjectRuntime(ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG)
+    ws.taskIsolation === "none" ||
+    isLocalProjectRuntime(runtimeConfig) ||
+    isSshSharedProjectDirRuntime(runtimeConfig)
   );
 }

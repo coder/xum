@@ -86,6 +86,10 @@ describe("AgentPluginInstallService marketplaces", () => {
     return service.preview({ input: marketDir, method: { kind: "cursor-marketplace", entry } });
   }
 
+  async function previewAgentsEntry(entry: string): Promise<AgentPluginInstallPreview> {
+    return service.preview({ input: marketDir, method: { kind: "agents-marketplace", entry } });
+  }
+
   async function listMarketplace(): Promise<AgentPluginMarketplaceListing> {
     const listed = await service.previewSource({ input: marketDir });
     if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
@@ -633,7 +637,7 @@ describe("AgentPluginInstallService marketplaces", () => {
     ]);
   });
 
-  test("each build counts the skills that its own file's entry lists", async () => {
+  test("only a Claude build counts the skills its entry lists; a Cursor entry's paths do not load", async () => {
     await writeFiles(marketDir, {
       ".cursor-plugin/marketplace.json": JSON.stringify({
         name: "cursor-market",
@@ -658,7 +662,8 @@ describe("AgentPluginInstallService marketplaces", () => {
       [
         "kit",
         [
-          ["cursor", 1],
+          // The Cursor entry installs through its folder's manifest, which ignores entry skills.
+          ["cursor", undefined],
           ["claude", 2],
         ],
       ],
@@ -935,4 +940,189 @@ describe("AgentPluginInstallService marketplaces", () => {
       "xlsx",
     ]);
   });
+
+  /**
+   * Shaped like tester-army/e2e: all three marketplace files list one plugin, the folder
+   * `plugins/e2e`, which carries a manifest of each ecosystem. The Agent Plugins file names it with
+   * a `local` source object, the other two with a plain path.
+   */
+  async function writeAgentsMarketplace(options: { only: boolean }): Promise<void> {
+    if (options.only) await git(marketDir, "rm", "-rq", ".");
+    await writeFiles(marketDir, {
+      ".agents/plugins/marketplace.json": JSON.stringify({
+        name: "e2e-market",
+        interface: { displayName: "E2E Market" },
+        plugins: [
+          {
+            name: "e2e",
+            source: { source: "local", path: "./plugins/e2e" },
+            policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
+            category: "Developer Tools",
+          },
+        ],
+      }),
+      "plugins/e2e/.codex-plugin/plugin.json": JSON.stringify({ name: "e2e" }),
+      "plugins/e2e/skills/write-tests/SKILL.md": skillMd("write-tests"),
+    });
+    if (!options.only) {
+      await writeFiles(marketDir, {
+        ".cursor-plugin/marketplace.json": JSON.stringify({
+          name: "e2e-cursor",
+          plugins: [{ name: "e2e", source: "./plugins/e2e", description: "Cursor e2e" }],
+        }),
+        ".claude-plugin/marketplace.json": marketplace([
+          { name: "e2e", source: "./plugins/e2e", description: "Claude e2e" },
+        ]),
+        "plugins/e2e/.claude-plugin/plugin.json": JSON.stringify({ name: "e2e" }),
+        "plugins/e2e/.cursor-plugin/plugin.json": JSON.stringify({ name: "e2e" }),
+      });
+    }
+    await commit(marketDir, "agent plugins marketplace");
+  }
+
+  test("a repository with only an Agent Plugins marketplace lists it; its entry previews and installs through its own manifest", async () => {
+    await writeAgentsMarketplace({ only: true });
+    const listing = await listMarketplace();
+    // The title is interface.displayName, not the file's `name`.
+    expect(listing.name).toBe("E2E Market");
+    expect(listing.warnings).toEqual([]);
+    expect(
+      singleBuildRows(listing).map((row) => [row.name, row.file, row.source, row.installable])
+    ).toEqual([["e2e", "agents", "plugins/e2e", true]]);
+
+    const preview = await previewAgentsEntry("e2e");
+    expect(preview.source.subpath).toBe("plugins/e2e");
+    // The entry installs through its folder's manifest: the selector is never the method.
+    expect(preview.method).toEqual({ kind: "agent-plugin" });
+    expect(preview.skills.map((skill) => skill.name)).toEqual(["write-tests"]);
+    await install(preview);
+    expect(await installedSkills("e2e")).toEqual(["write-tests"]);
+  }, 20_000);
+
+  test("a name in all three marketplace files is one row with the Cursor, Claude and Agent Plugins builds", async () => {
+    await writeAgentsMarketplace({ only: false });
+    const listing = await listMarketplace();
+    // The header is the first file that parsed: Cursor's.
+    expect(listing.name).toBe("e2e-cursor");
+    expect(
+      listing.entries.map((entry) => [
+        entry.name,
+        entry.description,
+        entry.builds.map((build) => [build.file, build.source, build.installable]),
+      ])
+    ).toEqual([
+      [
+        "e2e",
+        "Cursor e2e",
+        [
+          ["cursor", "plugins/e2e", true],
+          ["claude", "plugins/e2e", true],
+          ["agents", "plugins/e2e", true],
+        ],
+      ],
+    ]);
+    // Every build previews the one folder through its manifest.
+    const viaAgents = await previewAgentsEntry("e2e");
+    const viaCursor = await previewCursorEntry("e2e");
+    expect([viaAgents.source.subpath, viaAgents.method]).toEqual([
+      viaCursor.source.subpath,
+      viaCursor.method,
+    ]);
+  }, 20_000);
+
+  test("an Agent Plugins entry that its policy withholds, or whose folder has no manifest, does not install", async () => {
+    await writeAgentsMarketplace({ only: true });
+    await writeFiles(marketDir, {
+      ".agents/plugins/marketplace.json": JSON.stringify({
+        name: "e2e-market",
+        plugins: [
+          {
+            name: "held",
+            source: { source: "local", path: "./plugins/e2e" },
+            policy: { installation: "NOT_AVAILABLE" },
+          },
+          { name: "bare", source: { source: "local", path: "./plugins/bare" } },
+        ],
+      }),
+      "plugins/bare/skills/loose/SKILL.md": skillMd("loose"),
+    });
+    await commit(marketDir, "a withheld and a bare entry");
+    const listing = await listMarketplace();
+    const rows = singleBuildRows(listing);
+    expect(rows.map((row) => [row.name, row.installable])).toEqual([
+      ["held", false],
+      ["bare", true],
+    ]);
+    expect(rows[0].reason).toContain("NOT_AVAILABLE");
+    expect(rows[1].reason).toBeUndefined();
+    await expect(previewAgentsEntry("held")).rejects.toThrow("NOT_AVAILABLE");
+    await expect(previewAgentsEntry("bare")).rejects.toThrow(
+      "The Agent Plugins marketplace entry 'bare' has no plugin manifest in its folder. Xum does not install it."
+    );
+    expect((await service.list()).map((item) => item.name)).toEqual([]);
+  }, 20_000);
+
+  test("an Agent Plugins entry whose manifest names another plugin is refused; Cursor keeps its manifest's name", async () => {
+    await writeAgentsMarketplace({ only: false });
+    await writeFiles(marketDir, {
+      "plugins/e2e/.codex-plugin/plugin.json": JSON.stringify({ name: "other" }),
+    });
+    await commit(marketDir, "the folder's manifest names another plugin");
+    await expect(previewAgentsEntry("e2e")).rejects.toThrow(
+      "The Agent Plugins marketplace entry 'e2e' points to a plugin named 'other'."
+    );
+    // The comparison is exact: a name Xum rewrites on load does not match, and no lossy mapping
+    // pairs an entry with a differently named plugin.
+    await writeFiles(marketDir, {
+      ".agents/plugins/marketplace.json": JSON.stringify({
+        name: "e2e-market",
+        plugins: [{ name: "my_tool", source: "./tools/my_tool" }],
+      }),
+      "tools/my_tool/.claude-plugin/plugin.json": JSON.stringify({ name: "my_tool" }),
+      "tools/my_tool/skills/lint/SKILL.md": skillMd("lint"),
+    });
+    await commit(marketDir, "an entry name with an underscore");
+    await expect(previewAgentsEntry("my_tool")).rejects.toThrow(
+      "points to a plugin named 'my-tool'"
+    );
+    await writeFiles(marketDir, {
+      ".agents/plugins/marketplace.json": JSON.stringify({
+        name: "e2e-market",
+        plugins: [{ name: "e2e", source: "./plugins/e2e" }],
+      }),
+    });
+    await commit(marketDir, "back to e2e");
+    // The rule is Codex's: a Cursor entry still previews as the plugin its manifest names.
+    const cursor = await service.preview({
+      input: marketDir,
+      method: { kind: "cursor-marketplace", entry: "e2e" },
+    });
+    expect(cursor.manifest.name).toBe("other");
+  }, 60_000);
+
+  test("install never takes an Agent Plugins entry selector; an update follows the folder without the marketplace file", async () => {
+    await writeAgentsMarketplace({ only: true });
+    const preview = await previewAgentsEntry("e2e");
+    await expect(
+      service.install({
+        source: preview.source,
+        method: { kind: "agents-marketplace", entry: "e2e" },
+        expectedSha: preview.lockedSha,
+        expectedConsentDigest: preview.consentDigest,
+      })
+    ).rejects.toThrow("cannot be installed as Agent Plugins marketplace entry");
+    expect((await service.list()).map((item) => item.name)).toEqual([]);
+    await install(preview);
+    expect(await installedSkills("e2e")).toEqual(["write-tests"]);
+    await writeFiles(marketDir, { "plugins/e2e/skills/lint2/SKILL.md": skillMd("lint2") });
+    await git(marketDir, "rm", "-q", ".agents/plugins/marketplace.json");
+    await commit(marketDir, "drop the marketplace file, add a skill");
+    const head = (await git(marketDir, "rev-parse", "HEAD")).trim();
+    const review = await service.previewUpdate({ name: "e2e" });
+    expect(review.toSha).toBe(head);
+    await updateWithReview("e2e");
+    expect(await installedSkills("e2e")).toEqual(["lint2", "write-tests"]);
+    const updated = (await service.list()).find((item) => item.name === "e2e");
+    expect([updated?.lockedSha, updated?.source?.subpath]).toEqual([head, "plugins/e2e"]);
+  }, 60_000);
 });

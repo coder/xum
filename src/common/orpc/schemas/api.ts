@@ -90,11 +90,8 @@ import {
   McpAppViewSchema,
 } from "./mcpApps";
 import { SshPromptEventSchema, SshPromptResponseInputSchema } from "./ssh";
-import {
-  RuntimeConfigSchema,
-  RuntimeAvailabilitySchema,
-  RuntimeEnablementIdSchema,
-} from "./runtime";
+import { RuntimeConfigSchema, RuntimeAvailabilitySchema } from "./runtime";
+import { IsolationChoiceSchema } from "@/common/schemas/isolation";
 import { SecretSchema } from "./secrets";
 import {
   CompletedMessagePartSchema,
@@ -949,6 +946,18 @@ export const projects = {
   setTrust: {
     input: z.object({ projectPath: z.string(), trusted: z.boolean() }),
     output: z.void(),
+  },
+  // Trust for one SSH+None directory of a project (ProjectConfig.trustedSshDirectories).
+  // Granting requires the project itself to be trusted. Returns the stored (resolved) projectDir.
+  setSshDirectoryTrust: {
+    input: z.object({
+      projectPath: z.string(),
+      host: z.string(),
+      port: z.number().int().nullish(),
+      projectDir: z.string(),
+      trusted: z.boolean(),
+    }),
+    output: ResultSchema(z.object({ projectDir: z.string() }), z.string()),
   },
   setDisplayName: {
     input: z
@@ -3402,7 +3411,7 @@ export const config = {
       coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS),
       worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS),
       runtimeEnablement: z.record(z.string(), z.boolean()),
-      defaultRuntime: z.string().nullable(),
+      defaultIsolation: IsolationChoiceSchema.nullable(),
       agentAiDefaults: AgentAiDefaultsSchema,
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
@@ -3547,7 +3556,8 @@ export const config = {
       .object({
         projectPath: z.string().nullish(),
         runtimeEnablement: z.record(z.string(), z.boolean()).nullish(),
-        defaultRuntime: RuntimeEnablementIdSchema.nullish(),
+        // null clears the default (project override or global); undefined leaves it unchanged.
+        defaultIsolation: IsolationChoiceSchema.nullish(),
         runtimeOverridesEnabled: z.boolean().nullish(),
       })
       .strict(),

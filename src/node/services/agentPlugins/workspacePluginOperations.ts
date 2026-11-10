@@ -10,7 +10,11 @@ import {
 import type { ORPCContext } from "@/node/orpc/context";
 import type { MCPWorkspaceRequestOptions } from "@/node/services/mcpServerManager";
 import { createRuntimeForWorkspace, resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
-import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import {
+  isProjectTrusted,
+  isWorkspaceProjectTrusted,
+  secretsForWorkspace,
+} from "@/node/utils/projectTrust";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
@@ -157,7 +161,12 @@ async function resolveWorkspaceMcpRequestOptions(
   const projectSecrets = await secretsToRecord(
     isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, context.secretsStore)
-      : context.secretsStore.getEffectiveSecrets(metadata.projectPath)
+      : secretsForWorkspace(
+          context.secretsStore,
+          context.config,
+          metadata.projectPath,
+          metadata.runtimeConfig
+        )
   );
   if (signal.aborted) return null;
   return {
@@ -166,6 +175,7 @@ async function resolveWorkspaceMcpRequestOptions(
     runtime,
     workspacePath,
     trusted: isWorkspaceProjectTrusted(context.config, metadata),
+    runtimeConfig: metadata.runtimeConfig,
     overrides,
     overridesAuthoritative: authoritative,
     // Like the send path: a non-authoritative read that exhausted its

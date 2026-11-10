@@ -498,24 +498,40 @@ describe("spawnProcess", () => {
       return Object.assign(result.handle, { outputPath });
     }
 
+    // The log spans many pages, and each remote page runs two bash execs (size probe, then tail),
+    // so the wall time grows with host load and passes the 5 s default. The timeout only catches
+    // a hang: the exec count checks the work per page, and the byte bound in the loop checks how
+    // much one read returns.
     it.each(["local", "remote"] as const)(
       "reads %s output in bounded pages that decode to the whole log",
       async (kind) => {
         const handle = await spawnWithLog(kind, raw);
+        const execSpy = spyOn(LocalRuntime.prototype, "exec");
         let offset = 0;
         let text = "";
-        for (let attempt = 0; attempt < 1_000 && offset < raw.length; attempt++) {
-          const read = await handle.readOutput(offset, 1_000);
-          // One page, plus at most 3 bytes to finish a character cut at its end.
-          expect(read.newOffset - offset).toBeGreaterThanOrEqual(1);
-          expect(read.newOffset - offset).toBeLessThanOrEqual(1_003);
-          expect(read.fileSize).toBe(raw.length);
-          text += read.content;
-          offset = read.newOffset;
+        let pages = 0;
+        let execs = 0;
+        try {
+          for (let attempt = 0; attempt < 1_000 && offset < raw.length; attempt++) {
+            const read = await handle.readOutput(offset, 1_000);
+            pages++;
+            // One page, plus at most 3 bytes to finish a character cut at its end.
+            expect(read.newOffset - offset).toBeGreaterThanOrEqual(1);
+            expect(read.newOffset - offset).toBeLessThanOrEqual(1_003);
+            expect(read.fileSize).toBe(raw.length);
+            text += read.content;
+            offset = read.newOffset;
+          }
+          execs = execSpy.mock.calls.length;
+        } finally {
+          execSpy.mockRestore();
         }
         expect(offset).toBe(raw.length);
         expect(text).toBe(decode(raw));
-      }
+        // A remote page is one size probe plus one tail read, and a local page runs no exec.
+        expect(execs).toBe(kind === "remote" ? 2 * pages : 0);
+      },
+      30_000
     );
 
     // A decoder strips U+FEFF at the start of its input as a byte-order mark, and the offset

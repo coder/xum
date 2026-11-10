@@ -157,6 +157,50 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_pdf_input: true,
   },
 
+  // Claude Fable 5.2 - Released November 9, 2026, successor to Fable 5.1 in the
+  // Mythos-class tier. Official pricing: $8/M input, $40/M output (20% below Fable 5.1),
+  // 5-minute cache write $10/M (1.25x input), cache read $0.20/M (0.025x input, the same
+  // multiplier as Fable 5.1). The 1-hour cache write tier ($16/M, 2x input) has no field
+  // (displayUsage derives it from input), and fast mode ($16/$80) is a serviceTierPricing
+  // factor. Native 1M context, 128K max output, effort ladder low..max with native xhigh;
+  // adaptive thinking is always on (default effort high).
+  // https://platform.claude.com/docs/en/models/fable-5-2/overview
+  "claude-fable-5-2": {
+    max_input_tokens: 1000000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.000008, // $8 per million input tokens
+    output_cost_per_token: 0.00004, // $40 per million output tokens
+    cache_creation_input_token_cost: 0.00001, // $10 per million tokens (1.25× input)
+    cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.025× input)
+    litellm_provider: "anthropic",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
+  // Claude Mythos 5.2 - Released November 9, 2026 alongside Fable 5.2: the same model
+  // with some safeguards lifted, for organizations verified through Anthropic's
+  // verification programs. Identical specs and pricing to Fable 5.2 (see above).
+  // https://platform.claude.com/docs/en/models/mythos-5-2/overview
+  "claude-mythos-5-2": {
+    max_input_tokens: 1000000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.000008, // $8 per million input tokens
+    output_cost_per_token: 0.00004, // $40 per million output tokens
+    cache_creation_input_token_cost: 0.00001, // $10 per million tokens (1.25× input)
+    cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.025× input)
+    litellm_provider: "anthropic",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Claude Fable 5.1 - successor to Fable 5 in the Mythos-class tier at the same
   // input/output pricing: $10/M input, $50/M output, cache write 1.25x input. Cache
   // reads are cheaper than Fable 5 at $0.25/M (0.025x input, a quarter of the old
@@ -632,6 +676,52 @@ export const modelsExtra: Record<string, ModelData> = {
   // introductory rates do not apply: $4/M input, $20/M output, $0.20/M cached input at
   // `global` (`us` bills 10% more). Source: Vertex AI model and pricing docs, 2026-10-23.
   "gemini-4-argon-cyber-permissive": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 65536,
+    input_cost_per_token: 0.000004, // $4 per million input tokens
+    output_cost_per_token: 0.00002, // $20 per million output tokens, including thinking tokens
+    cache_read_input_token_cost: 0.0000002, // $0.20 per million cached input tokens
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
+  // Gemini 4 Carbon - GA on the Gemini API and Vertex AI on November 10, 2026. Stable
+  // `gemini-4-carbon` model ID; input, thinking, and output share one 1,048,576-token
+  // window. Like Argon, a synchronous request caps output at 65,536 tokens (a larger
+  // max_output_tokens opts into long decode, which Xum does not drive). We encode the
+  // introductory rates Google bills through November 30, 2026 ($2/M input, $10/M output,
+  // $0.10/M implicitly cached input). TODO(2026-12-01): raise to the standard rates
+  // ($4/$20/$0.20). No >200K tier. Source: Gemini API model and pricing docs, 2026-11-10.
+  "gemini-4-carbon": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 65536,
+    input_cost_per_token: 0.000002, // $2 per million input tokens (intro rate)
+    output_cost_per_token: 0.00001, // $10 per million output tokens, including thinking tokens (intro rate)
+    cache_read_input_token_cost: 0.0000001, // $0.10 per million cached input tokens (intro rate)
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
+  // Gemini 4 Carbon Cyber Permissive - Vertex AI only (`google-vertex:`), for projects on
+  // its own allowlist (Fairwind program), in the `global` and `us` locations. Limits as
+  // Gemini 4 Carbon above, including the 65,536-token synchronous output cap. Carbon's
+  // introductory rates do not apply: $4/M input, $20/M output, $0.20/M cached input at
+  // `global` (`us` bills 10% more). Source: Vertex AI model and pricing docs, 2026-11-10.
+  "gemini-4-carbon-cyber-permissive": {
     max_input_tokens: 1048576,
     max_output_tokens: 65536,
     input_cost_per_token: 0.000004, // $4 per million input tokens

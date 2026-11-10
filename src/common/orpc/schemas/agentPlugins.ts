@@ -212,6 +212,11 @@ export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
    * No install record stores a method (agentPluginInstalls.ts).
    */
   z.object({ kind: z.literal("cursor-marketplace"), entry: z.string().min(1) }),
+  /**
+   * One entry of an Agent Plugins (Codex) marketplace (`.agents/plugins/marketplace.json`). A
+   * preview selector only, exactly like `cursor-marketplace`: install never gets it back.
+   */
+  z.object({ kind: z.literal("agents-marketplace"), entry: z.string().min(1) }),
 ]);
 export type AgentPluginInstallMethod = z.infer<typeof AgentPluginInstallMethodSchema>;
 
@@ -292,12 +297,15 @@ export const AgentPluginInstallPreviewSchema = z.object({
   agents: z.array(z.string()),
   /**
    * The files of `agents` with Cursor `readonly: true` or a Claude read-only search list: they
-   * run on Explore's tools, so the review says file edits are removed and the shell stays.
+   * run on Explore's tools, so the review says file edits are removed. The shell stays unless the
+   * agent is also in `shellRemovedAgents`.
    */
   readonlyAgents: z.array(z.string()),
   /**
-   * The files of `readonlyAgents` whose mapped tools leave no bash tool (a Claude
-   * `disallowedTools: [Bash]`), so the review says the shell is removed too.
+   * The files of `readonlyAgents` whose mapped tools leave no bash tool (for example a Claude
+   * `disallowedTools: [Bash]`, or a `tools` list that grants no bash tool, such as Cursor
+   * `readonly: true` with `tools: [Read]`; a Claude read-only search list keeps bash), so the
+   * review says the shell is removed too.
    */
   shellRemovedAgents: z.array(z.string()),
   /** Executable workflow scripts (workflows/*.js) invokable after install. */
@@ -334,8 +342,8 @@ export const AgentPluginInstallPreviewSchema = z.object({
  * broken entry in one file never disables or enables the other file's build.
  */
 export const AgentPluginMarketplaceBuildSchema = z.object({
-  /** The marketplace file that lists the entry. */
-  file: z.enum(["cursor", "claude"]),
+  /** The marketplace file that lists the entry. The order is the order of a row's builds. */
+  file: z.enum(["cursor", "claude", "agents"]),
   /** The entry `source` kind; "relative" is a folder of the marketplace repository. */
   sourceKind: z.enum([
     "relative",
@@ -360,12 +368,12 @@ export const AgentPluginMarketplaceBuildSchema = z.object({
 });
 
 /**
- * One plugin name of a marketplace listing. A repository with both marketplace files lists a
- * name once; a name in both files has two builds, Cursor first.
+ * One plugin name of a marketplace listing. A repository with several marketplace files lists a
+ * name once; a name in more than one file has a build per file, in the order of the file enum.
  */
 export const AgentPluginMarketplaceEntrySchema = z.object({
   name: z.string(),
-  /** The first build's description. */
+  /** The description of the first build that has one. */
   description: z.string().optional(),
   builds: z.array(AgentPluginMarketplaceBuildSchema).min(1),
 });

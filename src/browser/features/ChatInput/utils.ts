@@ -35,6 +35,7 @@ import type { ChatAttachment } from "@/browser/features/ChatInput/ChatAttachment
 export type CreationRuntimeValidationError =
   | { mode: "docker"; kind: "missingImage" }
   | { mode: "ssh"; kind: "missingHost" }
+  | { mode: "ssh"; kind: "missingProjectDir" }
   | { mode: "ssh"; kind: "missingCoderWorkspace" }
   | { mode: "ssh"; kind: "missingCoderTemplate" }
   | { mode: "ssh"; kind: "missingCoderPreset" };
@@ -517,7 +518,14 @@ export function validateCreationRuntime(
       return null;
     }
 
-    return runtime.host.trim() ? null : { mode: "ssh", kind: "missingHost" };
+    if (!runtime.host.trim()) {
+      return { mode: "ssh", kind: "missingHost" };
+    }
+    // SSH+None runs in an existing directory on the host, so it has nothing to create from.
+    if (runtime.workspaceIsolation === "none" && !(runtime.projectDir ?? "").trim()) {
+      return { mode: "ssh", kind: "missingProjectDir" };
+    }
+    return null;
   }
 
   return null;

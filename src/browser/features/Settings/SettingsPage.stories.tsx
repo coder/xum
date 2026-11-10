@@ -40,7 +40,7 @@ const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
   Secrets: /Secrets are stored in/i,
   Security: /Project Trust/i,
   "Server Access": /Server access sessions/i,
-  Runtimes: /Default runtime/i,
+  Runtimes: /Default isolation/i,
   Experiments: /Experimental features that are still in development/i,
   Keybinds: /Open agent picker/i,
   Backup: /Settings backup/i,

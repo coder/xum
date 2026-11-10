@@ -13,8 +13,8 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 
 | Model                  | ID                            | Aliases                                                      | Default |
 | ---------------------- | ----------------------------- | ------------------------------------------------------------ | ------- |
-| Fable 5.1              | anthropic:claude-fable-5-1    | `fable`                                                      |         |
-| Mythos 5.1             | anthropic:claude-mythos-5-1   | `mythos`                                                     |         |
+| Fable 5.2              | anthropic:claude-fable-5-2    | `fable`                                                      |         |
+| Mythos 5.2             | anthropic:claude-mythos-5-2   | `mythos`                                                     |         |
 | Opus 5.5               | anthropic:claude-opus-5-5     | `opus`                                                       | ✓       |
 | Sonnet 5.5             | anthropic:claude-sonnet-5-5   | `sonnet`                                                     |         |
 | Haiku 5.5              | anthropic:claude-haiku-5-5    | `haiku`                                                      |         |
@@ -24,6 +24,7 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 | Gemini 3.1 Pro Preview | google:gemini-3.1-pro-preview | `gemini`, `gemini-pro`                                       |         |
 | Gemini 3.8 Flash       | google:gemini-3.8-flash       | `gemini-flash`                                               |         |
 | Gemini 4 Argon         | google:gemini-4-argon         | `argon`, `gemini-argon`, `gemini-4`                          |         |
+| Gemini 4 Carbon        | google:gemini-4-carbon        | `carbon`, `gemini-carbon`                                    |         |
 | Grok 4.7               | xai:grok-4.7                  | `grok`, `grok-4.7`                                           |         |
 | DeepSeek V4 Pro        | deepseek:deepseek-v4-pro      | `deepseek`, `deepseek-pro`, `deepseek-v4`, `deepseek-v4-pro` |         |
 | DeepSeek V4 Flash      | deepseek:deepseek-v4-flash    | `deepseek-flash`, `deepseek-v4-flash`                        |         |
@@ -109,18 +110,36 @@ that model's fallback chain. Chains apply only to refusals, never to quota,
 auth, or network errors. Edit them under **Settings → Models → Model
 Fallbacks**, or in `~/.xum/config.json` under `modelFallbacks`.
 
+Two cases follow Anthropic's guidance for Claude Fable 5.2:
+
+- Anthropic recommends no fallback for a `reasoning_extraction` refusal: the
+  request asks the model to reproduce its reasoning in the reply. Xum shows the
+  refusal and does not retry on the chain. Change the prompt instead. Every
+  other refusal category, and a refusal with no category, falls back as usual.
+- A fallback attempt never uses Anthropic [Fast mode](/config/providers#anthropic-fast-mode),
+  even when the chat does. Anthropic limits Fast mode to some models and rejects
+  `speed: "fast"` on the others, so the fallback runs at standard speed.
+
 New installs start with these chains:
 
 | Model                         | Falls back to               |
 | ----------------------------- | --------------------------- |
-| `anthropic:claude-fable-5-1`  | `anthropic:claude-opus-5`   |
+| `anthropic:claude-fable-5-2`  | `anthropic:claude-opus-5`   |
 | `anthropic:claude-sonnet-5-5` | `anthropic:claude-sonnet-5` |
+
+New installs also get the same Opus 5 chain for the earlier Fable models,
+`anthropic:claude-fable-5-1` and `anthropic:claude-fable-5`, so an older Xum
+version keeps its refusal fallback after a downgrade.
 
 Claude Sonnet 5.5 can refuse some higher-risk cybersecurity requests, and
 Anthropic's own fallback for those requests is Claude Sonnet 5.
 
-Updates never change an existing config's chains. If your config predates the
-Sonnet 5.5 chain, add it by hand:
+Updates change an existing config's chains in one case only. When the `fable`
+alias moves to a new Fable model, Xum adds the default chain of each Fable
+model it has not seeded yet to your config, once. It never replaces a chain you already have for that model, and it
+does not add the chain again after you delete it. Other new chains, such as the
+Sonnet 5.5 chain, reach new installs only. If your config predates the Sonnet
+5.5 chain, add it by hand:
 
 1. Under **Settings → Models**, add the custom model `claude-sonnet-5` for
    Anthropic.

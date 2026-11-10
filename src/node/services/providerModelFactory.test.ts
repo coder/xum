@@ -3107,6 +3107,8 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
 
   it.each([
     ["unsupported model", { speed: "fast" }, "anthropic:claude-opus-4-7"],
+    // Anthropic removes Fast mode from Opus 4.8 on 2026-11-30 and then rejects it.
+    ["Opus 4.8", { speed: "fast" }, "anthropic:claude-opus-4-8"],
     ["ZDR beta opt-out", { speed: "fast", disableBetaFeatures: true }, "anthropic:claude-opus-5-5"],
     ["preference unset", {}, "anthropic:claude-opus-5-5"],
     [

@@ -5,11 +5,13 @@
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally:
 // bun test ./scripts/ci/installReleaseTools.test.ts
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { runScript, writeExecutable, type RunResult } from "./runScript";
+import { SPAWNING_TEST_TIMEOUT_MS, runScript, writeExecutable, type RunResult } from "./runScript";
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const INSTALL = path.resolve(import.meta.dir, "install-release-tools.sh");
 

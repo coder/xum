@@ -8,7 +8,7 @@ import type {
   ParsedRuntime,
   RuntimeAvailabilityStatus,
 } from "@/common/types/runtime";
-import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
+import type { IsolationChoice } from "@/common/types/isolation";
 import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
@@ -188,7 +188,7 @@ interface UseCreationWorkspaceReturn {
   coderConfigFallback: CoderWorkspaceConfig;
   /** Fallback SSH host used when leaving the Coder runtime. */
   sshHostFallback: string;
-  defaultRuntimeMode: RuntimeChoice;
+  defaultIsolation: IsolationChoice;
   /** Set the currently selected runtime (discriminated union) */
   setSelectedRuntime: (runtime: ParsedRuntime) => void;
   toast: Toast | null;
@@ -1063,7 +1063,7 @@ export function useCreationWorkspace({
     selectedRuntime: settings.selectedRuntime,
     coderConfigFallback,
     sshHostFallback,
-    defaultRuntimeMode: settings.defaultRuntimeMode,
+    defaultIsolation: settings.defaultIsolation,
     setSelectedRuntime,
     toast,
     setToast,

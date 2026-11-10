@@ -40,6 +40,7 @@ describe("Known Models Integration", () => {
     ["astra", /^openai:gpt-[\d.]+-astra$/],
     ["gemini", /^google:gemini-.*pro/],
     ["argon", /^google:gemini-4-argon/],
+    ["carbon", /^google:gemini-4-carbon/],
     ["gemini-flash", /^google:gemini-.*flash/],
     ["grok", /^xai:grok-/],
     ["muse", /^meta:muse-wonder-/],
@@ -64,6 +65,8 @@ describe("Known Models Integration", () => {
     ["anthropic:claude-opus-5", "anthropic/claude-opus-4.5"],
     ["anthropic:claude-sonnet-5", "anthropic/claude-sonnet-4.5"],
     ["anthropic:claude-haiku-4-5", "anthropic/claude-3.5-haiku"],
+    ["anthropic:claude-fable-5-1", "anthropic/claude-opus-4.5"],
+    ["anthropic:claude-mythos-5-1", "anthropic/claude-opus-4.5"],
   ])("retired id %s keeps its tokenizer override", (modelId, tokenizer) => {
     expect(TOKENIZER_MODEL_OVERRIDES[modelId]).toBe(tokenizer);
   });

@@ -1568,6 +1568,10 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.projectService.setTrust(input.projectPath, input.trusted)
         ),
+      setSshDirectoryTrust: t
+        .input(schemas.projects.setSshDirectoryTrust.input)
+        .output(schemas.projects.setSshDirectoryTrust.output)
+        .handler(({ context, input }) => context.projectService.setSshDirectoryTrust(input)),
 
       setDisplayName: t
         .input(schemas.projects.setDisplayName.input)

@@ -293,6 +293,52 @@ describe("entryInstallMethods", () => {
       refusal
     );
   });
+
+  test("an Agent Plugins entry installs only through its folder's own manifest", async () => {
+    const agentsEntry = parseClaudeMarketplace(
+      JSON.stringify({
+        name: "e2e",
+        plugins: [{ name: "kit", source: { source: "local", path: "./plugins/kit" } }],
+      }),
+      "agents"
+    ).entries[0];
+    const ctx = { file: "agents" as const, entry: agentsEntry, rootSource: false };
+    // A folder with a Codex manifest installs as an Agent Plugin; the selector is not a method.
+    using tmp = new DisposableTempDir("install-methods");
+    await writeTree(tmp.path, ["skills/lint"], {
+      ".codex-plugin/plugin.json": JSON.stringify({ name: "kit" }),
+    });
+    const detected = (await detectInstallMethods(tmp.path)).methods;
+    expect(entryInstallMethods(detected, { ...ctx, relative: true })).toEqual({
+      methods: [{ kind: "agent-plugin" }],
+      warnings: [],
+    });
+    const refusal =
+      "The Agent Plugins marketplace entry 'kit' has no plugin manifest in its folder. Xum does not install it.";
+    // No generated manifest for a folder of the repository, no Skills for another repository.
+    expect(() => entryInstallMethods([], { ...ctx, relative: true })).toThrow(refusal);
+    expect(() => entryInstallMethods([{ kind: "skills" }], { ...ctx, relative: true })).toThrow(
+      refusal
+    );
+    expect(() => entryInstallMethods([{ kind: "skills" }], { ...ctx, relative: false })).toThrow(
+      refusal
+    );
+  });
+
+  test("a Claude entry still becomes its own manifest when its folder has none", () => {
+    const claudeEntry = parseClaudeMarketplace(
+      JSON.stringify({ name: "acme", plugins: [{ name: "kit", source: "./kit" }] }),
+      "claude"
+    ).entries[0];
+    expect(
+      entryInstallMethods([], {
+        file: "claude",
+        entry: claudeEntry,
+        rootSource: false,
+        relative: true,
+      }).methods
+    ).toEqual([{ kind: "claude-marketplace", entry: "kit" }]);
+  });
 });
 
 describe("chooseInstallMethod", () => {
@@ -327,6 +373,23 @@ describe("chooseInstallMethod", () => {
         method: { kind: "claude-marketplace", entry: "pstack" },
       })
     ).toThrow("cannot be installed as Claude Code marketplace entry");
+  });
+
+  test("an Agent Plugins marketplace entry matches only the same entry, not another file's", () => {
+    const kit = { kind: "agents-marketplace" as const, entry: "kit" };
+    expect(chooseInstallMethod([kit], { mode: "exact", method: { ...kit } })).toEqual(kit);
+    expect(() =>
+      chooseInstallMethod([kit], {
+        mode: "exact",
+        method: { kind: "agents-marketplace", entry: "other" },
+      })
+    ).toThrow("cannot be installed as Agent Plugins marketplace entry");
+    expect(() =>
+      chooseInstallMethod([kit], {
+        mode: "exact",
+        method: { kind: "cursor-marketplace", entry: "kit" },
+      })
+    ).toThrow("cannot be installed as Cursor marketplace entry");
   });
 
   test("update keeps a generated install on skills unless the repository has its own manifest", () => {

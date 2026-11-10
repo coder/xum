@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# gh logs whole replies (check names, comment bodies) to stderr under GH_DEBUG or DEBUG. That would
+# bypass what this script prints, so it runs gh without them.
+unset GH_DEBUG DEBUG
 
 # Wait for Codex to respond to a `@codex review` request.
 #
 # Usage: ./scripts/wait_pr_codex.sh <pr_number> [--once]
 #
+# Output carries fixed text, counts, timestamps and GitHub IDs only. Codex comment bodies quote
+# PR code, so an approval prints the comment's time instead of its body, and findings print
+# counts with the explicit read: ./scripts/check_codex_comments.sh <pr_number>
+#
 # Exits:
-#   0 - Codex approved, or reported a usage limit with no outstanding findings
-#   1 - Codex left comments to address OR failed to review for another reason
+#   0 - Codex approved and the Codex comments gate counted no open review thread, or Codex
+#       reported a usage limit with no outstanding findings
+#   1 - Codex left comments to address, approved while a review thread is open (or while the
+#       gate could not read the threads), OR failed to review for another reason
 #  10 - still waiting for Codex response (only in --once mode)
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -40,6 +49,9 @@ SKIP_FETCH_SYNC="${MUX_SKIP_FETCH_SYNC:-0}"
 # shellcheck source=./lib/branch_sync_guard.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/branch_sync_guard.sh"
+# shellcheck source=./lib/reply_shape.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/reply_shape.sh"
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 REACTIONS_SCAN_CACHE_FILE="${MUX_REACTIONS_SCAN_CACHE_FILE:-}"
 if [[ -z "$REACTIONS_SCAN_CACHE_FILE" && -n "$PR_DATA_FILE" ]]; then
@@ -255,7 +267,7 @@ FETCH_ALL_THUMBS_UP_REACTIONS() {
       return 1
     fi
 
-    page_nodes=$(echo "$reactions_page" | jq -c '.data.repository.pullRequest.reactions.nodes // []')
+    page_nodes=$(reply_connection_nodes "$reactions_page" reactions) || return 1
     # Via stdin: accumulated pages can exceed Linux's per-argument limit (MAX_ARG_STRLEN).
     all_reactions=$(printf '%s\n%s' "$all_reactions" "$page_nodes" | jq -cs '.[0] + .[1]')
 
@@ -274,7 +286,7 @@ FETCH_ALL_THUMBS_UP_REACTIONS() {
         cursor="$end_cursor"
         ;;
       *)
-        echo "❌ assertion failed: unexpected reactions hasNextPage value '$has_next'" >&2
+        echo "❌ assertion failed: unexpected reactions hasNextPage value in the GitHub reply" >&2
         return 1
         ;;
     esac
@@ -354,11 +366,32 @@ record_full_reactions_scan() {
 
 # Sets check_output and check_rc (0 clean, 1 unresolved, 10 review still running).
 run_codex_comments_gate() {
-  if check_output=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" 2>&1); then
+  # --counts-only: the gate prints counts and fixed lines, never a Codex comment body. That keeps
+  # check_output (matched below and printed on failure) free of text that Codex or a PR author wrote.
+  if check_output=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" --counts-only 2>&1); then
     check_rc=0
   else
     check_rc=$?
   fi
+}
+
+# An approval comment or a thumbs-up says nothing about review threads that are still unresolved:
+# only the gate reads every thread. So an approval stands only when the gate (run before it) counted
+# 0 unresolved review threads: every run that read the threads prints the count, and a gate that
+# could not read them (a malformed page, a crash) prints none, which is no proof that none is open.
+# Regular comments do not block an approval here: the gate counts every Codex regular comment except
+# the ones that codex_comment_is_informational (scripts/lib/codex_comments.jq) reads as clean, and a
+# Codex comment that is not a finding must not turn an approval into exit 1. wait_pr_ready.sh runs
+# the gate over them again (its step 6), and CI's Codex Comments job runs on PR pushes, not in the
+# merge queue.
+approval_stands() {
+  if grep -Eq '^Found 0 unresolved review thread' <<<"$check_output"; then
+    return 0
+  fi
+  echo ""
+  echo "$check_output"
+  echo "❌ Codex approved PR #$PR_NUMBER, but the Codex comments gate did not confirm that no review thread is open."
+  return 1
 }
 
 # A push-triggered Codex run posts no security receipt (coder/xum#7731), so the gate waits on one.
@@ -381,7 +414,7 @@ CHECK_CODEX_STATUS_ONCE() {
   local all_threads
   local request_at
   local rate_limit_comment
-  local approval_comment
+  local approval_comment_at
   local approval_reaction_at
   local reactions_has_previous
   local all_thumbs_up_reactions
@@ -403,7 +436,7 @@ CHECK_CODEX_STATUS_ONCE() {
   pr_state=$(echo "$pr_data" | jq -r '.data.repository.pullRequest.state // empty')
   pr_head=$(echo "$pr_data" | jq -r '.data.repository.pullRequest.headRefOid // empty')
   if ! [[ "$pr_head" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "❌ assertion failed: PR headRefOid is missing or malformed: '$pr_head'" >&2
+    echo "❌ assertion failed: PR headRefOid is missing or malformed in the GitHub reply" >&2
     return 1
   fi
 
@@ -423,13 +456,15 @@ CHECK_CODEX_STATUS_ONCE() {
       ;;
     OPEN) ;;
     *)
-      echo "❌ assertion failed: unexpected PR state '$pr_state' for PR #$PR_NUMBER" >&2
+      echo "❌ assertion failed: unexpected PR state in the GitHub reply for PR #$PR_NUMBER" >&2
       return 1
       ;;
   esac
 
-  all_comments=$(echo "$pr_data" | jq '.data.repository.pullRequest.comments.nodes')
-  all_threads=$(echo "$pr_data" | jq '.data.repository.pullRequest.reviewThreads.nodes')
+  all_comments=$(reply_connection_nodes "$pr_data" comments) || return 1
+  all_threads=$(reply_connection_nodes "$pr_data" reviewThreads) || return 1
+  # The reaction times are printed on approval, so the window's reactions get the same check.
+  reply_connection_nodes "$pr_data" reactions >/dev/null || return 1
 
   # Ignore Codex's own comments since they mention "@codex review" in boilerplate.
   request_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" '[.[] | select(.author.login != $bot and (.body | contains("@codex review")))] | sort_by(.createdAt) | last | .createdAt // empty')
@@ -469,19 +504,22 @@ CHECK_CODEX_STATUS_ONCE() {
     [.[] | select(.createdAt > $request_at and .isMinimized != true and codex_usage_limit($bot))]
     | sort_by(.createdAt) | last // empty | .body // empty')
 
-  approval_comment=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt, body}] | sort_by(.createdAt) | last // empty | .body // empty')
+  # Only the time leaves this jq: the approval comment's body is Codex text.
+  approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
 
-  if [[ -n "$approval_comment" ]]; then
+  if [[ -n "$approval_comment_at" ]]; then
+    approval_stands || return 1
     echo ""
     echo "✅ Codex approved PR #$PR_NUMBER"
     echo ""
-    echo "$approval_comment"
+    echo "Approval comment time: $approval_comment_at"
     return 0
   fi
 
   approval_reaction_at=$(echo "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.data.repository.pullRequest.reactions.nodes[]? | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
   if [[ -n "$approval_reaction_at" ]]; then
+    approval_stands || return 1
     echo ""
     echo "✅ Codex approved PR #$PR_NUMBER via thumbs-up on the PR description"
     echo ""
@@ -529,7 +567,7 @@ CHECK_CODEX_STATUS_ONCE() {
       return 1
       ;;
     *)
-      echo "❌ assertion failed: unexpected reactions hasPreviousPage value '$reactions_has_previous'" >&2
+      echo "❌ assertion failed: unexpected reactions hasPreviousPage value in the GitHub reply" >&2
       return 1
       ;;
   esac
@@ -543,6 +581,7 @@ CHECK_CODEX_STATUS_ONCE() {
     approval_reaction_at=$(echo "$all_thumbs_up_reactions" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
     if [[ -n "$approval_reaction_at" ]]; then
+      approval_stands || return 1
       echo ""
       echo "✅ Codex approved PR #$PR_NUMBER via thumbs-up on the PR description"
       echo ""
@@ -607,7 +646,7 @@ echo "⏳ Waiting for Codex review on PR #$PR_NUMBER..."
 echo ""
 echo "Tip: after you comment '@codex review', Codex will respond with either:"
 echo "  - review comments / threads to address (script exits 1)"
-echo "  - thumbs-up reaction on the PR description OR an explicit approval comment (script exits 0)"
+echo "  - thumbs-up reaction on the PR description OR an explicit approval comment (script exits 0, or 1 while a review thread is open)"
 echo ""
 
 while true; do

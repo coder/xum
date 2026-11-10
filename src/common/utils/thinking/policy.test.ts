@@ -312,6 +312,9 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
+    for (const model of ["anthropic:claude-fable-5-2", "anthropic:claude-mythos-5-2"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    }
   });
 
   test("clamps 'off' up to 'low' for Mythos-class models", () => {
@@ -320,6 +323,8 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("anthropic:claude-fable-5-1", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5-1", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-fable-5-2", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-mythos-5-2", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-opus-5-5", "off")).toBe("low");
   });
 
@@ -341,14 +346,16 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
   });
 
-  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash and Argon but not older Flash", () => {
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash, Argon and Carbon but not older Flash", () => {
     // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
     // request envelope and debug snapshots agree with what the Google adapter sends.
-    // Argon has no "off" either; unclamped, it would run at its medium default.
+    // Argon and Carbon have no "off" either; unclamped, they would run at their medium default.
     for (const model of [
       "google:gemini-3.8-flash",
       "openrouter:google/gemini-3.8-flash",
       "google:gemini-4-argon",
+      "google:gemini-4-carbon",
+      "google-vertex:gemini-4-carbon-cyber-permissive",
     ]) {
       expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
       expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
@@ -537,8 +544,12 @@ describe("getThinkingPolicyForModel", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.1-pro-preview")).toEqual(["low", "high"]);
   });
 
-  test("returns low/medium/high (no off) for Gemini 4 Argon, unlike the Gemini 3 Pro set", () => {
-    for (const model of ["google:gemini-4-argon", "openrouter:google/gemini-4-argon"]) {
+  test("returns low/medium/high (no off) for Gemini 4 Argon and Carbon, unlike the Gemini 3 Pro set", () => {
+    for (const model of [
+      "google:gemini-4-argon",
+      "openrouter:google/gemini-4-argon",
+      "google:gemini-4-carbon",
+    ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
       expect(enforceThinkingPolicy(model, "off")).toBe("low");
       expect(enforceThinkingPolicy(model, "medium")).toBe("medium");

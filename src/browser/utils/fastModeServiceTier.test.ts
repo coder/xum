@@ -218,9 +218,14 @@ describe("fast mode service tier", () => {
     expect(ultrafastModeAvailable("xai:grok-4.7", { providersConfig: null })).toBe(false);
   });
 
-  test("offers Anthropic Fast mode only for supported Opus models on the direct API", () => {
+  test("offers Anthropic Fast mode only for supported models on the direct API", () => {
     const anthropic = { apiKeySet: true, isEnabled: true, isConfigured: true };
-    for (const model of ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"]) {
+    for (const model of [
+      "claude-fable-5-2",
+      "claude-mythos-5-2",
+      "claude-opus-5-5",
+      "claude-opus-5",
+    ]) {
       expect(
         getFastModeProvider(`anthropic:${model}`, {
           resolvedRouteProvider: "direct",
@@ -228,8 +233,17 @@ describe("fast mode service tier", () => {
         })
       ).toBe("anthropic");
     }
-    // Opus 4.7 errors and Opus 4.6 silently runs at standard speed.
-    for (const model of ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5"]) {
+    // Opus 4.7 errors and Opus 4.6 silently runs at standard speed. Fable/Mythos
+    // gained Fast mode with 5.2; earlier versions do not have it. Opus 4.8 loses it
+    // on 2026-11-30.
+    for (const model of [
+      "claude-opus-4-8",
+      "claude-opus-4-7",
+      "claude-opus-4-6",
+      "claude-sonnet-5",
+      "claude-fable-5-1",
+      "claude-mythos-5-1",
+    ]) {
       expect(getFastModeProvider(`anthropic:${model}`, { resolvedRouteProvider: "direct" })).toBe(
         null
       );

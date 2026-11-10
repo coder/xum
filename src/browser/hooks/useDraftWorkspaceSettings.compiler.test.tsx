@@ -111,7 +111,7 @@ describe("useDraftWorkspaceSettings under React Compiler", () => {
     getAppConfigStore().updateOptimistically({
       userPreferences: undefined,
       defaultModel: undefined,
-      defaultRuntime: undefined,
+      defaultIsolation: undefined,
     });
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;

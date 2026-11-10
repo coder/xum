@@ -466,7 +466,7 @@ describe("resolveModelParameterOverrides", () => {
     });
   });
 
-  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon", () => {
+  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon and Carbon", () => {
     const providersConfig = withGoogleModelParameters({
       "*": {
         max_output_tokens: 32768,
@@ -476,7 +476,11 @@ describe("resolveModelParameterOverrides", () => {
       },
     });
 
-    for (const model of ["google:gemini-3.8-flash", "google:gemini-4-argon"]) {
+    for (const model of [
+      "google:gemini-3.8-flash",
+      "google:gemini-4-argon",
+      "google:gemini-4-carbon",
+    ]) {
       const result = resolveModelParameterOverrides(providersConfig, "google", model);
 
       expect(result).toEqual({
@@ -485,6 +489,23 @@ describe("resolveModelParameterOverrides", () => {
         },
       });
     }
+  });
+
+  it("strips penalty parameters for Gemini 4 Carbon only", () => {
+    const providersConfig = withGoogleModelParameters({
+      "*": {
+        seed: 42,
+        frequency_penalty: 0.5,
+        presence_penalty: 0.5,
+      },
+    });
+
+    expect(
+      resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-carbon")
+    ).toEqual({ standard: { seed: 42 } });
+    expect(
+      resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-argon")
+    ).toEqual({ standard: { seed: 42, frequencyPenalty: 0.5, presencePenalty: 0.5 } });
   });
 
   it("strips deprecated sampling parameters for Gemini 3.5 Flash-Lite", () => {

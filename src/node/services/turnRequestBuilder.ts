@@ -243,7 +243,11 @@ import {
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
-import { isWorkspaceProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceProjectTrusted,
+  isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
+} from "@/node/utils/projectTrust";
 import {
   resolveTurnAnthropicCacheTtl,
   supportsAnthropicCache,
@@ -1400,7 +1404,12 @@ export class TurnRequestBuilder {
       .catch(() => ({ overrides: undefined, authoritative: false }));
     const projectSecrets = isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+      : secretsForWorkspace(
+          this.dependencies.secretsStore,
+          this.dependencies.config,
+          metadata.projectPath,
+          metadata.runtimeConfig
+        );
     await mcpServerManager.getToolsForWorkspace(
       {
         workspaceId,
@@ -1408,6 +1417,7 @@ export class TurnRequestBuilder {
         runtime,
         workspacePath,
         trusted: isWorkspaceProjectTrusted(this.dependencies.config, metadata),
+        runtimeConfig: metadata.runtimeConfig,
         overrides: read.overrides,
         overridesAuthoritative: read.authoritative,
         ...(read.authoritative
@@ -1900,6 +1910,8 @@ export class TurnRequestBuilder {
       minimumThinkingLevelOverride: ThinkingLevel | undefined;
       enforceMinimum: boolean;
       recordTiming?: boolean;
+      /** A refusal-fallback hop: the refused model's Anthropic Fast pick does not carry over. */
+      refusalFallback?: boolean;
     }) => {
       if (
         options.enforceMinimum &&
@@ -1946,6 +1958,7 @@ export class TurnRequestBuilder {
           workspaceId,
           providersConfig: providersConfigSnapshot,
           getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
+          withoutAnthropicFastMode: options.refusalFallback === true,
           getAnthropicCacheTtlOverride: () => agentCacheTtl.value,
           promptCacheScope,
         }
@@ -2732,7 +2745,12 @@ export class TurnRequestBuilder {
 
     const projectSecrets = isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+      : secretsForWorkspace(
+          this.dependencies.secretsStore,
+          this.dependencies.config,
+          metadata.projectPath,
+          metadata.runtimeConfig
+        );
 
     const streamToken = this.dependencies.streamManager.generateStreamToken();
 
@@ -2754,6 +2772,7 @@ export class TurnRequestBuilder {
             runtime,
             workspacePath,
             trusted: projectTrusted,
+            runtimeConfig: metadata.runtimeConfig,
             overrides: mcpOverrides,
             overridesAuthoritative: mcpOverridesAuthoritative,
             // A non-authoritative read that exhausted its budget (unreachable
@@ -4228,6 +4247,7 @@ export class TurnRequestBuilder {
                     nextModelString
                   ),
                   enforceMinimum: true,
+                  refusalFallback: true,
                 });
                 if (!nextSeedResult.success) {
                   return Err(formatSendMessageError(nextSeedResult.error).message);

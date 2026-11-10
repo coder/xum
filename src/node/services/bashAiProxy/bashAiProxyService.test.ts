@@ -349,9 +349,15 @@ describe("BashAiProxyService", () => {
 
   describe("SSH workspaces", () => {
     /**
-     * A stand-in SSH host on this machine: a "remote" port is a local TCP relay to the proxy,
-     * like `ssh -R`, and the health probe is an HTTP GET through that port, like the remote
-     * bash probe.
+     * A stand-in SSH host on this machine: a forward is a local TCP relay to the proxy, like
+     * `ssh -R`, and the health probe is an HTTP GET through it, like the remote bash probe.
+     *
+     * A remote port is a name in the host's own table (`relays`, `strangers`), not a port on this
+     * machine: the proxy hashes remote ports into the same range as its own listener's, so a real
+     * bind could meet that listener or any other process, and the host would answer it as a
+     * connection failure. ssh answers a busy remote port with a refusal, and so does this host.
+     * A relay listens on an ephemeral local port; `host.fetch` is how a command on the host
+     * reaches a forwarded port.
      */
     function fakeSshHost(
       hostKey: string,
@@ -366,11 +372,21 @@ describe("BashAiProxyService", () => {
     ) {
       const opened: number[] = [];
       let closes = 0;
-      const relays = new Set<net.Server>();
+      const relays = new Map<number, net.Server>();
+      /** Remote ports another user holds, with the answer their server gives to any probe. */
+      const strangers = new Map<number, string>();
       const sockets = new Set<net.Socket>();
       const destroyAll = (relay: net.Server) => {
         relay.close();
         for (const socket of sockets) socket.destroy(); // close() alone waits for keep-alive
+      };
+      /** A request from a command on this host to a forwarded port, as `curl 127.0.0.1:<port>`. */
+      const hostFetch = (url: string, init?: RequestInit): Promise<Response> => {
+        const to = new URL(url);
+        const relay = relays.get(Number(to.port));
+        if (!relay) return Promise.reject(new Error(`nothing listens on host port ${to.port}`));
+        to.port = String((relay.address() as AddressInfo).port);
+        return fetch(to, init);
       };
       const target: ForwardTarget = {
         hostKey,
@@ -380,6 +396,9 @@ describe("BashAiProxyService", () => {
           if (options.refuse) throw new ReverseForwardRefusedError("remote port forwarding failed");
           if (options.unreachable) throw new Error("ssh: connect to host: Connection timed out");
           await options.gate;
+          if (relays.has(remotePort) || strangers.has(remotePort)) {
+            throw new ReverseForwardRefusedError("remote port forwarding failed");
+          }
           const relay = net.createServer((socket) => {
             sockets.add(socket);
             socket.once("close", () => sockets.delete(socket));
@@ -390,9 +409,9 @@ describe("BashAiProxyService", () => {
           });
           await new Promise<void>((resolve, reject) => {
             relay.once("error", reject);
-            relay.listen(remotePort, "127.0.0.1", () => resolve());
+            relay.listen(0, "127.0.0.1", () => resolve());
           });
-          relays.add(relay);
+          relays.set(remotePort, relay);
           let resolveClosed!: () => void;
           const closed = new Promise<void>((resolve) => (resolveClosed = resolve));
           relay.once("close", () => resolveClosed());
@@ -401,14 +420,16 @@ describe("BashAiProxyService", () => {
             close: () => {
               closes++;
               if (options.survivesClose) return; // like an ssh process left after a crash
-              relays.delete(relay);
+              relays.delete(remotePort);
               destroyAll(relay);
             },
           };
         },
         remoteHealth: async (remotePort, nonce) => {
+          const stranger = strangers.get(remotePort);
+          if (stranger !== undefined) return stranger;
           try {
-            const res = await fetch(
+            const res = await hostFetch(
               `http://127.0.0.1:${remotePort}${BASH_AI_PROXY_HEALTH_PATH}?nonce=${nonce}`
             );
             return await res.text();
@@ -420,13 +441,40 @@ describe("BashAiProxyService", () => {
       return {
         target,
         opened,
+        fetch: hostFetch,
+        /** True once a forward listens on `remotePort`: a restore in the background is up. */
+        listening: (remotePort: number) => relays.has(remotePort),
         closes: () => closes,
-        dropAll: () => {
-          for (const relay of relays) destroyAll(relay);
+        /** Another user binds `remotePort` and answers every probe with `answer`. */
+        occupy: (remotePort: number, answer: string) => strangers.set(remotePort, answer),
+        /** Resolves after every dropped forward has reported `closed`, as the manager sees it. */
+        dropAll: async () => {
+          const closed = [...relays.values()].map(
+            (relay) => new Promise<void>((resolve) => relay.once("close", () => resolve()))
+          );
+          for (const relay of relays.values()) destroyAll(relay);
           relays.clear();
+          await Promise.all(closed);
         },
       };
     }
+
+    /**
+     * Polls `condition` until it holds. It fails after 4 s, under the 5 s test timeout, and says
+     * which condition never held. Only a failure pays the budget. The clock is monotonic, so a
+     * test that sets the system time cannot stretch it.
+     */
+    async function until(condition: () => boolean | Promise<boolean>): Promise<void> {
+      const deadline = Bun.nanoseconds() + 4e9;
+      while (!(await condition())) {
+        if (Bun.nanoseconds() > deadline) {
+          throw new Error(`timed out waiting for: ${condition.toString()}`);
+        }
+        await Bun.sleep(5);
+      }
+    }
+
+    const portOf = (env: Record<string, string>) => Number(new URL(env.ANTHROPIC_BASE_URL).port);
 
     test("commands reach the proxy through the host's forwarded port and are counted", async () => {
       const host = fakeSshHost("ssh-host-1");
@@ -435,7 +483,7 @@ describe("BashAiProxyService", () => {
       const remotePort = Number(new URL(env.ANTHROPIC_BASE_URL).port);
       expect(host.opened).toEqual([remotePort]);
 
-      const res = await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
+      const res = await host.fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
         method: "POST",
         headers: { "x-api-key": env.ANTHROPIC_API_KEY },
         body: "{}",
@@ -452,8 +500,7 @@ describe("BashAiProxyService", () => {
       expect(host.opened).toHaveLength(1);
 
       // A dropped forward is opened again on the next turn.
-      host.dropAll();
-      await Bun.sleep(10);
+      await host.dropAll();
       await proxy.envFor("ssh-ws", "ssh", []);
       expect(host.opened).toHaveLength(2);
     });
@@ -473,24 +520,18 @@ describe("BashAiProxyService", () => {
       sshTargets.set("ssh-ws", host.target);
       const before = await proxy.envFor("ssh-ws", "ssh", []);
       const remotePort = Number(new URL(before.ANTHROPIC_BASE_URL).port);
-      const nonce = "0".repeat(32);
-      const recordedAnswer = await (
-        await fetch(`http://127.0.0.1:${remotePort}${BASH_AI_PROXY_HEALTH_PATH}?nonce=${nonce}`)
-      ).text();
+      const recordedAnswer = await host.target.remoteHealth(remotePort, "0".repeat(32));
+      if (recordedAnswer === undefined) throw new Error("the forward did not answer the probe");
       await proxy.stop(); // the forward goes away; the port is free on the "host"
 
       // Another user binds the saved remote port and answers with the recorded token.
-      const stranger = http.createServer((_req, res) => res.end(recordedAnswer));
-      await new Promise<void>((resolve) => stranger.listen(remotePort, "127.0.0.1", resolve));
-      try {
-        proxy = makeProxy();
-        const after = await proxy.envFor("ssh-ws", "ssh", []);
-        // Not adopted: Xum opened its own forward on another candidate port.
-        expect(after.ANTHROPIC_BASE_URL).not.toBe(before.ANTHROPIC_BASE_URL);
-        expect(host.opened.length).toBeGreaterThan(1);
-      } finally {
-        stranger.close();
-      }
+      host.occupy(remotePort, recordedAnswer);
+      proxy = makeProxy();
+      const after = await proxy.envFor("ssh-ws", "ssh", []);
+      // Not adopted: Xum opened its own forward on another candidate port.
+      expect(after.ANTHROPIC_BASE_URL).toBeDefined();
+      expect(after.ANTHROPIC_BASE_URL).not.toBe(before.ANTHROPIC_BASE_URL);
+      expect(host.opened.length).toBeGreaterThan(1);
     });
 
     test("a connection failure is retried after a short wait, a refusal is not", async () => {
@@ -525,9 +566,9 @@ describe("BashAiProxyService", () => {
 
       proxy = makeProxy();
       await proxy.restore();
-      await Bun.sleep(50);
+      await until(() => host.listening(portOf(fromB))); // the forward restores in the background
       expect(host.opened).toHaveLength(2);
-      const res = await fetch(`${fromB.ANTHROPIC_BASE_URL}/v1/messages`, {
+      const res = await host.fetch(`${fromB.ANTHROPIC_BASE_URL}/v1/messages`, {
         method: "POST",
         headers: { "x-api-key": fromB.ANTHROPIC_API_KEY },
         body: "{}",
@@ -557,6 +598,8 @@ describe("BashAiProxyService", () => {
       rootShared = true;
       proxy = makeProxy();
       await proxy.restore();
+      // A restore that opens nothing has no completion to wait for: the pause only gives a
+      // regression time to show.
       await Bun.sleep(50);
       expect(host.opened).toHaveLength(1); // restore opened nothing
       expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
@@ -605,7 +648,7 @@ describe("BashAiProxyService", () => {
       try {
         // A long job keeps calling without a new turn.
         setSystemTime(new Date(first + 2 * 60 * 60_000));
-        const res = await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
+        const res = await host.fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
           method: "POST",
           headers: { "x-api-key": env.ANTHROPIC_API_KEY },
           body: "{}",
@@ -618,7 +661,7 @@ describe("BashAiProxyService", () => {
         setSystemTime(new Date(first + 4 * 60 * 60_000));
         proxy = makeProxy();
         await proxy.restore();
-        await Bun.sleep(50);
+        await until(async () => (await usedAt()) > afterTraffic); // saved in the background
         expect(await usedAt()).toBeGreaterThan(afterTraffic);
       } finally {
         setSystemTime();
@@ -630,11 +673,6 @@ describe("BashAiProxyService", () => {
       let open!: () => void;
       const gate = new Promise<void>((resolve) => (open = resolve));
       return { ...fakeSshHost(hostKey, { gate }), open };
-    }
-
-    async function until(condition: () => boolean): Promise<void> {
-      for (let i = 0; i < 200 && !condition(); i++) await Bun.sleep(5);
-      expect(condition()).toBe(true);
     }
 
     test("turning the switch off during a forward setup closes the forward it returns", async () => {
@@ -698,12 +736,14 @@ describe("BashAiProxyService", () => {
 
       proxy = makeProxy();
       await proxy.restore();
-      await Bun.sleep(50); // forwards restore in the background
+      // The forwards restore in the background. A Coder host has no job past its first await,
+      // so it has opened nothing once the plain host's forward is up.
+      await until(() => plain.listening(portOf(before)));
       expect(plain.opened).toHaveLength(2);
       expect(coder.opened).toHaveLength(1);
 
       // A remote process started before the restart still reaches the proxy, same URL and key.
-      const res = await fetch(`${before.ANTHROPIC_BASE_URL}/v1/messages`, {
+      const res = await plain.fetch(`${before.ANTHROPIC_BASE_URL}/v1/messages`, {
         method: "POST",
         headers: { "x-api-key": before.ANTHROPIC_API_KEY },
         body: "{}",
@@ -716,6 +756,7 @@ describe("BashAiProxyService", () => {
       const host = fakeSshHost("ssh-host-4", { survivesClose: true });
       sshTargets.set("ssh-ws", host.target);
       const before = await proxy.envFor("ssh-ws", "ssh", []);
+      expect(before.ANTHROPIC_BASE_URL).toBeDefined(); // two failed setups would agree on undefined
       // A crash: the ssh -R process survives, the backend does not.
       await proxy.stop();
 
@@ -723,7 +764,24 @@ describe("BashAiProxyService", () => {
       const after = await proxy.envFor("ssh-ws", "ssh", []);
       expect(after.ANTHROPIC_BASE_URL).toBe(before.ANTHROPIC_BASE_URL);
       expect(host.opened).toHaveLength(1); // the surviving forward still reaches the new proxy
-      host.dropAll();
+      await host.dropAll();
+    });
+
+    test("a taken remote port moves to the next candidate, and a restart adopts that forward", async () => {
+      const host = fakeSshHost("ssh-host-16", { survivesClose: true });
+      sshTargets.set("ssh-ws", host.target);
+      const [taken, next] = candidatePorts(`${rootDir}\0ssh-host-16`, 4);
+      host.occupy(taken, "not the proxy"); // another user on the host holds the first candidate
+      const before = await proxy.envFor("ssh-ws", "ssh", []);
+      expect(before.ANTHROPIC_BASE_URL).toBeDefined();
+      expect(new URL(before.ANTHROPIC_BASE_URL).port).toBe(String(next));
+      await proxy.stop(); // a crash: the ssh -R process survives, the backend does not
+
+      proxy = makeProxy();
+      const after = await proxy.envFor("ssh-ws", "ssh", []);
+      expect(after.ANTHROPIC_BASE_URL).toBe(before.ANTHROPIC_BASE_URL);
+      expect(host.opened).toEqual([taken, next]); // adopted: nothing opened after the restart
+      await host.dropAll();
     });
   });
 

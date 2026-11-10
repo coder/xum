@@ -66,15 +66,21 @@ export function consumePendingPluginsSectionIntent(): PluginsSectionIntent | nul
   return intent;
 }
 
-/** Subscribe a mounted section; returns an unsubscribe. */
+/**
+ * Subscribe a mounted section; returns an unsubscribe. `alreadyRead` is the intent the section
+ * read from the buffer when it mounted: it already acted on it, so it is not delivered again. An
+ * intent published after that read (the section renders before its effects run) reaches the
+ * listener now, instead of being dropped with the buffer. Only the Plugins section subscribes, so
+ * nothing else is waiting for the buffer: a second subscriber would find it cleared.
+ */
 export function subscribePluginsSectionIntents(
-  listener: (intent: PluginsSectionIntent) => void
+  listener: (intent: PluginsSectionIntent) => void,
+  alreadyRead: PluginsSectionIntent | null = null
 ): () => void {
   listeners.add(listener);
-  // The subscribing section already read the buffered intent at mount (peek above). Only the
-  // Plugins section subscribes, so nothing else is waiting for it: a second subscriber would
-  // find the buffer cleared.
+  const buffered = pendingIntent;
   pendingIntent = null;
+  if (buffered !== null && buffered !== alreadyRead) listener(buffered);
   return () => {
     listeners.delete(listener);
   };
