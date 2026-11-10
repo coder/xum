@@ -29,7 +29,7 @@ export interface ClippingBoundary {
 }
 
 export function px(value: string | undefined): number {
-  const parsed = Number.parseFloat(String(value || "0"));
+  const parsed = Number.parseFloat(value ?? "0");
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
@@ -68,7 +68,7 @@ function normalizeText(text: string): string {
 function directText(el: Element): string {
   const own = Array.from(el.childNodes)
     .filter((node) => node.nodeType === TEXT_NODE)
-    .map((node) => node.textContent || "");
+    .map((node) => node.textContent ?? "");
   return normalizeText(own.join(" "));
 }
 
@@ -90,7 +90,7 @@ export function isNestedInTextBoundary(page: LayoutPage, el: Element): boolean {
 export function isRequiredControl(el: Element): boolean {
   if (!el.matches(CONTROL) || el.matches(DISABLED_CONTROL)) return false;
   if (!el.hasAttribute("role")) return true;
-  return CONTROL_ROLES.has((el.getAttribute("role") || "").toLowerCase());
+  return CONTROL_ROLES.has((el.getAttribute("role") ?? "").toLowerCase());
 }
 
 function isHiddenStyle(style: LayoutStyle): boolean {

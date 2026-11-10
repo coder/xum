@@ -71,7 +71,7 @@ export interface FakeLayoutPage {
 function numbers(attribute: string | null, count: number, what: string): number[] {
   const values = (attribute ?? "").trim().split(/\s+/).filter(Boolean).map(Number);
   if (values.length === 0) return Array<number>(count).fill(0);
-  if (values.length !== count || values.some(Number.isNaN)) throw new Error(`bad ${what}: ${attribute}`);
+  if (values.length !== count || values.some(Number.isNaN)) throw new Error(`bad ${what}: ${attribute ?? ""}`);
   return values;
 }
 
@@ -131,14 +131,25 @@ function topElementAt(document: Document, x: number, y: number): Element | null 
 }
 
 function createSignals(options: FakeLayoutPageOptions, calls: string[]): SettleSignals {
-  const settle = { layoutQuiet: true, domQuiet: true, animationsSettled: true, documentComplete: true, ...options.settle };
+  const settle = {
+    layoutQuiet: true,
+    domQuiet: true,
+    animationsSettled: true,
+    documentComplete: true,
+    ...options.settle,
+  };
+  // Every signal records that it was awaited and resolves at once with the configured value.
+  const signal = <T>(name: string, value: T): Promise<T> => {
+    calls.push(name);
+    return Promise.resolve(value);
+  };
   return {
-    fontsReady: async () => void calls.push("fonts"),
-    layoutQuiet: async () => (calls.push("layoutQuiet"), settle.layoutQuiet),
-    domQuiet: async () => (calls.push("domQuiet"), settle.domQuiet),
-    finiteAnimationsSettled: async () => (calls.push("animations"), settle.animationsSettled),
-    frames: async () => void calls.push("frames"),
-    sleep: async () => void calls.push("sleep"),
+    fontsReady: () => signal("fonts", undefined),
+    layoutQuiet: () => signal("layoutQuiet", settle.layoutQuiet),
+    domQuiet: () => signal("domQuiet", settle.domQuiet),
+    finiteAnimationsSettled: () => signal("animations", settle.animationsSettled),
+    frames: () => signal("frames", undefined),
+    sleep: () => signal("sleep", undefined),
     documentComplete: () => (calls.push("documentComplete"), settle.documentComplete),
   };
 }

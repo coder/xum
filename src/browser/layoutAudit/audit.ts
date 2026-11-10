@@ -305,7 +305,7 @@ function textClipCheck(pass: AuditPass, el: Element): void {
 
 // Opaque: opacity and background alpha both at least 0.95. Computed styles are rgb()/rgba().
 function isOpaqueColor(color: string): boolean {
-  const rgba = color.trim().toLowerCase().match(/^rgba?\(([^)]+)\)$/);
+  const rgba = /^rgba?\(([^)]+)\)$/.exec(color.trim().toLowerCase());
   if (rgba === null) return false;
   const parts = rgba[1].split(/[\s,/]+/).filter(Boolean);
   if (parts.length < 4) return true;

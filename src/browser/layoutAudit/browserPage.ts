@@ -125,9 +125,9 @@ function observeMutations(win: BrowserWindow, onChange: () => void): () => void 
 }
 
 // A failed font load must not stall the audit: ready is awaited for its timing, not its outcome.
+// A page whose browser has no font set has nothing to wait for.
 function waitForFonts(win: BrowserWindow): Promise<void> {
-  const ready = win.document.fonts?.ready;
-  return ready ? ready.then(noop, noop) : Promise.resolve();
+  return Promise.resolve(win.document.fonts?.ready).then(noop, noop);
 }
 
 function waitForFrames(win: BrowserWindow, count: number): Promise<void> {
