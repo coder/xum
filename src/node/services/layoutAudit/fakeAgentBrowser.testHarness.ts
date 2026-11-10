@@ -37,6 +37,8 @@ export interface FakeAgentBrowserScript {
   missing?: boolean;
   /** tool_env fails to source. */
   toolEnvFails?: boolean;
+  /** Shell lines appended to a tool_env that sources, after the PATH line. */
+  toolEnvLines?: string[];
   /** `open` exits 1. */
   openFails?: boolean;
   /** `close` never answers, like a daemon that is still executing a command. */
@@ -193,7 +195,11 @@ export async function installFakeAgentBrowser(
   await fs.writeFile(path.join(binDir, "agent-browser"), fakeScript(stateDir), { mode: 0o755 });
   const toolEnv = script.toolEnvFails
     ? "return 1\n"
-    : `export PATH=${shellQuote(script.missing ? emptyDir : `${binDir}:${process.env.PATH ?? ""}`)}\n`;
+    : [
+        `export PATH=${shellQuote(script.missing ? emptyDir : `${binDir}:${process.env.PATH ?? ""}`)}`,
+        ...(script.toolEnvLines ?? []),
+        "",
+      ].join("\n");
   await fs.writeFile(path.join(projectDir, ".xum", "tool_env"), toolEnv);
   if (script.openFails) await fs.writeFile(path.join(stateDir, "open-fails"), "");
   if (script.closeHangs) await fs.writeFile(path.join(stateDir, "close-hangs"), "");

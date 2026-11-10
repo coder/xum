@@ -95,8 +95,15 @@ const FRAME_END = "@@xum-layout-end";
  * included) never reaches stdout or stderr. `cd /` keeps the daemon outside the workspace. Every
  * call carries the same flags and the same folder, `close` included, so it addresses the same
  * daemon.
+ *
+ * The driver neutralizes the inherited variables and the word-splitting state: a tool_env that
+ * sets IFS would make the sweep read its newline-separated names as one word, so IFS is unset
+ * first (unset, it splits on space, tab and newline). A tool_env that redefines a command such
+ * as `env`, `sed` or `agent-browser` is outside that boundary: tool_env is trusted project code
+ * that can run anything.
  */
 const SHELL_COMMON = String.raw`
+unset IFS
 for v in $(env | sed -n 's/^\(AGENT_BROWSER_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
 export AGENT_BROWSER_SOCKET_DIR="$XUM_LAYOUT_SOCKET_DIR"
 ab_wrap=

@@ -356,6 +356,19 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     }
   });
 
+  test("a tool_env that redefines IFS and exports agent-browser settings changes neither the sweep nor the widths", async () => {
+    // With IFS=" " the sweep's newline-separated names would read as one word and survive.
+    const { outcomes, fake } = await run({
+      toolEnvLines: ['IFS=" "', "export AGENT_BROWSER_CDP=1", "export AGENT_BROWSER_FUTURE_FLAG=1"],
+    });
+    expect(outcomes.map((outcome) => `${outcome.viewport.width} ${outcome.status}`)).toEqual(
+      RUN_ORDER.map((width) => `${width} complete`)
+    );
+    expect(await fake.agentBrowserEnvNames()).toEqual(
+      Array.from({ length: 10 }, () => ["AGENT_BROWSER_SOCKET_DIR"])
+    );
+  });
+
   test("every call names a config of the run's own folder, and it is empty", async () => {
     const { fake } = await run({});
     const dirs = (await fake.socketDirs()).map((call) => call.dir);
