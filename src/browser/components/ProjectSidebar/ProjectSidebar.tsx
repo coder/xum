@@ -98,6 +98,7 @@ import {
   collectActiveWorkflowGroupKeys,
   computeSidebarTaskGroups,
   computeTaskGroupMemberRowMeta,
+  getTaskGroupHeaderChildTrunk,
   type SidebarTaskGroupModel,
 } from "./sidebarTaskGroups";
 import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
@@ -2338,24 +2339,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           }}
         />
       );
-      // Expanded members hang below the header on the task-group member rail;
-      // the header owns the top of that trunk so the run starts at the header
-      // row (mirrors childTrunkActive on workspace parent rows).
-      const firstDisplayMember = group.displayMembers[0];
-      const firstMemberMeta =
-        isExpanded && firstDisplayMember != null
-          ? memberMetaByWorkspaceId.get(firstDisplayMember.id)
-          : undefined;
-      const memberChildTrunk =
-        firstMemberMeta != null
-          ? {
-              left: getSubAgentParentRailX(
-                getTaskGroupMemberDepth(headerDepth),
-                "task-group-member"
-              ),
-              active: firstMemberMeta.sharedTrunkActiveThroughRow,
-            }
-          : undefined;
+      const memberChildTrunk = getTaskGroupHeaderChildTrunk({
+        group,
+        isExpanded,
+        headerDepth,
+        memberMetaByWorkspaceId,
+      });
       const renderedRows: React.ReactNode[] = [
         headerMeta != null ? (
           <SubAgentListItem

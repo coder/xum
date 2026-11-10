@@ -1,4 +1,7 @@
-import { getTaskGroupMemberDepth } from "@/browser/components/sidebarItemLayout";
+import {
+  getSubAgentParentRailX,
+  getTaskGroupMemberDepth,
+} from "@/browser/components/sidebarItemLayout";
 import {
   isSidebarSubAgentRunning,
   isWorkspaceDelegatedActivityActive,
@@ -365,6 +368,33 @@ export function computeSidebarTaskGroups(params: {
   }
 
   return { groupsByStorageKey, memberGroupStorageKeyByWorkspaceId };
+}
+
+/**
+ * The trunk stub an expanded group header draws from its center down to its
+ * bottom edge. Expanded members hang below the header on the task-group member
+ * rail, so the header owns the top of that trunk and the run starts at the
+ * header row (mirrors childTrunkActive on workspace parent rows). It animates
+ * while the first member's shared trunk does. Collapsed or empty groups draw none.
+ */
+export function getTaskGroupHeaderChildTrunk(params: {
+  group: SidebarTaskGroupModel;
+  isExpanded: boolean;
+  headerDepth: number;
+  memberMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
+}): { left: number; active: boolean } | undefined {
+  const firstMember = params.group.displayMembers[0];
+  if (!params.isExpanded || firstMember == null) {
+    return undefined;
+  }
+  const firstMemberMeta = params.memberMetaByWorkspaceId.get(firstMember.id);
+  if (firstMemberMeta == null) {
+    return undefined;
+  }
+  return {
+    left: getSubAgentParentRailX(getTaskGroupMemberDepth(params.headerDepth), "task-group-member"),
+    active: firstMemberMeta.sharedTrunkActiveThroughRow,
+  };
 }
 
 /**

@@ -823,6 +823,10 @@ export const ParentTrunkContinuity: Story = {
   args: undefined as never,
   name: "SubAgent States/Parent Trunk Continuity",
   render: renderParentTrunkContinuity,
+  // The play asserts the trunk geometry, and AppSidebarThreeActiveSubAgents already
+  // snapshots the same parent with three running children, so this story stays out of
+  // the Pixel snapshot budget (scripts/check-storybook-snapshot-budget.mjs).
+  parameters: { pixel: { exclude: true } },
   play: async ({ canvasElement }) => {
     await waitFor(async () => {
       const canvas = within(canvasElement);
@@ -848,7 +852,8 @@ export const ParentTrunkContinuityPhone: Story = {
   ...ParentTrunkContinuity,
   name: "SubAgent States/Parent Trunk Continuity Phone",
   parameters: {
-    pixel: { matrix: { viewports: ["phone"] } },
+    // Same reason as ParentTrunkContinuity: the play is the contract at phone width.
+    pixel: { exclude: true },
     viewport: {
       options: {
         phone: { name: "Phone", styles: { width: "390px", height: "844px" }, type: "mobile" },
@@ -1012,6 +1017,8 @@ export const ParentTitleDuringChildChanges: Story = {
 export const LowestRunningChild: Story = {
   args: undefined as never,
   name: "SubAgent States/Lowest Running Child",
+  // The play asserts where the inactive tail starts and ends; no Pixel snapshot needed.
+  parameters: { pixel: { exclude: true } },
   render: () => (
     <div className="subagent-connector-clock w-[340px] max-w-full">
       <SubAgentListItem

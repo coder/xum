@@ -688,6 +688,21 @@ export function filterVisibleAgentRows(
 }
 
 /**
+ * Rows with visible children own the top of the shared child trunk; it animates
+ * while any visible child is running so the run reads from the parent down to
+ * the lowest running child. Rows without visible children get no stub.
+ */
+function getChildTrunkMeta<T>(
+  children: readonly T[] | undefined,
+  isRunning: (child: T) => boolean
+): { childTrunkActive?: boolean } {
+  if (children == null || children.length === 0) {
+    return {};
+  }
+  return { childTrunkActive: children.some(isRunning) };
+}
+
+/**
  * Build render metadata for visible rows in a flattened workspace tree.
  */
 export function computeAgentRowRenderMeta(
@@ -793,7 +808,6 @@ export function computeAgentRowRenderMeta(
       effectiveParentId != null
         ? (metadataByWorkspaceId.get(effectiveParentId)?.depth ?? 0) + 1
         : 0;
-    const visibleChildren = visibleChildrenByParent.get(workspace.id);
     metadataByWorkspaceId.set(workspace.id, {
       depth: effectiveDepth,
       ...(effectiveParentId != null ? { visibleParentWorkspaceId: effectiveParentId } : {}),
@@ -801,16 +815,9 @@ export function computeAgentRowRenderMeta(
       connectorPosition,
       sharedTrunkActiveThroughRow,
       sharedTrunkActiveBelowRow,
-      // Rows with visible children own the top of the shared child trunk; it
-      // animates while any visible child is running so the run reads from the
-      // parent down to the lowest running child.
-      ...(visibleChildren != null && visibleChildren.length > 0
-        ? {
-            childTrunkActive: visibleChildren.some((child) =>
-              isSidebarSubAgentRunning(child, options)
-            ),
-          }
-        : {}),
+      ...getChildTrunkMeta(visibleChildrenByParent.get(workspace.id), (child) =>
+        isSidebarSubAgentRunning(child, options)
+      ),
       ancestorTrunks,
       // Inactive sub-agents are intentionally absent from the sidebar; the transcript decoration
       // is the canonical place to inspect and manage the persistent hierarchy.
@@ -860,19 +867,18 @@ export function computeRowMetaForVisibleNodes(
 
   // Recomputed for the final visible node set: base meta may carry a stale
   // childTrunkActive from a pass where different children were visible.
-  const getChildTrunkMeta = (nodeId: string): { childTrunkActive?: boolean } => {
-    const children = childrenByParentId.get(nodeId);
-    if (children == null || children.length === 0) {
-      return {};
-    }
-    return { childTrunkActive: children.some((child) => child.isRunning) };
-  };
+  const getVisibleChildTrunkMeta = (nodeId: string) =>
+    getChildTrunkMeta(childrenByParentId.get(nodeId), (child) => child.isRunning);
 
   const metaById = new Map<string, AgentRowRenderMeta>();
   for (const node of nodes) {
     if (node.parentId == null) {
       const { childTrunkActive: _staleChildTrunkActive, ...baseMeta } = node.baseMeta;
-      metaById.set(node.id, { ...baseMeta, ancestorTrunks: [], ...getChildTrunkMeta(node.id) });
+      metaById.set(node.id, {
+        ...baseMeta,
+        ancestorTrunks: [],
+        ...getVisibleChildTrunkMeta(node.id),
+      });
       continue;
     }
 
@@ -926,7 +932,7 @@ export function computeRowMetaForVisibleNodes(
       connectorPosition,
       sharedTrunkActiveThroughRow,
       sharedTrunkActiveBelowRow,
-      ...getChildTrunkMeta(node.id),
+      ...getVisibleChildTrunkMeta(node.id),
       ancestorTrunks,
     });
   }
