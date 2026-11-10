@@ -426,10 +426,9 @@ export function organizerRunEnd(
   runTimeout: AbortSignal | undefined
 ): { kind: "record"; note: string | undefined } | { kind: "failed"; error: string } {
   if (result.streamError === undefined) return { kind: "record", note: result.note };
-  const cutByRunTimeout =
-    runTimeout?.aborted === true &&
-    result.abortReason !== undefined &&
-    result.abortReason === runTimeout.reason;
+  // An aborted signal's reason is never undefined (abort() with none stores an AbortError), so a
+  // stream with no abort reason never matches.
+  const cutByRunTimeout = runTimeout?.aborted === true && result.abortReason === runTimeout.reason;
   if (cutByRunTimeout && result.ops.some((op) => op.applied)) {
     return { kind: "record", note: RUN_TIMEOUT_NOTE };
   }
