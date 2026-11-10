@@ -31,6 +31,9 @@ const NAME_SUFFIX_MAX = 48;
 const GAP_MAX = 48;
 
 const SIGNED_URL_PARAM = "(?:sig|signature|x-amz-signature|x-goog-signature)";
+// Where a signed URL's value starts, and the characters that end it.
+const SIGNED_URL_VALUE_START = String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)`;
+const SIGNED_URL_VALUE_END = String.raw`\s"'\\<>&#,;)\]}`;
 
 // Credential shapes that are secret on their own, wherever they appear.
 const STANDALONE_SECRET_PATTERNS: RegExp[] = [
@@ -49,7 +52,7 @@ const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // Google `X-Goog-Signature`. Only the value goes, and only in query position (after `?` or `&`,
   // `&amp;` too, as in XML listings). `signature` stays out of SECRET_NAME: the memory-write guard
   // reuses it, and prose such as `signature: foo(a, b)` must stay writable.
-  new RegExp(String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)[^\s"'\\<>&#,;)\]}]+`, "gi"),
+  new RegExp(String.raw`${SIGNED_URL_VALUE_START}[^${SIGNED_URL_VALUE_END}]+`, "gi"),
   // Anchored to the start of a character run: `\b` also matches after `-`, so `eyJ-eyJ-eyJ-...`
   // would start a scan to the end of the run at every `eyJ`.
   /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
@@ -84,10 +87,48 @@ const ESCAPED_QUOTED_VALUE = String.raw`(?<run>\\{1,${ESCAPE_RUN_MAX}})(?<quote>
 // The value is a quoted run (to its closing quote, or to the end of an unterminated one) or one
 // unquoted word, optionally behind an auth scheme.
 // Already-redacted values are skipped so the passes compose, and so are comparisons (`token === x`).
+// What goes on after a skipped marker is read by the marker tail pattern below.
+const KEY_VALUE_PREFIX = String.raw`${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}(?:\\{0,${ESCAPE_RUN_MAX}}["']\]?)?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}}`;
+// The characters that end an unquoted value.
+const UNQUOTED_VALUE_END = String.raw`\s"'\\,;&}\])`;
 const SECRET_KEY_VALUE_PATTERN = new RegExp(
-  String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}(?:\\{0,${ESCAPE_RUN_MAX}}["']\]?)?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}})` +
-    String.raw`(?![=]|\[redacted\])(?:${QUOTED_VALUE}|${ESCAPED_QUOTED_VALUE}|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+)`,
+  `(${KEY_VALUE_PREFIX})` +
+    String.raw`(?![=]|\[redacted\])(?:${QUOTED_VALUE}|${ESCAPED_QUOTED_VALUE}|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^${UNQUOTED_VALUE_END}]+)`,
   "gi"
+);
+
+// A value that goes on after a marker. A pass that redacts part of a value leaves the marker inside
+// it (`sig=abc.<key>.xyz` is `sig=abc.[redacted].xyz` once the key pattern ran), and a value that a
+// model writes beside a marker starts with it (`password=[redacted]SEKRIT`). The two patterns above
+// end a value at the marker's `]` or skip a value that starts with the marker, so the rest stayed
+// readable, and the write guard accepted it. A marker is no end of a value: the value goes on through
+// the characters that would continue it without the marker, and through a `]` that a character of
+// the value follows (the marker's own bracket, which the pass that cut the value there leaves behind,
+// or a bracket inside the value: ending at it would leave `[redacted]]d]Z` for a second pass to cut
+// again). A marker with nothing after it is a redacted value, and stays as it is.
+// This runs after every other pass, on what they left, and only puts the marker over a span of their
+// output, so it never redacts less than they do. Extending their patterns would take the tail in
+// their pass, and a later pass would no longer read what it holds (`token="SEKRIT"` or a
+// `Cookie:` header glued to the marker).
+// Linear: a marker, then characters of a class and markers with nothing after them.
+const MARKER_SOURCE = String.raw`\[redacted\]`;
+function markerTail(valueEnd: string): string {
+  return String.raw`${MARKER_SOURCE}(?:${MARKER_SOURCE}|\](?=[^${valueEnd}])|[^${valueEnd}])+`;
+}
+const KEY_MARKER_TAIL_PATTERN = new RegExp(
+  `(${KEY_VALUE_PREFIX})` + markerTail(UNQUOTED_VALUE_END),
+  "gi"
+);
+const SIGNED_URL_MARKER_TAIL_PATTERN = new RegExp(
+  SIGNED_URL_VALUE_START + markerTail(SIGNED_URL_VALUE_END),
+  "gi"
+);
+// What both patterns need: a marker with a character after it that no value ends at (the signed-URL
+// set holds all of the key pair's, so this one is the wider). Most text has none, and then a scan
+// for a key or a parameter, which reads the whole text, would find nothing.
+const MARKER_TAIL_CANDIDATE = new RegExp(
+  String.raw`${MARKER_SOURCE}\]?[^${UNQUOTED_VALUE_END}]`,
+  "i"
 );
 
 // A session cookie is a bearer credential that has no keyword and no token shape of its own, so the
@@ -509,12 +550,26 @@ function redactCookieHeaders(text: string, onRemoved: (removed: string) => void)
   return parts.join("");
 }
 
+/** Puts the marker over what goes on after a marker in a value (see `KEY_MARKER_TAIL_PATTERN`). */
+function redactMarkerTails(text: string, onRemoved: (removed: string) => void): string {
+  if (!MARKER_TAIL_CANDIDATE.test(text)) return text;
+  const keyed = text.replace(KEY_MARKER_TAIL_PATTERN, (match: string, prefix: string) => {
+    onRemoved(match.slice(prefix.length));
+    return `${prefix}${REDACTED}`;
+  });
+  return keyed.replace(SIGNED_URL_MARKER_TAIL_PATTERN, (match: string) => {
+    onRemoved(match);
+    return REDACTED;
+  });
+}
+
 /**
- * Which passes took a value out: main's regex passes, or the reader that runs on their output. The
- * write guard compares each apart, so its verdict on the regex passes' values is main's own: a
- * value the reader takes out of the previous text never excuses one the regex takes out of the new.
+ * Which passes took a value out: main's regex passes, the reader that runs on their output, or the
+ * marker tails after that. The write guard compares each apart, so its verdict on the regex passes'
+ * values is main's own: a value the reader or a tail takes out of the previous text never excuses
+ * one the regex takes out of the new.
  */
-type RemovalSource = "regex" | "reader";
+type RemovalSource = "regex" | "reader" | "tail";
 
 /**
  * The redaction passes, in order, each on the previous pass's output. `onRemoved` hears what each
@@ -549,7 +604,8 @@ function runRedactionPasses(
   // Last, on what the passes above left: the reader only replaces spans of their output with the
   // marker, so it never brings back a character they took out. It adds the rest of a value that
   // the regex ended early (at a quote, a `]` or a marker inside it), and never redacts less.
-  return redactCookieHeaders(redacted, (removed) => onRemoved(removed, "reader"));
+  redacted = redactCookieHeaders(redacted, (removed) => onRemoved(removed, "reader"));
+  return redactMarkerTails(redacted, (removed) => onRemoved(removed, "tail"));
 }
 
 /** Replaces common credential shapes with `[redacted]`. */
@@ -565,7 +621,11 @@ export function redactSecretLike(text: string): string {
  * key) makes a new value and is refused too, though it adds no secret.
  */
 export function addsSecretLike(previous: string, updated: string): boolean {
-  const held: Record<RemovalSource, Map<string, number>> = { regex: new Map(), reader: new Map() };
+  const held: Record<RemovalSource, Map<string, number>> = {
+    regex: new Map(),
+    reader: new Map(),
+    tail: new Map(),
+  };
   runRedactionPasses(previous, (removed, source) => {
     // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
     held[source].set(removed, (held[source].get(removed) ?? 0) + 1);
