@@ -1055,6 +1055,8 @@ describe("redactSecretLike", () => {
     ["a bare parameter", "?sig=SEKRIT", "?sig=[redacted]"],
     ["an XML-escaped ampersand", "?a=1&amp;signature=SEKRIT", "?a=1&amp;signature=[redacted]"],
     ["a Google signature", "?X-Goog-Signature=SEKRIT", "?X-Goog-Signature=[redacted]"],
+    // An earlier pass redacts the whole value, so the signature pattern sees only the marker.
+    ["a value that an earlier pass redacted", "?sig=sk-ABCDEFGHIJKLMNOP", "?sig=[redacted]"],
     ["a value that is the marker already", "?sig=[redacted]", "?sig=[redacted]"],
     [
       "a marker after an XML-escaped ampersand",
