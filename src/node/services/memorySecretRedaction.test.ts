@@ -1064,11 +1064,12 @@ describe("redactSecretLike", () => {
       "(see https://h/p?sig=SEKRIT)",
       "(see https://h/p?sig=[redacted])",
     ],
-    // The marker is the head of the value: the text keeps it, and what follows stays as on main.
+    // The marker is the head of the value: the passes read it as on main, and the output does not
+    // take the `]` that main wrote after it.
     ["a value that is the marker already", "?sig=[redacted]", "?sig=[redacted]"],
     ["a marker and a bracket", "?sig=[redacted]]", "?sig=[redacted]]"],
     ["a value behind the marker", "?sig=[redacted]SEKRIT", "?sig=[redacted]SEKRIT"],
-    ["a value behind an upper-case marker", "?sig=[REDACTED]x", "?sig=[REDACTED]x"],
+    ["a value behind an upper-case marker", "?sig=[REDACTED]x", "?sig=[redacted]x"],
     [
       "a semicolon and a value behind the marker",
       "https://x/?sig=[redacted];SEKRIT",
@@ -1102,6 +1103,38 @@ describe("redactSecretLike", () => {
       }
     }
   );
+
+  // The collapse follows the `]` that main's passes add through the passes after the signed-URL
+  // pattern, and takes out only that one: a `]` the text had after a marker stays.
+  it("leaves a `]` after a marker that no signed-URL match wrote", () => {
+    const text = "user text [[redacted]] and [redacted]] keep";
+    expect(redactSecretLike(text)).toBe(text);
+    expect(redactSecretLike("x ?sig=[redacted]] y [redacted]]")).toBe(
+      "x ?sig=[redacted]] y [redacted]]"
+    );
+  });
+
+  // A header that only the cookie reader detects reads on past a `]`, so the reader still sees the
+  // extra `]` that the signed-URL pattern wrote, as on main: the redaction hides `SEKRIT` too, and
+  // the guard judges an edit of the tail as main's does.
+  it.each([
+    String.raw`a\tcookie": [?sig=sk-ABCDEFGHIJKLMNOP x], SEKRIT`,
+    String.raw`a\tcookie": [?sig=[redacted] x], SEKRIT`,
+  ])("hides a tail that the reader reads on past a marker: %s", (text) => {
+    const redacted = redactSecretLike(text);
+    expect(redacted).not.toContain("SEKRIT");
+    expect(redactSecretLike(redacted)).toBe(redacted);
+  });
+
+  it.each([
+    ['password="?sig=[redacted]"\n?sig=SEKRIT', 'password="?sig=SEKRIT"'],
+    [
+      String.raw`a\tcookie": [?sig=[redacted] x], AAA`,
+      String.raw`a\tcookie": [?sig=[redacted] x], SEKRIT`,
+    ],
+  ])("judges an edit as main's guard does: %j then %j", (previous, updated) => {
+    expect(addsSecretLike(previous, updated)).toBe(true);
+  });
 
   // A half marker is not the marker: a value that merely starts like it is still a value.
   it("redacts a signature value that starts like the marker but is not it", () => {
@@ -1226,9 +1259,9 @@ describe("containsSecretLike", () => {
     expect(containsSecretLike("Auth uses a password manager and a bearer scheme.")).toBe(false);
   });
 
-  // The signed-URL pattern writes the head of a marker back as it was. Main wrote `[redacted]]`
-  // there and so flagged it: the verdict stays. A marker that the cookie rule puts back stays unflagged.
-  it("flags a marker that the signed-URL pattern reads and writes back", () => {
+  // The passes still write `[redacted]]` after the head of a marker, and only the output drops that
+  // `]`, so the verdict is main's. A marker that the cookie rule puts back stays unflagged.
+  it("flags a marker that the signed-URL pattern reads", () => {
     expect(containsSecretLike("?sig=[redacted]")).toBe(true);
     expect(containsSecretLike("?sig=[redacted]]")).toBe(true);
     expect(containsSecretLike("Cookie: [redacted]")).toBe(false);
