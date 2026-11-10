@@ -49,6 +49,22 @@ export class EmptyStreamOutputError extends Error {
 }
 
 /**
+ * What a refusal in a category with no recommended fallback tells the user. Another model would
+ * refuse the same request, so none of these suggests one. Each category has its own cause:
+ * Anthropic's refusals page says a reasoning_extraction refusal "usually" comes from wording
+ * that asks for the model's reasoning in its reply, and that the wording "can sit in a system
+ * prompt, a skill, or a tool description". A category without an entry gets the neutral text.
+ */
+const NO_FALLBACK_REFUSAL_TEXT: ReadonlyMap<string, string> = new Map([
+  [
+    "reasoning_extraction",
+    "Retrying the same request will not help. This refusal usually comes from wording that asks the model to write out its reasoning in its reply. Check the prompt, AGENTS.md and the system prompt, skills, and tool descriptions, and ask for a short explanation instead.",
+  ],
+]);
+const NEUTRAL_NO_FALLBACK_REFUSAL_TEXT =
+  "Retrying the same request will not help: the refusal stands, so change the request.";
+
+/**
  * Terminal provider refusal: the model declined to continue the turn. Unlike
  * EmptyStreamOutputError (a transport drop), retrying the same request will
  * likely refuse again, so this maps to the non-retryable "model_refusal" stream
@@ -60,14 +76,16 @@ export class ModelRefusalError extends Error {
     finishReason: string,
     details: { fallbackNote?: string; noFallbackCategory?: string } = {}
   ) {
+    const { fallbackNote, noFallbackCategory: category } = details;
+    let advice =
+      "Retrying the same request is unlikely to help; try rephrasing or a different model.";
+    if (category !== undefined) {
+      // mutation-equivalent: every NO_FALLBACK_REFUSAL_TEXT value is non-empty, so ?? and || agree
+      advice = NO_FALLBACK_REFUSAL_TEXT.get(category) ?? NEUTRAL_NO_FALLBACK_REFUSAL_TEXT;
+    }
     super(
-      `The model refused to continue (finishReason: ${finishReason}): ${model}. ` +
-        // Anthropic: a refusal with no recommended fallback (today only reasoning_extraction)
-        // stands, and the prompt must change. Another model would refuse the same prompt.
-        (details.noFallbackCategory !== undefined
-          ? "Retrying the same request will not help: it asks the model to reproduce its reasoning in the reply, so change the prompt."
-          : "Retrying the same request is unlikely to help; try rephrasing or a different model.") +
-        (details.fallbackNote ? ` ${details.fallbackNote}` : "")
+      `The model refused to continue (finishReason: ${finishReason}): ${model}. ${advice}` +
+        (fallbackNote ? ` ${fallbackNote}` : "")
     );
     this.name = "ModelRefusalError";
   }

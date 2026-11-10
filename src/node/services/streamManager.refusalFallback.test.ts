@@ -619,6 +619,7 @@ describe("StreamManager - refusal categories with no recommended fallback", () =
     const message = completion.status === "failed" ? completion.streamError.error : "";
     expect(message).toContain("reasoning_extraction");
     expect(message).not.toContain("chain exhausted");
+    expect(message).not.toContain("different model");
   });
 
   test("a hop that refuses with reasoning_extraction ends the chain at that hop", async () => {

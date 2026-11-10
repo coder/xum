@@ -9,6 +9,7 @@ import {
   EmptyStreamOutputError,
   getContextBudgetStreamError,
   getSelfClassifiedStreamError,
+  ModelRefusalError,
   StreamTruncatedError,
 } from "./streamErrors";
 import {
@@ -206,6 +207,31 @@ describe("self-describing stream errors", () => {
       errorType: "context_budget_blocked",
     });
     expect(getContextBudgetStreamError(new Error("x"))).toBeNull();
+  });
+});
+
+describe("ModelRefusalError wording", () => {
+  const refusal = (details?: { fallbackNote?: string; noFallbackCategory?: string }) =>
+    new ModelRefusalError("anthropic:claude-fable-5-2", "refusal", details).message;
+
+  test("a refusal that may fall back suggests a different model", () => {
+    expect(refusal()).toContain("different model");
+    expect(refusal({ fallbackNote: "Chain exhausted." })).toContain("Chain exhausted.");
+  });
+
+  // Anthropic gives these refusals no fallback model: another model would refuse the same request.
+  test("reasoning_extraction explains its cause and never suggests another model", () => {
+    const message = refusal({ noFallbackCategory: "reasoning_extraction" });
+    expect(message).toContain("reasoning");
+    expect(message).not.toContain("different model");
+  });
+
+  // Only reasoning_extraction has its explanation: a later no-fallback category must not show it.
+  test("another no-fallback category gets neutral text, without that cause or another model", () => {
+    const message = refusal({ noFallbackCategory: "a_future_category" });
+    expect(message).not.toContain("reasoning");
+    expect(message).not.toContain("different model");
+    expect(message).toContain("change the request");
   });
 });
 
