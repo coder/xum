@@ -2682,18 +2682,17 @@ describe("MemoryConsolidationService", () => {
           const harvestRun = fixture.service.maybeHarvestThenSweep(epoch);
           await held.modelCreated(2);
           await settle();
-          // The dream's own timeout only: a chunk that waits has none running.
-          expect(held.events).toEqual(["timeout", "dream-start"]);
+          // The dream's turn deadline and its stream timeout. A waiting chunk may add its own turn
+          // deadline, but no stream of it has started.
+          expect(held.events.slice(0, 3)).toEqual(["timeout", "timeout", "dream-start"]);
+          expect(held.events).not.toContain("start-1");
 
           held.releaseDream();
           await held.streamStarted(1);
-          expect(held.events.slice(0, 5)).toEqual([
-            "timeout",
-            "dream-start",
-            "dream-end",
-            "timeout",
-            "start-1",
-          ]);
+          // The chunk's stream timeout starts after the dream ended, right before its stream.
+          const startAt = held.events.indexOf("start-1");
+          expect(held.events[startAt - 1]).toBe("timeout");
+          expect(held.events.indexOf("dream-end")).toBeLessThan(startAt - 1);
           await Promise.all([dreamRun, harvestRun]);
         } finally {
           timeoutSpy.mockRestore();
@@ -2865,7 +2864,9 @@ describe("MemoryConsolidationService", () => {
         await until(() => held.events.includes("start-1"));
         const second = fixture.service.maybeRun("ws-other", "manual");
         await waitingForTurn(fixture, 2);
-        expect(held.events).toEqual(["timeout-1", "start-1"]);
+        // Each run's turn deadline starts when it queues (1, 3); its stream timeout only when its
+        // turn arrives (2, then 4 after the first stream ended).
+        expect(held.events).toEqual(["timeout-1", "timeout-2", "start-1", "timeout-3"]);
 
         held.release(1);
         await until(() => held.events.includes("start-2"));
@@ -2873,9 +2874,11 @@ describe("MemoryConsolidationService", () => {
         expect((await Promise.all([first, second])).every((run) => run.success)).toBe(true);
         expect(held.events).toEqual([
           "timeout-1",
-          "start-1",
-          "end-1",
           "timeout-2",
+          "start-1",
+          "timeout-3",
+          "end-1",
+          "timeout-4",
           "start-2",
           "end-2",
         ]);
