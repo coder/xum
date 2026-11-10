@@ -289,6 +289,9 @@ describe("log file sink state machine", () => {
   test("lines written while a rotation is in flight reach the new log, in order", async () => {
     const { releaseFirstStream, secondStream } = stickFirstStream();
     await makeNextLineRotate();
+    const logsDir = path.dirname(getLogFilePath());
+    await fsPromises.writeFile(path.join(logsDir, "mux.1.log"), "older rotated log\n");
+    await fsPromises.writeFile(path.join(logsDir, "mux.2.log"), "oldest rotated log\n");
     log.info("line that rotates the log");
     log.info("held line one");
     log.info("held line two");
@@ -306,6 +309,13 @@ describe("log file sink state machine", () => {
       path.join(path.dirname(getLogFilePath()), "mux.1.log")
     );
     expect(rotated.subarray(-4096).toString()).toContain("line that rotates the log");
+    // The older files moved up one place.
+    expect(await fsPromises.readFile(path.join(logsDir, "mux.2.log"), "utf8")).toBe(
+      "older rotated log\n"
+    );
+    expect(await fsPromises.readFile(path.join(logsDir, "mux.3.log"), "utf8")).toBe(
+      "oldest rotated log\n"
+    );
   });
 
   test("a later transition does not write the held lines again", async () => {
@@ -339,6 +349,17 @@ describe("log file sink state machine", () => {
     const current = await readLog();
     expect(current).toContain("held during the clear");
     expect(current).not.toContain("line before the clear");
+  });
+
+  test("a clear on an idle sink leaves the sink able to open", async () => {
+    const createWriteStreamSpy = spyOn(fs, "createWriteStream");
+
+    await clearLogFiles();
+    // The sink queue lowers its depth a few microtasks after the clear resolves.
+    await new Promise((resolve) => setImmediate(resolve));
+    log.info("line after a clear of an idle sink");
+
+    expect(createWriteStreamSpy).toHaveBeenCalledTimes(1);
   });
 
   test("held lines are bounded, and the lines past the bound are the ones dropped", async () => {
