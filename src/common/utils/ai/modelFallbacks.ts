@@ -20,6 +20,8 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
  * Fable 5.1, so it is not a proven refusal-recovery target, and pinning keeps
  * fresh installs and already-seeded configs on identical bytes without a
  * chain-target migration. Revisit once Opus 5.5 refusal behavior is known.
+ * Opus 5 is also one of Anthropic's permitted server-side fallback targets for
+ * Fable 5.2 (https://platform.claude.com/docs/en/models/fable-5-2/whats-new-fable-5-2).
  *
  * Seeded into the config exactly once, guarded by
  * migrations.defaultModelFallbacksSeededFable52 (each earlier fable alias move

@@ -157,16 +157,20 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_pdf_input: true,
   },
 
-  // Claude Fable 5.2 / Mythos 5.2 - released November 9, 2026. Same underlying model and
-  // pricing: $8/M input, $40/M output, 5m cache write $10/M (1.25x input), cache read
-  // $0.20/M (0.025x input). Native 1M context, 128K max output, native xhigh effort level.
-  // https://platform.claude.com/docs/en/about-claude/pricing
+  // Claude Fable 5.2 - Released November 9, 2026, successor to Fable 5.1 in the
+  // Mythos-class tier. Official pricing: $8/M input, $40/M output (20% below Fable 5.1),
+  // 5-minute cache write $10/M (1.25x input), cache read $0.20/M (0.025x input, the same
+  // multiplier as Fable 5.1). The 1-hour cache write tier ($16/M, 2x input) has no field
+  // (displayUsage derives it from input), and fast mode ($16/$80) is a serviceTierPricing
+  // factor. Native 1M context, 128K max output, effort ladder low..max with native xhigh;
+  // adaptive thinking is always on (default effort high).
+  // https://platform.claude.com/docs/en/models/fable-5-2/overview
   "claude-fable-5-2": {
     max_input_tokens: 1000000,
     max_output_tokens: 128000,
     input_cost_per_token: 0.000008, // $8 per million input tokens
     output_cost_per_token: 0.00004, // $40 per million output tokens
-    cache_creation_input_token_cost: 0.00001, // $10 per million tokens (1.25× input, 5m write)
+    cache_creation_input_token_cost: 0.00001, // $10 per million tokens (1.25× input)
     cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.025× input)
     litellm_provider: "anthropic",
     mode: "chat",
@@ -177,12 +181,16 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
+  // Claude Mythos 5.2 - Released November 9, 2026 alongside Fable 5.2: the same model
+  // with some safeguards lifted, for organizations verified through Anthropic's
+  // verification programs. Identical specs and pricing to Fable 5.2 (see above).
+  // https://platform.claude.com/docs/en/models/mythos-5-2/overview
   "claude-mythos-5-2": {
     max_input_tokens: 1000000,
     max_output_tokens: 128000,
     input_cost_per_token: 0.000008, // $8 per million input tokens
     output_cost_per_token: 0.00004, // $40 per million output tokens
-    cache_creation_input_token_cost: 0.00001, // $10 per million tokens (1.25× input, 5m write)
+    cache_creation_input_token_cost: 0.00001, // $10 per million tokens (1.25× input)
     cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.025× input)
     litellm_provider: "anthropic",
     mode: "chat",

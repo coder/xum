@@ -42,7 +42,9 @@ import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
  * list is the one that binds thinking to the prefix (a tail change also breaks its thinking
  * replay). Live through the Coder gateway (2026-10-15), Opus 5.5, Sonnet
  * 5.5, Haiku 5.5 and Fable 5.1 accepted the row after a user message, then with an assistant
- * row after it, and read the whole earlier request from the cache.
+ * row after it, and read the whole earlier request from the cache. Anthropic documents
+ * mid-conversation system messages on Fable 5.2 and Mythos 5.2 as well
+ * (https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages).
  */
 export function acceptsVolatileSystemTailRow(
   modelString: string,

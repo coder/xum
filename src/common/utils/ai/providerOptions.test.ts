@@ -257,18 +257,18 @@ describe("buildProviderOptions - Anthropic", () => {
       );
       expect(anthropic51.thinking).toEqual({ type: "adaptive", display: "summarized" });
       expect(anthropic51.effort).toBe("medium");
-      // So do Fable 5.2 and Mythos 5.2.
-      for (const model of ["anthropic:claude-fable-5-2", "anthropic:claude-mythos-5-2"]) {
-        const options52 = anthropicProviderOptions(buildProviderOptions(model, "medium"));
-        expect(options52.thinking).toEqual({ type: "adaptive", display: "summarized" });
-        expect(options52.effort).toBe("medium");
-      }
       // Mythos 5.1 does too.
       const mythos51 = anthropicProviderOptions(
         buildProviderOptions("anthropic:claude-mythos-5-1", "medium")
       );
       expect(mythos51.thinking).toEqual({ type: "adaptive", display: "summarized" });
       expect(mythos51.effort).toBe("medium");
+      // Fable 5.2 and Mythos 5.2 too.
+      for (const model of ["anthropic:claude-fable-5-2", "anthropic:claude-mythos-5-2"]) {
+        const options = anthropicProviderOptions(buildProviderOptions(model, "medium"));
+        expect(options.thinking).toEqual({ type: "adaptive", display: "summarized" });
+        expect(options.effort).toBe("medium");
+      }
     });
 
     test("omits thinking instead of sending disabled when off", () => {
@@ -281,13 +281,13 @@ describe("buildProviderOptions - Anthropic", () => {
       expect(buildProviderOptions("anthropic:claude-fable-5-1", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
+      expect(buildProviderOptions("anthropic:claude-mythos-5-1", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
       expect(buildProviderOptions("anthropic:claude-fable-5-2", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
       expect(buildProviderOptions("anthropic:claude-mythos-5-2", "off")).toEqual({
-        anthropic: { ...baseAnthropicOptions, effort: "low" },
-      });
-      expect(buildProviderOptions("anthropic:claude-mythos-5-1", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
       // Opus 5.5 rejects disabled thinking too (breaking change from Opus 5, which
@@ -537,6 +537,7 @@ describe("buildProviderOptions - Anthropic", () => {
         "claude-sonnet-5-5",
         "claude-haiku-5-5",
         "claude-fable-5-1",
+        // Fable 5.2 and Mythos 5.2 run the prefix check on every account.
         "claude-fable-5-2",
         "claude-mythos-5-2",
       ]) {

@@ -50,11 +50,12 @@ interface KnownModel extends KnownModelDefinition {
 // Model definitions. Note we avoid listing legacy models here. These represent the focal models
 // of the community.
 const MODEL_DEFINITIONS = {
-  // Claude Fable 5.2 - Mythos-class model (a tier above Opus), released November 9, 2026
-  // as the successor to Fable 5.1. $8/M input, $40/M output (down from $10/$50), cache
-  // reads 0.025x input. API id `claude-fable-5-2`; Fable 5.1 and Fable 5 stay usable as
-  // the custom model strings `anthropic:claude-fable-5-1` and `anthropic:claude-fable-5`.
-  // See https://platform.claude.com/docs/en/models/fable-5-2/overview
+  // Claude Fable 5.2 - Mythos-class model (a tier above Opus), released November 9,
+  // 2026 as the successor to Fable 5.1 (the generally-available safeguarded variant).
+  // $8/M input, $40/M output (20% below Fable 5.1), cache reads still 0.025x input.
+  // API id `claude-fable-5-2`; Fable 5.1 and Fable 5 stay usable as the custom model
+  // strings `anthropic:claude-fable-5-1` and `anthropic:claude-fable-5`.
+  // https://platform.claude.com/docs/en/models/fable-5-2/overview
   FABLE: {
     provider: "anthropic",
     providerModelId: "claude-fable-5-2",
@@ -66,12 +67,13 @@ const MODEL_DEFINITIONS = {
     // same text, so real usage can run ~1.0-1.3x higher than this estimate.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // Claude Mythos 5.2 - released November 9, 2026 alongside Fable 5.2 as its twin with
-  // some safeguards lifted, with identical specs and pricing ($8/M input, $40/M output,
-  // 0.025x-input cache reads). Only organizations in Anthropic's verification programs
-  // (such as the Cyber Verification Program) can use it. API id `claude-mythos-5-2`;
-  // Mythos 5.1 and Mythos 5 stay usable as the custom model strings
-  // `anthropic:claude-mythos-5-1` and `anthropic:claude-mythos-5`.
+  // Claude Mythos 5.2 - released November 9, 2026 alongside Fable 5.2 as its
+  // restricted-access, safeguards-lifted twin, with identical specs and pricing ($8/M
+  // input, $40/M output, 0.025x-input cache reads). Available only to organizations
+  // verified through Anthropic's verification programs (no self-serve sign-up).
+  // API id `claude-mythos-5-2`; Mythos 5.1 and Mythos 5 stay usable as the custom model
+  // strings `anthropic:claude-mythos-5-1` and `anthropic:claude-mythos-5`.
+  // https://platform.claude.com/docs/en/models/mythos-5-2/overview
   // Not warmed: most users cannot access it, and its tokenizer override is already
   // warmed via FABLE.
   MYTHOS: {
@@ -294,10 +296,10 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
 // FABLE/OPUS comments); keep their approximate-tokenizer overrides so exact-id
 // lookup does not fall back to the generic per-provider tokenizer.
 const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
-  "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-fable-5-1": "anthropic/claude-opus-4.5",
-  "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-mythos-5-1": "anthropic/claude-opus-4.5",
+  "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
   "anthropic:claude-haiku-4-5": "anthropic/claude-3.5-haiku",
@@ -305,6 +307,15 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "openai:daybreak-blue-latest": "openai/gpt-5",
   "openai:daybreak-red-latest": "openai/gpt-5",
 };
+
+/**
+ * Ids of retired first-class models. The model catalogue keeps offering them so users can
+ * still find a model a newer built-in replaced, even when only models-extra describes it
+ * (Fable 5.1 and Mythos 5.1 are not in LiteLLM's models.json).
+ */
+export const RETIRED_KNOWN_MODEL_IDS: readonly string[] = Object.keys(
+  LEGACY_TOKENIZER_MODEL_OVERRIDES
+);
 
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   ...LEGACY_TOKENIZER_MODEL_OVERRIDES,

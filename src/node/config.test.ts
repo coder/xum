@@ -200,6 +200,7 @@ describe("Config", () => {
           migrations: {
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
+            defaultModelFallbacksSeededFable52: true,
             persistentSubagentsDefaulted: true,
           },
         })
@@ -5258,7 +5259,7 @@ describe("Config", () => {
     it.each([
       ["5.1", { defaultModelFallbacksSeeded: true }, FABLE_5_1],
       [
-        "5.5",
+        "5.2",
         { defaultModelFallbacksSeeded: true, defaultModelFallbacksSeededFable51: true },
         FABLE,
       ],
@@ -6125,6 +6126,7 @@ describe("Config", () => {
             persistentSubagentsDefaulted: true,
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
+            defaultModelFallbacksSeededFable52: true,
           },
         })
       );

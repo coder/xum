@@ -479,7 +479,8 @@ export function anthropicSupportsBetweenToolsThinking(modelString: string): bool
  *
  * On enforced accounts, Claude Opus 5.5, Claude Sonnet 5.5, Claude Haiku 5.5, and
  * Claude Fable 5.1 reject a request that replays a block whose prefix has since changed.
- * Claude Fable 5.2 and Claude Mythos 5.2 reject it on every account, whatever its age.
+ * Claude Fable 5.2 and Claude Mythos 5.2 run the check on every account, whatever its age
+ * (https://platform.claude.com/docs/en/models/fable-5-2/whats-new-fable-5-2).
  * Mythos 5.1 is not on the list: "Claude Mythos 5.1 and models before Claude Fable 5.1
  * don't run the prefix check" (#5889). Listing it stripped its history thinking at "off".
  * See https://platform.claude.com/docs/en/build-with-claude/preserved-thinking

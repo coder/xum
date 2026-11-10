@@ -632,78 +632,6 @@ function readLegacyWorkspaceHeartbeatsExperiment(rootDir: string): boolean {
   }
 }
 
-/**
- * One-time seed passes for the default refusal-fallback chains (e.g. Fable →
- * Opus), one per migration flag. Each fable alias move adds a pass: older
- * configs only have a chain for the old source key, and the new key is a new
- * default that deserves one seed of its own (still never overwriting an
- * existing chain for it).
- *
- * Each chain is gated on its own flag. Claiming a flag tells a downgraded build
- * (whose FABLE is that era's id) that its own default was seeded, so the pass
- * that claims a flag must carry that era's chain, or a downgrade would silently
- * lose refusal fallback. A flag that is already set is never re-run, so users
- * who later edit or delete a default chain are not overridden.
- * SEEDED_MODEL_FALLBACKS, not DEFAULT_MODEL_FALLBACKS: chains added after these
- * flags shipped reach fresh installs only (#5087).
- */
-const MODEL_FALLBACK_SEED_PASSES = [
-  ["defaultModelFallbacksSeeded", FABLE_5_DEFAULT_MODEL_FALLBACKS],
-  ["defaultModelFallbacksSeededFable51", FABLE_5_1_DEFAULT_MODEL_FALLBACKS],
-  ["defaultModelFallbacksSeededFable52", SEEDED_MODEL_FALLBACKS],
-] as const;
-
-/**
- * Run the pending MODEL_FALLBACK_SEED_PASSES on a parsed config in place.
- * Returns true when it changed the config (it then claims every pass flag).
- */
-function seedDefaultModelFallbacks(
-  parsed: Partial<AppConfigOnDisk> & Record<string, unknown>
-): boolean {
-  const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
-  const pendingPasses = MODEL_FALLBACK_SEED_PASSES.filter(
-    ([flag]) => migrationsBeforeSeed[flag] !== true
-  );
-  if (pendingPasses.length === 0) {
-    return false;
-  }
-  // Gap-check against the RAW on-disk map with canonicalized keys, not the
-  // sanitized map: a hand-edited entry whose chain sanitizes away (e.g.
-  // {enabled:false, models:[]}) is still user intent and must not be
-  // overwritten. Merging into the raw map also keeps unrelated chains
-  // byte-identical on disk (lenient-on-read preserved).
-  const rawFallbacks =
-    typeof parsed.modelFallbacks === "object" &&
-    parsed.modelFallbacks !== null &&
-    !Array.isArray(parsed.modelFallbacks)
-      ? (parsed.modelFallbacks as Record<string, unknown>)
-      : {};
-  // Same key form as persistence (sanitizeFallbackModelString): a `coder:` key
-  // stays gateway-scoped. Runtime lookup is raw-first, so a Coder-scoped chain
-  // serves only its own selection and must not stand in for the direct default
-  // (a cross-typed or shadowed Coder instance never shares the direct chain).
-  const existingCanonicalKeys = new Set(
-    Object.keys(rawFallbacks).map((key) => sanitizeFallbackModelString(key))
-  );
-  const missingDefaults = Object.fromEntries(
-    pendingPasses
-      .flatMap(([, chains]) => Object.entries(chains))
-      .filter(([sourceModel]) => !existingCanonicalKeys.has(sourceModel))
-  );
-  if (Object.keys(missingDefaults).length > 0) {
-    // Write through the raw-record view: user entries are deliberately kept
-    // unvalidated on disk (normalizeModelFallbacks sanitizes on every read),
-    // so the merged map is not a ModelFallbacks yet.
-    const rawParsed: Record<string, unknown> = parsed;
-    rawParsed.modelFallbacks = { ...rawFallbacks, ...missingDefaults };
-  }
-  parsed.migrations = {
-    ...migrationsBeforeSeed,
-    ...Object.fromEntries(MODEL_FALLBACK_SEED_PASSES.map(([flag]) => [flag, true])),
-  };
-  return true;
-}
-
 function normalizeConfigMigrations(value: unknown): AppConfigMigrations {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {};
@@ -754,6 +682,80 @@ function migrateRaisedTaskSettingsDefaults(
   if (migrations.taskSettingsDefaultsRaised === true) return configModified;
   parsed.taskSettings = raisePreviousTaskSettingsDefaults(parsed.taskSettings);
   parsed.migrations = { ...migrations, taskSettingsDefaultsRaised: true };
+  return true;
+}
+
+/**
+ * One-time seed passes for the default refusal-fallback chains (e.g. Fable →
+ * Opus), one per migration flag. Each fable alias move adds a pass: older
+ * configs only have a chain for the old source key, and the new key is a new
+ * default that deserves one seed of its own (still never overwriting an
+ * existing chain for it).
+ *
+ * Each chain is gated on its own flag. Claiming a flag tells a downgraded build
+ * (whose FABLE is that era's id) that its own default was seeded, so the pass
+ * that claims a flag must carry that era's chain, or a downgrade would silently
+ * lose refusal fallback. A flag that is already set is never re-run, so users
+ * who later edit or delete a default chain are not overridden.
+ * SEEDED_MODEL_FALLBACKS, not DEFAULT_MODEL_FALLBACKS: chains added after these
+ * flags shipped reach fresh installs only (#5087).
+ */
+const MODEL_FALLBACK_SEED_PASSES = [
+  ["defaultModelFallbacksSeeded", FABLE_5_DEFAULT_MODEL_FALLBACKS],
+  ["defaultModelFallbacksSeededFable51", FABLE_5_1_DEFAULT_MODEL_FALLBACKS],
+  ["defaultModelFallbacksSeededFable52", SEEDED_MODEL_FALLBACKS],
+] as const;
+
+/** Every seed-pass flag claimed; fresh installs start with all of them. */
+const ALL_MODEL_FALLBACK_SEED_FLAGS = Object.fromEntries(
+  MODEL_FALLBACK_SEED_PASSES.map(([flag]) => [flag, true])
+) as Record<(typeof MODEL_FALLBACK_SEED_PASSES)[number][0], true>;
+
+/**
+ * Run the pending MODEL_FALLBACK_SEED_PASSES on `parsed` (mutated in place).
+ * Returns true when it changed the config (it then claims every pass flag).
+ */
+function seedDefaultModelFallbacks(
+  parsed: Partial<AppConfigOnDisk> & Record<string, unknown>
+): boolean {
+  const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
+  const pendingPasses = MODEL_FALLBACK_SEED_PASSES.filter(
+    ([flag]) => migrationsBeforeSeed[flag] !== true
+  );
+  if (pendingPasses.length === 0) {
+    return false;
+  }
+  // Gap-check against the RAW on-disk map with canonicalized keys, not the
+  // sanitized map: a hand-edited entry whose chain sanitizes away (e.g.
+  // {enabled:false, models:[]}) is still user intent and must not be
+  // overwritten. Merging into the raw map also keeps unrelated chains
+  // byte-identical on disk (lenient-on-read preserved).
+  const rawFallbacks =
+    typeof parsed.modelFallbacks === "object" &&
+    parsed.modelFallbacks !== null &&
+    !Array.isArray(parsed.modelFallbacks)
+      ? (parsed.modelFallbacks as Record<string, unknown>)
+      : {};
+  // Same key form as persistence (sanitizeFallbackModelString): a `coder:` key
+  // stays gateway-scoped. Runtime lookup is raw-first, so a Coder-scoped chain
+  // serves only its own selection and must not stand in for the direct default
+  // (a cross-typed or shadowed Coder instance never shares the direct chain).
+  const existingCanonicalKeys = new Set(
+    Object.keys(rawFallbacks).map((key) => sanitizeFallbackModelString(key))
+  );
+  const missingDefaults = Object.fromEntries(
+    pendingPasses
+      .flatMap(([, chains]) => Object.entries(chains))
+      .filter(([sourceModel]) => !existingCanonicalKeys.has(sourceModel))
+  );
+  if (Object.keys(missingDefaults).length > 0) {
+    // Write through the raw-record view: user entries are deliberately kept
+    // unvalidated on disk (normalizeModelFallbacks sanitizes on every read),
+    // so the merged map is not a ModelFallbacks yet.
+    const rawParsed: Record<string, unknown> = parsed;
+    rawParsed.modelFallbacks = { ...rawFallbacks, ...missingDefaults };
+  }
+  parsed.migrations = { ...migrationsBeforeSeed, ...ALL_MODEL_FALLBACK_SEED_FLAGS };
   return true;
 }
 
@@ -2757,9 +2759,7 @@ export class Config {
         ? { agentHeartbeatsEnabled: true }
         : {}),
       migrations: {
-        defaultModelFallbacksSeeded: true,
-        defaultModelFallbacksSeededFable51: true,
-        defaultModelFallbacksSeededFable52: true,
+        ...ALL_MODEL_FALLBACK_SEED_FLAGS,
         persistentSubagentsDefaulted: true,
         agentHeartbeatsSeeded: true,
         taskSettingsDefaultsRaised: true,
@@ -3072,6 +3072,8 @@ export class Config {
     const minThinkingLevelByModel = normalizeMinThinkingLevelByModel(
       parsed.minThinkingLevelByModel
     );
+    // One-time seed passes of the default refusal-fallback chains (see
+    // MODEL_FALLBACK_SEED_PASSES).
     if (seedDefaultModelFallbacks(parsed)) {
       configModified = true;
     }

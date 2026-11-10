@@ -86,13 +86,6 @@ describe("fast mode service tier", () => {
       getFastModeProvider("xai:grok-code-fast-1", { resolvedRouteProvider: "direct" })
     ).toBeNull();
     expect(getFastModeProvider("anthropic:claude-sonnet-4-5")).toBeNull();
-    // Fable 5.2 and Mythos 5.2 added Fast mode; Fable 5.1 never had it.
-    for (const model of ["anthropic:claude-fable-5-2", "anthropic:claude-mythos-5-2"]) {
-      expect(getFastModeProvider(model, { resolvedRouteProvider: "direct" })).toBe("anthropic");
-    }
-    expect(
-      getFastModeProvider("anthropic:claude-fable-5-1", { resolvedRouteProvider: "direct" })
-    ).toBeNull();
   });
 
   test("offers the shared OpenAI tier on explicit and preference-routed gateways", () => {
@@ -225,9 +218,15 @@ describe("fast mode service tier", () => {
     expect(ultrafastModeAvailable("xai:grok-4.7", { providersConfig: null })).toBe(false);
   });
 
-  test("offers Anthropic Fast mode only for supported Opus models on the direct API", () => {
+  test("offers Anthropic Fast mode only for supported models on the direct API", () => {
     const anthropic = { apiKeySet: true, isEnabled: true, isConfigured: true };
-    for (const model of ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"]) {
+    for (const model of [
+      "claude-fable-5-2",
+      "claude-mythos-5-2",
+      "claude-opus-5-5",
+      "claude-opus-5",
+      "claude-opus-4-8",
+    ]) {
       expect(
         getFastModeProvider(`anthropic:${model}`, {
           resolvedRouteProvider: "direct",
@@ -235,8 +234,15 @@ describe("fast mode service tier", () => {
         })
       ).toBe("anthropic");
     }
-    // Opus 4.7 errors and Opus 4.6 silently runs at standard speed.
-    for (const model of ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5"]) {
+    // Opus 4.7 errors and Opus 4.6 silently runs at standard speed. Fable/Mythos
+    // gained Fast mode with 5.2; earlier versions do not have it.
+    for (const model of [
+      "claude-opus-4-7",
+      "claude-opus-4-6",
+      "claude-sonnet-5",
+      "claude-fable-5-1",
+      "claude-mythos-5-1",
+    ]) {
       expect(getFastModeProvider(`anthropic:${model}`, { resolvedRouteProvider: "direct" })).toBe(
         null
       );

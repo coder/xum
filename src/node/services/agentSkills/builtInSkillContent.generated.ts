@@ -5994,7 +5994,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "### Anthropic Fast mode",
       "",
-      'Claude Opus 5.5, Opus 5, and Opus 4.8 support Anthropic\'s [Fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) research preview: up to 2.5× faster output at 2× token pricing. Toggle it from the thinking selector\'s **Fast mode** row, the command palette (**Toggle Fast Mode**), `/fast`, or its keyboard shortcut. Like the thinking level, the choice is saved per chat and stays with the chat when you switch models. Chats without a choice use `"speed": "fast"` under `anthropic` in `providers.jsonc` as their default.',
+      'Claude Fable 5.2, Mythos 5.2, Opus 5.5, Opus 5, and Opus 4.8 support Anthropic\'s [Fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode): up to 2.5× faster output at 2× token pricing. Toggle it from the thinking selector\'s **Fast mode** row, the command palette (**Toggle Fast Mode**), `/fast`, or its keyboard shortcut. Like the thinking level, the choice is saved per chat and stays with the chat when you switch models. Chats without a choice use `"speed": "fast"` under `anthropic` in `providers.jsonc` as their default.',
       "",
       "Fast mode is only sent on the direct Anthropic API with an account that has Fast mode access. It is hidden for gateway routes (OpenRouter, Bedrock, Coder), custom Anthropic-compatible providers, a non-`api.anthropic.com` base URL, and when Anthropic beta features are disabled for ZDR. Costs are priced from the speed Anthropic reports for each response.",
       "",
