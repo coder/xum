@@ -506,6 +506,7 @@ export const WorstCasePhone: AppStory = {
   play: async ({ canvasElement }) => {
     const line = await findLine(canvasElement);
     await assertOneLine(line);
+    await assertStopDrawsLikeTheChips(line);
     await assertPanels(line, "sheet");
     await assertSheetTabs(line);
     await assertSheetFocusWhenChipHides(line, "ws-activity-line-phone");
@@ -591,7 +592,7 @@ export const SubAgentsOnlyPhone: AppStory = {
     const line = await findLine(canvasElement, 1);
     await assertOneLine(line);
     await assertChipsLeftWithoutDividers(line);
-    await assertStopDrawsLikeAChip(line);
+    await assertStopDrawsLikeTheChips(line);
   },
 };
 
@@ -620,58 +621,45 @@ function drawsABox(element: Element): boolean {
   const bordered =
     widths.some((width) => parseFloat(width) > 0) && colors.some((color) => !clear(color));
   return bordered || !clear(style.backgroundColor) || style.backgroundImage !== "none";
-} /** The drawn box of a line control: its tallest box-painting descendant (the touch target itself draws nothing). */
-function drawnBox(control: HTMLElement): Element {
+}
+
+/** A control's drawing: its tallest box-painting descendant, or none for a text-only chip. */
+function drawnBox(control: HTMLElement): Element | undefined {
   const boxes = [...control.querySelectorAll("*")].filter(drawsABox);
-  if (boxes.length === 0) {
-    throw new Error(`${control.getAttribute("aria-label") ?? "control"} draws no box`);
-  }
+  if (boxes.length === 0) return undefined;
   return boxes.reduce((best, box) =>
     box.getBoundingClientRect().height > best.getBoundingClientRect().height ? box : best
   );
 }
 
-/** The control's one visible icon: hidden icons (the desktop Swap of the phone icon) report no box. */
-function visibleIcon(control: HTMLElement): Element {
-  const icons = [...control.querySelectorAll("svg")].filter(
-    (icon) => icon.getBoundingClientRect().width > 0
-  );
-  if (icons.length !== 1) {
-    throw new Error(`Expected one visible icon, found ${icons.length}`);
-  }
-  return icons[0];
+function pillLook(box: Element) {
+  const style = getComputedStyle(box);
+  const icon = box.querySelector("svg");
+  return {
+    height: Math.round(box.getBoundingClientRect().height),
+    radius: style.borderTopLeftRadius,
+    border: `${style.borderTopWidth} ${style.borderTopColor}`,
+    color: style.color,
+    icon: icon === null ? null : Math.round(icon.getBoundingClientRect().width),
+  };
 }
 
-// Beside chips in a phone-width row, Stop draws exactly like an idle bordered activity chip
-// (Mike: the interrupt control must match the sub-agents and background-bashes pills): the drawn
-// boxes agree on height, corner radius, border width, border color and idle text color, and the
-// icons render at the same size. All of it is read from the rendered boxes, not from class names.
-async function assertStopDrawsLikeAChip(line: HTMLElement) {
-  const chips = shownChips(line);
-  await expect(chips.length).toBeGreaterThan(0);
-  const stop = within(line).getByRole("button", { name: "Stop streaming" });
-  const stopBox = drawnBox(stop);
-  const chipBox = drawnBox(chips[0]);
-  // Half a pixel of play, because the runner's browser lands layout on fractional pixels.
-  await expect(stopBox.getBoundingClientRect().height).toBeCloseTo(
-    chipBox.getBoundingClientRect().height,
-    0
-  );
-  await expect(parseFloat(getComputedStyle(stopBox).borderRadius)).toBeCloseTo(
-    parseFloat(getComputedStyle(chipBox).borderRadius),
-    0
-  );
-  await expect(getComputedStyle(stopBox).borderTopWidth).toBe(
-    getComputedStyle(chipBox).borderTopWidth
-  );
-  await expect(getComputedStyle(stopBox).borderTopColor).toBe(
-    getComputedStyle(chipBox).borderTopColor
-  );
-  await expect(getComputedStyle(stopBox).color).toBe(getComputedStyle(chipBox).color);
-  await expect(visibleIcon(stop).getBoundingClientRect().width).toBeCloseTo(
-    visibleIcon(chips[0]).getBoundingClientRect().width,
-    0
-  );
+// Beside chips in a phone-width row, Stop draws like the idle bordered chips (Mike: the interrupt
+// control matches the sub-agents and background-bashes pills): same height, corner radius, border
+// and text color, and an icon the size of theirs. Read from the rendered boxes, not class names.
+async function assertStopDrawsLikeTheChips(line: HTMLElement) {
+  const stop = drawnBox(within(line).getByRole("button", { name: "Stop streaming" }));
+  if (stop === undefined) throw new Error("Stop draws no box beside the chips");
+  const pills = shownChips(line)
+    .map(drawnBox)
+    .filter((box) => box !== undefined);
+  await expect(pills.length).toBeGreaterThan(0);
+  const stopLook = pillLook(stop);
+  for (const pill of pills) {
+    const look = pillLook(pill);
+    // The "+N" chip is text only, so it has no icon to size Stop's against.
+    await expect(stopLook).toEqual({ ...look, icon: look.icon ?? stopLook.icon });
+  }
 }
 
 // The phone line draws each of its controls smaller than the touch box around it, so it reads as a
@@ -729,13 +717,10 @@ export const PhoneHitAreaOutsizesItsDrawing: AppStory = {
               `${name} draws a ${Math.round(hit.height)}px box on the touch target itself, so the control is as large as its hit area`
             );
           }
-          const boxes = [...control.querySelectorAll("*")].filter(drawsABox);
+          const tallest = drawnBox(control);
           // The plain TODO chip draws no box at all (text only), so there is nothing to size.
-          if (boxes.length === 0) continue;
+          if (tallest === undefined) continue;
           drawn += 1;
-          const tallest = boxes.reduce((best, box) =>
-            box.getBoundingClientRect().height > best.getBoundingClientRect().height ? box : best
-          );
           const drawing = tallest.getBoundingClientRect();
           if (drawing.height >= MOBILE_TOUCH_TARGET_PX) {
             throw new Error(
