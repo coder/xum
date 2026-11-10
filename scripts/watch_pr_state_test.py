@@ -19,9 +19,12 @@ START = 1_800_000_000
 # and with the load of the host. With 8 to 16 copies of this file on two cores of a host that other
 # jobs load (three runs, 32 copies), the longest single run took 18.8 s, 24.4 s and 29.4 s (median
 # 2.4 s to 4.3 s), so the 30 s this replaced could fail the test with TimeoutExpired, which says
-# nothing about the script. The bound is 4 times the longest run seen. The pr.yml step that runs the
-# gate tests stops at 15 minutes, so a hang in every run cannot hold the job.
-WATCH_RUN_TIMEOUT_SECS = 120
+# nothing about the script. On a host that other agents load more (16 busy loops beside three
+# copies of this file, 2026-11-09), a run took 1.7 s at the median and 106.6 s at the longest of
+# 576 runs, and 3 of them took more than 30 s, so the 120 s that followed was about 1.1 times the
+# longest run. The bound is about 3 times the longest run seen. The pr.yml step that runs the gate
+# tests stops at 15 minutes, so a hang in every run cannot hold the job.
+WATCH_RUN_TIMEOUT_SECS = 300
 
 # Strict protocol doubles. gh answers poll N with fixture entry N and fails on any call
 # the fixture does not cover. sleep advances the clock that date reads instead of waiting.

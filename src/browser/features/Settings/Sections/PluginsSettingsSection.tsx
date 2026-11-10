@@ -1225,7 +1225,7 @@ const NotAppliedList: React.FC<{ items?: readonly AgentPluginNotApplied[]; class
   );
 };
 
-/** What a read-only agent loses: its edit tools, and its shell when a `disallowedTools` list removed it. */
+/** What a read-only agent loses: its edit tools, and its shell when its mapped tool list removed it. */
 const ReadonlyAgentNote: React.FC<{ preview: AgentPluginInstallPreview; agent: string }> = (
   props
 ) => {
