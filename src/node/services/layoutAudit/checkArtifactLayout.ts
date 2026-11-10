@@ -9,10 +9,7 @@ import { runLayoutPasses } from "@/node/services/layoutAudit/agentBrowserLayoutR
 import { LAYOUT_AUDIT_PAGE_SCRIPT } from "@/node/services/layoutAudit/layoutAuditPageScript.generated";
 import { withLayoutMemory } from "@/node/services/layoutAudit/layoutFingerprints";
 import { buildLayoutReport } from "@/node/services/layoutAudit/layoutReport";
-import {
-  failedOutcomes,
-  type ViewportOutcome,
-} from "@/node/services/layoutAudit/viewportOutcome";
+import { failedOutcomes, type ViewportOutcome } from "@/node/services/layoutAudit/viewportOutcome";
 import { log } from "@/node/services/log";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 

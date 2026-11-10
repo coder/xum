@@ -81,8 +81,7 @@ describe("checkArtifactLayout", () => {
       ...overrides,
     });
 
-  const install = (script: FakeAgentBrowserScript = {}) =>
-    installFakeAgentBrowser(tempDir, script);
+  const install = (script: FakeAgentBrowserScript = {}) => installFakeAgentBrowser(tempDir, script);
 
   const evalCount = async (fake: FakeAgentBrowser) =>
     (await fake.calls()).filter((argv) => argv.includes("eval")).length;
@@ -200,7 +199,11 @@ describe("checkArtifactLayout", () => {
     const controller = new AbortController();
     const pending = check({ abortSignal: controller.signal });
     await waitForCondition(
-      () => fs.access(path.join(tempDir, "fake-state", "hang-started")).then(() => true, () => false),
+      () =>
+        fs.access(path.join(tempDir, "fake-state", "hang-started")).then(
+          () => true,
+          () => false
+        ),
       { timeoutMs: 10_000 }
     );
     controller.abort();

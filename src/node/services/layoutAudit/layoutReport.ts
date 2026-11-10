@@ -124,9 +124,7 @@ export function buildLayoutReport(
     .flatMap((outcome) => toCandidates(outcome, previous))
     .sort(compareCandidates);
   const issues = candidates.slice(0, LAYOUT_AUDIT_MAX_ISSUES).map((candidate) => candidate.issue);
-  const notChecked = outcomes
-    .flatMap(toNotChecked)
-    .sort((a, b) => a.viewport - b.viewport);
+  const notChecked = outcomes.flatMap(toNotChecked).sort((a, b) => a.viewport - b.viewport);
   const persistentCount = candidates.filter((candidate) => candidate.issue.persistent).length;
   const common = {
     issues,
@@ -138,7 +136,10 @@ export function buildLayoutReport(
     }),
   };
   return {
-    report: notChecked.length === 0 ? { checked: true, ...common } : { checked: false, notChecked, ...common },
+    report:
+      notChecked.length === 0
+        ? { checked: true, ...common }
+        : { checked: false, notChecked, ...common },
     next: nextSnapshot(complete, previous),
   };
 }

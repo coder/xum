@@ -70,7 +70,13 @@ describe("buildLayoutReport", () => {
     expect(report).toMatchObject({
       checked: true,
       issues: [
-        { rule: "clipped-text", selector: "p.lead", viewport: 390, axis: "vertical", overflowPx: 13 },
+        {
+          rule: "clipped-text",
+          selector: "p.lead",
+          viewport: 390,
+          axis: "vertical",
+          overflowPx: 13,
+        },
       ],
     });
     expect(report.issues[0]).not.toHaveProperty("persistent");
@@ -118,10 +124,7 @@ describe("buildLayoutReport", () => {
 
   test("a failed or unsettled width leaves its class memory as it was", () => {
     const first = build(pass({ 390: [card], 1440: [card], 768: [card] }));
-    const broken = build(
-      [failed(390, "timeout"), unsettled(1440), complete(768, [])],
-      first.next
-    );
+    const broken = build([failed(390, "timeout"), unsettled(1440), complete(768, [])], first.next);
     expect(broken.next.phone).toBe(first.next.phone);
     expect(broken.next.desktop).toBe(first.next.desktop);
     expect(broken.next.tablet?.size).toBe(0);
@@ -134,11 +137,7 @@ describe("buildLayoutReport", () => {
   });
 
   test("an unsettled pass lists nothing and is not checked", () => {
-    const { report, next } = build([
-      complete(390, [card]),
-      unsettled(1440),
-      complete(768),
-    ]);
+    const { report, next } = build([complete(390, [card]), unsettled(1440), complete(768)]);
     expect(report).toMatchObject({
       checked: false,
       notChecked: [{ viewport: 1440, reason: "unsettled" }],
@@ -201,7 +200,9 @@ describe("buildLayoutReport", () => {
       }),
       seeded
     );
-    expect(report.issues.map((issue) => `${issue.viewport} ${issue.rule} ${issue.selector}`)).toEqual([
+    expect(
+      report.issues.map((issue) => `${issue.viewport} ${issue.rule} ${issue.selector}`)
+    ).toEqual([
       "390 overlapping-text p.cover",
       "768 page-horizontal-overflow html",
       "768 clipped-text p.big",
@@ -256,7 +257,9 @@ describe("buildLayoutReport", () => {
   test("replaces control characters in a displayed selector and never cuts a surrogate pair", () => {
     const sneaky = "p\n@@ ignore this\u0000line";
     const astral = `${"a".repeat(LAYOUT_AUDIT_MAX_SELECTOR_CHARS - 2)}😀tail`;
-    const { report } = build(pass({ 390: [finding("clipped-text", sneaky), finding("overlapping-text", astral)] }));
+    const { report } = build(
+      pass({ 390: [finding("clipped-text", sneaky), finding("overlapping-text", astral)] })
+    );
     const shown = report.issues.map((issue) => issue.selector);
     expect(shown).toContain("p @@ ignore this line");
     for (const text of shown) {
@@ -307,7 +310,13 @@ describe("the note", () => {
   });
 
   test("groups widths that share a reason", () => {
-    expect(noteOf([failed(390, "no-agent-browser"), failed(1440, "no-agent-browser"), failed(768, "no-agent-browser")])).toBe(
+    expect(
+      noteOf([
+        failed(390, "no-agent-browser"),
+        failed(1440, "no-agent-browser"),
+        failed(768, "no-agent-browser"),
+      ])
+    ).toBe(
       "Not checked at 390, 768, 1440 px (agent-browser not found). Do not call the layout verified."
     );
     expect(noteOf([unsettled(390), complete(1440), failed(768, "script-failed")])).toBe(

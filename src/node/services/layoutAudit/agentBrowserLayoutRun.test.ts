@@ -90,8 +90,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
 
   /** Global flags of every call: one session, one namespace, never `--all`. */
   const expectOneOwnSession = (calls: string[][]) => {
-    const values = (flag: string) =>
-      new Set(calls.map((argv) => argv[argv.indexOf(flag) + 1]));
+    const values = (flag: string) => new Set(calls.map((argv) => argv[argv.indexOf(flag) + 1]));
     expect([...values("--namespace")]).toEqual(["xum-layout"]);
     const sessions = [...values("--session")];
     expect(sessions).toHaveLength(1);
@@ -113,15 +112,25 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     expect(outcomes.map((outcome) => outcome.viewport.width)).toEqual(RUN_ORDER);
     const calls = await fake.calls();
     expect(subcommands(calls)).toEqual([
-      "set", "open", "eval",
-      "set", "open", "eval",
-      "set", "open", "eval",
+      "set",
+      "open",
+      "eval",
+      "set",
+      "open",
+      "eval",
+      "set",
+      "open",
+      "eval",
       "close",
     ]);
     expectOneOwnSession(calls);
     const sets = calls.filter((argv) => argv.includes("set"));
     expect(sets.map((argv) => argv.slice(argv.indexOf("viewport")))).toEqual(
-      LAYOUT_AUDIT_VIEWPORTS.map((viewport) => ["viewport", String(viewport.width), String(viewport.height)])
+      LAYOUT_AUDIT_VIEWPORTS.map((viewport) => [
+        "viewport",
+        String(viewport.width),
+        String(viewport.height),
+      ])
     );
     expect(await fake.openedUrls()).toEqual([FILE_URL, FILE_URL, FILE_URL]);
   });
@@ -133,7 +142,9 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       expect(await fake.evalStdin(width)).toBe(PAGE_SCRIPT);
     }
     for (const argv of calls) expect(argv.join(" ")).not.toContain(PAGE_SCRIPT);
-    expect(calls.filter((argv) => argv.includes("eval")).every((argv) => argv.includes("--stdin"))).toBe(true);
+    expect(
+      calls.filter((argv) => argv.includes("eval")).every((argv) => argv.includes("--stdin"))
+    ).toBe(true);
   });
 
   test("returns the findings of a complete pass", async () => {
@@ -152,7 +163,11 @@ describe("runLayoutPasses through a fake agent-browser", () => {
 
   test("a browser that ignores the viewport is not a result", async () => {
     const { outcomes } = await run({ eval: { 1440: { kind: "pass", viewportWidth: 800 } } });
-    expect(summary(outcomes)).toEqual(["390 complete", "1440 failed wrong-viewport", "768 complete"]);
+    expect(summary(outcomes)).toEqual([
+      "390 complete",
+      "1440 failed wrong-viewport",
+      "768 complete",
+    ]);
   });
 
   test("no agent-browser on PATH: nothing runs and there is nothing to close", async () => {
@@ -201,7 +216,12 @@ describe("runLayoutPasses through a fake agent-browser", () => {
   });
 
   test("a result that is not a page result is a failed script", async () => {
-    for (const result of [null, "ok", { complete: true }, { complete: true, viewportWidth: 390, findings: [{ rule: "nope" }] }]) {
+    for (const result of [
+      null,
+      "ok",
+      { complete: true },
+      { complete: true, viewportWidth: 390, findings: [{ rule: "nope" }] },
+    ]) {
       const { outcomes } = await run({ eval: { 390: { kind: "result", result } } });
       expect(summary(outcomes)[0]).toBe("390 failed script-failed");
     }
@@ -209,7 +229,11 @@ describe("runLayoutPasses through a fake agent-browser", () => {
 
   test("a hang keeps the earlier widths, times the rest out and still closes", async () => {
     const { outcomes, fake } = await run({ eval: { 1440: { kind: "hang" } } }, { budgetMs: 6_000 });
-    expect(summary(outcomes)).toEqual(["390 complete", "1440 failed timeout", "768 failed timeout"]);
+    expect(summary(outcomes)).toEqual([
+      "390 complete",
+      "1440 failed timeout",
+      "768 failed timeout",
+    ]);
     const calls = await fake.calls();
     expect(subcommands(calls)).toEqual(["set", "open", "eval", "set", "open", "eval", "close"]);
     expectOneOwnSession(calls);
@@ -219,15 +243,23 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     const controller = new AbortController();
     const pending = run({ eval: { 1440: { kind: "hang" } } }, { abortSignal: controller.signal });
     // The fake exists once `run` has installed it; the hang marker says the call is in flight.
-    await waitForCondition(async () => {
-      const started = await fs
-        .access(path.join(projectDir, "fake-state", "hang-started"))
-        .then(() => true, () => false);
-      return started;
-    }, { timeoutMs: 10_000 });
+    await waitForCondition(
+      async () => {
+        const started = await fs.access(path.join(projectDir, "fake-state", "hang-started")).then(
+          () => true,
+          () => false
+        );
+        return started;
+      },
+      { timeoutMs: 10_000 }
+    );
     controller.abort();
     const { outcomes, fake } = await pending;
-    expect(summary(outcomes)).toEqual(["390 complete", "1440 failed aborted", "768 failed aborted"]);
+    expect(summary(outcomes)).toEqual([
+      "390 complete",
+      "1440 failed aborted",
+      "768 failed aborted",
+    ]);
     expect(subcommands(await fake.calls()).filter((name) => name === "close")).toHaveLength(1);
   });
 
@@ -248,12 +280,15 @@ describe("runLayoutPasses through a fake agent-browser", () => {
   });
 
   test("passes the URL as data: spaces, #, quotes and shell syntax arrive unchanged", async () => {
-    const nasty = "file:///tmp/my%20report%20%231/it's \"x\" $(touch pwned) `id`; &&.html";
+    const nasty = 'file:///tmp/my%20report%20%231/it\'s "x" $(touch pwned) `id`; &&.html';
     const { outcomes, fake } = await run({}, { fileUrl: nasty });
     expect(summary(outcomes)).toEqual(["390 complete", "1440 complete", "768 complete"]);
     expect(await fake.openedUrls()).toEqual([nasty, nasty, nasty]);
     expect(
-      await fs.access(path.join(projectDir, "pwned")).then(() => true, () => false)
+      await fs.access(path.join(projectDir, "pwned")).then(
+        () => true,
+        () => false
+      )
     ).toBe(false);
   });
 

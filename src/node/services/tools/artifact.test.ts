@@ -1,12 +1,4 @@
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  setDefaultTimeout,
-  spyOn,
-  test,
-} from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -156,9 +148,7 @@ describe("artifact tool", () => {
 
   describe("layout audit", () => {
     const publish = (file: string, html = "<p>hello</p>") =>
-      fs
-        .writeFile(path.join(scratchDir, "artifacts", file), html)
-        .then(() => run({ path: file }));
+      fs.writeFile(path.join(scratchDir, "artifacts", file), html).then(() => run({ path: file }));
 
     /** The result as the model and the chat history see it. */
     const serialized = (result: ArtifactToolResult): Record<string, unknown> =>
@@ -184,7 +174,10 @@ describe("artifact tool", () => {
       expect(result).toMatchObject({
         success: true,
         kind: "html",
-        layout: { checked: true, issues: [{ rule: "clipped-text", selector: "h1", viewport: 1440 }] },
+        layout: {
+          checked: true,
+          issues: [{ rule: "clipped-text", selector: "h1", viewport: 1440 }],
+        },
       });
       expect(await evalCalls()).toBe(3);
     });
@@ -219,7 +212,10 @@ describe("artifact tool", () => {
         const result = await publish("page.html");
         expect(result).toMatchObject({
           success: true,
-          layout: { checked: false, notChecked: expect.arrayContaining([{ viewport: 390, reason: "timeout" }]) },
+          layout: {
+            checked: false,
+            notChecked: expect.arrayContaining([{ viewport: 390, reason: "timeout" }]),
+          },
         });
         expect(spy).toHaveBeenCalledTimes(1);
       } finally {
@@ -231,7 +227,10 @@ describe("artifact tool", () => {
       await withFake({ eval: { 390: { kind: "throw", message: "boom" } } });
       expect(await publish("page.html")).toMatchObject({
         success: true,
-        layout: { checked: false, notChecked: expect.arrayContaining([{ viewport: 390, reason: "script-failed" }]) },
+        layout: {
+          checked: false,
+          notChecked: expect.arrayContaining([{ viewport: 390, reason: "script-failed" }]),
+        },
       });
     });
 

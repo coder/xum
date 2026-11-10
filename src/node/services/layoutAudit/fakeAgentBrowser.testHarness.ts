@@ -145,7 +145,9 @@ export async function installFakeAgentBrowser(
   script: FakeAgentBrowserScript = {}
 ): Promise<FakeAgentBrowser> {
   if (projectAutomationDisabled()) {
-    throw new Error("project automation is disabled: tool_env would not run, so the fake is unreachable");
+    throw new Error(
+      "project automation is disabled: tool_env would not run, so the fake is unreachable"
+    );
   }
   const binDir = path.join(projectDir, "fake-bin");
   const emptyDir = path.join(projectDir, "fake-empty-bin");
