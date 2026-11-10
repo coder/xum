@@ -36,17 +36,28 @@ const PROJECT_PATH = "/tmp/project";
 const BRANCHES = ["main"];
 
 function loadCompiledHook(): typeof UseDraftWorkspaceSettings {
-  const compiled = transformSync(readFileSync(HOOK_PATH, "utf8"), {
-    filename: HOOK_PATH,
-    babelrc: false,
-    configFile: false,
-    // Same module output as the repo's Jest Babel config, from declared dependencies only.
-    presets: [
-      ["@babel/preset-env", { targets: { node: "current" }, modules: "commonjs" }],
-      "@babel/preset-typescript",
-    ],
-    plugins: [["babel-plugin-react-compiler", reactCompilerConfig]],
-  });
+  // Babel's first transform installs a process-wide Error.prepareStackTrace that hands every
+  // stack to Bun's native default, which throws for a non-Error target. Later test files in
+  // the same bun process then break: undici's fetch calls Error.captureStackTrace({}) on its
+  // error path, so brotliResponseGuard.test.ts saw "First argument must be an Error object"
+  // instead of the fetch failure. Restore the hook once the transform is done.
+  const originalPrepareStackTrace = Error.prepareStackTrace;
+  let compiled: ReturnType<typeof transformSync>;
+  try {
+    compiled = transformSync(readFileSync(HOOK_PATH, "utf8"), {
+      filename: HOOK_PATH,
+      babelrc: false,
+      configFile: false,
+      // Same module output as the repo's Jest Babel config, from declared dependencies only.
+      presets: [
+        ["@babel/preset-env", { targets: { node: "current" }, modules: "commonjs" }],
+        "@babel/preset-typescript",
+      ],
+      plugins: [["babel-plugin-react-compiler", reactCompilerConfig]],
+    });
+  } finally {
+    Error.prepareStackTrace = originalPrepareStackTrace;
+  }
   assert(compiled?.code, "React Compiler produced no output for useDraftWorkspaceSettings.ts");
 
   const moduleExports: Record<string, unknown> = {};
