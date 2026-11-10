@@ -2066,7 +2066,8 @@ export class MemoryConsolidationService extends EventEmitter {
                   ? fromStored
                   : self.unlessLiveAttempt(workspaceId, fromStored),
               projectPath,
-              attempt.holdsJobLock || inJobTurn
+              // Every journal under the lock runs in the job's turn, before or after its claim.
+              inJobTurn
             );
             log.warn("[MemoryConsolidation] harvest failed", {
               workspaceId,
