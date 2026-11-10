@@ -47,19 +47,49 @@ export function resolveSshDirectoryTrustNotice(input: {
   };
 }
 
+/** The SSH+None directory the creation form shows right now, and how to write a new path into it. */
+export interface SshDirectoryTrustSelection {
+  projectPath: string;
+  host: string;
+  projectDir: string;
+  applyProjectDir: (projectDir: string) => void;
+}
+
+/**
+ * Writes the host-resolved directory into the selection only while it still shows the directory
+ * the request trusted. The trust controls stay usable while a request runs, so by the time it
+ * returns the user may have picked another host, directory, isolation or project (current is null
+ * once the SSH+None controls unmount); writing then would overwrite that newer choice.
+ */
+export function applyResolvedProjectDir(
+  current: SshDirectoryTrustSelection | null,
+  request: { projectPath: string; host: string; projectDir: string },
+  resolvedProjectDir: string
+): boolean {
+  const stillShown =
+    current !== null &&
+    current.projectPath === request.projectPath &&
+    current.host.trim() === request.host &&
+    current.projectDir.trim() === request.projectDir;
+  if (!stillShown || resolvedProjectDir === request.projectDir) return false;
+  current.applyProjectDir(resolvedProjectDir);
+  return true;
+}
+
 /**
  * Saves the user's trust choice for an SSH+None directory and refreshes what depends on it.
  * Returns the error to show, or null on success; never throws.
  *
  * The backend stores the directory resolved on the host (~ expanded), as workspaces persist it.
- * Writing that back through onProjectDirResolved keeps the field, the remembered directory and the
- * stored trust entry identical, so a typed "~/app" still shows as trusted after a restart.
+ * Writing that back into the selection keeps the field, the remembered directory and the stored
+ * trust entry identical, so a typed "~/app" still shows as trusted after a restart.
  */
 export async function saveSshDirectoryTrust(
   deps: {
     api: Pick<APIClient["projects"], "setSshDirectoryTrust">;
     refreshProjects: () => Promise<void>;
-    onProjectDirResolved: (projectDir: string) => void;
+    /** Read after the request returns, so the write-back sees the latest selection. */
+    currentSelection: () => SshDirectoryTrustSelection | null;
   },
   request: { projectPath: string; host: string; projectDir: string; trusted: boolean }
 ): Promise<string | null> {
@@ -68,9 +98,7 @@ export async function saveSshDirectoryTrust(
     if (!result.success) {
       return result.error;
     }
-    if (result.data.projectDir !== request.projectDir) {
-      deps.onProjectDirResolved(result.data.projectDir);
-    }
+    applyResolvedProjectDir(deps.currentSelection(), request, result.data.projectDir);
     publishProjectTrustChanged();
     await deps.refreshProjects();
     return null;

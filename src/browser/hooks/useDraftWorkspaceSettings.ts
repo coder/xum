@@ -9,16 +9,13 @@ import {
   type CoderWorkspaceConfig,
   type SshWorkspaceIsolation,
   buildRuntimeString,
+  normalizeRuntimeEnablement,
   RUNTIME_MODE,
   CODER_RUNTIME_PLACEHOLDER,
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
-import {
-  DEFAULT_ISOLATION,
-  nearestSupportedIsolation,
-  runtimeIdFromIsolation,
-  type IsolationChoice,
-} from "@/common/types/isolation";
+import { runtimeIdFromIsolation, type IsolationChoice } from "@/common/types/isolation";
+import { projectDefaultIsolation } from "@/browser/features/ChatInput/creationDraftProject";
 import {
   readOptionField,
   readSshOptionDefaults,
@@ -215,24 +212,20 @@ interface SettingsDefaultIsolation {
 }
 
 /**
- * The Settings default for new workspaces in a project: its override, else the global default.
- * The backend migrates legacy defaultRuntime into defaultIsolation; a pair with no backend yet
- * falls back to the nearest one on the same project isolation. This is its own hook because
+ * The Settings default for new workspaces in a project: its override, else the global default,
+ * resolved against the isolations the project's Settings enable (projectDefaultIsolation). The
+ * backend migrates legacy defaultRuntime into defaultIsolation. This is its own hook because
  * React Compiler treats hook results as frozen: computed inline, the calls below made it drop
  * the memoized default runtime on every keystroke (#5937, useDraftWorkspaceSettings.compiler.test).
  */
 function useSettingsDefaultIsolation(projectPath: string): SettingsDefaultIsolation {
   const { userProjects } = useProjectContext();
-  const projectConfig = userProjects.get(projectPath);
   const globalDefaultIsolation = useAppConfig((config) => config.defaultIsolation);
-  const hasProjectRuntimeOverrides =
-    projectConfig?.runtimeOverridesEnabled === true ||
-    Boolean(projectConfig?.runtimeEnablement) ||
-    projectConfig?.defaultIsolation !== undefined;
-  const isolation = nearestSupportedIsolation(
-    (hasProjectRuntimeOverrides ? projectConfig?.defaultIsolation : undefined) ??
-      globalDefaultIsolation ??
-      DEFAULT_ISOLATION
+  const globalEnablement = useAppConfig((config) => config.runtimeEnablement);
+  const isolation = projectDefaultIsolation(
+    userProjects.get(projectPath),
+    globalDefaultIsolation,
+    normalizeRuntimeEnablement(globalEnablement)
   );
   return {
     isolation,

@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import type { ProjectConfig } from "@/common/types/project";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { subscribeProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
-import { resolveSshDirectoryTrustNotice, saveSshDirectoryTrust } from "./sshDirectoryTrustState";
+import {
+  resolveSshDirectoryTrustNotice,
+  applyResolvedProjectDir,
+  saveSshDirectoryTrust,
+} from "./sshDirectoryTrustState";
 
 const projectPath = "/repo/app";
 const directory = { host: "box", projectDir: "/srv/app" };
@@ -80,7 +84,13 @@ describe("saveSshDirectoryTrust", () => {
           calls.refreshed++;
           return Promise.resolve();
         },
-        onProjectDirResolved: (dir: string) => calls.resolved.push(dir),
+        // The form still shows the requested directory when the request returns.
+        currentSelection: () => ({
+          projectPath,
+          host: "box",
+          projectDir: "~/app",
+          applyProjectDir: (dir: string) => calls.resolved.push(dir),
+        }),
       },
     };
   }
@@ -118,5 +128,46 @@ describe("saveSshDirectoryTrust", () => {
       api: { setSshDirectoryTrust: () => Promise.reject(new Error("offline")) },
     };
     expect(await saveSshDirectoryTrust(failing, request)).toBe("offline");
+  });
+});
+
+describe("applyResolvedProjectDir", () => {
+  const request = { projectPath, host: "box", projectDir: "~/app" };
+
+  function selection(
+    overrides: Partial<{ projectPath: string; host: string; projectDir: string }>
+  ) {
+    const applied: string[] = [];
+    return {
+      applied,
+      current: {
+        projectPath,
+        host: "box",
+        projectDir: "~/app",
+        ...overrides,
+        applyProjectDir: (dir: string) => applied.push(dir),
+      },
+    };
+  }
+
+  test("writes the resolved path while the form still shows the requested directory", () => {
+    // Untrimmed input still counts: the request carries the trimmed values.
+    const { applied, current } = selection({ host: " box ", projectDir: "~/app " });
+    expect(applyResolvedProjectDir(current, request, "/home/me/app")).toBe(true);
+    expect(applied).toEqual(["/home/me/app"]);
+  });
+
+  test.each([
+    ["another host", { host: "other" }],
+    ["another directory", { projectDir: "~/other" }],
+    ["another project", { projectPath: "/repo/other" }],
+  ] as const)("keeps a newer selection on %s", (_label, overrides) => {
+    const { applied, current } = selection(overrides);
+    expect(applyResolvedProjectDir(current, request, "/home/me/app")).toBe(false);
+    expect(applied).toEqual([]);
+  });
+
+  test("writes nothing once the SSH+None controls are gone", () => {
+    expect(applyResolvedProjectDir(null, request, "/home/me/app")).toBe(false);
   });
 });

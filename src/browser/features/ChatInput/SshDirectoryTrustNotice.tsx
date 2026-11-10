@@ -1,9 +1,13 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import type { ProjectConfig } from "@/common/types/project";
-import { resolveSshDirectoryTrustNotice, saveSshDirectoryTrust } from "./sshDirectoryTrustState";
+import {
+  resolveSshDirectoryTrustNotice,
+  saveSshDirectoryTrust,
+  type SshDirectoryTrustSelection,
+} from "./sshDirectoryTrustState";
 
 /**
  * Trust for the SSH+None directory being configured on the creation form. The directory is not
@@ -25,7 +29,12 @@ export function SshDirectoryTrustNotice(props: {
    */
   onProjectDirResolved: (projectDir: string) => void;
 }) {
-  const { pending, error, saveTrust } = useSshDirectoryTrustSaver(props.onProjectDirResolved);
+  const { pending, error, saveTrust } = useSshDirectoryTrustSaver({
+    projectPath: props.projectPath,
+    host: props.host,
+    projectDir: props.projectDir,
+    applyProjectDir: props.onProjectDirResolved,
+  });
   const notice = resolveSshDirectoryTrustNotice(props);
   if (notice === null) return null;
 
@@ -47,11 +56,21 @@ export function SshDirectoryTrustNotice(props: {
 }
 
 /** Saves one trust choice at a time and keeps its pending state and last error for the row. */
-function useSshDirectoryTrustSaver(onProjectDirResolved: (projectDir: string) => void) {
+function useSshDirectoryTrustSaver(selection: SshDirectoryTrustSelection) {
   const { api } = useAPI();
   const { refreshProjects } = useProjectContext();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The selection the form shows now, or null once these controls unmount. A request's
+  // resolved-path write-back reads it after the await, so it never restores a selection the
+  // user has since changed (see applyResolvedProjectDir).
+  const currentSelectionRef = useRef<SshDirectoryTrustSelection | null>(null);
+  useLayoutEffect(() => {
+    currentSelectionRef.current = selection;
+    return () => {
+      currentSelectionRef.current = null;
+    };
+  });
 
   const saveTrust = async (request: Parameters<typeof saveSshDirectoryTrust>[1]) => {
     if (!api || pending) return;
@@ -59,7 +78,11 @@ function useSshDirectoryTrustSaver(onProjectDirResolved: (projectDir: string) =>
     setError(null);
     setError(
       await saveSshDirectoryTrust(
-        { api: api.projects, refreshProjects, onProjectDirResolved },
+        {
+          api: api.projects,
+          refreshProjects,
+          currentSelection: () => currentSelectionRef.current,
+        },
         request
       )
     );
