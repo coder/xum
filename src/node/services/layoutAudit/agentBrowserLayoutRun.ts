@@ -81,18 +81,23 @@ const FRAME_END = "@@xum-layout-end";
 
 /**
  * Values reach the scripts only through env vars and stdin: nothing from the artifact path or
- * the page is spliced into the shell text, and the page script never travels in argv. The
- * identity and state variables that would change which browser runs, where its session files
- * go, or what it restores, are unset (the flags below win over the rest of the env). `cd /` puts
- * the daemon outside the project and workspace, so no project agent-browser.json applies. Every
- * call carries the same flags and the same socket folder, `close` included, so it addresses the
- * same daemon.
+ * the page is spliced into the shell text, and the page script never travels in argv.
+ *
+ * The audit must only ever drive the browser it launched. So every inherited AGENT_BROWSER_*
+ * variable is unset (an inherited AGENT_BROWSER_CDP would attach to an existing browser and
+ * navigate a live tab; the profile, provider and engine variables change which browser runs and
+ * what it restores), and only what the run sets is exported. An explicit `--config` replaces the
+ * user-level and project agent-browser configs, which can name the same things; the run writes
+ * an empty one into its own folder. `env` feeds only the sweep's sed: its output (values
+ * included) never reaches stdout or stderr. `cd /` keeps the daemon outside the workspace. Every
+ * call carries the same flags and the same folder, `close` included, so it addresses the same
+ * daemon.
  */
 const SHELL_COMMON = String.raw`
-unset AGENT_BROWSER_SESSION AGENT_BROWSER_SESSION_NAME AGENT_BROWSER_NAMESPACE AGENT_BROWSER_RESTORE AGENT_BROWSER_STATE AGENT_BROWSER_INIT_SCRIPTS AGENT_BROWSER_ENABLE AGENT_BROWSER_HEADED AGENT_BROWSER_PROFILE AGENT_BROWSER_AUTO_CONNECT AGENT_BROWSER_PROVIDER AGENT_BROWSER_ENGINE
+for v in $(env | sed -n 's/^\(AGENT_BROWSER_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
 export AGENT_BROWSER_SOCKET_DIR="$XUM_LAYOUT_SOCKET_DIR"
 ab_wrap=
-ab() { $ab_wrap agent-browser --session "$XUM_LAYOUT_SESSION" --headed false --idle-timeout ${IDLE_TIMEOUT} "$@"; }
+ab() { $ab_wrap agent-browser --session "$XUM_LAYOUT_SESSION" --config "$XUM_LAYOUT_SOCKET_DIR/config.json" --idle-timeout ${IDLE_TIMEOUT} "$@"; }
 cd / || exit ${EXIT_SETUP_FAILED}
 `;
 
@@ -109,6 +114,8 @@ ${SHELL_COMMON}
 # Plain mkdir: it fails on a path that already exists, so the run never adopts a folder it did
 # not make, and CLOSE never removes one.
 mkdir -m 700 "$XUM_LAYOUT_SOCKET_DIR" || exit ${EXIT_SETUP_FAILED}
+# This run made the folder, so it removes it when it cannot go on: CLOSE is skipped for this exit.
+printf '{}' > "$XUM_LAYOUT_SOCKET_DIR/config.json" || { rm -rf -- "$XUM_LAYOUT_SOCKET_DIR"; exit ${EXIT_SETUP_FAILED}; }
 set -- $XUM_LAYOUT_VIEWPORTS
 while [ "$#" -ge 2 ]; do
   width=$1; height=$2; shift 2

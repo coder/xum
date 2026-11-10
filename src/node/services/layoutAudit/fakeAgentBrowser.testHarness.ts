@@ -9,7 +9,9 @@ import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
  * A POSIX-sh stand-in for the `agent-browser` CLI, reached the way production reaches the real
  * one: a trusted project's `.xum/tool_env` puts its folder first on PATH. It answers the five
  * calls the layout audit makes (`set viewport`, `open`, `--json eval --stdin`, `close`) and logs
- * every call, so a test sees the exact argv, the opened URLs and the stdin of each eval.
+ * every call, so a test sees the exact argv, the opened URLs and the stdin of each eval. For
+ * every call it also logs the NAMES of the AGENT_BROWSER_* variables it inherited (never their
+ * values) and the content of the file `--config` names.
  */
 
 /** What `eval` prints and returns for one width. The default is a clean, complete pass. */
@@ -55,6 +57,13 @@ export interface FakeAgentBrowser {
    * existed at the time.
    */
   socketDirs(): Promise<Array<{ dir: string; existed: boolean }>>;
+  /** Per call, in order: the names of the AGENT_BROWSER_* variables set in the call's env. */
+  agentBrowserEnvNames(): Promise<string[][]>;
+  /**
+   * Per call, in order: the `--config` path, and its content when the file existed then (the
+   * run's folder is gone afterwards).
+   */
+  configs(): Promise<Array<{ path: string; content: string | undefined }>>;
 }
 
 // The fake ends every argv field with this byte (octal 037 in its printf).
@@ -111,9 +120,19 @@ printf '%s\\037' "$@" >> "$STATE/calls.log"
 printf '\\n' >> "$STATE/calls.log"
 if [ -d "\${AGENT_BROWSER_SOCKET_DIR-}" ]; then existed=yes; else existed=no; fi
 printf '%s %s\\n' "$existed" "\${AGENT_BROWSER_SOCKET_DIR-}" >> "$STATE/socket-dirs.log"
+env | sed -n 's/^\\(AGENT_BROWSER_[A-Za-z0-9_]*\\)=.*/\\1/p' | sort | tr '\\n' ' ' >> "$STATE/env-names.log"
+printf '\\n' >> "$STATE/env-names.log"
+config=
+previous=
+for arg in "$@"; do
+  [ "$previous" = --config ] && config=$arg
+  previous=$arg
+done
+if [ -f "$config" ]; then content=$(cat "$config"); else content=MISSING; fi
+printf '%s\\t%s\\n' "$config" "$content" >> "$STATE/configs.log"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --session|--headed|--idle-timeout) shift 2 ;;
+    --session|--config|--idle-timeout) shift 2 ;;
     --json) shift ;;
     *) break ;;
   esac
@@ -200,5 +219,18 @@ export async function installFakeAgentBrowser(
           existed: line.startsWith("yes "),
           dir: line.slice(line.indexOf(" ") + 1),
         })),
+    agentBrowserEnvNames: async () =>
+      ((await read("env-names.log")) ?? "")
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => line.split(" ").filter(Boolean)),
+    configs: async () =>
+      ((await read("configs.log")) ?? "")
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => {
+          const [filePath = "", content = ""] = line.split("\t");
+          return { path: filePath, content: content === "MISSING" ? undefined : content };
+        }),
   };
 }

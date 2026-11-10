@@ -81,7 +81,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
   /** Subcommand of each call: the first argv field that is not a global flag or its value. */
   const subcommands = (calls: string[][]) =>
     calls.map((argv) => {
-      const flagsWithValue = ["--session", "--headed", "--idle-timeout"];
+      const flagsWithValue = ["--session", "--config", "--idle-timeout"];
       for (let index = 0; index < argv.length; index++) {
         if (flagsWithValue.includes(argv[index] ?? "")) index += 1;
         else if (argv[index] !== "--json") return argv[index];
@@ -89,7 +89,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       return undefined;
     });
 
-  /** Global flags of every call: one session of its own, never `--all`. */
+  /** Global flags of every call: one session of its own, never `--all`, never `--headed`. */
   const expectOneOwnSession = (calls: string[][]) => {
     const values = (flag: string) => new Set(calls.map((argv) => argv[argv.indexOf(flag) + 1]));
     const sessions = [...values("--session")];
@@ -97,12 +97,10 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     expect(sessions[0]).toMatch(/^xum-layout-[0-9a-f]{12}$/);
     for (const argv of calls) {
       expect(argv).not.toContain("--all");
-      expect(argv.slice(argv.indexOf("--headed"), argv.indexOf("--headed") + 4)).toEqual([
-        "--headed",
-        "false",
-        "--idle-timeout",
-        "10s",
-      ]);
+      expect(argv).not.toContain("--headed");
+      expect(
+        argv.slice(argv.indexOf("--idle-timeout"), argv.indexOf("--idle-timeout") + 2)
+      ).toEqual(["--idle-timeout", "10s"]);
     }
   };
 
@@ -323,6 +321,38 @@ describe("runLayoutPasses through a fake agent-browser", () => {
         () => false
       )
     ).toBe(false);
+  });
+
+  test("an inherited agent-browser setting never reaches a call, whatever its name", async () => {
+    const inherited = {
+      AGENT_BROWSER_CDP: "1",
+      AGENT_BROWSER_PROFILE: "/nonexistent-profile",
+      AGENT_BROWSER_FUTURE_FLAG: "1",
+    };
+    Object.assign(process.env, inherited);
+    try {
+      const { outcomes, fake } = await run({});
+      expect(summary(outcomes)).toEqual(["390 complete", "1440 complete", "768 complete"]);
+      // The ten calls (three widths of set, open and eval, then the close) each saw the run's
+      // own folder and nothing else.
+      expect(await fake.agentBrowserEnvNames()).toEqual(
+        Array.from({ length: 10 }, () => ["AGENT_BROWSER_SOCKET_DIR"])
+      );
+    } finally {
+      for (const name of Object.keys(inherited)) delete process.env[name];
+    }
+  });
+
+  test("every call names a config of the run's own folder, and it is empty", async () => {
+    const { fake } = await run({});
+    const dirs = (await fake.socketDirs()).map((call) => call.dir);
+    const configs = await fake.configs();
+    expect(configs).toHaveLength(10);
+    expect(new Set(dirs).size).toBe(1);
+    for (const config of configs) {
+      expect(config.path).toBe(`${dirs[0]}/config.json`);
+      expect(JSON.parse(config.content ?? "null")).toEqual({});
+    }
   });
 
   test("a hung run still has its folder removed by the close", async () => {
