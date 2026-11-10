@@ -3,7 +3,6 @@ import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:te
 import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
-  boundTailContent,
   parseSpawnRecordMeta,
   type BackgroundProcess,
   type BackgroundProcessMeta,
@@ -712,7 +711,7 @@ describe("BackgroundProcessManager", () => {
       const event = await eventPromise;
       expect(event.workspaceId).toBe(testWorkspaceId);
       // The unterminated line only matches at settlement, so the payload is the combined
-      // settlement wake: matched line first, then the synthetic settle line and output tail.
+      // settlement wake: the matched line plus the terminal status.
       expect(event.payload.lines[0]).toBe("READY");
       expect(event.payload.totalMatches).toBe(1);
       expect(event.payload.filter).toBe("READY");
@@ -910,8 +909,8 @@ describe("BackgroundProcessManager", () => {
       expect(
         manager
           .pullMonitorWakeSignals(testWorkspaceId)
-          .find((snapshot) => snapshot.processId === result.processId)?.match?.lines
-      ).toEqual(["READY"]);
+          .find((snapshot) => snapshot.processId === result.processId)?.match?.throughOffset
+      ).toBeGreaterThan(0);
     });
 
     it("retires a monitor after repeated output failures while exit probes stay healthy", async () => {
@@ -1936,7 +1935,6 @@ describe("BackgroundProcessManager", () => {
 
       const before = manager.pullMonitorWakeSignals(testWorkspaceId);
       const snapshot = before.find((candidate) => candidate.processId === result.processId);
-      expect(snapshot?.match?.lines).toEqual(["READY"]);
       expect(snapshot?.match?.throughOffset).toBeGreaterThan(0);
 
       manager.acknowledgeMonitorWake(
@@ -1970,8 +1968,8 @@ describe("BackgroundProcessManager", () => {
       expect(
         manager
           .pullMonitorWakeSignals(testWorkspaceId)
-          .find((snapshot) => snapshot.processId === result.processId)?.match?.lines
-      ).toEqual(["READY"]);
+          .find((snapshot) => snapshot.processId === result.processId)?.match?.throughOffset
+      ).toBeGreaterThan(0);
 
       await manager.terminate(result.processId, { monitorDisposition: "discard" });
 
@@ -2003,7 +2001,8 @@ describe("BackgroundProcessManager", () => {
       const first = manager
         .pullMonitorWakeSignals(testWorkspaceId)
         .find((snapshot) => snapshot.processId === result.processId);
-      expect(first?.match?.lines).toEqual(["BATCH_A"]);
+      const firstThrough = first?.match?.throughOffset;
+      expect(firstThrough).toBeGreaterThan(0);
       for (let attempt = 0; attempt < 80 && events.length < 2; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
@@ -2017,7 +2016,7 @@ describe("BackgroundProcessManager", () => {
       const remaining = manager
         .pullMonitorWakeSignals(testWorkspaceId)
         .find((snapshot) => snapshot.processId === result.processId);
-      expect(remaining?.match?.lines).toEqual(["BATCH_B"]);
+      expect(remaining?.match?.throughOffset).toBeGreaterThan(firstThrough ?? Infinity);
       await manager.terminate(result.processId, { monitorDisposition: "discard" });
     });
 
@@ -2067,21 +2066,15 @@ describe("BackgroundProcessManager", () => {
         // could ever falsely suppress the wake (EOF == shown offset for unread output is fine).
         expect(payload.matchedThroughOffset).toBeUndefined();
         expect(payload.lines).toEqual([]);
-        expect(
-          (payload.tailLines ?? []).some((line) =>
-            line.includes("Unresolved review comments found")
-          )
-        ).toBe(true);
         const wakeSignal = manager
           .pullMonitorWakeSignals(testWorkspaceId)
           .find((snapshot) => snapshot.processId === result.processId);
         expect(wakeSignal?.match).toBeUndefined();
-        expect(
-          wakeSignal?.terminal?.tailLines?.some(
-            (entry) =>
-              entry.line.includes("Unresolved review comments found") && entry.endOffset > 0
-          )
-        ).toBe(true);
+        expect(wakeSignal?.terminal).toMatchObject({
+          status: "exited",
+          exitCode: 1,
+          wakeOnExit: true,
+        });
         // Durability ordering: the wake emit precedes registry deletion.
         expect(order).toEqual(["match", "stopped"]);
         expect(stoppedEvents[0]).toMatchObject({
@@ -2156,10 +2149,7 @@ describe("BackgroundProcessManager", () => {
         const wakeSignal = manager
           .pullMonitorWakeSignals(testWorkspaceId)
           .find((snapshot) => snapshot.processId === result.processId);
-        expect(wakeSignal?.match?.lines).toEqual(["ERR boom"]);
-        expect(wakeSignal?.match?.lines.some((line) => line.includes("process settled:"))).toBe(
-          false
-        );
+        expect(wakeSignal?.match?.throughOffset).toBe(payload.matchedThroughOffset);
       });
 
       it("emits no settlement wake on discard-mode termination (task_stop)", async () => {
@@ -2323,8 +2313,7 @@ describe("BackgroundProcessManager", () => {
 
         expect(matchEvents).toHaveLength(1);
         expect(matchEvents[0].lines[0]).toBe("ERR final");
-        // The matched line appears once in lines; its tail-window duplicate travels separately
-        // and is deduped by BashMonitorWakeReconciler.composeLines before delivery.
+        // The matched line appears once in the settlement payload's lines.
         expect(matchEvents[0].lines.filter((line) => line === "ERR final")).toHaveLength(1);
         expect(matchEvents[0].terminal).toEqual({ status: "exited", exitCode: 0 });
         expect(stoppedEvents).toHaveLength(1);
@@ -2379,9 +2368,9 @@ describe("BackgroundProcessManager", () => {
         manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
         manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
-        // The script waits for a gate file so the tail-read spy below is installed before the
+        // The script waits for a gate file so the scan-read spy below is installed before the
         // monitor can settle. A script that exits at once can settle first (a busy host is enough),
-        // and then the test waits for a tail read that already happened.
+        // and then the test waits for a scan read that already happened.
         const gate = path.join(bgOutputDir, "settle-gate");
         const result = await manager.spawn(
           runtime,
@@ -2400,27 +2389,32 @@ describe("BackgroundProcessManager", () => {
         expect(proc).not.toBeNull();
         if (proc == null) return;
 
-        // Hold the settlement helper inside its tail read so beginShutdown deterministically
+        // Hold the settlement helper inside its final scan read so beginShutdown deterministically
         // lands after the claim (claimMonitorSettlement's own shutdown guard is already past).
-        let releaseTail!: () => void;
-        const tailGate = new Promise<void>((resolve) => {
-          releaseTail = resolve;
+        let releaseScan!: () => void;
+        const scanGate = new Promise<void>((resolve) => {
+          releaseScan = resolve;
         });
-        let tailReadStarted!: () => void;
-        const tailReadStartedPromise = new Promise<void>((resolve) => {
-          tailReadStarted = resolve;
+        let scanStarted!: () => void;
+        const scanStartedPromise = new Promise<void>((resolve) => {
+          scanStarted = resolve;
         });
-        const realGetOutputFileSize = proc.handle.getOutputFileSize.bind(proc.handle);
-        spyOn(proc.handle, "getOutputFileSize").mockImplementation(async () => {
-          tailReadStarted();
-          await tailGate;
-          return realGetOutputFileSize();
+        let held = false;
+        const realReadOutput = proc.handle.readOutput.bind(proc.handle);
+        spyOn(proc.handle, "readOutput").mockImplementation(async (offset: number) => {
+          // Only the settlement scan reads under the settled latch; hold that one read.
+          if (proc.monitor?.settled && !held) {
+            held = true;
+            scanStarted();
+            await scanGate;
+          }
+          return realReadOutput(offset);
         });
 
         await fs.writeFile(gate, "");
-        await tailReadStartedPromise;
+        await scanStartedPromise;
         manager.beginShutdown();
-        releaseTail();
+        releaseScan();
         await new Promise((resolve) => setTimeout(resolve, 300));
 
         // No settlement wake may be persisted or queued during ServiceContainer.dispose, and no
@@ -2466,9 +2460,8 @@ describe("BackgroundProcessManager", () => {
         expect(proc.monitor?.pendingLines).toEqual(["ERR pending"]);
 
         // Fail the settlement scan read (only reads under the settled latch) while holding it
-        // open so beginShutdown deterministically lands mid-scan. The wake_on_exit=false branch
-        // has no tail read, so this is the only guard between the failed scan and the legacy
-        // pending-match emit.
+        // open so beginShutdown deterministically lands mid-scan. This is the only guard between
+        // the failed scan and the legacy pending-match emit.
         let releaseScan!: () => void;
         const scanGate = new Promise<void>((resolve) => {
           releaseScan = resolve;
@@ -2498,121 +2491,15 @@ describe("BackgroundProcessManager", () => {
         expect(stoppedEvents).toHaveLength(0);
       });
 
-      it("excludes already-shown final lines from the settlement tail", async () => {
-        const eventPromise = waitForMonitorMatch(manager, 8_000);
-        const result = await manager.spawn(
-          runtime,
-          testWorkspaceId,
-          "printf 'alpha shown\\n'; sleep 0.5; printf 'omega new\\n'",
-          {
-            cwd: process.cwd(),
-            displayName: "settle-tail-shown-frontier",
-            monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
-          }
-        );
-        expect(result.success).toBe(true);
-        if (!result.success) return;
-
-        // Owner unfiltered read consumes the first line while the process still runs, advancing
-        // the shown frontier past it.
-        const read = await manager.getOutput(
-          result.processId,
-          undefined,
-          false,
-          1,
-          undefined,
-          testWorkspaceId
-        );
-        expect(read.success).toBe(true);
-        if (!read.success) return;
-        expect(read.output).toContain("alpha shown");
-
-        const event = await eventPromise;
-        const tail = event.payload.tailLines ?? [];
-        // Already-shown bytes must not be re-presented as new post-settlement output.
-        expect(tail).not.toContain("alpha shown");
-        // The genuinely unseen final line survives (unless the read raced past it too).
-        if (!read.output.includes("omega new")) {
-          expect(tail).toContain("omega new");
-        }
-      });
-
-      it("keeps a bounded suffix when the final output is one oversized line", async () => {
-        // No line boundary inside the final ~4 KB window: dropping the lone mid-line fragment
-        // would deliver an empty tail exactly when the oversized line (long JSON diagnostics,
-        // a single-line compiler failure) IS the decisive output.
-        const eventPromise = waitForMonitorMatch(manager, 8_000);
-        const result = await manager.spawn(
-          runtime,
-          testWorkspaceId,
-          "head -c 6000 /dev/zero | tr '\\0' X; printf 'TAIL_END\\n'",
-          {
-            cwd: process.cwd(),
-            displayName: "settle-tail-oversized-line",
-            monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
-          }
-        );
-        expect(result.success).toBe(true);
-        if (!result.success) return;
-
-        const event = await eventPromise;
-        const tail = event.payload.tailLines ?? [];
-        // The bounded suffix survives with an explicit truncation marker instead of vanishing.
-        expect(tail).toHaveLength(1);
-        expect(tail[0]).toContain("[truncated]");
-        expect(tail[0]).toContain("TAIL_END");
-      });
-
-      it("bounds oversized tail content and marks it mid-content (degraded size query)", () => {
-        // A runtime handle's transient size-query failure degrades to 0, turning the tail read
-        // into a full-file read; the post-read bound must re-cut to the final byte window and
-        // report the mid-content start so the caller drops the leading partial line.
-        const oversized = `${"A".repeat(8192)}\nEND\n`;
-        const bounded = boundTailContent(oversized, 4096);
-        expect(Buffer.byteLength(bounded.content, "utf8")).toBe(4096);
-        expect(bounded.startedMidContent).toBe(true);
-        // The final complete lines survive at the end of the window.
-        expect(bounded.content.endsWith("\nEND\n")).toBe(true);
-
-        // Content already within the bound passes through untouched.
-        const small = "short\nEND\n";
-        expect(boundTailContent(small, 4096)).toEqual({
-          content: small,
-          startedMidContent: false,
-        });
-      });
-
-      it("still wakes when the settlement tail read fails", async () => {
-        const eventPromise = waitForMonitorMatch(manager, 6_000);
-        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'boom\\n'; exit 1", {
-          cwd: process.cwd(),
-          displayName: "settle-tail-failure",
-          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
-        });
-        expect(result.success).toBe(true);
-        if (!result.success) return;
-
-        const proc = await manager.getProcess(result.processId);
-        expect(proc).not.toBeNull();
-        if (proc == null) return;
-        spyOn(proc.handle, "getOutputFileSize").mockImplementation(() =>
-          Promise.reject(new Error("tail read failed"))
-        );
-
-        const event = await eventPromise;
-        expect(event.payload.terminal).toEqual({ status: "exited", exitCode: 1 });
-        expect(event.payload.lines).toEqual([]);
-      });
-
       it("cancellation during the claimed settlement window wins (no terminal wake, one canceled stop)", async () => {
         const matchEvents: MonitorMatchPayload[] = [];
         const stoppedEvents: MonitorStoppedPayload[] = [];
         manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
         manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
-        // The script waits for a gate file so the tail-read spy below is installed before the
+        // The script waits for a gate file so the scan-read spy below is installed before the
         // monitor can settle. A script that exits at once can settle first (a busy host is enough),
-        // and then the test waits for a tail read that already happened.
+        // and then the test waits for a scan read that already happened.
         const gate = path.join(bgOutputDir, "settle-gate");
         const result = await manager.spawn(
           runtime,
@@ -2631,28 +2518,33 @@ describe("BackgroundProcessManager", () => {
         expect(proc).not.toBeNull();
         if (proc == null) return;
 
-        // Hold the settlement helper inside its tail read so the cancel deterministically lands
-        // in the claimed window.
-        let releaseTail!: () => void;
-        const tailGate = new Promise<void>((resolve) => {
-          releaseTail = resolve;
+        // Hold the settlement helper inside its final scan read so the cancel deterministically
+        // lands in the claimed window.
+        let releaseScan!: () => void;
+        const scanGate = new Promise<void>((resolve) => {
+          releaseScan = resolve;
         });
-        let tailReadStarted!: () => void;
-        const tailReadStartedPromise = new Promise<void>((resolve) => {
-          tailReadStarted = resolve;
+        let scanStarted!: () => void;
+        const scanStartedPromise = new Promise<void>((resolve) => {
+          scanStarted = resolve;
         });
-        const realGetOutputFileSize = proc.handle.getOutputFileSize.bind(proc.handle);
-        spyOn(proc.handle, "getOutputFileSize").mockImplementation(async () => {
-          tailReadStarted();
-          await tailGate;
-          return realGetOutputFileSize();
+        let held = false;
+        const realReadOutput = proc.handle.readOutput.bind(proc.handle);
+        spyOn(proc.handle, "readOutput").mockImplementation(async (offset: number) => {
+          // Only the settlement scan reads under the settled latch; hold that one read.
+          if (proc.monitor?.settled && !held) {
+            held = true;
+            scanStarted();
+            await scanGate;
+          }
+          return realReadOutput(offset);
         });
 
         await fs.writeFile(gate, "");
-        await tailReadStartedPromise;
-        // Explicit cancel (task_stop path) while the settlement helper awaits the tail read.
+        await scanStartedPromise;
+        // Explicit cancel (task_stop path) while the settlement helper awaits the scan read.
         await manager.terminate(result.processId, { monitorDisposition: "discard" });
-        releaseTail();
+        releaseScan();
         await new Promise((resolve) => setTimeout(resolve, 300));
 
         expect(matchEvents).toHaveLength(0);
@@ -2822,6 +2714,8 @@ describe("BackgroundProcessManager", () => {
         status: "running",
         shownThroughOffset: 0,
         terminalStatusShownToAgent: false,
+        outputBytesRead: 0,
+        incompleteLineBuffer: "",
         handle: { getExitCode } as unknown as BackgroundHandle,
       } as unknown as BackgroundProcess;
       const internal = manager as unknown as {
