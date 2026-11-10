@@ -562,8 +562,8 @@ describe("StreamManager - refusal categories with no recommended fallback", () =
     }
   );
 
-  // Anthropic: for this category, "change the prompt rather than retry the request". Telling the
-  // user to try another model would send them to a model that refuses the same prompt.
+  // Anthropic: this category has no recommended fallback model, so "change the prompt rather than
+  // retry the request". The text must not tell the user to try another model.
   test.each([
     { chain: "with a fallback chain", modelFallback: () => preparedFallback() },
     { chain: "without a fallback chain", modelFallback: () => undefined },

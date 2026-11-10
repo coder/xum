@@ -49,8 +49,9 @@ export class EmptyStreamOutputError extends Error {
 }
 
 /**
- * What a refusal in a category with no recommended fallback tells the user. Another model would
- * refuse the same request, so none of these suggests one. Each category has its own cause:
+ * What a refusal in a category with no recommended fallback tells the user. Anthropic gives such
+ * a category no fallback model and says "the refusal stands", so none of these suggests another
+ * model: the request is what must change. Each category has its own cause:
  * Anthropic's refusals page says a reasoning_extraction refusal "usually" comes from wording
  * that asks for the model's reasoning in its reply, and that the wording "can sit in a system
  * prompt, a skill, or a tool description". A category without an entry gets the neutral text.

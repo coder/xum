@@ -219,7 +219,8 @@ describe("ModelRefusalError wording", () => {
     expect(refusal({ fallbackNote: "Chain exhausted." })).toContain("Chain exhausted.");
   });
 
-  // Anthropic gives these refusals no fallback model: another model would refuse the same request.
+  // Anthropic gives these refusals no recommended fallback model and says the refusal stands, so
+  // the text must send the user to the request, not to another model.
   test("reasoning_extraction explains its cause and never suggests another model", () => {
     const message = refusal({ noFallbackCategory: "reasoning_extraction" });
     expect(message).toContain("reasoning");
