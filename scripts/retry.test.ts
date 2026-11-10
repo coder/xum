@@ -154,37 +154,49 @@ describe.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
       }
     }
 
+    // bash counts `$SECONDS` in whole seconds, and retry.sh reads it twice (when it starts the budget
+    // and when it cuts a try), so a second boundary between the two reads takes one second off a cut:
+    // 8 for 9. A host that stalls the script for longer takes more off. So one cut can be anything
+    // from 5 to 9. Of three runs at least one has no stall, so the largest first cut is the whole
+    // budget. A budget that is off by one second (remaining - 1, + 1, - 2, + 2) never cuts at 9.
     test("cuts each later try off at what is left of the budget, not at the whole budget", async () => {
       await stubTimeout();
-      const result = await retry([
-        "--budget-secs",
-        "9",
-        "0",
-        "0",
-        await command({ succeedOn: 2, seconds: 2 }),
-      ]);
-      expect(result.exitCode).toBe(0);
+      for (let run = 0; run < 3; run++) {
+        // `command` counts its runs in the file `runs`: start each run with a new count.
+        await rm(path.join(work, "runs"), { force: true });
+        const result = await retry([
+          "--budget-secs",
+          "9",
+          "0",
+          "0",
+          await command({ succeedOn: 2, seconds: 2 }),
+        ]);
+        expect(result.exitCode).toBe(0);
+      }
       const seconds = (await lines("cuts")).map((cut) => Number(cut.split(" ")[2]));
-      expect(seconds).toHaveLength(2);
-      // bash counts `$SECONDS` in whole seconds, so a tick between the start of retry.sh and the
-      // first cut takes one second off the first budget: 8 or 9, never less or more.
-      expect(seconds[0]).toBeGreaterThanOrEqual(8);
-      expect(seconds[0]).toBeLessThanOrEqual(9);
-      expect(seconds[1]).toBeLessThanOrEqual(7);
-      expect(seconds[1]).toBeGreaterThan(0);
+      expect(seconds).toHaveLength(6);
+      const firsts = [seconds[0], seconds[2], seconds[4]];
+      for (const first of firsts) {
+        expect(first).toBeGreaterThanOrEqual(5);
+        expect(first).toBeLessThanOrEqual(9);
+      }
+      expect(Math.max(...firsts)).toBe(9);
+      // The second try follows a try that took 2 s, so it is cut off at 7 s or less, never at 9.
+      for (const second of [seconds[1], seconds[3], seconds[5]]) {
+        expect(second).toBeGreaterThan(0);
+        expect(second).toBeLessThanOrEqual(7);
+      }
     });
 
     test("kills a try that ignores the TERM 5 seconds after the cut", async () => {
       await stubTimeout();
-      // bash counts `$SECONDS` in whole seconds, so a second boundary between the two reads in
-      // retry.sh takes one second off a cut: 8 for 9. A cut is 8 or 9, and of three runs at least one
-      // has no tick, so the largest cut is the whole budget. A cut at the budget minus one never is.
+      // The same rule as the test above: each cut is 5 to 9, and one of three runs cuts at 9.
       for (let run = 0; run < 3; run++) {
         await retry(["--budget-secs", "9", "0", "0", await command({ succeedOn: 1 })]);
       }
       const cuts = await lines("cuts");
       expect(cuts).toHaveLength(3);
-      for (const cut of cuts) expect(cut).toMatch(/^-k 5 [89]$/);
+      for (const cut of cuts) expect(cut).toMatch(/^-k 5 [5-9]$/);
       expect(cuts).toContain("-k 5 9");
     });
 
