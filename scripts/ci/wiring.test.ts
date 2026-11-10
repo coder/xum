@@ -6,13 +6,15 @@
 // its last scripted run, so a command that retries too often ends instead of waiting for its budget.
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally: bun test ./scripts/ci/wiring.test.ts
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { appBuilderPath } from "app-builder-bin";
 import { parse } from "yaml";
-import { runScript, writeExecutable, type RunResult } from "./runScript";
+import { SPAWNING_TEST_TIMEOUT_MS, runScript, writeExecutable, type RunResult } from "./runScript";
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const REPO = path.resolve(import.meta.dir, "../..");
 const ACTION = path.join(REPO, ".github/actions/setup-xum/action.yml");
@@ -442,6 +444,12 @@ describe("make dist-*: the zip directory reaches every electron-builder call", (
 // while it fetches what app-builder asks for. These checks pin the call, and the pin: an
 // electron-builder bump that moves app-builder to another AppImage tool would leave the cache
 // holding a tool that app-builder never reads, and Build / Linux would download the new one with no retry.
+interface WorkflowStep {
+  uses?: string;
+  run?: string;
+  with?: Record<string, unknown>;
+}
+
 describe("the AppImage tool wiring", () => {
   test("setup-xum fetches the tool only when the caller asks, after it restores the electron-builder cache", async () => {
     const steps = await setupActionSteps();
@@ -471,16 +479,33 @@ describe("the AppImage tool wiring", () => {
     ]);
   });
 
-  test("Build / Linux asks setup-xum for the tool", async () => {
-    const workflow = parse(await readFile(path.join(WORKFLOWS, "pr.yml"), "utf8")) as {
-      jobs: Record<string, { steps: { uses?: string; with?: Record<string, unknown> }[] }>;
-    };
-    const setup = workflow.jobs["build-linux"]?.steps.filter(
-      (step) => step.uses === "./.github/actions/setup-xum"
-    );
+  test("every job that builds an AppImage asks setup-xum for the tool", async () => {
+    const builders: string[] = [];
+    for (const file of (await readdir(WORKFLOWS)).filter((name) => name.endsWith(".yml"))) {
+      const workflow = parse(await readFile(path.join(WORKFLOWS, file), "utf8")) as {
+        jobs?: Record<string, { steps?: WorkflowStep[] }>;
+      };
+      for (const [id, job] of Object.entries(workflow.jobs ?? {})) {
+        const steps = job.steps ?? [];
+        // electron-builder builds an AppImage for `--linux`, directly or through `make dist-linux`.
+        const builds = steps.some((step) =>
+          /electron-builder\b.*--linux|make dist-linux/.test(step.run ?? "")
+        );
+        if (!builds) continue;
+        builders.push(`${file}:${id}`);
+        const setup = steps.filter((step) => step.uses === "./.github/actions/setup-xum");
 
-    expect(setup).toHaveLength(1);
-    expect(setup?.[0]?.with?.["appimage-tool"]).toBe("true");
+        expect(setup, `${file}:${id} calls setup-xum once`).toHaveLength(1);
+        expect(setup[0]?.with?.["appimage-tool"], `${file}:${id} asks for the tool`).toBe("true");
+      }
+    }
+
+    // The jobs this test has to find: a new AppImage job joins this list, with its input.
+    expect(builders.sort()).toEqual([
+      "_desktop-release.yml:build-linux",
+      "_desktop-release.yml:build-linux-arm64",
+      "pr.yml:build-linux",
+    ]);
   });
 
   test("app-builder asks for the version and the archive that the script pins", async () => {
@@ -496,5 +521,23 @@ describe("the AppImage tool wiring", () => {
 
     expect(binary).toContain(version ?? "");
     expect(binary).toContain(sha512 ?? "");
+  });
+
+  // The release builds the Linux AppImage on x64 and on a native arm64 runner. Both app-builder
+  // binaries must ask for the pinned archive, and the arm64 runner unpacks it with the arm64 7za.
+  test.each(["x64", "arm64"])("the %s release build reads the pinned archive", async (arch) => {
+    const script = await readFile(path.join(REPO, "scripts/ci/prefetch-appimage-tool.sh"), "utf8");
+    const version = /^version=(appimage-[\d.]+)$/m.exec(script)?.[1] ?? "";
+    const sha512 = /^#\s+([A-Za-z0-9+/]{86}==)$/m.exec(script)?.[1] ?? "";
+    const modules = path.join(REPO, "node_modules");
+    const binary = await readFile(
+      path.join(modules, "app-builder-bin/linux", arch, "app-builder"),
+      "latin1"
+    );
+
+    expect(version).not.toBe("");
+    expect(binary).toContain(version);
+    expect(binary).toContain(sha512);
+    expect(await Bun.file(path.join(modules, "7zip-bin/linux", arch, "7za")).exists()).toBe(true);
   });
 });

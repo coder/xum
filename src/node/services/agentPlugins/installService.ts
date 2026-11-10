@@ -15,6 +15,10 @@ import {
   type AgentPluginInstallEntry,
 } from "@/common/config/schemas/agentPluginInstalls";
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
+import {
+  isAbbreviatedCommitSha,
+  normalizeAgentPluginSubpath,
+} from "@/common/utils/agentPluginSource";
 import { getOwn } from "@/common/utils/getOwn";
 import { AgentPluginRuleTypeSchema } from "@/common/orpc/schemas/agentPlugins";
 import type {
@@ -207,7 +211,6 @@ import {
 import {
   assertNoAgentPluginUrlCredentials,
   isFullCommitSha,
-  normalizeAgentPluginSubpath,
   parseAgentPluginSourceInput,
 } from "./sourceInput";
 
@@ -2509,7 +2512,7 @@ export class AgentPluginInstallService {
       return { ref: symrefMatch[1], refType: "branch", sha: shaMatch[1] };
     }
 
-    if (/^[0-9a-f]{7,39}$/i.test(ref)) {
+    if (isAbbreviatedCommitSha(ref)) {
       // A short SHA can't be fetched shallowly and can't be resolved by ls-remote.
       throw new Error(
         `'${ref}' looks like an abbreviated commit SHA. Use the full 40-character SHA, a branch, or a tag.`

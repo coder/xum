@@ -4,12 +4,23 @@
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally:
 // bun test ./scripts/ci/downloadVerified.test.ts
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  setDefaultTimeout,
+  test,
+} from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { runScript, type RunResult } from "./runScript";
+import { SPAWNING_TEST_TIMEOUT_MS, runScript, type RunResult } from "./runScript";
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const DOWNLOAD = path.resolve(import.meta.dir, "download-verified.sh");
 const FETCH_ONCE = path.resolve(import.meta.dir, "fetch-once.sh");

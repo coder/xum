@@ -6,7 +6,12 @@ import * as fs from "fs";
 import cjsFs from "fs";
 import * as os from "os";
 import { log } from "@/node/services/log";
-import { CONFIG_TREE_FIELDS, Config, MAX_LOGGED_METADATA_LOAD_FAILURES } from "./config";
+import {
+  CONFIG_TREE_FIELDS,
+  CONFIG_UNCHANGED,
+  Config,
+  MAX_LOGGED_METADATA_LOAD_FAILURES,
+} from "./config";
 import {
   projectRegistrationLockFilePath,
   withProjectRegistrationLock,
@@ -200,6 +205,7 @@ describe("Config", () => {
           migrations: {
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
+            defaultModelFallbacksSeededFable52: true,
             persistentSubagentsDefaulted: true,
           },
         })
@@ -3912,6 +3918,270 @@ describe("Config", () => {
       await waiting;
       expect(calls).toBe(2);
     });
+
+    it("editConfigIfChanged writes nothing for an unchanged config, with or without waiting for the lock", async () => {
+      // Every MCP settings save clears its legacy config.json value through this. An edit that
+      // changed nothing still rewrote the whole file: at 7,550 workspaces, each save
+      // re-serialized the registry.
+      await config.editConfig((cfg) => cfg);
+      const saveConfig = spyOn(
+        config as unknown as { saveConfig: (cfg: unknown) => unknown },
+        "saveConfig"
+      );
+      await config.editConfigIfChanged(() => CONFIG_UNCHANGED);
+      expect(saveConfig).not.toHaveBeenCalled();
+
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      const waiting = config.editConfigIfChanged(() => CONFIG_UNCHANGED);
+      // Long enough for the edit to step out of the queue and wait for the lock.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await otherProcess[Symbol.asyncDispose]();
+      await waiting;
+      expect(saveConfig).not.toHaveBeenCalled();
+
+      // A changed config is written as by editConfig.
+      await config.editConfigIfChanged((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
+      expect(saveConfig).toHaveBeenCalledTimes(1);
+      expect(new Config(tempDir).loadConfigOrDefault().heartbeatDefaultIntervalMs).toBe(360_000);
+    });
+
+    /**
+     * Makes the next read of config.json fail once, once armed: `io` and `missing` throw from
+     * the read itself, `parse` from parsing bytes that are valid.
+     */
+    function injectConfigReadFault(fault: "io" | "missing" | "parse") {
+      const configFile = path.join(tempDir, "config.json");
+      const state = { armed: false, injected: 0 };
+      const realRead = fs.readFileSync;
+      const realParse = JSON.parse;
+      const readSpy = spyOn(fs, "readFileSync").mockImplementation(((
+        ...args: Parameters<typeof fs.readFileSync>
+      ) => {
+        if (fault !== "parse" && state.armed && String(args[0]) === configFile) {
+          state.armed = false;
+          state.injected++;
+          const code = fault === "io" ? "EIO" : "ENOENT";
+          throw Object.assign(new Error(`injected ${code}`), { code });
+        }
+        return realRead(...args);
+      }) as typeof fs.readFileSync);
+      const parseSpy = spyOn(JSON, "parse").mockImplementation(((
+        text: string,
+        reviver?: Parameters<typeof JSON.parse>[1]
+      ) => {
+        if (fault === "parse" && state.armed && text.includes('"heartbeatDefaultIntervalMs"')) {
+          state.armed = false;
+          state.injected++;
+          throw new SyntaxError("injected parse failure");
+        }
+        return realParse(text, reviver) as unknown;
+      }) as typeof JSON.parse);
+      return {
+        state,
+        restore: () => {
+          readSpy.mockRestore();
+          parseSpy.mockRestore();
+        },
+      };
+    }
+
+    it.each([
+      { fault: "io" as const, failure: "an I/O error" },
+      { fault: "missing" as const, failure: "a missing file" },
+      { fault: "parse" as const, failure: "a JSON parse error" },
+    ])(
+      "editConfigIfChanged fails before its transform runs when its locked read of config.json hits $failure, with or without waiting for the lock",
+      async ({ fault }) => {
+        // A lenient read hands the transform defaults, which hold nothing to change: a settings
+        // clear then reported success over a config.json nobody read, and a legacy enabled
+        // server came back. The read under the lock is strict, so the edit fails first.
+        await config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
+        const injection = injectConfigReadFault(fault);
+        let transformed = 0;
+        const unchanged = (): typeof CONFIG_UNCHANGED => {
+          transformed++;
+          return CONFIG_UNCHANGED;
+        };
+        try {
+          // The lock is free: the read under it is the edit's first read of the file.
+          config.loadConfigOrDefault();
+          injection.state.armed = true;
+          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+          await expect(config.editConfigIfChanged(unchanged)).rejects.toThrow(/injected/);
+          expect(injection.state.injected).toBe(1);
+
+          // Another process holds the lock: the edit reads once it has waited for it.
+          const fresh = new Config(tempDir);
+          fresh.loadConfigOrDefault();
+          const otherProcess = await acquireProcessFileLock({
+            lockPath: projectRegistrationLockFilePath(tempDir),
+            timeoutMs: 5_000,
+            label: "test holder",
+          });
+          const waiting = fresh.editConfigIfChanged(unchanged);
+          // Long enough for the edit to step out of the queue and wait for the lock.
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          injection.state.armed = true;
+          await otherProcess[Symbol.asyncDispose]();
+          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+          await expect(waiting).rejects.toThrow(/injected/);
+          expect(injection.state.injected).toBe(2);
+        } finally {
+          injection.restore();
+        }
+        expect(transformed).toBe(0);
+        expect(new Config(tempDir).loadConfigOrDefault().heartbeatDefaultIntervalMs).toBe(360_000);
+      }
+    );
+
+    it("editConfigIfChanged fails when another writer replaces config.json after its locked read, with or without waiting for the lock", async () => {
+      // A write's save refuses to replace bytes that the edit did not read (#5929). An edit
+      // that changes nothing writes nothing, so it must make that check itself: a settings clear
+      // otherwise reported success while a replaced config.json carried a legacy enable.
+      await config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
+      const configFile = path.join(tempDir, "config.json");
+      const outside = JSON.stringify({ projects: [], heartbeatDefaultIntervalMs: 420_000 });
+      // The transform runs after the edit's locked read: replace the file as an older build would.
+      const replaceOutside = (): typeof CONFIG_UNCHANGED => {
+        fs.writeFileSync(`${configFile}.outside`, outside);
+        fs.renameSync(`${configFile}.outside`, configFile);
+        return CONFIG_UNCHANGED;
+      };
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(config.editConfigIfChanged(replaceOutside)).rejects.toThrow(/changed on disk/);
+
+      // Another process holds the lock: the edit reads once it has waited for it.
+      const fresh = new Config(tempDir);
+      fresh.loadConfigOrDefault();
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      const waiting = fresh.editConfigIfChanged(replaceOutside);
+      // Long enough for the edit to step out of the queue and wait for the lock.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await otherProcess[Symbol.asyncDispose]();
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(waiting).rejects.toThrow(/changed on disk/);
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(outside);
+    });
+
+    it("editConfigIfChanged fails before its transform runs when config.json does not exist", async () => {
+      // The registry lives in config.json, so an edit that finds none has nothing it can answer
+      // "unchanged" for: a settings clear would report success for a file nobody read.
+      let transformed = 0;
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        config.editConfigIfChanged(() => {
+          transformed++;
+          return CONFIG_UNCHANGED;
+        })
+      ).rejects.toThrow(/ENOENT/);
+      expect(transformed).toBe(0);
+      expect(fs.existsSync(path.join(tempDir, "config.json"))).toBe(false);
+    });
+
+    it("editConfigIfChanged reads strictly behind an edit that already waits for the lock", async () => {
+      // An edit that finds another one waiting joins the waiters' chain without trying the
+      // lock. Its read in that chain is strict too: here the edit ahead of it leaves a
+      // config.json that fails structural validation, which a lenient read would accept.
+      await config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
+      const configFile = path.join(tempDir, "config.json");
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      const ahead = config.editConfig(() => {
+        fs.writeFileSync(configFile, JSON.stringify({ projects: [["", { workspaces: [] }]] }));
+        throw new Error("the edit ahead fails after it replaced config.json");
+      });
+      // Long enough for the first edit to step out of the queue and wait for the lock.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      let transformed = 0;
+      const behind = config.editConfigIfChanged(() => {
+        transformed++;
+        return CONFIG_UNCHANGED;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await otherProcess[Symbol.asyncDispose]();
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(ahead).rejects.toThrow(/edit ahead fails/);
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(behind).rejects.toThrow(/non-empty string path/);
+      expect(transformed).toBe(0);
+    });
+
+    it.each([
+      { lock: "without a held lock", held: false },
+      { lock: "within a held lock", held: true },
+    ])(
+      "editConfig keeps its lenient read $lock: it still edits a config.json that fails structural validation",
+      async ({ held }) => {
+        // Only editConfigIfChanged reads strictly. editConfig keeps main's read, which loads what
+        // it can of such a file (an empty project key loads as "/"), so its edits still land.
+        const configFile = path.join(tempDir, "config.json");
+        fs.writeFileSync(
+          configFile,
+          JSON.stringify({
+            projects: [["", { workspaces: [] }]],
+            heartbeatDefaultIntervalMs: 360_000,
+          })
+        );
+        const edit = (cfg: Parameters<Parameters<Config["editConfig"]>[0]>[0]) => ({
+          ...cfg,
+          heartbeatDefaultIntervalMs: 420_000,
+        });
+        if (held) {
+          await withProjectRegistrationLock(tempDir, (lock) =>
+            config.editConfig(edit, { withinRegistrationLock: lock })
+          );
+        } else {
+          await config.editConfig(edit);
+        }
+        expect(new Config(tempDir).loadConfigOrDefault().heartbeatDefaultIntervalMs).toBe(420_000);
+      }
+    );
+
+    it("the load-time migration persist keeps its lenient read on a config.json that fails structural validation", async () => {
+      // The persist runs on every load that migrates. It reads leniently as on main, so a file
+      // that a strict read refuses still gets its migrated form.
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(configFile, JSON.stringify({ projects: [["", { workspaces: [] }]] }));
+      const fresh = new Config(tempDir);
+      fresh.loadConfigOrDefault();
+      const persist = (fresh as unknown as { migrationPersist: Promise<void> | null })
+        .migrationPersist;
+      expect(persist).not.toBeNull();
+      await persist;
+      const stored = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        migrations?: unknown;
+      };
+      expect(stored.migrations).toBeDefined();
+    });
+
+    it("editConfigIfChanged fails before its transform runs on a config.json that fails structural validation", async () => {
+      // editConfig's lenient read keeps what it can of such a file. An edit that may report
+      // no change must answer the whole file, so it fails instead.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [["", { workspaces: [] }]] })
+      );
+      let transformed = 0;
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        config.editConfigIfChanged(() => {
+          transformed++;
+          return CONFIG_UNCHANGED;
+        })
+      ).rejects.toThrow(/non-empty string path/);
+      expect(transformed).toBe(0);
+    });
   });
 
   describe("configFileWriteGeneration", () => {
@@ -5094,6 +5364,7 @@ describe("Config", () => {
           migrations: {
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
+            defaultModelFallbacksSeededFable52: true,
           },
           modelFallbacks: {
             // Gateway-prefixed key + non-string chain entries + unknown trigger.
@@ -5125,6 +5396,7 @@ describe("Config", () => {
   describe("default model fallbacks seeding", () => {
     const FABLE = KNOWN_MODELS.FABLE.id;
     const LEGACY_FABLE = "anthropic:claude-fable-5";
+    const FABLE_5_1 = "anthropic:claude-fable-5-1";
     // The shipped chain target is pinned to Opus 5, not the moving
     // KNOWN_MODELS.OPUS alias (see DEFAULT_MODEL_FALLBACKS).
     const OPUS = "anthropic:claude-opus-5";
@@ -5137,10 +5409,12 @@ describe("Config", () => {
       fs.writeFileSync(configFilePath(), JSON.stringify({ projects: [] }));
 
       const loaded = config.loadConfigOrDefault();
-      // The original seed pass also carries the legacy Fable 5 chain so a
-      // downgraded build (whose FABLE is Fable 5) still finds its default.
+      // The seed pass also carries the legacy Fable 5 and Fable 5.1 chains so
+      // a downgraded build (whose FABLE is one of those) still finds its
+      // default.
       expect(loaded.modelFallbacks).toEqual({
         [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE_5_1]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
       });
       expect(loaded.migrations?.defaultModelFallbacksSeeded).toBe(true);
@@ -5153,6 +5427,7 @@ describe("Config", () => {
       };
       expect(raw.modelFallbacks).toEqual({
         [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE_5_1]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
       });
       expect(raw.migrations?.defaultModelFallbacksSeeded).toBe(true);
@@ -5166,6 +5441,7 @@ describe("Config", () => {
           migrations: {
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
+            defaultModelFallbacksSeededFable52: true,
           },
         })
       );
@@ -5173,11 +5449,13 @@ describe("Config", () => {
       expect(config.loadConfigOrDefault().modelFallbacks).toBeUndefined();
     });
 
-    it("seeds the Fable 5.1 chain once for configs seeded before the 5.1 promotion", async () => {
+    it("seeds the Fable 5.1 and 5.2 chains once for configs seeded before the 5.1 promotion", async () => {
       // Pre-5.1 configs carry a chain only for the old source key
-      // (anthropic:claude-fable-5); the promoted FABLE key must get its own
-      // one-time seed without touching the legacy chain (the legacy default
-      // is only added while the original seed pass itself runs).
+      // (anthropic:claude-fable-5). Claiming the 5.1 flag must carry the 5.1
+      // chain (a downgraded 5.1 build trusts that flag), and the promoted
+      // FABLE key gets its own one-time seed. The user's legacy chain is
+      // untouched (that default is only added while the original seed pass
+      // itself runs).
       fs.writeFileSync(
         configFilePath(),
         JSON.stringify({
@@ -5189,43 +5467,89 @@ describe("Config", () => {
         })
       );
 
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.modelFallbacks).toEqual({
+      const expected = {
         "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
+        [FABLE_5_1]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
-      });
+      };
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.modelFallbacks).toEqual(expected);
       expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
 
       await flushConfigEdits();
       const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
         modelFallbacks?: unknown;
-        migrations?: { defaultModelFallbacksSeededFable51?: unknown };
+        migrations?: {
+          defaultModelFallbacksSeededFable51?: unknown;
+          defaultModelFallbacksSeededFable52?: unknown;
+        };
       };
-      expect(raw.modelFallbacks).toEqual({
-        "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
-        [FABLE]: { models: [OPUS] },
-      });
+      expect(raw.modelFallbacks).toEqual(expected);
       expect(raw.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
+      expect(raw.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
     });
 
-    it("does not overwrite an existing Fable 5.1 chain during the 5.1 re-seed", () => {
+    it("seeds only the Fable 5.2 chain for configs seeded before the 5.2 promotion", async () => {
+      // A 5.1-era config whose user deleted the 5.1 default: the 5.1 flag is
+      // already claimed, so its chain stays deleted. Only the promoted FABLE
+      // key is seeded.
       fs.writeFileSync(
         configFilePath(),
         JSON.stringify({
           projects: [],
-          migrations: { defaultModelFallbacksSeeded: true },
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
           modelFallbacks: {
-            [FABLE]: { models: ["openai:gpt-5.5"] },
+            "anthropic:claude-opus-4-6": { models: ["openai:gpt-5.5"] },
           },
         })
       );
 
+      const expected = {
+        "anthropic:claude-opus-4-6": { models: ["openai:gpt-5.5"] },
+        [FABLE]: { models: [OPUS] },
+      };
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.modelFallbacks).toEqual({
-        [FABLE]: { models: ["openai:gpt-5.5"] },
-      });
-      expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
+      expect(loaded.modelFallbacks).toEqual(expected);
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
+
+      await flushConfigEdits();
+      const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
+        modelFallbacks?: unknown;
+        migrations?: { defaultModelFallbacksSeededFable52?: unknown };
+      };
+      expect(raw.modelFallbacks).toEqual(expected);
+      expect(raw.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
     });
+
+    it.each([
+      ["5.1", { defaultModelFallbacksSeeded: true }, FABLE_5_1],
+      [
+        "5.2",
+        { defaultModelFallbacksSeeded: true, defaultModelFallbacksSeededFable51: true },
+        FABLE,
+      ],
+    ] as const)(
+      "does not overwrite an existing chain during the Fable %s re-seed",
+      (_label, migrations, sourceModel) => {
+        fs.writeFileSync(
+          configFilePath(),
+          JSON.stringify({
+            projects: [],
+            migrations,
+            modelFallbacks: { [sourceModel]: { models: ["openai:gpt-5.5"] } },
+          })
+        );
+
+        const loaded = config.loadConfigOrDefault();
+        expect(loaded.modelFallbacks?.[sourceModel]).toEqual({ models: ["openai:gpt-5.5"] });
+        expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
+        expect(loaded.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
+      }
+    );
 
     it("merges the seeded default with pre-existing chains for other source models", async () => {
       fs.writeFileSync(
@@ -5242,6 +5566,7 @@ describe("Config", () => {
       expect(loaded.modelFallbacks).toEqual({
         "anthropic:claude-opus-4-6": { models: ["openai:gpt-5.5"] },
         [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE_5_1]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
       });
 
@@ -5254,6 +5579,7 @@ describe("Config", () => {
       expect(raw.modelFallbacks).toEqual({
         "anthropic:claude-opus-4-6": { models: ["openai:gpt-5.5"] },
         [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE_5_1]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
       });
       expect(raw.migrations?.defaultModelFallbacksSeeded).toBe(true);
@@ -5265,7 +5591,9 @@ describe("Config", () => {
         JSON.stringify({
           projects: [],
           modelFallbacks: {
-            "openrouter:anthropic/claude-fable-5-1": { models: ["openai:gpt-5.5"] },
+            [`openrouter:anthropic/${KNOWN_MODELS.FABLE.providerModelId}`]: {
+              models: ["openai:gpt-5.5"],
+            },
           },
         })
       );
@@ -5275,8 +5603,93 @@ describe("Config", () => {
       expect(config.loadConfigOrDefault().modelFallbacks).toEqual({
         [FABLE]: { models: ["openai:gpt-5.5"] },
         [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE_5_1]: { models: [OPUS] },
       });
     });
+
+    it("still seeds the direct default when the user chain uses a Coder-scoped Fable key", () => {
+      // Coder keys stay gateway-scoped (sanitizeFallbackModelString). Runtime
+      // lookup is raw-first, so this chain serves only the Coder selection and
+      // a direct FABLE selection still needs its own default chain.
+      const coderKey = `coder:anthropic/${KNOWN_MODELS.FABLE.providerModelId}`;
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
+          modelFallbacks: { [coderKey]: { models: ["openai:gpt-5.5"] } },
+        })
+      );
+
+      expect(config.loadConfigOrDefault().modelFallbacks).toEqual({
+        [coderKey]: { models: ["openai:gpt-5.5"] },
+        [FABLE]: { models: [OPUS] },
+      });
+    });
+
+    it("does not activate a fallback through a Coder-scoped tombstone", async () => {
+      // Read-time sanitizing drops this empty, disabled entry, and a default-typed
+      // Coder selection then resolves through the direct key. Seeding the direct
+      // default here would turn on a fallback the user disabled.
+      const coderKey = `coder:anthropic/${KNOWN_MODELS.FABLE.providerModelId}`;
+      const tombstone = { enabled: false, models: [] };
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
+          modelFallbacks: { [coderKey]: tombstone },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.modelFallbacks?.[FABLE]).toBeUndefined();
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
+      // After the migration write-back, the direct default must not reach disk either.
+      await flushConfigEdits();
+      const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
+        modelFallbacks?: Record<string, unknown>;
+        migrations?: { defaultModelFallbacksSeededFable52?: unknown };
+      };
+      expect(raw.modelFallbacks?.[FABLE]).toBeUndefined();
+      expect(raw.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
+    });
+
+    it.each<[string, string, unknown, { models: string[] } | undefined]>([
+      ["a Coder tombstone", " coder:anthropic", { enabled: false, models: [] }, undefined],
+      [
+        "an OpenRouter chain",
+        " openrouter:anthropic",
+        { models: ["openai:gpt-5.5"] },
+        { models: ["openai:gpt-5.5"] },
+      ],
+    ])(
+      "treats %s under a key with a leading space like the trimmed key",
+      (_label, prefix, entry, expectedDirect) => {
+        // Hand-edited keys can carry stray whitespace. The seed must read them the
+        // way persistence does (trimmed), or it seeds a default that either wins
+        // over the user's chain or activates a fallback the user disabled.
+        fs.writeFileSync(
+          configFilePath(),
+          JSON.stringify({
+            projects: [],
+            migrations: {
+              defaultModelFallbacksSeeded: true,
+              defaultModelFallbacksSeededFable51: true,
+            },
+            modelFallbacks: { [`${prefix}/${KNOWN_MODELS.FABLE.providerModelId}`]: entry },
+          })
+        );
+
+        expect(config.loadConfigOrDefault().modelFallbacks?.[FABLE]).toEqual(expectedDirect);
+      }
+    );
 
     it("respects a hand-edited tombstone whose chain sanitizes away", () => {
       fs.writeFileSync(
@@ -5293,9 +5706,10 @@ describe("Config", () => {
       // The entry sanitizes to nothing at runtime (no fallback fires), but it
       // is still user intent: the seed must not replace it with an enabled
       // default chain, and the raw on-disk form must survive. Only the
-      // untouched legacy key gets seeded.
+      // untouched legacy keys get seeded.
       expect(loaded.modelFallbacks).toEqual({
         [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE_5_1]: { models: [OPUS] },
       });
       expect(loaded.migrations?.defaultModelFallbacksSeeded).toBe(true);
 
@@ -5342,6 +5756,7 @@ describe("Config", () => {
       expect(loaded.modelFallbacks).toEqual({
         [FABLE]: { enabled: false, models: ["openai:gpt-5.5"] },
         [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE_5_1]: { models: [OPUS] },
       });
       expect(loaded.migrations?.defaultModelFallbacksSeeded).toBe(true);
     });
@@ -5349,6 +5764,7 @@ describe("Config", () => {
     it("applies the defaults to fresh installs and locks the flag on first save", async () => {
       expect(config.loadConfigOrDefault().modelFallbacks).toEqual({
         [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE_5_1]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
         [SONNET_5_5]: { models: [SONNET_5] },
       });
@@ -5361,6 +5777,7 @@ describe("Config", () => {
       };
       expect(raw.modelFallbacks).toEqual({
         [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE_5_1]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
         [SONNET_5_5]: { models: [SONNET_5] },
       });
@@ -5370,6 +5787,7 @@ describe("Config", () => {
       // the one chain per source model; nothing is re-seeded or duplicated.
       expect(new Config(tempDir).loadConfigOrDefault().modelFallbacks).toEqual({
         [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE_5_1]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
         [SONNET_5_5]: { models: [SONNET_5] },
       });
@@ -5378,6 +5796,14 @@ describe("Config", () => {
     it.each([
       [
         "fully seeded",
+        {
+          defaultModelFallbacksSeeded: true,
+          defaultModelFallbacksSeededFable51: true,
+          defaultModelFallbacksSeededFable52: true,
+        },
+      ],
+      [
+        "seeded before the Fable 5.2 promotion",
         { defaultModelFallbacksSeeded: true, defaultModelFallbacksSeededFable51: true },
       ],
       ["seeded before the Fable 5.1 promotion", { defaultModelFallbacksSeeded: true }],
@@ -6030,6 +6456,7 @@ describe("Config", () => {
             persistentSubagentsDefaulted: true,
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
+            defaultModelFallbacksSeededFable52: true,
           },
         })
       );
