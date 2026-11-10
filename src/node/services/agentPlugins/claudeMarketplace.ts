@@ -27,6 +27,7 @@ import {
   displayRepoUrl,
   normalizeAgentPluginSubpath,
   pointsAtThisMachine,
+  surelyOnThisMachine,
 } from "@/common/utils/agentPluginSource";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -279,8 +280,10 @@ function sourceRef(source: Record<string, unknown>): string | undefined {
 function assertMarketplaceMayName(value: string, url: string, marketplaceUrl: string): void {
   // SECURITY: a marketplace fetched from the network must not point Xum at a repository on this
   // machine (a private checkout the user never chose), by path or by a loopback host such as
-  // `ssh://localhost/...`. A marketplace on this machine may.
-  if (pointsAtThisMachine(url) && !pointsAtThisMachine(marketplaceUrl)) {
+  // `ssh://localhost/...`. A marketplace on this machine may. Which marketplace is on this machine
+  // leans remote (`surelyOnThisMachine`): it grants rights, so a doubt must not.
+  const marketplaceIsLocal = surelyOnThisMachine(marketplaceUrl);
+  if (pointsAtThisMachine(url) && !marketplaceIsLocal) {
     throw new Error(
       `'${value}' is a path on this machine; a remote marketplace cannot install it.`
     );
@@ -289,7 +292,7 @@ function assertMarketplaceMayName(value: string, url: string, marketplaceUrl: st
   // SSH agent to whatever host the catalog names, also a DNS alias of this machine or of a private
   // host. Git resolves the name itself, so Xum cannot check the address first (DNS rebinding).
   // Such a marketplace may name only https sources; a marketplace on this machine may name any.
-  if (!pointsAtThisMachine(marketplaceUrl) && !url.startsWith("https://")) {
+  if (!marketplaceIsLocal && !url.startsWith("https://")) {
     throw new Error(
       `'${value}' is not an https URL; a remote marketplace can name only https git sources.`
     );

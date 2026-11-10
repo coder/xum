@@ -73,6 +73,17 @@ export function pointsAtThisMachine(url: string): boolean {
 }
 
 /**
+ * `pointsAtThisMachine` for a check that grants rights instead of refusing a source: a marketplace
+ * on this machine may name local paths and ssh sources. `pointsAtThisMachine` reads any first
+ * character and a colon as a drive, as Git for Windows does, which is the safe side when a source
+ * is left out. Here it is not: git on Linux and macOS reads `h:org/repo.git` or `C:repo` as ssh to
+ * the host alias `h` or `C`. So a drive counts only with a letter and a slash (`C:\repo`, `C:/repo`).
+ */
+export function surelyOnThisMachine(url: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(url) || (!/^.:/su.test(url) && pointsAtThisMachine(url));
+}
+
+/**
  * Validate and normalize a repo-relative plugin folder (`a/b/c`). Throws a
  * user-facing error for anything that could leave the repository or be read
  * as a pattern: absolute paths, `.`/`..`/empty segments, `.git`, control
@@ -149,7 +160,7 @@ export function isAbbreviatedCommitSha(ref: string): boolean {
 const PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/;
 
 /** Escapes of escapes (`%2567`) are decoded this many times, and a text still escaped after that is refused. */
-export const MAX_ESCAPE_PASSES = 4;
+const MAX_ESCAPE_PASSES = 4;
 
 /**
  * `text` with its percent escapes decoded one level per entry, until the text stops changing: the
