@@ -15,6 +15,8 @@ import {
 } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { Err } from "@/common/types/result";
+import type { BashSandboxApprovalEvent } from "@/common/types/stream";
+import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 
@@ -118,5 +120,32 @@ describe("replayHistory historyReplayStatus", () => {
     expect(caughtUp.cursor).toBeUndefined();
     // Rows already emitted stay emitted; the status tells the client not to trust them.
     expect(events.filter(isMuxMessage)).toHaveLength(2);
+  });
+
+  it("replays a pending sandbox approval, and drops it once answered", async () => {
+    const h = await setup(false);
+    const pendingEvent: BashSandboxApprovalEvent = {
+      type: "bash-sandbox-approval",
+      workspaceId,
+      toolCallId: "call-waiting",
+      script: "security find-generic-password",
+      reason: "needs the login keychain",
+      pending: true,
+      timestamp: 1,
+    };
+    const answer = sandboxApprovalManager.request(
+      workspaceId,
+      "call-waiting",
+      undefined,
+      pendingEvent
+    );
+
+    const { events } = await replay(h);
+    expect(events).toContainEqual(pendingEvent);
+
+    sandboxApprovalManager.answer(workspaceId, "call-waiting", false);
+    await answer;
+    const after = await replay(h);
+    expect(after.events.some((event) => event.type === "bash-sandbox-approval")).toBe(false);
   });
 });

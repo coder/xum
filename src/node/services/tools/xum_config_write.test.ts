@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 import * as jsonc from "jsonc-parser";
 
@@ -9,6 +9,7 @@ const GLOBAL_WORKSPACE_ID = "workspace-global";
 import type { XumToolScope } from "@/common/types/toolScope";
 
 import { projectRegistrationLockFilePath } from "@/node/config/projectRegistrationLock";
+import { setAgentSandboxTargets } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 import { createXumConfigWriteTool } from "./xum_config_write";
@@ -241,6 +242,301 @@ describe("mux_config_write", () => {
         },
       ],
     ]);
+  });
+
+  describe("agentSandbox guard", () => {
+    const initialConfig = {
+      agentSandbox: { enabled: true, network: "allowlist" },
+      projects: [["/test/proj", { workspaces: [], agentSandbox: { enabled: true } }]],
+      taskSettings: { maxParallelAgentTasks: 4 },
+    };
+    // The global sandbox is off and only /test/proj has it on, so a workspace row that moves out
+    // of /test/proj leaves the sandbox. While it is on, only the user changes projects.
+    const projectOnlyConfig = {
+      agentSandbox: { enabled: false },
+      projects: [
+        [
+          "/test/proj",
+          { workspaces: [{ path: "/test/proj/ws", id: "ws1" }], agentSandbox: { enabled: true } },
+        ],
+        ["/test/multi", { workspaces: [] }],
+      ],
+    };
+    const multiWorkspace = {
+      path: "/test/multi/ws",
+      id: "ws2",
+      projects: [
+        { projectPath: "/test/multi", projectName: "multi" },
+        { projectPath: "/test/proj", projectName: "proj" },
+      ],
+    };
+    const withRows = (rows: Record<string, unknown[]>) =>
+      projectOnlyConfig.projects.map(([projectPath, config]) => [
+        projectPath,
+        { ...(config as object), workspaces: rows[projectPath as string] ?? [] },
+      ]);
+    const cases: Array<{
+      name: string;
+      config?: object;
+      operations: Array<{ op: "set"; path: Array<string | number>; value: unknown }>;
+      refused: boolean;
+    }> = [
+      {
+        name: "refuses moving a workspace to a project without the override",
+        config: projectOnlyConfig,
+        operations: [
+          {
+            op: "set",
+            path: ["projects"],
+            value: withRows({ "/test/multi": [{ path: "/test/proj/ws", id: "ws1" }] }),
+          },
+        ],
+        refused: true,
+      },
+      {
+        name: "refuses a second row for a workspace folder under a project without the override",
+        config: projectOnlyConfig,
+        operations: [
+          {
+            op: "set",
+            path: ["projects"],
+            value: withRows({
+              "/test/proj": [{ path: "/test/proj/ws", id: "ws1" }],
+              "/test/multi": [{ path: "/test/proj/ws/", id: "ws3" }],
+            }),
+          },
+        ],
+        refused: true,
+      },
+      {
+        name: "refuses dropping a sandboxed project from a multi-project workspace",
+        config: {
+          ...projectOnlyConfig,
+          projects: withRows({
+            "/test/proj": [{ path: "/test/proj/ws", id: "ws1" }],
+            "/test/multi": [multiWorkspace],
+          }),
+        },
+        operations: [
+          {
+            op: "set",
+            path: ["projects", 1, 1, "workspaces", 0, "projects"],
+            value: [multiWorkspace.projects[0]],
+          },
+        ],
+        refused: true,
+      },
+      // The row's path is its commands' cwd and a write root.
+      {
+        name: "refuses changing a workspace row's path",
+        config: projectOnlyConfig,
+        operations: [
+          { op: "set", path: ["projects", 0, 1, "workspaces", 0, "path"], value: "/test/.ssh" },
+        ],
+        refused: true,
+      },
+      {
+        name: "refuses a moved row whose id and path both change",
+        config: projectOnlyConfig,
+        operations: [
+          {
+            op: "set",
+            path: ["projects"],
+            value: withRows({ "/test/multi": [{ path: "/test/proj/ws/.", id: "ws9" }] }),
+          },
+        ],
+        refused: true,
+      },
+      // A trusted project's repo MCP servers start outside the sandbox.
+      {
+        name: "refuses marking a project trusted while the sandbox is on",
+        config: projectOnlyConfig,
+        operations: [{ op: "set", path: ["projects", 0, 1, "trusted"], value: true }],
+        refused: true,
+      },
+      {
+        name: "allows adding a workspace row while no sandbox is on",
+        config: { projects: [["/test/proj", { workspaces: [] }]] },
+        operations: [
+          {
+            op: "set",
+            path: ["projects", 0, 1, "workspaces", 0],
+            value: { path: "/test/proj/ws", id: "ws1" },
+          },
+        ],
+        refused: false,
+      },
+      {
+        name: "refuses turning the global sandbox off",
+        operations: [{ op: "set", path: ["agentSandbox", "enabled"], value: false }],
+        refused: true,
+      },
+      {
+        name: "refuses opening the global network",
+        operations: [{ op: "set", path: ["agentSandbox", "network"], value: "open" }],
+        refused: true,
+      },
+      {
+        name: "refuses a project override change",
+        operations: [
+          { op: "set", path: ["projects", 0, 1, "agentSandbox"], value: { enabled: false } },
+        ],
+        refused: true,
+      },
+      {
+        name: "refuses dropping a project that has an override",
+        operations: [{ op: "set", path: ["projects"], value: [] }],
+        refused: true,
+      },
+      {
+        name: "refuses an aliased project entry without the override",
+        operations: [
+          {
+            op: "set",
+            path: ["projects"],
+            value: [
+              ["/test/proj", { workspaces: [], agentSandbox: { enabled: true } }],
+              ["/test/proj/", { workspaces: [] }],
+            ],
+          },
+        ],
+        refused: true,
+      },
+      {
+        name: "refuses an unrelated change while the sandbox is on",
+        operations: [{ op: "set", path: ["taskSettings", "maxParallelAgentTasks"], value: 8 }],
+        refused: true,
+      },
+      {
+        name: "allows an unrelated change while no sandbox is on",
+        config: { taskSettings: { maxParallelAgentTasks: 4 } },
+        operations: [{ op: "set", path: ["taskSettings", "maxParallelAgentTasks"], value: 8 }],
+        refused: false,
+      },
+      // A new parent folder would make /test/proj its sub-project, under the parent's setting.
+      {
+        name: "refuses adding a project while the sandbox is on",
+        operations: [{ op: "set", path: ["projects", 1], value: ["/test", { workspaces: [] }] }],
+        refused: true,
+      },
+      {
+        name: "refuses removing a project while the sandbox is on",
+        config: projectOnlyConfig,
+        operations: [{ op: "set", path: ["projects"], value: [projectOnlyConfig.projects[0]] }],
+        refused: true,
+      },
+      {
+        name: "allows adding a project while no sandbox is on",
+        config: { projects: [["/test/proj", { workspaces: [] }]] },
+        operations: [{ op: "set", path: ["projects", 1], value: ["/test", { workspaces: [] }] }],
+        refused: false,
+      },
+      {
+        name: "refuses turning the sandbox on",
+        config: { agentSandbox: { enabled: false } },
+        operations: [{ op: "set", path: ["agentSandbox", "enabled"], value: true }],
+        refused: true,
+      },
+      {
+        name: "allows setting agentSandbox to the same value",
+        config: { agentSandbox: { enabled: false } },
+        operations: [{ op: "set", path: ["agentSandbox"], value: { enabled: false } }],
+        refused: false,
+      },
+    ];
+
+    for (const testCase of cases) {
+      it(testCase.name, async () => {
+        using xumHome = new TestTempDir("mux-config-write");
+        const configPath = path.join(xumHome.path, "config.json");
+        const before = JSON.stringify(testCase.config ?? initialConfig, null, 2);
+        await fs.writeFile(configPath, before, "utf-8");
+
+        const tool = await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID);
+        const result = (await tool.execute!(
+          { file: "config", operations: testCase.operations, confirm: true },
+          mockToolCallOptions
+        )) as XumConfigWriteResult;
+
+        expect(result.success).toBe(!testCase.refused);
+        if (testCase.refused) {
+          expect(result.success ? "" : result.error).toContain("agentSandbox");
+          expect(await fs.readFile(configPath, "utf-8")).toBe(before);
+        }
+      });
+    }
+
+    // apiKeyFile makes the backend read a file the sandbox hides, and baseUrl sends it anywhere.
+    it("refuses a providers write while the sandbox is on", async () => {
+      using xumHome = new TestTempDir("mux-config-write");
+      const providersPath = path.join(xumHome.path, "providers.jsonc");
+      const before = JSON.stringify({ anthropic: { apiKey: "sk-ant-123" } }, null, 2);
+      await fs.writeFile(providersPath, before, "utf-8");
+      await fs.writeFile(
+        path.join(xumHome.path, "config.json"),
+        JSON.stringify(projectOnlyConfig),
+        "utf-8"
+      );
+
+      const tool = await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID);
+      const result = (await tool.execute!(
+        {
+          file: "providers",
+          operations: [
+            { op: "set", path: ["anthropic", "baseUrl"], value: "https://attacker.example" },
+          ],
+          confirm: true,
+        },
+        mockToolCallOptions
+      )) as XumConfigWriteResult;
+
+      expect(result.success ? "" : result.error).toContain("agentSandbox");
+      expect(await fs.readFile(providersPath, "utf-8")).toBe(before);
+    });
+
+    // `xum run` gives the tools a private config copy without agentSandbox.
+    describe("with the setting on in the real config only", () => {
+      afterEach(() => setAgentSandboxTargets(null));
+
+      it("refuses a providers write", async () => {
+        using xumHome = new TestTempDir("mux-config-write");
+        const providersPath = path.join(xumHome.path, "providers.jsonc");
+        const before = JSON.stringify({ anthropic: { apiKey: "sk-ant-123" } }, null, 2);
+        await fs.writeFile(providersPath, before, "utf-8");
+        await fs.writeFile(path.join(xumHome.path, "config.json"), "{}", "utf-8");
+        const write = async () =>
+          (await (
+            await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID)
+          ).execute!(
+            {
+              file: "providers",
+              operations: [
+                { op: "set", path: ["anthropic", "baseUrl"], value: "https://attacker.example" },
+              ],
+              confirm: true,
+            },
+            mockToolCallOptions
+          )) as XumConfigWriteResult;
+        const settings = {
+          network: "loopback" as const,
+          allowedHosts: [],
+          extraWritePaths: [],
+          extraReadPaths: [],
+        };
+
+        setAgentSandboxTargets({ fallback: { ...settings, enabled: false }, byProject: new Map() });
+        expect((await write()).success).toBe(true);
+
+        await fs.writeFile(providersPath, before, "utf-8");
+        setAgentSandboxTargets({
+          fallback: { ...settings, enabled: false },
+          byProject: new Map([["/real/project", { ...settings, enabled: true }]]),
+        });
+        const refused = await write();
+        expect(refused.success ? "" : refused.error).toContain("agentSandbox");
+        expect(await fs.readFile(providersPath, "utf-8")).toBe(before);
+      });
+    });
   });
 
   it("returns validation issues and does not write when schema validation fails", async () => {

@@ -20,6 +20,7 @@ import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { AgentSandboxPathError } from "@/node/services/agentSandbox/fileToolSandbox";
 import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import {
   discoverAgentSkills,
@@ -418,6 +419,36 @@ describe("agentSkillsService", () => {
     const bar = skills.find((s) => s.name === "bar");
     expect(bar).toBeDefined();
     expect(bar!.scope).toBe("global");
+  });
+
+  // Codex review: a command can link a project SKILL.md to a file that its sandbox hides.
+  test("a project skill that the sandbox gate refuses yields to the global skill", async () => {
+    using project = new DisposableTempDir("agent-skills-sandbox-project");
+    using global = new DisposableTempDir("agent-skills-sandbox-global");
+    const projectSkillsRoot = path.join(project.path, ".mux", "skills");
+    await writeSkill(global.path, "foo", "from global");
+    await writeSkill(projectSkillsRoot, "foo", "from project");
+    const hidden = path.join(projectSkillsRoot, "foo", "SKILL.md");
+    const gated: string[] = [];
+    const options = {
+      roots: { projectRoot: projectSkillsRoot, globalRoot: global.path },
+      runtimeFactory,
+      sandboxGate: (resolvedPath: string, access: "read" | "write") => {
+        gated.push(resolvedPath);
+        return resolvedPath === hidden
+          ? Promise.reject(new AgentSandboxPathError(resolvedPath, access))
+          : Promise.resolve();
+      },
+    };
+    const runtime = new LocalRuntime(project.path);
+
+    const { skills } = await discoverAgentSkills(runtime, project.path, options);
+    const read = await readAgentSkill(runtime, project.path, SkillNameSchema.parse("foo"), options);
+
+    expect(skills.find((skill) => skill.name === "foo")).toMatchObject({ scope: "global" });
+    expect(read.package.frontmatter.description).toBe("from global");
+    expect(gated).toContain(hidden);
+    expect(gated.every((gatedPath) => gatedPath.startsWith(project.path))).toBe(true);
   });
 
   test("subprojects inherit ancestor skills with nearest-directory precedence", async () => {

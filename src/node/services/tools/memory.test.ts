@@ -157,6 +157,39 @@ describe("memory tool", () => {
     expect(await pathExists(path.join(fixture.xumHome, "memory", "global", "late.md"))).toBe(false);
   });
 
+  // Every workspace loads the global memory index into its tool description, also one without
+  // the sandbox.
+  it("refuses global memory writes while the agent sandbox covers the workspace", async () => {
+    using fixture = await createFixture();
+    fixture.config.runtime.agentSandboxPolicy = () => ({
+      writeRoots: [fixture.checkout],
+      gitCommonDirs: [],
+      denyWrite: [],
+      denyRead: [],
+      allowRead: [fixture.checkout],
+      network: "allowlist",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    });
+    const tool = createMemoryTool(fixture.config);
+
+    const refused = await run(tool, {
+      command: "create",
+      path: "/memories/global/rules.md",
+      file_text: "rules",
+    });
+    expect(refused.success).toBe(false);
+    expect(await pathExists(path.join(fixture.xumHome, "memory", "global", "rules.md"))).toBe(
+      false
+    );
+    const workspace = await run(tool, {
+      command: "create",
+      path: "/memories/workspace/notes.md",
+      file_text: "notes",
+    });
+    expect(workspace.success).toBe(true);
+  });
+
   describe("command dispatch", () => {
     it("creates, views, edits, renames and deletes through the tool surface", async () => {
       using fixture = await createFixture();

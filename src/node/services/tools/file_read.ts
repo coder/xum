@@ -1,3 +1,4 @@
+import { fileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
 import { tool } from "ai";
 import type { FileReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -29,7 +30,13 @@ export const createFileReadTool: ToolFactory = (config: ToolConfiguration) => {
           correctedPath: validatedPath,
           warning: pathWarning,
           resolvedPath,
-        } = resolvePathWithinCwd(filePath, config.cwd, config.runtime);
+        } = await resolvePathWithinCwd(
+          filePath,
+          config.cwd,
+          config.runtime,
+          "read",
+          fileToolSandboxContext(config)
+        );
         filePath = validatedPath;
 
         // Check if file exists using runtime
