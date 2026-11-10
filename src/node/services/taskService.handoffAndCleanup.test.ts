@@ -2497,7 +2497,7 @@ describe("TaskService", () => {
       // live turn through the terminal-only path.
       let retryPending = false;
       const { workspaceService } = createWorkspaceServiceMocks({
-        hasPendingAutoRetry: () => retryPending,
+        hasPendingAutoRetry: mock(() => retryPending),
       });
       // The child has no newer execution, so a pending retry revives the stored failure.
       const config = await createTestConfig(rootDir);
