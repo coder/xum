@@ -235,6 +235,8 @@ interface PendingCheck {
   dueAt: number;
   timer: ReturnType<typeof setTimeout>;
   blocked: boolean;
+  /** When the current deadline window began: a beat due before it belongs to an earlier one. */
+  windowStartedAt: number;
   heartbeat: ReturnType<typeof setTimeout>;
 }
 
@@ -283,6 +285,7 @@ class DocumentChannel implements FrameDocumentChannel {
         value,
         firstSentAt: sentAt,
         blocked: false,
+        windowStartedAt: sentAt,
         heartbeat: this.beatAfter(() => this.pending),
         ...this.armDeadline(sentAt + FRAME_DOCUMENT_CHECK_DEADLINE_MS, onMissed),
       };
@@ -316,7 +319,11 @@ class DocumentChannel implements FrameDocumentChannel {
       const pending = current();
       // clearPending() stops the heartbeat with its check, so a beat always finds it pending.
       if (pending == null) return;
-      if (this.now() - dueAt > FRAME_DOCUMENT_CHECK_LATE_MS) pending.blocked = true;
+      // A block across a deadline also holds back a beat that fires after the extension; it marks
+      // the window it was due in, not the new one.
+      if (dueAt >= pending.windowStartedAt && this.now() - dueAt > FRAME_DOCUMENT_CHECK_LATE_MS) {
+        pending.blocked = true;
+      }
       pending.heartbeat = this.beatAfter(current);
     }, FRAME_DOCUMENT_HEARTBEAT_MS);
   }
@@ -343,8 +350,9 @@ class DocumentChannel implements FrameDocumentChannel {
    * SECURITY AUDIT: a page the frame navigated to cannot answer, so this only delays its close. A
    * dead document closes at the first deadline whose window saw no block. A page that keeps the
    * shared thread busy (WebKit, in-process Chromium) makes every window blocked, and stays shown,
-   * without the bridge, until the cap passes and its current block ends (24.5 s measured in
-   * WebKit with 6 s blocks, against 12.4 s with no extension). It freezes the whole app meanwhile.
+   * without the bridge, until the cap passes and its current block ends (24.16 to 24.26 s measured
+   * in WebKit with 6 s blocks, against 12.4 s with no extension). It freezes the whole app
+   * meanwhile.
    */
   private deadlinePassed(onMissed: () => void): void {
     const pending = this.pending;
@@ -357,6 +365,7 @@ class DocumentChannel implements FrameDocumentChannel {
     if (blocked && now < capAt) {
       // The next window asks again: a block it does not see cannot extend it.
       pending.blocked = false;
+      pending.windowStartedAt = now;
       Object.assign(
         pending,
         this.armDeadline(Math.min(now + FRAME_DOCUMENT_CHECK_DEADLINE_MS, capAt), onMissed)

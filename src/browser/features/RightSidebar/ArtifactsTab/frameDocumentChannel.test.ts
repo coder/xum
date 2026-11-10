@@ -413,6 +413,21 @@ describe("frame document channel: checks", () => {
     expect(missed).toBe(1);
   });
 
+  // A block across the deadline makes the deadline fire late, so the check gets one more deadline.
+  // The same block held back a beat that fires right after that extension. The beat belongs to the
+  // window before, so the new window must not count it: a dead document closes one deadline later.
+  test("a block across the deadline extends the check only once", async () => {
+    const clock = blockingClock();
+    const { channel } = boundChannel(clock.now);
+    let missed = 0;
+    channel.check(() => missed++);
+    // The beat due with the deadline was armed after it, so it fires right after the extension.
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS - 10);
+    await clock.block(600);
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    expect(missed).toBe(1);
+  });
+
   test("a heartbeat late by the threshold or less does not extend the check", async () => {
     const clock = blockingClock();
     const { channel } = boundChannel(clock.now);
