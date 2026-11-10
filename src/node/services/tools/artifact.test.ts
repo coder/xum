@@ -154,6 +154,10 @@ describe("artifact tool", () => {
     const serialized = (result: ArtifactToolResult): Record<string, unknown> =>
       JSON.parse(JSON.stringify(result)) as Record<string, unknown>;
 
+    /** The widths the layout lists as not checked; none when it is missing or checked. */
+    const notCheckedOf = (result: ArtifactToolResult) =>
+      result.success && result.layout?.checked === false ? result.layout.notChecked : [];
+
     const evalCalls = async () =>
       (await fakeBrowser.calls()).filter((argv) => argv.includes("eval")).length;
 
@@ -210,13 +214,8 @@ describe("artifact tool", () => {
       );
       try {
         const result = await publish("page.html");
-        expect(result).toMatchObject({
-          success: true,
-          layout: {
-            checked: false,
-            notChecked: expect.arrayContaining([{ viewport: 390, reason: "timeout" }]),
-          },
-        });
+        expect(result).toMatchObject({ success: true, layout: { checked: false } });
+        expect(notCheckedOf(result)).toContainEqual({ viewport: 390, reason: "timeout" });
         expect(spy).toHaveBeenCalledTimes(1);
       } finally {
         spy.mockRestore();
@@ -225,13 +224,9 @@ describe("artifact tool", () => {
 
     test("a crashed audit script is not checked and the publish succeeds", async () => {
       await withFake({ eval: { 390: { kind: "throw", message: "boom" } } });
-      expect(await publish("page.html")).toMatchObject({
-        success: true,
-        layout: {
-          checked: false,
-          notChecked: expect.arrayContaining([{ viewport: 390, reason: "script-failed" }]),
-        },
-      });
+      const result = await publish("page.html");
+      expect(result).toMatchObject({ success: true, layout: { checked: false } });
+      expect(notCheckedOf(result)).toContainEqual({ viewport: 390, reason: "script-failed" });
     });
 
     test("a re-publish marks an issue it showed before as persistent", async () => {

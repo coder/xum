@@ -11,6 +11,7 @@ import {
 } from "@/common/constants/artifactLayoutAudit";
 import {
   LayoutAuditReportSchema,
+  type LayoutAuditIssue,
   type LayoutAuditPageFinding,
 } from "@/common/types/artifactLayoutAudit";
 import type { FingerprintSnapshot } from "./layoutFingerprints";
@@ -54,6 +55,10 @@ const build = (outcomes: ViewportOutcome[], previous: FingerprintSnapshot = {}) 
 
 const card = finding("clipped-text", "div.card > h2", 12);
 
+/** Width, full selector and persistence of an issue, for comparing a whole list at once. */
+const shape = (issue: LayoutAuditIssue) =>
+  [issue.viewport, issue.selector, issue.persistent] as const;
+
 describe("buildLayoutReport", () => {
   test("a complete pass with nothing found is checked and clean", () => {
     const { report } = build(pass());
@@ -91,12 +96,11 @@ describe("buildLayoutReport", () => {
       pass({ 390: [{ ...card, overflowPx: 400 }], 1440: [finding("clipped-text", "p.other")] }),
       first.next
     );
-    expect(second.report.issues).toEqual([
-      // New first (1440 is new), then the persistent 390 card; its px changed and still matches.
-      expect.objectContaining({ viewport: 1440, selector: "p.other" }),
-      expect.objectContaining({ viewport: 390, selector: "div.card > h2", persistent: true }),
+    // New first (1440 is new), then the persistent 390 card; its px changed and still matches.
+    expect(second.report.issues.map(shape)).toEqual([
+      [1440, "p.other", undefined],
+      [390, "div.card > h2", true],
     ]);
-    expect(second.report.issues[0]).not.toHaveProperty("persistent");
     expect(second.report.note).toContain("persistent");
     expect(second.report.note).toContain("tell the user");
   });
@@ -104,13 +108,13 @@ describe("buildLayoutReport", () => {
   test("the same selector is a different finding in another viewport class", () => {
     const first = build(pass({ 390: [card] }));
     const second = build(pass({ 1440: [card] }), first.next);
-    expect(second.report.issues).toEqual([expect.not.objectContaining({ persistent: true })]);
+    expect(second.report.issues.map(shape)).toEqual([[1440, "div.card > h2", undefined]]);
   });
 
   test("a note for persistent issues only tells the agent it may stop", () => {
     const first = build(pass({ 390: [card] }));
     const second = build(pass({ 390: [card] }), first.next);
-    expect(second.report.issues).toEqual([expect.objectContaining({ persistent: true })]);
+    expect(second.report.issues.map(shape)).toEqual([[390, "div.card > h2", true]]);
     expect(second.report.note).toStartWith("Every issue was also reported last time");
   });
 
@@ -119,7 +123,7 @@ describe("buildLayoutReport", () => {
     const clean = build(pass(), first.next);
     expect(clean.next.phone?.size).toBe(0);
     const again = build(pass({ 390: [card] }), clean.next);
-    expect(again.report.issues).toEqual([expect.not.objectContaining({ persistent: true })]);
+    expect(again.report.issues.map(shape)).toEqual([[390, "div.card > h2", undefined]]);
   });
 
   test("a failed or unsettled width leaves its class memory as it was", () => {
@@ -229,9 +233,7 @@ describe("buildLayoutReport", () => {
         ],
       })
     );
-    expect(report.issues).toEqual([
-      expect.objectContaining({ selector: "p.both", axis: "vertical", overflowPx: 40 }),
-    ]);
+    expect(report.issues).toMatchObject([{ selector: "p.both", axis: "vertical", overflowPx: 40 }]);
   });
 
   test("shows a long selector shortened but remembers it in full", () => {
@@ -249,7 +251,7 @@ describe("buildLayoutReport", () => {
     }
     // Only `a` comes back: `b` must not ride along on `a`'s shortened text.
     const second = build(pass({ 390: [a] }), first.next);
-    expect(second.report.issues).toEqual([expect.objectContaining({ persistent: true })]);
+    expect(second.report.issues.map((issue) => issue.persistent)).toEqual([true]);
     const third = build(pass({ 390: [b] }), build(pass({ 390: [a] })).next);
     expect(third.report.issues[0]).not.toHaveProperty("persistent");
   });

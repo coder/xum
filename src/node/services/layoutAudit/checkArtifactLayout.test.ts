@@ -12,7 +12,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
-import type { LayoutAuditPageFinding } from "@/common/types/artifactLayoutAudit";
+import type { LayoutAuditPageFinding, LayoutAuditReport } from "@/common/types/artifactLayoutAudit";
 import type { ExecStream } from "@/node/runtime/Runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { AvailableArtifactsLocation } from "@/node/services/artifactsOperations";
@@ -34,6 +34,12 @@ const card: LayoutAuditPageFinding = {
   axis: "horizontal",
   overflowPx: 12,
 };
+
+const thrice = (value: string) => [value, value, value];
+
+/** The widths a report lists as not checked; none when it checked everything. */
+const notCheckedOf = (report: LayoutAuditReport | undefined) =>
+  report?.checked === false ? report.notChecked : [];
 
 const execStream = (stdout: string, exitCode: number): ExecStream => ({
   stdout: new ReadableStream({
@@ -103,7 +109,7 @@ describe("checkArtifactLayout", () => {
     });
     expect(await evalCount(fake)).toBe(3);
     expect(await fake.openedUrls()).toEqual(
-      Array(3).fill(pathToFileURL(path.join(artifactsDir, "chart.html")).href)
+      thrice(pathToFileURL(path.join(artifactsDir, "chart.html")).href)
     );
   });
 
@@ -186,10 +192,9 @@ describe("checkArtifactLayout", () => {
 
   test("a crashed script is not checked", async () => {
     await install({ eval: { 390: { kind: "throw", message: "boom" } } });
-    expect(await check()).toMatchObject({
-      checked: false,
-      notChecked: expect.arrayContaining([{ viewport: 390, reason: "script-failed" }]),
-    });
+    const report = await check();
+    expect(report).toMatchObject({ checked: false });
+    expect(notCheckedOf(report)).toContainEqual({ viewport: 390, reason: "script-failed" });
   });
 
   test("a cancelled call reports what it had and leaves the memory alone", async () => {
@@ -269,7 +274,7 @@ describe("checkArtifactLayout", () => {
     };
     await check({ location: posix, relPath: "my report/a#b?.html" });
     expect(await fake.openedUrls()).toEqual(
-      Array(3).fill("file:///var/mux/scratch/artifacts/my%20report/a%23b%3F.html")
+      thrice("file:///var/mux/scratch/artifacts/my%20report/a%23b%3F.html")
     );
 
     const resolve = spyOn(runtime, "resolvePath").mockResolvedValue("/home/dev/.xum/scratch");
@@ -282,7 +287,9 @@ describe("checkArtifactLayout", () => {
   });
 
   test("an untrusted project's tool_env is neither looked up nor sourced", async () => {
-    const exec = spyOn(runtime, "exec").mockImplementation(async () => execStream("", 127));
+    const exec = spyOn(runtime, "exec").mockImplementation(() =>
+      Promise.resolve(execStream("", 127))
+    );
     const report = await check({ trusted: false });
     expect(report).toMatchObject({ checked: false });
     expect(exec).toHaveBeenCalledTimes(1);
@@ -294,7 +301,9 @@ describe("checkArtifactLayout", () => {
   test("the project-automation kill switch also keeps tool_env from running", async () => {
     await fs.mkdir(path.join(tempDir, ".xum"), { recursive: true });
     await fs.writeFile(path.join(tempDir, ".xum", "tool_env"), "exit 9\n");
-    const exec = spyOn(runtime, "exec").mockImplementation(async () => execStream("", 127));
+    const exec = spyOn(runtime, "exec").mockImplementation(() =>
+      Promise.resolve(execStream("", 127))
+    );
     const previous = process.env[DISABLE_PROJECT_AUTOMATION_ENV];
     process.env[DISABLE_PROJECT_AUTOMATION_ENV] = "1";
     try {
