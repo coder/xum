@@ -174,6 +174,11 @@ export function jsonValueHidesSecret(value: unknown): boolean {
  * not parse would be skipped whole. The scanner never throws and does not recurse.
  */
 function jsonStringsMatchSecretPattern(text: string): boolean {
+  // mutation-equivalent: without a backslash each decoded string is the raw text between two
+  // quotes (or up to a line break or the end of the file), and those are non-word characters, so
+  // the raw check has already seen every match here with the same word boundaries. Only the
+  // time differs, and this scan is synchronous.
+  if (!text.includes("\\")) return false;
   const scanner = jsonc.createScanner(text);
   for (let token = scanner.scan(); token !== jsonc.SyntaxKind.EOF; token = scanner.scan()) {
     if (token === jsonc.SyntaxKind.StringLiteral && matchesSecretPattern(scanner.getTokenValue())) {
