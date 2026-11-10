@@ -301,11 +301,13 @@ describe("AgentPluginInstallService marketplaces", () => {
     );
   });
 
-  test("a relative entry whose folder is missing is listed as not installable", async () => {
+  test("a relative entry whose folder is missing is listed as not installable, with or without skills", async () => {
     await writeFiles(marketDir, {
       ".claude-plugin/marketplace.json": marketplace([
         DOCS,
         { name: "gone", source: "./plugins/gone", skills: ["./skills/x"] },
+        // No skills list, so no skill count: the folder check still runs.
+        { name: "gone-bare", source: "./plugins/gone-bare" },
       ]),
     });
     await commit(marketDir, "an entry without its folder");
@@ -316,6 +318,11 @@ describe("AgentPluginInstallService marketplaces", () => {
     ).toEqual([
       ["docs", true, undefined],
       ["gone", false, "Xum cannot install the entry's folder 'plugins/gone': it does not exist"],
+      [
+        "gone-bare",
+        false,
+        "Xum cannot install the entry's folder 'plugins/gone-bare': it does not exist",
+      ],
     ]);
   });
 
@@ -733,6 +740,42 @@ describe("AgentPluginInstallService marketplaces", () => {
       })
     ).rejects.toThrow("cannot be installed as Cursor marketplace entry");
     expect((await service.list()).map((item) => item.name)).toEqual([]);
+  }, 20_000);
+
+  test("a Cursor entry lists as installable with any manifest its preview reads; a missing folder does not", async () => {
+    await writeFiles(marketDir, {
+      ".cursor-plugin/marketplace.json": JSON.stringify({
+        name: "cursor-market",
+        plugins: [
+          { name: "rooted", source: "rooted" },
+          { name: "clauded", source: "clauded" },
+          { name: "gone", source: "plugins/gone" },
+        ],
+      }),
+      "rooted/plugin.json": JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "rooted",
+      }),
+      "rooted/skills/a/SKILL.md": skillMd("a"),
+      "clauded/.claude-plugin/plugin.json": JSON.stringify({ name: "clauded" }),
+      "clauded/skills/b/SKILL.md": skillMd("b"),
+    });
+    await commit(marketDir, "Cursor entries with a root manifest, a Claude manifest and no folder");
+    const listing = await listMarketplace();
+    expect(
+      listing.entries.flatMap((entry) =>
+        entry.builds
+          .filter((build) => build.file === "cursor")
+          .map((build) => [entry.name, build.installable, build.reason])
+      )
+    ).toEqual([
+      ["rooted", true, undefined],
+      ["clauded", true, undefined],
+      ["gone", false, "Xum cannot install the entry's folder 'plugins/gone': it does not exist"],
+    ]);
+    // The listing offers what the preview installs.
+    expect((await previewCursorEntry("rooted")).method).toEqual({ kind: "agent-plugin" });
+    expect((await previewCursorEntry("clauded")).method).toEqual({ kind: "claude-plugin" });
   }, 20_000);
 
   test("an installed Cursor entry lists its not-applied parts and updates by its folder", async () => {
