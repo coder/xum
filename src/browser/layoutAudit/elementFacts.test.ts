@@ -5,7 +5,9 @@ import { createFakeLayoutPage } from "./fakeLayoutPage.testHarness";
 /** The selectors of every element matching `query`, in document order. */
 function selectors(html: string, query: string): string[] {
   using fake = createFakeLayoutPage(html);
-  return Array.from(fake.page.document.querySelectorAll(query)).map((el) => selectorFor(fake.page, el));
+  return Array.from(fake.page.document.querySelectorAll(query)).map((el) =>
+    selectorFor(fake.page, el)
+  );
 }
 
 describe("selectorFor", () => {

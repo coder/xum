@@ -50,7 +50,10 @@ async function auditFixture(
     const raw: unknown = await Promise.race([
       page.evaluate(LAYOUT_AUDIT_PAGE_SCRIPT),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`${fixture} did not finish in ${PASS_TIMEOUT_MS} ms`)), PASS_TIMEOUT_MS)
+        setTimeout(
+          () => reject(new Error(`${fixture} did not finish in ${PASS_TIMEOUT_MS} ms`)),
+          PASS_TIMEOUT_MS
+        )
       ),
     ]);
     const ms = performance.now() - started;
@@ -69,7 +72,9 @@ function fixtureNames(): string[] {
 }
 
 function formatRow(row: Row): string {
-  const findings = row.pass.findings.map((f) => `${f.rule} ${f.selector} ${f.axis} ${f.overflowPx}`);
+  const findings = row.pass.findings.map(
+    (f) => `${f.rule} ${f.selector} ${f.axis} ${f.overflowPx}`
+  );
   return [
     row.fixture.padEnd(30),
     String(row.width).padStart(4),
@@ -118,7 +123,9 @@ async function main() {
       for (const viewport of LAYOUT_AUDIT_VIEWPORTS) {
         const row = await auditFixture(browser, fixture, viewport);
         console.log(formatRow(row));
-        failures.push(...mismatches(row).map((problem) => `${fixture} at ${row.width}: ${problem}`));
+        failures.push(
+          ...mismatches(row).map((problem) => `${fixture} at ${row.width}: ${problem}`)
+        );
       }
     }
   } finally {

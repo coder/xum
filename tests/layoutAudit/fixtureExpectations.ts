@@ -39,9 +39,21 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
   },
   "control-broken-reachability": {
     // Upstream: 3 at 390 and 3 at 1440. Measured at 768: the same three.
-    390: ["viewport-unreachable-control", "viewport-unreachable-control", "viewport-unreachable-control"],
-    1440: ["viewport-unreachable-control", "viewport-unreachable-control", "viewport-unreachable-control"],
-    768: ["viewport-unreachable-control", "viewport-unreachable-control", "viewport-unreachable-control"],
+    390: [
+      "viewport-unreachable-control",
+      "viewport-unreachable-control",
+      "viewport-unreachable-control",
+    ],
+    1440: [
+      "viewport-unreachable-control",
+      "viewport-unreachable-control",
+      "viewport-unreachable-control",
+    ],
+    768: [
+      "viewport-unreachable-control",
+      "viewport-unreachable-control",
+      "viewport-unreachable-control",
+    ],
   },
   "occlusion-exclusions-clean": CLEAN,
   "real-animated-entry": CLEAN,

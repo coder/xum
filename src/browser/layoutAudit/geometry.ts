@@ -1,9 +1,6 @@
 // Adapted from lavish-axi (MIT). See lavish-axi-LICENSE.txt in this folder.
 import { LAYOUT_AUDIT_THRESHOLDS as THRESHOLDS } from "@/common/constants/artifactLayoutAudit";
-import type {
-  LayoutAuditAxis,
-  LayoutAuditPageFinding,
-} from "@/common/types/artifactLayoutAudit";
+import type { LayoutAuditAxis, LayoutAuditPageFinding } from "@/common/types/artifactLayoutAudit";
 import type { Box } from "./layoutPage";
 
 /** A rectangle or boundary where only the edges of the axes in play need to be present. */
@@ -57,7 +54,7 @@ function axisOverflow(rect: Edges, boundary: Edges, axis: LayoutAuditAxis): Axis
 /** The candidate with the larger overflowPx. A tie keeps `current` (upstream's strict `>`). */
 export function strongest<T extends { overflowPx: number }>(
   current: T | null,
-  candidate: T | null,
+  candidate: T | null
 ): T | null {
   if (candidate === null) return current;
   return current === null || candidate.overflowPx > current.overflowPx ? candidate : current;
@@ -129,7 +126,12 @@ export function classifyMaterialRectEscape(input: {
   axes?: readonly LayoutAuditAxis[];
   minOutsidePx?: number;
 }): RectEscape | null {
-  const { rect, boundary, axes = ["horizontal", "vertical"], minOutsidePx = THRESHOLDS.controlMinOutsidePx } = input;
+  const {
+    rect,
+    boundary,
+    axes = ["horizontal", "vertical"],
+    minOutsidePx = THRESHOLDS.controlMinOutsidePx,
+  } = input;
   let best: RectEscape | null = null;
   for (const axis of axes) {
     const outside = axisOverflow(rect, boundary, axis);
@@ -137,7 +139,8 @@ export function classifyMaterialRectEscape(input: {
       outside !== null &&
       outside.overflowPx >= minOutsidePx &&
       (outside.centerOutside || outside.outsideRatio >= THRESHOLDS.minOutsideRatio);
-    if (material) best = strongest(best, { axis, side: outside.side, overflowPx: outside.overflowPx });
+    if (material)
+      best = strongest(best, { axis, side: outside.side, overflowPx: outside.overflowPx });
   }
   return best;
 }
@@ -146,7 +149,7 @@ export function classifyMaterialRectEscape(input: {
 export function materialViewportPx(viewportWidth: number): number {
   return Math.max(
     THRESHOLDS.pageOverflowMinPx,
-    viewportWidth * THRESHOLDS.pageOverflowMinViewportRatio,
+    viewportWidth * THRESHOLDS.pageOverflowMinViewportRatio
   );
 }
 
@@ -172,7 +175,7 @@ export function findingKey(finding: LayoutAuditPageFinding): string {
 /** Findings of `second` that `first` also holds: a real defect is in both samples. */
 export function findStableLayoutFindings(
   first: readonly LayoutAuditPageFinding[],
-  second: readonly LayoutAuditPageFinding[],
+  second: readonly LayoutAuditPageFinding[]
 ): LayoutAuditPageFinding[] {
   const firstKeys = new Set(first.map(findingKey));
   return second.filter((finding) => firstKeys.has(findingKey(finding)));

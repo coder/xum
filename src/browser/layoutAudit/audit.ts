@@ -56,7 +56,9 @@ interface Point {
 }
 
 function roundedOverflowPx(value: number): number {
-  return Math.round(Math.max(0, value) * THRESHOLDS.overflowPrecision) / THRESHOLDS.overflowPrecision;
+  return (
+    Math.round(Math.max(0, value) * THRESHOLDS.overflowPrecision) / THRESHOLDS.overflowPrecision
+  );
 }
 
 /** Adds a finding unless its rule, selector and axis were already reported in this pass. */
@@ -110,7 +112,7 @@ function textEscapesRightEdge(pass: AuditPass, el: Element): boolean {
   if (auditedText(pass.page, el) === "") return false;
   const materialPx = materialViewportPx(pass.metrics.viewportWidth);
   return textFragments(pass.page, el).some(
-    (fragment) => viewportEscape(pass, fragment, materialPx)?.side === "end",
+    (fragment) => viewportEscape(pass, fragment, materialPx)?.side === "end"
   );
 }
 
@@ -128,7 +130,12 @@ function pageOverflowCheck(pass: AuditPass, elements: readonly Element[]): void 
   const overflowPx = scrollWidth - viewportWidth;
   const hasEscapedContent = elements.some((el) => elementEscapesRightEdge(pass, el));
   if (isMaterialPageOverflow({ overflowPx, viewportWidth, hasEscapedContent })) {
-    report(pass, { rule: "page-horizontal-overflow", selector: "html", axis: "horizontal", overflowPx });
+    report(pass, {
+      rule: "page-horizontal-overflow",
+      selector: "html",
+      axis: "horizontal",
+      overflowPx,
+    });
   }
 }
 
@@ -143,7 +150,11 @@ interface ControlClip {
 function strongestControlClip(page: LayoutPage, el: Element, rect: Box): ControlClip | null {
   let clipped: ControlClip | null = null;
   for (const boundary of clippingBoundariesFor(page, el)) {
-    const escape = classifyMaterialRectEscape({ rect, boundary: boundary.box, axes: boundary.axes });
+    const escape = classifyMaterialRectEscape({
+      rect,
+      boundary: boundary.box,
+      axes: boundary.axes,
+    });
     clipped = strongest(clipped, escape && { boundary, escape, overflowPx: escape.overflowPx });
   }
   return clipped;
@@ -322,7 +333,11 @@ function isOpaqueSurface(page: LayoutPage, el: Element): boolean {
 // Product of the opacities from `node` up to, not including, `stopParent`.
 function effectiveOpacityTo(page: LayoutPage, node: Element, stopParent: Element | null): number {
   let opacity = 1;
-  for (let current: Element | null = node; current && current !== stopParent; current = current.parentElement) {
+  for (
+    let current: Element | null = node;
+    current && current !== stopParent;
+    current = current.parentElement
+  ) {
     const value = Number.parseFloat(page.style(current).opacity || "1");
     if (Number.isFinite(value)) opacity *= value;
   }
@@ -331,7 +346,11 @@ function effectiveOpacityTo(page: LayoutPage, node: Element, stopParent: Element
 
 // Walking up from the element on top, the first node that shares a parent with the text's own
 // chain and sits on an opaque surface is the cover (a sibling block, not a descendant).
-function findOpaqueSibling(pass: AuditPass, textChain: readonly Element[], top: Element): Element | null {
+function findOpaqueSibling(
+  pass: AuditPass,
+  textChain: readonly Element[],
+  top: Element
+): Element | null {
   let foundOpaqueSurface = false;
   for (const node of chainBelowRoot(pass.page, top)) {
     if (isNearAnimation(pass.animated, node)) return null;
@@ -360,13 +379,16 @@ function fragmentSamplePoints(fragment: Box): Point[] {
     positions.map((yRatio) => ({
       x: fragment.left + fragment.width * xRatio,
       y: fragment.top + fragment.height * yRatio,
-    })),
+    }))
   );
 }
 
 function isInsideViewport(point: Point, metrics: PageMetrics): boolean {
   return (
-    point.x >= 0 && point.y >= 0 && point.x <= metrics.viewportWidth && point.y <= metrics.viewportHeight
+    point.x >= 0 &&
+    point.y >= 0 &&
+    point.x <= metrics.viewportWidth &&
+    point.y <= metrics.viewportHeight
   );
 }
 
@@ -438,7 +460,7 @@ export function auditLayout(page: LayoutPage): LayoutAuditPageFinding[] {
   const pass = createPass(page);
   const elements = Array.from(page.document.body.querySelectorAll("*")).slice(
     0,
-    THRESHOLDS.maxAuditedElements,
+    THRESHOLDS.maxAuditedElements
   );
   pageOverflowCheck(pass, elements);
   for (const el of elements) controlChecks(pass, el);

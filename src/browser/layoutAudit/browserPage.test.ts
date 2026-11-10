@@ -89,7 +89,9 @@ describe("createBrowserLayoutPage", () => {
   });
 
   test("reads rendered text from innerText, and from textContent where an element has none", () => {
-    using fake = createFakeBrowserWindow({ bodyHtml: '<p id="p">visible <i>words</i></p><svg><text id="t">label</text></svg>' });
+    using fake = createFakeBrowserWindow({
+      bodyHtml: '<p id="p">visible <i>words</i></p><svg><text id="t">label</text></svg>',
+    });
     const page = createBrowserLayoutPage(fake.win);
     const paragraph = fake.win.document.getElementById("p") as Element;
     expect(page.renderedText(paragraph)).toBe("visible words");
@@ -113,7 +115,9 @@ describe("createBrowserLayoutPage", () => {
   });
 
   test("names the targets of running animations, through a pseudo-element's owner too", () => {
-    using fake = createFakeBrowserWindow({ bodyHtml: "<a id='a'></a><b id='b'></b><i id='c'></i>" });
+    using fake = createFakeBrowserWindow({
+      bodyHtml: "<a id='a'></a><b id='b'></b><i id='c'></i>",
+    });
     const get = (id: string) => fake.win.document.getElementById(id) as Element;
     const running = (target: unknown) => ({ playState: "running", effect: { target } });
     Object.assign(fake.win.document, {
@@ -146,9 +150,15 @@ describe("createBrowserSettleSignals", () => {
     const signals = createBrowserSettleSignals(fake.win);
     Object.defineProperty(fake.win.document, "fonts", { value: undefined, configurable: true });
     await signals.fontsReady();
-    Object.defineProperty(fake.win.document, "fonts", { value: { ready: Promise.resolve() }, configurable: true });
+    Object.defineProperty(fake.win.document, "fonts", {
+      value: { ready: Promise.resolve() },
+      configurable: true,
+    });
     await signals.fontsReady();
-    Object.defineProperty(fake.win.document, "fonts", { value: { ready: Promise.reject(new Error("no font")) }, configurable: true });
+    Object.defineProperty(fake.win.document, "fonts", {
+      value: { ready: Promise.reject(new Error("no font")) },
+      configurable: true,
+    });
     await signals.fontsReady();
   });
 
@@ -171,9 +181,15 @@ describe("createBrowserSettleSignals", () => {
   test("documentComplete follows the document's readyState", () => {
     using fake = createFakeBrowserWindow();
     const signals = createBrowserSettleSignals(fake.win);
-    Object.defineProperty(fake.win.document, "readyState", { value: "interactive", configurable: true });
+    Object.defineProperty(fake.win.document, "readyState", {
+      value: "interactive",
+      configurable: true,
+    });
     expect(signals.documentComplete()).toBe(false);
-    Object.defineProperty(fake.win.document, "readyState", { value: "complete", configurable: true });
+    Object.defineProperty(fake.win.document, "readyState", {
+      value: "complete",
+      configurable: true,
+    });
     expect(signals.documentComplete()).toBe(true);
   });
 
@@ -204,7 +220,11 @@ describe("createBrowserSettleSignals", () => {
 
     test("is settled when every finite animation finishes in time, even one that is cancelled", async () => {
       using fake = createFakeBrowserWindow();
-      stubAnimations(fake.win, [finite(delay(10)), finite(Promise.reject(new Error("cancelled"))), infinite]);
+      stubAnimations(fake.win, [
+        finite(delay(10)),
+        finite(Promise.reject(new Error("cancelled"))),
+        infinite,
+      ]);
       expect(await createBrowserSettleSignals(fake.win).finiteAnimationsSettled(1_000)).toBe(true);
     });
 

@@ -52,7 +52,10 @@ describe("runLayoutAudit", () => {
 
   // The control appears just before sample B (during the pause) or just before sample C (while
   // the DOM waits to go quiet): the page was still moving.
-  function signalsThatAdd(fake: ReturnType<typeof createFakeLayoutPage>, moment: "pause" | "quiet") {
+  function signalsThatAdd(
+    fake: ReturnType<typeof createFakeLayoutPage>,
+    moment: "pause" | "quiet"
+  ) {
     const add = () => fake.page.document.body.insertAdjacentHTML("beforeend", OFF_LEFT("late"));
     const signals: SettleSignals = {
       ...fake.signals,
@@ -108,7 +111,9 @@ describe("runLayoutAudit", () => {
   });
 
   test("a pass lists at most as many findings as the result schema allows", async () => {
-    const many = Array.from({ length: LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS + 10 }, (_, i) => OFF_LEFT(`b${i}`));
+    const many = Array.from({ length: LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS + 10 }, (_, i) =>
+      OFF_LEFT(`b${i}`)
+    );
     using fake = createFakeLayoutPage(many.join(""), PHONE);
     const result = await runLayoutAudit(fake.page, fake.signals);
     expect(result.findings).toHaveLength(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS);

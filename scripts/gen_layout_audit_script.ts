@@ -28,7 +28,9 @@ const MAX_SCRIPT_BYTES = 96 * 1024;
 const COPYRIGHT = "Copyright (c) 2026 Kun Chen";
 
 function readLicense(): string {
-  const license = fs.readFileSync(path.join(PROJECT_ROOT, LICENSE), "utf-8").replace(/\r\n?/g, "\n");
+  const license = fs
+    .readFileSync(path.join(PROJECT_ROOT, LICENSE), "utf-8")
+    .replace(/\r\n?/g, "\n");
   assert(license.includes(COPYRIGHT), `${LICENSE} must hold the lavish-axi copyright notice`);
   assert(!license.includes("*/"), `${LICENSE} must not close a block comment`);
   return license;
@@ -57,7 +59,10 @@ async function buildScript(): Promise<string> {
   const script = `(() => {\n${bundle}\nreturn ${GLOBAL_NAME}.run();\n})()`;
   assert(script.includes(COPYRIGHT), "the MIT notice must ship with the ported code");
   const bytes = Buffer.byteLength(script);
-  assert(bytes <= MAX_SCRIPT_BYTES, `the audit script is ${bytes} bytes, over ${MAX_SCRIPT_BYTES}: did a heavy import reach it?`);
+  assert(
+    bytes <= MAX_SCRIPT_BYTES,
+    `the audit script is ${bytes} bytes, over ${MAX_SCRIPT_BYTES}: did a heavy import reach it?`
+  );
   return script;
 }
 

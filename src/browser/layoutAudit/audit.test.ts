@@ -101,7 +101,9 @@ describe("clipped-text", () => {
   });
 
   test("text under a hidden ancestor is never reported", () => {
-    expect(audit(`<div data-box="0 0 100 20" data-css="display: none">${TEXT("")}</div>`)).toEqual([]);
+    expect(audit(`<div data-box="0 0 100 20" data-css="display: none">${TEXT("")}</div>`)).toEqual(
+      []
+    );
   });
 
   test("diagram surfaces are outside the audit", () => {
@@ -117,7 +119,9 @@ describe("clipped-text", () => {
 
   test("standard screen-reader-only text is never reported", () => {
     expect(audit(HIDDEN("position: absolute; white-space: nowrap", "0 0 1 1"))).toEqual([]);
-    expect(audit(HIDDEN("position: absolute; clip: rect(0px, 0px, 0px, 0px)", "0 0 1 1"))).toEqual([]);
+    expect(audit(HIDDEN("position: absolute; clip: rect(0px, 0px, 0px, 0px)", "0 0 1 1"))).toEqual(
+      []
+    );
     expect(audit(HIDDEN("position: fixed; white-space: nowrap", "0 0 2 2"))).toEqual([]);
   });
 
@@ -182,7 +186,7 @@ describe("clipped-control", () => {
       <p data-box="0 0 300 20" data-lines="0 0 300 20">A long paragraph of text here</p>`);
     expect(audit(html)).toEqual([finding("clipped-control", "div#bar", "horizontal", 50)]);
     const withoutControl = IN_BAR(
-      '<p data-box="0 0 300 20" data-lines="0 0 300 20">A long paragraph of text here</p>',
+      '<p data-box="0 0 300 20" data-lines="0 0 300 20">A long paragraph of text here</p>'
     );
     expect(audit(withoutControl)).toEqual([finding("clipped-text", "div#bar", "horizontal", 100)]);
   });
@@ -191,7 +195,9 @@ describe("clipped-control", () => {
 describe("viewport-unreachable-control", () => {
   test("a control off the left edge is reported", () => {
     const html = '<button id="b" data-box="-60 10 100 30">Menu</button>';
-    expect(audit(html)).toEqual([finding("viewport-unreachable-control", "button#b", "horizontal", 60)]);
+    expect(audit(html)).toEqual([
+      finding("viewport-unreachable-control", "button#b", "horizontal", 60),
+    ]);
   });
 
   test("off the left by 3 px is tolerated, 4 px is a failure", () => {
@@ -209,8 +215,12 @@ describe("viewport-unreachable-control", () => {
 
   test("a control below the end of the page is reported, one inside it is not", () => {
     const button = '<button data-box="10 1000 100 40">Buy</button>';
-    expect(audit(button)).toEqual([finding("viewport-unreachable-control", TOP_BUTTON, "vertical", 140)]);
-    expect(audit(button, { viewport: { width: 390, height: 844, scrollHeight: 2000 } })).toEqual([]);
+    expect(audit(button)).toEqual([
+      finding("viewport-unreachable-control", TOP_BUTTON, "vertical", 140),
+    ]);
+    expect(audit(button, { viewport: { width: 390, height: 844, scrollHeight: 2000 } })).toEqual(
+      []
+    );
   });
 
   test("the page's scroll position moves the control down the page", () => {
@@ -240,7 +250,9 @@ describe("viewport-unreachable-control", () => {
       fake.page.document.documentElement.setAttribute("data-css", "overflow-y: hidden");
       return auditLayout(fake.page);
     }
-    expect(locked(button)).toEqual([finding("viewport-unreachable-control", TOP_BUTTON, "vertical", 96)]);
+    expect(locked(button)).toEqual([
+      finding("viewport-unreachable-control", TOP_BUTTON, "vertical", 96),
+    ]);
     const held = `<div id="pane" data-box="0 0 390 800" data-css="overflow-y: auto">${button}</div>`;
     expect(locked(held)).toEqual([]);
     const offScreenPane = held.replace("0 0 390 800", "0 -900 390 800");
@@ -255,18 +267,30 @@ describe("viewport-unreachable-content", () => {
     `<p data-box="${left} 0 100 20" data-css="${css}" data-lines="${left} 0 100 20">Text off the left</p>`;
 
   test("text past the left edge is reported, rounded to a tenth of a pixel", () => {
-    expect(audit(TEXT(-80))).toEqual([finding("viewport-unreachable-content", TOP_P, "horizontal", 80)]);
-    expect(audit(TEXT(-80.26))).toEqual([finding("viewport-unreachable-content", TOP_P, "horizontal", 80.3)]);
+    expect(audit(TEXT(-80))).toEqual([
+      finding("viewport-unreachable-content", TOP_P, "horizontal", 80),
+    ]);
+    expect(audit(TEXT(-80.26))).toEqual([
+      finding("viewport-unreachable-content", TOP_P, "horizontal", 80.3),
+    ]);
   });
 
   test("the text must be at least 24 px out: 23 px is tolerated, 24 px is a failure", () => {
     expect(audit(TEXT(-23))).toEqual([]);
-    expect(audit(TEXT(-24))).toEqual([finding("viewport-unreachable-content", TOP_P, "horizontal", 24)]);
+    expect(audit(TEXT(-24))).toEqual([
+      finding("viewport-unreachable-content", TOP_P, "horizontal", 24),
+    ]);
   });
 
   test.each([
-    ["in a horizontal scroller", (html: string) => `<div data-box="0 0 390 50" data-css="overflow-x: auto">${html}</div>`],
-    ["that is positioned", (html: string) => html.replace('data-css=""', 'data-css="position: absolute"')],
+    [
+      "in a horizontal scroller",
+      (html: string) => `<div data-box="0 0 390 50" data-css="overflow-x: auto">${html}</div>`,
+    ],
+    [
+      "that is positioned",
+      (html: string) => html.replace('data-css=""', 'data-css="position: absolute"'),
+    ],
     ["that is animated", (html: string) => html.replace("<p ", "<p data-animated ")],
     ["in a diagram", (html: string) => `<div class="mermaid">${html}</div>`],
   ])("text %s is not reported", (_name, wrap) => {
@@ -286,7 +310,9 @@ describe("page-horizontal-overflow", () => {
 
   test("a control past the edge is evidence too", () => {
     const html = '<button data-box="300 0 342 30">Wide</button>';
-    expect(audit(html, wide(642))).toEqual([finding("page-horizontal-overflow", "html", "horizontal", 252)]);
+    expect(audit(html, wide(642))).toEqual([
+      finding("page-horizontal-overflow", "html", "horizontal", 252),
+    ]);
   });
 
   test("at 390 px a document 23 px too wide is cosmetic, 24 px is a failure", () => {
@@ -298,12 +324,17 @@ describe("page-horizontal-overflow", () => {
 
   test("a scroll width with no content past the edge is not a failure", () => {
     expect(audit('<div data-box="0 0 642 20"></div>', wide(642))).toEqual([]);
-    expect(audit('<p data-box="0 0 300 20" data-lines="0 0 300 20">Text that fits</p>', wide(642))).toEqual([]);
+    expect(
+      audit('<p data-box="0 0 300 20" data-lines="0 0 300 20">Text that fits</p>', wide(642))
+    ).toEqual([]);
   });
 
   test.each([
     ["positioned", WIDE_TEXT.replace("<p ", '<p data-css="position: absolute" ')],
-    ["in a horizontal scroller", `<div data-box="0 0 390 50" data-css="overflow-x: auto">${WIDE_TEXT}</div>`],
+    [
+      "in a horizontal scroller",
+      `<div data-box="0 0 390 50" data-css="overflow-x: auto">${WIDE_TEXT}</div>`,
+    ],
     ["animated", WIDE_TEXT.replace("<p ", "<p data-animated ")],
     ["a diagram", `<div class="mermaid">${WIDE_TEXT}</div>`],
   ])("text that is %s is not evidence", (_name, html) => {
@@ -330,7 +361,9 @@ describe("overlapping-text", () => {
     expect(audit(STAGE(COVER("background-color: rgba(255, 255, 255, 0.94)")))).toEqual([]);
     expect(audit(STAGE(COVER("background-color: rgba(255, 255, 255, 0.95)")))).toEqual(COVERED);
     expect(audit(STAGE(COVER("background-color: rgb(255, 255, 255); opacity: 0.94")))).toEqual([]);
-    expect(audit(STAGE(COVER("background-color: rgb(255, 255, 255); opacity: 0.95")))).toEqual(COVERED);
+    expect(audit(STAGE(COVER("background-color: rgb(255, 255, 255); opacity: 0.95")))).toEqual(
+      COVERED
+    );
   });
 
   test("90% of the sample points must be covered: 6 of 9 and 8 of 9 are not enough, 9 of 9 is", () => {
@@ -362,7 +395,9 @@ describe("overlapping-text", () => {
 
   test("positioned text overlaps on purpose, and motion makes the sample unreliable", () => {
     expect(audit(STAGE(COVER(), "Hello world text", 'data-css="position: relative"'))).toEqual([]);
-    expect(audit(STAGE(COVER("background-color: rgb(255, 255, 255)", "data-animated")))).toEqual([]);
+    expect(audit(STAGE(COVER("background-color: rgb(255, 255, 255)", "data-animated")))).toEqual(
+      []
+    );
     expect(audit(STAGE(COVER(), "Hello world text", "data-animated"))).toEqual([]);
   });
 });

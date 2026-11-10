@@ -23,7 +23,7 @@ import type { LayoutPage, SettleSignals } from "./layoutPage";
  */
 export async function runLayoutAudit(
   page: LayoutPage,
-  signals: SettleSignals,
+  signals: SettleSignals
 ): Promise<LayoutAuditPagePass> {
   await signals.fontsReady();
   await signals.layoutQuiet(SETTLE.quietMs, SETTLE.quietMaxMs);

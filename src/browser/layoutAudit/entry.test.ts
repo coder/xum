@@ -5,7 +5,11 @@ import { createFakeBrowserWindow } from "./fakeLayoutPage.testHarness";
 describe("auditWindow", () => {
   test("a page with nothing wrong audits complete and clean", async () => {
     using fake = createFakeBrowserWindow({ width: 390, bodyHtml: "<p>hello world</p>" });
-    expect(await auditWindow(fake.win)).toEqual({ complete: true, viewportWidth: 390, findings: [] });
+    expect(await auditWindow(fake.win)).toEqual({
+      complete: true,
+      viewportWidth: 390,
+      findings: [],
+    });
   });
 
   test("a crash while waiting gives an incomplete pass with no findings, never a rejection", async () => {
@@ -16,7 +20,11 @@ describe("auditWindow", () => {
       },
       configurable: true,
     });
-    expect(await auditWindow(fake.win)).toEqual({ complete: false, viewportWidth: 390, findings: [] });
+    expect(await auditWindow(fake.win)).toEqual({
+      complete: false,
+      viewportWidth: 390,
+      findings: [],
+    });
   });
 
   test("a crash while measuring does too, and an unreadable width reads as 0", async () => {
@@ -25,6 +33,10 @@ describe("auditWindow", () => {
       throw new Error("style broke");
     };
     Object.defineProperty(fake.win, "innerWidth", { value: 0, configurable: true });
-    expect(await auditWindow(fake.win)).toEqual({ complete: false, viewportWidth: 0, findings: [] });
+    expect(await auditWindow(fake.win)).toEqual({
+      complete: false,
+      viewportWidth: 0,
+      findings: [],
+    });
   });
 });

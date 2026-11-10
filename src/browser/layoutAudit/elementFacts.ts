@@ -17,7 +17,15 @@ const SEMANTIC_TEXT_BOUNDARY =
 // Upstream also lists [data-lavish-action] (Lavish's own UI), which Xum never injects.
 const CONTROL = "button,input,select,textarea,a[href],summary,[role]";
 const DISABLED_CONTROL = "input[type='hidden'],[disabled],[aria-disabled='true']";
-const CONTROL_ROLES = new Set(["button", "link", "checkbox", "radio", "switch", "textbox", "combobox"]);
+const CONTROL_ROLES = new Set([
+  "button",
+  "link",
+  "checkbox",
+  "radio",
+  "switch",
+  "textbox",
+  "combobox",
+]);
 // Diagram surfaces stay outside the general audit. Upstream also lists [data-lavish-ui].
 const DIAGRAM = ".mermaid,svg";
 
@@ -118,7 +126,7 @@ export function hasHorizontalScrollerAncestor(page: LayoutPage, el: Element): bo
 export function hasReachableVerticalScrollerAncestor(
   page: LayoutPage,
   el: Element,
-  viewportHeight: number,
+  viewportHeight: number
 ): boolean {
   return chainBelowRoot(page, el.parentElement).some((node) => {
     const rect = page.box(node);
@@ -219,7 +227,7 @@ function isStandardVisuallyHidden(style: LayoutStyle, rect: Box): boolean {
 
 function hasStandardVisuallyHiddenAncestor(page: LayoutPage, el: Element): boolean {
   return selfAndAncestors(el).some((node) =>
-    isStandardVisuallyHidden(page.style(node), page.box(node)),
+    isStandardVisuallyHidden(page.style(node), page.box(node))
   );
 }
 
@@ -261,7 +269,7 @@ function selectorPart(page: LayoutPage, node: Element): string {
   const tag = node.tagName.toLowerCase();
   if (node.id) return `${tag}#${page.escapeIdent(node.id)}`;
   const same = Array.from(node.parentElement?.children ?? []).filter(
-    (sibling) => sibling.tagName === node.tagName,
+    (sibling) => sibling.tagName === node.tagName
   );
   return same.length > 1 ? `${tag}:nth-of-type(${same.indexOf(node) + 1})` : tag;
 }

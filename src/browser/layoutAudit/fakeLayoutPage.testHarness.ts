@@ -71,7 +71,8 @@ export interface FakeLayoutPage {
 function numbers(attribute: string | null, count: number, what: string): number[] {
   const values = (attribute ?? "").trim().split(/\s+/).filter(Boolean).map(Number);
   if (values.length === 0) return Array<number>(count).fill(0);
-  if (values.length !== count || values.some(Number.isNaN)) throw new Error(`bad ${what}: ${attribute ?? ""}`);
+  if (values.length !== count || values.some(Number.isNaN))
+    throw new Error(`bad ${what}: ${attribute ?? ""}`);
   return values;
 }
 
@@ -156,7 +157,7 @@ function createSignals(options: FakeLayoutPageOptions, calls: string[]): SettleS
 
 export function createFakeLayoutPage(
   bodyHtml: string,
-  options: FakeLayoutPageOptions = {},
+  options: FakeLayoutPageOptions = {}
 ): FakeLayoutPage {
   const window = new Window();
   window.document.body.innerHTML = bodyHtml;
@@ -207,7 +208,7 @@ export interface FakeBrowserWindow {
  * createRange) on the returned window.
  */
 export function createFakeBrowserWindow(
-  options: { width?: number; height?: number; bodyHtml?: string } = {},
+  options: { width?: number; height?: number; bodyHtml?: string } = {}
 ): FakeBrowserWindow {
   const window = new Window({ width: options.width ?? 390, height: options.height ?? 844 });
   window.document.body.innerHTML = options.bodyHtml ?? "";

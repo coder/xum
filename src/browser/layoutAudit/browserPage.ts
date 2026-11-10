@@ -39,7 +39,8 @@ function animationTarget(win: BrowserWindow, animation: Animation): Element | nu
   const effect = animation.effect;
   const target: unknown = effect !== null && "target" in effect ? effect.target : null;
   if (target instanceof win.Element) return target;
-  const owner = typeof target === "object" && target !== null && "element" in target ? target.element : null;
+  const owner =
+    typeof target === "object" && target !== null && "element" in target ? target.element : null;
   return owner instanceof win.Element ? owner : null;
 }
 
@@ -78,10 +79,11 @@ export function createBrowserLayoutPage(win: BrowserWindow): LayoutPage {
 export function observeUntilQuiet(
   observe: (onChange: () => void) => () => void,
   quietMs: number,
-  maxMs: number,
+  maxMs: number
 ): Promise<boolean> {
   return new Promise((resolve) => {
-    const timers: { quiet?: ReturnType<typeof setTimeout>; max?: ReturnType<typeof setTimeout> } = {};
+    const timers: { quiet?: ReturnType<typeof setTimeout>; max?: ReturnType<typeof setTimeout> } =
+      {};
     let stop: () => void = noop;
     let done = false;
     const finish = (quiet: boolean) => {
