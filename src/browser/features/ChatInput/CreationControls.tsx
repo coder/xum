@@ -49,6 +49,7 @@ import {
   isProjectIsolationEnabled,
   isWorkspaceIsolationEnabled,
   nearestSupportedIsolation,
+  resolveEnabledIsolation,
   runtimeIdFromIsolation,
   type IsolationChoice,
   type ProjectIsolation,
@@ -611,7 +612,11 @@ function CreationControlsContent(props: CreationControlsProps) {
   // Either select changes one axis; an unsupported pair snaps to the nearest one the project
   // supports. The pair maps to a runtime choice, so per-runtime inputs (host, image) carry over.
   const selectIsolation = (choice: IsolationChoice) => {
-    const next = nearestSupportedIsolation(choice);
+    // Same rule as the Settings default: skip pairs with no backend and pairs Settings disable,
+    // keeping the picked project isolation when any of its pairs is enabled.
+    const next =
+      (props.runtimeEnablement ? resolveEnabledIsolation(choice, props.runtimeEnablement) : null) ??
+      nearestSupportedIsolation(choice);
     const runtimeId = runtimeIdFromIsolation(next);
     if (runtimeId === null || (runtimeId === "coder" && !props.coderProps)) {
       return;
