@@ -756,7 +756,7 @@ Rules:
 - Credentials are never preserved or promoted. A key, token, password, private key, connection string, session cookie or other secret-like value in a memory file is not a fact to keep: when you merge, prune or promote a file that holds one, leave the value out and say what it was for and where it lives. This overrides keeping every fact line, and holds on a final pass too.
 - Prefer `str_replace`/`insert` edits over delete-and-recreate.
 - Pinned files may be edited but must not be deleted or renamed. Project memory is available only for single-project runs. The tool rejects out-of-policy operations — do not retry rejected commands.
-- The run prompt states your budget of mutating commands, or that the run has no edit limit. Spend edits on the highest-value cleanups first; finishing under budget is good.
+- The run prompt states your budget of mutating commands. Spend it on the highest-value cleanups first; finishing under budget is good.
 - When nothing needs fixing, do nothing. An empty run is a valid outcome.
 
 When done, reply with a one-line summary of what changed (or "no changes needed").
