@@ -43,12 +43,12 @@ function listingOf(entries: AgentPluginMarketplaceEntry[]): AgentPluginMarketpla
   };
 }
 
-function renderListing(listing: AgentPluginMarketplaceListing) {
+function renderListing(listing: AgentPluginMarketplaceListing, busy = false) {
   const previewed: MarketplaceEntrySelector[] = [];
   const view = render(
     <MarketplaceListing
       listing={listing}
-      busy={false}
+      busy={busy}
       error={null}
       onBack={() => undefined}
       onPickEntry={() => undefined}
@@ -83,6 +83,18 @@ test("a repeated entry name never makes two checked radios", () => {
   expect(radios.map((radio) => (radio as HTMLInputElement).checked)).toEqual([false, true, false]);
   fireEvent.click(view.getByRole("button", { name: "Preview docs" }));
   expect(previewed).toEqual([{ kind: "claude-marketplace", entry: "docs" }]);
+});
+
+test("the preview action shows a spinner and Fetching… only while the preview loads", () => {
+  const listing = listingOf([{ name: "docs", builds: [build("claude")] }]);
+
+  const idle = renderListing(listing).view;
+  expect(idle.getByRole("button", { name: "Preview docs" }).querySelector("svg")).toBeNull();
+  cleanup();
+
+  const busy = renderListing(listing, true).view;
+  const fetching = busy.getByRole("button", { name: "Fetching…" });
+  expect(fetching.querySelector("svg.animate-spin")).not.toBeNull();
 });
 
 test("a name in both marketplace files has one row whose two actions preview their own build", () => {
