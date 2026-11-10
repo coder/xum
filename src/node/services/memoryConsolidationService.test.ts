@@ -18,21 +18,26 @@ import {
   MEMORY_ANALYZER_OP_BUDGET,
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
+  MEMORY_CONSOLIDATION_TIMEOUT_MS,
 } from "@/common/constants/memory";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
   analyzerJobLockPath,
+  analyzerJobLockTimeoutMs,
+  dreamLockWaitMs,
   dreamStreamLockPath,
   HARVEST_MAX_ATTEMPTS,
   harvestResumeState,
   MemoryConsolidationService,
+  organizerRunEnd,
   resolveDreamAgentBody,
   resolveDreamModelString,
   resolveHeadlessAgentModelString,
   resolveHeadlessAgentSettings,
   resolveHeadlessAgentBody,
   resolveHeadlessAgentDefinition,
+  RUN_TIMEOUT_NOTE,
   sidecarLockPath,
   staleExhaustedHarvestFailure,
 } from "./memoryConsolidationService";
@@ -4827,6 +4832,221 @@ describe("MemoryConsolidationService", () => {
       expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
 
       expect(fixture.modelPrompts.at(-1)).toContain(line);
+    });
+  });
+
+  describe("dream run timeout", () => {
+    const minute = 60_000;
+
+    function setTimeoutMinutes(fixture: Fixture, minutes: number): Promise<void> {
+      return fixture.config.updateUserPreferences([
+        { memory: { dreamRunTimeoutMinutes: minutes } },
+      ]);
+    }
+
+    /**
+     * A model whose first step creates a workspace file (unless `editFirst` is false) and whose
+     * next step hangs until its stream is aborted. Aborting `timeout` stands in for the run timeout
+     * firing; the hanging step aborts it itself once the edit has landed.
+     */
+    function hangingModel(timeout: AbortController, editFirst: boolean): MockLanguageModelV3 {
+      let calls = 0;
+      const usage = {
+        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: { total: 0, text: 0, reasoning: 0 },
+      };
+      return new MockLanguageModelV3({
+        doStream: (options) => {
+          calls += 1;
+          if (editFirst && calls === 1) {
+            const chunks: LanguageModelV3StreamPart[] = [
+              {
+                type: "tool-call",
+                toolCallId: "edit",
+                toolName: "memory",
+                input: JSON.stringify({
+                  command: "create",
+                  path: "/memories/workspace/split.md",
+                  file_text: "fact\n",
+                }),
+              },
+              { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage },
+            ];
+            return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+          }
+          return new Promise((_resolve, reject) => {
+            options.abortSignal?.addEventListener("abort", () =>
+              reject(new Error("stalled provider call aborted"))
+            );
+            timeout.abort(new DOMException("run timeout", "TimeoutError"));
+          });
+        },
+      });
+    }
+
+    it("waits for the longest healthy holder, never under the constant", () => {
+      expect(dreamLockWaitMs(MEMORY_CONSOLIDATION_TIMEOUT_MS)).toBe(
+        MEMORY_CONSOLIDATION_TIMEOUT_MS
+      );
+      expect(dreamLockWaitMs(30 * minute)).toBe(30 * minute);
+      // A shorter organizer timeout does not shorten the wait for an analyzer chunk holder.
+      expect(dreamLockWaitMs(minute)).toBe(MEMORY_CONSOLIDATION_TIMEOUT_MS);
+      // No timeout: waiters keep the floor and give up instead of waiting forever.
+      expect(dreamLockWaitMs(null)).toBe(MEMORY_CONSOLIDATION_TIMEOUT_MS);
+    });
+
+    it("lets an analyzer job wait out every chunk's dream wait and stream", () => {
+      // The default keeps the wait it had before the setting: (2 × 12 + 1) × 5 minutes.
+      expect(analyzerJobLockTimeoutMs(MEMORY_CONSOLIDATION_TIMEOUT_MS)).toBe(125 * minute);
+      expect(analyzerJobLockTimeoutMs(null)).toBe(125 * minute);
+      // 12 chunks, each waiting 30 minutes and streaming 5, then 5 for the reads and saves.
+      expect(analyzerJobLockTimeoutMs(30 * minute)).toBe((12 * 35 + 5) * minute);
+    });
+
+    describe("organizerRunEnd", () => {
+      const applied = [
+        { command: "create" as const, path: "/memories/workspace/a.md", applied: true },
+      ];
+      const refused = [
+        { command: "create" as const, path: "/memories/workspace/a.md", applied: false },
+      ];
+      const fired = () => AbortSignal.abort();
+      const live = () => new AbortController().signal;
+
+      it("keeps the record and the note of a stream that ended on its own", () => {
+        expect(
+          organizerRunEnd(
+            { ops: [], note: "stopped at the cost ceiling after $1.00" },
+            live(),
+            live()
+          )
+        ).toEqual({
+          kind: "record",
+          note: "stopped at the cost ceiling after $1.00",
+        });
+      });
+
+      it("keeps the record of a run its timeout cut after an applied edit", () => {
+        expect(
+          organizerRunEnd({ ops: applied, streamError: "cut short" }, fired(), live())
+        ).toEqual({
+          kind: "record",
+          note: RUN_TIMEOUT_NOTE,
+        });
+      });
+
+      it.each([
+        ["no edit was applied", refused, fired(), live()],
+        ["removal aborted it", applied, fired(), fired()],
+        ["the timeout did not fire", applied, live(), live()],
+        ["the run had no timeout", applied, undefined, live()],
+      ])("fails a stream error when %s", (_why, ops, runTimeout, removal) => {
+        expect(organizerRunEnd({ ops, streamError: "cut short" }, runTimeout, removal)).toEqual({
+          kind: "failed",
+          error: "consolidation stream failed: cut short",
+        });
+      });
+    });
+
+    it("cuts the organizer stream at the saved timeout and keeps the record of its edits", async () => {
+      const timeout = new AbortController();
+      using fixture = await createFixture({ modelFactory: () => hangingModel(timeout, true) });
+      await setTimeoutMinutes(fixture, 30);
+      const timeouts: number[] = [];
+      const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+        timeouts.push(ms);
+        return timeout.signal;
+      });
+      try {
+        const result = await fixture.service.maybeRun("ws-dream", "manual");
+
+        expect(timeouts).toContain(30 * minute);
+        expect(result.success).toBe(true);
+        const record = await fixture.service.getRecord("ws-dream");
+        expect(record?.note).toBe(RUN_TIMEOUT_NOTE);
+        expect(record?.ops.filter((op) => op.applied).map((op) => op.path)).toEqual([
+          "/memories/workspace/split.md",
+        ]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("fails a run its timeout cut before any edit, and saves no record", async () => {
+      const timeout = new AbortController();
+      using fixture = await createFixture({ modelFactory: () => hangingModel(timeout, false) });
+      const timeouts: number[] = [];
+      const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+        timeouts.push(ms);
+        return timeout.signal;
+      });
+      try {
+        const result = await fixture.service.maybeRun("ws-dream", "manual");
+
+        // No saved value: the constant.
+        expect(timeouts).toContain(MEMORY_CONSOLIDATION_TIMEOUT_MS);
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("consolidation stream failed");
+        expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("with the timeout off, runs the organizer without one, and a waiter gives up", async () => {
+      // A run that hangs until workspace removal: with the timeout off nothing else ends it.
+      let hung!: () => void;
+      const started = new Promise<void>((resolve) => (hung = resolve));
+      let calls = 0;
+      using fixture = await createFixture({
+        modelFactory: () => {
+          calls += 1;
+          if (calls > 1) return scriptedModel();
+          return new MockLanguageModelV3({
+            doStream: (options) => {
+              hung();
+              return new Promise((_resolve, reject) => {
+                options.abortSignal?.addEventListener("abort", () =>
+                  reject(new Error("stalled provider call aborted"))
+                );
+              });
+            },
+          });
+        },
+      });
+      await fixture.addWorkspace("ws-other");
+      await setTimeoutMinutes(fixture, 0);
+
+      const timeouts: number[] = [];
+      let fireDeadlines = false;
+      const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+        timeouts.push(ms);
+        // Once the hung run streams, a waiter's deadline fires at once, as it would after the floor.
+        return fireDeadlines
+          ? AbortSignal.abort(new DOMException("deadline", "TimeoutError"))
+          : new AbortController().signal;
+      });
+      try {
+        const hanging = fixture.service.maybeRun("ws-dream", "manual");
+        await started;
+        // Only its own turn deadline: the organizer stream got no timeout.
+        expect(timeouts).toEqual([MEMORY_CONSOLIDATION_TIMEOUT_MS]);
+
+        fireDeadlines = true;
+        const waiter = await fixture.service.maybeRun("ws-other", "manual");
+
+        expect(timeouts).toEqual([
+          MEMORY_CONSOLIDATION_TIMEOUT_MS,
+          MEMORY_CONSOLIDATION_TIMEOUT_MS,
+        ]);
+        expect(waiter.success).toBe(false);
+        if (!waiter.success) expect(waiter.error).toContain("dream run timeout is off");
+
+        await fixture.service.cancelInFlightConsolidation("ws-dream");
+        expect((await hanging).success).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 
