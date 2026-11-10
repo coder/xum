@@ -55,11 +55,19 @@ export class EmptyStreamOutputError extends Error {
  * error type.
  */
 export class ModelRefusalError extends Error {
-  constructor(model: string, finishReason: string, fallbackNote?: string) {
+  constructor(
+    model: string,
+    finishReason: string,
+    details: { fallbackNote?: string; noFallbackCategory?: string } = {}
+  ) {
     super(
       `The model refused to continue (finishReason: ${finishReason}): ${model}. ` +
-        "Retrying the same request is unlikely to help; try rephrasing or a different model." +
-        (fallbackNote ? ` ${fallbackNote}` : "")
+        // Anthropic: a refusal with no recommended fallback (today only reasoning_extraction)
+        // stands, and the prompt must change. Another model would refuse the same prompt.
+        (details.noFallbackCategory !== undefined
+          ? "Retrying the same request will not help: it asks the model to reproduce its reasoning in the reply, so change the prompt."
+          : "Retrying the same request is unlikely to help; try rephrasing or a different model.") +
+        (details.fallbackNote ? ` ${details.fallbackNote}` : "")
     );
     this.name = "ModelRefusalError";
   }

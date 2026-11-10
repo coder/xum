@@ -14,7 +14,10 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
 import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
-import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
+import {
+  isRefusalFinishReason,
+  readNoFallbackRefusalCategory,
+} from "@/common/utils/messages/refusalFinishReason";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { hasCommitWorthyParts } from "@/node/services/historyService";
 import { log, type Logger } from "@/node/services/log";
@@ -361,7 +364,10 @@ export class AttemptLoop {
     await this.handleStreamFailure(
       workspaceId,
       streamInfo,
-      new ModelRefusalError(streamInfo.model, refusalFinishReason, fallbackNote)
+      new ModelRefusalError(streamInfo.model, refusalFinishReason, {
+        fallbackNote,
+        noFallbackCategory: readNoFallbackRefusalCategory(streamInfo.lastStepProviderMetadata),
+      })
     );
   }
 
