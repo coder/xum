@@ -2063,6 +2063,8 @@ function agentsMarketplaceOptions(): MockORPCClientOptions {
  * through the folder's own manifest. The second row's Agent Plugins build is withheld by policy.
  */
 export const AddPluginAgentsMarketplace: Story = {
+  // The Pixel budget is at its cap: this story is checked by its play only.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <PluginsSectionStoryShell options={agentsMarketplaceOptions()}>
       <PluginsSettingsSection />
@@ -2101,9 +2103,8 @@ export const AddPluginAgentsMarketplacePhoneViewport: Story = {
   },
   parameters: {
     layout: "fullscreen",
-    pixel: {
-      matrix: { themes: ["dark"], viewports: ["phone"] },
-    },
+    // The Pixel budget is at its cap: the play checks the phone layout instead.
+    pixel: PIXEL_DISABLED,
   },
   render: () => (
     <PluginsSectionStoryShell options={agentsMarketplaceOptions()}>

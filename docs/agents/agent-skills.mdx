@@ -146,7 +146,7 @@ A repository with `.cursor-plugin/marketplace.json` at its root and no plugin ma
 
 #### Agent Plugins marketplaces
 
-A repository with `.agents/plugins/marketplace.json` at its root and no plugin manifest is an Agent Plugins (Codex) marketplace. **Settings → Plugins** lists its plugins, and you install one plugin per install. The list is titled with `interface.displayName`, or with `name` when that is missing. An entry in this file has no `description`, so the list shows none for it.
+A repository with `.agents/plugins/marketplace.json` at its root and no plugin manifest is an Agent Plugins (Codex) marketplace. **Settings → Plugins** lists its plugins, and you install one plugin per install. The list is titled with `interface.displayName`, or with `name` when that is missing. The format has no entry `description`, so such an entry usually shows none, unless another marketplace file lists the same plugin with one.
 
 An entry's `source` is a folder of the repository: `{ "source": "local", "path": "./plugins/name" }`, or the plain string `"./plugins/name"`. The path is relative to the repository root, not to `.agents/plugins/`, and it must start with `./` (`"./"` is the root). A path without the leading `./`, or with `..`, is listed with the reason it cannot install. An entry can also name another repository with a git `url` or a `git-subdir` source, with the same limits as in a Claude Code marketplace. Xum lists `npm` entries but does not install them. An entry whose `policy.installation` is `NOT_AVAILABLE` is listed and does not install. Xum ignores `metadata.pluginRoot` in this file.
 
