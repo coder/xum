@@ -16,7 +16,12 @@ import {
   type FakeAgentBrowser,
   type FakeAgentBrowserScript,
 } from "./fakeAgentBrowser.testHarness";
-import { LAYOUT_MEMORY_MAX_PATHS, startLayoutAudit } from "./layoutFingerprints";
+import {
+  LAYOUT_MEMORY_MAX_PATHS,
+  layoutAuditPathsInFlight,
+  startLayoutAudit,
+} from "./layoutFingerprints";
+import * as layoutReport from "./layoutReport";
 
 // Every audit spawns shells (a fake CLI run is about a dozen processes); a loaded CI host is slow.
 setDefaultTimeout(60_000);
@@ -268,6 +273,52 @@ describe("checkArtifactLayout", () => {
       releaseFirst();
       exec.mockRestore();
     }
+  });
+
+  describe("the audit of a path ends on every way out of a check", () => {
+    // Every check starts an audit of its path, and the path's ordering state lives until that
+    // audit ends: after a check has returned, no path of it may still be in flight.
+    const expectNoneLeft = async (run: () => Promise<unknown>) => {
+      const before = layoutAuditPathsInFlight();
+      await run();
+      expect(layoutAuditPathsInFlight()).toBe(before);
+    };
+
+    test("a complete check", async () => {
+      await install();
+      await expectNoneLeft(check);
+    });
+
+    test("a check in which no width completed", async () => {
+      await install({ missing: true });
+      await expectNoneLeft(check);
+    });
+
+    test("a cancelled check", async () => {
+      await install();
+      await expectNoneLeft(() => check({ abortSignal: AbortSignal.abort() }));
+    });
+
+    test("work that throws", async () => {
+      spyOn(runtime, "resolvePath").mockRejectedValue(new Error("ssh down"));
+      await expectNoneLeft(() =>
+        check({ location: { kind: "runtime", runtime, dir: "~/.xum/scratch/artifacts" } })
+      );
+    });
+
+    test("a report that cannot be built is not checked and never throws", async () => {
+      await install();
+      const build = spyOn(layoutReport, "buildLayoutReport").mockImplementationOnce(() => {
+        throw new Error("build failed");
+      });
+      try {
+        await expectNoneLeft(async () => {
+          expect(await check()).toMatchObject({ checked: false });
+        });
+      } finally {
+        build.mockRestore();
+      }
+    });
   });
 
   test("a check in which no width completed changes no memory, so it pushes no other path out", async () => {

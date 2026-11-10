@@ -91,6 +91,16 @@ async function auditOutcomes(
   });
 }
 
+/** Never throws: whatever goes wrong with the audit's work is one more way to be "not checked". */
+async function outcomesOrFailed(input: ArtifactLayoutInput): Promise<ViewportOutcome[]> {
+  try {
+    return await auditOutcomes(input, Date.now() + (input.budgetMs ?? LAYOUT_AUDIT_BUDGET_MS));
+  } catch (error) {
+    log.debug("layout audit failed", { error });
+    return failedOutcomes("browser-failed");
+  }
+}
+
 /**
  * Checks a just-published HTML artifact at 390, 768 and 1440 px in agent-browser and says what
  * is broken. Returns undefined for every other kind, so the caller needs no branch.
@@ -101,18 +111,17 @@ async function auditOutcomes(
  * fix. The audit only reports. Nothing here wakes or re-prompts the agent.
  *
  * Overlapping publishes of one path run at the same time, each with its own budget from its own
- * start. The memory commit is the only thing that is ordered: by start, not by finish.
+ * start. The memory commit is the only thing that is ordered: by start, not by finish. Every
+ * audit that starts finishes exactly once, whatever happened to its work: the ordering state of
+ * its path lives until then.
  */
 export async function checkArtifactLayout(
   input: ArtifactLayoutInput
 ): Promise<LayoutAuditReport | undefined> {
   if (input.kind !== "html") return undefined;
   const turn = startLayoutAudit(input.sessionDir, input.relPath);
+  const outcomes = await outcomesOrFailed(input);
   try {
-    const outcomes = await auditOutcomes(
-      input,
-      Date.now() + (input.budgetMs ?? LAYOUT_AUDIT_BUDGET_MS)
-    );
     // "Persistent" means the agent was shown the issue on an earlier publish. A cancelled
     // call's report was probably never delivered, so it leaves the memory alone. So does a
     // check in which no width completed: it learned nothing, and committing it would still
@@ -123,7 +132,7 @@ export async function checkArtifactLayout(
         outcomes.some((outcome) => outcome.status === "complete")
     );
   } catch (error) {
-    log.debug("layout audit failed", { error });
+    log.debug("layout audit report failed", { error });
     return buildLayoutReport(failedOutcomes("browser-failed"), {}).report;
   }
 }

@@ -29,24 +29,39 @@ export function layoutFingerprint(rule: LayoutAuditRule, selector: string): stri
 
 export const LAYOUT_MEMORY_MAX_PATHS = 64;
 
-interface RememberedPath {
-  snapshot: FingerprintSnapshot;
-  /** Start order of the audit that committed it. */
-  startedAs: number;
-}
-
 // In-process only, on purpose: a backend restart forgets what the agent was shown, and the next
 // publish then marks nothing persistent (the safe direction: the agent sees the issue again).
 // Insertion order is the recency order: a commit moves its path to the end.
-const remembered = new Map<string, RememberedPath>();
+const remembered = new Map<string, FingerprintSnapshot>();
+
+/**
+ * The ordering state of one path. It lives in its own map, not with the memory, and exists
+ * exactly while an audit of the path is in flight: the first start creates it and the last
+ * finish deletes it. The memory is bounded and evicts paths, but an audit that is still running
+ * keeps its ordering, so a slow early audit cannot overwrite what a later one committed even
+ * after that commit's memory entry was evicted.
+ */
+interface PathAudits {
+  /** Audits of the path that started and have not finished. */
+  inFlight: number;
+  /** The highest start number whose audit has committed memory; 0 when none has. */
+  committedStart: number;
+}
+const auditsByPath = new Map<string, PathAudits>();
 let auditsStarted = 0;
+
+/** How many paths have an audit in flight. */
+export function layoutAuditPathsInFlight(): number {
+  return auditsByPath.size;
+}
 
 export interface LayoutAuditTurn {
   /**
-   * One synchronous step, taken once the audit's outcomes are known: reads what the path has
-   * remembered, lets `build` turn that into the report and the memory after it, and keeps that
-   * memory when `remember` is true and no audit that started later has committed for this path.
-   * An audit that loses that check still gets its own report back.
+   * One synchronous step that ends the audit, taken once its outcomes are known: reads what the
+   * path has remembered, lets `build` turn that into the report and the memory after it, and
+   * keeps that memory when `remember` is true and no audit that started later has committed for
+   * this path. An audit that loses that check still gets its own report back. The audit ends
+   * whether or not `build` throws. Call it exactly once.
    */
   finish<T>(
     build: (previous: FingerprintSnapshot) => { report: T; next: FingerprintSnapshot },
@@ -54,10 +69,9 @@ export interface LayoutAuditTurn {
   ): T;
 }
 
-function commit(key: string, startedAs: number, snapshot: FingerprintSnapshot): void {
-  if ((remembered.get(key)?.startedAs ?? 0) > startedAs) return;
+function commit(key: string, snapshot: FingerprintSnapshot): void {
   remembered.delete(key);
-  remembered.set(key, { snapshot, startedAs });
+  remembered.set(key, snapshot);
   for (const oldest of remembered.keys()) {
     if (remembered.size <= LAYOUT_MEMORY_MAX_PATHS) break;
     remembered.delete(oldest);
@@ -68,17 +82,28 @@ function commit(key: string, startedAs: number, snapshot: FingerprintSnapshot): 
  * Takes this audit's place in the start order of its path. Audits of one path do not wait for
  * each other (a wait would have no deadline of its own): each runs with its own budget, and
  * the start order decides whose memory stands, so a slow early audit cannot overwrite what a
- * later one left. Call it before the audit's first await.
+ * later one left. Call it before the audit's first await, and finish what it returns.
  */
 export function startLayoutAudit(sessionDir: string, relPath: string): LayoutAuditTurn {
   const key = JSON.stringify([sessionDir, relPath]);
+  const path = auditsByPath.get(key) ?? { inFlight: 0, committedStart: 0 };
+  auditsByPath.set(key, path);
+  path.inFlight += 1;
   auditsStarted += 1;
   const startedAs = auditsStarted;
   return {
     finish: (build, remember) => {
-      const { report, next } = build(remembered.get(key)?.snapshot ?? {});
-      if (remember) commit(key, startedAs, next);
-      return report;
+      try {
+        const { report, next } = build(remembered.get(key) ?? {});
+        if (remember && startedAs > path.committedStart) {
+          path.committedStart = startedAs;
+          commit(key, next);
+        }
+        return report;
+      } finally {
+        path.inFlight -= 1;
+        if (path.inFlight === 0) auditsByPath.delete(key);
+      }
     },
   };
 }

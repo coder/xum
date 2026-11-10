@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   LAYOUT_MEMORY_MAX_PATHS,
+  layoutAuditPathsInFlight,
   layoutFingerprint,
   startLayoutAudit,
   type FingerprintSnapshot,
@@ -95,6 +96,20 @@ describe("startLayoutAudit", () => {
     expect(memoryOf(dir, "a.html")).toEqual(remember("early"));
   });
 
+  test("an older audit that finishes after the newer one's memory was evicted does not write", () => {
+    const dir = freshDir();
+    const older = startLayoutAudit(dir, "a.html");
+    const newer = startLayoutAudit(dir, "a.html");
+    finish(newer, remember("newer"));
+    // Enough other paths commit to push a.html's entry out of the bounded memory.
+    for (let index = 0; index < LAYOUT_MEMORY_MAX_PATHS; index++) {
+      finish(startLayoutAudit(dir, `other${index}.html`), remember(`other${index}`));
+    }
+    expect(memoryOf(dir, "a.html")).toEqual({});
+    finish(older, remember("older"));
+    expect(memoryOf(dir, "a.html")).toEqual({});
+  });
+
   test("the start order is kept per path", () => {
     const dir = freshDir();
     const early = startLayoutAudit(dir, "a.html");
@@ -134,5 +149,36 @@ describe("startLayoutAudit", () => {
     }
     finish(startLayoutAudit(dir, "newcomer.html"), remember("newcomer"), false);
     expect(memoryOf(dir, "p0.html")).toEqual(remember("p0"));
+  });
+});
+
+describe("the audits of a path in flight", () => {
+  test("a path counts from its first start until its last finish", () => {
+    const dir = freshDir();
+    const base = layoutAuditPathsInFlight();
+    const first = startLayoutAudit(dir, "a.html");
+    const second = startLayoutAudit(dir, "a.html");
+    expect(layoutAuditPathsInFlight()).toBe(base + 1);
+    finish(second, remember("second"));
+    expect(layoutAuditPathsInFlight()).toBe(base + 1);
+    finish(first, {}, false);
+    expect(layoutAuditPathsInFlight()).toBe(base);
+  });
+
+  test("a finish that leaves nothing behind still ends the audit", () => {
+    const base = layoutAuditPathsInFlight();
+    finish(startLayoutAudit(freshDir(), "a.html"), remember("dropped"), false);
+    expect(layoutAuditPathsInFlight()).toBe(base);
+  });
+
+  const throwingBuild = () => {
+    throw new Error("build failed");
+  };
+
+  test("a build that throws still ends the audit", () => {
+    const base = layoutAuditPathsInFlight();
+    const turn = startLayoutAudit(freshDir(), "a.html");
+    expect(() => turn.finish(throwingBuild, true)).toThrow("build failed");
+    expect(layoutAuditPathsInFlight()).toBe(base);
   });
 });
