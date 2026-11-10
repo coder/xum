@@ -36,7 +36,6 @@ import {
   shellQuote,
   type SpawnCommandOptions,
 } from "@/node/runtime/backgroundCommands";
-import { getBashPath } from "@/node/utils/main/bashPath";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
 import {
   openRecordFile,
@@ -52,6 +51,7 @@ import {
 } from "@/node/runtime/LocalBaseRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { isAgentSandboxStartError } from "@/node/runtime/sandbox/agentSandboxTargets";
+import { PROTECTED_BASH } from "@/node/runtime/sandbox/sandboxPaths";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
 import { isErrnoWithCode } from "@/node/utils/fs";
@@ -241,12 +241,12 @@ async function createEmptyOutputLog(
  * The launcher of a call that the user approved to run outside the agent sandbox. Its PATH is the
  * user's, which can hold a folder that sandboxed commands write (an activated .venv/bin), and the
  * approval card shows only the script, so `nohup` and `bash` do not come from that PATH (Codex
- * review): the bash of an approved foreground call, and the nohup that macOS protects.
+ * review): macOS protects both.
  */
 function approvedLauncher(
   sandbox: SpawnOptions["sandbox"]
 ): Pick<SpawnCommandOptions, "bashPath" | "nohupPath"> {
-  return sandbox === "off" ? { bashPath: getBashPath(), nohupPath: "/usr/bin/nohup" } : {};
+  return sandbox === "off" ? { bashPath: PROTECTED_BASH, nohupPath: "/usr/bin/nohup" } : {};
 }
 
 /**

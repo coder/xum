@@ -87,6 +87,7 @@ const MOVED_CREDENTIAL_STORES = [
   { name: "PREFIX", value: "npm", file: "npm/etc/npmrc" },
   { name: "PIP_CONFIG_FILE", value: "pip.conf", file: "pip.conf" },
   { name: "GRADLE_USER_HOME", value: "gradle", file: "gradle/gradle.properties" },
+  { name: "DOCKER_CONFIG", value: "docker", file: "docker/config.json" },
 ];
 
 describe("buildAgentSandboxPolicy", () => {

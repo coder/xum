@@ -4,6 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
+import * as bashPath from "@/node/utils/main/bashPath";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { LocalRuntime } from "./LocalRuntime";
 import { setAgentCgroupEnrollmentTargets } from "./agentCgroupEnrollment";
@@ -367,6 +368,28 @@ describe("LocalBaseRuntime.exec sandbox opt-out", () => {
     expect(await run(new SandboxedRuntime(true), "internal")).toBe("ran\n");
     expect(await run(new SandboxedRuntime(true), "off")).toBe("ran\n");
     expect(await run(new SandboxedRuntime(false), "off")).toBe("planted\nran\n");
+  });
+
+  // getBashPath() takes the first bash on Xum's PATH, which can be in a .venv/bin in the workspace.
+  it("runs every opt-out command with the bash that macOS protects", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-opt-out-bash-"));
+    const planted = path.join(dir, "bash");
+    await fs.writeFile(planted, '#!/bin/sh\necho planted\nexec /bin/bash "$@"\n', { mode: 0o755 });
+    spyOn(bashPath, "getBashPath").mockReturnValue(planted);
+    try {
+      const run = async (runtime: LocalBaseRuntime, sandbox: "off" | "internal") => {
+        const stream = await runtime.exec("echo ran", { cwd: dir, timeout: 5, sandbox });
+        await stream.stdin.close();
+        return readStreamAsString(stream.stdout);
+      };
+
+      expect(await run(new SandboxedRuntime(true), "off")).toBe("ran\n");
+      expect(await run(new SandboxedRuntime(true), "internal")).toBe("ran\n");
+      expect(await run(new SandboxedRuntime(false), "off")).toBe("planted\nran\n");
+    } finally {
+      mock.restore();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

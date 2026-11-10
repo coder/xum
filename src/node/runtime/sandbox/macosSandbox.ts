@@ -90,10 +90,16 @@ export function ensureAgentSandboxRuntime(): Promise<void> {
   return srtSession;
 }
 
-/** Stops the srt proxies and log monitor (shutdown and tests). */
+/**
+ * Stops the srt proxies and log monitor (shutdown and tests). A start still under way, such as
+ * one that a config change began, ends first: it would start them again after the reset (Codex
+ * review).
+ */
 export async function resetAgentSandboxRuntime(): Promise<void> {
-  if (srtSession === undefined) return;
+  const session = srtSession;
+  if (session === undefined) return;
   srtSession = undefined;
+  await session.catch(() => undefined);
   await SandboxManager.reset();
 }
 

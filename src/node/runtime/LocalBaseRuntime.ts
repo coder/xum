@@ -51,7 +51,7 @@ import {
   type AgentSandboxPolicy,
   type AgentSandboxPolicyInput,
 } from "./sandbox/agentSandboxTargets";
-import { isPathAtOrUnder } from "./sandbox/sandboxPaths";
+import { isPathAtOrUnder, PROTECTED_BASH } from "./sandbox/sandboxPaths";
 import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import { agentCgroupEnrollmentLineForProject } from "./agentCgroupEnrollment";
 import {
@@ -346,9 +346,9 @@ export abstract class LocalBaseRuntime implements Runtime {
    * calls, MCP servers and Xum's own commands. Bash sources the file that BASH_ENV names before
    * the script, and it defines the exported bash functions (`BASH_FUNC_git%%`) whatever BASH_ENV
    * and PATH are, and either can run a file that a sandboxed command wrote in the workspace (Codex
-   * review), so no opt-out keeps them. Xum's fixed scripts also skip the inherited PATH, which can
-   * hold a folder that sandboxed commands write (an activated <workspace>/.venv/bin), so a planted
-   * `rm` or `bash` never runs unsandboxed. This holds while the sandbox is on for any project: a
+   * review), so no opt-out keeps them. Each runs PROTECTED_BASH, and Xum's fixed scripts also skip
+   * the inherited PATH, which can hold a folder that sandboxed commands write (an activated
+   * <workspace>/.venv/bin), so a planted `rm` or `bash` never runs unsandboxed. This holds while the sandbox is on for any project: a
    * sandboxed command of one project can write those files for a call of another, and a runtime
    * for a new worktree's path finds no project at all (Codex review).
    */
@@ -368,9 +368,9 @@ export abstract class LocalBaseRuntime implements Runtime {
       ...Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("BASH_FUNC_"))),
       BASH_ENV: "",
     });
-    if (options.sandbox === "off") return { ...inherited, env: withoutBashStartup };
+    if (options.sandbox === "off") return { bashPath: PROTECTED_BASH, env: withoutBashStartup };
     return {
-      bashPath: "/bin/bash",
+      bashPath: PROTECTED_BASH,
       env: (env) => ({ ...withoutBashStartup(env), PATH: SYSTEM_PATH }),
     };
   }

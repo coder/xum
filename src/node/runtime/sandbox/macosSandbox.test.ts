@@ -4,6 +4,7 @@ import { AgentSandboxStartError, type AgentSandboxPolicy } from "./agentSandboxT
 import {
   SRT_RULES_TO_REMOVE,
   agentSandboxDenialsAfterExit,
+  ensureAgentSandboxRuntime,
   resetAgentSandboxRuntime,
   wrapWithPolicy,
 } from "./macosSandbox";
@@ -248,6 +249,30 @@ describe("wrapWithPolicy", () => {
         wrapWithPolicy(policy(), SCRIPT, { bashPath: "/bin/bash", abortSignal: controller.signal })
       )
     ).toBe(aborted);
+  });
+});
+
+describe("resetAgentSandboxRuntime", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  // A config change starts srt without waiting, so shutdown can reset it while it starts.
+  it("stops srt after a start that is still under way ends", async () => {
+    let finishStart = (): void => undefined;
+    spyOn(SandboxManager, "initialize").mockReturnValueOnce(
+      new Promise<void>((resolve) => (finishStart = resolve))
+    );
+    const reset = spyOn(SandboxManager, "reset").mockResolvedValue(undefined);
+
+    const starting = ensureAgentSandboxRuntime();
+    const stopping = resetAgentSandboxRuntime();
+    await Promise.resolve();
+    expect(reset).not.toHaveBeenCalled();
+
+    finishStart();
+    await Promise.all([starting, stopping]);
+    expect(reset).toHaveBeenCalledTimes(1);
   });
 });
 

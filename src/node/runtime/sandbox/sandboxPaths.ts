@@ -13,6 +13,13 @@ import { getXumHome } from "@/common/constants/paths";
 
 export const XUM_HOME_TOKEN = "<xumHome>";
 
+/**
+ * The bash of each call that opts out of a sandbox that applies, which macOS protects (SIP):
+ * getBashPath() takes the first bash on Xum's PATH, which can be in a folder that sandboxed
+ * commands write, such as an activated <workspace>/.venv/bin (Codex review).
+ */
+export const PROTECTED_BASH = "/bin/bash";
+
 export class AgentSandboxStartError extends Error {
   // dry-duplicate-ok: each named Error subclass sets its own message and name
   constructor(reason: string) {
@@ -321,6 +328,10 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     // Gradle reads repository credentials from gradle.properties in its user home, which the
     // environment can move into an open folder (Codex review). Gradle skips a file it cannot see.
     ...fromEnv("GRADLE_USER_HOME", "gradle.properties"),
+    // Docker keeps registry logins and proxy passwords in config.json in its config folder, which
+    // DOCKER_CONFIG can move into an open folder (Codex review). ~/.docker is not open, and the
+    // sandbox closes the Docker socket in any case.
+    ...fromEnv("DOCKER_CONFIG", "config.json"),
     `${XUM_HOME_TOKEN}/server.lock`,
     `${XUM_HOME_TOKEN}/providers.jsonc`,
     `${XUM_HOME_TOKEN}/secrets.json`,

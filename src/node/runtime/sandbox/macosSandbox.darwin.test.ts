@@ -13,6 +13,7 @@ import type { BackgroundHandle } from "@/node/runtime/Runtime";
 import { spawnProcess } from "@/node/services/backgroundProcessExecutor";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createTestToolConfig, mockToolCallOptions } from "@/node/services/tools/testHelpers";
+import * as bashPath from "@/node/utils/main/bashPath";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { syncLocalGitSubmodules } from "@/node/runtime/submoduleSync";
 import {
@@ -907,7 +908,14 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
           { mode: 0o755 }
         );
       }
-      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+      // getBashPath() takes the first bash on Xum's PATH, which can be that folder too. Sandboxed
+      // commands run it as well, so the marker is hidden: only a launcher outside can write it.
+      setAgentSandboxTargets({
+        fallback: BASE_SETTINGS,
+        byProject: new Map(),
+        hiddenFiles: [marker],
+      });
+      const xumBash = spyOn(bashPath, "getBashPath").mockReturnValue(path.join(plantDir, "bash"));
 
       const result = await spawnProcess(new LocalRuntime(workspace), "echo approved", {
         cwd: workspace,
@@ -916,6 +924,7 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
         env: { BASH_ENV: startup, PATH: `${plantDir}:${process.env.PATH ?? ""}` },
         sandbox: "off",
       });
+      xumBash.mockRestore();
       expect(result.success).toBe(true);
       if (!result.success) return;
       try {
