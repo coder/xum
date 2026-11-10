@@ -475,11 +475,11 @@ function simpleCommands(run: string): string[][] {
   return run
     .replace(/\\\r?\n\s*/g, " ")
     .split("\n")
+    .map((line) => line.replace(/(^|\s)#.*/, "$1"))
     .flatMap((line) => line.split(/;|&&|\|\||\||&/))
     .map((part) => {
       const words: string[] = [];
       for (const raw of part.trim().split(/\s+/)) {
-        if (raw.startsWith("#")) break;
         const word = raw.replace(/^(?:\$\(|\(|`)+/, "").replace(/[)`]+$/, "");
         if (word !== "") words.push(word);
       }
@@ -491,20 +491,22 @@ function simpleCommands(run: string): string[][] {
 
 const basename = (word: string): string => word.slice(word.lastIndexOf("/") + 1);
 
-// Whether the arguments of one electron-builder call build the Linux AppImage. `--linux` or `-l`
-// (alone or in a cluster such as `-wl`) does. Without a platform option electron-builder builds
-// for the host, so the call builds it on a runner that may be Linux, unless it is another
-// command (`install-app-deps`) or builds no package (`--dir`, `--help`).
+// Whether the arguments of one electron-builder call build the Linux AppImage. A call that builds
+// no package (`--dir`, `--help`) or runs another command (`install-app-deps`) does not. Otherwise
+// `--linux` or `-l` (alone or in a cluster such as `-wl`) does. Without a platform option
+// electron-builder builds for the host, so the call builds it on a runner that may be Linux, unless
+// it names another platform (`--mac`, `--win`, `-m`, `-w`).
 function electronBuilderBuildsAppImage(args: string[], mayRunOnLinux: boolean): boolean {
-  if (args.some((arg) => arg === "--linux" || /^-[mwl]*l[mwl]*$/.test(arg))) return true;
-  const otherPlatform = args.some(
-    (arg) => arg === "--mac" || arg === "--win" || /^-[mwl]+$/.test(arg)
-  );
   const buildsNothing =
     ["install-app-deps", "node-gyp-rebuild", "create-self-signed-cert", "start"].includes(
       args[0] ?? ""
     ) || args.some((arg) => ["--dir", "--help", "-h", "--version"].includes(arg));
-  return mayRunOnLinux && !otherPlatform && !buildsNothing;
+  if (buildsNothing) return false;
+  if (args.some((arg) => arg === "--linux" || /^-[mwl]*l[mwl]*$/.test(arg))) return true;
+  const otherPlatform = args.some(
+    (arg) => arg === "--mac" || arg === "--win" || /^-[mwl]+$/.test(arg)
+  );
+  return mayRunOnLinux && !otherPlatform;
 }
 
 // Whether a job builds the Linux AppImage. electron-builder builds it as above, directly or through
@@ -521,7 +523,10 @@ function buildsAppImage(job: WorkflowJob): boolean {
       words.some((word, i) => {
         const rest = words.slice(i + 1);
         if (basename(word) === "make") {
-          return rest.includes("dist-linux") || (mayRunOnLinux && rest.includes("dist"));
+          return (
+            rest.some((arg) => /^dist-linux(?:-|$)/.test(arg)) ||
+            (mayRunOnLinux && rest.includes("dist"))
+          );
         }
         if (word === "run")
           return rest[0] === "dist:linux" || (mayRunOnLinux && rest[0] === "dist");
@@ -629,6 +634,15 @@ describe("the AppImage job detector", () => {
     ["make dist after cd and &&", linux, "cd app && make dist", true],
     ["make dist in a for loop", linux, "for i in 1; do make dist; done", true],
     ["make dist before a comment", linux, "make dist # build it", true],
+    ["make dist-linux-arm64", linux, "make dist-linux-arm64", true],
+    [
+      "a semicolon in a comment line",
+      linux,
+      "# Packaging is elsewhere; make dist is not run\ntrue",
+      false,
+    ],
+    ["a semicolon in a comment after a command", linux, "true # one; make dist", false],
+    ["electron-builder -l --dir", linux, "bun x electron-builder -l --dir", false],
   ])("%s", (_name, runsOn, run, builds) => {
     expect(buildsAppImage({ "runs-on": runsOn, steps: [{ run }] })).toBe(builds);
   });
