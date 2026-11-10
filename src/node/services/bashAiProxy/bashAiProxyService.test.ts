@@ -442,15 +442,39 @@ describe("BashAiProxyService", () => {
         target,
         opened,
         fetch: hostFetch,
+        /** True once a forward listens on `remotePort`: a restore in the background is up. */
+        listening: (remotePort: number) => relays.has(remotePort),
         closes: () => closes,
         /** Another user binds `remotePort` and answers every probe with `answer`. */
         occupy: (remotePort: number, answer: string) => strangers.set(remotePort, answer),
-        dropAll: () => {
+        /** Resolves after every dropped forward has reported `closed`, as the manager sees it. */
+        dropAll: async () => {
+          const closed = [...relays.values()].map(
+            (relay) => new Promise<void>((resolve) => relay.once("close", () => resolve()))
+          );
           for (const relay of relays.values()) destroyAll(relay);
           relays.clear();
+          await Promise.all(closed);
         },
       };
     }
+
+    /**
+     * Polls `condition` until it holds. It fails after 4 s, under the 5 s test timeout, and says
+     * which condition never held. Only a failure pays the budget. The clock is monotonic, so a
+     * test that sets the system time cannot stretch it.
+     */
+    async function until(condition: () => boolean | Promise<boolean>): Promise<void> {
+      const deadline = Bun.nanoseconds() + 4e9;
+      while (!(await condition())) {
+        if (Bun.nanoseconds() > deadline) {
+          throw new Error(`timed out waiting for: ${condition.toString()}`);
+        }
+        await Bun.sleep(5);
+      }
+    }
+
+    const portOf = (env: Record<string, string>) => Number(new URL(env.ANTHROPIC_BASE_URL).port);
 
     test("commands reach the proxy through the host's forwarded port and are counted", async () => {
       const host = fakeSshHost("ssh-host-1");
@@ -476,8 +500,7 @@ describe("BashAiProxyService", () => {
       expect(host.opened).toHaveLength(1);
 
       // A dropped forward is opened again on the next turn.
-      host.dropAll();
-      await Bun.sleep(10);
+      await host.dropAll();
       await proxy.envFor("ssh-ws", "ssh", []);
       expect(host.opened).toHaveLength(2);
     });
@@ -543,7 +566,7 @@ describe("BashAiProxyService", () => {
 
       proxy = makeProxy();
       await proxy.restore();
-      await Bun.sleep(50);
+      await until(() => host.listening(portOf(fromB))); // the forward restores in the background
       expect(host.opened).toHaveLength(2);
       const res = await host.fetch(`${fromB.ANTHROPIC_BASE_URL}/v1/messages`, {
         method: "POST",
@@ -575,6 +598,8 @@ describe("BashAiProxyService", () => {
       rootShared = true;
       proxy = makeProxy();
       await proxy.restore();
+      // A restore that opens nothing has no completion to wait for: the pause only gives a
+      // regression time to show.
       await Bun.sleep(50);
       expect(host.opened).toHaveLength(1); // restore opened nothing
       expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
@@ -636,7 +661,7 @@ describe("BashAiProxyService", () => {
         setSystemTime(new Date(first + 4 * 60 * 60_000));
         proxy = makeProxy();
         await proxy.restore();
-        await Bun.sleep(50);
+        await until(async () => (await usedAt()) > afterTraffic); // saved in the background
         expect(await usedAt()).toBeGreaterThan(afterTraffic);
       } finally {
         setSystemTime();
@@ -648,11 +673,6 @@ describe("BashAiProxyService", () => {
       let open!: () => void;
       const gate = new Promise<void>((resolve) => (open = resolve));
       return { ...fakeSshHost(hostKey, { gate }), open };
-    }
-
-    async function until(condition: () => boolean): Promise<void> {
-      for (let i = 0; i < 200 && !condition(); i++) await Bun.sleep(5);
-      expect(condition()).toBe(true);
     }
 
     test("turning the switch off during a forward setup closes the forward it returns", async () => {
@@ -716,7 +736,9 @@ describe("BashAiProxyService", () => {
 
       proxy = makeProxy();
       await proxy.restore();
-      await Bun.sleep(50); // forwards restore in the background
+      // The forwards restore in the background. A Coder host has no job past its first await,
+      // so it has opened nothing once the plain host's forward is up.
+      await until(() => plain.listening(portOf(before)));
       expect(plain.opened).toHaveLength(2);
       expect(coder.opened).toHaveLength(1);
 
@@ -742,7 +764,7 @@ describe("BashAiProxyService", () => {
       const after = await proxy.envFor("ssh-ws", "ssh", []);
       expect(after.ANTHROPIC_BASE_URL).toBe(before.ANTHROPIC_BASE_URL);
       expect(host.opened).toHaveLength(1); // the surviving forward still reaches the new proxy
-      host.dropAll();
+      await host.dropAll();
     });
 
     test("a taken remote port moves to the next candidate, and a restart adopts that forward", async () => {
@@ -759,7 +781,7 @@ describe("BashAiProxyService", () => {
       const after = await proxy.envFor("ssh-ws", "ssh", []);
       expect(after.ANTHROPIC_BASE_URL).toBe(before.ANTHROPIC_BASE_URL);
       expect(host.opened).toEqual([taken, next]); // adopted: nothing opened after the restart
-      host.dropAll();
+      await host.dropAll();
     });
   });
 
