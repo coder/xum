@@ -725,6 +725,29 @@ describe("BashAiProxyService", () => {
       expect(host.opened).toHaveLength(1); // the surviving forward still reaches the new proxy
       host.dropAll();
     });
+
+    test("a taken remote port moves to the next candidate, and a restart adopts that forward", async () => {
+      const host = fakeSshHost("ssh-host-16", { survivesClose: true });
+      sshTargets.set("ssh-ws", host.target);
+      const [taken, next] = candidatePorts(`${rootDir}\0ssh-host-16`, 4);
+      // Another process on the host holds the first remote candidate.
+      const stranger = http.createServer((_req, res) => res.end("not the proxy"));
+      await new Promise<void>((resolve) => stranger.listen(taken, "127.0.0.1", resolve));
+      try {
+        const before = await proxy.envFor("ssh-ws", "ssh", []);
+        expect(before.ANTHROPIC_BASE_URL).toBeDefined();
+        expect(new URL(before.ANTHROPIC_BASE_URL).port).toBe(String(next));
+        await proxy.stop(); // a crash: the ssh -R process survives, the backend does not
+
+        proxy = makeProxy();
+        const after = await proxy.envFor("ssh-ws", "ssh", []);
+        expect(after.ANTHROPIC_BASE_URL).toBe(before.ANTHROPIC_BASE_URL);
+        expect(host.opened).toEqual([taken, next]); // adopted: nothing opened after the restart
+        host.dropAll();
+      } finally {
+        stranger.close();
+      }
+    });
   });
 
   test("a provider redirect is refused, not followed", async () => {
