@@ -140,27 +140,34 @@ setDefaultTimeout(30_000);
 
 // A remote monitor polls once a second and every poll runs shell commands, so a monitor test
 // that waits for a state change needs a deadline in the tens of seconds on a busy host. The
-// deadline stays below the file's test timeout, so a real hang still fails with a message.
+// deadline stays below the file's test timeout, so a real hang still fails with a message. A test
+// that waits twice in a row needs its own timeout above the sum of the waits.
 const MONITOR_WAIT = { timeoutMs: 20_000, intervalMs: 50 };
 
 function waitForMonitorMatch(
   manager: BackgroundProcessManager,
   timeoutMs = 20_000
 ): Promise<{ workspaceId: string; payload: MonitorMatchPayload }> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      manager.off("monitor:match", handler);
-      reject(new Error("Timed out waiting for monitor match"));
-    }, timeoutMs);
+  const match = new Promise<{ workspaceId: string; payload: MonitorMatchPayload }>(
+    (resolve, reject) => {
+      const timeout = setTimeout(() => {
+        manager.off("monitor:match", handler);
+        reject(new Error("Timed out waiting for monitor match"));
+      }, timeoutMs);
 
-    const handler = (workspaceId: string, payload: MonitorMatchPayload) => {
-      clearTimeout(timeout);
-      manager.off("monitor:match", handler);
-      resolve({ workspaceId, payload });
-    };
+      const handler = (workspaceId: string, payload: MonitorMatchPayload) => {
+        clearTimeout(timeout);
+        manager.off("monitor:match", handler);
+        resolve({ workspaceId, payload });
+      };
 
-    manager.on("monitor:match", handler);
-  });
+      manager.on("monitor:match", handler);
+    }
+  );
+  // A test that fails before it awaits the match leaves this promise to reject on its timer, and
+  // an unhandled rejection can fail a later test. An await still sees the rejection.
+  match.catch(() => undefined);
+  return match;
 }
 
 describe("BackgroundProcessManager", () => {
@@ -982,7 +989,7 @@ describe("BackgroundProcessManager", () => {
       } finally {
         outputProbeFailure.value = false;
       }
-    });
+    }, 60_000);
 
     it("suppresses already-shown matches from the failed stop payload", async () => {
       const stoppedEvents: MonitorStoppedPayload[] = [];
@@ -1024,7 +1031,7 @@ describe("BackgroundProcessManager", () => {
       } finally {
         outputProbeFailure.value = false;
       }
-    });
+    }, 60_000);
 
     it("retires the monitor when the output file disappears mid-run", async () => {
       // Budget (#7531): the monitor's first remote poll can run before the file changes. Then
