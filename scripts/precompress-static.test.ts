@@ -1,8 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { brotliCompressSync, brotliDecompressSync, constants, gunzipSync } from "zlib";
+import { SPAWNING_TEST_TIMEOUT_MS } from "./ci/runScript";
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const SCRIPT = path.join(import.meta.dir, "precompress-static.ts");
 

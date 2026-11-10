@@ -2,16 +2,20 @@
 // records each wait and returns at once, so the wait sequence is asserted without waiting.
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally: bun test ./scripts/retry.test.ts
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { runScript, writeExecutable, type RunResult } from "./ci/runScript";
+import {
+  SPAWNING_TEST_TIMEOUT_MS,
+  runScript,
+  writeExecutable,
+  type RunResult,
+} from "./ci/runScript";
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const RETRY = path.resolve(import.meta.dir, "retry.sh");
-
-// A test whose command really sleeps (4 s here) needs more than bun's 5 s default on a busy host.
-const SLOW_TEST_MS = 30_000;
 
 let work: string;
 
@@ -86,27 +90,23 @@ describe("exponential backoff", () => {
     expect(await lines("sleeps")).toEqual(["2", "4", "8", "16", "32", "60", "60", "60"]);
   });
 
-  test(
-    "stops when the next wait would end after the budget, counting the wait",
-    async () => {
-      // Each try takes 1 s, so the wait before try 4 (16 s) is the first to pass the 15 s budget.
-      // A budget check that ignored the wait would run on until the tries alone took 15 s.
-      const result = await retry([
-        "--max-backoff-secs",
-        "60",
-        "--budget-secs",
-        "15",
-        "0",
-        "2",
-        await command({ seconds: 1 }),
-      ]);
-      expect(result.exitCode).toBe(1);
-      expect(result.stdout).toContain("15s budget is spent");
-      expect(await lines("runs")).toHaveLength(4);
-      expect(await lines("sleeps")).toEqual(["2", "4", "8"]);
-    },
-    SLOW_TEST_MS
-  );
+  test("stops when the next wait would end after the budget, counting the wait", async () => {
+    // Each try takes 1 s, so the wait before try 4 (16 s) is the first to pass the 15 s budget.
+    // A budget check that ignored the wait would run on until the tries alone took 15 s.
+    const result = await retry([
+      "--max-backoff-secs",
+      "60",
+      "--budget-secs",
+      "15",
+      "0",
+      "2",
+      await command({ seconds: 1 }),
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("15s budget is spent");
+    expect(await lines("runs")).toHaveLength(4);
+    expect(await lines("sleeps")).toEqual(["2", "4", "8"]);
+  });
 
   test("gives up at once on a fatal status", async () => {
     const result = await retry([
@@ -154,26 +154,22 @@ describe.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
       }
     }
 
-    test(
-      "cuts each later try off at what is left of the budget, not at the whole budget",
-      async () => {
-        await stubTimeout();
-        const result = await retry([
-          "--budget-secs",
-          "9",
-          "0",
-          "0",
-          await command({ succeedOn: 2, seconds: 2 }),
-        ]);
-        expect(result.exitCode).toBe(0);
-        const seconds = (await lines("cuts")).map((cut) => Number(cut.split(" ")[2]));
-        expect(seconds).toHaveLength(2);
-        expect(seconds[0]).toBe(9);
-        expect(seconds[1]).toBeLessThanOrEqual(7);
-        expect(seconds[1]).toBeGreaterThan(0);
-      },
-      SLOW_TEST_MS
-    );
+    test("cuts each later try off at what is left of the budget, not at the whole budget", async () => {
+      await stubTimeout();
+      const result = await retry([
+        "--budget-secs",
+        "9",
+        "0",
+        "0",
+        await command({ succeedOn: 2, seconds: 2 }),
+      ]);
+      expect(result.exitCode).toBe(0);
+      const seconds = (await lines("cuts")).map((cut) => Number(cut.split(" ")[2]));
+      expect(seconds).toHaveLength(2);
+      expect(seconds[0]).toBe(9);
+      expect(seconds[1]).toBeLessThanOrEqual(7);
+      expect(seconds[1]).toBeGreaterThan(0);
+    });
 
     test("kills a try that ignores the TERM 5 seconds after the cut", async () => {
       await stubTimeout();
@@ -181,19 +177,15 @@ describe.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
       expect(await lines("cuts")).toEqual(["-k 5 9"]);
     });
 
-    test(
-      "still cuts a try off when nothing is left of the budget",
-      async () => {
-        // `timeout 0` means no limit. With a budget of 0 the first try starts with 0 seconds left,
-        // and retry.sh must still cut it off (at 1 second) instead of letting it run to its end.
-        const started = Date.now();
-        const result = await retry(["--budget-secs", "0", "0", "1", "/bin/sleep", "15"]);
-        expect(result.exitCode).toBe(1);
-        expect(result.stdout).toContain("exit 124");
-        expect(Date.now() - started).toBeLessThan(10_000);
-      },
-      SLOW_TEST_MS
-    );
+    test("still cuts a try off when nothing is left of the budget", async () => {
+      // `timeout 0` means no limit. With a budget of 0 the first try starts with 0 seconds left,
+      // and retry.sh must still cut it off (at 1 second) instead of letting it run to its end.
+      const started = Date.now();
+      const result = await retry(["--budget-secs", "0", "0", "1", "/bin/sleep", "15"]);
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain("exit 124");
+      expect(Date.now() - started).toBeLessThan(10_000);
+    });
   }
 );
 
