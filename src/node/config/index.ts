@@ -2726,8 +2726,7 @@ export class Config {
     const kept = options?.keepSnapshot ? this.configSnapshot : undefined;
     this.configSnapshot = undefined;
     try {
-      rawBytes = this.readConfigBytes(options?.requireFile);
-      if (options?.readBytes) options.readBytes.bytes = rawBytes;
+      rawBytes = this.readConfigBytes(options);
       if (rawBytes !== undefined) {
         const parsedValue: unknown = JSON.parse(rawBytes.toString("utf-8"));
         if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
@@ -2800,13 +2799,19 @@ export class Config {
    * failure path (throwOnError callers rethrow); only ENOENT means missing, and with
    * `requireFile` (editConfigIfChanged) it throws too.
    */
-  private readConfigBytes(requireFile: boolean | undefined): Buffer | undefined {
+  private readConfigBytes(options?: {
+    requireFile?: boolean;
+    readBytes?: { bytes?: Buffer };
+  }): Buffer | undefined {
+    let bytes: Buffer;
     try {
-      return fs.readFileSync(this.configFile);
+      bytes = fs.readFileSync(this.configFile);
     } catch (readError) {
-      if (requireFile || !isEnoentError(readError)) throw readError;
+      if (options?.requireFile || !isEnoentError(readError)) throw readError;
       return undefined;
     }
+    if (options?.readBytes) options.readBytes.bytes = bytes;
+    return bytes;
   }
 
   private validateConfigStructure(parsed: Partial<AppConfigOnDisk>): void {

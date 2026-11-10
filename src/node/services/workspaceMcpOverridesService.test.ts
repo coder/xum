@@ -1953,10 +1953,11 @@ describe("WorkspaceMcpOverridesService", () => {
         expect(keptStat).toBe(true);
         const reader = new WorkspaceMcpOverridesService(new Config(config.rootDir));
         const { overrides: effective } = await reader.getOverridesForWorkspace(id);
-        expect({ outcome, enabled: effective.enabledServers ?? [] }).toEqual({
-          outcome: expect.stringMatching(/changed on disk/),
-          enabled: expect.not.arrayContaining(["consent-sensitive"]),
-        });
+        // Both in one assertion, so a failure shows the outcome and the server state together.
+        expect({
+          outcome: outcome.includes("changed on disk") ? "refused" : outcome,
+          serverEnabled: (effective.enabledServers ?? []).includes("consent-sensitive"),
+        }).toEqual({ outcome: "refused", serverEnabled: false });
       }
     );
 
