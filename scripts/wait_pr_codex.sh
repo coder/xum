@@ -384,9 +384,10 @@ run_codex_comments_gate() {
 # setup notice) and a failure notice that a completed board for the current head supersedes. So an
 # approval comment never blocks itself. A gate that could not read the threads or the comments (a
 # malformed page, a crash) printed no count, and that is no proof that none is open.
-# Gate 10 means the only open comment is a board that is still running (Codex often posts the code
-# receipt before its security review ends): the approval does not stand yet, so keep waiting
-# (return 10) and judge it once the board completes.
+# Gate 10 means every open comment is pending: a running board, and a failure notice beside it that
+# a completed board will supersede (Codex often posts the code receipt before its security review
+# ends). The approval does not stand yet, so keep waiting (return 10) and judge it once the board
+# completes.
 approval_stands() {
   if [ "$check_rc" -eq 10 ]; then
     return 10
