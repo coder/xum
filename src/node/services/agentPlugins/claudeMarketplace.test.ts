@@ -445,13 +445,14 @@ describe("resolveEntrySource", () => {
 
   test("a marketplace whose host Xum cannot read is remote", () => {
     // `URL` refuses `:+22`, a zone id and `|`, but OpenSSH takes the port and git signs in to the
-    // host. `#@` and a colon in the user part make `URL` and git read two different hosts.
+    // host. `#@`, a colon in the user part and an `@[` make `URL` and git read two different hosts.
     for (const marketplaceUrl of [
       "ssh://evil.example:+22/market.git",
       "ssh://[fe80::1%25eth0]/market.git",
       "ssh://evil|host/market.git",
       "ssh://localhost#@evil.example/market.git",
       "evil.example:c@localhost:market.git",
+      "ssh://localhost/y@[fe80::1]/market.git",
     ]) {
       for (const platform of ["linux", "win32"] as const) {
         onPlatform(platform, () => expectRemoteMarketplace(marketplaceUrl));

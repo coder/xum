@@ -293,7 +293,10 @@ describe("surelyOnThisMachine", () => {
     ["a path with a colon after its first slash", "/srv/repos/a:b"],
     ["a file URL", "file:///srv/repos/market"],
     ["an ssh URL to localhost", "ssh://localhost/srv/market.git"],
-    ["an ssh URL with a user, a trailing dot and a port", "ssh://git@LOCALHOST.:2222/srv/market.git"],
+    [
+      "an ssh URL with a user, a trailing dot and a port",
+      "ssh://git@LOCALHOST.:2222/srv/market.git",
+    ],
     ["an ssh URL to a loopback IPv4 spelling", "ssh://127.1/srv/market.git"],
     ["an ssh URL to the IPv6 loopback", "ssh://[::1]/srv/market.git"],
     ["an https URL to a loopback address", "https://127.0.0.1/market.git"],
@@ -337,6 +340,9 @@ describe("surelyOnThisMachine", () => {
     ["a fragment that hides the host from URL", "ssh://localhost#@evil.example/market.git"],
     // Git reads the host before the first colon, `evil.example`, and the rest as a path.
     ["an scp URL whose user part holds a colon", "evil.example:c@localhost:market.git"],
+    // An `@[` anywhere makes git read the host up to the next `]`: ssh signs in to fe80::1.
+    ["an scp URL with a later bracket", "localhost:c@[fe80::1]:market.git"],
+    ["an ssh URL with a bracket in its path", "ssh://localhost/y@[fe80::1]/market.git"],
     // Git reads the host `~h`: the first slash comes after the colon.
     ["a tilde with a colon before its first slash", "~h:org/market.git"],
     ["a colon first", ":market.git"],

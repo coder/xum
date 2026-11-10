@@ -280,9 +280,10 @@ function sourceRef(source: Record<string, unknown>): string | undefined {
 function assertMarketplaceMayName(value: string, url: string, marketplaceUrl: string): void {
   // SECURITY: a marketplace fetched from the network must not point Xum at a repository on this
   // machine (a private checkout the user never chose), by path or by a loopback host such as
-  // `ssh://localhost/...`. A marketplace on this machine may. Which marketplace is on this machine
-  // leans remote (`surelyOnThisMachine`): it grants rights, so a doubt must not.
-  const marketplaceIsLocal = surelyOnThisMachine(marketplaceUrl);
+  // `ssh://localhost/...`. A marketplace on this machine may. A marketplace is on this machine only
+  // as git reads its URL on this platform (`surelyOnThisMachine`; a drive such as `C:/market` only
+  // on Windows, where git reads it as a path): it grants rights, so a doubt must not.
+  const marketplaceIsLocal = surelyOnThisMachine(marketplaceUrl, process.platform);
   if (pointsAtThisMachine(url) && !marketplaceIsLocal) {
     throw new Error(
       `'${value}' is a path on this machine; a remote marketplace cannot install it.`
