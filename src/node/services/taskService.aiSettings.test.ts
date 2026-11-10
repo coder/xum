@@ -1938,7 +1938,7 @@ describe("TaskService", () => {
         identity: {
           attemptId: string | undefined;
           receiptEligible: boolean;
-          inheritedReport: boolean;
+          inheritedReport: null;
         }
       ): unknown;
       settleOwnedTaskAttempt(taskId: string, attempt: unknown, source: string): void;
@@ -2001,7 +2001,7 @@ describe("TaskService", () => {
               successor = ledger.beginOwnedTaskAttempt(childId, "test-successor", {
                 attemptId: undefined,
                 receiptEligible: false,
-                inheritedReport: false,
+                inheritedReport: null,
               });
             }
             throw new Error("handle store disk full");

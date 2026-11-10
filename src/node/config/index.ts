@@ -34,8 +34,11 @@ import type {
 } from "@/common/config/schemas";
 import {
   DEFAULT_MODEL_FALLBACKS,
+  FABLE_5_1_DEFAULT_MODEL_FALLBACKS,
+  FABLE_5_DEFAULT_MODEL_FALLBACKS,
   LEGACY_DEFAULT_MODEL_FALLBACKS,
   SEEDED_MODEL_FALLBACKS,
+  sanitizeFallbackModelString,
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
@@ -679,6 +682,93 @@ function migrateRaisedTaskSettingsDefaults(
   if (migrations.taskSettingsDefaultsRaised === true) return configModified;
   parsed.taskSettings = raisePreviousTaskSettingsDefaults(parsed.taskSettings);
   parsed.migrations = { ...migrations, taskSettingsDefaultsRaised: true };
+  return true;
+}
+
+/**
+ * Source-model keys under which one raw on-disk fallback entry counts as "already has
+ * a chain" for the seed. A `coder:` key keeps the persistence key form
+ * (sanitizeFallbackModelString): runtime lookup is raw-first, so a Coder-scoped chain
+ * serves only its own selection and must not stand in for the direct default (a
+ * cross-typed or shadowed Coder instance never shares the direct chain). Read-time
+ * sanitizing drops an entry whose chain sanitizes away, such as a hand-written
+ * `{enabled: false, models: []}`. A default-typed Coder selection then falls through to
+ * the direct key, so such an entry also covers its direct key, as it did before.
+ */
+function fallbackSeedGapKeys(key: string, entry: unknown): string[] {
+  const scopedKey = sanitizeFallbackModelString(key);
+  if (!scopedKey.startsWith("coder:")) return [scopedKey];
+  const keptAtRuntime = normalizeModelFallbacks({ [key]: entry }) !== undefined;
+  return keptAtRuntime ? [scopedKey] : [scopedKey, normalizeToCanonical(key).trim()];
+}
+
+/**
+ * One-time seed passes for the default refusal-fallback chains (e.g. Fable →
+ * Opus), one per migration flag. Each fable alias move adds a pass: older
+ * configs only have a chain for the old source key, and the new key is a new
+ * default that deserves one seed of its own (still never overwriting an
+ * existing chain for it).
+ *
+ * Each chain is gated on its own flag. Claiming a flag tells a downgraded build
+ * (whose FABLE is that era's id) that its own default was seeded, so the pass
+ * that claims a flag must carry that era's chain, or a downgrade would silently
+ * lose refusal fallback. A flag that is already set is never re-run, so users
+ * who later edit or delete a default chain are not overridden.
+ * SEEDED_MODEL_FALLBACKS, not DEFAULT_MODEL_FALLBACKS: chains added after these
+ * flags shipped reach fresh installs only (#5087).
+ */
+const MODEL_FALLBACK_SEED_PASSES = [
+  ["defaultModelFallbacksSeeded", FABLE_5_DEFAULT_MODEL_FALLBACKS],
+  ["defaultModelFallbacksSeededFable51", FABLE_5_1_DEFAULT_MODEL_FALLBACKS],
+  ["defaultModelFallbacksSeededFable52", SEEDED_MODEL_FALLBACKS],
+] as const;
+
+/** Every seed-pass flag claimed; fresh installs start with all of them. */
+const ALL_MODEL_FALLBACK_SEED_FLAGS = Object.fromEntries(
+  MODEL_FALLBACK_SEED_PASSES.map(([flag]) => [flag, true])
+) as Record<(typeof MODEL_FALLBACK_SEED_PASSES)[number][0], true>;
+
+/**
+ * Run the pending MODEL_FALLBACK_SEED_PASSES on `parsed` (mutated in place).
+ * Returns true when it changed the config (it then claims every pass flag).
+ */
+function seedDefaultModelFallbacks(
+  parsed: Partial<AppConfigOnDisk> & Record<string, unknown>
+): boolean {
+  const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
+  const pendingPasses = MODEL_FALLBACK_SEED_PASSES.filter(
+    ([flag]) => migrationsBeforeSeed[flag] !== true
+  );
+  if (pendingPasses.length === 0) {
+    return false;
+  }
+  // Gap-check against the RAW on-disk map (keys from fallbackSeedGapKeys), not
+  // the sanitized map: a hand-edited entry whose chain sanitizes away (e.g.
+  // {enabled:false, models:[]}) is still user intent and must not be
+  // overwritten. Merging into the raw map also keeps unrelated chains
+  // byte-identical on disk (lenient-on-read preserved).
+  const rawFallbacks =
+    typeof parsed.modelFallbacks === "object" &&
+    parsed.modelFallbacks !== null &&
+    !Array.isArray(parsed.modelFallbacks)
+      ? (parsed.modelFallbacks as Record<string, unknown>)
+      : {};
+  const existingCanonicalKeys = new Set(
+    Object.entries(rawFallbacks).flatMap(([key, entry]) => fallbackSeedGapKeys(key, entry))
+  );
+  const missingDefaults = Object.fromEntries(
+    pendingPasses
+      .flatMap(([, chains]) => Object.entries(chains))
+      .filter(([sourceModel]) => !existingCanonicalKeys.has(sourceModel))
+  );
+  if (Object.keys(missingDefaults).length > 0) {
+    // Write through the raw-record view: user entries are deliberately kept
+    // unvalidated on disk (normalizeModelFallbacks sanitizes on every read),
+    // so the merged map is not a ModelFallbacks yet.
+    const rawParsed: Record<string, unknown> = parsed;
+    rawParsed.modelFallbacks = { ...rawFallbacks, ...missingDefaults };
+  }
+  parsed.migrations = { ...migrationsBeforeSeed, ...ALL_MODEL_FALLBACK_SEED_FLAGS };
   return true;
 }
 
@@ -1818,6 +1908,17 @@ function configFileWatchDirsKey(dirs: ReadonlyMap<string, ReadonlySet<string>>):
   return JSON.stringify(Array.from(dirs, ([dir, names]) => [dir, Array.from(names)]));
 }
 
+/**
+ * Returned by an editConfig transform that changed nothing: the edit then writes nothing. The
+ * transform runs under the edit's lock on the bytes a write would replace, so the decision is
+ * made inside the same hold (a check read before the lock can miss another process's commit).
+ */
+export const CONFIG_UNCHANGED: unique symbol = Symbol("config unchanged");
+/** An editConfig transform (see CONFIG_UNCHANGED). */
+export type ConfigEditTransform = (
+  config: ProjectsConfig
+) => ProjectsConfig | typeof CONFIG_UNCHANGED;
+
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
@@ -2602,7 +2703,12 @@ export class Config {
   }
 
   private readConfigOrDefault(
-    options?: { throwOnError?: boolean; keepSnapshot?: boolean },
+    options?: {
+      throwOnError?: boolean;
+      keepSnapshot?: boolean;
+      /** A missing config.json fails the read like an unreadable one (see readConfigBytes). */
+      requireFile?: boolean;
+    },
     key?: string
   ): ProjectsConfig {
     // Read as a Buffer and hand the same snapshot to the failure handler: backing up via a
@@ -2615,17 +2721,7 @@ export class Config {
     const kept = options?.keepSnapshot ? this.configSnapshot : undefined;
     this.configSnapshot = undefined;
     try {
-      try {
-        rawBytes = fs.readFileSync(this.configFile);
-      } catch (readError) {
-        // No existsSync probe: it also returns false for EACCES/ENOTDIR/EIO,
-        // which would silently select the fresh-install default while the
-        // config is merely transiently unreadable — in strict mode that
-        // empty view feeds destructive "not in config" decisions. Route
-        // non-ENOENT failures through the shared failure path below
-        // (throwOnError callers rethrow); only ENOENT means missing.
-        if (!isEnoentError(readError)) throw readError;
-      }
+      rawBytes = this.readConfigBytes(options?.requireFile);
       if (rawBytes !== undefined) {
         const parsedValue: unknown = JSON.parse(rawBytes.toString("utf-8"));
         if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
@@ -2682,13 +2778,29 @@ export class Config {
         ? { agentHeartbeatsEnabled: true }
         : {}),
       migrations: {
-        defaultModelFallbacksSeeded: true,
-        defaultModelFallbacksSeededFable51: true,
+        ...ALL_MODEL_FALLBACK_SEED_FLAGS,
         persistentSubagentsDefaulted: true,
         agentHeartbeatsSeeded: true,
         taskSettingsDefaultsRaised: true,
       },
     };
+  }
+
+  /**
+   * config.json's bytes, or undefined when it does not exist. No existsSync probe: it also
+   * returns false for EACCES/ENOTDIR/EIO, which would silently select the fresh-install default
+   * while the config is merely transiently unreadable — in strict mode that empty view feeds
+   * destructive "not in config" decisions. Non-ENOENT failures throw into the caller's shared
+   * failure path (throwOnError callers rethrow); only ENOENT means missing, and with
+   * `requireFile` (editConfigIfChanged) it throws too.
+   */
+  private readConfigBytes(requireFile: boolean | undefined): Buffer | undefined {
+    try {
+      return fs.readFileSync(this.configFile);
+    } catch (readError) {
+      if (requireFile || !isEnoentError(readError)) throw readError;
+      return undefined;
+    }
   }
 
   private validateConfigStructure(parsed: Partial<AppConfigOnDisk>): void {
@@ -2996,60 +3108,9 @@ export class Config {
     const minThinkingLevelByModel = normalizeMinThinkingLevelByModel(
       parsed.minThinkingLevelByModel
     );
-    // One-time seed of the default refusal-fallback chains (e.g. Fable →
-    // Opus). Guarded by migrations.defaultModelFallbacksSeeded so the
-    // seed is applied exactly once: users who later edit or delete the
-    // default chains are not overridden on subsequent loads/updates.
-    // defaultModelFallbacksSeededFable51 re-runs the gap-check once after
-    // the fable alias moved to Fable 5.1: pre-5.1 configs only have a
-    // chain for the old source key, and the new key is a new default that
-    // deserves one seed of its own (still never overwriting an existing
-    // 5.1 chain).
-    const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
-    if (
-      migrationsBeforeSeed.defaultModelFallbacksSeeded !== true ||
-      migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true
-    ) {
-      // Gap-check against the RAW on-disk map with canonicalized keys, not
-      // the sanitized map: a hand-edited entry whose chain sanitizes away
-      // (e.g. {enabled:false, models:[]}) is still user intent and must not
-      // be overwritten. Merging into the raw map also keeps unrelated
-      // chains byte-identical on disk (lenient-on-read preserved).
-      const rawFallbacks =
-        typeof parsed.modelFallbacks === "object" &&
-        parsed.modelFallbacks !== null &&
-        !Array.isArray(parsed.modelFallbacks)
-          ? (parsed.modelFallbacks as Record<string, unknown>)
-          : {};
-      const existingCanonicalKeys = new Set(
-        Object.keys(rawFallbacks).map((key) => normalizeToCanonical(key).trim())
-      );
-      // Completing the original seed pass claims defaultModelFallbacksSeeded,
-      // which downgraded builds trust for their own (pre-5.1) default keys;
-      // seed those legacy chains too so a downgrade keeps refusal fallback.
-      // SEEDED_MODEL_FALLBACKS, not DEFAULT_MODEL_FALLBACKS: chains added
-      // after these flags shipped reach fresh installs only (#5087).
-      const seedDefaults =
-        migrationsBeforeSeed.defaultModelFallbacksSeeded !== true
-          ? { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...SEEDED_MODEL_FALLBACKS }
-          : SEEDED_MODEL_FALLBACKS;
-      const missingDefaults = Object.fromEntries(
-        Object.entries(seedDefaults).filter(
-          ([sourceModel]) => !existingCanonicalKeys.has(sourceModel)
-        )
-      );
-      if (Object.keys(missingDefaults).length > 0) {
-        // Write through the raw-record view: user entries are deliberately
-        // kept unvalidated on disk (normalizeModelFallbacks sanitizes on
-        // every read), so the merged map is not a ModelFallbacks yet.
-        const rawParsed: Record<string, unknown> = parsed;
-        rawParsed.modelFallbacks = { ...rawFallbacks, ...missingDefaults };
-      }
-      parsed.migrations = {
-        ...migrationsBeforeSeed,
-        defaultModelFallbacksSeeded: true,
-        defaultModelFallbacksSeededFable51: true,
-      };
+    // One-time seed passes of the default refusal-fallback chains (see
+    // MODEL_FALLBACK_SEED_PASSES).
+    if (seedDefaultModelFallbacks(parsed)) {
       configModified = true;
     }
 
@@ -3113,7 +3174,10 @@ export class Config {
       // re-applied on every load, so the identity transform re-reads disk, re-runs them,
       // and persists the migrated form under the queue. One-shot guard: while a persist
       // is in flight, the loads it performs internally must not re-schedule.
-      this.migrationPersist = this.enqueueGatedConfigEdit((migratedConfig) => migratedConfig)
+      this.migrationPersist = this.enqueueGatedConfigEdit(
+        (migratedConfig) => migratedConfig,
+        /* strictRead */ false
+      )
         .catch((error: unknown) => {
           // Keep startup resilient even if persisting migration fails.
           log.warn("Failed to persist migrated config", { error });
@@ -3639,9 +3703,28 @@ export class Config {
     options: { withinRegistrationLock?: ProjectRegistrationLockHandle } = {}
   ): Promise<void> {
     if (options.withinRegistrationLock !== undefined) {
-      return this.enqueueConfigEdit(fn, { kind: "held", lock: options.withinRegistrationLock });
+      return this.enqueueConfigEdit(
+        fn,
+        { kind: "held", lock: options.withinRegistrationLock },
+        /* strictRead */ false
+      );
     }
-    return this.enqueueGatedConfigEdit(fn);
+    return this.enqueueGatedConfigEdit(fn, /* strictRead */ false);
+  }
+
+  /**
+   * editConfig for a transform that may find nothing to change: returning CONFIG_UNCHANGED writes
+   * nothing. An edit that changes nothing otherwise still rewrites the whole config.json.
+   *
+   * Its read under the lock is strict: a read that fails for any reason (I/O, JSON, structure, or
+   * a config.json missing under the lock) fails the edit before `fn` runs. editConfig's lenient
+   * read hands `fn` defaults instead, which hold nothing to change, so CONFIG_UNCHANGED would
+   * report success for a file nobody read (a settings clear then left a legacy enabled server in
+   * config.json). So CONFIG_UNCHANGED only ever answers the parsed config.json. It also fails
+   * when config.json was replaced after that read, as a write's save does (#5929).
+   */
+  async editConfigIfChanged(fn: ConfigEditTransform): Promise<void> {
+    return this.enqueueGatedConfigEdit(fn, /* strictRead */ true);
   }
 
   /**
@@ -3653,7 +3736,8 @@ export class Config {
    * dropped by this process's save — even by an edit that never touched the project set.
    */
   private async enqueueGatedConfigEdit(
-    fn: (config: ProjectsConfig) => ProjectsConfig
+    fn: ConfigEditTransform,
+    strictRead: boolean
   ): Promise<void> {
     // Straight into the queue, in call order: the edit takes its own hold of the file lock
     // inside its slot, at write time. When the lock is held elsewhere — another process, or
@@ -3663,7 +3747,7 @@ export class Config {
     // waiting (see lockWaiters). Its first run was discarded: nothing it mutated survives,
     // since loadConfigOrDefault parses fresh bytes on every call.
     try {
-      return await this.enqueueConfigEdit(fn, { kind: "none" });
+      return await this.enqueueConfigEdit(fn, { kind: "none" }, strictRead);
     } catch (error) {
       if (!(error instanceof ProjectRegistrationLockContended)) throw error;
       return error.rerun;
@@ -3675,10 +3759,10 @@ export class Config {
    * for it, and records the chain's new tail. Called synchronously from the edit's queue
    * slot, so the chain order is the slot order.
    */
-  private joinLockWaiters(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
+  private joinLockWaiters(fn: ConfigEditTransform, strictRead: boolean): Promise<void> {
     const rerun = (this.lockWaiters ?? Promise.resolve()).then(() =>
       withProjectRegistrationFileLock(this.rootDir, (lock) =>
-        this.enqueueConfigEdit(fn, { kind: "held", lock })
+        this.enqueueConfigEdit(fn, { kind: "held", lock }, strictRead)
       )
     );
     // The tail settles either way, so one edit's failure never wedges the ones behind it.
@@ -4061,8 +4145,10 @@ export class Config {
    * detail rather than a caller-initiated mutation.
    */
   private enqueueConfigEdit(
-    fn: (config: ProjectsConfig) => ProjectsConfig,
-    registrationLock: RegistrationLockState
+    fn: ConfigEditTransform,
+    registrationLock: RegistrationLockState,
+    /** See editConfigIfChanged. */
+    strictRead: boolean
   ): Promise<void> {
     // Defer the fiber start to a microtask: Effect.runPromise executes fibers
     // synchronously on the caller's stack until the first async boundary, but the old
@@ -4073,7 +4159,7 @@ export class Config {
     // Effect failures reject this promise with the raw error (v4 runPromise does not
     // wrap causes), so callers observe the same rejections as before.
     return Promise.resolve().then(() =>
-      Effect.runPromise(this.enqueueConfigEditEffect(fn, registrationLock))
+      Effect.runPromise(this.enqueueConfigEditEffect(fn, registrationLock, strictRead))
     );
   }
 
@@ -4086,8 +4172,9 @@ export class Config {
    * fiber cancelled while waiting never runs its edit).
    */
   private enqueueConfigEditEffect(
-    fn: (config: ProjectsConfig) => ProjectsConfig,
-    registrationLock: RegistrationLockState
+    fn: ConfigEditTransform,
+    registrationLock: RegistrationLockState,
+    strictRead: boolean
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -4100,9 +4187,24 @@ export class Config {
     // bytes this edit did not read (#5929). A rename between this stat and the read only makes
     // the save refuse (fail closed), never overwrite.
     let readStatKey: string | undefined;
-    const transform = (): ProjectsConfig => {
+    const transform = (): ProjectsConfig | typeof CONFIG_UNCHANGED => {
       readStatKey = self.readEditStatKey();
-      return fn(self.readConfigOrDefault({ keepSnapshot: true }));
+      return fn(
+        self.readConfigOrDefault({
+          keepSnapshot: true,
+          throwOnError: strictRead,
+          requireFile: strictRead,
+        })
+      );
+    };
+    // A transform that changes nothing writes nothing, so the save's check that config.json is
+    // still the file this edit read (#5929) runs here instead. A file that a manual editor or an
+    // older build replaced after the read fails the edit as that save would: a legacy clear then
+    // reported success while the replaced file carried a legacy enable.
+    const assertReadUnchanged = (): void => {
+      const expectedStatKey = readStatKey;
+      assert(expectedStatKey !== undefined, "config edit skipped its write without a fresh read");
+      self.assertConfigFileUnchanged(expectedStatKey);
     };
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
@@ -4147,6 +4249,9 @@ export class Config {
               },
               catch: (error) => error,
             });
+            if (newConfig === CONFIG_UNCHANGED) {
+              return yield* Effect.try({ try: assertReadUnchanged, catch: (error) => error });
+            }
             return yield* write(newConfig, registrationLock.lock);
           }
           // The gate runs here, before any lock work, so an unreadable config is refused for
@@ -4169,12 +4274,16 @@ export class Config {
           yield* Effect.tryPromise({
             try: async () => {
               if (self.lockWaiters !== null) {
-                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
+                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn, strictRead));
               }
               await using lock = await tryProjectRegistrationFileLock(self.rootDir);
               if (lock === null)
-                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
-              await Effect.runPromise(write(transform(), lock));
+                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn, strictRead));
+              // CONFIG_UNCHANGED writes nothing, so it needs no write gate: editConfigIfChanged's
+              // strict read has already failed the edit on a config.json it could not read.
+              const newConfig = transform();
+              if (newConfig === CONFIG_UNCHANGED) assertReadUnchanged();
+              else await Effect.runPromise(write(newConfig, lock));
             },
             catch: (error) => error,
           });

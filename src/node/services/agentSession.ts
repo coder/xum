@@ -400,7 +400,7 @@ type AgentSessionInterruptResult = Result<void> & { streamStopped?: true };
 
 /**
  * Tracked file state for detecting external edits.
- * Uses timestamp-based polling with diff injection.
+ * Uses timestamp-based polling and a content-free notice (see createFileChangeNotificationMessage).
  */
 // Re-export types from FileChangeTracker for backward compatibility
 export type { FileState } from "@/node/services/utils/fileChangeTracker";
@@ -5816,7 +5816,7 @@ export class AgentSession {
     // Materialize @file mentions from the user message into a snapshot.
     // This ensures prompt-cache stability: we read files once and persist the content,
     // so subsequent turns don't re-read (which would change the prompt prefix if files changed).
-    // File changes after this point are surfaced via <system-file-update> diffs instead.
+    // File changes after this point are surfaced via <system-file-update> notices instead.
     const snapshotResult = isPlanReviewFeedbackSend
       ? null
       : await this.materializeFileAtMentionsSnapshot(trimmedMessage);

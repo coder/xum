@@ -145,6 +145,7 @@ describe("PluginHooksPanel with Cursor hooks", () => {
     expect(view.queryByText(/Xum runs only mcp_tool hooks/)).toBeNull();
     expect(view.queryAllByRole("button", { name: /^Trust / })).toHaveLength(0);
     expect(view.getAllByText(/does not run in remote workspaces/i)).toHaveLength(3);
+    expect(view.queryByText("needs review")).toBeNull();
   });
 
   test("shows the entry as declared, with a bidi control marked", async () => {
@@ -165,6 +166,19 @@ describe("PluginHooksPanel with Cursor hooks", () => {
     expect(trust.hasAttribute("disabled")).toBe(false);
     view.getByText(/runs a shell command on this computer as you, without a sandbox/);
     view.getByText(/does not run in remote workspaces/i);
+    view.getByText("needs review");
+  });
+
+  test("a hook shows its matcher, and a hook without one shows none", async () => {
+    const view = renderPanel([
+      cursorHook("stop", { command: "./hooks/a.sh", matcher: "^bash$" }, "runnable"),
+      cursorHook("beforeShellExecution", { command: "./hooks/b.sh" }, "runnable"),
+    ]);
+
+    await view.findByText("beforeShellExecution");
+    expect(view.getAllByText(/^matcher /).map((span) => span.textContent)).toEqual([
+      "matcher ^bash$",
+    ]);
   });
 
   test("Trust waits until the user expands a cut entry", async () => {
