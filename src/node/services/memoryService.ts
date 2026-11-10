@@ -3866,14 +3866,15 @@ function computeStrReplaceUpdate(
   newStr: string,
   virtualPath: string
 ): string {
-  const occurrences = countOccurrences(content, oldStr);
+  const offsets = findOccurrenceOffsets(content, oldStr);
+  const occurrences = offsets.length;
   if (occurrences === 0) {
     throw new MemoryCommandError(
       `No replacement was performed: old_str was not found in ${virtualPath}`
     );
   }
   if (occurrences > 1) {
-    const lines = findMatchingLines(content, oldStr);
+    const lines = lineNumbersOf(content, offsets);
     throw new MemoryCommandError(
       `No replacement was performed: old_str matches ${occurrences} locations (lines ${lines.join(", ")}) in ${virtualPath}. Provide a longer, unique old_str.`
     );
@@ -3993,39 +3994,66 @@ function assertWithinFileSizeCap(content: string, maxFileBytes?: number): void {
   }
 }
 
-function countOccurrences(content: string, needle: string): number {
-  let count = 0;
-  let index = content.indexOf(needle);
-  while (index !== -1) {
-    count += 1;
-    index = content.indexOf(needle, index + 1);
+/**
+ * Offsets of every occurrence of needle in content, ascending, with overlapping occurrences counted
+ * ("aa" in "aaa" occurs twice). Memory content and old_str are untrusted model input, so this is
+ * Knuth-Morris-Pratt over UTF-16 code units, linear in both lengths. A loop of
+ * `indexOf(needle, index + 1)` is not: each overlapping hit re-compares most of the needle, so a
+ * 50 KiB run of "a" searched in a 100 KiB file cost about 1.7 s per pass.
+ */
+export function findOccurrenceOffsets(content: string, needle: string): number[] {
+  const offsets: number[] = [];
+  // No occurrence fits, and the border table below would be as large as the needle.
+  if (needle.length > content.length) return offsets;
+  const borders = borderTable(needle);
+  let matched = 0;
+  for (let i = 0; i < content.length; i++) {
+    const unit = content.charCodeAt(i);
+    while (matched > 0 && unit !== needle.charCodeAt(matched)) matched = borders[matched - 1];
+    if (unit === needle.charCodeAt(matched)) matched += 1;
+    if (matched === needle.length) {
+      offsets.push(i - needle.length + 1);
+      // Fall back to the longest border: the next occurrence can start inside this one.
+      matched = borders[matched - 1];
+    }
   }
-  return count;
+  return offsets;
+}
+
+/** borders[i] is the length of the longest proper prefix of needle[0..i] that is also its suffix. */
+function borderTable(needle: string): Int32Array {
+  // Callers refuse an empty old_str: it would match at every offset.
+  if (needle.length === 0) throw new Error("needle must not be empty");
+  const borders = new Int32Array(needle.length);
+  let length = 0;
+  for (let i = 1; i < needle.length; i++) {
+    const unit = needle.charCodeAt(i);
+    while (length > 0 && unit !== needle.charCodeAt(length)) length = borders[length - 1];
+    if (unit === needle.charCodeAt(length)) length += 1;
+    borders[i] = length;
+  }
+  return borders;
 }
 
 /**
- * 1-based line numbers, ascending and without repeats, of the lines where occurrences of needle
- * start. Memory content is untrusted model input, so this makes ONE forward pass: needle and
- * newline are each searched once from where their last hit ended, which keeps the cost linear in
- * content.length however many matches there are. Re-splitting the prefix before every match was
- * quadratic: a failed str_replace on a 100 KB file with 51,200 matches took seconds of CPU.
+ * 1-based line numbers, ascending and without repeats, of the lines where the ascending offsets
+ * fall. One forward pass: the next newline is kept between offsets, because searching for it again
+ * per offset would rescan one long line once per match. Re-splitting the prefix before every match
+ * was quadratic: a failed str_replace on a 100 KB file with 51,200 matches took seconds of CPU.
  */
-function findMatchingLines(content: string, needle: string): number[] {
+export function lineNumbersOf(content: string, offsets: readonly number[]): number[] {
   const lines: number[] = [];
   let line = 1;
-  // First newline not yet counted into `line`, or -1 once none is left. It is kept between matches:
-  // searching for it again per match would rescan one long line once per match.
+  // First newline not yet counted into `line`, or -1 once none is left.
   let nextNewline = content.indexOf("\n");
-  let index = content.indexOf(needle);
-  while (index !== -1) {
-    // Only newlines before `index` count: a match that starts with a newline starts on the line
+  for (const offset of offsets) {
+    // Only newlines before the offset count: a match that starts with a newline starts on the line
     // that newline ends.
-    while (nextNewline !== -1 && nextNewline < index) {
+    while (nextNewline !== -1 && nextNewline < offset) {
       line += 1;
       nextNewline = content.indexOf("\n", nextNewline + 1);
     }
     if (lines[lines.length - 1] !== line) lines.push(line);
-    index = content.indexOf(needle, index + 1);
   }
   return lines;
 }
