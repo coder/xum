@@ -36,6 +36,7 @@ import {
   ArtifactsTabLabel,
   MemoryTabLabel,
   OutputTabLabel,
+  PlanTabLabel,
   ReviewTabLabel,
   StatsTabLabel,
   TimelineTabLabel,
@@ -76,6 +77,9 @@ const DevToolsTab = lazyPanel("Debug", () =>
 );
 const GoalTab = lazyPanel("Goal", () =>
   import("@/browser/features/RightSidebar/GoalTab").then((m) => m.GoalTab)
+);
+const PlanTab = lazyPanel("Plan", () =>
+  import("@/browser/features/RightSidebar/PlanTab").then((m) => m.PlanTab)
 );
 const MemoryTab = lazyPanel("Memory", () =>
   import("@/browser/features/RightSidebar/Memory/MemoryTab").then((m) => m.MemoryTab)
@@ -123,6 +127,11 @@ export interface TabPanelContext {
     onTouchImmersiveChange: (isTouch: boolean) => void;
   };
   artifacts: {
+    /** Set when a shortcut opened the tab: the panel takes focus so its single-key shortcuts work. */
+    autoFocus: boolean;
+    onAutoFocusConsumed: () => void;
+  };
+  plan: {
     /** Set when a shortcut opened the tab: the panel takes focus so its single-key shortcuts work. */
     autoFocus: boolean;
     onAutoFocusConsumed: () => void;
@@ -185,6 +194,18 @@ const TAB_RENDERERS = {
   instructions: {
     Label: ({ workspaceId }) => <InstructionsTabLabel workspaceId={workspaceId} />,
     renderPanel: (ctx) => <InstructionsTab workspaceId={ctx.workspaceId} />,
+  },
+  plan: {
+    Label: PlanTabLabel,
+    renderPanel: (ctx) => (
+      <ErrorBoundary workspaceInfo="Plan tab">
+        <PlanTab
+          workspaceId={ctx.workspaceId}
+          autoFocus={ctx.plan.autoFocus}
+          onAutoFocusConsumed={ctx.plan.onAutoFocusConsumed}
+        />
+      </ErrorBoundary>
+    ),
   },
   goal: {
     Label: ({ workspaceId }) => <GoalTabLabel workspaceId={workspaceId} />,

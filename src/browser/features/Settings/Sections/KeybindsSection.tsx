@@ -71,6 +71,9 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   OPEN_TIMELINE_DIALOG: "Open Timeline tab (small viewports)",
   OPEN_STATS_DIALOG: "Open Stats tab (small viewports)",
   OPEN_ARTIFACTS_TAB: "Focus Artifacts tab, or hide the sidebar when focused",
+  OPEN_PLAN_TAB: "Open Plan tab",
+  PLAN_TAB_EDIT: "Open the plan file in the editor (Plan tab)",
+  PLAN_TAB_COPY: "Copy the plan (Plan tab)",
   TOGGLE_AGENT_INTERFACE_VIEW: "Switch between status page and chat (Agent interface view)",
   TOGGLE_STATUS_TRANSCRIPT_PEEK: "Show or hide the transcript on the status page",
   STATUS_START_HERE: "Start here from the agent's last reply (status page)",
@@ -272,6 +275,10 @@ const KEYBIND_GROUPS: Array<{
       "OPEN_TIMELINE_DIALOG",
       "OPEN_STATS_DIALOG",
     ],
+  },
+  {
+    label: "Plan tab",
+    keys: ["OPEN_PLAN_TAB", "PLAN_TAB_EDIT", "PLAN_TAB_COPY"],
   },
   {
     label: "Artifacts",
