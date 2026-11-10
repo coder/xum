@@ -75,19 +75,25 @@ const BASE_SRT_CONFIG: SandboxRuntimeConfig = {
 };
 
 let srtSession: Promise<void> | undefined;
+// The last reset, which every start waits for: the reset would stop a start that began while it
+// ran, and that start's callers would see srt as ready (Codex review).
+let srtReset: Promise<void> = Promise.resolve();
 
 /**
  * Starts srt's HTTP and SOCKS proxy on 127.0.0.1 and its violation log monitor, once. A failed
  * start is retried by the next caller; until one succeeds, sandboxed commands fail closed.
  */
 export function ensureAgentSandboxRuntime(): Promise<void> {
-  srtSession ??= SandboxManager.initialize(BASE_SRT_CONFIG, undefined, true).catch(
-    (error: unknown) => {
-      srtSession = undefined;
+  if (srtSession !== undefined) return srtSession;
+  const session: Promise<void> = srtReset
+    .then(() => SandboxManager.initialize(BASE_SRT_CONFIG, undefined, true))
+    .catch((error: unknown) => {
+      // A start after a reset may have replaced this one.
+      if (srtSession === session) srtSession = undefined;
       throw error;
-    }
-  );
-  return srtSession;
+    });
+  srtSession = session;
+  return session;
 }
 
 /**
@@ -99,8 +105,9 @@ export async function resetAgentSandboxRuntime(): Promise<void> {
   const session = srtSession;
   if (session === undefined) return;
   srtSession = undefined;
-  await session.catch(() => undefined);
-  await SandboxManager.reset();
+  const reset = session.catch(() => undefined).then(() => SandboxManager.reset());
+  srtReset = reset.catch(() => undefined);
+  await reset;
 }
 
 /** The srt config that turns `policy` into one command's Seatbelt profile. */

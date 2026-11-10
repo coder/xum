@@ -253,7 +253,8 @@ describe("wrapWithPolicy", () => {
 });
 
 describe("resetAgentSandboxRuntime", () => {
-  afterEach(() => {
+  afterEach(async () => {
+    await resetAgentSandboxRuntime();
     mock.restore();
   });
 
@@ -273,6 +274,31 @@ describe("resetAgentSandboxRuntime", () => {
     finishStart();
     await Promise.all([starting, stopping]);
     expect(reset).toHaveBeenCalledTimes(1);
+  });
+
+  // `xum workflow` resets srt before its fibers stop, so a command can start srt during the reset.
+  it("starts srt again only after a reset ends, and keeps that start", async () => {
+    let failStart = (_error: Error): void => undefined;
+    const initialize = spyOn(SandboxManager, "initialize")
+      .mockResolvedValue(undefined)
+      .mockReturnValueOnce(new Promise<void>((_resolve, reject) => (failStart = reject)));
+    let finishReset = (): void => undefined;
+    spyOn(SandboxManager, "reset")
+      .mockResolvedValue(undefined)
+      .mockReturnValueOnce(new Promise<void>((resolve) => (finishReset = resolve)));
+
+    const first = ensureAgentSandboxRuntime();
+    const stopping = resetAgentSandboxRuntime();
+    const second = ensureAgentSandboxRuntime();
+    failStart(new Error("stopped"));
+    expect(await rejectionOf(first)).toBeInstanceOf(Error);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(initialize).toHaveBeenCalledTimes(1);
+
+    finishReset();
+    await Promise.all([stopping, second]);
+    expect(initialize).toHaveBeenCalledTimes(2);
+    expect(ensureAgentSandboxRuntime()).toBe(second);
   });
 });
 
