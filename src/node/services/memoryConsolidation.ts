@@ -691,6 +691,18 @@ export function organizerEditBudget(editLimit: number | null | undefined): {
 }
 
 /**
+ * The abort that alone ended a stream: the signal had aborted and the stream reported no error
+ * part. Undefined after a provider error, even one that came as the signal fired.
+ */
+function abortThatEndedStream(
+  streamErrors: readonly string[],
+  signal: AbortSignal | undefined
+): { reason: unknown } | undefined {
+  if (streamErrors.length > 0 || signal?.aborted !== true) return undefined;
+  return { reason: signal.reason as unknown };
+}
+
+/**
  * Run one headless consolidation pass. The caller resolves the model and the
  * dream agent body (CLI: built-in definition; app: standard agent resolution)
  * so this module stays independent of agent-resolution plumbing.
@@ -792,8 +804,8 @@ export async function runMemoryConsolidation(args: {
   });
   // An abort ends the stream without an error part, so a pass cut short by its timeout or by
   // workspace removal would read as clean and be journaled as a success.
-  const endedByAbort = streamErrors.length === 0 && args.abortSignal?.aborted === true;
-  if (endedByAbort) {
+  const abortEnd = abortThatEndedStream(streamErrors, args.abortSignal);
+  if (abortEnd !== undefined) {
     streamErrors.push("memory consolidation was cut short by its timeout or by workspace removal");
   }
   // Set apart from `streamErrors`: only a stream that failed or was aborted has unreliable usage.
@@ -846,6 +858,6 @@ export async function runMemoryConsolidation(args: {
     spentUsd: meter.spentUsd(),
     note: meter.note(),
     streamError,
-    abortReason: endedByAbort ? args.abortSignal?.reason : undefined,
+    abortReason: abortEnd?.reason,
   };
 }

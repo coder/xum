@@ -5622,7 +5622,7 @@ describe("MemoryConsolidationService", () => {
         ["no edit was applied", refused, "timeout"],
       ] as const)("fails a stream error when %s", (_why, ops, reason) => {
         const runTimeout = fired();
-        const abortReason = reason === "timeout" ? runTimeout.reason : reason;
+        const abortReason: unknown = reason === "timeout" ? runTimeout.reason : reason;
         expect(
           organizerRunEnd({ ops: [...ops], streamError: "cut short", abortReason }, runTimeout)
         ).toEqual({ kind: "failed", error: "consolidation stream failed: cut short" });
