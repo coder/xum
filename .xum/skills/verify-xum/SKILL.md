@@ -260,8 +260,11 @@ output: it resolves relative paths against its daemon's directory.
 ### WebKit capture
 
 agent-browser drives Chromium. Phone users run Safari, which is WebKit, and the two engines lay
-some pages out differently, so a Chromium pass cannot show a WebKit-only defect. `webkit-capture`
-opens a page of the run in Playwright WebKit at a phone viewport:
+some pages out differently, so a Chromium pass cannot show a WebKit-only defect. Playwright WebKit
+on Linux is still not iOS Safari: a phone-width screenshot of it did not reproduce the exact iPhone
+Safari Mermaid overflow that led to this capture. So a clean `-webkit` capture is not proof for iOS
+Safari. `webkit-capture` opens a page
+of the run in Playwright WebKit at a phone viewport:
 
 ```bash
 .xum/skills/verify-xum/scripts/verify-xum.sh webkit-capture "/workspace/$VERIFY_XUM_WORKSPACE_ID" chat/reply
@@ -345,8 +348,9 @@ Proof standards:
 - For every UI change to layout, CSS, SVG or scrolling, add a WebKit capture
   (`verify-xum.sh webkit-capture`, above) of each page the change reaches, and read the
   `-webkit` PNG next to the `-375` one. Phone users run Safari, which is WebKit, and agent-browser
-  is Chromium: a page that fits in the `-375` capture can still break in WebKit, as Mermaid
-  diagrams did on an iPhone. Say which captures you could not make in WebKit, and why.
+  is Chromium: a page that fits in the `-375` capture can still break in WebKit. Say which captures
+  you could not make in WebKit, and why. For a bug a user saw in iOS Safari, a clean `-webkit`
+  capture does not close it: report it as not checked on a real iPhone.
 - Check side effects next to what is visible: rows in
   `$VERIFY_XUM_ROOT/sessions/<workspace id>/chat.jsonl`, entries in `$VERIFY_XUM_ROOT/config.json`,
   git state in the worktree, or the CLI view above.
