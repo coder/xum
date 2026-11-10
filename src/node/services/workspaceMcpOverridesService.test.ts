@@ -6336,6 +6336,12 @@ describe("WorkspaceMcpOverridesService", () => {
         }
         return cfg;
       });
+      // The value fails the workspace before any write: the sweep does not rewrite config.json
+      // for a value it then cannot prune.
+      const configFile = path.join(config.rootDir, "config.json");
+      // The first registry read can backfill rows (createdAt) and save once: take it first.
+      await config.getAllWorkspaceMetadata();
+      const inodeBefore = nodeFs.statSync(configFile).ino;
 
       const failures = await service.prunePluginOverrideKeysForWorkspaces(
         [naming.workspaceId, unrelated.workspaceId, bystander.workspaceId],
@@ -6345,6 +6351,7 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(failures.map((failure) => failure.workspaceId)).toEqual([naming.workspaceId]);
       expect(String(failures[0].error)).toMatch(/legacy MCP settings value/);
       expect(await enabledOf(bystander.workspacePath)).toEqual(["other"]);
+      expect(nodeFs.statSync(configFile).ino).toBe(inodeBefore);
     });
   });
 
