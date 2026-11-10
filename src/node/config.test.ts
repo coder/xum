@@ -853,6 +853,50 @@ describe("Config", () => {
       expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
     });
 
+    it("rejects the edit when its read of config.json fails with ENOENT while the file stays in place", async () => {
+      // The lenient read treats ENOENT as a fresh install and hands the transform defaults. The
+      // file was there all along (a transient lookup failure), and its stat did not change, so
+      // a save on those defaults would replace the registry: the edit has no bytes to vouch for.
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/repo-kept", { workspaces: [] });
+        return cfg;
+      });
+      const configFile = path.join(tempDir, "config.json");
+      const before = fs.readFileSync(configFile, "utf-8");
+      config.loadConfigOrDefault();
+      const realRead = fs.readFileSync;
+      let failedReads = 0;
+      const readSpy = spyOn(fs, "readFileSync").mockImplementation(((
+        ...args: Parameters<typeof fs.readFileSync>
+      ) => {
+        if (failedReads === 0 && String(args[0]) === configFile) {
+          failedReads++;
+          throw Object.assign(new Error("ENOENT: injected lookup failure"), { code: "ENOENT" });
+        }
+        return realRead(...args);
+      }) as typeof fs.readFileSync);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      let sawDefaults = false;
+      let error: unknown;
+      try {
+        error = await config
+          .editConfig((cfg) => {
+            sawDefaults = cfg.projects.size === 0;
+            return { ...cfg, updateChannel: "nightly" };
+          })
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+      } finally {
+        readSpy.mockRestore();
+        errorSpy.mockRestore();
+      }
+      expect({ failedReads, sawDefaults }).toEqual({ failedReads: 1, sawDefaults: true });
+      expect(String(error)).toContain("config.json changed on disk");
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(before);
+    });
+
     it("saves an edit that reads the outside bytes first", async () => {
       fs.writeFileSync(path.join(tempDir, "config.json"), outside);
       await config.setUpdateChannel("nightly");
