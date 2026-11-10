@@ -13,6 +13,7 @@ import {
   collectPluginBackup,
   PLUGIN_BACKUP_DIR,
   PLUGIN_BACKUP_MANIFEST_PATH,
+  readPluginRestore,
 } from "./agentPluginBackup";
 import { captureRejection, commitAll, runGit, writeFixtureFile } from "./testHelpers";
 
@@ -100,6 +101,11 @@ describe("backup of the managed plugin list", () => {
     const request = { repositoryRoot: repository.rootDir, managedPath: settings.path };
     return { gitRepo, payload, repository, managed, request };
   }
+
+  /** The lock a plugin install, update or uninstall holds; calling what it returns finishes it. */
+  const startMutation = () => acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+  /** Long enough that a read which ignored the lock would be done. */
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 250));
 
   async function readSidecar(managed: string): Promise<unknown> {
     return JSON.parse(
@@ -242,33 +248,180 @@ describe("backup of the managed plugin list", () => {
         "source.url",
       ],
       [
-        "whitespace in its URL",
+        "a folder the installer refuses",
         {
           source: {
             type: "git",
-            url: "https://github.com/example/two words.git",
+            url: "https://github.com/example/mono.git",
+            ref: "main",
+            refType: "branch",
+            subpath: "../mono",
+          },
+        },
+        "source.subpath",
+      ],
+      [
+        "a folder written with its slashes (the installer takes it without them)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "main",
+            refType: "branch",
+            subpath: "/plugins/beta/",
+          },
+        },
+        "source.subpath",
+      ],
+      [
+        "a URL the installer's source parser refuses (the schema reads ext as an scp host)",
+        {
+          source: { type: "git", url: "ext::payload", ref: "main", refType: "branch" },
+        },
+        "source.url",
+      ],
+      [
+        "a URL with a query the installer strips",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git?x=1",
             ref: "main",
             refType: "branch",
           },
         },
         "source.url",
       ],
+      [
+        "a URL with a fragment the installer strips",
+        {
+          source: {
+            type: "git",
+            url: "git@github.com:example/mono.git#main",
+            ref: "main",
+            refType: "branch",
+          },
+        },
+        "source.url",
+      ],
+      [
+        "a ref git cannot hold",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "feature branch",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
       ["a commit that is not a full id", { lockedSha: "abc123" }, "lockedSha"],
+      [
+        "a ref with a bidi character (a branch the installer takes)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "ma\u202Ein",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a ref with a zero-width joiner (a branch the installer takes)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "ma\u200Din",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a ref with a soft hyphen (a branch the installer takes)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "ma\u00ADin",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a ref with an emoji tag character (a branch the installer takes)",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "ma\u{E0067}in",
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a ref over 256 characters",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "b".repeat(257),
+            refType: "branch",
+          },
+        },
+        "source.ref",
+      ],
+      [
+        "a folder over 1024 characters",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/mono.git",
+            ref: "main",
+            refType: "branch",
+            subpath: "a".repeat(1025),
+          },
+        },
+        "source.subpath",
+      ],
+      [
+        "an MCP server name over 256 characters",
+        { importedComponents: { skills: [], mcpServers: ["m".repeat(257)] } },
+        "importedComponents.mcpServers",
+      ],
+      [
+        "a URL that starts with a dash (git would read it as an option)",
+        {
+          source: { type: "git", url: "-ux:touch", ref: "main", refType: "branch" },
+        },
+        "source.url",
+      ],
     ])(
-      "refuses the push for a plugin with %s, naming the plugin and the way out",
+      "leaves out a plugin with %s, logs its name and the field, and still pushes the others",
       async (_label, overrides, field) => {
-        await writeRegistry(muxRoot, [registryRow("alpha"), registryRow("too-big", overrides)]);
+        const info = spyOn(log, "info").mockImplementation(() => undefined);
+        await writeRegistry(muxRoot, [registryRow("alpha"), registryRow("held-back", overrides)]);
         const { payload, managed, request } = await prepare();
 
-        const error = (await captureRejection(
-          payload.exportTo({ ...request, contents: DEFAULT_CONTENTS })
-        )) as { code?: string; message: string };
+        await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
 
-        expect(error.code).toBe("IO_ERROR");
-        expect(error.message).toContain('"too-big"');
-        expect(error.message).toContain(field);
-        expect(error.message).toContain('Turning off "Agent plugins"');
-        expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
+        const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
+        expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha"]);
+        const logged = info.mock.calls.filter(([message]) =>
+          String(message).includes("the backup list cannot hold")
+        );
+        expect(logged).toHaveLength(1);
+        expect(String(logged[0]?.[0])).toContain(field);
+        expect(logged[0]?.[1]).toEqual({ plugin: "held-back" });
+        // The log names the plugin and the field, never a URL, a ref or a name it holds.
+        expect(JSON.stringify(info.mock.calls)).not.toContain("github.com");
+        info.mockRestore();
       }
     );
 
@@ -282,6 +435,10 @@ describe("backup of the managed plugin list", () => {
         "host-starts-with-localhost": "ssh://git@localhost.example.com/example/repo.git",
         // scp-style ssh to a host named `file`: a remote source, which the backup schema reads.
         "scp-host-named-file": "file:host/share/scp-host-named-file.git",
+        // A user before a one-letter host is no drive: Git for Windows reads `h:` alone as one.
+        "scp-user-one-letter-host": "git@h:example/scp-user-one-letter-host.git",
+        // `%20` has no other spelling, so a producer escapes it: this install must still push.
+        "escaped-space": "https://dev.azure.com/org/My%20Project/_git/escaped-space",
       } as const;
       const leftOutUrls = {
         "abs-path": "/home/someone/plugins/abs-path",
@@ -290,6 +447,9 @@ describe("backup of the managed plugin list", () => {
         "nt-share": "/??/UNC/someone/share/nt-share.git",
         "home-path": "~/plugins/home-path",
         "drive-path": "C:\\plugins\\drive-path",
+        // Git for Windows opens a drive-relative path as a local folder, not as ssh to a host `C`.
+        "drive-relative-path": "C:plugins/drive-relative-path",
+        "drive-relative-namespace": String.raw`\\?\C:\plugins\drive-relative-namespace`,
         "ssh-localhost": "ssh://user@localhost/home/someone/repo.git",
         "git-loopback": "git://127.0.0.1/someone/repo.git",
         "scp-localhost": "localhost:someone/repo.git",
@@ -320,6 +480,271 @@ describe("backup of the managed plugin list", () => {
         .filter(([message]) => String(message).includes("its source is on this machine"))
         .map(([, fields]) => (fields as { plugin: string }).plugin);
       expect(logged.sort()).toEqual(Object.keys(leftOutUrls).sort());
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin whose URL has whitespace, a control character or a format character, and logs it", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      // The installer takes an scp-style source with a space, so that plugin works here: the push
+      // must not fail for it, or no backup could be made.
+      const withUrl = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const spacedUrls = {
+        "scp-with-space": "gitbox:srv/my repos/r.git",
+        "https-with-space": "https://github.com/example/two words.git",
+        "control-character": "https://github.com/example/re\u0007po.git",
+        "right-to-left-mark": "https://github.com/exam\u200Fple/repo.git",
+      };
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        ...Object.entries(spacedUrls).map(([name, url]) =>
+          registryRow(name, { source: withUrl(url) })
+        ),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha"]);
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("a format character"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(Object.keys(spacedUrls).sort());
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin whose URL escapes a letter, a digit or one of - . _ ~, and logs it", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const withUrl = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const escapedUrls = {
+        // The publish-time secret scan reads the list as written, so this token would pass it.
+        "escaped-token": `https://example.com/%67hp_${"a".repeat(36)}/repo.git`,
+        "escaped-digit": "https://example.com/org/%31/escaped-digit.git",
+        "escaped-tilde": "https://example.com/%7Eorg/escaped-tilde.git",
+      };
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        ...Object.entries(escapedUrls).map(([name, url]) =>
+          registryRow(name, { source: withUrl(url) })
+        ),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      const exported = await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha"]);
+      expect(exported.secretFiles).toEqual([]);
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("as a percent escape"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(Object.keys(escapedUrls).sort());
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin that hides a token behind an allowed percent escape, and logs only its name", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const withUrl = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const hiddenUrls = {
+        // `%20` ends the word before the token, so the raw scan finds no `\bghp_`.
+        "token-after-space": `https://example.com/%20ghp_${"a".repeat(36)}/repo.git`,
+        "key-header": "https://example.com/-----BEGIN%20PRIVATE%20KEY-----/repo.git",
+        // An escape of an escape decodes to the token on a second read.
+        "double-escaped": `https://example.com/%2520ghp_${"b".repeat(36)}/repo.git`,
+        // A malformed escape has no reading to rely on (left out for that, not for a token).
+        "malformed-escape": "https://example.com/%E0%A4%A/repo.git",
+      };
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        // A `%20` that hides nothing keeps working, and stays in the list.
+        registryRow("spaced", { source: withUrl("https://dev.azure.com/org/My%20Project/_git/x") }),
+        ...Object.entries(hiddenUrls).map(([name, url]) =>
+          registryRow(name, { source: withUrl(url) })
+        ),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      const exported = await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const text = await fs.readFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "utf-8");
+      const sidecar = JSON.parse(text) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha", "spaced"]);
+      expect(text).not.toContain("ghp_");
+      expect(text).not.toContain("PRIVATE");
+      expect(exported.secretFiles).toEqual([]);
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("percent escape"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(Object.keys(hiddenUrls).sort());
+      // The log names the plugin only: no URL and no token.
+      const everything = JSON.stringify(info.mock.calls);
+      for (const leak of ["ghp_", "PRIVATE", "example.com"]) expect(everything).not.toContain(leak);
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin that hides a token behind an escape of two to four levels, and lists a space escaped up to four times", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const withUrl = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const token = "a".repeat(36);
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        // `%2520` is a space escaped twice: it hides nothing, so the plugin stays listed.
+        registryRow("spaced-twice", {
+          source: withUrl("https://dev.azure.com/org/My%2520Project/_git/x"),
+        }),
+        // `%2567` is `%67`, which is `g`: the first pass sees only a percent sign.
+        registryRow("g-twice", { source: withUrl(`https://example.com/%2567hp_${token}/r.git`) }),
+        registryRow("g-thrice", {
+          source: withUrl(`https://example.com/%252567hp_${token}/r.git`),
+        }),
+        // A space escaped twice right before a token: no pass of the raw scan finds the token.
+        registryRow("space-twice-token", {
+          source: withUrl(`https://example.com/%2520ghp_${token}/r.git`),
+        }),
+        // Four levels is the most the check decodes. A space escaped four times hides nothing and
+        // stays listed. A token behind four levels shows in the fourth form, and is left out.
+        registryRow("spaced-four-levels", {
+          source: withUrl("https://dev.azure.com/org/My%25252520Project/_git/x"),
+        }),
+        registryRow("token-four-levels", {
+          source: withUrl(`https://example.com/%25252520ghp_${token}/r.git`),
+        }),
+        // A fifth level is left after the four passes: nothing says how a reader decodes it.
+        registryRow("space-five-levels", {
+          source: withUrl("https://dev.azure.com/org/My%2525252520Project/_git/x"),
+        }),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const text = await fs.readFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "utf-8");
+      const sidecar = JSON.parse(text) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual([
+        "alpha",
+        "spaced-four-levels",
+        "spaced-twice",
+      ]);
+      expect(text).not.toContain("ghp_");
+      const logged = info.mock.calls.map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual([
+        "g-thrice",
+        "g-twice",
+        "space-five-levels",
+        "space-twice-token",
+        "token-four-levels",
+      ]);
+      expect(JSON.stringify(info.mock.calls)).not.toContain(token);
+      info.mockRestore();
+    });
+
+    it("lists a plugin on a ref the installer takes, and leaves out one with a format character", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const withRef = (name: string, ref: string) =>
+        registryRow(name, {
+          source: {
+            type: "git",
+            url: `https://github.com/example/${name}.git`,
+            ref,
+            refType: "branch",
+          },
+        });
+      // Real git holds all of these as branches, resolves them in `ls-remote` and clones them with
+      // `--branch <ref>`, which takes the next argument as its value even when it starts with a dash.
+      const listedRefs = {
+        main: "main",
+        "branch-head": "HEAD",
+        "branch-refs-foo": "refs/foo",
+        "branch-refs-team": "refs/team",
+        "branch-dash-x": "-x",
+      };
+      // The list refuses what the card would show as another ref: bidi, joiner, soft hyphen, tag.
+      const leftOutRefs = {
+        "ref-bidi": "ma\u202Ein",
+        "ref-joiner": "ma\u200Din",
+        "ref-soft-hyphen": "ma\u00ADin",
+        "ref-emoji-tag": "ma\u{E0067}in",
+      };
+      await writeRegistry(muxRoot, [
+        ...Object.entries(listedRefs).map(([name, ref]) => withRef(name, ref)),
+        ...Object.entries(leftOutRefs).map(([name, ref]) => withRef(name, ref)),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const sidecar = (await readSidecar(managed)) as {
+        plugins: Array<{ name: string; source: { ref: string } }>;
+      };
+      expect(sidecar.plugins.map((plugin) => [plugin.name, plugin.source.ref])).toEqual(
+        Object.entries(listedRefs).sort(([a], [b]) => a.localeCompare(b))
+      );
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("source.ref"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(Object.keys(leftOutRefs).sort());
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin that hides a token behind a JSON escape in a component name", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const token = `ghp_${"a".repeat(36)}`;
+      const imported = (skills: string[], mcpServers: string[]) => ({
+        importedComponents: { skills, mcpServers },
+      });
+      // The installer takes these names. JSON writes the first character as `\n`, `\t` or `\u0001`,
+      // so the token has no word boundary in the file the publish-time scan reads.
+      const hidden = {
+        "server-newline": imported([], [`\n${token}`]),
+        "skill-tab": imported([`\t${token}`], []),
+        "server-control": imported([], [`\u0001${token}`]),
+      };
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        // Control characters that hide nothing stay listed.
+        registryRow("multi-line", imported(["two\nlines"], ["a\tb"])),
+        ...Object.entries(hidden).map(([name, overrides]) => registryRow(name, overrides)),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      const exported = await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const text = await fs.readFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "utf-8");
+      const sidecar = JSON.parse(text) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha", "multi-line"]);
+      expect(text).not.toContain("ghp_");
+      expect(exported.secretFiles).toEqual([]);
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("control character"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(Object.keys(hidden).sort());
+      expect(JSON.stringify(info.mock.calls)).not.toContain("ghp_");
+      info.mockRestore();
+    });
+
+    it("leaves out a plugin that hides a token in its ref or its folder behind an escape", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const source = (extra: Record<string, unknown>) => ({
+        type: "git",
+        url: "https://github.com/example/mono.git",
+        ref: "main",
+        refType: "branch",
+        ...extra,
+      });
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        registryRow("ref-token", { source: source({ ref: `%20ghp_${"a".repeat(36)}` }) }),
+        registryRow("folder-token", {
+          source: source({ subpath: `plugins/%20ghp_${"a".repeat(36)}` }),
+        }),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((plugin) => plugin.name)).toEqual(["alpha"]);
+      expect(JSON.stringify(info.mock.calls)).not.toContain("ghp_");
       info.mockRestore();
     });
 
@@ -450,9 +875,6 @@ describe("backup of the managed plugin list", () => {
     });
 
     describe("against a plugin install, update or uninstall in progress", () => {
-      /** The lock those mutations hold; `release` is the mutation finishing. */
-      const startMutation = () => acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
-      const settle = () => new Promise((resolve) => setTimeout(resolve, 250));
       const listedNames = (manifest: Awaited<ReturnType<typeof collectPluginBackup>>) =>
         manifest?.plugins.map((plugin) => `${plugin.name}@${plugin.lockedSha}`);
 
@@ -582,6 +1004,80 @@ describe("backup of the managed plugin list", () => {
       expect(preview.plugins.skipped).toBe(false);
     });
 
+    describe("against a plugin install, update or uninstall in progress", () => {
+      it("waits for the mutation, then compares with the registry and folders it left", async () => {
+        const { payload, request } = await backupOf([registryRow("alpha"), registryRow("beta")]);
+        await useLocalRegistry([registryRow("alpha"), registryRow("beta")]);
+        await writeFixtureFile(muxRoot, "plugins/alpha/plugin.json", "{}");
+        await writeFixtureFile(muxRoot, "plugins/beta/plugin.json", "{}");
+        const finishMutation = await startMutation();
+        let done = false;
+        const previewing = payload
+          .previewRestore({ ...request, contents: DEFAULT_CONTENTS })
+          .finally(() => {
+            done = true;
+          });
+
+        await settle();
+        expect(done).toBe(false);
+        // Beta is uninstalled while the read waits: its registry row and its folder go together.
+        await writeRegistry(muxRoot, [registryRow("alpha")]);
+        await fs.rm(path.join(muxRoot, "plugins", "beta"), { recursive: true });
+        await finishMutation();
+
+        const statuses = Object.fromEntries(
+          (await previewing).plugins.rows.map((row) => [row.name, row.status])
+        );
+        expect(statuses).toEqual({ alpha: "installed", beta: "missing" });
+      });
+
+      it("fails with an IO_ERROR that names the way out when the mutation outlasts the wait", async () => {
+        const { managed } = await backupOf([registryRow("alpha")]);
+        await writeFixtureFile(muxRoot, "plugins/alpha/plugin.json", "{}");
+        const finishMutation = await startMutation();
+
+        const error = (await captureRejection(
+          readPluginRestore({
+            muxRoot,
+            sourceDir: managed,
+            contents: DEFAULT_CONTENTS,
+            lockTimeoutMs: 50,
+          })
+        )) as { code?: string; message: string };
+
+        expect(error.code).toBe("IO_ERROR");
+        expect(error.message).toContain("modifying plugins");
+        expect(error.message).toContain('Turning off "Agent plugins" restores');
+        await finishMutation();
+        // The failed wait took nothing, and a read frees the lock when it is done.
+        const report = await readPluginRestore({
+          muxRoot,
+          sourceDir: managed,
+          contents: DEFAULT_CONTENTS,
+          lockTimeoutMs: 50,
+        });
+        expect(report.rows.map((row) => row.status)).toEqual(["installed"]);
+        await (
+          await startMutation()
+        )();
+      });
+
+      it("takes no lock with the flag off, which is the way out the error names", async () => {
+        const { managed } = await backupOf([registryRow("alpha")]);
+        const finishMutation = await startMutation();
+
+        const off = await readPluginRestore({
+          muxRoot,
+          sourceDir: managed,
+          contents: PLUGINS_OFF,
+          lockTimeoutMs: 50,
+        });
+
+        expect(off.skipped).toBe(true);
+        await finishMutation();
+      });
+    });
+
     it("reads a plugin of the same name and commit from another repository, spelling or folder as in use", async () => {
       const source = (url: string, subpath?: string) => ({
         type: "git",
@@ -648,6 +1144,57 @@ describe("backup of the managed plugin list", () => {
         "other-repo-gone": "conflict",
         "same-gone": "folderMissing",
       });
+    });
+
+    it("reads the https form of a listed ssh source as that plugin, and nothing else as it", async () => {
+      const source = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const { payload, request } = await backupOf([
+        registryRow("ssh-listed", { source: source("git@github.com:example/ssh-listed.git") }),
+        registryRow("ssh-url-listed", {
+          source: source("ssh://git@host.example:2222/example/ssh-url-listed.git"),
+        }),
+        registryRow("https-listed", {
+          source: source("https://github.com/example/https-listed.git"),
+        }),
+        registryRow("another-path", { source: source("git@github.com:example/another-path.git") }),
+        registryRow("another-port", {
+          source: source("ssh://git@host.example:2222/example/another-port.git"),
+        }),
+      ]);
+      await useLocalRegistry([
+        // Installed by a review from the https address of the listed ssh source.
+        registryRow("ssh-listed", { source: source("https://github.com/example/ssh-listed.git") }),
+        registryRow("ssh-url-listed", {
+          source: source("https://host.example/example/ssh-url-listed.git"),
+        }),
+        // Installed over ssh where the backup lists the https address.
+        registryRow("https-listed", { source: source("git@github.com:example/https-listed.git") }),
+        registryRow("another-path", { source: source("https://github.com/example/elsewhere.git") }),
+        registryRow("another-port", {
+          source: source("ssh://git@host.example:2200/example/another-port.git"),
+        }),
+      ]);
+      for (const name of [
+        "ssh-listed",
+        "ssh-url-listed",
+        "https-listed",
+        "another-path",
+        "another-port",
+      ]) {
+        await writeFixtureFile(muxRoot, `plugins/${name}/plugin.json`, "{}");
+      }
+
+      const preview = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
+
+      expect(Object.fromEntries(preview.plugins.rows.map((row) => [row.name, row.status]))).toEqual(
+        {
+          "ssh-listed": "installed",
+          "ssh-url-listed": "installed",
+          "https-listed": "installed",
+          "another-path": "conflict",
+          "another-port": "conflict",
+        }
+      );
     });
 
     it("hands back the pin and the source a reinstall needs", async () => {
@@ -831,6 +1378,62 @@ describe("backup of the managed plugin list", () => {
         managed,
         JSON.stringify({ schemaVersion: 1, plugins: [alpha, option, short, share] })
       );
+
+      const preview = await previewAndValidate(payload, request);
+
+      expect(preview.plugins.rows.map((row) => row.name)).toEqual(["alpha"]);
+      expect(preview.plugins.warnings).toHaveLength(3);
+    });
+
+    it("leaves out a row whose folder the installer refuses or whose ref git cannot hold", async () => {
+      const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
+      const [alpha] = sidecar.plugins;
+      const mono = "https://github.com/example/mono.git";
+      const source = (extra: Record<string, unknown>) => ({
+        type: "git",
+        url: mono,
+        ref: "main",
+        refType: "branch",
+        ...extra,
+      });
+      const rows = [
+        alpha,
+        { ...alpha, name: "absolute-folder", source: source({ subpath: "/plugins/demo" }) },
+        { ...alpha, name: "parent-folder", source: source({ subpath: "../demo" }) },
+        { ...alpha, name: "git-folder", source: source({ subpath: ".git" }) },
+        { ...alpha, name: "spaced-ref", source: source({ ref: "feature branch" }) },
+        { ...alpha, name: "short-id-ref", source: source({ ref: "abc1234" }) },
+        { ...alpha, name: "kept-folder", source: source({ subpath: "plugins/demo" }) },
+      ];
+      await writeSidecar(managed, JSON.stringify({ schemaVersion: 1, plugins: rows }));
+
+      const preview = await previewAndValidate(payload, request);
+
+      // A row the install review would refuse is never offered for it.
+      expect(preview.plugins.rows.map((row) => row.name)).toEqual(["alpha", "kept-folder"]);
+      expect(preview.plugins.warnings).toHaveLength(5);
+    });
+
+    it("leaves out a row whose url the installer's source parser refuses or rewrites", async () => {
+      const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
+      const [alpha] = sidecar.plugins;
+      const withUrl = (name: string, url: string) => ({
+        ...alpha,
+        name,
+        source: { type: "git", url, ref: "main", refType: "branch" },
+      });
+      const rows = [
+        alpha,
+        // The schema reads `ext` as an scp host: the preview would refuse it as a remote helper.
+        withUrl("remote-helper", "ext::payload"),
+        // The parser strips a query and a fragment, so the preview would fetch another URL than
+        // the row names.
+        withUrl("with-query", "https://github.com/example/repo.git?x=1"),
+        withUrl("with-fragment", "git@github.com:example/repo.git#main"),
+      ];
+      await writeSidecar(managed, JSON.stringify({ schemaVersion: 1, plugins: rows }));
 
       const preview = await previewAndValidate(payload, request);
 
@@ -1151,20 +1754,6 @@ describe("backup of the managed plugin list", () => {
         expect((await listedRows())[0]).toMatchObject({ name: "alpha", lockedSha: shaOf("z") });
       });
 
-      it("keeps a plugin without approval when only the slashes of its folder differ", async () => {
-        const mono = "https://github.com/example/mono.git";
-        await pushFromFirstMachine([
-          registryRow("beta", { source: gitSource(mono, "plugins/beta") }),
-        ]);
-
-        const pushed = await pushFromSecondMachine([
-          registryRow("beta", { source: gitSource(mono, "/plugins/beta/") }),
-        ]);
-
-        expect(pushed.success).toBe(true);
-        expect((await listedRows()).map((row) => row.source.subpath)).toEqual(["/plugins/beta/"]);
-      });
-
       it.each([
         ["a host in another case", "https://GitHub.com/example/alpha.git"],
         ["no .git", "https://github.com/example/alpha"],
@@ -1180,9 +1769,10 @@ describe("backup of the managed plugin list", () => {
         expect(removalOf(refused).names).toEqual(["alpha"]);
       });
 
-      it("asks for approval once when the same repository comes back over SSH instead of HTTPS", async () => {
+      it("asks for approval once when an ssh install is not exactly the https form of the listed URL", async () => {
         await pushFromFirstMachine([registryRow("alpha")]);
         // The other machine has an SSH agent, so `example/alpha` shorthand became an scp URL there.
+        // Its https form (no `.git`) is not the listed `...alpha.git`: another spelling, another source.
         const overSsh = [
           registryRow("alpha", { source: gitSource("git@github.com:example/alpha") }),
         ];
@@ -1202,6 +1792,86 @@ describe("backup of the managed plugin list", () => {
         ]);
         // The backup now spells it that way, so the next push needs no approval.
         expect((await pushFromSecondMachine(overSsh)).success).toBe(true);
+      });
+
+      it("needs no approval when the install is the https form of the listed ssh source, or the other way round", async () => {
+        const https = registryRow("alpha", {
+          source: gitSource("https://github.com/example/alpha.git"),
+        });
+        const overSsh = registryRow("alpha", {
+          source: gitSource("git@github.com:example/alpha.git"),
+        });
+        // The backup lists the ssh source. A review installed it from its https address.
+        await pushFromFirstMachine([overSsh]);
+        expect((await pushFromSecondMachine([https])).success).toBe(true);
+        expect((await listedRows()).map((row) => row.source.url)).toEqual([
+          "https://github.com/example/alpha.git",
+        ]);
+
+        // The machine that installed it over ssh pushes next, and is not asked in turn.
+        expect((await pushFromSecondMachine([overSsh])).success).toBe(true);
+        expect((await listedRows()).map((row) => row.source.url)).toEqual([
+          "git@github.com:example/alpha.git",
+        ]);
+      });
+
+      it.each([
+        [
+          "another port",
+          "ssh://git@host.example:2222/example/alpha.git",
+          "ssh://git@host.example:2200/example/alpha.git",
+        ],
+        ["another path", "git@github.com:example/alpha.git", "https://github.com/example/beta.git"],
+        [
+          "another host",
+          "git@github.com:example/alpha.git",
+          "https://gitlab.com/example/alpha.git",
+        ],
+        [
+          "an ssh and an scp spelling",
+          "ssh://git@github.com/example/alpha.git",
+          "git@github.com:example/alpha.git",
+        ],
+      ])("still asks for approval for %s", async (_label, listed, installed) => {
+        await pushFromFirstMachine([registryRow("alpha", { source: gitSource(listed) })]);
+
+        const refused = await pushFromSecondMachine([
+          registryRow("alpha", { source: gitSource(installed) }),
+        ]);
+
+        expect(removalOf(refused).names).toEqual(["alpha"]);
+      });
+
+      it("pushes a plugin whose ref the list refuses without it, and asks before it drops one that was listed", async () => {
+        const withRef = (name: string, ref: string) =>
+          registryRow(name, {
+            source: {
+              type: "git",
+              url: `https://github.com/example/${name}.git`,
+              ref,
+              refType: "branch",
+            },
+          });
+        await pushFromFirstMachine([withRef("alpha", "main"), withRef("beta", "main")]);
+
+        // The installer takes a branch with a bidi mark (or a zero-width joiner), the list does not.
+        const refused = removalOf(
+          await pushFromSecondMachine([
+            withRef("alpha", "main"),
+            withRef("beta", "ma\u202Ein"),
+            withRef("gamma", "ma\u200Din"),
+          ])
+        );
+        // Only the plugin that was listed is named. `gamma` was never in the backup.
+        expect(refused).toMatchObject({ names: ["beta"], wholeList: false, unreadable: false });
+        expect(await listedNames()).toEqual(["alpha", "beta"]);
+
+        const approved = await pushFromSecondMachine(
+          [withRef("alpha", "main"), withRef("beta", "ma\u202Ein"), withRef("gamma", "ma\u200Din")],
+          { approvedPluginRemovalDigest: refused.approval }
+        );
+        expect(approved.success).toBe(true);
+        expect(await listedNames()).toEqual(["alpha"]);
       });
 
       it("pushes once the approval of that removal comes back with it", async () => {
@@ -1280,6 +1950,70 @@ describe("backup of the managed plugin list", () => {
         });
         expect(pushed.success).toBe(true);
         expect(await listedNames()).toEqual(["alpha"]);
+      });
+
+      /** Another machine's push of a change to the stored list file, applied to a fresh clone. */
+      async function changeStoredList(change: (file: string) => Promise<void>) {
+        const clone = path.join(tempDir, "tamper");
+        await fs.rm(clone, { recursive: true, force: true });
+        await runGit(["clone", "--quiet", originPath, clone]);
+        await change(path.join(clone, "xum", PLUGIN_BACKUP_MANIFEST_PATH));
+        await commitAll(clone, "change the plugin list");
+        await runGit(["-C", clone, "push", "--quiet", "origin", "HEAD:refs/heads/main"]);
+      }
+
+      it("asks again when another machine changes only the entries this build cannot read", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+        const addFuture = (url: string) =>
+          changeStoredList(async (file) => {
+            const list = JSON.parse(await fs.readFile(file, "utf-8")) as {
+              plugins: Array<{ name: string }>;
+            };
+            list.plugins = list.plugins.filter((plugin) => plugin.name !== "future");
+            list.plugins.push({ name: "future", source: { type: "archive", url } } as never);
+            await fs.writeFile(file, JSON.stringify(list), "utf-8");
+          });
+        await addFuture("https://x/one.tgz");
+        const shown = removalOf(await pushFromSecondMachine([registryRow("alpha")]));
+
+        // Same names and flags, other unreadable bytes: the approval of the card on screen no
+        // longer covers what the push would drop.
+        await addFuture("https://x/two.tgz");
+        const again = removalOf(
+          await pushFromSecondMachine([registryRow("alpha")], {
+            approvedPluginRemovalDigest: shown.approval,
+          })
+        );
+
+        expect(again).toMatchObject({ names: [], wholeList: false, unreadable: true });
+        expect(again.approval).not.toBe(shown.approval);
+        expect(await listedNames()).toEqual(["alpha", "future"]);
+      });
+
+      it("asks again when a list this build cannot read at all is unreadable for another reason", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+        // No file to hash: the approval rests on why the list was not read.
+        await changeStoredList(async (file) => {
+          // The folder stays (git keeps no empty one), so the list is there but has no file.
+          await fs.writeFile(path.join(path.dirname(file), "notes.txt"), "kept", "utf-8");
+          await fs.rm(file);
+        });
+        const shown = removalOf(await pushFromSecondMachine([registryRow("alpha")]));
+        const repeated = removalOf(await pushFromSecondMachine([registryRow("alpha")]));
+        expect(repeated.approval).toBe(shown.approval);
+
+        await changeStoredList(async (file) => {
+          await fs.writeFile(path.join(tempDir, "outside.json"), "{}", "utf-8");
+          await fs.symlink(path.join(tempDir, "outside.json"), file);
+        });
+        const again = removalOf(
+          await pushFromSecondMachine([registryRow("alpha")], {
+            approvedPluginRemovalDigest: shown.approval,
+          })
+        );
+
+        expect(again).toMatchObject({ names: [], wholeList: false, unreadable: true });
+        expect(again.approval).not.toBe(shown.approval);
       });
 
       it("asks again when the same names gain an unreadable part or the whole list", async () => {
