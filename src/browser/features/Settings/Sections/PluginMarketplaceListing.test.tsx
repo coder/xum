@@ -172,7 +172,7 @@ test("a refused Agent Plugins build is disabled with its reason while the other 
 test("the header names every marketplace file the rows come from, in build order", () => {
   const header = (entries: AgentPluginMarketplaceEntry[]) => {
     const { view } = renderListing(listingOf(entries));
-    const text = view.getByText(/marketplaces? ·/).textContent;
+    const text = view.getByText(/[Mm]arketplaces? ·/).textContent;
     view.unmount();
     return text;
   };
@@ -191,4 +191,6 @@ test("the header names every marketplace file the rows come from, in build order
       { name: "c", builds: [build("cursor")] },
     ])
   ).toBe("Cursor, Claude Code and Agent Plugins marketplaces · 3 plugins");
+  // A marketplace that lists nothing names no file.
+  expect(header([])).toBe("Marketplace · 0 plugins");
 });
