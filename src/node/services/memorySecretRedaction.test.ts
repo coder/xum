@@ -813,6 +813,12 @@ describe("redactSecretLike", () => {
         `"1. **Cookie: a" keep`,
         `"1. **Cookie: [redacted]" keep`,
       ],
+      // Markers count from the string's quote: blanks before the quote do not use them up.
+      [
+        "an indented string with blanks before the name",
+        `${" ".repeat(16)}"  Cookie: a" keep`,
+        `${" ".repeat(16)}"  Cookie: [redacted]" keep`,
+      ],
       [
         "a trace's `<` inside a string",
         `"< Set-Cookie: a" keep`,
