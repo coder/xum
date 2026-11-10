@@ -479,11 +479,13 @@ export function anthropicSupportsBetweenToolsThinking(modelString: string): bool
  *
  * On enforced accounts, Claude Opus 5.5, Claude Sonnet 5.5, Claude Haiku 5.5, and
  * Claude Fable 5.1 reject a request that replays a block whose prefix has since changed.
- * Claude Fable 5.2, Claude Mythos 5.2 and Claude Mythos 5.1 run the check on every
- * account, whatever its age. The preserved-thinking docs (fetched 2026-11-10) list a 400
- * for Mythos 5.1 on accounts created both before and after August 31, 2026, replacing the
- * older "Mythos 5.1 ... don't run the prefix check" line that #5957 relied on. Listing a
- * model that skips the check is harmless on the wire: such models accept `block_binding`.
+ * On the Claude API, Claude Fable 5.2, Claude Mythos 5.2 and Claude Mythos 5.1 run the
+ * check on every account, whatever its age. The preserved-thinking docs (fetched
+ * 2026-11-10) list a 400 for Mythos 5.1 on accounts created both before and after August 31,
+ * 2026, replacing the older "Mythos 5.1 ... don't run the prefix check" line that #5957
+ * relied on (the Fable 5.2 migration guide says Mythos 5.1 on Bedrock still skips it). Every
+ * consumer of this predicate is route-gated, and a model that skips the check accepts
+ * `block_binding`, so listing it is harmless where the check does not run.
  * See https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
  */
 export function anthropicBindsThinkingToPrefix(modelString: string): boolean {
