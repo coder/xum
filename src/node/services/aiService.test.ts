@@ -2519,6 +2519,36 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   });
 
+  /**
+   * Runs `body` with Anthropic Fast mode on the route (Coder workspaces export a gateway
+   * ANTHROPIC_BASE_URL, which takes it off) and the JSON bodies of the requests to the provider.
+   * Only serialized requests are inspected: no provider is ever contacted.
+   */
+  async function withCapturedAnthropicBodies(
+    body: (bodies: Array<{ speed?: string }>) => Promise<void>
+  ): Promise<void> {
+    const hostBaseUrl = process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_BASE_URL;
+    const bodies: Array<{ speed?: string }> = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (typeof init?.body !== "string") throw new Error("Expected serialized request body");
+        bodies.push(JSON.parse(init.body) as { speed?: string });
+        return Promise.resolve(new Response("{}", { status: 400 }));
+      }, globalThis.fetch)
+    );
+    try {
+      await body(bodies);
+    } finally {
+      fetchSpy.mockRestore();
+      if (hostBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+      else process.env.ANTHROPIC_BASE_URL = hostBaseUrl;
+    }
+  }
+
+  const sendOnce = (model: LanguageModel) =>
+    generateText({ model, prompt: "continue", maxRetries: 0 }).catch(() => undefined);
+
   // Anthropic limits Fast mode to some models (Opus 5 needs a waitlist) and rejects `speed: "fast"`
   // elsewhere, so a refusal fallback must not inherit the refused model's Fast pick.
   it.each([
@@ -2526,9 +2556,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     { pick: "the provider's Fast preference", chatTier: undefined, providerSpeed: "fast" as const },
   ])("a refusal fallback never sends Anthropic Fast mode ($pick)", async (c) => {
     using xumHome = new DisposableTempDir("ai-service-fallback-no-fast");
-    // Coder workspaces export a gateway ANTHROPIC_BASE_URL, which takes Fast mode off the route.
-    const hostBaseUrl = process.env.ANTHROPIC_BASE_URL;
-    delete process.env.ANTHROPIC_BASE_URL;
     const sourceModel = KNOWN_MODELS.FABLE.id;
     const fallbackModel = "anthropic:claude-opus-5";
     await writeMainConfig(xumHome.path, {
@@ -2543,16 +2570,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       },
     });
     harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
-    const bodies: Array<{ speed?: string }> = [];
-    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
-      Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
-        if (typeof init?.body !== "string") throw new Error("Expected serialized request body");
-        bodies.push(JSON.parse(init.body) as { speed?: string });
-        // Only inspect serialized requests; never contact a provider.
-        return Promise.resolve(new Response("{}", { status: 400 }));
-      }, globalThis.fetch)
-    );
-    try {
+    await withCapturedAnthropicBodies(async (bodies) => {
       const holder: NonNullable<StreamMessageOptions["activeTurnThinkingOverride"]> = {};
       const result = await harness.service.streamMessage({
         messages: [createMuxMessage("user", "user", "continue")],
@@ -2568,23 +2586,51 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const primary = harness.startStreamCalls[0];
       const fallback = await primary.modelFallback!.prepare(fallbackModel);
       if (!fallback.success) throw new Error("Expected prepared fallback");
-      const send = (model: LanguageModel) =>
-        generateText({ model, prompt: "continue", maxRetries: 0 }).catch(() => undefined);
       // Control: the refused model itself still runs in Fast mode.
-      await send(primary.model);
+      await sendOnce(primary.model);
       expect(bodies.at(-1)?.speed).toBe("fast");
-      await send(fallback.data.model);
+      await sendOnce(fallback.data.model);
       expect(bodies.at(-1)).not.toHaveProperty("speed");
       // A Fast pick made mid-turn does not reach the fallback either.
       holder.serviceTier = "priority";
-      await send(fallback.data.model);
+      await sendOnce(fallback.data.model);
       expect(bodies.at(-1)).not.toHaveProperty("speed");
       expect(bodies).toHaveLength(3);
-    } finally {
-      fetchSpy.mockRestore();
-      if (hostBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
-      else process.env.ANTHROPIC_BASE_URL = hostBaseUrl;
-    }
+    });
+  });
+
+  // The Auto-routing tier fallback is not a refusal fallback: the composer's model is the one the
+  // user picked, so it keeps the chat's Fast pick.
+  it("an Auto-routing tier fallback keeps the chat's Anthropic Fast pick", async () => {
+    using xumHome = new DisposableTempDir("ai-service-auto-fallback-keeps-fast");
+    const composerModel = KNOWN_MODELS.FABLE.id;
+    const tierModel = "no-such-provider:tier-model";
+    const metadata = createLocalWorkspaceMetadata("auto-fallback-fast", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      anthropic: { apiKey: "test-key" },
+    });
+    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    await withCapturedAnthropicBodies(async (bodies) => {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: tierModel,
+        thinkingLevel: "off",
+        muxProviderOptions: { openai: { serviceTier: "priority" } },
+        autoModelRouting: {
+          requestedFallbackModel: composerModel,
+          tierId: "hard",
+          model: tierModel,
+          status: "routed",
+        },
+      });
+      expect(result.success).toBe(true);
+      // The tier model cannot be built, so the turn runs on the composer's model.
+      expect(harness.startStreamCalls[0].modelString).toBe(composerModel);
+      await sendOnce(harness.startStreamCalls[0].model);
+      expect(bodies.at(-1)?.speed).toBe("fast");
+    });
   });
 
   it.each([false, true])("pins assembly across attempts (budget=%s)", async (tokenBudget) => {
