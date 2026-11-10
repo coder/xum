@@ -512,6 +512,18 @@ describe("the Agent Plugins marketplace file", () => {
     ).toEqual({ kind: "relative", subpath: "x" });
   });
 
+  test("entry names follow the plugin-name grammar here, Claude's grammar elsewhere", () => {
+    for (const name of ["Demo", "demo_tool", "a--b", "x".repeat(65)]) {
+      expect(agents([{ name, source: "./x" }]).entries[0].problem).toContain(
+        "is not a valid plugin name"
+      );
+      expect(
+        marketplace([{ name, source: "./x" }], undefined, "claude").entries[0].problem
+      ).toBeUndefined();
+    }
+    expect(agents([{ name: "demo-tool.v2", source: "./x" }]).entries[0].problem).toBeUndefined();
+  });
+
   test("an entry that names the root installs only from a Claude file", () => {
     // A listing exists only when the root has no plugin manifest, so only an entry that is its
     // own manifest (Claude) can install from the root.
