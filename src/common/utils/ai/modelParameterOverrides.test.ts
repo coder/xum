@@ -491,6 +491,23 @@ describe("resolveModelParameterOverrides", () => {
     }
   });
 
+  it("strips penalty parameters for Gemini 4 Carbon only", () => {
+    const providersConfig = withGoogleModelParameters({
+      "*": {
+        seed: 42,
+        frequency_penalty: 0.5,
+        presence_penalty: 0.5,
+      },
+    });
+
+    expect(
+      resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-carbon")
+    ).toEqual({ standard: { seed: 42 } });
+    expect(
+      resolveModelParameterOverrides(providersConfig, "google", "google:gemini-4-argon")
+    ).toEqual({ standard: { seed: 42, frequencyPenalty: 0.5, presencePenalty: 0.5 } });
+  });
+
   it("strips deprecated sampling parameters for Gemini 3.5 Flash-Lite", () => {
     const providersConfig = withGoogleModelParameters({
       "gemini-3.5-flash-lite": {

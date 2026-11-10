@@ -50,6 +50,16 @@ export function modelRejectsSamplingParameters(modelString: string): boolean {
   );
 }
 
+const PENALTY_CALL_SETTINGS = ["frequencyPenalty", "presencePenalty"] as const;
+
+/**
+ * Gemini 4 Carbon returns HTTP 400 when frequency_penalty or presence_penalty is present
+ * (Google's Carbon developer guide), so a wildcard penalty override would fail every request.
+ */
+function modelRejectsPenaltyParameters(modelString: string): boolean {
+  return stripModelProviderPrefixes(modelString).startsWith("gemini-4-carbon");
+}
+
 /**
  * Resolves model parameter overrides from providers.jsonc config.
  *
@@ -127,6 +137,11 @@ export function resolveModelParameterOverrides(
   );
   if (modelRejectsSamplingParameters(capabilityModelString)) {
     for (const key of SAMPLING_CALL_SETTINGS) {
+      delete standard[key];
+    }
+  }
+  if (modelRejectsPenaltyParameters(capabilityModelString)) {
+    for (const key of PENALTY_CALL_SETTINGS) {
       delete standard[key];
     }
   }
