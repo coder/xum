@@ -1070,7 +1070,8 @@ describe("AgentPluginInstallService marketplaces", () => {
     await expect(previewAgentsEntry("e2e")).rejects.toThrow(
       "The Agent Plugins marketplace entry 'e2e' points to a plugin named 'other'."
     );
-    // A manifest name outside the plugin-name grammar matches in the form Xum loads it.
+    // The comparison is exact: a name Xum rewrites on load does not match, and no lossy mapping
+    // pairs an entry with a differently named plugin.
     await writeFiles(marketDir, {
       ".agents/plugins/marketplace.json": JSON.stringify({
         name: "e2e-market",
@@ -1080,7 +1081,9 @@ describe("AgentPluginInstallService marketplaces", () => {
       "tools/my_tool/skills/lint/SKILL.md": skillMd("lint"),
     });
     await commit(marketDir, "an entry name with an underscore");
-    expect((await previewAgentsEntry("my_tool")).manifest.name).toBe("my-tool");
+    await expect(previewAgentsEntry("my_tool")).rejects.toThrow(
+      "points to a plugin named 'my-tool'"
+    );
     await writeFiles(marketDir, {
       ".agents/plugins/marketplace.json": JSON.stringify({
         name: "e2e-market",
