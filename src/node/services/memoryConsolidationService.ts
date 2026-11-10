@@ -211,6 +211,16 @@ function resolveDreamCostCeilingUsd(config: Config): number | undefined {
   return config.loadConfigOrDefault().userPreferences?.memory?.dreamCostCeilingUsd;
 }
 
+/**
+ * The user's edit limit for one organizer run, read at each run like the ceiling. A stored 0 (an
+ * emptied Settings field) means no limit, `null`. No stored value is `undefined`, which
+ * runMemoryConsolidation reads as the default, so existing configs keep 8 edits.
+ */
+function resolveDreamEditLimit(config: Config): number | null | undefined {
+  const saved = config.loadConfigOrDefault().userPreferences?.memory?.dreamEditLimit;
+  return saved === 0 ? null : saved;
+}
+
 export function resolveDreamAgentBody(muxRoot: string): Promise<string | null> {
   return resolveHeadlessAgentBody(muxRoot, "dream");
 }
@@ -1566,6 +1576,7 @@ export class MemoryConsolidationService extends EventEmitter {
           model: modelResult.data.model,
           pricingModel: modelResult.data.metadataModel,
           ceilingUsd: resolveDreamCostCeilingUsd(self.config),
+          editLimit: resolveDreamEditLimit(self.config),
           agentBody,
           memoryService: self.memoryService,
           metaService: self.metaService,

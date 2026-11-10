@@ -15,7 +15,7 @@
  * - pin protection: pinned files may be edited, never deleted or renamed —
  *   including via a delete/rename of an ancestor directory (subtree check)
  * - op budget: at most MEMORY_CONSOLIDATION_OP_BUDGET mutating commands per
- *   run (reads unlimited). Budget is consumed by accepted mutations only
+ *   run (reads unlimited), or the user's dream edit limit for an organizer run. Budget is consumed by accepted mutations only
  *   (applied, dry-run, and dispatch failures); guard rejections do not
  *   consume it — runaway retries are bounded by the step ceiling instead.
  * - dry-run: mutations are journaled as proposed but not applied
@@ -31,7 +31,15 @@
  * TODO(#3534, phase 2): net-shrink enforcement needs a byte-size API on
  * MemoryService; until then the journal is the only post-run signal.
  */
-import { tool, streamText, stepCountIs, type LanguageModel, type Tool } from "ai";
+import {
+  tool,
+  streamText,
+  stepCountIs,
+  type LanguageModel,
+  type StopCondition,
+  type Tool,
+  type ToolSet,
+} from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import assert from "@/common/utils/assert";
@@ -645,6 +653,16 @@ export function createConsolidationMemoryTool(args: {
 }
 
 /**
+ * The step ceiling of an organizer run: 4 steps for each edit (today's 32 steps for the default 8),
+ * never below MEMORY_CONSOLIDATION_MAX_STEPS, so a raised limit can be spent. No edit limit means
+ * no step ceiling: the run timeout and the cost ceiling end the run.
+ */
+export function organizerStepCeiling(editLimit: number | null): StopCondition<ToolSet>[] {
+  if (editLimit === null) return [];
+  return [stepCountIs(Math.max(MEMORY_CONSOLIDATION_MAX_STEPS, 4 * editLimit))];
+}
+
+/**
  * Run one headless consolidation pass. The caller resolves the model and the
  * dream agent body (CLI: built-in definition; app: standard agent resolution)
  * so this module stays independent of agent-resolution plumbing.
@@ -681,10 +699,20 @@ export async function runMemoryConsolidation(args: {
   pricingModel?: string;
   /** The run stops once its measured spend reaches this many USD; none when absent. */
   ceilingUsd?: number;
+  /**
+   * Mutating commands this run may make: the user's dream edit limit. `null` means no limit.
+   * Absent (the debug CLI) means MEMORY_CONSOLIDATION_OP_BUDGET.
+   */
+  editLimit?: number | null;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
+  const editLimit =
+    args.editLimit === undefined ? MEMORY_CONSOLIDATION_OP_BUDGET : args.editLimit;
   const journal: MemoryConsolidationOp[] = [];
   const { tool: memoryTool, isBudgetExhausted } = createConsolidationMemoryTool({
+    // No limit is an endless budget: tryConsume() never reaches Infinity, and the budget's
+    // limit is never persisted (the record keeps only `budgetExhausted`).
+    budget: createMutationBudget(editLimit ?? Number.POSITIVE_INFINITY),
     memoryService: args.memoryService,
     metaService: args.metaService,
     ctx: args.ctx,
@@ -712,14 +740,22 @@ export async function runMemoryConsolidation(args: {
         finalPassNoSecrets;
 
   const meter = createSpendMeter({ pricingModel: args.pricingModel, ceilingUsd: args.ceilingUsd });
+  // The prompt states the budget, so a raised limit reaches the model (dream.md names no number,
+  // and a user's own dream definition may not either).
+  const budgetPrompt =
+    editLimit === null
+      ? " This run has no edit limit."
+      : ` You have ${editLimit} mutating commands this run.`;
   const stream = streamText({
     model: args.model,
     system: args.agentBody,
     prompt:
-      "Run a memory-consolidation pass now. Survey the memory directories, then apply the highest-value cleanups within budget." +
+      "Run a memory-consolidation pass now." +
+      budgetPrompt +
+      " Survey the memory directories, then apply the highest-value cleanups within budget." +
       finalPassPrompt,
     tools: { memory: memoryTool },
-    stopWhen: [stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS), meter.stopIfCeilingReached],
+    stopWhen: [...organizerStepCeiling(editLimit), meter.stopIfCeilingReached],
     onStepEnd: meter.recordStep,
     maxOutputTokens: meter.maxOutputTokens,
     abortSignal: args.abortSignal,

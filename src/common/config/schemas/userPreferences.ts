@@ -193,6 +193,11 @@ export const UserPreferencesSchema = z.object({
         .min(MEMORY_DREAM_COST_CEILING_MIN_USD)
         .max(MEMORY_DREAM_COST_CEILING_MAX_USD)
         .optional(),
+      /**
+       * Mutating memory commands one organizer run (background or manual) may make. 0 means no
+       * limit; absent means MEMORY_CONSOLIDATION_OP_BUDGET. The analyzer keeps its own budget.
+       */
+      dreamEditLimit: z.number().int().min(0).optional(),
     })
     .optional(),
   ui: z
