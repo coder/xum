@@ -489,6 +489,15 @@ function createDeferredUsageRecorder(label: string, workspaceId: string) {
   };
 }
 
+/** A promise and the function that settles it: one handoff of the in-process dream turn. */
+function createHandoff(): { settled: Promise<void>; settle: () => void } {
+  let settle!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  return { settled, settle };
+}
+
 /**
  * Waits for the in-process dream turn like waitForTurnOrAbort, and also gives up when `deadline`
  * aborts: "deadline" then, "aborted" when `signal` (removal) did.
@@ -827,6 +836,8 @@ export class MemoryConsolidationService extends EventEmitter {
    * its wait was cancelled.
    */
   private dreamStreamTail: Promise<void> = Promise.resolve();
+  /** Settles each time a holder lets the in-process dream turn go (see waitForDreamTurnHandoffs). */
+  private dreamTurnHandoff = createHandoff();
 
   /**
    * Analyzer-job queue, keyed by the workspace-memory owner. `harvestInFlight` is per compaction
@@ -1569,17 +1580,21 @@ export class MemoryConsolidationService extends EventEmitter {
     // waiter still releases its link, which lets successors pass it.
     this.dreamStreamTail = previous.then(() => turnDone);
     const runTimeoutMs = resolveDreamRunTimeoutMs(this.config);
+    // Whether this run held the turn: only a holder's release hands it on (a cancelled waiter's
+    // release is no progress of the queue).
+    let held = false;
     try {
-      // Every waiter gives up after the same wait as the lock below, whatever the holder's own
-      // setting: a holder that started with the run timeout off and hung holds this in-process
-      // turn until Xum restarts, even after the user sets a timeout again. The waiter then fails
-      // and its next trigger retries; a queue of healthy runs can also make it wait that long.
+      // Every waiter gives up when one holder keeps the turn longer than the wait of the lock
+      // below, whatever the holder's own setting: a holder that started with the run timeout off
+      // and hung holds this in-process turn until Xum restarts, even after the user sets a
+      // timeout again. The waiter then fails and its next trigger retries.
       const waitMs = dreamLockWaitMs(runTimeoutMs);
-      const turn = await waitForDreamTurn(previous, signal, AbortSignal.timeout(waitMs));
+      const turn = await this.waitForDreamTurnHandoffs(previous, signal, waitMs);
       if (turn === "aborted") return { outcome: "cancelled" };
       if (turn === "deadline") {
         return { outcome: "lock-failed", error: dreamTurnTimeoutMessage(waitMs) };
       }
+      held = true;
       let releaseLock: () => Promise<void>;
       try {
         releaseLock = await acquireCrossProcessLock({
@@ -1604,7 +1619,35 @@ export class MemoryConsolidationService extends EventEmitter {
       }
     } finally {
       release();
+      if (held) this.handOffDreamTurn();
     }
+  }
+
+  /**
+   * Waits for the in-process dream turn, giving up after `waitMs` without a handoff. The deadline
+   * restarts each time a holder lets the turn go, so it bounds one holder, not the whole queue: a
+   * waiter behind several healthy runs (each cut at its own timeout) keeps its place, as an
+   * analyzer retry behind a live job must, while one behind a hung holder gives up and retries.
+   */
+  private async waitForDreamTurnHandoffs(
+    previous: Promise<void>,
+    signal: AbortSignal,
+    waitMs: number
+  ): Promise<"turn" | "aborted" | "deadline"> {
+    for (;;) {
+      const handoff = this.dreamTurnHandoff.settled.then(() => "handoff" as const);
+      const outcome = await Promise.race([
+        waitForDreamTurn(previous, signal, AbortSignal.timeout(waitMs)),
+        handoff,
+      ]);
+      if (outcome !== "handoff") return outcome;
+    }
+  }
+
+  private handOffDreamTurn(): void {
+    const handoff = this.dreamTurnHandoff;
+    this.dreamTurnHandoff = createHandoff();
+    handoff.settle();
   }
 
   /**

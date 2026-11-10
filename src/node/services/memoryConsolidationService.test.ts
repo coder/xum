@@ -2916,27 +2916,71 @@ describe("MemoryConsolidationService", () => {
       }
     }
 
+    // The turn deadline bounds one holder, not the queue: a run behind two healthy streams that
+    // together take longer than its wait still gets its turn (an analyzer retry behind a live job
+    // must not fail early), while one behind a hung holder gives up (see "dream run timeout").
+    it("restarts a waiter's turn deadline at each handoff, so a queue of healthy runs does not fail it", async () => {
+      const held = heldStreams();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      await fixture.addWorkspace("ws-other");
+      await fixture.addWorkspace("ws-third");
+      const first = fixture.service.maybeRun("ws-dream", "manual");
+      await until(() => held.events.includes("start-1"));
+
+      // From here on, every timer is one the test fires by hand.
+      const controllers: AbortController[] = [];
+      const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation(() => {
+        const controller = new AbortController();
+        controllers.push(controller);
+        return controller.signal;
+      });
+      try {
+        const second = fixture.service.maybeRun("ws-other", "manual");
+        await waitingForTurn(fixture, 2);
+        const third = fixture.service.maybeRun("ws-third", "manual");
+        await waitingForTurn(fixture, 3);
+        // The third run's first deadline: the second run's came before it.
+        const thirdFirstDeadline = controllers[1];
+
+        held.release(1);
+        await until(() => held.events.includes("start-2"));
+        // The first holder handed the turn on: the third run's old deadline no longer counts.
+        thirdFirstDeadline.abort(new DOMException("deadline", "TimeoutError"));
+        await new Promise((resolve) => setImmediate(resolve));
+        held.release(2);
+        await until(() => held.events.includes("start-3"));
+        held.release(3);
+
+        const results = await Promise.all([first, second, third]);
+        expect(results.every((run) => run.success)).toBe(true);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    });
+
     it("starts a run's timeout when its turn arrives, not while it waits behind another stream", async () => {
       // Streams hold until released, so a second stream that starts anyway (no queue) shows up
       // in the log before the first one ends, however slow the host is.
       const held = heldStreams();
       const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+      // A 3-minute run timeout tells a stream's timeout apart from each waiter's turn deadline
+      // (the 5-minute floor), which this test does not log.
+      const streamTimeoutMs = 3 * 60_000;
       let timeoutCount = 0;
       const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
-        held.events.push(`timeout-${++timeoutCount}`);
+        if (ms === streamTimeoutMs) held.events.push(`timeout-${++timeoutCount}`);
         return realTimeout(ms);
       });
       try {
         using fixture = await createFixture({ modelFactory: held.factory });
+        await fixture.config.updateUserPreferences([{ memory: { dreamRunTimeoutMinutes: 3 } }]);
         await fixture.addWorkspace("ws-other");
 
         const first = fixture.service.maybeRun("ws-dream", "manual");
         await until(() => held.events.includes("start-1"));
         const second = fixture.service.maybeRun("ws-other", "manual");
         await waitingForTurn(fixture, 2);
-        // Each run's turn deadline starts when it queues (1, 3); its stream timeout only when its
-        // turn arrives (2, then 4 after the first stream ended).
-        expect(held.events).toEqual(["timeout-1", "timeout-2", "start-1", "timeout-3"]);
+        expect(held.events).toEqual(["timeout-1", "start-1"]);
 
         held.release(1);
         await until(() => held.events.includes("start-2"));
@@ -2944,11 +2988,9 @@ describe("MemoryConsolidationService", () => {
         expect((await Promise.all([first, second])).every((run) => run.success)).toBe(true);
         expect(held.events).toEqual([
           "timeout-1",
-          "timeout-2",
           "start-1",
-          "timeout-3",
           "end-1",
-          "timeout-4",
+          "timeout-2",
           "start-2",
           "end-2",
         ]);
