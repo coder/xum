@@ -1527,6 +1527,8 @@ describe("organizerEditBudget", () => {
     [null, MEMORY_DREAM_EDIT_LIMIT_MAX],
     [MEMORY_DREAM_EDIT_LIMIT_MAX + 1, MEMORY_DREAM_EDIT_LIMIT_MAX],
     [1_000_000, MEMORY_DREAM_EDIT_LIMIT_MAX],
+    // NaN would make Math.min NaN, a budget that never refuses.
+    [Number.NaN, MEMORY_CONSOLIDATION_OP_BUDGET],
   ])("gives a limit of %p a budget of %p and a prompt line that says so", (editLimit, limit) => {
     const editBudget = organizerEditBudget(editLimit);
 

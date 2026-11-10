@@ -683,7 +683,9 @@ export function createConsolidationMemoryTool(args: {
  *
  * Unlimited, and any limit over it, runs at MEMORY_DREAM_EDIT_LIMIT_MAX: memory contents are
  * untrusted model input, so the cap bounds the accepted writes of one run and its journal rows.
- * The preference schema already refuses a larger value; Math.min guards every other caller.
+ * The preference schema already refuses a larger value; Math.min guards every other caller. NaN
+ * (the schema drops it too) would make Math.min NaN and the budget endless, so it runs at the
+ * default, like an absent limit.
  * The step ceiling is 4 steps for each edit (today's 32 steps for the default 8), never below
  * MEMORY_CONSOLIDATION_MAX_STEPS, so a raised limit can be spent.
  */
@@ -693,7 +695,7 @@ export function organizerEditBudget(editLimit: number | null | undefined): {
   stepCeiling: Array<StopCondition<ToolSet>>;
 } {
   const limit = Math.min(
-    editLimit === undefined
+    editLimit === undefined || Number.isNaN(editLimit)
       ? MEMORY_CONSOLIDATION_OP_BUDGET
       : (editLimit ?? Number.POSITIVE_INFINITY),
     MEMORY_DREAM_EDIT_LIMIT_MAX
