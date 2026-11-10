@@ -300,24 +300,27 @@ describe("TaskService", () => {
       });
     });
 
-    // A Stop or reactivation can land while the stream end awaits its report read: the second
-    // cut-source check, right before the continuation classification, discards the cut.
-    test("a stop epoch bump during the report read discards the cut instead of deferring it", async () => {
+    // A Stop or reactivation can land while the stream end awaits its reads: the second cut-source
+    // check, right before the continuation classification, discards the cut. The bump lands in
+    // the inactive-workflow-owner read, which a cut stream always awaits (the plan-like probe is
+    // skipped for a stream that has no final response or propose_plan result).
+    test("a stop epoch bump during the stream end's reads discards the cut instead of deferring it", async () => {
       // awaiting_report: a deferral would also set the task running again.
       const t = await setupChildTask({ taskStatus: "awaiting_report" });
       t.receiptFake.register("entry-1", "pending");
       const internal = t.taskService as unknown as {
-        isPlanLikeTaskWorkspace: (entry: unknown) => Promise<boolean>;
+        interruptTaskRecoveryForInactiveWorkflowOwner: (...args: unknown[]) => Promise<boolean>;
       };
-      const realIsPlanLike = internal.isPlanLikeTaskWorkspace.bind(t.taskService);
+      const realRead = internal.interruptTaskRecoveryForInactiveWorkflowOwner.bind(t.taskService);
       let bumps = 0;
-      const isPlanLike = spyOn(internal, "isPlanLikeTaskWorkspace").mockImplementation(
-        async (entry) => {
-          bumps++;
-          t.taskService.bumpWorkspaceStopEpoch(t.childId);
-          return await realIsPlanLike(entry);
-        }
-      );
+      const read = spyOn(
+        internal,
+        "interruptTaskRecoveryForInactiveWorkflowOwner"
+      ).mockImplementation(async (...args) => {
+        bumps++;
+        t.taskService.bumpWorkspaceStopEpoch(t.childId);
+        return await realRead(...args);
+      });
 
       try {
         await streamEnd(
@@ -325,7 +328,7 @@ describe("TaskService", () => {
           cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
         );
       } finally {
-        isPlanLike.mockRestore();
+        read.mockRestore();
       }
 
       expect(bumps).toBe(1);

@@ -305,6 +305,19 @@ else:
                     self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
                     self.assertIn("The reviewThreads in the GitHub reply are not a list of objects", result.stdout + result.stderr)
 
+    def test_a_thread_whose_isResolved_is_no_boolean_is_not_read_as_resolved(self):
+        # The reader selects `.isResolved == false`: the string "false" is not false, so the thread read as resolved.
+        for kind, value in (("string", "false"), ("null", None), ("number", 0)):
+            with self.subTest(kind=kind):
+                data = fixture([check()])
+                data["threads"] = [thread("[P1] Fix authorization")]
+                data["threads"][0]["isResolved"] = value
+                for script, extra in (("check_pr_reviews.sh", ("--counts-only",)), ("wait_pr_checks.sh", ())):
+                    result = self.run_script(data, script, *extra)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("The reviewThreads in the GitHub reply are not a list of objects", result.stdout + result.stderr)
+                    self.assertNotIn("UNRESOLVED_THREADS", result.stdout)
+
     def test_values_that_the_checks_gate_rejects_are_not_printed_back(self):
         for field in ("state", "mergeable", "mergeStateStatus", "reviewDecision"):
             with self.subTest(field=field):
@@ -677,6 +690,10 @@ class GateOutputTest(unittest.TestCase):
             "comments false": (lambda pr: pr["comments"].update(nodes=False), (wait,)),
             "reviews false": (lambda pr: pr["reviews"].update(nodes=False), (wait,)),
             "threads false": (lambda pr: pr["reviewThreads"].update(nodes=False), (wait, reader)),
+            # Every reader selects `.isResolved == false`, so a value that is no boolean would count as resolved.
+            "thread isResolved string": (lambda pr: pr["reviewThreads"]["nodes"][0].update(isResolved="false"), (wait, reader)),
+            "thread isResolved null": (lambda pr: pr["reviewThreads"]["nodes"][0].update(isResolved=None), (wait, reader)),
+            "thread isResolved missing": (lambda pr: pr["reviewThreads"]["nodes"][0].pop("isResolved"), (wait, reader)),
             "thread comments false": (lambda pr: pr["reviewThreads"]["nodes"][0].update(comments={"nodes": False}), (wait, reader)),
             # The wait script prints these times ("Timestamp:", "Review timestamp:"), so a time with a line
             # break and a forged line in it must stop the script.
@@ -744,7 +761,7 @@ class GateOutputTest(unittest.TestCase):
                 self.assert_clean(result, 1)
                 self.assertIn(f"Timestamp: {time}", result.stdout)
                 self.assertNotIn("are not a list of objects", result.stderr)
-        for time in (RESPONSE_AT[:-1] + ".1234567890Z", RESPONSE_AT[:-1] + ".Z", RESPONSE_AT[:-1] + ".123+00:00"):
+        for time in (RESPONSE_AT[:-1] + ".1234567890Z", RESPONSE_AT[:-1] + ".Z", RESPONSE_AT[:-1] + ".123+00:00", RESPONSE_AT[:-1], RESPONSE_AT[:-1] + ".123"):
             with self.subTest(rejected=time):
                 data = snapshot([request, comment("Review failed.", BOT, time)])
                 result = self.run_script("wait_pr_coder_agents_review.sh", "--once", data=data)

@@ -4,6 +4,7 @@ import {
   FRAME_DOCUMENT_CHECK_CAP_MS,
   FRAME_DOCUMENT_CHECK_DEADLINE_MS,
   FRAME_DOCUMENT_CHECK_LATE_MS,
+  FRAME_DOCUMENT_HEARTBEAT_MS,
 } from "@/common/constants/artifactInteractions";
 import {
   ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND,
@@ -14,6 +15,8 @@ import {
 import { runFrameDocument, type FrameParent } from "./frameDocument.testHarness";
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+/** `vi` with the fake-timer method bun implements but bun-types does not declare. */
+const fakeTimers = vi as typeof vi & { getTimerCount(): number };
 
 /** A parent window that hands each announcement to `channel`, like the frame hosts do. */
 function hostFor(channel: FrameDocumentChannel): FrameParent {
@@ -374,5 +377,108 @@ describe("frame document channel: checks", () => {
     channel.close();
     await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS + 1);
     expect(missed).toBe(0);
+  });
+
+  /**
+   * The channel's clock while `block(ms)` runs: Xum's thread is blocked that long, so each timer
+   * due meanwhile fires when the block ends, as late as it is.
+   */
+  function blockingClock() {
+    let blockEndsAt: number | null = null;
+    return {
+      now: () => blockEndsAt ?? performance.now(),
+      block: async (ms: number) => {
+        blockEndsAt = performance.now() + ms;
+        await advanceClock(ms);
+        blockEndsAt = null;
+      },
+    };
+  }
+
+  // An artifact that runs chained tasks holds its answer back past the deadline, and the deadline
+  // itself can fire on time, at the boundary between two of its tasks.
+  test("a block of Xum's thread before an on-time deadline extends the check once", async () => {
+    const clock = blockingClock();
+    const { channel } = boundChannel(clock.now);
+    let missed = 0;
+    channel.check(() => missed++);
+    await advanceClock(1000);
+    await clock.block(1000);
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS - 2000);
+    expect(missed).toBe(0);
+    // The extended window sees no block, so its deadline closes the frame.
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS - 1);
+    expect(missed).toBe(0);
+    await advanceClock(1);
+    expect(missed).toBe(1);
+  });
+
+  // A block across the deadline makes the deadline fire late, so the check gets one more deadline.
+  // The same block held back a beat that fires right after that extension. The beat belongs to the
+  // window before, so the new window must not count it: a dead document closes one deadline later.
+  test("a block across the deadline extends the check only once", async () => {
+    const clock = blockingClock();
+    const { channel } = boundChannel(clock.now);
+    let missed = 0;
+    channel.check(() => missed++);
+    // The beat due with the deadline was armed after it, so it fires right after the extension.
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS - 10);
+    await clock.block(600);
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    expect(missed).toBe(1);
+  });
+
+  // An artifact that keeps the thread busy blocks each window, not only the first one.
+  test("a block in an extended window extends the check again", async () => {
+    const clock = blockingClock();
+    const { channel } = boundChannel(clock.now);
+    let missed = 0;
+    channel.check(() => missed++);
+    await advanceClock(1000);
+    await clock.block(1000);
+    // The first deadline extends the check to two deadlines after it went out.
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS - 1000);
+    await clock.block(1000);
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS - 2000);
+    expect(missed).toBe(0);
+    // The third window sees no block.
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    expect(missed).toBe(1);
+  });
+
+  test("a heartbeat late by the threshold or less does not extend the check", async () => {
+    const clock = blockingClock();
+    const { channel } = boundChannel(clock.now);
+    let missed = 0;
+    channel.check(() => missed++);
+    // The block starts at a beat, so the next beat fires exactly the threshold late.
+    await advanceClock(FRAME_DOCUMENT_HEARTBEAT_MS);
+    await clock.block(FRAME_DOCUMENT_HEARTBEAT_MS + FRAME_DOCUMENT_CHECK_LATE_MS);
+    await advanceClock(
+      FRAME_DOCUMENT_CHECK_DEADLINE_MS -
+        2 * FRAME_DOCUMENT_HEARTBEAT_MS -
+        FRAME_DOCUMENT_CHECK_LATE_MS
+    );
+    expect(missed).toBe(1);
+  });
+
+  test("the heartbeat runs only while a check is pending", async () => {
+    const { channel, checks, answer } = boundChannel();
+    expect(fakeTimers.getTimerCount()).toBe(0);
+    let missed = 0;
+    channel.check(() => missed++);
+    await advanceClock(FRAME_DOCUMENT_HEARTBEAT_MS * 2);
+    answer(checks[0]);
+    await advanceClock(1);
+    expect(fakeTimers.getTimerCount()).toBe(0);
+
+    channel.check(() => missed++);
+    await advanceClock(FRAME_DOCUMENT_CHECK_DEADLINE_MS);
+    expect(missed).toBe(1);
+    expect(fakeTimers.getTimerCount()).toBe(0);
+
+    channel.check(() => missed++);
+    channel.close();
+    expect(fakeTimers.getTimerCount()).toBe(0);
   });
 });

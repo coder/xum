@@ -26,6 +26,12 @@ export const FRAME_DOCUMENT_CHECK_DEADLINE_MS = 5000;
  */
 export const FRAME_DOCUMENT_CHECK_LATE_MS = 250;
 /**
+ * The period of the heartbeat that runs while a check is pending (frameDocumentChannel.ts). A
+ * beat that fires more than FRAME_DOCUMENT_CHECK_LATE_MS late means the app's thread was blocked;
+ * any block longer than this period plus that threshold makes one beat that late.
+ */
+export const FRAME_DOCUMENT_HEARTBEAT_MS = 50;
+/**
  * The latest the host closes a frame whose check stays unanswered, counted from the first
  * unanswered check, however often late timers extended its deadline (frameDocumentChannel.ts).
  */
