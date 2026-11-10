@@ -216,7 +216,7 @@ function resolveDreamCostCeilingUsd(config: Config): number | undefined {
 
 /**
  * The user's edit limit for one organizer run, read at each run like the ceiling. A stored 0 (an
- * emptied Settings field) means no limit, `null`. No stored value is `undefined`, which
+ * emptied Settings field) means unlimited, `null`, which runs at the safety cap. No stored value is `undefined`, which
  * runMemoryConsolidation reads as the default, so existing configs keep 8 edits.
  */
 function resolveDreamEditLimit(config: Config): number | null | undefined {

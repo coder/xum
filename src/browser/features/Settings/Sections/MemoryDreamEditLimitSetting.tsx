@@ -1,13 +1,18 @@
 import { useState } from "react";
 import { Input } from "@/browser/components/Input/Input";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
-import { MEMORY_CONSOLIDATION_OP_BUDGET } from "@/common/constants/memory";
+import {
+  MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_DREAM_EDIT_LIMIT_MAX,
+} from "@/common/constants/memory";
 
 // Digits only: `Number()` alone would also take "0x10", "1e3", "+5" and "2.5".
 const WHOLE_NUMBER_PATTERN = /^\d+$/;
 
-const INVALID_LIMIT_MESSAGE =
-  "Enter a whole number of edits, or enter 0 or leave empty for unlimited edits.";
+/** What unlimited means: the safety cap still bounds one run (see MEMORY_DREAM_EDIT_LIMIT_MAX). */
+const UNLIMITED_LABEL = `Unlimited (safety cap: ${MEMORY_DREAM_EDIT_LIMIT_MAX} edits per run)`;
+
+const INVALID_LIMIT_MESSAGE = `Enter a whole number of edits up to ${MEMORY_DREAM_EDIT_LIMIT_MAX}, or enter 0 or leave empty for unlimited.`;
 
 /** What a draft stands for: a limit (0 means unlimited), or why it is no limit. */
 type ParsedLimit = { limit: number } | { error: string };
@@ -16,7 +21,7 @@ function parseLimit(draft: string): ParsedLimit {
   const trimmed = draft.trim();
   if (trimmed === "") return { limit: 0 };
   const limit = Number(trimmed);
-  return WHOLE_NUMBER_PATTERN.test(trimmed) && Number.isSafeInteger(limit)
+  return WHOLE_NUMBER_PATTERN.test(trimmed) && limit <= MEMORY_DREAM_EDIT_LIMIT_MAX
     ? { limit }
     : { error: INVALID_LIMIT_MESSAGE };
 }
@@ -58,8 +63,8 @@ export function MemoryDreamEditLimitSetting() {
         </label>
         <div className="text-muted mt-0.5 text-xs">
           Most memory edits one organizer run can make, in the background or from Consolidate now.
-          Each create, replace, insert, delete or rename is one edit. Enter 0 or leave empty for
-          unlimited edits; the run timeout and the cost ceiling then end the run.
+          Each create, replace, insert, delete or rename is one edit. Enter 0 or leave empty for{" "}
+          {UNLIMITED_LABEL}: memory files are untrusted input, so one run never makes more.
         </div>
         {"error" in parsed && (
           <div role="alert" className="text-error mt-1 text-xs">

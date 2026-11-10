@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { flushUserPreferences, getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import { MEMORY_DREAM_EDIT_LIMIT_MAX } from "@/common/constants/memory";
 import { MemoryDreamEditLimitSetting } from "./MemoryDreamEditLimitSetting";
 
 /**
@@ -138,7 +139,7 @@ describe("MemoryDreamEditLimitSetting", () => {
   });
 
   // Each parses as a number in JavaScript or is half typed; only whole digits are a limit.
-  test.each(["-1", "2.5", "1e3", "0x10", "+5", "abc", "99999999999999999"])(
+  test.each(["-1", "2.5", "1e3", "0x10", "+5", "abc", String(MEMORY_DREAM_EDIT_LIMIT_MAX + 1)])(
     "keeps the saved limit when %p is left, and shows why",
     async (keys) => {
       const { view, input, saved, type, blur } = await renderSetting({
@@ -164,6 +165,15 @@ describe("MemoryDreamEditLimitSetting", () => {
     await blur();
 
     expect(writes).toEqual([]);
+  });
+
+  test("takes a limit up to the safety cap", async () => {
+    const { saved, type, blur } = await renderSetting();
+
+    type(String(MEMORY_DREAM_EDIT_LIMIT_MAX));
+    await blur();
+
+    expect(saved()?.dreamEditLimit).toBe(MEMORY_DREAM_EDIT_LIMIT_MAX);
   });
 
   test("does not save the limit that is already saved", async () => {

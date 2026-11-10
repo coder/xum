@@ -19,6 +19,7 @@ import {
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
   MEMORY_CONSOLIDATION_TIMEOUT_MS,
+  MEMORY_DREAM_EDIT_LIMIT_MAX,
 } from "@/common/constants/memory";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
@@ -4820,7 +4821,8 @@ describe("MemoryConsolidationService", () => {
     it.each([
       [undefined, "You have 8 mutating commands this run."],
       [24, "You have 24 mutating commands this run."],
-      [0, "This run has no edit limit."],
+      // Unlimited runs at the safety cap.
+      [0, `You have ${MEMORY_DREAM_EDIT_LIMIT_MAX} mutating commands this run.`],
     ])("runs an organizer pass for a saved limit of %p with its budget", async (limit, line) => {
       using fixture = await createFixture();
       // Other preferences, but no memory group unless a limit is saved: the run still reads it.
