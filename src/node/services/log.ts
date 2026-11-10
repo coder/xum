@@ -93,8 +93,48 @@ let sinkTransition: Promise<void> = Promise.resolve();
 let sinkTransitionDepth = 0;
 let sinkLifecycleEpoch = 0;
 
+// A rotation or clear takes the stream away at once and opens its replacement later, in the sink
+// queue. Lines that arrive in between wait here and go first to the next stream that opens, in
+// order. The bound keeps a transition that never ends from growing the buffer without limit.
+export const MAX_PENDING_SINK_BYTES = 1024 * 1024;
+let pendingSinkLines: string[] = [];
+let pendingSinkBytes = 0;
+
+function holdLineForNextStream(line: string): void {
+  const bytes = Buffer.byteLength(line, "utf-8");
+  // mutation-equivalent: > or >= moves a 1 MiB bound by one byte, and a line's size depends on its timestamp prefix, so no test can pin that byte
+  if (pendingSinkBytes + bytes > MAX_PENDING_SINK_BYTES) {
+    return;
+  }
+  pendingSinkLines.push(line);
+  pendingSinkBytes += bytes;
+}
+
+function dropPendingSinkLines(): void {
+  pendingSinkLines = [];
+  // mutation-equivalent: a leftover byte lowers the next 1 MiB bound by one byte, which no test can pin
+  pendingSinkBytes = 0;
+}
+
+// Opens the sink's stream for `filePath`, which holds `size` bytes, and writes the held lines first.
+// They go through writeSink like any line, so the size and the rotation limit count them.
+function openStreamWithHeldLines(filePath: string, size: number): void {
+  const stream = createSafeStream(filePath);
+  fileSinkState = { status: "open", stream, path: filePath, size };
+  const held = pendingSinkLines;
+  dropPendingSinkLines();
+  for (const line of held) {
+    writeSink(line);
+  }
+}
+
+// Counts resets. A transition that was in flight at a reset must not change the depth that the
+// reset started over from.
+let sinkResetGeneration = 0;
+
 function enqueueSinkTransition(task: () => Promise<void>): Promise<void> {
   sinkTransitionDepth += 1;
+  const generation = sinkResetGeneration;
 
   // `run` is the caller-visible promise: resolves/rejects with the task's real outcome.
   const run = sinkTransition.catch(() => undefined).then(task);
@@ -108,7 +148,9 @@ function enqueueSinkTransition(task: () => Promise<void>): Promise<void> {
       }
     })
     .finally(() => {
-      sinkTransitionDepth -= 1;
+      if (generation === sinkResetGeneration) {
+        sinkTransitionDepth -= 1;
+      }
     });
 
   return run;
@@ -203,8 +245,7 @@ function ensureSinkOpen(): void {
       fileSize = 0;
     }
 
-    const stream = createSafeStream(activeLogPath);
-    fileSinkState = { status: "open", stream, path: activeLogPath, size: fileSize };
+    openStreamWithHeldLines(activeLogPath, fileSize);
   } catch (error) {
     // Never throw from the logger; enter degraded mode and retry later.
     setDegradedState(error);
@@ -241,8 +282,7 @@ function rotateSink(): void {
       return;
     }
 
-    const stream = createSafeStream(openSink.path);
-    fileSinkState = { status: "open", stream, path: openSink.path, size: 0 };
+    openStreamWithHeldLines(openSink.path, 0);
   }).catch(() => undefined);
 }
 
@@ -250,6 +290,10 @@ function writeSink(cleanLineWithNewline: string): void {
   try {
     ensureSinkOpen();
     if (fileSinkState.status !== "open") {
+      // A rotation or clear is between its old stream and its new one.
+      if (sinkTransitionDepth > 0 && fileSinkState.status === "idle") {
+        holdLineForNextStream(cleanLineWithNewline);
+      }
       return;
     }
 
@@ -315,8 +359,7 @@ function clearSink(): Promise<void> {
       return;
     }
 
-    const stream = createSafeStream(activeLogPath);
-    fileSinkState = { status: "open", stream, path: activeLogPath, size: 0 };
+    openStreamWithHeldLines(activeLogPath, 0);
   });
 }
 
@@ -368,6 +411,8 @@ export function __resetFileSinkForTests(): void {
   sinkTransition = Promise.resolve();
   sinkTransitionDepth = 0;
   sinkLifecycleEpoch = 0;
+  sinkResetGeneration += 1;
+  dropPendingSinkLines();
 }
 
 /**
