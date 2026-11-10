@@ -38,6 +38,7 @@ import {
 import { buildWorkflowProgressSummary, formatWorkflowProgressNote } from "./workflowProgress";
 import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import {
+  AgentReportWaitTimeoutError,
   ForegroundWaitBackgroundedError,
   type AgentTaskStatusLookup,
   type AgentTaskTimestamps,
@@ -961,7 +962,9 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           if (error instanceof TaskNotFoundError) {
             return { status: "not_found" as const, taskId };
           }
-          if (/timed out/i.test(message)) {
+          // The class, never the text: a failed task's own error text can say "timed out", and it
+          // must reach the parent as that text.
+          if (error instanceof AgentReportWaitTimeoutError) {
             const status = taskService.getAgentTaskStatus(taskId);
             if (isAgentTaskActiveStatus(status)) {
               return { status, taskId, ...getAgentTaskElapsedField(taskId) };

@@ -17,6 +17,7 @@ import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } fro
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { getSubagentGitPatchArtifactsFilePath } from "@/node/services/subagentGitPatchArtifacts";
 import {
+  AgentReportWaitTimeoutError,
   ForegroundWaitBackgroundedError,
   type AgentTaskReport,
   type TaskService,
@@ -1991,7 +1992,7 @@ describe("task_await tool", () => {
 
     const waitForAgentReport = mock((taskId: string) => {
       if (taskId === "timeout") {
-        return Promise.reject(new Error("Timed out waiting for agent_report"));
+        return Promise.reject(new AgentReportWaitTimeoutError());
       }
       if (taskId === "missing") {
         return Promise.reject(new TaskNotFoundError());
@@ -2044,6 +2045,26 @@ describe("task_await tool", () => {
       expect(result).toEqual({
         results: [{ status: "error", taskId: "failed", error: modelNotFound }],
       });
+    });
+
+    it("returns the text of a failed agent task that says it timed out", async () => {
+      using tempDir = new TestTempDir("test-task-await-error-text-timed-out");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      // A provider timeout is the child's own failure, not the wait running out.
+      const text = "Upstream provider request timed out after 30s";
+      const taskServices = createFakeTaskServices({
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => "interrupted" as const),
+        waitForAgentReport: mock(() => Promise.reject(new Error(text))),
+      });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+      for (const timeout_secs of [0, 5]) {
+        const result: unknown = await Promise.resolve(
+          tool.execute!({ task_ids: ["failed"], timeout_secs }, mockToolCallOptions)
+        );
+        expect(result).toEqual({ results: [{ status: "error", taskId: "failed", error: text }] });
+      }
     });
 
     it("returns it for a non-blocking read of an agent task", async () => {
