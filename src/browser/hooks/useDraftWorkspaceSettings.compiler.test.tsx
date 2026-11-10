@@ -40,8 +40,10 @@ function loadCompiledHook(): typeof UseDraftWorkspaceSettings {
   // stack to Bun's native default, which throws for a non-Error target. Later test files in
   // the same bun process then break: undici's fetch calls Error.captureStackTrace({}) on its
   // error path, so brotliResponseGuard.test.ts saw "First argument must be an Error object"
-  // instead of the fetch failure. Restore the hook once the transform is done.
-  const originalPrepareStackTrace = Error.prepareStackTrace;
+  // instead of the fetch failure. Restore the hook once the transform is done. Reflect keeps
+  // the hook unbound. Restore by assignment: in Bun, redefining the property from a copied
+  // descriptor left Babel's hook in effect.
+  const originalPrepareStackTrace: unknown = Reflect.get(Error, "prepareStackTrace");
   let compiled: ReturnType<typeof transformSync>;
   try {
     compiled = transformSync(readFileSync(HOOK_PATH, "utf8"), {
@@ -56,7 +58,7 @@ function loadCompiledHook(): typeof UseDraftWorkspaceSettings {
       plugins: [["babel-plugin-react-compiler", reactCompilerConfig]],
     });
   } finally {
-    Error.prepareStackTrace = originalPrepareStackTrace;
+    Reflect.set(Error, "prepareStackTrace", originalPrepareStackTrace);
   }
   assert(compiled?.code, "React Compiler produced no output for useDraftWorkspaceSettings.ts");
 
