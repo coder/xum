@@ -4,6 +4,7 @@ import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppC
 import {
   MEMORY_CONSOLIDATION_TIMEOUT_MS,
   MEMORY_DREAM_EDIT_LIMIT_MAX,
+  MEMORY_DREAM_MAX_STEPS,
   MEMORY_DREAM_RUN_TIMEOUT_MAX_MINUTES,
 } from "@/common/constants/memory";
 import { parseWholeNumberDraft, type ParsedWholeNumberDraft } from "./wholeNumberDraft";
@@ -61,11 +62,11 @@ export function MemoryDreamRunTimeoutSetting() {
         </label>
         <div className="text-muted mt-0.5 text-xs">
           An organizer run stops after this many minutes. Leave empty for {DEFAULT_MINUTES}. Enter 0
-          for no timeout: then only the edit limit (at most {MEMORY_DREAM_EDIT_LIMIT_MAX} edits, 4
-          steps each) and the cost ceiling, if set, end a run. A run that hangs holds the memory
-          lock until Xum restarts: other memory runs in the same Xum process wait behind it until
-          then, and runs in another Xum process give up after waiting at least {DEFAULT_MINUTES}{" "}
-          minutes for it and try again later.
+          for no timeout: then only the edit limit (at most {MEMORY_DREAM_EDIT_LIMIT_MAX} edits),
+          the step ceiling ({MEMORY_DREAM_MAX_STEPS} steps) and the cost ceiling, if set, end a run.
+          A run that hangs holds the memory lock until Xum restarts: other memory runs in the same
+          Xum process wait behind it until then, and runs in another Xum process give up after
+          waiting at least {DEFAULT_MINUTES} minutes for it and try again later.
         </div>
         {"error" in parsed && (
           <div role="alert" className="text-error mt-1 text-xs">
