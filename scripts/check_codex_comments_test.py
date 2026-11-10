@@ -68,6 +68,27 @@ def collapsed(body, label):
     return body.replace(HEADING, folded, 1) + "\n\n</details>"
 
 
+def clean_board(head):
+    """A completed board whose code review of `head` found nothing: the review state that binds a
+    thumbs-up, or a receipt without its Reviewed commit line, to that head."""
+    original = FIXTURES["review_state_summary"]["body"]
+    body = original.replace(
+        '"has_any_findings":true,"has_unresolved_findings":false,"status":"completed"},"security_review"',
+        '"has_any_findings":false,"has_unresolved_findings":false,"status":"completed"},"security_review"',
+        1,
+    )
+    assert body != original
+    return comment(board_for(body, head))
+
+
+def receipt_for(head):
+    """A clean code-review receipt whose Reviewed commit line names `head`."""
+    original = FIXTURES["code_review_no_findings"]["body"]
+    body = original.replace("74ad33212c", head[:10])
+    assert body != original
+    return body
+
+
 def comment(body, author=BOT, created_at=AFTER, minimized=False, association="MEMBER"):
     return {
         "id": "comment",
@@ -1090,9 +1111,13 @@ else:
         request = comment("@codex review", "maintainer", REQUEST)
         for name, fixture in FIXTURES.items():
             with self.subTest(name=name):
-                result = self.run_gate(
-                    snapshot([request, comment(fixture["body"])]), "wait_pr_codex.sh"
-                )
+                data = snapshot([request, comment(fixture["body"])])
+                if fixture.get("wait_exit_code") == 0:
+                    # A receipt approves the head that its Reviewed commit line names, or, without that line,
+                    # the head that a clean board records. This one names 74ad33212c.
+                    named = "74ad33212c" + "0" * 30
+                    data = snapshot([request, comment(fixture["body"]), clean_board(named)], head=named)
+                result = self.run_gate(data, "wait_pr_codex.sh")
                 # Completed informational envelopes and in-progress summaries keep
                 # polling for approval; unknown reports remain failures under the CI policy.
                 # A fixture can name its own readiness result: the clean code-review
@@ -1228,7 +1253,8 @@ else:
         receipt = FIXTURES["code_review_no_findings_without_commit"]["body"]
         body = receipt.replace("Another round soon, please!", HOSTILE)
         self.assertIn(HOSTILE, body)
-        result = self.assert_gate(0, snapshot([request, comment(body)]), "wait_pr_codex.sh")
+        data = snapshot([request, comment(body), clean_board("a" * 40)])
+        result = self.assert_gate(0, data, "wait_pr_codex.sh")
         self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
         self.assertIn("✅ Codex approved PR #4145", result.stdout)
         self.assertIn(f"Approval comment time: {AFTER}", result.stdout)
@@ -1334,7 +1360,8 @@ else:
         receipt = FIXTURES["code_review_no_findings_without_commit"]["body"]
         for time in (AFTER[:-1] + ".1Z", AFTER[:-1] + ".123Z", AFTER[:-1] + ".123456789Z"):
             with self.subTest(accepted=time):
-                result = self.assert_gate(0, snapshot([request, comment(receipt, created_at=time)]), "wait_pr_codex.sh")
+                data = snapshot([request, comment(receipt, created_at=time), clean_board("a" * 40)])
+                result = self.assert_gate(0, data, "wait_pr_codex.sh")
                 self.assertIn(f"Approval comment time: {time}", result.stdout)
         for time in (
             AFTER[:-1] + ".1234567890Z",  # more digits than a time has
@@ -1358,10 +1385,11 @@ else:
         # The approval comment and the thumbs-up say nothing about threads that are still unresolved: the
         # gate reads every thread. An approval used to end the wait with exit 0 although the gate found one.
         request = comment("@codex review", "maintainer", REQUEST)
-        receipt = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
+        receipt = comment(receipt_for("a" * 40))
+        clean = clean_board("a" * 40)
         thumbs_up = [{"user": {"login": BOT}, "createdAt": AFTER}]
         # The thumbs-up is older than the reactions window: the double serves it only from its pages.
-        scanned = snapshot([request, comment("Codex is looking.")], [thread("[P1] Fix authorization")])
+        scanned = snapshot([request, comment("Codex is looking."), clean], [thread("[P1] Fix authorization")])
         scanned["data"]["repository"]["pullRequest"]["reactions"]["pageInfo"]["hasPreviousPage"] = True
         scan_env = {"CODEX_GATE_REACTIONS_NODES": json.dumps(thumbs_up)}
         many = [thread("[P1] Fix authorization") for _ in range(10)]
@@ -1370,7 +1398,7 @@ else:
             "comment approval, open thread": (snapshot([request, receipt], [thread("[P1] Fix authorization")]), None, 1),
             "comment approval, thread from before the request": (snapshot([request, receipt], [thread("[P1] Fix authorization", created_at=BEFORE)]), None, 1),
             "comment approval, ten open threads": (snapshot([request, receipt], many), None, 10),
-            "reaction approval, open thread": (snapshot([request, comment("Codex is looking.")], [thread("[P1] Fix authorization")], reactions=thumbs_up), None, 1),
+            "reaction approval, open thread": (snapshot([request, comment("Codex is looking."), clean], [thread("[P1] Fix authorization")], reactions=thumbs_up), None, 1),
             "reaction scan approval, open thread": (scanned, scan_env, 1),
         }
         for name, (data, env, count) in blocked.items():
@@ -1385,14 +1413,14 @@ else:
         standing = {
             "resolved thread": snapshot([request, receipt], [thread("[P1] Fixed", resolved=True)]),
             "minimized finding": snapshot([request, receipt, comment("[P1] Fix authorization", minimized=True)]),
-            "reaction, resolved thread": snapshot([request, comment("Codex is looking.")], [thread("[P1] Fixed", resolved=True)], reactions=thumbs_up),
+            "reaction, resolved thread": snapshot([request, comment("Codex is looking."), clean], [thread("[P1] Fixed", resolved=True)], reactions=thumbs_up),
         }
         for name, data in standing.items():
             with self.subTest(case=name):
                 result = self.assert_gate(0, data, "wait_pr_codex.sh")
                 self.assertIn("✅ Codex approved PR #4145", result.stdout)
         # The same scan with the thread resolved approves, so the scan path is the one under test above.
-        resolved_scan = snapshot([request, comment("Codex is looking.")], [thread("[P1] Fixed", resolved=True), thread("[P1] Open elsewhere", resolved=True)])
+        resolved_scan = snapshot([request, comment("Codex is looking."), clean], [thread("[P1] Fixed", resolved=True), thread("[P1] Open elsewhere", resolved=True)])
         resolved_scan["data"]["repository"]["pullRequest"]["reactions"]["pageInfo"]["hasPreviousPage"] = True
         with self.subTest(case="reaction scan approval, resolved thread"):
             result = self.run_gate(resolved_scan, "wait_pr_codex.sh", env_extra=scan_env)
@@ -1402,13 +1430,13 @@ else:
     def test_an_approval_does_not_stand_when_the_gate_could_not_read_the_threads(self):
         # A gate that fails on the thread pages prints no thread count. No count is no proof that no thread is open.
         request = comment("@codex review", "maintainer", REQUEST)
-        receipt = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
+        receipt = comment(receipt_for("a" * 40))
         thumbs_up = [{"user": {"login": BOT}, "createdAt": AFTER}]
         # The double gives the gate's thread pages a page flag that the gate rejects, and the poller's own window no flag.
         broken_pages = {"CODEX_GATE_NEXT_PAGE": HOSTILE, "CODEX_GATE_NEXT_PAGE_FIELD": "reviewThreads"}
         cases = {
             "approval comment": snapshot([request, receipt]),
-            "thumbs-up": snapshot([request, comment("Codex is looking.")], reactions=thumbs_up),
+            "thumbs-up": snapshot([request, comment("Codex is looking."), clean_board("a" * 40)], reactions=thumbs_up),
         }
         for name, data in cases.items():
             with self.subTest(approval=name):
@@ -1502,7 +1530,8 @@ else:
         ):
             with self.subTest(author=author, created_at=created_at):
                 data = snapshot(
-                    [request, comment(FIXTURES["summary"]["body"])],
+                    # A thumbs-up counts for the head that a clean board records.
+                    [request, clean_board("a" * 40)],
                     reactions=[
                         {
                             "user": {"login": author},
@@ -1511,6 +1540,52 @@ else:
                     ],
                 )
                 self.assert_gate(expected, data, "wait_pr_codex.sh")
+
+    def test_an_approval_stands_only_for_the_current_head(self):
+        # A push starts a review of the new head, but an approval for the earlier head is still newer than
+        # the last `@codex review` request. It used to end the wait with exit 0 while the review of the
+        # new head was still running (PR 8057).
+        request = comment("@codex review", "maintainer", REQUEST)
+        old, head = "c" * 40, "d" * 40
+        thumbs_up = [{"user": {"login": BOT}, "createdAt": AFTER}]
+        old_receipt = comment(receipt_for(old))
+        commitless = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
+        running = comment(board_for(FIXTURES["review_state_running_summary"]["body"], head))
+        stale = {
+            "receipt for the older head, review of the head running": snapshot([request, old_receipt, running], head=head),
+            "receipt for the older head, board still on the older head": snapshot([request, old_receipt, clean_board(old)], head=head),
+            "receipt without a commit, review of the head running": snapshot([request, commitless, running], head=head),
+            "receipt without a commit, board on the older head": snapshot([request, commitless, clean_board(old)], head=head),
+            "thumbs-up, review of the head running": snapshot([request, running], reactions=thumbs_up, head=head),
+            "thumbs-up, board on the older head": snapshot([request, clean_board(old)], reactions=thumbs_up, head=head),
+        }
+        for name, data in stale.items():
+            with self.subTest(stale=name):
+                result = self.assert_gate(10, data, "wait_pr_codex.sh")
+                self.assertNotIn("approved", result.stdout)
+                # The comments gate reads no approval: the receipt of an older head leaves the review of this head pending.
+                self.assert_gate(10, data)
+        # No board at all: the gate has no state for the head, so the older receipt ends the wait with the
+        # failure that names the missing approval, and never with an approval.
+        with self.subTest(stale="receipt for the older head, no board"):
+            result = self.assert_gate(1, snapshot([request, old_receipt], head=head), "wait_pr_codex.sh")
+            self.assertIn("no approval signal was found", result.stdout)
+            self.assertNotIn("✅ Codex approved", result.stdout)
+        # A thumbs-up beside a board whose review of the head had findings is no approval of the head.
+        findings = comment(board_for(FIXTURES["review_state_summary"]["body"], head))
+        with self.subTest(stale="thumbs-up, board of the head with findings"):
+            result = self.assert_gate(10, snapshot([request, findings], reactions=thumbs_up, head=head), "wait_pr_codex.sh")
+            self.assertNotIn("✅ Codex approved", result.stdout)
+        approving = {
+            "receipt that names the head": snapshot([request, comment(receipt_for(head))], head=head),
+            "receipt that names the head, newer head's board running": snapshot([request, comment(receipt_for(head)), running], head=head),
+            "receipt without a commit, clean board for the head": snapshot([request, commitless, clean_board(head)], head=head),
+            "thumbs-up, clean board for the head": snapshot([request, clean_board(head)], reactions=thumbs_up, head=head),
+        }
+        for name, data in approving.items():
+            with self.subTest(approving=name):
+                result = self.assert_gate(0, data, "wait_pr_codex.sh")
+                self.assertIn("✅ Codex approved PR #4145", result.stdout)
 
 
 if __name__ == "__main__":

@@ -91,6 +91,7 @@ Use these scripts to check, resolve, and wait on Codex review comments:
 - `./scripts/check_codex_comments.sh <pr_number>` — Lists unresolved Codex comments (both regular comments and review threads). Outputs thread IDs needed for resolution.
 - `./scripts/resolve_pr_comment.sh <thread_id>` — Resolves a review thread by its ID (e.g., `PRRT_abc123`).
 - `./scripts/wait_pr_codex.sh <pr_number>` — Waits for Codex-only status (or one-shot status with `--once`).
+  It accepts an approval for the current head only. A receipt counts when its Reviewed commit line names the head. A receipt without that line, and a thumbs-up, count only beside a board that records a clean, finished code review of the head. After a push, the approval of an older head does not end the wait, even when it is newer than the last `@codex review`.
 - `./scripts/wait_pr_ready.sh <pr_number>` — Unified Codex + CI gate poller (preferred for normal PR readiness loops).
 
 The PR readiness definition, the review loop, and its early-stop cases live in the PR Workflow section of AGENTS.md; follow them there.
