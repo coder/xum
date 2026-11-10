@@ -59,6 +59,7 @@ import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
+import { lazyFileToolSandboxGate } from "@/node/services/agentSandbox/fileToolSandbox";
 import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import type { Config } from "@/node/config";
@@ -13932,6 +13933,12 @@ export class AgentSession {
     // When workspace agents are disabled, resolve skills from the project path instead of
     // the worktree so skill invocation uses the same precedence/discovery root as the UI.
     const skillDiscoveryPath = disableWorkspaceAgents ? metadata.projectPath : workspacePath;
+    // The snapshot reaches the model, so a project skill loads only where a sandboxed command could
+    // read its SKILL.md, as in the skills index: a command can link it to a file that a project
+    // secret names (Codex review).
+    const sandboxGate = lazyFileToolSandboxGate(runtime, workspacePath, {
+      env: await this.aiService.getWorkspaceSandboxEnv(metadata),
+    });
 
     // Dedupe per skill against recent persisted snapshots. A wider window keeps multi-skill
     // turns from reloading snapshots that were persisted together on the previous turn.
@@ -14005,6 +14012,7 @@ export class AgentSession {
             // #6426: the default roots (no storage context) add project plugins only when trusted.
             projectPluginsTrusted: isWorkspaceProjectTrusted(this.config, metadata),
             runtimeFactory: this.aiService.runtimeFactory,
+            sandboxGate,
           },
         };
         resolved = await readAgentSkill(
