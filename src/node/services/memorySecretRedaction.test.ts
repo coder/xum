@@ -720,6 +720,15 @@ describe("redactSecretLike", () => {
         `${"\\".repeat(31)}"cookie${"\\".repeat(31)}"${GAP}: sid=${SESSION}`,
         `${"\\".repeat(31)}"cookie${"\\".repeat(31)}"${GAP}: [redacted]`,
       ],
+      // A new marker takes the value's quotes with it: kept, they would not read back the same.
+      ["a quoted key's quoted value", `"cookie"${GAP}:"${SESSION}"`, `"cookie"${GAP}:[redacted]`],
+      // An even run before a quote escapes backslashes, not the quote: the value closes there and
+      // the next field stays.
+      [
+        "a quoted value that ends in escaped backslashes",
+        jsonOf(`"cookie"${GAP}:'${SESSION}\\\\',"safe":"SAFE"}`),
+        String.raw`"\"cookie\"${GAP}:[redacted],\"safe\":\"SAFE\"}"`,
+      ],
     ])("reads %s where only the reader sees the header", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
