@@ -55,9 +55,9 @@ description: Agent instructions for AI assistants working on the Xum codebase
 - CRAP gate: `make crap-check` scores the functions you changed. When it (or the report after an agent `git commit`/`git push`) names a function, read the `crap-gate` skill (`.xum/skills/crap-gate/SKILL.md`) before fixing it. In block mode, `Quality / CRAP` violations fail `Required`. Agents must not add the `crap-debt` label or a `Crap-Debt:` trailer without the maintainer's explicit approval for that PR: the label skips every CI block (the trailer skips only local checks: the commit hook and `make crap-check`), and agent PRs run as the maintainer's account, so GitHub cannot tell who added them.
 - DRY and mutation gates: `make dry-check` reports near-duplicate functions that your change makes, and `make mutate-check` reports mutants in the functions you changed that the unit tests do not kill. CI warns unless the `DRY_MODE` or `MUTATION_MODE` repo variable is `block`. Before you fix a finding or accept one with a marker, read the `gauntlet` skill (`.xum/skills/gauntlet/SKILL.md`).
 - `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.
-- `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.
-- `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`.
-- To wait on PR checks, a stack or the merge queue, run `./scripts/watch_pr_state.sh <pr>... [--queue]` instead of a hand-written polling loop. It prints each state change, ends on every final state (merged, removed from the queue, closed, failed, ready) and exits 2 on a read it cannot classify. It prints states, counts and GitHub IDs, not check names: after `failed`, list the head commit's checks with `gh pr view <pr_number> --json statusCheckRollup`.
+- `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration. It prints counts, not check names: list the head commit's checks with `gh pr view <pr_number> --json statusCheckRollup`.
+- `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`. It prints counts: read the findings with `./scripts/check_codex_comments.sh <pr_number>`.
+- To wait on PR checks, a stack or the merge queue, run `./scripts/watch_pr_state.sh <pr>... [--queue]` instead of a hand-written polling loop. It prints each state change, ends on every final state (merged, removed from the queue, closed, failed, ready) and exits 2 on a read it cannot classify. It prints states, counts and GitHub IDs, not check names: after `failed`, list the head commit's checks with `gh pr view <pr_number> --json statusCheckRollup`. The failed count also includes the failures on GitHub's merge commit, which that read does not list, so the count names how many of them there are.
 
 ## Dependencies & Supply Chain
 
@@ -143,6 +143,10 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 - When streaming crashes, any incomplete state committed to disk should either be repairable on next load or excluded from provider requests to avoid API validation errors.
 - **Startup-time initialization must never crash the app.** Wrap in try-catch, use timeouts, fall back silently.
 - **`server.lock` liveness is decided by process identity** (pid, start time, boot id, PID namespace and platform; `judgeHolder()` in `src/node/utils/concurrency/processLiveness.ts`), except that a lock with this process's own pid is live only if this process wrote it. The `/version` probe (`src/node/services/xumBackendProbe.ts`) covers only what identity cannot decide, for example macOS, Windows, locks from older builds, and identity that is incomplete or unreadable. Do not add more liveness heuristics (timeouts, extra probes, process-state guesses) to `src/node/services/serverLockfile.ts` or the probe. A lock reader never deletes a lock: `acquire()` replaces a stale one, and its owner's `release()` removes it.
+
+## Agent Plugins
+
+- Plugin install-method choice is a Draft (`rfc/20261106_plugin-install-method-choice.md` at commit `4a1cf82e1da83bfabc04c340c8f080e2fc3eb7e4` of branch `plugin-install-method-choice-parked`). Before anyone builds it, its design must cover what every other Xum build does to a plugin whose saved manifest that build does not load: hook trust, OAuth sign-ins, the registry row and updates. Never repair state that another build changed: fail closed and let a reinstall review it.
 
 ## Command Palette & UI Access
 

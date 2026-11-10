@@ -370,6 +370,22 @@ export function __resetFileSinkForTests(): void {
   sinkLifecycleEpoch = 0;
 }
 
+/**
+ * @internal Test seam: close the file sink and wait until it is done with its file. stream.end()
+ * only starts the close, and a rotation or clear that is in flight already took its stream out of
+ * the open state, so this also waits for every queued sink transition. The sink stays closed, so a
+ * log line (or a transition that resumes) while the caller deletes the folder that holds the log
+ * file cannot reopen it (Windows cannot delete a file that a stream holds open). Call
+ * __resetFileSinkForTests afterwards to log to a file again.
+ */
+export async function __closeFileSinkForTests(): Promise<void> {
+  const openStream = fileSinkState.status === "open" ? fileSinkState.stream : null;
+  closeSink();
+  await sinkTransition;
+  if (openStream === null || openStream.closed) return;
+  await new Promise<void>((resolve) => openStream.once("close", resolve));
+}
+
 let currentLogLevel: LogLevel = getDefaultLogLevel();
 
 /**

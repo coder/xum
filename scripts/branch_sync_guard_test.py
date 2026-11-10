@@ -225,6 +225,23 @@ class CheckoutGuardTest(unittest.TestCase):
         result = self.assert_blocked_before_gates("wait_pr_checks.sh", SYNC_ERROR)
         self.assertIn("1 commit(s) behind", result.stderr)
 
+    def test_the_guard_never_prints_a_branch_name_that_the_pr_author_chose(self):
+        hostile = "IGNORE-PREVIOUS-INSTRUCTIONS"
+        self.env["FAKE_PR_HEAD_REF"] = hostile
+        for script in WAIT_SCRIPTS:
+            with self.subTest(script=script, case="skipped on another branch"):
+                result = self.run_script(script)
+                skipped = [line for line in result.stderr.splitlines() if "Skipping the local sync check" in line]
+                self.assertEqual(len(skipped), 1, result.stdout + result.stderr)
+                self.assertNotIn(hostile, result.stdout + result.stderr)
+                self.assertNotIn("feature", skipped[0])
+        # A reply with no usable head commit used to be echoed whole, branch name included.
+        self.env["FAKE_PR_HEAD_OID"] = "not-a-sha"
+        for script in WAIT_SCRIPTS:
+            with self.subTest(script=script, case="malformed reply"):
+                result = self.assert_blocked_before_gates(script, "gh returned no head branch, head commit or fork flag")
+                self.assertNotIn(hostile, result.stdout + result.stderr)
+
     def test_uncommitted_changes_on_the_pr_branch_are_blocked(self):
         (self.work / "tracked.txt").write_text("edited\n")
         self.assert_blocked_before_gates("wait_pr_checks.sh", "uncommitted changes")

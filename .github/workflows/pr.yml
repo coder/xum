@@ -38,6 +38,7 @@ jobs:
       nix_deps: ${{ steps.filter.outputs.nix_deps }}
       docker: ${{ steps.filter.outputs.docker }}
       e2e_tests: ${{ steps.filter.outputs.e2e_tests }}
+      phone_chrome: ${{ steps.filter.outputs.phone_chrome }}
       vscode: ${{ steps.filter.outputs.vscode }}
       # Shared job gates, computed once instead of repeated in every job.
       # tests: code or CI config changed, and this isn't the merge queue's post-merge
@@ -121,6 +122,36 @@ jobs:
               - 'Makefile'
               - 'package.json'
               - 'bun.lock'
+            # Test / Phone chrome: what the live phone page is built from. The renderer bundle holds
+            # src/browser, src/common and src/constants (read from the sourcemaps of `make
+            # build-renderer`, 2026-11-09), vite builds it with the config and the packages named
+            # here, and the generator brings its own seed and token helpers. Server code (src/node,
+            # src/cli) only supplies data that the skeleton turns into slots: the merge queue runs the
+            # job for every group that changes code or CI config (the `tests` filter), so a change
+            # there that moves the page still stops at the queue. A group that changes only docs skips it.
+            phone_chrome:
+              - 'src/browser/**'
+              - 'src/common/**'
+              - 'src/constants/**'
+              - 'src/vite/**'
+              - 'src/node/orpc/staticWorkspaceView/**'
+              - 'index.html'
+              - 'vite*.ts'
+              - 'tsconfig*.json'
+              - 'patches/**'
+              - 'public/**'
+              - 'package.json'
+              - 'bun.lock'
+              - 'Makefile'
+              - 'scripts/perf/generatePhoneChrome.ts'
+              - 'scripts/perf/neutralSeed.ts'
+              - 'scripts/perf/fixtures/neutralSeed/**'
+              - 'scripts/perf/serverToken.ts'
+              - 'scripts/precompress-static.ts'
+              - 'scripts/stamp-service-worker.ts'
+              - '.github/workflows/pr.yml'
+              - '.github/actions/setup-xum/**'
+              - '.github/actions/setup-playwright/**'
             vscode:
               - 'vscode/**'
             nix_deps:
@@ -233,7 +264,8 @@ jobs:
       # test never writes a cache under ~/.cache). The script checks both files against the
       # sha256 pins in itself on every run (hit or miss), then rebuilds the pack's own directory
       # from them. The key hashes that script, so a changed pin starts a fresh cache, and a
-      # language added to the Makefile's list needs no new key. The step below downloads them
+      # language added to `LANGUAGES` in that script changes its hash and needs no other key
+      # change. The step below downloads them
       # (15 minutes of retries on a cold cache), and the save follows at once, ahead of the long
       # make run. A hit whose files fail the pins is discarded and downloaded again (the log
       # shows `::warning::`). A cache entry cannot be replaced, so that bad entry keeps its key
@@ -832,12 +864,6 @@ jobs:
           SHARD: ${{ matrix.shard }}
           # No provider secrets here, so the repros' app uses the mock AI.
           BUGBASH_REPROS: ${{ matrix.shard == '1/4' && '1' || '0' }}
-      # The static workspace view's phone skeleton must match the live page (#5971). On drift, the
-      # failure names the element and the command that regenerates the skeleton.
-      # It reuses the `make build` of `make test-e2e` above.
-      - name: Check the phone chrome skeleton
-        if: matrix.os == 'linux' && matrix.shard == '1/4'
-        run: make check-phone-chrome
       - name: Run tests
         if: matrix.os == 'macos'
         env:
@@ -863,6 +889,42 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 14
+
+  test-phone-chrome:
+    # The static workspace view's phone skeleton must match the live page (#5971). On drift, the
+    # failure names the element and the command that regenerates the skeleton. This was a step of
+    # Test / E2E (linux, 1/4), which a PR runs only when it changes e2e_tests: #7993 changed a class
+    # in src/browser, skipped that job, and broke main (skipped counts as passing in Required).
+    # Here a PR runs it when phone_chrome matches, and the merge queue runs it for every group that
+    # changes code or CI config (a group that changes only docs skips it).
+    # It does not wait for `tests`: index.html, public/ and patches/ build the page too and are in
+    # neither the src nor the config filter, so a PR that changes only them has tests false.
+    # Like `tests`, it skips the push that the merge queue's own merge makes on main.
+    name: Test / Phone chrome
+    # Five runs took 2 min 13 s to 2 min 32 s (the build is 1 of those minutes). 15 minutes is about
+    # 6 times the longest, and a job that hangs holds a runner until GitHub's 6 h limit without it.
+    timeout-minutes: 15
+    needs: [changes]
+    if: >-
+      github.event.inputs.test_filter == '' &&
+      (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') &&
+      (needs.changes.outputs.phone_chrome == 'true' ||
+      (github.event_name != 'pull_request' && needs.changes.outputs.tests == 'true'))
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-xum
+        with:
+          skip-build-caches: "true"
+      # Bound browser setup; Playwright downloads can stall after progress reaches 100%.
+      - uses: ./.github/actions/setup-playwright
+        timeout-minutes: 10
+      # check-phone-chrome drives the built tree (`xum server` and the renderer), as its recipe
+      # says. These are the build prerequisites of its sibling generate-phone-chrome.
+      - run: make build-main build-renderer build-static
+      - run: make check-phone-chrome
 
   bugbash-sandbox:
     # The bug-bash sandbox (#5714, #5931): its self-check (isolation, proxy and export refusals,
@@ -1214,7 +1276,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # electron-builder unpacks the checked Electron zip of this job's arch (the runner is
+      # arm64, so the x64 job needs the darwin-x64 zip) instead of downloading it without retries.
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: darwin-${{ matrix.arch }}
       - name: Setup code signing
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: ./scripts/setup-macos-signing.sh
@@ -1251,7 +1318,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # electron-builder unpacks the checked Electron zip instead of downloading it without retries.
       - uses: ./.github/actions/setup-xum
+        with:
+          electron-zip: "true"
+          electron-zip-targets: win32-x64
       - name: Add MSYS2 make to PATH
         shell: pwsh
         run: |
@@ -1323,8 +1394,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      # The four test targets take 70 to 112 s here (93 s at the median of 33 PR runs). Each gate run
-      # in them has a 120 s hang guard (scripts/check_codex_comments_test.py), so a gate that hung
+      # The four test targets take 70 to 112 s here (93 s at the median of 33 PR runs). Each script
+      # run in them has a hang guard: 120 s in scripts/check_codex_comments_test.py and
+      # scripts/pr_checks_test.py, 300 s in scripts/watch_pr_state_test.py,
+      # scripts/required_superseded_test.py and scripts/branch_sync_guard_test.py. A gate that hung
       # on every run would hold the job until GitHub's 6 h limit without a step limit. 15 minutes is
       # about 8 times the longest run seen.
       - name: Test PR readiness gates
@@ -1351,6 +1424,7 @@ jobs:
       - test-storybook
       - test-windows
       - test-e2e
+      - test-phone-chrome
       - bugbash-sandbox
       - smoke-server
       - smoke-docker
