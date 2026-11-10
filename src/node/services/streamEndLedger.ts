@@ -6,6 +6,7 @@ import { log } from "@/node/services/log";
 import type {
   AdmittedSend,
   AttemptFence,
+  InheritedReport,
   OwnedTaskAttempt,
   StreamEndDecision,
   StreamEndTaskOrigin,
@@ -213,7 +214,7 @@ export class StreamEndLedger {
       // An attempt this process does not own has no record of what the CAS that published it left
       // on the row, so a reported row is never read as inherited: the continuation is refused,
       // never assumed.
-      inheritedReport: attempt?.inheritedReport ?? false,
+      inheritedReport: attempt?.inheritedReport ?? null,
       outcome: "pending",
       turn: this.deps.workspaceService().getActiveTurnGeneration(taskId),
     };
@@ -269,8 +270,7 @@ export class StreamEndLedger {
     // row inherited from an earlier attempt (a reactivated execution) says nothing about this one.
     const resolved =
       outcome === "nonreport" &&
-      !decision.inheritedReport &&
-      this.rowReportsAttempt(taskId, decision.attemptId)
+      this.rowReportsAttempt(taskId, decision.attemptId, decision.inheritedReport)
         ? "indeterminate"
         : outcome;
     decision.outcome = resolved;
@@ -365,13 +365,25 @@ export class StreamEndLedger {
     return true;
   }
 
-  /** The task's row reads a completed report bound to `attemptId`. */
-  private rowReportsAttempt(taskId: string, attemptId: string): boolean {
+  /**
+   * The task's row reads a completed report bound to `attemptId`, other than `inherited` (the one
+   * the row carried when the attempt began). Only an inherited report of an `interrupted` row can
+   * be replaced, and the replacing report writes `reported` (see InheritedReport).
+   */
+  private rowReportsAttempt(
+    taskId: string,
+    attemptId: string,
+    inherited: InheritedReport | null = null
+  ): boolean {
     const workspace = findWorkspaceEntry(
       this.deps.config().loadConfigOrDefault(),
       taskId
     )?.workspace;
-    return workspace?.taskAttemptId === attemptId && hasCompletedAgentReport(workspace);
+    if (workspace?.taskAttemptId !== attemptId || !hasCompletedAgentReport(workspace)) return false;
+    return (
+      inherited == null ||
+      (inherited.taskStatus === "interrupted" && workspace.taskStatus === "reported")
+    );
   }
 
   /**

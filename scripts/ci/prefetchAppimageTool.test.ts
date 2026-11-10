@@ -7,7 +7,15 @@
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally:
 // bun test ./scripts/ci/prefetchAppimageTool.test.ts
-import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  setDefaultTimeout,
+  test,
+} from "bun:test";
 import {
   chmod,
   copyFile,
@@ -21,7 +29,9 @@ import {
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { path7za } from "7zip-bin";
-import { runScript, writeExecutable, type RunResult } from "./runScript";
+import { SPAWNING_TEST_TIMEOUT_MS, runScript, writeExecutable, type RunResult } from "./runScript";
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const SCRIPT = path.resolve(import.meta.dir, "prefetch-appimage-tool.sh");
 const VERSION = "appimage-12.0.1";

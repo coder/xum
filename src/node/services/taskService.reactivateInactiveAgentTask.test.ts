@@ -214,6 +214,7 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
           runtimeConfig: local,
           parentWorkspaceId: PARENT,
           taskStatus: "reported",
+          reportedAt: AT,
           taskAttemptId: PRIOR,
           title: "Child",
           ...child,
@@ -606,7 +607,8 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
       source: "reactivation",
       attemptId,
       receiptEligible: false,
-      inheritedReport: true,
+      // The predecessor's report stays on the row, and its status is what the attempt inherits.
+      inheritedReport: { taskStatus: "reported" },
     });
     expect(h.row()?.taskAttemptUnproven).toBe(true);
     expect(h.ledger.currentAttemptIdByTaskId.get(CHILD)).toBe(attemptId);
@@ -709,7 +711,7 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
       source: "reactivation",
       attemptId: h.row()?.taskAttemptId,
       receiptEligible: c.eligible,
-      inheritedReport: true,
+      inheritedReport: { taskStatus: "reported" },
     });
     expect(h.row()?.taskAttemptUnproven).toBe(c.eligible ? undefined : true);
   });
@@ -749,12 +751,25 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
     expect(h.ledger.hasLiveReawakening(CHILD)).toBe(false);
   });
 
+  test("a reactivated interrupted child that carries a report inherits it as interrupted", async () => {
+    // Only this row shape can be reported again: its attempt's report turns the row `reported`.
+    const h = await setup({ taskStatus: "interrupted", reportedAt: AT });
+    expect(await h.send()).toMatchObject(Ok({ delivery: "reactivated" }));
+    expect(h.row()).toMatchObject({ taskStatus: "interrupted", reportedAt: AT });
+    expect(h.ledger.ownedAttempt(CHILD)?.inheritedReport).toStrictEqual({
+      taskStatus: "interrupted",
+    });
+  });
+
   test("a legacy archived child that was running at the decision is reactivated", async () => {
     // Only a flip to running since the decision refuses; this status was running all along.
     const h = await setup({ archivedAt: AT, taskStatus: "running" });
     expect(await h.send()).toMatchObject(Ok({ delivery: "reactivated" }));
     expect(h.row()?.taskStatus).toBe("running");
     expect(h.ledger.ownedAttempt(CHILD)?.attemptId).toBe(h.row()?.taskAttemptId);
+    // A row that reads running carries no report, whatever stale `reportedAt` it still holds.
+    expect(h.row()?.reportedAt).toBe(AT);
+    expect(h.ledger.ownedAttempt(CHILD)?.inheritedReport).toBeNull();
     expect(h.turns.length).toBe(1);
   });
 });

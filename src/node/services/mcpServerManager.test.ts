@@ -5046,6 +5046,54 @@ describe("MCPServerManager", () => {
     expect(result.overridesUsed).toEqual({});
   });
 
+  test("an uncached workspace's first serve fails closed when a save that skips its publication lands during the disk read", async () => {
+    // A settings save publishes only to workspaces this manager holds state for
+    // (hasWorkspaceOverridesSnapshot), so an uncached sharer of the written checkout gets no
+    // publication. Its first serve, parked on a disk read from before the save, must be
+    // stopped by the epoch that the save moved, before any server starts.
+    manager.dispose();
+    let epoch = "epoch-1";
+    let readStarted: () => void = () => undefined;
+    const readStartedPromise = new Promise<void>((resolve) => {
+      readStarted = resolve;
+    });
+    let resolveRead: (value: Record<string, unknown>) => void = () => undefined;
+    const pendingRead = new Promise<Record<string, unknown>>((resolve) => {
+      resolveRead = resolve;
+    });
+    let reads = 0;
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve("plugin-epoch"),
+        readOverridesEpoch: () => Promise.resolve(epoch),
+        readWorkspaceOverrides: () => {
+          reads += 1;
+          if (reads > 1) return Promise.resolve({ disabledServers: ["ordinary"] }); // After the save.
+          readStarted();
+          return pendingRead;
+        },
+      },
+    });
+    configService.listServers = mock(() =>
+      Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
+    );
+    servers.serve("node ordinary.js");
+    const workspaceId = "ws-uncached-sharer";
+    expect(manager.hasWorkspaceOverridesSnapshot(workspaceId)).toBe(false);
+
+    const serve = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    await readStartedPromise;
+    // The save: the document is written and the epoch moves; no publication reaches here.
+    epoch = "epoch-2";
+    resolveRead({}); // The pre-save state, which leaves "ordinary" enabled.
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(serve).rejects.toThrow(/about to start/);
+    expect(servers.exec).not.toHaveBeenCalled();
+    expect(servers.connectCount("node ordinary.js")).toBe(0);
+  });
+
   test("stopServersWithKeyPrefix invalidates instances published by an in-flight startup, then retries them", async () => {
     const workspaceId = "ws-swap-race";
     const pluginKey = "plugin:abc123:echo";

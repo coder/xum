@@ -13,7 +13,13 @@ import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { __resetFileSinkForTests, clearLogFiles, closeLogFile, log } from "./log";
+import {
+  __closeFileSinkForTests,
+  __resetFileSinkForTests,
+  clearLogFiles,
+  closeLogFile,
+  log,
+} from "./log";
 import { subscribeLogFeed, type LogEntry } from "./logBuffer";
 
 describe("log file sink state machine", () => {
@@ -101,6 +107,50 @@ describe("log file sink state machine", () => {
 
     log.info("line after clear");
     expect(createWriteStreamSpy).toHaveBeenCalledTimes(2);
+  });
+
+  test("__closeFileSinkForTests resolves only after the descriptor is closed and keeps the sink closed", async () => {
+    const originalCreateWriteStream = fs.createWriteStream;
+    const createdStreams: fs.WriteStream[] = [];
+    const createWriteStreamSpy = spyOn(fs, "createWriteStream").mockImplementation((...args) => {
+      const stream = originalCreateWriteStream(...args);
+      createdStreams.push(stream);
+      return stream;
+    });
+
+    log.info("line before the sink is closed");
+    const stream = createdStreams[0];
+    if (!stream) {
+      throw new Error("expected a log stream");
+    }
+    expect(stream.closed).toBe(false);
+
+    await __closeFileSinkForTests();
+    expect(stream.closed).toBe(true);
+
+    // A line that arrives while the caller deletes the log folder must not reopen the sink.
+    log.info("line after the sink is closed");
+    expect(createWriteStreamSpy).toHaveBeenCalledTimes(1);
+
+    // With no sink open there is nothing to wait for.
+    await __closeFileSinkForTests();
+
+    __resetFileSinkForTests();
+    log.info("line after the sink is reset");
+    expect(createWriteStreamSpy).toHaveBeenCalledTimes(2);
+  });
+
+  test("__closeFileSinkForTests also waits for a clear that is in flight", async () => {
+    log.info("line before the clear");
+    let cleared = false;
+    // clearLogFiles takes the stream out of the open state at once and finishes in the sink queue.
+    const clearing = clearLogFiles().then(() => {
+      cleared = true;
+    });
+
+    await __closeFileSinkForTests();
+    expect(cleared).toBe(true);
+    await clearing;
   });
 
   test("clearLogFiles rejects when truncate fails", async () => {
