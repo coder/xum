@@ -139,10 +139,21 @@ describe("getModelStats", () => {
     expect(stats.cache_read_input_token_cost).toBe(0.000000075);
   });
 
+  test("resolves Gemini 4 Carbon with its introductory pricing and synchronous output cap", () => {
+    expect(expectStats("google:gemini-4-carbon")).toMatchObject({
+      max_input_tokens: 1048576,
+      max_output_tokens: 65536,
+      input_cost_per_token: 0.000002,
+      output_cost_per_token: 0.00001,
+      cache_read_input_token_cost: 0.0000001,
+    });
+  });
+
   test.each([
     // [model, input, output, cacheRead]: the base models' introductory rates do not apply.
     ["google-vertex:gemini-3.8-flash-cyber", 0.0000015, 0.0000075, 0.00000015],
     ["google-vertex:gemini-4-argon-cyber-permissive", 0.000004, 0.00002, 0.0000002],
+    ["google-vertex:gemini-4-carbon-cyber-permissive", 0.000004, 0.00002, 0.0000002],
   ] as const)(
     "resolves the Vertex-only %s custom model with its list pricing and limits",
     (model, input, output, cacheRead) => {

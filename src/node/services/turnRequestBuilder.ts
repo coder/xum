@@ -1868,6 +1868,8 @@ export class TurnRequestBuilder {
       minimumThinkingLevelOverride: ThinkingLevel | undefined;
       enforceMinimum: boolean;
       recordTiming?: boolean;
+      /** A refusal-fallback hop: the refused model's Anthropic Fast pick does not carry over. */
+      refusalFallback?: boolean;
     }) => {
       if (
         options.enforceMinimum &&
@@ -1914,6 +1916,7 @@ export class TurnRequestBuilder {
           workspaceId,
           providersConfig: providersConfigSnapshot,
           getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
+          withoutAnthropicFastMode: options.refusalFallback === true,
           getAnthropicCacheTtlOverride: () => agentCacheTtl.value,
           promptCacheScope,
         }
@@ -4169,6 +4172,7 @@ export class TurnRequestBuilder {
                     nextModelString
                   ),
                   enforceMinimum: true,
+                  refusalFallback: true,
                 });
                 if (!nextSeedResult.success) {
                   return Err(formatSendMessageError(nextSeedResult.error).message);

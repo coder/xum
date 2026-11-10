@@ -24,6 +24,7 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 | Gemini 3.1 Pro Preview | google:gemini-3.1-pro-preview | `gemini`, `gemini-pro`                                       |         |
 | Gemini 3.8 Flash       | google:gemini-3.8-flash       | `gemini-flash`                                               |         |
 | Gemini 4 Argon         | google:gemini-4-argon         | `argon`, `gemini-argon`, `gemini-4`                          |         |
+| Gemini 4 Carbon        | google:gemini-4-carbon        | `carbon`, `gemini-carbon`                                    |         |
 | Grok 4.7               | xai:grok-4.7                  | `grok`, `grok-4.7`                                           |         |
 | DeepSeek V4 Pro        | deepseek:deepseek-v4-pro      | `deepseek`, `deepseek-pro`, `deepseek-v4`, `deepseek-v4-pro` |         |
 | DeepSeek V4 Flash      | deepseek:deepseek-v4-flash    | `deepseek-flash`, `deepseek-v4-flash`                        |         |
@@ -108,6 +109,16 @@ When a model refuses to respond, Xum can retry the turn on the next model in
 that model's fallback chain. Chains apply only to refusals, never to quota,
 auth, or network errors. Edit them under **Settings → Models → Model
 Fallbacks**, or in `~/.xum/config.json` under `modelFallbacks`.
+
+Two cases follow Anthropic's guidance for Claude Fable 5.2:
+
+- Anthropic recommends no fallback for a `reasoning_extraction` refusal: the
+  request asks the model to reproduce its reasoning in the reply. Xum shows the
+  refusal and does not retry on the chain. Change the prompt instead. Every
+  other refusal category, and a refusal with no category, falls back as usual.
+- A fallback attempt never uses Anthropic [Fast mode](/config/providers#anthropic-fast-mode),
+  even when the chat does. Anthropic limits Fast mode to some models and rejects
+  `speed: "fast"` on the others, so the fallback runs at standard speed.
 
 New installs start with these chains:
 

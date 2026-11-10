@@ -140,7 +140,20 @@ describe("log file sink state machine", () => {
     expect(createWriteStreamSpy).toHaveBeenCalledTimes(2);
   });
 
-  test("__closeFileSinkForTests also waits for a clear that is in flight", async () => {
+  // Records every stream that the sink opens.
+  function recordCreatedStreams(): fs.WriteStream[] {
+    const originalCreateWriteStream = fs.createWriteStream;
+    const createdStreams: fs.WriteStream[] = [];
+    spyOn(fs, "createWriteStream").mockImplementation((...args) => {
+      const stream = originalCreateWriteStream(...args);
+      createdStreams.push(stream);
+      return stream;
+    });
+    return createdStreams;
+  }
+
+  test("__closeFileSinkForTests also waits for a clear that is in flight, and for its stream to close", async () => {
+    const createdStreams = recordCreatedStreams();
     log.info("line before the clear");
     let cleared = false;
     // clearLogFiles takes the stream out of the open state at once and finishes in the sink queue.
@@ -150,7 +163,51 @@ describe("log file sink state machine", () => {
 
     await __closeFileSinkForTests();
     expect(cleared).toBe(true);
+    expect(createdStreams.length).toBe(1);
+    expect(createdStreams.every((stream) => stream.closed)).toBe(true);
     await clearing;
+  });
+
+  test("a clear does not wait for a stream that is already closed", async () => {
+    const createdStreams = recordCreatedStreams();
+    log.info("line before the stream is closed behind the sink's back");
+    const stream = createdStreams[0];
+    if (!stream) {
+      throw new Error("expected a log stream");
+    }
+    // The sink still holds the stream as its open sink, but the stream is closed and 'close' will
+    // not fire again. Report that state directly, so the test does not wait for a real close,
+    // which takes seconds on a loaded host. A stream that ignores end() cannot close by itself.
+    Object.defineProperty(stream, "closed", { value: true, configurable: true });
+    const endSpy = spyOn(stream, "end").mockImplementation(() => stream);
+
+    await clearLogFiles();
+
+    // Give the real stream back its state, then close it.
+    endSpy.mockRestore();
+    Reflect.deleteProperty(stream, "closed");
+    stream.destroy();
+  });
+
+  test("a clear waits for a failed stream to close, and does not wait forever for it", async () => {
+    const createdStreams = recordCreatedStreams();
+    log.info("line before the stream fails");
+    const stream = createdStreams[0];
+    if (!stream) {
+      throw new Error("expected a log stream");
+    }
+    // A stream that fails before it flushes never finishes or closes by itself.
+    const endSpy = spyOn(stream, "end").mockImplementation(() => stream);
+
+    const clearing = clearLogFiles();
+    // The clear starts in the sink queue, and the stream fails while it waits for the close.
+    await new Promise((resolve) => setImmediate(resolve));
+    stream.emit("error", new Error("forced log stream failure"));
+    await clearing;
+
+    // The clear waited until the failed stream was destroyed and its descriptor closed.
+    expect(stream.closed).toBe(true);
+    endSpy.mockRestore();
   });
 
   test("clearLogFiles rejects when truncate fails", async () => {
