@@ -4241,6 +4241,10 @@ describe("AgentPluginInstallService", () => {
       const restarted = new AgentPluginInstallService(config, {
         mcpServerManager: stopStub as unknown as MCPServerManager,
       });
+      // The retry wait after a failed pass ends only when the test advances the clock. On a slow
+      // run the real 30 s could pass first, and the status reads and scans below would start
+      // passes that clear the fixture records.
+      using clock = freezeMonotonicClock();
       // Before the sign-in service is wired, no pass ran: the record is pending without an error.
       expect(await restarted.pendingSignOutStatus()).toEqual({
         kind: "pending",
@@ -4299,13 +4303,9 @@ describe("AgentPluginInstallService", () => {
       // Reading the status retries like the discovery gate, so a fixed cause clears it.
       fail = false;
       await internals.settledSignOutPasses();
-      const later = spyOn(performance, "now").mockReturnValue(performance.now() + 31_000);
-      try {
-        // The read waits for the retry it started, so it already reports the cleared record.
-        expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
-      } finally {
-        later.mockRestore();
-      }
+      clock.advance(31_000);
+      // The read waits for the retry it started, so it already reports the cleared record.
+      expect(await restarted.pendingSignOutStatus()).toEqual({ kind: "none" });
       await oauth.dispose();
     });
 
