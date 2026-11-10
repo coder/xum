@@ -15,6 +15,7 @@ import {
 } from "@/common/constants/storage";
 import {
   MEMORY_DREAM_COST_CEILING_MAX_USD,
+  MEMORY_DREAM_RUN_TIMEOUT_MAX_MINUTES,
   MEMORY_DREAM_COST_CEILING_MIN_USD,
 } from "@/common/constants/memory";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
@@ -198,6 +199,16 @@ export const UserPreferencesSchema = z.object({
        * limit; absent means MEMORY_CONSOLIDATION_OP_BUDGET. The analyzer keeps its own budget.
        */
       dreamEditLimit: z.number().int().min(0).optional(),
+      /**
+       * Minutes one organizer run may stream before it is cut. 0 means no timeout; absent means
+       * MEMORY_CONSOLIDATION_TIMEOUT_MS. Analyzer chunks keep that constant.
+       */
+      dreamRunTimeoutMinutes: z
+        .number()
+        .int()
+        .min(0)
+        .max(MEMORY_DREAM_RUN_TIMEOUT_MAX_MINUTES)
+        .optional(),
     })
     .optional(),
   ui: z

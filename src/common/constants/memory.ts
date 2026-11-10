@@ -150,3 +150,9 @@ export const MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP = 3;
  * count.
  */
 export const MEMORY_CONSOLIDATION_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Largest dream run timeout a user can set, in minutes (24 hours). Node clamps a timer past
+ * 2^31 - 1 ms (about 24.8 days) to 1 ms, so an unbounded value would cut the run at once. 0, the
+ * smallest, means no timeout.
+ */
+export const MEMORY_DREAM_RUN_TIMEOUT_MAX_MINUTES = 24 * 60;
