@@ -9,9 +9,33 @@ import {
   nearestSupportedIsolation,
   normalizeIsolationChoice,
   resolveDefaultIsolation,
+  resolveEnabledIsolation,
   runtimeIdFromIsolation,
 } from "./isolation";
-import { RUNTIME_ENABLEMENT_IDS } from "./runtime";
+import { DEFAULT_RUNTIME_ENABLEMENT, RUNTIME_ENABLEMENT_IDS } from "./runtime";
+
+describe("resolveEnabledIsolation", () => {
+  it("keeps the project axis and skips workspace isolations Settings disable", () => {
+    const withoutWorktree = { ...DEFAULT_RUNTIME_ENABLEMENT, worktree: false };
+    // Worktree is SSH's preferred pair, but it is disabled, so SSH+None is what gets created.
+    expect(
+      resolveEnabledIsolation({ project: "ssh", workspace: "docker" }, withoutWorktree)
+    ).toEqual({ project: "ssh", workspace: "none" });
+  });
+
+  it("falls back to a Local pair when the project isolation has nothing enabled", () => {
+    const coderNeedsWorktree = { ...DEFAULT_RUNTIME_ENABLEMENT, worktree: false };
+    expect(
+      resolveEnabledIsolation({ project: "coder", workspace: "worktree" }, coderNeedsWorktree)
+    ).toEqual({ project: "local", workspace: "none" });
+    expect(
+      resolveEnabledIsolation(
+        { project: "ssh", workspace: "worktree" },
+        { ...DEFAULT_RUNTIME_ENABLEMENT, ssh: false }
+      )
+    ).toEqual({ project: "local", workspace: "worktree" });
+  });
+});
 
 describe("isolation ↔ runtime id mapping", () => {
   it.each(RUNTIME_ENABLEMENT_IDS.map((id) => [id]))("round-trips %s", (id) => {

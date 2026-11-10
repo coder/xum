@@ -561,8 +561,10 @@ export function RuntimesSection() {
   };
 
   const handleDefaultIsolationChange = (choice: IsolationChoice) => {
-    // A pair with no backend yet snaps to the nearest one on the same project isolation.
-    const next = nearestSupportedIsolation(choice);
+    // Persist what new workspaces will actually get: a pair with no backend yet, or one Settings
+    // disable, snaps to the nearest supported and enabled pair (the same rule the select shows).
+    const next =
+      resolveEnabledIsolation(choice, effectiveEnablement) ?? nearestSupportedIsolation(choice);
 
     if (!isProjectScope) {
       setDefaultIsolation(next);

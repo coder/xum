@@ -10683,7 +10683,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- Xum syncs nothing into that directory and never checks out branches, moves, or deletes it. Archiving or deleting the workspace leaves it in place.",
       "- Every workspace with the same directory shares it, like the [Local](/runtime/local) runtime does on your machine.",
       "- The local project does not need to be a git repository.",
-      "- Project trust covers your local project, not the directory on the host. So Xum doesn't run that directory's `.xum/init` hook or load repo-controlled configuration from it (tool hooks, project agents, skills, plugins, and MCP servers).",
+      "- Project trust covers your local project, not the directory on the host. So Xum treats that directory like an untrusted project: it doesn't run its `.xum/init` hook or tool hooks, and doesn't load its project plugins or MCP servers.",
       "",
       "## Authentication",
       "",
