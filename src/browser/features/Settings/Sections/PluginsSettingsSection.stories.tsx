@@ -420,7 +420,8 @@ export const InstalledPhoneViewport: Story = {
       for (const { commit, line } of commits) {
         const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
         let text = walker.nextNode();
-        while (text !== null && !(text.textContent ?? "").includes(commit)) text = walker.nextNode();
+        while (text !== null && !(text.textContent ?? "").includes(commit))
+          text = walker.nextNode();
         if (text === null) throw new Error(`Commit ${commit} is not on its source line`);
         const start = (text.textContent ?? "").indexOf(commit);
         const range = document.createRange();
