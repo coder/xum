@@ -1747,10 +1747,10 @@ function marketplaceOptions(listing = MARKETPLACE_LISTING): MockORPCClientOption
   };
 }
 
-async function openMarketplace(canvasElement: HTMLElement) {
+async function openMarketplace(canvasElement: HTMLElement, repo = "anthropics/skills") {
   const canvas = within(canvasElement);
   await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
-  await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), "anthropics/skills");
+  await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), repo);
   await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
   await canvas.findByRole("group", { name: "Pick one plugin to install" });
   return canvas;
@@ -1918,15 +1918,6 @@ function cursorMarketplaceOptions(): MockORPCClientOptions {
   };
 }
 
-async function openCursorMarketplace(canvasElement: HTMLElement) {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
-  await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), "cursor/plugins");
-  await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
-  await canvas.findByRole("group", { name: "Pick one plugin to install" });
-  return canvas;
-}
-
 /**
  * A repository with both marketplace files (cursor/plugins). pstack is in both: its row has a
  * Preview action per build, and each previews its own build. origin-apps' Cursor build is an npm
@@ -1939,7 +1930,7 @@ export const AddPluginCursorMarketplace: Story = {
     </PluginsSectionStoryShell>
   ),
   play: async ({ canvasElement }) => {
-    const canvas = await openCursorMarketplace(canvasElement);
+    const canvas = await openMarketplace(canvasElement, "cursor/plugins");
     await canvas.findByText(/Cursor and Claude Code marketplaces · 3 plugins/);
     await expect(canvas.getByRole("radio", { name: /pstack/ })).toBeChecked();
 
@@ -1988,13 +1979,148 @@ export const AddPluginCursorMarketplacePhoneViewport: Story = {
     </PluginsSectionStoryShell>
   ),
   play: async ({ canvasElement }) => {
-    const canvas = await openCursorMarketplace(canvasElement);
+    const canvas = await openMarketplace(canvasElement, "cursor/plugins");
     await canvas.findByRole("button", { name: "Preview Claude build" });
     const group = canvas.getByRole("group", { name: "Pick one plugin to install" });
     const card = group.closest("div[class*='rounded-md']");
     if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
     if (card.scrollWidth > card.clientWidth + 1) {
       throw new Error("The merged marketplace list overflows the card at phone width");
+    }
+  },
+};
+
+const E2E_SOURCE = {
+  type: "git" as const,
+  url: "https://github.com/tester-army/e2e.git",
+  ref: "main",
+  refType: "branch" as const,
+};
+
+/**
+ * Shaped like tester-army/e2e: all three marketplace files list `e2e` from one folder, and the
+ * Agent Plugins file also lists a plugin that its policy withholds.
+ */
+const AGENTS_MARKETPLACE_LISTING: AgentPluginMarketplaceListing = {
+  name: "e2e",
+  description: "Skills for writing, running, and debugging e2e tests",
+  owner: "TesterArmy",
+  source: E2E_SOURCE,
+  lockedSha: "14dc946c40091496531451cf40e81eb407fe640e",
+  entries: [
+    {
+      name: "e2e",
+      description: "Write, run, and debug end-to-end tests for web and mobile apps with e2e.",
+      builds: [
+        { file: "cursor", sourceKind: "relative", source: "plugins/e2e", installable: true },
+        { file: "claude", sourceKind: "relative", source: "plugins/e2e", installable: true },
+        { file: "agents", sourceKind: "relative", source: "plugins/e2e", installable: true },
+      ],
+    },
+    {
+      name: "e2e-labs",
+      builds: [
+        { file: "cursor", sourceKind: "relative", source: "plugins/e2e-labs", installable: true },
+        {
+          file: "agents",
+          sourceKind: "relative",
+          source: "plugins/e2e-labs",
+          installable: false,
+          reason:
+            "The marketplace marks this plugin policy.installation NOT_AVAILABLE, so Xum does not install it.",
+        },
+      ],
+    },
+  ],
+  methods: [],
+  warnings: [],
+};
+
+function agentsMarketplaceOptions(): MockORPCClientOptions {
+  const method = { kind: "agent-plugin" as const };
+  return {
+    agentPlugins: {
+      items: [],
+      marketplace: AGENTS_MARKETPLACE_LISTING,
+      previewsByMethod: {
+        "agents-marketplace": {
+          ...SKILLS_PREVIEW,
+          source: { ...E2E_SOURCE, subpath: "plugins/e2e" },
+          method,
+          methods: [method],
+          skillsCliSkills: [],
+          manifest: { name: "e2e", description: "e2e, Agent Plugins build" },
+          targetPath: "~/.mux/plugins/e2e",
+        },
+      },
+    },
+  };
+}
+
+/**
+ * A repository with all three marketplace files (tester-army/e2e). The header names the three
+ * files, the first row has a Preview action per build, and the Agent Plugins build previews
+ * through the folder's own manifest. The second row's Agent Plugins build is withheld by policy.
+ */
+export const AddPluginAgentsMarketplace: Story = {
+  render: () => (
+    <PluginsSectionStoryShell options={agentsMarketplaceOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openMarketplace(canvasElement, "tester-army/e2e");
+    await canvas.findByText(/Cursor, Claude Code and Agent Plugins marketplaces · 2 plugins/);
+    await expect(canvas.getByRole("radio", { name: /^e2e\s/ })).toBeChecked();
+    for (const name of [
+      "Preview Cursor build",
+      "Preview Claude build",
+      "Preview Agent Plugins build",
+    ]) {
+      await expect(canvas.getByRole("button", { name })).toBeEnabled();
+    }
+
+    await userEvent.click(canvas.getByRole("radio", { name: /e2e-labs/ }));
+    await expect(canvas.getByRole("button", { name: "Preview Cursor build" })).toBeEnabled();
+    await expect(
+      canvas.getByRole("button", { name: "Preview Agent Plugins build" })
+    ).toBeDisabled();
+    await canvas.findByText(/policy\.installation NOT_AVAILABLE/);
+
+    await userEvent.click(canvas.getByRole("radio", { name: /^e2e\s/ }));
+    await userEvent.click(canvas.getByRole("button", { name: "Preview Agent Plugins build" }));
+    await canvas.findByText("e2e, Agent Plugins build");
+    await expect(canvas.getByText("Agent Plugin", { selector: "span" })).toBeVisible();
+  },
+};
+
+/** The three-file list at phone width: three build lines and three actions fit the card. */
+export const AddPluginAgentsMarketplacePhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={agentsMarketplaceOptions()}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openMarketplace(canvasElement, "tester-army/e2e");
+    await canvas.findByRole("button", { name: "Preview Agent Plugins build" });
+    const group = canvas.getByRole("group", { name: "Pick one plugin to install" });
+    const card = group.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("The three-file marketplace list overflows the card at phone width");
     }
   },
 };
