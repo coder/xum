@@ -40,6 +40,17 @@ Host ovh-1
   User root
 ```
 
+## Workspace isolation on SSH
+
+By default each SSH workspace gets its own git worktree on the host, synced from your local repository.
+
+Choose **None** as the workspace isolation to work directly in an existing directory on the host instead, for example a repository you already cloned there:
+
+- Enter the directory (for example `~/src/my-app`) next to the host. Xum remembers it per project.
+- Xum syncs nothing into that directory and never checks out branches, moves, or deletes it. Archiving or deleting the workspace leaves it in place.
+- Every workspace with the same directory shares it, like the [Local](/runtime/local) runtime does on your machine.
+- The local project does not need to be a git repository.
+
 ## Authentication
 
 <Info>
