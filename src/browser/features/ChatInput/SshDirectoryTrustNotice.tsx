@@ -21,14 +21,17 @@ export function SshDirectoryTrustNotice(props: {
   host: string;
   projectDir: string;
   disabled: boolean;
+  /**
+   * The backend stores the directory resolved on the host (~ expanded), as workspaces persist it.
+   * Writing that back into the selection keeps the field, the remembered directory and the stored
+   * trust entry identical, so a typed "~/app" still shows as trusted after a restart.
+   */
+  onProjectDirResolved: (projectDir: string) => void;
 }) {
   const { api } = useAPI();
   const { refreshProjects } = useProjectContext();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // The backend stores projectDir resolved on the host (~ expanded), as workspaces persist it.
-  // Remember what the typed value resolved to so a typed "~/app" shows as trusted after the grant.
-  const [resolved, setResolved] = useState<{ typed: string; stored: string } | null>(null);
 
   const host = props.host.trim();
   const typedDir = props.projectDir.trim();
@@ -39,12 +42,11 @@ export function SshDirectoryTrustNotice(props: {
       : project;
   if (host === "" || typedDir === "" || owner?.trusted !== true) return null;
 
-  const storedDir = resolved?.typed === typedDir ? resolved.stored : typedDir;
   const runtimeConfig = buildRuntimeConfig({
     mode: "ssh",
     host,
     workspaceIsolation: "none",
-    projectDir: storedDir,
+    projectDir: typedDir,
   });
   const trusted = isWorkspaceDirTrustedBy(owner.trustedSshDirectories, runtimeConfig);
 
@@ -56,14 +58,16 @@ export function SshDirectoryTrustNotice(props: {
       const result = await api.projects.setSshDirectoryTrust({
         projectPath: props.projectPath,
         host,
-        projectDir: storedDir,
+        projectDir: typedDir,
         trusted: next,
       });
       if (!result.success) {
         setError(result.error);
         return;
       }
-      setResolved({ typed: typedDir, stored: result.data.projectDir });
+      if (result.data.projectDir !== typedDir) {
+        props.onProjectDirResolved(result.data.projectDir);
+      }
       publishProjectTrustChanged();
       await refreshProjects();
     } catch (err) {

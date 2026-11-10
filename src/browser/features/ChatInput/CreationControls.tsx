@@ -865,6 +865,15 @@ function CreationControlsContent(props: CreationControlsProps) {
               host={selectedRuntime.host}
               projectDir={selectedRuntime.projectDir ?? ""}
               disabled={props.disabled}
+              onProjectDirResolved={(projectDir) =>
+                onSelectedRuntimeChange({
+                  mode: "ssh",
+                  host: selectedRuntime.host,
+                  coder: selectedRuntime.coder,
+                  workspaceIsolation: "none",
+                  projectDir,
+                })
+              }
             />
           )}
 
