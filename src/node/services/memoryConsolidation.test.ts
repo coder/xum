@@ -1883,6 +1883,120 @@ describe("runMemoryConsolidation", () => {
     });
   });
 
+  describe("edit limit", () => {
+    async function run(
+      fixture: Fixture,
+      model: MockLanguageModelV3,
+      options: { editLimit?: number | null; ceilingUsd?: number } = {}
+    ) {
+      return runMemoryConsolidation({
+        model,
+        pricingModel: PRICED_MODEL,
+        agentBody: "Consolidate the memory directories.",
+        memoryService: fixture.memoryService,
+        metaService: fixture.metaService,
+        ctx: fixture.ctx,
+        dryRun: false,
+        ...options,
+      });
+    }
+
+    /** A model whose first step creates `count` workspace files at once and whose second ends. */
+    function creatingModel(count: number): { model: MockLanguageModelV3; prompts: string[] } {
+      const prompts: string[] = [];
+      let calls = 0;
+      const usage = {
+        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: { total: 0, text: 0, reasoning: 0 },
+      };
+      const model = new MockLanguageModelV3({
+        doStream: (options) => {
+          calls += 1;
+          prompts.push(JSON.stringify(options.prompt));
+          const creates: LanguageModelV3StreamPart[] = Array.from({ length: count }, (_, i) => ({
+            type: "tool-call",
+            toolCallId: `create-${i}`,
+            toolName: "memory",
+            input: JSON.stringify({
+              command: "create",
+              path: `/memories/workspace/f${i}.md`,
+              file_text: "fact\n",
+            }),
+          }));
+          const chunks: LanguageModelV3StreamPart[] =
+            calls === 1
+              ? [...creates, { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage }]
+              : [{ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage }];
+          return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+        },
+      });
+      return { model, prompts };
+    }
+
+    it("spends the configured limit and refuses the edit after it", async () => {
+      using fixture = await createFixture();
+      const scripted = creatingModel(5);
+
+      const result = await run(fixture, scripted.model, { editLimit: 3 });
+
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(3);
+      expect(result.budgetExhausted).toBe(true);
+      expect(scripted.prompts[0]).toContain("You have 3 mutating commands this run.");
+    });
+
+    it("refuses no edit and says so in the prompt when there is no limit", async () => {
+      using fixture = await createFixture();
+      const scripted = creatingModel(MEMORY_CONSOLIDATION_OP_BUDGET + 4);
+
+      const result = await run(fixture, scripted.model, { editLimit: null });
+
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(MEMORY_CONSOLIDATION_OP_BUDGET + 4);
+      expect(result.budgetExhausted).toBe(false);
+      expect(scripted.prompts[0]).toContain("This run has no edit limit.");
+    });
+
+    it("keeps the default budget for a caller that passes no limit", async () => {
+      using fixture = await createFixture();
+      const scripted = creatingModel(MEMORY_CONSOLIDATION_OP_BUDGET + 1);
+
+      const result = await run(fixture, scripted.model);
+
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(MEMORY_CONSOLIDATION_OP_BUDGET);
+      expect(scripted.prompts[0]).toContain(
+        `You have ${MEMORY_CONSOLIDATION_OP_BUDGET} mutating commands this run.`
+      );
+    });
+
+    it("takes 4 steps for each edit of a raised limit", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      await run(fixture, scripted.model, { editLimit: 24 });
+
+      expect(scripted.calls).toHaveLength(96);
+    });
+
+    it("never takes fewer steps than the default limit allows", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      await run(fixture, scripted.model, { editLimit: 2 });
+
+      expect(scripted.calls).toHaveLength(MEMORY_CONSOLIDATION_MAX_STEPS);
+    });
+
+    it("has no step ceiling without a limit, so only the cost ceiling ends this run", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      // $0.50 a step: the 40th step reaches the $20 ceiling, past the default 32 steps.
+      const result = await run(fixture, scripted.model, { editLimit: null, ceilingUsd: 20 });
+
+      expect(scripted.calls).toHaveLength(40);
+      expect(result.note).toBe("stopped at the cost ceiling after $20.00");
+    });
+  });
+
   it("reports a pass cut short by its timeout as a stream error, not a clean run", async () => {
     // A real provider stream ends silently when its request is aborted: no error part reaches
     // consumeStream, so the pass used to read as clean and be journaled as a success.

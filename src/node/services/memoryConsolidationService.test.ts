@@ -4809,6 +4809,25 @@ describe("MemoryConsolidationService", () => {
     });
   });
 
+  describe("dream edit limit", () => {
+    // The organizer reads the user's limit at each run and states it in its prompt; the prompt's
+    // number is also the budget its memory tool enforces (see runMemoryConsolidation).
+    it.each([
+      [undefined, "You have 8 mutating commands this run."],
+      [24, "You have 24 mutating commands this run."],
+      [0, "This run has no edit limit."],
+    ])("runs an organizer pass for a saved limit of %p with its budget", async (limit, line) => {
+      using fixture = await createFixture();
+      if (limit !== undefined) {
+        await fixture.config.updateUserPreferences([{ memory: { dreamEditLimit: limit } }]);
+      }
+
+      expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+
+      expect(fixture.modelPrompts.at(-1)).toContain(line);
+    });
+  });
+
   describe("dream cost ceiling", () => {
     function setCeiling(fixture: Fixture, usd: number | null): Promise<void> {
       return fixture.config.updateUserPreferences([{ memory: { dreamCostCeilingUsd: usd } }]);

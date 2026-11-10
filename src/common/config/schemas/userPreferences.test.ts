@@ -153,6 +153,25 @@ describe("UserPreferencesSchema", () => {
     }
   });
 
+  test("keeps a whole dream edit limit, 0 included, and reads an invalid one as no limit saved", () => {
+    // 0 is the user's "unlimited"; it must survive the load, or an emptied field reads as 8.
+    for (const stored of [0, 1, 24, Number.MAX_SAFE_INTEGER]) {
+      expect(normalizeUserPreferences({ memory: { dreamEditLimit: stored } })).toEqual({
+        memory: { dreamEditLimit: stored },
+      });
+    }
+    // A hand-edited value that is not a whole, non-negative, exact number drops only itself, so
+    // the run uses the default and the other preferences stay.
+    for (const stored of [-1, 2.5, 2 ** 60, "8", null]) {
+      expect(
+        normalizeUserPreferences({
+          memory: { dreamEditLimit: stored, dreamCostCeilingUsd: 2 },
+          appearance: { vimEnabled: true },
+        })
+      ).toEqual({ memory: { dreamCostCeilingUsd: 2 }, appearance: { vimEnabled: true } });
+    }
+  });
+
   test("prunes empty nested preference groups", () => {
     expect(
       pruneUserPreferences({
