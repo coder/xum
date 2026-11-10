@@ -402,6 +402,12 @@ export const InstalledPhoneViewport: Story = {
       await canvas.findByText("~/.mux/plugins"),
       ...[MANAGED_ITEM, PINNED_ITEM, UNMANAGED_ITEM].map((item) => canvas.getByText(item.location)),
     ];
+    // The commit id of the source line is a word too: the line wraps at spaces around it.
+    const commits = [MANAGED_ITEM, PINNED_ITEM, MAX_LENGTH_ITEM].map((item) => {
+      const commit = item.lockedSha?.slice(0, 12);
+      if (commit === undefined) throw new Error(`${item.name} has no locked commit`);
+      return { commit, line: canvas.getByText(new RegExp(` · ${commit}$`)) };
+    });
     for (let width = 320; width <= 390; width += 5) {
       wrapper.style.width = `${width}px`;
       for (const path of paths) {
@@ -409,6 +415,19 @@ export const InstalledPhoneViewport: Story = {
         range.selectNodeContents(path);
         if (renderedLineTops(range).size !== 1) {
           throw new Error(`${path.textContent} is split across lines at ${width}px`);
+        }
+      }
+      for (const { commit, line } of commits) {
+        const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+        let text = walker.nextNode();
+        while (text !== null && !(text.textContent ?? "").includes(commit)) text = walker.nextNode();
+        if (text === null) throw new Error(`Commit ${commit} is not on its source line`);
+        const start = (text.textContent ?? "").indexOf(commit);
+        const range = document.createRange();
+        range.setStart(text, start);
+        range.setEnd(text, start + commit.length);
+        if (renderedLineTops(range).size !== 1) {
+          throw new Error(`Commit ${commit} is split across lines at ${width}px`);
         }
       }
     }
