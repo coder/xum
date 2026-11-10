@@ -813,6 +813,51 @@ describe("redactSecretLike", () => {
         `"1. **Cookie: a" keep`,
         `"1. **Cookie: [redacted]" keep`,
       ],
+      [
+        "a trace's `<` inside a string",
+        `"< Set-Cookie: a" keep`,
+        `"< Set-Cookie: [redacted]" keep`,
+      ],
+      ["a list dash inside a string", `"- Cookie: a" keep`, `"- Cookie: [redacted]" keep`],
+      ["a code span inside a string", '"`Cookie: a`" keep', '"`Cookie: [redacted]" keep'],
+      // Any other escape before the name ends the string's hint: the value runs to the raw end.
+      [
+        "an escaped letter before the name",
+        String.raw`"\Cookie: a" keep`,
+        String.raw`"\Cookie: [redacted]`,
+      ],
+      // An escaped backslash before the close quote leaves the quote unescaped: it closes the string.
+      [
+        "a value that ends in an escaped backslash",
+        jsonOf({ o: `Cookie${GAP}: a\\`, p: "keep" }),
+        `{"o":"Cookie${GAP}: [redacted]","p":"keep"}`,
+      ],
+      // An escape after a close quote that is no line break or tab is inside the value.
+      [
+        "a quote before another escape",
+        String.raw`echo 'Cookie${GAP}: a'\x sid=SEKRIT`,
+        `echo 'Cookie${GAP}: [redacted]`,
+      ],
+      // An escaped tab is content: it ends no string.
+      [
+        "an escaped tab inside a value",
+        jsonOf({ o: `Cookie${GAP}: a\tsid=SEKRIT`, p: 1 }),
+        `{"o":"Cookie${GAP}: [redacted]","p":1}`,
+      ],
+      // A quote right after a comma opens an item, so the `]` inside it does not end the list.
+      [
+        "an item right after a comma",
+        `{"set-cookie"${GAP}:["a","b]c","SEKRIT"],"host":"h"}`,
+        `{"set-cookie"${GAP}:[redacted],"host":"h"}`,
+      ],
+      // Only spaces and tabs are skipped before the syntax that ends a quoted key's value.
+      [
+        "a form feed after a quoted key's value",
+        `{"cookie": "a"\f; sid=SEKRIT}`,
+        `{"cookie": [redacted]`,
+      ],
+      // Blanks after the value stay, so the marker reads back alone.
+      ["blanks after a value", `Cookie: a"  \nHost: h`, `Cookie: [redacted]  \nHost: h`],
     ])("reads %s", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
@@ -882,6 +927,7 @@ describe("redactSecretLike", () => {
       ["an empty quoted value", '{"cookie": "", "a": 1}', '{"cookie": "[redacted]", "a": 1}'],
     ])("redacts %s as the regex pass does", (_label, text, expected) => {
       expect(redactSecretLike(text)).toBe(expected);
+      expect(redactSecretLike(expected)).toBe(expected);
       expect(addsSecretLike("", text)).toBe(true);
     });
 
@@ -894,6 +940,7 @@ describe("redactSecretLike", () => {
 
       expect(redacted).toContain("[redacted]");
       expect(redacted).not.toContain(SESSION);
+      expect(redactSecretLike(redacted)).toBe(redacted);
     });
 
     // A marker inside quotes covers only what it replaced: a cookie pair after it in the same quoted
@@ -907,6 +954,7 @@ describe("redactSecretLike", () => {
       ],
     ])("redacts a cookie pair after the marker in %s", (_label, text, expected) => {
       expect(redactSecretLike(text)).toBe(expected);
+      expect(redactSecretLike(expected)).toBe(expected);
     });
 
     // What this rule writes, read back (the model's own notes quote what it read), stays as it is.
@@ -1160,6 +1208,26 @@ describe("addsSecretLike", () => {
         expect(addsSecretLike(previous, updated)).toBe(true);
       }
     );
+
+    it("refuses a second copy of a value only the reader takes out", () => {
+      expect(addsSecretLike(byReader, `${byReader}\n${byReader}`)).toBe(true);
+    });
+  });
+
+  // The guard counts each value as often as it occurs, and compares only what each pass takes out,
+  // not the name before it, as main's does.
+  describe("counts values as main's guard does", () => {
+    it("passes a text that holds the same value twice against itself", () => {
+      const twice = "password: SEKRIT\npassword: SEKRIT";
+      expect(addsSecretLike(twice, twice)).toBe(false);
+    });
+
+    it.each([
+      ["a cookie header renamed", "Cookie: SEKRIT", "Set-Cookie: SEKRIT"],
+      ["a secret key renamed", "password: SEKRIT", "token: SEKRIT"],
+    ])("passes %s that keeps its value", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(false);
+    });
   });
 
   it("flags an edit that swaps one credential for another, which keeps their count", () => {

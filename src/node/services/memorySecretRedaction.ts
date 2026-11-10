@@ -289,6 +289,8 @@ function readList(text: string, at: number, frame: Frame): UnitEnd {
     const char = text.charAt(pos + run);
     if (itemStart && QUOTE.test(char)) {
       const item = readQuoted(text, pos + run + 1, { quote: char, run }, stop);
+      // mutation-equivalent: without it the list resumes at the item's stop, where its frame stops it
+      // again at the same index
       if (item.kind === "stopped") return item;
       pos = item.next;
     } else {
@@ -326,6 +328,8 @@ function settleValue(
   start: number,
   unit: UnitEnd
 ): { start: number; end: number } {
+  // mutation-equivalent: a stopped unit's `next` is its frame's end, so reading on from there, or
+  // testing a key's syntax there, ends at the same index
   if (unit.kind !== "closed") return { start, end: unit.end };
   if (header.keyForm && keyValueEnds(text, unit.next, header.frame)) {
     return { start, end: unit.end };
@@ -344,6 +348,8 @@ function readQuotedValue(
   const stop = (pos: number, posRun: number): number => frameEnd(text, pos, posRun, frame);
   const unit = readQuoted(text, contentStart, { quote, run }, stop);
   const value = settleValue(text, header, start, unit);
+  // mutation-equivalent: a value that is no key's always reads past its unit's close, so its end is
+  // never the unit's
   if (!header.keyForm || unit.kind !== "closed" || value.end !== unit.end) return value;
   // A quoted key's value that ends at its own close goes with both its quotes. A kept quote pair
   // around the marker would not read back the same: the regex pass eats all but one backslash of
@@ -362,6 +368,8 @@ function readValue(text: string, header: CookieHeader): { start: number; end: nu
   // empty header in a quoted argument (`-H "Cookie: " url`) runs to the end of the line.
   if (QUOTE.test(opener)) return readQuotedValue(text, header, run, opener);
   const endsAtOnce = frameEnd(text, start, run, frame);
+  // mutation-equivalent: no frame ends at a `[`, and reading to the frame's end from here makes the
+  // same first test
   if (endsAtOnce !== -1) return { start, end: endsAtOnce };
   if (run === 0 && opener === "[") {
     return settleValue(text, header, start, readList(text, start + 1, frame));
@@ -493,6 +501,8 @@ function redactCookieHeaders(text: string, onRemoved: (removed: string) => void)
       onRemoved(removed);
     }
     setHint(state, null);
+    // mutation-equivalent: the value ends after the header's name, and only blanks lie between the
+    // trimmed end and this one, which change no hint once it is cleared
     at = value.end;
   }
   parts.push(text.slice(copied));
