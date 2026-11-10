@@ -2539,8 +2539,8 @@ describe("TaskService", () => {
         })
       );
       await handleStore.upsertWorkspaceTurn(failedRecord);
-      const realStored = workspaceTurnManager.getStoredWorkspaceTurn.bind(workspaceTurnManager);
-      const probe = spyOn(workspaceTurnManager, "getStoredWorkspaceTurn");
+      const realStored = workspaceTurnManager.getWorkspaceTurnRecord.bind(workspaceTurnManager);
+      const probe = spyOn(workspaceTurnManager, "getWorkspaceTurnRecord");
       probe.mockImplementation(async (owner, handle) => {
         const result = await realStored(owner, handle);
         if (owner === grandId) retryPending = true;

@@ -16543,7 +16543,7 @@ export class TaskService implements AgentTaskIntegration {
     for (const ownerWorkspaceId of this.listAncestorsOfWorkspaces(index.parentById, descendants)) {
       // Probe the stored record, not a snapshot: a snapshot can repair or revive a stale record
       // (a write under this owner), and nothing may be written until the checks below pass.
-      const probe = await workspaceTurnManager.getStoredWorkspaceTurn(ownerWorkspaceId, handleId);
+      const probe = await workspaceTurnManager.getWorkspaceTurnRecord(ownerWorkspaceId, handleId);
       if (probe == null) continue;
       if (
         !this.isTerminalTurnOfDescendantUnder(
