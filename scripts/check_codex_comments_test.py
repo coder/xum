@@ -1477,7 +1477,8 @@ else:
                 self.assertNotIn("Approval comment time", result.stdout)
         # Only the bot's receipt is an approval: a person can post the same words.
         with self.subTest(body="a maintainer's comment with the receipt text"):
-            human = comment(FIXTURES["code_review_no_findings"]["body"], author="maintainer")
+            # Not the fixture's body: its help footer names "@codex review", so the comment would be a request.
+            human = comment("Codex Review: Didn't find any major issues. Nice work!", author="maintainer")
             self.assert_gate(10, snapshot([request, human]), "wait_pr_codex.sh")
         # The formats that the gate reads as informational approve: the apostrophe of either kind, the
         # receipt marker, a reviewed commit line.
