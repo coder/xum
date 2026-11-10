@@ -134,7 +134,16 @@ describe("summarizeChecks", () => {
 
 describe("fetchGoalBoardPrSection", () => {
   test("gh failure or garbage output is unavailable, and the board says so", async () => {
-    for (const view of [null, "not json", JSON.stringify({ number: "x" })]) {
+    const url = "https://github.com/acme/widgets/pull/42";
+    for (const view of [
+      null,
+      "not json",
+      JSON.stringify({ number: "x" }),
+      // One bad field is enough: the number must be a safe integer and the URL a string.
+      JSON.stringify({ number: "x", url }),
+      JSON.stringify({ number: 1.5, url }),
+      JSON.stringify({ number: 42, url: 7 }),
+    ]) {
       expect(await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view }))).toEqual({
         kind: "unavailable",
       });
@@ -157,6 +166,18 @@ describe("fetchGoalBoardPrSection", () => {
     expect(
       await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads }))
     ).toMatchObject({ status: { unresolvedThreads: { count: 7, atLeast: false } } });
+  });
+
+  test("the thread query names the repository and the number of the PR", async () => {
+    const scripts: string[] = [];
+    const runner: GoalBoardBashRunner = (_workspaceId, script) => {
+      scripts.push(script);
+      return Promise.resolve(script.includes("gh api graphql") ? null : PR_VIEW);
+    };
+    await fetchGoalBoardPrSection(WORKSPACE_ID, runner);
+    const query = scripts.filter((script) => script.includes("gh api graphql"));
+    expect(query).toHaveLength(1);
+    expect(query[0]).toMatch(/-F owner=\W*acme\W* -F name=\W*widgets\W* -F number=42 /);
   });
 
   test("a thread reply without the flags leaves the thread count unavailable", async () => {
