@@ -206,4 +206,33 @@ describeIntegration("SSH+None directory trust (UI)", () => {
       await cleanupView(view, cleanupDom);
     }
   }, 30_000);
+
+  test("the Set as default shortcut saves the default from the keyboard", async () => {
+    const cleanupDom = installDom();
+    const projectPath = "/Users/dev/ssh-default-shortcut";
+    expandProjects([projectPath]);
+    const client = createMockORPCClient({ projects: trustedProject(projectPath), workspaces: [] });
+    const view = renderApp({ apiClient: client });
+
+    try {
+      await openSshNoneForm(view, projectPath, "/srv/app");
+      await findButtonEventually(view.container, "Set as default");
+      fireEvent.keyDown(window, {
+        key: "D",
+        code: "KeyD",
+        ctrlKey: true,
+        altKey: true,
+        shiftKey: true,
+      });
+
+      await waitFor(() => {
+        const state = view.container.querySelector('[data-component="IsolationDefaultState"]');
+        if (!state) throw new Error("Default state not shown");
+      });
+      const saved = new Map(await client.projects.list()).get(projectPath);
+      expect(saved?.defaultIsolation).toEqual({ project: "ssh", workspace: "none" });
+    } finally {
+      await cleanupView(view, cleanupDom);
+    }
+  }, 30_000);
 });

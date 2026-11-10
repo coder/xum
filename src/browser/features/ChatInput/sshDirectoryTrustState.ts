@@ -119,16 +119,19 @@ export function applyResolvedProjectDir(
 
 /**
  * The remembered runtime options with the SSH directory `typed` replaced by its host-resolved
- * spelling, or null when they no longer remember `typed` (the user has since used another one).
+ * spelling, or null when they no longer remember `typed` on `host` (the user has since used another
+ * directory or host). The host must match too: a path resolved on one host means nothing on
+ * another, and writing it next to a newer host would refill the field with a wrong directory.
  */
 export function withResolvedRememberedProjectDir(
   remembered: RuntimeOptionDefaults,
-  typed: string,
+  target: { host: string; typed: string },
   resolved: string
 ): RuntimeOptionDefaults | null {
-  if (resolved === typed || readOptionField(remembered, "ssh", "projectDir", "").trim() !== typed) {
-    return null;
-  }
+  const stillRemembered =
+    readOptionField(remembered, "ssh", "host", "").trim() === target.host &&
+    readOptionField(remembered, "ssh", "projectDir", "").trim() === target.typed;
+  if (!stillRemembered || resolved === target.typed) return null;
   return writeOptionField(remembered, "ssh", "projectDir", resolved);
 }
 
@@ -146,8 +149,11 @@ export async function saveSshDirectoryTrust(
     refreshProjects: () => Promise<void>;
     /** Read after the request returns, so the write-back sees the latest selection. */
     currentSelection: () => SshDirectoryTrustSelection | null;
-    /** Replaces the project's remembered SSH directory `typed` with `resolved`, if it holds it. */
-    rememberResolvedProjectDir: (projectPath: string, typed: string, resolved: string) => void;
+    /** Replaces the project's remembered SSH directory with `resolved`, if it still holds the request's. */
+    rememberResolvedProjectDir: (
+      request: { projectPath: string; host: string; projectDir: string },
+      resolved: string
+    ) => void;
   },
   request: { projectPath: string; host: string; projectDir: string; trusted: boolean }
 ): Promise<string | null> {
@@ -162,7 +168,7 @@ export async function saveSshDirectoryTrust(
       // SSH can take seconds). The field the user comes back to fills from the remembered
       // directory, so upgrade that one: left as "~/app" it would never match the stored
       // "/home/me/app" entry and the directory would look untrusted for good.
-      deps.rememberResolvedProjectDir(request.projectPath, request.projectDir, resolved);
+      deps.rememberResolvedProjectDir(request, resolved);
     }
     publishProjectTrustChanged();
     await deps.refreshProjects();

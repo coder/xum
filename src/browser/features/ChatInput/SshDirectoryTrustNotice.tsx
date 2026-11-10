@@ -70,13 +70,16 @@ export function SshDirectoryTrustNotice(props: {
   );
 }
 
-function rememberResolvedProjectDir(projectPath: string, typed: string, resolved: string) {
+function rememberResolvedProjectDir(
+  request: { projectPath: string; host: string; projectDir: string },
+  resolved: string
+) {
   const next = withResolvedRememberedProjectDir(
-    readRuntimeOptionDefaults(projectPath),
-    typed,
+    readRuntimeOptionDefaults(request.projectPath),
+    { host: request.host, typed: request.projectDir },
     resolved
   );
-  if (next !== null) updateRuntimeOptionDefaults(projectPath, () => next);
+  if (next !== null) updateRuntimeOptionDefaults(request.projectPath, () => next);
 }
 
 /** Saves one trust choice at a time and keeps what is pending and the last failure for the row. */

@@ -93,8 +93,8 @@ describe("saveSshDirectoryTrust", () => {
           projectDir: "~/app",
           applyProjectDir: (dir: string) => calls.resolved.push(dir),
         }),
-        rememberResolvedProjectDir: (_path: string, typed: string, resolved: string) =>
-          calls.remembered.push([typed, resolved]),
+        rememberResolvedProjectDir: (req: { host: string; projectDir: string }, resolved: string) =>
+          calls.remembered.push([req.host, req.projectDir, resolved]),
       },
     };
   }
@@ -121,7 +121,7 @@ describe("saveSshDirectoryTrust", () => {
       await saveSshDirectoryTrust({ ...deps, currentSelection: () => null }, request)
     ).toBeNull();
     expect(calls.resolved).toEqual([]);
-    expect(calls.remembered).toEqual([["~/app", "/home/me/app"]]);
+    expect(calls.remembered).toEqual([["box", "~/app", "/home/me/app"]]);
   });
 
   test("leaves an already-resolved directory alone", async () => {
@@ -150,14 +150,25 @@ describe("withResolvedRememberedProjectDir", () => {
   const remembered = { ssh: { host: "box", projectDir: "~/app" } };
 
   test("replaces the typed spelling with the resolved one, keeping the other options", () => {
-    expect(withResolvedRememberedProjectDir(remembered, "~/app", "/home/me/app")).toEqual({
-      ssh: { host: "box", projectDir: "/home/me/app" },
-    });
+    expect(
+      withResolvedRememberedProjectDir(remembered, { host: "box", typed: "~/app" }, "/home/me/app")
+    ).toEqual({ ssh: { host: "box", projectDir: "/home/me/app" } });
   });
 
   test("leaves a directory the user has since replaced", () => {
-    expect(withResolvedRememberedProjectDir(remembered, "~/other", "/home/me/other")).toBeNull();
-    expect(withResolvedRememberedProjectDir(remembered, "~/app", "~/app")).toBeNull();
+    expect(
+      withResolvedRememberedProjectDir(remembered, { host: "box", typed: "~/other" }, "/home/x")
+    ).toBeNull();
+    expect(
+      withResolvedRememberedProjectDir(remembered, { host: "box", typed: "~/app" }, "~/app")
+    ).toBeNull();
+  });
+
+  test("leaves the directory when the remembered host has changed", () => {
+    // A path resolved on host A must not be stored next to host B.
+    expect(
+      withResolvedRememberedProjectDir(remembered, { host: "other", typed: "~/app" }, "/home/a/app")
+    ).toBeNull();
   });
 });
 
