@@ -7,6 +7,7 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
+import { renderedLineTops, textLineTops } from "@/browser/stories/helpers/renderedLines";
 import { PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import type {
@@ -215,14 +216,6 @@ function pluginCardOf(element: HTMLElement): HTMLElement {
   return card;
 }
 
-/**
- * The line tops that the text of `range` covers. An inline-block's own client rects hold one box
- * for all its lines, so measure a range over its text.
- */
-function renderedLineTops(range: Range): Set<number> {
-  return new Set(Array.from(range.getClientRects()).map((rect) => Math.round(rect.top)));
-}
-
 /** The plain words of `element` (letters and a trailing punctuation mark) that span two lines. */
 function splitProseWords(element: HTMLElement): string[] {
   const split: string[] = [];
@@ -364,12 +357,10 @@ export const InstalledPhoneViewport: Story = {
     await canvas.findByRole("button", { name: /Update/ });
     await expectInterfaceAsText(canvasElement);
     // Max-length separator-free names must wrap instead of overflowing the
-    // card's right edge at phone width.
+    // card's right edge at phone width: checked in the sweep below, down to 320 px.
     const maxRow = await canvas.findByText(MAX_LENGTH_NAME);
     const card = maxRow.closest("div[class*='rounded-md']");
-    if (card instanceof HTMLElement && card.scrollWidth > card.clientWidth + 1) {
-      throw new Error("Max-length plugin row overflows its card at phone width");
-    }
+    if (!(card instanceof HTMLElement)) throw new Error("Max-length plugin card not found");
     const capability = await canvas.findByText(MAX_LENGTH_CAPABILITY);
     const capabilityCard = capability.closest("div[class*='rounded-md']");
     if (
@@ -394,6 +385,36 @@ export const InstalledPhoneViewport: Story = {
       for (const counts of canvas.getAllByText(/skills imported/)) {
         const split = splitProseWords(counts);
         if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}px`);
+      }
+    }
+    // A path that fits a line moves to the next line whole, like a file name. The plugins folder
+    // of the intro and the locations of the rows are all shorter than a 320 px line.
+    const paths = [
+      await canvas.findByText("~/.mux/plugins"),
+      ...[MANAGED_ITEM, PINNED_ITEM, UNMANAGED_ITEM].map((item) => canvas.getByText(item.location)),
+    ];
+    // The commit id of the source line is a word too: the line wraps at spaces around it.
+    const commits = [MANAGED_ITEM, PINNED_ITEM, MAX_LENGTH_ITEM].map((item) => {
+      const commit = item.lockedSha?.slice(0, 12);
+      if (commit === undefined) throw new Error(`${item.name} has no locked commit`);
+      return { commit, line: canvas.getByText(new RegExp(` · ${commit}$`)) };
+    });
+    for (let width = 320; width <= 390; width += 5) {
+      wrapper.style.width = `${width}px`;
+      if (card.scrollWidth > card.clientWidth + 1) {
+        throw new Error(`Max-length plugin row overflows its card at ${width}px`);
+      }
+      for (const path of paths) {
+        const range = document.createRange();
+        range.selectNodeContents(path);
+        if (renderedLineTops(range).size !== 1) {
+          throw new Error(`${path.textContent} is split across lines at ${width}px`);
+        }
+      }
+      for (const { commit, line } of commits) {
+        if (textLineTops(line, commit).size !== 1) {
+          throw new Error(`Commit ${commit} is split across lines at ${width}px`);
+        }
       }
     }
   },
@@ -1829,6 +1850,62 @@ export const AddPluginMarketplacePhoneViewport: Story = {
   },
 };
 
+/** An entry name with hyphens that is longer than a phone line: its Preview label wraps at them. */
+const HYPHENATED_ENTRY_NAME = "design-readiness-orchestrator-with-weekly-status-reports";
+const HYPHENATED_NAME_LISTING: AgentPluginMarketplaceListing = {
+  ...MARKETPLACE_LISTING,
+  entries: [
+    { ...MARKETPLACE_LISTING.entries[0], name: HYPHENATED_ENTRY_NAME },
+    ...MARKETPLACE_LISTING.entries.slice(1),
+  ],
+};
+
+/**
+ * The "Preview <entry name>" action of a long entry name at phone width: the label wraps at its
+ * spaces and hyphens, so no part of the name is cut in two, and the button stays inside the card
+ * down to 320 px. Play-only: the marketplace story above snapshots the same panel (Pixel budget).
+ */
+export const AddPluginMarketplaceLongNamePhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: PIXEL_DISABLED,
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={marketplaceOptions(HYPHENATED_NAME_LISTING)}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openMarketplace(canvasElement);
+    const preview = await canvas.findByRole("button", { name: `Preview ${HYPHENATED_ENTRY_NAME}` });
+    const group = canvas.getByRole("group", { name: "Pick one plugin to install" });
+    const card = group.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (let width = 320; width <= 390; width += 5) {
+      wrapper.style.width = `${width}px`;
+      if (card.scrollWidth > card.clientWidth + 1) {
+        throw new Error(`The marketplace list overflows the card at ${width}px`);
+      }
+      if (preview.getBoundingClientRect().right > card.getBoundingClientRect().right + 1) {
+        throw new Error(`The Preview button sticks out of the card at ${width}px`);
+      }
+      for (const part of ["Preview", ...HYPHENATED_ENTRY_NAME.split("-")]) {
+        if (textLineTops(preview, part).size !== 1) {
+          throw new Error(`${part} of the Preview button is split across lines at ${width}px`);
+        }
+      }
+    }
+  },
+};
+
 const CURSOR_PLUGINS_SOURCE = {
   type: "git" as const,
   url: "https://github.com/cursor/plugins.git",
@@ -2114,6 +2191,9 @@ const COMPONENT_FILES = {
 /** A separator-free name longer than a phone line: it can only wrap inside its own box. */
 const LONG_FILE_NAME = "implementation_readiness_design_review_orchestrator_agent_v2.md";
 
+/** A valid slash command name with no separator and 63 of the 64 characters allowed. */
+const LONG_COMMAND_NAME = "implementationreadinessdesignrevieworchestratoragentsversiontwo";
+
 /** A configured plugins folder with one segment longer than a phone line. */
 const LONG_PLUGINS_DIRECTORY = `~/.mux/plugins/${"d".repeat(100)}`;
 
@@ -2127,6 +2207,10 @@ const COMPONENT_FILES_PREVIEW: AgentPluginInstallPreview = {
   mcpServers: [],
   agents: [...COMPONENT_FILES.agents, LONG_FILE_NAME],
   workflows: COMPONENT_FILES.workflows,
+  slashCommands: [
+    { name: "design-review-orchestrator", description: "Reviews a design." },
+    { name: LONG_COMMAND_NAME, description: "Runs the whole review." },
+  ],
   codexHooks: [
     {
       key: "hooks/hooks.json#PreToolUse[0][0]",
@@ -2145,11 +2229,11 @@ const COMPONENT_FILES_PREVIEW: AgentPluginInstallPreview = {
 };
 
 /**
- * File names of agents, workflows and reviewed components, the words of the hook list and the
- * plugins folder at phone width: each name moves to the next line whole instead of splitting at
- * the card's edge, a name longer than a line wraps inside its own box, and nothing sticks out of
- * the screen, down to 320 px. Play-only: the other phone stories of this file snapshot the same
- * panel (Pixel budget).
+ * File names of agents, workflows and reviewed components, slash command names, the words of the
+ * hook list and the plugins folder at phone width: each name moves to the next line whole instead
+ * of splitting at the card's edge, a name longer than a line wraps inside its own box, and
+ * nothing sticks out of the screen, down to 320 px. Play-only: the other phone stories of this
+ * file snapshot the same panel (Pixel budget).
  */
 export const AddPluginFileNamesPhoneViewport: Story = {
   globals: {
@@ -2188,6 +2272,7 @@ export const AddPluginFileNamesPhoneViewport: Story = {
       ...COMPONENT_FILES.agents,
       ...COMPONENT_FILES.workflows,
       "implementation_readiness_review.md",
+      "/design-review-orchestrator",
     ];
     for (const width of ["390px", "320px"]) {
       wrapper.style.width = width;
@@ -2207,6 +2292,10 @@ export const AddPluginFileNamesPhoneViewport: Story = {
         if (hook === undefined) throw new Error("The hook list item is missing");
         const split = splitProseWords(hook);
         if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}`);
+        const command = canvas.getByText(`/${LONG_COMMAND_NAME}`);
+        if (command.getBoundingClientRect().right > wrapper.getBoundingClientRect().right + 1) {
+          throw new Error(`The long slash command sticks out of the screen at ${width}`);
+        }
         if (wrapper.scrollWidth > wrapper.clientWidth + 1) {
           throw new Error(`The plugins section is wider than the screen at ${width}`);
         }

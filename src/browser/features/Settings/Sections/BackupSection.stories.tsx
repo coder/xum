@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, within } from "storybook/test";
+import { textLineTops } from "@/browser/stories/helpers/renderedLines";
 import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { BackupSection } from "./BackupSection.js";
@@ -110,6 +111,8 @@ export const Phone: Story = {
   },
 };
 
+const DOCS_HELPER_SHA = "89abcdef0123456789abcdef0123456789abcdef";
+
 const PLUGINS_IN_BACKUP: BackupPluginRow[] = [
   {
     name: "pstack",
@@ -153,10 +156,12 @@ const PLUGINS_IN_BACKUP: BackupPluginRow[] = [
     source: {
       type: "git",
       url: "https://github.com/example/docs-helper.git",
-      ref: "main",
+      // A ref that fills most of a phone line: the commit id after it must move to the next line
+      // whole instead of being cut at the line's edge.
+      ref: "release/2026-11-docs-helper-v2",
       refType: "branch",
     },
-    lockedSha: "89abcdef0123456789abcdef0123456789abcdef",
+    lockedSha: DOCS_HELPER_SHA,
     status: "folderMissing",
   },
 ];
@@ -215,6 +220,18 @@ export const PluginsInBackupPhone: Story = {
     await expect(card).not.toBeNull();
     for (const element of card?.querySelectorAll("*") ?? []) {
       await expect(element.getBoundingClientRect().right).toBeLessThanOrEqual(frameRight + 0.5);
+    }
+
+    // The commit id is one word: a ref that fills the line pushes it to the next line whole. The
+    // line's edge only falls inside the id at some widths, so sweep from 320 px up to the phone
+    // width.
+    const commit = DOCS_HELPER_SHA.slice(0, 12);
+    const refLine = canvas.getByText(new RegExp(` · ${commit}$`));
+    for (let width = 320; width <= PHONE_WIDTH_PX; width += 5) {
+      frame.style.width = `${width}px`;
+      if (textLineTops(refLine, commit).size !== 1) {
+        throw new Error(`Commit ${commit} is split across lines at ${width}px`);
+      }
     }
   },
 };

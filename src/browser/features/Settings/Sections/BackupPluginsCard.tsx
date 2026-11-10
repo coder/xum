@@ -90,7 +90,7 @@ function PluginRow(props: { plugin: BackupPluginRow }) {
         {displayRepoUrl(plugin.source.url)}
         {folder}
       </span>
-      <span className="text-muted block font-mono break-all">
+      <span className="text-muted block font-mono break-words">
         {plugin.source.ref} · {plugin.lockedSha.slice(0, 12)}
       </span>
     </li>
