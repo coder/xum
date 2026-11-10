@@ -5074,14 +5074,14 @@ describe("Config", () => {
       });
       await config.updateRuntimeEnablement({
         runtimeEnablement: { local: true, worktree: false },
-        defaultRuntime: "worktree",
+        defaultIsolation: { project: "local", workspace: "worktree" },
       });
 
       const saved = config.loadConfigOrDefault();
       expect(saved.defaultModel).toBe("openai:gpt-5.6-sol");
       expect(saved.hiddenModels).toEqual(["anthropic:claude-sonnet-4-5"]);
       expect(saved.runtimeEnablement).toEqual({ worktree: false });
-      expect(saved.defaultRuntime).toBe("worktree");
+      expect(saved.defaultIsolation).toEqual({ project: "local", workspace: "worktree" });
     });
 
     it("rejects invalid route overrides before saving", async () => {
@@ -5097,6 +5097,157 @@ describe("Config", () => {
       }
       expect((thrown as Error).message).toBe("invalid route");
       expect(config.loadConfigOrDefault().routePriority).toBeUndefined();
+    });
+  });
+
+  describe("default isolation migration", () => {
+    function writeRawConfig(raw: Record<string, unknown>): void {
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(raw));
+    }
+
+    function readRawConfig(): {
+      defaultIsolation?: unknown;
+      defaultRuntime?: unknown;
+      projects: Array<[string, { defaultIsolation?: unknown; defaultRuntime?: unknown }]>;
+    } {
+      return JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as ReturnType<
+        typeof readRawConfig
+      >;
+    }
+
+    it("loads a legacy-only defaultRuntime as an isolation pair, globally and per project", () => {
+      writeRawConfig({
+        defaultRuntime: "ssh",
+        projects: [["/repo", { workspaces: [], defaultRuntime: "ssh" }]],
+      });
+
+      const fresh = new Config(tempDir);
+      const loaded = fresh.loadConfigOrDefault();
+      expect(loaded.defaultIsolation).toEqual({ project: "ssh", workspace: "worktree" });
+      expect(loaded.projects.get("/repo")?.defaultIsolation).toEqual({
+        project: "ssh",
+        workspace: "worktree",
+      });
+      expect(fresh.getClientConfig().defaultIsolation).toEqual({
+        project: "ssh",
+        workspace: "worktree",
+      });
+    });
+
+    it("falls back to the legacy defaultRuntime when defaultIsolation is malformed", () => {
+      writeRawConfig({
+        defaultIsolation: { project: "mars", workspace: "worktree" },
+        defaultRuntime: "docker",
+        projects: [["/repo", { workspaces: [], defaultIsolation: "ssh", defaultRuntime: "coder" }]],
+      });
+
+      const loaded = new Config(tempDir).loadConfigOrDefault();
+      expect(loaded.defaultIsolation).toEqual({ project: "local", workspace: "docker" });
+      expect(loaded.projects.get("/repo")?.defaultIsolation).toEqual({
+        project: "coder",
+        workspace: "worktree",
+      });
+    });
+
+    it("prefers a valid defaultIsolation over a disagreeing legacy defaultRuntime", () => {
+      writeRawConfig({
+        defaultIsolation: { project: "local", workspace: "none" },
+        defaultRuntime: "ssh",
+        projects: [],
+      });
+
+      expect(new Config(tempDir).getClientConfig().defaultIsolation).toEqual({
+        project: "local",
+        workspace: "none",
+      });
+    });
+
+    it("saves defaultIsolation with its legacy defaultRuntime mirror", async () => {
+      writeRawConfig({ projects: [["/repo", { workspaces: [] }]] });
+      const fresh = new Config(tempDir);
+
+      await fresh.updateRuntimeEnablement({
+        defaultIsolation: { project: "local", workspace: "devcontainer" },
+      });
+      await fresh.updateRuntimeEnablement({
+        projectPath: "/repo",
+        defaultIsolation: { project: "coder", workspace: "worktree" },
+      });
+
+      const raw = readRawConfig();
+      expect(raw.defaultIsolation).toEqual({ project: "local", workspace: "devcontainer" });
+      expect(raw.defaultRuntime).toBe("devcontainer");
+      const project = raw.projects.find(([projectPath]) => projectPath === "/repo")?.[1];
+      expect(project?.defaultIsolation).toEqual({ project: "coder", workspace: "worktree" });
+      expect(project?.defaultRuntime).toBe("coder");
+    });
+
+    it("mirrors an unsupported pair as its nearest supported legacy runtime", async () => {
+      writeRawConfig({ projects: [["/repo", { workspaces: [] }]] });
+      const fresh = new Config(tempDir);
+
+      await fresh.updateRuntimeEnablement({
+        defaultIsolation: { project: "ssh", workspace: "docker" },
+      });
+      await fresh.updateRuntimeEnablement({
+        projectPath: "/repo",
+        defaultIsolation: { project: "coder", workspace: "none" },
+      });
+
+      const raw = readRawConfig();
+      // The pair itself is kept so the UI can show what the user picked.
+      expect(raw.defaultIsolation).toEqual({ project: "ssh", workspace: "docker" });
+      expect(raw.defaultRuntime).toBe("ssh");
+      const project = raw.projects.find(([projectPath]) => projectPath === "/repo")?.[1];
+      expect(project?.defaultIsolation).toEqual({ project: "coder", workspace: "none" });
+      expect(project?.defaultRuntime).toBe("coder");
+    });
+
+    it("rewrites a legacy-only config with both fields on the next save", async () => {
+      writeRawConfig({
+        defaultRuntime: "local",
+        projects: [["/repo", { workspaces: [], defaultRuntime: "docker" }]],
+      });
+      const fresh = new Config(tempDir);
+
+      await fresh.editConfig((cfg) => cfg);
+
+      const raw = readRawConfig();
+      expect(raw.defaultIsolation).toEqual({ project: "local", workspace: "none" });
+      expect(raw.defaultRuntime).toBe("local");
+      const project = raw.projects.find(([projectPath]) => projectPath === "/repo")?.[1];
+      expect(project?.defaultIsolation).toEqual({ project: "local", workspace: "docker" });
+      expect(project?.defaultRuntime).toBe("docker");
+    });
+
+    it("clearing removes both defaultIsolation and the legacy defaultRuntime", async () => {
+      writeRawConfig({
+        defaultIsolation: { project: "ssh", workspace: "worktree" },
+        defaultRuntime: "ssh",
+        projects: [
+          [
+            "/repo",
+            {
+              workspaces: [],
+              defaultIsolation: { project: "local", workspace: "docker" },
+              defaultRuntime: "docker",
+            },
+          ],
+        ],
+      });
+      const fresh = new Config(tempDir);
+
+      await fresh.updateRuntimeEnablement({ defaultIsolation: null });
+      await fresh.updateRuntimeEnablement({ projectPath: "/repo", defaultIsolation: null });
+
+      const raw = readRawConfig();
+      expect(raw.defaultIsolation).toBeUndefined();
+      expect(raw.defaultRuntime).toBeUndefined();
+      const project = raw.projects.find(([projectPath]) => projectPath === "/repo")?.[1];
+      expect(project).toBeDefined();
+      expect(project?.defaultIsolation).toBeUndefined();
+      expect(project?.defaultRuntime).toBeUndefined();
+      expect(new Config(tempDir).getClientConfig().defaultIsolation).toBeNull();
     });
   });
 

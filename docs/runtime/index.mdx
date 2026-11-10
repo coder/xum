@@ -3,27 +3,49 @@ title: Runtimes
 description: Configure where and how Xum executes agent workspaces
 ---
 
-Runtimes determine where and how Xum executes agent workspaces.
+Runtimes determine where and how Xum executes agent workspaces. A runtime is two independent choices that compose:
 
-| Runtime                                    | Isolation                                  | Best For                                    |
-| ------------------------------------------ | ------------------------------------------ | ------------------------------------------- |
-| **[Local](/runtime/local)**                | All workspaces share the project directory | Quick edits to your working copy            |
-| **[Worktree](/runtime/worktree)**          | Each workspace gets its own directory      | Running multiple agents in parallel         |
-| **[SSH](/runtime/ssh)**                    | Remote execution over SSH                  | Security, performance, heavy parallelism    |
-| **[Docker](/runtime/docker)**              | Isolated container per workspace           | Full isolation, reproducible environments   |
-| **[Dev Container](/runtime/devcontainer)** | Container from devcontainer.json           | Projects with existing devcontainer configs |
+- **Project isolation** — where the project lives and commands run.
+- **Workspace isolation** — how each workspace is separated from the other workspaces of the project.
+
+| Project isolation           | Runs on                             |
+| --------------------------- | ----------------------------------- |
+| **Local**                   | This machine                        |
+| **[SSH](/runtime/ssh)**     | A remote host over SSH              |
+| **[Coder](/runtime/coder)** | A Coder workspace, reached over SSH |
+
+| Workspace isolation                        | Each workspace gets                | Best For                                    |
+| ------------------------------------------ | ---------------------------------- | ------------------------------------------- |
+| **[None](/runtime/local)**                 | The shared project directory       | Quick edits to your working copy            |
+| **[Worktree](/runtime/worktree)**          | Its own git worktree               | Running multiple agents in parallel         |
+| **[Docker](/runtime/docker)**              | Its own container                  | Full isolation, reproducible environments   |
+| **[Dev Container](/runtime/devcontainer)** | A container from devcontainer.json | Projects with existing devcontainer configs |
+
+## Supported combinations
+
+| Project \ Workspace | None | Worktree | Docker | Dev Container |
+| ------------------- | ---- | -------- | ------ | ------------- |
+| Local               | Yes  | Yes      | Yes    | Yes           |
+| SSH                 | Yes  | Yes      | —      | —             |
+| Coder               | —    | Yes      | —      | —             |
+
+Combinations marked "—" are listed in the picker but disabled until a backend supports them.
+
+**SSH + None** runs every workspace directly in an existing directory on the host (for example `~/src/my-app`). Xum does not sync, check out, move, or delete anything in that directory, and it does not need a local git repository.
 
 ## Choosing a Runtime
 
-Choose a runtime when creating a workspace.
+Pick both when creating a workspace: _Run on_ selects the project isolation and _with_ selects the workspace isolation. Set the defaults, and turn options on or off, in **Settings → Runtimes**, globally or per project.
+
+Configs written by older versions (a single default runtime) are migrated automatically, and the old field is still written so you can downgrade.
 
 ## Init Hooks
 
 [Init hooks](/hooks/init) and agent bash tool executions can detect the runtime type via the `XUM_RUNTIME` environment variable:
 
-- `local` — Local runtime
-- `worktree` — Worktree runtime
-- `ssh` — SSH runtime
+- `local` — Local project, no workspace isolation
+- `worktree` — Local project, worktree isolation
+- `ssh` — SSH project (worktree or no workspace isolation)
 - `docker` — Docker runtime
 - `devcontainer` — Dev Container runtime
 

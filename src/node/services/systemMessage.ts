@@ -4,7 +4,7 @@ import path from "node:path";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { MCPServerMap } from "@/common/types/mcp";
 import type { RuntimeMode } from "@/common/types/runtime";
-import { RUNTIME_MODE } from "@/common/types/runtime";
+import { RUNTIME_MODE, isSshSharedProjectDirRuntime } from "@/common/types/runtime";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import {
   INSTRUCTION_SCOPE,
@@ -113,7 +113,8 @@ function buildEnvironmentContext(
   workspacePath: string,
   runtimeType: RuntimeMode,
   bestOf: WorkspaceMetadata["bestOf"] | undefined,
-  scratchDirSet: boolean
+  scratchDirSet: boolean,
+  sshSharedProjectDir: boolean
 ): string {
   // Common lines shared across git-based runtimes
   const gitCommonLines = [
@@ -146,6 +147,16 @@ function buildEnvironmentContext(
       break;
 
     case RUNTIME_MODE.SSH:
+      if (sshSharedProjectDir) {
+        // SSH+None works directly in the user's existing directory on the host, like local
+        // project-dir: no per-workspace clone, and it may or may not be git.
+        description = `You are working directly in the shared project directory ${workspacePath} on a remote host (not an isolated clone)`;
+        lines = [
+          "- Tools run here automatically",
+          "- Other workspaces may use this same directory - do not discard changes you did not make",
+        ];
+        break;
+      }
       // SSH runtime clones the repository on a remote host
       description = `Your working directory is ${workspacePath} (a git repository clone)`;
       lines = gitCommonLines;
@@ -781,7 +792,8 @@ export function buildSystemMessageFromSources(
     workspacePath,
     runtimeType,
     metadata.bestOf,
-    options?.scratchDirSet === true
+    options?.scratchDirSet === true,
+    isSshSharedProjectDirRuntime(metadata.runtimeConfig)
   )}`;
 
   if (metadata.kind === "scratch") {

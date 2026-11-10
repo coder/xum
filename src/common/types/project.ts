@@ -18,6 +18,7 @@ import type { z } from "zod";
 import type { ProjectConfigSchema, WorkspaceConfigSchema } from "../orpc/schemas";
 import type { AgentAiDefaults } from "./agentAiDefaults";
 import type { AutoModelRoutingConfig } from "./autoModelRouting";
+import type { IsolationChoice } from "./isolation";
 import type { RuntimeEnablementId } from "./runtime";
 import type { TaskSettings } from "./tasks";
 import type { ThinkingLevel } from "./thinking";
@@ -185,7 +186,13 @@ export interface ProjectsConfig {
    */
   stopCoderWorkspaceOnArchive?: boolean;
 
-  /** Global default runtime for new workspaces. */
+  /** Global default project × workspace isolation for new workspaces. */
+  defaultIsolation?: IsolationChoice;
+
+  /**
+   * Legacy mirror of `defaultIsolation` for downgrade compatibility (older builds read only this
+   * flat runtime id). Derived from `defaultIsolation` on save; read only as a migration fallback.
+   */
   defaultRuntime?: RuntimeEnablementId;
 
   /**

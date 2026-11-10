@@ -3,7 +3,7 @@ import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { ProjectConfig } from "@/common/types/project";
 import { DEFAULT_RUNTIME_ENABLEMENT, type ParsedRuntime } from "@/common/types/runtime";
-import { changeCreationDraftProject } from "./creationDraftProject";
+import { changeCreationDraftProject, projectDefaultIsolation } from "./creationDraftProject";
 
 const PROJECTS = new Map<string, ProjectConfig>([
   ["/projects/a", { workspaces: [] }],
@@ -41,6 +41,38 @@ describe("changeCreationDraftProject", () => {
     expect(store.getView(draftId).draft).toMatchObject({
       subProjectPath: "/projects/a/sub",
       execution: choices,
+    });
+  });
+});
+
+describe("projectDefaultIsolation", () => {
+  const sshWorktree = { project: "ssh", workspace: "worktree" } as const;
+
+  test("a project that disables Worktree starts an inherited SSH x Worktree default on SSH x None", () => {
+    // Settings shows SSH x None here; starting on SSH x Worktree made creation fall back to Local.
+    const project: ProjectConfig = { workspaces: [], runtimeEnablement: { worktree: false } };
+    expect(projectDefaultIsolation(project, sshWorktree, DEFAULT_RUNTIME_ENABLEMENT)).toEqual({
+      project: "ssh",
+      workspace: "none",
+    });
+  });
+
+  test("the project's own default wins only while it overrides Settings", () => {
+    const localDocker = { project: "local", workspace: "docker" } as const;
+    const overriding: ProjectConfig = { workspaces: [], defaultIsolation: localDocker };
+    expect(projectDefaultIsolation(overriding, sshWorktree, DEFAULT_RUNTIME_ENABLEMENT)).toEqual(
+      localDocker
+    );
+    expect(projectDefaultIsolation(undefined, sshWorktree, DEFAULT_RUNTIME_ENABLEMENT)).toEqual(
+      sshWorktree
+    );
+  });
+
+  test("global Settings apply to a project without overrides", () => {
+    const noSsh = { ...DEFAULT_RUNTIME_ENABLEMENT, ssh: false };
+    expect(projectDefaultIsolation({ workspaces: [] }, sshWorktree, noSsh)).toEqual({
+      project: "local",
+      workspace: "worktree",
     });
   });
 });

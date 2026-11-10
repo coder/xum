@@ -236,7 +236,11 @@ import {
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
-import { isWorkspaceProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceProjectTrusted,
+  isWorkspaceProjectTrustedIn,
+  secretsForWorkspace,
+} from "@/node/utils/projectTrust";
 import {
   resolveTurnAnthropicCacheTtl,
   supportsAnthropicCache,
@@ -1371,7 +1375,12 @@ export class TurnRequestBuilder {
       .catch(() => ({ overrides: undefined, authoritative: false }));
     const projectSecrets = isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+      : secretsForWorkspace(
+          this.dependencies.secretsStore,
+          this.dependencies.config,
+          metadata.projectPath,
+          metadata.runtimeConfig
+        );
     await mcpServerManager.getToolsForWorkspace(
       {
         workspaceId,
@@ -1379,6 +1388,7 @@ export class TurnRequestBuilder {
         runtime,
         workspacePath,
         trusted: isWorkspaceProjectTrusted(this.dependencies.config, metadata),
+        runtimeConfig: metadata.runtimeConfig,
         overrides: read.overrides,
         overridesAuthoritative: read.authoritative,
         ...(read.authoritative
@@ -2700,7 +2710,12 @@ export class TurnRequestBuilder {
 
     const projectSecrets = isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+      : secretsForWorkspace(
+          this.dependencies.secretsStore,
+          this.dependencies.config,
+          metadata.projectPath,
+          metadata.runtimeConfig
+        );
 
     const streamToken = this.dependencies.streamManager.generateStreamToken();
 
@@ -2722,6 +2737,7 @@ export class TurnRequestBuilder {
             runtime,
             workspacePath,
             trusted: projectTrusted,
+            runtimeConfig: metadata.runtimeConfig,
             overrides: mcpOverrides,
             overridesAuthoritative: mcpOverridesAuthoritative,
             // A non-authoritative read that exhausted its budget (unreachable
