@@ -450,6 +450,65 @@ interface WorkflowStep {
   with?: Record<string, unknown>;
 }
 
+interface WorkflowJob {
+  "runs-on"?: unknown;
+  steps?: WorkflowStep[];
+}
+
+// Whether a job builds the Linux AppImage. A command split over lines with a trailing backslash
+// reads as one. electron-builder builds it for `--linux`, directly or through `make dist-linux` or
+// `bun run dist:linux`, and the unqualified `make dist` (or `bun run dist`) builds for the runner's
+// own OS. `runs-on` is often an expression, so only a literal macOS or Windows runner rules a job out.
+function buildsAppImage(job: WorkflowJob): boolean {
+  const runsOn =
+    typeof job["runs-on"] === "string" ? job["runs-on"] : JSON.stringify(job["runs-on"]);
+  const mayRunOnLinux = !/^(macos|windows)-[\w.-]+$/.test(runsOn);
+  return (job.steps ?? []).some((step) => {
+    const run = (step.run ?? "").replace(/\\\r?\n\s*/g, " ");
+    return (
+      /electron-builder\b.*--linux|make dist-linux|run dist:linux/.test(run) ||
+      (mayRunOnLinux && /(?:make|run) dist(?![-:\w])/.test(run))
+    );
+  });
+}
+
+// A workflow that builds an AppImage in a form this test does not know would skip the tool check
+// and download the tool with no retry. Each row is one form that the detector must find or leave.
+describe("the AppImage job detector", () => {
+  const linux = "ubuntu-latest";
+  test.each([
+    ["electron-builder --linux", linux, "bun x electron-builder --linux --publish always", true],
+    [
+      "electron-builder over several lines",
+      linux,
+      "bun x electron-builder \\\n  --linux \\\n  --publish always",
+      true,
+    ],
+    ["make dist-linux", linux, "make dist-linux", true],
+    ["bun run dist:linux", linux, "bun run dist:linux", true],
+    ["a plain make dist on a Linux runner", linux, "make dist", true],
+    ["a plain bun run dist on a Linux runner", linux, "bun run dist", true],
+    [
+      "a plain make dist on a runner named by an expression",
+      "${{ needs.changes.outputs.runner-4 }}",
+      "make dist",
+      true,
+    ],
+    ["a plain make dist on a macOS runner", "macos-15", "make dist", false],
+    ["make dist-mac", linux, "make dist-mac", false],
+    ["bun run dist:win", linux, "bun run dist:win", false],
+    ["electron-builder --win", linux, "bun x electron-builder --win --publish always", false],
+    [
+      "electron-builder and --linux in two commands",
+      linux,
+      "bun x electron-builder --mac\necho --linux",
+      false,
+    ],
+  ])("%s", (_name, runsOn, run, builds) => {
+    expect(buildsAppImage({ "runs-on": runsOn, steps: [{ run }] })).toBe(builds);
+  });
+});
+
 describe("the AppImage tool wiring", () => {
   test("setup-xum fetches the tool only when the caller asks, after it restores the electron-builder cache", async () => {
     const steps = await setupActionSteps();
@@ -483,17 +542,14 @@ describe("the AppImage tool wiring", () => {
     const builders: string[] = [];
     for (const file of (await readdir(WORKFLOWS)).filter((name) => name.endsWith(".yml"))) {
       const workflow = parse(await readFile(path.join(WORKFLOWS, file), "utf8")) as {
-        jobs?: Record<string, { steps?: WorkflowStep[] }>;
+        jobs?: Record<string, WorkflowJob>;
       };
       for (const [id, job] of Object.entries(workflow.jobs ?? {})) {
-        const steps = job.steps ?? [];
-        // electron-builder builds an AppImage for `--linux`, directly or through `make dist-linux`.
-        const builds = steps.some((step) =>
-          /electron-builder\b.*--linux|make dist-linux/.test(step.run ?? "")
-        );
-        if (!builds) continue;
+        if (!buildsAppImage(job)) continue;
         builders.push(`${file}:${id}`);
-        const setup = steps.filter((step) => step.uses === "./.github/actions/setup-xum");
+        const setup = (job.steps ?? []).filter(
+          (step) => step.uses === "./.github/actions/setup-xum"
+        );
 
         expect(setup, `${file}:${id} calls setup-xum once`).toHaveLength(1);
         expect(setup[0]?.with?.["appimage-tool"], `${file}:${id} asks for the tool`).toBe("true");
