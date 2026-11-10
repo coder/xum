@@ -2,6 +2,16 @@
 // executable stubs (a fake `sleep`, `curl` or `uname` first on PATH).
 import { chmod, writeFile } from "node:fs/promises";
 
+// Per-test limit for the tests that spawn programs. Bun's default is 5 s, and these tests start
+// bash, make, python or node a few times each: with 8 copies of one test file and 24 busy loops
+// on a 32-CPU host (load 264) the slowest test took 28.3 s and the median test 3.3 s (672 runs),
+// and with the limit lifted on a host at a load of about 100 four of the six files had a test
+// over 3 s. A test that spawns once still takes a few hundred milliseconds when the host is
+// quiet. The limit is about 4 times the slowest run measured, so a loaded host does not fail a
+// test with a timeout that says nothing about the script, and a test that hangs still fails.
+// `setDefaultTimeout` applies to the file that calls it.
+export const SPAWNING_TEST_TIMEOUT_MS = 120_000;
+
 export interface RunResult {
   exitCode: number;
   stdout: string;

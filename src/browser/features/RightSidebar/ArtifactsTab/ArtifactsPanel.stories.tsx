@@ -875,6 +875,83 @@ export const NavigateAwayLink: Story = {
   play: ({ canvasElement }) => assertNavigatedAway(canvasElement),
 };
 
+// An artifact that sets its route in its own load handler. WebKit fires the iframe's load event
+// again about 100 ms later, possibly before the host bound the document's port. The document is
+// still the one Xum built, so the artifact must stay open, and its bridge must still work.
+const HASH_ON_LOAD_HTML = `<!doctype html><html><head><script>
+  window.addEventListener("message", function (event) {
+    if (event.data && event.data.xumOnLoadTest === "save") window.xum.setState({ route: location.hash });
+  });
+  window.addEventListener("load", function () {
+    location.hash = "#/s/onload";
+    parent.postMessage({ xumOnLoadTest: "hashed" }, "*");
+  });
+</script></head><body><p>hash on load</p></body></html>`;
+
+// What the artifact reported, and each load of the artifact frame, in arrival order.
+const hashOnLoadEvents: string[] = [];
+const hashOnLoadStates: unknown[] = [];
+/** WebKit fires the iframe's load event for a fragment change; Chromium fires none. */
+const firesFragmentLoad = () => !navigator.userAgent.includes("Chrome/");
+export const HashOnLoadStaysOpen: Story = {
+  tags: ["webkit"],
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    hashOnLoadEvents.length = 0;
+    hashOnLoadStates.length = 0;
+    const onMessage = (event: MessageEvent) => {
+      const message = (event.data as { xumOnLoadTest?: unknown } | null)?.xumOnLoadTest;
+      if (typeof message === "string") hashOnLoadEvents.push(message);
+    };
+    // A capturing listener on the document: load does not bubble, and the frame's first load
+    // can come before the play runs.
+    const onLoad = (event: Event) => {
+      const target = event.target;
+      if (target instanceof HTMLIFrameElement && target.dataset.testid === "artifact-frame") {
+        hashOnLoadEvents.push("load");
+      }
+    };
+    window.addEventListener("message", onMessage);
+    document.addEventListener("load", onLoad, true);
+    return () => {
+      window.removeEventListener("message", onMessage);
+      document.removeEventListener("load", onLoad, true);
+    };
+  },
+  render: () =>
+    renderPanel(
+      "on-load.html",
+      { "on-load.html": ok("on-load.html", HASH_ON_LOAD_HTML) },
+      {
+        workspaceId: `${WORKSPACE_ID}-on-load`,
+        onSetState: (input) => hashOnLoadStates.push(input.state),
+      }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("artifact-frame");
+    if (!(frame instanceof HTMLIFrameElement)) throw new Error("Story bug: no artifact iframe");
+    const notice = () => canvas.queryByText(/This artifact navigated away/);
+    // The frame's first load, then (WebKit only) the extra load of the route change.
+    const loadsToWaitFor = firesFragmentLoad() ? 2 : 1;
+    const routeChangeLoaded = () =>
+      hashOnLoadEvents.includes("hashed") &&
+      hashOnLoadEvents.filter((event) => event === "load").length >= loadsToWaitFor;
+    // Those loads, or the notice that closed the frame at one of them.
+    await waitFor(() => expect(routeChangeLoaded() || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
+    await expect(notice()).toBeNull();
+    frame.contentWindow?.postMessage({ xumOnLoadTest: "save" }, "*");
+    await waitFor(() => expect(hashOnLoadStates.length > 0 || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
+    await expect(notice()).toBeNull();
+    await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
+    await expect(hashOnLoadStates).toEqual([{ route: "#/s/onload" }]);
+  },
+};
+
 // A hash router (superblink's map nodes set location.hash). WebKit fires the iframe's load event
 // again for every fragment change and history traversal. Chromium does for history.back() only
 // when it returns to the srcdoc's own first entry. The document is still the one Xum built, so the
@@ -1405,5 +1482,76 @@ export const McpAppViewNavigateAway: Story = {
     const canvas = within(canvasElement);
     await canvas.findByText(/This artifact navigated away/, undefined, { timeout: 10000 });
     await expect(canvas.queryByTestId("mcp-app-frame")).toBeNull();
+  },
+};
+
+// Xum's own thread is blocked for 6 s right after a check. WebKit runs the frame on that thread,
+// so the document cannot answer meanwhile, and WebKit then ran the overdue deadline before the
+// document's answer: a live artifact closed. A deadline that fires late only extends the check
+// (frameDocumentChannel.ts). The play blocks the thread in a load listener that runs after the
+// host's own, which sent the check.
+const HOST_FREEZE_MS = 6000;
+const HOST_FREEZE_HTML = `<!doctype html><html><head><script>
+  window.addEventListener("message", function (event) {
+    var test = event.data && event.data.xumFreezeTest;
+    if (test === "save") window.xum.setState({ saved: true });
+    if (test !== "go") return;
+    // A traversal to the srcdoc's own first entry: both engines fire the iframe's load for it.
+    history.pushState(null, "", "about:srcdoc#/p");
+    setTimeout(function () { history.back(); }, 50);
+  });
+  window.addEventListener("load", function () {
+    parent.postMessage({ xumFreezeTest: "ready" }, "*");
+  });
+</script></head><body><p>host freeze</p></body></html>`;
+
+const freezeEvents: string[] = [];
+const freezeStates: unknown[] = [];
+export const HostFreezeKeepsArtifactOpen: Story = {
+  tags: ["webkit"],
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    freezeEvents.length = 0;
+    freezeStates.length = 0;
+    const handler = (event: MessageEvent) => {
+      const message = (event.data as { xumFreezeTest?: unknown } | null)?.xumFreezeTest;
+      if (typeof message === "string") freezeEvents.push(message);
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  },
+  render: () =>
+    renderPanel(
+      "freeze.html",
+      { "freeze.html": ok("freeze.html", HOST_FREEZE_HTML) },
+      {
+        workspaceId: `${WORKSPACE_ID}-freeze`,
+        onSetState: (input) => freezeStates.push(input.state),
+      }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("artifact-frame");
+    if (!(frame instanceof HTMLIFrameElement)) throw new Error("Story bug: no artifact iframe");
+    await waitFor(() => expect(freezeEvents).toContain("ready"));
+    let froze = false;
+    frame.addEventListener("load", () => {
+      if (froze) return;
+      froze = true;
+      const end = performance.now() + HOST_FREEZE_MS;
+      while (performance.now() < end) {
+        // The app's thread is blocked, as by a long render or a stalled main process call.
+      }
+      frame.contentWindow?.postMessage({ xumFreezeTest: "save" }, "*");
+    });
+    frame.contentWindow?.postMessage({ xumFreezeTest: "go" }, "*");
+    const notice = () => canvas.queryByText(/This artifact navigated away/);
+    // The save after the freeze, or the notice that closed the frame instead.
+    await waitFor(() => expect(freezeStates.length > 0 || notice() != null).toBe(true), {
+      timeout: 20000,
+    });
+    await expect(notice()).toBeNull();
+    await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
+    await expect(freezeStates).toEqual([{ saved: true }]);
   },
 };

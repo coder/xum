@@ -34,7 +34,9 @@ import {
   collectMcpCommandApprovals,
   collectProjectBundle,
   createBackupPayload,
+  hidesSecretBehindEscapes,
   isFilesystemError,
+  jsonValueHidesSecret,
   localOnlyPayloadFiles,
   mergeBackupPreferences,
   matchedProjectWrites,
@@ -5808,12 +5810,118 @@ describe("sanitizeBackupGitRemote", () => {
   });
 });
 
+describe("hidesSecretBehindEscapes", () => {
+  const token = `ghp_${"a".repeat(36)}`;
+
+  // The raw scan finds none of these: the escape ends the word before the token or splits the header.
+  it.each([
+    ["a token after an escaped space", `https://h/%20${token}/r.git`],
+    ["a private key header with escaped spaces", "https://h/-----BEGIN%20PRIVATE%20KEY-----/r.git"],
+    ["an escape of an escape", `https://h/%2520${token}/r.git`],
+    ["three levels of escape", `https://h/%252520${token}/r.git`],
+    ["four levels of escape", `https://h/%25252520${token}/r.git`],
+    // Still escaped after the passes: nothing says how a reader decodes it.
+    ["more levels of escape than the passes", `https://h/%2525252520${token}/r.git`],
+    // The token shows in form 1 (` ghp_...%5f`) and not in form 2 (` ghp_..._`, where the `_` joins
+    // the word): a check of the last form alone would pass it.
+    ["a token visible only in an earlier decoded form", `https://h/%20${token}%255f/r.git`],
+    // A fifth level is left after the four passes: nothing says how a reader decodes it.
+    ["a space escaped five times, which hides no token", "https://h/My%2525252520Project/r.git"],
+    ["a letter of the token escaped twice", `https://h/%2567hp_${"a".repeat(36)}/r.git`],
+    ["a letter of the token escaped three times", `https://h/%252567hp_${"a".repeat(36)}/r.git`],
+    ["an escape that is cut short", "https://h/%E0%A4%A/r.git"],
+    ["bytes that are not UTF-8", "https://h/%FF/r.git"],
+    ["a malformed escape next to a valid one", "https://h/%zz%20x"],
+  ])("flags %s", (_label, text) => {
+    expect(hidesSecretBehindEscapes(text)).toBe(true);
+  });
+
+  it.each([
+    ["no escape", "https://h/r.git"],
+    ["an escaped space in a project name", "https://dev.azure.com/org/My%20Project/_git/x"],
+    ["an escaped slash and colon", "https://h/a%2Fb%3Ac/r.git"],
+    ["a UTF-8 letter", "https://h/caf%C3%A9/r.git"],
+    ["a percent sign that starts no escape", "https://h/100%/r.git"],
+    ["an escaped percent sign", "https://h/100%25/r.git"],
+    ["a space escaped twice", "https://h/My%2520Project/r.git"],
+    ["a space escaped three times", "https://h/My%252520Project/r.git"],
+    // The most levels the check decodes: it reads all four forms and finds no token.
+    ["a space escaped four times", "https://h/My%25252520Project/r.git"],
+  ])("lets %s through", (_label, text) => {
+    expect(hidesSecretBehindEscapes(text)).toBe(false);
+  });
+});
+
+describe("jsonValueHidesSecret", () => {
+  const token = `ghp_${"a".repeat(36)}`;
+  const publishScan = (value: unknown) =>
+    scanBackupFilesForSecrets(
+      [{ path: "agent-plugins/manifest.json", content: Buffer.from(JSON.stringify(value)) }],
+      resolveBackupContents({})
+    );
+
+  // JSON writes each of these first characters as an escape, so the token has no word boundary in
+  // the text the publish-time scan reads. The strings themselves have one.
+  it.each([
+    ["a newline", "\n"],
+    ["a tab", "\t"],
+    ["a carriage return", "\r"],
+    ["a control character written as \\u00XX", "\u0001"],
+    ["a lone surrogate", "\ud800"],
+  ])("finds a token after %s that the scan of the JSON text passes", (_label, prefix) => {
+    const value = { importedComponents: { skills: [], mcpServers: [`${prefix}${token}`] } };
+
+    expect(publishScan(value)).toEqual([]);
+    expect(jsonValueHidesSecret(value)).toBe(true);
+  });
+
+  it("finds a token in an object key, at any depth", () => {
+    const value = { a: [{ b: { [`\n${token}`]: 1 } }] };
+
+    expect(publishScan(value)).toEqual([]);
+    expect(jsonValueHidesSecret(value)).toBe(true);
+  });
+
+  it("finds a token that a percent escape hides, in a value or a key", () => {
+    expect(jsonValueHidesSecret({ url: `https://h/%20${token}/r.git` })).toBe(true);
+    expect(jsonValueHidesSecret({ [`%20${token}`]: "x" })).toBe(true);
+  });
+
+  it("leaves a token that the scan of the JSON text finds to the scan, which holds the file for review", () => {
+    const value = [{ name: token }, { url: `https://h/${token}/r.git` }];
+
+    expect(publishScan(value)).toEqual(["agent-plugins/manifest.json"]);
+    expect(jsonValueHidesSecret(value)).toBe(false);
+  });
+
+  it("still finds the hidden token in an entry that also holds a token the scan finds", () => {
+    expect(jsonValueHidesSecret([{ a: token }, { b: `\n${token}` }])).toBe(true);
+  });
+
+  it("lets values through that hold no token", () => {
+    const value = {
+      name: "pstack",
+      url: "https://dev.azure.com/org/My%20Project/_git/x",
+      importedComponents: { skills: ["review\ntwo\tlines"], mcpServers: [] },
+      count: 3,
+      nothing: null,
+      flag: false,
+    };
+
+    expect(jsonValueHidesSecret(value)).toBe(false);
+  });
+});
+
 describe("isFilesystemError", () => {
   it("takes a failed fs call and nothing our own errors can be mistaken for", () => {
     const missing = Object.assign(new Error("gone"), { code: "ENOENT" });
     expect(isFilesystemError(missing)).toBe(true);
     expect(
       isFilesystemError(Object.assign(new Error("too big"), { code: "ERR_FS_FILE_TOO_LARGE" }))
+    ).toBe(true);
+    // Node on Windows names a failed fs call it cannot map this way, and main took every coded error.
+    expect(
+      isFilesystemError(Object.assign(new Error("unknown error, open"), { code: "UNKNOWN" }))
     ).toBe(true);
     expect(isFilesystemError(new Error("no code"))).toBe(false);
     expect(isFilesystemError({ code: "ENOENT" })).toBe(false);
