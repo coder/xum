@@ -21,6 +21,7 @@ import { MemoryService, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir } from "./tools/testHelpers";
 import {
   buildHarvestChunks,
+  HARVEST_INPUT_STALE_MESSAGE,
   runMemoryHarvest,
   selectOpenEpoch,
   type ChunkStreamGate,
@@ -740,6 +741,36 @@ describe("runMemoryHarvest", () => {
       expect(prompt).not.toContain("DEEP-LEAF");
       expect(prompt).toContain("[redacted deeply nested provider output]");
     });
+  });
+
+  it("re-verifies before every provider step and stops the chunk when trust changes mid-loop", async () => {
+    // The pre-chunk check passes; the model's tool-call step makes the loop
+    // continue, and the gate runs again before that next request.
+    using fixture = createFixture();
+    let checks = 0;
+    const { model, calls } = scriptedModel(
+      chunkScript([createFile("/memories/workspace/testing.md", "fact\n")])
+    );
+    const result = await runHarvest(fixture, model, {
+      // pre-chunk + first step pass; the second provider step is refused.
+      beforeDispatch: () => Promise.resolve(++checks < 3),
+    });
+    expect(checks).toBeGreaterThanOrEqual(3);
+    // The refused step's request carries the aborted signal, so a real provider sends nothing.
+    expect(calls.at(-1)?.abortSignal?.aborted).toBe(true);
+    expect(result.streamError).toBe(HARVEST_INPUT_STALE_MESSAGE);
+    // The refused chunk did not finish: a retry resumes it.
+    expect(result.nextChunk).toBe(0);
+  });
+
+  it("refuses the chunk before its first request when the input went stale", async () => {
+    using fixture = createFixture();
+    const { model, calls } = scriptedModel(chunkScript([]));
+    const result = await runHarvest(fixture, model, {
+      beforeDispatch: () => Promise.resolve(false),
+    });
+    expect(calls).toHaveLength(0);
+    expect(result.streamError).toBe(HARVEST_INPUT_STALE_MESSAGE);
   });
 
   it("serializes transcript evidence as JSON instead of breakable pseudo-XML", async () => {

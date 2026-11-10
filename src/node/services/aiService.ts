@@ -328,7 +328,15 @@ export class AIService extends EventEmitter {
     workspaceId: string,
     // The memory context does not depend on the model; the parameter keeps
     // AgentSession's per-model cache contract unchanged.
-    _modelString: string
+    _modelString: string,
+    options?: {
+      /**
+       * Routed turn without Project Trust: memories carrying project skill
+       * provenance stay out of the index (least privilege, mirroring the
+       * request's own withholding).
+       */
+      excludeProjectSkillContent?: boolean;
+    }
   ): Promise<MemorySessionContext | null> {
     if (!this.turnRequestBuilderBindings.memoryService) return null;
     if (this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) !== true) {
@@ -347,9 +355,15 @@ export class AIService extends EventEmitter {
         // disables project memory when no single project identity exists.
         projectPath: resolveMemoryProjectIdentity(metadata),
       };
-      const indexEntries =
-        await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx);
-      return { indexEntries };
+      const indexEntries = (
+        await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx)
+      ).filter(
+        (entry) => options?.excludeProjectSkillContent !== true || !entry.carriesProjectSkillContent
+      );
+      // Set only when an entry carries provenance: a clean context keeps its plain shape.
+      return indexEntries.some((entry) => entry.carriesProjectSkillContent)
+        ? { indexEntries, carriesProjectSkillContent: true }
+        : { indexEntries };
     } catch (error) {
       // Self-healing: memory context is best-effort, never a stream blocker.
       log.warn("Failed to build memory session context", { workspaceId, error });
@@ -1197,6 +1211,12 @@ export class AIService extends EventEmitter {
       // Prepared candidates must use the final caller's admission, not their earlier preview.
       buildOutcome.turnExecutionOptions.assertAdmissionCurrent = opts.assertAdmissionCurrent;
       buildOutcome.turnExecutionOptions.withAdmissionCurrent = opts.withAdmissionCurrent;
+      // Routed project-skill turns: the consent gate rides
+      // turnExecutionOptions into StreamManager.startStream, which invokes
+      // it inside its critical section (mutex held, safety and temp-dir
+      // setup done) immediately before the provider stream is constructed —
+      // checking here would leave that section as a revocation window. Its
+      // rejection surfaces below as a failed stream start.
       buildOutcome.turnExecutionOptions.stopFence = opts.stopFence;
       // Stop-cascade fence: a turn admitted before the stop latched (so the cascade's single
       // stopStream could not capture it) must not reach the provider. Abort the pending start

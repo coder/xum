@@ -364,7 +364,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         expect(completions).toHaveLength(1);
         // The user's follow-up arrives mid-stream: queued, bound to A.
         expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
-          Ok(undefined)
+          Ok({ queued: true })
         );
         expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
         // The report turn ends on a terminal agent_report.
@@ -442,7 +442,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           muxMetadata: { type: "normal" as const, reviews: [review] },
           authoredText: "follow-up",
         })
-      ).toEqual(Ok(undefined));
+      ).toEqual(Ok({ queued: true }));
       // Barrier: the report is published and its attempt released while the reporting turn is
       // still live, so the queued follow-up has not drained.
       const event = stack.endStream(0, { report: "done" }, false);
@@ -578,11 +578,11 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       );
       // Two follow-ups queued during the report turn (task-attempt entries never batch).
       expect(await workspaceService.sendMessage(childId, "first follow-up", sendOptions)).toEqual(
-        Ok(undefined)
+        Ok({ queued: true })
       );
       expect(
         await workspaceService.sendMessage(childId, "<review>a</review>\nsecond", reviewedSend)
-      ).toEqual(Ok(undefined));
+      ).toEqual(Ok({ queued: true }));
       stack.endStream(0, { report: "done" }, true);
       await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
       await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
@@ -695,7 +695,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           Ok(undefined)
         );
         expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
-          Ok(undefined)
+          Ok({ queued: true })
         );
         expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
         const event = stack.endStream(0, { report: "done" }, !late);
@@ -759,7 +759,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         Ok(undefined)
       );
       expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
-        Ok(undefined)
+        Ok({ queued: true })
       );
       stack.endStream(0, { report: "done" }, true);
       await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
@@ -789,7 +789,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         Ok(undefined)
       );
       expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
-        Ok(undefined)
+        Ok({ queued: true })
       );
       stack.endStream(0, { report: "done" }, true);
       await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
@@ -834,7 +834,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       // Attachment-only sends are valid user input (AgentSession accepts files without text).
       expect(
         await workspaceService.sendMessage(childId, "", { ...sendOptions, fileParts })
-      ).toEqual(Ok(undefined));
+      ).toEqual(Ok({ queued: true }));
       expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
       stack.endStream(0, { report: "done" }, true);
       await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
@@ -862,7 +862,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         Ok(undefined)
       );
       expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
-        Ok(undefined)
+        Ok({ queued: true })
       );
       // A turn that ended on tool calls carries no report (and cannot be promoted to one).
       stack.endStream(0, { finishReason: "tool-calls" }, true);
@@ -905,7 +905,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       const onCanceled = mock((_reason: string) => undefined);
       expect(
         await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
-      ).toEqual(Ok(undefined));
+      ).toEqual(Ok({ queued: true }));
       // The parent's session dir is a file: the report artifact cannot be written there.
       const parentSessionDir = path.join(config.sessionsDir, rootId);
       await fsPromises.rm(parentSessionDir, { recursive: true, force: true });
@@ -975,9 +975,11 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           Ok(undefined)
         );
         const onCanceled = mock((_reason: string) => undefined);
+        // Queued behind the active turn: the acknowledgement says so (class routing resolves at
+        // delivery, so the composer attributes the routed model then).
         expect(
           await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
-        ).toEqual(Ok(undefined));
+        ).toEqual(Ok({ queued: true }));
         stack.endStream(0, {}, true);
         // The decision is registered pending at the event tick, before the handler runs: only the
         // handler's deferral shows that this test reaches the deferred path (#7003).
@@ -1088,7 +1090,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       );
       expect(
         await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
-      ).toEqual(Ok(undefined));
+      ).toEqual(Ok({ queued: true }));
       stack.endStream(0, {}, true);
       await inGap.promise;
       await editChildRow(config, childId, editRow);
@@ -1143,7 +1145,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await until(() => stack.completions.length === 1, "the continuation stream");
       if (options.queueFollowUp) {
         expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
-          Ok(undefined)
+          Ok({ queued: true })
         );
       }
       if (options.statusAtEnd != null) {
@@ -1358,7 +1360,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       const onCanceled = mock((_reason: string) => undefined);
       expect(
         await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
-      ).toEqual(Ok(undefined));
+      ).toEqual(Ok({ queued: true }));
       await editChildRow(config, childId, (row) => {
         row.taskStatus = "reported";
         row.reportedAt = REPORTED_AT;
@@ -1436,7 +1438,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         const onCanceled = mock((_reason: string) => undefined);
         expect(
           await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
-        ).toEqual(Ok(undefined));
+        ).toEqual(Ok({ queued: true }));
         stack.endStream(0, {}, true);
         await until(
           () => completions.length > 1 || stack.heldTexts().length > 0,
@@ -1473,7 +1475,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       const onCanceled = mock((_reason: string) => undefined);
       expect(
         await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
-      ).toEqual(Ok(undefined));
+      ).toEqual(Ok({ queued: true }));
       stack.endStream(0, {}, true);
       await until(
         () => completions.length > 1 || stack.heldTexts().length > 0,
@@ -1515,7 +1517,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         const onCanceled = mock((_reason: string) => undefined);
         expect(
           await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
-        ).toEqual(Ok(undefined));
+        ).toEqual(Ok({ queued: true }));
         // The row kept the predecessor's report across the CAS and still reads it now.
         expect(entryOf(config, childId)).toMatchObject({
           taskStatus: "interrupted",
@@ -1556,7 +1558,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       ).toMatchObject(Ok({ delivery: "reactivated" }));
       await until(() => completions.length === 1, "the continuation stream");
       expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
-        Ok(undefined)
+        Ok({ queued: true })
       );
       expect(entryOf(config, childId)).toMatchObject({
         taskStatus: "interrupted",
@@ -1596,7 +1598,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         Ok(undefined)
       );
       expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
-        Ok(undefined)
+        Ok({ queued: true })
       );
       stack.endStream(0, { report: "done" }, true);
       await until(() => blocked, "handler blocked");
@@ -1644,7 +1646,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           agentInitiated: true,
           onCanceled,
         })
-      ).toEqual(Ok(undefined));
+      ).toEqual(Ok({ queued: true }));
       stack.endStream(0, { report: "done" }, true);
       await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
       await yieldMacrotasks(5);
@@ -1679,7 +1681,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         Ok(undefined)
       );
       expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
-        Ok(undefined)
+        Ok({ queued: true })
       );
       stack.endStream(0, { report: "done" }, true);
       await until(() => blocked, "handler blocked");
@@ -1733,7 +1735,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     const onCanceled = mock((_reason: string) => undefined);
     expect(
       await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
-    ).toEqual(Ok(undefined));
+    ).toEqual(Ok({ queued: true }));
     stack.endStream(0, { report: "done" }, true);
     await until(() => blocked, "handler blocked");
     await until(() => !child.session.isBusy(), "session idle");
@@ -1913,7 +1915,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
       // The user's follow-up arrives mid-stream: queued, bound to the re-driven attempt.
       expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
-        Ok(undefined)
+        Ok({ queued: true })
       );
       expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
       // The re-driven turn ends on a terminal agent_report.
@@ -1945,7 +1947,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       const onCanceled = mock((_reason: string) => undefined);
       expect(
         await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
-      ).toEqual(Ok(undefined));
+      ).toEqual(Ok({ queued: true }));
       // Another backend reports the re-driven attempt while this stream runs: no start of the
       // attempt is known here, so the row's report cannot be read as inherited.
       await editChildRow(config, childId, (row) => {
@@ -1993,7 +1995,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       });
       // A follow-up sent now is bound to B (the current row) and queued behind the live stream.
       expect(await workspaceService.sendMessage(childId, "b follow-up", sendOptions)).toEqual(
-        Ok(undefined)
+        Ok({ queued: true })
       );
       expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
       // The re-driven attempt's stream ends on a terminal agent_report.
@@ -2425,7 +2427,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         beforeStop: async ({ workspaceService, sendOptions }) => {
           expect(
             await workspaceService.sendMessage("r22fc01", "queued before stop", sendOptions)
-          ).toEqual(Ok(undefined));
+          ).toEqual(Ok({ queued: true }));
           expect(workspaceService.hasQueuedMessages("r22fc01")).toBe(true);
         },
       });
@@ -2490,7 +2492,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           // Both sends are accepted: the first reawakens a fresh attempt and runs, the second queues
           // behind it. The handler (still on the stale abort) must then leave that queue alone:
           // the second message is kept (queued, restored or held), never dropped silently.
-          expect(sends).toEqual([Ok(undefined), Ok(undefined), true]);
+          expect(sends).toEqual([Ok(undefined), Ok({ queued: true }), true]);
           const kept =
             observed.queuedAfter ||
             observed.restored.includes("second after stop") ||
@@ -2828,9 +2830,11 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         expect(await workspaceService.resumeStream(childId, { model, agentId: "compact" })).toEqual(
           Ok({ started: true })
         );
+        // Queued behind the resume turn: the acknowledgement says so (class routing
+        // resolves at dispatch).
         expect(
           await workspaceService.sendMessage(childId, "follow-up text", stack.sendOptions)
-        ).toEqual(Ok(undefined));
+        ).toEqual(Ok({ queued: true }));
         stack.endStream(0, { agentId: "compact" }, true);
         await until(() => !stack.child.session.isBusy(), "resume turn settled");
         // The follow-up is held behind the pending stream-end decision, and the attempt fence

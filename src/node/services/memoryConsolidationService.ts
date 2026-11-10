@@ -70,7 +70,7 @@ import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { HistoryService } from "@/node/services/historyService";
-import type { MuxMessage } from "@/common/types/message";
+import { excludeRejectedTurnRows, type MuxMessage } from "@/common/types/message";
 import {
   analyzedFloorRowId,
   budgetSpent,
@@ -81,6 +81,12 @@ import {
   type HarvestEpoch,
   type HarvestProgress,
 } from "@/node/services/memoryHarvest";
+import {
+  messagesCarryProjectSkillContent,
+  redactProjectSkillToolResults,
+  withholdProjectSkillContentFromRequest,
+} from "@/node/services/agentSkills/loadedSkillSnapshots";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
@@ -475,6 +481,11 @@ interface HarvestSource {
   compactionEpoch: number;
   completionMetadata?: CompactionCompletionMetadata;
   readEpoch: () => Promise<Result<HarvestEpoch>>;
+  /**
+   * A fresh read of the same rows for the pre-dispatch recheck, when `readEpoch` returns a
+   * snapshot: a turn refused and stamped since must drop out. Default: `readEpoch`.
+   */
+  rereadEpoch?: () => Promise<Result<HarvestEpoch>>;
 }
 
 /** What an attempt learns before it streams; shared so a failure record can carry it. */
@@ -811,6 +822,59 @@ export class MemoryConsolidationService extends EventEmitter {
   ) {
     super();
     this.sidecarPath = path.join(config.rootDir, "memory-consolidation.json");
+  }
+
+  /**
+   * Quarantine of rejected rows whose durable stamp failed (the live session's
+   * set plus the durable repair record): the harvest boundary must exclude
+   * them like request assembly does. Err means the record could not be read —
+   * the harvest fails closed. Late-bound — WorkspaceService is constructed
+   * after core services.
+   */
+  /**
+   * Whether project skill content may reach the dream provider for this
+   * workspace: the workspace's project (as registered in config) is trusted.
+   * A scratch workspace's workdir is not a project key, so it reads untrusted
+   * — the conservative side, matching provider-selection consent.
+   */
+  private isHarvestProjectTrusted(workspaceId: string): boolean {
+    const entry = this.config.findWorkspace(workspaceId);
+    return entry != null && isProjectTrusted(this.config, entry.projectPath);
+  }
+
+  /**
+   * Pre-dispatch re-verification of a built harvest input: trust must not
+   * have been revoked since the input was built with it, and every row in the
+   * input must still be provider-eligible under a fresh quarantine read (a
+   * Retry can refuse and stamp a turn meanwhile). False on unreadable state.
+   */
+  private async harvestInputStillCurrent(
+    source: HarvestSource,
+    trustedAtBuild: boolean,
+    rowIds: readonly string[]
+  ): Promise<boolean> {
+    if (trustedAtBuild && !this.isHarvestProjectTrusted(source.workspaceId)) return false;
+    const epoch = await (source.rereadEpoch ?? source.readEpoch)();
+    if (!epoch.success) return false;
+    const quarantine =
+      (await this.getQuarantinedRowIds?.(source.workspaceId)) ?? Ok(new Set<string>());
+    if (!quarantine.success) return false;
+    const eligible = new Set(
+      excludeRejectedTurnRows(epoch.data.messages, quarantine.data).map((row) => row.id)
+    );
+    return rowIds.every((id) => eligible.has(id));
+  }
+
+  private getQuarantinedRowIds?: (
+    workspaceId: string
+  ) => Result<ReadonlySet<string>, string> | Promise<Result<ReadonlySet<string>, string>>;
+
+  setQuarantinedRowIdsLookup(
+    lookup: (
+      workspaceId: string
+    ) => Result<ReadonlySet<string>, string> | Promise<Result<ReadonlySet<string>, string>>
+  ): void {
+    this.getQuarantinedRowIds = lookup;
   }
 
   private enabled(): boolean {
@@ -1625,7 +1689,7 @@ export class MemoryConsolidationService extends EventEmitter {
       // child's own removal tombstone still refuses every read and commit of
       // the run (MemoryScopeContext.guardedWorkspaceId) — a remover in another
       // backend cannot abort this controller.
-      const ctx: MemoryScopeContext = {
+      const scopeCtx: MemoryScopeContext = {
         runtime: null,
         checkoutCwd: "",
         workspaceId,
@@ -1634,6 +1698,19 @@ export class MemoryConsolidationService extends EventEmitter {
           ? { guardedWorkspaceId: options.actingWorkspaceId }
           : {}),
       };
+      // The sweep reads freely across the scope, so everything it writes
+      // inherits the provenance of any memory (harvest inbox included) that
+      // carries project skill content — unknown is tainted.
+      const scopeCarriesProjectSkillContent = yield* Effect.promise(() =>
+        self.memoryService.scopeCarriesProjectSkillContent(scopeCtx)
+      );
+      const ctx: MemoryScopeContext = scopeCarriesProjectSkillContent
+        ? { ...scopeCtx, writeProvenance: { carriesProjectSkillContent: true } }
+        : scopeCtx;
+      // The dream provider may differ from the workspace's: without Project
+      // Trust the sweep cannot read memories carrying project skill provenance,
+      // and trust granted at setup is re-verified right before its request.
+      const sweepTrusted = self.isHarvestProjectTrusted(workspaceId);
 
       // The stream's usage is recorded after its queue slot is released, not inside it.
       const usageRecorder = createDeferredUsageRecorder("MemoryConsolidation", workspaceId);
@@ -1647,6 +1724,12 @@ export class MemoryConsolidationService extends EventEmitter {
           metaService: self.metaService,
           ctx,
           dryRun: false,
+          excludeProjectSkillContent: !sweepTrusted,
+          projectSkillContentStillReadable: sweepTrusted
+            ? () => Promise.resolve(self.isHarvestProjectTrusted(workspaceId))
+            : undefined,
+          beforeDispatch: () =>
+            Promise.resolve(!sweepTrusted || self.isHarvestProjectTrusted(workspaceId)),
           finalPass: trigger === "archive",
           // Hard timeout: a wedged provider stream must not hold the in-flight
           // lock forever (and stall the sequential launch sweep behind it).
@@ -1941,6 +2024,20 @@ export class MemoryConsolidationService extends EventEmitter {
           boundaryKey: `${OPEN_EPOCH_KEY_PREFIX}${newest.id}`,
           compactionEpoch: openEpoch.compactionEpoch,
           readEpoch: () => Promise.resolve(Ok({ messages: openEpoch.messages })),
+          rereadEpoch: async () => {
+            const fresh = await self.historyService.getHistoryFromLatestBoundary(workspaceId);
+            if (!fresh.success) return Err(fresh.error);
+            const reread = selectOpenEpoch(fresh.data);
+            // A compaction closed the epoch meanwhile: its rows sit behind a boundary now, where
+            // no Retry can refuse and stamp them, so the snapshot is current (the quarantine is
+            // still read fresh).
+            return Ok({
+              messages:
+                reread.compactionEpoch === openEpoch.compactionEpoch
+                  ? reread.messages
+                  : openEpoch.messages,
+            });
+          },
         },
         scope.data,
         removalSignal
@@ -2143,6 +2240,46 @@ export class MemoryConsolidationService extends EventEmitter {
       });
       if (!epoch.success) return yield* Effect.fail(new Error(epoch.error));
 
+      // Rejected turns are transcript-only: the dream model (which may use
+      // an explicit alternate provider) must not harvest their prompt or
+      // repository snapshots — filter stamped rows plus the quarantine
+      // (the session's in-memory set, or the durable repair record when the
+      // post-restart launch sweep runs before any session exists), expanded
+      // from turn keys to the whole turn exactly like the repair stamps it.
+      // Resolved before the model is built: a fail-closed skip costs no client.
+      const quarantine = yield* Effect.promise(
+        async () => (await self.getQuarantinedRowIds?.(workspaceId)) ?? Ok(new Set<string>())
+      );
+      // Fail CLOSED when the record is unreadable: an empty set would let an
+      // unstamped rejected turn reach the dream provider. The journaled failure
+      // keeps the harvest retryable once a session repairs the record.
+      if (!quarantine.success) {
+        return yield* Effect.fail(
+          new Error(`rejected-turn quarantine unavailable: ${quarantine.error}`)
+        );
+      }
+      const eligibleRows = excludeRejectedTurnRows(epoch.data.messages, quarantine.data);
+      // Project skill content may leave for the dream provider (possibly
+      // another provider) only while the workspace's project is trusted — the
+      // routed request's rule. Without trust, snapshot rows, tainted tool
+      // results and summaries carrying (or of unknown) provenance are withheld
+      // from the harvest input, the epoch summary included: compaction stamps
+      // it, and runMemoryHarvest quotes it into every chunk's prompt.
+      const projectTrusted = self.isHarvestProjectTrusted(workspaceId);
+      // Withheld over the whole epoch, then cut at the floor: a row after the floor can quote
+      // project content read before it.
+      const harvestRows = projectTrusted
+        ? eligibleRows
+        : withholdProjectSkillContentFromRequest(eligibleRows);
+      const harvestSummary =
+        projectTrusted || epoch.data.summary === undefined
+          ? epoch.data.summary
+          : redactProjectSkillToolResults([epoch.data.summary])[0];
+      const harvestRowsAfter = (floor: string | null): MuxMessage[] => {
+        const after = new Set(rowsAfterFloor(epoch.data.messages, floor).map((row) => row.id));
+        return harvestRows.filter((row) => after.has(row.id));
+      };
+
       const completedRecord = (
         progress: HarvestProgress,
         outcome: Pick<MemoryHarvestRecord, "note" | "readThroughRowId"> = {}
@@ -2287,15 +2424,41 @@ export class MemoryConsolidationService extends EventEmitter {
                 budgetSpent(opts.progress),
                 epochBudgetSpent(records, epoch.data.messages)
               );
+              const harvestMessages = harvestRowsAfter(floor);
+              // The analyzer distills this input and reads memory freely: under trust, what it
+              // writes inherits the provenance of project skill content in either (unknown is
+              // tainted). Without trust both are withheld from it.
+              const harvestCtx: MemoryScopeContext =
+                projectTrusted &&
+                (messagesCarryProjectSkillContent(
+                  harvestSummary === undefined
+                    ? harvestMessages
+                    : [...harvestMessages, harvestSummary]
+                ) ||
+                  (await self.memoryService.scopeCarriesProjectSkillContent(ctx)))
+                  ? { ...ctx, writeProvenance: { carriesProjectSkillContent: true } }
+                  : ctx;
               const result = await runMemoryHarvest({
                 model: modelResult.data.model,
                 pricingModel: modelResult.data.metadataModel,
                 ceilingUsd: resolveDreamCostCeilingUsd(self.config),
                 memoryService: self.memoryService,
                 metaService: self.metaService,
-                ctx,
-                messages: rowsAfterFloor(epoch.data.messages, floor),
-                summary: epoch.data.summary,
+                ctx: harvestCtx,
+                messages: harvestMessages,
+                summary: harvestSummary,
+                excludeProjectSkillContent: !projectTrusted,
+                projectSkillContentStillReadable: projectTrusted
+                  ? () => Promise.resolve(self.isHarvestProjectTrusted(workspaceId))
+                  : undefined,
+                // Trust and the quarantine were read before the model was built;
+                // re-verify right before each chunk's request and provider step.
+                beforeDispatch: () =>
+                  self.harvestInputStillCurrent(
+                    source,
+                    projectTrusted,
+                    harvestMessages.map((message) => message.id)
+                  ),
                 resume: opts.progress,
                 // The cursor reaches disk after each clean chunk: a crash or a later chunk's failure
                 // must not make the retry write the earlier chunks' memory again.

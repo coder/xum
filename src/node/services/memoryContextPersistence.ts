@@ -26,6 +26,8 @@ export const MEMORY_CONTEXT_FILE_NAME = "memory-context.json";
 export interface CachedMemoryContext {
   context: MemorySessionContext | null;
   memoryEnabled: boolean;
+  /** Built for a routed turn without Project Trust: memories with project skill provenance withheld. */
+  excludesProjectSkillContent?: boolean;
 }
 
 // The removed Memory Hot Set experiment left three fields in the file. They are read and
@@ -36,11 +38,15 @@ const CachedMemoryContextSchema = z.object({
     .object({
       indexEntries: z.array(z.object({ path: z.string(), description: z.string() })),
       hotMemoriesBlock: z.string().nullable().optional(),
+      // Provenance survives a restart: a routed turn's consent gate arms on it.
+      carriesProjectSkillContent: z.boolean().optional(),
     })
     .nullable(),
   includesHotMemories: z.boolean().optional(),
   memoryEnabled: z.boolean(),
   hotSetEnabled: z.boolean().optional(),
+  // Files written before the field existed were built without exclusion.
+  excludesProjectSkillContent: z.boolean().default(false),
 });
 
 const MemoryContextFileSchema = z.object({
@@ -69,6 +75,7 @@ function toFile(
       includesHotMemories: true,
       memoryEnabled: cached.memoryEnabled,
       hotSetEnabled: false,
+      excludesProjectSkillContent: cached.excludesProjectSkillContent === true,
       context:
         cached.context == null
           ? null
@@ -78,6 +85,9 @@ function toFile(
                 description: entry.description,
               })),
               hotMemoriesBlock: null,
+              ...(cached.context.carriesProjectSkillContent === true
+                ? { carriesProjectSkillContent: true }
+                : {}),
             },
     };
   }
@@ -143,8 +153,17 @@ export class MemoryContextStore {
     for (const [modelString, saved] of Object.entries(parsed.data.contexts)) {
       // Drop the retired Hot Set fields: the runtime entry holds only what the prompt uses.
       contexts.set(modelString, {
-        context: saved.context == null ? null : { indexEntries: saved.context.indexEntries },
+        context:
+          saved.context == null
+            ? null
+            : {
+                indexEntries: saved.context.indexEntries,
+                ...(saved.context.carriesProjectSkillContent === true
+                  ? { carriesProjectSkillContent: true }
+                  : {}),
+              },
         memoryEnabled: saved.memoryEnabled,
+        ...(saved.excludesProjectSkillContent ? { excludesProjectSkillContent: true } : {}),
       });
     }
     return { windowKey: parsed.data.windowKey, contexts };

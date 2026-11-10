@@ -53,7 +53,10 @@ function isIndexedSkill(skill: AgentSkillDescriptor): boolean {
  * so the model sees them adjacent to the tool call schema.
  */
 function buildSkillReadDescription(config: ToolConfiguration): string {
-  const { prefix, block } = skillIndexSectionFor(config.availableSkills);
+  const { prefix, block } = skillIndexSectionFor(
+    config.availableSkills,
+    config.excludeProjectSkillContent === true
+  );
   return prefix + block;
 }
 
@@ -61,16 +64,32 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
  * The agent_skill_read description split at its "Available skills" part (block, "" without
  * skills). The request assembler keeps that block frozen inside a context segment
  * (planSkillIndex), so a skill added mid-session does not rewrite the cached tool block.
+ * Callers pass the same exclusion the tools are built with, so the assembler finds the block.
  */
-export function skillIndexSectionFor(availableSkills: readonly InvocableSkill[] | undefined) {
+export function skillIndexSectionFor(
+  availableSkills: readonly InvocableSkill[] | undefined,
+  excludeProjectSkillContent: boolean
+) {
   return {
     prefix: TOOL_DEFINITIONS.agent_skill_read.description,
-    block: buildSkillIndexSection(availableSkills),
+    block: buildSkillIndexSection(availableSkills, excludeProjectSkillContent),
   };
 }
 
-function buildSkillIndexSection(availableSkills: readonly InvocableSkill[] | undefined) {
-  const skills = (availableSkills ?? []).filter(isIndexedSkill);
+function buildSkillIndexSection(
+  availableSkills: readonly InvocableSkill[] | undefined,
+  excludeProjectSkillContent: boolean
+) {
+  // Only indexed skills (isIndexedSkill: advertised and model-invocable) are
+  // listed; the others can still be invoked via /skill-name or agent_skill_read.
+  // A routed turn that must not carry project skill content also leaves the
+  // project-scope descriptors out: description and whenToUse are
+  // repository-controlled text that would otherwise ride the initial request
+  // (kept under trust, they arm the turn's consent gate instead — see
+  // withToolDescriptionProvenance).
+  const skills = (availableSkills ?? []).filter(
+    (s) => isIndexedSkill(s) && !(excludeProjectSkillContent && s.scope === "project")
+  );
 
   if (skills.length === 0) {
     return "";

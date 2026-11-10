@@ -33,6 +33,8 @@ export interface PendingTaskStartWaiter {
 
 export interface CompletedAgentReportCacheEntry {
   reportMarkdown: string;
+  /** Report provenance (see SubagentReportArtifactIndexEntry.carriesProjectSkillContent). */
+  carriesProjectSkillContent?: boolean;
   planFilePath?: string;
   structuredOutput?: unknown;
   title?: string;

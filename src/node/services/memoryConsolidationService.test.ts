@@ -8,6 +8,7 @@ import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-
 
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
+import { COMPACTION_SUMMARY_WITHHELD_MESSAGE } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import type {
   MemoryConsolidationStatusChangeEventPayload,
   MemoryHarvestRecordPayload,
@@ -114,12 +115,13 @@ function scriptedModel(capturePrompt?: (prompt: string) => void): MockLanguageMo
   });
 }
 
-function harvestCandidateModel(): MockLanguageModelV3 {
+function harvestCandidateModel(capturePrompt?: (prompt: string) => void): MockLanguageModelV3 {
   let streamCount = 0;
   return new MockLanguageModelV3({
     doStream: (options) => {
       streamCount++;
       const prompt = userPromptText(options);
+      capturePrompt?.(prompt);
       const isHarvest = prompt.includes("just-compacted transcript epoch");
       const chunks: LanguageModelV3StreamPart[] =
         isHarvest && streamCount === 1
@@ -499,6 +501,9 @@ async function createFixture(options?: {
   // Register a workspace so config.findWorkspace resolves it.
   await config.editConfig((cfg) => {
     cfg.projects.set("/projects/demo", {
+      // Trusted by default: project skill content may reach the dream
+      // provider; the trust-revocation tests flip this off explicitly.
+      trusted: true,
       workspaces: [{ id: "ws-dream", name: "ws-dream", path: "/projects/demo/ws-dream" }],
     });
     return cfg;
@@ -605,7 +610,8 @@ async function seedCompactionEpoch(
   fixture: Fixture,
   workspaceId = "ws-dream",
   epoch = 1,
-  previousBoundaryHistorySequence?: number
+  previousBoundaryHistorySequence?: number,
+  options?: { summaryText?: string; summaryMetadata?: Record<string, unknown> }
 ): Promise<CompactionCompletionMetadata> {
   // Epoch 1 keeps the original ids that other tests cite.
   const suffix = epoch === 1 ? "" : `-${epoch}`;
@@ -622,8 +628,13 @@ async function seedCompactionEpoch(
   const summary = createMuxMessage(
     `summary-${epoch}`,
     "assistant",
-    "The user prefers concise tests.",
-    { compactionBoundary: true, compacted: "user", compactionEpoch: epoch }
+    options?.summaryText ?? "The user prefers concise tests.",
+    {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: epoch,
+      ...options?.summaryMetadata,
+    }
   );
   await fixture.historyService.appendToHistory(workspaceId, summary);
 
@@ -1120,6 +1131,108 @@ describe("MemoryConsolidationService", () => {
       skippedCandidates: 0,
       ops: [{ command: "create", path: "/memories/workspace/testing.md", applied: true }],
     });
+  });
+
+  it("withholds project skill content from the harvest when the project is not trusted", async () => {
+    // The dream provider may differ from the workspace's; project skill
+    // content leaves for it only while the project is trusted. The epoch
+    // summary (stamped by compaction) and the snapshot rows are both inputs.
+    for (const trusted of [true, false]) {
+      // A memory-writing analyzer model so the harvest writes a file whose
+      // provenance can be checked below.
+      const prompts: string[] = [];
+      using fixture = await createFixture({
+        modelFactory: () => harvestCandidateModel((prompt) => prompts.push(prompt)),
+      });
+      await fixture.config.editConfig((cfg) => {
+        const project = cfg.projects.get("/projects/demo");
+        if (project) project.trusted = trusted;
+        return cfg;
+      });
+      await fixture.historyService.appendToHistory(
+        "ws-dream",
+        createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+        })
+      );
+      const metadata = await seedCompactionEpoch(fixture, "ws-dream", 1, undefined, {
+        summaryText: "SUMMARY QUOTING THE SKILL",
+        summaryMetadata: { carriesProjectSkillContent: true },
+      });
+
+      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+      const harvestPrompt = prompts.find((prompt) =>
+        prompt.includes("just-compacted transcript epoch")
+      );
+      expect(harvestPrompt).toBeDefined();
+      if (trusted) {
+        expect(harvestPrompt).toContain("SUMMARY QUOTING THE SKILL");
+        expect(harvestPrompt).toContain("PROJECT SKILL BODY");
+      } else {
+        expect(harvestPrompt).not.toContain("SUMMARY QUOTING THE SKILL");
+        expect(harvestPrompt).not.toContain("PROJECT SKILL BODY");
+        expect(harvestPrompt).toContain(COMPACTION_SUMMARY_WITHHELD_MESSAGE);
+      }
+      // The analyzer distills the input: a file it writes from project skill
+      // content under trust carries the provenance (sidecar), so routed
+      // requests after a revocation can withhold what derives from it.
+      const written = (
+        await fixture.memoryService.listIndexEntries({
+          runtime: null,
+          checkoutCwd: "",
+          workspaceId: "ws-dream",
+          projectPath: "/projects/demo",
+        })
+      ).find((entry) => entry.path === "/memories/workspace/testing.md");
+      expect(written).toBeDefined();
+      expect(written?.carriesProjectSkillContent).toBe(trusted);
+    }
+  });
+
+  it("aborts the harvest when trust is revoked between model creation and dispatch", async () => {
+    // The input was built while trusted; the model construction await is a
+    // window in which trust can be revoked. The pre-dispatch re-verification
+    // must catch it: no harvest request, a retryable failed record.
+    const gate = Promise.withResolvers<void>();
+    using fixture = await createFixture({ modelGate: gate.promise });
+    const metadata = await seedCompactionEpoch(fixture);
+    const run = fixture.service.maybeHarvestThenSweep(metadata);
+    for (let i = 0; i < 200 && fixture.modelCalls.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(fixture.modelCalls.length).toBeGreaterThanOrEqual(1);
+    await fixture.config.editConfig((cfg) => {
+      const project = cfg.projects.get("/projects/demo");
+      if (project) project.trusted = false;
+      return cfg;
+    });
+    gate.resolve();
+
+    expect((await run).success).toBe(true);
+    expect(
+      fixture.modelPrompts.some((prompt) => prompt.includes("just-compacted transcript epoch"))
+    ).toBe(false);
+    expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord?.status).toBe(
+      "failed"
+    );
+  });
+
+  it("fails the harvest closed when the rejected-turn quarantine cannot be read", async () => {
+    // After a failed rejection stamp the durable record is the only key
+    // protecting the turn, so an unreadable record must not read as "nothing
+    // quarantined": no harvest model call, a retryable failed record. The
+    // sweep (memory files, not the transcript) still runs.
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    fixture.service.setQuarantinedRowIdsLookup(() => Err("record unreadable"));
+    const metadata = await seedCompactionEpoch(fixture);
+
+    const result = await fixture.service.maybeHarvestThenSweep(metadata);
+
+    expect(result.success).toBe(true);
+    expect(fixture.modelCalls).toHaveLength(1);
+    const status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord?.status).toBe("failed");
   });
 
   it("prunes old harvest sidecar records while preserving the newest status", async () => {

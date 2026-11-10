@@ -15,11 +15,17 @@ export const createTaskRetitleTool: ToolFactory = (config: ToolConfiguration) =>
     execute: async (args): Promise<unknown> => {
       const workspaceId = requireWorkspaceId(config, "task_retitle");
       const taskService = requireTaskService(config, "task_retitle");
-      const result = await taskService.retitleDescendantAgentTask(
-        workspaceId,
-        args.task_id,
-        args.title
-      );
+      // A title authored while project skill content is in context is
+      // repository-derived text: the task is stamped so task_list withholds
+      // or stamps the title after a revocation.
+      const contextCarriesProjectSkillContent =
+        config.memoryWriteCarriesProjectSkillContent === true ||
+        config.projectSkillContentInContext?.() === true;
+      const result = contextCarriesProjectSkillContent
+        ? await taskService.retitleDescendantAgentTask(workspaceId, args.task_id, args.title, {
+            carriesProjectSkillContent: true,
+          })
+        : await taskService.retitleDescendantAgentTask(workspaceId, args.task_id, args.title);
 
       const toolResult = result.success
         ? {

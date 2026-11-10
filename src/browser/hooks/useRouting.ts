@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
@@ -10,6 +10,7 @@ import {
   type RouteContext,
 } from "@/common/routing";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { isRouteProviderConfigured } from "@/common/utils/ai/modelAvailability";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
@@ -36,6 +37,13 @@ export interface RoutingState {
   routePriority: string[];
   /** Per-model route overrides */
   routeOverrides: Record<string, string>;
+  /**
+   * True once the routing config fetch has landed. Until then routePriority
+   * is the built-in default — availability verdicts computed against it can
+   * be wrong for gateway-routed setups, so consumers gating UI on route
+   * reachability must wait for this.
+   */
+  loaded: boolean;
 
   /** What route will be used for a given canonical model? */
   resolveRoute(canonicalModel: string): {
@@ -76,11 +84,17 @@ export function useRouting(): RoutingState {
   const store = getAppConfigStore();
   const routePriority = useAppConfig((config) => config.routePriority) ?? DEFAULT_ROUTE_PRIORITY;
   const routeOverrides = useAppConfig((config) => config.routeOverrides) ?? EMPTY_ROUTE_OVERRIDES;
+  // Until the store's first snapshot lands, routePriority is the built-in
+  // default — availability verdicts computed against it can be wrong for
+  // gateway-routed setups, so consumers gating UI on route reachability wait.
+  const loaded = useSyncExternalStore(store.subscribe, () => store.getSnapshot() != null);
 
+  // Shared predicates: the send-path availability check
+  // (isModelServableWithProvidersConfig) uses these same definitions, so the
+  // Settings picker and skill-routing verdicts cannot drift apart.
   const isConfigured = useCallback(
     (provider: string) =>
-      providersConfig?.[provider]?.isConfigured === true &&
-      providersConfig?.[provider]?.isEnabled !== false,
+      providersConfig != null && isRouteProviderConfigured(providersConfig, provider),
     [providersConfig]
   );
 
@@ -240,5 +254,6 @@ export function useRouting(): RoutingState {
     setRoutePreferences,
     setRoutePriority,
     setRouteOverride,
+    loaded,
   };
 }

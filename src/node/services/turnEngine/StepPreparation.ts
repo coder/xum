@@ -42,6 +42,7 @@ import { ContextBudgetBlockedError } from "@/node/services/contextBudgetError";
 import type { HistoryService } from "@/node/services/historyService";
 import type { ContinuousPrefixSwap } from "@/node/services/continuousCompactionJournal";
 import { log } from "@/node/services/log";
+import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import type {
   ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
@@ -691,6 +692,30 @@ export class StepPreparation {
       thinkingOverride
     );
     let rebuiltFirstStepMessages = pendingRebuild == null ? undefined : await pendingRebuild;
+    // Routed project-skill turns: per-attempt consent verdict at the
+    // provider-call boundary — prepareStep is the last awaited hook
+    // before EVERY step's provider request (fallback and retry
+    // recreations included), so mid-turn revocation stops the next
+    // request instead of riding the stream. The callback already
+    // performed its rejection bookkeeping; throwing surfaces through
+    // the stream's standard error path, which also emits the visible
+    // error row — hence midStream, so the callback does not emit its own.
+    // Consent before budget: a refused request is not worth measuring.
+    if (request.preDispatchConsentGate) {
+      const consentError = await request.preDispatchConsentGate({
+        midStream: true,
+        // This step's messages: a project skill read by an earlier step of
+        // this stream rides in them and must arm the gate now.
+        stepMessages: rebuiltFirstStepMessages ?? effectiveMessages,
+        // A swapped prefix's rows carry no provenance any more; the swap
+        // carries the verdict of its own (filtered) sources.
+        swappedPrefixCarriesProjectSkillContent:
+          stepTracker?.consumedPrefixSwap?.carriesProjectSkillContent === true,
+      });
+      if (consentError) {
+        throw new Error(formatSendMessageError(consentError).message);
+      }
+    }
     // #5086, preserved thinking: a replayed in-turn thinking block stays valid only
     // while everything before it is unchanged. A consumed prefix swap or a change to
     // the advertised tool set edits that prefix, so rows sent up to that step never

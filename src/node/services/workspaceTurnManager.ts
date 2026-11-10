@@ -401,6 +401,12 @@ export interface WorkspaceTurnCreateArgs {
   agentTaskAi?: AgentTaskTurnAi;
   attentionPolicy?: BackgroundWorkAttentionPolicy;
   /**
+   * The launching turn's context carried project skill content: stamped on the
+   * target's opening row so its provenance tracking inherits it (see
+   * TaskCreateArgs.carriesProjectSkillContent).
+   */
+  carriesProjectSkillContent?: boolean;
+  /**
    * Internal-only: dispatch the prompt through this sender instead of
    * workspaceService.sendMessage. A bash-monitor wake that reactivates an inactive
    * sub-agent keeps the wake row's own metadata and acceptance callbacks while the
@@ -2384,6 +2390,9 @@ export class WorkspaceTurnManager {
         acceptanceOrigin: "automatic",
         startStreamInBackground: true,
         requireIdle: !queuedForExistingWorkspace,
+        ...(args.carriesProjectSkillContent === true
+          ? { userRowCarriesProjectSkillContent: true }
+          : {}),
         ...(args.sendIdentities != null
           ? { sendIdentities: args.sendIdentities, skipOnSendCompaction: true }
           : {}),

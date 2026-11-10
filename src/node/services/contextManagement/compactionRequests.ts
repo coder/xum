@@ -27,6 +27,8 @@ export function buildAutoCompactionFollowUp(params: {
   taskTurnKind?: TaskTurnKind;
   muxMetadata?: MuxMessageMetadata;
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /** The interrupted stream ran with a routed consent gate (see CompactionFollowUpRequest). */
+  routedProjectConsent?: boolean;
   autoModelRouting?: AutoModelRoutingRecord;
   /** The diverted send already ran the message.send prompt hooks (see the field doc). */
   pluginSendHooksApplied?: true;
@@ -70,6 +72,9 @@ export function buildAutoCompactionFollowUp(params: {
     followUp.workspaceTurnMetadata = params.workspaceTurnMetadata;
   }
 
+  if (params.routedProjectConsent === true) {
+    followUp.routedProjectConsent = true;
+  }
   if (params.autoModelRouting) {
     followUp.autoModelRouting = params.autoModelRouting;
   }

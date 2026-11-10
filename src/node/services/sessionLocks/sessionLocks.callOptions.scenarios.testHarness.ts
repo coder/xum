@@ -321,6 +321,8 @@ export async function oneFork(
       workspaceId,
       marker: { sessionDir, locks: historyService.locks },
       abandonedMessages: [],
+      // No rows here, so trust changes nothing; the summarizer is never reached.
+      projectTrusted: true,
       guardTailMessageId: "none",
     });
     await awaitPendingBranchSummary(workspaceId);

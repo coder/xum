@@ -633,6 +633,10 @@ export type ChunkStreamTurn<T> =
  */
 export type ChunkStreamGate = <T>(stream: () => Promise<T>) => Promise<ChunkStreamTurn<T>>;
 
+/** Retryable harvest failure: trust or quarantine changed under the built input. */
+export const HARVEST_INPUT_STALE_MESSAGE =
+  "harvest input changed before dispatch (trust or rejected-turn quarantine); retry";
+
 /** Streams one analyzer chunk to its end. `label` names the chunk in an error ("2/3"). */
 async function analyzeChunk(args: {
   model: LanguageModel;
@@ -647,7 +651,14 @@ async function analyzeChunk(args: {
   pricingModel?: string;
   /** Prices each step and ends the chunk once the job's spend reaches its ceiling. */
   meter: SpendMeter;
+  /** See runMemoryHarvest. */
+  beforeDispatch?: () => Promise<boolean>;
 }): Promise<ChunkOutcome> {
+  // Per-step gate outcome. A throw inside prepareStep is swallowed by the
+  // SDK's step loop (logged, no error part), so the gate aborts the stream
+  // and flags the chunk instead; the flag decides the outcome below.
+  let stale = false;
+  const gate = new AbortController();
   const stream = streamText({
     model: args.model,
     system: MEMORY_ANALYZER_SYSTEM_PROMPT,
@@ -656,10 +667,24 @@ async function analyzeChunk(args: {
     stopWhen: [stepCountIs(MEMORY_ANALYZER_MAX_STEPS), args.meter.stopIfCeilingReached],
     onStepEnd: args.meter.recordStep,
     maxOutputTokens: args.meter.maxOutputTokens,
-    abortSignal: args.signal,
+    abortSignal: AbortSignal.any([args.signal, gate.signal]),
+    // The gate runs again before every provider step, so a revocation after
+    // the first step stops the next request instead of retransmitting the input.
+    prepareStep:
+      args.beforeDispatch === undefined
+        ? undefined
+        : async () => {
+            const beforeDispatch = args.beforeDispatch;
+            if (beforeDispatch !== undefined && !stale && !(await beforeDispatch())) {
+              stale = true;
+              gate.abort(new Error(HARVEST_INPUT_STALE_MESSAGE));
+            }
+            return undefined;
+          },
   });
   const streamErrors: string[] = [];
   await stream.consumeStream({ onError: (error) => streamErrors.push(getErrorMessage(error)) });
+  if (stale) return { streamError: HARVEST_INPUT_STALE_MESSAGE };
   if (streamErrors.length > 0) return { streamError: streamErrors[0] };
   // An abort ends the stream without an error part, so it would read as a clean chunk and move
   // the cursor past a chunk that was never analyzed.
@@ -730,6 +755,19 @@ export async function runMemoryHarvest(args: {
   abortSignal?: AbortSignal;
   /** Timeout for each chunk's stream. Default: MEMORY_CONSOLIDATION_TIMEOUT_MS. */
   chunkTimeoutMs?: number;
+  /**
+   * Re-verification run immediately before EACH chunk's provider request
+   * (model construction and earlier chunks are awaits the caller cannot see
+   * past): the harvest input was filtered by trust and quarantine when it was
+   * built, and either can change meanwhile. `false` ends the harvest with a
+   * retryable stream error instead of sending the stale input. Each chunk is a multi-step tool
+   * loop, so it runs again before every provider step.
+   */
+  beforeDispatch?: () => Promise<boolean>;
+  /** Untrusted project: the analyzer's reads of memories carrying project skill provenance are refused. */
+  excludeProjectSkillContent?: boolean;
+  /** Trusted at setup: trust re-read at each memory read (a revocation mid-run must not wait). */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
   /**
    * Best-effort cost telemetry: headless harvest bypasses the chat cost
    * pipeline, so the caller records each completed chunk stream's full usage
@@ -810,7 +848,11 @@ export async function runMemoryHarvest(args: {
       transcript: chunks[index].transcript,
       landedOps: index === resumed.startChunk ? resumed.landedInStartChunk : undefined,
     });
-    const turn = await args.streamGate(async () => {
+    const turn = await args.streamGate(async (): Promise<ChunkOutcome> => {
+      // The wait for the gate is another await the input can go stale across.
+      if (args.beforeDispatch !== undefined && !(await args.beforeDispatch())) {
+        return { streamError: HARVEST_INPUT_STALE_MESSAGE };
+      }
       // Own timeout per chunk: a long epoch must not run out of time on its later chunks. Created
       // here, once the gate let the chunk start, so it never counts the wait for the gate. The
       // same signal guards the chunk's memory tool, so a mutation still in flight when it fires
@@ -836,6 +878,8 @@ export async function runMemoryHarvest(args: {
         deniedCommands: ["delete", "rename", "insert"],
         rejectSecretLike: true,
         description: ANALYZER_TOOL_DESCRIPTION,
+        excludeProjectSkillContent: args.excludeProjectSkillContent,
+        projectSkillContentStillReadable: args.projectSkillContentStillReadable,
       });
       return analyzeChunk({
         model: args.model,
@@ -846,6 +890,7 @@ export async function runMemoryHarvest(args: {
         recordUsage: args.recordUsage,
         pricingModel: args.pricingModel,
         meter,
+        beforeDispatch: args.beforeDispatch,
       });
     });
     // Ends the run like a failed stream: no model call was made, so the cursor stays on this
