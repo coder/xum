@@ -18,8 +18,6 @@ export type ViewportOutcome =
       viewport: LayoutAuditViewport;
       status: "complete";
       findings: readonly LayoutAuditPageFinding[];
-      /** Stable findings the page measured but did not return (its cap). Absent when none. */
-      omittedFindings?: number;
     }
   | { viewport: LayoutAuditViewport; status: "unsettled" }
   | { viewport: LayoutAuditViewport; status: "failed"; reason: FailedReason };

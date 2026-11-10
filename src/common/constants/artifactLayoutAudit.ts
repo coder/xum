@@ -62,8 +62,6 @@ export const LAYOUT_AUDIT_CLOSE_RESERVE_MS = 3_000;
 export const LAYOUT_AUDIT_MAX_ISSUES = 10;
 /** Longest selector shown in a tool result. Fingerprints use the full selector. */
 export const LAYOUT_AUDIT_MAX_SELECTOR_CHARS = 120;
-/** Findings one page pass may return (bounds the driver's output, not the model's view). */
-export const LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS = 50;
 /** Longest guidance line in a tool result. */
 export const LAYOUT_AUDIT_MAX_NOTE_CHARS = 240;
 
@@ -107,6 +105,20 @@ export const LAYOUT_AUDIT_THRESHOLDS = {
   /** Findings report overflow to this precision (tenths of a pixel). */
   overflowPrecision: 10,
 } as const;
+
+/**
+ * A sanity bound on the findings of one page pass, so a broken page result cannot be unbounded.
+ * No real pass reaches it: the rules inspect at most `maxAuditedElements` elements and, per
+ * element, report at most 5 findings (clipped-control, viewport-unreachable-control on each of
+ * two axes, viewport-unreachable-content and clipped-text). The overlap rule adds at most one
+ * per sampled candidate, `maxOcclusionCandidates` in all, and the page overflow rule one: 800 x
+ * 5 + 200 + 1 = 4201. A pass over the bound is rejected at the boundary, and that width reads
+ * as not checked.
+ */
+export const LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS =
+  LAYOUT_AUDIT_THRESHOLDS.maxAuditedElements * 5 +
+  LAYOUT_AUDIT_THRESHOLDS.maxOcclusionCandidates +
+  1;
 
 /** How the page is let settle before the audit measures it (lavish-axi's values). */
 export const LAYOUT_AUDIT_SETTLE = {

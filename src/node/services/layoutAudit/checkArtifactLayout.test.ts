@@ -126,6 +126,17 @@ describe("checkArtifactLayout", () => {
     expect((await check())?.issues[0]).not.toHaveProperty("persistent");
   });
 
+  test("a width with more findings than the list holds lists ten and counts the rest", async () => {
+    const findings = Array.from({ length: 51 }, (_, index) => ({
+      ...card,
+      selector: `p.row-${index}`,
+    }));
+    await install({ eval: { 390: { kind: "pass", findings } } });
+    const report = await check();
+    expect(report).toMatchObject({ checked: true, more: 41 });
+    expect(report?.issues).toHaveLength(10);
+  });
+
   test("memory is kept per path and per session", async () => {
     await install({ eval: { 390: { kind: "pass", findings: [card] } } });
     await check();

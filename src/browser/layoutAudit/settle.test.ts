@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS } from "@/common/constants/artifactLayoutAudit";
 import type { LayoutAuditPageFinding } from "@/common/types/artifactLayoutAudit";
 import { createFakeLayoutPage } from "./fakeLayoutPage.testHarness";
 import type { SettleSignals } from "./layoutPage";
@@ -113,21 +112,11 @@ describe("runLayoutAudit", () => {
   const manyButtons = (count: number) =>
     Array.from({ length: count }, (_, i) => OFF_LEFT(`b${i}`)).join("");
 
-  test("a pass lists at most as many findings as the result schema allows, and counts the rest", async () => {
-    using fake = createFakeLayoutPage(manyButtons(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS + 10), PHONE);
+  test("returns every stable finding, however many there are", async () => {
+    using fake = createFakeLayoutPage(manyButtons(120), PHONE);
     const result = await runLayoutAudit(fake.page, fake.signals);
-    expect(result.findings).toHaveLength(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS);
+    expect(result.findings).toHaveLength(120);
     expect(result.findings[0].selector).toBe("button#b0");
-    expect(result.omittedFindings).toBe(10);
-  });
-
-  test("a pass at the cap, not over it, leaves nothing out", async () => {
-    using fake = createFakeLayoutPage(manyButtons(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS), PHONE);
-    const result = await runLayoutAudit(fake.page, fake.signals);
-    expect(result.findings).toHaveLength(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS);
-    expect(result).not.toHaveProperty("omittedFindings");
-
-    using over = createFakeLayoutPage(manyButtons(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS + 1), PHONE);
-    expect((await runLayoutAudit(over.page, over.signals)).omittedFindings).toBe(1);
+    expect(result.findings[119].selector).toBe("button#b119");
   });
 });

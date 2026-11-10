@@ -4,6 +4,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import {
+  LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS,
   LAYOUT_AUDIT_VIEWPORTS,
   type LayoutAuditViewportWidth,
 } from "@/common/constants/artifactLayoutAudit";
@@ -150,15 +151,38 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     expect(outcomes[1]).toMatchObject({ status: "complete", findings: [finding] });
   });
 
-  test("carries the count of findings the page left out, and only when there were some", async () => {
+  // A selector at the long end of what the page script writes: five parts, a class and an index.
+  const findingsOf = (count: number): LayoutAuditPageFinding[] =>
+    Array.from({ length: count }, (_, index) => ({
+      ...finding,
+      selector: `body > main#app > section.dashboard-panel:nth-of-type(2) > div.card-body > p.card-title:nth-of-type(${index})`,
+    }));
+
+  test("three passes at the findings bound come back whole: the output bound fits them", async () => {
+    const atBound = {
+      kind: "pass",
+      findings: findingsOf(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS),
+    } as const;
+    const { outcomes } = await run({ eval: { 390: atBound, 1440: atBound, 768: atBound } });
+    expect(summary(outcomes)).toEqual(["390 complete", "1440 complete", "768 complete"]);
+    for (const outcome of outcomes) {
+      expect(outcome.status === "complete" ? outcome.findings.length : -1).toBe(
+        LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS
+      );
+    }
+  });
+
+  test("a page result over the findings bound is rejected, and that width is not checked", async () => {
     const { outcomes } = await run({
       eval: {
-        390: { kind: "pass", findings: [finding], omittedFindings: 3 },
-        1440: { kind: "pass", findings: [finding] },
+        1440: { kind: "pass", findings: findingsOf(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS + 1) },
       },
     });
-    expect(outcomes[0]).toMatchObject({ status: "complete", omittedFindings: 3 });
-    expect(outcomes[1]).not.toHaveProperty("omittedFindings");
+    expect(summary(outcomes)).toEqual([
+      "390 complete",
+      "1440 failed script-failed",
+      "768 complete",
+    ]);
   });
 
   test("an unsettled pass drops its findings and the run goes on", async () => {
@@ -230,8 +254,6 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       "ok",
       { complete: true },
       { complete: true, viewportWidth: 390, findings: [{ rule: "nope" }] },
-      { complete: true, viewportWidth: 390, findings: [], omittedFindings: -1 },
-      { complete: true, viewportWidth: 390, findings: [], omittedFindings: 1.5 },
     ]) {
       const { outcomes } = await run({ eval: { 390: { kind: "result", result } } });
       expect(summary(outcomes)[0]).toBe("390 failed script-failed");

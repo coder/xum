@@ -6,10 +6,7 @@ import {
   LAYOUT_AUDIT_VIEWPORTS,
   type LayoutAuditViewport,
 } from "@/common/constants/artifactLayoutAudit";
-import {
-  LayoutAuditPagePassSchema,
-  type LayoutAuditPagePass,
-} from "@/common/types/artifactLayoutAudit";
+import { LayoutAuditPagePassSchema } from "@/common/types/artifactLayoutAudit";
 import { TOOL_ENV_FAILED_EXIT, toolEnvPrelude } from "@/node/services/artifactCapabilities";
 import type { FailedReason, ViewportOutcome } from "@/node/services/layoutAudit/viewportOutcome";
 import { log } from "@/node/services/log";
@@ -75,8 +72,14 @@ const SOCKET_DIR_PARENT = "/tmp";
 const IDLE_TIMEOUT = "10s";
 /** How long CLOSE waits for `close` before it removes the socket folder anyway. */
 const CLOSE_WAIT_SECONDS = 2;
-/** The run prints at most a few records of findings; this bounds a page that floods it. */
-const MAX_RUN_OUTPUT_BYTES = 512 * 1024;
+/**
+ * Three passes at the schema's bound (LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS, 4201 findings), each
+ * finding about 110 bytes of JSON plus its selector (at most five parts of about 30 bytes, so
+ * 256 bytes in all): 3 x 4201 x 256 is about 3.1 MiB, and 4 MiB leaves room for the envelopes
+ * and the frames. A run whose output is cut has records without their end line, and those count
+ * as missing.
+ */
+const MAX_RUN_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_CLOSE_OUTPUT_BYTES = 4096;
 
 const FRAME_START = "@@xum-layout";
@@ -202,18 +205,6 @@ function parsePagePass(envelope: string) {
   }
 }
 
-function completeOutcome(
-  viewport: LayoutAuditViewport,
-  pass: LayoutAuditPagePass
-): ViewportOutcome {
-  return {
-    viewport,
-    status: "complete",
-    findings: pass.findings,
-    ...(pass.omittedFindings ? { omittedFindings: pass.omittedFindings } : {}),
-  };
-}
-
 function outcomeOf(viewport: LayoutAuditViewport, record: RunRecord): ViewportOutcome {
   if (record.status !== 0 && record.envelope === "") {
     return { viewport, status: "failed", reason: "browser-failed" };
@@ -224,7 +215,9 @@ function outcomeOf(viewport: LayoutAuditViewport, record: RunRecord): ViewportOu
   if (pass.viewportWidth !== viewport.width) {
     return { viewport, status: "failed", reason: "wrong-viewport" };
   }
-  return pass.complete ? completeOutcome(viewport, pass) : { viewport, status: "unsettled" };
+  return pass.complete
+    ? { viewport, status: "complete", findings: pass.findings }
+    : { viewport, status: "unsettled" };
 }
 
 /** One outcome per width, in run order. Every width without a record is "not checked". */

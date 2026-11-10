@@ -93,16 +93,11 @@ function toNotChecked(outcome: ViewportOutcome): LayoutAuditNotChecked[] {
   return [{ viewport: outcome.viewport.width, reason }];
 }
 
-/**
- * What stays remembered of a complete width: the fingerprints that are still detected there. A
- * pass that left findings out (its cap) cannot say which remembered ones no longer stand, so
- * nothing is dropped from its width.
- */
+/** What stays remembered of a complete width: the fingerprints that are still detected there. */
 function standingFingerprints(
   outcome: CompleteOutcome,
   remembered: ReadonlySet<string>
 ): Iterable<string> {
-  if ((outcome.omittedFindings ?? 0) > 0) return remembered;
   const detected = new Set(
     outcome.findings.map((finding) => layoutFingerprint(finding.rule, finding.selector))
   );
@@ -137,19 +132,6 @@ function nextSnapshot(
 }
 
 /**
- * Issues found and not listed: the candidates cut by the list cap, and the findings the pages
- * counted but did not return. Clamped like `overflowPx`: the result schema wants a safe integer.
- */
-function countUnlisted(
-  candidates: readonly Candidate[],
-  listed: readonly Candidate[],
-  complete: readonly CompleteOutcome[]
-): number {
-  const omitted = complete.reduce((sum, outcome) => sum + (outcome.omittedFindings ?? 0), 0);
-  return Math.min(candidates.length - listed.length + omitted, Number.MAX_SAFE_INTEGER);
-}
-
-/**
  * Pure: outcomes of one audit and the memory before it become the model-facing report and the
  * memory after it. `checked` is true only when every width completed a settled pass. The
  * issues of the widths that did complete are listed either way.
@@ -168,7 +150,7 @@ export function buildLayoutReport(
   const issues = listed.map((candidate) => candidate.issue);
   const notChecked = outcomes.flatMap(toNotChecked).sort((a, b) => a.viewport - b.viewport);
   const persistentCount = candidates.filter((candidate) => candidate.issue.persistent).length;
-  const unlisted = countUnlisted(candidates, listed, complete);
+  const unlisted = candidates.length - listed.length;
   const common = {
     issues,
     ...(unlisted > 0 ? { more: unlisted } : {}),

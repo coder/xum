@@ -1,28 +1,9 @@
 // Adapted from lavish-axi (MIT). See lavish-axi-LICENSE.txt in this folder.
-import {
-  LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS,
-  LAYOUT_AUDIT_SETTLE as SETTLE,
-} from "@/common/constants/artifactLayoutAudit";
-import type {
-  LayoutAuditPageFinding,
-  LayoutAuditPagePass,
-} from "@/common/types/artifactLayoutAudit";
+import { LAYOUT_AUDIT_SETTLE as SETTLE } from "@/common/constants/artifactLayoutAudit";
+import type { LayoutAuditPagePass } from "@/common/types/artifactLayoutAudit";
 import { auditLayout } from "./audit";
 import { findStableLayoutFindings } from "./geometry";
 import type { LayoutPage, SettleSignals } from "./layoutPage";
-
-/**
- * The result schema caps a pass at this many findings, and the cap drops the tail of the list.
- * What it drops is counted, so the node side can tell a pass that saw everything from one that
- * did not: a capped pass must not read as a complete list.
- */
-function capFindings(
-  stable: readonly LayoutAuditPageFinding[]
-): Pick<LayoutAuditPagePass, "findings" | "omittedFindings"> {
-  const omitted = stable.length - LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS;
-  const findings = stable.slice(0, LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS);
-  return omitted > 0 ? { findings, omittedFindings: omitted } : { findings };
-}
 
 /**
  * Upstream's `runLayoutAudit`: let the page settle, measure twice 120 ms apart, and keep only
@@ -52,10 +33,9 @@ export async function runLayoutAudit(
   const domQuiet = await signals.domQuiet(SETTLE.quietMs, SETTLE.quietMaxMs);
   const final = domQuiet ? auditLayout(page) : second;
   const complete = animationsSettled && signals.documentComplete() && domQuiet;
-  const stable = findStableLayoutFindings(domQuiet ? second : first, final);
   return {
     complete,
     viewportWidth: page.metrics().viewportWidth,
-    ...capFindings(stable),
+    findings: findStableLayoutFindings(domQuiet ? second : first, final),
   };
 }
