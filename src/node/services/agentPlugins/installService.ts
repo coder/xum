@@ -1410,35 +1410,48 @@ async function subpathNotAFolderReason(
 }
 
 /**
+ * The real folder at `subpath`, or why the preview would not stage it: missing, escaping the
+ * repository, or a path through a file or a symbolic link.
+ */
+async function realEntryFolder(
+  stagedDir: string,
+  subpath: string | undefined
+): Promise<{ entryDir: string } | { why: string }> {
+  let entryDir: string;
+  try {
+    entryDir = await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? ""));
+  } catch (error) {
+    return { why: hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error) };
+  }
+  const notAFolder = await subpathNotAFolderReason(stagedDir, subpath);
+  return notAFolder !== undefined ? { why: notAFolder } : { entryDir };
+}
+
+/**
  * The folder of a relative marketplace build, or why the listing does not offer it: the preview
- * would fail on a missing or escaping folder, on a path through a file or a symbolic link, and on
- * a Cursor or Agent Plugins folder without a plugin manifest of its own (entryInstallMethods).
- * The reason names the folder, not the staging path.
+ * would fail on a folder that realEntryFolder refuses, and on a Cursor or Agent Plugins folder
+ * without a plugin manifest of its own (entryInstallMethods). The reason names the folder, not
+ * the staging path.
  */
 async function checkedEntryFolder(
   stagedDir: string,
   subpath: string | undefined,
   file: MarketplaceFile
 ): Promise<{ entryDir: string } | { reason: string }> {
-  const folderReason = (why: string) => ({
-    reason: `Xum cannot install the entry's folder '${subpath ?? "."}': ${why}`,
-  });
-  let entryDir: string;
-  try {
-    entryDir = await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? ""));
-  } catch (error) {
-    return folderReason(
-      hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error)
-    );
+  const shown = subpath ?? ".";
+  const folder = await realEntryFolder(stagedDir, subpath);
+  if ("why" in folder) {
+    return { reason: `Xum cannot install the entry's folder '${shown}': ${folder.why}` };
   }
-  const notAFolder = await subpathNotAFolderReason(stagedDir, subpath);
-  if (notAFolder !== undefined) return folderReason(notAFolder);
-  if (!MARKETPLACE_FILE_RULES[file].entryIsManifest && !(await hasPluginManifest(entryDir))) {
+  if (
+    !MARKETPLACE_FILE_RULES[file].entryIsManifest &&
+    !(await hasPluginManifest(folder.entryDir))
+  ) {
     return {
-      reason: `The entry's folder '${subpath ?? "."}' has no plugin manifest, so Xum cannot install it.`,
+      reason: `The entry's folder '${shown}' has no plugin manifest, so Xum cannot install it.`,
     };
   }
-  return { entryDir };
+  return folder;
 }
 
 /** The git source that preview returns and install persists. */
