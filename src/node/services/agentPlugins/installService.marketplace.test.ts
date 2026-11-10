@@ -1061,6 +1061,23 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect((await service.list()).map((item) => item.name)).toEqual([]);
   }, 20_000);
 
+  test("an Agent Plugins entry whose manifest names another plugin is refused; Cursor keeps its manifest's name", async () => {
+    await writeAgentsMarketplace({ only: false });
+    await writeFiles(marketDir, {
+      "plugins/e2e/.codex-plugin/plugin.json": JSON.stringify({ name: "other" }),
+    });
+    await commit(marketDir, "the folder's manifest names another plugin");
+    await expect(previewAgentsEntry("e2e")).rejects.toThrow(
+      "The Agent Plugins marketplace entry 'e2e' points to a plugin named 'other'."
+    );
+    // The rule is Codex's: a Cursor entry still previews as the plugin its manifest names.
+    const cursor = await service.preview({
+      input: marketDir,
+      method: { kind: "cursor-marketplace", entry: "e2e" },
+    });
+    expect(cursor.manifest.name).toBe("other");
+  }, 60_000);
+
   test("install never takes an Agent Plugins entry selector; an update follows the folder without the marketplace file", async () => {
     await writeAgentsMarketplace({ only: true });
     const preview = await previewAgentsEntry("e2e");

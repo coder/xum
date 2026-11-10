@@ -95,6 +95,7 @@ import {
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
 import {
+  assertEntryNamesPlugin,
   chooseStagedMethod,
   detectInstallMethods,
   generatesManifest,
@@ -3121,6 +3122,7 @@ export class AgentPluginInstallService {
       }
       throw new Error(problem);
     }
+    assertEntryNamesPlugin(marketplace, plugin.name);
     return {
       plugin,
       warnings: [...choice.warnings, ...generatedWarnings, ...diagnostics.map((d) => d.message)],

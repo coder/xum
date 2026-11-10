@@ -167,6 +167,8 @@ interface MarketplaceFileRules {
    * manifest (Cursor plugin RFC, D23).
    */
   entryIsManifest: boolean;
+  /** The entry name must be the plugin name its folder's manifest declares (Codex's rule). */
+  entryNamesPlugin: boolean;
   /** An object `{source: "local", path}` names a folder of the marketplace, as a plain path does. */
   localSource: boolean;
   /** The entry-name grammar, and how a refusal describes it. */
@@ -271,6 +273,7 @@ export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRule
   cursor: {
     selector: "cursor-marketplace",
     entryIsManifest: false,
+    entryNamesPlugin: false,
     localSource: false,
     entryName: MARKETPLACE_ENTRY_NAME,
     objectSources: OBJECT_SOURCE_KINDS,
@@ -280,6 +283,7 @@ export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRule
   claude: {
     selector: "claude-marketplace",
     entryIsManifest: true,
+    entryNamesPlugin: false,
     localSource: false,
     entryName: MARKETPLACE_ENTRY_NAME,
     objectSources: OBJECT_SOURCE_KINDS,
@@ -289,6 +293,7 @@ export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRule
   agents: {
     selector: "agents-marketplace",
     entryIsManifest: false,
+    entryNamesPlugin: true,
     localSource: true,
     // Codex checks an entry name with the plugin-name grammar (PluginId::new), not Claude's.
     entryName: {

@@ -591,6 +591,22 @@ export function relativeEntryContext(
   return { file, entry, relative: true, rootSource: resolved.subpath === undefined };
 }
 
+/**
+ * The plugin a marketplace entry previews must carry the entry's name where the file says so:
+ * Codex refuses an Agent Plugins entry whose manifest names another plugin, and the user picked
+ * the entry by that name.
+ */
+export function assertEntryNamesPlugin(
+  ctx: MarketplaceEntryContext | undefined,
+  pluginName: string
+): void {
+  if (ctx === undefined || !MARKETPLACE_FILE_RULES[ctx.file].entryNamesPlugin) return;
+  if (pluginName === ctx.entry.name) return;
+  throw new Error(
+    `The ${AGENT_PLUGIN_INSTALL_METHOD_LABELS[MARKETPLACE_FILE_RULES[ctx.file].selector]} '${ctx.entry.name}' points to a plugin named '${pluginName}'. Xum installs it only under the name the marketplace lists.`
+  );
+}
+
 /** The error when a marketplace entry's folder fits no method. */
 export function noEntryMethodMessage(
   entry: string,
