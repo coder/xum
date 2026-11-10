@@ -80,7 +80,7 @@ const MODEL_DEFINITIONS = {
     provider: "anthropic",
     providerModelId: "claude-mythos-5-2",
     aliases: ["mythos"],
-    // Same tokenizer situation as Fable 5 (see FABLE above): reuse Opus 4.5 for
+    // Same tokenizer situation as FABLE above: reuse Opus 4.5 for
     // approximate counting; real usage can run ~1.0-1.3x higher.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },

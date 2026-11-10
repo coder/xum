@@ -389,4 +389,22 @@ describe("resolveEntrySource", () => {
       )
     ).toMatchObject({ kind: "remote", url: "ssh://localhost/srv/tool.git" });
   });
+
+  test("a marketplace gets the rights of one on this machine only when it is there on every platform", () => {
+    // Git for Windows reads `h:` as a drive, but git on Linux and macOS signs in over ssh to the
+    // host alias `h`: such a marketplace is remote and names only https sources.
+    for (const marketplaceUrl of ["h:org/market.git", "C:market", "git@h:org/market.git"]) {
+      expect(
+        resolveOnly({ source: "url", url: "git@evil.example:org/x.git" }, { marketplaceUrl })
+      ).toContain("only https");
+      expect(resolveOnly({ source: "url", url: "/home/me/private" }, { marketplaceUrl })).toContain(
+        "path on this machine"
+      );
+    }
+    for (const marketplaceUrl of ["C:\\repos\\market", "C:/repos/market", "~/market"]) {
+      expect(
+        resolveOnly({ source: "url", url: "git@gitlab.com:acme/tool.git" }, { marketplaceUrl })
+      ).toMatchObject({ kind: "remote", url: "git@gitlab.com:acme/tool.git" });
+    }
+  });
 });

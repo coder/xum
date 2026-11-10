@@ -699,7 +699,9 @@ function fallbackSeedGapKeys(key: string, entry: unknown): string[] {
   const scopedKey = sanitizeFallbackModelString(key);
   if (!scopedKey.startsWith("coder:")) return [scopedKey];
   const keptAtRuntime = normalizeModelFallbacks({ [key]: entry }) !== undefined;
-  return keptAtRuntime ? [scopedKey] : [scopedKey, normalizeToCanonical(key).trim()];
+  // scopedKey, not key: normalizeToCanonical does not trim, so a raw key with a
+  // leading space would keep its " coder" prefix and miss the direct key.
+  return keptAtRuntime ? [scopedKey] : [scopedKey, normalizeToCanonical(scopedKey)];
 }
 
 /**

@@ -34,6 +34,7 @@ import {
   BackupPluginsCard,
   PluginRemovalCard,
   reviewBackedUpPlugins,
+  savedPluginReport,
   usePluginRemovalPrompt,
 } from "./BackupPluginsCard";
 
@@ -367,6 +368,7 @@ export function BackupSection() {
   savedDraftRef.current = savedDraft;
 
   const isDirty = !draftsEqual(draft, savedDraft);
+  const shownPluginBackup = savedPluginReport(pluginBackup, isDirty);
   // What the repository operations act on. With the Artifacts experiment off the global shelf
   // is left out even when the saved setting includes it: the row is hidden, so the user could
   // not see or change it. The saved setting itself is kept for when the experiment returns.
@@ -377,7 +379,10 @@ export function BackupSection() {
   const saving = activeAction === "save";
   const busy = activeAction !== null;
   const pluginRemoval = usePluginRemovalPrompt({ busy, push: handlePush });
-  const clearPluginRemoval = pluginRemoval.clear;
+  // The settings reload effect must rerun for a new API client only, so it reads the current
+  // `clear` through this ref instead of listing it as a dependency.
+  const clearPluginRemovalRef = useRef(pluginRemoval.clear);
+  clearPluginRemovalRef.current = pluginRemoval.clear;
   // A settings read is pending (a reconnect keeps the form on screen while it reloads). Save
   // waits for it: the draft's untouched fields would overwrite changes made on the server.
   const [reading, setReading] = useState(false);
@@ -438,7 +443,7 @@ export function BackupSection() {
           setShelfSkipped([]);
           setSymlinkSkipped(undefined);
           setPluginBackup(EMPTY_BACKUP_PLUGIN_REPORT);
-          clearPluginRemoval();
+          clearPluginRemovalRef.current();
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -505,7 +510,7 @@ export function BackupSection() {
       abortController.abort();
       void iterator?.return?.();
     };
-  }, [api, clearPluginRemoval]);
+  }, [api]);
 
   async function handleSave() {
     if (!api || saveBlocked) return;
@@ -809,7 +814,7 @@ export function BackupSection() {
   // Hands the missing plugins to Settings → Plugins, where each one gets its install review.
   function reviewPlugins() {
     reviewBackedUpPlugins({
-      report: pluginBackup,
+      report: shownPluginBackup,
       enabled: !busy,
       openPlugins: () => setActiveSection("plugins"),
     });
@@ -1198,7 +1203,7 @@ export function BackupSection() {
         items={symlinkSkipped}
       />
 
-      <BackupPluginsCard report={pluginBackup} busy={busy} onReview={reviewPlugins} />
+      <BackupPluginsCard report={shownPluginBackup} busy={busy} onReview={reviewPlugins} />
 
       {projectImports.length > 0 ? (
         <div className="border-border-light space-y-3 rounded-md border p-3">
