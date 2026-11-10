@@ -16561,7 +16561,17 @@ export class TaskService implements AgentTaskIntegration {
         handleId,
         options
       );
-      return record == null ? null : { ownerWorkspaceId, record };
+      // Check the snapshot that is returned, not only the probe: an auto-retry that starts
+      // between the two reads makes this one `running`, and a live turn is not readable here.
+      return record != null &&
+        this.isTerminalTurnOfDescendantUnder(
+          index.parentById,
+          descendants,
+          ownerWorkspaceId,
+          record
+        )
+        ? { ownerWorkspaceId, record }
+        : null;
     }
     return null;
   }

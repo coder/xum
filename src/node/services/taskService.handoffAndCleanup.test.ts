@@ -2483,6 +2483,78 @@ describe("TaskService", () => {
       });
     });
 
+    test("cannot return a turn that an auto-retry revived between its two reads", async () => {
+      // The read validates a snapshot of the stored failure, then reads again with the caller as
+      // the consumer. A retry that starts in between makes the second snapshot `running`, and a
+      // read that returned it would hand the parent a live turn through the terminal-only path.
+      let retryPending = false;
+      const { workspaceService } = createWorkspaceServiceMocks({
+        hasPendingAutoRetry: () => retryPending,
+      });
+      // The child has no newer execution, so a pending retry revives the stored failure.
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "grand", grandId),
+          projectWorkspace(projectPath, "parent", parentId, {
+            name: "agent_explore_parent",
+            parentWorkspaceId: grandId,
+            agentType: "explore",
+            taskStatus: "running",
+          }),
+          projectWorkspace(projectPath, "child", childId, {
+            name: "agent_explore_child",
+            parentWorkspaceId: parentId,
+            agentType: "explore",
+            taskStatus: "running",
+          }),
+        ],
+        testTaskSettings(1, 3)
+      );
+      const { taskService, workspaceTurnManager, historyService } = createTaskServiceHarness(
+        config,
+        { workspaceService }
+      );
+      const handleStore = new TaskHandleStore(config);
+      await historyService.appendToHistory(
+        childId,
+        createMuxMessage("prompt", "user", "work", {
+          muxMetadata: {
+            type: "workspace-turn-task",
+            taskHandleId: handleId,
+            ownerWorkspaceId: grandId,
+            turnId: failedRecord.turnId,
+          },
+        })
+      );
+      await handleStore.upsertWorkspaceTurn(failedRecord);
+      const realSnapshot = workspaceTurnManager.getWorkspaceTurnSnapshot.bind(workspaceTurnManager);
+      let ownerReads = 0;
+      const snapshot = spyOn(workspaceTurnManager, "getWorkspaceTurnSnapshot");
+      snapshot.mockImplementation(async (owner, handle, options) => {
+        const result = await realSnapshot(owner, handle, options);
+        if (owner === grandId) {
+          ownerReads += 1;
+          if (ownerReads === 1) retryPending = true;
+        }
+        return result;
+      });
+      try {
+        const read = await taskService.getDescendantTerminalWorkspaceTurnSnapshot(
+          parentId,
+          handleId
+        );
+
+        expect(ownerReads).toBeGreaterThan(1);
+        expect(read).toBeNull();
+      } finally {
+        snapshot.mockRestore();
+      }
+    });
+
     test("cannot read an active turn", async () => {
       const { taskService, handleStore } = await setup();
       await handleStore.upsertWorkspaceTurn(failedRecord);
