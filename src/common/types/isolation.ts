@@ -5,14 +5,16 @@
  * are still created and persisted with the existing RuntimeConfig union, so this module owns the
  * single mapping between the two models:
  *
- * | Project \ Workspace | none   | worktree | docker | devcontainer |
- * | ------------------- | ------ | -------- | ------ | ------------ |
- * | local               | local  | worktree | docker | devcontainer |
- * | ssh                 | -      | ssh      | -      | -            |
- * | coder               | -      | coder    | -      | -            |
+ * | Project \ Workspace | none        | worktree | docker | devcontainer |
+ * | ------------------- | ----------- | -------- | ------ | ------------ |
+ * | local               | local       | worktree | docker | devcontainer |
+ * | ssh                 | ssh (none)  | ssh      | -      | -            |
+ * | coder               | -           | coder    | -      | -            |
  *
- * Cells marked "-" have no backend yet. They stay visible (disabled, with a reason) so the
- * composition is discoverable and future backends only need to fill in the table.
+ * Cells name the runtime choice (RuntimeEnablementId) that backs the pair; "ssh (none)" is the SSH
+ * runtime with `workspaceIsolation: "none"`. Cells marked "-" have no backend yet. They stay
+ * visible (disabled, with a reason) so the composition is discoverable: a new backend only has to
+ * fill in its cell here and in isolationFromRuntimeConfig().
  */
 import type { z } from "zod";
 import type {
@@ -20,7 +22,7 @@ import type {
   ProjectIsolationSchema,
   WorkspaceIsolationSchema,
 } from "@/common/schemas/isolation";
-import type { RuntimeEnablement, RuntimeEnablementId } from "./runtime";
+import type { RuntimeConfig, RuntimeEnablement, RuntimeEnablementId } from "./runtime";
 
 export type ProjectIsolation = z.infer<typeof ProjectIsolationSchema>;
 export type WorkspaceIsolation = z.infer<typeof WorkspaceIsolationSchema>;
@@ -36,7 +38,10 @@ export const WORKSPACE_ISOLATIONS: readonly WorkspaceIsolation[] = [
 
 export const DEFAULT_ISOLATION: IsolationChoice = { project: "local", workspace: "worktree" };
 
-/** Legacy flat runtime choice → isolation pair. Every legacy value has exactly one pair. */
+/**
+ * Legacy flat runtime choice → isolation pair. Every legacy value has exactly one pair; pairs that
+ * share a runtime choice (SSH+None and SSH+Worktree) map back to the pre-split default (worktree).
+ */
 const ISOLATION_FOR_RUNTIME_ID: Record<RuntimeEnablementId, IsolationChoice> = {
   local: { project: "local", workspace: "none" },
   worktree: { project: "local", workspace: "worktree" },
@@ -46,13 +51,16 @@ const ISOLATION_FOR_RUNTIME_ID: Record<RuntimeEnablementId, IsolationChoice> = {
   coder: { project: "coder", workspace: "worktree" },
 };
 
-/** Isolation pair → backend runtime choice; null where no backend supports the pair yet. */
+/**
+ * Isolation pair → backend runtime choice; null where no backend supports the pair yet. Also the
+ * legacy `defaultRuntime` mirror written for older builds.
+ */
 const RUNTIME_ID_FOR_ISOLATION: Record<
   ProjectIsolation,
   Record<WorkspaceIsolation, RuntimeEnablementId | null>
 > = {
   local: { none: "local", worktree: "worktree", docker: "docker", devcontainer: "devcontainer" },
-  ssh: { none: null, worktree: "ssh", docker: null, devcontainer: null },
+  ssh: { none: "ssh", worktree: "ssh", docker: null, devcontainer: null },
   coder: { none: null, worktree: "coder", docker: null, devcontainer: null },
 };
 
@@ -126,6 +134,31 @@ export function isWorkspaceIsolationEnabled(
   workspace: WorkspaceIsolation
 ): boolean {
   return enablement?.[WORKSPACE_ISOLATION_ENABLEMENT_ID[workspace]] !== false;
+}
+
+/** The isolation pair an existing workspace's runtime config runs with. */
+export function isolationFromRuntimeConfig(config: RuntimeConfig | undefined): IsolationChoice {
+  switch (config?.type) {
+    case undefined:
+    case "worktree":
+      return { project: "local", workspace: "worktree" };
+    case "local":
+      // Legacy "local" with srcBaseDir is a worktree (same test as isWorktreeRuntime).
+      return {
+        project: "local",
+        workspace:
+          "srcBaseDir" in config && typeof config.srcBaseDir === "string" ? "worktree" : "none",
+      };
+    case "docker":
+      return { project: "local", workspace: "docker" };
+    case "devcontainer":
+      return { project: "local", workspace: "devcontainer" };
+    case "ssh":
+      return {
+        project: config.coder != null ? "coder" : "ssh",
+        workspace: config.workspaceIsolation === "none" ? "none" : "worktree",
+      };
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
