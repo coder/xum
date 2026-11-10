@@ -1041,6 +1041,47 @@ describe("redactSecretLike", () => {
     ).toBe("https://h.example.com/p?sv=1&sig=[redacted]&sp=r#frag (see ?signature=[redacted])");
   });
 
+  // The harvest renderer and the guard run redaction over text that may hold the marker already, so
+  // a second pass must change nothing: the value pattern started at the `[redacted` of an earlier
+  // pass and stopped before its `]`, which left `[redacted]]`.
+  it.each([
+    ["a request line", "GET /x?a=1&sig=SEKRIT2 HTTP/1.1", "GET /x?a=1&sig=[redacted] HTTP/1.1"],
+    [
+      "a JSON string",
+      '{"u": "https://h/p?X-Amz-Signature=SEKRIT4"}',
+      '{"u": "https://h/p?X-Amz-Signature=[redacted]"}',
+    ],
+    ["a bare parameter", "?sig=SEKRIT", "?sig=[redacted]"],
+    ["an XML-escaped ampersand", "?a=1&amp;signature=SEKRIT", "?a=1&amp;signature=[redacted]"],
+    ["a Google signature", "?X-Goog-Signature=SEKRIT", "?X-Goog-Signature=[redacted]"],
+    ["a value that is the marker already", "?sig=[redacted]", "?sig=[redacted]"],
+    [
+      "a marker in a request line",
+      "GET /x?a=1&sig=[redacted] HTTP/1.1",
+      "GET /x?a=1&sig=[redacted] HTTP/1.1",
+    ],
+  ])(
+    "redacts a signed URL's signature once and leaves the marker alone: %s",
+    (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+      expect(redacted).toBe(expected);
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    }
+  );
+
+  // A half marker is not the marker: a value that merely starts like it is still a value.
+  it("redacts a signature value that starts like the marker but is not it", () => {
+    expect(redactSecretLike("?sig=[redacted")).toBe("?sig=[redacted]");
+    expect(redactSecretLike("?sig=[redactedSEKRIT")).toBe("?sig=[redacted]");
+  });
+
+  it("keeps the guard's verdict on a signature: a secret is flagged, the marker is not", () => {
+    expect(containsSecretLike("?sig=SEKRIT")).toBe(true);
+    expect(containsSecretLike("?sig=[redacted]")).toBe(false);
+    expect(addsSecretLike("", "?sig=SEKRIT")).toBe(true);
+    expect(addsSecretLike("", "?sig=[redacted]")).toBe(false);
+  });
+
   // `signature` is not a secret name: the memory-write guard reuses this detector, and a note
   // about a function signature or a signed commit must stay writable.
   it("leaves a signature or sig that is not a URL query parameter readable", () => {
