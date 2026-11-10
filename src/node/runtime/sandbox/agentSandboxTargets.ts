@@ -54,16 +54,16 @@ export function setAgentSandboxTargets(targets: AgentSandboxTargets | null): voi
 }
 
 /**
- * The sandbox setting for a command of the project at `projectPath` (the same key the agent
- * cgroup uses), or null when no sandbox applies. An unknown project gets the global setting.
- * A command of a multi-project workspace can change the checkout of each of `otherProjectPaths`
- * too, so it gets the strictest of their settings: the sandbox applies when any of them has it
- * on.
+ * The enabled sandbox settings for a command of the project at `projectPath` (the same key the
+ * agent cgroup uses), or null when no sandbox applies. An unknown project gets the global
+ * setting. A command of a multi-project workspace can change the checkout of each of
+ * `otherProjectPaths` too, so the sandbox applies when any of them has it on, and the command
+ * gets the strictest of their policies (buildStrictestAgentSandboxPolicy()).
  */
 export function agentSandboxSettingsFor(
   projectPath: string | undefined,
   otherProjectPaths: readonly string[] = []
-): ResolvedAgentSandboxSettings | null {
+): ResolvedAgentSandboxSettings[] | null {
   const targets = sandboxTargets;
   if (targets === null) return null;
   const settingsOf = (key: string | undefined): ResolvedAgentSandboxSettings =>
@@ -71,7 +71,7 @@ export function agentSandboxSettingsFor(
   const enabled = [projectPath, ...otherProjectPaths]
     .map(settingsOf)
     .filter((settings) => settings.enabled);
-  return enabled.length === 0 ? null : strictestSettings(enabled);
+  return enabled.length === 0 ? null : enabled;
 }
 
 const NETWORK_STRICTNESS: Record<AgentSandboxNetwork, number> = {
@@ -80,44 +80,52 @@ const NETWORK_STRICTNESS: Record<AgentSandboxNetwork, number> = {
   open: 2,
 };
 
-/** What every one of `list` allows (a project with the sandbox off limits nothing). */
-function strictestSettings(
-  list: readonly ResolvedAgentSandboxSettings[]
-): ResolvedAgentSandboxSettings {
-  if (list.length === 1) return list[0];
-  const shared = (lists: ReadonlyArray<readonly string[]>): string[] =>
-    lists.reduce<string[]>(
-      (kept, next) => kept.filter((entry) => next.includes(entry)),
-      [...lists[0]]
-    );
-  const network = list
-    .map((settings) => settings.network)
-    .reduce((a, b) => (NETWORK_STRICTNESS[b] < NETWORK_STRICTNESS[a] ? b : a));
-  // A project with the open network allows every host, so only the allow lists limit the hosts.
-  const hostLists = list.filter((settings) => settings.network === "allowlist");
+/**
+ * What the policy of each of `list` allows (a project with the sandbox off limits nothing). It
+ * compares the real paths that each project's own policy opens, so two links to one folder
+ * still match, and a link that a command put in a folder it can write, which that policy does
+ * not follow, cannot open more (Codex review). A project whose own policy fails fails it too.
+ */
+export function buildStrictestAgentSandboxPolicy(
+  list: readonly ResolvedAgentSandboxSettings[],
+  input: AgentSandboxPolicyInput
+): AgentSandboxPolicy {
+  const policies = list.map((settings) => buildAgentSandboxPolicy(settings, input));
+  if (policies.length === 1) return policies[0];
+  const network = policies.map((policy) => policy.network).reduce(stricterNetwork);
   return {
-    enabled: true,
+    writeRoots: sharedPaths(policies.map((policy) => policy.writeRoots)),
+    gitCommonDirs: sharedPaths(policies.map((policy) => policy.gitCommonDirs)),
+    denyWrite: dedupe(policies.flatMap((policy) => policy.denyWrite)),
+    denyRead: dedupe(policies.flatMap((policy) => policy.denyRead)),
+    allowRead: sharedPaths(policies.map((policy) => policy.allowRead)),
     network,
-    // Host names match in any case.
-    allowedHosts:
-      network === "allowlist"
-        ? shared(hostLists.map((s) => s.allowedHosts.map((host) => host.toLowerCase())))
-        : [],
-    extraWritePaths: sharedPaths(list.map((settings) => settings.extraWritePaths)),
-    extraReadPaths: sharedPaths(list.map((settings) => settings.extraReadPaths)),
+    allowedHosts: network === "allowlist" ? sharedHosts(policies) : [],
+    allowLocalBinding: true,
   };
 }
 
+function stricterNetwork(a: AgentSandboxNetwork, b: AgentSandboxNetwork): AgentSandboxNetwork {
+  return NETWORK_STRICTNESS[b] < NETWORK_STRICTNESS[a] ? b : a;
+}
+
+/** A project with the open network allows every host, so only the allow lists limit the hosts. */
+function sharedHosts(policies: readonly AgentSandboxPolicy[]): string[] {
+  // Host names match in any case.
+  const hostLists = policies
+    .filter((policy) => policy.network === "allowlist")
+    .map((policy) => policy.allowedHosts.map((host) => host.toLowerCase()));
+  return hostLists.reduce((kept, next) => kept.filter((host) => next.includes(host)));
+}
+
 /**
- * The paths that every one of `lists` opens: each entry that an entry of every list holds, so
- * `/shared` and `/shared/cache` share `/shared/cache` (Codex review).
+ * The real paths that every one of `lists` opens: each entry that an entry of every list holds,
+ * so `/shared` and `/shared/cache` share `/shared/cache` (Codex review).
  */
 function sharedPaths(lists: ReadonlyArray<readonly string[]>): string[] {
-  const holds = (outer: string, inner: string) =>
-    isPathAtOrUnder(expandSandboxPathSpelling(inner), expandSandboxPathSpelling(outer));
   return dedupe(
     lists.flatMap((entries) =>
-      entries.filter((entry) => lists.every((other) => other.some((outer) => holds(outer, entry))))
+      entries.filter((entry) => lists.every((other) => isUnderAny(entry, other)))
     )
   );
 }

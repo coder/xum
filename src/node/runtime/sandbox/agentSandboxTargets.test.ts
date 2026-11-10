@@ -10,6 +10,7 @@ import {
   agentSandboxPolicyAllows,
   agentSandboxSettingsFor,
   buildAgentSandboxPolicy,
+  buildStrictestAgentSandboxPolicy,
   setAgentSandboxTargets,
 } from "./agentSandboxTargets";
 import { askpassSessionsRoot } from "../sshAskpass";
@@ -95,6 +96,14 @@ const MOVED_CREDENTIAL_STORES = [
   { name: "AZURE_CONFIG_DIR", value: "azure", file: "azure/msal_token_cache.json" },
   { name: "GH_CONFIG_DIR", value: "gh", file: "gh/hosts.yml" },
   { name: "KUBECONFIG", value: "kubeconfig", file: "kubeconfig" },
+  { name: "AZURE_CLIENT_CERTIFICATE_PATH", value: "azure.pem", file: "azure.pem" },
+  { name: "NETRC", value: "netrc", file: "netrc" },
+  { name: "AWS_WEB_IDENTITY_TOKEN_FILE", value: "web-identity", file: "web-identity" },
+  { name: "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", value: "gcloud-token", file: "gcloud-token" },
+  { name: "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", value: "gcloud.json", file: "gcloud.json" },
+  { name: "AZURE_FEDERATED_TOKEN_FILE", value: "azure-token", file: "azure-token" },
+  { name: "PGPASSFILE", value: "pgpass", file: "pgpass" },
+  { name: "POSTGRES_PASSWORD_FILE", value: "pg-password", file: "pg-password" },
 ];
 
 describe("buildAgentSandboxPolicy", () => {
@@ -1114,6 +1123,21 @@ describe("buildAgentSandboxPolicy", () => {
     expect(policy.denyRead).toContain(path.join(os.homedir(), ".cache", "uv", "aws-credentials"));
   });
 
+  test("hides a secret file that a variable names by convention, and nothing else", () => {
+    const policy = buildAgentSandboxPolicy(SETTINGS, {
+      cwd: repo,
+      env: {
+        SOPS_AGE_KEY_FILE: "~/.cache/uv/age.key",
+        // A tool Xum does not know resolves this from where it runs: nothing to hide here.
+        DEPLOY_TOKEN_FILE: "deploy-token",
+        SSL_CERT_FILE: path.join(repo, "ca.pem"),
+      },
+    });
+
+    expect(policy.denyRead).toContain(path.join(os.homedir(), ".cache", "uv", "age.key"));
+    expect(agentSandboxPolicyAllows(policy, path.join(repo, "ca.pem"), "read")).toBe(true);
+  });
+
   // Xum runs `git submodule update` outside the sandbox with the project's secrets.
   test("keeps the git config that the command's environment names read-only", async () => {
     await fs.writeFile(path.join(repo, "global.gitconfig"), "[include]\n\tpath = more.gitconfig\n");
@@ -1299,7 +1323,27 @@ describe("buildAgentSandboxPolicy credential files", () => {
 
 // A command of a multi-project workspace can change every project's checkout.
 describe("agentSandboxSettingsFor several projects", () => {
-  afterEach(() => setAgentSandboxTargets(null));
+  let root: string;
+  let cwd: string;
+
+  beforeEach(async () => {
+    root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-projects-")));
+    cwd = path.join(root, "repo");
+    await fs.mkdir(cwd);
+  });
+
+  afterEach(async () => {
+    setAgentSandboxTargets(null);
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  const policyFor = (projectPath: string, otherProjectPaths: string[]) => {
+    const settings = agentSandboxSettingsFor(projectPath, otherProjectPaths);
+    if (settings === null) throw new Error(`no sandbox for ${projectPath}`);
+    // Outside the temp folders, so the test's folders are not write roots of every policy.
+    using _tmpdir = homeOutsideWriteRoots();
+    return buildStrictestAgentSandboxPolicy(settings, { cwd });
+  };
 
   test("applies the sandbox when one project has it on, with what each such project allows", () => {
     const on = (overrides: Partial<ResolvedAgentSandboxSettings>) => ({
@@ -1309,50 +1353,127 @@ describe("agentSandboxSettingsFor several projects", () => {
     const a = on({
       network: "allowlist",
       allowedHosts: ["x.dev", "y.dev"],
-      extraWritePaths: ["~/.gradle", "~/.m2"],
-      extraReadPaths: ["~/.npmrc"],
+      extraWritePaths: [path.join(root, "gradle"), path.join(root, "m2")],
+      extraReadPaths: [path.join(root, "npmrc")],
     });
     setAgentSandboxTargets({
       fallback: { ...SETTINGS, enabled: false },
       byProject: new Map([
         ["/a", a],
         // Host names match in any case.
-        ["/b", on({ network: "allowlist", allowedHosts: ["Y.dev"], extraWritePaths: ["~/.m2"] })],
-        ["/open", on({ network: "open", extraWritePaths: ["~/.m2", "~/.gradle"] })],
+        [
+          "/b",
+          on({
+            network: "allowlist",
+            allowedHosts: ["Y.dev"],
+            extraWritePaths: [path.join(root, "m2")],
+          }),
+        ],
+        [
+          "/open",
+          on({
+            network: "open",
+            extraWritePaths: [path.join(root, "m2"), path.join(root, "gradle")],
+          }),
+        ],
         ["/loopback", on({ network: "loopback" })],
       ]),
     });
 
     expect(agentSandboxSettingsFor("/off")).toBeNull();
-    expect(agentSandboxSettingsFor("/off", ["/a"])).toEqual(a);
-    expect(agentSandboxSettingsFor("/a", ["/off", "/b", "/open"])).toEqual({
-      enabled: true,
-      network: "allowlist",
-      allowedHosts: ["y.dev"],
-      extraWritePaths: ["~/.m2"],
-      extraReadPaths: [],
-    });
-    expect(agentSandboxSettingsFor("/open", ["/loopback"])?.network).toBe("loopback");
+    expect(agentSandboxSettingsFor("/off", ["/a"])).toEqual([a]);
+    const policy = policyFor("/a", ["/off", "/b", "/open"]);
+    expect(policy.network).toBe("allowlist");
+    expect(policy.allowedHosts).toEqual(["y.dev"]);
+    expect(policy.writeRoots).toContain(path.join(root, "m2"));
+    expect(policy.writeRoots).not.toContain(path.join(root, "gradle"));
+    expect(policy.allowRead).not.toContain(path.join(root, "npmrc"));
+    expect(policyFor("/open", ["/loopback"]).network).toBe("loopback");
   });
 
   test("keeps a path that one project lists inside a folder that the other lists", () => {
     setAgentSandboxTargets({
       fallback: { ...SETTINGS, enabled: false },
       byProject: new Map([
-        ["/a", { ...SETTINGS, extraWritePaths: ["/shared"], extraReadPaths: ["~/tools/x"] }],
+        [
+          "/a",
+          {
+            ...SETTINGS,
+            extraWritePaths: [path.join(root, "shared")],
+            extraReadPaths: [path.join(root, "tools", "x")],
+          },
+        ],
         [
           "/b",
           {
             ...SETTINGS,
-            extraWritePaths: ["/shared/cache", "/other"],
-            extraReadPaths: [path.join(os.homedir(), "tools")],
+            extraWritePaths: [path.join(root, "shared", "cache"), path.join(root, "other")],
+            extraReadPaths: [path.join(root, "tools")],
           },
         ],
       ]),
     });
 
-    const settings = agentSandboxSettingsFor("/a", ["/b"]);
-    expect(settings?.extraWritePaths).toEqual(["/shared/cache"]);
-    expect(settings?.extraReadPaths).toEqual(["~/tools/x"]);
+    const policy = policyFor("/a", ["/b"]);
+    expect(policy.writeRoots).toContain(path.join(root, "shared", "cache"));
+    expect(policy.writeRoots).not.toContain(path.join(root, "shared"));
+    expect(policy.writeRoots).not.toContain(path.join(root, "other"));
+    expect(policy.allowRead).toContain(path.join(root, "tools", "x"));
+    expect(policy.allowRead).not.toContain(path.join(root, "tools"));
+  });
+
+  test("keeps a folder that two projects name through different symlinks", async () => {
+    for (const folder of ["write", "read"]) {
+      await fs.mkdir(path.join(root, folder));
+      await fs.symlink(path.join(root, folder), path.join(root, `${folder}-a`));
+      await fs.symlink(path.join(root, folder), path.join(root, `${folder}-b`));
+    }
+    const through = (link: string): ResolvedAgentSandboxSettings => ({
+      ...SETTINGS,
+      extraWritePaths: [path.join(root, `write-${link}`)],
+      extraReadPaths: [path.join(root, `read-${link}`)],
+    });
+    setAgentSandboxTargets({
+      fallback: { ...SETTINGS, enabled: false },
+      byProject: new Map([
+        ["/a", through("a")],
+        ["/b", through("b")],
+      ]),
+    });
+
+    const policy = policyFor("/a", ["/b"]);
+    expect(policy.writeRoots).toContain(path.join(root, "write"));
+    expect(policy.allowRead).toContain(path.join(root, "read"));
+  });
+
+  // The policy does not follow a link in a write root: a command could have put it there.
+  test("does not open what a link in one project's write root points to", async () => {
+    const home = path.join(root, "home");
+    const secret = path.join(home, "secret");
+    await fs.mkdir(secret, { recursive: true });
+    await fs.mkdir(path.join(root, "cache"));
+    await fs.symlink(secret, path.join(root, "cache", "link"));
+    setAgentSandboxTargets({
+      fallback: { ...SETTINGS, enabled: false },
+      byProject: new Map([
+        ["/a", { ...SETTINGS, extraReadPaths: [secret] }],
+        [
+          "/b",
+          {
+            ...SETTINGS,
+            extraWritePaths: [path.join(root, "cache")],
+            extraReadPaths: [path.join(root, "cache", "link")],
+          },
+        ],
+      ]),
+    });
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const policy = policyFor("/a", ["/b"]);
+
+      expect(agentSandboxPolicyAllows(policy, path.join(secret, "key"), "read")).toBe(false);
+    } finally {
+      homedir.mockRestore();
+    }
   });
 });

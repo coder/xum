@@ -6,7 +6,7 @@ import { Config } from "@/node/config";
 import {
   agentSandboxPolicyAllows,
   agentSandboxSettingsFor,
-  buildAgentSandboxPolicy,
+  buildStrictestAgentSandboxPolicy,
   setAgentSandboxTargets,
 } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { waitForCondition } from "@/node/services/testDispatchHelpers";
@@ -49,12 +49,14 @@ describe("AgentSandboxService", () => {
 
     await service.start();
 
-    expect(agentSandboxSettingsFor(PARENT)?.allowedHosts).toEqual(["parent.example"]);
-    expect(agentSandboxSettingsFor(CHILD)?.allowedHosts).toEqual(["parent.example"]);
+    expect(agentSandboxSettingsFor(PARENT)?.[0].allowedHosts).toEqual(["parent.example"]);
+    expect(agentSandboxSettingsFor(CHILD)?.[0].allowedHosts).toEqual(["parent.example"]);
     expect(agentSandboxSettingsFor(OTHER)).toBeNull();
     // A project Xum does not know, and a command with no project, get the global setting.
-    expect(agentSandboxSettingsFor("/projects/unknown")?.allowedHosts).toEqual(["global.example"]);
-    expect(agentSandboxSettingsFor(undefined)?.allowedHosts).toEqual(["global.example"]);
+    expect(agentSandboxSettingsFor("/projects/unknown")?.[0].allowedHosts).toEqual([
+      "global.example",
+    ]);
+    expect(agentSandboxSettingsFor(undefined)?.[0].allowedHosts).toEqual(["global.example"]);
   });
 
   it("saves the settings and returns them with only the projects that override the global one", async () => {
@@ -111,7 +113,7 @@ describe("AgentSandboxService", () => {
       await config.updateAgentSandbox({ enabled: true });
       service = new AgentSandboxService(config, { privateConfigRoot: runRoot });
       await service.start();
-      const policy = buildAgentSandboxPolicy(agentSandboxSettingsFor(undefined)!, {
+      const policy = buildStrictestAgentSandboxPolicy(agentSandboxSettingsFor(undefined)!, {
         cwd: rootDir,
       });
       const allows = (parts: string[], access: "read" | "write") =>
@@ -146,7 +148,7 @@ describe("AgentSandboxService", () => {
 
     // The global setting is off, so only the project's salvaged `enabled` turns it on, and the
     // global network survives its broken sibling field.
-    expect(agentSandboxSettingsFor(OTHER)?.network).toBe("loopback");
+    expect(agentSandboxSettingsFor(OTHER)?.[0].network).toBe("loopback");
     expect(agentSandboxSettingsFor(undefined)).toBeNull();
   });
 });

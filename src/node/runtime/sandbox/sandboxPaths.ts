@@ -151,6 +151,30 @@ function kubeconfigPaths(env: NodeJS.ProcessEnv): string[] {
 }
 
 /**
+ * A variable that names a secret file by the common convention: AWS_WEB_IDENTITY_TOKEN_FILE,
+ * CLOUDSDK_AUTH_ACCESS_TOKEN_FILE, CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE,
+ * AZURE_FEDERATED_TOKEN_FILE, PGPASSFILE, SOPS_AGE_KEY_FILE, the `<NAME>_PASSWORD_FILE` of Docker
+ * images. A list of CLIs always misses some (Codex review), so the name decides.
+ */
+const SECRET_FILE_VARIABLE =
+  /(?:TOKEN|CREDENTIALS?|PASS(?:WORD)?|SECRETS?|KEY|AUTH)_?(?:FILE|PATH)(?:_OVERRIDE)?$/;
+
+/**
+ * The files that SECRET_FILE_VARIABLE variables name. Only an absolute or `~/` value: a tool that
+ * Xum does not know may resolve anything else from where it runs, which is the open workspace.
+ */
+function secretFileVariablePaths(env: NodeJS.ProcessEnv): string[] {
+  return Object.entries(env)
+    .filter(([name]) => SECRET_FILE_VARIABLE.test(name))
+    .flatMap(([, value]) => (isNamedSecretFile(value) ? [value] : []));
+}
+
+function isNamedSecretFile(value: string | undefined): value is string {
+  if (value === undefined || value === os.devNull) return false;
+  return path.isAbsolute(value) || value.startsWith("~/");
+}
+
+/**
  * envPath() of each variable that npm reads as its `key` setting: npm matches `npm_config_` in
  * any case, and lowercases the rest with `-` for each later `_` (@npmcli/config loadEnv()).
  */
@@ -352,8 +376,12 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     ...fromEnv("GOOGLE_APPLICATION_CREDENTIALS"),
     ...fromEnv("CLOUDSDK_CONFIG"),
     ...fromEnv("AZURE_CONFIG_DIR"),
+    ...fromEnv("AZURE_CLIENT_CERTIFICATE_PATH"),
     ...fromEnv("GH_CONFIG_DIR", "hosts.yml"),
     ...kubeconfigPaths(env),
+    // Python requests and Go's module fetches read logins from the .netrc that NETRC names.
+    ...fromEnv("NETRC"),
+    ...secretFileVariablePaths(env),
     `${XUM_HOME_TOKEN}/server.lock`,
     `${XUM_HOME_TOKEN}/providers.jsonc`,
     `${XUM_HOME_TOKEN}/secrets.json`,

@@ -10,7 +10,7 @@ import { log } from "@/node/services/log";
 import {
   AgentSandboxStartError,
   agentSandboxSettingsFor,
-  buildAgentSandboxPolicy,
+  buildStrictestAgentSandboxPolicy,
   type AgentSandboxPolicy,
 } from "./agentSandboxTargets";
 import { sandboxToolEnv } from "./sandboxPaths";
@@ -188,7 +188,7 @@ export async function wrapForAgentSandbox(
   if (!isAgentSandboxSupported()) {
     throw new AgentSandboxStartError(`${SANDBOX_EXEC_PATH} is missing`);
   }
-  const policy = buildAgentSandboxPolicy(settings, {
+  const policy = buildStrictestAgentSandboxPolicy(settings, {
     cwd,
     workspaceRoots: options.workspaceRoots,
     scratchDir: options.scratchDir,

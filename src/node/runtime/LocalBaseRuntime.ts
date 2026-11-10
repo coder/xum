@@ -47,7 +47,7 @@ import {
   agentSandboxApplies,
   agentSandboxSettingsFor,
   anyAgentSandboxEnabled,
-  buildAgentSandboxPolicy,
+  buildStrictestAgentSandboxPolicy,
   type AgentSandboxPolicy,
   type AgentSandboxPolicyInput,
 } from "./sandbox/agentSandboxTargets";
@@ -577,7 +577,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       input.otherProjectPaths
     );
     if (settings === null) return null;
-    return buildAgentSandboxPolicy(settings, {
+    return buildStrictestAgentSandboxPolicy(settings, {
       ...input,
       workspaceRoots: this.withCheckoutRoot(input.cwd, input.workspaceRoots),
     });
