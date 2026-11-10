@@ -391,6 +391,18 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     );
   });
 
+  // `unset` fails on a readonly variable and bash keeps the value, so a run that went on would
+  // drive a browser with a setting it did not choose. Nothing may run, the close included.
+  test.each([
+    ["IFS", 'readonly IFS=" "'],
+    ["an exported agent-browser setting", "export AGENT_BROWSER_CDP=1; readonly AGENT_BROWSER_CDP"],
+    ["the socket folder variable", "readonly AGENT_BROWSER_SOCKET_DIR=/tmp/not-the-runs-folder"],
+  ])("a tool_env that makes %s readonly stops the run before any call", async (_name, line) => {
+    const { outcomes, fake } = await run({ toolEnvLines: [line] });
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(["failed", "failed", "failed"]);
+    expect(await fake.calls()).toEqual([]);
+  });
+
   test("every call names a config of the run's own folder, and it is empty", async () => {
     const { fake } = await run({});
     const dirs = (await fake.socketDirs()).map((call) => call.dir);

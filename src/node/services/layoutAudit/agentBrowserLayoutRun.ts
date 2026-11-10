@@ -101,14 +101,18 @@ const FRAME_END = "@@xum-layout-end";
  *
  * The driver neutralizes the inherited variables and the word-splitting state: a tool_env that
  * sets IFS would make the sweep read its newline-separated names as one word, so IFS is unset
- * first (unset, it splits on space, tab and newline). A tool_env that redefines a command such
+ * first (unset, it splits on space, tab and newline). Each of these steps ends the script when
+ * it fails, before any agent-browser call and before the run makes its folder: a tool_env that
+ * marks IFS or an AGENT_BROWSER_* variable `readonly` makes `unset` fail, and bash then keeps
+ * the old value (for a readonly AGENT_BROWSER_SOCKET_DIR it even exports it), so going on would
+ * drive a browser with settings the run did not choose. A tool_env that redefines a command such
  * as `env`, `sed` or `agent-browser` is outside that boundary: tool_env is trusted project code
  * that can run anything.
  */
 const SHELL_COMMON = String.raw`
-unset IFS
-for v in $(env | sed -n 's/^\(AGENT_BROWSER_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
-export AGENT_BROWSER_SOCKET_DIR="$XUM_LAYOUT_SOCKET_DIR"
+unset IFS || exit ${EXIT_SETUP_FAILED}
+for v in $(env | sed -n 's/^\(AGENT_BROWSER_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v" || exit ${EXIT_SETUP_FAILED}; done
+export AGENT_BROWSER_SOCKET_DIR="$XUM_LAYOUT_SOCKET_DIR" || exit ${EXIT_SETUP_FAILED}
 ab_wrap=
 ab() { $ab_wrap agent-browser --session "$XUM_LAYOUT_SESSION" --config "$XUM_LAYOUT_SOCKET_DIR/config.json" --idle-timeout ${IDLE_TIMEOUT} "$@"; }
 cd / || exit ${EXIT_SETUP_FAILED}
