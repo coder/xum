@@ -22,6 +22,7 @@ import { z } from "zod";
 import { ServiceTierSchema } from "../config/schemas/providersConfig";
 
 import { RuntimeEnablementIdSchema } from "./ids";
+import { IsolationChoiceSchema } from "./isolation";
 import { RuntimeEnablementOverridesSchema } from "./runtimeEnablement";
 
 export const WorktreeArchiveSnapshotProjectSchema = z.object({
@@ -429,8 +430,18 @@ export const ProjectConfigSchema = z.object({
   runtimeOverridesEnabled: z.boolean().optional().meta({
     description: "Whether this project uses runtime overrides, even if no overrides are set",
   }),
+  defaultIsolation: IsolationChoiceSchema.optional().meta({
+    description:
+      "Default project × workspace isolation override for new workspaces in this project",
+  }),
+  /**
+   * Legacy mirror of `defaultIsolation` for downgrade compatibility: older builds only read this
+   * flat runtime id. Written as the nearest supported runtime on every save; read only as a
+   * migration fallback when `defaultIsolation` is absent or malformed.
+   */
   defaultRuntime: RuntimeEnablementIdSchema.optional().meta({
-    description: "Default runtime override for new workspaces in this project",
+    description:
+      "Legacy mirror of defaultIsolation (flat runtime id) kept so older builds can read it",
   }),
   projectKind: z.enum(["user", "system"]).optional().meta({
     description:

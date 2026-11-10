@@ -70,6 +70,12 @@ import {
   RUNTIME_ENABLEMENT_IDS,
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
+import {
+  nearestSupportedIsolation,
+  resolveDefaultIsolation,
+  runtimeIdFromIsolation,
+  type IsolationChoice,
+} from "@/common/types/isolation";
 import { SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import {
   DEFAULT_RUNTIME_CONFIG,
@@ -1020,6 +1026,46 @@ function setProjectAgentResourceLimits(project: ProjectConfig, value: unknown): 
   else delete project.agentResourceLimits;
 }
 
+/**
+ * `defaultIsolation` is canonical; `defaultRuntime` is the flat runtime id older builds read.
+ * Resolving both from either field is the migration for legacy configs (only `defaultRuntime`),
+ * and deriving the legacy mirror from the resolved pair keeps downgrades working. A pair with no
+ * backend yet (e.g. ssh × docker) mirrors its nearest supported runtime so old builds still get a
+ * usable default. Returns no fields when neither is set, so callers delete both.
+ */
+function resolvePersistedDefaultIsolation(record: {
+  defaultIsolation?: unknown;
+  defaultRuntime?: unknown;
+}): { defaultIsolation: IsolationChoice; defaultRuntime: RuntimeEnablementId | undefined } | null {
+  const defaultIsolation = resolveDefaultIsolation(
+    record.defaultIsolation,
+    normalizeRuntimeEnablementId(record.defaultRuntime)
+  );
+  if (!defaultIsolation) {
+    return null;
+  }
+  const defaultRuntime =
+    runtimeIdFromIsolation(nearestSupportedIsolation(defaultIsolation)) ?? undefined;
+  return { defaultIsolation, defaultRuntime };
+}
+
+/** Write the canonical isolation default and its legacy mirror onto `target`, or delete both. */
+function applyPersistedDefaultIsolation(
+  target: { defaultIsolation?: IsolationChoice; defaultRuntime?: RuntimeEnablementId },
+  resolved: ReturnType<typeof resolvePersistedDefaultIsolation>
+): void {
+  if (resolved) {
+    target.defaultIsolation = resolved.defaultIsolation;
+  } else {
+    delete target.defaultIsolation;
+  }
+  if (resolved?.defaultRuntime) {
+    target.defaultRuntime = resolved.defaultRuntime;
+  } else {
+    delete target.defaultRuntime;
+  }
+}
+
 function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectConfig {
   // Per-project runtime overrides are optional; keep config.json sparse by persisting only explicit
   // overrides (false enablement + explicit default runtime selections).
@@ -1029,6 +1075,7 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
 
   const record = projectConfig as ProjectConfig & {
     runtimeEnablement?: unknown;
+    defaultIsolation?: unknown;
     defaultRuntime?: unknown;
     runtimeOverridesEnabled?: unknown;
     projectKind?: unknown;
@@ -1037,7 +1084,7 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     icon?: unknown;
   };
   const runtimeEnablement = normalizeRuntimeEnablementOverrides(record.runtimeEnablement);
-  const defaultRuntime = normalizeRuntimeEnablementId(record.defaultRuntime);
+  const defaultIsolation = resolvePersistedDefaultIsolation(record);
   const runtimeOverridesEnabled = record.runtimeOverridesEnabled === true ? true : undefined;
 
   const next = { ...record };
@@ -1054,11 +1101,9 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     delete next.runtimeOverridesEnabled;
   }
 
-  if (defaultRuntime) {
-    next.defaultRuntime = defaultRuntime;
-  } else {
-    delete next.defaultRuntime;
-  }
+  // Runs on both load and save: load migrates legacy defaultRuntime-only projects (so the
+  // projects list carries defaultIsolation), save rewrites the legacy mirror for older builds.
+  applyPersistedDefaultIsolation(next, defaultIsolation);
 
   const workspaces = Array.isArray(record.workspaces) ? record.workspaces : [];
   next.workspaces = workspaces.map((workspace) =>
@@ -3204,7 +3249,8 @@ export class Config {
     const updateChannel = parseUpdateChannel(parsed.updateChannel);
 
     const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
-    const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
+    // Migrates legacy configs that only stored the flat defaultRuntime.
+    const resolvedDefaultIsolation = resolvePersistedDefaultIsolation(parsed);
 
     const userPreferences = dropRemovedWorkspaceNotifications(
       normalizeUserPreferences(parsed.userPreferences),
@@ -3255,7 +3301,8 @@ export class Config {
       stopCoderWorkspaceOnArchive,
       terminalDefaultShell: parseOptionalNonEmptyString(parsed.terminalDefaultShell),
       updateChannel,
-      defaultRuntime,
+      defaultIsolation: resolvedDefaultIsolation?.defaultIsolation,
+      defaultRuntime: resolvedDefaultIsolation?.defaultRuntime,
       runtimeEnablement,
       // Validated here rather than trusted: a hand-edited or older-build value that fails the
       // schema would otherwise reach the IPC output validator and fail the whole settings
@@ -3568,9 +3615,13 @@ export class Config {
         data.runtimeEnablement = runtimeEnablement;
       }
 
-      const defaultRuntime = normalizeRuntimeEnablementId(config.defaultRuntime);
-      if (defaultRuntime !== undefined) {
-        data.defaultRuntime = defaultRuntime;
+      // Write the canonical pair plus the legacy flat mirror so older builds keep the default.
+      const resolvedDefaultIsolation = resolvePersistedDefaultIsolation(config);
+      if (resolvedDefaultIsolation) {
+        data.defaultIsolation = resolvedDefaultIsolation.defaultIsolation;
+        if (resolvedDefaultIsolation.defaultRuntime) {
+          data.defaultRuntime = resolvedDefaultIsolation.defaultRuntime;
+        }
       }
 
       if (config.settingsBackup) {
@@ -3797,7 +3848,7 @@ export class Config {
         config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR,
       worktreeArchiveBehavior: config.worktreeArchiveBehavior ?? DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
       runtimeEnablement: normalizeRuntimeEnablement(config.runtimeEnablement),
-      defaultRuntime: config.defaultRuntime ?? null,
+      defaultIsolation: resolvePersistedDefaultIsolation(config)?.defaultIsolation ?? null,
       agentAiDefaults: config.agentAiDefaults ?? {},
       chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
       llmDebugLogs: config.llmDebugLogs === true,
@@ -4033,19 +4084,20 @@ export class Config {
 
   async updateRuntimeEnablement(input: {
     runtimeEnablement?: Partial<Record<RuntimeEnablementId, boolean>> | null;
-    defaultRuntime?: RuntimeEnablementId | null;
+    /** null clears the default; undefined leaves it unchanged. */
+    defaultIsolation?: IsolationChoice | null;
     runtimeOverridesEnabled?: boolean | null;
     projectPath?: string | null;
   }): Promise<void> {
     await this.editConfig((config) => {
       const shouldUpdateRuntimeEnablement = input.runtimeEnablement !== undefined;
-      const shouldUpdateDefaultRuntime = input.defaultRuntime !== undefined;
+      const shouldUpdateDefaultIsolation = input.defaultIsolation !== undefined;
       const shouldUpdateOverridesEnabled = input.runtimeOverridesEnabled !== undefined;
       const projectPath = input.projectPath?.trim();
 
       if (
         !shouldUpdateRuntimeEnablement &&
-        !shouldUpdateDefaultRuntime &&
+        !shouldUpdateDefaultIsolation &&
         !shouldUpdateOverridesEnabled
       ) {
         return config;
@@ -4055,7 +4107,11 @@ export class Config {
         input.runtimeEnablement == null
           ? undefined
           : normalizeRuntimeEnablementOverrides(input.runtimeEnablement);
-      const defaultRuntime = input.defaultRuntime ?? undefined;
+      // Resolve through the same helper as load/save so the in-memory legacy mirror matches the
+      // new pair (a stale defaultRuntime must not survive, or clearing would resurrect it).
+      const defaultIsolation = resolvePersistedDefaultIsolation({
+        defaultIsolation: input.defaultIsolation ?? undefined,
+      });
       const runtimeOverridesEnabled = input.runtimeOverridesEnabled === true ? true : undefined;
 
       if (projectPath) {
@@ -4070,9 +4126,8 @@ export class Config {
           if (runtimeEnablement) nextProject.runtimeEnablement = runtimeEnablement;
           else delete nextProject.runtimeEnablement;
         }
-        if (shouldUpdateDefaultRuntime) {
-          if (defaultRuntime) nextProject.defaultRuntime = defaultRuntime;
-          else delete nextProject.defaultRuntime;
+        if (shouldUpdateDefaultIsolation) {
+          applyPersistedDefaultIsolation(nextProject, defaultIsolation);
         }
         if (shouldUpdateOverridesEnabled) {
           if (runtimeOverridesEnabled) nextProject.runtimeOverridesEnabled = true;
@@ -4087,8 +4142,8 @@ export class Config {
       if (shouldUpdateRuntimeEnablement) {
         next.runtimeEnablement = runtimeEnablement;
       }
-      if (shouldUpdateDefaultRuntime) {
-        next.defaultRuntime = defaultRuntime;
+      if (shouldUpdateDefaultIsolation) {
+        applyPersistedDefaultIsolation(next, defaultIsolation);
       }
       return next;
     });

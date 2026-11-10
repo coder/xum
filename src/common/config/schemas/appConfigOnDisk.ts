@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { AgentIdSchema, RuntimeEnablementIdSchema } from "../../schemas/ids";
+import { IsolationChoiceSchema } from "../../schemas/isolation";
 import { ProjectConfigSchema } from "../../schemas/project";
 import { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
@@ -246,6 +247,9 @@ export const AppConfigOnDiskSchema = z
     terminalDefaultShell: z.string().optional(),
     updateChannel: UpdateChannelSchema.optional(),
     runtimeEnablement: RuntimeEnablementOverridesSchema.optional(),
+    defaultIsolation: IsolationChoiceSchema.optional(),
+    // Legacy mirror of defaultIsolation: older builds read only this flat runtime id, so every
+    // save writes the nearest supported runtime here to keep downgrades working.
     defaultRuntime: RuntimeEnablementIdSchema.optional(),
     // `.catch`: an unusable stored value must not fail the whole config parse. Degrading to
     // "not configured" keeps every other setting loadable and lets the user re-enter this one.

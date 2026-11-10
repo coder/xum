@@ -89,11 +89,8 @@ import {
   McpAppViewSchema,
 } from "./mcpApps";
 import { SshPromptEventSchema, SshPromptResponseInputSchema } from "./ssh";
-import {
-  RuntimeConfigSchema,
-  RuntimeAvailabilitySchema,
-  RuntimeEnablementIdSchema,
-} from "./runtime";
+import { RuntimeConfigSchema, RuntimeAvailabilitySchema } from "./runtime";
+import { IsolationChoiceSchema } from "@/common/schemas/isolation";
 import { SecretSchema } from "./secrets";
 import {
   CompletedMessagePartSchema,
@@ -3399,7 +3396,7 @@ export const config = {
       coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS),
       worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS),
       runtimeEnablement: z.record(z.string(), z.boolean()),
-      defaultRuntime: z.string().nullable(),
+      defaultIsolation: IsolationChoiceSchema.nullable(),
       agentAiDefaults: AgentAiDefaultsSchema,
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
@@ -3529,7 +3526,8 @@ export const config = {
       .object({
         projectPath: z.string().nullish(),
         runtimeEnablement: z.record(z.string(), z.boolean()).nullish(),
-        defaultRuntime: RuntimeEnablementIdSchema.nullish(),
+        // null clears the default (project override or global); undefined leaves it unchanged.
+        defaultIsolation: IsolationChoiceSchema.nullish(),
         runtimeOverridesEnabled: z.boolean().nullish(),
       })
       .strict(),
