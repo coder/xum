@@ -1117,8 +1117,11 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     childId: string,
     options: {
       row?: Partial<WorkspaceConfigEntry>;
-      /** Turns the row into this status once the stream runs (a Stop landing before the stream end). */
-      statusAtEnd?: WorkspaceConfigEntry["taskStatus"];
+      /**
+       * Turns the row into this status once the stream runs (a Stop landing before the stream end),
+       * or removes its status when null.
+       */
+      statusAtEnd?: WorkspaceConfigEntry["taskStatus"] | null;
       end: { finishReason?: string; proposePlan?: boolean };
       queueFollowUp: boolean;
     }
@@ -1146,14 +1149,17 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           Ok(undefined)
         );
       }
-      if (options.statusAtEnd != null) {
+      if (options.statusAtEnd !== undefined) {
         await editChildRow(stack.config, childId, (row) => {
-          row.taskStatus = options.statusAtEnd;
+          if (options.statusAtEnd === null) delete row.taskStatus;
+          else row.taskStatus = options.statusAtEnd;
         });
       }
       // The row reads the status the case names when the stream ends (running by default).
       expect(entryOf(stack.config, childId)?.taskStatus).toBe(
-        options.statusAtEnd ?? options.row?.taskStatus ?? "running"
+        options.statusAtEnd === null
+          ? undefined
+          : (options.statusAtEnd ?? options.row?.taskStatus ?? "running")
       );
       stack.endStream(0, options.end, true);
       if (!options.queueFollowUp) await until(() => !child.session.isBusy(), "session idle");
@@ -1246,6 +1252,24 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       name: "a final response on an interrupted row",
       row: undefined,
       statusAtEnd: "interrupted" as const,
+      end: {},
+    },
+    {
+      name: "a final response on a queued row",
+      row: undefined,
+      statusAtEnd: "queued" as const,
+      end: {},
+    },
+    {
+      name: "a final response on a starting row",
+      row: undefined,
+      statusAtEnd: "starting" as const,
+      end: {},
+    },
+    {
+      name: "a final response on a row without a status",
+      row: undefined,
+      statusAtEnd: null,
       end: {},
     },
     {

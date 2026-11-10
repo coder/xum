@@ -2648,8 +2648,12 @@ interface ChildStreamEndState extends ChildStreamEndContext {
    */
   readonly reportArgs: Awaited<ReturnType<TaskService["resolveFinalAgentReportArgs"]>>;
   /**
-   * Whether the task is plan-like. Not read (false) where no reader needs the answer: a stream
-   * with neither a final response nor a propose_plan result, and a reported row's final response.
+   * Whether the task is plan-like. Not read (false) where its answer changes no decision: a stream
+   * with neither a final response nor a propose_plan result, and a reported row's final response
+   * without a propose_plan result. A propose_plan result always reads it, on a reported row too:
+   * for a plan-like task, decideNonreportBeforeContinuation leaves the decision to the plan
+   * hand-off (or to the stream-end listener on a reported row), and for any other task it
+   * resolves `nonreport` at once, unless the stream also carries a report.
    */
   readonly isPlanLike: boolean;
   readonly proposePlanResult: ReturnType<TaskService["findProposePlanSuccessInParts"]>;
@@ -20363,8 +20367,9 @@ export class TaskService implements AgentTaskIntegration {
     // answer (the ledger can still turn that into `indeterminate`: see
     // StreamEndLedger.resolveStreamEndDecision), and it does so before the cleanup of the
     // reported task, as a plan-like task's final response always did.
-    // The answer still matters to a propose_plan result (the plan hand-off) and to a final
-    // response on any other row (a plan-like task's final response is no report).
+    // The answer still matters to a propose_plan result, also on a reported row (it decides
+    // whether the handler resolves the decision now: see ChildStreamEndState.isPlanLike), and to a
+    // final response on any other row (a plan-like task's final response is no report).
     const probeDecidesReport =
       proposePlanResult != null || (finalAgentReportArgs != null && status !== "reported");
     const isPlanLike = probeDecidesReport ? await this.isPlanLikeTaskWorkspace(entry) : false;
