@@ -15,6 +15,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { renderLegendLabel } from "@/browser/features/Analytics/chartLegend";
 import {
   ANALYTICS_CHART_COLORS,
   CHART_AXIS_STROKE,
@@ -171,7 +172,7 @@ export function DynamicChart(props: DynamicChartProps): JSX.Element {
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
             <Tooltip formatter={formatTooltipValue} contentStyle={CHART_TOOLTIP_CONTENT_STYLE} />
-            <Legend wrapperStyle={{ fontSize: "11px" }} />
+            <Legend wrapperStyle={{ fontSize: "11px" }} formatter={renderLegendLabel} />
             <Pie
               data={chartRows}
               nameKey={props.xAxis}
@@ -216,7 +217,7 @@ export function DynamicChart(props: DynamicChartProps): JSX.Element {
         cursor={{ fill: "var(--color-hover)" }}
         contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
       />
-      <Legend wrapperStyle={{ fontSize: "11px" }} />
+      <Legend wrapperStyle={{ fontSize: "11px" }} formatter={renderLegendLabel} />
     </>
   );
 

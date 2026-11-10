@@ -17,11 +17,30 @@ export const TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS = 2 * 60 * 1000;
 export const WORKTREE_DELETE_GIT_TIMEOUT_MS = 60 * 1000;
 
 /**
- * Bounds the best-effort `git fetch origin <trunk>` before a local worktree is added. A Git
- * credential helper (for example Coder's askpass waiting on missing external auth) can block the
- * fetch indefinitely; after this deadline creation continues from the local trunk.
+ * Bounds the best-effort `git fetch origin <trunk>` of a local worktree creation (before the
+ * worktree is added, or before the checkout of one whose files are populated after it is
+ * announced). A Git credential helper (for example Coder's askpass waiting on missing external
+ * auth) can block the fetch indefinitely; after this deadline creation continues from the refs
+ * it already has.
  */
 export const WORKTREE_CREATE_FETCH_TIMEOUT_MS = 15 * 1000;
+
+/**
+ * Freshness contract of that fetch. A worktree creation runs `git fetch origin <branch>` unless a
+ * fetch of the same branch from the same repository and origin URL is still running, or got an
+ * answer from origin (the branch, or that origin has no such branch) less than this long ago;
+ * then it uses that fetch. Creations that wait on a fetch that fails or times out share the
+ * failure and fall back to local refs, but the next creation fetches again. Reuse never extends the window, so a later burst fetches again. Each creation
+ * still reads the local and origin refs itself, so the parent's unpushed commits win.
+ */
+export const WORKTREE_CREATE_FETCH_REUSE_MS = 10 * 1000;
+
+/**
+ * Bounds the backend's naming of a worktree workspace created before its name existed: the init
+ * hook waits for the name to rename the branch, so a slow or unreachable naming model must not
+ * hold setup longer than an origin fetch can.
+ */
+export const WORKSPACE_NAME_GENERATION_TIMEOUT_MS = 15 * 1000;
 
 /**
  * Bounds backup Git calls that can hang on a blackholed remote, while leaving room for a

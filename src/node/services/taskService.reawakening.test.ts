@@ -6,6 +6,7 @@ import { TaskHandleStore } from "@/node/services/taskHandleStore";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import { Ok, Err, type Result } from "@/common/types/result";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import type { SendMessageError } from "@/common/types/errors";
 import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
@@ -19,6 +20,7 @@ import {
   createTestConfig,
   createWorkspaceServiceMocks,
   findWorkspaceInConfig,
+  makeWorkspaceTurnCreateMock,
   projectWorkspace,
   saveLocalParentWorkspace,
   saveTestConfig,
@@ -37,6 +39,7 @@ import {
   createAgentTask,
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
+  startLiveWorkspaceTurn,
   registerLiveWorkspaceTurnHandle,
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
@@ -170,14 +173,10 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "sib-a", "sib-a", {
           parentWorkspaceId: "tree-root",
           taskStatus: "reported",
-          taskExecutionId: "wst_a",
-          taskExecutionStatus: "running",
         }),
         projectWorkspace(projectPath, "sib-b", "sib-b", {
           parentWorkspaceId: "tree-root",
           taskStatus: "reported",
-          taskExecutionId: "wst_b",
-          taskExecutionStatus: "running",
         }),
       ],
       testTaskSettings()
@@ -186,9 +185,18 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
     // The execution mirror only counts when backed by a LIVE handle registration (a stale
-    // mirror can outlive its handle after a crash or failed reconciliation).
-    await registerLiveWorkspaceTurnHandle(taskService, "sib-a", "wst_a");
-    await registerLiveWorkspaceTurnHandle(taskService, "sib-b", "wst_b");
+    // mirror can outlive its handle after a crash or failed reconciliation). The root's
+    // accepted reawakenings write both.
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "sib-a",
+      handleId: "wst_a",
+    });
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "sib-b",
+      handleId: "wst_b",
+    });
 
     // Both endpoints are effectively executing: the reawakened sender may message peers, and
     // the reawakened target (advertised as running by task_list's execution overlay) accepts.
@@ -259,8 +267,6 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "sib-b", "sib-b", {
           parentWorkspaceId: "tree-root",
           taskStatus: "reported",
-          taskExecutionId: "wst_preaccept",
-          taskExecutionStatus: "running",
         }),
       ],
       testTaskSettings()
@@ -268,13 +274,16 @@ describe("TaskService", () => {
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "sib-b",
-      "wst_preaccept",
-      "tree-root",
-      "reserved"
-    );
+    const reawakening = await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "sib-b",
+      handleId: "wst_preaccept",
+      accept: false,
+    });
+    expect(findWorkspaceInConfig(config, "sib-b")).toMatchObject({
+      taskExecutionId: "wst_preaccept",
+      taskExecutionStatus: "running",
+    });
 
     expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hello")).toEqual(
       Err({
@@ -287,13 +296,7 @@ describe("TaskService", () => {
 
     // Once the owner's turn is admitted (onAccepted marks the registration accepted), the same
     // target accepts peer messages.
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "sib-b",
-      "wst_preaccept",
-      "tree-root",
-      "accepted"
-    );
+    await reawakening.accept();
     expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hello again")).toEqual(
       Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
     );
@@ -377,9 +380,14 @@ describe("TaskService", () => {
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    // Live handle registration lets the reawakened sender pass the ENTRY check; the mid-send
-    // interruption is then only observable through the admission probe's mirror re-read.
-    await registerLiveWorkspaceTurnHandle(taskService, "sib-a", "wst_a");
+    // The root's accepted reawakening (live handle registration) lets the sender pass the ENTRY
+    // check; the mid-send interruption is then only observable through the admission probe's
+    // mirror re-read.
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "sib-a",
+      handleId: "wst_a",
+    });
 
     expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "still there?")).toEqual(
       Err({
@@ -407,8 +415,6 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "leaf-a", "leaf-a", {
           parentWorkspaceId: "branch-a",
           taskStatus: "reported",
-          taskExecutionId: "wst_leaf",
-          taskExecutionStatus: "running",
         }),
         projectWorkspace(projectPath, "sib-b", "sib-b", {
           parentWorkspaceId: "tree-root",
@@ -426,7 +432,11 @@ describe("TaskService", () => {
       stopStream: mock((): Promise<Result<void>> => Promise.resolve(Err("cancel failed"))),
     });
     const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
-    await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "leaf-a",
+      handleId: "wst_leaf",
+    });
     // The cascade settles the captured live execution itself (interruptCapturedExecution); this
     // models the fail-closed case where that explicit interrupt fails, so the record keeps
     // waiting for an authoritative settlement — the release mechanics under test.
@@ -459,9 +469,9 @@ describe("TaskService", () => {
     // free it — otherwise the child stays barred from peer messaging until restart even after
     // every admission-visible marker refuses on its own.
     const internals = taskService as unknown as {
-      workspaceStopsInProgress: Map<string, number>;
+      taskStopLatch: { workspaceStopsInProgress: Map<string, number> };
     };
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
     // A STALE handle settling for the same workspace is NOT settlement for the live execution:
     // the mirror still points at wst_leaf, so releasing here would let the still-running child
@@ -478,14 +488,14 @@ describe("TaskService", () => {
       "wst_stale"
     );
     expect(staleInterrupt.success).toBe(true);
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
     const interrupted = await workspaceTurnManagerFor(taskService).interruptWorkspaceTurn(
       "tree-root",
       "wst_leaf"
     );
     expect(interrupted.success).toBe(true);
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
   test("successful no-op stream stop still retains the latch for an unsettled PREPARING execution the cascade could not settle", async () => {
@@ -508,8 +518,6 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "leaf-a", "leaf-a", {
           parentWorkspaceId: "branch-a",
           taskStatus: "reported",
-          taskExecutionId: "wst_leaf",
-          taskExecutionStatus: "running",
         }),
         projectWorkspace(projectPath, "sib-b", "sib-b", {
           parentWorkspaceId: "tree-root",
@@ -521,7 +529,11 @@ describe("TaskService", () => {
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "leaf-a",
+      handleId: "wst_leaf",
+    });
     // See the unconfirmed-stop test above: the cascade's own explicit interrupt of the captured
     // execution fails here, leaving the record waiting for an authoritative settlement.
     const interruptSpy = spyOn(
@@ -535,8 +547,10 @@ describe("TaskService", () => {
     interruptSpy.mockRestore();
     expect(findWorkspaceInConfig(config, "leaf-a")?.taskStatus).toBe("reported");
 
-    const internals = taskService as unknown as { workspaceStopsInProgress: Map<string, number> };
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+    const internals = taskService as unknown as {
+      taskStopLatch: { workspaceStopsInProgress: Map<string, number> };
+    };
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
     // User resume clears the level-triggered suppression; only the retained latch refuses the
     // prepared turn's child until its execution settles.
@@ -557,7 +571,7 @@ describe("TaskService", () => {
       "wst_leaf"
     );
     expect(interrupted.success).toBe(true);
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
   test("settlement with a swallowed mirror write still refuses peer sends via registration removal", async () => {
@@ -576,8 +590,6 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "leaf-a", "leaf-a", {
           parentWorkspaceId: "branch-a",
           taskStatus: "reported",
-          taskExecutionId: "wst_leaf",
-          taskExecutionStatus: "running",
         }),
         projectWorkspace(projectPath, "sib-b", "sib-b", {
           parentWorkspaceId: "tree-root",
@@ -589,7 +601,11 @@ describe("TaskService", () => {
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "leaf-a",
+      handleId: "wst_leaf",
+    });
 
     // Establish a retained latch (accepted-but-unsettled live execution under a hard stop whose
     // own explicit interrupt of that execution failed; see the unconfirmed-stop test).
@@ -602,9 +618,9 @@ describe("TaskService", () => {
     expect(interruptSpy).toHaveBeenCalledTimes(1);
     interruptSpy.mockRestore();
     const internals = taskService as unknown as {
-      workspaceStopsInProgress: Map<string, number>;
+      taskStopLatch: { workspaceStopsInProgress: Map<string, number> };
     };
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
     // Settlement's terminal mirror write does not land (another writer replaced it), so the
     // on-disk mirror keeps claiming "running". Releasing the latch on the
@@ -628,7 +644,7 @@ describe("TaskService", () => {
     expect(
       workspaceTurnManagerFor(taskService).getLiveWorkspaceTurnRegistration("leaf-a")
     ).toBeUndefined();
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(false);
 
     taskService.resetAutoResumeCount("branch-a");
     expect(
@@ -660,8 +676,6 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "leaf-a", "leaf-a", {
           parentWorkspaceId: "branch-a",
           taskStatus: "reported",
-          taskExecutionId: "wst_leaf",
-          taskExecutionStatus: "running",
         }),
       ],
       testTaskSettings()
@@ -670,7 +684,11 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks();
     const { aiService, stopStream } = createAIServiceMocks(config);
     const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
-    await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "leaf-a",
+      handleId: "wst_leaf",
+    });
 
     taskService.markParentWorkspaceInterrupted("branch-a");
     await taskService.terminateAllDescendantAgentTasks("branch-a");
@@ -687,7 +705,7 @@ describe("TaskService", () => {
       status: "interrupted",
     });
     const internals = taskService as unknown as {
-      workspaceStopsInProgress: Map<string, number>;
+      taskStopLatch: { workspaceStopsInProgress: Map<string, number> };
     };
     expect(
       workspaceTurnManagerFor(taskService).getLiveWorkspaceTurnRegistration("leaf-a")
@@ -697,7 +715,7 @@ describe("TaskService", () => {
       expect.objectContaining({ abandonPartial: false })
     );
     // No owner left to settle: the latch releases with the cascade instead of at restart.
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(false);
     // The owner's terminal wake for the handle its own Stop interrupted is suppressed (same as
     // task_stop), so a restart cannot resurrect it as a wake-up.
     const attention = await new TerminalAttentionStore(config).get(
@@ -745,8 +763,10 @@ describe("TaskService", () => {
     taskService.markParentWorkspaceInterrupted("branch-a");
     await taskService.terminateAllDescendantAgentTasks("branch-a");
 
-    const internals = taskService as unknown as { workspaceStopsInProgress: Map<string, number> };
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    const internals = taskService as unknown as {
+      taskStopLatch: { workspaceStopsInProgress: Map<string, number> };
+    };
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
   test("sendAgentTreeMessage refuses root sends while an interrupted workspace turn winds down", async () => {
@@ -757,6 +777,7 @@ describe("TaskService", () => {
       config,
       projectPath,
       [
+        projectWorkspace(projectPath, "owner-ws", "owner-ws"),
         projectWorkspace(projectPath, "root", "tree-root"),
         projectWorkspace(projectPath, "child-a", "child-a", {
           parentWorkspaceId: "tree-root",
@@ -788,7 +809,13 @@ describe("TaskService", () => {
     const { aiService } = createAIServiceMocks(config, { stopStream });
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
-    await registerLiveWorkspaceTurnHandle(taskService, "tree-root", "wst_root_turn", "owner-ws");
+    // owner-ws created the root and is running a delegated turn on it.
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "owner-ws",
+      workspaceId: "tree-root",
+      handleId: "wst_root_turn",
+      ownerCreatedWorkspace: true,
+    });
 
     const interrupting = workspaceTurnManagerFor(taskService).interruptWorkspaceTurn(
       "owner-ws",
@@ -824,6 +851,7 @@ describe("TaskService", () => {
       config,
       projectPath,
       [
+        projectWorkspace(projectPath, "owner-ws", "owner-ws"),
         projectWorkspace(projectPath, "root", "tree-root"),
         projectWorkspace(projectPath, "child-a", "child-a", {
           parentWorkspaceId: "tree-root",
@@ -839,23 +867,18 @@ describe("TaskService", () => {
     // owner's requireIdle send passes admission. Correlating a peer trigger with it would let
     // that trigger's stream-end settle the owner's unaccepted handle as the delegated result.
     // Once accepted, the turn stays owner-only (#4997): the descendant waits for it either way.
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "tree-root",
-      "wst_unaccepted_corr",
-      "owner-ws",
-      "reserved"
-    );
+    // owner-ws created the root; its delegated turn there is still a reservation.
+    const delegated = await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "owner-ws",
+      workspaceId: "tree-root",
+      handleId: "wst_unaccepted_corr",
+      ownerCreatedWorkspace: true,
+      accept: false,
+    });
     expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "status?")).toEqual(
       Ok({ delivery: "queued", relation: "target_ancestor", awaitsDelegatedTurn: true })
     );
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "tree-root",
-      "wst_unaccepted_corr",
-      "owner-ws",
-      "accepted"
-    );
+    await delegated.accept();
     expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "second update")).toEqual(
       Ok({ delivery: "queued", relation: "target_ancestor", awaitsDelegatedTurn: true })
     );
@@ -929,27 +952,31 @@ describe("TaskService", () => {
     expect(stale?.executionStatus).toBeUndefined();
     expect(stale?.executionTaskId).toBeUndefined();
 
-    // Backed by an ACCEPTED live handle (the same predicate peer admission uses), the overlay
-    // is advertised again.
-    await registerLiveWorkspaceTurnHandle(taskService, "task-b", "wst_stale_overlay");
-    const live = taskService
-      .listTaskTreeAgents("task-a")
-      .tasks.find((task) => task.taskId === "task-b");
-    expect(live?.executionStatus).toBe("running");
-    expect(live?.executionTaskId).toBe("wst_stale_overlay");
-
-    // A pre-acceptance reservation is not live for peers either.
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "task-b",
-      "wst_stale_overlay",
-      "tree-root",
-      "recovered"
-    );
+    // A pre-acceptance reservation is not live for peers either, although the root's
+    // reawakening already wrote the running mirror.
+    const reawakening = await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "task-b",
+      handleId: "wst_live_overlay",
+      accept: false,
+    });
+    expect(findWorkspaceInConfig(config, "task-b")).toMatchObject({
+      taskExecutionId: "wst_live_overlay",
+      taskExecutionStatus: "running",
+    });
     const reserved = taskService
       .listTaskTreeAgents("task-a")
       .tasks.find((task) => task.taskId === "task-b");
     expect(reserved?.executionStatus).toBeUndefined();
+
+    // Backed by an ACCEPTED live handle (the same predicate peer admission uses), the overlay
+    // is advertised again.
+    await reawakening.accept();
+    const live = taskService
+      .listTaskTreeAgents("task-a")
+      .tasks.find((task) => task.taskId === "task-b");
+    expect(live?.executionStatus).toBe("running");
+    expect(live?.executionTaskId).toBe("wst_live_overlay");
   });
 
   test("sendMessageToDescendantAgentTask reawakens legacy archived descendants", async () => {
@@ -1007,6 +1034,166 @@ describe("TaskService", () => {
     expect(unarchive.mock.calls.map((call) => call[0])).toEqual([intermediateTaskId, childTaskId]);
     expect(sendMessage).toHaveBeenCalled();
   });
+
+  // F54: a parent message to a reported child whose last stream is still ending (its continuation
+  // already settled) was queued as a plain synthetic turn. That turn ran with no task execution, so
+  // the child could not report, message or spawn. The message must reawaken the child once the
+  // stream ends.
+  test("a parent message to a reported child that is still streaming reawakens it after the stream ends", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-streaming-reported";
+    const childTaskId = "child-streaming-reported";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
+          parentWorkspaceId,
+          taskStatus: "reported",
+        }),
+      ],
+      testTaskSettings()
+    );
+    let streaming = true;
+    let releaseIdle: () => void = () => undefined;
+    const idle = new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    });
+    const waitForIdleAndNoQueuedMessages = mock(() => idle);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      waitForIdleAndNoQueuedMessages,
+    });
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock((workspaceId: string) => streaming && workspaceId === childTaskId),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+
+    // Two sends while the tail streams: both must arrive as task-owned turns, in send order.
+    for (const message of ["First decision", "Second decision"]) {
+      const sent = await taskService.sendMessageToDescendantAgentTask(
+        parentWorkspaceId,
+        childTaskId,
+        message,
+        "tool-end"
+      );
+      expect(sent.success ? null : sent.error).toBeNull();
+    }
+
+    streaming = false;
+    releaseIdle();
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionId).toMatch(/^wst_/);
+    const deliveries = sendMessage.mock.calls.map((call) => ({
+      text: String(call[1]),
+      type: (call[2] as { muxMetadata?: MuxMessageMetadata }).muxMetadata?.type,
+    }));
+    expect(deliveries).toHaveLength(2);
+    expect(deliveries[0].text).toContain("First decision");
+    expect(deliveries[1].text).toContain("Second decision");
+    expect(deliveries.map((delivery) => delivery.type)).toEqual([
+      "workspace-turn-task",
+      "workspace-turn-task",
+    ]);
+  });
+
+  // F203 (drift scan of F54): the user archives the child while a deferred parent message waits
+  // for its stream to end. The archive is the later user decision, so the redelivery must not
+  // unarchive the child. A send to an already archived child still restores it on purpose.
+  const f203Cases = [
+    {
+      name: "does not unarchive a child the user archived during the wait",
+      archivedAtSend: undefined,
+      duringWait: { archivedAt: "2026-08-09T00:00:00.000Z" },
+      archivedAfter: true,
+    },
+    {
+      name: "does not unarchive a child the user unarchived and archived again during the wait",
+      archivedAtSend: "2026-08-01T00:00:00.000Z",
+      duringWait: {
+        unarchivedAt: "2026-08-05T00:00:00.000Z",
+        archivedAt: "2026-08-09T00:00:00.000Z",
+      },
+      archivedAfter: true,
+    },
+    {
+      name: "still unarchives a child that was archived at the send",
+      archivedAtSend: "2026-08-01T00:00:00.000Z",
+      duringWait: {},
+      archivedAfter: false,
+    },
+  ] as const;
+  for (const f203 of f203Cases) {
+    test(`a deferred parent message ${f203.name}`, async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentWorkspaceId = "parent-deferred-archived";
+      const childTaskId = "child-deferred-archived";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentWorkspaceId),
+          projectWorkspace(projectPath, "child", childTaskId, {
+            runtimeConfig: { type: "local" },
+            parentWorkspaceId,
+            taskStatus: "reported",
+            ...(f203.archivedAtSend != null ? { archivedAt: f203.archivedAtSend } : {}),
+          }),
+        ],
+        testTaskSettings()
+      );
+      let streaming = true;
+      let releaseIdle: () => void = () => undefined;
+      const idle = new Promise<void>((resolve) => {
+        releaseIdle = resolve;
+      });
+      const setChildField = (field: "archivedAt" | "unarchivedAt", value: string) =>
+        config.editConfig((cfg) => {
+          const workspace = Array.from(cfg.projects.values())
+            .flatMap((project) => project.workspaces)
+            .find((candidate) => candidate.id === childTaskId);
+          if (workspace) workspace[field] = value;
+          return cfg;
+        });
+      const unarchive = mock(async (workspaceId: string): Promise<Result<void>> => {
+        if (workspaceId === childTaskId)
+          await setChildField("unarchivedAt", "2026-08-10T00:00:00.000Z");
+        return Ok(undefined);
+      });
+      const { workspaceService } = createWorkspaceServiceMocks({
+        waitForIdleAndNoQueuedMessages: mock(() => idle),
+        unarchiveWhileTaskTreeLocked: unarchive,
+      });
+      const { aiService } = createAIServiceMocks(config, {
+        isStreaming: mock((workspaceId: string) => streaming && workspaceId === childTaskId),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+
+      const sent = await taskService.sendMessageToDescendantAgentTask(
+        parentWorkspaceId,
+        childTaskId,
+        "Late decision",
+        "tool-end"
+      );
+      expect(sent.success ? sent.data.delivery : sent.error).toBe("queued");
+
+      // What the user does while the message waits.
+      for (const [field, value] of Object.entries(f203.duringWait)) {
+        await setChildField(field as "archivedAt" | "unarchivedAt", value);
+      }
+      streaming = false;
+      releaseIdle();
+      await flushTerminalAttentionDrains(taskService);
+
+      const child = findWorkspaceInConfig(config, childTaskId);
+      expect(isWorkspaceArchived(child?.archivedAt, child?.unarchivedAt)).toBe(f203.archivedAfter);
+      expect(unarchive.mock.calls.length > 0).toBe(!f203.archivedAfter);
+    });
+  }
 
   test("sendMessageToDescendantAgentTask reawakens an inactive child of a scratch parent", async () => {
     // Scratch (project-less) chats spawn scratch children in the SCRATCH config bucket; a
@@ -1998,13 +2185,121 @@ describe("TaskService", () => {
     expect(nestedTasks.every((workspace) => workspace.taskStatus === "queued")).toBe(true);
   });
 
+  // "after the scan" is the live repro: after a restart, startup recovery overlapped early clients
+  // (it outlived its step bound). A parent reawakened its reported child while the reconciliation
+  // pass was still iterating. The pass then rewrote the child's mirror back to the stale terminal
+  // handle it had read before the reawakening, so the child's own turn hit "cannot spawn new
+  // tasks after agent_report" on task and workflow_run.
+  // "before the scan" is hardening (F16): a reawakening between the pass's config read and its
+  // handle scan puts the live handle in the scan, and the pass must not downgrade the turn's
+  // accepted registration. Startup ordering keeps clients out of that window today.
+  for (const holdPoint of ["after the scan", "before the scan"] as const) {
+    test(`startup mirror reconciliation keeps a reawakening that lands ${holdPoint}`, async () => {
+      const config = await createTestConfig(rootDir);
+      stubStableIds(config, ["rewakehandle", "rewaketurn", "rewakegrandchild"]);
+      const projectPath = path.join(rootDir, "repo");
+      const parentWorkspaceId = "parent-reconcile-rewake";
+      const childTaskId = "child-reconcile-rewake";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentWorkspaceId),
+          projectWorkspace(projectPath, "child", childTaskId, {
+            runtimeConfig: { type: "local" },
+            parentWorkspaceId,
+            agentId: "explore",
+            agentType: "explore",
+            taskStatus: "reported",
+            reportedAt: "2026-08-10T00:00:00.000Z",
+            taskExecutionId: "wst_stale",
+            taskExecutionStatus: "interrupted",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+        const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+        await internal?.onAccepted?.();
+        return Ok(undefined);
+      });
+      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      const { taskHandleStore } = workspaceTurnManagerInternals(taskService);
+      await taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord(parentWorkspaceId, childTaskId, "wst_stale", "interrupted")
+      );
+
+      // Hold the reconciliation pass after its config snapshot, before or after the handle scan.
+      let markScanned: (() => void) | undefined;
+      const scanned = new Promise<void>((resolve) => {
+        markScanned = resolve;
+      });
+      let releaseScan: (() => void) | undefined;
+      const scanGate = new Promise<void>((resolve) => {
+        releaseScan = resolve;
+      });
+      const listAll = taskHandleStore.listAllWorkspaceTurns.bind(taskHandleStore);
+      const listSpy = spyOn(taskHandleStore, "listAllWorkspaceTurns").mockImplementationOnce(
+        async (...args) => {
+          if (holdPoint === "after the scan") {
+            const records = await listAll(...args);
+            markScanned?.();
+            await scanGate;
+            return records;
+          }
+          markScanned?.();
+          await scanGate;
+          return listAll(...args);
+        }
+      );
+      try {
+        const recovery = taskService.recoverInterruptedTasks();
+        await scanned;
+
+        const reactivated = await taskService.sendMessageToDescendantAgentTask(
+          parentWorkspaceId,
+          childTaskId,
+          "Xum restarted and stopped your turn. Continue.",
+          "tool-end"
+        );
+        expect(reactivated).toMatchObject({
+          success: true,
+          data: { delivery: "reactivated", executionTaskId: "wst_rewakehandle" },
+        });
+
+        releaseScan?.();
+        await recovery;
+      } finally {
+        releaseScan?.();
+        listSpy.mockRestore();
+      }
+
+      expect(findWorkspaceInConfig(config, childTaskId)).toMatchObject({
+        taskStatus: "reported",
+        taskExecutionId: "wst_rewakehandle",
+        taskExecutionStatus: "running",
+      });
+      // The reawakened turn stays accepted, so peers can still address the child.
+      expect(
+        workspaceTurnManagerFor(taskService).getLiveWorkspaceTurnRegistration(childTaskId)
+      ).toEqual({
+        handleId: "wst_rewakehandle",
+        ownerWorkspaceId: parentWorkspaceId,
+        accepted: true,
+      });
+      expect(
+        await createAgentTask(taskService, childTaskId, "Run the cold-reader check")
+      ).toMatchObject({ success: true });
+    });
+  }
+
   test("does not accept agent_report while task-owned workspace turns are still active", async () => {
     const config = await createTestConfig(rootDir);
 
     const projectPath = path.join(rootDir, "repo");
     const rootWorkspaceId = "root-111";
     const parentTaskId = "task-222";
-    const workspaceTurnId = "workspace-turn-child";
     const workspaceTurnHandleId = "wst_childturn";
 
     await saveWorkspaces(
@@ -2023,21 +2318,17 @@ describe("TaskService", () => {
     );
 
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({ remove });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      remove,
+      create: makeWorkspaceTurnCreateMock(config, projectPath),
+    });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      workspaceTurnId,
-      workspaceTurnHandleId,
-      parentTaskId,
-      "reserved",
-      {
-        turnId: "turn-1",
-        updatedAt: "2026-06-19T00:00:00.000Z",
-        createdWorkspace: true,
-        createdAt: "2026-06-19T00:00:00.000Z",
-      }
-    );
+    // The task's own new workspace turn, still a pre-acceptance reservation.
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: parentTaskId,
+      handleId: workspaceTurnHandleId,
+      accept: false,
+    });
 
     await streamEnd(taskService, {
       type: "stream-end",
@@ -2076,7 +2367,6 @@ describe("TaskService", () => {
     const projectPath = path.join(rootDir, "repo");
     const rootWorkspaceId = "root-111";
     const parentTaskId = "task-222";
-    const workspaceTurnId = "workspace-turn-child";
     const workspaceTurnHandleId = "wst_childturn_notify";
 
     await saveWorkspaces(
@@ -2094,22 +2384,17 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      create: makeWorkspaceTurnCreateMock(config, projectPath),
+    });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      workspaceTurnId,
-      workspaceTurnHandleId,
-      parentTaskId,
-      "reserved",
-      {
-        turnId: "turn-1",
-        updatedAt: "2026-06-19T00:00:00.000Z",
-        createdWorkspace: true,
-        attentionPolicy: "notify_on_terminal",
-        createdAt: "2026-06-19T00:00:00.000Z",
-      }
-    );
+    // The task's own new workspace turn, still a pre-acceptance reservation.
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: parentTaskId,
+      handleId: workspaceTurnHandleId,
+      attentionPolicy: "notify_on_terminal",
+      accept: false,
+    });
 
     await streamEnd(taskService, {
       type: "stream-end",
@@ -2130,7 +2415,6 @@ describe("TaskService", () => {
     const projectPath = path.join(rootDir, "repo");
     const rootWorkspaceId = "root-111";
     const parentTaskId = "task-222";
-    const workspaceTurnId = "workspace-turn-child";
     const workspaceTurnHandleId = "wst_childturn_notify";
 
     await saveWorkspaces(
@@ -2148,22 +2432,17 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      create: makeWorkspaceTurnCreateMock(config, projectPath),
+    });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      workspaceTurnId,
-      workspaceTurnHandleId,
-      parentTaskId,
-      "reserved",
-      {
-        turnId: "turn-1",
-        updatedAt: "2026-06-19T00:00:00.000Z",
-        createdWorkspace: true,
-        attentionPolicy: "notify_on_terminal",
-        createdAt: "2026-06-19T00:00:00.000Z",
-      }
-    );
+    // The task's own new workspace turn, still a pre-acceptance reservation.
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: parentTaskId,
+      handleId: workspaceTurnHandleId,
+      attentionPolicy: "notify_on_terminal",
+      accept: false,
+    });
 
     await taskService.initialize();
 

@@ -10,6 +10,7 @@
  * For --aa, base and head are two builds of one commit, so build-to-build noise counts as host noise.
  * PAGE_TIMING_LOCK=<file>: one flock hold per run, never per block (the shared dev-host measurement lock).
  * Exit: 0 pass or qualified, 1 a gate failed or the host did not qualify, 2 bad input, 3 an invalid run.
+ * --out must be a new or empty folder, so a result file in it is always this invocation's.
  * A gated run (--qualification) takes one page: the summary is written only when every page ends.
  */
 import { spawn } from "node:child_process";
@@ -22,13 +23,27 @@ import { parseArgs } from "node:util";
 import { chromium } from "playwright";
 import { diffSeed, snapshotSeed, writeNeutralSeed } from "./neutralSeed";
 import * as core from "./pageTimingCore";
-import { probe, STATIC_VIEW_ID } from "./pageTimingProbe";
+import { probe, STATIC_VIEW_IDS } from "./pageTimingProbe";
+import * as stats from "./pageTimingStats";
 import { BLOCK_PAIRS, gate, kthLargest, launchPlan, median, type Signal } from "./pageTimingStats";
+import { newServerToken, serverTokenEnv, withServerToken } from "./serverToken";
 
 /** Lighthouse's mobile values, applied as DevTools throttling: real timings, not the simulator's. */
 const viewport = { width: 412, height: 823 };
+/**
+ * Lighthouse's mobile User-Agent (its emulatedUserAgent). `xum server` picks a phone page by the
+ * User-Agent ("Mobi"), and Chrome sends no Sec-CH-UA-Mobile over plain http.
+ */
+const LIGHTHOUSE_MOBILE_UA =
+  "Mozilla/5.0 (Linux; Android 11; moto g power (2022)) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36";
 const PHONE = {
-  context: { viewport, deviceScaleFactor: 1.75, isMobile: true, hasTouch: true },
+  context: {
+    viewport,
+    deviceScaleFactor: 1.75,
+    isMobile: true,
+    hasTouch: true,
+    userAgent: LIGHTHOUSE_MOBILE_UA,
+  },
   network: {
     offline: false,
     latency: 562.5,
@@ -60,11 +75,18 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-function hostIsQuietNow(): boolean {
-  const psiFile = "/proc/pressure/cpu";
-  const psi = fs.existsSync(psiFile) ? fs.readFileSync(psiFile, "utf8") : null;
-  return core.hostIsQuiet(os.loadavg()[0], psi, os.availableParallelism());
+/** process.kill that ignores ESRCH: the process or group already exited. */
+function signalIfAlive(pid: number, signal: NodeJS.Signals) {
+  try {
+    process.kill(pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
 }
+
+const psiFile = "/proc/pressure/cpu";
+const psi = () => (fs.existsSync(psiFile) ? fs.readFileSync(psiFile, "utf8") : null);
+const hostIsQuietNow = () => core.hostIsQuiet(os.loadavg()[0], psi(), os.availableParallelism());
 
 /** PIDs of the processes whose environment holds the entry (Linux /proc; elsewhere none are found). */
 function withEnv(entry: string): number[] {
@@ -84,8 +106,15 @@ async function startServer(tree: string, root: string, home: string, logFile: st
   const { port } = probePort.address() as net.AddressInfo;
   probePort.close();
   const log = fs.openSync(logFile, "w");
-  const env = { PATH: process.env.PATH, HOME: home, XUM_ROOT: root, XUM_DISABLE_TELEMETRY: "1" };
-  const args = `dist/cli/index.js server --no-auth --host 127.0.0.1 --port ${port}`.split(" ");
+  const token = newServerToken();
+  const env = {
+    PATH: process.env.PATH,
+    HOME: home,
+    XUM_ROOT: root,
+    XUM_DISABLE_TELEMETRY: "1",
+    ...serverTokenEnv(token),
+  };
+  const args = `dist/cli/index.js server --host 127.0.0.1 --port ${port}`.split(" ");
   const server = spawn("node", args, {
     cwd: tree,
     env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null" },
@@ -107,13 +136,15 @@ async function startServer(tree: string, root: string, home: string, logFile: st
     if (server.exitCode === null && server.signalCode === null) await once(server, "exit");
     // Workspace commands run in their own process groups, so the group kill misses them, and they can
     // still write into the seed after the server exits. All inherit HOME: wait until no process has it.
-    for (let i = 0; withEnv(`HOME=${home}`).length > 0; i++) {
-      if (i === 100) throw new Error(`${logFile}: processes outlived the server by 10 s`);
-      await sleep(100);
-    }
+    const kill = (pid: number) => signalIfAlive(pid, "SIGKILL");
     fs.closeSync(log);
+    await core
+      .reapRun(() => withEnv(`HOME=${home}`), kill, sleep)
+      .catch((error: unknown) => {
+        throw new Error(`${logFile}: ${String(error)}`);
+      });
   };
-  return { origin, stop };
+  return { origin, token, stop };
 }
 
 /** One navigation with a fresh root (and seed), server and browser. Values in seconds. */
@@ -121,6 +152,7 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
   // One lock hold per run, from seed creation to folder removal, never per block (see the header).
   // Never on a busy host either: runOnQuietHost waits for quiet outside the lock.
   return core.runOnQuietHost({ isQuiet: hostIsQuietNow, sleep }, withLock, async () => {
+    const host = core.hostState(os.loadavg()[0], psi()); // the state runOnQuietHost just accepted
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "page-timing-"));
     const [seedDir, log] = [path.join(tmp, "seed"), path.join(o.out, `${o.name}.server.log`)];
     let home = path.join(tmp, "home"); // a P2 run uses its seed's home
@@ -133,11 +165,14 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
       const before = seed && snapshotSeed(seedDir);
       for (const dir of [root, home]) fs.mkdirSync(dir, { recursive: true });
       const server = await startServer(o.tree, root, home, log);
-      const values = await browse(o, `${server.origin}${route}`).finally(server.stop);
+      const run = await browse(o, `${server.origin}${route}`, server.token).finally(server.stop);
       const now = (rel: string) => fs.readFileSync(path.join(seedDir, rel));
-      const rewrites = before ? core.seedRewrites(diffSeed(before, seedDir), before, now) : [];
+      const diff = before && diffSeed(before, seedDir);
+      const rewrites = diff ? core.seedRewrites(diff, before, now) : [];
+      const record = { ...o, ...run, host, seedAdded: diff?.added ?? [], seedRewrites: rewrites };
+      fs.writeFileSync(path.join(o.out, `${o.name}.json`), JSON.stringify(record));
       if (rewrites.length > 0) throw new Error(`${o.name}: a build rewrote the seed: ${rewrites}`);
-      return values;
+      return run.values;
     } finally {
       // Invalid runs clean up too, unless a process still uses the folder (stop() then threw).
       if (withEnv(`HOME=${home}`).length === 0) fs.rmSync(tmp, { recursive: true, force: true });
@@ -145,14 +180,15 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
   });
 }
 
-async function browse(o: Parameters<typeof measure>[0], url: string): Promise<Values> {
+/** `url` is what the record keeps. The navigation adds the server's token, which stays out of the record. */
+async function browse(o: Parameters<typeof measure>[0], url: string, token: string) {
   const browser = await chromium.launch({ executablePath: o.chrome, headless: true }); // fresh profile
   try {
     const context = await browser.newContext(PHONE.context);
     let [workers, fromWorker] = [0, 0];
     context.on("serviceworker", () => workers++);
     const { mode, page } = o;
-    const arg = { target: core.TARGET[page], mode, page, staticViewId: STATIC_VIEW_ID };
+    const arg = { target: core.TARGET[page], mode, page, staticViewIds: STATIC_VIEW_IDS };
     // tsx (esbuild keepNames) wraps the probe's inner functions in __name(), which the page lacks.
     const content = `var __name = (f) => f; (${probe})(${JSON.stringify(arg)})`;
     await context.addInitScript({ content });
@@ -163,7 +199,7 @@ async function browse(o: Parameters<typeof measure>[0], url: string): Promise<Va
     await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
     await cdp.send("Network.emulateNetworkConditions", PHONE.network);
     await cdp.send("Emulation.setCPUThrottlingRate", { rate: PHONE.cpuSlowdown });
-    await tab.goto(url, { waitUntil: "load", timeout: 180_000 });
+    await tab.goto(withServerToken(url, token), { waitUntil: "load", timeout: 180_000 });
     const ucsDone = "r.visibleLive !== null && r.elementTiming.some((e) => e.live)";
     const done = o.mode === "ucs" ? ucsDone : "r.ir !== null";
     await tab.waitForFunction(`((r) => !!r && ${done})(window.__pageTiming)`, null, {
@@ -175,9 +211,9 @@ async function browse(o: Parameters<typeof measure>[0], url: string): Promise<Va
     const apiAfterRun = (await tab.evaluate('"serviceWorker" in navigator')) as boolean;
     const failures = core.serviceWorkerProofFailures({ workers, fromWorker, apiAfterRun });
     if (failures.length > 0) throw new Error(`${o.name}: ${failures.join(", ")}`);
-    const values = o.mode === "ucs" ? core.usefulContentShown(record) : { ir: record.ir! / 1000 };
-    fs.writeFileSync(file("json"), JSON.stringify({ ...o, url, record, values }));
-    return values;
+    const values: Values =
+      o.mode === "ucs" ? core.usefulContentShown(record) : { ir: record.ir! / 1000 };
+    return { url, record, values }; // measure() writes the per-run JSON once the seed check ran
   } finally {
     await browser.close();
   }
@@ -199,11 +235,15 @@ async function block(o: Common & { base: string; head: string; label: string }) 
   return { ucs: d("ucs"), ucsLive: d("ucsLive"), ir: d("ir") };
 }
 
-/** The file's entry for the page if it can gate a run: qualified, with finite MDIs. Else null. */
+const signals = ["ucs", "ir"] as const;
+/** The file's entry for the page if it can gate a run: qualified, with MDIs within the limits. Else null. */
 function qualifiedEntry(file: string, page: core.Page) {
   try {
     const q = JSON.parse(fs.readFileSync(file, "utf8"))[page] as Host;
-    const ok = [q.mdi.ucs, q.mdi.ir].every((v) => typeof v === "number" && v >= 0 && v < Infinity);
+    // Within the limits, not only finite: an older runner's file can call a noisier host qualified (#6204).
+    const ok = signals.every(
+      (k) => typeof q.mdi[k] === "number" && q.mdi[k] >= 0 && q.mdi[k] <= stats.QUALIFY_MDI_LIMIT[k]
+    );
     return q.qualification === "qualified" && ok ? q : null;
   } catch {
     return null; // unreadable, not JSON, or no entry or MDIs for the page
@@ -225,6 +265,18 @@ async function main(): Promise<number> {
   });
   const pages = a.pages.split(",") as core.Page[];
   const predict = new URLSearchParams(a.predict.replaceAll(",", "&")); // "p1.ucs=3.9,p2.ir=1.2"
+  const predictKeys = [...predict.keys()];
+  const twice = predictKeys.find((k, i) => predictKeys.indexOf(k) !== i);
+  const outUsed =
+    a.out &&
+    fs.existsSync(a.out) &&
+    (!fs.statSync(a.out).isDirectory() || fs.readdirSync(a.out).length);
+  const html = (t?: string) =>
+    t && fs.existsSync(path.join(t, "dist/index.html"))
+      ? fs.readFileSync(path.join(t, "dist/index.html"))
+      : null;
+  const [baseHtml, headHtml] = [html(a.base), html(a.head)];
+  const twoCommits = a.aa && baseHtml && headHtml && !baseHtml.equals(headHtml);
   const keys = pages.flatMap((p) => [`${p}.ucs`, `${p}.ir`]);
   const cli = (t?: string) => (t ? path.resolve(t, "dist/cli/index.js") : "");
   const missing = [cli(a.base), cli(a.head)].filter((f) => f && !fs.existsSync(f));
@@ -232,12 +284,16 @@ async function main(): Promise<number> {
   const errors = [
     !a.base || !a.head ? "--base and --head are required" : "",
     missing.length > 0 ? `not a built tree, missing: ${missing.join(", ")}` : "",
-    pages.some((p) => !(p in core.TARGET)) ? `unknown page in --pages ${a.pages}` : "",
+    pages.some((p) => !Object.hasOwn(core.TARGET, p)) ? `unknown page in --pages ${a.pages}` : "",
+    fs.existsSync(a.chrome) ? "" : `--chrome ${a.chrome} does not exist`,
+    outUsed ? `--out ${a.out} is not a new or empty folder` : "",
+    twoCommits ? "--aa needs two builds of one commit: their dist/index.html differs" : "",
     a.aa && a.qualification ? "--aa and --qualification exclude each other" : "",
     a.qualification && pages.length !== 1 ? "a gated run takes one page (--pages p1)" : "",
     a.qualification && !host ? `${a.qualification} has no qualified ${pages[0]} entry` : "",
     a.predict && !a.qualification ? "--predict needs --qualification" : "",
     [...predict].some(([k, v]) => !keys.includes(k) || !(+v > 0)) ? "bad --predict keys" : "",
+    twice ? `duplicate --predict key ${twice}` : "",
   ].filter(Boolean);
   if (!a.base || !a.head || errors.length > 0) {
     console.error(`${errors.join("; ")} (usage: see the header of scripts/perf/pageTiming.ts)`);

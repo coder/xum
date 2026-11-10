@@ -1,3 +1,5 @@
 # Mintlify docs that use JSX comments which prettier mangles
 docs/system-prompt.md
 
+# Generated one-line JSON string (make generate-phone-chrome); prettier would requote and rewrap it
+src/common/staticWorkspaceView/phoneChrome.generated.ts

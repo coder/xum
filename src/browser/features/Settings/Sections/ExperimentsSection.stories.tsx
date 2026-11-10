@@ -1,5 +1,5 @@
 import type { ComponentType } from "react";
-import { expect, waitFor, within } from "@storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Meta, StoryObj } from "@storybook/react-vite";
@@ -35,8 +35,6 @@ export const Experiments: Story = {
     // Memory sub-experiments are nested under Agent Memory, so with the parent
     // off they must not appear anywhere in the list.
     await canvas.findByLabelText("Toggle Agent Memory");
-    await expect(canvas.queryByLabelText("Toggle Memory Intuition")).toBeNull();
-    await expect(canvas.queryByLabelText("Toggle Memory Hot Set")).toBeNull();
     await expect(canvas.queryByLabelText("Toggle Memory Consolidation")).toBeNull();
   },
 };
@@ -46,7 +44,10 @@ export const MemorySettingsEnabled: Story = {
     <SettingsSectionStory
       setup={() =>
         setupSettingsStory({
-          experiments: { [EXPERIMENT_IDS.MEMORY]: true },
+          experiments: {
+            [EXPERIMENT_IDS.MEMORY]: true,
+            [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
+          },
         })
       }
     >
@@ -58,9 +59,9 @@ export const MemorySettingsEnabled: Story = {
 
     // With Agent Memory enabled, the sub-experiment toggles render in the
     // nested panel under the parent row.
-    await canvas.findByLabelText("Toggle Memory Intuition");
-    await canvas.findByLabelText("Toggle Memory Hot Set");
     await canvas.findByLabelText("Toggle Memory Consolidation");
+    // With consolidation on, its dream cost ceiling sits under it, empty until the user sets one.
+    await expect(await canvas.findByLabelText("Dream cost ceiling")).toHaveValue("");
   },
 };
 

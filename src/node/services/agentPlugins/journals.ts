@@ -14,10 +14,10 @@
  * import cycle: installService imports discovery for container scans.
  */
 import { randomUUID } from "node:crypto";
-import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 /** Staging dir name under the mux home dir — NOT under ~/.mux/plugins, which discovery scans. */
 export const STAGING_DIR_NAME = "plugin-staging";
@@ -26,6 +26,12 @@ export const STAGING_DIR_NAME = "plugin-staging";
 export const MUTATION_LOCK_FILE = "mutation.lock";
 /** Renewal cadence for pre-#4415 builds (they reclaim by age); never a takeover threshold. */
 const MUTATION_LOCK_STALE_MS = 30 * 60 * 1000;
+
+/**
+ * How long an acquire waits on a live holder before failing (covers a full clone). The installer
+ * and the settings backup's plugin read wait this long, so both give up on the same holder.
+ */
+export const MUTATION_LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
 
 export function acquirePluginMutationLock(
   rootDir: string,
@@ -87,7 +93,7 @@ export function isJournalName(entry: string): boolean {
 export async function containerHasUnreconciledJournals(containerPath: string): Promise<boolean> {
   const stagingRoot = path.join(path.dirname(containerPath), STAGING_DIR_NAME);
   try {
-    return (await fsPromises.readdir(stagingRoot)).some(
+    return (await nodeHostFiles.promises.readdir(stagingRoot)).some(
       (entry) => isJournalName(entry) && entry.endsWith(".json")
     );
   } catch (error) {
@@ -104,7 +110,10 @@ export async function containerHasUnreconciledJournals(containerPath: string): P
  * that overlap the scan.
  */
 export interface ContainerMutationState {
-  /** Fail-closed: an unreadable staging root reports true. */
+  /**
+   * Recovery journals, or a pending post-update sign-out (#6122). Fail-closed: an unreadable
+   * staging root or record reports true.
+   */
   hasJournals: boolean;
   /**
    * Epoch token; `undefined` when the epoch file has never been written (a
@@ -126,7 +135,10 @@ export interface ContainerMutationState {
  */
 export async function readMutationEpochToken(stagingRoot: string): Promise<string | undefined> {
   try {
-    return await fsPromises.readFile(path.join(stagingRoot, MUTATION_EPOCH_FILE), "utf-8");
+    return await nodeHostFiles.promises.readFile(
+      path.join(stagingRoot, MUTATION_EPOCH_FILE),
+      "utf-8"
+    );
   } catch (error) {
     // hasErrorCode, not `instanceof Error`: under babel-jest's vm sandbox,
     // fs errors come from another realm and fail instanceof — every missing
@@ -140,8 +152,57 @@ export async function readContainerMutationState(
   containerPath: string
 ): Promise<ContainerMutationState> {
   const stagingRoot = path.join(path.dirname(containerPath), STAGING_DIR_NAME);
-  const hasJournals = await containerHasUnreconciledJournals(containerPath);
+  const hasJournals = (
+    await Promise.all([
+      containerHasUnreconciledJournals(containerPath),
+      containerHasPendingSignOuts(containerPath),
+    ])
+  ).includes(true);
   return { hasJournals, epoch: await readMutationEpochToken(stagingRoot) };
+}
+
+/**
+ * Credential URLs that plugin updates still have to sign out (#6122), next to the container.
+ * While the record exists, every discovery gate (also headless processes that never build the
+ * install service) keeps the managed container closed: a plugin server must not connect with
+ * its old sign-in's tokens.
+ */
+export const PENDING_SIGN_OUTS_FILE_NAME = "plugin-sign-outs-pending.json";
+
+/** One stat. Fail-closed: a record that cannot be stat'ed counts as pending. */
+export async function containerHasPendingSignOuts(containerPath: string): Promise<boolean> {
+  try {
+    await nodeHostFiles.promises.stat(pendingSignOutsPath(containerPath));
+    return true;
+  } catch (error) {
+    return !hasErrorCode(error, "ENOENT");
+  }
+}
+
+function pendingSignOutsPath(containerPath: string): string {
+  return path.join(path.dirname(containerPath), PENDING_SIGN_OUTS_FILE_NAME);
+}
+
+/**
+ * The record's state for a diagnostic (#6627). It reads the file, because a record that can be
+ * stat'ed but not read (a directory, missing read permission) still fails every sign-out pass.
+ */
+export async function pendingSignOutsRecordState(
+  containerPath: string
+): Promise<{ kind: "absent" } | { kind: "present" } | { kind: "unreadable"; code: string }> {
+  try {
+    // Not a regular file (a FIFO would block readFile): unreadable, without reading it.
+    if (!(await nodeHostFiles.promises.stat(pendingSignOutsPath(containerPath))).isFile())
+      return { kind: "unreadable", code: "not a regular file" };
+    await nodeHostFiles.promises.readFile(pendingSignOutsPath(containerPath));
+    return { kind: "present" };
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return { kind: "absent" };
+    // fs errors come from another realm under the Jest VM: read `code` without instanceof.
+    const code: unknown =
+      typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+    return { kind: "unreadable", code: typeof code === "string" ? code : "unknown error" };
+  }
 }
 
 /**
@@ -155,11 +216,11 @@ export async function readContainerMutationState(
 export async function bumpContainerMutationEpoch(stagingRoot: string): Promise<void> {
   const token = randomUUID();
   const tempPath = path.join(stagingRoot, `.${MUTATION_EPOCH_FILE}-${token}.tmp`);
-  await fsPromises.writeFile(tempPath, token, "utf-8");
+  await nodeHostFiles.promises.writeFile(tempPath, token, "utf-8");
   try {
-    await fsPromises.rename(tempPath, path.join(stagingRoot, MUTATION_EPOCH_FILE));
+    await nodeHostFiles.promises.rename(tempPath, path.join(stagingRoot, MUTATION_EPOCH_FILE));
   } catch (error) {
-    await fsPromises.rm(tempPath, { force: true }).catch(() => undefined);
+    await nodeHostFiles.promises.rm(tempPath, { force: true }).catch(() => undefined);
     throw error;
   }
 }

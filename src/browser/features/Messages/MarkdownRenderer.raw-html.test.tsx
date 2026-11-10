@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { rawHtmlUsesOnlyAllowedTags } from "./MarkdownCore";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+// The lazy KaTeX chunk publishes its plugins when it loads, so the tests below render math at once.
+import "./katexRehypePlugin";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
 

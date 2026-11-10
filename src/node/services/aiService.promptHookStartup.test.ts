@@ -15,6 +15,7 @@ import { ProviderService } from "./providerService";
 import type { MCPServerManager } from "./mcpServerManager";
 import { createTestHistoryService } from "./testHistoryService";
 import { codexPluginHookService } from "./agentPlugins/codexHookService";
+import { eventSpine } from "./events/eventSpine";
 import { loadPluginCodexHooks } from "./agentPlugins/codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./agentPlugins/manifest";
 import { computePluginInstanceId } from "./agentPlugins/mcpConfig";
@@ -162,5 +163,26 @@ describe("UserPromptSubmit hooks on the first prompt", () => {
     });
 
     expect(getToolsForWorkspace).not.toHaveBeenCalled();
+  });
+});
+
+describe("message.send hook presence for the accepted-send check", () => {
+  test("a first send after a restart sees the workspace's lazy hooks", async () => {
+    // Codex PRRT_kwDOPxxmWM6rSBny: before the load, a retry skipped the accepted-send check.
+    const { service } = await setup(promptHook);
+    expect(await service.prepareMessageSendHooks(workspaceId)).toBe(true);
+  });
+
+  test("another workspace's message.send hooks do not count", async () => {
+    // Codex PRRT_kwDOPxxmWM6rQd90.
+    const unregister = eventSpine.useBefore("message.send", () => undefined, {
+      workspaceId: "another-workspace",
+    });
+    try {
+      const { service } = await setup({ hooks: {} });
+      expect(await service.prepareMessageSendHooks(workspaceId)).toBe(false);
+    } finally {
+      unregister();
+    }
   });
 });

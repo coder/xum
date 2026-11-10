@@ -51,6 +51,19 @@ describe("MuxMessageSchema mcpPromptSnapshot parsing", () => {
   });
 });
 
+describe("MuxMessageSchema agentSkillSnapshot parsing", () => {
+  test.each(["tdd", "pstack:tdd"])("keeps the %s snapshot identity", (skillName) => {
+    const agentSkillSnapshot = { skillName, scope: "global" as const, sha256: "abc" };
+    const parsed = MuxMessageSchema.parse({
+      ...createMessage(),
+      role: "user" as const,
+      metadata: { synthetic: true, agentSkillSnapshot },
+    });
+
+    expect(parsed.metadata?.agentSkillSnapshot).toEqual(agentSkillSnapshot);
+  });
+});
+
 describe("MuxMessageSchema toolModelUsages parsing", () => {
   test("drops a malformed tool usage alone and keeps its valid siblings", () => {
     const valid = {

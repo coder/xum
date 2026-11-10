@@ -3,7 +3,6 @@ import { INSTANCE_DISCOVERY_MAX_LIMIT } from "@/constants/agentMessaging";
 import {
   buildTaskToolAgentArgsSchema,
   getAvailableTools,
-  supportsGoogleNativeToolsWithFunctionTools,
   TaskToolArgsSchema,
   TaskRetitleToolArgsSchema,
   TaskWorkspaceLifecycleToolArgsSchema,
@@ -11,47 +10,9 @@ import {
   TOOL_DEFINITIONS,
   WorkflowRunToolArgsSchema,
 } from "./toolDefinitions";
+import { AskUserQuestionToolArgsSchema as LightAskUserQuestionToolArgsSchema } from "./askUserQuestionSchemas";
 
 describe("TOOL_DEFINITIONS", () => {
-  it("only advertises intuition with both recall and memory enabled, never its internal tools", () => {
-    for (const enableMemory of [false, true]) {
-      for (const enableIntuition of [false, true]) {
-        const tools = getAvailableTools("openai:test", { enableMemory, enableIntuition });
-        expect(tools.includes("intuition")).toBe(enableMemory && enableIntuition);
-        expect(tools).not.toContain("memory_read");
-        expect(tools).not.toContain("intuition_report");
-      }
-    }
-  });
-
-  it("bounds intuition cues and confidence reports without requiring evidence for uncertain leads", () => {
-    expect(TOOL_DEFINITIONS.intuition.schema.safeParse({ cue: "" }).success).toBe(false);
-    expect(TOOL_DEFINITIONS.intuition.schema.safeParse({ cue: "x".repeat(2001) }).success).toBe(
-      false
-    );
-    expect(TOOL_DEFINITIONS.intuition.schema.safeParse({ cue: "Relevant task" }).success).toBe(
-      true
-    );
-    const item = {
-      path: "/memories/global/test.md",
-      relevance: 0.5,
-      excerpt: "",
-      why: "Potential lead",
-    };
-    expect(TOOL_DEFINITIONS.intuition_report.schema.safeParse({ items: [item] }).success).toBe(
-      true
-    );
-    expect(
-      TOOL_DEFINITIONS.intuition_report.schema.safeParse({ items: [{ ...item, relevance: 1.1 }] })
-        .success
-    ).toBe(false);
-    expect(
-      TOOL_DEFINITIONS.intuition_report.schema.safeParse({
-        items: Array.from({ length: 7 }, () => item),
-      }).success
-    ).toBe(false);
-  });
-
   it("accepts custom subagent_type IDs (deprecated alias)", () => {
     const parsed = TaskToolArgsSchema.safeParse({
       subagent_type: "potato",
@@ -275,16 +236,98 @@ describe("TOOL_DEFINITIONS", () => {
 
   it("accepts bash tool calls using command (alias for script)", () => {
     const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({
-      command: "ls",
+      command: "ls -la src",
       timeout_secs: 60,
       run_in_background: false,
+      description: "List files",
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.script).toBe("ls -la src");
+      expect(parsed.data.display_name).toBe("List files");
+      expect("command" in parsed.data).toBe(false);
+    }
+  });
+
+  // Each case names a token only its own hint contains, so a case that falls through to the
+  // wrong hint (or to none) fails.
+  const hintTokens = [
+    "call memory",
+    "grep or rg",
+    "file_edit_replace_string",
+    "file_read",
+    "cut off",
+  ];
+  it.each([
+    {
+      name: "memory view",
+      input: { command: "view", path: "/memories/global" },
+      hint: "call memory",
+    },
+    {
+      name: "memory create",
+      input: { command: "create", path: "/memories/global/a.md", file_text: "secret body" },
+      hint: "call memory",
+    },
+    {
+      name: "grep",
+      input: { command: "grep", path: "src", pattern: "foo", output_mode: "content", "-n": true },
+      hint: "grep or rg",
+    },
+    {
+      name: "edit",
+      input: { command: "edit", path: "src/a.ts", old_string: "before", new_string: "after" },
+      hint: "file_edit_replace_string",
+    },
+    {
+      name: "read",
+      input: { command: "cat src/a.ts", offset: 10, limit: 5 },
+      hint: "file_read",
+    },
+    { name: "cut-off one word", input: { command: "cd", display_name: "Go" }, hint: "cut off" },
+    { name: "unknown key", input: { command: "ls -la", parameter: "verbose" }, hint: undefined },
+  ])("rejects a $name call sent as bash command without running it", ({ input, hint }) => {
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse(input);
+
+    expect(parsed.success).toBe(false);
+    if (parsed.success) return;
+    expect(parsed.error.issues).toHaveLength(1);
+    const [issue] = parsed.error.issues;
+    expect(issue.path).toEqual(["command"]);
+    expect(hintTokens.filter((token) => issue.message.includes(token))).toEqual(
+      hint == null ? [] : [hint]
+    );
+    // Only the command preview and foreign key names come back, never other values.
+    for (const [key, value] of Object.entries(input)) {
+      if (key === "command" || key === "display_name") continue;
+      expect(issue.message).toContain(key);
+      if (typeof value === "string") expect(issue.message).not.toContain(value);
+    }
+  });
+
+  it("caps the command preview in a rejected bash command alias", () => {
+    const command = `echo ${"word ".repeat(200)}TAIL`;
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({ command, path: "src" });
+
+    expect(parsed.success).toBe(false);
+    if (parsed.success) return;
+    expect(parsed.error.issues[0].message).not.toContain("TAIL");
+    expect(parsed.error.issues[0].message.length).toBeLessThan(400);
+  });
+
+  it("accepts foreign keys next to script and strips them", () => {
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({
+      script: "ls",
+      command: "view",
+      path: "/memories/global",
       display_name: "Test",
     });
 
     expect(parsed.success).toBe(true);
     if (parsed.success) {
       expect(parsed.data.script).toBe("ls");
-      expect("command" in parsed.data).toBe(false);
+      expect("path" in parsed.data).toBe(false);
     }
   });
 
@@ -385,6 +428,69 @@ describe("TOOL_DEFINITIONS", () => {
     expect(parsed.success).toBe(true);
     if (parsed.success) {
       expect(parsed.data.display_name).toBe("Real Name");
+    }
+  });
+
+  it("derives display_name from the script when a bash call omits it", () => {
+    // Haiku 5.5 often omits display_name; a rejection wastes one model step.
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({
+      script: "\n  git status --short  \necho done",
+      timeout_secs: 60,
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.display_name).toBe("git status --short");
+    }
+  });
+
+  it("falls back to the default display_name for a whitespace-only script", () => {
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({
+      script: "  \n\t\n",
+      timeout_secs: 60,
+      display_name: null,
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.display_name).toBe("bash");
+    }
+  });
+
+  it("accepts a bash call that omits timeout_secs or sends it as null", () => {
+    // Open-weight models omit it constantly, and a rejection costs a model step. The handler owns
+    // the default, so parsing must leave the value absent: a zod default would also bound every
+    // background process, which must instead live until stopped.
+    for (const run_in_background of [false, true]) {
+      const omitted = TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls", run_in_background });
+      expect(omitted.success).toBe(true);
+      if (omitted.success) {
+        expect(omitted.data.timeout_secs).toBeUndefined();
+      }
+
+      const nulled = TOOL_DEFINITIONS.bash.schema.safeParse({
+        script: "ls",
+        run_in_background,
+        timeout_secs: null,
+      });
+      expect(nulled.success).toBe(true);
+      if (nulled.success) {
+        expect(nulled.data.timeout_secs).toBeNull();
+      }
+    }
+  });
+
+  it("keeps a positive bound on an explicit bash timeout_secs", () => {
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls", timeout_secs: 5 });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.timeout_secs).toBe(5);
+    }
+
+    for (const timeout_secs of [0, -1]) {
+      expect(TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls", timeout_secs }).success).toBe(
+        false
+      );
     }
   });
 
@@ -618,6 +724,13 @@ describe("TOOL_DEFINITIONS", () => {
     });
   });
 
+  // The renderer's open-question selector (openAskUserQuestions.ts) and the aggregator's
+  // truncation rule parse args with the light module's schema (kept out of the main chunk,
+  // #7363); it must stay the schema the tool itself validates with.
+  it("ask_user_question validates with the light askUserQuestionSchemas module's schema", () => {
+    expect(TOOL_DEFINITIONS.ask_user_question.schema).toBe(LightAskUserQuestionToolArgsSchema);
+  });
+
   it("accepts ask_user_question headers longer than 12 characters", () => {
     const parsed = TOOL_DEFINITIONS.ask_user_question.schema.safeParse({
       questions: [
@@ -655,6 +768,26 @@ describe("TOOL_DEFINITIONS", () => {
     });
 
     expect(parsed.success).toBe(false);
+  });
+
+  it("accepts <plugin>:<skill> on the skill read tools but keeps writes bare", () => {
+    // Tool tests call execute() directly, so only this schema check sees what the model may send.
+    expect(TOOL_DEFINITIONS.agent_skill_read.schema.safeParse({ name: "pstack:tdd" }).success).toBe(
+      true
+    );
+    expect(
+      TOOL_DEFINITIONS.agent_skill_read_file.schema.safeParse({
+        name: "pstack:tdd",
+        filePath: "SKILL.md",
+      }).success
+    ).toBe(true);
+    expect(
+      TOOL_DEFINITIONS.agent_skill_write.schema.safeParse({
+        name: "pstack:tdd",
+        filePath: "SKILL.md",
+        content: "x",
+      }).success
+    ).toBe(false);
   });
 
   it("always includes global skill management tools", () => {
@@ -854,23 +987,6 @@ describe("TOOL_DEFINITIONS", () => {
     expect(enabledTools).toContain("workflow_resume");
   });
 
-  it("gates native Google tools to Gemini 3 models", () => {
-    expect(getAvailableTools("google:gemini-2.5-pro")).not.toContain("google_search");
-    expect(getAvailableTools("google:gemini-2.5-pro")).not.toContain("url_context");
-    expect(getAvailableTools("google:gemini-4-pro")).not.toContain("google_search");
-    expect(getAvailableTools("google:gemini-4-pro")).not.toContain("url_context");
-
-    for (const modelString of [
-      "google:gemini-3.1-pro-preview",
-      "google:gemini-3.5-flash",
-      "google:models/gemini-3.5-flash",
-    ]) {
-      const tools = getAvailableTools(modelString);
-      expect(tools).toContain("google_search");
-      expect(tools).toContain("url_context");
-    }
-  });
-
   it("exposes xAI native search tools only for frontier Grok", () => {
     for (const modelString of [
       "xai:grok-4.7",
@@ -885,14 +1001,6 @@ describe("TOOL_DEFINITIONS", () => {
       );
     }
     expect(getAvailableTools("xai:grok-4-1-fast")).not.toContain("x_search");
-  });
-
-  it("classifies Gemini 3 as supporting mixed native Google and function tools", () => {
-    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-2.5-pro")).toBe(false);
-    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-3.1-pro-preview")).toBe(true);
-    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-3.5-flash")).toBe(true);
-    expect(supportsGoogleNativeToolsWithFunctionTools("models/gemini-3.5-flash")).toBe(true);
-    expect(supportsGoogleNativeToolsWithFunctionTools("gemini-4-pro")).toBe(false);
   });
 
   it("agent_skill_write schema rejects an advertise tool argument (advertise is authored in content)", () => {

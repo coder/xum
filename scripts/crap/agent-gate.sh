@@ -29,6 +29,9 @@ set -uo pipefail
 phase=${1:-}
 [[ "${XUM_TOOL:-}" == "bash" ]] || exit 0
 [[ "$phase" == "post" || ("$phase" == "pre" && "$CRAP_GATE_MODE" == "block") ]] || exit 0
+# After a failed command (Xum's bash result has success false, any nonzero
+# exit in the chain), the commit or push may not have happened: report nothing.
+[[ "$phase" == "post" && "${XUM_TOOL_RESULT_SUCCESS:-}" == "false" ]] && exit 0
 
 # Every tool call reaches this point, so up to the match below use only bash
 # builtins: no git, bun, uv or other process.
@@ -43,12 +46,17 @@ if [[ -z "$script" && -r "${XUM_TOOL_INPUT_PATH:-}" ]]; then
   script=${script//\\\"/\"}
   script=${script//$'\x01'/\\}
 fi
-# A `git ... commit` or `git ... push` at a command position (string start, a
-# newline, or after ; & | ( { ), so a quoted "git commit" in an echo does not
-# match. Variable assignments and env/command/time/sudo may come first
-# (GIT_EDITOR=true git commit).
+# A `git commit` or `git push` at a command position (string start, a newline,
+# or after ; & | ( { ), so a quoted "git commit" in an echo does not match.
+# Variable assignments and env/command/time/sudo may come first
+# (GIT_EDITOR=true git commit). Between git and the subcommand only options
+# (-c x=y, -C dir, --no-pager) may appear, so a read-only command whose
+# arguments mention one (git log --grep commit) does not match. An option
+# value with spaces or quotes (git -c "a=b c" commit) does not match either:
+# the gate then reports nothing, as for any command it does not recognize.
 cmd_prefix="([A-Za-z_][A-Za-z0-9_]*=[^[:space:];&|]*[[:space:]]+|(env|command|time|sudo)[[:space:]]+)*"
-git_write="(^|[;&|({"$'\n'"])[[:space:]]*${cmd_prefix}git[[:space:]]([^;&|]*[[:space:]])?(commit|push)([[:space:];&|)]|\$)"
+git_opt="(-[cC][[:space:]]+[^-[:space:];&|][^[:space:];&|]*|-[^[:space:];&|]*)"
+git_write="(^|[;&|({"$'\n'"])[[:space:]]*${cmd_prefix}git([[:space:]]+${git_opt})*[[:space:]]+(commit|push)([[:space:];&|)]|\$)"
 [[ "$script" =~ $git_write ]] || exit 0
 
 warn_skip() {

@@ -7,8 +7,27 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { BashOutputToolResult } from "@/common/types/tools";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { randomUUID } from "crypto";
+import {
+  TestTempDir,
+  createTestToolConfig as createBaseToolConfig,
+  readExitCodeWhenWritten,
+} from "./testHelpers";
 import type { ToolExecutionOptions } from "ai";
+
+// Unique workspace IDs per run (#7256): spawn records live in the shared
+// /tmp/mux-bashes/<workspaceId>, and the loop-test runner runs several test files at once. A fixed
+// "test-workspace" let one file's cleanup delete another file's records, as #5591 fixed for
+// backgroundProcessManager.test.ts.
+const RUN_ID = randomUUID().slice(0, 12);
+const TEST_WS = `test-workspace-${RUN_ID}`;
+const WS_A = `workspace-a-${RUN_ID}`;
+const WS_B = `workspace-b-${RUN_ID}`;
+const createTestToolConfig = (
+  tempDir: string,
+  options?: Parameters<typeof createBaseToolConfig>[1]
+): ReturnType<typeof createBaseToolConfig> =>
+  createBaseToolConfig(tempDir, { workspaceId: TEST_WS, ...options });
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -98,7 +117,7 @@ describe("bash_output tool", () => {
     // Spawn a process that outputs incrementally
     const spawnResult = await manager.spawn(
       runtime,
-      "test-workspace",
+      TEST_WS,
       "echo 'line1'; sleep 0.5; echo 'line2'",
       { cwd: process.cwd(), displayName: "test" }
     );
@@ -140,7 +159,7 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
   });
 
@@ -156,7 +175,7 @@ describe("bash_output tool", () => {
     // Spawn a process that outputs multiple lines
     const spawnResult = await manager.spawn(
       runtime,
-      "test-workspace",
+      TEST_WS,
       "echo 'ERROR: something failed'; echo 'INFO: everything ok'; echo 'ERROR: another error'",
       { cwd: process.cwd(), displayName: "test" }
     );
@@ -182,7 +201,7 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
   });
 
@@ -195,7 +214,7 @@ describe("bash_output tool", () => {
     config.runtimeTempDir = tempDir.path;
     config.backgroundProcessManager = manager;
 
-    const spawnResult = await manager.spawn(runtime, "test-workspace", "echo 'test'", {
+    const spawnResult = await manager.spawn(runtime, TEST_WS, "echo 'test'", {
       cwd: process.cwd(),
       displayName: "test",
     });
@@ -219,7 +238,7 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
   });
 
@@ -230,14 +249,14 @@ describe("bash_output tool", () => {
     const runtime = createTestRuntime();
 
     const config = createTestToolConfig(process.cwd(), {
-      workspaceId: "workspace-a",
+      workspaceId: WS_A,
       sessionsDir: tempDir.path,
     });
     config.runtimeTempDir = tempDir.path;
     config.backgroundProcessManager = manager;
 
     // Spawn process in different workspace
-    const spawnResult = await manager.spawn(runtime, "workspace-b", "echo 'test'", {
+    const spawnResult = await manager.spawn(runtime, WS_B, "echo 'test'", {
       cwd: process.cwd(),
       displayName: "test",
     });
@@ -258,7 +277,7 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    await manager.cleanup("workspace-b");
+    await manager.cleanup(WS_B);
     tempDir[Symbol.dispose]();
   });
 
@@ -272,7 +291,7 @@ describe("bash_output tool", () => {
     config.backgroundProcessManager = manager;
 
     // Spawn a process that exits quickly
-    const spawnResult = await manager.spawn(runtime, "test-workspace", "echo 'done'", {
+    const spawnResult = await manager.spawn(runtime, TEST_WS, "echo 'done'", {
       cwd: process.cwd(),
       displayName: "test",
     });
@@ -281,8 +300,7 @@ describe("bash_output tool", () => {
       throw new Error("Failed to spawn process");
     }
 
-    // Wait for process to exit
-    await new Promise((r) => setTimeout(r, 200));
+    expect(await readExitCodeWhenWritten(spawnResult.outputDir)).toBe("0");
 
     const tool = createBashOutputTool(config);
     const result = (await tool.execute!(
@@ -297,9 +315,9 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
-  });
+  }, 15_000);
 
   it("should block and wait for output when timeout_secs > 0", async () => {
     const tempDir = new TestTempDir("test-bash-output");
@@ -318,7 +336,7 @@ describe("bash_output tool", () => {
     // This avoids flakiness from the spawn call itself taking a non-trivial amount of time.
     const spawnResult = await manager.spawn(
       runtime,
-      "test-workspace",
+      TEST_WS,
       `while [ ! -f "${signalPath}" ]; do sleep 0.1; done; echo 'delayed output'`,
       { cwd: process.cwd(), displayName: processId }
     );
@@ -351,7 +369,7 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
   });
 
@@ -368,7 +386,7 @@ describe("bash_output tool", () => {
     const processId = `quick-exit-${Date.now()}`;
 
     // Spawn a process that exits quickly
-    const spawnResult = await manager.spawn(runtime, "test-workspace", "echo 'quick exit'", {
+    const spawnResult = await manager.spawn(runtime, TEST_WS, "echo 'quick exit'", {
       cwd: process.cwd(),
       displayName: processId,
     });
@@ -377,8 +395,7 @@ describe("bash_output tool", () => {
       throw new Error("Failed to spawn process");
     }
 
-    // Wait for process to exit
-    await new Promise((r) => setTimeout(r, 200));
+    expect(await readExitCodeWhenWritten(spawnResult.outputDir)).toBe("0");
 
     const tool = createBashOutputTool(config);
 
@@ -398,9 +415,9 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
-  });
+  }, 15_000);
 
   it("should wait full timeout duration when no output and process running", async () => {
     const tempDir = new TestTempDir("test-bash-output");
@@ -414,7 +431,7 @@ describe("bash_output tool", () => {
     const processId = `long-sleep-${Date.now()}`;
 
     // Spawn a process that sleeps for a long time with no output
-    const spawnResult = await manager.spawn(runtime, "test-workspace", "sleep 30", {
+    const spawnResult = await manager.spawn(runtime, TEST_WS, "sleep 30", {
       cwd: process.cwd(),
       displayName: processId,
     });
@@ -444,7 +461,7 @@ describe("bash_output tool", () => {
 
     // Cleanup
     await manager.terminate(spawnResult.processId, { monitorDisposition: "discard" });
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
   });
 
@@ -460,7 +477,7 @@ describe("bash_output tool", () => {
     const processId = `no-wait-${Date.now()}`;
 
     // Spawn a process that sleeps (no immediate output)
-    const spawnResult = await manager.spawn(runtime, "test-workspace", "sleep 30", {
+    const spawnResult = await manager.spawn(runtime, TEST_WS, "sleep 30", {
       cwd: process.cwd(),
       displayName: processId,
     });
@@ -488,7 +505,7 @@ describe("bash_output tool", () => {
 
     // Cleanup
     await manager.terminate(spawnResult.processId, { monitorDisposition: "discard" });
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
   });
 
@@ -504,7 +521,7 @@ describe("bash_output tool", () => {
     const processId = `abort-test-${Date.now()}`;
 
     // Spawn a long-running process with no output
-    const spawnResult = await manager.spawn(runtime, "test-workspace", "sleep 60", {
+    const spawnResult = await manager.spawn(runtime, TEST_WS, "sleep 60", {
       cwd: process.cwd(),
       displayName: processId,
     });
@@ -538,7 +555,7 @@ describe("bash_output tool", () => {
 
     // Cleanup
     await manager.terminate(spawnResult.processId, { monitorDisposition: "discard" });
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
   });
 
@@ -554,7 +571,7 @@ describe("bash_output tool", () => {
     const processId = `queued-msg-test-${Date.now()}`;
 
     // Spawn a long-running process with no output
-    const spawnResult = await manager.spawn(runtime, "test-workspace", "sleep 60", {
+    const spawnResult = await manager.spawn(runtime, TEST_WS, "sleep 60", {
       cwd: process.cwd(),
       displayName: processId,
     });
@@ -565,15 +582,23 @@ describe("bash_output tool", () => {
 
     const tool = createBashOutputTool(config);
 
-    // Queue a message after 200ms
-    setTimeout(() => manager.setMessageQueued("test-workspace", true), 200);
+    // Change the live queue decision only after this output wait has sampled it.
+    let queued = false;
+    const waiting = Promise.withResolvers<void>();
+    config.hasQueuedMessages = () => {
+      waiting.resolve();
+      return queued;
+    };
 
     // Call with long timeout - should be interrupted by queued message
     const start = Date.now();
-    const result = (await tool.execute!(
+    const resultPromise = tool.execute!(
       { process_id: spawnResult.processId, timeout_secs: 30 },
       mockToolCallOptions
-    )) as BashOutputToolResult;
+    ) as Promise<BashOutputToolResult>;
+    await waiting.promise;
+    queued = true;
+    const result = await resultPromise;
     const elapsed = Date.now() - start;
 
     expect(result.success).toBe(true);
@@ -582,13 +607,11 @@ describe("bash_output tool", () => {
       expect(result.output).toBe("(waiting interrupted)");
       // Should have returned quickly after queued message, not waiting full 30s
       expect(elapsed).toBeLessThan(1000);
-      expect(elapsed).toBeGreaterThan(150); // At least waited until message was queued
     }
 
     // Cleanup
-    manager.setMessageQueued("test-workspace", false);
     await manager.terminate(spawnResult.processId, { monitorDisposition: "discard" });
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
   });
 });

@@ -23,6 +23,7 @@ import { AgentSession, type AgentSessionChatEvent } from "../node/services/agent
 import { CodexOauthService } from "../node/services/codexOauthService";
 import { CoderOauthService } from "../node/services/coderOauthService";
 import { ProviderService } from "../node/services/providerService";
+import { AgentResourceLimitsService } from "../node/services/agentResourceLimits/agentResourceLimitsService";
 import { createCoreServices } from "../node/services/coreServicesRoot";
 import { closeScopeBounded, disposeAppRuntime } from "../node/services/di/appRuntime";
 import {
@@ -625,6 +626,11 @@ async function main(): Promise<number> {
     realProviderService
   );
   turnRequestBuilderBindings.coderOauthService = coderOauthService;
+
+  // The agent commands of this run start from this process, so it applies the limits that
+  // Settings saved in the real config, as the server does.
+  const agentResourceLimits = new AgentResourceLimitsService(realConfig);
+  await agentResourceLimits.start();
 
   // CLI-only exit code control: allows agent to set the process exit code
   // Useful for CI workflows where the agent should block merge on failure
@@ -1506,6 +1512,10 @@ async function main(): Promise<number> {
                 run: () => backgroundProcessManager.terminateAll(),
               },
             ]),
+        // Hygiene, as in ServiceContainer.dispose: the watches are non-persistent, so they
+        // never hold the process open, but no callback reaches torn-down services.
+        { name: "config.stopWatchingConfigFile", run: () => config.stopWatchingConfigFile() },
+        { name: "agentResourceLimits.dispose", run: () => agentResourceLimits.dispose() },
         // Last: release the Effect runtime that owns the core graph.
         { name: "appRuntime.dispose", run: () => disposeAppRuntime(coreRuntime.managed) },
       ],

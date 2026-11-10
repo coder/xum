@@ -2,7 +2,7 @@ import { type Page } from "@playwright/test";
 import { electronTest as test, electronExpect as expect } from "../electronTest";
 import { getXumE2EEnv } from "../env";
 import {
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_TAB_KEY,
 } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
@@ -31,7 +31,7 @@ async function primeReviewSidebarForWorkspace(page: Page, workspaceId: string): 
       window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
     },
     {
-      collapsedKey: RIGHT_SIDEBAR_COLLAPSED_KEY,
+      collapsedKey: getRightSidebarCollapsedKey(workspaceId),
       diffBaseKey: reviewDiffBaseKey,
       sidebarTabKey: RIGHT_SIDEBAR_TAB_KEY,
     }

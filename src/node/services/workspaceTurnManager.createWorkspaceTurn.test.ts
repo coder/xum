@@ -112,6 +112,44 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
+  test("createWorkspaceTurn bases a worktree owner's new workspace on the branch its checkout is on", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+      workspaceName: "workspace-1",
+    });
+    initGitRepo(projectPath);
+    // An auto-named worktree: workspace.create renamed only its branch, so its name is no branch.
+    const ownerCheckout = path.join(rootDir, "src", "workspace-1");
+    execSync(`git worktree add -b sidebar-k3m9 "${ownerCheckout}"`, {
+      cwd: projectPath,
+      stdio: "ignore",
+    });
+    await config.editConfig((cfg) => {
+      const owner = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === parentId);
+      if (owner == null) throw new Error("the owner must exist");
+      owner.path = ownerCheckout;
+      owner.runtimeConfig = { type: "worktree", srcBaseDir: path.join(rootDir, "src") };
+      return cfg;
+    });
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Summarize the repo",
+      title: "Workspace turn",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    const createCall = createWorkspace.mock.calls[0] as unknown[];
+    expect(createCall[2]).toBe("sidebar-k3m9");
+  });
+
   test("createWorkspaceTurn creates delegated targets without default unrelated-messaging consent", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
@@ -180,6 +218,97 @@ describe("WorkspaceTurnManager", () => {
       },
     });
   });
+
+  // #6426: a project's own plugin agents load only when project plugins are allowed (a trusted
+  // project, no project-automation kill switch), so an explicit workspace-turn agentId naming one
+  // validates only then. createWorkspaceTurn already refuses an untrusted owner project, so the
+  // reachable "not allowed" case is a trusted project under the kill switch.
+  test.each([true, false])(
+    "createWorkspaceTurn validates a project plugin agent id only when project plugins are allowed (allowed: %s)",
+    async (allowed) => {
+      const config = await createTestConfig(rootDir);
+      stubStableIds(config, ["childworkspace", "firstturn", "followuphandle", "followupturn"]);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      const pluginDir = path.join(projectPath, ".mux", "plugins", "repo-plugin");
+      await fsPromises.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(pluginDir, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: "repo-plugin",
+        }),
+        "utf-8"
+      );
+      await fsPromises.writeFile(
+        path.join(pluginDir, "agents", "repo-agent.md"),
+        "---\nname: Repo agent\ndescription: Project plugin agent\nbase: exec\n---\nBody\n",
+        "utf-8"
+      );
+
+      const createWorkspace = mock(async (): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        await config.editConfig((cfg) => {
+          const project = cfg.projects.get(projectPath);
+          assert(project, "test project must exist");
+          project.workspaces.push({
+            path: projectPath,
+            id: "childworkspace",
+            name: "workspace-turn",
+            title: "Workspace turn",
+            createdAt: "2026-06-19T00:00:00.000Z",
+            runtimeConfig: { type: "local" },
+          });
+          return cfg;
+        });
+        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
+      });
+      const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+        const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+        await internal?.onAccepted?.();
+        return Ok(undefined);
+      });
+      const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+      const { taskService } = createWorkspaceTurnManagerHarness(config, {
+        workspaceService: workspaceMocks.workspaceService,
+      });
+
+      const first = await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: parentId,
+        prompt: "Initial turn",
+        title: "Workspace turn",
+        workspace: { mode: "new" },
+      });
+      expect(first.success).toBe(true);
+
+      const previousKillSwitch = process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+      if (allowed) delete process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+      else process.env.XUM_DISABLE_PROJECT_AUTOMATION = "1";
+      let followUp: Awaited<ReturnType<typeof taskService.createWorkspaceTurn>>;
+      try {
+        followUp = await taskService.createWorkspaceTurn({
+          ownerWorkspaceId: parentId,
+          agentId: "repo-agent",
+          prompt: "Use the plugin agent",
+          title: "Plugin agent",
+          workspace: { mode: "existing", workspaceId: "childworkspace" },
+        });
+      } finally {
+        if (previousKillSwitch === undefined) delete process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+        else process.env.XUM_DISABLE_PROJECT_AUTOMATION = previousKillSwitch;
+      }
+
+      if (allowed) {
+        expect(followUp.success).toBe(true);
+        expect(sendMessage).toHaveBeenCalledTimes(2);
+        expect(sendMessage.mock.calls[1]?.[2]).toMatchObject({ agentId: "repo-agent" });
+      } else {
+        expect(followUp.success).toBe(false);
+        if (!followUp.success) {
+          expect(followUp.error).toContain("unknown agentId (repo-agent)");
+        }
+        expect(sendMessage).toHaveBeenCalledTimes(1);
+      }
+    }
+  );
 
   test("createWorkspaceTurn keeps prechecks advisory when the owner has uncommitted agent changes", async () => {
     const config = await createTestConfig(rootDir);
@@ -259,6 +388,50 @@ describe("WorkspaceTurnManager", () => {
       expect(result.error).toContain("no turn was dispatched");
     }
     expect(createWorkspace).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("createWorkspaceTurn names why a plugin agent that Xum loads is refused, not unknown agentId (A4)", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    checkoutOwnerBranch(projectPath, "parent");
+    // A trusted project's own plugin, with an agent file that has no frontmatter.
+    const pluginDir = path.join(projectPath, ".xum", "plugins", "egm");
+    await fsPromises.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "egm",
+      })
+    );
+    await fsPromises.writeFile(path.join(pluginDir, "agents", "broken.md"), "No frontmatter.\n");
+
+    const createWorkspace = makeCreateMockReturning(
+      Ok({ metadata: createWorkspaceTurnMetadata(projectPath) })
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "broken",
+      prompt: "Should not run",
+      title: "Refused plugin agent",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain(
+        "Task.createWorkspaceTurn: invalid-definition: plugin agent broken of egm"
+      );
+      expect(result.error).not.toContain("unknown agentId");
+    }
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
@@ -971,6 +1144,58 @@ describe("WorkspaceTurnManager", () => {
     const childEntry = findWorkspaceInConfig(config, childWorkspaceId);
     expect(childEntry?.agentType).toBe("explore");
     expect(childEntry?.agentId).toBeUndefined();
+  });
+
+  test("createWorkspaceTurn admits a descendant agent workspace when the owner's handle directory has an unreadable entry", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["followhandle", "followturn"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const childWorkspaceId = "reported-child";
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(projectPath, childWorkspaceId),
+        id: childWorkspaceId,
+        name: "agent_explore_reported_child",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        parentWorkspaceId: parentId,
+        agentType: "explore",
+        taskStatus: "reported",
+        reportedAt: "2026-06-19T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+      return cfg;
+    });
+    // A directory where a handle file belongs fails the owner's listing with EISDIR, even as root.
+    await fsPromises.mkdir(
+      path.join(config.sessionsDir, parentId, "task-handles", "wst_unreadable.json"),
+      { recursive: true }
+    );
+
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, { workspaceService });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Follow up",
+      title: "Follow up",
+      allowAgentWorkspace: true,
+      attentionPolicy: "notify_on_terminal",
+      workspace: { mode: "existing", workspaceId: childWorkspaceId },
+    });
+    expect(result.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    const outsider = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Follow up",
+      title: "Follow up",
+      workspace: { mode: "existing", workspaceId: childWorkspaceId },
+    });
+    expect(outsider).toEqual(Err("Task.createWorkspaceTurn: invalid_scope for existing workspace"));
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   test("createWorkspaceTurn existing-target agent override dispatches without persisting AI settings", async () => {

@@ -19,14 +19,14 @@ import {
   cleanupView,
   openProjectCreationView,
   setupTestDom,
-  waitForLatestDraftId,
+  waitForOpenDraftId,
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
-import { getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { resetAiSelectionIntentForTests } from "@/browser/utils/aiSelectionIntent";
 import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
-import { getDraftScopeId, getProjectScopeId } from "@/common/constants/storage";
+import { getCreationDraftScopeId, getDraftScopeId } from "@/common/constants/storage";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 
@@ -38,6 +38,7 @@ interface CreationView {
   view: ReturnType<typeof renderApp>;
   cleanupDom: () => void;
   chat: ChatHarness;
+  draftId: string;
 }
 
 async function setupCreationView(): Promise<CreationView> {
@@ -51,11 +52,10 @@ async function setupCreationView(): Promise<CreationView> {
   const normalizedProjectPath = await addProjectViaUI(view, projectPath);
   await openProjectCreationView(view, normalizedProjectPath);
 
-  const draftId = await waitForLatestDraftId(normalizedProjectPath);
+  const draftId = await waitForOpenDraftId();
 
   const chat = new ChatHarness(view.container, getDraftScopeId(normalizedProjectPath, draftId), {
     kind: "creation",
-    projectPath: normalizedProjectPath,
     draftId,
   });
 
@@ -65,6 +65,7 @@ async function setupCreationView(): Promise<CreationView> {
     view,
     cleanupDom,
     chat,
+    draftId,
   };
 }
 
@@ -77,8 +78,8 @@ describeIntegration("Creation slash commands", () => {
     await cleanupSharedRepo();
   });
 
-  test("/model updates project-scoped model in creation mode", async () => {
-    const { projectPath, view, cleanupDom, chat } = await setupCreationView();
+  test("/model updates the creation draft's model", async () => {
+    const { view, cleanupDom, chat, draftId } = await setupCreationView();
 
     try {
       const alias = "sonnet";
@@ -98,9 +99,7 @@ describeIntegration("Creation slash commands", () => {
 
       await waitFor(
         () => {
-          expect(getUserPreferences().ai?.projectDefaults?.[projectPath]?.model).toBe(
-            expectedModel
-          );
+          expect(getCreationDraftStore().getView(draftId).draft?.ai.model).toBe(expectedModel);
         },
         { timeout: 5_000 }
       );
@@ -144,10 +143,10 @@ describeIntegration("Creation slash commands", () => {
       experimentId: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
       enabled: true,
     });
-    const { projectPath, view, cleanupDom } = await setupCreationView();
+    const { view, cleanupDom, draftId } = await setupCreationView();
 
     try {
-      const projectScopeId = getProjectScopeId(projectPath);
+      const projectScopeId = getCreationDraftScopeId(draftId);
       await waitFor(
         () => {
           expect(getAutoRouting(projectScopeId, "model")).toBe(true);

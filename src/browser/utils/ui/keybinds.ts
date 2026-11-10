@@ -244,17 +244,24 @@ export type ChatPaneScope = "main" | `side:${string}`;
  * resolve through their parent so they follow the same ownership as focused elements.
  */
 export function paneHandlesKeyEvent(scope: ChatPaneScope, target: EventTarget | null): boolean {
+  const sideWorkspaceId = getSideChatPaneWorkspaceId(target);
+  return scope === "main"
+    ? sideWorkspaceId == null
+    : sideWorkspaceId != null && scope === `side:${sideWorkspaceId}`;
+}
+
+/**
+ * The workspace of the /side chat pane that owns the target (the nearest pane marker), or null
+ * when the main pane owns it. Window-level shortcuts use it to act on the focused chat.
+ */
+export function getSideChatPaneWorkspaceId(target: EventTarget | null): string | null {
   const element =
     typeof HTMLElement !== "undefined" && target instanceof HTMLElement
       ? target
       : typeof Node !== "undefined" && target instanceof Node
         ? target.parentElement
         : null;
-  const sidePane = element?.closest(`[${SIDE_CHAT_PANE_ATTR}]`);
-  const sideWorkspaceId = sidePane?.getAttribute(SIDE_CHAT_PANE_ATTR);
-  return scope === "main"
-    ? !sidePane
-    : sideWorkspaceId != null && scope === `side:${sideWorkspaceId}`;
+  return element?.closest(`[${SIDE_CHAT_PANE_ATTR}]`)?.getAttribute(SIDE_CHAT_PANE_ATTR) ?? null;
 }
 
 /**
@@ -476,6 +483,10 @@ export const KEYBINDS = {
   /** Load older transcript messages when pagination is available */
   LOAD_OLDER_MESSAGES: { key: "h", shift: true },
 
+  /** Show newer transcript messages below a detached slice (the pair of LOAD_OLDER_MESSAGES).
+   * Not Shift+L: immersive review's quick like (REVIEW_QUICK_LIKE) uses it. */
+  SHOW_NEWER_MESSAGES: { key: "j", shift: true },
+
   /** Navigate to next workspace in current project */
   NEXT_WORKSPACE: { key: "j", ctrl: true },
 
@@ -486,6 +497,11 @@ export const KEYBINDS = {
   // VS Code-style quick toggle
   // macOS: Cmd+P, Win/Linux: Ctrl+P
   TOGGLE_SIDEBAR: { key: "P", ctrl: true },
+
+  /** Collapse or expand the right sidebar */
+  // VS Code uses this letter for its sidebars. "command": on macOS only Cmd matches, so the
+  // Ctrl form of the chord stays free.
+  TOGGLE_RIGHT_SIDEBAR: { key: "B", ctrl: true, shift: true, macCtrlBehavior: "command" },
 
   /** Cycle through configured models */
   CYCLE_MODEL: { key: "/", ctrl: true },
@@ -555,9 +571,17 @@ export const KEYBINDS = {
    */
   STOP_COMPUTER_USE: { key: "Escape", ctrl: true, shift: true },
 
-  // Expand the background processes strip and focus its first row; again (or Esc) collapses it.
-  // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords.
-  FOCUS_BACKGROUND_PROCESSES: { key: "J", ctrl: true, shift: true },
+  // Open the live line's background bashes, TODO, sub-agents or reviews panel and focus it; again
+  // (or Esc) closes it. All four share one modifier pair so the chips' chords read as one family.
+  // Ctrl/Cmd+Alt, like NEW_SIDEBAR_TAB: Ctrl/Cmd+Shift has no free letters left for them, and
+  // Ctrl+Alt+T is GNOME's terminal. Matched by `code`: Option+letter is a dead key on macOS.
+  // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords
+  // (its secondary side bar toggle takes the "bash" mnemonic letter).
+  // The settings backup chords reuse these keys only inside the Settings dialog.
+  FOCUS_BACKGROUND_PROCESSES: { key: "j", code: "KeyJ", ctrl: true, alt: true },
+  OPEN_TODO_PANEL: { key: "o", code: "KeyO", ctrl: true, alt: true },
+  OPEN_SUB_AGENTS_PANEL: { key: "a", code: "KeyA", ctrl: true, alt: true },
+  OPEN_REVIEWS_PANEL: { key: "r", code: "KeyR", ctrl: true, alt: true },
   // Scoped to a focused row of the background processes strip.
   BACKGROUND_PROCESS_NEXT: { key: "ArrowDown" },
   BACKGROUND_PROCESS_PREV: { key: "ArrowUp" },
@@ -590,8 +614,17 @@ export const KEYBINDS = {
   /** Show the Stats tab full-screen on small viewports, where the right sidebar is hidden */
   OPEN_STATS_DIALOG: { key: "s", shift: true },
 
-  /** Open (or focus) the Artifacts tab in the right sidebar */
+  /** Open or focus the Artifacts tab in the right sidebar, or collapse the sidebar when focus is in it */
   OPEN_ARTIFACTS_TAB: { key: "K", ctrl: true, shift: true },
+
+  /** Agent interface view: switch the main pane between the agent's status page and the chat */
+  TOGGLE_AGENT_INTERFACE_VIEW: { key: "S", ctrl: true, shift: true },
+
+  /** Agent interface view: show or hide the transcript peek under the status page's bar */
+  TOGGLE_STATUS_TRANSCRIPT_PEEK: { key: "p", code: "KeyP", ctrl: true, alt: true, shift: true },
+
+  /** Agent interface view: open Start Here from the agent's last reply, from the status page's bar */
+  STATUS_START_HERE: { key: "h", code: "KeyH", ctrl: true, alt: true, shift: true },
 
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.
@@ -615,9 +648,9 @@ export const KEYBINDS = {
   FIT_ARTIFACT_IMAGE: { key: "0" },
   /** Show an image artifact at actual size (100%) */
   ACTUAL_SIZE_ARTIFACT_IMAGE: { key: "1" },
-  /** Pin the shown artifact version to the project shelf */
+  /** Pin the shown artifact to the project shelf */
   PIN_ARTIFACT_TO_PROJECT_SHELF: { key: "p" },
-  /** Pin the shown artifact version to the global shelf */
+  /** Pin the shown artifact to the global shelf */
   PIN_ARTIFACT_TO_GLOBAL_SHELF: { key: "P", shift: true },
   /** Unpin the selected shelf entry */
   UNPIN_SHELF_ENTRY: { key: "u" },
@@ -747,6 +780,10 @@ export const KEYBINDS = {
   // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
   SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
   SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS: { key: "u", code: "KeyU", ctrl: true, alt: true },
+  // Not Ctrl+Alt+P (PIN_WORKSPACE) or Ctrl+Alt+L (the lock-screen key on several desktops).
+  SETTINGS_BACKUP_TOGGLE_PLUGINS: { key: "x", code: "KeyX", ctrl: true, alt: true },
+  SETTINGS_BACKUP_REVIEW_PLUGINS: { key: "y", code: "KeyY", ctrl: true, alt: true },
+  SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL: { key: "z", code: "KeyZ", ctrl: true, alt: true },
 
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },

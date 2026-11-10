@@ -2,10 +2,13 @@
 // runs this file before the real check (scripts/ tests are not part of the
 // `bun test src` lane).
 import { expect, test } from "bun:test";
+import ts from "typescript";
 import {
   checkSeamComments,
   findSeamComments,
+  findTestHookNames,
   isProductionSource,
+  typescriptProblem,
 } from "./check-test-seam-comments";
 
 const seams = (text: string, file = "src/x.ts") =>
@@ -84,6 +87,94 @@ test("matches honest phrasings without the word test in the seam claim", () => {
     []
   );
   expect(seams("// Some focused tests only need metadata.\nexport const d = 1;")).toEqual([]);
+});
+
+test("matches override-for-tests claims", () => {
+  expect(
+    seams(
+      "export function f(params: {\n  /** Override for tests; production reads the config. */\n  probe?: () => boolean;\n}) {}"
+    )
+  ).toEqual(["2:f.params.probe"]);
+  expect(seams("// Overrides for tests only.\nexport const a = 1;")).toEqual(["1:a"]);
+  expect(seams("// Override for unit tests.\nexport const c = 1;")).toEqual(["1:c"]);
+  // An override that is not for tests stays quiet.
+  expect(seams("// Override for the request timeout.\nexport const b = 1;")).toEqual([]);
+});
+
+test("matches in-tests seam claims, not prose about tests", () => {
+  expect(
+    seams("class Pool {\n  /** Shorten the idle window in tests. */\n  setIdle(ms: number) {}\n}")
+  ).toEqual(["2:Pool.setIdle"]);
+  expect(seams("// Pure getter. Useful in tests for checking state.\nexport const a = 1;")).toEqual(
+    ["1:a"]
+  );
+  expect(seams("// Shorten the idle window in integration tests.\nexport const e = 1;")).toEqual([
+    "1:e",
+  ]);
+  // Prose that mentions tests without claiming the symbol exists for them.
+  expect(
+    seams("// The runner's clock: nodeClock, a TestClock in tests.\nexport const b = 1;")
+  ).toEqual([]);
+  expect(
+    seams(
+      "// The public method is spied/overridden in tests, so call this one.\nexport const c = 1;"
+    )
+  ).toEqual([]);
+  expect(seams("// Force telemetry off in tests/CI and E2E.\nexport const d = 1;")).toEqual([]);
+  // Negated claims say the symbol is not for tests.
+  expect(seams("// This callback must never be called in tests.\nexport const f = 1;")).toEqual([]);
+  expect(seams("// Not used in tests; production only.\nexport const g = 1;")).toEqual([]);
+  expect(seams("// This is not needed in tests.\nexport const h = 1;")).toEqual([]);
+});
+
+test("flags declarations named ...ForTests or ...ForTesting, not their uses", () => {
+  const text = [
+    "export function resetForTests() {}",
+    "class Pool {",
+    "  setIdleForTests(ms: number) {}",
+    "}",
+    "export const visibleForTesting = resetForTests;",
+    'export const api = { "quotedForTests"() {}, ["computedForTests"]: 1 };',
+    'import { importedForTests } from "./x";',
+    "resetForTests();",
+    "pool.clearForTests();",
+    "pool?.clearForTests();",
+    "const { boundForTests } = api;",
+    "export const testsForUsers = 1;",
+    "export const first = 1, laterForTests = 2;",
+    "export class Harness { constructor(public injectedForTests: () => void, plain: number) {} }",
+    "function f() { const innerForTests = 1; }",
+    "export { resetForTests as aliasForTests };",
+    "export enum ModeForTests { A }",
+    "export namespace HooksForTests {}",
+    "export const { exportedBoundForTests, nested: [deepForTests] } = api;",
+  ].join("\n");
+  expect(
+    findTestHookNames("src/x.ts", text).map((hit) => `${hit.line}:${hit.symbol}:${hit.phrase}`)
+  ).toEqual([
+    "1:resetForTests:resetForTests",
+    "3:Pool.setIdleForTests:setIdleForTests",
+    "5:visibleForTesting:visibleForTesting",
+    "6:api.quotedForTests:quotedForTests",
+    "6:api.computedForTests:computedForTests",
+    "13:laterForTests:laterForTests",
+    "14:Harness.injectedForTests:injectedForTests",
+    "15:f.innerForTests:innerForTests",
+    "16:aliasForTests:aliasForTests",
+    "17:ModeForTests:ModeForTests",
+    "18:HooksForTests:HooksForTests",
+    "19:exportedBoundForTests:exportedBoundForTests",
+    "19:deepForTests:deepForTests",
+  ]);
+});
+
+test("explains a missing typescript install instead of crashing", () => {
+  // Without node_modules, Bun resolves `typescript` to a stub that has only `version`.
+  expect(typescriptProblem({ version: "5.9.3", versionMajorMinor: "5.9" })).toContain(
+    "bun install --frozen-lockfile"
+  );
+  expect(typescriptProblem(undefined)).toContain("not installed");
+  expect(typescriptProblem(ts)).toBeUndefined();
 });
 
 test("keys comments on star re-exports by module or namespace", () => {

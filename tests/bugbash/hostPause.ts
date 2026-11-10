@@ -1,8 +1,9 @@
 /**
  * The host pause (#5714). The user decided to pause model-driven bug-bash runs until they run in
  * the bug-bash sandbox. A run is model-driven when a model picks the UI actions: `e2e explore`
- * charters (`make bug-bash`, run.ts), the MCP Apps suite (`agent.act`, `make mcp-apps-e2e`) and
- * any other e2e command that loads these configs. Such a run reads untrusted page and AI text,
+ * charters (`make bug-bash`, run.ts), the MCP Apps suite (`agent.act`, `make mcp-apps-e2e`), the
+ * story suite and the agent repros (`make test-stories`) and any other e2e command that loads
+ * these configs. Such a run reads untrusted page and AI text,
  * and the app that it drives can run commands on this host.
  *
  * Exact-step repros keep running on the host as before: `e2e run` and `e2e list` with
@@ -12,7 +13,8 @@
  *
  * The pause has no override: no env var or flag turns it off. Model-driven runs pass only
  * inside the bug-bash sandbox with a provider proxy for the job (sandbox/inContainer.ts):
- * `e2e explore` there (`make bug-bash`, run.ts), and the MCP Apps suite (mcpapps/hostPause.ts).
+ * `e2e explore` there (`make bug-bash`, run.ts), the MCP Apps suite (mcpapps/hostPause.ts), the
+ * story suite (tests/stories/hostPause.ts) and `e2e run --tag agent` (sandbox/explorerModel.ts).
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -45,6 +47,40 @@ const real = (file: string | undefined) => {
   }
 };
 
+/** Whether this process is an e2e run's worker: it gets no args, and loads the config again. */
+export function isE2eWorker(argv: readonly string[] = process.argv): boolean {
+  const main = real(argv[1]);
+  return main != null && main === real(E2E_WORKER);
+}
+
+/** The `--tag` values of e2e args, and whether they hold a `--tag-mode`. */
+function tagSelection(args: readonly string[]) {
+  const tags: string[] = [];
+  let mode = false;
+  for (let i = 0; i < args.length; i++) {
+    const [name, inline] = args[i].split(/=(.*)/s, 2);
+    if (name === "--tag-mode") mode = true;
+    if (name === "--tag") tags.push(inline ?? args[++i] ?? "");
+  }
+  return { tags, mode };
+}
+
+/**
+ * Whether e2e args select by the `agent` tag alone: one `--tag agent` and no `--tag-mode`. An
+ * `agent`-tagged repro (reproRules.test.ts) needs a model, so only such a run gets one, in a
+ * model-driven sandbox job (sandbox/explorerModel.ts, sandbox/launch.ts). e2e also reads
+ * comma-separated tags, so `--tag agent,x` is not this selection.
+ */
+export function onlyAgentTag(args: readonly string[]): boolean {
+  const { tags, mode } = tagSelection(args);
+  return !mode && tags.length === 1 && tags[0] === "agent";
+}
+
+/** Whether any `--tag` value of e2e args names the `agent` tag, alone or in a comma list. */
+export function namesAgentTag(args: readonly string[]): boolean {
+  return tagSelection(args).tags.some((value) => value.split(",").includes("agent"));
+}
+
 /** The e2e command (`run`, `explore`, ...) of an e2e CLI process, or undefined. */
 export function e2eCommand(argv: readonly string[] = process.argv): string | undefined {
   const main = real(argv[1]);
@@ -63,9 +99,9 @@ export function e2eCommandRefusal(
   env: NodeJS.ProcessEnv = process.env,
   root = "/"
 ): string | null {
-  const main = real(argv[1]);
   // A worker gets no args. Only a CLI run that passed this check forks one.
-  if (main != null && main === real(E2E_WORKER)) return null;
+  if (isE2eWorker(argv)) return null;
+  const main = real(argv[1]);
   if (main == null || main !== real(E2E_CLI))
     return modelDrivenRefusal(`a bug-bash e2e config loaded by ${argv[1] ?? "an unknown script"}`);
   const command = e2eCommand(argv);

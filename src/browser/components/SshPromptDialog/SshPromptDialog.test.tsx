@@ -317,7 +317,7 @@ describe("SshPromptDialog", () => {
       await flushReactWork();
     });
     await waitFor(() => expect(respondMock).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(queryByRole("button", { name: "Reject" })).toBeNull());
+    await waitFor(() => expect(queryByRole("button", { name: "Reject" }) === null).toBe(true));
     expect(queryByText("Prompt expired")).toBeNull();
     expect(respondMock).toHaveBeenNthCalledWith(2, { requestId: "req-1", response: "no" });
   });

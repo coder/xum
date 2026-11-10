@@ -19,6 +19,7 @@ import type { StreamMessageOptions } from "./turnRequestBuilder";
 import { createProposePlanTool } from "./tools/propose_plan";
 import { TestTempDir, createTestToolConfig } from "./tools/testHelpers";
 import { createTestHistoryService } from "./testHistoryService";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 const model = "openai:gpt-4o";
 const sendOptions = { model, agentId: "exec" };
@@ -475,6 +476,7 @@ describe("AgentSession plan-review snapshot capture", () => {
           emitChatEvent: (_workspaceId, message) => emitted.push(message.id),
         },
         {
+          runtimeFactory: nodeRuntimeFactory,
           workspaceId,
           metadata: metadataFor(workspaceId),
           planStorage: createTestPlanStorage(),
@@ -670,6 +672,7 @@ describe("AgentSession plan-review snapshot: an admitted append outlives Stop/fa
                 h.session.emitChatEvent({ ...message, type: "message" }),
             },
             {
+              runtimeFactory: nodeRuntimeFactory,
               workspaceId,
               metadata: metadataFor(workspaceId),
               planStorage: createTestPlanStorage(),

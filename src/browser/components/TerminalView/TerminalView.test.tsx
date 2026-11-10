@@ -42,6 +42,9 @@ let subscribeCallbacks: TerminalSubscribeCallbacks[] = [];
 let terminalInstances: MockTerminal[] = [];
 let unsubscribeMock: ReturnType<typeof mock<() => void>>;
 
+// ghostty-web's open() focuses the terminal, at once and again after a timeout.
+let focusOnOpen = false;
+
 const initMock = mock(() => Promise.resolve());
 const terminalOnExitMock = mock(
   (_input: { sessionId: string }, _options?: { signal?: AbortSignal }) =>
@@ -69,7 +72,10 @@ class MockTerminal {
     this.cols = cols;
     this.rows = rows;
   });
-  blur = mock(() => undefined);
+  textarea: HTMLTextAreaElement | null = null;
+  blur = mock(() => {
+    this.textarea?.blur();
+  });
   focus = mock(() => undefined);
   dispose = mock(() => undefined);
 
@@ -81,7 +87,13 @@ class MockTerminal {
   loadAddon = mock((_addon: unknown) => undefined);
 
   open(container: HTMLElement): void {
-    container.append(document.createElement("textarea"));
+    const textarea = document.createElement("textarea");
+    this.textarea = textarea;
+    container.append(textarea);
+    if (focusOnOpen) {
+      textarea.focus();
+      setTimeout(() => textarea.focus(), 0);
+    }
   }
 
   attachCustomKeyEventHandler = mock((_handler: (ev: KeyboardEvent) => boolean) => undefined);
@@ -176,6 +188,7 @@ describe("TerminalView", () => {
     mockRouter = createRouter();
     subscribeCallbacks = [];
     terminalInstances = [];
+    focusOnOpen = false;
   });
 
   afterEach(() => {
@@ -280,6 +293,23 @@ describe("TerminalView", () => {
     expect(firstOnExit).toHaveBeenCalledTimes(0);
     expect(secondOnExit).toHaveBeenCalledTimes(1);
     expect(secondOnExit.mock.calls[0]?.[0]).toBe(7);
+  });
+
+  // A terminal that must not take focus hands back the focus ghostty-web takes as it opens it:
+  // left on the page body, keystrokes would reach the chat (as after the right sidebar's toggle
+  // expands a sidebar that shows a terminal).
+  test("a terminal opened without autoFocus leaves focus where it was", async () => {
+    focusOnOpen = true;
+    const toggle = document.createElement("button");
+    document.body.append(toggle);
+    toggle.focus();
+
+    renderTerminal(mock((_exitCode: number) => undefined));
+    await waitFor(() => expect(mockRouter.subscribe).toHaveBeenCalledTimes(1));
+    // Past ghostty-web's delayed focus.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+
+    expect(document.activeElement).toBe(toggle);
   });
 
   // The container stays visibility:hidden ("Connecting...") until the first screen state, and a

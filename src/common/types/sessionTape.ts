@@ -58,7 +58,7 @@
  *   support. Version 3 tapes have `masking: "none"` (full content).
  * - Parse every line with the line schemas below, decode each event with
  *   `new RPCJsonSerializer().deserialize({ json: line.event, meta: line.meta })`, and validate
- *   the result with `WorkspaceChatMessageSchema`.
+ *   the result with `OnChatEventSchema` (it includes `message-batch`).
  * - Validate every event. If any line or event is invalid, or the trailer is missing, reject the
  *   tape or flag it as invalid. Never drop individual events silently. Flag `truncated`,
  *   `stopped` and `error` tapes explicitly.
@@ -116,14 +116,6 @@ export const SessionTapeTrailerSchema = z.object({
   }),
 });
 
-export const SessionTapeLineSchema = z.union([
-  SessionTapeHeaderSchema,
-  SessionTapeEventLineSchema,
-  SessionTapeTrailerSchema,
-]);
-
 export type SessionTapeHeader = z.infer<typeof SessionTapeHeaderSchema>;
-export type SessionTapeEventLine = z.infer<typeof SessionTapeEventLineSchema>;
 export type SessionTapeEndReason = z.infer<typeof SessionTapeEndReasonSchema>;
 export type SessionTapeTrailer = z.infer<typeof SessionTapeTrailerSchema>;
-export type SessionTapeLine = z.infer<typeof SessionTapeLineSchema>;

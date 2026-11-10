@@ -25,6 +25,7 @@ import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import { createConfigStores } from "@/node/config";
 import type { Config, ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
@@ -38,7 +39,11 @@ import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRunt
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowService } from "@/node/services/workflows/WorkflowService";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
@@ -95,6 +100,7 @@ interface WorkflowContext {
   codexOauthService: CodexOauthService;
   coderOauthService: CoderOauthService;
   realProviderService: ProviderService;
+  agentResourceLimits: AgentResourceLimitsService;
 }
 
 export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<unknown> {
@@ -221,17 +227,23 @@ async function copyPersistentConfig(
 
 async function disposeWorkflowResources(input: {
   tempDir: DisposableTempDir;
+  config: Config;
   services?: WorkflowServices;
   session?: AgentSession;
   codexOauthService?: CodexOauthService;
   coderOauthService?: CoderOauthService;
   realProviderService?: ProviderService;
+  agentResourceLimits?: AgentResourceLimitsService;
 }): Promise<void> {
   const services = input.services;
   // Same shape as `xum run`'s list: every step is contained, reported, and
   // timed as a `[shutdown]` line; a failing step never skips the ones after it.
   await runBestEffortCleanup(
     [
+      // First: stop the config.json watches before the services go, so no watch callback
+      // reaches a torn-down service. A failed setup stops them too.
+      { name: "config.stopWatchingConfigFile", run: () => input.config.stopWatchingConfigFile() },
+      { name: "agentResourceLimits.dispose", run: () => input.agentResourceLimits?.dispose() },
       ...(services
         ? [
             // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
@@ -273,11 +285,13 @@ async function disposeWorkflowResources(input: {
 async function disposeWorkflowContext(ctx: WorkflowContext): Promise<void> {
   await disposeWorkflowResources({
     tempDir: ctx.tempDir,
+    config: ctx.config,
     services: ctx.services,
     session: ctx.session,
     codexOauthService: ctx.codexOauthService,
     coderOauthService: ctx.coderOauthService,
     realProviderService: ctx.realProviderService,
+    agentResourceLimits: ctx.agentResourceLimits,
   });
 }
 
@@ -286,16 +300,19 @@ async function createWorkflowContext(options: {
   projectDir: string;
 }): Promise<WorkflowContext> {
   const tempDir = new DisposableTempDir("mux-workflow");
+  // Outside the try: the stores only build paths, and the setup-failure cleanup below needs
+  // the run config to stop its config.json watches.
+  const runStores = createConfigStores(tempDir.path);
+  const config = runStores.config;
   let services: WorkflowServices | undefined;
   let session: AgentSession | undefined;
   let codexOauthService: CodexOauthService | undefined;
   let coderOauthService: CoderOauthService | undefined;
   let realProviderService: ProviderService | undefined;
+  let agentResourceLimits: AgentResourceLimitsService | undefined;
   try {
     const realStores = createConfigStores();
     const realConfig = realStores.config;
-    const runStores = createConfigStores(tempDir.path);
-    const config = runStores.config;
     await copyPersistentConfig(realStores, runStores);
 
     const realProvidersStore = realStores.providersConfigStore;
@@ -338,6 +355,10 @@ async function createWorkflowContext(options: {
       realProviderService
     );
     services.turnRequestBuilderBindings.coderOauthService = coderOauthService;
+    // The workflow's agent commands start from this process, so it applies the limits that
+    // Settings saved in the real config, as the server does.
+    agentResourceLimits = new AgentResourceLimitsService(realConfig);
+    await agentResourceLimits.start();
 
     // Const capture: `services` is a `let`, so the deferred sanitize closure
     // below would lose TypeScript's definite-assignment narrowing.
@@ -392,15 +413,18 @@ async function createWorkflowContext(options: {
       codexOauthService,
       coderOauthService,
       realProviderService,
+      agentResourceLimits,
     };
   } catch (error) {
     await disposeWorkflowResources({
       tempDir,
+      config,
       services,
       session,
       codexOauthService,
       coderOauthService,
       realProviderService,
+      agentResourceLimits,
     });
     throw error;
   }
@@ -452,6 +476,7 @@ function createWorkflowService(input: {
           runtimeTempDir: runtime.normalizePath(".xum/tmp", input.ctx.workspacePath),
           workspaceSessionDir,
           trusted: input.ctx.projectTrusted,
+          sessionLocks: input.ctx.services.historyService.locks,
         },
       }),
     resolveWorkflowScript: (scriptPath) =>
@@ -460,6 +485,17 @@ function createWorkflowService(input: {
         runtime,
         workspacePath: input.ctx.workspacePath,
         projectTrusted: input.ctx.projectTrusted,
+        // Outside the agent loop: the headless CLI builds host runtimes.
+        runtimeFactory: nodeRuntimeFactory,
+      }),
+    assertStoredPluginWorkflowReviewed: (stored) =>
+      assertStoredPluginWorkflowReviewed({
+        ...stored,
+        runtime,
+        workspacePath: input.ctx.workspacePath,
+        projectTrusted: input.ctx.projectTrusted,
+        // Outside the agent loop: the headless CLI builds host runtimes.
+        runtimeFactory: nodeRuntimeFactory,
       }),
     getCurrentProjectTrusted: () => input.ctx.projectTrusted,
     runnerId: input.ctx.workspaceId,
@@ -516,6 +552,8 @@ async function runWorkflow(scriptPath: string, options: WorkflowCLIOptions): Pro
       runtime,
       workspacePath: ctx.workspacePath,
       projectTrusted: ctx.projectTrusted,
+      // Outside the agent loop: the headless CLI builds host runtimes.
+      runtimeFactory: nodeRuntimeFactory,
     });
     const result = await workflowService.startWorkflow({
       script,

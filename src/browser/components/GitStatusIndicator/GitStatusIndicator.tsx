@@ -14,6 +14,8 @@ interface GitStatusIndicatorProps {
   tooltipPosition?: "right" | "bottom";
   /** When true, shows blue pulsing styling to indicate agent is working */
   isWorking?: boolean;
+  /** When true, a tap switches between lines and commits instead of opening the divergence dialog. */
+  tapTogglesMode?: boolean;
 }
 
 /**
@@ -27,6 +29,7 @@ export const GitStatusIndicator: React.FC<GitStatusIndicatorProps> = ({
   projectPath,
   tooltipPosition = "right",
   isWorking = false,
+  tapTogglesMode = false,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const trimmedWorkspaceId = workspaceId.trim();
@@ -81,6 +84,7 @@ export const GitStatusIndicator: React.FC<GitStatusIndicatorProps> = ({
       workspaceId={trimmedWorkspaceId}
       isWorking={isWorking}
       isRefreshing={isRefreshing}
+      tapTogglesMode={tapTogglesMode}
     />
   );
 };

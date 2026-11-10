@@ -1,6 +1,6 @@
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { within } from "@storybook/test";
+import { within } from "storybook/test";
 import { SecuritySection } from "./SecuritySection.js";
 import { SettingsSectionStory, setupSecurityStory } from "./settingsStoryUtils.js";
 

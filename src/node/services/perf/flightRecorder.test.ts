@@ -620,6 +620,23 @@ describe("FlightRecorder", () => {
       expect(slowCalls.every((slow) => slow.path === "a.slow" && slow.ok)).toBe(true);
     });
 
+    test("a manual capture keeps its span but does not trip slow-rpc; bash calls still trip", () => {
+      const { recorder, call } = makeRecorder();
+      const trips: Array<{ kind: string; path?: string }> = [];
+      recorder.onTrip((trip) => trips.push(trip));
+      recorder.setEnabled(true);
+      call("perfCaptures.captureNow", 8000);
+      expect(trips).toEqual([]);
+      call("workspace.executeBash", 2500);
+      expect(trips.map((trip) => [trip.kind, trip.path])).toEqual([
+        ["slow-rpc", "workspace.executeBash"],
+      ]);
+      expect(recorder.getSnapshot().rpc.slowCalls.map((span) => span.path)).toEqual([
+        "perfCaptures.captureNow",
+        "workspace.executeBash",
+      ]);
+    });
+
     test("distinct paths are capped and the full snapshot still fits the schema", () => {
       const { recorder, call } = makeRecorder();
       recorder.setEnabled(true);

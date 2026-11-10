@@ -1,17 +1,23 @@
 import { expect, test } from "bun:test";
-import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
+import { getOwn } from "@/common/utils/getOwn";
+import type { MCPSettingsReadSnapshot, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import {
   applySavedSettings,
+  hasUnsavedServerOverrides,
+  settingsErrors,
   SettingsRequests,
+  withSettingsToolRuns,
   type ServerSettingsEntry,
 } from "./serverSettingsEntries";
 
-const snapshot = (units: string): MCPSettingsSnapshot => ({
+const snapshot = (units: string): MCPSettingsReadSnapshot => ({
   properties: { units: { type: "string", title: "Units" } },
   values: { units },
   layout: [],
   warnings: [],
   droppedSettingCount: 0,
+  instanceToken: "instance-1",
+  readId: "read-1",
 });
 
 test("settings requests: only a server's latest request in the current open applies", () => {
@@ -34,13 +40,63 @@ test("settings requests: only a server's latest request in the current open appl
   expect(requests.take(open, "cad").isLatest()).toBe(false);
 });
 
-test("a save's values become the snapshot's values", () => {
+test("a save's snapshot replaces the shown one under the save's request ID", () => {
   const entries: Record<string, ServerSettingsEntry> = {
     cad: { fetchId: 2, snapshot: snapshot("in") },
+    lathe: { notConnected: true },
   };
-  expect(applySavedSettings(entries, "cad", { units: "mm" }).cad).toEqual({
-    fetchId: 2,
+  expect(applySavedSettings(entries, "cad", 5, snapshot("mm")).cad).toEqual({
+    fetchId: 5,
     snapshot: snapshot("mm"),
   });
-  expect(applySavedSettings({}, "cad", { units: "mm" })).toEqual({});
+  // No section to update: an unread or unavailable server keeps its entry.
+  expect(applySavedSettings(entries, "lathe", 5, snapshot("mm")).lathe).toEqual({
+    notConnected: true,
+  });
+  expect(applySavedSettings({}, "cad", 5, snapshot("mm"))).toEqual({});
+});
+
+test("validation errors keep a setting named __proto__", () => {
+  // JSON.parse keeps "__proto__" as an own key, as the IPC payload does.
+  const properties = JSON.parse(
+    '{"__proto__": {"type": "string", "title": "Proto", "maxLength": 1}}'
+  ) as MCPSettingsSnapshot["properties"];
+  const draft = JSON.parse('{"__proto__": "too long"}') as MCPSettingsSnapshot["values"];
+  const errors = settingsErrors(properties, draft);
+  expect(Object.keys(errors)).toEqual(["__proto__"]);
+  expect(getOwn(errors, "__proto__")).toBe("Proto must be at most 1 characters");
+});
+
+test("unsaved server overrides: the server's allowlist or enablement differs from the saved one", () => {
+  const saved = { toolAllowlist: { cad: ["a", "b"], lathe: ["x"] } };
+  expect(hasUnsavedServerOverrides(saved, saved, "cad")).toBe(false);
+  // Deselecting and selecting again reorders the list: it is the saved allowlist.
+  expect(
+    hasUnsavedServerOverrides(saved, { toolAllowlist: { cad: ["b", "a"], lathe: ["x"] } }, "cad")
+  ).toBe(false);
+  expect(
+    hasUnsavedServerOverrides(saved, { toolAllowlist: { cad: ["b"], lathe: ["x"] } }, "cad")
+  ).toBe(true);
+  expect(hasUnsavedServerOverrides(saved, { toolAllowlist: { lathe: ["x"] } }, "cad")).toBe(true);
+  // Another server's edit does not count for cad.
+  expect(hasUnsavedServerOverrides(saved, { toolAllowlist: { cad: ["a", "b"] } }, "cad")).toBe(
+    false
+  );
+  expect(hasUnsavedServerOverrides(saved, { ...saved, disabledServers: ["cad"] }, "cad")).toBe(
+    true
+  );
+  expect(
+    hasUnsavedServerOverrides({ enabledServers: ["cad"] }, { enabledServers: ["cad"] }, "cad")
+  ).toBe(false);
+});
+
+test("tool runs in flight count like saves: per server, until none runs", () => {
+  const runs = {
+    cad: { running: ["cad.reset"], results: {} },
+    lathe: { running: [], results: {} },
+  };
+  expect(withSettingsToolRuns({ cad: 1 }, runs, ["cad", "lathe"])).toEqual({ cad: 2 });
+  expect(withSettingsToolRuns({}, { lathe: runs.lathe }, ["lathe"])).toEqual({});
+  // A server the dialog no longer lists (removed from the config) does not block Save.
+  expect(withSettingsToolRuns({}, runs, ["lathe"])).toEqual({});
 });

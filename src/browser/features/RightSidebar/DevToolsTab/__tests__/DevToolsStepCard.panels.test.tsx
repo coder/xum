@@ -4,34 +4,11 @@ import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../../../../../tests/ui/domGlobals";
 import type { DevToolsStep, DevToolsStepOutput } from "@/common/types/devtools";
 import { DevToolsStepCard } from "../DevToolsStepCard";
+import { makeDevToolsStep } from "./devToolsStepFixture";
 
 // Characterization tests for the expanded card's Input and Output panels and the
 // formatters behind them. Step content comes from replayed JSONL without schema
 // checks, so the fixtures mix well-formed and malformed parts on purpose.
-
-function makeStep(overrides: Partial<DevToolsStep> = {}): DevToolsStep {
-  return {
-    id: "step-1",
-    runId: "run-1",
-    stepNumber: 1,
-    type: "stream",
-    modelId: "claude-sonnet",
-    provider: null,
-    startedAt: "2026-10-13T00:00:00.000Z",
-    durationMs: null,
-    input: null,
-    output: null,
-    usage: null,
-    error: null,
-    rawRequest: null,
-    requestHeaders: null,
-    responseHeaders: null,
-    rawResponse: null,
-    rawChunks: null,
-    inputTransformations: null,
-    ...overrides,
-  };
-}
 
 /** Renders the card expanded and returns the panel under the given heading. */
 function openPanel(step: DevToolsStep, heading: "Input" | "Output") {
@@ -43,7 +20,7 @@ function openPanel(step: DevToolsStep, heading: "Input" | "Output") {
 }
 
 function outputPanel(output: DevToolsStepOutput | null, error: string | null = null) {
-  return openPanel(makeStep({ output, error }), "Output");
+  return openPanel(makeDevToolsStep({ output, error }), "Output");
 }
 
 /** The text of the Output panel's Content block, which renders `output.content`. */
@@ -175,7 +152,7 @@ describe("DevToolsStepCard panels", () => {
   describe("input panel", () => {
     test("shows the latest two prompt messages until asked for all", () => {
       const panel = openPanel(
-        makeStep({
+        makeDevToolsStep({
           input: {
             prompt: [
               { role: "system", content: "be brief" },
@@ -200,20 +177,25 @@ describe("DevToolsStepCard panels", () => {
     });
 
     test("labels a message that is not a record unknown and previews it as is", () => {
-      const panel = openPanel(makeStep({ input: { prompt: ["raw string message"] } }), "Input");
+      const panel = openPanel(
+        makeDevToolsStep({ input: { prompt: ["raw string message"] } }),
+        "Input"
+      );
       expect(panel.getByRole("button", { name: /unknown/ }).textContent).toContain(
         "raw string message"
       );
     });
 
     test("shows the raw input when the prompt is not a message list", () => {
-      const panel = openPanel(makeStep({ input: { prompt: "a bare prompt" } }), "Input");
+      const panel = openPanel(makeDevToolsStep({ input: { prompt: "a bare prompt" } }), "Input");
       expect(panel.getByText(/"prompt": "a bare prompt"/)).toBeTruthy();
       cleanup();
-      expect(openPanel(makeStep(), "Input").getByText("No input recorded")).toBeTruthy();
+      expect(openPanel(makeDevToolsStep(), "Input").getByText("No input recorded")).toBeTruthy();
       cleanup();
       expect(
-        openPanel(makeStep({ input: { prompt: [] } }), "Input").getByText("No prompt messages")
+        openPanel(makeDevToolsStep({ input: { prompt: [] } }), "Input").getByText(
+          "No prompt messages"
+        )
       ).toBeTruthy();
     });
   });

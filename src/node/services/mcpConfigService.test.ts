@@ -11,9 +11,11 @@ import * as os from "os";
 import { Config } from "@/node/config";
 import { MCPConfigService } from "./mcpConfigService";
 import { MCPServerManager } from "./mcpServerManager";
+import { log } from "@/node/services/log";
 import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import type { MCPServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { TelemetryEventPayload } from "@/common/telemetry/payload";
 
 describe("MCPConfigService", () => {
   let tempDir: string;
@@ -300,6 +302,16 @@ describe("MCPConfigService", () => {
     expect(capture).toHaveBeenCalledWith(
       expect.objectContaining({ event: "mcp_server_config_changed" })
     );
+  });
+  // #5755: the existing-server lookup must not read Object.prototype.constructor.
+  test("adding a server named after an Object.prototype key records an add", async () => {
+    const actions: unknown[] = [];
+    const capture = mock((payload: TelemetryEventPayload) => {
+      if (payload.event === "mcp_server_config_changed") actions.push(payload.properties.action);
+    });
+    const apiService = new MCPConfigService(config, { telemetryService: { capture } });
+    await apiService.addForApi({ name: "constructor", command: "node server.js" });
+    expect(actions).toEqual(["add"]);
   });
 });
 
@@ -1233,5 +1245,139 @@ describe("Workspace MCP overrides filtering", () => {
     expect(servers).toEqual({
       "server-c": { transport: "stdio", command: "cmd-c", disabled: false },
     });
+  });
+});
+
+// #2060: a broken mcp.jsonc entry must be visible, never a silent server with an empty command.
+describe("MCPConfigService config problems", () => {
+  let tempDir: string;
+  let service: MCPConfigService;
+  let configPath: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-problems-"));
+    service = new MCPConfigService(new Config(tempDir));
+    configPath = path.join(tempDir, "mcp.jsonc");
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("a syntax error in one entry drops that entry, keeps the others, and names it", async () => {
+    await fs.writeFile(
+      configPath,
+      '{"servers":{"a":{"command":"echo a"},\n"b":{"command" "echo b"}}}'
+    );
+    expect(await service.listServers()).toEqual({
+      a: { transport: "stdio", command: "echo a", disabled: false },
+      // Fail closed: kept disabled, so it still shadows other layers (#2060).
+      b: { transport: "stdio", command: "", disabled: true },
+    });
+    expect(await service.getConfigProblems()).toEqual({
+      path: configPath,
+      problems: [{ line: 2, column: 16, server: "b", message: "colon expected" }],
+    });
+  });
+
+  test("an entry that is not a server is a problem, not a server without a command", async () => {
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({
+        servers: { ok: "echo ok", num: 42, empty: "", nothing: { disabled: true } },
+      })
+    );
+    const listed = await service.listServers();
+    expect(listed.ok.disabled).toBe(false);
+    for (const name of ["num", "empty", "nothing"]) expect(listed[name].disabled).toBe(true);
+    const { problems } = await service.getConfigProblems();
+    expect(problems.map((problem) => problem.server)).toEqual(["num", "empty", "nothing"]);
+    for (const problem of problems) expect(problem.line).toBe(1);
+  });
+
+  test("comments and trailing commas are valid JSONC, not problems", async () => {
+    await fs.writeFile(configPath, '{\n  // note\n  "servers": {\n    "a": "echo a",\n  },\n}\n');
+    expect(await service.getConfigProblems()).toEqual({ path: configPath, problems: [] });
+    expect(Object.keys(await service.listServers())).toEqual(["a"]);
+  });
+
+  test("a problem outside the servers object keeps every server", async () => {
+    await fs.writeFile(configPath, '{"servers":{"a":"echo a"}, "other": }');
+    expect(Object.keys(await service.listServers())).toEqual(["a"]);
+    const { problems } = await service.getConfigProblems();
+    expect(problems).toHaveLength(1);
+    expect(problems[0].server).toBeNull();
+  });
+
+  test("a duplicate servers block keeps the last one, as jsonc.parse did, and blocks saves", async () => {
+    const raw = '{"servers":{"old":"echo old"},\n"servers":{"new":"echo new"}}';
+    await fs.writeFile(configPath, raw);
+    expect(Object.keys(await service.listServers())).toEqual(["new"]);
+    const { problems } = await service.getConfigProblems();
+    expect(problems).toEqual([
+      { line: 1, column: 2, server: null, message: '"servers" appears more than once' },
+    ]);
+    expect((await service.addServer("c", { command: "echo c" })).success).toBe(false);
+    expect(await fs.readFile(configPath, "utf-8")).toBe(raw);
+  });
+
+  test("an invalid last duplicate still wins, so the earlier command does not start", async () => {
+    await fs.writeFile(configPath, '{"servers":{"a":"echo old","a":42}}');
+    expect((await service.listServers()).a).toEqual({
+      transport: "stdio",
+      command: "",
+      disabled: true,
+    });
+  });
+
+  test("a UTF-8 BOM is not a problem, as with jsonc.parse", async () => {
+    await fs.writeFile(configPath, '\uFEFF{"servers":{"a":"echo a"}}');
+    expect(await service.getConfigProblems()).toEqual({ path: configPath, problems: [] });
+    expect(Object.keys(await service.listServers())).toEqual(["a"]);
+  });
+
+  test("a skipped repo-override entry still shadows the global server of that name", async () => {
+    await fs.writeFile(configPath, '{"servers":{"a":"echo global"}}');
+    const projectPath = path.join(tempDir, "repo");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.writeFile(path.join(projectPath, ".xum", "mcp.jsonc"), '{"servers":{"a":42}}');
+    expect((await service.listServers(projectPath, true)).a).toEqual({
+      transport: "stdio",
+      command: "",
+      disabled: true,
+    });
+  });
+
+  test("Settings writes refuse a file with problems and leave its bytes alone", async () => {
+    const raw = '{"servers":{"a":"echo a", "b":{"command" "echo b"}}}';
+    await fs.writeFile(configPath, raw);
+    const results = [
+      await service.addServer("c", { command: "echo c" }),
+      await service.removeServer("a"),
+      await service.setServerEnabled("a", false),
+      await service.setToolAllowlist("a", ["x"]),
+    ];
+    for (const result of results) {
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("colon expected");
+    }
+    expect(await fs.readFile(configPath, "utf-8")).toBe(raw);
+  });
+
+  test("the log warns once per new set of problems", async () => {
+    const warn = spyOn(log, "warn");
+    try {
+      await fs.writeFile(configPath, '{"servers":{"b":{"command" "y"}}}');
+      await service.listServers();
+      await service.listServers();
+      const count = () =>
+        warn.mock.calls.filter((call) => String(call[0]).includes("mcp.jsonc")).length;
+      expect(count()).toBe(1);
+      await fs.writeFile(configPath, '{"servers":{"b":42}}');
+      await service.listServers();
+      expect(count()).toBe(2);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

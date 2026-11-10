@@ -1,7 +1,8 @@
-import { userEvent, waitFor } from "@storybook/test";
+import { userEvent, waitFor } from "storybook/test";
 
 import { appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { openLeftSidebar } from "@/browser/stories/storyPlayHelpers";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 
@@ -32,8 +33,7 @@ export const ScratchCreationWithProjects: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        // Start expanded so the play function can click the sidebar entry
-        // even in mobile viewport modes.
+        // Start the wide sidebar expanded so the play function can click the sidebar entry.
         updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
         return createMockORPCClient({
           projects: new Map([
@@ -49,15 +49,11 @@ export const ScratchCreationWithProjects: AppStory = {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
     try {
+      // Phones start with the drawer closed, and a previous story's play may have left the wide
+      // sidebar collapsed.
+      await openLeftSidebar(storyRoot);
       const newScratchButton = await waitFor(
         () => {
-          // Guard: a previous story's play-function may have left the sidebar
-          // collapsed via localStorage.
-          if (document.documentElement.dataset.leftSidebarCollapsed === "true") {
-            const expandBtn = storyRoot.querySelector<HTMLElement>("[aria-label='Expand sidebar']");
-            if (expandBtn) expandBtn.click();
-            throw new Error("Sidebar collapsed: expanding");
-          }
           const el = storyRoot.querySelector<HTMLElement>("[aria-label='New scratch chat']");
           if (!el) throw new Error("New scratch chat button not found");
           return el;

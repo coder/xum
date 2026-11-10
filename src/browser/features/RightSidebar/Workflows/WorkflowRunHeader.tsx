@@ -118,7 +118,7 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
   return (
     <div className="border-border flex flex-col gap-2.5 border-b pb-3.5">
       <div className="flex items-center gap-2">
-        <span className="text-accent flex min-w-0 items-center gap-2">
+        <span className="text-accent-text flex min-w-0 items-center gap-2">
           <Workflow className="h-[15px] w-[15px] shrink-0" />
           <span className="text-content-primary truncate text-[15px] font-semibold">
             {run.workflow.name}

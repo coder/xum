@@ -13,13 +13,13 @@ import type {
 } from "@/common/config/schemas/appConfigOnDisk";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { SettingsBackup } from "@/common/config/schemas/settingsBackup";
+import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
 import type { z } from "zod";
 import type { ProjectConfigSchema, WorkspaceConfigSchema } from "../orpc/schemas";
 import type { AgentAiDefaults } from "./agentAiDefaults";
 import type { AutoModelRoutingConfig } from "./autoModelRouting";
 import type { RuntimeEnablementId } from "./runtime";
 import type { TaskSettings } from "./tasks";
-import type { LayoutPresetsConfig } from "./uiLayouts";
 import type { ThinkingLevel } from "./thinking";
 import type { GoalDefaults } from "@/constants/goals";
 
@@ -83,15 +83,8 @@ export interface ProjectsConfig {
   userPreferences?: UserPreferences;
   /** Global task settings (agent sub-workspaces, queue limits, nesting depth) */
   taskSettings?: TaskSettings;
-  /** UI layout presets + hotkeys (shared via ~/.xum/config.json). */
-  layoutPresets?: LayoutPresetsConfig;
   /** Let chat transcripts use the full chat pane width instead of the default readable column. */
   chatTranscriptFullWidth?: boolean;
-  /**
-   * Xum Gateway routing preferences (shared via ~/.xum/config.json).
-   * Mirrors browser localStorage so switching server ports doesn't reset the UI.
-   */
-  muxGatewayEnabled?: boolean;
   /** Enable recording AI SDK devtools logs to ~/.xum/sessions/<workspace>/devtools.jsonl */
   llmDebugLogs?: boolean;
   /**
@@ -119,11 +112,14 @@ export interface ProjectsConfig {
   heartbeatDefaultPrompt?: string;
   /** Default heartbeat interval used when a workspace heartbeat does not set its own cadence. */
   heartbeatDefaultIntervalMs?: number;
+  /** CPU and memory that all local agent processes share (Linux cgroup v2). Absent = no limit. */
+  agentResourceLimits?: AgentResourceLimits;
+  /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
+  agentResourceLimitsEnabled?: boolean;
   /** Global defaults for new workspace goals. */
   goalDefaults?: GoalDefaults;
   /** Default evaluation model for workflow `evaluate()` steps (Settings → Tasks & Workflows). */
   evaluationDefaults?: EvaluationDefaults;
-  muxGatewayModels?: string[];
   routePriority?: string[];
   routeOverrides?: Record<string, string>;
   /**

@@ -1162,6 +1162,58 @@ describeIntegration("Runtime integration tests", () => {
         // Cleanup
         await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
       });
+
+      // #5163: the cp -R -P fork inherits the source's whole stash, older entries included. The
+      // snapshot must record each entry, or the task_remove lossy check counts them as the fork's.
+      test("records every inherited stash entry in the source-ref snapshot (#5163)", async () => {
+        const runtime = createSSHRuntime();
+        const projectName = `fork-stash-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+        const layout = getLayout(`/some/path/${projectName}`);
+        const sourceWorkspacePath = getRemoteWorkspacePath(layout, "source");
+        const newWorkspacePath = getRemoteWorkspacePath(layout, "forked");
+        await execSSH(
+          runtime,
+          [
+            `mkdir -p "${sourceWorkspacePath}"`,
+            `cd "${sourceWorkspacePath}"`,
+            `git init -q`,
+            `git config user.email "test@example.com"`,
+            `git config user.name "Test"`,
+            `echo root > root.txt && git add root.txt && git commit -qm root`,
+            `echo one > root.txt && git add root.txt && git stash -q`,
+            `echo two > root.txt && git add root.txt && git stash -q`,
+          ].join(" && ")
+        );
+        const sourceEntries = await execSSH(
+          runtime,
+          `git -C "${sourceWorkspacePath}" rev-list --walk-reflogs refs/stash`
+        );
+        expect(sourceEntries.stdout.trim().split("\n")).toHaveLength(2);
+
+        const initLogger = {
+          logStep(_message: string) {},
+          logStdout(_line: string) {},
+          logStderr(_line: string) {},
+          logComplete(_exitCode: number) {},
+        };
+        const forkResult = await runtime.forkWorkspace({
+          projectPath: `/some/path/${projectName}`,
+          sourceWorkspaceName: "source",
+          newWorkspaceName: "forked",
+          initLogger,
+        });
+        expect(forkResult.success).toBe(true);
+
+        const recorded = await execSSH(
+          runtime,
+          `git -C "${newWorkspacePath}" for-each-ref '--format=%(objectname)' refs/xum/source-snapshot/stash-reflog/`
+        );
+        expect(recorded.stdout.trim().split("\n").sort()).toEqual(
+          sourceEntries.stdout.trim().split("\n").sort()
+        );
+
+        await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
+      });
     });
 
     describe("deleteWorkspace", () => {

@@ -1,6 +1,6 @@
 ---
 name: bug-bash
-description: Run an agent bug bash of the Xum web UI in the bug-bash sandbox (TesterArmy `e2e explore` charters, each in its own locked-down Docker container with a seeded `xum server`), then verify each finding with a failing repro test. Use when asked to "bug bash" Xum, run e2e explore agents or the MCP Apps suite against the app, or try to break the app with AI explorers.
+description: Run an agent bug bash of the Xum web UI in the bug-bash sandbox (TesterArmy `e2e explore` charters, each in its own locked-down Docker container with a seeded `xum server`), then verify each finding with a failing repro test. Use when asked to "bug bash" Xum, run e2e explore agents, the MCP Apps suite or the story tests against the app, or try to break the app with AI explorers.
 ---
 
 # Bug bash in the sandbox
@@ -17,19 +17,31 @@ Xum harness. Where the two differ, follow this skill.
 ## How the sandbox works
 
 - The host pause (`tests/bugbash/hostPause.ts`) refuses every model-driven e2e process on the host
-  with exit 2: `e2e explore`, and every command with `e2e.mcpapps.config.ts`. Outside the sandbox
+  with exit 2: `e2e explore`, and every command with `e2e.mcpapps.config.ts`,
+  `tests/stories/e2e.config.ts` or `tests/stories/e2e.electron.config.ts`. Outside the sandbox
   the agents hold no model, so an `agent.*` step fails with `MODEL_UNAVAILABLE`. No override
   exists. `e2e run` and `e2e list` of exact-step repros still run on the host.
-- `make bug-bash` (`tests/bugbash/run.ts`) and `make mcp-apps-e2e` are the launchers. They run
+- `make bug-bash` (`tests/bugbash/run.ts`), `make mcp-apps-e2e` and `make test-stories` are the
+  launchers. They run
   `tests/bugbash/sandbox/launch.ts`, one container per job.
 - The image `ghcr.io/coder/xum-bugbash-sandbox` (about 1.4 GB, linux/amd64) holds only tools:
-  Node 22, Bun, git and the Chromium of `@e2e-dev/web`'s playwright-core. The runner pulls it only
-  by the digest in `tests/bugbash/sandbox/image.json` and never builds it.
+  Node 22, Bun, git, the Chromium of `@e2e-dev/web`'s playwright-core, and Xvfb plus libgtk-3
+  for Xum Electron (the Electron binary comes from the mounted node_modules).
 - The inputs key (`make bugbash-sandbox-key`) is a hash of the Dockerfile, `build.sh` and the
-  playwright-core version in `bun.lock`. The runner refuses an image whose key differs from the
-  checkout. After a change to any of the three, a maintainer runs the manual workflow
-  "Bug-bash sandbox image" on main and updates `image.json` in a reviewed PR. An e2e update that
-  keeps playwright-core keeps the key, so the image stays valid.
+  playwright-core version in `bun.lock`. Every job, in CI and on your machine, looks up the tag
+  `inputs-<key>` anonymously and verifies its attestation on the host with
+  `gh attestation verify` (main's workflow "Bug-bash sandbox image", `refs/heads/main`). gh needs
+  your `gh auth login` or `GH_TOKEN`. The token stays on the host: no job container gets it.
+  A verified image is pulled by digest.
+- Any other outcome (no tag, a lookup error, no gh, no token, a failed verification) logs the
+  reason, builds the image locally with `build.sh` (local tag, no push, no registry login) or
+  reuses that build, and prints a LOCAL IMAGE warning (a `::warning::` annotation in GitHub
+  Actions). Both images must carry the checkout's key as their inputs label. A local build adds
+  no power: each job already runs its checkout's files, `dist/` and `node_modules/`.
+- An image change lands in one PR: the PR that changes the Dockerfile, `build.sh` or
+  playwright-core runs on a local build. Its merge push runs the workflow "Bug-bash sandbox
+  image" on main, which publishes the image once for each inputs key (a manual run on main
+  retries a failed publish). An e2e update that keeps playwright-core keeps the key, so the image stays valid.
 - The container gets `--network none`, `--read-only`, `--cap-drop ALL`, no-new-privileges, a
   non-root user, 4 GB memory and tmpfs scratch folders. It reads copies of the git-listed files,
   plus `dist/` and `node_modules/` read-only. An env allowlist passes no credential.
@@ -58,7 +70,9 @@ Xum harness. Where the two differ, follow this skill.
 4. Dry run at $0 with no key: `make bug-bash-sandbox-check` (isolation, proxy and export
    refusals against a fake upstream, about 2 minutes) and `make test-bugbash-repros-sandbox` (the
    repros through the launcher on the mock app AI, about 4 minutes). CI's
-   `Test / Bug-bash sandbox` job runs both.
+   `Test / Bug-bash sandbox` job runs both, in the merge queue and on PRs that change
+   `tests/e2e`, `tests/bugbash`, `playwright.config.ts`, `pr.yml`, `Makefile`, `package.json`
+   or `bun.lock`.
 
 ## 2. Plan charters
 
@@ -100,7 +114,7 @@ Options:
   `claude-haiku-5-5`). Adding Opus finds more distinct bugs and needs about $29.
 - `BUGBASH_EFFORT`: low, medium (default), high, xhigh or max. A higher effort raises the
   estimate as a marked guess.
-- `make bug-bash` refuses `BUGBASH_MODEL`, which only `make mcp-apps-e2e` reads.
+- `make bug-bash` refuses `BUGBASH_MODEL`, which only `make mcp-apps-e2e` and `make test-stories` read.
 - Every model-driven job refuses `BUGBASH_SCENARIO`: its `bash-ai-proxy` scenario needs project
   automation, which those jobs turn off.
 
@@ -113,6 +127,73 @@ Suite tests drive flows with `agent.act` in on-screen words and pin each outcome
 `expect`. Use `agent.assert(..., { vision: "only" })` for "is it on screen": the accessibility
 tree also lists off-screen nodes. Prove a new suite test fails on the old `dist/` before the fix
 lands.
+
+Stories: `make test-stories BUGBASH_BUDGET_USD=3` runs three sandbox jobs with `BUGBASH_MODEL`
+(default Sonnet 5.5) and the mock app AI. The first job runs the story tests,
+`tests/stories/*.e2e.ts`: user stories that one plain agent drives with `agent.act` and
+`agent.assert`, each pinned by an exact `expect`. The second job runs the `agent`-tagged repros
+(`e2e run --tag agent`, and no other `--tag` or `--tag-mode`). The third job runs the Electron
+stories, `tests/stories/electron/*.e2e.ts` (`tests/stories/e2e.electron.config.ts`), on Xum
+Electron. `make` stops at the first failed job, so the later jobs then do not run. The budget and the 30-minute deadline apply to each job. `STORIES_ARGS` passes e2e
+arguments to every job. A story config change goes in `tests/stories/e2e.config.ts`, which
+reuses the web target of `tests/bugbash/e2e.config.ts`; both story configs share
+`tests/stories/storyConfig.ts`.
+Electron stories: the target first downloads the Electron binary on the host
+(`make electron-binary`, a prerequisite of `make test-stories`; it needs Node.js), and the
+launcher refuses an Electron job without `node_modules/electron/dist/electron`. In the container,
+`sandbox/entry.ts` starts Xvfb (`:99`, no TCP) for that job only. The target's app,
+`startApp.ts --electron`, seeds XUM_ROOT with tutorials off, writes a control file
+(`tests/bugbash/appControl.ts`) and serves the built `dist/` on 127.0.0.1. The provider
+(`tests/stories/electronProvider.ts`) starts one Xum Electron per attempt with an allowlisted env:
+the mock AI, agent tools, terminals and project automation off, no HTTP API server, and never
+`XUM_ALLOW_MULTIPLE_INSTANCES`. It refuses to start Electron when a switch is missing. In Electron
+the seeded project starts collapsed, and every attempt shares the one seeded root, so a story
+sees the UI state that an earlier one left: use `tests/stories/helpers.ts`
+(`openPlayground`), which works from either state. `app.clearState()`,
+extra headers and locale overrides do not work on this target (one fresh app per attempt).
+The first run, with one smoke story and no agent repro, spent $0.09 at list price and took about
+2 minutes with the build. Each job's results come back to `tests/stories/.e2e/stories-<time>-<pid>/`,
+`tests/stories/.e2e/stories-electron-<time>-<pid>/` (with `electron.log`) and
+`tests/bugbash/.e2e/agent-repros-<time>-<pid>/`, each with its `.proxy.jsonl` and a
+`.spend.json` (the job's spend at list price, its cap and its proxy call counts).
+Replay cache (`tests/bugbash/sandbox/cacheSeed.ts`): each story job records its verified
+`agent.act` steps (e2e read-write mode) into `<output>/cache/`, which comes back with the output.
+To replay them on the next run, make them the seed: `bun tests/stories/summary.ts --next-seed
+tests/stories/.e2e-cache-seed` replaces that folder with the caches of the newest web and Electron
+story jobs, as CI does. Do not copy new entries into an old seed: it only grows until the launcher
+refuses it. A replayed `agent.act` step makes no model call. Each model-driven job still makes one
+probe call before its container starts, and `agent.assert` and `agent.extract` always call the model.
+The folder is git-ignored so that no `git add -A` commits it. The launcher stages it into the
+job (a story job only) and refuses any entry that is not a regular `<sha256>.json` file of 1 MiB
+or less, more than 1000 entries, or more than 128 MiB in all. Each run
+summary counts the outcomes (`Cache N replayed`). An empty or missing seed is a cold run.
+CI: the `Stories` workflow (`.github/workflows/stories.yml`) runs one `make test-stories` with
+Sonnet 5.5 and `BUGBASH_BUDGET_USD=3` (the cap per job) once for each PR in the merge queue
+(pr.yml's `Test / Stories` job calls it), nightly on main and on demand (Actions > Stories > Run
+workflow, on any branch). `Required` waits for it in the queue but counts its result only when the
+repo variable `STORIES_MODE` is `block`. Unset is warn mode: a failure shows but blocks no merge.
+On each push to a PR that is not a draft, pr.yml's `Test / Stories (Haiku)` job runs it with
+Haiku 5.5 and a $1 cap per job (its `model` and `budget_usd` inputs): Haiku on PRs, Sonnet in the
+queue. Sonnet 5.5 judges that lane's story asserts (`judge_model`, which sets
+`BUGBASH_JUDGE_MODEL`), because Haiku missed layout defects on screenshots. The agent repros keep
+Haiku as their judge. Fork and Dependabot PRs skip it. `Required` counts that result only when the repo variable
+`STORIES_PR_MODE` is `block`: warn until 50 PR runs with less than 5% failures. When
+every failed job's proxy record holds a provider 5xx (`bun tests/stories/summary.ts
+--upstream-fault`), the workflow runs `make test-stories` once more. It restores the seed with actions/cache
+(this ref's newest, else main's), writes e2e's page of each job with its spend to the job
+summary (`bun tests/stories/summary.ts`), uploads each job's `report.json` and `.spend.json` as the
+artifact `stories-reports-<attempt>` and, on a failure, the `results/` folders as
+`stories-evidence-<attempt>` (both kept 7 days), and, except in the merge queue, saves the next seed: `bun
+tests/stories/summary.ts --next-seed <dir>` (the caches of the newest web and Electron story
+jobs, less the seed entries either one deleted, at most 1000 entries and 128 MiB). GitHub scopes a saved cache to its ref, and a queue ref is temporary, so a
+merge-queue run saves none. Only the nightly and on-demand runs on main change what main replays. A PR that changes the sandbox image inputs has no verified image yet, so each of its jobs builds the image locally (up to 25 minutes) and warns.
+After the PR lane, pr.yml's `Test / Stories (Haiku) comment` job posts the same page as one PR
+comment, which each push edits (`tests/stories/prComment.ts`; `--dry-run` prints the body). It
+runs the base commit's copy with no install scripts, writes only while the run's commit is still
+the PR head, and is not in `Required`.
+To check state across a server restart, a story imports `test` from `tests/stories/fixtures.ts`
+and calls `xum.restartServer()` (same port and XUM_ROOT), then `app.open()`: e2e's
+`app.restart()` only opens a new page.
 
 ## 4. Read the results
 
@@ -143,7 +224,8 @@ removes only those whose launcher is provably dead on this boot, and exits 3 whe
 for one. Check that container's `xum.bugbash.owner` and `xum.bugbash.checkout` labels with
 `docker inspect`, then `docker rm -f <id>` it. A SIGKILLed launcher also leaves
 `$TMPDIR/xum-bugbash-sandbox/<checkout>/<job>` and a `xum-bugbash-docker-*` folder in `$TMPDIR`:
-remove both by hand.
+remove both by hand. A run without a verified image leaves a local image
+of about 1.4 GB: remove it with `docker image rm xum-bugbash-sandbox:inputs-<key>`.
 
 ## 5. Triage and verify
 
@@ -153,9 +235,11 @@ Xum rules:
 - Check `findings.md` for the charter's app AI mode. In mock mode, "Mock response: ..." replies
   and "model calls are disabled in mock AI mode" errors are expected, not bugs.
 - Read the source (`src/browser/...`) before keeping a finding. Reject explorer mistakes first.
-- A repro goes in `tests/bugbash/repros/<slug>.e2e.ts` (tracked) with exact `screen`, `browser`
-  and `expect` steps, never `agent.*`. `tests/bugbash/reproRules.test.ts` fails on a repro that
-  takes the `agent` fixture.
+- A repro goes in `tests/bugbash/repros/<slug>.e2e.ts` (tracked). Use exact `screen`, `browser`
+  and `expect` steps where they work. A repro may use `agent.*` steps only when each of its tests
+  has the `agent` tag: `tests/bugbash/reproRules.test.ts` fails on a repro that takes the `agent`
+  fixture without it. Every free repro run passes `--exclude-tag agent`, so only a model-driven
+  sandbox job runs these repros: `make test-stories`.
 - Prove every repro: put the bug back in a scratch edit, rebuild, see `ASSERTION_FAILED` on the
   bug's own assertion, then remove the edit and see it pass.
 - Tags: `bugbash` plus the bug ID. Add `mock-only` when the test needs a `[mock:...]` prompt or a
@@ -174,3 +258,10 @@ Xum rules:
 Report confirmed bugs first (title, expected vs actual, root cause `file:line`, steps, video path,
 repro test), then unverified risks, then rejected findings by reason, then the charters run and
 their cost.
+
+When the `artifact` tool is available, attach the latest report as an artifact. Xum offers that
+tool only when the Artifacts experiment is on and `$XUM_SCRATCH_DIR` is set. Write the report to
+`$XUM_SCRATCH_DIR/artifacts/bug-bash-report.md` and publish it with the `artifact` tool. After each
+new round, update that same file and publish it again, so the Artifacts tab keeps one report with a
+version per round. The run folder is git-ignored and local, so the artifact is the copy the user
+can open. Without the tool, give the report in the chat reply only.

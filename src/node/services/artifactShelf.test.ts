@@ -32,7 +32,6 @@ afterEach(async () => {
 
 const meta = (title: string, pinnedAtMs = 1) => ({
   sourceWorkspaceId: "ws-1",
-  version: 1,
   title,
   kind: "markdown" as const,
   pinnedAtMs,
@@ -429,6 +428,23 @@ describe("pin, list, read, unpin", () => {
     await fs.rm(path.join(scopeDir, "a.md", "a.md"));
     await fs.symlink(path.join(outside, "secret.md"), path.join(scopeDir, "a.md", "a.md"));
     expect(await readShelfEntry(shelfRoot, scopeDir, "a.md")).toEqual({ status: "missing" });
+  });
+
+  test("an entry pinned before versions were removed still lists, without a version", async () => {
+    const scopeDir = projectDir();
+    await pinToShelf({
+      shelfRoot,
+      scopeDir,
+      relPath: "old.md",
+      bytes: Buffer.from("old"),
+      meta: meta("Old"),
+    });
+    const metaPath = path.join(scopeDir, "old.md", "meta.json");
+    const stored = JSON.parse(await fs.readFile(metaPath, "utf-8")) as Record<string, unknown>;
+    await fs.writeFile(metaPath, JSON.stringify({ ...stored, version: 3 }));
+    const entries = await listShelfScope(shelfRoot, scopeDir, "project");
+    expect(entries.map((e) => e.name)).toEqual(["old.md"]);
+    expect(entries[0]).not.toHaveProperty("version");
   });
 
   test("malformed meta hides an entry instead of failing the listing", async () => {

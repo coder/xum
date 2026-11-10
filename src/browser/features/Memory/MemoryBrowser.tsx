@@ -22,10 +22,12 @@ import type {
   MemoryConsolidationRecordPayload,
   MemoryConsolidationStatusPayload,
   MemoryFileInfo,
+  MemoryHarvestRecordPayload,
 } from "@/common/orpc/schemas/memory";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getErrorMessage } from "@/common/utils/errors";
+import { formatCostWithDollar } from "@/common/utils/tokens/usageAggregator";
 import { MemoryFileEditor } from "./MemoryFileEditor";
 
 const SCOPE_LABELS: Record<MemoryScope, string> = {
@@ -116,9 +118,7 @@ export function MemoryBrowser(props: MemoryBrowserProps) {
             continue;
           }
           if (!scopes.includes(event.scope)) continue;
-          // A read-side re-ranking (view/recall) leaves the file unchanged:
-          // refresh the list, but do not label the note as agent-edited.
-          if (event.actor === "agent" && event.reason !== "access") {
+          if (event.actor === "agent") {
             setAgentEditedPaths((prev) => {
               if (prev.has(event.path)) return prev;
               const next = new Set(prev);
@@ -449,13 +449,13 @@ function MemoryFileRow(props: MemoryFileRowProps) {
         >
           <span className="truncate">{base}</span>
           {props.agentEdited && (
-            <span className="bg-accent/15 text-accent shrink-0 rounded px-1.5 py-px text-[10px] font-medium">
+            <span className="bg-accent/15 text-accent-text shrink-0 rounded px-1.5 py-px text-[10px] font-medium">
               agent edited
             </span>
           )}
         </button>
         {props.file.pinned && (
-          <Pin className="text-accent h-3.5 w-3.5 shrink-0 fill-current" aria-hidden="true" />
+          <Pin className="text-accent-text h-3.5 w-3.5 shrink-0 fill-current" aria-hidden="true" />
         )}
         {/* Reserved-width actions revealed on hover/focus so rows stay quiet
             at rest without layout shift. */}
@@ -504,10 +504,126 @@ function uniqueConsolidationSummaryLines(
   return lines;
 }
 
-function formatConsolidationRecord(record: MemoryConsolidationRecordPayload | null): string {
+/** What a run's steps cost, as priced from the usage each reported; absent in older records. */
+function formatSpent(spentUsd: number | undefined): string {
+  return spentUsd === undefined ? "" : ` · ${formatCostWithDollar(spentUsd)}`;
+}
+
+/**
+ * Applied ops that touched this scope. One organizer pass writes the same record, with all its
+ * ops, to every scope it covers, so the run's total would repeat on each scope line. A rename
+ * counts in the scope of either end.
+ */
+function countScopeChanges(record: MemoryConsolidationRecordPayload, scope: MemoryScope): number {
+  const prefix = `${MEMORY_VIRTUAL_ROOT}/${scope}/`;
+  return record.ops.filter(
+    (op) => op.applied && (op.path.startsWith(prefix) || op.newPath?.startsWith(prefix) === true)
+  ).length;
+}
+
+/**
+ * A run's cost and why it ended before the model finished (the cost ceiling), so a line that
+ * reads like a finished run does not hide a stopped one.
+ */
+function formatRunCostParts(record: MemoryConsolidationRecordPayload): string[] {
+  const parts: string[] = [];
+  if (record.spentUsd !== undefined) parts.push(formatCostWithDollar(record.spentUsd));
+  if (record.note !== undefined) parts.push(record.note);
+  return parts;
+}
+
+/** A pass writes one record to each scope it covers; its time and trigger identify the pass. */
+function consolidationRunKey(record: MemoryConsolidationRecordPayload): string {
+  return `${record.lastRunAt}:${record.trigger}`;
+}
+
+interface ConsolidationScopeLine {
+  label: string;
+  scope: MemoryScope;
+  record: MemoryConsolidationRecordPayload | null;
+  unavailable?: boolean;
+}
+
+function formatScopeRecord(line: ConsolidationScopeLine, withRunCost: boolean): string {
+  if (line.unavailable === true) return "unavailable";
+  if (line.record === null) return "never";
+  const count = countScopeChanges(line.record, line.scope);
+  return [
+    formatRelativeTime(line.record.lastRunAt),
+    line.record.trigger,
+    `${count} change${count === 1 ? "" : "s"}`,
+    ...(withRunCost ? formatRunCostParts(line.record) : []),
+  ].join(" · ");
+}
+
+/** The run that two or more scope lines show; with three lines, at most one run can. */
+function findSharedRun(
+  lines: ConsolidationScopeLine[]
+): { record: MemoryConsolidationRecordPayload; scopes: MemoryScope[] } | null {
+  for (const line of lines) {
+    if (line.record === null) continue;
+    const key = consolidationRunKey(line.record);
+    const scopes = lines
+      .filter((other) => other.record !== null && consolidationRunKey(other.record) === key)
+      .map((other) => other.scope);
+    if (scopes.length > 1) return { record: line.record, scopes };
+  }
+  return null;
+}
+
+function formatSharedRunLine(shared: ReturnType<typeof findSharedRun>): string | null {
+  if (shared === null) return null;
+  const parts = formatRunCostParts(shared.record);
+  return parts.length === 0 ? null : `Run cost (${shared.scopes.join(", ")}): ${parts.join(" · ")}`;
+}
+
+/**
+ * The scope status lines, plus one line for the cost and note of a run that more than one scope
+ * line shows: repeated on each line, three scopes of a $0.90 run read as $2.70. A run on one
+ * line keeps its cost on that line.
+ */
+function formatConsolidationScopes(status: MemoryConsolidationStatusPayload): {
+  scopeLines: Array<{ label: string; text: string }>;
+  sharedRunLine: string | null;
+} {
+  const lines: ConsolidationScopeLine[] = [
+    { label: "Workspace", scope: "workspace", record: status.workspaceRecord },
+    {
+      label: "Project",
+      scope: "project",
+      record: status.projectAvailable ? status.projectRecord : null,
+      unavailable: !status.projectAvailable,
+    },
+    { label: "Global", scope: "global", record: status.globalRecord },
+  ];
+  const shared = findSharedRun(lines);
+  const scopeLines = lines.map((line) => ({
+    label: line.label,
+    text: formatScopeRecord(line, shared?.scopes.includes(line.scope) !== true),
+  }));
+  return { scopeLines, sharedRunLine: formatSharedRunLine(shared) };
+}
+
+/** Before the first status read: every scope reads "never", as no run is known yet. */
+const NO_CONSOLIDATION_STATUS: MemoryConsolidationStatusPayload = {
+  workspaceRecord: null,
+  projectRecord: null,
+  globalRecord: null,
+  latestHarvestRecord: null,
+  projectAvailable: true,
+};
+
+function formatHarvestRecord(record: MemoryHarvestRecordPayload | null): string {
   if (record === null) return "never";
-  const appliedCount = record.ops.filter((op) => op.applied).length;
-  return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}`;
+  // Records written before the analyzer have no `ops`: their counts are inbox candidates, not edits.
+  const counts =
+    record.ops === undefined
+      ? `${record.acceptedCandidates} accepted / ${record.skippedCandidates} skipped`
+      : `${record.acceptedCandidates} edit${record.acceptedCandidates === 1 ? "" : "s"} / ${record.skippedCandidates} rejected`;
+  // Why a completed run read only part of its epoch (its edit budget ran out, or the cost ceiling
+  // stopped it), so a line that says "completed" does not read as "everything analyzed".
+  const note = record.note === undefined ? "" : ` · ${record.note}`;
+  return `${record.status}: ${counts}${formatSpent(record.spentUsd)}${note}`;
 }
 
 /**
@@ -566,13 +682,10 @@ function ConsolidationFooter(props: {
     }
   };
 
-  const projectLabel =
-    status?.projectAvailable === false
-      ? "unavailable"
-      : formatConsolidationRecord(status?.projectRecord ?? null);
-  const harvestLabel = status?.latestHarvestRecord
-    ? `${status.latestHarvestRecord.status}: ${status.latestHarvestRecord.acceptedCandidates} accepted / ${status.latestHarvestRecord.skippedCandidates} skipped`
-    : "never";
+  const { scopeLines, sharedRunLine } = formatConsolidationScopes(
+    status ?? NO_CONSOLIDATION_STATUS
+  );
+  const harvestLabel = formatHarvestRecord(status?.latestHarvestRecord ?? null);
   const harvestError =
     status?.latestHarvestRecord?.status === "failed" ? status.latestHarvestRecord.error : undefined;
   // One consolidation pass can cover workspace, project, and global memory at
@@ -596,14 +709,18 @@ function ConsolidationFooter(props: {
       >
         {/* Use the shared, portaled tooltip only: a native title duplicates the UI tooltip and ignores z-index. */}
         <div className="text-muted min-w-0 flex-1 space-y-0.5">
-          <div className="counter-nums truncate">
-            Workspace: {formatConsolidationRecord(status?.workspaceRecord ?? null)}
-          </div>
-          <div className="counter-nums truncate">Project: {projectLabel}</div>
-          <div className="counter-nums truncate">
-            Global: {formatConsolidationRecord(status?.globalRecord ?? null)}
-          </div>
-          <div className="counter-nums truncate">Harvest: {harvestLabel}</div>
+          {/* Wrap, never truncate: these lines carry the note that a run stopped at the cost
+              ceiling or read only part of its epoch, and a touch screen cannot open the tooltip
+              that would show the rest. */}
+          {scopeLines.map((line) => (
+            <div key={line.label} className="counter-nums break-words">
+              {line.label}: {line.text}
+            </div>
+          ))}
+          {sharedRunLine !== null && (
+            <div className="counter-nums break-words">{sharedRunLine}</div>
+          )}
+          <div className="counter-nums break-words">Harvest: {harvestLabel}</div>
           {harvestError !== undefined && (
             <div role="alert" className="text-error truncate">
               Harvest error: {harvestError}

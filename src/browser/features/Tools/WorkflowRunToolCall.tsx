@@ -651,7 +651,7 @@ function getEventTone(event: WorkflowRunEvent): "normal" | "success" | "warning"
 function getEventToneClass(event: WorkflowRunEvent): string {
   switch (getEventTone(event)) {
     case "success":
-      return "text-success";
+      return "text-success-text";
     case "warning":
       return "text-warning";
     case "normal":

@@ -65,7 +65,7 @@ export interface StepBudgetInput {
   toolResultTokens?: number;
   /**
    * Assembled estimate of the next provider request (the measure the per-step preflight
-   * enforces), when known. Floors only the hard stop, never the advisory stages.
+   * enforces), when known. Floors the measure both the hard stop and the advisory stages open on.
    */
   nextRequestTokens?: number;
   modelContextLimit: number | null | undefined;
@@ -127,11 +127,13 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   if (input.threshold >= 1) return result;
   // Stages are best-effort. Skip a stage without headroom rather than forcing an early rollover;
   // the final assembled-payload preflight remains authoritative before dispatch. Both stages
-  // open on `projected`, which settlement and the send that publishes the prompt agree on.
+  // open on `hardProjected`, the measure their headroom check and the hard stop use, and the
+  // next turn start decides them on its own estimate too. Opening on provider usage instead let
+  // an estimate above that usage close a stage's band before it opened (#5223).
   if (
     !input.handoffRequested &&
     hardProjected + WARNING_RESERVE_TOKENS < hardCeiling &&
-    projected >= getContextBudgetHandoffPoint(limit, input.threshold)
+    hardProjected >= getContextBudgetHandoffPoint(limit, input.threshold)
   ) {
     return { ...result, decision: "handoff" };
   }
@@ -139,7 +141,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   if (
     input.finalHandoffAvailable &&
     hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling &&
-    projected >= getContextBudgetFinalPoint(limit)
+    hardProjected >= getContextBudgetFinalPoint(limit)
   ) {
     return { ...result, decision: "final" };
   }
@@ -154,6 +156,26 @@ export function estimateToolResultSize(result: unknown): {
   return measureBudgetContent(result);
 }
 
+type BudgetContentKind =
+  | "json"
+  | "messages"
+  | "message"
+  | "parts"
+  | "part"
+  | "assistant-parts"
+  | "assistant-part"
+  | "output"
+  | "output-parts"
+  | "output-part"
+  | "request-options";
+
+const BUDGET_ITEM_KIND: Partial<Record<BudgetContentKind, BudgetContentKind>> = {
+  messages: "message",
+  parts: "part",
+  "assistant-parts": "assistant-part",
+  "output-parts": "output-part",
+};
+
 function measureBudgetContent(
   result: unknown,
   textParts?: string[],
@@ -165,23 +187,9 @@ function measureBudgetContent(
   let toolResultChars = 0;
   let imageParts = 0;
   const ancestors = new Set<object>();
-  const stack: Array<{
-    value: unknown;
-    leave?: boolean;
-    kind?:
-      | "json"
-      | "messages"
-      | "message"
-      | "parts"
-      | "part"
-      | "assistant-parts"
-      | "assistant-part"
-      | "reasoning-options"
-      | "openai-reasoning-options"
-      | "tool-result-options"
-      | "mux-tool-result-options"
-      | "output";
-  }> = [{ value: result, kind }];
+  const stack: Array<{ value: unknown; leave?: boolean; kind?: BudgetContentKind }> = [
+    { value: result, kind },
+  ];
   while (stack.length > 0) {
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const entry = stack.pop()!;
@@ -218,18 +226,8 @@ function measureBudgetContent(
     stack.push({ value, leave: true });
     toolResultChars += 2;
     if (Array.isArray(value)) {
-      for (const child of value)
-        stack.push({
-          value: child,
-          kind:
-            entry.kind === "messages"
-              ? "message"
-              : entry.kind === "assistant-parts"
-                ? "assistant-part"
-                : entry.kind === "parts"
-                  ? "part"
-                  : "json",
-        });
+      const itemKind = (entry.kind && BUDGET_ITEM_KIND[entry.kind]) ?? "json";
+      for (const child of value) stack.push({ value: child, kind: itemKind });
       toolResultChars += value.length;
       continue;
     }
@@ -239,7 +237,8 @@ function measureBudgetContent(
     // Tool JSON can impersonate SDK part shapes. Only direct model-message/fresh
     // attachment parts get SDK media semantics; canonical tool wrappers are also
     // safe because the shared attachment sanitizer removes their data recursively.
-    const isPart = entry.kind === "part" || entry.kind === "assistant-part";
+    const messagePart = entry.kind === "part" || entry.kind === "assistant-part";
+    const isPart = messagePart || entry.kind === "output-part";
     const image = isPart && record.type === "image" && "image" in record;
     const inlineText =
       typeof record.data === "object" &&
@@ -260,22 +259,12 @@ function measureBudgetContent(
         (urlMedia && key === "url")
       )
         continue;
-      // Ciphertext length does not measure reasoning tokens. Provider usage tracks the underlying reasoning.
-      // Exclude only the SDK replay field; identical keys in user/tool JSON must still count.
-      if (
-        entry.kind === "openai-reasoning-options" &&
-        key === "reasoningEncryptedContent" &&
-        typeof child === "string"
-      )
-        continue;
-      // The dedupe projection's restoration stash (toolCatalog.ts) never reaches
-      // the wire: adapters serialize only their own providerOptions namespace.
-      if (
-        entry.kind === "mux-tool-result-options" &&
-        key === "rawToolSearchOutput" &&
-        typeof child === "string"
-      )
-        continue;
+      // On model output, providerOptions replays provider metadata (reasoning signatures and
+      // ciphertext, item IDs, cache hints), which providers do not bill as input text.
+      if (key === "providerOptions" && entry.kind === "assistant-part") continue;
+      // Options on user and tool content can reach the model as text (an Anthropic
+      // document's context and title), but adapters never send Xum's own namespace.
+      if (entry.kind === "request-options" && key === "mux") continue;
       toolResultChars += JSON.stringify(key).length + 2;
       textParts?.push(key);
       let childKind: typeof entry.kind = "json";
@@ -284,20 +273,10 @@ function measureBudgetContent(
         else if (record.role === "user" || record.role === "tool") childKind = "parts";
       } else if (isPart && record.type === "tool-result" && key === "output") {
         childKind = "output";
-      } else if (isPart && record.type === "tool-result" && key === "providerOptions") {
-        childKind = "tool-result-options";
-      } else if (entry.kind === "tool-result-options" && key === "mux") {
-        childKind = "mux-tool-result-options";
       } else if (entry.kind === "output" && record.type === "content" && key === "value") {
-        childKind = "parts";
-      } else if (
-        entry.kind === "assistant-part" &&
-        record.type === "reasoning" &&
-        key === "providerOptions"
-      ) {
-        childKind = "reasoning-options";
-      } else if (entry.kind === "reasoning-options" && key === "openai") {
-        childKind = "openai-reasoning-options";
+        childKind = "output-parts";
+      } else if (key === "providerOptions" && (messagePart || entry.kind === "message")) {
+        childKind = "request-options";
       }
       stack.push({ value: child, kind: childKind });
     }

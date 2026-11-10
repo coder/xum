@@ -1,11 +1,13 @@
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAppViewTabKey, makeAppViewTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
+  addTabToFocusedTabset,
   collectAllTabs,
   parseRightSidebarLayoutState,
   selectOrAddTab,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { getRightSidebarLayoutKey } from "@/common/constants/storage";
 import {
   mcpAppSelectionKey,
@@ -15,7 +17,7 @@ import {
 } from "../ArtifactsTab/mcpAppViewsStore";
 
 /**
- * MCP App views as right-sidebar tabs (artifacts experiment): one "app:<viewKey>" tab per view,
+ * MCP App views as right-sidebar tabs (mcp-apps experiment): one "app:<viewKey>" tab per view,
  * keyed by the view's mcpAppSelectionKey. Plugin UIs get their own tab like built-in tools,
  * instead of living in Artifacts (which shows only files the agent created).
  */
@@ -36,6 +38,21 @@ export function withAppViewTab(
   toolCallId: string
 ): RightSidebarLayoutState {
   return selectOrAddTab(state, appViewTabFor(toolCallId));
+}
+
+/**
+ * Add a view's tab to the workspace's saved layout without making it active, unless it has one.
+ * Works whether or not the workspace's sidebar is mounted (it follows the saved layout).
+ */
+export function saveAppViewTab(workspaceId: string, toolCallId: string): void {
+  // With the sidebar's start-tab fallback: a workspace without a saved layout starts the same
+  // way as when its sidebar creates the layout.
+  updateRightSidebarLayout(workspaceId, (layout) => {
+    const tab = appViewTabFor(toolCallId);
+    return collectAllTabs(layout.root).includes(tab)
+      ? layout
+      : addTabToFocusedTabset(layout, tab, false);
+  });
 }
 
 /**

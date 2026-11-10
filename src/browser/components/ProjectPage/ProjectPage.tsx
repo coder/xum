@@ -1,5 +1,4 @@
 import React, { useRef, useCallback, useState, useEffect } from "react";
-import { Menu } from "lucide-react";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { cn } from "@/common/lib/utils";
 import { CREATION_COLUMN_MAX_WIDTH_CLASS } from "@/constants/layout";
@@ -29,20 +28,20 @@ import {
   getAgentsInitNudgeKey,
   getArchivedWorkspacesKey,
   getArchivedWorkspacesExpandedKey,
+  getCreationDraftScopeId,
 } from "@/common/constants/storage";
-import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { CreationDraftGate } from "@/browser/features/ChatInput/CreationDraftGate";
 import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
-import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
-import { Button } from "@/browser/components/Button/Button";
+import { autoFocusUnlessPhone } from "@/browser/utils/env";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { LeftSidebarToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 
 interface ProjectPageProps {
   projectPath: string;
   projectName: string;
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   /** Sub-project path for parent-owned draft creation. */
   pendingSubProjectPath?: string | null;
   /** Draft ID for UI-only workspace creation drafts (from URL) */
@@ -202,7 +201,6 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   projectPath,
   projectName,
   leftSidebarCollapsed,
-  onToggleLeftSidebarCollapsed,
   pendingSubProjectPath,
   pendingDraftId,
   onWorkspaceCreated,
@@ -210,10 +208,13 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   const { api } = useAPI();
   const chatInputRef = useRef<ChatInputAPI | null>(null);
   const pendingAgentsInitSendRef = useRef(false);
-  // #6038: "Run /init" sends through the creation composer, which cannot send while its branch
-  // list loads (or failed). Off until the composer of this scope reports it can send.
-  const creationComposerKey = `${projectPath}:${pendingDraftId ?? "__pending__"}`;
+  // #6038, #6423: "Run /init" sends through the creation composer, so it is off whenever that
+  // composer's Send is off (branch list, Coder presets, a send in flight, ...). Off until the
+  // composer of this scope reports it can send.
+  // Keyed by draft id alone: a project change keeps the same editor (file reads, voice input).
+  const creationComposerKey = pendingDraftId ?? "__pending__";
   const [creationSendBlocked, setCreationSendBlocked] = useCreationSendBlocked(creationComposerKey);
+  const creationScopeId = pendingDraftId ? getCreationDraftScopeId(pendingDraftId) : undefined;
   const [showAgentsInitNudge, setShowAgentsInitNudge] = usePersistedState<boolean>(
     getAgentsInitNudgeKey(projectPath),
     false,
@@ -271,8 +272,12 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   }, [setShowAgentsInitNudge]);
 
   const handleRunAgentsInit = useCallback(() => {
-    // Switch project-scope mode to exec.
-    updateUserPreferences({ ai: { projectDefaults: { [projectPath]: { agentId: "exec" } } } });
+    // Run it in Exec: the draft owns its agent, so a project default would not reach this send.
+    if (pendingDraftId) {
+      getCreationDraftStore().updateExecution(pendingDraftId, {
+        agent: { id: "exec", scope: "built-in" },
+      });
+    }
 
     // Run the /init skill and start the creation chat.
     if (chatInputRef.current) {
@@ -282,19 +287,11 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
       });
     } else {
       pendingAgentsInitSendRef.current = true;
-      getDraftStore().setText(
-        getComposerDraftScope({
-          variant: "creation",
-          workspaceId: null,
-          creationProjectPath: projectPath,
-          pendingDraftId: pendingDraftId ?? undefined,
-        }),
-        "/init"
-      );
+      if (pendingDraftId) getCreationDraftStore().update(pendingDraftId, { text: "/init" });
     }
 
     setShowAgentsInitNudge(false);
-  }, [projectPath, pendingDraftId, setShowAgentsInitNudge]);
+  }, [pendingDraftId, setShowAgentsInitNudge]);
 
   const handleChatReady = useCallback((api: ChatInputAPI) => {
     chatInputRef.current = api;
@@ -311,42 +308,32 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
 
     // Auto-focus the prompt once when entering the creation screen.
     // Defensive: avoid re-focusing on unrelated re-renders (e.g. workspace list updates),
-    // which can move the user's caret.
+    // which can move the user's caret. Phones skip it: focus opens the software keyboard,
+    // which covered the page from the moment the home-screen app launched.
     if (didAutoFocusRef.current) {
       return;
     }
     didAutoFocusRef.current = true;
-    api.focus();
+    autoFocusUnlessPhone(() => api.focus());
   }, []);
 
   return (
-    <AgentProvider projectPath={projectPath}>
-      <ThinkingProvider projectPath={projectPath}>
+    <AgentProvider projectPath={projectPath} scopeId={creationScopeId}>
+      <ThinkingProvider projectPath={projectPath} scopeId={creationScopeId}>
         {/* Flex container to fill parent space */}
         {/* No workspace is open, so this page is the one `main` landmark (#5969). */}
         <main className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
           {/* Draggable header bar - matches WorkspaceMenuBar for consistency */}
           <div
             className={cn(
-              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
-              isDesktopMode() ? "h-10 titlebar-drag" : "h-8"
+              // Same height as the app shell's fixed sidebar toggle bar, which sits over this header
+              // while the sidebar is collapsed.
+              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2",
+              leftSidebarCollapsed && "pl-0",
+              isDesktopMode() ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
             )}
           >
-            {leftSidebarCollapsed && (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onToggleLeftSidebarCollapsed}
-                title="Open sidebar"
-                aria-label="Open sidebar menu"
-                className={cn(
-                  "hidden mobile-menu-btn h-6 w-6 shrink-0 text-muted hover:text-foreground",
-                  isDesktopMode() && "titlebar-no-drag"
-                )}
-              >
-                <Menu className="h-4 w-4" />
-              </Button>
-            )}
+            {leftSidebarCollapsed && <LeftSidebarToggleBarSpacer showNewChat />}
           </div>
           {/* Scrollable content area. mobile-header-spacer keeps content below
               the fixed mobile header on touch devices. */}
@@ -371,19 +358,23 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
                       />
                     )}
                     {/* ChatInput for workspace creation. */}
-                    <ChatInput
-                      // Key by project + draft so project navigation and draft switches both remount
-                      // creation-local state (including any in-flight creation send).
-                      key={creationComposerKey}
-                      variant="creation"
+                    <CreationDraftGate
+                      draftId={pendingDraftId}
                       projectPath={projectPath}
-                      projectName={projectName}
-                      pendingSubProjectPath={pendingSubProjectPath}
-                      pendingDraftId={pendingDraftId}
-                      onReady={handleChatReady}
-                      onCreationSendBlockedChange={setCreationSendBlocked}
-                      onWorkspaceCreated={onWorkspaceCreated}
-                    />
+                      subProjectPath={pendingSubProjectPath ?? null}
+                    >
+                      <ChatInput
+                        key={creationComposerKey}
+                        variant="creation"
+                        projectPath={projectPath}
+                        projectName={projectName}
+                        pendingSubProjectPath={pendingSubProjectPath}
+                        pendingDraftId={pendingDraftId}
+                        onReady={handleChatReady}
+                        onCreationSendBlockedChange={setCreationSendBlocked}
+                        onWorkspaceCreated={onWorkspaceCreated}
+                      />
+                    </CreationDraftGate>
                     {providersLoading ? (
                       <div className="flex items-center justify-center gap-2 py-1.5">
                         <Skeleton className="h-7 w-32" />

@@ -2,7 +2,11 @@ import * as path from "node:path";
 import { listBackupManagedPathSpellings } from "@/common/compat/legacyMux";
 import { VERSION } from "@/version";
 import type { Config } from "@/node/config";
-import type { BackupFileChange, BackupProjectImport } from "@/common/orpc/schemas/backup";
+import {
+  EMPTY_BACKUP_PLUGIN_REPORT,
+  type BackupFileChange,
+  type BackupProjectImport,
+} from "@/common/orpc/schemas/backup";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import {
   MAX_BACKUP_PROJECT_ENTRIES,
@@ -39,6 +43,7 @@ import {
   applyShelfRestore,
   collectShelfBackup,
   measureManagedTree,
+  omitSymlinkedShelfEntries,
   planShelfRestore,
   previewShelfRestore,
   readShelfBackup,
@@ -48,6 +53,12 @@ import {
   writeShelfBackup,
   type ShelfRestoreEntry,
 } from "./artifactShelfBackup";
+import {
+  exportPluginBackup,
+  readPluginRestore,
+  readPluginSidecar,
+  readPriorPluginList,
+} from "./agentPluginBackup";
 import { BackupRepoCache } from "./gitRepo";
 import {
   MAX_BACKUP_FILE_COUNT,
@@ -82,6 +93,8 @@ import {
   mergeBackupPreferences,
   projectBackupPreferences,
   localOnlyPayloadFiles,
+  omitSymlinkedDestinations,
+  omitSymlinkedProjectMemory,
   planRestoreWrites,
   readBackupPayload,
   restoreBackupPayload,
@@ -274,7 +287,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     );
   }
 
-  async function buildPayload(contents: BackupContents, overrides?: { keepLocalSecrets: true }) {
+  async function buildPayload(
+    contents: BackupContents,
+    overrides?: { keepLocalSecrets: true; followSkillLinks: false }
+  ) {
     return await createBackupPayload({
       muxRoot,
       contents,
@@ -283,6 +299,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       sourceLabel: path.basename(muxRoot),
       // The service owns the user-facing override, so report rather than throw.
       reportSecrets: true,
+      followSkillLinks: true,
       ...overrides,
     });
   }
@@ -520,6 +537,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     async exportTo(exportOptions) {
       const payload = await buildPayload(exportOptions.contents);
       const destination = await managedDir(exportOptions.repositoryRoot, exportOptions.managedPath);
+      // The checked-out backup's plugin list, read before the core write clears the managed path:
+      // a push that leaves one of its plugins out removes it from the backup.
+      const priorPlugins = await readPriorPluginList(destination);
       // Owner-only like the safety snapshot: the export copies allowlisted sources that may
       // themselves be owner-only, and it lands here before the secret scan has said anything
       // about it. Git records only the exec bit, so the modes never reach the remote.
@@ -577,6 +597,15 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           },
         ];
       }
+      // The plugin list is a few kilobytes of URLs and commit ids, so it is written before the
+      // shelf measures what is left of the tree's budgets. It joins the same secret scan.
+      const plugins = await exportPluginBackup({
+        muxRoot,
+        destination,
+        contents: exportOptions.contents,
+        prior: priorPlugins,
+      });
+      scanFiles = [...scanFiles, ...plugins.files];
       // The shelf sidecar goes last, into whatever the core payload and bundle left of the
       // managed tree's budgets: an entry that does not fit is skipped and reported rather
       // than failing the whole push over agent output.
@@ -617,6 +646,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         secretFiles,
         secretApproval: backupSecretApprovalDigest(scanFiles, secretFiles),
         shelfSkipped,
+        pluginRemoval: plugins.pluginRemoval,
       };
     },
 
@@ -633,10 +663,14 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           commandApprovals: [],
           projectImports: [],
           projectBundleSkipped: false,
+          plugins: EMPTY_BACKUP_PLUGIN_REPORT,
         };
       }
 
-      const payload = await readBackupPayload(sourceDir, { contents });
+      const { payload, skipped: symlinkSkipped } = await omitSymlinkedDestinations(
+        muxRoot,
+        await readBackupPayload(sourceDir, { contents })
+      );
       // The preflight restore itself runs, so a destination this payload cannot be written to
       // fails here instead of after the user accepts a plan that cannot execute. Recomputed
       // rather than carried over to the restore, for the same reason the approvals are.
@@ -647,7 +681,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       const { localOnly, overwritten } = await localOnlyPayloadFiles(
         muxRoot,
         local.keys(),
-        restoredPaths
+        restoredPaths,
+        new Set(symlinkSkipped)
       );
       const changes: BackupFileChange[] = [];
       for (const file of payload.files) {
@@ -684,6 +719,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
 
       let projectImports: BackupProjectImport[] = [];
       let projectBundleSkipped = false;
+      let memorySymlinkSkipped: string[] = [];
       if (!contents.includeProjects) {
         // Existence-only: with the toggle off the sidecar is never parsed, so a malformed
         // bundle cannot block a core-only preview.
@@ -692,11 +728,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         const bundlePlan = await readBundleWithPlan(sourceDir);
         if (bundlePlan !== null) {
           projectImports = toProjectImports(bundlePlan.plan);
-          changes.push(...(await matchedProjectChanges(bundlePlan.plan)));
+          const memory = await omitSymlinkedProjectMemory(muxRoot, bundlePlan.plan.matched);
+          memorySymlinkSkipped = memory.skipped;
+          changes.push(
+            ...(await matchedProjectChanges({ ...bundlePlan.plan, matched: memory.matched }))
+          );
         }
       }
       const shelfPlan = await readShelfWithPlan(sourceDir, contents);
-      changes.push(...(await previewShelfRestore(muxRoot, shelfPlan.entries)));
+      const shelf = await omitSymlinkedShelfEntries(muxRoot, shelfPlan.entries);
+      changes.push(...(await previewShelfRestore(muxRoot, shelf.entries)));
       return {
         changes: changes.sort((a, b) => a.path.localeCompare(b.path)),
         localOnlyFiles: localOnly,
@@ -708,6 +749,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         projectImports,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
+        plugins: await readPluginRestore({ muxRoot, sourceDir, contents }),
+        symlinkSkipped: [...symlinkSkipped, ...memorySymlinkSkipped, ...shelf.skipped].sort(),
       };
     },
 
@@ -722,7 +765,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           describeMissingBackup(validateOptions.managedPath)
         );
       }
-      const payload = await readBackupPayload(sourceDir, { contents: validateOptions.contents });
+      const { payload, skipped: coreSymlinkSkipped } = await omitSymlinkedDestinations(
+        muxRoot,
+        await readBackupPayload(sourceDir, { contents: validateOptions.contents })
+      );
       assertBackupCommandsApproved(
         await collectMcpCommandApprovals(muxRoot, payload.files, payload.manifest.mcpRedactions),
         validateOptions.approvedCommandTokens
@@ -730,20 +776,38 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // The same preflight the restore runs, so a payload it would refuse is refused here,
       // before the caller takes a safety snapshot it would have no use for.
       await planRestoreWrites(muxRoot, payload);
+      // So is a plugin list this machine cannot read from disk. A list it cannot parse is only
+      // reported, and reading either writes nothing.
+      await readPluginSidecar(sourceDir, validateOptions.contents);
       // A shelf sidecar the restore would refuse is refused before the snapshot, too.
-      await readShelfWithPlan(sourceDir, validateOptions.contents);
+      const shelf = await omitSymlinkedShelfEntries(
+        muxRoot,
+        (await readShelfWithPlan(sourceDir, validateOptions.contents)).entries
+      );
+      const symlinkSkipped = [...coreSymlinkSkipped, ...shelf.skipped].sort();
       if (!validateOptions.contents.includeProjects) {
-        return { hasProjectBundle: false, projectImports: [], matchedProjects: [] };
+        return {
+          hasProjectBundle: false,
+          projectImports: [],
+          matchedProjects: [],
+          symlinkSkipped,
+        };
       }
       // A bundle the restore would refuse is refused here too, for the same reason.
       const bundlePlan = await readBundleWithPlan(sourceDir);
       if (bundlePlan === null) {
-        return { hasProjectBundle: false, projectImports: [], matchedProjects: [] };
+        return {
+          hasProjectBundle: false,
+          projectImports: [],
+          matchedProjects: [],
+          symlinkSkipped,
+        };
       }
+      const memory = await omitSymlinkedProjectMemory(muxRoot, bundlePlan.plan.matched);
       // The matched writes' own refusals (memory size and count limits, non-file
       // destinations) belong to the preflight too: found only inside the restore, they
       // would surface after the core settings were already overwritten.
-      for (const match of bundlePlan.plan.matched) {
+      for (const match of memory.matched) {
         await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match), {
           addOnly: false,
         });
@@ -751,13 +815,12 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // So does the recovery copy: a destination that cannot be snapshotted (a local file
       // past the backup budgets) refuses the restore here, not after the core writes. The
       // restore takes the real snapshot again inside its lock window.
-      if (bundlePlan.plan.matched.length > 0) {
-        await withMemoryLock(() =>
-          collectOverwritableProjectMemory(muxRoot, bundlePlan.plan.matched)
-        );
+      if (memory.matched.length > 0) {
+        await withMemoryLock(() => collectOverwritableProjectMemory(muxRoot, memory.matched));
       }
       return {
         hasProjectBundle: true,
+        symlinkSkipped: [...symlinkSkipped, ...memory.skipped].sort(),
         projectImports: toProjectImports(bundlePlan.plan),
         // The classification the caller validated against, destination included. Restore
         // re-partitions the bundle but only writes entries that resolve to the very same
@@ -781,7 +844,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // write, so nothing can edit a file between its snapshot bytes and its overwrite.
       await writeBackupPayload(
         snapshotRoot,
-        await buildPayload(contents, { keepLocalSecrets: true }),
+        await buildPayload(contents, { keepLocalSecrets: true, followSkillLinks: false }),
         { portable: false, ownerOnly: true }
       );
     },
@@ -789,7 +852,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     async restore(restoreOptions) {
       const sourceDir = await managedDir(restoreOptions.repositoryRoot, restoreOptions.managedPath);
       const contents = restoreOptions.contents;
-      const payload = await readBackupPayload(sourceDir, { contents });
+      const { payload, skipped: symlinkSkipped } = await omitSymlinkedDestinations(
+        muxRoot,
+        await readBackupPayload(sourceDir, { contents }),
+        restoreOptions.symlinkSkipped
+      );
       const before = await localFilesByPath(contents);
 
       const restoreCore = async (
@@ -799,6 +866,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           muxRoot,
           contents,
           payload,
+          symlinkSkipped,
           approvedCommandTokens: restoreOptions.approvedCommandTokens,
         });
         if (result.backupPreferences !== undefined) {
@@ -838,9 +906,18 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // Read and validated before anything changes; written after the settings, since a
       // pinned artifact is the least important part of a restore.
       const shelfPlan = await readShelfWithPlan(sourceDir, contents);
+      const shelf = await omitSymlinkedShelfEntries(
+        muxRoot,
+        shelfPlan.entries,
+        restoreOptions.symlinkSkipped
+      );
+      // Only reported, never written: a plugin comes back through the install review, which is
+      // the consent a restore cannot give on the user's behalf (agentPluginBackup.ts).
+      const plugins = await readPluginRestore({ muxRoot, sourceDir, contents });
       let projectBundleSkipped = false;
       const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
       const memoryChanges: string[] = [];
+      const memorySymlinkSkipped: string[] = [];
       let core: { localOnlyFiles: string[] };
       // The bundle itself is read here — the repo lock holds the checkout stable — but its
       // plan is computed inside the memory lock below, where the inputs it depends on are.
@@ -884,13 +961,13 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
               registered,
               await readProjectMemoryOrigins(muxRoot, registered, bundleSourcePaths(bundle))
             );
-            const matched = plan.matched.filter((match) => validatedMatched.has(planKey(match)));
+            const validated = plan.matched.filter((match) => validatedMatched.has(planKey(match)));
             // A validated match that no longer writes — its project unregistered since, or
             // resolved to a different local project now — is refused rather than dropped:
             // the caller reports unapproved candidates from its validation, so a silently
             // omitted entry would leave a "completed" restore with that project's memory
             // neither written nor offered. Nothing has changed yet; a new preview re-offers it.
-            const stillMatched = new Set(matched.map(planKey));
+            const stillMatched = new Set(validated.map(planKey));
             const dropped = restoreOptions.matchedProjects.find(
               (match) =>
                 !stillMatched.has(
@@ -903,6 +980,15 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
                 `Cannot restore: the project registration for '${dropped.projectPath}' changed since the restore was validated; preview again to continue`
               );
             }
+            // The preflight's skip set, like the core payload's: the snapshot below and the
+            // writes leave out exactly what the caller validated.
+            const memory = await omitSymlinkedProjectMemory(
+              muxRoot,
+              validated,
+              restoreOptions.symlinkSkipped
+            );
+            memorySymlinkSkipped.push(...memory.skipped);
+            const matched = memory.matched;
             if (matched.length > 0) {
               for (const match of matched) {
                 await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match), {
@@ -923,9 +1009,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             // lock, or the registration read above may no longer describe the project set.
             await registration.assertStillOwned();
             const coreResult = await restoreCore(registration);
+            // Again after the core writes, keeping every path skipped above: a memory path
+            // turned into a link meanwhile is left alone (its snapshot copy is already taken)
+            // instead of failing the restore after the settings changed.
+            const writable = await omitSymlinkedProjectMemory(muxRoot, matched, memory.skipped);
+            memorySymlinkSkipped.push(
+              ...writable.skipped.filter((file) => !memory.skipped.includes(file))
+            );
             // Matched entries restore verbatim, exactly what the preview promised. Imports
             // are executed separately by the service, after project registration.
-            for (const match of matched) {
+            for (const match of writable.matched) {
               let written: string[];
               try {
                 await registration.assertStillOwned();
@@ -959,9 +1052,12 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         );
       }
 
+      // Again after the core and memory writes, like the matched memory: an entry turned into
+      // a link meanwhile is left alone instead of failing after the settings changed.
+      const writableShelf = await omitSymlinkedShelfEntries(muxRoot, shelf.entries, shelf.skipped);
       const shelfWritten = await applyShelfRestore({
         xumRoot: muxRoot,
-        entries: shelfPlan.entries,
+        entries: writableShelf.entries,
         snapshotPath: restoreOptions.snapshotPath,
         registeredProjects: registeredProjectDirs(),
       });
@@ -977,6 +1073,13 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         localOnlyFiles: core.localOnlyFiles,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
+        plugins,
+        symlinkSkipped: [
+          ...symlinkSkipped,
+          ...memorySymlinkSkipped,
+          ...shelf.skipped,
+          ...writableShelf.skipped,
+        ].sort(),
         restoredProjectMemory,
       };
     },

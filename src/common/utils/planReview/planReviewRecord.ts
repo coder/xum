@@ -103,10 +103,7 @@ export const PlanReviewRecordSchema = z.discriminatedUnion("kind", [
 
 export type PlanReviewRecord = z.infer<typeof PlanReviewRecordSchema>;
 export type PlanReviewRecordKind = PlanReviewRecord["kind"];
-export type PlanReviewSnapshotRecord = z.infer<typeof PlanReviewSnapshotRecordSchema>;
 export type PlanReviewFeedbackRecord = z.infer<typeof PlanReviewFeedbackRecordSchema>;
-export type PlanReviewFeedbackComment = z.infer<typeof PlanReviewFeedbackCommentSchema>;
-export type PlanReviewFeedbackReply = z.infer<typeof PlanReviewFeedbackReplySchema>;
 
 /**
  * Snapshot content is line-ending-normalized before hashing so anchors map 1:1 across platforms.

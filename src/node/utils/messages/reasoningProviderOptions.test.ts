@@ -128,6 +128,24 @@ describe("attachReasoningReplayMetadata", () => {
     });
   });
 
+  test("persists and replays Vertex thought signatures under the namespace Vertex reads", () => {
+    // @ai-sdk/google-vertex reports metadata under both `googleVertex` and `vertex`.
+    const persisted = reasoningProviderOptionsFromMetadata({
+      googleVertex: { thoughtSignature: "ts_vertex" },
+      vertex: { thoughtSignature: "ts_vertex" },
+    } as ReasoningProviderMetadata);
+    const input = assistantMessage([
+      { type: "reasoning", text: "thinking", providerOptions: persisted },
+      { type: "text", text: "answer" },
+    ]);
+
+    const [output] = attachReasoningReplayMetadata([input]);
+
+    expect(reasoningParts(output)[0].providerMetadata).toEqual({
+      googleVertex: { thoughtSignature: "ts_vertex" },
+    });
+  });
+
   test("forwards Anthropic redacted_thinking data so the SDK replays the block", () => {
     const redacted: ReasoningProviderMetadata = { anthropic: { redactedData: "opaque" } };
     const input = assistantMessage([

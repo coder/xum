@@ -26,7 +26,7 @@ function buildPage() {
   sidebar.append(strip, panel);
   shell.append(chat, sidebar);
   document.body.append(left, shell);
-  return { left, chat, sidebar, strip, panel };
+  return { left, shell, chat, sidebar, strip, panel };
 }
 
 // The full-screen sidebar (outer) can end first while Artifacts fullscreen (inner) stays open,
@@ -64,4 +64,20 @@ test("leaves alone what someone else made inert, before or meanwhile", async () 
   restore();
   expect(page.left.inert).toBe(true);
   expect(page.chat.inert).toBe(true);
+});
+
+// Wide-window fullscreen pins the panel over the workspace shell only (like immersive review): the
+// left sidebar outside the shell must stay usable.
+test("with a root, only content inside the root goes inert", () => {
+  const page = buildPage();
+  const restore = makeOthersInert(page.panel, page.shell);
+  expect([page.left.inert, page.chat.inert, page.strip.inert]).toEqual([false, true, true]);
+  restore();
+  expect([page.left.inert, page.chat.inert, page.strip.inert]).toEqual([false, false, false]);
+});
+
+test("throws when the element is not inside the root", () => {
+  const page = buildPage();
+  expect(() => makeOthersInert(page.left, page.shell)).toThrow("not inside root");
+  expect(() => makeOthersInert(page.shell, page.shell)).toThrow("not inside root");
 });

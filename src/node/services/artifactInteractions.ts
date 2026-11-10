@@ -31,11 +31,11 @@ import type { ORPCContext } from "@/node/orpc/context";
 import { assertArtifactsEnabled, type ArtifactsContext } from "./artifactsOperations";
 import { parseArtifactRelativePath } from "./artifactStore";
 import {
+  describeArtifact,
   getArtifactId,
-  readArtifactIndex,
   readArtifactState,
   writeArtifactState,
-} from "./artifactVersionStore";
+} from "./artifactRecordStore";
 import { log } from "./log";
 import type { HistoryService } from "./historyService";
 import type { SendMessageInternalOptions } from "./taskWorkspaceSeam";
@@ -47,12 +47,12 @@ export const ARTIFACT_INTERACTION_DEDUPE_PREFIX = "artifact-interaction:";
 /** History rows scanned on replay for already-delivered ids (pending records are recent). */
 const REPLAY_HISTORY_SCAN_MESSAGES = 200;
 
+// Records from older builds also hold a `version`, which this schema drops.
 const PendingRecordSchema = z.object({
   id: z.string().min(1),
   workspaceId: z.string().min(1),
   artifactPath: z.string().min(1),
   artifactTitle: z.string(),
-  version: z.number().int().nonnegative(),
   text: z.string(),
   data: z.unknown().optional(),
   createdAtMs: z.number(),
@@ -153,7 +153,7 @@ export function buildArtifactInteractionText(record: PendingArtifactInteraction)
   ).replace(/</g, "\\u003c");
   return (
     `<artifact_interaction artifact="${escapeXmlAttribute(record.artifactPath)}"` +
-    ` title="${escapeXmlAttribute(record.artifactTitle)}" version="${record.version}"` +
+    ` title="${escapeXmlAttribute(record.artifactTitle)}"` +
     ` action="send">${body}</artifact_interaction>`
   );
 }
@@ -165,28 +165,10 @@ export function buildArtifactInteractionMetadata(
     id: record.id,
     artifactPath: record.artifactPath,
     title: record.artifactTitle,
-    version: record.version,
     action: "send",
     text: record.text,
     ...(record.data !== undefined ? { data: record.data } : {}),
   };
-}
-
-/**
- * Which version an interaction refers to, and its title. `version: null` means the live file: it
- * resolves to the latest stored version, or 0 when the file has none yet.
- */
-export async function resolveArtifactInteractionTarget(
-  sessionDir: string,
-  relPath: string,
-  version: number | null
-): Promise<{ artifactId: string; version: number; title: string }> {
-  const artifactId = getArtifactId(relPath);
-  const index = await readArtifactIndex(sessionDir, artifactId);
-  const latest = index?.versions.at(-1);
-  const resolved = version ?? latest?.version ?? 0;
-  const label = index?.versions.find((entry) => entry.version === resolved)?.label;
-  return { artifactId, version: resolved, title: label ?? path.posix.basename(relPath) };
 }
 
 function validateJsonPayload(value: unknown, what: string): string | null {
@@ -228,6 +210,10 @@ async function dispatchPending(
 ): Promise<Result<void, string>> {
   const sessionDir = sessionDirOf(deps, record.workspaceId);
   const sendOptions = await deps.getDefaultSendOptions(record.workspaceId);
+  // Set once the user row is durable and the record is gone. A turn that then fails to start
+  // (e.g. no API key) still returns Err, but the message was delivered: its error shows in the
+  // chat as a stream error. Reporting it as "not sent" offered a Send that duplicated it (#7342).
+  let accepted = false;
   const result = await deps.sendMessage(
     record.workspaceId,
     buildArtifactInteractionText(record),
@@ -244,14 +230,20 @@ async function dispatchPending(
       queueDedupeKey: `${ARTIFACT_INTERACTION_DEDUPE_PREFIX}${record.id}`,
       // Fires once the user row is durable (immediately when idle, at dispatch when queued), so a
       // restart before then still finds the record and re-sends it.
-      onAccepted: () => removePending(sessionDir, record.id),
+      onAccepted: async () => {
+        await removePending(sessionDir, record.id);
+        // Only after the removal: a record left behind could be re-sent by a later startup.
+        // Known limit (#7643): if the removal throws, AgentSession still keeps the row, and the
+        // send is reported as failed although it was delivered.
+        accepted = true;
+      },
       // A queued send the user withdrew (Stop, queue clear) or one that failed before its stream
       // started is settled: replaying it on the next startup would resurrect it.
       onCanceled: () => removePending(sessionDir, record.id),
       onAcceptedPreStreamFailure: () => removePending(sessionDir, record.id),
     }
   );
-  if (!result.success) {
+  if (!result.success && !accepted) {
     // Startup replay keeps the record for the next startup; a live send removes it (its caller
     // reports the error).
     return Err(typeof result.error === "string" ? result.error : JSON.stringify(result.error));
@@ -262,7 +254,7 @@ async function dispatchPending(
 /** A confirmed send from the Artifacts tab: persist, then dispatch. */
 export async function sendArtifactInteraction(
   deps: ArtifactInteractionDeps,
-  input: { workspaceId: string; path: string; version: number | null; text: string; data?: unknown }
+  input: { workspaceId: string; path: string; text: string; data?: unknown }
 ): Promise<Result<{ id: string }, string>> {
   const segments = parseArtifactRelativePath(input.path);
   if (typeof segments === "string") return Err(segments);
@@ -274,13 +266,11 @@ export async function sendArtifactInteraction(
     if (error != null) return Err(error);
   }
   const sessionDir = sessionDirOf(deps, input.workspaceId);
-  const target = await resolveArtifactInteractionTarget(sessionDir, input.path, input.version);
   const record: PendingArtifactInteraction = {
     id: (deps.newId ?? randomUUID)(),
     workspaceId: input.workspaceId,
     artifactPath: segments.join("/"),
-    artifactTitle: target.title,
-    version: target.version,
+    artifactTitle: (await describeArtifact(sessionDir, input.path)).title,
     text: input.text,
     ...(input.data !== undefined ? { data: input.data } : {}),
     createdAtMs: (deps.now ?? Date.now)(),
@@ -369,8 +359,6 @@ export async function listWorkspacesWithPendingInteractions(
   return found;
 }
 
-// window.xum.setState belongs to the artifact, not to one version: a republish keeps what the
-// user picked. Only send() still names a version (the one the user saw when they confirmed).
 export async function getArtifactInteractionState(
   sessionsDir: string,
   input: { workspaceId: string; path: string }
@@ -444,7 +432,7 @@ async function assertRouteWorkspace(
 
 export async function sendInteractionRoute(
   context: InteractionRouteContext,
-  input: { workspaceId: string; path: string; version: number | null; text: string; data?: unknown }
+  input: { workspaceId: string; path: string; text: string; data?: unknown }
 ): Promise<Result<{ id: string }, string>> {
   const missing = await assertRouteWorkspace(context, input.workspaceId);
   if (missing != null) return Err(missing);

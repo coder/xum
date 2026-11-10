@@ -151,16 +151,16 @@ describe("useRouting", () => {
     override?: string;
     expected: string;
   }> = [
-    { availability: { isEnabled: false }, override: undefined, expected: "mux-gateway" },
+    { availability: { isEnabled: false }, override: undefined, expected: "openrouter" },
     {
       availability: { discoveredModels: [], models: [] },
       override: undefined,
-      expected: "mux-gateway",
+      expected: "openrouter",
     },
     {
       availability: { removedModels: ["prod-openai/gpt-6-astra"] },
       override: undefined,
-      expected: "mux-gateway",
+      expected: "openrouter",
     },
     { availability: { isEnabled: false }, override: "direct", expected: "direct" },
     { availability: {}, override: "direct", expected: "coder" },
@@ -171,7 +171,7 @@ describe("useRouting", () => {
       const model = "coder:prod-openai/gpt-6-astra";
       providersConfig = {
         openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-        "mux-gateway": { apiKeySet: true, isEnabled: true, isConfigured: true },
+        openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
         coder: {
           apiKeySet: false,
           isEnabled: true,
@@ -182,7 +182,7 @@ describe("useRouting", () => {
           ...testCase.availability,
         },
       };
-      routePriority = ["mux-gateway", "direct"];
+      routePriority = ["openrouter", "direct"];
       if (testCase.override) routeOverrides = { "openai:gpt-6-astra": testCase.override };
       getProvidersConfigStore().setClient(stubClient);
       getAppConfigStore().setClient(stubClient);
@@ -193,7 +193,7 @@ describe("useRouting", () => {
   );
 
   test("hook instances share one config fetch via the AppConfigStore", async () => {
-    routeOverrides = { "openai:gpt-5.4": "mux-gateway" };
+    routeOverrides = { "openai:gpt-5.4": "openrouter" };
     let configFetchCount = 0;
     const baseGetConfig = configGetConfig;
     configGetConfig = () => {
@@ -228,9 +228,9 @@ describe("useRouting", () => {
     await waitFor(() => expect(result.current.routePriority).toEqual(["direct"]));
 
     act(() => {
-      result.current.setRoutePriority(["mux-gateway", "direct"]);
+      result.current.setRoutePriority(["openrouter", "direct"]);
     });
-    expect(result.current.routePriority).toEqual(["mux-gateway", "direct"]);
+    expect(result.current.routePriority).toEqual(["openrouter", "direct"]);
 
     await waitFor(() => expect(result.current.routePriority).toEqual(["direct"]));
   });

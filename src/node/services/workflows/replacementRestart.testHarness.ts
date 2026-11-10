@@ -32,6 +32,7 @@ import {
   type WorkflowTaskServiceAdapterOptions,
 } from "./WorkflowTaskServiceAdapter";
 import { hashWorkflowStepInput } from "./workflowReplayKey";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 export const FIXTURE_RUN_ID = "wfr_replacement_restart";
 export const FIXTURE_PARENT_ID = "parentrestart1";
@@ -186,6 +187,7 @@ async function end(
     }
   } else {
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: FIXTURE_PARENT_ID,
       workspaceSessionDir: sessionDir(config),
       childTaskId: childId,

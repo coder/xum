@@ -1,4 +1,4 @@
-import * as net from "node:net";
+import { isIP } from "@/node/utils/ipAddress";
 
 /**
  * Pure SSRF target validators shared by outbound fetchers (web_fetch, MCP icon
@@ -23,7 +23,7 @@ export function normalizeHostname(hostname: string): string {
 }
 
 function parseIpv4Octets(address: string): number[] | null {
-  if (net.isIP(address) !== 4) {
+  if (isIP(address) !== 4) {
     return null;
   }
 
@@ -52,7 +52,7 @@ function normalizeIpv6Address(address: string): string {
 
 function parseIpv6Segments(address: string): number[] | null {
   let normalized = normalizeIpv6Address(address);
-  if (net.isIP(normalized) !== 6) {
+  if (isIP(normalized) !== 6) {
     return null;
   }
 

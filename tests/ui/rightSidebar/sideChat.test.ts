@@ -19,9 +19,9 @@ import { workspaceStore, useWorkspaceStoreRaw } from "@/browser/stores/Workspace
 import { SIDE_CHAT_PANE_ATTR } from "@/browser/utils/ui/keybinds";
 import { collectAllTabsWithTabset, dockTabToEdge } from "@/browser/utils/rightSidebarLayout";
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
-import { makeSideChatTabType } from "@/browser/types/rightSidebar";
+import { makeSideChatTabType, NEW_TAB } from "@/browser/types/rightSidebar";
 
-import { getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { getRightSidebarCollapsedKey, getRightSidebarLayoutKey } from "@/common/constants/storage";
 import { updatePersistedState, readPersistedState } from "@/browser/hooks/usePersistedState";
 import { collectAllTabs, type RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { getRetryBarrierDerivation } from "@/browser/components/ChatPane/retryBarrierDerivation";
@@ -30,8 +30,22 @@ import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { preloadTestModules } from "../../ipc/setup";
 import { createStreamCollector } from "../../ipc/streamCollector";
 import { createAppHarness, type AppHarness } from "../harness";
+import { openSidebarNewTab } from "../helpers";
 
 const SIDE_PANE_SELECTOR = `[${SIDE_CHAT_PANE_ATTR}]`;
+/**
+ * A turn that stays live until it is stopped (the mock holds it before its first tool call).
+ * Tests that check a stream is left running use it: the finite [mock:long-stream] (about 18 s of
+ * timers) ended first on a loaded runner, and its deltas re-render the transcript in this same
+ * process, which slowed every other step. In the Escape tests an ended stream would also hide a
+ * listener that stopped the wrong chat.
+ */
+const HELD_TURN = "[mock:tool:parallel-step]";
+/**
+ * Creating a side chat copies and rewrites the parent's history in the backend. At load ~100 it
+ * took up to 10 s, so the earlier 10 s budget (#6375) flaked.
+ */
+const SIDE_CHAT_CREATION_TIMEOUT_MS = 30_000;
 const COMPOSER_SELECTOR = 'textarea[aria-label="Message"]';
 
 function getSidePane(app: AppHarness, workspaceId?: string): HTMLElement | null {
@@ -104,8 +118,57 @@ async function waitForSideChatId(app: AppHarness): Promise<string> {
       expect(sideChats).toHaveLength(1);
       return sideChats[0].id;
     },
+    { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
+  );
+}
+
+/** The tabs of the sidebar layout saved for the main chat. */
+function getSavedSidebarTabs(app: AppHarness): string[] {
+  const layout = readPersistedState<RightSidebarLayoutState | null>(
+    getRightSidebarLayoutKey(app.workspaceId),
+    null
+  );
+  return layout == null ? [] : collectAllTabs(layout.root);
+}
+
+/** Open two side chats from the main chat. Their tabs are then the sidebar's only tabs. */
+async function openTwoSideChats(app: AppHarness): Promise<[string, string]> {
+  await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
+  const first = await waitForSideChatId(app);
+  // A pane mounts once the app has its chat's metadata. Until then a close is ignored, and a
+  // metadata update cannot drop the chat.
+  await waitFor(() => expect(getSidePane(app, first)).not.toBeNull(), { timeout: 10_000 });
+  await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
+  const second = await waitFor(
+    async () => {
+      const others = (await app.env.orpc.workspace.list()).filter(
+        (ws) => ws.sideChatParentWorkspaceId === app.workspaceId && ws.id !== first
+      );
+      expect(others).toHaveLength(1);
+      return others[0].id;
+    },
+    { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
+  );
+  await waitFor(
+    () => {
+      expect(getSidePane(app, second)).not.toBeNull();
+      expect(getSavedSidebarTabs(app).toSorted()).toEqual(
+        [first, second].map((id) => makeSideChatTabType(id)).toSorted()
+      );
+      getSideChatCloseButton(app, first);
+      getSideChatCloseButton(app, second);
+    },
     { timeout: 10_000 }
   );
+  return [first, second];
+}
+
+function getSideChatCloseButton(app: AppHarness, workspaceId: string): HTMLButtonElement {
+  const button = app.view.container.querySelector<HTMLButtonElement>(
+    `[role="tab"][id$="-tab-side:${workspaceId}"] button[aria-label="Close side chat"]`
+  );
+  if (button == null) throw new Error(`Side chat ${workspaceId} has no close button`);
+  return button;
 }
 
 function isStreaming(workspaceId: string): boolean {
@@ -136,7 +199,9 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
   test("the launcher opens idle independent side chats without submitting the main draft or stopping its stream", async () => {
     const app = await createAppHarness({
       branchPrefix: "side-launcher",
-      beforeRender: (workspaceId) =>
+      beforeRender: (workspaceId) => {
+        // This test exercises the expanded launcher's panes, not the collapsed overview.
+        updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
         updatePersistedState(getRightSidebarLayoutKey(workspaceId), {
           version: 1,
           openTabsOnly: true,
@@ -152,7 +217,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
               { type: "tabset", id: "other-pane", tabs: ["costs"], activeTab: "costs" },
             ],
           },
-        }),
+        });
+      },
     });
     const service = app.env.services.toORPCContext().workspaceService;
     const send = jest.spyOn(service, "sendMessage");
@@ -160,8 +226,11 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     parentStream.start();
     try {
       await parentStream.waitForSubscription(10_000);
-      await sendFrom(() => getMainComposer(app), app.workspaceId, "[mock:long-stream] main");
-      expect(await parentStream.waitForEvent("stream-start", 10_000)).not.toBeNull();
+      await sendFrom(() => getMainComposer(app), app.workspaceId, `${HELD_TURN} main`);
+      // The file's first send pays the cold backend send path: at load ~100 it took 5 s from
+      // sendMessage to the model call and 7.5 s from the click to stream-start, so 10 s flaked.
+      // Same stream-start budget as the other tests here (#6215).
+      expect(await parentStream.waitForEvent("stream-start", 30_000)).not.toBeNull();
       const draft = "Keep this unsent main question";
       act(() =>
         getDraftStore().setText({ kind: "workspace", workspaceId: app.workspaceId }, draft)
@@ -177,7 +246,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await waitFor(
         () => {
           expect(getSideComposer(app, firstId).value).toBe("");
-          expect(pane.querySelector('[role="tab"][id$="-tab-new"]')).toBeNull();
+          expect(pane.querySelector('[role="tab"][id$="-tab-new"]') === null).toBe(true);
           const tab = pane.querySelector(`[role="tab"][id$="-tab-side:${firstId}"]`);
           expect(tab).not.toBeNull();
           expect(document.activeElement === getSideComposer(app, firstId)).toBe(true);
@@ -191,7 +260,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       act(() => getDraftStore().setText({ kind: "workspace", workspaceId: firstId }, firstDraft));
       await waitFor(() => expect(getSideComposer(app, firstId).value).toBe(firstDraft));
 
-      fireEvent.click(within(pane).getByRole("button", { name: "New tab" }));
+      await openSidebarNewTab(pane);
       fireEvent.click(await within(pane).findByRole("button", { name: "Side chat" }));
       const secondId = await waitFor(
         async () => {
@@ -201,7 +270,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
           expect(chats).toHaveLength(2);
           return chats.find((ws) => ws.id !== firstId)!.id;
         },
-        { timeout: 10_000 }
+        { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
       );
       await waitFor(() => expect(getSideComposer(app, secondId).value).toBe(""), {
         timeout: 10_000,
@@ -224,6 +293,9 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await waitFor(() => expect(getSideComposer(app, firstId).value).toBe(firstDraft));
       expect(getSidePane(app, firstId)?.textContent).not.toContain("Only the second side chat");
       expect(getMainComposer(app).value).toBe(draft);
+      // The held main turn cannot finish by itself, so it must still be live.
+      expect(parentStream.getEvents().some((event) => event.type === "stream-abort")).toBe(false);
+      expect(isStreaming(app.workspaceId)).toBe(true);
     } finally {
       send.mockRestore();
       parentStream.stop();
@@ -232,7 +304,11 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
   }, 90_000);
 
   test("the launcher prevents duplicate requests and remains usable after creation fails", async () => {
-    const app = await createAppHarness({ branchPrefix: "side-launcher-retry" });
+    const app = await createAppHarness({
+      branchPrefix: "side-launcher-retry",
+      beforeRender: (workspaceId) =>
+        updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false),
+    });
     const service = app.env.services.toORPCContext().workspaceService;
     const create = jest.spyOn(service, "createSideChat");
     let rejectCreation!: (error: Error) => void;
@@ -246,7 +322,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       const sidebar = app.view.container.querySelector<HTMLElement>(
         '[aria-label="Workspace insights"]'
       )!;
-      fireEvent.click(await within(sidebar).findByRole("button", { name: "New tab" }));
+      await openSidebarNewTab(sidebar);
       const row = await within(sidebar).findByRole("button", { name: "Side chat" });
       fireEvent.click(row);
       fireEvent.click(row);
@@ -385,10 +461,18 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       );
       expect(closeButton).not.toBeNull();
       fireEvent.click(closeButton!);
-      await waitFor(() => {
-        expect(getSidePane(app)).toBeNull();
-        expect(app.view.container.querySelector('button[aria-label="Close side chat"]')).toBeNull();
-      });
+      // The tab goes only after the backend removes the side chat (#6375).
+      await waitFor(
+        () => {
+          expect(getSidePane(app)).toBeNull();
+          expect(
+            app.view.container.querySelector('button[aria-label="Close side chat"]') === null
+          ).toBe(true);
+        },
+        { timeout: 10_000 }
+      );
+      // It was the only tab, so the sidebar closed with it.
+      expect(readPersistedState(getRightSidebarCollapsedKey(app.workspaceId), false)).toBe(true);
       await waitFor(
         async () => {
           expect(await app.env.orpc.workspace.getInfo({ workspaceId: sideChatId })).toBeNull();
@@ -412,6 +496,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     let observingStartup = true;
     let parentDeltas = 0;
     const parentStops: string[] = [];
+    const parentStarts: string[] = [];
+    const parentEnds: string[] = [];
     const sideStartupSymptoms = new Set<string>();
     const sideStarts: string[] = [];
 
@@ -452,6 +538,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       if (event.workspaceId === app.workspaceId) {
         if (type === "stream-delta") parentDeltas += 1;
         if (type === "stream-abort" || type === "stream-error") parentStops.push(type);
+        if (event.message.type === "stream-start") parentStarts.push(event.message.messageId);
+        if (event.message.type === "stream-end") parentEnds.push(event.message.messageId);
       } else {
         if (type === "stream-start") sideStarts.push(event.workspaceId);
         if (
@@ -515,11 +603,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await waitFor(() => expect(parentDeltas).toBeGreaterThan(deltasBeforeOpen), {
         timeout: 10_000,
       });
-      expect(isStreaming(app.workspaceId)).toBe(true);
       expect(parentStops).toEqual([]);
-      expect((await context.historyService.readPartial(app.workspaceId))?.id).toBe(
-        parentPartial.id
-      );
       expect(sideStartupSymptoms).toEqual(new Set());
       expect(sideStarts).toEqual([]);
       expect(service.getOrCreateSession(childId).hasPendingAutoRetry()).toBe(false);
@@ -530,7 +614,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       expect(isStreaming(childId)).toBe(false);
 
       // Only an explicit question starts this independent conversation. It remains a side chat,
-      // which is the backend's read-only capability boundary, while the parent keeps streaming.
+      // which is the backend's read-only capability boundary, and the parent turn runs on.
       observingStartup = false;
       const question = "Explain this context without continuing the main task";
       await sendFrom(() => getSideComposer(app), childId, question);
@@ -547,8 +631,25 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
         (await app.env.orpc.workspace.getInfo({ workspaceId: childId }))?.sideChatParentWorkspaceId
       ).toBe(app.workspaceId);
       expect(getTranscript(app, "main").textContent).not.toContain(question);
-      expect(isStreaming(app.workspaceId)).toBe(true);
+
+      // The parent's [mock:long-stream] is finite (about 18 s of timers). On a loaded runner the
+      // steps above outlast it, so asserting it was "still streaming" here flaked. The invariant is
+      // that opening the side chat never stopped or restarted the parent turn: it starts and ends
+      // once, as the message the side chat copied. The budget covers the rest of that stream.
+      await waitFor(() => expect(parentEnds).toEqual([parentPartial.id]), { timeout: 30_000 });
+      expect(parentStarts).toEqual([parentPartial.id]);
       expect(parentStops).toEqual([]);
+      // The premise: the side chat copied the parent turn mid-stream, not its finished reply.
+      const turnText = async (workspaceId: string) => {
+        const history = await context.historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!history.success) throw new Error(history.error);
+        const turn = history.data.find((message) => message.id === parentPartial.id);
+        if (turn == null) throw new Error(`${workspaceId} has no copy of the parent turn`);
+        return turn.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
+      };
+      const copiedText = await turnText(childId);
+      expect(copiedText.length).toBeGreaterThan(0);
+      expect(copiedText.length).toBeLessThan((await turnText(app.workspaceId)).length);
     } finally {
       observingStartup = false;
       observer.disconnect();
@@ -567,13 +668,18 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     try {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const id = await waitForSideChatId(app);
-      const closeButton = await waitFor(() => {
-        const button = app.view.container.querySelector<HTMLButtonElement>(
-          'button[aria-label="Close side chat"]'
-        );
-        if (!button) throw new Error("side tab not ready");
-        return button;
-      });
+      // Waits on backend work (the new side chat's tab, the real discard below) get a budget:
+      // the discard alone took 1.6 s at load ~100, past waitFor's one-second default (#6375).
+      const closeButton = await waitFor(
+        () => {
+          const button = app.view.container.querySelector<HTMLButtonElement>(
+            'button[aria-label="Close side chat"]'
+          );
+          if (!button) throw new Error("side tab not ready");
+          return button;
+        },
+        { timeout: 10_000 }
+      );
       remove.mockResolvedValueOnce({ success: false, error: "Keep this tab for retry" });
       fireEvent.click(closeButton);
       await waitFor(() =>
@@ -591,9 +697,125 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
 
       // Successful retry is the only path that removes the still-reachable tab.
       fireEvent.click(closeButton);
-      await waitFor(() => expect(app.view.container.contains(closeButton)).toBe(false));
+      await waitFor(() => expect(app.view.container.contains(closeButton)).toBe(false), {
+        timeout: 10_000,
+      });
       expect(await app.env.orpc.workspace.getInfo({ workspaceId: id })).toBeNull();
     } finally {
+      remove.mockRestore();
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("side chats whose discards finish together still close the sidebar", async () => {
+    const app = await createAppHarness({ branchPrefix: "side-close-together" });
+    const remove = jest.spyOn(app.env.services.toORPCContext().workspaceService, "remove");
+    try {
+      const ids = await openTwoSideChats(app);
+      // Both discards resolve in one batch, so the second tab's close runs before React commits
+      // the first one's. The chats stay in the backend: only the sidebar is under test.
+      let finish: () => void = () => undefined;
+      const finished = new Promise<void>((resolve) => (finish = resolve));
+      remove.mockImplementation(() =>
+        finished.then(() => ({ success: true as const, data: undefined }))
+      );
+      for (const id of ids) fireEvent.click(getSideChatCloseButton(app, id));
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(2));
+      await act(async () => finish());
+
+      // Both tabs go, and the sidebar closes with them. The next expand shows the New tab.
+      await waitFor(() => expect(getSavedSidebarTabs(app)).toEqual([NEW_TAB]), { timeout: 10_000 });
+      expect(readPersistedState(getRightSidebarCollapsedKey(app.workspaceId), false)).toBe(true);
+    } finally {
+      remove.mockRestore();
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("one metadata update that drops a closing side chat and the other still closes the sidebar", async () => {
+    const app = await createAppHarness({ branchPrefix: "side-close-one-update" });
+    const service = app.env.services.toORPCContext().workspaceService;
+    const remove = jest.spyOn(service, "remove");
+    // A new chat's init end refreshes its metadata. A refresh that landed with the drop below
+    // would bring its chat back, so the test waits for both chats' refreshes first.
+    const refresh = jest.spyOn(service, "refreshAndEmitMetadata");
+    try {
+      const [closing, other] = await openTwoSideChats(app);
+      await waitFor(() =>
+        expect(refresh.mock.calls.map(([id]) => id)).toEqual(
+          expect.arrayContaining([closing, other])
+        )
+      );
+      // More refreshes can start after this point. The chats stay in the backend, so one that lands
+      // with the drop below re-emits a chat and its tab comes back (#7293). Stub them before the
+      // await, so a call that starts during it is a no-op too.
+      refresh.mockImplementation(async () => undefined);
+      await Promise.all(
+        refresh.mock.results.flatMap((result) => (result.type === "return" ? [result.value] : []))
+      );
+      // The close waits on its discard while one update (a reconnect's snapshot, say) drops both
+      // chats. The chats stay in the backend: only the sidebar is under test.
+      remove.mockImplementation(() => new Promise<never>(() => undefined));
+      fireEvent.click(getSideChatCloseButton(app, closing));
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        for (const workspaceId of [closing, other]) {
+          service.emit("metadata", { workspaceId, metadata: null });
+        }
+      });
+
+      await waitFor(() => expect(getSavedSidebarTabs(app)).toEqual([NEW_TAB]), { timeout: 10_000 });
+      expect(readPersistedState(getRightSidebarCollapsedKey(app.workspaceId), false)).toBe(true);
+    } finally {
+      refresh.mockRestore();
+      remove.mockRestore();
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("closing the last side chat from its composer focuses the toggle when its metadata goes first", async () => {
+    const app = await createAppHarness({ branchPrefix: "side-close-focus" });
+    const service = app.env.services.toORPCContext().workspaceService;
+    const realRemove = service.remove.bind(service);
+    const remove = jest.spyOn(service, "remove");
+    // As above: a late init-end refresh would bring the dropped chat back.
+    const refresh = jest.spyOn(service, "refreshAndEmitMetadata");
+    let reply: () => void = () => undefined;
+    const replied = new Promise<void>((resolve) => (reply = resolve));
+    try {
+      await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
+      const id = await waitForSideChatId(app);
+      const composer = await waitFor(() => getSideComposer(app, id), { timeout: 10_000 });
+      await waitFor(() =>
+        expect(refresh.mock.calls.map(([workspaceId]) => workspaceId)).toContain(id)
+      );
+      // As above: every later refresh is a no-op (#7293).
+      refresh.mockImplementation(async () => undefined);
+      await Promise.all(
+        refresh.mock.results.flatMap((result) => (result.type === "return" ? [result.value] : []))
+      );
+      // The real discard drops the chat's metadata, which unmounts its composer, and its reply
+      // waits: focus has already left the sidebar when the close resolves.
+      remove.mockImplementation(async (...args) => {
+        const result = await realRemove(...args);
+        await replied;
+        return result;
+      });
+      composer.focus();
+      fireEvent.keyDown(composer, { key: "w", ctrlKey: true });
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(1));
+
+      await waitFor(() => expect(getSavedSidebarTabs(app)).toEqual([NEW_TAB]), { timeout: 10_000 });
+      expect(readPersistedState(getRightSidebarCollapsedKey(app.workspaceId), false)).toBe(true);
+      const expectToggleFocused = () =>
+        expect(document.activeElement?.getAttribute("aria-label")).toBe("Expand right sidebar");
+      await waitFor(expectToggleFocused);
+      // The late reply leaves focus there.
+      await act(async () => reply());
+      expectToggleFocused();
+    } finally {
+      reply();
+      refresh.mockRestore();
       remove.mockRestore();
       await app.dispose();
     }
@@ -643,21 +865,28 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const firstId = await waitForSideChatId(app);
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
-      const ids = await waitFor(async () => {
-        const sideChats = (await app.env.orpc.workspace.list()).filter(
-          (metadata) => metadata.sideChatParentWorkspaceId === app.workspaceId
-        );
-        expect(sideChats).toHaveLength(2);
-        return sideChats.map((metadata) => metadata.id);
-      });
+      // Creating the second side chat is backend work: give it the same budget as the first (#6375).
+      const ids = await waitFor(
+        async () => {
+          const sideChats = (await app.env.orpc.workspace.list()).filter(
+            (metadata) => metadata.sideChatParentWorkspaceId === app.workspaceId
+          );
+          expect(sideChats).toHaveLength(2);
+          return sideChats.map((metadata) => metadata.id);
+        },
+        { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
+      );
       expect(ids).toContain(firstId);
-      await waitFor(() => {
-        for (const id of ids) {
-          expect(
-            app.view.container.querySelector(`[role="tab"][id$="-tab-side:${id}"]`)
-          ).not.toBeNull();
-        }
-      });
+      await waitFor(
+        () => {
+          for (const id of ids) {
+            expect(
+              app.view.container.querySelector(`[role="tab"][id$="-tab-side:${id}"]`)
+            ).not.toBeNull();
+          }
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await app.dispose();
     }
@@ -669,25 +898,34 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const firstId = await waitForSideChatId(app);
       const draft = "Unsent question in the first side chat";
-      await waitFor(() => expect(getSideComposer(app).value).toBe(""));
+      // Waits after backend work (creating, loading or removing a side chat) can take over the
+      // default one-second budget on a busy runner (#6375), so they get a budget. The draft
+      // store update below is local and keeps the default.
+      await waitFor(() => expect(getSideComposer(app).value).toBe(""), { timeout: 10_000 });
       act(() => getDraftStore().setText({ kind: "workspace", workspaceId: firstId }, draft));
       await waitFor(() => expect(getSideComposer(app).value).toBe(draft));
 
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
-      const secondId = await waitFor(async () => {
-        const sideChats = (await app.env.orpc.workspace.list()).filter(
-          (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
-        );
-        expect(sideChats).toHaveLength(2);
-        return sideChats.find((ws) => ws.id !== firstId)!.id;
-      });
+      const secondId = await waitFor(
+        async () => {
+          const sideChats = (await app.env.orpc.workspace.list()).filter(
+            (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
+          );
+          expect(sideChats).toHaveLength(2);
+          return sideChats.find((ws) => ws.id !== firstId)!.id;
+        },
+        { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
+      );
       const sideTab = (id: string) =>
         app.view.container.querySelector<HTMLElement>(`[role="tab"][id$="-tab-side:${id}"]`);
-      await waitFor(() => {
-        expect(sideTab(firstId)).not.toBeNull();
-        expect(sideTab(secondId)?.getAttribute("aria-selected")).toBe("true");
-        expect(getSideComposer(app).value).toBe("");
-      });
+      await waitFor(
+        () => {
+          expect(sideTab(firstId)).not.toBeNull();
+          expect(sideTab(secondId)?.getAttribute("aria-selected")).toBe("true");
+          expect(getSideComposer(app).value).toBe("");
+        },
+        { timeout: 10_000 }
+      );
       const secondQuestion = "Question in the second side chat";
       await sendFrom(() => getSideComposer(app), secondId, secondQuestion);
       await waitFor(
@@ -696,18 +934,24 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       );
 
       fireEvent.click(sideTab(firstId)!);
-      await waitFor(() => expect(getSideComposer(app).value).toBe(draft));
+      await waitFor(() => expect(getSideComposer(app).value).toBe(draft), { timeout: 10_000 });
       expect(getSidePane(app)?.textContent).not.toContain(secondQuestion);
       fireEvent.click(sideTab(firstId)!.querySelector('button[aria-label="Close side chat"]')!);
-      await waitFor(async () => {
-        expect(sideTab(firstId)).toBeNull();
-        expect(sideTab(secondId)).not.toBeNull();
-        expect(await app.env.orpc.workspace.getInfo({ workspaceId: firstId })).toBeNull();
-        expect(await app.env.orpc.workspace.getInfo({ workspaceId: secondId })).not.toBeNull();
-      });
+      // The tab and the workspace go only after the backend removes the side chat, which took
+      // about 0.7 s on an idle host.
+      await waitFor(
+        async () => {
+          expect(sideTab(firstId)).toBeNull();
+          expect(sideTab(secondId)).not.toBeNull();
+          expect(await app.env.orpc.workspace.getInfo({ workspaceId: firstId })).toBeNull();
+          expect(await app.env.orpc.workspace.getInfo({ workspaceId: secondId })).not.toBeNull();
+        },
+        { timeout: 10_000 }
+      );
       fireEvent.click(sideTab(secondId)!);
-      await waitFor(() =>
-        expect(getSidePane(app)?.textContent).toContain(`Mock response: ${secondQuestion}`)
+      await waitFor(
+        () => expect(getSidePane(app)?.textContent).toContain(`Mock response: ${secondQuestion}`),
+        { timeout: 10_000 }
       );
     } finally {
       await app.dispose();
@@ -719,6 +963,15 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     const service = app.env.services.toORPCContext().workspaceService;
     const interruptSpy = jest.spyOn(service, "interruptStream");
     const collectors: ReturnType<typeof createStreamCollector>[] = [];
+    // Two live streams make React log thousands of "not wrapped in act(...)" warnings. Without
+    // --silent (CI passes it, a local run does not), jest builds and source-maps a stack for
+    // each one, which kept the event loop busy for most of the second stream's 10 s start
+    // budget (#6464). Drop only those warnings; every other console.error still prints.
+    const realError = console.error.bind(console);
+    const errorSpy = jest.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      if (typeof args[0] === "string" && args[0].includes("not wrapped in act(")) return;
+      realError(...args);
+    });
     try {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const firstId = await waitForSideChatId(app);
@@ -726,13 +979,17 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
         timeout: 10_000,
       });
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
-      const secondId = await waitFor(async () => {
-        const sideChats = (await app.env.orpc.workspace.list()).filter(
-          (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
-        );
-        expect(sideChats).toHaveLength(2);
-        return sideChats.find((ws) => ws.id !== firstId)!.id;
-      });
+      // Creating a side chat is backend work that can pass the default one-second budget (#6375).
+      const secondId = await waitFor(
+        async () => {
+          const sideChats = (await app.env.orpc.workspace.list()).filter(
+            (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
+          );
+          expect(sideChats).toHaveLength(2);
+          return sideChats.find((ws) => ws.id !== firstId)!.id;
+        },
+        { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
+      );
       // Registration precedes the open-tab event; dock only after that event selects the second.
       await waitFor(() => expect(getSidePane(app, secondId)).not.toBeNull(), { timeout: 10_000 });
       act(() => {
@@ -756,14 +1013,10 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       collectors.push(firstStream, secondStream);
       for (const collector of collectors) collector.start();
       await Promise.all(collectors.map((collector) => collector.waitForSubscription(10_000)));
-      await sendFrom(() => getSideComposer(app, firstId), firstId, "[mock:long-stream] first side");
+      await sendFrom(() => getSideComposer(app, firstId), firstId, `${HELD_TURN} first side`);
       expect(await firstStream.waitForEvent("stream-start", 10_000)).not.toBeNull();
       await waitFor(() => expect(isStreaming(firstId)).toBe(true), { timeout: 10_000 });
-      await sendFrom(
-        () => getSideComposer(app, secondId),
-        secondId,
-        "[mock:long-stream] second side"
-      );
+      await sendFrom(() => getSideComposer(app, secondId), secondId, `${HELD_TURN} second side`);
       expect(await secondStream.waitForEvent("stream-start", 10_000)).not.toBeNull();
       await waitFor(() => expect(isStreaming(secondId)).toBe(true), { timeout: 10_000 });
       interruptSpy.mockClear();
@@ -787,12 +1040,13 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await expect(interruptSpy.mock.results[0]?.value).resolves.toMatchObject({ success: true });
       await waitFor(() => expect(isStreaming(firstId)).toBe(false), { timeout: 10_000 });
       expect(await firstStream.waitForEvent("stream-abort", 10_000)).not.toBeNull();
-      // The finite mock may finish naturally during setup on slow CI. The invariant is that
-      // Escape did not abort its sibling, not that the sibling stays live for a fixed duration.
+      // The held sibling cannot finish by itself, so Escape must have left it live.
       expect(secondStream.getEvents().some((event) => event.type === "stream-abort")).toBe(false);
+      expect(isStreaming(secondId)).toBe(true);
     } finally {
       for (const collector of collectors) collector.stop();
       interruptSpy.mockRestore();
+      errorSpy.mockRestore();
       await app.dispose();
     }
   }, 90_000);
@@ -823,8 +1077,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const sideChatId = await waitForSideChatId(app);
       await waitFor(() => expect(getSidePane(app)).not.toBeNull());
-      await startStream("side", sideChatId, "[mock:long-stream] side stream");
-      await startStream("main", app.workspaceId, "[mock:long-stream] main stream");
+      await startStream("side", sideChatId, `${HELD_TURN} side stream`);
+      await startStream("main", app.workspaceId, `${HELD_TURN} main stream`);
 
       // Focus in the main transcript: only the main chat stops.
       interruptSpy.mockClear();
@@ -836,8 +1090,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
 
       // Restart both, side last; focus in the side transcript: only the side chat stops.
       await stopViaApi(sideChatId);
-      await startStream("main", app.workspaceId, "[mock:long-stream] main again");
-      await startStream("side", sideChatId, "[mock:long-stream] side again");
+      await startStream("main", app.workspaceId, `${HELD_TURN} main again`);
+      await startStream("side", sideChatId, `${HELD_TURN} side again`);
       interruptSpy.mockClear();
       pressEscapeOn(getTranscript(app, "side"));
       await waitFor(() => expect(interruptSpy).toHaveBeenCalled(), { timeout: 10_000 });

@@ -30,6 +30,8 @@ describe("useComputerUse", () => {
     saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
+    // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+    globalThis.CustomEvent = globalThis.window.CustomEvent;
   });
 
   afterEach(() => {

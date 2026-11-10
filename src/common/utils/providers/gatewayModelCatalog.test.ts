@@ -273,6 +273,49 @@ describe("gatewayModelCatalog", () => {
     ).toBe(true);
   });
 
+  // #5660: Anthropic-type gateways list dated snapshot ids only. A dated entry satisfies the
+  // undated id the built-in model sends; removals stay exact, as for the Gemini alias.
+  test("accepts an undated id whose -YYYYMMDD snapshot is in a Coder catalog; removals stay exact", () => {
+    const catalog = ["anthropic/claude-haiku-4-5-20251001"];
+    const check = (modelId: string, removed?: string[]) =>
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        modelId,
+        undefined,
+        catalog,
+        removed
+      );
+    expect(check("anthropic/claude-haiku-4-5")).toBe(true);
+    expect(check("anthropic/claude-haiku-4-5-20251001")).toBe(true);
+    // Only a full 8-digit date suffix counts, and only on the same id.
+    expect(check("anthropic/claude-haiku-4")).toBe(false);
+    expect(check("anthropic/claude-haiku-4-5-2025")).toBe(false);
+    expect(check("other/claude-haiku-4-5")).toBe(false);
+    // Only Claude ids: another family's upstream need not serve an undated alias.
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog("coder", "corp/gpt-6.1-sol", undefined, [
+        "corp/gpt-6.1-sol-20260930",
+      ])
+    ).toBe(false);
+    // A bare Claude id (no gateway provider name).
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog("coder", "claude-haiku-4-5", undefined, [
+        "claude-haiku-4-5-20251001",
+      ])
+    ).toBe(true);
+    // A custom gateway provider name before the Claude id.
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        "claude-aws-us-east-2/claude-haiku-4-5",
+        undefined,
+        ["claude-aws-us-east-2/claude-haiku-4-5-20251001"]
+      )
+    ).toBe(true);
+    expect(check("anthropic/claude-haiku-4-5", ["anthropic/claude-haiku-4-5"])).toBe(false);
+    expect(check("anthropic/claude-haiku-4-5", ["anthropic/claude-haiku-4-5-20251001"])).toBe(true);
+  });
+
   test("gates Coder routing on the catalog whether models is missing, empty, or manual-only", () => {
     // The catalog verdict must not depend on the shape of `models`: missing
     // (hand-edited config), empty, or holding only unrelated manual entries.

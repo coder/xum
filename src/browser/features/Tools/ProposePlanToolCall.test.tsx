@@ -864,7 +864,7 @@ describe("ProposePlanToolCall", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Continue in Auto" }));
     await waitFor(() => expect(sendMessageCalls).toHaveLength(2));
-    await waitFor(() => expect(view.queryByRole("alert")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("alert") === null).toBe(true));
   });
 
   describe("latest plan shortcut and palette request (#4963)", () => {

@@ -61,6 +61,41 @@ describe("Goal slash command", () => {
     }
   }, 60_000);
 
+  // #4126: a $skill inside /goal would reach the model as plain text, so the composer refuses it
+  // and keeps the text; a mention in backticks is code and still sets the goal.
+  test("refuses a skill mention inside /goal and keeps the text in the composer", async () => {
+    const app = await createAppHarness({ branchPrefix: "goal-skill" });
+
+    try {
+      const textarea = () =>
+        app.view.container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]');
+      await app.chat.typeWithoutSending("/goal $orchestrate ship the release");
+      fireEvent.keyDown(textarea()!, { key: "Enter" });
+
+      await waitFor(
+        () => expect(app.view.container.textContent).toContain("Skills do not load inside /goal"),
+        { timeout: 10_000 }
+      );
+      expect(textarea()?.value).toBe("/goal $orchestrate ship the release");
+      const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
+      expect(goal).toBeNull();
+
+      await app.chat.typeWithoutSending("/goal ship the release, see `$orchestrate`");
+      fireEvent.keyDown(textarea()!, { key: "Enter" });
+      await waitFor(
+        async () => {
+          const { goal: set } = await app.env.orpc.workspace.getGoal({
+            workspaceId: app.workspaceId,
+          });
+          expect(set?.objective).toBe("ship the release, see `$orchestrate`");
+        },
+        { timeout: 10_000 }
+      );
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
   test("sends /goal with staged attachments as a normal message instead of a command", async () => {
     // Simulates a transferred staging-failure draft: raw /goal text plus a
     // staged attachment chip persisted under the workspace draft keys.

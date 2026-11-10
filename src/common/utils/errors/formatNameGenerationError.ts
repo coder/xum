@@ -34,16 +34,6 @@ export function formatNameGenerationError(error: NameGenerationError): Formatted
         };
       }
 
-      // Xum Gateway uses OAuth coupon codes, not API keys.
-      if (error.authKind === "api_key_missing" && error.provider === "mux-gateway") {
-        return {
-          title: "Xum Gateway not connected",
-          message: "Connect your Xum Gateway account to enable workspace naming.",
-          hint: "Open Settings → Providers and connect Xum Gateway.",
-          docsPath: "/getting-started/mux-gateway",
-        };
-      }
-
       // api_key_missing and invalid_credentials share the same remediation path.
       return {
         title: "API key error",

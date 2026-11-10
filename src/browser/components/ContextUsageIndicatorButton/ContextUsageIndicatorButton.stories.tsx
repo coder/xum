@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { fn, userEvent, waitFor, within } from "@storybook/test";
+import { fn, userEvent, waitFor, within } from "storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { TOKEN_COMPONENT_COLORS, type TokenMeterData } from "@/common/utils/tokens/tokenMeterUtils";
 import { ContextUsageIndicatorButton } from "./ContextUsageIndicatorButton.js";

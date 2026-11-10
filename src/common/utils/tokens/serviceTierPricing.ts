@@ -176,8 +176,11 @@ const SERVICE_TIER_FACTORS: Readonly<
   "gpt-4o-2024-05-13": { fast: fastShortOnly(1.75) },
   "gpt-4o-mini": { fast: fastShortOnly(5 / 3) },
   // Anthropic Fast mode: 2× Standard across the full context window, with prompt
-  // caching multipliers applied on top (Opus 5.5 $8/$40, Opus 5 and 4.8 $10/$50).
+  // caching multipliers applied on top (Fable/Mythos 5.2 $16/$80, Opus 5.5 $8/$40,
+  // Opus 5 and 4.8 $10/$50).
   // https://platform.claude.com/docs/en/build-with-claude/fast-mode#pricing
+  "claude-fable-5-2": { fast: DOUBLE_BOTH_BANDS },
+  "claude-mythos-5-2": { fast: DOUBLE_BOTH_BANDS },
   "claude-opus-5-5": { fast: DOUBLE_BOTH_BANDS },
   "claude-opus-5": { fast: DOUBLE_BOTH_BANDS },
   "claude-opus-4-8": { fast: DOUBLE_BOTH_BANDS },
@@ -198,10 +201,10 @@ function lookupTierFactors(
 
 /** Short-context rate fields paired with their long-context counterparts. */
 const RATE_FIELDS = [
-  ["input_cost_per_token", "input_cost_per_token_above_200k_tokens"],
-  ["output_cost_per_token", "output_cost_per_token_above_200k_tokens"],
-  ["cache_read_input_token_cost", "cache_read_input_token_cost_above_200k_tokens"],
-  ["cache_creation_input_token_cost", "cache_creation_input_token_cost_above_200k_tokens"],
+  ["input_cost_per_token", "input_cost_per_token_above_threshold"],
+  ["output_cost_per_token", "output_cost_per_token_above_threshold"],
+  ["cache_read_input_token_cost", "cache_read_input_token_cost_above_threshold"],
+  ["cache_creation_input_token_cost", "cache_creation_input_token_cost_above_threshold"],
 ] as const;
 
 /**

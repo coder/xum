@@ -7,6 +7,7 @@ import {
   dismissChatError,
   peekChatError,
   publishChatError,
+  publishChatInfo,
   useChatErrorToasts,
 } from "./chatErrorToasts";
 
@@ -31,8 +32,10 @@ describe("useChatErrorToasts", () => {
   /** A chat input whose single toast slot the test drives: `show` renders a toast, `dismiss` clears it. */
   function mountInput(workspaceId: string | null, options?: { strict?: boolean }) {
     const shown: string[] = [];
-    const pushToast = (toast: { message: string }) => {
+    const pushed: Array<{ type: string; message: string }> = [];
+    const pushToast = (toast: { type: "error" | "info"; message: string }) => {
       shown.push(toast.message);
+      pushed.push({ type: toast.type, message: toast.message });
     };
     const initialProps: Props = { workspaceId, visible: null };
     const rendered = renderHook(
@@ -41,6 +44,7 @@ describe("useChatErrorToasts", () => {
     );
     return {
       shown,
+      pushed,
       ...rendered,
       show: (message: string) => rendered.rerender({ workspaceId, visible: message }),
       dismiss: () => rendered.rerender({ workspaceId, visible: null }),
@@ -167,6 +171,42 @@ describe("useChatErrorToasts", () => {
     input.show("Stop could not be recorded");
     input.dismiss();
     expect(peekChatError("ws-j")).toBeUndefined();
+  });
+
+  test("an info notice shows as an info toast, and a newer one replaces one still waiting", () => {
+    publishChatError("ws-k", "Stop could not be recorded");
+    publishChatInfo("ws-k", "Plugin ralph: plugin continued turn 1 of 50");
+    publishChatInfo("ws-k", "Plugin ralph: plugin continued turn 2 of 50");
+
+    const input = mountInput("ws-k");
+    input.show("Stop could not be recorded");
+    input.dismiss();
+    input.show("Plugin ralph: plugin continued turn 2 of 50");
+    input.dismiss();
+
+    expect(input.pushed).toEqual([
+      { type: "error", message: "Stop could not be recorded" },
+      { type: "info", message: "Plugin ralph: plugin continued turn 2 of 50" },
+    ]);
+    expect(peekChatError("ws-k")).toBeUndefined();
+  });
+
+  test("info notices published while one shows leave only the newest to show next", () => {
+    const input = mountInput("ws-l");
+    act(() => {
+      publishChatInfo("ws-l", "turn 1");
+    });
+    input.show("turn 1");
+    act(() => {
+      publishChatInfo("ws-l", "turn 2");
+      publishChatInfo("ws-l", "turn 3");
+    });
+    input.dismiss();
+    input.show("turn 3");
+    input.dismiss();
+
+    expect(input.shown).toEqual(["turn 1", "turn 3"]);
+    expect(peekChatError("ws-l")).toBeUndefined();
   });
 
   test("StrictMode's replayed effect re-pushes the same error instead of consuming the next one", () => {

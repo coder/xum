@@ -7,6 +7,7 @@ import {
   matchesNewSidebarTabKeybind,
   isKeybindDeprecated,
   KEYBINDS,
+  getSideChatPaneWorkspaceId,
   paneHandlesKeyEvent,
   SIDE_CHAT_PANE_ATTR,
   type ChatPaneScope,
@@ -425,6 +426,7 @@ describe("global keybind collisions", () => {
     "NEXT_WORKSPACE",
     "PREV_WORKSPACE",
     "TOGGLE_SIDEBAR",
+    "TOGGLE_RIGHT_SIDEBAR",
     "CYCLE_MODEL",
     "OPEN_TERMINAL",
     "OPEN_IN_EDITOR",
@@ -438,12 +440,18 @@ describe("global keybind collisions", () => {
     "DECREASE_THINKING",
     "TOGGLE_FAST_MODE",
     "FOCUS_BACKGROUND_PROCESSES",
+    "OPEN_TODO_PANEL",
+    "OPEN_SUB_AGENTS_PANEL",
+    "OPEN_REVIEWS_PANEL",
     "FOCUS_CHAT",
     "CLOSE_TAB",
     "NEW_SIDEBAR_TAB",
     "OPEN_TIMELINE_DIALOG",
     "OPEN_STATS_DIALOG",
     "OPEN_ARTIFACTS_TAB",
+    "TOGGLE_AGENT_INTERFACE_VIEW",
+    "TOGGLE_STATUS_TRANSCRIPT_PEEK",
+    "STATUS_START_HERE",
     "SIDEBAR_TAB_1",
     "SIDEBAR_TAB_2",
     "SIDEBAR_TAB_3",
@@ -636,9 +644,13 @@ describe("paneHandlesKeyEvent", () => {
     document.body.appendChild(outerPane);
 
     expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["side:beta"]);
+    // Window shortcuts (Fast/Ultrafast) act on the chat this lookup names.
+    expect(getSideChatPaneWorkspaceId(text)).toBe("beta");
     innerPane.removeAttribute(SIDE_CHAT_PANE_ATTR);
     expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["side:alpha"]);
+    expect(getSideChatPaneWorkspaceId(text)).toBe("alpha");
     outerPane.removeAttribute(SIDE_CHAT_PANE_ATTR);
     expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["main"]);
+    expect(getSideChatPaneWorkspaceId(text)).toBeNull();
   });
 });

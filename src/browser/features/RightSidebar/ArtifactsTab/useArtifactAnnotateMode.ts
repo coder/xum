@@ -21,8 +21,8 @@ function setWorkspaceAnnotating(workspaceId: string, on: boolean) {
  * per press.
  *
  * `support` is the selected artifact's annotate flavour (null: it cannot be annotated, so the
- * mode reads as off). `pickKey` identifies the shown file version: a pick made on another
- * version is not shown.
+ * mode reads as off). `pickKey` identifies the shown file content: a pick made before the file
+ * was rewritten is not shown.
  */
 export function useArtifactAnnotateMode(
   workspaceId: string,
@@ -39,7 +39,7 @@ export function useArtifactAnnotateMode(
   const setAnnotationPick: (value: null) => void = setPick;
   return {
     annotating,
-    /** The open comment box's pick, if one is open on the shown version. */
+    /** The open comment box's pick, if one is open on the shown content. */
     pendingPick,
     openAnnotation: (next: ArtifactAnnotationPick) => setPick({ key: pickKey, pick: next }),
     setAnnotationPick,

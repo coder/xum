@@ -13,12 +13,17 @@ import { pageToolText, type ToolTextPage } from "@/common/utils/tools/pageToolTe
 import * as RealWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as RealSubagentTranscriptDialogModule from "@/browser/features/Tools/SubagentTranscriptDialog";
 import * as RealElapsedTimeDisplayModule from "@/browser/features/Tools/Shared/ElapsedTimeDisplay";
+import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import { createMappedAliasProvidersConfig, MAPPED_ALIAS_MODEL } from "@/browser/testUtils";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 let workspaceContextMock: {
   workspaceMetadata: Map<string, FrontendWorkspaceMetadata>;
   setSelectedWorkspace?: (selection: unknown) => void;
 } | null = null;
+let providersConfigMock: ProvidersConfigMap | null = null;
+const realProvidersConfigModule = { ...RealProvidersConfigModule };
 
 // Restore the real modules after this suite so the partial stubs cannot leak into later
 // suites that render the real components (e.g. AgentContext.test uses the real provider).
@@ -26,6 +31,7 @@ restoreModulesAfterSuite([
   ["@/browser/contexts/WorkspaceContext", { ...RealWorkspaceContextModule }],
   ["@/browser/features/Tools/SubagentTranscriptDialog", { ...RealSubagentTranscriptDialogModule }],
   ["@/browser/features/Tools/Shared/ElapsedTimeDisplay", { ...RealElapsedTimeDisplayModule }],
+  ["@/browser/hooks/useProvidersConfig", realProvidersConfigModule],
 ]);
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   useOptionalWorkspaceContext: () => workspaceContextMock,
@@ -34,6 +40,14 @@ void mock.module("@/browser/contexts/WorkspaceContext", () => ({
 
 void mock.module("@/browser/features/Tools/SubagentTranscriptDialog", () => ({
   SubagentTranscriptDialog: () => null,
+}));
+
+void mock.module("@/browser/hooks/useProvidersConfig", () => ({
+  ...realProvidersConfigModule,
+  useProvidersConfig: () => ({
+    ...realProvidersConfigModule.useProvidersConfig(),
+    config: providersConfigMock,
+  }),
 }));
 
 void mock.module("@/browser/features/Tools/Shared/ElapsedTimeDisplay", () => ({
@@ -130,6 +144,7 @@ describe("TaskToolCall", () => {
 
   afterEach(() => {
     workspaceContextMock = null;
+    providersConfigMock = null;
     cleanup();
     mock.restore();
     globalThis.window = originalWindow;
@@ -228,6 +243,53 @@ describe("TaskToolCall", () => {
     expect(settings?.textContent).toContain("Opus 5");
     expect(settings?.textContent).toContain("thinking: high");
     expect(settings?.textContent).not.toContain("thinking: low");
+  });
+
+  test("labels best-of candidates by their group index when a middle candidate failed to spawn", () => {
+    // The partial result lists only the spawned candidates, so candidate 2's slot is missing.
+    const groupId = "task-group:parent:call-1";
+    const spawned = [0, 2].map((index) =>
+      createWorkspaceMetadata({
+        id: `task-child-${index + 1}`,
+        bestOf: { groupId, index, total: 3 },
+      })
+    );
+    workspaceContextMock = {
+      workspaceMetadata: new Map(spawned.map((workspace) => [workspace.id, workspace])),
+    };
+
+    const bestOfArgs = {
+      subagent_type: "explore",
+      prompt: "Compare three approaches.",
+      title: "Best of 3",
+      run_in_background: true,
+      n: 3,
+    };
+    const AgentTaskToolCall = getToolComponent("task", bestOfArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={bestOfArgs}
+          result={{
+            status: "running",
+            taskIds: ["task-child-1", "task-child-3"],
+            tasks: [
+              { taskId: "task-child-1", status: "running" },
+              { taskId: "task-child-3", status: "running" },
+            ],
+            note: "Grouped task creation spawned 2 of 3 task(s); 1 failed: workspace creation failed.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task"));
+
+    const text = view.container.textContent ?? "";
+    expect(text).toContain("candidate 1");
+    expect(text).toContain("candidate 3");
+    expect(text).not.toContain("candidate 2");
   });
 
   test("prefers linked report settings over the spawn snapshot after cleanup", () => {
@@ -686,6 +748,39 @@ describe("TaskToolCall", () => {
 
     const settings = view.container.querySelector("[data-task-ai-settings]");
     expect(settings?.textContent).toContain("thinking: low");
+  });
+
+  test("labels a mapped alias's thinking from its target model", () => {
+    workspaceContextMock = { workspaceMetadata: new Map() };
+    providersConfigMock = createMappedAliasProvidersConfig();
+
+    const agentTaskArgs = {
+      subagent_type: "explore",
+      prompt: "Look around.",
+      title: "Explore task",
+      run_in_background: true,
+    };
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={{
+            status: "running",
+            taskId: "task-child-3",
+            modelString: MAPPED_ALIAS_MODEL,
+            thinkingLevel: "max",
+            note: "Task started in background.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task"));
+
+    const settings = view.container.querySelector("[data-task-ai-settings]");
+    expect(settings?.textContent).toContain("thinking: max");
   });
 });
 
@@ -1299,7 +1394,7 @@ describe("TaskSendMessageToolCall", () => {
     );
     const status = view.getByRole("status");
     const sent = result.status === "accepted" || result.status === "reactivated";
-    expect(status.className.includes("text-success")).toBe(sent);
+    expect(status.className.includes("text-success-text")).toBe(sent);
     expect(status.className.includes("text-danger")).toBe(!sent && result.status !== "queued");
     if (result.error != null) expect(view.getByRole("alert").textContent).toBe(result.error);
     if (result.reason != null) expect(view.getByRole("alert").textContent).toBe(result.reason);
@@ -1366,7 +1461,7 @@ describe("TaskSendMessageToolCall", () => {
         <TaskSendMessageToolCall args={taskSendMessageArgs} result={result} status="completed" />
       </TooltipProvider>
     );
-    expect(view.getByRole("status").className).not.toContain("text-success");
+    expect(view.getByRole("status").className).not.toContain("text-success-text");
     fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
     expect(view.getByText(taskSendMessageArgs.message)).toBeTruthy();
   });
@@ -1440,7 +1535,7 @@ describe("TaskSendMessageToolCall", () => {
       const statuses = view.getAllByRole("status");
       expect(statuses).toHaveLength(2);
       for (const status of statuses) {
-        expect(status.className).not.toContain("text-success");
+        expect(status.className).not.toContain("text-success-text");
         expect(status.className.includes("text-danger")).toBe(expectedStatus === "failed");
         expect(status.textContent).not.toContain("Result unavailable");
       }
@@ -1460,7 +1555,7 @@ describe("TaskSendMessageToolCall", () => {
           <TaskSendMessageToolCall args={taskSendMessageArgs} result={result} status="completed" />
         </TooltipProvider>
       );
-      expect(view.getByRole("status").className).not.toContain("text-success");
+      expect(view.getByRole("status").className).not.toContain("text-success-text");
       expect(view.getByRole("status").textContent).toBe("Result unavailable");
     }
   );

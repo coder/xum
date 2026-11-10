@@ -6,6 +6,9 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { StreamAbortEventSchema } from "@/common/orpc/schemas/stream";
 import { Err, Ok } from "@/common/types/result";
+import type { MuxMessage } from "@/common/types/message";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { StreamManager, type TurnEngineEvent, type TurnExecutionOptions } from "./streamManager";
 import { SessionUsageService } from "./sessionUsageService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -16,6 +19,7 @@ import {
   installStreamManagerTestHistory,
   historyService,
   createTestLanguageModel,
+  finishStep,
   testStartOptions,
   REFUSAL_FINISH,
   STOP_FINISH,
@@ -25,13 +29,6 @@ import {
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
-
-function finishStep(
-  usage: Record<string, number>,
-  providerMetadata?: Record<string, unknown>
-): Record<string, unknown> {
-  return { type: "finish-step", usage, ...(providerMetadata ? { providerMetadata } : {}) };
-}
 
 /** Starts a public turn; callers await `completion` (or stop the stream first). */
 async function startTurnForTests(
@@ -95,6 +92,25 @@ async function readSidecarRecords(
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
+// Haiku 5.5 bills a whole request at its long-context rate once the prompt passes 100K tokens.
+const LONG_CONTEXT_MODEL = "anthropic:claude-haiku-5-5";
+// Under the threshold alone; the turn's summed prompt is over it.
+const SHORT_STEP_USAGE = { inputTokens: 80_000, outputTokens: 400, totalTokens: 80_400 };
+const LONG_STEP_USAGE = { inputTokens: 120_000, outputTokens: 600, totalTokens: 120_600 };
+
+/** The persisted turn's cost minus the provider's bill: each step priced as its own request. */
+function costAboveRequestPrices(message: MuxMessage, steps: Array<Record<string, number>>) {
+  const turn = createDisplayUsage(
+    message.metadata?.usage,
+    LONG_CONTEXT_MODEL,
+    message.metadata?.providerMetadata
+  );
+  const requests = sumUsageHistory(
+    steps.map((usage) => createDisplayUsage(usage, LONG_CONTEXT_MODEL)!)
+  );
+  return (getTotalCost(turn) ?? NaN) - (getTotalCost(requests) ?? NaN);
+}
+
 /** The turn's only sidecar row: a duplicate write would double-count the spend. */
 async function readSingleSidecarRecord(
   sessionsDir: string,
@@ -136,7 +152,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
     overrides: Partial<ToolModelUsageEventForTests> = {}
   ): ToolModelUsageEventForTests {
     return {
-      toolName: overrides.toolName ?? "intuition",
+      toolName: overrides.toolName ?? "nested_tool",
       toolCallId: overrides.toolCallId ?? "tool-call-1",
       timestamp: overrides.timestamp ?? Date.now(),
       model: overrides.model ?? "anthropic:claude-sonnet-4-20250514",
@@ -157,6 +173,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
     historySequence?: number;
     chunks: ScriptedChunk[];
     usage?: Record<string, number>;
+    steps?: ScriptedAttempt["steps"];
     streamManager?: StreamManager;
     events?: TurnEngineEvent[];
     options?: Partial<TurnExecutionOptions>;
@@ -172,6 +189,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
           {
             chunks: params.chunks,
             usage: params.usage ?? { inputTokens: 4, outputTokens: 6, totalTokens: 10 },
+            steps: params.steps,
           },
           ...(params.fallbackAttempts ?? []),
         ]),
@@ -249,6 +267,20 @@ describe("StreamManager - TTFT metadata persistence", () => {
     expect(updatedMessage.metadata?.metadataModel).toBe("openai:gpt-4");
   });
 
+  test("a completed turn prices each step at its own context tier", async () => {
+    const steps = [SHORT_STEP_USAGE, LONG_STEP_USAGE];
+    const message = await completeTurnAndReadMessage({
+      workspaceId: "long-context-completed-workspace",
+      messageId: "long-context-completed-message",
+      chunks: [...steps.map((usage) => finishStep(usage)), text("done"), STOP_FINISH],
+      usage: { inputTokens: 200_000, outputTokens: 1_000, totalTokens: 201_000 },
+      steps: steps.map((usage) => ({ usage })),
+      options: { modelString: LONG_CONTEXT_MODEL },
+    });
+
+    expect(costAboveRequestPrices(message, steps)).toBeCloseTo(0, 12);
+  });
+
   test("emits and persists routeProvider from initial stream metadata", async () => {
     const events: TurnEngineEvent[] = [];
     const updatedMessage = await completeTurnAndReadMessage({
@@ -259,26 +291,40 @@ describe("StreamManager - TTFT metadata persistence", () => {
       options: {
         initialMetadata: {
           routeProvider: "openrouter",
-          routedThroughGateway: true,
         },
       },
     });
 
     expect(events.find((event) => event.type === "stream-start")).toMatchObject({
       routeProvider: "openrouter",
-      routedThroughGateway: true,
     });
     expect(events.find((event) => event.type === "stream-end")).toMatchObject({
-      metadata: { routeProvider: "openrouter", routedThroughGateway: true },
+      metadata: { routeProvider: "openrouter" },
     });
     expect(updatedMessage.metadata?.routeProvider).toBe("openrouter");
-    expect(updatedMessage.metadata?.routedThroughGateway).toBe(true);
+  });
+
+  // ACP routes a completed turn back to its prompt by this id; the abort event's twin
+  // is checked in "aborted stream usage persistence".
+  test("the stream-end event carries the ACP prompt id from the initial metadata", async () => {
+    const events: TurnEngineEvent[] = [];
+    await completeTurnAndReadMessage({
+      workspaceId: "acp-prompt-end-workspace",
+      messageId: "acp-prompt-end-message",
+      events,
+      chunks: [text("hello"), STOP_FINISH],
+      options: { initialMetadata: { acpPromptId: "acp-prompt-1" } },
+    });
+
+    expect(events.find((event) => event.type === "stream-end")).toMatchObject({
+      acpPromptId: "acp-prompt-1",
+    });
   });
 
   test("persists per-invocation tool model usages on the final assistant message", async () => {
     const startTime = Date.now() - 1000;
     const firstToolUsage = createToolModelUsageEvent({
-      toolName: "intuition",
+      toolName: "nested_tool",
       toolCallId: "tool-call-1",
       timestamp: startTime + 50,
       model: "openai:gpt-4",
@@ -290,7 +336,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
       providerMetadata: { openai: { reasoningTokens: 4 } },
     });
     const secondToolUsage = createToolModelUsageEvent({
-      toolName: "intuition",
+      toolName: "nested_tool",
       toolCallId: "tool-call-2",
       timestamp: startTime + 90,
       model: "openai:gpt-4",
@@ -351,7 +397,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
                 workspaceId,
                 firstMessageId,
                 createToolModelUsageEvent({
-                  toolName: "intuition",
+                  toolName: "nested_tool",
                   toolCallId: "tool-call-first",
                   usage: { inputTokens: 24, outputTokens: 6, totalTokens: 30 },
                 })
@@ -368,7 +414,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
                 workspaceId,
                 firstMessageId,
                 createToolModelUsageEvent({
-                  toolName: "intuition",
+                  toolName: "nested_tool",
                   toolCallId: "tool-call-stale",
                   usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
                 })
@@ -388,7 +434,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
     });
     expect(readToolModelUsages(firstMessage)).toMatchObject([
       {
-        toolName: "intuition",
+        toolName: "nested_tool",
         toolCallId: "tool-call-first",
       },
     ]);
@@ -570,6 +616,24 @@ describe("StreamManager - aborted stream usage persistence", () => {
       anthropic: { cacheCreationInputTokens: 42 },
     });
     expect(partial?.metadata?.contextUsage).toMatchObject(ABORT_STEP_USAGE);
+  });
+
+  test("an aborted turn prices each finished step at its own context tier", async () => {
+    const workspaceId = "long-context-abort-workspace";
+    const messageId = "long-context-abort-message";
+    const steps = [SHORT_STEP_USAGE, LONG_STEP_USAGE];
+    const { streamManager, completion } = await startHeldTurnForTests({
+      workspaceId,
+      messageId,
+      chunks: [partialText, ...steps.map((usage) => finishStep(usage))],
+      options: { modelString: LONG_CONTEXT_MODEL },
+    });
+
+    await streamManager.stopStream(workspaceId, { abortReason: "user" });
+    expect((await completion).status).toBe("aborted");
+
+    const partial = await readHistoryMessage(historyService, workspaceId, messageId);
+    expect(costAboveRequestPrices(partial, steps)).toBeCloseTo(0, 12);
   });
 
   test("emits the effective fallback model and its pinned pricing identity with aborted usage", async () => {
@@ -909,5 +973,86 @@ describe("StreamManager - aborted stream usage persistence", () => {
     } finally {
       await cleanup();
     }
+  });
+
+  test("the committed partial gets the abort event's duration, context metadata and tool-model usage", async () => {
+    const workspaceId = "abort-partial-metadata";
+    const messageId = "abort-partial-metadata-message";
+    const events: TurnEngineEvent[] = [];
+    const stepProviderMetadata = { anthropic: { cacheCreationInputTokens: 42 } };
+    const { streamManager, completion } = await startHeldTurnForTests({
+      workspaceId,
+      messageId,
+      events,
+      chunks: (activeManager) => [
+        partialText,
+        finishStep(ABORT_STEP_USAGE, stepProviderMetadata),
+        () =>
+          activeManager().recordToolModelUsage(workspaceId, messageId, {
+            toolName: "task",
+            timestamp: 1,
+            model: KNOWN_MODELS.SONNET.id,
+            usage: { inputTokens: 70, outputTokens: 7, totalTokens: 77 },
+          }),
+        // The turn runs for a measurable time before the stop.
+        () => new Promise<void>((resolve) => setTimeout(resolve, 5)),
+      ],
+    });
+
+    await streamManager.stopStream(workspaceId, { abortReason: "user" });
+    expect((await completion).status).toBe("aborted");
+
+    const event = StreamAbortEventSchema.parse(events.find((e) => e.type === "stream-abort"));
+    expect(event.metadata?.duration).toBeGreaterThanOrEqual(5);
+    expect(event.metadata?.contextProviderMetadata).toEqual(stepProviderMetadata);
+    const partial = await readHistoryMessage(historyService, workspaceId, messageId);
+    expect(partial.metadata?.duration).toBe(event.metadata?.duration);
+    expect(partial.metadata?.contextProviderMetadata).toEqual(stepProviderMetadata);
+    expect(partial.metadata?.toolModelUsages?.map((usage) => usage.usage.inputTokens)).toEqual([
+      70,
+    ]);
+  });
+
+  test("the abort event keeps the stop's abandon flag, the ACP prompt id and the costs-included mark", async () => {
+    const workspaceId = "abort-event-fields";
+    const events: TurnEngineEvent[] = [];
+    const { streamManager, completion } = await startHeldTurnForTests({
+      workspaceId,
+      messageId: "abort-event-fields-message",
+      events,
+      chunks: [partialText, finishStep(ABORT_STEP_USAGE)],
+      options: { initialMetadata: { costsIncluded: true, acpPromptId: "acp-prompt-1" } },
+    });
+
+    await streamManager.stopStream(workspaceId, { abortReason: "user", abandonPartial: true });
+    expect((await completion).status).toBe("aborted");
+
+    expect(events.find((e) => e.type === "stream-abort")).toMatchObject({
+      abandonPartial: true,
+      acpPromptId: "acp-prompt-1",
+      metadata: { providerMetadata: { mux: { costsIncluded: true } } },
+    });
+  });
+
+  test("an aborted turn backfills reasoning tokens the provider did not report", async () => {
+    const workspaceId = "abort-reasoning-backfill";
+    const messageId = "abort-reasoning-backfill-message";
+    const reasoningText = "Thinking through tradeoffs";
+    const { streamManager } = await startHeldTurnForTests({
+      workspaceId,
+      messageId,
+      chunks: [
+        { type: "reasoning-delta", text: reasoningText },
+        partialText,
+        finishStep(ABORT_STEP_USAGE),
+      ],
+    });
+
+    await streamManager.stopStream(workspaceId, { abortReason: "user" });
+
+    const partial = await readHistoryMessage(historyService, workspaceId, messageId);
+    expect(partial.metadata?.usage?.reasoningTokens).toBe(
+      await countTokens(KNOWN_MODELS.SONNET.id, reasoningText)
+    );
   });
 });

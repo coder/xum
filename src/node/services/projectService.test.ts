@@ -11,8 +11,11 @@ import { ORPCError } from "@orpc/server";
 import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { DraftService } from "./draftService";
+import { CreationDraftService } from "./creationDraftService";
 import { ProjectService, type CloneEvent } from "./projectService";
+import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
+import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { getRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import {
   projectRegistrationLockFilePath,
   withProjectRegistrationLock,
@@ -64,7 +67,7 @@ async function withEnv<T>(
 const DEFAULT_FAKE_GIT_SHIM = `#!/bin/sh
 printf '%s\n' "$@" > "$FAKE_GIT_ARGS_LOG"
 if [ "$1" = "clone" ]; then
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -106,7 +109,7 @@ async function cloneWithFakeGit(
   expect(result.success).toBe(true);
   if (!result.success) throw new Error("Expected success");
   const loggedArgs = (await fs.readFile(fakeGit.fakeGitArgsLogPath, "utf-8")).trim().split("\n");
-  return { result, loggedArgs, cloneWorkPath: loggedArgs[4] ?? "" };
+  return { result, loggedArgs, cloneWorkPath: loggedArgs[5] ?? "" };
 }
 
 async function collectCloneEvents(
@@ -891,8 +894,9 @@ exec ${realGit} "$@"
         if (testCase.expectedRepoUrl) {
           expect(captured.loggedArgs[0]).toBe("clone");
           expect(captured.loggedArgs[1]).toBe("--progress");
-          expect(captured.loggedArgs[2]).toBe("--");
-          expect(captured.loggedArgs[3]).toBe(testCase.expectedRepoUrl);
+          expect(captured.loggedArgs[2]).toBe("--no-local");
+          expect(captured.loggedArgs[3]).toBe("--");
+          expect(captured.loggedArgs[4]).toBe(testCase.expectedRepoUrl);
         }
         expect(path.dirname(captured.cloneWorkPath)).toBe(path.resolve(cloneParentDir));
         expect(path.basename(captured.cloneWorkPath)).toMatch(
@@ -935,14 +939,14 @@ exec ${realGit} "$@"
         cloneParentDir,
         sshAuthSock: path.join(tempDir, "fake-ssh-agent.sock"),
         gitShimBody: `#!/bin/sh
-printf '%s\\n' "$4" >> "$FAKE_GIT_ARGS_LOG"
-case "$4" in
+printf '%s\\n' "$5" >> "$FAKE_GIT_ARGS_LOG"
+case "$5" in
   git@github.com:*)
     echo "git@github.com: Permission denied (publickey)." >&2
     exit 128
     ;;
 esac
-mkdir -p "$5/.git"
+mkdir -p "$6/.git"
 exit 0
 `,
       });
@@ -984,14 +988,14 @@ exit 0
           }
         },
         gitShimBody: `#!/bin/sh
-printf '%s\n' "$4" >> "$FAKE_GIT_ARGS_LOG"
-case "$4" in
+printf '%s\n' "$5" >> "$FAKE_GIT_ARGS_LOG"
+case "$5" in
   git@github.com:*)
     echo "git@github.com: Permission denied (publickey)." >&2
     exit 128
     ;;
 esac
-mkdir -p "$5/.git"
+mkdir -p "$6/.git"
 exit 0
 `,
       });
@@ -1016,7 +1020,7 @@ exit 0
         repoUrl: "git@github.com:owner/private.git",
         cloneParentDir,
         gitShimBody: `#!/bin/sh
-printf '%s\\n' "$4" >> "$FAKE_GIT_ARGS_LOG"
+printf '%s\\n' "$5" >> "$FAKE_GIT_ARGS_LOG"
 echo "git@github.com: Permission denied (publickey)." >&2
 exit 128
 `,
@@ -1038,7 +1042,7 @@ exit 128
         repoUrl: "https://github.com/owner/private.git",
         cloneParentDir,
         gitShimBody: `#!/bin/sh
-printf '%s\\n' "$4" >> "$FAKE_GIT_ARGS_LOG"
+printf '%s\\n' "$5" >> "$FAKE_GIT_ARGS_LOG"
 echo "remote: Write access to repository not granted." >&2
 echo "fatal: unable to access 'https://github.com/owner/private.git/': The requested URL returned error: 403" >&2
 exit 128
@@ -1091,7 +1095,7 @@ exit 128
         `#!/bin/sh
 if [ "$1" = "clone" ]; then
   echo 'progress: starting' >&2
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1128,6 +1132,40 @@ exit 1
       } finally {
         process.env.PATH = originalPath;
       }
+    });
+
+    // A repack of the source (git starts one in the background after a commit or fetch) deletes
+    // loose objects while a local-path clone copies them one by one, and the clone fails with
+    // "failed to copy file to ...". A test cannot pause that repack, so this plants what the copy
+    // cannot take: a symlink in objects/ ("symlink ... exists, refusing to clone with --local").
+    // `git upload-pack` never reads it.
+    it("clones a local repository through git's transport, not by copying its object files", async () => {
+      if (process.platform === "win32") {
+        // Creating a symlink needs a privilege that Windows runners lack.
+        return;
+      }
+
+      const sourceRepoPath = await createLocalGitRepository(tempDir, "source-repo-transport");
+      await fs.symlink(
+        "missing-target",
+        path.join(sourceRepoPath, ".git", "objects", "info", "stale-link")
+      );
+      const cloneParentDir = path.join(tempDir, "transport-clones");
+
+      const events: CloneEvent[] = [];
+      for await (const event of service.cloneWithProgress({
+        repoUrl: sourceRepoPath,
+        cloneParentDir,
+      })) {
+        events.push(event);
+      }
+
+      const terminalEvent = events[events.length - 1];
+      expect(terminalEvent?.type, JSON.stringify(terminalEvent)).toBe("success");
+      if (terminalEvent?.type !== "success") throw new Error("Expected success event");
+      const headOf = (repoPath: string) =>
+        execSync("git rev-parse HEAD", { cwd: repoPath, encoding: "utf-8" }).trim();
+      expect(headOf(terminalEvent.normalizedPath)).toBe(headOf(sourceRepoPath));
     });
 
     it("yields error and rolls back when cloned project cannot be persisted in config", async () => {
@@ -1209,7 +1247,7 @@ exit 1
         `#!/bin/sh
 if [ "$1" = "clone" ]; then
   echo 'progress: starting' >&2
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   sleep 1000 &
   pid=$!
   trap 'kill $pid 2>/dev/null; exit 0' TERM INT
@@ -1281,7 +1319,7 @@ exit 1
         `#!/bin/sh
 if [ "$1" = "clone" ]; then
   echo 'progress: starting' >&2
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   sleep 1000 &
   pid=$!
   trap 'kill $pid 2>/dev/null; exit 0' TERM INT
@@ -1348,7 +1386,7 @@ exit 1
         fakeGitPath,
         `#!/bin/sh
 if [ "$1" = "clone" ]; then
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   mkdir -p "$CONCURRENT_DEST_PATH"
   printf 'keep\n' > "$CONCURRENT_MARKER_PATH"
   exit 1
@@ -1446,7 +1484,7 @@ exit 1
         `#!/bin/sh
 if [ "$1" = "clone" ]; then
   printf 'SSH_ASKPASS=%s\nSSH_ASKPASS_REQUIRE=%s\nGIT_TERMINAL_PROMPT=%s\n' "\${SSH_ASKPASS:-}" "\${SSH_ASKPASS_REQUIRE:-}" "\${GIT_TERMINAL_PROMPT:-}" > "$FAKE_GIT_ENV_LOG"${sshAskpassGuard}
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1535,7 +1573,7 @@ if [ "$1" = "clone" ]; then
     echo "Host key verification failed." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1627,7 +1665,7 @@ if [ "$1" = "clone" ]; then
     echo "Host key verification failed." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1707,7 +1745,7 @@ if [ "$1" = "clone" ]; then
     echo "Host key verification failed." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1788,7 +1826,7 @@ if [ "$1" = "clone" ]; then
     echo "Host key verification failed." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -1923,7 +1961,7 @@ if [ "$1" = "clone" ]; then
     echo "git@github.com: Permission denied (publickey,password)." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -2058,7 +2096,7 @@ if [ "$1" = "clone" ]; then
     echo "Permission denied (publickey,password)." >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -2138,7 +2176,7 @@ if [ "$1" = "clone" ]; then
     echo "Unexpected SSH_ASKPASS for HTTPS clone" >&2
     exit 128
   fi
-  mkdir -p "$5/.git"
+  mkdir -p "$6/.git"
   exit 0
 fi
 exit 1
@@ -2293,6 +2331,26 @@ exit 1
       expect(branchResult.recommendedTrunk).toBe("main");
     });
 
+    // A failed create removes the directory right after the initial commit. A detached
+    // `git maintenance run --auto` from that commit was still using the repository then, and
+    // Bun's recursive fs.rm can stop early without an error when an entry it listed is
+    // removed meanwhile, so the "fails initGit create without leaving .git" test saw the
+    // directory survive about 1 run in 40 with git 2.55.
+    it("starts no background git maintenance that outlives the initial commit", async () => {
+      const testDir = path.join(tempDir, "no-maintenance");
+      await fs.mkdir(testDir);
+      const tracePath = path.join(tempDir, "git-trace2.json");
+
+      const result = await withEnv({ GIT_TRACE2_EVENT: tracePath }, () => service.gitInit(testDir));
+
+      expect(result.success).toBe(true);
+      // The commit writes the child_start event for a maintenance child before it exits, so
+      // the child shows up here even if it detached and has not run yet.
+      const trace = await fs.readFile(tracePath, "utf-8");
+      expect(trace).toContain('"hierarchy":"commit"');
+      expect(trace).not.toContain('"maintenance"');
+    });
+
     it("succeeds for unborn git repo (git init but no commits)", async () => {
       const testDir = path.join(tempDir, "unborn-git");
       await fs.mkdir(testDir);
@@ -2401,6 +2459,109 @@ exit 1
           { projectPath: childPath, trusted: true },
         ],
       ]);
+    });
+
+    it("setTrust drops remote plugin snapshots even when the MCP update throws (#6426)", async () => {
+      // A remote host whose listing runs in a local shell; each exec is one cold read.
+      let execs = 0;
+      class CountingRuntime extends ShellRemoteRuntime {
+        override getAgentHostKey(): string {
+          return "trust-test";
+        }
+        override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+          execs++;
+          return super.exec(command, options);
+        }
+      }
+      const runtime = new CountingRuntime(tempDir);
+      const containers = [path.join(tempDir, ".xum", "plugins")];
+      await getRemoteProjectPluginSnapshot(runtime, tempDir, containers);
+      service.setMcpServerManager({
+        applyProjectTrust: () => {
+          throw new Error("MCP update failed");
+        },
+        forgetProjectTrust: () => undefined,
+      });
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
+      await expect(service.setTrust(path.join(tempDir, "project"), true)).rejects.toThrow(
+        "MCP update failed"
+      );
+      await getRemoteProjectPluginSnapshot(runtime, tempDir, containers);
+      expect(execs).toBe(2);
+    });
+
+    it("drops remote plugin snapshots when another config writer changes trust (#7621)", async () => {
+      let execs = 0;
+      class CountingRuntime extends ShellRemoteRuntime {
+        override getAgentHostKey(): string {
+          return "external-trust-test";
+        }
+        override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+          execs++;
+          return super.exec(command, options);
+        }
+      }
+      const runtime = new CountingRuntime(tempDir);
+      const containers = [path.join(tempDir, ".xum", "plugins")];
+      const read = () => getRemoteProjectPluginSnapshot(runtime, tempDir, containers);
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [], trusted: true });
+        return current;
+      });
+      service.watchProjectTrust();
+      // A second instance writes config.json like the `xum trust` CLI. Registered after the
+      // service's listener, this one resolves once the service has seen the change.
+      const otherWriter = new Config(tempDir);
+      const writeProject = async (fields: { trusted: boolean; displayName?: string }) => {
+        const seen = new Promise<void>((resolve) => {
+          const unsubscribe = config.onConfigChanged(() => {
+            unsubscribe();
+            resolve();
+          });
+        });
+        await otherWriter.editConfig((current) => {
+          current.projects.set(projectPath, { workspaces: [], ...fields });
+          return current;
+        });
+        await seen;
+      };
+
+      try {
+        await read();
+        expect(execs).toBe(1);
+        // A change that leaves trust alone keeps the snapshot.
+        await writeProject({ trusted: true, displayName: "Project" });
+        await read();
+        expect(execs).toBe(1);
+        // A revoke and a re-grant outside setTrust: the next read lists again.
+        await writeProject({ trusted: false });
+        await writeProject({ trusted: true });
+        await read();
+        expect(execs).toBe(2);
+      } finally {
+        service.beginShutdown();
+      }
+    });
+
+    it("setIcon stores an icon name and null clears it", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+
+      await service.setIcon(projectPath, "rocket");
+      expect(new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.icon).toBe(
+        "rocket"
+      );
+
+      await service.setIcon(projectPath, null);
+      const [listed] = service.list().filter(([listedPath]) => listedPath === projectPath);
+      expect(listed?.[1]).not.toHaveProperty("icon");
+      expect(
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)
+      ).not.toHaveProperty("icon");
     });
 
     it("validates, writes, and clears code workspace sync paths", async () => {
@@ -2880,11 +3041,10 @@ exit 1
       const cfg = config.loadConfigOrDefault();
       cfg.projects.set(projectPath, { workspaces: [] });
       await config.editConfig(() => cfg);
-      const draftService = new DraftService(config);
+      const draftService = new CreationDraftService(config);
       service.setDraftCleaner(draftService);
-      const draftScope = { kind: "creation" as const, projectPath, draftId: "draft-1" };
-      await draftService.update({ scope: draftScope, text: "unsent" });
-      await draftService.putListEntry({ ...draftScope, subProjectPath: null, createdAt: 1 });
+      const scope = { kind: "creation" as const, draftId: "draft-1" };
+      await draftService.update({ scope, projectPath, text: "unsent" });
 
       const result = await service.remove(projectPath);
 
@@ -2896,8 +3056,8 @@ exit 1
       const after = config.loadConfigOrDefault();
       expect(after.projects.has(projectPath)).toBe(false);
       // Removal cleans the draft files server-side, whichever client (if any) removed it.
-      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual(["list.json"]);
-      expect((await draftService.getList()).entries).toEqual([]);
+      expect(await fs.readdir(path.join(config.rootDir, "creation-drafts"))).toEqual([]);
+      expect((await draftService.list()).drafts).toEqual([]);
     });
 
     it.each([
@@ -2910,19 +3070,18 @@ exit 1
       cfg.projects.set(parentPath, { workspaces: [] });
       cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
       await config.editConfig(() => cfg);
-      const draftService = new DraftService(config);
+      const draftService = new CreationDraftService(config);
       service.setDraftCleaner(draftService);
-      const draftScope = { kind: "creation" as const, projectPath: childPath, draftId: "draft-1" };
-      await draftService.update({ scope: draftScope, text: "unsent" });
-      await draftService.putListEntry({ ...draftScope, subProjectPath: null, createdAt: 1 });
+      const scope = { kind: "creation" as const, draftId: "draft-1" };
+      await draftService.update({ scope, projectPath: childPath, text: "unsent" });
 
       const result = await service.remove(removedPath);
 
       expect(result.success && result.data.removedCreationDrafts).toEqual([
         { projectPath: childPath, draftId: "draft-1" },
       ]);
-      expect(await fs.readdir(path.join(config.rootDir, "drafts"))).toEqual(["list.json"]);
-      expect((await draftService.getList()).entries).toEqual([]);
+      expect(await fs.readdir(path.join(config.rootDir, "creation-drafts"))).toEqual([]);
+      expect((await draftService.list()).drafts).toEqual([]);
     });
 
     it("returns project_not_found for unknown project", async () => {

@@ -225,11 +225,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
     return (
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         {modelName && (
-          <ModelDisplay
-            modelString={modelName}
-            routedThroughGateway={message.routedThroughGateway}
-            routeProvider={message.routeProvider}
-          />
+          <ModelDisplay modelString={modelName} routeProvider={message.routeProvider} />
         )}
         {message.modelFallback && (
           <ModelFallbackBadge modelFallback={message.modelFallback} effectiveModel={modelName} />

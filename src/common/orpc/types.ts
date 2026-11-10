@@ -30,7 +30,6 @@ export type SendMessageOptions = z.infer<typeof schemas.SendMessageOptionsSchema
 export type HistoryEditPrecondition = z.infer<typeof schemas.HistoryEditPreconditionSchema>;
 
 // Provider types (single source of truth - derived from schemas)
-export type AWSCredentialStatus = z.infer<typeof schemas.AWSCredentialStatusSchema>;
 export type ProviderModelEntry = z.infer<typeof schemas.ProviderModelEntrySchema>;
 export type ProviderModelDiscoveryResult = z.infer<
   typeof schemas.ProviderModelDiscoveryResultSchema
@@ -44,6 +43,8 @@ export type CustomProviderMutationError = z.infer<typeof schemas.CustomProviderM
 export type AddCustomProviderInput = z.infer<typeof schemas.providers.addCustomProvider.input>;
 export type FilePart = z.infer<typeof schemas.FilePartSchema>;
 export type WorkspaceChatMessage = z.infer<typeof schemas.WorkspaceChatMessageSchema>;
+/** An onChat event: a WorkspaceChatMessage or an onChat-only `message-batch` (#5102). */
+export type OnChatEvent = z.infer<typeof schemas.OnChatEventSchema>;
 /** One held input's display data (see HeldInputsChangedEventSchema). */
 export type HeldInput = Extract<
   WorkspaceChatMessage,

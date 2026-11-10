@@ -6,6 +6,7 @@ import { ExperimentsService } from "./experimentsService";
 import { TelemetryService } from "./telemetryService";
 import { MemoryService } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
+import { MEMORY_CONTEXT_FILE_NAME } from "./memoryContextPersistence";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import * as fs from "node:fs/promises";
 import { attachLanguageModelCleanup, runLanguageModelCleanup } from "./languageModelCleanup";
@@ -82,7 +83,6 @@ async function setup(
         canonicalProviderName: "openai",
         canonicalModelId: requestedModel.slice("openai:".length),
         wireProviderName: "openai",
-        routedThroughGateway: false,
       })
     );
   });
@@ -171,7 +171,11 @@ async function setup(
   });
   const registration = eventSpine.useRequestContext(assembly, { workspaceId });
   const oldCache = Reflect.get(h.session, "memoryContextByModelString") as Map<string, unknown>;
-  oldCache.set("preserved-model", { context: { hotMemoriesBlock: "Preserved old notes" } });
+  oldCache.set("preserved-model", {
+    context: {
+      indexEntries: [{ path: "/memories/global/old.md", description: "Preserved old notes" }],
+    },
+  });
   expect(
     (
       await historyService.appendManyToHistory(workspaceId, [
@@ -278,7 +282,11 @@ describe("pinned full-payload rollover admission", () => {
             ).toBe(false);
           expect(Reflect.get(h.session, "memoryContextByModelString")).toBe(oldCache);
           expect(oldCache.get("preserved-model")).toEqual({
-            context: { hotMemoriesBlock: "Preserved old notes" },
+            context: {
+              indexEntries: [
+                { path: "/memories/global/old.md", description: "Preserved old notes" },
+              ],
+            },
           });
         }
         if (fits) {
@@ -424,27 +432,27 @@ describe("pinned full-payload rollover admission", () => {
         new MemoryMetaService(config.rootDir)
       );
       spyOn(fixture.experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) =>
-          id === EXPERIMENT_IDS.MEMORY ||
-          id === EXPERIMENT_IDS.MEMORY_HOT_SET ||
-          id === EXPERIMENT_IDS.TOKEN_BUDGET
+        (id) => id === EXPERIMENT_IDS.MEMORY || id === EXPERIMENT_IDS.TOKEN_BUDGET
       );
-      const previous = {
-        context: { indexEntries: [], hotMemoriesBlock: "Obsolete notes" },
-        includesHotMemories: true,
-        memoryEnabled: true,
-        hotSetEnabled: true,
-      };
+      const notes = (description: string) => [{ path: "/memories/global/notes.md", description }];
+      const previous = { context: { indexEntries: notes("Obsolete notes") }, memoryEnabled: true };
       oldCache.set(model, previous);
       const fresh = overflow ? "漢".repeat(70000) : "Fresh retained notes";
-      const readMemory = spyOn(service, "buildMemorySessionContext").mockImplementation(
-        (_workspace, _model, options) =>
-          Promise.resolve({
-            indexEntries: [],
-            hotMemoriesBlock: options?.includeHotMemories === false ? null : fresh,
-          })
+      const readMemory = spyOn(service, "buildMemorySessionContext").mockResolvedValue({
+        indexEntries: notes(fresh),
+      });
+      // The index reaches the request through the memory tool description.
+      assembleTools.mockImplementation((_model, options) =>
+        Promise.resolve({
+          session_history: smallTool,
+          memory: tool({
+            description: (options.memoryIndexEntries ?? [])
+              .map((entry) => entry.description)
+              .join(),
+            inputSchema: jsonSchema({ type: "object", properties: {} }),
+          }),
+        })
       );
-      assembleTools.mockResolvedValue({ session_history: smallTool, memory: smallTool });
       try {
         expect(
           (
@@ -454,22 +462,31 @@ describe("pinned full-payload rollover admission", () => {
             })
           ).success
         ).toBe(!overflow);
-        expect(readMemory).toHaveBeenCalledTimes(2);
+        expect(readMemory).toHaveBeenCalledTimes(1);
         expect(applyReset).toHaveBeenCalledTimes(overflow ? 0 : 1);
         if (overflow) {
           expect(Reflect.get(h.session, "memoryContextByModelString")).toBe(oldCache);
           expect(oldCache.get(model)).toBe(previous);
         } else {
-          expect(start.mock.calls[0][0].system).toContain(fresh);
-          expect(start.mock.calls[0][0].system).not.toContain("Obsolete notes");
+          const sentIndex = start.mock.calls[0][0].tools?.memory?.description;
+          expect(sentIndex).toContain(fresh);
+          expect(sentIndex).not.toContain("Obsolete notes");
           const cache = Reflect.get(h.session, "memoryContextByModelString") as Map<
             string,
             unknown
           >;
-          expect(cache.get(model)).toMatchObject({
-            context: { hotMemoriesBlock: fresh },
-            includesHotMemories: true,
+          expect(cache.get(model)).toEqual({
+            context: { indexEntries: notes(fresh) },
+            memoryEnabled: true,
           });
+          // The new window's context is saved before its first stream, so a server restart
+          // during that turn restores these bytes instead of rebuilding them.
+          const saved = await fs.readFile(
+            path.join(fixture.config.sessionsDir, workspaceId, MEMORY_CONTEXT_FILE_NAME),
+            "utf-8"
+          );
+          expect(saved).toContain(fresh);
+          expect(saved).not.toContain("Obsolete notes");
         }
       } finally {
         await fixture.cleanup();
@@ -618,6 +635,32 @@ describe("pinned full-payload rollover admission", () => {
             () => false
           )
         ).toBe(false);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test("a Stop during an emergency rollover's runtime start arms no retry", async () => {
+    const fixture = await setup("deferred-schema", true);
+    const { h, service } = fixture;
+    // The rollover's request preparation reports a runtime failure without a pre-start error.
+    // A workspace-turn interrupt or a hard timeout lands while it waits for the runtime: it ends
+    // the retry loop, and the aborted runtime start fails as retryable runtime_start_failed.
+    spyOn(service, "prepareStreamMessage").mockImplementation(() => {
+      h.session.abandonAutoRetry("task_stopped");
+      return Promise.resolve(Err({ type: "runtime_start_failed", message: "Aborted" }));
+    });
+    const scheduled: string[] = [];
+    h.session.onChatEvent(({ message }) => {
+      if (message.type === "auto-retry-scheduled") scheduled.push(message.type);
+    });
+    try {
+      const result = await h.session.sendMessage("Small follow-up", { model, agentId: "exec" });
+      expect(result).toMatchObject({ success: false, error: { type: "runtime_start_failed" } });
+      expect({ pending: h.session.hasPendingAutoRetry(), scheduled }).toEqual({
+        pending: false,
+        scheduled: [],
+      });
     } finally {
       await fixture.cleanup();
     }

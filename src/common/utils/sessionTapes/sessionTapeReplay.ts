@@ -13,7 +13,7 @@
  * without an error.
  */
 import { resolveXumEnvironmentValue, type XumEnvironment } from "@/common/compat/xumEnv";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatEvent } from "@/common/orpc/types";
 import { MAX_TIMER_DELAY_MS } from "@/constants/timers";
 import type { LoadedSessionTape } from "./sessionTapeLoader";
 
@@ -88,7 +88,7 @@ function sleepUntilAborted(ms: number, signal: AbortSignal | undefined): Promise
 export async function* replaySessionTape(
   tape: Pick<LoadedSessionTape, "events">,
   options: SessionTapeReplayOptions
-): AsyncGenerator<WorkspaceChatMessage> {
+): AsyncGenerator<OnChatEvent> {
   const { pacing, signal } = options;
   // The generator body runs on the first pull, so offsets start when the consumer starts reading,
   // like the recorder's offsets.

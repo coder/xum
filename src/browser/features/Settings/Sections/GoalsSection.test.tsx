@@ -14,9 +14,9 @@ import {
 
 type GoalDefaultsUpdate = Parameters<APIClient["config"]["updateGoalDefaults"]>[0];
 
-import { GoalsSection } from "./GoalsSection";
+import { GoalDefaultsControls } from "./GoalsSection";
 
-function renderGoalsSection(config: { goalDefaults?: GoalDefaults } = {}) {
+function renderGoalDefaultsControls(config: { goalDefaults?: GoalDefaults } = {}) {
   const current: Partial<TestClientConfig> = { ...config };
   const updateGoalDefaults = mock(({ goalDefaults }: GoalDefaultsUpdate) => {
     // The real input is partial; the backend stores it normalized, as getConfig returns it.
@@ -36,7 +36,7 @@ function renderGoalsSection(config: { goalDefaults?: GoalDefaults } = {}) {
   const view = render(
     <APIProvider client={createTestApiClient(mockApi)}>
       <ThemeProvider forcedTheme="dark">
-        <GoalsSection />
+        <GoalDefaultsControls />
       </ThemeProvider>
     </APIProvider>
   );
@@ -44,7 +44,7 @@ function renderGoalsSection(config: { goalDefaults?: GoalDefaults } = {}) {
   return { view, updateGoalDefaults };
 }
 
-describe("GoalsSection", () => {
+describe("GoalDefaultsControls", () => {
   let cleanupDom: (() => void) | null = null;
 
   beforeEach(() => {
@@ -59,7 +59,7 @@ describe("GoalsSection", () => {
   });
 
   test("renders default goal settings", async () => {
-    const { view } = renderGoalsSection();
+    const { view } = renderGoalDefaultsControls();
 
     const budgetInput = (await waitFor(() =>
       view.getByLabelText("Default goal budget in dollars")
@@ -73,7 +73,7 @@ describe("GoalsSection", () => {
   });
 
   test("persists edited goal defaults", async () => {
-    const { view, updateGoalDefaults } = renderGoalsSection({
+    const { view, updateGoalDefaults } = renderGoalDefaultsControls({
       goalDefaults: { ...DEFAULT_GOAL_DEFAULTS, defaultBudgetCents: 300 },
     });
 

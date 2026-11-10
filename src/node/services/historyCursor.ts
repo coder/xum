@@ -14,9 +14,9 @@ export function isHistoryIdentifierRepresentable(id: string): boolean {
 }
 
 const offset = z.number().int().nonnegative().safe();
-export const HistoryArtifactSchema = z.enum(["chat", "archive"]);
+const HistoryArtifactSchema = z.enum(["chat", "archive"]);
 export type HistoryArtifact = z.infer<typeof HistoryArtifactSchema>;
-export const HistorySnapshotSchema = z
+const HistorySnapshotSchema = z
   .object({
     endOffsetSnapshot: offset,
     inode: z.string(),

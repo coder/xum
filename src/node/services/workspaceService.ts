@@ -1,3 +1,4 @@
+import { humanId } from "human-id";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { removeRuntimeScratchDir } from "@/node/runtime/runtimeScratchDir";
 import type { ContextManagementService } from "./contextManagement/contextManagementService";
@@ -8,13 +9,19 @@ import { CompactionPendingState } from "./compactionPendingState";
 import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import { Effect, type Scope } from "effect";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
+import { hostClockFor } from "./di/hostClockLive";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import {
   DesktopInputCoordinator,
   settleArchivedSharedDesktopTask,
 } from "@/node/services/desktop/DesktopInputCoordinator";
 import * as path from "path";
 import { isDeepStrictEqual } from "util";
-import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
+import {
+  TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
+  WORKSPACE_NAME_GENERATION_TIMEOUT_MS,
+} from "@/constants/terminationTimeouts";
+import { isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
 import { EventEmitter } from "events";
@@ -50,7 +57,7 @@ import {
   workspacesSharingPlanDirectory,
   type Config,
 } from "@/node/config";
-import type { ProjectsConfig, Workspace } from "@/common/types/project";
+import type { ProjectConfig, ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import { askUserQuestionManager } from "@/node/services/askUserQuestionManager";
@@ -65,6 +72,7 @@ import { codexPluginHookService } from "@/node/services/agentPlugins/codexHookSe
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
+import type { ExtensionAgentStatus } from "@/node/utils/extensionMetadata";
 import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
@@ -92,6 +100,9 @@ import {
   isWorkspaceEvent,
   statusSetResultStatus,
 } from "@/node/services/aiServiceEventGuards";
+// Outside the agent loop: WorkspaceService passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
 import type { TelemetryService } from "@/node/services/telemetryService";
@@ -220,6 +231,7 @@ import {
 } from "@/node/services/sideChat";
 import {
   generateWorkspaceIdentity,
+  type GenerateWorkspaceIdentityResult,
   type NameGenerationCandidate,
 } from "@/node/services/workspaceTitleGenerator";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
@@ -269,7 +281,8 @@ import type {
 } from "@/common/orpc/types";
 
 import type { z } from "zod";
-import type { SendMessageError } from "@/common/types/errors";
+import type { NameGenerationError, SendMessageError } from "@/common/types/errors";
+import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 // Aliased to avoid clashing with the private `formatSendMessageError` string formatter below.
 import {
   createStreamErrorMessage,
@@ -284,9 +297,14 @@ import type {
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
   WorkspaceRemoveWarning,
+  WorkspaceBackgroundProcessBlocker,
 } from "@/common/types/workspace";
-import { isDynamicToolPart } from "@/common/types/toolParts";
-import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
+import { type DynamicToolPart, isDynamicToolPart } from "@/common/types/toolParts";
+import {
+  ASK_USER_QUESTION_NOT_WAITING_MESSAGE,
+  buildAskUserQuestionSummary,
+  isAsyncAskUserQuestionOutput,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import {
   AskUserQuestionToolArgsSchema,
   AskUserQuestionToolResultSchema,
@@ -311,13 +329,7 @@ import {
   STAGED_ATTACHMENT_MIRROR_DIR_NAME,
   STAGED_ATTACHMENT_REHYDRATE_PENDING_FILE_NAME,
 } from "@/common/constants/stagedAttachments";
-import {
-  isActiveWorkflowRunStatus,
-  isNestedWorkflowRun,
-  type WorkflowRunRecord,
-  type WorkflowRunStatus,
-} from "@/common/types/workflow";
-import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import { type WorkflowRunRecord, type WorkflowRunStatus } from "@/common/types/workflow";
 import {
   hasInProcessWorkflowWork,
   type WorkflowArchiveAdmissionGuard,
@@ -406,12 +418,14 @@ import {
   type AgentMessageDispatchMode,
   getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
+  normalizeMessagingTag,
 } from "@/common/orpc/schemas/workspace";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
   ArchivePreflightResult,
   ArchiveWorkspaceResult,
   BackgroundProcessInfo,
+  WorkspaceNameGenerationRequest,
 } from "@/common/orpc/schemas/api";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
@@ -433,8 +447,9 @@ import {
   BashMonitorRegistryStore,
   type BashMonitorRegistryRecord,
 } from "@/node/services/bashMonitorRegistryStore";
+import { BashMonitorPersistence } from "@/node/services/bashMonitorPersistence";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { getSelfIdentity } from "@/node/utils/concurrency/processLiveness";
 import {
   judgeLifecycleMarkerOwner,
@@ -450,6 +465,15 @@ import {
   type DeliveredWakeRecord,
 } from "@/node/services/bashMonitorWakeReconciler";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
+import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
+import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
+import { WorkspaceNaming } from "@/node/services/workspaceNaming";
+import { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
+import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
+import { SendPreflight } from "@/node/services/sendPreflight";
+import { ContextMutationGate } from "@/node/services/contextMutationGate";
+import { BashMonitorActivity } from "@/node/services/bashMonitorActivity";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
   areArchiveUntrackedPathListsEqual,
@@ -468,6 +492,11 @@ import {
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import {
+  isManualUserSupersessionMessage,
+  isResetBoundaryMessage,
+  isTerminalWorkflowTaskAwaitRecord,
+} from "@/node/services/taskMessagePredicates";
 import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
 import {
   computeSendDigest,
@@ -552,8 +581,6 @@ const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 // Upper bound on startup .code-workspace reconciliation (see initialize()).
 const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
 const STARTUP_STAGED_ATTACHMENT_RECOVERY_TIMEOUT_MS = 10_000;
-// Removal's join of MCP prompt discoveries it aborted (#4805); see abortAndJoinMcpPromptDiscoveries.
-const MCP_PROMPT_DISCOVERY_JOIN_TIMEOUT_MS = 10_000;
 
 /**
  * Cap on transient startup-recovery AgentSessions alive at once (see initialize()). Each
@@ -638,21 +665,24 @@ type PlanFileDeletionError =
   | { type: "runtime_unreachable"; message: string }
   | { type: "delete_failed"; message: string };
 
-interface ActiveWorkflowRunIdsOptions {
-  /**
-   * Install the shared Set for an ARCHIVED workspace too. Only workflow status events need
-   * that (so later events accumulate without a disk scan); read paths leave dormant
-   * workspaces out of the cache. See resolveActiveWorkflowRunIds.
-   */
-  installDormant?: boolean;
-}
+/**
+ * Random draws before an auto-generated name falls back to a numbered suffix. The pool holds
+ * millions of names, so a collision past the first draw means the generator is stubbed.
+ */
+const AUTO_WORKSPACE_NAME_ATTEMPTS = 10;
 
 /**
- * Base name used when /new auto-generates a branch name. Numbered suffixes
- * (`workspace-1`, `workspace-2`, ...) come from {@link generateForkBranchName}
- * so the existing fork-style numbering helpers stay the single source of truth.
+ * Docker-style provisional names ("calm-otters-sing") read better than "workspace-N" while
+ * auto-naming runs, and do not look like a numbered sequence the user has to manage.
  */
-const AUTO_NEW_WORKSPACE_BASE_NAME = "workspace";
+export function generateAutoWorkspaceName(existingNames: ReadonlySet<string>): string {
+  let candidate = "";
+  for (let attempt = 0; attempt < AUTO_WORKSPACE_NAME_ATTEMPTS; attempt++) {
+    candidate = humanId({ separator: "-", capitalize: false });
+    if (!existingNames.has(candidate)) return candidate;
+  }
+  return generateForkBranchName(candidate, [...existingNames]);
+}
 
 // Keep short to feel instant, but debounce bursts of file_edit_* tool calls.
 
@@ -826,31 +856,6 @@ function isTerminalWorkflowToolResultMessage(message: MuxMessage, runId: string)
   );
 }
 
-function isInternalResumeAutoCompactionMessage(message: MuxMessage): boolean {
-  const muxMetadata = message.metadata?.muxMetadata;
-  if (muxMetadata?.type !== "compaction-request" || muxMetadata.source !== "auto-compaction") {
-    return false;
-  }
-  return muxMetadata.parsed.followUpContent?.dispatchOptions?.source === "internal-resume";
-}
-
-function isSyntheticManualSupersessionMessage(message: MuxMessage): boolean {
-  const muxMetadata = message.metadata?.muxMetadata;
-  return (
-    message.metadata?.synthetic === true &&
-    muxMetadata?.type === "compaction-request" &&
-    muxMetadata.source === "auto-compaction" &&
-    !isInternalResumeAutoCompactionMessage(message)
-  );
-}
-
-function isManualUserSupersessionMessage(message: MuxMessage): boolean {
-  return (
-    message.role === "user" &&
-    (message.metadata?.synthetic !== true || isSyntheticManualSupersessionMessage(message))
-  );
-}
-
 function isWorkflowResultContinuationMessage(message: MuxMessage, runId: string): boolean {
   return (
     message.metadata?.muxMetadata?.type === WORKFLOW_RESULT_METADATA_TYPE &&
@@ -873,34 +878,6 @@ function isCoalescedWorkflowResultMessage(message: MuxMessage, runId: string): b
   return message.parts.some(
     (part) => part.type === "text" && textContainsWorkflowResultPayload(part.text, runId)
   );
-}
-
-function isResetBoundaryMessage(message: MuxMessage): boolean {
-  return message.metadata?.contextBoundaryKind === CONTEXT_BOUNDARY_KINDS.RESET;
-}
-
-function isFailedWorkflowRunSnapshot(value: unknown, runId: string): boolean {
-  if (value == null || typeof value !== "object") {
-    return false;
-  }
-  const record = value as Record<string, unknown>;
-  return record.id === runId && record.status === "failed";
-}
-
-function isTerminalWorkflowTaskAwaitRecord(
-  record: Record<string, unknown>,
-  runId: string
-): boolean {
-  if (record.taskId !== runId) {
-    return false;
-  }
-  if (record.status === "completed" || record.status === "interrupted") {
-    return true;
-  }
-  if (record.status === "error") {
-    return isFailedWorkflowRunSnapshot(record.run, runId);
-  }
-  return false;
 }
 
 function isTerminalWorkflowTaskAwaitResultMessage(message: MuxMessage, runId: string): boolean {
@@ -1023,11 +1000,6 @@ function withEffectiveHeartbeatInterval(
   return { ...settings, intervalMs: settings.intervalMs ?? defaultIntervalMs };
 }
 
-interface WorkspaceAgentStatus {
-  emoji: string;
-  message: string;
-  url?: string;
-}
 type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
 
 /** Narrow DevTools cleanup surface used on archive/remove and by the startup sweep. */
@@ -1066,6 +1038,14 @@ function isDedicatedCoderRuntime(runtimeConfig: RuntimeConfig | undefined): bool
   );
 }
 
+/** What archiving does to the dedicated Coder workspace Xum created for this workspace. */
+function remoteBoxArchiveBehavior(
+  metadata: WorkspaceMetadata | undefined,
+  coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior
+): CoderWorkspaceArchiveBehavior {
+  return isDedicatedCoderRuntime(metadata?.runtimeConfig) ? coderWorkspaceArchiveBehavior : "keep";
+}
+
 /**
  * Whether archiving takes the structural mutation gate (#4476): it deletes the managed checkout,
  * or stops or deletes a dedicated Coder workspace (#4871).
@@ -1077,7 +1057,7 @@ function archiveTakesMutationGate(
 ): boolean {
   return (
     archiveDeletesManagedWorktree(metadata, worktreeArchiveBehavior) ||
-    (isDedicatedCoderRuntime(metadata.runtimeConfig) && coderWorkspaceArchiveBehavior !== "keep")
+    remoteBoxArchiveBehavior(metadata, coderWorkspaceArchiveBehavior) !== "keep"
   );
 }
 // #4476: removal stops this backend's own stream, terminals, MCP servers, init hook and background
@@ -1107,6 +1087,26 @@ function logRegistrationRollbackFailure(workspaceId: string, error: unknown): vo
 interface CreationRollbackResult {
   entryGone: boolean;
   leftovers: string[];
+}
+
+/** The backend naming of a workspace created before its generated name existed. */
+interface CreationNaming {
+  /** The generated identity, or why there is none (failure, timeout, abort). Never rejects. */
+  readonly outcome: Promise<Result<GenerateWorkspaceIdentityResult, string>>;
+  /**
+   * Called once when create() settles: true when it returned the workspace, so the title may
+   * apply; false aborts the naming.
+   */
+  settleCreation(created: boolean): void;
+  /** Called once the branch is final: renamed, kept, or never to be renamed. Idempotent. */
+  settleBranch(): void;
+}
+
+/** Why a backend-generated branch name cannot replace the provisional one, if it cannot. */
+function refuseGeneratedBranchName(generated: string, provisional: string): string | undefined {
+  const validation = validateWorkspaceBranchName(generated);
+  if (!validation.valid) return validation.error ?? "invalid generated branch name";
+  return generated === provisional ? "the generated name is the same" : undefined;
 }
 
 function describeRollbackLeftovers(leftovers: readonly string[]): string {
@@ -1167,7 +1167,6 @@ const WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE =
 // workspace became active. This is an expected race, not a compaction failure, so the
 // idle-compaction loop must not count it toward suppression.
 const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipped.";
-const BASH_MONITOR_PERSIST_RETRY_DELAYS_MS = [50, 200] as const;
 
 async function waitForAgentSessionIdle(session: AgentSession, signal?: AbortSignal): Promise<void> {
   assert(session instanceof AgentSession, "waitForAgentSessionIdle requires an AgentSession");
@@ -1682,7 +1681,7 @@ async function copyDirIfMissingBestEffort(params: {
       }
     }
 
-    await fsPromises.mkdir(path.dirname(params.destDir), { recursive: true });
+    // fs.cp creates missing parent folders of destDir itself (Node and Bun).
     await fsPromises.cp(params.srcDir, params.destDir, { recursive: true });
   } catch (error: unknown) {
     if (isErrnoWithCode(error, "ENOENT")) {
@@ -1696,6 +1695,17 @@ async function copyDirIfMissingBestEffort(params: {
       error: getErrorMessage(error),
     });
   }
+}
+
+/**
+ * Index entries a rollup can merge: a non-empty task id and an object value. Self-healing: the
+ * index files are read without per-entry validation, and one malformed entry (e.g. null) would
+ * throw in the merge and drop every other entry of the rollup.
+ */
+function mergeableIndexEntries<T>(entries: Array<[string, T]>): Array<[string, T]> {
+  return entries.filter(
+    ([taskId, entry]) => taskId.length > 0 && entry != null && typeof entry === "object"
+  );
 }
 
 function coerceUpdatedAtMs(entry: { createdAtMs?: number; updatedAtMs?: number }): number {
@@ -1755,7 +1765,8 @@ async function collectReferencedStagedAttachmentPaths(input: {
       try {
         // Streamed: every snapshot archive scans the full append-only history.
         for (const stagedPath of await extractStagedAttachmentPathsFromFile(
-          path.join(input.sessionDir, fileName)
+          path.join(input.sessionDir, fileName),
+          input.historyService.files
         )) {
           paths.add(stagedPath);
         }
@@ -1778,6 +1789,8 @@ interface ChildPatchRollupTarget {
   parentSessionDir: string;
   childWorkspaceId: string;
   childSessionDir: string;
+  /** The parent's workspace FIFO for its artifact index writes (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }
 
 type ChildPatchArtifactEntries = Array<[string, SubagentGitPatchArtifact]>;
@@ -1851,6 +1864,7 @@ async function mergeChildPatchArtifactIndex(
   await updateSubagentGitPatchArtifactsFile({
     workspaceId: params.parentWorkspaceId,
     workspaceSessionDir: params.parentSessionDir,
+    locks: params.locks,
     update: (parentFile) => {
       for (const [taskId, childEntry] of childEntries) {
         if (!taskId) continue;
@@ -1890,6 +1904,8 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
   childTaskModelString?: string;
   /** Task-level thinking/reasoning level for the child workspace (optional; persists into transcript artifacts). */
   childTaskThinkingLevel?: ThinkingLevel;
+  /** The parent's workspace FIFO for its artifact index writes (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<void> {
   if (params.parentWorkspaceId.length === 0) {
     return;
@@ -2000,6 +2016,7 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         await upsertSubagentTranscriptArtifactIndexEntry({
           workspaceId: params.parentWorkspaceId,
           workspaceSessionDir: params.parentSessionDir,
+          locks: params.locks,
           childTaskId: params.childWorkspaceId,
           updater: (existing) => ({
             childTaskId: params.childWorkspaceId,
@@ -2092,10 +2109,13 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
       await updateSubagentReportArtifactsFile({
         workspaceId: params.parentWorkspaceId,
         workspaceSessionDir: params.parentSessionDir,
+        locks: params.locks,
         update: (parentFile) => {
-          for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
-
+          // rollUpAncestorWorkspaceIds reads the array, so an entry without one is skipped too.
+          const mergeable = mergeableIndexEntries(childEntries).filter(([, entry]) =>
+            Array.isArray(entry.ancestorWorkspaceIds)
+          );
+          for (const [taskId, childEntry] of mergeable) {
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
             const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
@@ -2173,10 +2193,9 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
       await updateSubagentTranscriptArtifactsFile({
         workspaceId: params.parentWorkspaceId,
         workspaceSessionDir: params.parentSessionDir,
+        locks: params.locks,
         update: (parentFile) => {
-          for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
-
+          for (const [taskId, childEntry] of mergeableIndexEntries(childEntries)) {
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
             const childUpdated = coerceUpdatedAtMs(childEntry);
             const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
@@ -2244,6 +2263,13 @@ export interface WorkspaceServiceEvents {
     removedParentWorkspaceId?: string;
   }) => void;
   activity: (event: { workspaceId: string; activity: WorkspaceActivitySnapshot | null }) => void;
+  /**
+   * A write changed the workspace's session usage (SessionUsageService.onUsageChanged), so a
+   * renderer refetches it and its ancestors' sub-agent projections. A session-usage-delta
+   * reaches only a live session's subscribed chat, and nothing else announces a sub-agent's
+   * in-flight or headless spend.
+   */
+  "usage-changed": (event: { workspaceId: string }) => void;
   /** Request an incremental analytics ingest outside the stream-end path. */
   analyticsIngest: (event: { workspaceId: string }) => void;
   /** An admitted session turn generation ended for good (see TurnAdmissionHost). */
@@ -2398,6 +2424,73 @@ function aliasesProjectMetadataDir(projectName: string): boolean {
   return PROJECT_METADATA_DIR_NAMES.some((dirName) => dirName === folded);
 }
 
+/**
+ * Why an entry may not carry a messaging tag, or null when it may (see setMessagingTag).
+ * Root chats only: a side chat is discarded with its main chat, and a sub-agent child's
+ * parent owns its messaging — tagging either would create a link that outlives its meaning.
+ */
+function messagingTagRootRefusal(
+  entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">
+): string | null {
+  if (entry.sideChatParentWorkspaceId != null) {
+    return "Messaging tags can only be set on a root chat, not a side chat.";
+  }
+  if (entry.parentWorkspaceId != null) {
+    return "Messaging tags can only be set on a root chat, not a sub-agent chat.";
+  }
+  return null;
+}
+
+/**
+ * Applies a tag write to a fresh entry. Re-mints the revocation generation only on a
+ * real change (mirroring consent's repeat-on rule): a clear/re-tag cycle must fence
+ * tag-linked sends admitted under the previous link, while a no-op write fences nothing.
+ */
+function applyMessagingTag(
+  entry: Pick<Workspace, "messagingTag" | "messagingTagGeneration">,
+  normalizedTag: string | null
+): void {
+  if ((entry.messagingTag ?? null) === normalizedTag) {
+    return;
+  }
+  if (normalizedTag === null) {
+    delete entry.messagingTag;
+  } else {
+    entry.messagingTag = normalizedTag;
+  }
+  entry.messagingTagGeneration = crypto.randomUUID();
+}
+
+/** Root-only refusal first, then tag validation: the value a tag write may persist. */
+function messagingTagWriteValue(
+  entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">,
+  tag: string | null
+): Result<string | null, string> {
+  const refusal = messagingTagRootRefusal(entry);
+  if (refusal != null) {
+    return Err(refusal);
+  }
+  return resolveMessagingTagValue(tag);
+}
+
+/**
+ * Resolves user tag input to the value to persist: null clears (null/empty input), a
+ * normalized tag sets, and anything else is an error the caller returns before any write.
+ */
+function resolveMessagingTagValue(tag: string | null): Result<string | null, string> {
+  if (tag === null || tag.trim() === "") {
+    return Ok(null);
+  }
+  const normalized = normalizeMessagingTag(tag);
+  if (normalized === null) {
+    return Err(
+      "Invalid messaging tag: use 1-32 characters, starting with a letter or digit, " +
+        "followed by letters, digits, hyphens, or underscores (an optional leading @ is allowed)."
+    );
+  }
+  return Ok(normalized);
+}
+
 function mintUnrelatedWorkspaceConsent(): string {
   const generation = crypto.randomUUID();
   assert(
@@ -2405,6 +2498,75 @@ function mintUnrelatedWorkspaceConsent(): string {
     "minted unrelated-workspace consent must satisfy the fail-closed reader"
   );
   return generation;
+}
+
+type MuxMessagePart = MuxMessage["parts"][number];
+
+/** Finalizes one ask_user_question tool part with `answers` (already answered is idempotent). */
+function finalizeAskUserQuestionPart(
+  part: DynamicToolPart,
+  answers: Record<string, string>
+): Result<{ part: MuxMessagePart; output: AskUserQuestionToolSuccessResult }> {
+  if (part.toolName !== "ask_user_question") {
+    return Err(
+      `toolCallId=${part.toolCallId} is toolName=${part.toolName}, expected ask_user_question`
+    );
+  }
+
+  if (part.state === "output-available") {
+    // A non-blocking question completed without answers; its answers are a chat message, so this
+    // path must not report them as delivered.
+    if (isAsyncAskUserQuestionOutput(part.output)) {
+      return Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE);
+    }
+    // Already answered - treat as idempotent.
+    const parsedOutput = AskUserQuestionToolResultSchema.safeParse(part.output);
+    return parsedOutput.success
+      ? Ok({ part, output: parsedOutput.data })
+      : Err(`ask_user_question output validation failed: ${parsedOutput.error.message}`);
+  }
+
+  const parsedArgs = AskUserQuestionToolArgsSchema.safeParse(part.input);
+  if (!parsedArgs.success) {
+    return Err(`ask_user_question input validation failed: ${parsedArgs.error.message}`);
+  }
+
+  const output: AskUserQuestionToolSuccessResult = {
+    summary: buildAskUserQuestionSummary(answers),
+    ui_only: {
+      ask_user_question: {
+        questions: parsedArgs.data.questions,
+        answers,
+      },
+    },
+  };
+  return Ok({ part: { ...part, state: "output-available" as const, output }, output });
+}
+
+/**
+ * Restart fallback of answerAskUserQuestion: finalizes the ask_user_question tool call in `msg`
+ * with `answers`, or reports why it cannot.
+ */
+function finalizeAskUserQuestionMessage(
+  msg: MuxMessage,
+  toolCallId: string,
+  answers: Record<string, string>
+): Result<{ updated: MuxMessage; output: AskUserQuestionToolSuccessResult }> {
+  const index = msg.parts.findIndex(
+    (part) => isDynamicToolPart(part) && part.toolCallId === toolCallId
+  );
+  const part = msg.parts[index];
+  if (!isDynamicToolPart(part)) {
+    return Err("ask_user_question toolCallId not found in message");
+  }
+  const finalized = finalizeAskUserQuestionPart(part, answers);
+  if (!finalized.success) {
+    return Err(finalized.error);
+  }
+  return Ok({
+    updated: { ...msg, parts: msg.parts.with(index, finalized.data.part) },
+    output: finalized.data.output,
+  });
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
@@ -2471,33 +2633,13 @@ export class WorkspaceService
    */
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
-  private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
-  // Failed-persistence chains active per process, so a later cancellation (task_stop after a
-  // runtime failure) can invalidate in-flight persists and scheduled retries by generation.
-  // "failed" can never follow "canceled" for one generation (stopMonitor guards on
-  // monitor.stopped), so tracking only live failed chains suffices; the owning chain removes
-  // its entry on termination, keeping the map bounded by in-flight failure persists.
-  private readonly activeBashMonitorFailurePersists = new Map<
-    string,
-    { createdAt: string; canceled: boolean }
-  >();
-
-  private trackBashMonitorPersistence(workspaceId: string, promise: Promise<void>): Promise<void> {
-    const pending =
-      this.pendingBashMonitorPersistenceByWorkspace.get(workspaceId) ?? new Set<Promise<void>>();
-    this.pendingBashMonitorPersistenceByWorkspace.set(workspaceId, pending);
-    const tracked = promise.finally(() => {
-      pending.delete(tracked);
-      if (pending.size === 0) this.pendingBashMonitorPersistenceByWorkspace.delete(workspaceId);
-    });
-    pending.add(tracked);
-    return tracked;
-  }
-
-  private async drainBashMonitorPersistence(workspaceId: string): Promise<void> {
-    const pending = this.pendingBashMonitorPersistenceByWorkspace.get(workspaceId);
-    if (pending != null) await Promise.allSettled([...pending]);
-  }
+  private readonly bashMonitorPersistence = new BashMonitorPersistence({
+    registry: () => this.bashMonitorRegistryStore,
+    discardProcess: (workspaceId, processId, createdAt) =>
+      this.bashMonitorWakeReconciler.discardProcess(workspaceId, processId, createdAt),
+    isRemoving: (workspaceId) => this.removingWorkspaces.has(workspaceId),
+    onPersisted: (workspaceId) => this.scheduleBashMonitorWakeReconcile(workspaceId),
+  });
   private readonly bashOutputShownListener = (
     workspaceId: string,
     _payload: OutputShownPayload
@@ -2514,197 +2656,35 @@ export class WorkspaceService
     _workspaceId: string,
     payload: MonitorArmedPayload
   ): void => {
-    if (this.removingWorkspaces.has(payload.workspaceId)) return;
-    const persistence = this.bashMonitorRegistryStore
-      .upsert(payload)
-      .then(() => this.scheduleBashMonitorWakeReconcile(payload.workspaceId));
-    void this.trackBashMonitorPersistence(payload.workspaceId, persistence).catch(
-      (error: unknown) => {
-        log.error("Failed to persist armed bash monitor", {
-          workspaceId: payload.workspaceId,
-          error,
-        });
-      }
-    );
+    this.bashMonitorPersistence.onMonitorArmed(payload);
   };
   private readonly bashMonitorStoppedListener = (
     workspaceId: string,
     payload: MonitorStoppedPayload
   ): void => {
-    const processKey = workspaceId + "\u0000" + payload.processId;
-    const createdAt = payload.armMetadata?.createdAt;
-    if (payload.reason === "canceled" && createdAt != null) {
-      const active = this.activeBashMonitorFailurePersists.get(processKey);
-      if (active?.createdAt === createdAt) active.canceled = true;
-    }
-    const failurePersist =
-      payload.reason === "failed" && createdAt != null ? { createdAt, canceled: false } : undefined;
-    if (failurePersist != null) {
-      this.activeBashMonitorFailurePersists.set(processKey, failurePersist);
-    }
-    const wasCanceled = (): boolean => failurePersist?.canceled === true;
-    const settleFailurePersist = (): void => {
-      if (
-        failurePersist != null &&
-        this.activeBashMonitorFailurePersists.get(processKey) === failurePersist
-      ) {
-        this.activeBashMonitorFailurePersists.delete(processKey);
-      }
-    };
-    const persist = async (): Promise<boolean> => {
-      if (payload.reason === "canceled") {
-        if (createdAt == null) return false;
-        await this.bashMonitorWakeReconciler.discardProcess(
-          workspaceId,
-          payload.processId,
-          createdAt
-        );
-        await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId, createdAt);
-        return true;
-      }
-      if (payload.reason === "failed") {
-        if (wasCanceled()) return false;
-        if (payload.armMetadata != null) {
-          await this.bashMonitorRegistryStore.upsert(payload.armMetadata);
-        }
-        if (wasCanceled()) return false;
-        if (payload.terminal != null) {
-          if (createdAt == null) return false;
-          await this.bashMonitorRegistryStore.recordTerminal(
-            workspaceId,
-            payload.processId,
-            createdAt,
-            payload.terminal
-          );
-        }
-        if (wasCanceled()) return false;
-        if (createdAt == null) return false;
-        await this.bashMonitorRegistryStore.recordLost(workspaceId, payload.processId, createdAt, {
-          reason: "runtime-failure",
-          ...(payload.failureMessage != null ? { failureMessage: payload.failureMessage } : {}),
-          ...(payload.failedOperations != null
-            ? { failedOperations: payload.failedOperations }
-            : {}),
-          ...(payload.failedMatch != null ? { failedMatch: payload.failedMatch } : {}),
-          failedAt: new Date().toISOString(),
-        });
-        return !wasCanceled();
-      }
-      if (payload.terminal != null && createdAt != null) {
-        await this.bashMonitorRegistryStore.recordTerminal(
-          workspaceId,
-          payload.processId,
-          createdAt,
-          payload.terminal
-        );
-      }
-      return true;
-    };
-    const persistence = new Promise<void>((resolve) => {
-      let retryIndex = 0;
-      const finish = (): void => {
-        settleFailurePersist();
-        resolve();
-      };
-      const run = (): void => {
-        if (this.removingWorkspaces.has(workspaceId) || wasCanceled()) {
-          finish();
-          return;
-        }
-        void persist()
-          .then((persisted) => {
-            if (persisted && !wasCanceled()) {
-              this.scheduleBashMonitorWakeReconcile(workspaceId);
-            }
-            finish();
-          })
-          .catch((error: unknown) => {
-            if (wasCanceled()) {
-              finish();
-              return;
-            }
-            const delay = BASH_MONITOR_PERSIST_RETRY_DELAYS_MS[retryIndex++];
-            if (delay == null) {
-              log.error("Failed to retire bash monitor state", { workspaceId, error });
-              finish();
-              return;
-            }
-            const timer = setTimeout(run, delay);
-            timer.unref();
-          });
-      };
-      run();
-    });
-    void this.trackBashMonitorPersistence(workspaceId, persistence);
+    this.bashMonitorPersistence.onMonitorStopped(workspaceId, payload);
   };
-  // Last armed-monitor count successfully broadcast per workspace, so background process
-  // churn that doesn't change the count (e.g. a monitorless bash exiting) skips the
-  // activity re-emit. A missing entry means "unknown" (never successfully emitted), which
-  // must never dedupe: renderers may have bootstrapped a non-zero count from
-  // getActivityList(), so suppressing an unknown->0 transition would strand the sidebar.
-  private readonly lastEmittedBashMonitorCounts = new Map<string, number>();
-  // Workspaces where an armed monitor has ever been observed (by the change listener or
-  // a getActivityList read). Deliberately never pruned and kept separate from the dedupe
-  // map above: the dedupe entry is dropped while emits are in flight or failed, but the
-  // tombstone decision in getActivityList must survive those windows, otherwise a
-  // renderer that bootstrapped a non-zero count can never see the zero-count clear.
-  private readonly bashMonitorSeenWorkspaces = new Set<string>();
+  // Activity emits for bash monitor counts (the dedupe map and the seen set behind the
+  // zero-count tombstone). Lives in BashMonitorActivity; the closures read this service's live
+  // count, the extension metadata and the activity emitter at call time.
+  private readonly bashMonitorActivity = new BashMonitorActivity({
+    getActiveBashMonitorCount: (workspaceId) => this.getActiveBashMonitorCount(workspaceId),
+    getSnapshot: (workspaceId, options) => this.extensionMetadata.getSnapshot(workspaceId, options),
+    emitWorkspaceActivity: (workspaceId, snapshot) =>
+      this.emitWorkspaceActivity(workspaceId, snapshot),
+  });
   private readonly bashProcessChangeListener = (workspaceId: string): void => {
-    const count = this.getActiveBashMonitorCount(workspaceId);
-    if (count > 0) {
-      this.bashMonitorSeenWorkspaces.add(workspaceId);
-    }
-    if (this.lastEmittedBashMonitorCounts.get(workspaceId) === count) {
-      return;
-    }
-    // Clear the entry synchronously BEFORE the async emit: while an emit is in flight
-    // the last delivered count is unknown (the snapshot read may fail, and renderers
-    // may observe transient counts via workspace.activity.list()). Deleting up front
-    // means a concurrent change event — e.g. a stop racing a slow armed emit in a fast
-    // 0 -> 1 -> 0 sequence — can never dedupe against a stale pre-emit value and drop
-    // the clear. Cost: an occasional duplicate emit, which renderers apply idempotently.
-    this.lastEmittedBashMonitorCounts.delete(workspaceId);
-    void this.extensionMetadata
-      // Strict: emitting a suspect (partial-main) snapshot after a failed
-      // sidecar reconcile would clear goal/status in the renderer; the
-      // catch below already retains "unknown" and re-emits on next change.
-      .getSnapshot(workspaceId, { throwOnError: true })
-      .then((snapshot) => {
-        this.emitWorkspaceActivity(workspaceId, snapshot);
-        // Record only after a successful emit. Re-read the count because the emit merges
-        // the live value, which may have moved past the one that triggered this listener.
-        this.lastEmittedBashMonitorCounts.set(
-          workspaceId,
-          this.getActiveBashMonitorCount(workspaceId)
-        );
-      })
-      .catch((error: unknown) => {
-        // Leave the entry absent ("unknown") so the next change event always re-emits.
-        log.debug("Failed to emit activity after background bash monitor change", {
-          workspaceId,
-          error,
-        });
-      });
+    this.bashMonitorActivity.onProcessChange(workspaceId);
   };
-
-  // Lazily bootstrapped workflow activity cache so sidebar refreshes don't rescan run history.
-  private readonly activeWorkflowRunIdBootstrapsByWorkspace = new Map<
-    string,
-    Promise<Set<string>>
-  >();
-  private readonly activeWorkflowRunIdsByWorkspace = new Map<string, Set<string>>();
-  // Workspaces where NONZERO workflow-run activity was actually observed
-  // (bootstrap probe, run-status event, or list read). This — not cache
-  // presence — is the zero-count tombstone signal: the activity list's own
-  // probe installs an (empty) cache for every scoped id, so cache existence
-  // would fabricate recency:0 entries for every idle config-known workspace
-  // from the second list on, re-bloating the payload this scoping trims.
-  private readonly workflowRunSeenWorkspaces = new Set<string>();
 
   // Debounce post-compaction metadata refreshes (file_edit_* can fire rapidly)
   private readonly postCompactionRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  // Tracks workspaces currently being renamed to prevent streaming during rename
-  private readonly renamingWorkspaces = new Set<string>();
+  // Tracks workspaces currently being renamed to prevent streaming during rename. The Set lives in
+  // the shared WorkspaceLifecycleGates so services split out of this class can read it; the getter
+  // keeps the old name for this file and for tests that reach it through casts.
+  private get renamingWorkspaces(): Set<string> {
+    return this.lifecycleGates.renaming;
+  }
   // Plan deletions of a full clear in flight, per workspace (a count: two clears may overlap).
   // rename() refuses while one runs (#5479, see deletePlanFilesForWorkspace).
   private readonly planDeletionsInFlight = new Map<string, number>();
@@ -2712,12 +2692,18 @@ export class WorkspaceService
   // Cache for @file mention autocomplete (git ls-files output).
   private readonly fileCompletionsCache = new Map<string, FileCompletionsCacheEntry>();
   // Tracks workspaces currently being removed to prevent new sessions/streams during deletion.
-  private readonly removingWorkspaces = new Set<string>();
+  // Lives in WorkspaceLifecycleGates (see renamingWorkspaces).
+  private get removingWorkspaces(): Set<string> {
+    return this.lifecycleGates.removing;
+  }
   private onTodosChanged: ((workspaceId: string) => void) | null = null;
 
   // Tracks workspaces currently being archived to prevent runtime-affecting operations (e.g. SSH)
-  // from waking a dedicated workspace during archive().
-  private readonly archivingWorkspaces = new Set<string>();
+  // from waking a dedicated workspace during archive(). Lives in WorkspaceLifecycleGates (see
+  // renamingWorkspaces).
+  private get archivingWorkspaces(): Set<string> {
+    return this.lifecycleGates.archiving;
+  }
 
   // Tracks stream generations that are compaction turns so background stop snapshots
   // can carry authoritative notification policy instead of forcing the frontend to
@@ -2735,204 +2721,21 @@ export class WorkspaceService
     | ((workspaceId: string, outcome: IdleCompactionOutcome) => void)
     | undefined;
 
-  // Blocks new sends while a context-discarding history mutation (reset, full
-  // clear, destructive replace) is in flight, and enforces one such mutation
-  // at a time (r40). Sends already past this entry check are refused by the
-  // session-level turn-admission block (AgentSession.holdTurnAdmission).
-  private readonly contextMutationWorkspaces = new Set<string>();
+  // Context-discarding history mutations in flight and their completed count (the epoch).
+  // Lives in ContextMutationGate; the guard reaches the sessions through these closures.
+  private readonly contextMutationGate = new ContextMutationGate({
+    getOrCreateSession: (workspaceId) => this.getOrCreateSession(workspaceId),
+    isStreaming: (workspaceId) => this.aiService.isStreaming(workspaceId),
+    hasSendInPreflight: (workspaceId) => this.sendPreflight.hasSendInPreflight(workspaceId),
+  });
 
-  // r41: monotonic count of COMPLETED context-discarding mutations per
-  // workspace. Sends capture it synchronously with the entry check above and
-  // re-verify at their admission gates: the level-triggered admission block
-  // cannot catch a mutation that started and finished while a send sat in
-  // pre-admission awaits (e.g. branch-summary generation).
-  private readonly contextMutationEpochs = new Map<string, number>();
-
-  // r41: sends currently between the entry check and their settled outcome
-  // (queued, refused, or admitted — PREPARING is set before any early
-  // background-start return). Refine publication must not interleave with a
-  // send's pre-admission window: a proposal row published and RELEASED while
-  // a send with an already-persisted user row awaits admission would land
-  // after that user row and enter the send's request as a trailing foreign
-  // assistant row (see acquireIdleTurnExclusion).
-  private readonly preflightSendCounts = new Map<string, number>();
-  /**
-   * Idempotent sends: this process's identity as a send receiver (getSendStatus). A process
-   * restart is a new receiver: requests it had died with it.
-   */
-  private readonly sendReceiverId = crypto.randomUUID();
-  /** Send ids of sendMessage calls still running, per workspace (a count per id). */
-  private readonly inFlightSendIds = new Map<string, Map<string, number>>();
-  /**
-   * Send ids this receiver answered "not accepted" (getSendStatus), per workspace: a later arrival
-   * of one is refused, so a send the client already made visible again is never also appended.
-   * Never evicted for this process's life (a restart is a new receiver: its requests died with
-   * the old one), nor when the workspace is removed. Memory grows by one short string per id a
-   * client looked up that this process held nowhere (at most 100 per call). An id this process
-   * never saw must be remembered too: it may be a request still in transit. Clients look up only
-   * their own unresolved sends, so this stays about one entry per such send.
-   */
-  private readonly refusedSendIds = new Map<string, Set<string>>();
-  /**
-   * Codex P1 (PRRT_kwDOPxxmWM6cRi_J): sends the SESSION cannot observe yet —
-   * counted from service entry until the queue/session handoff, then released.
-   * Unlike preflightSendCounts (held for the whole service call for archive
-   * and refine interlocks), this feeds the session's follow-up idle probes:
-   * a follow-up redispatched from within the originating send's own turn
-   * (e.g. its on-send compaction completing) must not veto itself, and once
-   * handed off the session's own queue/turn-phase state governs visibility.
-   * Tickets are kept in arrival order so a send can tell whether an EARLIER send is
-   * still in preflight (sendMessage queues behind it) without two simultaneous
-   * arrivals each deferring to the other, and so sends reach their queue-or-direct
-   * decision in arrival order (a later arrival must not enqueue first because its
-   * preflight awaits finished sooner). Supersedable tickets are maintenance sends that
-   * yield to user input (requireIdle skips and queue-mode heartbeats): they never count
-   * as "earlier" for anyone, nobody waits on them, and they yield to a manual send in
-   * preflight through preflightSendCounts.
-   */
-  private readonly sessionInvisiblePreflights = new Map<
-    string,
-    Map<
-      number,
-      { supersedable: boolean; manual: boolean; decided: Promise<void>; markDecided: () => void }
-    >
-  >();
-  private nextSessionInvisiblePreflightTicket = 0;
-
-  private hasSessionInvisiblePreflight(workspaceId: string): boolean {
-    return (this.sessionInvisiblePreflights.get(workspaceId)?.size ?? 0) > 0;
-  }
-
-  /**
-   * A user send in service preflight (a `manual` ticket): auto-retry defers to it, since its
-   * acceptance cancels the retry. Resumes, automatic and yielding sends do not hold a retry back.
-   */
-  private hasManualSessionInvisiblePreflight(workspaceId: string): boolean {
-    for (const entry of this.sessionInvisiblePreflights.get(workspaceId)?.values() ?? []) {
-      if (entry.manual) return true;
-    }
-    return false;
-  }
-
-  /**
-   * See sessionInvisiblePreflights. Release is idempotent. Disposal (scope exit of the
-   * service call) also drains messages queued behind this preflight when it is a
-   * blocking ticket with no blocking ticket before it (the head of the line that others
-   * queue behind): those entries have no stream end to drain them if this send settled
-   * without a turn (refused, rejected, startup failed). A younger send that settles
-   * first must not drain, or it would dispatch entries ahead of the older still-live
-   * preflight; the older send drains when it settles. Supersedable tickets never drain
-   * because nothing queues behind them, and the drain is a no-op when a turn was handed
-   * off (the session is busy).
-   */
-  private armSessionInvisiblePreflight(
-    workspaceId: string,
-    options?: { supersedable?: boolean; manual?: boolean }
-  ): {
-    release: () => void;
-    hasEarlierPreflight: () => boolean;
-    /** Resolve once every earlier blocking ticket has reached its queue-or-direct decision. */
-    awaitEarlierDecisions: () => Promise<void>;
-    markDecided: () => void;
-  } & Disposable {
-    const ticket = this.nextSessionInvisiblePreflightTicket++;
-    const supersedable = options?.supersedable === true;
-    const manual = options?.manual === true && !supersedable;
-    let tickets = this.sessionInvisiblePreflights.get(workspaceId);
-    if (tickets == null) {
-      tickets = new Map();
-      this.sessionInvisiblePreflights.set(workspaceId, tickets);
-    }
-    let markDecided!: () => void;
-    const decided = new Promise<void>((resolve) => {
-      markDecided = resolve;
-    });
-    tickets.set(ticket, { supersedable, manual, decided, markDecided });
-    let released = false;
-    let releasedAsHead = false;
-    // Map iteration follows insertion order, so tickets before this one arrived earlier.
-    const earlierBlockingTickets = () => {
-      const earlier: Array<{ decided: Promise<void> }> = [];
-      if (released) {
-        return earlier;
-      }
-      for (const [liveTicket, entry] of this.sessionInvisiblePreflights.get(workspaceId) ?? []) {
-        if (liveTicket === ticket) {
-          break;
-        }
-        if (!entry.supersedable) {
-          earlier.push(entry);
-        }
-      }
-      return earlier;
-    };
-    const hasEarlierPreflight = () => earlierBlockingTickets().length > 0;
-    const release = () => {
-      if (released) {
-        return;
-      }
-      releasedAsHead = !supersedable && !hasEarlierPreflight();
-      released = true;
-      // A send that leaves before deciding must not keep later arrivals waiting.
-      markDecided();
-      const live = this.sessionInvisiblePreflights.get(workspaceId);
-      live?.delete(ticket);
-      if (live?.size === 0) {
-        this.sessionInvisiblePreflights.delete(workspaceId);
-      }
-    };
-    return {
-      release,
-      hasEarlierPreflight,
-      awaitEarlierDecisions: async () => {
-        await Promise.all(earlierBlockingTickets().map((entry) => entry.decided));
-      },
-      markDecided,
-      [Symbol.dispose]: () => {
-        release();
-        if (releasedAsHead) {
-          this.sessions.get(workspaceId)?.drainQueuedMessagesIfIdle();
-        }
-      },
-    };
-  }
-  // In-flight renderer executeBash requests per workspace. Incremented in the same
-  // synchronous block as executeBash's archivingWorkspaces check (mirroring
-  // preflightSendCounts) so archive admission and bash execution always observe each other:
-  // an exec admitted first holds the archive gate open for its full duration, and an exec
-  // entering after the gate armed is refused at entry.
-  private readonly preflightExecCounts = new Map<string, number>();
-  // Same pairing for renderer attachment staging (writes into the checkout an archive may
-  // capture/remove) and file-completion refreshes (run git through a runtime that could
-  // re-wake a stopped Coder workspace). See acquirePreflightAdmission.
-  private readonly preflightStagingCounts = new Map<string, number>();
-  private readonly preflightFileCompletionCounts = new Map<string, number>();
-  // Same pairing for renderer MCP prompt discovery (workspace.mcp.prompts.list): it readies the
-  // runtime (which can re-wake a stopped Coder workspace) and starts cached stdio servers inside
-  // the checkout. See acquireMcpPromptDiscoveryAdmission. Each admitted discovery carries an
-  // abort controller and a settlement so a removal can stop and join it (#4805).
-  private readonly mcpPromptDiscoveries = new Map<
-    string,
-    Set<{ controller: AbortController; settled: Promise<void>; settle: () => void }>
-  >();
-  /**
-   * In-flight forks counted per SOURCE workspace. A fork clones the source checkout and (for
-   * SSH/Coder runtimes) shares its remote workspace, so a model-driven archive admitted
-   * mid-fork could stop or snapshot the environment under the clone. Pairs with the archive
-   * gates like the other preflight counters: a fork admitted first is visible to the sink
-   * and the pre-interruption hold; one entering later observes archivingWorkspaces.
-   */
-  private readonly preflightForkCounts = new Map<string, number>();
-  /**
-   * Held refine turn exclusions (acquireIdleTurnExclusion), per workspace. A /refine apply
-   * writes approved skills into the checkout under it (#4965), so the archive gates count it
-   * like the other preflight counters.
-   */
-  private readonly refineExclusionCounts = new Map<string, number>();
-
-  // Tracks in-flight fork auto-title generations so only the first accepted continue
-  // message can claim the workspace title.
-  private readonly autoTitlingWorkspaces = new Set<string>();
+  // Sends between their entry check and their settled outcome, the session-invisible send
+  // tickets and the idempotent send ids. Lives in SendPreflight; a disposed head-of-line ticket
+  // drains the session queue through the closure.
+  private readonly sendPreflight = new SendPreflight({
+    drainQueuedMessagesIfIdle: (workspaceId) =>
+      this.sessions.get(workspaceId)?.drainQueuedMessagesIfIdle(),
+  });
 
   // Monotonic per-workspace stream generations prevent delayed stop-side metadata writes
   // from older streams from clobbering a newer streaming=true snapshot after async awaits.
@@ -3027,11 +2830,12 @@ export class WorkspaceService
     private readonly initStateManager: InitStateManager,
     private readonly extensionMetadata: ExtensionMetadataService,
     private readonly backgroundProcessManager: BackgroundProcessManager,
-    private readonly sessionUsageService?: SessionUsageService,
-    telemetryService?: TelemetryService,
-    experimentsService?: ExperimentsService,
-    sessionTimingService?: SessionTimingService,
-    private readonly streamManager?: StreamManager,
+    private readonly sessionUsageService: SessionUsageService | undefined,
+    telemetryService: TelemetryService | undefined,
+    experimentsService: ExperimentsService | undefined,
+    sessionTimingService: SessionTimingService | undefined,
+    // Every session's stream lifecycle (and its clock-driven retries) runs on this manager.
+    private readonly streamManager: StreamManager,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
     ),
@@ -3043,7 +2847,28 @@ export class WorkspaceService
     // construction builds its own from the stores above, like the other defaults.
     private readonly autoModelRouter: Pick<AutoModelRouter, "classify"> = new AutoModelRouter({
       providersConfigStore,
-    })
+    }),
+    // The turn path stamps the user message, its recency and the stream end on the sessions'
+    // clock. WorkspaceLive passes the HostClock service; by default the clock of the runner.
+    private readonly hostClock: HostClock = hostClockFor(effectRunner),
+    // WorkspaceLive passes the shared WorkspaceLifecycleGatesTag service; a standalone
+    // construction (tests, the bench) gets its own.
+    private readonly lifecycleGates: WorkspaceLifecycleGates = new WorkspaceLifecycleGates(),
+    // WorkspaceLive passes the WorkspaceExternalEditorsTag service, built on the same gates.
+    private readonly externalEditors: WorkspaceExternalEditors = new WorkspaceExternalEditors({
+      config,
+      files: nodeHostFiles,
+      leases: workspaceUseLeasesFor(config),
+      gates: lifecycleGates,
+    }),
+    // WorkspaceLive passes the WorkspaceNamingTag service.
+    private readonly naming: WorkspaceNaming = new WorkspaceNaming(),
+    // WorkspaceLive passes the WorkspaceWorkflowRunsTag service.
+    private readonly workflowRuns: WorkspaceWorkflowRuns = new WorkspaceWorkflowRuns({ config }),
+    // WorkspaceLive passes the WorkspaceOperationAdmissionTag service, built on the same gates.
+    private readonly operationAdmission: WorkspaceOperationAdmission = new WorkspaceOperationAdmission(
+      { config, gates: lifecycleGates }
+    )
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -3080,6 +2905,9 @@ export class WorkspaceService
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
     this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
+    this.sessionUsageService?.onUsageChanged((workspaceId) =>
+      this.emit("usage-changed", { workspaceId })
+    );
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
     // A cleared tombstone means a removed id was re-registered (downgraded
@@ -3480,6 +3308,10 @@ export class WorkspaceService
   };
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
   private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
+  /** Aborts a running status page agent pass before removal deletes the session dir; wired post-construction. */
+  private statusPageAgentCanceller: { cancelInFlightPass(workspaceId: string): Promise<void> } = {
+    cancelInFlightPass: () => Promise.resolve(),
+  };
   /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
   private workspaceMcpOverridesService?: WorkspaceServiceMcpOverridesPort;
 
@@ -4004,6 +3836,8 @@ export class WorkspaceService
     initAbortController: AbortController;
     /** Whether the creation made the branch; a sanitize abort keeps one it merely reused. */
     createdBranch: boolean;
+    /** Backend naming whose branch rename runs once the checkout is complete. */
+    naming?: CreationNaming;
   }): Promise<void> {
     const { workspaceId, runtime, initParams } = args;
     assert(
@@ -4013,7 +3847,8 @@ export class WorkspaceService
     // Only removal may interrupt the file checkout itself: archive aborts init too but keeps
     // the checkout registered and never reruns it, so parking a half-populated worktree
     // would strand it. Archive awaits this settlement, so it parks complete files; every
-    // phase after them (hooks, .xumignore, fast-forward, submodules) honours its abort.
+    // other phase (the origin fetch before them; hooks, .xumignore, fast-forward, submodules
+    // after them) honours its abort.
     const checkoutAbort = new AbortController();
     const forwardRemovalAbort = () => {
       if (this.removingWorkspaces.has(workspaceId)) checkoutAbort.abort();
@@ -4093,14 +3928,57 @@ export class WorkspaceService
     // Checkout populated and sanitized: only now may other task trees discover and message
     // this workspace. Granting at registration would rely on waitForInit, which a second
     // backend sharing this root does not observe.
-    await this.grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId);
-    await runBackgroundInit(
+    await this.runCreatedWorkspaceInit(
       runtime,
       initParams,
       workspaceId,
-      workspaceUseLeasesFor(this.config),
-      log
+      args.workspaceName,
+      args.naming,
+      args.createdBranch,
+      () => this.grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId)
     );
+  }
+
+  /**
+   * The init of a new workspace's populated checkout: a backend-named workspace's branch rename
+   * first, then `beforeInit`, then the init hook. A backend-named workspace holds the init use
+   * lease (#4857) from before its naming wait, not only while the hook runs: a structural rename
+   * meanwhile, by this backend or another, would move the checkout and the provisional branch
+   * under the branch rename and the hook. runBackgroundInit's own hold nests inside it.
+   */
+  private async runCreatedWorkspaceInit(
+    runtime: Runtime,
+    initParams: WorkspaceInitParams,
+    workspaceId: string,
+    workspaceName: string,
+    naming: CreationNaming | undefined,
+    createdBranch: boolean,
+    beforeInit?: () => Promise<void>
+  ): Promise<void> {
+    const useLeases = workspaceUseLeasesFor(this.config);
+    const init = async () => {
+      if (naming) {
+        await this.renameBranchAfterCreationNaming(
+          runtime,
+          initParams,
+          workspaceName,
+          naming,
+          createdBranch
+        );
+        // Removal may have started during the naming wait; it now owns the checkout.
+        if (this.removingWorkspaces.has(workspaceId)) return;
+      }
+      await beforeInit?.();
+      await runBackgroundInit(runtime, initParams, workspaceId, useLeases, log);
+    };
+    if (!naming) return init();
+    await withInitUseLease(useLeases, workspaceId, init).catch((error: unknown) => {
+      // The hold refuses while another backend mutates the workspace: neither the rename nor the
+      // hook ran.
+      naming.settleBranch();
+      initParams.initLogger.logStderr(`Initialization failed: ${getErrorMessage(error)}`);
+      initParams.initLogger.logComplete(-1);
+    });
   }
 
   setWorkspaceGoalService(service: WorkspaceGoalService): void {
@@ -4204,6 +4082,13 @@ export class WorkspaceService
     this.refinePassCanceller = service;
   }
 
+  /** Status page agent pass cancellation on remove; wired by the service container. */
+  setStatusPageAgentCanceller(service: {
+    cancelInFlightPass(workspaceId: string): Promise<void>;
+  }): void {
+    this.statusPageAgentCanceller = service;
+  }
+
   /**
    * Serialize a context-discarding history mutation (reset, full clear,
    * destructive replace) with refine staging/apply, which hold the same
@@ -4219,7 +4104,7 @@ export class WorkspaceService
   ): Promise<Result<AsyncDisposable>> {
     try {
       return Ok(
-        await acquireProcessFileLock({
+        await this.historyService.locks.acquireProcessFileLock({
           // r66: session-dir-external (see refineApplyLockPath) — acquiring
           // the old in-session lockfile after removal recreated the deleted
           // directory via the lock's own mkdir.
@@ -4233,72 +4118,6 @@ export class WorkspaceService
         `Cannot ${operation} while a refine operation is in progress: ${getErrorMessage(error)}`
       );
     }
-  }
-
-  /** r41: mark a context-discarding mutation as durably committed (see contextMutationEpochs). */
-  private advanceContextMutationEpoch(workspaceId: string): void {
-    this.contextMutationEpochs.set(
-      workspaceId,
-      (this.contextMutationEpochs.get(workspaceId) ?? 0) + 1
-    );
-  }
-
-  /**
-   * Admission guard for context-discarding history mutations (r40): reject
-   * new sends at the door (contextMutationWorkspaces), block turn admission
-   * inside the session, and only then verify idleness — all in one
-   * synchronous block, so no turn can slip between the check and the guard
-   * (see AgentSession.holdTurnAdmission for the pairing argument). Callers
-   * hold the guard across the whole mutation — including the refine
-   * drain/lock awaits — and must recheck busy-ness after those awaits for
-   * the turn starts that bypass admission gating (in-turn compaction
-   * retries observing a transient idle gap).
-   *
-   * Scope: process-local, like every send/rename/remove/busy guard in this
-   * service. Under XUM_ALLOW_MULTIPLE_INSTANCES=1 a second backend sharing
-   * the workspace can admit a send this guard never sees; sends do not
-   * participate in a cross-process admission protocol (only refine's
-   * durable staging/apply state does, via refine-apply.lock). Multi-instance
-   * mode is a development escape hatch — concurrent turn traffic against one
-   * workspace from two backends is unsupported beyond those durable-state
-   * locks. See CONCURRENT BACKENDS in processLiveness.ts.
-   */
-  private acquireContextMutationAdmissionGuard(
-    workspaceId: string,
-    operation: "truncate history" | "reset context" | "replace history"
-  ): Result<Disposable> {
-    if (this.contextMutationWorkspaces.has(workspaceId)) {
-      return Err("A context reset or clear is already in progress for this workspace.");
-    }
-    const session = this.getOrCreateSession(workspaceId);
-    this.contextMutationWorkspaces.add(workspaceId);
-    const admissionHold = session.holdTurnAdmission();
-    const guard: Disposable = {
-      [Symbol.dispose]: () => {
-        this.contextMutationWorkspaces.delete(workspaceId);
-        admissionHold[Symbol.dispose]();
-      },
-    };
-    // Busy check AFTER arming the block: a turn admitted first is observed
-    // here; a turn admitted later observes the block and refuses. Pending
-    // mid-stream compaction counts as turn work (r43): its direct session
-    // send bypasses this service's entry accounting.
-    if (session.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
-      guard[Symbol.dispose]();
-      return Err(`Cannot ${operation} while a turn is active. Press Esc to stop the stream first.`);
-    }
-    // r42: a send between its entry check and admission may have passed its
-    // pre-persist gate but not yet appended its rows. If this mutation
-    // committed first, those rows — including attacker-influenced family
-    // payload rows — would land durably in the fresh context: the epoch gate
-    // blocks the send's stream but cannot un-append. Refuse instead; sends
-    // settle in bounded time and the user retries. Counted synchronously at
-    // the send's entry, so one side always observes the other.
-    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
-      guard[Symbol.dispose]();
-      return Err(`Cannot ${operation} while a message is being sent. Try again in a moment.`);
-    }
-    return Ok(guard);
   }
 
   /**
@@ -4334,11 +4153,11 @@ export class WorkspaceService
     // trailing foreign assistant row. Refuse instead; the caller reports a
     // retryable failure. Counted synchronously at the send's entry, so on a
     // single thread one side always observes the other.
-    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+    if (this.sendPreflight.hasSendInPreflight(workspaceId)) {
       hold[Symbol.dispose]();
       return Err("a send is being admitted");
     }
-    const counted = this.acquirePreflightAdmission(this.refineExclusionCounts, workspaceId);
+    const counted = this.operationAdmission.refine.acquire(workspaceId);
     return Ok({
       [Symbol.dispose]: () => {
         counted[Symbol.dispose]();
@@ -4655,170 +4474,11 @@ export class WorkspaceService
     });
   }
 
-  private async populateActiveWorkflowRunIds(
-    workspaceId: string,
-    activeRunIds: Set<string>
-  ): Promise<Set<string>> {
-    try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, workspaceId),
-      });
-      const runs = await runStore.listRunStatusSnapshots();
-      for (const run of runs) {
-        if (
-          run.workspaceId === workspaceId &&
-          !isNestedWorkflowRun(run) &&
-          isActiveWorkflowRunStatus(run.status)
-        ) {
-          activeRunIds.add(run.id);
-        }
-      }
-    } catch (error) {
-      log.debug("Failed to inspect active workflow runs for workspace activity", {
-        workspaceId,
-        error,
-      });
-    }
-    return activeRunIds;
-  }
-
-  private async getActiveWorkflowRunIds(
-    workspaceId: string,
-    options?: ActiveWorkflowRunIdsOptions
-  ): Promise<Set<string>> {
-    let activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId, options);
-    // Converge on the installed cache: a dormant (archived) read resolves a DETACHED empty
-    // Set, and a workflow event can install and populate the shared one in the microtask
-    // gap above. Returning the detached copy would let an authoritative list response that
-    // lands after the event clear the activity the event just delivered to the renderer.
-    // (Same applies to the pathological detached disk probe in resolve's fallback.)
-    const installed = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
-    if (installed != null && installed !== activeRunIds) {
-      activeRunIds = installed;
-    }
-    if (
-      activeRunIds.size > 0 &&
-      // Installation re-check in THIS continuation: an eviction (removal, or
-      // a tombstone lifted for revival) can land in the microtask gap after
-      // resolve's own final check. A detached set must not repopulate the
-      // seen marker — the evicted id's caches are empty, so a stale marker
-      // would fabricate zero-count entries for the idle revived workspace.
-      this.activeWorkflowRunIdsByWorkspace.get(workspaceId) === activeRunIds
-    ) {
-      // A list- or event-delivered nonzero count is what makes a later zero
-      // meaningful as a tombstone (see workflowRunSeenWorkspaces).
-      this.workflowRunSeenWorkspaces.add(workspaceId);
-    }
-    return activeRunIds;
-  }
-
-  private async resolveActiveWorkflowRunIds(
-    workspaceId: string,
-    options?: ActiveWorkflowRunIdsOptions
-  ): Promise<Set<string>> {
-    assert(workspaceId.length > 0, "getActiveWorkflowRunIds requires workspaceId");
-    // Bounded retry: evictWorkspaceActivityCaches (removal, or a tombstone
-    // lifted for re-registration) can race an in-flight bootstrap. A waiter
-    // that captured the pre-eviction Set would otherwise return the removed
-    // incarnation's runs — ghost counts with no future terminal event to
-    // clear them — so after every await the Set is re-verified as still the
-    // installed cache and the read restarts when it was evicted.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const cached = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
-      if (cached != null) {
-        const bootstrap = this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId);
-        if (bootstrap != null) {
-          await bootstrap;
-        }
-        if (this.activeWorkflowRunIdsByWorkspace.get(workspaceId) !== cached) {
-          continue;
-        }
-        return cached;
-      }
-
-      const workspace = findWorkspaceEntry(
-        this.config.loadConfigOrDefault(),
-        workspaceId
-      )?.workspace;
-      // Archived stores are dormant until unarchive invalidates this cache. Live workflow
-      // events still update the shared Set without scanning archived session directories,
-      // so only the event path installs one: read paths (the activity list walks every
-      // config-known id) would otherwise fill this map with an empty Set per archived
-      // workspace, thousands on long-lived deployments, that nothing ever reads back.
-      // The detached result is provisional: getActiveWorkflowRunIds swaps in the shared
-      // Set if an event installed one before the caller's continuation ran.
-      if (workspace && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
-        const activeRunIds = new Set<string>();
-        if (options?.installDormant === true) {
-          this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
-        }
-        return activeRunIds;
-      }
-
-      // Install the shared Set before awaiting disk so parallel workflow status events
-      // mutate the same cache instead of racing to replace each other after bootstrap.
-      const activeRunIds = new Set<string>();
-      this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
-      const bootstrap = this.populateActiveWorkflowRunIds(workspaceId, activeRunIds);
-      this.activeWorkflowRunIdBootstrapsByWorkspace.set(workspaceId, bootstrap);
-      try {
-        await bootstrap;
-      } finally {
-        if (this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId) === bootstrap) {
-          this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
-        }
-      }
-      if (this.activeWorkflowRunIdsByWorkspace.get(workspaceId) !== activeRunIds) {
-        continue;
-      }
-      return activeRunIds;
-    }
-    // Eviction churn exhausted the retries (pathological): probe disk once
-    // more DETACHED so the caller still gets current durable state without
-    // installing a cache that may itself be mid-eviction.
-    return this.populateActiveWorkflowRunIds(workspaceId, new Set<string>());
-  }
-
-  private async updateActiveWorkflowRunCount(event: {
-    workspaceId: string;
-    runId: string;
-    status: WorkflowRunStatus;
-  }): Promise<number> {
-    // Bounded retry (same reason as resolveActiveWorkflowRunIds): an
-    // eviction can land in the microtask gap after the cache read resolves,
-    // so the mutation below would hit a detached incarnation — and must not
-    // mark the seen set for an id whose caches were just evicted, or the
-    // idle revived workspace emits fabricated zero-count entries forever.
-    let detachedSize = 0;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId, {
-        installDormant: true,
-      });
-      if (isActiveWorkflowRunStatus(event.status)) {
-        activeRunIds.add(event.runId);
-      } else {
-        activeRunIds.delete(event.runId);
-      }
-      detachedSize = activeRunIds.size;
-      if (this.activeWorkflowRunIdsByWorkspace.get(event.workspaceId) !== activeRunIds) {
-        continue;
-      }
-      if (isActiveWorkflowRunStatus(event.status)) {
-        this.workflowRunSeenWorkspaces.add(event.workspaceId);
-      }
-      return activeRunIds.size;
-    }
-    // Eviction churn exhausted the retries (pathological): report the last
-    // detached mutation's size without seen-marking, mirroring the detached
-    // disk-probe fallback in resolveActiveWorkflowRunIds.
-    return detachedSize;
-  }
-
   private mergeCachedActiveWorkflowRuns(
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot | null
   ): WorkspaceActivitySnapshot | null {
-    const activeRunIds = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+    const activeRunIds = this.workflowRuns.installedActiveWorkflowRunIds(workspaceId);
     if (activeRunIds == null) {
       return snapshot;
     }
@@ -4878,7 +4538,10 @@ export class WorkspaceService
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot
   ): Promise<WorkspaceActivitySnapshot> {
-    return mergeActiveWorkflowRuns(snapshot, await this.getActiveWorkflowRunIds(workspaceId));
+    return mergeActiveWorkflowRuns(
+      snapshot,
+      await this.workflowRuns.getActiveWorkflowRunIds(workspaceId)
+    );
   }
 
   public async emitWorkflowRunActivity(event: {
@@ -4888,7 +4551,7 @@ export class WorkspaceService
   }): Promise<void> {
     assert(event.workspaceId.length > 0, "emitWorkflowRunActivity requires workspaceId");
     assert(event.runId.length > 0, "emitWorkflowRunActivity requires runId");
-    await this.updateActiveWorkflowRunCount(event);
+    await this.workflowRuns.updateActiveWorkflowRunCount(event);
     let snapshot: WorkspaceActivitySnapshot | null;
     try {
       snapshot = await this.extensionMetadata.getSnapshot(event.workspaceId, {
@@ -4992,7 +4655,7 @@ export class WorkspaceService
 
   public async updateAgentStatus(
     workspaceId: string,
-    agentStatus: WorkspaceAgentStatus | null
+    agentStatus: ExtensionAgentStatus | null
   ): Promise<void> {
     await this.emitWorkspaceActivityUpdate(workspaceId, "update workspace agent status", () =>
       this.extensionMetadata.setAgentStatus(workspaceId, agentStatus)
@@ -5005,7 +4668,8 @@ export class WorkspaceService
       .catch(() => undefined)
       .then(async () => {
         const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-        const todos = await readTodosForSessionDir(sessionDir);
+        // Outside the agent loop: the host's session files.
+        const todos = await readTodosForSessionDir(sessionDir, nodeSessionFiles);
         const todoStatus = deriveTodoStatus(todos) ?? null;
 
         await this.emitWorkspaceActivityUpdate(workspaceId, "update workspace todo status", () =>
@@ -5064,7 +4728,8 @@ export class WorkspaceService
         // Stop snapshots need an authoritative todo summary even for background workspaces,
         // and centralizing the read here preserves the fire-and-forget abort/error handlers.
         const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-        const todos = await readTodosForSessionDir(sessionDir);
+        // Outside the agent loop: the host's session files.
+        const todos = await readTodosForSessionDir(sessionDir, nodeSessionFiles);
         hasTodos ??= todos.length > 0;
         // When there are no todos to derive from, leave `todoStatus` undefined
         // so setStreaming doesn't touch the slot. AgentStatusService writes
@@ -5148,7 +4813,8 @@ export class WorkspaceService
       // can lose the race against the frontend's lastRead (set via Date.now()
       // after the IPC round-trip). Using a fresh timestamp here ensures the
       // completion recency is strictly after any earlier lastRead write.
-      await this.updateRecencyTimestamp(workspaceId, Date.now());
+      // Wall clock on purpose: the renderer writes lastRead with Date.now() (#7282).
+      await this.updateRecencyTimestamp(workspaceId, nodeClock.nowMs());
     }
 
     await this.stopStreamingStatus(workspaceId, generation);
@@ -5296,7 +4962,7 @@ export class WorkspaceService
   collectRestartBlockers(): RestartBlocker[] {
     const sessions = new Map([...this.sessions, ...this.transientStartupRecoverySessions]);
     const config = this.config.loadConfigOrDefault();
-    const pendingTurns = new Set(this.preflightSendCounts.keys());
+    const pendingTurns = new Set(this.sendPreflight.sends.workspaceIds());
     let queuedMessages = 0;
     const heldInputWorkspaces: Array<{ id: string; title?: unknown; name?: unknown }> = [];
     let autoRetries = 0;
@@ -5331,9 +4997,9 @@ export class WorkspaceService
           ...this.renamingWorkspaces,
           ...this.removingWorkspaces,
           ...this.archivingWorkspaces,
-          ...this.contextMutationWorkspaces,
-          ...this.preflightForkCounts.keys(),
-          ...this.preflightStagingCounts.keys(),
+          ...this.contextMutationGate.mutatingWorkspaceIds(),
+          ...this.operationAdmission.fork.workspaceIds(),
+          ...this.operationAdmission.staging.workspaceIds(),
         ]).size,
       },
       { kind: "queued-messages", count: queuedMessages },
@@ -5345,7 +5011,7 @@ export class WorkspaceService
       { kind: "auto-retries", count: autoRetries },
       {
         kind: "background-processes",
-        count: Array.from(this.preflightExecCounts.values()).reduce((sum, count) => sum + count, 0),
+        count: this.operationAdmission.exec.total(),
       },
     ];
     return blockers.filter((blocker) => blocker.count > 0);
@@ -5567,6 +5233,7 @@ export class WorkspaceService
     return new AgentSession({
       contextManagement: this.contextManagement,
       effectRunner: this.effectRunner,
+      hostClock: this.hostClock,
       appFiberScope: this.appFiberScope,
       workspaceId,
       config: this.config,
@@ -5587,7 +5254,8 @@ export class WorkspaceService
           args.workspacePath,
           args.runtimeConfig
         ),
-      onContextWindowRollover: () => this.advanceContextMutationEpoch(workspaceId),
+      onContextWindowRollover: () =>
+        this.contextMutationGate.advanceContextMutationEpoch(workspaceId),
       onCompactionComplete: (metadata) => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
@@ -5611,13 +5279,17 @@ export class WorkspaceService
       // preflights (manual sends counted but not yet queued or busy) to the
       // session's follow-up idle probes so redispatched synthetic turns yield
       // to them. Codex P1 (PRRT_kwDOPxxmWM6cRi_J): reads the session-invisible
-      // counter, not preflightSendCounts — the originating send's reservation
+      // counter, not sendPreflight.sends — the originating send's reservation
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
-      hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
-      hasExternalManualSendPreflight: () => this.hasManualSessionInvisiblePreflight(workspaceId),
+      hasExternalSendPreflight: () => this.sendPreflight.hasSessionInvisiblePreflight(workspaceId),
+      hasExternalManualSendPreflight: () =>
+        this.sendPreflight.hasManualSessionInvisiblePreflight(workspaceId),
       isStopInProgress: () =>
         this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
+      isWorkspaceTurnStopped: async (correlation) =>
+        (await this.agentTaskIntegration?.isWorkspaceTurnStopped(workspaceId, correlation)) ===
+        true,
       getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
       onBeforeTurnCompletion: async () => {
         await this.agentTaskIntegration?.acknowledgeAgentReports(workspaceId);
@@ -5769,7 +5441,8 @@ export class WorkspaceService
       return null;
     const pending = new CompactionPendingState(
       pendingPath,
-      this.historyService.getCompactionPendingHistory(workspaceId)
+      this.historyService.getCompactionPendingHistory(workspaceId),
+      this.historyService.files
     );
     const receipt = await pending.load(() => true).catch(() => undefined);
     return receipt?.attachments.diffs.map((diff) => diff.path) ?? null;
@@ -5788,7 +5461,12 @@ export class WorkspaceService
     try {
       const runtime = createRuntimeForWorkspace(metadata);
       const owner = { ...metadata, id: workspaceId };
-      const legacyPath = await findImportableLegacyPlanPath(this.config, runtime, owner);
+      const legacyPath = await findImportableLegacyPlanPath(
+        this.config,
+        runtime,
+        owner,
+        this.historyService.locks
+      );
       return Ok(legacyPath === undefined ? null : await runtime.resolvePath(legacyPath));
     } catch (error) {
       return Err(`Failed to check for a plan from an older Xum: ${getErrorMessage(error)}`);
@@ -5813,10 +5491,12 @@ export class WorkspaceService
     }
     try {
       const runtime = createRuntimeForWorkspace(metadata);
-      const result = await importLegacyRemotePlan(this.config, runtime, {
-        ...metadata,
-        id: workspaceId,
-      });
+      const result = await importLegacyRemotePlan(
+        this.config,
+        runtime,
+        { ...metadata, id: workspaceId },
+        this.historyService.locks
+      );
       return Ok({ status: result.status, planPath: await runtime.resolvePath(result.planPath) });
     } catch (error) {
       return Err(`Failed to import the plan: ${getErrorMessage(error)}`);
@@ -6279,7 +5959,8 @@ export class WorkspaceService
                   ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
                 },
               }
-            : {}),
+            : // #5569: born without delegation, so no workspace turn can ever target it.
+              { bornWithoutDelegation: true as const }),
         });
         config.projects.set(SCRATCH_PROJECT_CONFIG_KEY, scratchProject);
         return config;
@@ -6303,6 +5984,31 @@ export class WorkspaceService
       );
       return Err(`Failed to create scratch workspace: ${getErrorMessage(error)}${kept}`);
     }
+  }
+
+  /** A free random name, as /new and backend-named creations use. */
+  private async nextAutoWorkspaceBranchName(
+    owningProjectPath: string,
+    projectConfig: ProjectConfig,
+    planDirectoryNames: ReadonlySet<string>
+  ): Promise<string> {
+    const existingNamesSet = new Set<string>(planDirectoryNames);
+    for (const entry of projectConfig.workspaces ?? []) {
+      if (typeof entry.name === "string") {
+        existingNamesSet.add(entry.name);
+      }
+    }
+    try {
+      for (const localBranch of await listLocalBranches(owningProjectPath)) {
+        existingNamesSet.add(localBranch);
+      }
+    } catch (error) {
+      log.debug("Failed to list local branches for /new auto-name preflight", {
+        projectPath: owningProjectPath,
+        error: getErrorMessage(error),
+      });
+    }
+    return generateAutoWorkspaceName(existingNamesSet);
   }
 
   async create(
@@ -6334,10 +6040,16 @@ export class WorkspaceService
        * startup resolver can bind to that handle and owner. Internal only; never from the API.
        */
       delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
+      /**
+       * Name the workspace after announcing it (see startCreationNaming): it opens under the
+       * provisional random name, and its branch is renamed before the init hook runs.
+       */
+      nameGeneration?: WorkspaceNameGenerationRequest;
     }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>> {
     const defaultConsent = options?.defaultUnrelatedConsent ?? "after-setup";
     const delegatedCreation = options?.delegatedCreation;
+    const nameGeneration = options?.nameGeneration;
     assert(
       delegatedCreation == null ||
         (delegatedCreation.handleId.length > 0 && delegatedCreation.ownerWorkspaceId.length > 0),
@@ -6386,6 +6098,15 @@ export class WorkspaceService
       type: "worktree",
       srcBaseDir: this.config.srcDir,
     };
+    const namingRefusal = this.refuseCreationNaming(
+      nameGeneration,
+      branchName,
+      title,
+      finalRuntimeConfig
+    );
+    if (namingRefusal) {
+      return Err(namingRefusal);
+    }
 
     // Names whose plan file another workspace already uses: plans live at
     // plans/<projectName>/<name>.md, and same-basename projects on the same plan storage share that
@@ -6404,34 +6125,17 @@ export class WorkspaceService
     }
 
     // Auto-generate a branch name when the caller omits one (used by /new to
-    // mirror /fork's seamless creation flow). Mirrors fork's auto-naming: scan
-    // existing workspace names AND local git branches so numbering is stable.
+    // mirror /fork's seamless creation flow). Scan existing workspace names AND
+    // local git branches so the random name never collides.
     // Branches/worktrees are owned by the parent project, so always read from
     // owningProjectPath even when a sub-project initiated creation.
-    let resolvedBranchName: string;
-    if (branchName == null) {
-      const existingNamesSet = new Set<string>(planDirectoryNames);
-      for (const entry of projectConfig.workspaces ?? []) {
-        if (typeof entry.name === "string") {
-          existingNamesSet.add(entry.name);
-        }
-      }
-      try {
-        for (const localBranch of await listLocalBranches(owningProjectPath)) {
-          existingNamesSet.add(localBranch);
-        }
-      } catch (error) {
-        log.debug("Failed to list local branches for /new auto-name preflight", {
-          projectPath: owningProjectPath,
-          error: getErrorMessage(error),
-        });
-      }
-      resolvedBranchName = generateForkBranchName(AUTO_NEW_WORKSPACE_BASE_NAME, [
-        ...existingNamesSet,
-      ]);
-    } else {
-      resolvedBranchName = branchName;
-    }
+    const resolvedBranchName =
+      branchName ??
+      (await this.nextAutoWorkspaceBranchName(
+        owningProjectPath,
+        projectConfig,
+        planDirectoryNames
+      ));
 
     const validation = validateWorkspaceBranchName(resolvedBranchName);
     if (!validation.valid) {
@@ -6490,6 +6194,13 @@ export class WorkspaceService
     // can reliably interrupt init even if the UI deletes the workspace during create().
     const initAbortController = new AbortController();
     this.initAbortControllers.set(workspaceId, initAbortController);
+    // Settled in the finally below; started now so naming overlaps the checkout.
+    const naming = this.startCreationNaming(
+      workspaceId,
+      nameGeneration,
+      initAbortController.signal
+    );
+    let namingCreated = false;
 
     const initLogger = this.createInitLogger(workspaceId);
     // True once a retained owner (the deferred checkout's settlement) finalizes the pending
@@ -6503,6 +6214,9 @@ export class WorkspaceService
       let finalWorkspaceName = initialWorkspaceName;
       const hasSanitizedWorkspaceName = finalBranchName !== finalWorkspaceName;
       let createResult: WorkspaceCreationResult;
+      // Whether this creation made its branch: undoing the creation deletes only such a branch,
+      // and a backend-named workspace renames only such a branch.
+      let createdBranch = false;
 
       // A name another workspace's plan file uses (#5139) is occupied on every runtime, like a
       // taken checkout directory: it gets the same collision suffix (or, for a sanitized branch
@@ -6553,6 +6267,7 @@ export class WorkspaceService
           deferMaterialization:
             options?.awaitMaterialization !== true && runtime.materializeWorkspace !== undefined,
         });
+        createdBranch = createResult.createdBranch === true;
 
         if (createResult.success) break;
 
@@ -6606,8 +6321,9 @@ export class WorkspaceService
         }
       }
 
-      const projectName =
-        owningProjectPath.split("/").pop() ?? owningProjectPath.split("\\").pop() ?? "unknown";
+      // The same name as the plan-directory checks above (getProjectName, process.platform aware):
+      // it names plans/<projectName>/ (#6714).
+      const projectName = getProjectName(owningProjectPath);
 
       const metadata = {
         id: workspaceId,
@@ -6649,9 +6365,7 @@ export class WorkspaceService
             initAbortController,
             // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
             // is safe only on a branch this creation made.
-            checkout:
-              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-              createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
+            checkout: createdBranch ? "force-delete" : "force-delete-keep-branch",
           });
         // #4745: nothing references this checkout before the registration write lands; undo the
         // creation, then fail with the failed step's own error.
@@ -6711,7 +6425,9 @@ export class WorkspaceService
             ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
             // Mirror /fork: when /new is invoked with a start message, defer title
             // selection until the first message can drive LLM-based generation.
-            ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
+            ...(pendingAutoTitle === true || naming !== undefined
+              ? { pendingAutoTitle: true }
+              : {}),
             // Default consent is granted once setup completes; marked in this same write so a
             // toggle from any backend that sees the row cancels it (#4446).
             ...(defaultConsent === "none"
@@ -6725,7 +6441,8 @@ export class WorkspaceService
                     ownerWorkspaceId: delegatedCreation.ownerWorkspaceId,
                   },
                 }
-              : {}),
+              : // #5569: the same birth fact as createScratch's stamp.
+                { bornWithoutDelegation: true as const }),
           });
           return config;
         });
@@ -6838,16 +6555,21 @@ export class WorkspaceService
                 initParams,
                 pending: pendingMaterialization,
                 initAbortController,
-                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-                createdBranch: createResult!.createdBranch === true,
-                // Removal, failed checkout or failed sanitization: the default never applies.
-              }).finally(() => this.clearPendingDefaultUnrelatedConsent(workspaceId))
-            : runBackgroundInit(
+                createdBranch,
+                naming,
+                // Removal, failed checkout or failed sanitization: the default never applies,
+                // and the branch is never renamed.
+              }).finally(() => {
+                naming?.settleBranch();
+                return this.clearPendingDefaultUnrelatedConsent(workspaceId);
+              })
+            : this.runCreatedWorkspaceInit(
                 runtime,
                 initParams,
                 workspaceId,
-                workspaceUseLeasesFor(this.config),
-                log
+                finalWorkspaceName,
+                naming,
+                createdBranch
               )
         );
       } else {
@@ -6864,11 +6586,11 @@ export class WorkspaceService
       eventSpine.emit("workspace.created", { workspaceId });
       // The caller now owns the pending default (see the option).
       if (defaultConsent === "caller-finalizes") pendingDefaultHandedOff = true;
+      namingCreated = true;
       return Ok({
         metadata: this.enrichFrontendMetadata(completeMetadata),
         // Lets a caller that undoes this creation keep a branch it merely reused (#4819).
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        createdBranch: createResult!.createdBranch === true,
+        createdBranch,
       });
     } catch (error) {
       initLogger.logComplete(-1);
@@ -6886,6 +6608,8 @@ export class WorkspaceService
       if (!pendingDefaultHandedOff) {
         await this.clearPendingDefaultUnrelatedConsent(workspaceId);
       }
+      // Any exit but the success above aborts the naming.
+      naming?.settleCreation(namingCreated);
     }
   }
 
@@ -7443,11 +7167,13 @@ export class WorkspaceService
     options?: {
       beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
       acknowledgedDescendantIds?: string[];
+      acknowledgedUnknownProcessRecords?: string[];
     }
   ): Promise<
     Result<void> & {
       descendants?: WorkspaceRemovalDescendant[];
       warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
   > {
     return await this.removeLocked(workspaceId, force, options);
@@ -7456,33 +7182,42 @@ export class WorkspaceService
   private async removeLocked(
     workspaceId: string,
     force: boolean,
-    options?: {
+    options: {
       beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
       acknowledgedDescendantIds?: string[];
-    }
+      acknowledgedUnknownProcessRecords?: string[];
+    } = {}
   ): Promise<
     Result<void> & {
       descendants?: WorkspaceRemovalDescendant[];
       warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
   > {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
       const operation = async () => {
-        const decision = options?.beforeRemove == null ? true : await options.beforeRemove();
+        const decision = options.beforeRemove == null ? true : await options.beforeRemove();
         if (decision === false) {
           return Ok(undefined);
         }
         const binding = decision === true ? undefined : decision;
-        const failure = (error: string) => {
+        const failure = (
+          error: string,
+          backgroundProcesses?: WorkspaceBackgroundProcessBlocker[]
+        ) => {
           const descendants =
             this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId);
-          return { ...Err(error), ...(descendants?.length ? { descendants } : {}) };
+          return {
+            ...Err(error),
+            ...(descendants?.length ? { descendants } : {}),
+            backgroundProcesses,
+          };
         };
         let releaseTreeGate: (() => Promise<void>) | undefined;
         // What the acknowledged descendants' forced removals left behind (#5143).
         let descendantWarnings: WorkspaceRemoveWarning[] = [];
         try {
-          if (options?.acknowledgedDescendantIds != null) {
+          if (options.acknowledgedDescendantIds != null) {
             if (this.agentTaskIntegration == null) {
               return failure("Task lifecycle service is unavailable.");
             }
@@ -7499,9 +7234,11 @@ export class WorkspaceService
             ]);
             const gate = await this.acquireStructuralMutationGate(
               [...gatedIds],
-              REMOVAL_OWN_ACTIVITY_POLICY
+              REMOVAL_OWN_ACTIVITY_POLICY,
+              options.acknowledgedUnknownProcessRecords
             );
-            if (!gate.success) return failure(`Cannot remove workspace: ${gate.error}`);
+            if (!gate.success)
+              return failure(`Cannot remove workspace: ${gate.error}`, gate.backgroundProcesses);
             releaseTreeGate = gate.data;
             const descendantsResult =
               await this.agentTaskIntegration.removeAcknowledgedDescendantsWhileTaskTreeLocked(
@@ -7516,9 +7253,11 @@ export class WorkspaceService
             workspaceId,
             force,
             binding,
-            releaseTreeGate != null ? { mutationGateHeld: true } : undefined
+            releaseTreeGate != null
+              ? { mutationGateHeld: true }
+              : { acknowledgedUnknownProcessRecords: options.acknowledgedUnknownProcessRecords }
           );
-          if (!result.success) return failure(result.error);
+          if (!result.success) return failure(result.error, result.backgroundProcesses);
           const warnings = [...descendantWarnings, ...(result.warnings ?? [])];
           return { ...result, ...(warnings.length > 0 ? { warnings } : {}) };
         } catch (error) {
@@ -7533,7 +7272,7 @@ export class WorkspaceService
         }
       };
       // Defer the project-list refresh until the complete descendant cascade ends.
-      return options?.acknowledgedDescendantIds != null
+      return options.acknowledgedDescendantIds != null
         ? await this.config.withDeferredChangeNotifications(operation)
         : await operation();
     });
@@ -7549,7 +7288,12 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     return await this.removeUnlocked(workspaceId, force, binding, options);
   }
 
@@ -7629,7 +7373,12 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     const result = await this.removeSingleWorkspaceUnlocked(workspaceId, force, binding, options);
     // Both removal entrypoints must discard side chats, but only after the parent is gone.
     // Keep this outside the parent's checkout locks and do not reacquire a task-tree lock:
@@ -7645,11 +7394,17 @@ export class WorkspaceService
     force = false,
     binding?: RemovalAttemptBinding,
     options?: RemovalCheckoutOptions
-  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+  ): Promise<
+    Result<void> & {
+      warnings?: WorkspaceRemoveWarning[];
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
+    }
+  > {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Only the checkout options reach the runtime.
-    const { mutationGateHeld, ...checkoutOptions } = options ?? {};
-    const runtimeOptions = mutationGateHeld === undefined ? options : checkoutOptions;
+    const { mutationGateHeld, acknowledgedUnknownProcessRecords, ...checkoutOptions } =
+      options ?? {};
+    const runtimeOptions = Object.keys(checkoutOptions).length > 0 ? checkoutOptions : undefined;
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -7713,9 +7468,14 @@ export class WorkspaceService
       if (mutationGateHeld !== true) {
         const gate = await this.acquireStructuralMutationGate(
           workspaceId,
-          REMOVAL_OWN_ACTIVITY_POLICY
+          REMOVAL_OWN_ACTIVITY_POLICY,
+          acknowledgedUnknownProcessRecords
         );
-        if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
+        if (!gate.success)
+          return {
+            ...Err(`Cannot remove workspace: ${gate.error}`),
+            backgroundProcesses: gate.backgroundProcesses,
+          };
         releaseMutationGate = gate.data;
       }
       // #4914: the marker, the deregistration and other backends' task commits all find the row
@@ -7763,7 +7523,7 @@ export class WorkspaceService
       // Same point for MCP prompt discoveries: new ones are refused since removingWorkspaces
       // was set, so joining the admitted ones leaves none that could publish servers after
       // the stopServers calls below (#4805).
-      await this.abortAndJoinMcpPromptDiscoveries(workspaceId);
+      await this.operationAdmission.abortAndJoinMcpPromptDiscoveries(workspaceId);
       // r65: keep renewing the removal tombstone's mtime until this removal
       // settles so a foreign backend's startup self-heal cannot mistake a
       // merely SLOW removal (a hung runtime deletion or MCP server close) for
@@ -7941,6 +7701,7 @@ export class WorkspaceService
         await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
         await clearPendingBranchSummary(workspaceId);
         await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+        await this.statusPageAgentCanceller.cancelInFlightPass(workspaceId);
 
         // Shared workspace memory, BEFORE any destructive step — so a failure
         // leaves a fully intact, retryable workspace: fold this workspace's
@@ -7990,6 +7751,7 @@ export class WorkspaceService
             ),
             beforeTombstone: () =>
               this.lockedSharedMemoryHandover(workspaceId, sharedMemoryOwnerId, force),
+            locks: this.historyService.locks,
           });
           sealedForRemoval = true;
           tombstonePublished = true;
@@ -8376,13 +8138,17 @@ export class WorkspaceService
       // tool-driven memory/skill writes and summary-row append cannot land
       // after the session directory is deleted.
       await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+      // A status page agent pass writes status.html and session usage; abort it too.
+      await this.statusPageAgentCanceller.cancelInFlightPass(workspaceId);
 
       // Drop any persistent sandbox mount BEFORE deleting the session
       // directory: dropScope disposes the runtime without disk writes and
       // waits for in-flight evaluation, so a late vars snapshot cannot
       // recreate the directory (and the QuickJS runtime is not leaked in the
-      // process-wide singleton).
-      await sandboxHostService.dropScope(workspaceId);
+      // process-wide singleton). The removal variant also refuses a later
+      // mount: a code_execution of the aborted turn can reach the scope lock
+      // after this drop (#7484).
+      await sandboxHostService.dropScopeForRemoval(workspaceId);
       // Plugin hook mounts live under their own scope keys; unregister their
       // spine middleware and drop their runtimes too. Never throws.
       await agentPluginHookService.disposeWorkspace(workspaceId);
@@ -8397,7 +8163,7 @@ export class WorkspaceService
         });
       }
 
-      await this.drainBashMonitorPersistence(workspaceId);
+      await this.bashMonitorPersistence.drainBashMonitorPersistence(workspaceId);
       await this.bashMonitorHistoryLocks.withLock(workspaceId, () =>
         this.bashMonitorWakeReconciler.dispose(workspaceId)
       );
@@ -8414,6 +8180,7 @@ export class WorkspaceService
               childSessionDir: sessionDir,
               childTaskModelString,
               childTaskThinkingLevel,
+              locks: this.historyService.locks,
             });
           } catch (error: unknown) {
             log.error("Failed to roll up child session artifacts into parent", {
@@ -8459,6 +8226,7 @@ export class WorkspaceService
             ownerSessionDir === undefined || sealedForRemoval
               ? undefined
               : () => this.lockedSharedMemoryHandover(workspaceId, memoryOwnerId, force),
+          locks: this.historyService.locks,
         });
         tombstonePublished = true;
       } catch (error) {
@@ -8560,6 +8328,7 @@ export class WorkspaceService
             workspaceId,
             attemptId: removalAttemptId,
             workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+            locks: this.historyService.locks,
           });
         } catch (rollbackError) {
           // r63: a failed rollback must not be silent — the workspace
@@ -8577,7 +8346,7 @@ export class WorkspaceService
         throw error;
       }
       removedFromConfig = true;
-      this.autoTitlingWorkspaces.delete(workspaceId);
+      this.naming.releaseAutoTitle(workspaceId);
       this.agentTaskIntegration?.noteWorkspaceRemoved(workspaceId);
       // Only once the workspace is deregistered (and its session, with the
       // transcript, gone) are the retryable harvest records truly
@@ -8642,6 +8411,7 @@ export class WorkspaceService
               workspaceId,
               attemptId: removalAttemptId,
               workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+              locks: this.historyService.locks,
             });
           } catch (rollbackError) {
             log.error(
@@ -8652,6 +8422,7 @@ export class WorkspaceService
           }
         }
         this.memoryConsolidationService?.releaseRemovalCancellation(workspaceId);
+        sandboxHostService.reinstateScope(workspaceId);
         if (pendingRemovalId != null) {
           await this.releasePendingRemoval(workspaceId, pendingRemovalId);
         }
@@ -8705,7 +8476,7 @@ export class WorkspaceService
       });
     }
     try {
-      await markRemotePlanMigratedForDeletion(this.config, owner);
+      await markRemotePlanMigratedForDeletion(this.config, owner, this.historyService.locks);
     } catch (error) {
       log.warn("Failed to mark the plan of a removed workspace migrated", {
         workspaceId,
@@ -9007,6 +8778,7 @@ export class WorkspaceService
       | "setHeartbeatSettings"
       | "unsetHeartbeatSettings"
       | "setUnrelatedWorkspaceConsent"
+      | "setMessagingTag"
       | "setAgentMessageDispatchMode"
       | "executeHeartbeat"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
@@ -9263,6 +9035,64 @@ export class WorkspaceService
       return Ok(undefined);
     } catch (error) {
       return Err(`Failed to update unrelated workspace consent: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
+   * User-only messaging tag for a root chat: chats sharing a tag may message each other
+   * (TaskService resolves that relation). Only user API clients call this — no agent tool may
+   * set a tag, and it is never routed through the generic `tags` map. `null`/empty clears the
+   * tag (absent is the only untagged representation); an invalid tag is rejected before any
+   * write. Side chats and sub-agent children are refused: tagging is root-chat only. This
+   * never mints or changes unrelated-workspace consent. Like the consent switch, Ok means
+   * committed to config AND published on the metadata channel; recency is not bumped.
+   */
+  async setMessagingTag(workspaceId: string, tag: string | null): Promise<Result<void, string>> {
+    try {
+      const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "setMessagingTag");
+      if (!resolved.success) {
+        return Err(resolved.error);
+      }
+      const { normalizedWorkspaceId, projectPath, workspacePath, workspaceEntry } = resolved.data;
+      // Root-only, then validate before any write: an invalid tag must not persist or publish.
+      const tagValue = messagingTagWriteValue(workspaceEntry, tag);
+      if (!tagValue.success) {
+        return Err(tagValue.error);
+      }
+      const normalizedTag = tagValue.data;
+
+      // Mutate inside the serialized editConfig transform against the FRESH entry (see
+      // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
+      let outcome: Result<void, string> = Err(this.workspaceNotFoundError());
+      await this.config.editConfig((freshConfig) => {
+        const entry = this.findFreshWorkspaceEntry(freshConfig, {
+          projectPath,
+          workspaceId: normalizedWorkspaceId,
+          workspacePath,
+        });
+        if (!entry) {
+          outcome = Err(this.workspaceNotFoundError());
+          return freshConfig;
+        }
+        // Re-check on the fresh entry: it may have become a child/side chat since resolution.
+        const freshRefusal = messagingTagRootRefusal(entry);
+        if (freshRefusal != null) {
+          outcome = Err(freshRefusal);
+          return freshConfig;
+        }
+        outcome = Ok(undefined);
+        applyMessagingTag(entry, normalizedTag);
+        return freshConfig;
+      });
+      if (!outcome.success) {
+        return Err(outcome.error);
+      }
+      // Publish after every successful write, including no-ops (same reason as consent above):
+      // Ok means committed AND published, so clients observe the tag once this acks.
+      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to update messaging tag: ${getErrorMessage(error)}`);
     }
   }
 
@@ -10238,10 +10068,12 @@ export class WorkspaceService
         // A row whose only legacy plan is the shared basename file stays unmigrated until the
         // user imports it (Option B). That file is named after the workspace, so after a rename
         // the offer would look at another path and the plan would be orphaned: refuse instead.
-        const importable = await findImportableLegacyPlanPath(this.config, runtimeForPlanFile, {
-          ...oldMetadata,
-          id: workspaceId,
-        });
+        const importable = await findImportableLegacyPlanPath(
+          this.config,
+          runtimeForPlanFile,
+          { ...oldMetadata, id: workspaceId },
+          this.historyService.locks
+        );
         if (importable !== undefined) {
           const shownPath = await runtimeForPlanFile.resolvePath(importable);
           await revertMove();
@@ -10592,6 +10424,254 @@ export class WorkspaceService
   public async getWorkspaceTitleModelCandidates(workspaceId: string): Promise<string[]> {
     const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
     return candidates.map((candidate) => candidate.model);
+  }
+
+  /** create()'s preflight for nameGeneration; returns the refusal, if any. */
+  private refuseCreationNaming(
+    request: WorkspaceNameGenerationRequest | undefined,
+    branchName: string | undefined,
+    title: string | undefined,
+    runtimeConfig: RuntimeConfig
+  ): string | undefined {
+    if (request === undefined) {
+      return undefined;
+    }
+    if (branchName != null || title != null) {
+      return "nameGeneration cannot be combined with branchName or title";
+    }
+    // Only a local worktree's branch can be renamed under its checkout before the init hook runs.
+    if (runtimeConfig.type !== "worktree") {
+      return "nameGeneration requires the worktree runtime";
+    }
+    if (!request.message.trim()) {
+      return "nameGeneration requires a non-empty message";
+    }
+    return undefined;
+  }
+
+  /**
+   * Start naming a workspace that create() opens under its provisional random name, while
+   * its checkout runs. The title applies as soon as it arrives (unless the user titled the
+   * workspace meanwhile); a failure keeps pendingAutoTitle so a later message titles it. The
+   * auto-title claim, taken before the workspace is announced, keeps the first message from
+   * starting a second naming request, and is released once this naming settles.
+   */
+  private startCreationNaming(
+    workspaceId: string,
+    request: WorkspaceNameGenerationRequest | undefined,
+    initAbortSignal: AbortSignal
+  ): CreationNaming | undefined {
+    if (request === undefined) return undefined;
+    this.naming.claimAutoTitle(workspaceId);
+    const namingAbort = new AbortController();
+    let settleCreation!: (created: boolean) => void;
+    const created = new Promise<boolean>((resolve) => {
+      settleCreation = resolve;
+    });
+    let settleBranch!: () => void;
+    const branchFinal = new Promise<void>((resolve) => {
+      settleBranch = resolve;
+    });
+    // An aborted init never reaches the rename (renameCreationBranch honours the abort).
+    initAbortSignal.addEventListener("abort", () => settleBranch(), { once: true });
+    const outcome = this.generateCreationIdentity(
+      request,
+      AbortSignal.any([namingAbort.signal, initAbortSignal]),
+      namingAbort
+    );
+    const titleFinal = outcome
+      .then(async (result) => {
+        if (!result.success) {
+          log.warn("Failed to name a new workspace", { workspaceId, error: result.error });
+          return;
+        }
+        if (!(await created)) return;
+        const persistResult = await this.updateWorkspaceTitleState(workspaceId, {
+          title: result.data.title,
+          clearPendingAutoTitle: true,
+          requirePendingAutoTitle: true,
+        });
+        if (!persistResult.success) {
+          log.warn("Failed to persist a new workspace's generated title", {
+            workspaceId,
+            error: persistResult.error,
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        log.error("Unexpected error naming a new workspace", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        this.naming.releaseAutoTitle(workspaceId);
+      });
+    // Neither part rejects: the title chain catches, and the branch only ever resolves.
+    this.naming.trackCreationNaming(workspaceId, Promise.all([titleFinal, branchFinal]));
+    return {
+      outcome,
+      settleCreation: (wasCreated) => {
+        if (!wasCreated) {
+          namingAbort.abort();
+          settleBranch();
+        }
+        settleCreation(wasCreated);
+      },
+      settleBranch: () => settleBranch(),
+    };
+  }
+
+  /**
+   * A fork's source metadata, read once the backend has named a source create() opened under its
+   * provisional name, so the fork copies its generated title and forks from its final branch. The
+   * wait is bounded by the naming deadline. A source whose branch is still provisional then (a
+   * long checkout holds the rename) refuses the fork: forking from that branch would race its
+   * rename.
+   */
+  private async readNamedForkSource(
+    sourceWorkspaceId: string
+  ): Promise<Result<WorkspaceMetadata, string>> {
+    if (!(await this.naming.waitForCreationNaming(sourceWorkspaceId))) {
+      return Err("The workspace is still being set up. Fork it again once its checkout finishes.");
+    }
+    const result = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
+    if (!result.success) {
+      return Err(`Failed to get source workspace metadata: ${result.error}`);
+    }
+    return result;
+  }
+
+  /**
+   * nameGeneration.generate: names a creation draft's message before its workspace exists. With
+   * a draftNamingId, the creation that hands this request off takes it over
+   * (generateCreationIdentity) instead of asking the model a second time.
+   */
+  generateDraftIdentity(
+    request: WorkspaceNameGenerationRequest
+  ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
+    const generation = this.generatePreCreationIdentity(request.message, request.candidates);
+    if (request.draftNamingId !== undefined) {
+      this.naming.retainDraftNaming(request.draftNamingId, generation);
+    }
+    return generation;
+  }
+
+  private async generatePreCreationIdentity(
+    message: string,
+    callerModels: string[],
+    abortSignal?: AbortSignal
+  ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
+    // Pre-creation naming has no workspace yet: the configured naming agent (model + thinking)
+    // still leads; the caller's models only fill in after the built-in fallbacks.
+    const candidates = await this.getWorkspaceNamingCandidates(undefined, callerModels);
+    return generateWorkspaceIdentity(
+      message,
+      candidates,
+      this.aiService,
+      undefined,
+      undefined,
+      abortSignal
+    );
+  }
+
+  private async generateCreationIdentity(
+    request: WorkspaceNameGenerationRequest,
+    signal: AbortSignal,
+    namingAbort: AbortController
+  ): Promise<Result<GenerateWorkspaceIdentityResult, string>> {
+    try {
+      // The form's request this creation hands off, running or finished, answers sooner and
+      // spares a second model call. One creation takes it: two workspaces given one generated
+      // name would collide on the branch.
+      const draftNaming = this.naming.takeDraftNaming(request.draftNamingId);
+      const generated = await raceWithAbortAndTimeout(
+        draftNaming ??
+          this.generatePreCreationIdentity(request.message.trim(), request.candidates, signal),
+        { signal, timeoutMs: WORKSPACE_NAME_GENERATION_TIMEOUT_MS }
+      );
+      if (generated.kind === "timeout") {
+        // Stop the request instead of leaving it running past the deadline. A form request taken
+        // over carries no signal of this creation's and runs to its end.
+        namingAbort.abort();
+        return Err("naming timed out");
+      }
+      if (generated.kind === "aborted") return Err("naming was cancelled");
+      if (!generated.value.success) {
+        return Err(formatNameGenerationError(generated.value.error).message);
+      }
+      return Ok(generated.value.data);
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+  }
+
+  /**
+   * The branch rename of a workspace create() named in the backend, at the one safe point: its
+   * checkout is complete (a running `git checkout` would write HEAD back to the old branch name)
+   * and its init hook has not started. Waits for the naming, honouring the init abort at once,
+   * then renames only the branch: the workspace name, directory and XUM_WORKSPACE_NAME stay the
+   * provisional name. Any failure keeps the provisional branch; the init continues either way.
+   */
+  private async renameBranchAfterCreationNaming(
+    runtime: Runtime,
+    initParams: WorkspaceInitParams,
+    workspaceName: string,
+    naming: CreationNaming,
+    createdBranch: boolean
+  ): Promise<void> {
+    initParams.initLogger.logStep("Naming branch...");
+    // Never throws: the init must run whatever happens to the rename.
+    const renamed = await this.renameCreationBranch(
+      runtime,
+      initParams,
+      workspaceName,
+      naming,
+      createdBranch
+    ).catch((error: unknown) => Err(getErrorMessage(error)));
+    naming.settleBranch();
+    if (renamed.success) {
+      initParams.initLogger.logStdout(`Renamed branch ${initParams.branchName} to ${renamed.data}`);
+      return;
+    }
+    log.warn("Keeping the provisional branch of a new workspace", {
+      workspaceName,
+      branchName: initParams.branchName,
+      reason: renamed.error,
+    });
+    initParams.initLogger.logStdout(`Keeping branch ${initParams.branchName}: ${renamed.error}`);
+  }
+
+  private async renameCreationBranch(
+    runtime: Runtime,
+    initParams: WorkspaceInitParams,
+    workspaceName: string,
+    naming: CreationNaming,
+    createdBranch: boolean
+  ): Promise<Result<string, string>> {
+    // The creation attached to a branch that already existed (another process made it after the
+    // provisional name was picked): that branch is not this workspace's to rename.
+    if (!createdBranch) return Err("the branch existed before this workspace");
+    const waited = await raceWithAbortAndTimeout(naming.outcome, {
+      signal: initParams.abortSignal,
+    });
+    if (waited.kind !== "ok") return Err("workspace setup was cancelled");
+    if (!waited.value.success) return Err(waited.value.error);
+    const generatedBranch = waited.value.data.name;
+    const refusal = refuseGeneratedBranchName(generatedBranch, initParams.branchName);
+    if (refusal !== undefined) return Err(refusal);
+    if (runtime.renameWorkspaceBranch === undefined) {
+      return Err("this runtime cannot rename branches");
+    }
+    const result = await runtime.renameWorkspaceBranch(
+      initParams.projectPath,
+      workspaceName,
+      initParams.branchName,
+      generatedBranch,
+      initParams.trusted
+    );
+    if (!result.success) return Err(result.error.split(/\r?\n/)[0] ?? result.error);
+    return Ok(generatedBranch);
   }
 
   private async maybeRunPendingAutoTitleFromMessage(
@@ -11075,24 +11155,12 @@ export class WorkspaceService
   }
 
   /**
-   * Workspaces an external editor (VS Code/Cursor/Zed deep link or a custom editor command)
-   * was opened for. Like native terminals, external editors are untrackable once open (deep
-   * links leave no process handle; custom commands spawn detached), so opens are recorded
-   * stickily in memory and as a durable per-workspace marker that survives app restarts.
-   */
-  private readonly externalEditorWorkspaces = new Set<string>();
-
-  /** See recordExternalEditorOpenAdmitted (#4883). */
-  private readonly externalEditorUseLeases = new Map<string, WorkspaceUseLease>();
-
-  /**
    * End this backend's native-terminal and editor use leases for a workspace it archives or
    * removes (#4883): the apps may still run, but the user chose to archive or remove it here,
    * as before. Release failures leave the lease held (fail closed) and are only logged.
    */
   private async releaseExternalAppUseLeases(workspaceId: string): Promise<void> {
-    const editorLease = this.externalEditorUseLeases.get(workspaceId);
-    this.externalEditorUseLeases.delete(workspaceId);
+    const editorLease = this.externalEditors.takeExternalEditorUseLease(workspaceId);
     const releases = [
       () => editorLease?.release(),
       () => this.terminalService?.releaseNativeTerminalUseLease(workspaceId),
@@ -11110,408 +11178,36 @@ export class WorkspaceService
     }
   }
 
-  /**
-   * Marker ancestry batches per workspace. A batch begins with a disk probe (did a durable
-   * marker exist before this batch wrote one?) and collects one launch-evidence token per
-   * recorded open; tokens are removed only by failed launches. When the last token of a
-   * batch is removed, every open in the batch failed, so the batch's marker is deleted
-   * unless it predated the batch (an earlier session's editor may still be running behind
-   * it). Deep-link opens recorded via recordExternalEditorOpen retain their token forever
-   * (they launch in the renderer immediately after recording and cannot report failures
-   * back), pinning the marker. Probing per batch — not per call — prevents a marker written
-   * by an earlier in-flight open of the same batch from masquerading as pre-existing
-   * evidence when every open in the batch fails.
-   */
-  private readonly externalEditorMarkerBatches = new Map<
-    string,
-    { markerPreexisted: boolean; tokens: Set<symbol> }
-  >();
+  // External editor opens live in WorkspaceExternalEditors; these facades keep the public API
+  // (the router, EditorService, TaskService) and the tests that spy on it unchanged.
 
-  /**
-   * Serializes marker writes against failed-launch rollbacks per workspace: an unserialized
-   * rollback's unlink could interleave with a concurrent open's write and delete the marker
-   * protecting that open's live editor.
-   */
-  private readonly externalEditorMarkerLocks = new MutexMap<string>();
-
-  /**
-   * Editor-open recordings currently in flight per workspace, counted synchronously at
-   * entry and released when the recording settles. An in-flight recording has already
-   * passed (or will synchronously fail) the admission checks and its launch follows without
-   * rechecking, so hasExternalEditorOpen counts these alongside durable evidence — a
-   * concurrent failed launch's rollback may collapse the shared marker and cache entry, and
-   * without this count that collapse would make a still-recording sibling invisible to an
-   * archive that then removes the environment beneath the launching editor. For editors this
-   * backend launches itself, the count lasts until the launcher returns (launchExternalEditor).
-   */
-  private readonly pendingExternalEditorRecordings = new Map<string, number>();
-
-  private externalEditorMarkerPath(workspaceId: string): string {
-    return path.join(this.config.sessionsDir, workspaceId, "external-editor-opened");
-  }
-
-  /**
-   * Disk probe for the durable marker. "unknown" means the probe failed in a way that cannot
-   * prove absence (EACCES, EIO, ...).
-   */
-  private async probeExternalEditorMarkerOnDisk(
-    workspaceId: string
-  ): Promise<"present" | "absent" | "unknown"> {
-    try {
-      await fsPromises.access(this.externalEditorMarkerPath(workspaceId));
-      return "present";
-    } catch (error) {
-      return isErrnoWithCode(error, "ENOENT") ? "absent" : "unknown";
-    }
-  }
-
-  /**
-   * Rollback handles for renderer-recorded deep-link opens, keyed by the CLIENT-generated
-   * launch token (client-side so the renderer can still redeem it when the recording
-   * response is lost mid-connection — a backend-minted token would die with the response).
-   * The renderer redeems a token via rollbackRecordedEditorOpen only when its launch
-   * provably never happened (placeholder closed before navigation, or an ambiguous
-   * recording RPC whose launch was abandoned). Entries for successful launches are retained
-   * for the app session — they pin the batch token that keeps the durable marker protected.
-   * A (buggy) reused token overwrites its old entry, whose pinned launch evidence then only
-   * over-refuses (fail closed).
-   */
-  private readonly externalEditorLaunchRollbacks = new Map<
-    string,
-    { workspaceId: string; rollback: () => Promise<void> }
-  >();
-
-  /**
-   * Rollback requests that arrived before their recording committed, keyed by launch token.
-   * The renderer can observe a transport rejection of its recordEditorOpen RPC while the
-   * backend handler is still awaiting marker persistence; its immediate rollback would find
-   * no rollback entry, no-op, and the handler would then commit a durable marker for a
-   * launch the renderer already abandoned — a false marker that permanently refuses future
-   * model-driven archives. An unknown-token rollback therefore leaves a tombstone that the
-   * recording consumes at commit time (in the same synchronous block that would register
-   * the rollback entry), undoing its own admission instead of committing. Bounded FIFO:
-   * tombstones whose recording never reached the backend are unredeemable, and evicting one
-   * can at worst leave a sticky marker behind (over-refuses archives — fail closed).
-   */
-  private readonly externalEditorRollbackTombstones = new Map<string, string>();
-
-  private static readonly EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP = 1024;
-
-  /**
-   * Record that the user is opening this workspace in an external editor. Refuses while an
-   * agent-driven archive is gating the workspace: the check shares the synchronous block with
-   * the in-memory recording (mirroring TerminalService.openNative), so an archive gate armed
-   * first refuses the open while an open recorded first is observed by the sink's
-   * untrackable-app check before snapshot capture.
-   */
-  async recordExternalEditorOpen(workspaceId: string, launchToken: string): Promise<Result<void>> {
-    const admitted = await this.recordExternalEditorOpenForLaunch(workspaceId);
-    if (!admitted.success) {
-      return admitted;
-    }
-    // A rollback for this token that raced ahead of the recording (the renderer saw the RPC
-    // reject while this handler was still persisting the marker) is consumed here, in the
-    // same synchronous block that would otherwise register the rollback entry: the renderer
-    // has already abandoned the launch, so undo the admission instead of committing a marker
-    // no editor will ever sit behind.
-    if (this.externalEditorRollbackTombstones.get(launchToken) === workspaceId) {
-      this.externalEditorRollbackTombstones.delete(launchToken);
-      await admitted.data.rollbackAfterFailedLaunch();
-      return Err(`Editor open for ${workspaceId} was rolled back before its recording finished.`);
-    }
-    // Deep-link opens launch in the renderer immediately after this returns; the rollback
-    // entry lets the renderer report a launch that provably never happened so the marker
-    // cannot outlive it (see externalEditorLaunchRollbacks for why the token is
-    // client-generated). The in-flight count has already ended here, so this backend's own
-    // rename or removal may still run before the client's hand-off. That is accepted (#4909):
-    // the launch runs in another process, and the editor opens the folder asynchronously even
-    // after the hand-off, which is the outcome those mutations already tolerate for an open editor.
-    this.externalEditorLaunchRollbacks.set(launchToken, {
-      workspaceId,
-      rollback: admitted.data.rollbackAfterFailedLaunch,
-    });
-    return Ok(undefined);
-  }
-
-  /**
-   * Redeems a recordExternalEditorOpen launch token after the renderer's placeholder window
-   * was closed before navigation (no editor launched). Idempotent for the renderer: unknown
-   * or already redeemed tokens succeed without touching durable state (they only leave a
-   * tombstone for a possibly in-flight recording), so renderer retries are safe.
-   */
-  async rollbackRecordedEditorOpen(
+  /** See WorkspaceExternalEditors.recordExternalEditorOpen. */
+  recordExternalEditorOpen(
     workspaceId: string,
-    launchToken: string
-  ): Promise<Result<void>> {
-    const entry = this.externalEditorLaunchRollbacks.get(launchToken);
-    if (entry?.workspaceId !== workspaceId) {
-      // Unknown token: the recording may still be in flight (its RPC rejected at the
-      // transport while the handler awaits marker persistence). Tombstone the token so the
-      // commit rolls itself back instead of persisting a marker for an abandoned launch
-      // (see externalEditorRollbackTombstones). Already-redeemed or never-recorded tokens
-      // leave an unredeemable tombstone the FIFO cap eventually evicts.
-      this.externalEditorRollbackTombstones.set(launchToken, workspaceId);
-      if (
-        this.externalEditorRollbackTombstones.size >
-        WorkspaceService.EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP
-      ) {
-        const oldest = this.externalEditorRollbackTombstones.keys().next().value;
-        if (oldest != null) {
-          this.externalEditorRollbackTombstones.delete(oldest);
-        }
-      }
-      return Ok(undefined);
-    }
-    this.externalEditorLaunchRollbacks.delete(launchToken);
-    await entry.rollback();
-    return Ok(undefined);
+    launchToken: string,
+    remotePath?: string | null
+  ): Promise<Result<{ remotePath: string } | undefined>> {
+    return this.externalEditors.recordExternalEditorOpen(workspaceId, launchToken, remotePath);
   }
 
-  /**
-   * Like recordExternalEditorOpen, but for callers that launch the editor themselves and can
-   * observe deterministic launch failures (the custom-editor route: EditorService validates
-   * the command and spawns nothing on failure). A failed launch must call
-   * rollbackAfterFailedLaunch so a marker this call created cannot become a sticky false
-   * positive that permanently refuses future model-driven snapshot/Coder-stop archives.
-   */
-  async recordExternalEditorOpenForLaunch(
+  /** See WorkspaceExternalEditors.rollbackRecordedEditorOpen. */
+  rollbackRecordedEditorOpen(workspaceId: string, launchToken: string): Promise<Result<void>> {
+    return this.externalEditors.rollbackRecordedEditorOpen(workspaceId, launchToken);
+  }
+
+  /** See WorkspaceExternalEditors.recordExternalEditorOpenForLaunch. */
+  recordExternalEditorOpenForLaunch(
     workspaceId: string
   ): Promise<Result<{ rollbackAfterFailedLaunch: () => Promise<void> }>> {
-    return this.withPendingExternalEditorOpen(workspaceId, () =>
-      this.recordExternalEditorOpenAdmitted(workspaceId)
-    );
+    return this.externalEditors.recordExternalEditorOpenForLaunch(workspaceId);
   }
 
-  /**
-   * Records an editor open that this backend launches itself (a custom command) and runs
-   * `launch` while the open still counts as in flight. This backend's own rename, removal and
-   * checkout-deleting archive ignore its editor lease, so without the count they could move or
-   * delete the checkout between the recording and the spawn (#4909), as for native terminals.
-   * Deep-link opens cannot use this: they launch in the client after recordExternalEditorOpen.
-   */
-  async launchExternalEditor(
+  /** See WorkspaceExternalEditors.launchExternalEditor. */
+  launchExternalEditor(
     workspaceId: string,
     launch: () => Promise<Result<void>>
   ): Promise<Result<void>> {
-    return this.withPendingExternalEditorOpen(workspaceId, async () => {
-      const recorded = await this.recordExternalEditorOpenAdmitted(workspaceId);
-      if (!recorded.success) {
-        // Refused (for example while a mutation holds the gate): never launch, never queue.
-        return recorded;
-      }
-      const launched = await launch();
-      if (!launched.success) {
-        // Pre-spawn failures must not leave a marker that permanently blocks later archives.
-        await recorded.data.rollbackAfterFailedLaunch();
-      }
-      return launched;
-    });
-  }
-
-  private async withPendingExternalEditorOpen<T>(
-    workspaceId: string,
-    run: () => Promise<T>
-  ): Promise<T> {
-    // Pending-recording admission pairing (mirrors TerminalService.openNative): the count is
-    // registered before any await — including the marker-lock wait, where a concurrent
-    // failed launch's rollback may collapse the shared marker and cache entry — so
-    // hasExternalEditorOpen stays true for the whole in-flight window. Refused recordings
-    // record nothing durable; the count simply releases in the finally.
-    this.pendingExternalEditorRecordings.set(
-      workspaceId,
-      (this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) + 1
-    );
-    try {
-      return await run();
-    } finally {
-      const remaining = (this.pendingExternalEditorRecordings.get(workspaceId) ?? 1) - 1;
-      if (remaining <= 0) {
-        this.pendingExternalEditorRecordings.delete(workspaceId);
-      } else {
-        this.pendingExternalEditorRecordings.set(workspaceId, remaining);
-      }
-    }
-  }
-
-  /** Body of recordExternalEditorOpenForLaunch after pending-recording admission. */
-  private async recordExternalEditorOpenAdmitted(
-    workspaceId: string
-  ): Promise<Result<{ rollbackAfterFailedLaunch: () => Promise<void> }>> {
-    if (this.archivingWorkspaces.has(workspaceId)) {
-      return Err(
-        `Workspace is being archived: ${workspaceId}. Unarchive it before opening an editor.`
-      );
-    }
-    // Also a path-safety boundary: the marker path joins the raw ID beneath the sessions
-    // directory, so an unknown (possibly traversal-crafted, e.g. "../../.ssh") ID must never
-    // reach the filesystem, and it publishes no lease either (lease directories are not pruned).
-    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null) {
-      return Err(`Workspace not found: ${workspaceId}`);
-    }
-    // #4883: like a native terminal (see TerminalService.nativeTerminalUseLeases), an editor's
-    // lifetime cannot be tracked, so this backend holds an "editor" use lease from the first
-    // open until it archives or removes the workspace (releaseExternalAppUseLeases) or exits.
-    // #4902: every open takes a share before the row is read again below (it probes the gate),
-    // so a rename, removal or archive can neither slip in between nor run meanwhile.
-    let lease: WorkspaceUseLease;
-    try {
-      lease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "editor");
-    } catch (error) {
-      return Err(getErrorMessage(error));
-    }
-    const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-    if (workspaceEntry == null) {
-      await lease.release();
-      return Err(`Workspace not found: ${workspaceId}`);
-    }
-    // Persisted archived state (not just an in-progress archive): a stale renderer can request
-    // an editor for an already-archived workspace whose checkout may already be snapshot and
-    // removed (mirrors TerminalService.openNative and the send/PTY/desktop admissions).
-    // Checked before the durable marker write so a refused open cannot permanently gate
-    // future snapshot archives of this workspace.
-    if (
-      isWorkspaceArchived(
-        workspaceEntry.workspace.archivedAt,
-        workspaceEntry.workspace.unarchivedAt
-      )
-    ) {
-      await lease.release();
-      return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
-    }
-    // Before any durable effect: one share per workspace is kept, after a failed launch too
-    // (fail closed).
-    if (this.externalEditorUseLeases.has(workspaceId)) {
-      await lease.release();
-    } else {
-      this.externalEditorUseLeases.set(workspaceId, lease);
-    }
-    // Durable marker: the editor can outlive Xum, so a restart must not forget the open.
-    // Persistence failure is fatal to the open (mirrors TerminalService.openNative): an
-    // editor opened without the marker would be invisible to archive gating after a restart,
-    // so refusing here is the only fail-closed option (the in-memory Set covers just this
-    // app session).
-    let admissionToken: symbol;
-    try {
-      admissionToken = await this.externalEditorMarkerLocks.withLock(workspaceId, async () => {
-        // Batch-scoped ancestry (see externalEditorMarkerBatches): the pre-existence probe
-        // runs once per batch, before the batch's first write, so a marker written by an
-        // earlier in-flight open of this same batch cannot masquerade as evidence of a real
-        // prior launch. "unknown" probes count as pre-existing (fail closed).
-        let batch = this.externalEditorMarkerBatches.get(workspaceId);
-        const createdBatch = batch == null;
-        if (batch == null) {
-          const preexisting = await this.probeExternalEditorMarkerOnDisk(workspaceId);
-          batch = { markerPreexisted: preexisting !== "absent", tokens: new Set() };
-          this.externalEditorMarkerBatches.set(workspaceId, batch);
-        }
-        const markerPath = this.externalEditorMarkerPath(workspaceId);
-        try {
-          await fsPromises.mkdir(path.dirname(markerPath), { recursive: true });
-          await fsPromises.writeFile(markerPath, new Date().toISOString());
-        } catch (error) {
-          // A newly created, still-empty batch must not outlive a failed persistence attempt:
-          // its probe (possibly a fail-closed "unknown" during the same filesystem hiccup)
-          // would become stale ancestry for a later retry, permanently preserving a marker
-          // that retry writes even when its launch fails. Discarding it makes the next
-          // attempt re-probe the recovered disk. A joined batch keeps its live tokens.
-          if (createdBatch && batch.tokens.size === 0) {
-            this.externalEditorMarkerBatches.delete(workspaceId);
-            // The failed write may still have created (or truncated) the marker file —
-            // ENOSPC and I/O errors can reject after the open. When this batch's probe
-            // proved absence, that artifact is ours and no launch backs it: left behind, it
-            // reads as durable launch evidence across restarts and classifies as
-            // pre-existing on retry. An "unknown" probe stays fail closed (never unlink
-            // what might predate us); unlink failure only over-refuses archives.
-            if (!batch.markerPreexisted) {
-              try {
-                await fsPromises.unlink(markerPath);
-              } catch {
-                // Best-effort (fail closed).
-              }
-            }
-          }
-          throw error;
-        }
-        // The sticky in-memory record is a cache of the just-written marker; before this
-        // point the pending-recording count already keeps archive gates closed.
-        this.externalEditorWorkspaces.add(workspaceId);
-        // Launch evidence is registered under the same lock as the write so a concurrent
-        // failed launch's rollback can never observe the marker without the token.
-        const token = Symbol("external-editor-launch");
-        batch.tokens.add(token);
-        return token;
-      });
-    } catch (error) {
-      log.error("Failed to persist external editor marker", { workspaceId, error });
-      return Err(
-        `Cannot open an editor for ${workspaceId}: persisting the editor-open marker failed (${getErrorMessage(error)}), and without it archive safety checks would forget the editor after a restart.`
-      );
-    }
-    return Ok({
-      rollbackAfterFailedLaunch: () =>
-        this.rollbackExternalEditorMarkerAfterFailedLaunch(workspaceId, admissionToken),
-    });
-  }
-
-  /**
-   * Undo a failed editor launch's durable marker. The marker is deleted only when its whole
-   * ancestry batch failed (no launch-evidence token remains, so no editor launched or can
-   * still launch under it) and it did not predate the batch (an earlier session's editor may
-   * still be running behind it). Serialized with marker writes so the unlink can never race
-   * a concurrent open's write; deletion failure keeps the sticky marker (fail closed).
-   */
-  private async rollbackExternalEditorMarkerAfterFailedLaunch(
-    workspaceId: string,
-    token: symbol
-  ): Promise<void> {
-    await this.externalEditorMarkerLocks.withLock(workspaceId, async () => {
-      const batch = this.externalEditorMarkerBatches.get(workspaceId);
-      if (batch == null) {
-        // Unknown batch (cannot happen: batches are only closed here): keep everything.
-        return;
-      }
-      batch.tokens.delete(token);
-      if (batch.tokens.size > 0) {
-        return;
-      }
-      // Every open in the batch failed: close it so the next open starts a fresh probe.
-      this.externalEditorMarkerBatches.delete(workspaceId);
-      if (batch.markerPreexisted) {
-        return;
-      }
-      try {
-        await fsPromises.unlink(this.externalEditorMarkerPath(workspaceId));
-      } catch (error) {
-        if (!isErrnoWithCode(error, "ENOENT")) {
-          // The marker may still exist, so the in-memory cache entry must stay to match it.
-          log.error("Failed to roll back external editor marker after a failed launch", {
-            workspaceId,
-            error,
-          });
-          return;
-        }
-      }
-      this.externalEditorWorkspaces.delete(workspaceId);
-    });
-  }
-
-  private async hasExternalEditorOpen(workspaceId: string): Promise<boolean> {
-    // Recordings still in flight count as open: see pendingExternalEditorRecordings.
-    if ((this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) > 0) {
-      return true;
-    }
-    if (this.externalEditorWorkspaces.has(workspaceId)) {
-      return true;
-    }
-    const probe = await this.probeExternalEditorMarkerOnDisk(workspaceId);
-    if (probe === "present") {
-      this.externalEditorWorkspaces.add(workspaceId);
-      return true;
-    }
-    // An "unknown" probe (EACCES, EIO, ...) cannot prove the marker is absent, and a false
-    // "absent" would let a snapshot archive remove the checkout under a surviving editor —
-    // fail closed without caching (the marker may still prove readable later).
-    return probe !== "absent";
+    return this.externalEditors.launchExternalEditor(workspaceId, launch);
   }
 
   /**
@@ -11524,7 +11220,7 @@ export class WorkspaceService
     if ((await this.terminalService?.hasOpenedNativeTerminal(workspaceId)) === true) {
       return true;
     }
-    return await this.hasExternalEditorOpen(workspaceId);
+    return await this.externalEditors.hasExternalEditorOpen(workspaceId);
   }
 
   /**
@@ -11569,8 +11265,13 @@ export class WorkspaceService
       // "refuse": also this backend's tracked background processes; "allow": only processes this
       // backend does not track (another backend's, or survivors of a crashed one).
       backgroundProcesses: "refuse" | "allow";
+    },
+    acknowledgedUnknownProcessRecords?: readonly string[]
+  ): Promise<
+    Result<() => Promise<void>> & {
+      backgroundProcesses?: WorkspaceBackgroundProcessBlocker[];
     }
-  ): Promise<Result<() => Promise<void>>> {
+  > {
     const targets = new Set(typeof workspaceId === "string" ? [workspaceId] : workspaceId);
     const workspaceIds = [...targets];
     const config = this.config.loadConfigOrDefault();
@@ -11590,15 +11291,24 @@ export class WorkspaceService
     try {
       release = await workspaceUseLeasesFor(this.config).acquireMutationGate(workspaceIds, {
         ignoreOwnKinds: new Map([...targets].map((id) => [id, own.ignoreKinds])),
-        hasRunningBackgroundProcesses: (id) =>
-          own.backgroundProcesses === "refuse" || !targets.has(id)
-            ? this.hasRunningBackgroundBashProcesses(id)
-            : this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(id, {
-                extraRecordDirs: this.extraBgRecordDirsForWorkspace(id),
-              }),
+        hasRunningBackgroundProcesses: (id) => this.hasRunningBackgroundBashProcesses(id),
+        ...(own.backgroundProcesses === "allow"
+          ? {
+              getBackgroundProcessBlockers: (id: string) =>
+                this.getRemovalBackgroundProcessBlockers(
+                  id,
+                  targets,
+                  acknowledgedUnknownProcessRecords
+                ),
+            }
+          : {}),
       });
     } catch (error) {
-      if (error instanceof WorkspaceBusyError) return Err(error.message);
+      if (error instanceof WorkspaceBusyError)
+        return {
+          ...Err(error.message),
+          ...(error.backgroundProcesses ? { backgroundProcesses: error.backgroundProcesses } : {}),
+        };
       throw error;
     }
     // #4909: ignoring this backend's own terminal/editor leases must not let the mutation race an
@@ -11611,7 +11321,7 @@ export class WorkspaceService
         this.terminalService?.hasPendingNativeTerminalOpen(target) === true
           ? "a native terminal"
           : own.ignoreKinds.has("editor") &&
-              (this.pendingExternalEditorRecordings.get(target) ?? 0) > 0
+              this.externalEditors.hasPendingExternalEditorOpen(target)
             ? "an external editor"
             : null;
       if (openInFlight != null) {
@@ -11621,6 +11331,31 @@ export class WorkspaceService
       }
     }
     return Ok(release);
+  }
+
+  private async getRemovalBackgroundProcessBlockers(
+    workspaceId: string,
+    targets: ReadonlySet<string>,
+    acknowledgedUnknownProcessRecords?: readonly string[]
+  ): Promise<WorkspaceBackgroundProcessBlocker[]> {
+    // Shared-checkout siblings are not removal targets. Their tracked processes still block removal.
+    if (!targets.has(workspaceId) && (await this.hasRunningBackgroundBashProcesses(workspaceId))) {
+      throw new WorkspaceBusyError(
+        `Workspace ${workspaceId} has a running background process; stop it and try again.`
+      );
+    }
+    const blockers = await this.backgroundProcessManager.getOrphanedBackgroundProcessBlockers(
+      workspaceId,
+      { extraRecordDirs: this.extraBgRecordDirsForWorkspace(workspaceId) }
+    );
+    const acknowledged = new Set(acknowledgedUnknownProcessRecords);
+    // Force never authorizes this bypass. Consent applies only to exact unknown records in removal targets.
+    return blockers.filter(
+      (record) =>
+        record.state !== "unknown" ||
+        !targets.has(workspaceId) ||
+        !acknowledged.has(record.recordPath)
+    );
   }
 
   /**
@@ -11655,32 +11390,6 @@ export class WorkspaceService
       terminalSessions: this.terminalService?.hasWorkspaceSessions(workspaceId) === true,
       desktopViewers: this.desktopSessionManager?.hasAttachedViewers(workspaceId) === true,
     };
-  }
-
-  /**
-   * Labels for the counted in-flight operations (bash exec, attachment staging, file
-   * completion, fork, MCP prompt discovery, refine) that archive and interrupt gates
-   * refuse on, in a fixed order so both gates report them alike.
-   */
-  private inFlightOperationLabels(workspaceId: string): string[] {
-    const counts: Array<[count: number, label: string]> = [
-      [this.preflightExecCounts.get(workspaceId) ?? 0, "a bash command executing"],
-      [this.preflightStagingCounts.get(workspaceId) ?? 0, "an attachment transfer in progress"],
-      [
-        this.preflightFileCompletionCounts.get(workspaceId) ?? 0,
-        "a file completion refresh in progress",
-      ],
-      [this.preflightForkCounts.get(workspaceId) ?? 0, "a fork of this workspace in progress"],
-      [
-        this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0,
-        "an MCP prompt discovery in progress",
-      ],
-      [
-        this.refineExclusionCounts.get(workspaceId) ?? 0,
-        "a refine apply or publication in progress",
-      ],
-    ];
-    return counts.filter(([count]) => count > 0).map(([, label]) => label);
   }
 
   /**
@@ -11747,7 +11456,7 @@ export class WorkspaceService
       },
     };
     const activityLabels: string[] = [];
-    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+    if (this.sendPreflight.hasSendInPreflight(workspaceId)) {
       activityLabels.push("a message send in progress");
     }
     // A user stream admitted after the caller's activity snapshot has already released its
@@ -11758,7 +11467,7 @@ export class WorkspaceService
     // different turn) is treated as user work and refuses.
     if (this.aiService.isStreaming(workspaceId)) {
       const streamCorrelation = parseWorkspaceTurnTaskCorrelation(
-        this.streamManager?.getStreamInfo(workspaceId)?.muxMetadata
+        this.streamManager.getStreamInfo(workspaceId)?.muxMetadata
       );
       const streamIsExpectedDelegatedTurn =
         streamCorrelation != null &&
@@ -11769,12 +11478,12 @@ export class WorkspaceService
         activityLabels.push("an active stream not attributable to the delegated turns");
       }
     }
-    activityLabels.push(...this.inFlightOperationLabels(workspaceId));
+    activityLabels.push(...this.operationAdmission.inFlightOperationLabels(workspaceId));
     // In-flight native-terminal/editor opens passed their own archive guards before this
     // hold armed and surface only through the pending-open counters until their durable
     // markers persist; the sink's untrackable-app check would refuse on them after the
     // turns were already destroyed.
-    if ((this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) > 0) {
+    if (this.externalEditors.hasPendingExternalEditorOpen(workspaceId)) {
       activityLabels.push("an external editor open in progress");
     }
     if (this.terminalService?.hasPendingNativeTerminalOpen(workspaceId) === true) {
@@ -11929,6 +11638,30 @@ export class WorkspaceService
       targetPaths: target.data.kind === "confirm-lossy-untracked-files" ? target.data.paths : [],
       subagents,
     });
+  }
+
+  /**
+   * The user's archive preflight. It adds the untracked files each sub-agent's snapshot archive
+   * would lose to the target's own, so one dialog confirms the whole cascade: without them the
+   * archive refuses at the first lossy sub-agent and the user has no way to confirm it.
+   */
+  async preflightArchiveWithSubagents(
+    workspaceId: string
+  ): Promise<Result<ArchivePreflightResult>> {
+    const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
+    // A "delete" archive snapshots nothing, and the cascade preflight refuses it for the
+    // model-facing caller only.
+    if (
+      worktreeArchiveBehavior === "delete" ||
+      this.listUnarchivedDescendants(workspaceId).length === 0
+    ) {
+      return await this.preflightArchive(workspaceId);
+    }
+    const cascade = await this.preflightArchiveCascade(workspaceId, worktreeArchiveBehavior);
+    if (!cascade.success) return Err(cascade.error);
+    const { targetPaths, subagents } = cascade.data;
+    if (targetPaths.length === 0 && subagents.length === 0) return Ok({ kind: "ready" });
+    return Ok({ kind: "confirm-lossy-untracked-files", paths: targetPaths, subagents });
   }
 
   /**
@@ -12112,22 +11845,11 @@ export class WorkspaceService
     const archivedDescendantIds: string[] = [];
     try {
       for (const descendant of descendants) {
-        const result = await this.archiveUnlocked(descendant.workspaceId, undefined, {
-          // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
-          // user-facing archive passes none of them.
-          forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
-          refuseLiveUserActivity: options?.refuseLiveUserActivity,
-          forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
-          worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
-          coderWorkspaceArchiveBehaviorOverride: "keep",
-          mutationGateHeld: true,
-        });
-        const failure = !result.success
-          ? result.error
-          : result.data.kind !== "archived"
-            ? // Its untracked files need their own confirmation: the parent's does not cover them.
-              "its untracked files would be lost by the snapshot archive; archive it on its own to review them"
-            : null;
+        const failure = await this.archiveCascadeDescendant(
+          descendant.workspaceId,
+          worktreeArchiveBehavior,
+          options
+        );
         if (failure != null) {
           return Err(
             `Cannot archive sub-agent ${descendant.title} (${descendant.workspaceId}): ${failure}`
@@ -12153,6 +11875,37 @@ export class WorkspaceService
       // The task-tree lock remains held, so nested removal must not reacquire that lock.
       for (const id of archivedDescendantIds) await this.removeSideChatsOf(id, true);
     }
+  }
+
+  /**
+   * Archive one sub-agent of a cascade under the tree's held gate and pinned behavior. Returns
+   * why it refused, or null once it is archived.
+   */
+  private async archiveCascadeDescendant(
+    descendantId: string,
+    worktreeArchiveBehavior: WorktreeArchiveBehavior,
+    options: ArchiveWorkspaceOptions | undefined
+  ): Promise<string | null> {
+    const result = await this.archiveUnlocked(
+      descendantId,
+      options?.acknowledgedSubagentUntrackedPaths?.[descendantId],
+      {
+        // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
+        // user-facing archive passes none of them.
+        forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
+        refuseLiveUserActivity: options?.refuseLiveUserActivity,
+        forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
+        worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+        coderWorkspaceArchiveBehaviorOverride: "keep",
+        mutationGateHeld: true,
+      }
+    );
+    if (!result.success) return result.error;
+    // Untracked files that the user did not confirm (or that appeared after the confirmation)
+    // refuse; the dialog's retry preflights again and lists them.
+    return result.data.kind === "archived"
+      ? null
+      : "its untracked files would be lost by the snapshot archive and were not confirmed; archive again to review them";
   }
 
   /**
@@ -12201,16 +11954,16 @@ export class WorkspaceService
       // Fail-closed live-activity gate for model-facing callers. This check and the
       // archivingWorkspaces.add above run in one synchronous block, pairing with the
       // synchronous entry guards in sendMessage: a send whose entry block ran first is
-      // visible here (preflightSendCounts or a registered stream) and refuses the archive;
+      // visible here (sendPreflight.sends or a registered stream) and refuses the archive;
       // a send entering later observes archivingWorkspaces and is refused instead.
       if (options?.refuseLiveUserActivity === true) {
         const liveActivity = this.listLiveWorkspaceActivity(workspaceId);
         const activityLabels: string[] = [];
         if (liveActivity.streaming) activityLabels.push("an active stream");
-        if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+        if (this.sendPreflight.hasSendInPreflight(workspaceId)) {
           activityLabels.push("a message send in progress");
         }
-        activityLabels.push(...this.inFlightOperationLabels(workspaceId));
+        activityLabels.push(...this.operationAdmission.inFlightOperationLabels(workspaceId));
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.backgroundBashProcesses) {
           activityLabels.push("running background bash processes");
@@ -12370,15 +12123,14 @@ export class WorkspaceService
         options?.coderWorkspaceArchiveBehaviorOverride ??
         this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
         DEFAULT_CODER_ARCHIVE_BEHAVIOR;
-      const isDedicatedCoderWorkspace = isDedicatedCoderRuntime(
-        beforeArchiveMetadata?.runtimeConfig
+      const remoteBoxBehavior = remoteBoxArchiveBehavior(
+        beforeArchiveMetadata,
+        coderWorkspaceArchiveBehavior
       );
-      if (options?.forbidCoderWorkspaceDeletion === true) {
-        if (isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior === "delete") {
-          return Err(
-            'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
-          );
-        }
+      if (options?.forbidCoderWorkspaceDeletion === true && remoteBoxBehavior === "delete") {
+        return Err(
+          'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
+        );
       }
 
       const canSnapshotManagedWorktree =
@@ -12399,8 +12151,7 @@ export class WorkspaceService
       // environment out from under a user's live shell or editor. Mirrors the lifecycle
       // caller's early refusal against the same pinned behavior reads. ("delete" for a
       // dedicated Coder workspace is refused outright above, so non-"keep" here means stop.)
-      const stopsDedicatedCoderWorkspace =
-        isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior !== "keep";
+      const stopsDedicatedCoderWorkspace = remoteBoxBehavior !== "keep";
       if (
         options?.refuseLiveUserActivity === true &&
         (needsSnapshotCapture || stopsDedicatedCoderWorkspace) &&
@@ -12939,8 +12690,7 @@ export class WorkspaceService
         return Ok(undefined);
       }
 
-      this.activeWorkflowRunIdsByWorkspace.delete(workspaceId);
-      this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+      this.workflowRuns.invalidateActiveWorkflowRunIds(workspaceId);
 
       // Emit updated metadata
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -13829,25 +13579,23 @@ export class WorkspaceService
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; projectPath: string }>> {
     // Source-fork admission pairs with the model-facing archive gates (same synchronous
     // block as the entry guards in sendMessage/executeBash): a fork admitted first is
-    // visible to the sink and the pre-interruption hold via preflightForkCounts and refuses
+    // visible to the sink and the pre-interruption hold via operationAdmission.fork and refuses
     // the archive; a fork entering later observes archivingWorkspaces and refuses here.
     // Without this pairing, a Coder-stop archive could stop the dedicated remote workspace
     // mid-clone while the fork shares it, and the child's init could restart it afterwards.
     if (this.archivingWorkspaces.has(sourceWorkspaceId)) {
       return Err(`Workspace is being archived: ${sourceWorkspaceId}. Unarchive it before forking.`);
     }
-    using _preflightFork = this.acquirePreflightAdmission(
-      this.preflightForkCounts,
-      sourceWorkspaceId
-    );
+    using _preflightFork = this.operationAdmission.fork.acquire(sourceWorkspaceId);
     // Set once the fork's ID exists; the finally below finalizes its pending default (#4455).
     let forkWorkspaceId: string | undefined;
     // Set while a failure must undo this fork's registration (#4818).
     let rollBackForkRegistration: (() => Promise<CreationRollbackResult>) | undefined;
     try {
-      const sourceMetadataResult = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
+      // Admitted first: archiving the source refuses meanwhile, as for any fork in progress.
+      const sourceMetadataResult = await this.readNamedForkSource(sourceWorkspaceId);
       if (!sourceMetadataResult.success) {
-        return Err(`Failed to get source workspace metadata: ${sourceMetadataResult.error}`);
+        return Err(sourceMetadataResult.error);
       }
       const sourceMetadata = sourceMetadataResult.data;
       if (sourceMetadata.kind === "scratch") {
@@ -14147,7 +13895,9 @@ export class WorkspaceService
 
           // Forking from a prior assistant response intentionally discards any later in-flight
           // state so the new workspace resumes cleanly at the chosen branch point.
-          await fsPromises.rm(path.join(newSessionDir, "partial.json"), { force: true });
+          await this.historyService.files.promises.rm(path.join(newSessionDir, "partial.json"), {
+            force: true,
+          });
           if (this.sessionTimingService) {
             await this.sessionTimingService.clearTimingFile(newWorkspaceId);
           } else {
@@ -14278,12 +14028,7 @@ export class WorkspaceService
         const allMetadataUpdated = await this.config.getAllWorkspaceMetadata();
         const updatedMetadata = allMetadataUpdated.find((m) => m.id === sourceWorkspaceId) ?? null;
         const enrichedMetadata = this.enrichMaybeFrontendMetadata(updatedMetadata);
-        const sourceSession = this.sessions.get(sourceWorkspaceId);
-        if (sourceSession) {
-          sourceSession.emitMetadata(enrichedMetadata);
-        } else {
-          this.emit("metadata", { workspaceId: sourceWorkspaceId, metadata: enrichedMetadata });
-        }
+        this.publishWorkspaceMetadata(sourceWorkspaceId, enrichedMetadata);
       };
 
       // The fork's registration also marked its source as sharing the Coder workspace (#5114).
@@ -14606,7 +14351,10 @@ export class WorkspaceService
           workspaceId: newWorkspaceId,
           // Cross-process pending marker home (r48): lets a first send served
           // by another backend wait for the in-flight summary.
-          sessionDir: path.join(this.config.sessionsDir, newWorkspaceId),
+          marker: {
+            sessionDir: path.join(this.config.sessionsDir, newWorkspaceId),
+            locks: this.historyService.locks,
+          },
           abandonedMessages: abandonedBranchMessages,
           isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
           guardTailMessageId: sourceMessageId,
@@ -14999,6 +14747,8 @@ export class WorkspaceService
     const result = await ensurePlanSnapshot(this.planReviewHistoryDeps, {
       workspaceId,
       metadata,
+      // Outside the agent loop: the host's runtimes.
+      runtimeFactory: nodeRuntimeFactory,
       planStorage: this.config,
       ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
     });
@@ -15065,7 +14815,7 @@ export class WorkspaceService
     // decided: under the history write lock at the row's actual append (sendMessage's
     // publication, see createPlanReviewFeedbackPrecondition), which also covers partial
     // truncations, sibling backends and feedback deferred behind on-send compaction.
-    const epochAtPrepare = this.contextMutationEpochs.get(workspaceId) ?? 0;
+    const epochAtPrepare = this.contextMutationGate.epoch(workspaceId);
     const prepared = await preparePlanReviewFeedback(
       this.historyService,
       workspaceId,
@@ -15073,7 +14823,7 @@ export class WorkspaceService
       input.options
     );
     if (!prepared.success) return prepared;
-    if ((this.contextMutationEpochs.get(workspaceId) ?? 0) !== epochAtPrepare) {
+    if (this.contextMutationGate.epoch(workspaceId) !== epochAtPrepare) {
       return Err({
         type: "send_failed",
         error: {
@@ -15294,27 +15044,6 @@ export class WorkspaceService
   }
 
   /**
-   * Increment a preflight admission counter in the caller's synchronous entry block and
-   * return a disposable releasing it. Pairs renderer-initiated workspace activity with the
-   * archive gate (see archiveUnlocked's refuseLiveUserActivity): an activity admitted first
-   * holds the gate open until it settles, and one entering after the gate armed observes
-   * archivingWorkspaces and refuses at entry.
-   */
-  private acquirePreflightAdmission(counts: Map<string, number>, workspaceId: string): Disposable {
-    counts.set(workspaceId, (counts.get(workspaceId) ?? 0) + 1);
-    return {
-      [Symbol.dispose]: () => {
-        const remaining = (counts.get(workspaceId) ?? 1) - 1;
-        if (remaining <= 0) {
-          counts.delete(workspaceId);
-        } else {
-          counts.set(workspaceId, remaining);
-        }
-      },
-    };
-  }
-
-  /**
    * Archive admission pairing for MCP prompt discovery (workspace.mcp.prompts.list), which
    * readies the runtime and starts cached stdio servers outside any stream. The guard check and
    * the counter increment run in one synchronous block, mirroring executeBash: a discovery
@@ -15327,58 +15056,7 @@ export class WorkspaceService
   acquireMcpPromptDiscoveryAdmission(
     workspaceId: string
   ): (Disposable & { signal: AbortSignal }) | undefined {
-    if (this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)) {
-      return undefined;
-    }
-    const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-    if (
-      workspaceEntry != null &&
-      isWorkspaceArchived(
-        workspaceEntry.workspace.archivedAt,
-        workspaceEntry.workspace.unarchivedAt
-      )
-    ) {
-      return undefined;
-    }
-    const { promise: settled, resolve: settle } = Promise.withResolvers<void>();
-    const discovery = { controller: new AbortController(), settled, settle };
-    let admitted = this.mcpPromptDiscoveries.get(workspaceId);
-    if (admitted === undefined) {
-      admitted = new Set();
-      this.mcpPromptDiscoveries.set(workspaceId, admitted);
-    }
-    admitted.add(discovery);
-    return {
-      signal: discovery.controller.signal,
-      [Symbol.dispose]: () => {
-        const current = this.mcpPromptDiscoveries.get(workspaceId);
-        current?.delete(discovery);
-        if (current?.size === 0) this.mcpPromptDiscoveries.delete(workspaceId);
-        discovery.settle();
-      },
-    };
-  }
-
-  /**
-   * #4805: a discovery admitted before a removal started can still publish stdio servers into
-   * the checkout. Abort each one and wait for it to settle, so anything it published exists
-   * before removal's stopServers runs. Bounded like the stream stop: a discovery that ignores
-   * its abort must not pin the removal, so the removal logs and proceeds.
-   */
-  private async abortAndJoinMcpPromptDiscoveries(workspaceId: string): Promise<void> {
-    const admitted = [...(this.mcpPromptDiscoveries.get(workspaceId) ?? [])];
-    if (admitted.length === 0) return;
-    for (const discovery of admitted) discovery.controller.abort();
-    const joined = await raceWithAbortAndTimeout(
-      Promise.all(admitted.map((discovery) => discovery.settled)),
-      { timeoutMs: MCP_PROMPT_DISCOVERY_JOIN_TIMEOUT_MS }
-    );
-    if (joined.kind !== "ok") {
-      log.warn("Workspace removal: an admitted MCP prompt discovery did not settle after abort", {
-        workspaceId,
-        pending: admitted.length,
-      });
-    }
+    return this.operationAdmission.acquireMcpPromptDiscoveryAdmission(workspaceId);
   }
 
   /**
@@ -15666,10 +15344,7 @@ export class WorkspaceService
     if (this.removingWorkspaces.has(input.workspaceId)) {
       return Err("Workspace is being removed.");
     }
-    using _preflightStaging = this.acquirePreflightAdmission(
-      this.preflightStagingCounts,
-      input.workspaceId
-    );
+    using _preflightStaging = this.operationAdmission.staging.acquire(input.workspaceId);
 
     const metadata = await this.getInfo(input.workspaceId);
     if (metadata == null) {
@@ -15714,10 +15389,7 @@ export class WorkspaceService
     if (this.archivingWorkspaces.has(input.workspaceId)) {
       return Err("Workspace is being archived. Unarchive it before downloading attachments.");
     }
-    using _preflightDownload = this.acquirePreflightAdmission(
-      this.preflightStagingCounts,
-      input.workspaceId
-    );
+    using _preflightDownload = this.operationAdmission.staging.acquire(input.workspaceId);
 
     const metadata = await this.getInfo(input.workspaceId);
     if (metadata == null) {
@@ -15803,30 +15475,18 @@ export class WorkspaceService
     // A late arrival of an id this receiver answered "not accepted": the
     // client shows its content again, so appending it now would duplicate it. Checked and the
     // ids registered as running in one synchronous block, so getSendStatus sees one or the other.
-    const refused = this.refusedSendIds.get(key);
-    if (sendIdentities.some((identity) => refused?.has(identity.id) === true)) {
+    const sendIds = sendIdentities.map((identity) => identity.id);
+    if (this.sendPreflight.isSendIdRefused(key, sendIds)) {
       log.info("sendMessage refused: the send id was already answered not accepted", {
         workspaceId: key,
       });
       return Err({ type: "unknown", raw: SEND_ID_REFUSED_MESSAGE });
     }
-    const inFlight = this.inFlightSendIds.get(key) ?? new Map<string, number>();
-    this.inFlightSendIds.set(key, inFlight);
-    for (const { id } of sendIdentities) inFlight.set(id, (inFlight.get(id) ?? 0) + 1);
-    try {
-      return await this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, {
-        ...internal,
-        sendIdentities,
-      });
-    } finally {
-      for (const { id } of sendIdentities) {
-        const count = inFlight.get(id) ?? 0;
-        if (count > 1) inFlight.set(id, count - 1);
-        else inFlight.delete(id);
-      }
-      if (inFlight.size === 0 && this.inFlightSendIds.get(key) === inFlight)
-        this.inFlightSendIds.delete(key);
-    }
+    using _inFlightSendIds = this.sendPreflight.trackInFlightSendIds(key, sendIds);
+    return await this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, {
+      ...internal,
+      sendIdentities,
+    });
   }
 
   /**
@@ -15850,21 +15510,19 @@ export class WorkspaceService
     if (findWorkspaceEntry(this.config.loadConfigOrDefault(), key) == null) {
       return Err(`Workspace ${key} not found`);
     }
-    const isReceiver = receiverId == null || receiverId === this.sendReceiverId;
+    const isReceiver = receiverId == null || receiverId === this.sendPreflight.sendReceiverId;
     return this.historyService.resolveSendIds(key, sendIds, (evidenceOf) => {
       const pending = this.sessions.get(key)?.getPendingSendIds() ?? new Set<string>();
-      for (const id of this.inFlightSendIds.get(key)?.keys() ?? []) pending.add(id);
+      for (const id of this.sendPreflight.inFlightSendIdsOf(key)) pending.add(id);
       const status = (id: string): SendStatus => {
         if (provesAccepted(evidenceOf(id))) return "accepted";
         if (pending.has(id)) return "pending";
         if (!isReceiver) return "unknown";
-        const refused = this.refusedSendIds.get(key) ?? new Set<string>();
-        this.refusedSendIds.set(key, refused);
-        refused.add(id);
+        this.sendPreflight.refuseSendId(key, id);
         return "not-accepted";
       };
       return {
-        receiverId: this.sendReceiverId,
+        receiverId: this.sendPreflight.sendReceiverId,
         statuses: sendIds.map((sendId) => ({ sendId, status: status(sendId) })),
       };
     });
@@ -15906,7 +15564,9 @@ export class WorkspaceService
     // sampling later — at enqueue or dispatch — would misclassify a message
     // the user authored before a goal became visible as an intervention
     // against it, pausing the fresh goal.
-    const authoredAtMs = Date.now();
+    // Wall clock on purpose: messageQueue folds it with Date.now() and
+    // WorkspaceGoalService.acknowledgeUser compares it with its wall-clock gate (#7282).
+    const authoredAtMs = nodeClock.nowMs();
     // Deliberate picker intent pins agent-task AI fields; only a person's own send may carry
     // it. Strip it here so it never reaches the queue, AgentSession, or persisted options.
     const { aiSelectionIntent, ...optionsWithoutAiSelectionIntent } = options;
@@ -16012,7 +15672,7 @@ export class WorkspaceService
       }
 
       // Archive admission pairing (see archiveUnlocked's refuseLiveUserActivity gate): these
-      // checks run in the same synchronous block as the preflightSendCounts increment below,
+      // checks run in the same synchronous block as the sendPreflight.sends increment below,
       // so a send and an archive always observe each other — whichever entry block runs first
       // refuses the other side. Also refuses sends to already-archived workspaces so no stream
       // can run hidden in a workspace the UI no longer surfaces.
@@ -16040,7 +15700,7 @@ export class WorkspaceService
         }
       }
 
-      if (this.contextMutationWorkspaces.has(workspaceId)) {
+      if (this.contextMutationGate.isMutating(workspaceId)) {
         log.debug("sendMessage blocked: a context-discarding history mutation is in progress", {
           workspaceId,
         });
@@ -16076,30 +15736,17 @@ export class WorkspaceService
       // reset/clear/replace that completes while this send is still doing
       // pre-admission work refuses the send instead of letting it append and
       // stream stale content into the fresh context.
-      let admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+      let admissionEpoch = this.contextMutationGate.epoch(workspaceId);
       let compactionAdmissionStale = () => false;
       const admissionEpochStale = () =>
         compactionAdmissionStale() ||
-        (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
+        this.contextMutationGate.epoch(workspaceId) !== admissionEpoch;
       // r41: count this send as in-preflight until it settles so refine
       // publication refuses to interleave with its pre-admission window
       // (context mutations instead refuse the send itself via the epoch
       // probe above). Released on every exit path; admitted sends have set
       // PREPARING (busy) by the time sendMessage returns.
-      this.preflightSendCounts.set(
-        workspaceId,
-        (this.preflightSendCounts.get(workspaceId) ?? 0) + 1
-      );
-      using _preflightSend = {
-        [Symbol.dispose]: () => {
-          const remaining = (this.preflightSendCounts.get(workspaceId) ?? 1) - 1;
-          if (remaining <= 0) {
-            this.preflightSendCounts.delete(workspaceId);
-          } else {
-            this.preflightSendCounts.set(workspaceId, remaining);
-          }
-        },
-      };
+      using _preflightSend = this.sendPreflight.sends.acquire(workspaceId);
       // Maintenance sends that yield to user input: requireIdle skips and queue-mode
       // heartbeats. Both must yield to a manual send in preflight rather than race it.
       const yieldsToPreflightSends =
@@ -16114,11 +15761,14 @@ export class WorkspaceService
         });
         return Ok(undefined);
       };
-      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId, {
-        supersedable: yieldsToPreflightSends,
-        manual:
-          (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.synthetic !== true,
-      });
+      using sessionInvisiblePreflight = this.sendPreflight.armSessionInvisiblePreflight(
+        workspaceId,
+        {
+          supersedable: yieldsToPreflightSends,
+          manual:
+            (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.synthetic !== true,
+        }
+      );
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       const workspaceConfig = this.config.findWorkspace(workspaceId);
@@ -16178,7 +15828,8 @@ export class WorkspaceService
         muxMeta?.type === "compaction-request" && muxMeta?.source === "idle-compaction";
       // Use current time for recency - this matches the timestamp used on the message
       // in agentSession.sendMessage(). Keeps ExtensionMetadata in sync with chat.jsonl.
-      const messageTimestamp = Date.now();
+      // Wall clock, like the user message timestamp that AgentSession stamps (#7282).
+      const messageTimestamp = nodeClock.nowMs();
       if (!isIdleCompaction) {
         void this.updateRecencyTimestamp(workspaceId, messageTimestamp);
       }
@@ -16337,7 +15988,7 @@ export class WorkspaceService
       // while the earlier turn is streaming, and ensureStreamSafety aborts the earlier turn
       // to start the later one. Queue behind the earlier in-preflight send instead.
       // requireIdle callers keep their skip semantics below (and are never waited on, see
-      // sessionInvisiblePreflights); edits bypass the queue by design.
+      // SendPreflight.sessionInvisiblePreflights); edits bypass the queue by design.
       // An idle session can still hold queued work: a report-decision hold (see
       // TurnAdmissionToken.resolveDispatch) leaves its entry queued with no turn running. A send
       // started directly here would run before that entry, so queue behind it; the queue then
@@ -16354,11 +16005,11 @@ export class WorkspaceService
       // captured before a manual send entered preflight would otherwise win
       // idle admission here — the session only reports busy late in
       // AgentSession.sendMessage, so `isBusy()` alone cannot see the user's
-      // in-flight turn. `preflightSendCounts` includes THIS send (incremented
+      // in-flight turn. `sendPreflight.sends` includes THIS send (incremented
       // synchronously at entry above), so any other in-preflight send makes
       // the count exceed 1; refusing is safe because idle-only callers
       // (continuations, heartbeats) treat this as a transient skip and retry.
-      const hasOtherSendInPreflight = (this.preflightSendCounts.get(workspaceId) ?? 0) > 1;
+      const hasOtherSendInPreflight = this.sendPreflight.sends.count(workspaceId) > 1;
       if (!shouldQueue && internal?.requireIdle && hasOtherSendInPreflight) {
         return Err({
           type: "unknown",
@@ -16389,8 +16040,7 @@ export class WorkspaceService
         internal = {
           ...internal,
           admissionStale: () =>
-            callerAdmissionStale?.() === true ||
-            (this.preflightSendCounts.get(workspaceId) ?? 0) > 1,
+            callerAdmissionStale?.() === true || this.sendPreflight.sends.count(workspaceId) > 1,
         };
       }
 
@@ -16689,11 +16339,9 @@ export class WorkspaceService
         internal?.synthetic !== true &&
         internal?.planReviewFeedback !== true &&
         normalizedOptions.editMessageId == null &&
-        workspaceConfig.pendingAutoTitle === true &&
-        !this.autoTitlingWorkspaces.has(workspaceId);
+        workspaceConfig.pendingAutoTitle === true;
       if (shouldRunPendingAutoTitle) {
-        this.autoTitlingWorkspaces.add(workspaceId);
-        claimedAutoTitle = true;
+        claimedAutoTitle = this.naming.claimAutoTitle(workspaceId);
       }
 
       // Handoff: the session releases the probe reservation the moment the
@@ -16711,8 +16359,8 @@ export class WorkspaceService
         readCompactionAdmission,
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
         onContextWindowRollover: () => {
-          this.advanceContextMutationEpoch(workspaceId);
-          admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+          this.contextMutationGate.advanceContextMutationEpoch(workspaceId);
+          admissionEpoch = this.contextMutationGate.epoch(workspaceId);
         },
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
@@ -16752,7 +16400,7 @@ export class WorkspaceService
         });
 
         if (claimedAutoTitle) {
-          this.autoTitlingWorkspaces.delete(workspaceId);
+          this.naming.releaseAutoTitle(workspaceId);
           claimedAutoTitle = false;
         }
 
@@ -16784,14 +16432,14 @@ export class WorkspaceService
             });
           })
           .finally(() => {
-            this.autoTitlingWorkspaces.delete(workspaceId);
+            this.naming.releaseAutoTitle(workspaceId);
           });
       }
 
       return result;
     } catch (error) {
       if (claimedAutoTitle) {
-        this.autoTitlingWorkspaces.delete(workspaceId);
+        this.naming.releaseAutoTitle(workspaceId);
         claimedAutoTitle = false;
       }
 
@@ -16922,21 +16570,9 @@ export class WorkspaceService
       // (mirrors sendMessage): the archive gate refuses while a resume that already passed
       // these guards is still doing pre-admission work, so neither side can slip past the
       // other's snapshot.
-      this.preflightSendCounts.set(
-        workspaceId,
-        (this.preflightSendCounts.get(workspaceId) ?? 0) + 1
-      );
-      using _preflightResume = {
-        [Symbol.dispose]: () => {
-          const remaining = (this.preflightSendCounts.get(workspaceId) ?? 1) - 1;
-          if (remaining <= 0) {
-            this.preflightSendCounts.delete(workspaceId);
-          } else {
-            this.preflightSendCounts.set(workspaceId, remaining);
-          }
-        },
-      };
-      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId);
+      using _preflightResume = this.sendPreflight.sends.acquire(workspaceId);
+      using sessionInvisiblePreflight =
+        this.sendPreflight.armSessionInvisiblePreflight(workspaceId);
       // A resume never queues, so later sends must not wait on its decision.
       sessionInvisiblePreflight.markDecided();
 
@@ -17512,75 +17148,15 @@ export class WorkspaceService
       //
       // In that case we persist the tool result into partial.json or chat.jsonl,
       // then emit a synthetic tool-call-end so the renderer updates immediately.
+      //
+      // A live stream owns its partial (it rewrites it from memory), so an unregistered question
+      // while streaming is not a restart leftover: it is a non-blocking (Exec) question whose
+      // immediate result has not reached the renderer yet. Finalizing it here would lose the
+      // answer, so refuse; once the result lands the card answers it with a chat message.
+      if (this.aiService.isStreaming(workspaceId)) {
+        return Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE);
+      }
       try {
-        // Helper: update a message in-place if it contains this ask_user_question tool call.
-        const tryFinalizeMessage = (
-          msg: MuxMessage
-        ): Result<{ updated: MuxMessage; output: AskUserQuestionToolSuccessResult }> => {
-          let foundToolCall = false;
-          let output: AskUserQuestionToolSuccessResult | null = null;
-          let errorMessage: string | null = null;
-
-          const updatedParts = msg.parts.map((part) => {
-            if (!isDynamicToolPart(part) || part.toolCallId !== toolCallId) {
-              return part;
-            }
-
-            foundToolCall = true;
-
-            if (part.toolName !== "ask_user_question") {
-              errorMessage = `toolCallId=${toolCallId} is toolName=${part.toolName}, expected ask_user_question`;
-              return part;
-            }
-
-            // Already answered - treat as idempotent.
-            if (part.state === "output-available") {
-              const parsedOutput = AskUserQuestionToolResultSchema.safeParse(part.output);
-              if (!parsedOutput.success) {
-                errorMessage = `ask_user_question output validation failed: ${parsedOutput.error.message}`;
-                return part;
-              }
-              output = parsedOutput.data;
-              return part;
-            }
-
-            const parsedArgs = AskUserQuestionToolArgsSchema.safeParse(part.input);
-            if (!parsedArgs.success) {
-              errorMessage = `ask_user_question input validation failed: ${parsedArgs.error.message}`;
-              return part;
-            }
-
-            const nextOutput: AskUserQuestionToolSuccessResult = {
-              summary: buildAskUserQuestionSummary(answers),
-              ui_only: {
-                ask_user_question: {
-                  questions: parsedArgs.data.questions,
-                  answers,
-                },
-              },
-            };
-            output = nextOutput;
-
-            return {
-              ...part,
-              state: "output-available" as const,
-              output: nextOutput,
-            };
-          });
-
-          if (errorMessage) {
-            return Err(errorMessage);
-          }
-          if (!foundToolCall) {
-            return Err("ask_user_question toolCallId not found in message");
-          }
-          if (!output) {
-            return Err("ask_user_question output missing after update");
-          }
-
-          return Ok({ updated: { ...msg, parts: updatedParts }, output });
-        };
-
         // 1) Prefer partial.json (most common after restart while waiting)
         const partial = await this.historyService.readPartial(workspaceId);
         if (partial) {
@@ -17593,7 +17169,7 @@ export class WorkspaceService
             workspaceId,
             partial.id,
             (current) => {
-              const finalized = tryFinalizeMessage(current);
+              const finalized = finalizeAskUserQuestionMessage(current, toolCallId, answers);
               if (!finalized.success) return null;
               output = finalized.data.output;
               return finalized.data.updated;
@@ -17662,7 +17238,7 @@ export class WorkspaceService
           );
         }
 
-        const finalized = tryFinalizeMessage(best);
+        const finalized = finalizeAskUserQuestionMessage(best, toolCallId, answers);
         if (!finalized.success) {
           return Err(finalized.error);
         }
@@ -18190,7 +17766,7 @@ export class WorkspaceService
       await resolvePlanFilePath(this.config, runtime, owner);
       if (options.markMigrated === true) {
         try {
-          await markRemotePlanMigratedForDeletion(this.config, owner);
+          await markRemotePlanMigratedForDeletion(this.config, owner, this.historyService.locks);
         } catch (error) {
           return Err({
             type: "delete_failed",
@@ -18219,7 +17795,7 @@ export class WorkspaceService
     >,
     runtime: Runtime
   ): Promise<PlanFileLocation> {
-    return resolvePlanFileLocation(this.config, runtime, metadata);
+    return resolvePlanFileLocation(this.config, runtime, metadata, this.historyService.locks);
   }
 
   /**
@@ -18378,7 +17954,10 @@ export class WorkspaceService
     // may remove rows (percentage > 0) pays the guard; percentage <= 0 is a deterministic
     // no-op that retires nothing and keeps the plain busy pre-check.
     if (effectivePercentage > 0) {
-      return this.acquireContextMutationAdmissionGuard(workspaceId, "truncate history");
+      return this.contextMutationGate.acquireContextMutationAdmissionGuard(
+        workspaceId,
+        "truncate history"
+      );
     }
     if (this.sessions.get(workspaceId)?.isBusy() || this.aiService.isStreaming(workspaceId)) {
       return Err(
@@ -18619,7 +18198,7 @@ export class WorkspaceService
     // r41: the discard is durable — sends that entered before it must not be
     // admitted afterwards (their content references the discarded context).
     if (isFullClear) {
-      this.advanceContextMutationEpoch(workspaceId);
+      this.contextMutationGate.advanceContextMutationEpoch(workspaceId);
     }
     // r43: a fork's settled branch-summary registration stays consumable
     // until the first send; its row was just deleted, so drop the
@@ -18667,7 +18246,10 @@ export class WorkspaceService
     // held across the refine drain/lock awaits below so a send admitted
     // mid-reset cannot snapshot the pre-reset transcript and stream across
     // the boundary.
-    const guardResult = this.acquireContextMutationAdmissionGuard(workspaceId, "reset context");
+    const guardResult = this.contextMutationGate.acquireContextMutationAdmissionGuard(
+      workspaceId,
+      "reset context"
+    );
     if (!guardResult.success) {
       return Err(guardResult.error);
     }
@@ -18774,7 +18356,7 @@ export class WorkspaceService
       // r41: the boundary is durable — sends that entered before it must not
       // be admitted afterwards (their content references the discarded
       // context).
-      this.advanceContextMutationEpoch(workspaceId);
+      this.contextMutationGate.advanceContextMutationEpoch(workspaceId);
       // r43: drop any settled-but-unconsumed branch-summary registration —
       // its row now sits behind the new boundary, and the next send would
       // otherwise re-emit that pre-reset summary into the live transcript.
@@ -18875,7 +18457,10 @@ export class WorkspaceService
     // inside an active turn, so they stay unguarded.
     let admissionGuard: Disposable | null = null;
     if (!isCompaction) {
-      const guardResult = this.acquireContextMutationAdmissionGuard(workspaceId, "replace history");
+      const guardResult = this.contextMutationGate.acquireContextMutationAdmissionGuard(
+        workspaceId,
+        "replace history"
+      );
       if (!guardResult.success) {
         return Err(guardResult.error);
       }
@@ -19035,8 +18620,8 @@ export class WorkspaceService
         }
         if (!isCompaction) {
           // r41: the destructive replacement is durable — refuse sends that
-          // entered before it (see contextMutationEpochs).
-          this.advanceContextMutationEpoch(workspaceId);
+          // entered before it (see ContextMutationGate.contextMutationEpochs).
+          this.contextMutationGate.advanceContextMutationEpoch(workspaceId);
           // r43: same branch-summary hygiene as full clear, and same r44
           // ordering — drop the registration only after the clear commits
           // (see truncateHistory).
@@ -19249,10 +18834,8 @@ export class WorkspaceService
    * an in-flight bootstrap keeps populating its orphaned Set harmlessly.
    */
   private evictWorkspaceActivityCaches(workspaceId: string): void {
-    this.activeWorkflowRunIdsByWorkspace.delete(workspaceId);
-    this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
-    this.bashMonitorSeenWorkspaces.delete(workspaceId);
-    this.workflowRunSeenWorkspaces.delete(workspaceId);
+    this.workflowRuns.evictWorkflowRunCaches(workspaceId);
+    this.bashMonitorActivity.evictSeenWorkspace(workspaceId);
   }
 
   /**
@@ -19435,13 +19018,13 @@ export class WorkspaceService
           log.debug("Failed to scope activity list to known workspaces", { error });
           scopedFailOpen = true;
           workspaceIds = new Set(snapshots.keys());
-          for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
+          for (const workspaceId of this.workflowRuns.cachedWorkspaceIds()) {
             workspaceIds.add(workspaceId);
           }
-          for (const workspaceId of this.bashMonitorSeenWorkspaces) {
+          for (const workspaceId of this.bashMonitorActivity.seenWorkspaceIds()) {
             workspaceIds.add(workspaceId);
           }
-          for (const workspaceId of this.workflowRunSeenWorkspaces) {
+          for (const workspaceId of this.workflowRuns.seenWorkspaceIds()) {
             workspaceIds.add(workspaceId);
           }
         }
@@ -19483,20 +19066,21 @@ export class WorkspaceService
             // installs an empty cache for every scoped id, which would turn
             // every idle config-known workspace into a fabricated recency:0
             // entry on the next list.
-            const hadWorkflowActivity = this.workflowRunSeenWorkspaces.has(workspaceId);
+            const hadWorkflowActivity = this.workflowRuns.hasSeenWorkflowRuns(workspaceId);
             // Bash-monitor counterpart of the workflow tombstone: a monitor that stopped
             // while the renderer was disconnected (or whose stop emit failed) must still
             // surface a zero-count entry here, otherwise the renderer's last-known
             // "watching" state survives reconnect. The seen-set is used instead of the
             // dedupe map because dedupe entries are dropped around in-flight/failed emits.
-            const hadBashMonitorActivityCache = this.bashMonitorSeenWorkspaces.has(workspaceId);
-            const activeWorkflowRunIds = await this.getActiveWorkflowRunIds(workspaceId);
+            const hadBashMonitorActivityCache = this.bashMonitorActivity.hasSeen(workspaceId);
+            const activeWorkflowRunIds =
+              await this.workflowRuns.getActiveWorkflowRunIds(workspaceId);
             const activeWorkflowRunCount = activeWorkflowRunIds.size;
             const activeBashMonitorCount = this.getActiveBashMonitorCount(workspaceId);
             if (activeBashMonitorCount > 0) {
               // A list-delivered non-zero count is a renderer-visible observation too:
               // remember it so the eventual stop always yields a tombstone entry.
-              this.bashMonitorSeenWorkspaces.add(workspaceId);
+              this.bashMonitorActivity.markSeen(workspaceId);
             }
             // Keep a zero-count tombstone for workspaces whose workflow- or monitor-only
             // activity was cleared while a frontend activity subscription was disconnected.
@@ -19872,7 +19456,10 @@ export class WorkspaceService
           ) {
             continue;
           }
-          probedWorkflowRunIds.set(workspaceId, await this.getActiveWorkflowRunIds(workspaceId));
+          probedWorkflowRunIds.set(
+            workspaceId,
+            await this.workflowRuns.getActiveWorkflowRunIds(workspaceId)
+          );
         }
         const isRawInvisible = (workspaceId: string): boolean =>
           !(initialConfigIds?.has(workspaceId) ?? false) &&
@@ -20175,7 +19762,7 @@ export class WorkspaceService
       // delivered to the renderer. Removed ids cannot re-enter: eviction deletes their
       // cache entry and the local tombstone is re-checked.
       for (const workspaceId of new Set([...workspaceIds, ...Object.keys(activityById)])) {
-        const installed = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+        const installed = this.workflowRuns.installedActiveWorkflowRunIds(workspaceId);
         if (installed == null) continue;
         const row = activityById[workspaceId];
         if (row != null) {
@@ -20520,10 +20107,7 @@ export class WorkspaceService
     if (this.archivingWorkspaces.has(workspaceId)) {
       return { paths: [] };
     }
-    using _preflightCompletions = this.acquirePreflightAdmission(
-      this.preflightFileCompletionCounts,
-      workspaceId
-    );
+    using _preflightCompletions = this.operationAdmission.fileCompletion.acquire(workspaceId);
 
     const metadata = await this.getInfo(workspaceId);
     if (!metadata) {
@@ -20549,10 +20133,7 @@ export class WorkspaceService
       // The refresh can outlive this call, so it holds its own admission: acquired here
       // while the outer admission is still held (no unguarded gap) and released when the
       // refresh settles, keeping the archive gate closed for the runtime work's duration.
-      const refreshAdmission = this.acquirePreflightAdmission(
-        this.preflightFileCompletionCounts,
-        workspaceId
-      );
+      const refreshAdmission = this.operationAdmission.fileCompletion.acquire(workspaceId);
       cacheEntry.refreshing = (async () => {
         const previousIndex = cacheEntry.index;
 
@@ -20623,23 +20204,13 @@ export class WorkspaceService
       return Err(`Workspace ${workspaceId} is being archived; cannot execute bash`);
     }
     // Archive admission pairing (same synchronous block as the guard above, mirroring
-    // sendMessage's preflightSendCounts): the metadata/init awaits below would otherwise
+    // sendMessage's sendPreflight.sends): the metadata/init awaits below would otherwise
     // hide this in-flight exec from the archive gate, letting an archive capture/remove the
     // checkout (or stop a dedicated Coder workspace) while the admitted command resumes
     // against it — on Coder even waking the workspace the archive hook just stopped. Held
     // until the command settles; an archive arming later observes the count, and an exec
     // entering after the gate armed is refused above.
-    this.preflightExecCounts.set(workspaceId, (this.preflightExecCounts.get(workspaceId) ?? 0) + 1);
-    using _preflightExec = {
-      [Symbol.dispose]: () => {
-        const remaining = (this.preflightExecCounts.get(workspaceId) ?? 1) - 1;
-        if (remaining <= 0) {
-          this.preflightExecCounts.delete(workspaceId);
-        } else {
-          this.preflightExecCounts.set(workspaceId, remaining);
-        }
-      },
-    };
+    using _preflightExec = this.operationAdmission.exec.acquire(workspaceId);
     // #4857: one "exec" use lease per call, until the command settles, so another backend
     // sharing this Xum root refuses to rename or remove the checkout under it. Taken before the
     // metadata read, so a mutation that finished first is seen by the reads below. While another
@@ -20812,6 +20383,7 @@ export class WorkspaceService
         runtimeTempDir: tempDir.path,
         overflow_policy: "truncate",
         trusted: isWorkspaceTrustedForSharedExecution(metadata, configSnapshot.projects),
+        sessionLocks: this.historyService.locks,
       });
 
       // Execute the script
@@ -21033,11 +20605,11 @@ export class WorkspaceService
       // kickoff candidate restored while a pre-goal manual send is mid-flight
       // (row already durable, session still phase-idle) can be consumed and
       // dispatched concurrently with — or ahead of — the user's turn.
-      // `preflightSendCounts` is incremented synchronously at sendMessage
+      // `sendPreflight.sends` is incremented synchronously at sendMessage
       // entry and held until the send settles; admitted sends have set
       // PREPARING (busy) by the time it releases. Queue-dispatched sends set
       // PREPARING synchronously before dispatch and are covered by isBusy().
-      isBusy: session?.isBusy() === true || (this.preflightSendCounts.get(workspaceId) ?? 0) > 0,
+      isBusy: session?.isBusy() === true || this.sendPreflight.hasSendInPreflight(workspaceId),
       // Held user input (a manual send refused at dispatch or restored after an interrupt) counts
       // as queued user input: an automatic goal turn never runs over input the user must resend
       // or discard, whichever candidate (kickoff, stream end, error resume) is pending (G4).
@@ -21125,7 +20697,9 @@ export class WorkspaceService
    * resolved; the unified resolver then uses its implicit fallback ancestor.
    */
   private async getAgentDefinitionContext(
-    workspaceId: string
+    workspaceId: string,
+    /** #7216: the caller's config snapshot, so trust comes from the config it resolves with. */
+    config: ProjectsConfig
   ): Promise<NodeAgentDefinitionContext | undefined> {
     try {
       const metadata = await this.getInfo(workspaceId);
@@ -21133,7 +20707,13 @@ export class WorkspaceService
         return undefined;
       }
       const runtime = createRuntimeForWorkspace(metadata);
-      return { runtime, workspacePath: resolveWorkspaceRootPath(metadata, runtime), workspaceId };
+      return {
+        runtime,
+        workspacePath: resolveWorkspaceRootPath(metadata, runtime),
+        workspaceId,
+        projectPluginsTrusted: isWorkspaceProjectTrustedIn(config.projects, metadata),
+        runtimeFactory: nodeRuntimeFactory,
+      };
     } catch {
       return undefined;
     }
@@ -21142,6 +20722,19 @@ export class WorkspaceService
   /** Cancel the workspace session's scheduled auto-retry of this goal's automatic turn. */
   abandonGoalAutoRetry(workspaceId: string, goalId: string): void {
     this.sessions.get(workspaceId)?.abandonGoalAutoRetry(goalId);
+  }
+
+  abandonAutoRetry(workspaceId: string, reason: string): void {
+    // Stop paths call this right before their stream stop: a throw must not skip that stop.
+    // A session still in its startup recovery is not registered yet, and that recovery can arm
+    // the stopped turn again.
+    try {
+      (
+        this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
+      )?.abandonAutoRetry(reason);
+    } catch (error: unknown) {
+      log.warn("abandonAutoRetry failed", { workspaceId, reason, error: getErrorMessage(error) });
+    }
   }
 
   async getGoalContinuationKickoffSendOptions(
@@ -21203,7 +20796,7 @@ export class WorkspaceService
       // kickoff must then use the user's configured default model, as the composer does, not
       // the built-in one (bug bash: the kickoff ran on a model the user had not picked).
       defaultModel: config.defaultModel,
-      definitionContext: await this.getAgentDefinitionContext(workspaceId),
+      definitionContext: await this.getAgentDefinitionContext(workspaceId, config),
     });
 
     // Selected values: the send path persists them and re-clamps at request time.
@@ -21476,7 +21069,7 @@ export class WorkspaceService
         },
       ],
       defaultModel: WORKSPACE_DEFAULTS.model,
-      definitionContext: await this.getAgentDefinitionContext(workspaceId),
+      definitionContext: await this.getAgentDefinitionContext(workspaceId, config),
     });
 
     return {
@@ -21994,7 +21587,7 @@ export class WorkspaceService
         },
       ],
       defaultModel: WORKSPACE_DEFAULTS.model,
-      definitionContext: await this.getAgentDefinitionContext(workspaceId),
+      definitionContext: await this.getAgentDefinitionContext(workspaceId, config),
     });
 
     return {

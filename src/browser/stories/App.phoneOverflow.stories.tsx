@@ -2,13 +2,14 @@
  * Phone-width overflow checks for #5769: the workspace footer must fit the screen, and a capped
  * bash Script block must show that more of the command sits below the cut.
  */
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ComponentType } from "react";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { waitForScrollStabilization } from "./storyPlayHelpers.js";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 const meta = { ...appMeta, title: "App/PhoneViewports/Overflow" };
 export default meta;
@@ -36,6 +37,8 @@ const LONG_SCRIPT = [
   "echo five",
 ].join("\n");
 
+const LONG_BRANCH = "bugbash-playground-with-a-long-name";
+
 const PR_DETECTION_JSON = JSON.stringify({
   number: 5769,
   url: "https://github.com/a-long-organization-name/a-long-repository-name/pull/5769",
@@ -44,10 +47,20 @@ const PR_DETECTION_JSON = JSON.stringify({
   mergeStateStatus: "CLEAN",
   title: "Phone footer fits",
   isDraft: false,
-  headRefName: "bugbash-playground-with-a-long-name",
+  headRefName: LONG_BRANCH,
   baseRefName: "main",
   statusCheckRollup: [],
 });
+
+// A detected PR swaps the project label for the PR's owner/repo, which can be long too.
+function detectLongRepoPR(_workspaceId: string, script: string) {
+  return Promise.resolve({
+    success: true as const,
+    output: script.includes("gh pr view") ? PR_DETECTION_JSON : "",
+    exitCode: 0,
+    wall_duration_ms: 5,
+  });
+}
 
 export const FooterAndScriptBlock: AppStory = {
   // A phone viewport for local viewing (the fixed frame does not move innerWidth).
@@ -60,16 +73,9 @@ export const FooterAndScriptBlock: AppStory = {
         setupSimpleChatStory({
           workspaceId: "ws-phone-overflow",
           // A long branch name: the footer row must truncate it instead of scrolling sideways.
-          workspaceName: "bugbash-playground-with-a-long-name",
+          workspaceName: LONG_BRANCH,
           projectName: "demo-app",
-          // A detected PR swaps the project label for the PR's owner/repo, which can be long too.
-          executeBash: (_workspaceId, script) =>
-            Promise.resolve({
-              success: true as const,
-              output: script.includes("gh pr view") ? PR_DETECTION_JSON : "",
-              exitCode: 0,
-              wall_duration_ms: 5,
-            }),
+          executeBash: detectLongRepoPR,
           messages: [
             createUserMessage("msg-1", "Call the API three times", {
               historySequence: 1,
@@ -107,6 +113,7 @@ export const FooterAndScriptBlock: AppStory = {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
     await waitForScrollStabilization(storyRoot);
 
+    const narrow = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
     const footerRow = await waitFor(() => {
       const row = storyRoot.querySelector<HTMLElement>(
         '[data-testid="workspace-footer-bar"] > div'
@@ -115,7 +122,11 @@ export const FooterAndScriptBlock: AppStory = {
       return row;
     });
     await waitFor(() => {
-      if (!footerRow.textContent?.includes("Last prompt")) throw new Error("Footer still loading");
+      // Phone widths drop "Last prompt" from the footer; wider windows (the test runner) still
+      // wait for it so the fit check covers the full row.
+      if (!narrow && !footerRow.textContent?.includes("Last prompt")) {
+        throw new Error("Footer still loading");
+      }
       if (!storyRoot.querySelector('[data-testid="workspace-footer-repository"]')) {
         throw new Error("PR repository label not shown yet");
       }
@@ -141,5 +152,52 @@ export const FooterAndScriptBlock: AppStory = {
     // Scrolled to the end, nothing is cut, so the bottom fade goes away.
     script.scrollTop = script.scrollHeight;
     await waitFor(() => expect(bottomFade()).toBe("0px"));
+  },
+};
+
+/**
+ * The phone footer at its fullest: diff numbers and a long PR repo leave the branch little width.
+ * Plays cannot emulate a coarse pointer, so the test runner's postVisit hook replays this story
+ * on a touch-emulated small phone and fails if the row clips a control below its touch target.
+ * The play only waits until everything that row shows has loaded.
+ */
+export const FooterTouchTargets: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          workspaceId: "ws-phone-footer-touch",
+          workspaceName: LONG_BRANCH,
+          projectName: "demo-app",
+          gitStatus: {
+            ahead: 2,
+            dirty: 1,
+            outgoingAdditions: 635,
+            outgoingDeletions: 67,
+            headBranch: LONG_BRANCH,
+          },
+          executeBash: detectLongRepoPR,
+          messages: [
+            createUserMessage("msg-1", "Check the footer", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP,
+            }),
+          ],
+        })
+      }
+    />
+  ),
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitFor(() => {
+      if (!storyRoot.querySelector('[data-testid="workspace-footer-repository"]')) {
+        throw new Error("PR repository label not shown yet");
+      }
+      // Git status reports the branch and the diff numbers together.
+      if (!within(storyRoot).queryByRole("button", { name: "Copy branch name" })) {
+        throw new Error("Branch not resolved yet");
+      }
+    });
   },
 };

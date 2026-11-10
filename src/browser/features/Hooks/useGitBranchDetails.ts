@@ -179,7 +179,8 @@ export function useGitBranchDetails(
     try {
       // Consolidated bash script that gets all git info and outputs JSON
       const getDirtyFiles = gitStatus?.dirty
-        ? "DIRTY_FILES=$(git status --porcelain 2>/dev/null | head -20)"
+        ? // No optional index lock: a read must not make a concurrent commit fail (#7626).
+          "DIRTY_FILES=$(git --no-optional-locks status --porcelain 2>/dev/null | head -20)"
         : "DIRTY_FILES=''";
 
       const script = `

@@ -4,6 +4,7 @@ import { z } from "zod";
 import { getContextBudgetHardCeiling } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
+import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -28,8 +29,17 @@ import {
   type PrepareModelAttemptOptions,
 } from "./turnRequestBuilder";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
+import type { HostClock } from "@/node/utils/hostClock";
+import type { EffectRunner } from "./di/effectRunner";
+import { Ok } from "@/common/types/result";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
-async function createPreparationHarness() {
+type TurnRequestBuilderDependencies = ConstructorParameters<typeof TurnRequestBuilder>[0];
+
+async function createPreparationHarness(
+  overrides: { runner?: EffectRunner; dependencies?: Partial<TurnRequestBuilderDependencies> } = {}
+) {
   const testHistory = await createTestHistoryService();
   const { config, historyService } = testHistory;
   const providerService = new ProviderService(config);
@@ -38,7 +48,8 @@ async function createPreparationHarness() {
     historyService,
     undefined,
     () => providerService.getConfig(),
-    () => undefined
+    () => undefined,
+    overrides.runner
   );
   const builder = new TurnRequestBuilder({
     config,
@@ -52,6 +63,8 @@ async function createPreparationHarness() {
     workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
     lastLlmRequestByWorkspace: new Map(),
     bindings: {},
+    hostServices: {},
+    runtimeFactory: nodeRuntimeFactory,
     emit: () => false,
     createAbortedTurnHandle: (messageId) => ({
       messageId,
@@ -73,6 +86,7 @@ async function createPreparationHarness() {
     shouldAllowLegacyInvalidWorkflowAgentOutputSchema: () => Promise.resolve(false),
     isStreaming: () => false,
     trackPendingDevToolsRunMetadata: () => undefined,
+    ...overrides.dependencies,
   });
   return { ...testHistory, builder, providerService, providersConfigStore };
 }
@@ -434,20 +448,140 @@ describe("TurnRequestBuilder assembled preflight", () => {
     expect(off.contextBudgetEstimate).toBeUndefined();
   });
 
-  it("measure-only mode returns the over-ceiling estimate instead of refusing", async () => {
-    const refused = await assembleBudgetCheckedPromptPayload(options(), { enabled: true }).catch(
-      (error: unknown) => error
-    );
-    if (!(refused instanceof ContextBudgetExceededError)) throw new Error("Expected refusal");
-    const measured = await assembleBudgetCheckedPromptPayload(options(), {
-      enabled: true,
-      measureOnly: true,
+  // #7662: after a completed reply, E is that reply's provider input plus the messages after it.
+  it("anchors the enforced estimate to the newest reply's provider input", async () => {
+    const base = options("openai:large-context-model");
+    const reply = createMuxMessage("reply", "assistant", "done", {
+      model: base.modelString,
+      metadataModel: base.modelString,
+      agentId: "exec",
+      thinkingLevel: base.effectiveThinkingLevel,
+      systemMessageTokens: 0,
+      contextUsage: { inputTokens: 50_000, outputTokens: 10, totalTokens: 50_010 },
     });
-    expect(measured.contextBudgetEstimate).toBe(refused.details.estimate);
-    const unchecked = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
-    expect(measured.messages).toEqual(unchecked.messages);
-    expect(measured.system).toEqual(unchecked.system);
-    expect(Object.keys(measured.tools ?? {})).toEqual(Object.keys(unchecked.tools ?? {}));
+    const request = {
+      ...base,
+      history: [createMuxMessage("earlier", "user", "earlier request"), reply, ...base.history],
+    };
+    const payload = await assembleBudgetCheckedPromptPayload(request, { enabled: true });
+    const full = (await estimateAssembledRequestTokensForModel(payload, {
+      model: request.modelString,
+      modelContextLimit: payload.contextBudgetLimit,
+    }))!.estimate;
+    expect(full).toBeLessThan(50_000);
+    expect(payload.contextBudgetTurnAnchor!.providerTokens).toBeGreaterThan(50_000);
+    expect(payload.contextBudgetEstimate).toBeGreaterThan(
+      payload.contextBudgetTurnAnchor!.providerTokens
+    );
+    // A compaction request's trim can drop rows the provider count holds.
+    const compaction = await assembleBudgetCheckedPromptPayload(
+      { ...request, compactionInputBudgetTokens: 90_000 },
+      { enabled: true }
+    );
+    expect(compaction.contextBudgetTurnAnchor).toBeUndefined();
+  });
+
+  // #7662: the reply's systemMessageTokens counted the system message and its rows, so a system
+  // message that grows by less than the retained rows still adds its growth.
+  it("adds system growth when the earlier request also sent system rows", async () => {
+    const opus = {
+      ...options(),
+      modelString: "anthropic:claude-opus-5-5",
+      providerForMessages: "anthropic",
+      routeProvider: "anthropic",
+    };
+    const stable = "stable instructions";
+    const tail = `\n\n[Warning: ${"retained row ".repeat(300)}]`;
+    const withSystem = (system: string, history: MuxMessage[]) =>
+      assembleBudgetCheckedPromptPayload(
+        { ...opus, history, systemMessage: system + tail, volatileSystemSuffixLength: tail.length },
+        { enabled: true }
+      );
+    const u1 = createMuxMessage("u1", "user", "first");
+    const a1 = createMuxMessage("a1", "assistant", "answer a1", {
+      volatileSystemTail: { text: "\n\n[Warning: A]", placement: "system" },
+    });
+    const u2 = createMuxMessage("u2", "user", "second");
+    const earlier = await withSystem(stable, [u1, a1, u2]);
+    expect(earlier.sentSystem.rowsText).not.toBe("");
+    const tokenizer = await getTokenizerForModel(opus.modelString);
+    const reply = createMuxMessage("a2", "assistant", "answer a2", {
+      model: opus.modelString,
+      metadataModel: opus.modelString,
+      agentId: "exec",
+      routeProvider: "anthropic",
+      thinkingLevel: opus.effectiveThinkingLevel,
+      volatileSystemTail: { text: tail, placement: "row" },
+      systemMessageTokens: await tokenizer.countTokens(
+        earlier.sentSystem.message + earlier.sentSystem.rowsText
+      ),
+      contextUsage: { inputTokens: 50_000, outputTokens: 10, totalTokens: 50_010 },
+    });
+    const history = [u1, a1, u2, reply, createMuxMessage("u3", "user", "third")];
+    const same = await withSystem(stable, history);
+    expect(same.contextBudgetTurnAnchor!.providerTokens).toBe(50_000);
+    const grown = await withSystem(`${stable} and more instructions`, history);
+    expect(grown.contextBudgetTurnAnchor!.providerTokens).toBeGreaterThan(50_000);
+  });
+});
+
+describe("TurnRequestBuilder MCP overrides deadline", () => {
+  it("leaves MCPServerManager a positive reread budget when the turn's TestClock trails wall time", async () => {
+    // MCPServerManager computes the reread budget as deadline - Date.now(). A deadline on the
+    // TestClock (months behind wall time) would leave 0 ms, skip the mandatory reread and serve
+    // closed, so the deadline reads the wall clock until #7282 moves both sides.
+    const clock = makeTestEffectRunner();
+    const getToolsForWorkspace = mock((_options: { overridesReadDeadlineAt?: number }) =>
+      Promise.resolve({})
+    );
+    let readClock: HostClock | undefined;
+    const metadata: WorkspaceMetadata = {
+      id: "workspace",
+      name: "workspace",
+      projectName: "project",
+      projectPath: "/tmp/project",
+      runtimeConfig: { type: "local" },
+    };
+    const harness = await createPreparationHarness({
+      runner: clock.runner,
+      dependencies: {
+        bindings: {
+          mcpServerManager: { getToolsForWorkspace } as unknown as NonNullable<
+            TurnRequestBuilderDependencies["bindings"]["mcpServerManager"]
+          >,
+        },
+        workspaceMcpOverridesService: {
+          getOverridesForWorkspace: (_workspaceId: string, options: { clock?: HostClock }) => {
+            readClock = options.clock;
+            return Promise.resolve({ overrides: undefined, authoritative: false });
+          },
+        } as unknown as WorkspaceMcpOverridesService,
+        getWorkspaceMetadata: () => Promise.resolve(Ok(metadata)),
+        createWorkspaceRuntimeContext: () =>
+          Ok({
+            runtime: { ensureReady: () => Promise.resolve({ ready: true }) },
+            workspacePath: "/tmp/project",
+          }) as unknown as ReturnType<
+            TurnRequestBuilderDependencies["createWorkspaceRuntimeContext"]
+          >,
+      },
+    });
+    try {
+      const started = await harness.builder.startWorkspaceMcpServers(
+        "workspace",
+        new AbortController().signal
+      );
+
+      expect(started).toBe(true);
+      const deadline = getToolsForWorkspace.mock.calls[0]?.[0].overridesReadDeadlineAt;
+      if (deadline == null) throw new Error("expected a non-authoritative reread deadline");
+      expect(deadline - Date.now()).toBeGreaterThan(0);
+      // The overrides read arms its timeout on the turn's TestClock, not on the Node clock.
+      expect(readClock?.nowMs()).toBe(clock.hostClock.nowMs());
+    } finally {
+      await harness.cleanup();
+      await clock.dispose();
+    }
   });
 });
 
@@ -634,7 +768,7 @@ describe("TurnRequestBuilder model attempt preparation", () => {
 
   it.each([
     { routeProvider: "openai" as const, hasCacheKey: true },
-    { routeProvider: "mux-gateway" as const, hasCacheKey: false },
+    { routeProvider: "coder" as const, hasCacheKey: false },
   ])("sets Chat Completions cache keys for $routeProvider routes", async (testCase) => {
     const harness = await createPreparationHarness();
     try {

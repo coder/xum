@@ -282,6 +282,9 @@ async function highlightMainThread(
     );
   }
 
+  // The worker uses @pierre/highlights first (highlightsEngine.ts); this fallback stays on Shiki.
+  // A static import of the engine would put its ~183 KB Wasm module into the main bundle and
+  // compile it at startup for every user, and a function-level import() is against repo rules.
   const highlighter = await getShikiHighlighter();
   const shikiLang = mapToShikiLang(language);
 

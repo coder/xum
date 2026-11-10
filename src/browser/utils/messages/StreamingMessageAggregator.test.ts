@@ -14,6 +14,7 @@ import { getInterruptionContext } from "@/common/utils/messages/retryEligibility
 import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 import { MAX_HISTORY_HIDDEN_SEGMENTS } from "./transcriptTruncationPlan";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import { setAcceptedAnswers } from "./openAskUserQuestions";
 import { canEditDisplayedUserMessage } from "@/browser/utils/chatEditing";
 import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 
@@ -1958,7 +1959,7 @@ describe("StreamingMessageAggregator", () => {
       ]);
     });
 
-    test("should clear fully completed todos when the final stream ends", () => {
+    test("keeps a finished plan after its turn and clears it when the next turn starts", () => {
       const aggregator = createTestAggregator();
       startTestStream(aggregator);
       writeTodos(aggregator, [
@@ -1966,9 +1967,37 @@ describe("StreamingMessageAggregator", () => {
         { content: "Do task 2", status: "completed" },
       ]);
 
-      expect(aggregator.getCurrentTodos()).toHaveLength(2);
       endTestStream(aggregator);
+      // The TODO chip reads 2/2 between turns.
+      expect(aggregator.getCurrentTodos()).toHaveLength(2);
+
+      aggregator.handleMessage({
+        type: "message",
+        id: "msg2",
+        role: "user",
+        parts: [{ type: "text", text: "Next task" }],
+        metadata: { historySequence: 2, timestamp: Date.now() },
+      });
       expect(aggregator.getCurrentTodos()).toHaveLength(0);
+    });
+
+    test("keeps an unfinished plan when the next turn starts", () => {
+      const aggregator = createTestAggregator();
+      startTestStream(aggregator);
+      writeTodos(aggregator, [
+        { content: "Do task 1", status: "completed" },
+        { content: "Do task 2", status: "pending" },
+      ]);
+      endTestStream(aggregator);
+
+      aggregator.handleMessage({
+        type: "message",
+        id: "msg2",
+        role: "user",
+        parts: [{ type: "text", text: "Continue" }],
+        metadata: { historySequence: 2, timestamp: Date.now() },
+      });
+      expect(aggregator.getCurrentTodos()).toHaveLength(2);
     });
 
     test("should preserve todos when stream aborts", () => {
@@ -1986,20 +2015,50 @@ describe("StreamingMessageAggregator", () => {
       expect(aggregator.getCurrentTodos()).toHaveLength(1);
     });
 
-    test("should keep completed todos on reload only while reconnecting to an active stream", () => {
-      const historicalMessage = historicalTodoMessage("msg1", [
-        { content: "Historical task 1", status: "completed" },
-        { content: "Historical task 2", status: "completed" },
-      ]);
+    test("a reload keeps a finished plan until a later user turn, as live", () => {
+      const historicalMessage = historicalTodoMessage(
+        "msg1",
+        [
+          { content: "Historical task 1", status: "completed" },
+          { content: "Historical task 2", status: "completed" },
+        ],
+        { historySequence: 2 }
+      );
+      const turn = (id: string, historySequence: number) =>
+        createMuxMessage(id, "user", "Next task", { historySequence, timestamp: historySequence });
 
-      const aggregator = createTestAggregator();
-      aggregator.loadHistoricalMessages([historicalMessage], true);
-      expect(aggregator.getCurrentTodos()).toHaveLength(2);
-      expect(aggregator.getCurrentTodos()[0].content).toBe("Historical task 1");
+      for (const hasActiveStream of [true, false]) {
+        const aggregator = createTestAggregator();
+        aggregator.loadHistoricalMessages([turn("u1", 1), historicalMessage], hasActiveStream);
+        expect(aggregator.getCurrentTodos()).toHaveLength(2);
+        expect(aggregator.getCurrentTodos()[0].content).toBe("Historical task 1");
+      }
 
-      const aggregator2 = createTestAggregator();
-      aggregator2.loadHistoricalMessages([historicalMessage], false);
-      expect(aggregator2.getCurrentTodos()).toHaveLength(0);
+      const idle = createTestAggregator();
+      idle.loadHistoricalMessages([turn("u1", 1), historicalMessage, turn("u3", 3)], false);
+      expect(idle.getCurrentTodos()).toHaveLength(0);
+
+      // A Token Budget warning is a user row that starts no turn.
+      const warned = createTestAggregator();
+      warned.loadHistoricalMessages(
+        [
+          historicalMessage,
+          createMuxMessage("warn", "user", "Write the next steps to workspace notes.", {
+            historySequence: 3,
+            timestamp: 3,
+            synthetic: true,
+            uiVisible: true,
+            muxMetadata: {
+              type: "context-budget-warning",
+              contextTokens: 800,
+              maxTokens: 1000,
+              budgetTokens: 991,
+            },
+          }),
+        ],
+        false
+      );
+      expect(warned.getCurrentTodos()).toHaveLength(2);
     });
 
     test("preserves completed todos on idle reload when they came from a partial assistant message", () => {
@@ -2202,44 +2261,6 @@ describe("StreamingMessageAggregator", () => {
     const asChatMessage = (msg: ReturnType<typeof createMuxMessage>) => ({
       ...msg,
       type: "message" as const,
-    });
-
-    test("prunes older messages on first compaction and keeps the new boundary", () => {
-      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
-
-      // Simulate messages accumulated during a live session (no prior compaction)
-      const msg1 = asChatMessage(
-        createMuxMessage("user-1", "user", "First message", {
-          historySequence: 0,
-          timestamp: 1,
-        })
-      );
-      const msg2 = asChatMessage(
-        createMuxMessage("assistant-1", "assistant", "Response", {
-          historySequence: 1,
-          timestamp: 2,
-        })
-      );
-
-      aggregator.handleMessage(msg1);
-      aggregator.handleMessage(msg2);
-
-      const summary = asChatMessage(
-        createMuxMessage("summary-1", "assistant", "Compacted summary", {
-          historySequence: 2,
-          compacted: "user",
-          compactionBoundary: true,
-          compactionEpoch: 1,
-          muxMetadata: { type: "compaction-summary" },
-        })
-      );
-      aggregator.handleMessage(summary);
-
-      // Existing messages with sequence < incoming boundary (2) are pruned.
-      // The incoming boundary itself is appended after pruning and remains visible.
-      const remaining = aggregator.getAllMessages();
-      expect(remaining).toHaveLength(1);
-      expect(remaining.map((m) => m.id)).toEqual(["summary-1"]);
     });
 
     test("keeps only the latest boundary epoch start on subsequent compactions", () => {
@@ -5396,6 +5417,32 @@ describe("StreamingMessageAggregator window seed (#4961)", () => {
     aggregator.loadHistoricalMessages([userRow(10)], true, { mode: "replace" });
     expect(aggregator.getCurrentTodos()).toEqual(done.todos);
   });
+
+  test("an all-completed seeded list that no row wrote clears when the running turn ends", () => {
+    // The seed is the session's list now: during a turn it may be that turn's own plan, or the
+    // one before it. A turn that writes none in the window does not keep it past its end.
+    const done = { ...seed, todos: [{ content: "done", status: "completed" as const }] };
+    const aggregator = createTestAggregator();
+    aggregator.setWindowSeed(done);
+    aggregator.loadHistoricalMessages([userRow(10)], true, { mode: "replace" });
+    startTestStream(aggregator, { historySequence: 11 });
+    expect(aggregator.getCurrentTodos()).toEqual(done.todos);
+
+    endTestStream(aggregator);
+    expect(aggregator.getCurrentTodos()).toEqual([]);
+  });
+
+  test("a finished list the running turn writes still stays after that turn", () => {
+    const done = { ...seed, todos: [{ content: "done", status: "completed" as const }] };
+    const aggregator = createTestAggregator();
+    aggregator.setWindowSeed(done);
+    aggregator.loadHistoricalMessages([userRow(10)], true, { mode: "replace" });
+    startTestStream(aggregator, { historySequence: 11 });
+    writeTodos(aggregator, done.todos);
+
+    endTestStream(aggregator);
+    expect(aggregator.getCurrentTodos()).toEqual(done.todos);
+  });
 });
 
 describe("StreamingMessageAggregator in-turn hidden notice rows", () => {
@@ -5474,5 +5521,106 @@ describe("StreamingMessageAggregator in-turn hidden notice rows", () => {
     });
     expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
     expect(aggregator.getPendingStreamModel()).toBe(model);
+  });
+});
+
+describe("transcript truncation keeps open questions", () => {
+  const questionInput = {
+    questions: [
+      {
+        question: "Which option?",
+        header: "Option",
+        options: [
+          { label: "First", description: "The first option." },
+          { label: "Second", description: "The second option." },
+        ],
+        multiSelect: false,
+      },
+    ],
+  };
+  const asyncOutput = {
+    summary: "Questions shown to the user.",
+    ui_only: {
+      ask_user_question: {
+        questions: questionInput.questions,
+        answers: {},
+        answerDelivery: "message",
+      },
+    },
+  };
+
+  function loadQuestionThenOutput(
+    answered: boolean,
+    workspaceId?: string,
+    input: Record<string, unknown> = questionInput
+  ) {
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT, workspaceId);
+    const answerRows = answered
+      ? [
+          createMuxMessage("answer-1", "user", "option 1", {
+            historySequence: 2,
+            timestamp: 2,
+            muxMetadata: {
+              type: "normal",
+              askUserQuestionAnswer: { toolCallId: "ask-1", answers: { "Which option?": "First" } },
+            },
+          }),
+        ]
+      : [];
+    aggregator.loadHistoricalMessages(
+      [
+        historicalToolMessage("question-1", "ask_user_question", input, {
+          toolCallId: "ask-1",
+          output: asyncOutput,
+          historySequence: 1,
+        }),
+        ...answerRows,
+        // Enough later agent output to push the question past the recent-row window.
+        ...Array.from({ length: 70 }, (_, index) =>
+          createMuxMessage(`later-${index}`, "assistant", `later response ${index}`, {
+            historySequence: index + 3,
+            timestamp: index + 3,
+          })
+        ),
+      ],
+      false
+    );
+    const rows = aggregator.getDisplayedMessages();
+    const question = rows.find((row) => row.type === "tool" && row.toolCallId === "ask-1");
+    return {
+      truncated: rows.some((row) => row.type === "history-hidden"),
+      questionShown: question !== undefined,
+      questionRowId: question?.id,
+    };
+  }
+
+  test("an unanswered question stays in the displayed rows", () => {
+    expect(loadQuestionThenOutput(false)).toMatchObject({ truncated: true, questionShown: true });
+  });
+
+  test("an answered question may be hidden like any older tool row", () => {
+    expect(loadQuestionThenOutput(true)).toMatchObject({ truncated: true, questionShown: false });
+  });
+
+  test("a question with malformed args (a generic card, never docked) is not kept", () => {
+    expect(loadQuestionThenOutput(false, undefined, { questions: "not a list" })).toMatchObject({
+      truncated: true,
+      questionShown: false,
+    });
+  });
+
+  test("an answer the app accepted without an answer row releases the question", () => {
+    // A batched answer rides an earlier queued message, so no answer row ever lands for it.
+    const workspaceId = "ws-truncation-accepted";
+    const before = loadQuestionThenOutput(false, workspaceId);
+    expect(before).toMatchObject({ truncated: true, questionShown: true });
+    setAcceptedAnswers(
+      { workspaceId, toolCallId: "ask-1", rowId: before.questionRowId },
+      { "Which option?": "First" }
+    );
+    expect(loadQuestionThenOutput(false, workspaceId)).toMatchObject({
+      truncated: true,
+      questionShown: false,
+    });
   });
 });

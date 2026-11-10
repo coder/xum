@@ -14,15 +14,12 @@ import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import { handOffCreationAiSelection } from "@/browser/utils/aiSelectionIntent";
 import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
-  getPendingScopeId,
-  getDraftScopeId,
+  getCreationDraftScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
-  getProjectScopeId,
-  getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import {
   getAppConfigStore,
@@ -56,13 +53,13 @@ import {
   unlockInitialStaging,
 } from "@/browser/features/ChatInput/initialStagingLock";
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
-import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import {
+  NO_INLINE_REFS,
   processSlashCommand,
   type CommandAction,
   type CommandResult,
@@ -70,10 +67,12 @@ import {
 } from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
-  getNameFromPersistedState,
+  buildFallbackWorkspaceIdentity,
   useWorkspaceName,
   type WorkspaceNameState,
 } from "@/browser/hooks/useWorkspaceName";
+import { getCreationDraftStore, useCreationDraft } from "@/browser/stores/CreationDraftStore";
+import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {
@@ -99,7 +98,7 @@ interface UseCreationWorkspaceOptions {
     metadata: FrontendWorkspaceMetadata,
     options?: WorkspaceCreatedOptions
   ) => void;
-  /** Current message input for name generation */
+  /** The message the workspace is named for (named on Send only). */
   message: string;
   /** Sub-project path to use for cwd and AGENTS.md context. */
   subProjectPath?: string | null;
@@ -124,6 +123,7 @@ function resolveCreationAgentId(
 
 function syncCreationPreferences(
   projectPath: string,
+  creationScopeId: string,
   workspaceId: string,
   agentId: string,
   reasoningMode: string,
@@ -131,7 +131,6 @@ function syncCreationPreferences(
 ): void {
   // Without the experiment the composer offers no Auto, so the creation scope has no choice.
   const experiments = getAppConfigStore().getSnapshot()?.experiments;
-  const projectScopeId = getProjectScopeId(projectPath);
   // Until the creation save lands the workspace has no saved settings, and project defaults
   // hold no reasoning mode.
   handOffCreationAiSelection(workspaceId, agentId, {
@@ -140,8 +139,8 @@ function syncCreationPreferences(
     ...(experiments?.[EXPERIMENT_IDS.AUTO_MODEL_ROUTING] === true
       ? {
           autoRouting: {
-            model: getAutoRouting(projectScopeId, "model", agentId),
-            thinkingLevel: getAutoRouting(projectScopeId, "thinkingLevel", agentId),
+            model: getAutoRouting(creationScopeId, "model", agentId),
+            thinkingLevel: getAutoRouting(creationScopeId, "thinkingLevel", agentId),
           },
         }
       : {}),
@@ -219,6 +218,45 @@ export type RuntimeAvailabilityState =
   | { status: "failed" }
   | { status: "loaded"; data: RuntimeAvailabilityMap };
 
+/** How workspace.create (or createScratch, with the title) names the workspace. */
+interface CreationName {
+  branchName?: string;
+  title?: string;
+  nameGeneration?: WorkspaceNameGenerationRequest;
+}
+
+/**
+ * Names exist only on Send. A manual name is used as typed; an attachment-only send gets the
+ * local fallback. Otherwise a worktree opens without waiting (`canHandOff`: the backend names it
+ * and renames its branch before the init hook runs), and other runtimes, which create the
+ * checkout under the final name, wait for the generated name (the fallback when that fails).
+ */
+async function resolveCreationName(input: {
+  api: NonNullable<ReturnType<typeof useLiveAPI>>;
+  manualName: string;
+  message: string;
+  /** No typed text: the message is only the attached-files summary. */
+  attachmentOnly: boolean;
+  canHandOff: boolean;
+  candidates: string[];
+}): Promise<CreationName> {
+  const manualName = input.manualName.trim();
+  if (manualName) return { branchName: manualName, title: manualName };
+  const { message, candidates } = input;
+  const generate = message.trim().length > 0 && !input.attachmentOnly;
+  if (generate && input.canHandOff) return { nameGeneration: { message, candidates } };
+  let identity = buildFallbackWorkspaceIdentity(message);
+  if (generate) {
+    try {
+      const result = await input.api.nameGeneration.generate({ message, candidates });
+      if (result.success) identity = result.data;
+    } catch (error) {
+      console.warn("Workspace name generation failed; using the fallback name:", error);
+    }
+  }
+  return { branchName: identity.name, title: identity.title.trim() || undefined };
+}
+
 /** True for a real (non-blank) creation draft ID. */
 function isDraftId(draftId: string | null | undefined): draftId is string {
   return typeof draftId === "string" && draftId.trim().length > 0;
@@ -279,8 +317,11 @@ export function useCreationWorkspace({
   const promoteWorkspaceDraft = workspaceContext?.promoteWorkspaceDraft;
   const deleteWorkspaceDraft = workspaceContext?.deleteWorkspaceDraft;
   const { currentWorkspaceId, currentProjectId, pendingDraftId } = useRouter();
+  // A bare project route shows a draft too (its newest, else a blank one), so the route's draft is
+  // the one WorkspaceContext resolved, not only an explicit ?draft= id.
+  const routeDraftId = workspaceContext?.pendingNewWorkspaceDraftId ?? pendingDraftId;
   const isMountedRef = useRef(true);
-  const latestRouteRef = useRef({ currentWorkspaceId, currentProjectId, pendingDraftId });
+  const latestRouteRef = useRef({ currentWorkspaceId, currentProjectId, routeDraftId });
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -290,7 +331,7 @@ export function useCreationWorkspace({
   }, []);
 
   // Keep router state fresh synchronously so auto-navigation checks don't lag behind route changes.
-  latestRouteRef.current = { currentWorkspaceId, currentProjectId, pendingDraftId };
+  latestRouteRef.current = { currentWorkspaceId, currentProjectId, routeDraftId };
   const { api } = useAPI();
   const liveApi = useLiveAPI();
   const { getProjectConfig, refreshProjects, loading: projectsLoading } = useProjectContext();
@@ -311,32 +352,18 @@ export function useCreationWorkspace({
 
   // Centralized draft workspace settings with automatic persistence
   const { settings, coderConfigFallback, sshHostFallback, setSelectedRuntime, setTrunkBranch } =
-    useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk);
+    useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk, draftId ?? "");
   const creationAgentId = resolveCreationAgentId(settings.agentId, agentBaseById);
 
-  // Persist draft workspace name generation state per draft (so multiple drafts don't share a
-  // single auto-naming/manual-name state).
-  const workspaceNameScopeId =
-    projectPath.trim().length > 0
-      ? isDraftId(draftId)
-        ? getDraftScopeId(projectPath, draftId)
-        : getPendingScopeId(projectPath)
-      : null;
-
-  // Project scope ID for reading send options at send time
-  const projectScopeId = getProjectScopeId(projectPath);
-
-  // Workspace name generation with debounce
-  // Backend tries the configured naming model first, then cheap models, then user's model
+  // The draft owns its AI choices and manual name (CreationDraftStore).
+  const creationScopeId = getCreationDraftScopeId(draftId ?? "");
+  const manualName = useCreationDraft(draftId ?? "").draft?.manualName ?? "";
+  const [isGeneratingName, setIsGeneratingName] = useState(false);
   const workspaceNameState = useWorkspaceName({
-    message,
-    debounceMs: 500,
-    userModel,
-    scopeId: workspaceNameScopeId,
+    manualName,
+    draftId: draftId ?? "",
+    isGenerating: isGeneratingName,
   });
-
-  // Destructure name state functions for use in callbacks
-  const { waitForGeneration } = workspaceNameState;
 
   // The project whose runtimes are shown. Only a new project shows the runtimes as "loading"
   // again: a new client (reconnect) reloads the same project behind the shown values.
@@ -395,7 +422,7 @@ export function useCreationWorkspace({
     };
   }, [trustPrompt]);
 
-  const handleSend = useCallback(
+  const handleSendOnce = useCallback(
     async (
       messageText: string,
       fileParts?: FilePart[],
@@ -410,6 +437,26 @@ export function useCreationWorkspace({
       const hasSendableAttachments = pendingFilesToStage.length > 0 || (fileParts?.length ?? 0) > 0;
       if ((!messageText.trim() && !hasSendableAttachments) || isSending || !liveApi) {
         return { success: false };
+      }
+
+      // Frozen from here (editor and project selector) until the send settles: the save, the name
+      // and the create all use the draft as it is now.
+      setIsSending(true);
+      setToast(null);
+
+      // Send creates from the saved draft: wait for every local change (a failed save stops it,
+      // keeping the draft).
+      if (isDraftId(draftId)) {
+        try {
+          await getCreationDraftStore().flush(draftId);
+        } catch (error) {
+          setToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: `The draft is not saved: ${getErrorMessage(error)}`,
+          });
+          return { success: false };
+        }
       }
 
       // Build runtime config early (used later for workspace creation)
@@ -469,29 +516,15 @@ export function useCreationWorkspace({
             })
           : null;
 
-      setIsSending(true);
-      setToast(null);
-
       let createdWorkspaceId: string | null = null;
 
       try {
-        // Wait for identity generation to complete (blocks if still in progress)
-        // Returns null if generation failed or manual name is empty (error already set in hook)
-        const identity = await waitForGeneration();
-        if (!identity) {
-          setIsSending(false);
-          return { success: false };
-        }
-
-        const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
-        const createTitle = normalizedTitle || undefined;
-
         // Read send options at send time: render state can lag a pick made just
         // before sending.
         // Override agentId from current draft settings so first-send uses the same
         // project/global/default resolution chain as the creation UI.
         const sendMessageOptions = {
-          ...getSendOptionsFromStorage(projectScopeId),
+          ...getSendOptionsFromStorage(creationScopeId),
           agentId: creationAgentId,
         };
         // Use normalized override if provided, otherwise fall back to already-normalized storage model
@@ -563,16 +596,29 @@ export function useCreationWorkspace({
           // Trust was confirmed and set, continue with creation
         }
 
+        // After the preflights, so that a hand-off reaches a create request.
+        setIsGeneratingName(true);
+        const creationName = await resolveCreationName({
+          api: liveApi,
+          manualName,
+          message,
+          attachmentOnly: messageText.trim().length === 0,
+          canHandOff: kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.WORKTREE,
+          candidates: userModel ? [userModel] : [],
+        }).finally(() => setIsGeneratingName(false));
+        const createTitle = creationName.title;
+
         const createResult =
           kind === "scratch"
             ? await liveApi.workspace.createScratch({ title: createTitle })
             : await liveApi.workspace.create({
                 projectPath,
-                branchName: identity.name,
+                branchName: creationName.branchName,
                 trunkBranch: settings.trunkBranch,
                 title: createTitle,
                 runtimeConfig,
                 subProjectPath: subProjectPath ?? undefined,
+                nameGeneration: creationName.nameGeneration,
               });
 
         if (!createResult.success) {
@@ -587,8 +633,6 @@ export function useCreationWorkspace({
 
         const { metadata } = createResult;
         createdWorkspaceId = metadata.id;
-        // Captured now: the form's name state can change while the rest of this send runs.
-        const submittedName = identity.name;
 
         // Best-effort: persist the initial AI settings to the backend immediately so this workspace
         // is portable across devices even before the first stream starts. Initial /goal commands do
@@ -615,41 +659,20 @@ export function useCreationWorkspace({
         const clearPendingDraft = () => {
           // Once the workspace exists, drop the draft even if the initial send fails
           // so we don't keep a hidden placeholder in the sidebar.
-          if (!projectPath) {
-            return;
-          }
-
-          if (isDraftScope && deleteWorkspaceDraft && typeof draftId === "string") {
+          if (!isDraftId(draftId)) return;
+          if (deleteWorkspaceDraft) {
             deleteWorkspaceDraft(projectPath, draftId);
             return;
           }
-
-          getDraftStore()
-            .deleteDraft(
-              getComposerDraftScope({
-                variant: "creation",
-                workspaceId: null,
-                creationProjectPath: projectPath,
-                pendingDraftId: draftId ?? undefined,
-              })
-            )
-            .catch(() => undefined);
-          // The default form's typed or generated name belongs to the workspace that now exists:
-          // left behind, the next visit offers it again and that create collides with the branch.
-          // Only this key: deleteWorkspaceStorage would drop every key of the pending scope.
-          // Only the submitted name: after a failed /goal hand-off save this runs once the command
-          // finishes, and the user may have typed the next workspace's name in the form by then.
-          const nameStateKey = getWorkspaceNameStateKey(getPendingScopeId(projectPath));
-          const currentName = getNameFromPersistedState(readPersistedState(nameStateKey, null));
-          // Trimmed like waitForGeneration trims a typed name before it is submitted.
-          if (currentName.trim() === submittedName) {
-            updatePersistedState(nameStateKey, undefined);
-          }
+          getCreationDraftStore()
+            .delete(draftId)
+            .catch((error: unknown) => console.error("Failed to delete a creation draft:", error));
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
         syncCreationPreferences(
           projectPath,
+          creationScopeId,
           metadata.id,
           creationAgentId,
           settings.reasoningMode,
@@ -664,7 +687,7 @@ export function useCreationWorkspace({
             if (!isMountedRef.current) return false;
             const latestRoute = latestRouteRef.current;
             if (latestRoute.currentWorkspaceId) return false;
-            return latestRoute.pendingDraftId === draftId;
+            return latestRoute.routeDraftId === draftId;
           })();
 
         // Navigate before staging: stageAttachment waits for runtime init, which
@@ -696,7 +719,7 @@ export function useCreationWorkspace({
               ? undefined
               : {
                   workspaceName: metadata.name,
-                  nameGenerated: workspaceNameState.autoGenerate,
+                  nameGenerated: manualName.trim().length === 0,
                   kind,
                   hookPath: projectPath,
                   timestamp: pendingUserMessage?.timestamp ?? Date.now(),
@@ -772,6 +795,7 @@ export function useCreationWorkspace({
           await initialAiSettingsPersisted;
           const commandEnv: SlashCommandEnv = {
             api: liveApi,
+            inlineRefs: NO_INLINE_REFS,
             workspaceId: metadata.id,
             variant: "workspace",
             projectPath: metadata.projectPath,
@@ -950,7 +974,7 @@ export function useCreationWorkspace({
       liveApi,
       isSending,
       projectPath,
-      projectScopeId,
+      creationScopeId,
       getProjectConfig,
       projectsLoading,
       onWorkspaceCreated,
@@ -962,9 +986,9 @@ export function useCreationWorkspace({
       settings.thinkingLevel,
       settings.reasoningMode,
       settings.trunkBranch,
-      waitForGeneration,
-      workspaceNameState.autoGenerate,
+      manualName,
       message,
+      userModel,
       subProjectPath,
       draftId,
       promoteWorkspaceDraft,
@@ -972,6 +996,21 @@ export function useCreationWorkspace({
       providersConfig,
     ]
   );
+  // `isSending` lags a render: a second Send before it lands would create a second workspace.
+  const sendingRef = useRef(false);
+  const handleSend: typeof handleSendOnce = async (...args) => {
+    if (sendingRef.current) return { success: false };
+    sendingRef.current = true;
+    let result: CreationSendResult = { success: false };
+    try {
+      result = await handleSendOnce(...args);
+      return result;
+    } finally {
+      sendingRef.current = false;
+      // A created workspace navigates away still frozen; any other outcome unfreezes.
+      if (!result.success) setIsSending(false);
+    }
+  };
 
   const trustDialog = trustPrompt
     ? createElement(ConfirmationModal, {

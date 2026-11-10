@@ -33,7 +33,7 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // +4 snapshots / +1 file: the Artifacts tab gallery (ArtifactsPanel.stories.tsx), consolidated
 // from 24 per-renderer variants to one phone and one laptop story in dark + light.
 // +6 snapshots / +1 file: Artifacts M4 chat cards (ArtifactToolCall.stories.tsx, phone + laptop
-// in dark + light) and the open version menu (ArtifactsPanel.stories.tsx, laptop dark + light).
+// in dark + light) and the open pin menu (ArtifactsPanel.stories.tsx, laptop dark + light).
 // +4 snapshots: Artifacts M5c Shelf group in the picker (ArtifactsPanel.stories.tsx, phone +
 // laptop in dark + light).
 // +4 snapshots / +1 file: Artifacts M5b messages sent from an artifact
@@ -51,7 +51,13 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // No growth for the sidebar launcher: NewTabLauncherNarrow shares its scene with empty
 // Output, replacing the separate OutputTabEmpty captures. Launcher keyboard/mobile
 // contracts and additional strip-overflow stories remain play-only.
-const MAX_SNAPSHOTS = 687;
+// +1 snapshot: the Skills CLI panel and its command (PluginsSettingsSection.stories.tsx
+// AddPluginSkillsCliCommand, laptop in dark; no other story shows it). The other install-method
+// stories in that file are play-only.
+// +2 snapshots: the Claude Code marketplace list of the Add panel (PluginsSettingsSection.stories.tsx
+// AddPluginMarketplace, laptop in dark, and AddPluginMarketplacePhoneViewport, phone in dark; no
+// other story shows the list).
+const MAX_SNAPSHOTS = 690;
 const MAX_SNAPSHOT_ENABLED_FILES = 120;
 
 const { values } = parseArgs({

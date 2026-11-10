@@ -215,8 +215,8 @@ function appendOmissionNote(request: MuxMessage, trim: Omit<CompactionInputTrim,
     `were left out and ${trim.omittedToolResults} tool results were replaced by size ` +
     "placeholders. Summarize what remains, and say in the summary that earlier history was " +
     "left out.]";
-  // Append inside the last text part: mergeConsecutiveUserMessages keeps one text part per
-  // message, so a separate note part could be dropped (see tagUserRowsWithHistoryItemIds).
+  // Append inside the last text part, so the note stays at the end of this row's text when it
+  // merges with a neighbour (see tagUserRowsWithHistoryItemIds).
   const lastText = request.parts.findLastIndex((part) => part.type === "text");
   const parts: Part[] =
     lastText === -1

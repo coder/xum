@@ -14,7 +14,7 @@ import type {
   DraftScope,
   PendingSend,
 } from "@/common/orpc/schemas/drafts";
-import { DraftService } from "./draftService";
+import { DRAFT_CHANGE_EVENT, DraftService } from "./draftService";
 import { resolveDraftSends } from "./draftSendResolution";
 import type { WorkspaceService } from "./workspaceService";
 
@@ -35,7 +35,7 @@ async function createHarness(tempDir: TestTempDir) {
   const file = path.join(config.sessionsDir, WORKSPACE_ID, "draft.json");
   const service = new DraftService(config);
   const events: DraftEvent[] = [];
-  service.on(DraftService.CHANGE_EVENT, (event: DraftEvent) => events.push(event));
+  service.on(DRAFT_CHANGE_EVENT, (event: DraftEvent) => events.push(event));
   return { config, file, service, events };
 }
 
@@ -123,6 +123,70 @@ describe("DraftService pending sends", () => {
       attachments: [],
     });
     expect((await service.get(SCOPE)).text).toBe("from the other window");
+  });
+
+  // #6405: the composer stays on from Enter, so keys typed before the take follow the sent text.
+  it("keeps keys typed right after the sent text, without the sent text", async () => {
+    using tempDir = new TestTempDir("drafts-pending-typed-after");
+    const { file, service } = await createHarness(tempDir);
+    await service.update({ scope: SCOPE, text: "first message" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "first message"),
+      attachments: [],
+      text: "first messagex",
+      localTake: { kind: "typed-after" },
+    });
+    expect((await service.get(SCOPE)).text).toBe("x");
+    expect((await readFile(file)).text).toBe("first message\n\nx");
+  });
+
+  it("repeats the sender's take only on the text the sender took it from", async () => {
+    using tempDir = new TestTempDir("drafts-pending-other-prefix");
+    const { service } = await createHarness(tempDir);
+    // Another window wrote it: it only starts with the sent text.
+    await service.update({ scope: SCOPE, text: "yesterday" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "yes"),
+      attachments: [],
+    });
+    expect((await service.get(SCOPE)).text).toBe("yesterday");
+    // The sender saved its typing, then another window wrote a newer text before the take.
+    await service.update({ scope: SCOPE, text: "yesx" });
+    await service.update({ scope: SCOPE, text: "yes, from the other window" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s2", "yes"),
+      attachments: [],
+      localTake: { kind: "typed-after", from: "yesx" },
+    });
+    expect((await service.get(SCOPE)).text).toBe("yes, from the other window");
+    // Saved and unchanged since: the prefix goes.
+    await service.update({ scope: SCOPE, text: "yesx" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s3", "yes"),
+      attachments: [],
+      localTake: { kind: "typed-after", from: "yesx" },
+    });
+    expect((await service.get(SCOPE)).text).toBe("x");
+  });
+
+  // #6585: the user replaced the composer text since Enter; the sender's take removed nothing.
+  it("keeps the whole text when the sender's take removed nothing", async () => {
+    using tempDir = new TestTempDir("drafts-pending-edited");
+    const { service } = await createHarness(tempDir);
+    const pasted = "Fix the bug in parser.ts";
+    await service.update({ scope: SCOPE, text: "Fix the bug" });
+    await service.beginSend({
+      scope: SCOPE,
+      pendingSend: pendingSend("s1", "Fix the bug"),
+      attachments: [],
+      text: pasted,
+      localTake: { kind: "edited" },
+    });
+    expect((await service.get(SCOPE)).text).toBe(pasted);
   });
 
   it("beginSend is idempotent by send id and refuses another payload under it", async () => {

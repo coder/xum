@@ -1,4 +1,4 @@
-import { userEvent, waitFor } from "@storybook/test";
+import { userEvent, waitFor } from "storybook/test";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { AppStory } from "@/browser/stories/meta.js";

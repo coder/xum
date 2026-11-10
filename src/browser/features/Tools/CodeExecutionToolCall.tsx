@@ -55,7 +55,7 @@ const ViewToggle: React.FC<ViewToggleProps> = ({
           "flex h-5 w-5 items-center justify-center rounded-full p-0.5 transition-colors",
           active && "bg-foreground/10",
           variant === "default" && "text-muted hover:text-foreground",
-          variant === "success" && "text-green-400 hover:text-green-300",
+          variant === "success" && "text-success-text hover:text-foreground",
           variant === "error" && "text-red-400 hover:text-red-300",
           variant === "warning" && "text-yellow-400 hover:text-yellow-300"
         )}

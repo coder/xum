@@ -76,6 +76,28 @@ export function useTranscriptRowDerivations(params: {
   };
 }
 
+// A new message snapshot (each stream delta, each page of older rows) recomputes navigation for
+// every prompt. Rows are memoized on prop identity, so an equal object is reused per prompt row
+// message (#4961 F20). Keyed weakly by the row's message object, so entries go away with it.
+const userMessageNavigationByMessage = new WeakMap<DisplayedMessage, UserMessageNavigation>();
+
+function reuseEqualUserMessageNavigation(
+  message: DisplayedMessage,
+  navigation: UserMessageNavigation
+): UserMessageNavigation {
+  const previous = userMessageNavigationByMessage.get(message);
+  if (
+    previous !== undefined &&
+    previous.prevUserMessageId === navigation.prevUserMessageId &&
+    previous.nextUserMessageId === navigation.nextUserMessageId &&
+    previous.onNavigate === navigation.onNavigate
+  ) {
+    return previous;
+  }
+  userMessageNavigationByMessage.set(message, navigation);
+  return navigation;
+}
+
 /**
  * Prev/next navigation between human prompts, keyed by historyId; null with fewer than two.
  * Separate from useTranscriptRowDerivations because ChatPane's navigate handler depends on
@@ -90,7 +112,7 @@ export function useUserMessageNavigation(params: {
   // Precompute per-user navigation objects so MessageRenderer rows receive stable prop
   // references across non-message updates (usage bumps, stats updates, etc.).
   return useMemo(() => {
-    const userHistoryIds: string[] = [];
+    const userMessages: Array<Extract<DisplayedMessage, { type: "user" }>> = [];
     for (const message of messages) {
       // Machine wakes and budget warnings should not interrupt navigation between human prompts.
       if (
@@ -100,22 +122,25 @@ export function useUserMessageNavigation(params: {
         message.agentPeerMessageTrigger == null &&
         message.contextBudgetWarning == null
       ) {
-        userHistoryIds.push(message.historyId);
+        userMessages.push(message);
       }
     }
 
-    if (userHistoryIds.length < 2) {
+    if (userMessages.length < 2) {
       return null;
     }
 
     const navigationByHistoryId = new Map<string, UserMessageNavigation>();
-    for (let index = 0; index < userHistoryIds.length; index++) {
-      navigationByHistoryId.set(userHistoryIds[index], {
-        prevUserMessageId: index > 0 ? userHistoryIds[index - 1] : undefined,
-        nextUserMessageId:
-          index < userHistoryIds.length - 1 ? userHistoryIds[index + 1] : undefined,
-        onNavigate: onNavigateToMessage,
-      });
+    for (let index = 0; index < userMessages.length; index++) {
+      const message = userMessages[index];
+      navigationByHistoryId.set(
+        message.historyId,
+        reuseEqualUserMessageNavigation(message, {
+          prevUserMessageId: userMessages[index - 1]?.historyId,
+          nextUserMessageId: userMessages[index + 1]?.historyId,
+          onNavigate: onNavigateToMessage,
+        })
+      );
     }
 
     return navigationByHistoryId;
@@ -147,15 +172,12 @@ export interface TranscriptRowProps {
 export function getTranscriptRowProps(params: {
   derivations: TranscriptRowDerivations;
   userMessageNavigationByHistoryId: ReadonlyMap<string, UserMessageNavigation> | null;
-  messages: readonly DisplayedMessage[];
   message: DisplayedMessage;
   index: number;
 }): TranscriptRowProps {
   const { derivations, message } = params;
   const bashOutputGroup = derivations.bashOutputGroupInfos[params.index];
-  const bashGroupKey = bashOutputGroup
-    ? params.messages[bashOutputGroup.firstIndex]?.id
-    : undefined;
+  const bashGroupKey = bashOutputGroup?.groupKey;
   const isBashGroupExpanded = bashGroupKey
     ? derivations.expandedBashGroups.has(bashGroupKey)
     : false;

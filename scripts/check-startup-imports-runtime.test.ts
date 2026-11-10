@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
 // Fixture tests for scripts/check-startup-imports-runtime.ts. Each test writes a tiny
 // project to a temp dir and loads its main.js through the real Node harness.
 import { afterEach, beforeEach, expect, test } from "bun:test";

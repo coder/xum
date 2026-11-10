@@ -1,9 +1,11 @@
 import { RuntimeConfigSchema } from "@/common/orpc/schemas/runtime";
+import { AgentResourceLimitsSchema } from "@/common/config/schemas/agentResourceLimits";
 import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
   AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
   AgentMessageDispatchModeSchema,
   BestOfGroupSchema,
+  MESSAGING_TAG_DESCRIPTION,
   ProjectRefSchema,
   UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   WorkflowTaskMetadataSchema,
@@ -141,6 +143,13 @@ export const WorkspaceConfigSchema = z.object({
   unrelatedWorkspaceConsent: z.string().optional().meta({
     description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   }),
+  messagingTag: z.string().optional().meta({
+    description: MESSAGING_TAG_DESCRIPTION,
+  }),
+  messagingTagGeneration: z.string().optional().meta({
+    description:
+      "Revocation generation for messagingTag, re-minted on every tag change (set or clear). Tag-linked sends capture both endpoints' generations at admission and refuse if either changed, so a clear/re-tag cycle cannot revive queued input. Never published on metadata.",
+  }),
   unrelatedWorkspaceConsentPending: z.literal(true).optional().meta({
     description:
       "Set in the same write that registers a new root workspace that gets default unrelated-messaging consent once its setup completes. The grant runs only while this is set and consumes it; an explicit consent toggle (from any backend sharing this root) clears it, so the default can never reverse a choice already made (#4446).",
@@ -152,6 +161,10 @@ export const WorkspaceConfigSchema = z.object({
   delegatedCreation: DelegatedCreationMarkSchema.optional().meta({
     description:
       "Set by a delegated task(kind: workspace, mode: new) in the same write that registers this target, and dropped once the creating handle's record persists. Binds the row to its handle and owner: the public create API cannot write it (#4983). interruptedAt is added by the startup resolver when the creator died before the record persisted.",
+  }),
+  bornWithoutDelegation: z.literal(true).optional().meta({
+    description:
+      "Set by the public create and createScratch in the same write that registers a row without a delegatedCreation mark, and never added or cleared later. Only a mode new task creation writes a creating workspace-turn record, so a row with this stamp has no workspace turn (#5569). Rows from other paths, and older rows, lack it.",
   }),
   agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
     description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
@@ -392,6 +405,11 @@ export const ProjectConfigSchema = z.object({
   color: z.string().optional().meta({
     description: "Project folder accent color (hex value like #5a9bd4 or preset name)",
   }),
+  // A plain string, not the picker enum, so an unknown name never fails the projects.list output.
+  icon: z.string().optional().meta({
+    description:
+      'Lucide icon name shown instead of the project\'s initial in the flat sidebar (e.g. "rocket")',
+  }),
   /**
    * Parent project path when this project is a one-level sub-project. Parentage is
    * re-derived from registered paths during project load/list so stale persisted
@@ -433,6 +451,10 @@ export const ProjectConfigSchema = z.object({
   codeWorkspaceSyncPath: z.string().optional().meta({
     description:
       "Path to a VS Code .code-workspace file kept in sync with this project's active worktrees (relative paths resolve against the project root). Unset = sync disabled.",
+  }),
+  agentResourceLimits: AgentResourceLimitsSchema.optional().meta({
+    description:
+      "CPU and memory that the local agent commands of this project share (Linux cgroup v2), inside the limit that all projects share. Absent = no project limit.",
   }),
 });
 

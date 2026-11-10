@@ -30,6 +30,7 @@ import { getSelfIdentity, judgeHolder } from "@/node/utils/concurrency/processLi
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
+import type { HistoryService } from "@/node/services/historyService";
 import { log } from "@/node/services/log";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { WORKFLOW_RUN_TASK_ID_PREFIX } from "@/node/services/tools/taskId";
@@ -63,7 +64,11 @@ import { parseDeclaredPhasesFromSource } from "./workflowMetadata";
 import { hydrateWorkflowRunPhaseManifest } from "./workflowPhaseManifest";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { parseWorkflowDescription, parseWorkflowName } from "./workflowDescription";
-import { resolveWorkflowScript, type ResolvedWorkflowScript } from "./workflowScriptResolver";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+  type ResolvedWorkflowScript,
+} from "./workflowScriptResolver";
 import {
   createProductionWorkflowTaskAdapter,
   DEFAULT_WORKFLOW_AGENT_ID,
@@ -99,6 +104,18 @@ export interface WorkflowServiceOptions {
    */
   evaluationAdapter?: WorkflowEvaluationPort;
   resolveWorkflowScript?: (scriptPath: string) => Promise<ResolvedWorkflowScript>;
+  /**
+   * The consent gate for a stored plugin or skill run (#6629, #6777,
+   * `assertStoredPluginWorkflowReviewed`): resume admission checks the snapshotted source with it.
+   * Absent ⇒ plugin and non-built-in skill runs never resume.
+   */
+  assertStoredPluginWorkflowReviewed?: (stored: {
+    scriptPath: string;
+    source: string;
+    scope: "project" | "global";
+    /** skill:// runs: where the skill came from; absent on legacy records (#6826). */
+    skillPluginName?: string | null;
+  }) => Promise<void>;
   onBackgroundRunTerminal?: (event: WorkflowBackgroundRunTerminalEvent) => Promise<void> | void;
   onRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   /** When true, background terminal notifications also fire for interrupted runs. */
@@ -197,6 +214,21 @@ function isThisProcessIncarnation(starter: WorkflowRunStarterRecord): boolean {
   );
 }
 
+/**
+ * The source kind of a stored run. A record from before `sourceKind` existed omits it (the schema
+ * accepts that shape), so its script path decides: a legacy `plugin://` or `skill://` run must
+ * still pass resume admission (#6777).
+ */
+function storedRunSourceKind(
+  sourceKind: WorkflowRunRecord["workflow"]["sourceKind"],
+  scriptPath: string | undefined
+): WorkflowRunRecord["workflow"]["sourceKind"] {
+  if (sourceKind !== undefined) return sourceKind;
+  if (scriptPath?.startsWith("plugin://")) return "plugin";
+  if (scriptPath?.startsWith("skill://")) return "skill";
+  return undefined;
+}
+
 export class WorkflowService {
   private readonly runStore: WorkflowRunStore;
   private readonly runtimeFactory: IJSRuntimeFactory;
@@ -207,6 +239,7 @@ export class WorkflowService {
   ) => WorkflowTaskAdapter;
   private readonly evaluationAdapter?: WorkflowEvaluationPort;
   private readonly resolveWorkflowScript?: (scriptPath: string) => Promise<ResolvedWorkflowScript>;
+  private readonly assertStoredPluginWorkflowReviewed?: WorkflowServiceOptions["assertStoredPluginWorkflowReviewed"];
   private readonly onBackgroundRunTerminal?: (
     event: WorkflowBackgroundRunTerminalEvent
   ) => Promise<void> | void;
@@ -234,6 +267,7 @@ export class WorkflowService {
     this.taskAdapterFactory = options.taskAdapterFactory;
     this.evaluationAdapter = options.evaluationAdapter;
     this.resolveWorkflowScript = options.resolveWorkflowScript;
+    this.assertStoredPluginWorkflowReviewed = options.assertStoredPluginWorkflowReviewed;
     this.onBackgroundRunTerminal = options.onBackgroundRunTerminal;
     this.onRunStatusChanged = options.onRunStatusChanged;
     this.notifyInterruptedBackgroundRunTerminal =
@@ -543,6 +577,7 @@ export class WorkflowService {
     );
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
+    await this.assertStoredRunReviewed(run);
     assertWorkflowRunCanRetryFromCheckpoint(run);
     // A checkpoint retry dispatched in the background is non-blocking just like background resume:
     // persist notify_on_terminal before starting the background runner.
@@ -569,6 +604,7 @@ export class WorkflowService {
     );
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
+    await this.assertStoredRunReviewed(run);
     assertWorkflowRunCanTransition(run.status, "running");
     // A run resumed in the background becomes non-blocking; persist so future stream-ends do not
     // re-force a task_await even if the run was originally started in the foreground.
@@ -594,6 +630,7 @@ export class WorkflowService {
     );
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
+    await this.assertStoredRunReviewed(run);
     assertWorkflowRunCanTransition(run.status, "running");
     return await this.runForegroundWithAbortInterrupt({
       workspaceId: input.workspaceId,
@@ -618,6 +655,7 @@ export class WorkflowService {
     );
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
+    await this.assertStoredRunReviewed(run);
     assertWorkflowRunCanRetryFromCheckpoint(run);
     return await this.runForegroundWithAbortInterrupt({
       workspaceId: input.workspaceId,
@@ -861,7 +899,7 @@ export class WorkflowService {
     failureMessage: string;
   }): Promise<boolean> {
     const projectTrusted = await this.resolveCurrentProjectTrust(input.projectTrusted);
-    const candidate = await this.getCrashRecoverableRun(input.runId);
+    const candidate = await this.getReviewedCrashRecoverableRun(input.runId);
     if (candidate === "starter-not-gone") {
       // The pending run's starter may still crash before writing `running`, and nothing else
       // re-runs this scan, so check again later (the retry stops once the run leaves pending).
@@ -896,6 +934,51 @@ export class WorkflowService {
       }
       console.error(input.failureMessage, error);
       return false;
+    }
+  }
+
+  /**
+   * Resume admission for a stored run (#6629): a plugin or skill run continues the source
+   * snapshotted at start, never the current file, so that snapshot must still match the plugin's
+   * consent record. Skill runs count too (#6777): a managed plugin skill's `workflow.js` has a
+   * record. Built-in skills ship with Xum and pass. Fails closed when this service has no gate.
+   */
+  private async assertStoredRunReviewed(
+    run: Pick<WorkflowRunRecord, "workflow" | "source">
+  ): Promise<void> {
+    const { scope } = run.workflow;
+    const scriptPath = run.workflow.canonicalScriptPath ?? run.workflow.sourcePath;
+    const sourceKind = storedRunSourceKind(run.workflow.sourceKind, scriptPath);
+    if (sourceKind !== "plugin" && (sourceKind !== "skill" || scope === "built-in")) return;
+    const gate = this.assertStoredPluginWorkflowReviewed;
+    if (gate === undefined || scriptPath === undefined || scope === "built-in") {
+      throw new Error("Xum cannot check this workflow's consent, so the run cannot resume");
+    }
+    await gate({
+      scriptPath,
+      source: run.source,
+      scope,
+      ...(run.workflow.skillPluginName !== undefined
+        ? { skillPluginName: run.workflow.skillPluginName }
+        : {}),
+    });
+  }
+
+  /**
+   * Crash recovery's candidate after `assertStoredRunReviewed` (#6629): a refused run is logged
+   * and not recovered.
+   */
+  private async getReviewedCrashRecoverableRun(
+    runId: string
+  ): Promise<WorkflowRunRecord | "starter-not-gone" | null> {
+    const candidate = await this.getCrashRecoverableRun(runId);
+    if (candidate === null || candidate === "starter-not-gone") return candidate;
+    try {
+      await this.assertStoredRunReviewed(candidate);
+      return candidate;
+    } catch (error) {
+      log.warn(`Not resuming workflow run ${runId}: ${getErrorMessage(error)}`);
+      return null;
     }
   }
 
@@ -1243,11 +1326,13 @@ export class WorkflowService {
       stepId: input.stepId,
       inputHash: input.inputHash,
     });
-    try {
-      return await this.runStore.getRun(childRunId);
-    } catch {
-      // No existing child run for this replay identity; resolve and snapshot below.
+    const existing = await this.runStore.getRun(childRunId).catch(() => null);
+    if (existing !== null) {
+      // A replayed child continues its snapshot, so it passes the same admission as a resume.
+      await this.assertStoredRunReviewed(existing);
+      return existing;
     }
+    // No existing child run for this replay identity; resolve and snapshot below.
 
     const resolveScript = this.resolveWorkflowScript;
     assert(resolveScript != null, "Nested workflows are not supported by this workflow service");
@@ -1346,6 +1431,8 @@ export interface WorkflowServiceContext {
   workspaceService: WorkspaceService;
   taskService: TaskService;
   workflowRuntimeFactory: IJSRuntimeFactory;
+  /** Its locks guard the parent's patch artifact index writes (phase 4: SessionLocks). */
+  historyService: Pick<HistoryService, "locks">;
 }
 
 export interface WorkflowStartRequest {
@@ -1398,6 +1485,7 @@ export async function resolveWorkflowContext(
     runtime,
     workspacePath,
     xumScope: context.aiService.resolveXumToolScopeForWorkspace(metadata, runtime, workspacePath),
+    runtimeFactory: context.aiService.runtimeFactory,
   });
   const workflowRuntimeTempDir = runtime.normalizePath(".xum/tmp", workspacePath);
 
@@ -1440,6 +1528,7 @@ export async function resolveWorkflowContext(
             runtimeTempDir: workflowRuntimeTempDir,
             workspaceSessionDir: path.join(context.config.sessionsDir, workspaceId),
             trusted: projectTrusted,
+            sessionLocks: context.historyService.locks,
           },
           getProjectTrusted: resolveWorkflowProjectTrusted,
         }),
@@ -1451,6 +1540,17 @@ export async function resolveWorkflowContext(
           projectSearchRoot: workspaceRootPath,
           projectTrusted: resolveWorkflowProjectTrusted(),
           skillStorageContext,
+          runtimeFactory: context.aiService.runtimeFactory,
+        }),
+      assertStoredPluginWorkflowReviewed: (stored) =>
+        assertStoredPluginWorkflowReviewed({
+          ...stored,
+          runtime,
+          workspacePath,
+          projectSearchRoot: workspaceRootPath,
+          projectTrusted: resolveWorkflowProjectTrusted(),
+          skillStorageContext,
+          runtimeFactory: context.aiService.runtimeFactory,
         }),
       // Settled markers are keyed by the run's terminal generation, so a resumed run's next
       // terminal transition re-arms attention by itself; only the downgrade-compat stable
@@ -1634,6 +1734,7 @@ export async function startWorkflowRun(
     projectSearchRoot: resolved.projectSearchRoot,
     projectTrusted: resolved.projectTrusted,
     skillStorageContext: resolved.skillStorageContext,
+    runtimeFactory: context.aiService.runtimeFactory,
   });
   if (input.rawCommand != null) {
     await context.workspaceService.prepareManualWorkflowInvocation(input.workspaceId);
@@ -1702,6 +1803,7 @@ export async function listWorkflowScripts(
     projectSearchRoot: resolved.projectSearchRoot,
     projectTrusted: resolved.projectTrusted,
     skillStorageContext: resolved.skillStorageContext,
+    runtimeFactory: context.aiService.runtimeFactory,
   });
 }
 
@@ -1723,6 +1825,7 @@ export function buildWorkflowScriptDescriptor(
     canonicalScriptPath: script.canonicalScriptPath,
     sourceKind: script.sourceKind,
     sourceHash: script.sourceHash,
+    ...(script.skillPluginName !== undefined ? { skillPluginName: script.skillPluginName } : {}),
     executable: true,
   };
 }

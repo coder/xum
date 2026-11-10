@@ -5,11 +5,16 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { installDom } from "../../../../../tests/ui/dom";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
-import { buildMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
+import { buildMcpAppCsp, mcpAppPreambleScript } from "./mcpAppCsp";
+import { createFrameDocumentChannel } from "./frameDocumentChannel";
 import { createMcpAppHost, type McpAppConsentRequest } from "./mcpAppHost";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
+import { restoreHistoryPrototypeAfterEach } from "./historyPrototype.testHarness";
+
+restoreHistoryPrototypeAfterEach();
 
 interface OpenAi {
+  toolInput: unknown;
   toolOutput: unknown;
   toolResponseMetadata: unknown;
   widgetState: unknown;
@@ -37,11 +42,15 @@ const SEED: McpAppOpenAiSeed = {
 function viewDocument(viewHtml: string, seed: McpAppOpenAiSeed = SEED): string {
   return finalizeSandboxedDocument(parseArtifactHtml(viewHtml), {
     csp: buildMcpAppCsp(GRANTED),
-    bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(seed)],
+    bridgeScript: [mcpAppPreambleScript("00"), mcpAppOpenAiShimScript(seed)],
   });
 }
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+/** Port messages arrive asynchronously: wait for a few round trips. */
+async function settle() {
+  for (let i = 0; i < 5; i++) await tick();
+}
 
 /**
  * Run a view document (scripts on) in its own happy-dom window, wired to a real host through a
@@ -55,6 +64,10 @@ async function runView(
     seed?: McpAppOpenAiSeed;
     /** The host does not answer (yet): what the view sees before any handshake reply. */
     silentHost?: boolean;
+    /** Runs once the host posted the lifecycle, before the view received any of it. */
+    afterLifecyclePosted?: (win: ViewWindow) => void;
+    /** Only tool-input after the handshake: the test sends the rest itself. */
+    inputOnly?: boolean;
   } = {}
 ) {
   const win = new Window({
@@ -64,7 +77,18 @@ async function runView(
     },
   }) as unknown as ViewWindow;
   // Bun's vm contexts lack the JS builtins happy-dom expects there; lend this realm's.
-  for (const name of ["Object", "Array", "Map", "Promise", "JSON", "String", "Number", "Error"]) {
+  // MessageChannel too: happy-dom has none, and the preamble opens the host channel with it.
+  for (const name of [
+    "Object",
+    "Array",
+    "Map",
+    "Promise",
+    "JSON",
+    "String",
+    "Number",
+    "Error",
+    "MessageChannel",
+  ]) {
     Object.defineProperty(win, name, { value: (globalThis as Record<string, unknown>)[name] });
   }
   const warnings: string[] = [];
@@ -73,18 +97,25 @@ async function runView(
   const consents: McpAppConsentRequest[] = [];
   const composer: string[] = [];
   const calls: Array<{ toolName: string; args: unknown }> = [];
-  const parent = {
-    postMessage: (message: { method?: string; params?: unknown }) => {
-      posted.push(message);
+  const savedStates: unknown[] = [];
+  // The view document's channel (frameDocumentChannel.ts), as McpAppFrame binds it.
+  const channel = createFrameDocumentChannel("00");
+  channel.setReceiver({
+    message: (message) => {
+      posted.push(message as { method?: string; params?: unknown });
       if (!options.silentHost) void host.handleMessage(message);
     },
+    leave: () => undefined,
+  });
+  const parent = {
+    postMessage: (data: unknown, _origin: string, ports: MessagePort[] = []) =>
+      channel.acceptOpen({ data, ports }),
   };
   Object.defineProperty(win, "parent", { value: parent, configurable: true });
   const host = createMcpAppHost({
     serverName: "dice",
     grantedCsp: GRANTED,
-    postToView: (data) =>
-      win.dispatchEvent(new win.MessageEvent("message", { data, source: parent as never })),
+    postToView: (data) => channel.post(data),
     getHostContext: () => ({
       theme: "dark",
       styles: { variables: {} },
@@ -102,6 +133,7 @@ async function runView(
     },
     readResource: () => Promise.reject(new Error("unused")),
     updateModelContext: () => Promise.resolve(),
+    saveWidgetState: (state) => savedStates.push(state),
     setDisplayMode: () => null,
     requestConsent: (request) => {
       consents.push(request);
@@ -112,7 +144,9 @@ async function runView(
     onSizeChanged: () => undefined,
     onInitialized: () => {
       host.sendToolInput({ count: 2 });
+      if (options.inputOnly) return;
       host.sendToolResult({ structuredContent: { dice: [3, 5] }, _meta: { seed: 7 } });
+      options.afterLifecyclePosted?.(win);
     },
     log: () => undefined,
   });
@@ -123,8 +157,8 @@ async function runView(
       options.seed
     )
   );
-  for (let i = 0; i < 5; i++) await tick();
-  return { win, host, posted, consents, composer, calls, warnings };
+  await settle();
+  return { win, host, posted, consents, composer, calls, warnings, savedStates };
 }
 
 const COLLECT_EVENTS = `window.events = [];
@@ -169,6 +203,7 @@ describe("window.openai shim", () => {
     expect(t.win.document.documentElement.lang).toBe("de-DE");
     // host-context-changed fires the event too.
     t.host.sendHostContextChanged({ theme: "light" });
+    await settle();
     expect(t.win.events.at(-1)).toEqual({ theme: "light" });
   });
 
@@ -200,7 +235,7 @@ describe("window.openai shim", () => {
       o.requestClose().catch(function () {});
       o.setWidgetState({ a: 1 });
       window.widgetAfter = o.widgetState;
-      o.setOpenInAppUrl({ href: "https://example.com" });
+      window.openInApp = o.setOpenInAppUrl ? "host" : "own link";
       // The Apps SDK feature-detection pattern: no file APIs here, so the view uses its own.
       window.picker = o.selectFiles ? "library" : o.uploadFile ? "upload" : "own input";
       window.modal = o.requestModal ? "host modal" : "own dialog";
@@ -211,7 +246,54 @@ describe("window.openai shim", () => {
     expect((t.win as unknown as { widgetAfter: unknown }).widgetAfter).toEqual({ a: 1 });
     expect((t.win as unknown as { picker: unknown }).picker).toBe("own input");
     expect((t.win as unknown as { modal: unknown }).modal).toBe("own dialog");
-    expect(t.warnings).toHaveLength(2);
+    // Xum does not use the URL, so the member is absent and the widget keeps its own link.
+    expect((t.win as unknown as { openInApp: unknown }).openInApp).toBe("own link");
+    expect(t.warnings).toHaveLength(1);
+  });
+
+  test("widget state starts from the stored state, and each setWidgetState is saved", async () => {
+    const t = await runView(
+      `window.atLoad = window.openai.widgetState;
+      window.openai.setWidgetState({ step: 3 });
+      window.openai.setWidgetState({ step: 4 });
+      window.done = true;`,
+      // A value with "</script>" cannot end the shim's script element.
+      { seed: { ...SEED, widgetState: { step: 2, note: "</script>" } } }
+    );
+    expect(t.win.done).toBe(true);
+    expect((t.win as unknown as { atLoad: unknown }).atLoad).toEqual({
+      step: 2,
+      note: "</script>",
+    });
+    // In order: the first at once, the newest after the shim's send interval.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await settle();
+    expect(t.savedStates).toEqual([{ step: 3 }, { step: 4 }]);
+  });
+
+  test("a burst of setWidgetState calls sends the first at once and the newest last", async () => {
+    // A slider drag: more calls than the document channel's rate limit lets through.
+    const t = await runView(
+      `for (var i = 1; i <= 30; i++) window.openai.setWidgetState({ n: i });
+      window.done = true;`
+    );
+    expect(t.win.done).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await settle();
+    expect(t.savedStates[0]).toEqual({ n: 1 });
+    expect(t.savedStates.at(-1)).toEqual({ n: 30 });
+    expect(t.savedStates.length).toBeLessThan(5);
+  });
+
+  test("seeded widget state round-trips as JSON, also a __proto__ key", async () => {
+    const t = await runView(
+      `var s = window.openai.widgetState;
+      window.result = { own: Object.prototype.hasOwnProperty.call(s, "__proto__"), flag: s.flag };
+      window.done = true;`,
+      { seed: { ...SEED, widgetState: JSON.parse('{"__proto__":{"flag":true}}') as unknown } }
+    );
+    expect(t.win.done).toBe(true);
+    expect((t.win as unknown as { result: unknown }).result).toEqual({ own: true });
   });
 
   test("host context is in the globals before any view script reads them", async () => {
@@ -243,13 +325,22 @@ describe("window.openai shim", () => {
   });
 
   /** The view's own MCP Apps client connecting after the shim did (a hybrid view). */
-  function connectStandardClient(t: Awaited<ReturnType<typeof runView>>) {
+  function connectStandardClient(
+    t: { win: ViewWindow },
+    data: Array<{ method?: string; params?: unknown }> = []
+  ) {
     const received: string[] = [];
     const parent = t.win.parent as unknown as { postMessage: (message: unknown) => void };
+    // Like the ext-apps SDK: handlers first, then the transport listener, then initialize.
     t.win.addEventListener("message", (event) => {
-      const { data, source } = event as unknown as { data: { method?: string }; source: unknown };
+      const message = event as unknown as {
+        data: { method?: string; params?: unknown };
+        source: unknown;
+      };
       // The ext-apps SDK's PostMessageTransport accepts only messages from window.parent.
-      if (source === parent && data.method !== undefined) received.push(data.method);
+      if (message.source !== parent || message.data.method === undefined) return;
+      received.push(message.data.method);
+      data.push(structuredClone(message.data));
     });
     parent.postMessage({ jsonrpc: "2.0", id: 99, method: "ui/initialize", params: {} });
     parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
@@ -269,6 +360,52 @@ describe("window.openai shim", () => {
       "ui/initialize",
       "ui/notifications/initialized",
     ]);
+  });
+
+  // A hybrid view whose client connects while the lifecycle the shim's handshake took is still
+  // on its way: the client gets it from the host, so the shim must not replay it.
+  test("a client that connects while the lifecycle is in flight gets each message once", async () => {
+    let received: string[] = [];
+    await runView("window.openai.toolOutput;", {
+      afterLifecyclePosted: (win) => {
+        received = connectStandardClient({ win });
+      },
+    });
+    await settle();
+    expect(received).toEqual(["ui/notifications/tool-input", "ui/notifications/tool-result"]);
+  });
+
+  // #6181: the client's ui/initialize falls between tool-input and tool-result. The shim
+  // replays tool-input, and tool-result must still come after it.
+  test("a client that connects inside the lifecycle gets tool-input before tool-result", async () => {
+    const t = await runView("window.openai.toolInput;", { inputOnly: true });
+    expect(t.win.openai.toolInput).toEqual({ count: 2 });
+    const received = connectStandardClient(t);
+    t.host.sendToolResult({ structuredContent: { dice: [3, 5] } });
+    await settle();
+    expect(received).toEqual(["ui/notifications/tool-input", "ui/notifications/tool-result"]);
+    expect(t.win.openai.toolOutput).toEqual({ dice: [3, 5] });
+  });
+
+  test("a widget that mutates toolOutput does not change what its own client is replayed", async () => {
+    const t = await runView("window.openai.toolOutput;");
+    (t.win.openai.toolOutput as { dice: number[] }).dice.push(99);
+    const data: Array<{ method?: string; params?: unknown }> = [];
+    connectStandardClient(t, data);
+    await settle();
+    expect(data.find((m) => m.method === "ui/notifications/tool-result")?.params).toEqual({
+      structuredContent: { dice: [3, 5] },
+      _meta: { seed: 7 },
+    });
+  });
+
+  // OpenAI's useOpenAiGlobal reads a global, but a widget may only listen for the event.
+  test("a widget that only listens for openai:set_globals still gets its tool data", async () => {
+    const t = await runView(COLLECT_EVENTS);
+    await settle();
+    expect(t.win.events.some((globals) => "toolOutput" in globals)).toBe(true);
+    expect(t.win.openai.toolOutput).toEqual({ dice: [3, 5] });
+    expect(t.posted.filter((m) => m.method === "ui/initialize")).toHaveLength(1);
   });
 
   test("a standard-only view gets the lifecycle once, with no shim handshake", async () => {
@@ -293,10 +430,13 @@ describe("window.openai shim", () => {
       t.posted.filter((m) => (m as { id?: unknown }).id === "host-1").length;
     const shimOnly = await runView("window.openai.toolOutput;");
     void shimOnly.host.teardown("unmount");
+    await settle();
     expect(teardownReplies(shimOnly)).toBe(1);
     const hybrid = await runView("window.openai.toolOutput;");
     connectStandardClient(hybrid);
+    await settle();
     void hybrid.host.teardown("unmount");
+    await settle();
     expect(teardownReplies(hybrid)).toBe(0);
   });
 

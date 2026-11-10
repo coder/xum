@@ -19,7 +19,9 @@
  */
 
 import assert from "node:assert";
-import type { Tool } from "ai";
+import { clockOf, type HostClock } from "@/node/utils/hostClock";
+import { randomUUID } from "node:crypto";
+import { asSchema, type FlexibleSchema, type Tool } from "ai";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
@@ -37,7 +39,9 @@ import {
 } from "@/node/services/hooks";
 import {
   eventSpine,
+  type HookTurn,
   type ToolExecuteContext,
+  type ToolInputParseResult,
   type WaterfallNext,
 } from "@/node/services/events/eventSpine";
 import { log } from "@/node/services/log";
@@ -53,11 +57,15 @@ export interface HookConfig {
   workspaceId: string;
   /** Additional environment variables to pass to hooks */
   env?: Record<string, string>;
+  /** See ToolExecutionHost.turn. */
+  turn?: HookTurn;
+  /** See ToolExecutionHost.clock. */
+  clock?: HostClock;
 }
 
 /**
  * Derive the hook config every hook-wrapped tool runs with, or null when
- * hooks must not run. Host-side reads (mux.load and intuition) share this
+ * hooks must not run. Host-side reads (mux.load) share this
  * trust gate with public tools: repo-controlled hooks run only for trusted projects.
  */
 export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | null {
@@ -81,6 +89,8 @@ export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | nu
       ...(config.xumEnv ?? {}),
       ...(config.secrets ?? {}),
     },
+    turn: config.hookTurn,
+    clock: config.clock,
   };
 }
 
@@ -127,19 +137,19 @@ export function withHooks<TParameters, TResult>(
   const wrappedToolRecord = wrappedTool as any as Record<string, unknown>;
 
   wrappedToolRecord.execute = async (args: TParameters, options: unknown) => {
-    // Extract abort signal from tool options (if present)
-    const abortSignal =
-      options && typeof options === "object" && "abortSignal" in options
-        ? (options as { abortSignal?: AbortSignal }).abortSignal
-        : undefined;
+    // The abort signal and the call ID from the AI SDK's tool options, when present.
+    const abortSignal = readToolOption(options, "abortSignal") as AbortSignal | undefined;
+    const toolCallId = readToolOption(options, "toolCallId");
 
     const outcome = await runThroughToolHookPipeline({
       toolName,
       args,
       config,
       abortSignal,
+      ...(typeof toolCallId === "string" ? { toolCallId } : {}),
       // The full schema: OpenAI requests carry a sanitized copy that drops constraints.
       inputJsonSchema: () => extractToolJsonSchema(unsanitizedTool(tool)),
+      parseInput: toolInputParser(unsanitizedTool(tool)),
       mcpOrigin: readMcpToolOrigin(tool),
       execute: (currentArgs) =>
         Promise.resolve(executeFn.call(tool, currentArgs, options) as TResult | Promise<TResult>),
@@ -149,6 +159,59 @@ export function withHooks<TParameters, TResult>(
   };
 
   return wrappedTool;
+}
+
+/**
+ * The parser the AI SDK runs on a model's tool input (a Zod schema's refinements, defaults and
+ * transforms), for a hook rewrite to pass too. Undefined when the schema has none: a plain JSON
+ * schema (MCP tools) is checked by the hook runner's validator alone.
+ */
+function toolInputParser(
+  rawTool: unknown
+): ((value: unknown) => Promise<ToolInputParseResult>) | undefined {
+  const raw =
+    rawTool !== null && typeof rawTool === "object"
+      ? (rawTool as { inputSchema?: unknown }).inputSchema
+      : undefined;
+  const schema = parserSchemaOf(raw);
+  const validate = schema?.validate;
+  if (typeof validate !== "function") return undefined;
+  return async (value) => {
+    try {
+      const parsed = (await (validate as (value: unknown) => unknown).call(schema, value)) as {
+        success?: unknown;
+        value?: unknown;
+      };
+      return parsed.success === true ? { success: true, value: parsed.value } : { success: false };
+    } catch {
+      // A validator that throws rejects the value, as in the AI SDK's own validation (Codex
+      // PRRT_kwDOPxxmWM6s5MCy).
+      return { success: false };
+    }
+  };
+}
+
+/**
+ * The schema whose `validate` the AI SDK runs: asSchema converts a standard schema (Zod) and a
+ * lazy schema (a function, Codex PRRT_kwDOPxxmWM6s5MCg). A plain object would make asSchema call
+ * the object as a lazy schema (see extractToolJsonSchema), so only jsonSchema() wrappers pass
+ * through as-is.
+ */
+function parserSchemaOf(raw: unknown): { validate?: unknown } | undefined {
+  if (typeof raw === "function") return asSchema(raw as FlexibleSchema<unknown>);
+  if (raw === null || typeof raw !== "object") return undefined;
+  return "~standard" in raw ? asSchema(raw as FlexibleSchema<unknown>) : raw;
+}
+
+function readToolOption(options: unknown, key: "abortSignal" | "toolCallId"): unknown {
+  return options !== null && typeof options === "object" && key in options
+    ? (options as Record<string, unknown>)[key]
+    : undefined;
+}
+
+/** A host-side call (mux.load) has no SDK call ID: its Pre and Post hooks share one. */
+function hookCallId(toolCallId: string | undefined): string {
+  return toolCallId ?? `xum-hook-call-${randomUUID()}`;
 }
 
 /** Outcome of one hook-gated execution (see runThroughToolHookPipeline). */
@@ -170,8 +233,12 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
   args: TArgs;
   config: HookConfig;
   abortSignal?: AbortSignal;
+  /** See ToolExecuteContext.toolCallId; generated when absent. */
+  toolCallId?: string;
   /** See ToolExecuteContext.inputJsonSchema. */
   inputJsonSchema?: () => unknown;
+  /** See ToolExecuteContext.parseInput. */
+  parseInput?: (value: unknown) => Promise<ToolInputParseResult>;
   /** See ToolExecuteContext.mcpOrigin. */
   mcpOrigin?: { serverName: string; toolName: string };
   execute: (args: TArgs) => Promise<TResult>;
@@ -181,16 +248,13 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
 
   const ctx: ToolExecuteContext = {
     toolName,
+    toolCallId: hookCallId(input.toolCallId),
     args: input.args,
-    host: {
-      runtime: config.runtime,
-      runtimeTempDir: config.runtimeTempDir,
-      cwd: config.cwd,
-      workspaceId: config.workspaceId,
-      env: config.env,
-    },
+    // HookConfig holds exactly the host fields.
+    host: { ...config },
     abortSignal: input.abortSignal,
     ...(input.inputJsonSchema != null ? { inputJsonSchema: input.inputJsonSchema } : {}),
+    ...(input.parseInput != null ? { parseInput: input.parseInput } : {}),
     ...(input.mcpOrigin != null ? { mcpOrigin: input.mcpOrigin } : {}),
     executed: false,
   };
@@ -199,6 +263,7 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
     assert(!c.blocked, `tool.execute terminal reached with blocked context (${toolName})`);
     // Middleware may have rewritten args; execute with the current ones.
     c.result = await input.execute(c.args as TArgs);
+    c.terminalResult = c.result;
     c.executed = true;
   });
 
@@ -245,6 +310,7 @@ async function shellToolHookMiddleware(
   next: WaterfallNext
 ): Promise<void> {
   const { runtime, cwd } = ctx.host;
+  const clock = clockOf(ctx.host);
 
   // Find hooks (checked per call - hooks can be added/removed dynamically)
   const [preHookPath, postHookPath, legacyHookPath] = await Promise.all([
@@ -278,7 +344,7 @@ async function shellToolHookMiddleware(
       postHookPath,
     });
 
-    const hookStart = Date.now();
+    const hookStart = clock.nowMs();
     const preResult = await runPreHook(runtime, preHookPath, hookContext);
 
     // Pre-hook blocked tool
@@ -297,7 +363,7 @@ async function shellToolHookMiddleware(
     // Run post-hook if exists
     if (postHookPath) {
       const postResult = await runPostHook(runtime, postHookPath, hookContext, ctx.result);
-      const hookDurationMs = Date.now() - hookStart;
+      const hookDurationMs = clock.nowMs() - hookStart;
       let hookOutput = postResult.output;
 
       if (!postResult.success && !hookOutput) {
@@ -321,7 +387,7 @@ async function shellToolHookMiddleware(
   if (legacyHookPath) {
     log.debug("[withHooks] Running tool with legacy hook", { toolName, hookPath: legacyHookPath });
 
-    const hookStart = Date.now();
+    const hookStart = clock.nowMs();
     const { result, hook } = await runWithHook<unknown>(
       runtime,
       legacyHookPath,
@@ -339,7 +405,7 @@ async function shellToolHookMiddleware(
         },
       }
     );
-    const hookDurationMs = Date.now() - hookStart;
+    const hookDurationMs = clock.nowMs() - hookStart;
 
     // Hook blocked tool execution (exited before $MUX_EXEC)
     if (!hook.toolExecuted) {
@@ -379,9 +445,9 @@ async function shellToolHookMiddleware(
   // Only post hook exists (no pre) - execute tool then run post
   assert(postHookPath, "shellToolHookMiddleware: expected tool_post path in post-only branch");
   await next();
-  const postStart = Date.now();
+  const postStart = clock.nowMs();
   const postResult = await runPostHook(runtime, postHookPath, hookContext, ctx.result);
-  const hookDurationMs = Date.now() - postStart;
+  const hookDurationMs = clock.nowMs() - postStart;
   if (postResult.output) {
     ctx.result = appendHookOutput(
       ctx.result,

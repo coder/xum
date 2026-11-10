@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { log } from "@/node/services/log";
 import writeFileAtomic, { renameRetryTiming, sync as writeFileAtomicSync } from "./writeFileAtomic";
 
 type BufferWrite = (
@@ -173,6 +174,18 @@ describe("writeFileAtomic", () => {
     expect((await fs.promises.stat(fresh)).mode & 0o777).toBe(0o640);
   });
 
+  it("the sync writer runs beforeRename and keeps the target when it throws", async () => {
+    expect(() =>
+      writeFileAtomicSync(target, payload, {
+        beforeRename: () => {
+          throw new Error("target changed");
+        },
+      })
+    ).toThrow("target changed");
+    expect(await contents(target)).toBe(previous);
+    expect(await siblings()).toEqual(["config.json"]);
+  });
+
   describe("rename retry", () => {
     const budgetMs = 2000;
     const maxDelayMs = 100;
@@ -226,6 +239,23 @@ describe("writeFileAtomic", () => {
       expect(await siblings()).toEqual(["config.json"]);
     });
 
+    it("runs beforeRename before every rename attempt, and stops when it throws", async () => {
+      failRenames(errno("EPERM"), 1);
+      let checks = 0;
+      const failure = await writeFileAtomic(target, payload, {
+        // The first check passes. The target then changes during the retry sleep, so the second
+        // check must refuse before the retry renames over it.
+        beforeRename: () => {
+          checks += 1;
+          if (checks > 1) throw new Error("target changed");
+        },
+      }).catch((error: unknown) => error);
+      expect(String(failure)).toContain("target changed");
+      expect(checks).toBe(2);
+      expect(await contents(target)).toBe(previous);
+      expect(await siblings()).toEqual(["config.json"]);
+    });
+
     it("rethrows the original error once the budget is spent", async () => {
       const error = errno("EPERM");
       failRenames(error, Infinity);
@@ -246,12 +276,15 @@ describe("writeFileAtomic", () => {
       const error = errno("EXDEV");
       const attempts = failRenames(error, Infinity);
       let failure: unknown;
+      let published = 0;
       try {
-        await writeFileAtomic(target, payload);
+        await writeFileAtomic(target, payload, { afterRename: () => published++ });
       } catch (caught) {
         failure = caught;
       }
       expect(failure).toBe(error);
+      // Nothing to publish: the target was never replaced.
+      expect(published).toBe(0);
       expect(attempts()).toBe(1);
       expect(sleeps).toEqual([]);
       expect(await siblings()).toEqual(["config.json"]);
@@ -303,6 +336,49 @@ describe("writeFileAtomic", () => {
         }
         expect(recorded.events).toEqual(["fsync file", "rename", "fsync dir"]);
         expect(await contents(target)).toBe(payload);
+      }
+    );
+
+    // #6728: a caller publishes in-memory state when readers can see the new file, and the write
+    // still resolves only after the directory flush.
+    it.each(["async", "sync"] as const)(
+      "runs afterRename once, between the rename and the directory flush (%s)",
+      async (variant) => {
+        const recorded = recordDirectorySyncs();
+        const afterRename = () => recorded.events.push("afterRename");
+        try {
+          if (variant === "async") await writeFileAtomic(target, payload, { afterRename });
+          else writeFileAtomicSync(target, payload, { afterRename });
+        } finally {
+          recorded.restore();
+        }
+        expect(recorded.events).toEqual(["fsync file", "rename", "afterRename", "fsync dir"]);
+      }
+    );
+
+    it.each(["async", "sync"] as const)(
+      "a throwing afterRename is logged, and the write still lands and resolves (%s)",
+      async (variant) => {
+        const logged: unknown[][] = [];
+        const logSpy = spyOn(log, "error").mockImplementation((...args: unknown[]) => {
+          logged.push(args);
+        });
+        const recorded = recordDirectorySyncs();
+        const afterRename = () => {
+          throw new Error("listener failed");
+        };
+        try {
+          if (variant === "async") await writeFileAtomic(target, payload, { afterRename });
+          else writeFileAtomicSync(target, payload, { afterRename });
+        } finally {
+          recorded.restore();
+          logSpy.mockRestore();
+        }
+        expect(recorded.events).toEqual(["fsync file", "rename", "fsync dir"]);
+        expect(await contents(target)).toBe(payload);
+        expect(await siblings()).toEqual(["config.json"]);
+        expect(logged).toHaveLength(1);
+        expect(JSON.stringify(logged[0])).toContain("listener failed");
       }
     );
 

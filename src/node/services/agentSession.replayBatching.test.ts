@@ -10,11 +10,11 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { CHAT_FILE_NAME } from "@/common/constants/paths";
 import type { MuxMessage } from "@/common/types/message";
-import type { CaughtUpMessage, WorkspaceChatMessage } from "@/common/orpc/types";
+import type { CaughtUpMessage, OnChatEvent } from "@/common/orpc/types";
 import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
 import { log } from "./log";
 import { ONCHAT_REPLAY_TIMING_LOG_MESSAGE } from "./onChatReplayTiming";
-import type { AgentSessionChatEvent } from "./agentSession";
+import type { AgentSessionReplayEvent } from "./agentSession";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 
 const workspaceId = "ws-replay-batching";
@@ -117,9 +117,9 @@ function textRows(count: number, firstSeq = 0, text?: (index: number) => string)
 async function replay(
   harness: AgentSessionHarness,
   batchReplay: boolean,
-  beforeReplayCompletion?: (events: AgentSessionChatEvent[]) => void
-): Promise<AgentSessionChatEvent[]> {
-  const events: AgentSessionChatEvent[] = [];
+  beforeReplayCompletion?: (events: AgentSessionReplayEvent[]) => void
+): Promise<AgentSessionReplayEvent[]> {
+  const events: AgentSessionReplayEvent[] = [];
   await harness.session.replayHistory(
     (event) => events.push(event),
     { type: "full" },
@@ -129,13 +129,13 @@ async function replay(
   return events;
 }
 
-function rowId(message: WorkspaceChatMessage): string {
+function rowId(message: OnChatEvent): string {
   if (message.type !== "message") throw new Error(`expected a message row, got ${message.type}`);
   return message.id;
 }
 
 /** Each row event as `message:<id>` or `batch:<id>,<id>…`; other events are dropped. */
-function shapes(events: AgentSessionChatEvent[]): string[] {
+function shapes(events: AgentSessionReplayEvent[]): string[] {
   const result: string[] = [];
   for (const { message } of events) {
     if (message.type === "message-batch") {
@@ -148,7 +148,7 @@ function shapes(events: AgentSessionChatEvent[]): string[] {
 }
 
 /** The rows as they would go on the wire, one per row, in order. */
-function wireRows(events: AgentSessionChatEvent[]): WorkspaceChatMessage[] {
+function wireRows(events: AgentSessionReplayEvent[]): OnChatEvent[] {
   return events.flatMap(({ message, wireMessage }) => {
     if (message.type === "message-batch") {
       // Batches are only produced on the self-validating path: both fields are parse output.
@@ -161,7 +161,7 @@ function wireRows(events: AgentSessionChatEvent[]): WorkspaceChatMessage[] {
   });
 }
 
-function caughtUp(events: AgentSessionChatEvent[]): CaughtUpMessage {
+function caughtUp(events: AgentSessionReplayEvent[]): CaughtUpMessage {
   const event = events.find(({ message }) => message.type === "caught-up")?.message;
   if (event?.type !== "caught-up") throw new Error("replay ended without caught-up");
   return event;
@@ -235,7 +235,7 @@ describe("onChat replay batching (#4868)", () => {
     // Unpacking the batches gives exactly the single-row event sequence: the same rows (wire
     // bytes) and the same other events (init replay, terminal state, queue snapshot, caught-up)
     // in the same places.
-    const flattened = (events: AgentSessionChatEvent[]) =>
+    const flattened = (events: AgentSessionReplayEvent[]) =>
       events.flatMap((event) =>
         event.message.type === "message" || event.message.type === "message-batch"
           ? wireRows([event]).map((row) => JSON.stringify(row))
@@ -319,7 +319,7 @@ describe("onChat replay batching (#4868)", () => {
     spyOn(EventLoopYielder.prototype, "isDue").mockImplementation(
       () => armed && ++loopChecks === 4
     );
-    const events: AgentSessionChatEvent[] = [];
+    const events: AgentSessionReplayEvent[] = [];
     const deliveredAtYield: string[][] = [];
     spyOn(EventLoopYielder.prototype, "yield").mockImplementation(() => {
       deliveredAtYield.push(wireRows(events).map(rowId));

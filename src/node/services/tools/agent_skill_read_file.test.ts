@@ -2,9 +2,17 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { describe, it, expect } from "bun:test";
-import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
+import {
+  createTestPluginInstallEntry,
+  reviewedComponentConsent,
+} from "@/node/services/agentPlugins/testFixtures";
 import { AgentSkillReadFileToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { createAgentSkillReadFileTool } from "./agent_skill_read_file";
+import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
+import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
   createTestToolConfig,
   mockToolCallOptions,
@@ -16,6 +24,8 @@ import {
   writeGlobalSkill,
   writeProjectSkill,
 } from "./testHelpers";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 type ReadFileTool = ReturnType<typeof createAgentSkillReadFileTool>;
 type ReadFileArgs = Parameters<NonNullable<ReadFileTool["execute"]>>[0];
@@ -83,7 +93,11 @@ describe("agent_skill_read_file", () => {
       path.join(tmp.path, "plugins.json"),
       JSON.stringify({
         plugins: [
-          createTestPluginInstallEntry("a-managed", { skills: ["allowed"], mcpServers: [] }),
+          createTestPluginInstallEntry(
+            "a-managed",
+            { skills: ["allowed"], mcpServers: [] },
+            await reviewedComponentConsent({ pluginDir: path.join(container, "a-managed") })
+          ),
         ],
       })
     );
@@ -145,7 +159,11 @@ describe("agent_skill_read_file", () => {
         registryPath,
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: ["allowed"], mcpServers: [] },
+              await reviewedComponentConsent({ pluginDir: pluginRoot })
+            ),
           ],
         })
       );
@@ -175,6 +193,140 @@ describe("agent_skill_read_file", () => {
       });
     }
   );
+
+  it("reads a remote plugin skill's files from its snapshot, inside the skill folder only", async () => {
+    using tmp = new TestTempDir("remote-plugin-skill-read-file");
+    const checkout = await fs.realpath(tmp.path);
+    const pluginRoot = path.join(checkout, ".xum", "plugins", "kit");
+    const skillDir = path.join(pluginRoot, "skills", "kit-skill");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginRoot, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "kit" })
+    );
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: kit-skill\ndescription: d\n---\n"
+    );
+    await fs.writeFile(path.join(skillDir, "data.txt"), "remote data");
+    // Inside the plugin, but outside the skill folder.
+    await fs.symlink(path.join(pluginRoot, "plugin.json"), path.join(skillDir, "manifest.json"));
+    const runtime = new HostKeyShellRemoteRuntime(checkout, "read-file-remote-plugin");
+    const tool = createAgentSkillReadFileTool(
+      createTestToolConfig(checkout, {
+        runtime,
+        xumScope: {
+          type: "project",
+          xumHome: checkout,
+          projectRoot: checkout,
+          projectStorageAuthority: "runtime",
+          projectPluginsTrusted: true,
+        },
+      })
+    );
+
+    expect(await executeReadFile(tool, { name: "kit-skill", filePath: "data.txt" })).toMatchObject({
+      success: true,
+      content: "1\tremote data",
+    });
+    expect(
+      await executeReadFile(tool, { name: "kit-skill", filePath: "manifest.json" })
+    ).toMatchObject({
+      success: false,
+      error: "Resolved file path points outside the skill directory: manifest.json",
+    });
+    // One listing, and the file itself never went over the remote runtime.
+    expect(runtime.pluginListings).toBe(1);
+    expect(runtime.commands.some((command) => command.includes("data.txt"))).toBe(false);
+  });
+
+  it("reads a file from the plugin named by <plugin>:<skill>", async () => {
+    using tmp = new TestTempDir("plugin-read-file-namespace");
+    for (const plugin of ["alpha", "beta"]) {
+      const root = path.join(tmp.path, "plugins", plugin);
+      const dir = path.join(root, "skills", "ns-fixture");
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(
+        path.join(root, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: plugin,
+        })
+      );
+      await fs.writeFile(
+        path.join(dir, "SKILL.md"),
+        "---\nname: ns-fixture\ndescription: x\n---\nBody\n"
+      );
+      await fs.writeFile(path.join(dir, "data.txt"), plugin);
+    }
+    // A global skill of the same name wins the bare lookup over both plugins.
+    const globalDir = path.join(tmp.path, "skills", "ns-fixture");
+    await fs.mkdir(globalDir, { recursive: true });
+    await fs.writeFile(
+      path.join(globalDir, "SKILL.md"),
+      "---\nname: ns-fixture\ndescription: x\n---\nBody\n"
+    );
+    await fs.writeFile(path.join(globalDir, "data.txt"), "global");
+    // Not `tdd`: keeps the fixture name unlikely to collide with host skills.
+    const tool = createAgentSkillReadFileTool(createTestToolConfig(tmp.path));
+    const read = (name: string) => executeReadFile(tool, { name, filePath: "data.txt" });
+
+    expect(await read("ns-fixture")).toMatchObject({ success: true, content: "1\tglobal" });
+    expect(await read("alpha:ns-fixture")).toMatchObject({ success: true, content: "1\talpha" });
+    expect(await read("beta:ns-fixture")).toMatchObject({ success: true, content: "1\tbeta" });
+    expect(await read("gamma:ns-fixture")).toMatchObject({ success: false });
+  });
+
+  it("adds the plugin sibling note to plugin skill files without changing content", async () => {
+    using tmp = new TestTempDir("plugin-read-file-sibling-note");
+    const pluginRoot = path.join(tmp.path, "plugins", "pstack");
+    await fs.mkdir(pluginRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginRoot, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+    const playbook = "See the **tdd** skill";
+    await writeGlobalSkill(pluginRoot, "poteto-mode", {
+      files: { "playbooks/bug-fix.md": playbook },
+    });
+    await writeGlobalSkill(pluginRoot, "tdd");
+    // The user's own skills: `tdd` shadows the plugin's sibling.
+    await writeGlobalSkill(tmp.path, "tdd");
+    await writeGlobalSkill(tmp.path, "mine", { files: { "notes.md": "mine" } });
+
+    // Production passes the turn's invocable list (turnContextAssembler); build it
+    // the same way from the same roots.
+    const config = createTestToolConfig(tmp.path);
+    const ctx = resolveSkillStorageContext({
+      runtime: config.runtime,
+      workspacePath: config.cwd,
+      xumScope: config.xumScope,
+      runtimeFactory,
+    });
+    const discovery = await discoverAgentSkills(ctx.runtime, ctx.workspacePath, {
+      roots: ctx.roots,
+      containment: ctx.containment,
+      runtimeFactory,
+    });
+    const tool = createAgentSkillReadFileTool({
+      ...config,
+      availableSkills: listInvocableSkills(discovery),
+    });
+
+    const pluginFile = await executeReadFile(tool, {
+      name: "poteto-mode",
+      filePath: "playbooks/bug-fix.md",
+    });
+    expect(pluginFile).toMatchObject({ success: true, content: `1\t${playbook}` });
+    expect(pluginFile.success && pluginFile.pluginSkillNote).toContain("`pstack:tdd`");
+
+    const ownFile = await executeReadFile(tool, { name: "mine", filePath: "notes.md" });
+    expect(ownFile).toMatchObject({ success: true, content: "1\tmine" });
+    expect(ownFile.success && ownFile.pluginSkillNote).toBeUndefined();
+  });
 
   it("allows reading built-in skill files", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-file-global-scope");
@@ -333,6 +485,31 @@ describe("agent_skill_read_file", () => {
         lines.map((_, i) => String(i + 1))
       );
       expect(rows.map((row) => row.slice(row.indexOf("\t") + 1))).toEqual(lines);
+    });
+
+    it("caps a page at 1000 lines and lets offset/limit page past it (#6388)", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-file-line-cap");
+      // 1001 short lines stay far below the 16 KB byte cap, so only the line cap applies.
+      const lines = Array.from({ length: 1001 }, (_, i) => `l${i + 1}`);
+      const tool = await createLongLineTool(tempDir, lines.join("\n"));
+
+      const whole = await executeReadFile(tool, { name: "long-lines", filePath: "playbook.md" });
+      expect(whole.success).toBe(false);
+      if (!whole.success) {
+        expect(whole.error).toContain("1000 lines");
+      }
+
+      const page = await executeReadFile(tool, {
+        name: "long-lines",
+        filePath: "playbook.md",
+        offset: 1,
+        limit: 1000,
+      });
+      expect(page.success).toBe(true);
+      if (page.success) {
+        expect(page.lines_read).toBe(1000);
+        expect(page.content.split("\n").at(-1)).toBe("1000\tl1000");
+      }
     });
 
     it("fails loudly, naming the line, when one line alone exceeds a page", async () => {

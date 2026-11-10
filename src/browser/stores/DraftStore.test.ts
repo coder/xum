@@ -2,30 +2,18 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
-import {
-  listPersistedKeys,
-  readPersistedState,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
-import {
-  getDraftScopeId,
-  getInputAttachmentsKey,
-  getInputKey,
-  getAutoExpandPrefsKey,
-  getPendingScopeId,
-  WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-} from "@/common/constants/storage";
+import { listPersistedKeys } from "@/browser/hooks/usePersistedState";
+import { getInputKey } from "@/common/constants/storage";
 import type { DraftAttachment, DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
 import { DRAFT_STORE_READY_TIMEOUT_MS, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
-import { DraftService } from "@/node/services/draftService";
+import { DRAFT_CHANGE_EVENT, DraftService } from "@/node/services/draftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { installDom } from "../../../tests/ui/dom";
-import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
-import { DraftStore, draftStoreScopeKey } from "./DraftStore";
+import { DraftStore } from "./DraftStore";
 
 // Older builds wrote these legacy keys; the key registry refuses them now, so seed them the way
 // an older build left them on disk.
@@ -53,14 +41,21 @@ function createClient(service: DraftService) {
     failImports: 0,
     failDeletes: 0,
     failGets: 0,
-    failListPuts: 0,
-    failListImports: 0,
-    /** Consumed one per putListEntry call, in call order. */
-    listPutGates: [] as Array<Promise<void>>,
     updateGate: null as Promise<void> | null,
+    /** Holds an update's reply after the service applied it (and pushed its change event). */
+    updateReplyGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
+    /** Subscriptions that reached subscribeGate (the store waits for this client's snapshot). */
+    subscribes: 0,
+    /** Holds the legacy import that follows a snapshot. */
+    importGate: null as Promise<void> | null,
+    imports: 0,
     updates: 0,
+    /** Snapshots the store finished handling (it asks for the next event only after that). */
+    snapshotsHandled: 0,
+    /** Change events (not snapshots) the store finished handling. */
+    changesHandled: 0,
   };
   const drafts = {
     list: () => service.list(),
@@ -79,7 +74,9 @@ function createClient(service: DraftService) {
         control.failUpdates--;
         throw new Error("update failed");
       }
-      return service.update(input);
+      const reply = await service.update(input);
+      await control.updateReplyGate;
+      return reply;
     },
     delete: async ({ scope }: { scope: DraftScope }) => {
       if (control.failDeletes > 0) {
@@ -89,32 +86,16 @@ function createClient(service: DraftService) {
       return service.delete(scope);
     },
     importLegacy: async (input: Parameters<DraftService["importLegacy"]>[0]) => {
+      control.imports++;
+      await control.importGate;
       if (control.failImports > 0) {
         control.failImports--;
         throw new Error("import failed");
       }
       return service.importLegacy(input);
     },
-    putListEntry: async (entry: Parameters<DraftService["putListEntry"]>[0]) => {
-      await control.listPutGates.shift();
-      if (control.failListPuts > 0) {
-        control.failListPuts--;
-        throw new Error("list put failed");
-      }
-      return service.putListEntry(entry);
-    },
-    importLegacyList: async ({
-      entries,
-    }: {
-      entries: Parameters<DraftService["importLegacyList"]>[0];
-    }) => {
-      if (control.failListImports > 0) {
-        control.failListImports--;
-        throw new Error("list import failed");
-      }
-      return service.importLegacyList(entries);
-    },
     subscribe: async (_input: void, opts?: { signal?: AbortSignal }) => {
+      control.subscribes++;
       await control.subscribeGate;
       const queue: DraftEvent[] = [];
       let wake: (() => void) | null = null;
@@ -122,7 +103,7 @@ function createClient(service: DraftService) {
         queue.push(event);
         wake?.();
       };
-      service.on(DraftService.CHANGE_EVENT, listener);
+      service.on(DRAFT_CHANGE_EVENT, listener);
       queue.unshift(await service.getSnapshotEvent());
       return (async function* () {
         try {
@@ -130,6 +111,8 @@ function createClient(service: DraftService) {
             const next = queue.shift();
             if (next) {
               yield next;
+              if (next.type === "snapshot") control.snapshotsHandled++;
+              else control.changesHandled++;
               continue;
             }
             await new Promise<void>((resolve) => {
@@ -138,7 +121,7 @@ function createClient(service: DraftService) {
             });
           }
         } finally {
-          service.off(DraftService.CHANGE_EVENT, listener);
+          service.off(DRAFT_CHANGE_EVENT, listener);
         }
       })();
     },
@@ -172,6 +155,19 @@ async function waitFor(
   }
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Runs every queued promise continuation (one macrotask turn). */
+const drainMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
+
+/** The message `flush` rejects with, or "" when it resolves. */
+function flushError(store: DraftStore): Promise<string> {
+  return store.flush(WS_SCOPE).then(
+    () => "",
+    (error: unknown) => String(error)
+  );
+}
+
 let cleanupDom: (() => void) | undefined;
 const stores: DraftStore[] = [];
 
@@ -194,22 +190,16 @@ afterEach(() => {
 describe("DraftStore", () => {
   test("imports legacy drafts without clobbering and removes keys only after the backend answered", async () => {
     using tempDir = new TestTempDir("draft-store-legacy");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const { service, client, control } = await createHarness(tempDir);
     // Another origin already stored this workspace's draft on the backend.
     await service.update({ scope: WS_SCOPE, text: "backend copy" });
-    const creationScopeId = getDraftScopeId(projectPath, "draft-a");
     seedLegacyKey(getInputKey(WS), "stale local copy");
-    seedLegacyKey(getInputKey(creationScopeId), "legacy creation text");
-    seedLegacyKey(getInputAttachmentsKey(creationScopeId), [image]);
-    seedLegacyKey(getInputKey(getPendingScopeId(projectPath)), "pending text");
-    // Scope-bound settings of the pending composer follow its draft, like createWorkspaceDraft.
-    updatePersistedState(getAutoExpandPrefsKey(getPendingScopeId(projectPath)), "pending-model");
 
-    // First start: every import fails, so every key must survive for the next start.
+    // First start: the import fails, so the key must survive for the next start.
     control.failImports = 100;
     const failing = createStore(client);
     await failing.whenReady();
-    expect(listPersistedKeys("input")).toHaveLength(4);
+    expect(listPersistedKeys("input")).toHaveLength(1);
     failing.setClient(null);
 
     control.failImports = 0;
@@ -218,29 +208,7 @@ describe("DraftStore", () => {
 
     expect(store.getText(WS_SCOPE)).toBe("backend copy");
     expect((await service.get(WS_SCOPE)).text).toBe("backend copy");
-    const creation: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
-    expect(await service.get(creation)).toMatchObject({
-      text: "legacy creation text",
-      attachments: [image],
-    });
-    expect(store.getAttachments(creation)).toEqual([image]);
-    // The pending draft became a listed creation draft of its project, still visible. draft-a
-    // had no list entry (none was seeded), so the first list write relisted its body too.
-    const projectDrafts = store.getCreationDraftsByProject()[projectPath];
-    expect(projectDrafts).toHaveLength(2);
-    const listed = projectDrafts.filter(({ draftId }) => draftId !== "draft-a");
-    const converted: DraftScope = { kind: "creation", projectPath, draftId: listed[0].draftId };
-    expect((await service.get(converted)).text).toBe("pending text");
     expect(listPersistedKeys("input")).toEqual([]);
-    expect(
-      readPersistedState<string | null>(
-        getAutoExpandPrefsKey(getDraftScopeId(projectPath, listed[0].draftId)),
-        null
-      )
-    ).toBe("pending-model");
-    expect(
-      readPersistedState<string | null>(getAutoExpandPrefsKey(getPendingScopeId(projectPath)), null)
-    ).toBeNull();
   });
 
   test("renders typing at once, keeps it through a failed write, and confirms it in flush", async () => {
@@ -347,213 +315,6 @@ describe("DraftStore", () => {
     ]);
   });
 
-  test("lists an attachment-only legacy pending draft on a later start after a failed listing", async () => {
-    using tempDir = new TestTempDir("draft-store-legacy-attachments");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const attachmentsKey = getInputAttachmentsKey(getPendingScopeId(projectPath));
-    seedLegacyKey(attachmentsKey, [image]);
-
-    // The draft is imported, but listing it fails: its only legacy key must survive (#5226).
-    control.failListPuts = 1;
-    const first = createStore(client);
-    await first.whenReady();
-    first.setClient(null);
-    expect(listPersistedKeys("inputAttachments")).toEqual([attachmentsKey]);
-
-    const second = createStore(client);
-    await second.whenReady();
-    const creationDrafts = (await service.list()).filter(({ scope }) => scope.kind === "creation");
-    expect(creationDrafts).toHaveLength(1);
-    const scope = creationDrafts[0].scope as Extract<DraftScope, { kind: "creation" }>;
-    expect((await service.get(scope)).attachments).toEqual([image]);
-    await waitFor(
-      () => second.getCreationDraftsByProject()[projectPath]?.[0]?.draftId === scope.draftId
-    );
-    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual([
-      scope.draftId,
-    ]);
-    expect(listPersistedKeys("inputAttachments")).toEqual([]);
-  });
-
-  test("imports the legacy draft list once, shows it while the import fails, and relists lost drafts", async () => {
-    using tempDir = new TestTempDir("draft-store-legacy-list");
-    const { config, projectPath, service, client, control } = await createHarness(tempDir);
-    // An older list that outgrew its 32 KiB budget (#5225), and a body whose row it lost.
-    const subProjectPath = path.join(projectPath, "x".repeat(300));
-    const legacy = Array.from({ length: 100 }, (_, i) => ({
-      draftId: `old-${i}`,
-      subProjectPath,
-      createdAt: i,
-    }));
-    seedLegacyKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, { [projectPath]: legacy });
-    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "t" });
-    const listedIds = (store: DraftStore) =>
-      (store.getCreationDraftsByProject()[projectPath] ?? []).map(({ draftId }) => draftId);
-
-    // The subscription relists the lost body itself, so it shows even while the import fails.
-    const expected = ["lost", ...legacy.map(({ draftId }) => draftId)];
-    control.failListImports = 1;
-    const failing = createStore(client);
-    await failing.whenReady();
-    expect(listedIds(failing)).toEqual(expected);
-    expect(listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).toHaveLength(1);
-    failing.setClient(null);
-
-    const store = createStore(client);
-    await store.whenReady();
-    await waitFor(() => listedIds(store).join() === expected.join());
-    expect(store.getCreationDraftsByProject()[projectPath][1].subProjectPath).toBe(subProjectPath);
-    expect(listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).toEqual([]);
-
-    // Restart: a new backend and store list every draft from the backend alone.
-    const restarted = createStore(createClient(new DraftService(config)).client);
-    await restarted.whenReady();
-    expect(listedIds(restarted)).toEqual(expected);
-  });
-
-  test("sends list puts of one draft in order, so an older sub-project never lands last", async () => {
-    using tempDir = new TestTempDir("draft-store-list-order");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const store = createStore(client);
-    await store.whenReady();
-    let releaseFirst: () => void = () => undefined;
-    control.listPutGates.push(
-      new Promise<void>((resolve) => {
-        releaseFirst = resolve;
-      })
-    );
-    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: "/a", createdAt: 1 });
-    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: "/b", createdAt: 1 });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    releaseFirst();
-    await waitFor(async () => (await service.getList()).entries[0]?.subProjectPath === "/b");
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect((await service.getList()).entries.map((entry) => entry.subProjectPath)).toEqual(["/b"]);
-    await waitFor(
-      () => store.getCreationDraftsByProject()[projectPath]?.[0]?.subProjectPath === "/b"
-    );
-  });
-
-  test("retries a list put that failed on a replaced client through the current one", async () => {
-    using tempDir = new TestTempDir("draft-store-list-reconnect");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const store = createStore(client);
-    await store.whenReady();
-    let release: () => void = () => undefined;
-    control.listPutGates.push(
-      new Promise<void>((resolve) => {
-        release = resolve;
-      })
-    );
-    control.failListPuts = 1;
-    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    // Reconnect while the put is in flight; then the old request fails.
-    store.setClient(createClient(service).client);
-    // Let the new subscription's snapshot (and its resend attempt) run first.
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    release();
-    await waitFor(async () => (await service.getList()).entries.length === 1, 5_000);
-  });
-
-  test("lists a saved draft whose list put kept failing until the app exited", async () => {
-    using tempDir = new TestTempDir("draft-store-list-put-lost");
-    const { config, projectPath, service, client, control } = await createHarness(tempDir);
-    const scope: DraftScope = { kind: "creation", projectPath, draftId: "d1" };
-    const store = createStore(client);
-    await store.whenReady();
-    control.failListPuts = 1_000;
-    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
-    store.setText(scope, "typed");
-    await store.flush(scope);
-    expect((await service.get(scope)).text).toBe("typed");
-    // Exit before a retry lands.
-    store.setClient(null);
-
-    const restarted = createStore(createClient(new DraftService(config)).client);
-    await restarted.whenReady();
-    expect(
-      restarted.getCreationDraftsByProject()[projectPath]?.map(({ draftId }) => draftId)
-    ).toEqual(["d1"]);
-    expect(restarted.getText(scope)).toBe("typed");
-  });
-
-  test("a delete waits for the draft's list put, so it is not relisted", async () => {
-    using tempDir = new TestTempDir("draft-store-list-delete-order");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const store = createStore(client);
-    await store.whenReady();
-    let release: () => void = () => undefined;
-    control.listPutGates.push(
-      new Promise<void>((resolve) => {
-        release = resolve;
-      })
-    );
-    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
-    const deleted = store.deleteDraft({ kind: "creation", projectPath, draftId: "d1" });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    release();
-    await deleted;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect((await service.getList()).entries).toEqual([]);
-    expect(store.getCreationDraftsByProject()[projectPath]).toBeUndefined();
-  });
-
-  test("replaces a malformed legacy draft list, so its import still completes", async () => {
-    using tempDir = new TestTempDir("draft-store-legacy-list-malformed");
-    const { projectPath, service, client } = await createHarness(tempDir);
-    window.localStorage.setItem(WORKSPACE_DRAFTS_BY_PROJECT_KEY, "{not json");
-    await service.update({ scope: { kind: "creation", projectPath, draftId: "lost" }, text: "t" });
-    const store = createStore(client);
-    await store.whenReady();
-    await waitFor(() => store.getCreationDraftsByProject()[projectPath]?.[0]?.draftId === "lost");
-    expect(listPersistedKeys(WORKSPACE_DRAFTS_BY_PROJECT_KEY)).toEqual([]);
-  });
-
-  test("keeps a deleted draft hidden when its list put lands while the delete waits", async () => {
-    using tempDir = new TestTempDir("draft-store-list-delete-hidden");
-    const { projectPath, client, control } = await createHarness(tempDir);
-    const store = createStore(client);
-    await store.whenReady();
-    let release: () => void = () => undefined;
-    control.listPutGates.push(
-      new Promise<void>((resolve) => {
-        release = resolve;
-      })
-    );
-    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
-    // The backend delete keeps failing: only the pending delete hides the row.
-    control.failDeletes = 100;
-    const deleted = store.deleteDraft({ kind: "creation", projectPath, draftId: "d1" });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    release();
-    await deleted;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(store.getCreationDraftsByProject()[projectPath]).toBeUndefined();
-  });
-
-  test("lists a legacy creation draft whose row the legacy list had already lost", async () => {
-    using tempDir = new TestTempDir("draft-store-legacy-unlisted-body");
-    const { projectPath, service, client } = await createHarness(tempDir);
-    // The body exists only in localStorage, and the (over-budget) legacy list lost its row.
-    seedLegacyKey(getInputKey(getDraftScopeId(projectPath, "draft-x")), "typed in an old build");
-    seedLegacyKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {
-      [projectPath]: [{ draftId: "other", subProjectPath: null, createdAt: 1 }],
-    });
-    const store = createStore(client);
-    await store.whenReady();
-    await waitFor(() =>
-      (store.getCreationDraftsByProject()[projectPath] ?? []).some(
-        ({ draftId }) => draftId === "draft-x"
-      )
-    );
-    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual([
-      "other",
-      "draft-x",
-    ]);
-    expect(listPersistedKeys("input")).toEqual([]);
-  });
-
   test("imports legacy drafts of workspace ids that start with underscores", async () => {
     using tempDir = new TestTempDir("draft-store-legacy-underscore");
     const { config, projectPath, service, client } = await createHarness(tempDir);
@@ -571,26 +332,6 @@ describe("DraftStore", () => {
     const store = createStore(client);
     await store.whenReady();
     expect((await service.get({ kind: "workspace", workspaceId })).text).toBe("underscored");
-  });
-
-  test("moves a draft only after the destination is saved", async () => {
-    using tempDir = new TestTempDir("draft-store-move");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
-    await service.update({ scope: source, text: "moving" });
-    const store = createStore(client);
-    await store.whenReady();
-
-    control.failUpdates = 100;
-    await store.moveDraft(source, WS_SCOPE);
-    // A delete issued before the destination was saved would have landed by now.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect((await service.get(source)).text).toBe("moving");
-
-    control.failUpdates = 0;
-    await store.moveDraft(source, WS_SCOPE);
-    expect((await service.get(WS_SCOPE)).text).toBe("moving");
-    expect((await service.get(source)).text).toBe("");
   });
 
   test("applies a queued attachment update when the server empties the list meanwhile", async () => {
@@ -651,8 +392,8 @@ describe("DraftStore", () => {
 
   test("retries a failed delete so no unreachable draft file is left", async () => {
     using tempDir = new TestTempDir("draft-store-delete-retry");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const scope: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    const { service, client, control } = await createHarness(tempDir);
+    const scope = WS_SCOPE;
     await service.update({ scope, text: "discarded" });
     const store = createStore(client);
     await store.whenReady();
@@ -660,6 +401,63 @@ describe("DraftStore", () => {
     control.failDeletes = 1;
     await store.deleteDraft(scope);
     await waitFor(async () => (await service.get(scope)).text === "");
+  });
+
+  test("a delete that waits for a write still deletes when that write's change event arrives first", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-echo");
+    const { service, client, control } = await createHarness(tempDir);
+    const scope = WS_SCOPE;
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseUpdate: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let releaseReply: () => void = () => undefined;
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    store.setText(scope, "typed");
+    const written = store.flush(scope);
+    await waitFor(() => control.updates > 0);
+    // The draft is deleted while its write is in flight, so the delete waits for that write.
+    const deleted = store.deleteDraft(scope);
+    const changesBefore = control.changesHandled;
+    releaseUpdate();
+    // The write lands, and the store handles its change event before the write's reply.
+    await waitFor(() => control.changesHandled > changesBefore);
+    releaseReply();
+    await written;
+    await deleted;
+    expect((await service.get(scope)).text).toBe("");
+    expect(store.getText(scope)).toBe("");
+  });
+
+  test("an edit during a waiting delete replaces the whole stored draft", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-wait-edit");
+    const { service, client, control } = await createHarness(tempDir);
+    const scope = WS_SCOPE;
+    const store = createStore(client);
+    await store.whenReady();
+    let releaseReply: () => void = () => undefined;
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    store.setText(scope, "typed");
+    const written = store.flush(scope);
+    await waitFor(async () => (await service.get(scope)).text === "typed");
+    const deleted = store.deleteDraft(scope);
+    // The user adds an attachment while the delete waits: the draft is live again, without text.
+    store.setAttachments(scope, [image]);
+    releaseReply();
+    await written;
+    await deleted;
+    control.updateReplyGate = null;
+    await store.flush(scope);
+    const stored = await service.get(scope);
+    expect(stored.text).toBe("");
+    expect(stored.attachments.map(({ id }) => id)).toEqual([image.id]);
+    expect(store.getText(scope)).toBe("");
   });
 
   test("becomes ready without a snapshot, and a late snapshot keeps typed text", async () => {
@@ -832,65 +630,318 @@ describe("DraftStore", () => {
     expect(listPersistedKeys("input")).toEqual([]);
   });
 
-  test("keeps the source of a move that was edited while its payloads loaded", async () => {
-    using tempDir = new TestTempDir("draft-store-move-edit");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
-    await service.update({ scope: source, text: "moving", attachments: [image] });
+  // #6438: a new backend (another process, its clock behind) numbers its revisions lower. The
+  // store kept the old backend's saved view, and a write reply below that view's revision put
+  // the old text back over what the user had just typed.
+  test("a write reply from a new backend with lower revisions keeps the typed text", async () => {
+    using tempDir = new TestTempDir("draft-store-new-backend");
+    const { config, client } = await createHarness(tempDir);
     const store = createStore(client);
     await store.whenReady();
+    store.setText(WS_SCOPE, "text on the old backend");
+    await store.flush(WS_SCOPE);
 
-    let release: () => void = () => undefined;
-    control.getGate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const moved = store.moveDraft(source, WS_SCOPE);
-    store.setText(source, "moving, edited");
-    release();
-    await moved;
+    // The same drafts on disk, served by a new process whose revisions start lower.
+    const realNow = Date.now;
+    Date.now = () => realNow() - 3_600_000;
+    let service: DraftService;
+    try {
+      service = new DraftService(config);
+    } finally {
+      Date.now = realNow;
+    }
+    const next = createClient(service);
+    store.setClient(next.client);
+    await waitFor(() => next.control.snapshotsHandled > 0);
+    expect(next.control.updates).toBe(0);
 
-    expect(store.getText(source)).toBe("moving, edited");
-    await store.flush(source);
-    expect((await service.get(source)).text).toBe("moving, edited");
+    store.setText(WS_SCOPE, "typed after the switch");
+    await store.flush(WS_SCOPE);
+    expect(next.control.updates).toBeGreaterThan(0);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
   });
 
-  // The project page opened without a draft id: its text survived a reload in localStorage before
-  // drafts moved to the backend. When the first listed draft is created it takes over the text
-  // and the attachments, even ones whose payloads have not loaded yet.
-  test("saves the default creation composer's draft and moves it, attachments included", async () => {
-    using tempDir = new TestTempDir("draft-store-default-creation");
-    const { projectPath, service, client } = await createHarness(tempDir);
-    const scope = getComposerDraftScope({
-      variant: "creation",
-      workspaceId: null,
-      creationProjectPath: projectPath,
-    });
-    const first = createStore(client);
-    await first.whenReady();
-    first.setText(scope, "typed before reload");
-    first.setAttachments(scope, [image]);
-    await first.flush(scope);
-    first.setClient(null);
-
-    // Reload: a new store hydrates from the backend.
+  // #6438, review round 3, #6542 and #6748: an edit saved to a new backend before its snapshot
+  // was compared with the old backend's view, lost to it, and the old text came back; and the
+  // write went to a backend whose drafts the store had not seen. Then (#6748) a save in that
+  // window was refused, because readiness was the first client's: a fork right after a reconnect
+  // copied the draft without the latest text. Now whenReady and the save wait for the new
+  // client's snapshot, as on a cold start, and the edit is saved once.
+  test("an edit waits for a new backend's snapshot before it is saved, and keeps the typed text", async () => {
+    using tempDir = new TestTempDir("draft-store-new-backend-early-write");
+    const { config, client } = await createHarness(tempDir);
     const store = createStore(client);
     await store.whenReady();
-    expect(store.getView(scope)).toMatchObject({
-      text: "typed before reload",
-      attachmentCount: 1,
-      payloadsLoaded: false,
-    });
+    store.setText(WS_SCOPE, "text on the old backend");
+    await store.flush(WS_SCOPE);
 
-    const listed: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
-    await store.moveDraft(scope, listed);
-    expect(await service.get(listed)).toMatchObject({
-      text: "typed before reload",
-      attachments: [image],
+    const realNow = Date.now;
+    Date.now = () => realNow() - 3_600_000;
+    let service: DraftService;
+    try {
+      service = new DraftService(config);
+    } finally {
+      Date.now = realNow;
+    }
+    const next = createClient(service);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
     });
-    expect(
-      (await service.list()).some(
-        (draft) => draftStoreScopeKey(draft.scope) === draftStoreScopeKey(scope)
-      )
-    ).toBe(false);
+    store.setClient(next.client);
+
+    let ready = false;
+    const readiness = store.whenReady().then(() => (ready = true));
+    store.setText(WS_SCOPE, "typed after the switch");
+    const saving = flushError(store);
+    // Positive barrier: the store subscribed to the new backend and waits for its snapshot.
+    await waitFor(() => next.control.subscribes === 1);
+    await drainMicrotasks();
+    expect(ready).toBe(false);
+    expect(next.control.updates).toBe(0);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    // Other readers still see the drafts as loaded (the WorkspaceContext draft GC).
+    expect(store.isHydrated()).toBe(true);
+
+    releaseSnapshot();
+    expect(await saving).toBe("");
+    await readiness;
+    expect(next.control.updates).toBe(1);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
+    // Saved once: the snapshot's own save of unsaved edits finds nothing left to write. The
+    // snapshot is handled, then the wait outlasts the store's 300 ms flush debounce (a timer the
+    // store does not expose).
+    await waitFor(() => next.control.snapshotsHandled >= 1);
+    await sleep(400);
+    expect(next.control.updates).toBe(1);
+    store.setText(WS_SCOPE, "typed later");
+    await store.flush(WS_SCOPE);
+    expect(store.getText(WS_SCOPE)).toBe("typed later");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed later");
+  });
+
+  // #6542: the old subscription's run resumed after its legacy import and opened writes for the
+  // client after it, so an edit reached the new backend before that backend's snapshot.
+  test("a client swap during the old subscription's legacy import keeps writes off the new backend", async () => {
+    using oldDir = new TestTempDir("draft-store-swap-during-import");
+    using newDir = new TestTempDir("draft-store-swap-target");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    // A reconnect whose snapshot is followed by an older build's workspace draft import.
+    seedLegacyKey(getInputKey(WS), "legacy text");
+    let releaseImport: () => void = () => undefined;
+    old.control.importGate = new Promise<void>((resolve) => {
+      releaseImport = resolve;
+    });
+    store.setClient(null);
+    store.setClient(old.client);
+    await waitFor(() => old.control.imports > 0);
+    store.setText(WS_SCOPE, "typed during the import");
+
+    const next = await createHarness(newDir);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+    releaseImport();
+    // The old run resumes after its import (it removes the legacy key once the backend took the
+    // draft); it must not open writes for the new client.
+    await waitFor(() => listPersistedKeys(getInputKey(WS)).length === 0);
+    const saving = flushError(store);
+    // Positive barrier: the store subscribed to the new backend and waits for its snapshot.
+    await waitFor(() => next.control.subscribes === 1);
+    await drainMicrotasks();
+    expect(next.control.updates).toBe(0);
+
+    releaseSnapshot();
+    expect(await saving).toBe("");
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the import");
+  });
+
+  // #6726: the same client reconnected (A, null, A) while the first run awaits its legacy import.
+  // The client check alone passes then (the client is A again); only the aborted signal stops the
+  // replaced run from opening writes, and readiness, before the new run's snapshot.
+  test("a same-client reconnect during the legacy import keeps writes until the new snapshot", async () => {
+    using tempDir = new TestTempDir("draft-store-same-client-reconnect-import");
+    const { client, control, service } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    seedLegacyKey(getInputKey(WS), "legacy text");
+    let releaseImport: () => void = () => undefined;
+    control.importGate = new Promise<void>((resolve) => {
+      releaseImport = resolve;
+    });
+    store.setClient(null);
+    store.setClient(client);
+    await waitFor(() => control.imports > 0);
+    store.setText(WS_SCOPE, "typed during the import");
+
+    let releaseSnapshot: () => void = () => undefined;
+    control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(null);
+    store.setClient(client);
+    const updatesBefore = control.updates;
+    releaseImport();
+    // The replaced run resumes after its import and removes the legacy key once the backend took
+    // the draft; it must not open writes for the run after it.
+    await waitFor(() => listPersistedKeys(getInputKey(WS)).length === 0);
+    const saving = flushError(store);
+    // Positive barrier: the replacing run subscribed (the third subscribe) and waits for its
+    // snapshot.
+    await waitFor(() => control.subscribes === 3);
+    await drainMicrotasks();
+    expect(control.updates).toBe(updatesBefore);
+
+    releaseSnapshot();
+    expect(await saving).toBe("");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed during the import");
+  });
+
+  // #6748: a save waiting for a reconnect's snapshot follows a further client change, and gives up
+  // only when the client is removed. The typed text stays either way.
+  test("a save waiting for a reconnect follows the next client, and rejects when the client is removed", async () => {
+    using oldDir = new TestTempDir("draft-store-wait-old");
+    using midDir = new TestTempDir("draft-store-wait-mid");
+    using newDir = new TestTempDir("draft-store-wait-new");
+    using laterDir = new TestTempDir("draft-store-wait-later");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    const mid = await createHarness(midDir);
+    mid.control.subscribeGate = new Promise<void>(() => undefined);
+    store.setClient(mid.client);
+    store.setText(WS_SCOPE, "typed during two reconnects");
+    const saving = flushError(store);
+
+    const next = await createHarness(newDir);
+    store.setClient(next.client);
+    expect(await saving).toBe("");
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed during two reconnects");
+    expect(mid.control.updates).toBe(0);
+
+    const later = await createHarness(laterDir);
+    later.control.subscribeGate = new Promise<void>(() => undefined);
+    store.setClient(later.client);
+    store.setText(WS_SCOPE, "typed before a disconnect");
+    const refused = flushError(store);
+    store.setClient(null);
+    expect(await refused).toContain("not connected");
+    expect(store.getText(WS_SCOPE)).toBe("typed before a disconnect");
+  });
+
+  // #6753 review: the save waited for the snapshot with the entry from before the wait. A delete
+  // and a new edit meanwhile replaced it, so the save resolved without writing the new text.
+  test("a save waiting for a reconnect writes the draft edited again after a delete", async () => {
+    using oldDir = new TestTempDir("draft-store-wait-replaced-old");
+    using newDir = new TestTempDir("draft-store-wait-replaced-new");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "saved on the old backend");
+    await store.flush(WS_SCOPE);
+
+    const next = await createHarness(newDir);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+    const saving = flushError(store);
+    await store.deleteDraft(WS_SCOPE);
+    store.setText(WS_SCOPE, "typed after the delete");
+
+    releaseSnapshot();
+    expect(await saving).toBe("");
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed after the delete");
+  });
+
+  // #6438: forgetting the views on a reconnect must not touch what the composer shows.
+  test("a reconnect to the same backend keeps showing the draft until its snapshot", async () => {
+    using tempDir = new TestTempDir("draft-store-reconnect-view");
+    const { client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "saved text");
+    store.setAttachments(WS_SCOPE, [image]);
+    await store.flush(WS_SCOPE);
+
+    store.setClient(null);
+    let releaseSnapshot: () => void = () => undefined;
+    control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    const handled = control.snapshotsHandled;
+    store.setClient(client);
+    const view = store.getView(WS_SCOPE);
+    expect([view.text, view.attachments.map(({ id }) => id)]).toEqual(["saved text", ["img-1"]]);
+    releaseSnapshot();
+    await waitFor(() => control.snapshotsHandled > handled);
+    expect(store.getText(WS_SCOPE)).toBe("saved text");
+  });
+
+  // #6438: the reset at a reconnect forgets the backend's views, never an unsaved edit.
+  test("unsaved typing survives a reconnect and is saved after the snapshot", async () => {
+    using tempDir = new TestTempDir("draft-store-reconnect-unsaved");
+    const { client, control, service } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "saved text");
+    await store.flush(WS_SCOPE);
+
+    control.failUpdates = 100;
+    store.setText(WS_SCOPE, "unsaved typing");
+    expect(await flushError(store)).toContain("update failed");
+    const handled = control.snapshotsHandled;
+    store.setClient(null);
+    store.setClient(client);
+    // The snapshot still holds the saved text.
+    await waitFor(() => control.snapshotsHandled > handled);
+    expect(store.getText(WS_SCOPE)).toBe("unsaved typing");
+    control.failUpdates = 0;
+    await store.flush(WS_SCOPE);
+    expect((await service.get(WS_SCOPE)).text).toBe("unsaved typing");
+  });
+
+  // #6438, the same switch with a write in flight: the old backend's late reply confirmed the
+  // edit, so it was never written to the new backend (lost on reload), and its view (the old
+  // backend's higher revision) again outranked every later reply of the new one.
+  test("an edit whose write was in flight when the backend changed reaches the new backend", async () => {
+    using oldDir = new TestTempDir("draft-store-old-backend");
+    using newDir = new TestTempDir("draft-store-switched-backend");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    old.control.updateGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    store.setText(WS_SCOPE, "typed during the switch");
+    const inFlight = store.flush(WS_SCOPE).catch(() => undefined);
+    await waitFor(() => old.control.updates === 1);
+
+    const next = await createHarness(newDir);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+    // The old backend answers before the new one's snapshot: nothing is written there yet.
+    release();
+    await inFlight;
+    expect(next.control.updates).toBe(0);
+    releaseSnapshot();
+    await waitFor(() => next.control.snapshotsHandled > 0);
+    await store.flush(WS_SCOPE);
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the switch");
+
+    store.setText(WS_SCOPE, "typed later");
+    await store.flush(WS_SCOPE);
+    expect(store.getText(WS_SCOPE)).toBe("typed later");
   });
 });

@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ReactNode } from "react";
 import { BackgroundBashProvider } from "@/browser/contexts/BackgroundBashContext";
 import { BashBackgroundListToolCall } from "@/browser/features/Tools/BashBackgroundListToolCall";

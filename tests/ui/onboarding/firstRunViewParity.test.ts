@@ -1,6 +1,6 @@
 /**
- * The server's static first-run view must match the live wizard's gateway step (T3 #5971, C step 2,
- * plan section 5.6, PR 2). The live wizard replaces the static copy in one commit, so any drift in
+ * The server's static first-run view must match the live wizard's providers step (T3 #5971, C step
+ * 2, plan section 5.6, PR 2). The live wizard replaces the static copy in one commit, so any drift in
  * tags, classes or text shows as a jump at handoff. Catches, for example, a class changed on the
  * live step (OnboardingWizardSplash) without the same change in FIRST_RUN_VIEW_HTML.
  *
@@ -36,35 +36,28 @@ jest.mock("@/browser/contexts/API", () => ({
   useAPI: () => ({ api: null }),
   useLiveAPI: () => null,
 }));
-jest.mock("@/browser/hooks/useRouting", () => ({
-  useRouting: () => ({ navigateToProject: jest.fn() }),
-}));
-jest.mock("@/browser/hooks/useMuxGatewayAccountStatus", () => ({
-  ...jest.requireActual<typeof import("@/browser/hooks/useMuxGatewayAccountStatus")>(
-    "@/browser/hooks/useMuxGatewayAccountStatus"
-  ),
-  useMuxGatewayAccountStatus: () => ({
-    data: null,
-    error: null,
-    isLoading: false,
-    refresh: jest.fn(),
-  }),
-}));
 
 import { OnboardingWizardSplash } from "@/browser/features/SplashScreens/OnboardingWizardSplash";
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
 import { FIRST_RUN_VIEW_HTML } from "@/node/orpc/firstRunView";
 
-/** Every element in document order: tag, class attribute and its own text, whitespace-collapsed. */
+/**
+ * Every element in document order: tag, class attribute and its own text, whitespace-collapsed.
+ * An <svg> counts without its children: Jest stubs the provider icons (svgReactMock), so only the
+ * static copy has their paths.
+ */
 function shape(root: Element): string[] {
   const norm = (s: string) => s.replace(/\s+/g, " ").trim();
-  return [root, ...Array.from(root.querySelectorAll("*"))].map((el) => {
-    const text = Array.from(el.childNodes)
-      .filter((n) => n.nodeType === window.Node.TEXT_NODE)
-      .map((n) => n.textContent ?? "")
-      .join("");
-    return `<${el.tagName.toLowerCase()} class="${norm(el.getAttribute("class") ?? "")}">${norm(text)}`;
-  });
+  const elements = [root, ...Array.from(root.querySelectorAll("*"))];
+  return elements
+    .filter((el) => !el.parentElement?.closest("svg"))
+    .map((el) => {
+      const text = Array.from(el.childNodes)
+        .filter((n) => n.nodeType === window.Node.TEXT_NODE)
+        .map((n) => n.textContent ?? "")
+        .join("");
+      return `<${el.tagName.toLowerCase()} class="${norm(el.getAttribute("class") ?? "")}">${norm(text)}`;
+    });
 }
 
 /** Parses the constant the way the page will: from a <template>, cloned with content.cloneNode. */
@@ -90,13 +83,13 @@ test("the static view is one inert element with the shared id and no main landma
   expect(view.querySelector("main")).toBeNull(); // the boot loader's <main> stays the only one
 });
 
-test("the static view matches the live gateway step's overlay and dialog", () => {
+test("the static view matches the live providers step's overlay and dialog", () => {
   const view = staticView();
   const expected = (selector: string) => shape(view.querySelector(selector)!);
   const staticOverlay = expected("[data-modal-dialog-overlay]");
   const staticDialog = expected("[role=dialog]");
 
-  // Under the static view, the live wizard opens on the gateway step and removes it (PR 1).
+  // Under the static view, the live wizard opens on the providers step and removes it (PR 1).
   document.body.append(view);
   mockProviders = { config: null, loading: true };
   const wizard = () => React.createElement(OnboardingWizardSplash, { onDismiss: jest.fn() });

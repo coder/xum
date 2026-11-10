@@ -79,6 +79,33 @@ describe("MCP Apps client gating", () => {
     // Hidden tools stay known for view calls.
     expect(client.hasTool("refresh_chart")).toBe(true);
     expect(client.toolUi("refresh_chart")?.visibility).toEqual(["app"]);
+    // A settings layout action on an app tool opens the app; it is not run as a regular tool.
+    expect(client.settingsToolAction("show_chart")?.opensApp).toBe(true);
+  });
+});
+
+describe("MCP Apps tools/list_changed", () => {
+  test("the client re-lists a server's tools on tools/list_changed, then reports it", async () => {
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [fixture],
+      stderr: "pipe",
+      env: fixtureEnv({ APPS_FIXTURE_LIST_CHANGED: "1" }),
+    });
+    const changed = Promise.withResolvers<void>();
+    const client = await createMCPClient({
+      transport,
+      mcpApps: true,
+      onToolsListChanged: () => changed.resolve(),
+    });
+    clients.push(client);
+    await client.tools();
+    expect(client.appEntrypoints().map((tool) => tool.toolName)).not.toContain("parts_library");
+    // The server adds an entry point tool and announces it (a legacy-era server: the manager
+    // has no other refresh for its catalog).
+    await client.callToolForApp("refresh_chart", {});
+    await changed.promise;
+    expect(client.appEntrypoints().map((tool) => tool.toolName)).toContain("parts_library");
   });
 });
 
@@ -252,7 +279,33 @@ describe("MCP Apps failed tool calls", () => {
       resourceUri: "ui://chart/view",
       arguments: { title: "Q3" },
       result: null,
+      outcome: "interrupted",
     });
+  });
+
+  test("a call that throws records a failed outcome", async () => {
+    using tempDir = new DisposableTempDir("mcp-apps-results");
+    const client = await connect(true);
+    const store = new McpAppResultStore((workspaceId) => path.join(tempDir.path, workspaceId));
+    const scope = { workspaceId: "ws1", messageId: "m1", token: "t1" };
+    const raw = await client.tools();
+    // Same tool object, so its view declaration stays attached (getMCPToolUi).
+    raw.show_chart.execute = () => Promise.reject(new Error("server crashed"));
+    const tools = withExecutionScope(
+      wrapMCPTools(raw, { appResults: { serverName: "apps", store } }),
+      scope
+    );
+    let threw = false;
+    try {
+      await tools.show_chart.execute!(
+        { title: "Q3" },
+        { toolCallId: "call-3", messages: [], context: undefined }
+      );
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    expect(await store.get("ws1", "call-3")).toMatchObject({ result: null, outcome: "failed" });
   });
 });
 

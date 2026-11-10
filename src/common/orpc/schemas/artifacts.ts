@@ -27,11 +27,8 @@ export const ArtifactListingSchema = z.discriminatedUnion("available", [
     entries: z.array(ArtifactEntrySchema),
     /** True when the walk stopped at the entry or depth limit. */
     truncated: z.boolean(),
-    /**
-     * Artifact paths with stored versions (Artifacts tab only). Paths missing from `entries`
-     * are deleted working files whose versions stay viewable.
-     */
-    versionedPaths: z.array(z.string()).optional(),
+    /** Artifact paths that have a publish record (Artifacts tab only). */
+    publishedPaths: z.array(z.string()).optional(),
   }),
   z.object({
     available: z.literal(false),
@@ -63,6 +60,17 @@ export const ArtifactReadResultSchema = z.discriminatedUnion("status", [
 ]);
 export type ArtifactReadResult = z.infer<typeof ArtifactReadResultSchema>;
 
+/**
+ * What a read returns. `missing` marks a file the folder does not have as a regular file (a
+ * listing leaves it out too), as against a read that failed, such as one that could not reach
+ * the runtime.
+ */
+export const ArtifactReadOutcomeSchema = z.discriminatedUnion("success", [
+  z.object({ success: z.literal(true), data: ArtifactReadResultSchema }),
+  z.object({ success: z.literal(false), error: z.string(), missing: z.literal(true).optional() }),
+]);
+export type ArtifactReadOutcome = z.infer<typeof ArtifactReadOutcomeSchema>;
+
 export const ArtifactCapabilitiesSchema = z.object({
   /**
    * Whether `agent-browser` is on the runtime's PATH, so the agent can look at its own HTML
@@ -72,47 +80,9 @@ export const ArtifactCapabilitiesSchema = z.object({
 });
 export type ArtifactCapabilities = z.infer<typeof ArtifactCapabilitiesSchema>;
 
-/**
- * Artifact versions (M4). Each artifact (identified by its path relative to the artifacts dir)
- * keeps an append-only list of byte-exact copies in the workspace's host session dir, so old
- * versions stay viewable after the file changes, is deleted, or its container is gone.
- *
- * Only the artifact tool writes versions now ("publish"). "turn-end" and "attach_file" stay for
- * indexes written by older builds: dropping them would make readArtifactIndex reject those
- * indexes as corrupt and move their history aside.
- */
-export const ArtifactVersionSourceSchema = z.enum(["publish", "turn-end", "attach_file"]);
-export type ArtifactVersionSource = z.infer<typeof ArtifactVersionSourceSchema>;
-
-/** Shelf pin requested by the agent's `artifact` tool; M5 copies pinned versions to the shelf. */
+/** Shelf pin requested by the agent's `artifact` tool: the live file's bytes are copied to the shelf. */
 export const ArtifactPinSchema = z.enum(["project", "global"]);
 export type ArtifactPin = z.infer<typeof ArtifactPinSchema>;
-
-export const ArtifactVersionSchema = z.object({
-  /** 1-based, increasing per artifact. */
-  version: z.number().int().positive(),
-  /** Title given at publish time; null for turn-end snapshots of older builds. */
-  label: z.string().nullable(),
-  source: ArtifactVersionSourceSchema,
-  createdAtMs: z.number(),
-  sha256: z.string(),
-  size: z.number(),
-  /** POSIX path relative to the artifacts dir at the time of the version. */
-  path: z.string(),
-  /** Kind override from the `artifact` tool; absent means "from the extension". */
-  kind: ArtifactKindSchema.optional(),
-});
-export type ArtifactVersion = z.infer<typeof ArtifactVersionSchema>;
-
-export const ArtifactVersionListSchema = z.object({
-  /** Stable id derived from the path (see getArtifactId). */
-  artifactId: z.string(),
-  path: z.string(),
-  pin: ArtifactPinSchema.nullable(),
-  /** Newest first; empty when the artifact has no versions yet. */
-  versions: z.array(ArtifactVersionSchema),
-});
-export type ArtifactVersionList = z.infer<typeof ArtifactVersionListSchema>;
 
 /**
  * Pinned workspace files (Concept C): any file of the checkout shown live in the Artifacts tab.
@@ -134,7 +104,7 @@ export const PinnedArtifactFilesSchema = z.discriminatedUnion("available", [
 export type PinnedArtifactFiles = z.infer<typeof PinnedArtifactFilesSchema>;
 
 /**
- * Cross-workspace shelf (M5c): pinned artifact versions shared by every workspace of a project
+ * Cross-workspace shelf (M5c): pinned artifact copies shared by every workspace of a project
  * ("project") or by every workspace ("global"). Entries are read-only byte copies.
  */
 export const ArtifactShelfScopeSchema = z.enum(["project", "global"]);
@@ -149,7 +119,6 @@ export const ArtifactShelfEntrySchema = z.object({
   title: z.string(),
   kind: ArtifactKindSchema,
   size: z.number(),
-  version: z.number(),
   sourceWorkspaceId: z.string(),
   sourcePath: z.string(),
   pinnedAtMs: z.number(),

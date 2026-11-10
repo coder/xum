@@ -104,17 +104,6 @@ export function assignSection<S extends ReviewStateSection>(
   sections[section] = value;
 }
 
-/** Replace one whole section (used by the legacy import); caps still apply. */
-export function withReviewStateSection<S extends ReviewStateSection>(
-  sections: ReviewStateSections,
-  section: S,
-  value: NonNullable<ReviewStateSections[S]>
-): ReviewStateSections {
-  const next: ReviewStateSections = { ...sections };
-  assignSection(next, section, value);
-  return capReviewStateSections(next);
-}
-
 /** Combines a key present on both sides; absent means last write wins. */
 type EntryMerge<V> = ((existing: V, incoming: V) => V) | undefined;
 

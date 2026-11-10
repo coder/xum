@@ -1002,7 +1002,7 @@ describe("DevToolsService", () => {
 
         const originalAppendFile = fs.appendFile;
         const appendFileSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
-          if (String(args[1]).includes('"type":"step"')) {
+          if ((args[1] as string).includes('"type":"step"')) {
             throw new Error("ENOSPC: no space left on device");
           }
           return originalAppendFile(...args);
@@ -1035,7 +1035,7 @@ describe("DevToolsService", () => {
         const rejectAppendsContaining = (needle: string) => {
           const originalAppendFile = fs.appendFile;
           return spyOn(fs, "appendFile").mockImplementation(async (...args) => {
-            if (String(args[1]).includes(needle)) {
+            if ((args[1] as string).includes(needle)) {
               throw new Error("ENOSPC: no space left on device");
             }
             return originalAppendFile(...args);
@@ -1583,7 +1583,7 @@ describe("DevToolsService", () => {
 
         releaseQueue();
         await Promise.all([run0, run1, cleared]);
-        appendedJson = appendFileSpy.mock.calls.map((call) => String(call[1]));
+        appendedJson = appendFileSpy.mock.calls.map((call) => call[1] as string);
       } finally {
         appendFileSpy.mockRestore();
       }

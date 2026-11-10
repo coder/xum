@@ -1,9 +1,9 @@
 /**
  * Coder deployment OAuth service.
  *
- * Internals are Effect-native (see codexOauthService.ts / muxGatewayOauthService.ts
- * for the shape): fallible pipelines are `Effect.gen` programs whose error
- * channel carries a single reason-carrying tagged error, and the public
+ * Internals are Effect-native (see codexOauthService.ts for the shape):
+ * fallible pipelines are `Effect.gen` programs whose error channel carries a
+ * single reason-carrying tagged error, and the public
  * Promise methods are thin `Effect.runPromise` facades folding back into the
  * wire `Result<_, string>` shape, so pre-Effect callers keep working
  * unchanged. The cross-process file-lock critical sections
@@ -16,7 +16,7 @@
  */
 import * as crypto from "crypto";
 import type http from "node:http";
-import { Duration, Effect, Schema } from "effect";
+import { Duration, Effect, Fiber, Schema } from "effect";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import {
@@ -27,7 +27,6 @@ import {
   coderAibridgeBaseUrl,
   CODER_AI_PROVIDERS_PATH,
   CODER_BUILDINFO_PATH,
-  CODER_GATEWAY_DEFAULT_PROVIDER_NAMES,
   coderGatewayWireProtocol,
   parseCoderGatewayProviders,
   CODER_OAUTH_CALLBACK_PATH,
@@ -41,8 +40,11 @@ import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import {
+  catalogRefreshFailureMessage,
+  probeCoderGatewayProviders,
   readPriorCoderCatalog,
   reconcileProviderCatalog,
+  type CoderProviderCatalogResult,
 } from "@/node/services/coderGatewayCatalogMerge";
 import {
   isCoderOauthAuthExpired,
@@ -317,6 +319,9 @@ export class CoderOauthError extends Schema.TaggedError<CoderOauthError>()("Code
 
 export class CoderOauthService {
   private readonly desktopFlows = new OAuthFlowManager();
+  // Desktop-flow pipeline fibers. A committed login keeps running provider discovery (with
+  // retries) after its flow ends, so dispose() interrupts these too (#5762).
+  private readonly pipelineFibers = new Set<Fiber.Fiber<void>>();
   private readonly refreshMutex = new AsyncMutex();
   // Serializes whole catalog refresh runs (fetch + locked commit). Automatic
   // post-login discovery and the Settings/command-palette refresh are
@@ -547,7 +552,7 @@ export class CoderOauthService {
 
   /**
    * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible
-   * (mirrors startDesktopFlowEffect in muxGatewayOauthService.ts): a client
+   * (mirrors startDesktopFlowEffect in codexOauthService.ts): a client
    * abort between the loopback-server acquisition and `desktopFlows.register`
    * would leak the server with nothing left to close it — user-initiated
    * Cancel flows through the pre-registration checkpoints and the flow
@@ -842,7 +847,7 @@ export class CoderOauthService {
       // tokens, then commit the login. Races against resultDeferred (which
       // resolves on cancel/timeout) so the fiber exits cleanly if the flow is
       // cancelled.
-      Effect.runFork(
+      const pipelineFiber = Effect.runFork(
         self.desktopCallbackPipeline({
           flowId,
           flowStartPersistedGeneration,
@@ -855,6 +860,8 @@ export class CoderOauthService {
           flowAbortSignal: flowAbort.signal,
         })
       );
+      self.pipelineFibers.add(pipelineFiber);
+      pipelineFiber.addObserver(() => self.pipelineFibers.delete(pipelineFiber));
 
       log.debug(`[Coder OAuth] Desktop flow started (flowId=${flowId})`);
 
@@ -881,64 +888,70 @@ export class CoderOauthService {
   }): Effect.Effect<void> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
-    return Effect.gen(function* () {
-      const callbackResult = yield* Effect.promise(() =>
-        Promise.race([args.channel.result, args.resultDeferred.promise.then((): null => null)])
-      );
+    // Uninterruptible up to the commit (#5762): dispose() interrupts these fibers, and an
+    // interrupt between the token exchange and the commit would skip the commit's non-committed
+    // path, the only one that revokes freshly exchanged tokens. Only the discovery after the
+    // commit is interruptible.
+    return Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const callbackResult = yield* Effect.promise(() =>
+          Promise.race([args.channel.result, args.resultDeferred.promise.then((): null => null)])
+        );
 
-      // null means the flow was finished externally (cancel/timeout).
-      if (!callbackResult) return;
+        // null means the flow was finished externally (cancel/timeout).
+        if (!callbackResult) return;
 
-      if (!callbackResult.success) {
-        yield* self.desktopFlows.finishEffect(args.flowId, Err(callbackResult.error));
-        return;
-      }
+        if (!callbackResult.success) {
+          yield* self.desktopFlows.finishEffect(args.flowId, Err(callbackResult.error));
+          return;
+        }
 
-      // The token exchange stays OUTSIDE the login commit lock: it is a
-      // network round-trip, and one stalled exchange must not block other
-      // logins from committing. The flow's abort signal cancels it on
-      // Cancel/flow-timeout (plus the request timeout inside requestTokens).
-      const tokenResult = yield* self.requestTokensEffect(
-        args.tokenEndpoint,
-        {
-          kind: "exchange",
-          deploymentUrl: args.deploymentUrl,
-          // Fresh session lineage: rotations preserve this id, a later login
-          // mints a new one, letting disconnect tell rotations and re-logins
-          // apart.
-          sessionId: randomBase64Url(16),
-          client: args.client,
-          code: callbackResult.data.code,
-          redirectUri: args.channel.redirectUri,
-          codeVerifier: args.codeVerifier,
-        },
-        args.flowAbortSignal
-      );
-      if (!tokenResult.success) {
-        args.channel.sendFailureResponse(tokenResult.error);
-        yield* self.desktopFlows.finishEffect(args.flowId, Err(tokenResult.error));
-        return;
-      }
+        // The token exchange stays OUTSIDE the login commit lock: it is a
+        // network round-trip, and one stalled exchange must not block other
+        // logins from committing. The flow's abort signal cancels it on
+        // Cancel/flow-timeout (plus the request timeout inside requestTokens).
+        const tokenResult = yield* self.requestTokensEffect(
+          args.tokenEndpoint,
+          {
+            kind: "exchange",
+            deploymentUrl: args.deploymentUrl,
+            // Fresh session lineage: rotations preserve this id, a later login
+            // mints a new one, letting disconnect tell rotations and re-logins
+            // apart.
+            sessionId: randomBase64Url(16),
+            client: args.client,
+            code: callbackResult.data.code,
+            redirectUri: args.channel.redirectUri,
+            codeVerifier: args.codeVerifier,
+          },
+          args.flowAbortSignal
+        );
+        if (!tokenResult.success) {
+          args.channel.sendFailureResponse(tokenResult.error);
+          yield* self.desktopFlows.finishEffect(args.flowId, Err(tokenResult.error));
+          return;
+        }
 
-      const committed = yield* self.commitDesktopLoginEffect(
-        args.flowId,
-        args.flowStartPersistedGeneration,
-        args.deploymentUrl,
-        tokenResult.auth,
-        args.channel
-      );
+        const committed = yield* self.commitDesktopLoginEffect(
+          args.flowId,
+          args.flowStartPersistedGeneration,
+          args.deploymentUrl,
+          tokenResult.auth,
+          args.channel
+        );
 
-      // Provider discovery runs only after the flow is committed: Cancel is no
-      // longer possible, so this network await cannot strand half-cancelled
-      // state (persisted auth with a cancelled flow). Its Result is folded
-      // and ignored like the pre-Effect fire-and-forget refresh. Model
-      // catalogs are NOT fetched here: a deployment can expose thousands of
-      // IDs, and a loaded catalog switches Coder routing into catalog-gated
-      // mode, so loading it is an explicit user action (refreshModels).
-      if (committed) {
-        yield* toWireResult(self.refreshGatewayProvidersEffect(tokenResult.auth));
-      }
-    });
+        // Provider discovery runs only after the flow is committed: Cancel is no
+        // longer possible, so this network await cannot strand half-cancelled
+        // state (persisted auth with a cancelled flow). Its Result is folded
+        // and ignored like the pre-Effect fire-and-forget refresh. Model
+        // catalogs are NOT fetched here: a deployment can expose thousands of
+        // IDs, and a loaded catalog switches Coder routing into catalog-gated
+        // mode, so loading it is an explicit user action (refreshModels).
+        if (committed) {
+          yield* restore(toWireResult(self.refreshGatewayProvidersEffect(tokenResult.auth)));
+        }
+      })
+    );
   }
 
   async waitForDesktopFlow(
@@ -1131,6 +1144,9 @@ export class CoderOauthService {
   async dispose(): Promise<void> {
     this.unsubscribeConfigChanged();
     await this.desktopFlows.shutdownAll();
+    // Each pipeline is uninterruptible up to its commit, so this waits for a token exchange or
+    // commit in progress and stops only the discovery after it.
+    await Effect.runPromise(Fiber.interruptAll([...this.pipelineFibers]));
   }
 
   // -------------------------------------------------------------------------
@@ -2112,13 +2128,14 @@ export class CoderOauthService {
     return Effect.gen(function* () {
       const response = yield* Effect.tryPromise({
         // async thunk: mirrors the old `await fetch(...)` coercion (see above).
-        try: async () =>
+        // Interruption (dispose(), #5762) aborts the request too.
+        try: async (interrupted) =>
           fetch(`${auth.deploymentUrl}${CODER_AI_PROVIDERS_PATH}`, {
             headers: {
               Authorization: `Bearer ${auth.access}`,
               Accept: "application/json",
             },
-            signal: AbortSignal.timeout(CATALOG_FETCH_TIMEOUT_MS),
+            signal: AbortSignal.any([interrupted, AbortSignal.timeout(CATALOG_FETCH_TIMEOUT_MS)]),
           }),
         catch: getErrorMessage,
       });
@@ -2182,7 +2199,7 @@ export class CoderOauthService {
   private fetchProviderCatalogEffect(
     auth: CoderOauthAuth,
     provider: CoderGatewayProvider
-  ): Effect.Effect<{ kind: "ok"; ids: string[] } | { kind: "unavailable" } | { kind: "error" }> {
+  ): Effect.Effect<CoderProviderCatalogResult> {
     const providerName = provider.name;
     return Effect.gen(function* () {
       const response = yield* Effect.tryPromise({
@@ -2218,7 +2235,7 @@ export class CoderOauthService {
           log.debug(
             `[Coder OAuth] ${providerName} model list failed transiently (${response.status})`
           );
-          return { kind: "error" } as const;
+          return { kind: "error", reason: `HTTP ${response.status}` } as const;
         }
         log.debug(`[Coder OAuth] ${providerName} model list unavailable (${response.status})`);
         return { kind: "unavailable" } as const;
@@ -2230,7 +2247,7 @@ export class CoderOauthService {
       });
       if (!isPlainObject(json) || !Array.isArray(json.data)) {
         log.debug(`[Coder OAuth] ${providerName} model list returned an invalid payload`);
-        return { kind: "error" } as const;
+        return { kind: "error", reason: "invalid response" } as const;
       }
       const ids: string[] = [];
       for (const entry of json.data) {
@@ -2245,7 +2262,7 @@ export class CoderOauthService {
       Effect.catch((message) =>
         Effect.sync(() => {
           log.debug(`[Coder OAuth] Failed to fetch ${providerName} models: ${message}`);
-          return { kind: "error" } as const;
+          return { kind: "error", reason: "request failed" } as const;
         })
       )
     );
@@ -2512,25 +2529,13 @@ export class CoderOauthService {
       // default-named deployments; custom-named instances stay reachable via
       // the user-managed additionalProviders escape hatch.
       const authoritative = listing.kind === "ok";
-      let providers: CoderGatewayProvider[];
-      if (authoritative) {
-        providers = listing.providers;
-      } else {
-        const section = self.providersConfigStore.loadProvidersConfig()?.coder as
-          | Record<string, unknown>
-          | undefined;
-        const known = new Map<string, CoderGatewayProvider>();
-        for (const name of CODER_GATEWAY_DEFAULT_PROVIDER_NAMES) {
-          known.set(name, { name, type: name });
-        }
-        for (const provider of [
-          ...parseCoderGatewayProviders(section?.discoveredProviders),
-          ...parseCoderGatewayProviders(section?.additionalProviders),
-        ]) {
-          known.set(provider.name, provider);
-        }
-        providers = [...known.values()];
-      }
+      const providers: CoderGatewayProvider[] = authoritative
+        ? listing.providers
+        : probeCoderGatewayProviders(
+            self.providersConfigStore.loadProvidersConfig()?.coder as
+              | Record<string, unknown>
+              | undefined
+          );
 
       // Provider catalogs are independent: fetch them concurrently and bound
       // each request, so one stalled provider can neither delay nor starve a
@@ -2664,12 +2669,10 @@ export class CoderOauthService {
         log.debug(
           "[Coder OAuth] Catalog refresh inconclusive: provider fetches failed transiently"
         );
+        // Name each failing provider and its status, so a user can tell a deployment problem
+        // (for example a gateway that answers 502) from a Xum problem (#5659).
         return yield* Effect.fail(
-          new CoderOauthError({
-            reason: everyFetchFailed
-              ? "Model discovery failed for every AI Gateway provider"
-              : "Model discovery failed for at least one AI Gateway provider; try refreshing again",
-          })
+          new CoderOauthError({ reason: catalogRefreshFailureMessage(results, everyFetchFailed) })
         );
       }
       if (!setResult.data.applied) {

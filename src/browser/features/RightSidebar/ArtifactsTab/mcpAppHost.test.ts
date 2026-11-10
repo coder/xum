@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
-import { MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
-import { passesFrameGate } from "./artifactBridge";
+import {
+  MCP_APP_MODEL_CONTEXT_MAX_BYTES,
+  MCP_APP_WIDGET_STATE_MAX_BYTES,
+} from "@/common/utils/mcpApps";
 import {
   createMcpAppHost,
   MCP_APP_CONSENT_ARGS_MAX_BYTES,
@@ -23,6 +25,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
   const composer: string[] = [];
   const opened: string[] = [];
   const sizes: Array<{ width?: number; height?: number }> = [];
+  const widgetStates: unknown[] = [];
   let initialized = 0;
   const host = createMcpAppHost({
     serverName: "charts",
@@ -56,6 +59,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
       modelContexts.push(text);
       return Promise.resolve();
     },
+    saveWidgetState: (state) => widgetStates.push(state),
     setDisplayMode: (mode) => {
       modeRequests.push(mode);
       return () => {
@@ -102,6 +106,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
     composer,
     opened,
     sizes,
+    widgetStates,
     request,
     reply,
     initialized: () => initialized,
@@ -109,14 +114,6 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
 }
 
 describe("MCP Apps host router", () => {
-  test("frame gate rejects other windows", () => {
-    const frame = Object.create(null) as Window;
-    const other = Object.create(null) as Window;
-    expect(passesFrameGate({ source: frame }, frame, () => true)).toBe(true);
-    expect(passesFrameGate({ source: other }, frame, () => true)).toBe(false);
-    expect(passesFrameGate({ source: frame }, frame, () => false)).toBe(false);
-  });
-
   test("initialize advertises only implemented capabilities and the granted CSP", async () => {
     const t = setup();
     await t.request(1, "ui/initialize", { appInfo: { name: "v" }, protocolVersion: "2026-01-26" });
@@ -275,11 +272,75 @@ describe("MCP Apps host router", () => {
       params: { width: 200, height: 1e9 },
     });
     expect(t.sizes).toEqual([{ width: 200, height: MCP_APP_MAX_HEIGHT }]);
+    await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
     const done = t.host.teardown("closed");
     const teardown = t.sent.at(-1) as { id: string; method: string };
     expect(teardown.method).toBe("ui/resource-teardown");
     await t.host.handleMessage({ jsonrpc: "2.0", id: teardown.id, result: {} });
     await done;
+  });
+
+  // #6181: the spec lets a host send requests only after the view's initialized.
+  test("a view that never sent initialized gets no teardown, and teardown resolves at once", async () => {
+    const t = setup();
+    await t.host.teardown("unmount");
+    expect(t.sent.some((m) => m.method === "ui/resource-teardown")).toBe(false);
+  });
+
+  // The window.openai shim posts request-display-mode right after its initialize, before
+  // initialized: the move must still wait for the teardown reply, its delivery barrier.
+  test("an accepted mode change before initialized still waits for the teardown reply", async () => {
+    const t = setup();
+    await t.request(1, "ui/initialize", { appCapabilities: {} });
+    const done = t.request(2, "ui/request-display-mode", { mode: "fullscreen" });
+    const teardown = t.sent.find((m) => m.method === "ui/resource-teardown");
+    expect(teardown).toBeDefined();
+    expect(t.moves).toEqual([]);
+    await t.host.handleMessage({ jsonrpc: "2.0", id: teardown?.id, result: {} });
+    await done;
+    expect(t.moves).toEqual(["fullscreen"]);
+  });
+
+  test("widget state is saved in order, and a state over the cap is dropped", async () => {
+    const t = setup();
+    const send = (state: unknown) =>
+      t.host.handleMessage({ jsonrpc: "2.0", method: "xum/widget-state", params: { state } });
+    await send({ n: 1 });
+    await send({ text: "x".repeat(MCP_APP_WIDGET_STATE_MAX_BYTES) });
+    // Not JSON (a view can post a cycle or a BigInt): dropped, and handleMessage still resolves.
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    await send(cycle);
+    await send({ big: BigInt(1) });
+    // JSON would change these (NaN to null, a Map or a Date to an object or a string, an
+    // undefined member dropped), so the stored state would not be what the widget set.
+    for (const changed of [
+      { x: NaN },
+      { m: new Map([[1, 2]]) },
+      { d: new Date(0) },
+      { u: undefined },
+    ])
+      await send(changed);
+    // A sparse array (JSON turns holes into null).
+    // eslint-disable-next-line no-sparse-arrays -- the hole is the point
+    await send({ a: [1, , 3] });
+    // An array property JSON would drop.
+    await send({ a: Object.assign([1, 2], { extra: true }) });
+    // Deeper than any widget state, and a self-cycle: refused without exhausting the stack.
+    let deep: unknown = 1;
+    for (let i = 0; i < 100_000; i++) deep = [deep];
+    await send(deep);
+    const selfCycle: unknown[] = [];
+    selfCycle.push(selfCycle);
+    await send(selfCycle);
+    // Shared references that JSON would expand exponentially: refused before any serialization.
+    let shared: Record<string, unknown> = { leaf: 1 };
+    for (let i = 0; i < 60; i++) shared = { left: shared, right: shared };
+    const started = Date.now();
+    await send(shared);
+    expect(Date.now() - started).toBeLessThan(1000);
+    await send(null);
+    expect(t.widgetStates).toEqual([{ n: 1 }, null]);
   });
 
   test("resources/read goes to the view's own server and returns its result", async () => {

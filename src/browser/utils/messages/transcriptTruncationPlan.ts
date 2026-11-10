@@ -128,6 +128,29 @@ function capOmissionSegments(
   return [mergedPrefix, ...segments.slice(mergedPrefixCount)];
 }
 
+type HistoryHiddenRow = Extract<DisplayedMessage, { type: "history-hidden" }>;
+
+// Rows are memoized on prop identity, and markers are rebuilt on every recompute (each stream
+// delta, each page of older rows). Reusing an equal marker keeps it from re-rendering (#4961
+// F20). Marker ids are positional and capped at maxHiddenSegments, so this holds a few entries.
+const previousHistoryHiddenRowById = new Map<string, { key: string; row: HistoryHiddenRow }>();
+
+/** Every field of a marker except its id, as one comparable value. */
+function historyHiddenRowKey(row: HistoryHiddenRow): string {
+  const counts = row.omittedMessageCounts;
+  return [row.hiddenCount, row.historySequence, counts?.tool, counts?.reasoning].join("/");
+}
+
+function reuseEqualHistoryHiddenRow(row: HistoryHiddenRow): HistoryHiddenRow {
+  const key = historyHiddenRowKey(row);
+  const previous = previousHistoryHiddenRowById.get(row.id);
+  if (previous?.key === key) {
+    return previous.row;
+  }
+  previousHistoryHiddenRowById.set(row.id, { key, row });
+  return row;
+}
+
 function renderKeptRowsWithMarkers(
   keptOldMessages: DisplayedMessage[],
   segments: OmissionSegment[]
@@ -150,13 +173,15 @@ function renderKeptRowsWithMarkers(
           ? segment.omittedMessageCounts
           : undefined;
 
-      rows.push({
-        type: "history-hidden",
-        id: `history-hidden-${segmentIndex + 1}`,
-        hiddenCount: segment.hiddenCount,
-        historySequence: -1,
-        omittedMessageCounts,
-      });
+      rows.push(
+        reuseEqualHistoryHiddenRow({
+          type: "history-hidden",
+          id: `history-hidden-${segmentIndex + 1}`,
+          hiddenCount: segment.hiddenCount,
+          historySequence: -1,
+          omittedMessageCounts,
+        })
+      );
 
       segmentIndex += 1;
     }

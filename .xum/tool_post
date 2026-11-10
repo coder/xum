@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# .xum/tool_post - Format TypeScript and Markdown files after edits
+# .xum/tool_post - Format TypeScript and Markdown files after edits, report the
+# CRAP gate after agent commits and pushes, then run the user's own tool_post.
 
-if [[ "$XUM_TOOL" == file_edit_* ]]; then
+# Recursion guard: a user hook that calls this file again (directly or through
+# a wrapper) gets nothing done twice. Set only below, right before the exec.
+[[ -n "${XUM_INTERNAL_PROJECT_TOOL_POST_DONE:-}" ]] && exit 0
+
+# A function, so its early returns still reach the user's hook below.
+format_edited_file() {
   file="${XUM_TOOL_INPUT_FILE_PATH:-}"
-  [[ -z "$file" ]] && exit 0
+  [[ -z "$file" ]] && return 0
 
   case "$file" in
     *.ts|*.tsx)
-      before=$(cat "$file" 2>/dev/null) || exit 0
+      before=$(cat "$file" 2>/dev/null) || return 0
       # 1. Format with prettier
       bun run prettier --write --log-level silent "$file" 2>/dev/null || true
       # 2. Fix tailwind class ordering (minimal config for speed)
@@ -18,16 +24,57 @@ if [[ "$XUM_TOOL" == file_edit_* ]]; then
       fi
       ;;
     *.md|*.mdx)
-      before=$(cat "$file" 2>/dev/null) || exit 0
+      before=$(cat "$file" 2>/dev/null) || return 0
       bun run prettier --write --log-level silent "$file" 2>/dev/null || true
       if [[ "$(cat "$file")" != "$before" ]]; then
         echo "Formatted: $file"
       fi
       ;;
   esac
+}
+
+if [[ "$XUM_TOOL" == file_edit_* ]]; then
+  format_edited_file
 fi
 
 # CRAP gate report after agent `git commit` / `git push` (warn mode only).
 if [[ "$XUM_TOOL" == "bash" ]]; then
   "${0%/*}/../scripts/crap/agent-gate.sh" post
 fi
+
+# Xum runs the first tool_post it finds, so this project hook replaces the
+# user's own tool_post. Run the user's hook last, through exec: its output, exit
+# code, env, stdin, args and cwd pass through unchanged. Only bash builtins up
+# to the exec: this runs after every tool call.
+#
+# The user's hook is <Xum home>/tool_post. The home comes from Xum's own
+# XUM_SCRATCH_DIR, <home>/sessions/<workspace id>/scratch in local and worktree
+# workspaces, not from HOME, XUM_ROOT or NODE_ENV: workspace secrets can
+# override those in the hook env, and Xum resolves its home (with its leftover
+# ~/.mux fallbacks) from its own process. Known limits, all fail-open (no user
+# hook runs, as before this hook chained):
+# - SSH, Docker and devcontainer workspaces: their home is on the remote host
+#   or in the container.
+# - No XUM_SCRATCH_DIR or XUM_WORKSPACE_ID (a hook run outside Xum), or a
+#   scratch dir of another shape (Windows paths, `xum run`'s private root).
+# - A user hook that is this file (a symlink, or a project at the Xum home).
+# - The user's hook shares this hook's time limit (Xum kills a tool_post after
+#   10 s), so after a slow CRAP report it has less time than on its own.
+# - A non-executable user hook. Xum on its own would run it and append the
+#   shell's "Permission denied" (exit 126) to every tool result. This hook
+#   skips it instead, so only this repo hides that setup error.
+# A missing tool_post means Xum would not run one either.
+run_user_tool_post() {
+  case ${XUM_RUNTIME:-} in
+    local | worktree) ;;
+    *) return 0 ;;
+  esac
+  local id=${XUM_WORKSPACE_ID:-} scratch=${XUM_SCRATCH_DIR:-}
+  local suffix=/sessions/$id/scratch
+  [[ -n "$id" && "$scratch" == /?*"$suffix" ]] || return 0
+  local hook=${scratch%"$suffix"}/tool_post
+  [[ -f "$hook" && -x "$hook" && ! "$hook" -ef "$0" ]] || return 0
+  export XUM_INTERNAL_PROJECT_TOOL_POST_DONE=1
+  exec "$hook" "$@"
+}
+run_user_tool_post "$@"

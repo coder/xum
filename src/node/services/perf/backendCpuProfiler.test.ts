@@ -72,6 +72,59 @@ describe("createBackendCpuProfiler", () => {
     expect(failedStop.sessions[0].disconnects).toBe(1);
   });
 
+  // While any inspector session is connected, V8 keeps every console.* argument it logs (up to
+  // ~1000 messages), and a disconnect does not free them: an APICallError logged during an 8 s
+  // capture kept its whole request body for the life of the process (F12, #6754).
+  test("every release discards console entries before it disconnects", async () => {
+    const discardedBeforeDisconnect = (session: FakeSession) =>
+      session.posts.at(-1) === "Runtime.discardConsoleEntries" && session.disconnects === 1;
+
+    const stopped = setup();
+    const run = await stopped.profiler.start({ samplingIntervalUs: 1000 });
+    if (!run.ok) throw new Error("expected a run");
+    await run.run.stop();
+    expect(discardedBeforeDisconnect(stopped.sessions[0])).toBe(true);
+
+    const cancelled = setup();
+    const cancelRun = await cancelled.profiler.start({ samplingIntervalUs: 1000 });
+    if (!cancelRun.ok) throw new Error("expected a run");
+    await cancelRun.run.cancel();
+    expect(discardedBeforeDisconnect(cancelled.sessions[0])).toBe(true);
+
+    // A failing discard must not keep the session connected.
+    const failedDiscard = setup({ failOn: "Runtime.discardConsoleEntries" });
+    const failRun = await failedDiscard.profiler.start({ samplingIntervalUs: 1000 });
+    if (!failRun.ok) throw new Error("expected a run");
+    expect(await failRun.run.stop()).toEqual({ nodes: [] });
+    expect(failedDiscard.sessions[0].disconnects).toBe(1);
+  });
+
+  test("a release that overlaps a pending one waits for its disconnect", async () => {
+    const discard = Promise.withResolvers<void>();
+    const { profiler, sessions } = setup();
+    const started = await profiler.start({ samplingIntervalUs: 1000 });
+    if (!started.ok) throw new Error("expected a run");
+    const session = sessions[0];
+    const post = session.post.bind(session);
+    session.post = (method: string) =>
+      method === "Runtime.discardConsoleEntries"
+        ? discard.promise.then(() => post(method))
+        : post(method);
+
+    let secondDone = false;
+    const first = started.run.cancel();
+    const second = started.run.cancel().then(() => {
+      secondDone = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The second cancel must not report a release while the session is still connected.
+    expect(secondDone).toBe(false);
+    discard.resolve();
+    await Promise.all([first, second]);
+    expect(session.disconnects).toBe(1);
+  });
+
   test("cancel releases the session without stopping through it", async () => {
     const { profiler, sessions } = setup();
     const started = await profiler.start({ samplingIntervalUs: 1000 });

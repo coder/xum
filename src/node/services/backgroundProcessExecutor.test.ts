@@ -1,12 +1,37 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { randomUUID } from "crypto";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { BackgroundHandle } from "@/node/runtime/Runtime";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import type { BackgroundHandle, ExecStream } from "@/node/runtime/Runtime";
+import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
-import { BG_EXIT_CODE_FILENAME, spawnProcess } from "./backgroundProcessExecutor";
+import {
+  BG_EXIT_CODE_FILENAME,
+  migrateToBackground,
+  spawnProcess,
+} from "./backgroundProcessExecutor";
+
+// Spawn records live in the shared /tmp/mux-bashes/<workspaceId>. A Date.now() id collided between
+// test processes that started in the same millisecond, and one process's cleanup deleted the
+// other's records (#5591, #7256), so each run gets its own id.
+const RUN_ID = randomUUID().slice(0, 12);
+
+/**
+ * The workspace directory of a spawn record (`<tempDir>/mux-bashes/<workspaceId>/<processId>`).
+ * Removing only the record leaves this empty parent behind. Every workspace id here ends in
+ * RUN_ID, so the check keeps a cleanup from ever deleting a directory this run did not create.
+ */
+function ownWorkspaceDir(outputDir: string): string {
+  const dir = path.dirname(outputDir);
+  if (!path.basename(dir).endsWith(RUN_ID)) {
+    throw new Error(`Refusing to clean ${dir}: its name does not end in this run's id`);
+  }
+  return dir;
+}
 
 /**
  * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so
@@ -42,8 +67,15 @@ function createRemoteLikeRuntime(
   });
 }
 
+/**
+ * Waits for the code the wrapper writes. Its exit marker exists, empty, from the redirect's create
+ * until the write (`echo $? > exit_code`), and a slow host stretches that gap: poll against a
+ * deadline, because a count of polls shrinks to about a second when each poll is quick. A test that
+ * calls this needs its own timeout.
+ */
 async function waitForExit(handle: BackgroundHandle): Promise<number | null> {
-  for (let attempt = 0; attempt < 100; attempt++) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
     const exitCode = await handle.getExitCode();
     if (exitCode !== null) return exitCode;
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -67,7 +99,7 @@ describe("spawnProcess", () => {
     cleanupDirs.push(hostDir);
     const base = new LocalRuntime(hostDir);
     const tempDir = await base.tempDir();
-    const workspaceId = `remote-throw-${Date.now()}`;
+    const workspaceId = `remote-throw-${RUN_ID}`;
     cleanupDirs.push(`${tempDir}/mux-bashes/${workspaceId}`);
 
     const result = await spawnProcess(createRemoteLikeRuntime(base, true), "echo hi", {
@@ -88,7 +120,7 @@ describe("spawnProcess", () => {
     const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-cwd-claim-"));
     cleanupDirs.push(hostDir);
     const runtime = new LocalRuntime(hostDir);
-    const workspaceId = `cwd-claim-${Date.now()}`;
+    const workspaceId = `cwd-claim-${RUN_ID}`;
     const workspaceDir = `${await runtime.tempDir()}/mux-bashes/${workspaceId}`;
     cleanupDirs.push(workspaceDir);
     const recordDir = (name: string) => path.join(workspaceDir, name);
@@ -118,7 +150,7 @@ describe("spawnProcess", () => {
     const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-cwd-throw-"));
     cleanupDirs.push(hostDir);
     const base = new LocalRuntime(hostDir);
-    const workspaceId = `cwd-throw-${Date.now()}`;
+    const workspaceId = `cwd-throw-${RUN_ID}`;
     const recordDir = `${await base.tempDir()}/mux-bashes/${workspaceId}/claimed`;
     cleanupDirs.push(path.dirname(recordDir));
     await fs.mkdir(recordDir, { recursive: true });
@@ -163,18 +195,18 @@ describe("spawnProcess", () => {
     const runtime = new ExecPathMappingRuntime(hostDir, hostDir, execDir);
     const result = await spawnProcess(runtime, `pwd > ${shellQuote(outFile)}`, {
       cwd: hostDir,
-      workspaceId: `mapped-cwd-${Date.now()}`,
+      workspaceId: `mapped-cwd-${RUN_ID}`,
       processId: "pwd",
     });
 
     expect(result.success).toBe(true);
     if (!result.success) return;
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
 
     expect(await waitForExit(result.handle)).toBe(0);
     expect((await fs.readFile(outFile, "utf8")).trim()).toBe(execDir);
-  });
+  }, 15_000);
 
   it("pathEnv values win over colliding caller env in background wrappers", async () => {
     const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-pathenv-collision-"));
@@ -187,7 +219,7 @@ describe("spawnProcess", () => {
       `printf %s "$XUM_TEST_TOOLENV" > ${shellQuote(outFile)}`,
       {
         cwd: hostDir,
-        workspaceId: `pathenv-collision-${Date.now()}`,
+        workspaceId: `pathenv-collision-${RUN_ID}`,
         processId: "collision",
         env: { XUM_TEST_TOOLENV: "/wrong/value" },
         pathEnv: { XUM_TEST_TOOLENV: "/right/value" },
@@ -197,11 +229,11 @@ describe("spawnProcess", () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
 
     expect(await waitForExit(result.handle)).toBe(0);
     expect((await fs.readFile(outFile, "utf8")).trim()).toBe("/right/value");
-  });
+  }, 15_000);
 
   it("probes local records with fs instead of spawning a shell per poll", async () => {
     const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-local-probe-"));
@@ -212,7 +244,7 @@ describe("spawnProcess", () => {
       "printf 'one\\ntwo\\n'; sleep 0.3; printf 'three\\n'",
       {
         cwd: hostDir,
-        workspaceId: `local-probe-${Date.now()}`,
+        workspaceId: `local-probe-${RUN_ID}`,
         processId: "local-probe",
       }
     );
@@ -220,7 +252,7 @@ describe("spawnProcess", () => {
     expect(result.success).toBe(true);
     if (!result.success) return;
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
 
     // Monitors tick every 100ms on local runtimes; each shell probe forks the main process, so
     // the local read path must not touch runtime.exec at all.
@@ -259,34 +291,34 @@ describe("spawnProcess", () => {
     cleanupDirs.push(hostDir);
     const result = await spawnProcess(new LocalRuntime(hostDir), "echo hi", {
       cwd: hostDir,
-      workspaceId: `local-missing-${Date.now()}`,
+      workspaceId: `local-missing-${RUN_ID}`,
       processId: "missing",
     });
 
     expect(result.success).toBe(true);
     if (!result.success) return;
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
     expect(await waitForExit(result.handle)).toBe(0);
 
     await fs.rm(path.join(result.outputDir, "output.log"));
     const probe = await result.handle.readOutputForMonitor?.(0);
     expect(probe?.success).toBe(false);
-  });
+  }, 15_000);
 
   it("fails the strict exit probe when the exit marker is a dangling symlink", async () => {
     const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-dangling-marker-"));
     cleanupDirs.push(hostDir);
     const result = await spawnProcess(new LocalRuntime(hostDir), "echo hi", {
       cwd: hostDir,
-      workspaceId: `dangling-marker-${Date.now()}`,
+      workspaceId: `dangling-marker-${RUN_ID}`,
       processId: "dangling",
     });
 
     expect(result.success).toBe(true);
     if (!result.success) return;
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
     expect(await waitForExit(result.handle)).toBe(0);
 
     const markerPath = path.join(result.outputDir, BG_EXIT_CODE_FILENAME);
@@ -297,7 +329,7 @@ describe("spawnProcess", () => {
     // fail (feeding monitor retirement) rather than report a still-running process forever.
     const probe = await result.handle.getExitCodeForMonitor?.();
     expect(probe?.success).toBe(false);
-  });
+  }, 15_000);
 
   /**
    * Spawns a script that creates $READY_FILE once its traps and children are in place, and waits
@@ -310,14 +342,14 @@ describe("spawnProcess", () => {
     const runtime = new LocalRuntime(hostDir);
     const result = await spawnProcess(runtime, script, {
       cwd: hostDir,
-      workspaceId: `${tag}-${Date.now()}`,
+      workspaceId: `${tag}-${RUN_ID}`,
       processId: tag,
       env: { READY_FILE: readyFile },
     });
     expect(result.success).toBe(true);
     if (!result.success) throw new Error(result.error);
     handles.push(result.handle);
-    cleanupDirs.push(result.outputDir);
+    cleanupDirs.push(ownWorkspaceDir(result.outputDir));
     const ready = () =>
       fs.access(readyFile).then(
         () => true,
@@ -338,6 +370,49 @@ describe("spawnProcess", () => {
       return false;
     }
   }
+
+  it("keeps the background child identity after exit and disposal", async () => {
+    const { result } = await spawnLive('sleep 30 & : > "$READY_FILE"; wait', "local-identity");
+    const evidence = result.handle.localProcess;
+    expect(evidence).toEqual({
+      pid: result.pid,
+      identity: { ...getSelfIdentity(), birth: linuxBirth(result.pid) },
+    });
+    if (process.platform === "linux") {
+      expect(evidence?.identity?.birth).toStartWith("linux-ticks:");
+    }
+    await result.handle.terminate();
+    expect(await waitForExit(result.handle)).toBe(143);
+    await result.handle.dispose();
+    expect(result.handle.localProcess).toBe(evidence);
+  }, 15_000);
+
+  it.each(["remote", "devcontainer"] as const)(
+    "does not add host identity to a %s background handle",
+    async (kind) => {
+      const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-nonlocal-identity-"));
+      cleanupDirs.push(hostDir);
+      const base = new LocalRuntime(hostDir);
+      // Use real local operations while testing container PID classification.
+      const runtime =
+        kind === "remote"
+          ? createRemoteLikeRuntime(base)
+          : new Proxy(base, { getPrototypeOf: () => DevcontainerRuntime.prototype });
+      const result = await spawnProcess(runtime, "exit 0", {
+        cwd: hostDir,
+        workspaceId: `nonlocal-identity-${kind}-${RUN_ID}`,
+        processId: "nonlocal-identity",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error(result.error);
+      handles.push(result.handle);
+      cleanupDirs.push(ownWorkspaceDir(result.outputDir));
+      expect(result.handle.localProcess).toBeUndefined();
+      expect(await waitForExit(result.handle)).toBe(0);
+      expect(result.handle.localProcess).toBeUndefined();
+    },
+    15_000
+  );
 
   it("concurrent terminate calls share one kill sequence", async () => {
     const { result, runtime } = await spawnLive(
@@ -412,35 +487,51 @@ describe("spawnProcess", () => {
       const runtime = kind === "local" ? base : createRemoteLikeRuntime(base, false, beforeTail);
       const result = await spawnProcess(runtime, "sleep 60", {
         cwd: hostDir,
-        workspaceId: `bounded-read-${kind}-${Date.now()}`,
+        workspaceId: `bounded-read-${kind}-${RUN_ID}`,
         processId: "bounded-read",
       });
       if (!result.success) throw new Error(result.error);
       handles.push(result.handle);
-      cleanupDirs.push(result.outputDir);
+      cleanupDirs.push(ownWorkspaceDir(result.outputDir));
       const outputPath = path.join(result.outputDir, "output.log");
       await fs.appendFile(outputPath, log);
       return Object.assign(result.handle, { outputPath });
     }
 
+    // The log spans many pages, and each remote page runs two bash execs (size probe, then tail),
+    // so the wall time grows with host load and passes the 5 s default. The timeout only catches
+    // a hang: the exec count checks the work per page, and the byte bound in the loop checks how
+    // much one read returns.
     it.each(["local", "remote"] as const)(
       "reads %s output in bounded pages that decode to the whole log",
       async (kind) => {
         const handle = await spawnWithLog(kind, raw);
+        const execSpy = spyOn(LocalRuntime.prototype, "exec");
         let offset = 0;
         let text = "";
-        for (let attempt = 0; attempt < 1_000 && offset < raw.length; attempt++) {
-          const read = await handle.readOutput(offset, 1_000);
-          // One page, plus at most 3 bytes to finish a character cut at its end.
-          expect(read.newOffset - offset).toBeGreaterThanOrEqual(1);
-          expect(read.newOffset - offset).toBeLessThanOrEqual(1_003);
-          expect(read.fileSize).toBe(raw.length);
-          text += read.content;
-          offset = read.newOffset;
+        let pages = 0;
+        let execs = 0;
+        try {
+          for (let attempt = 0; attempt < 1_000 && offset < raw.length; attempt++) {
+            const read = await handle.readOutput(offset, 1_000);
+            pages++;
+            // One page, plus at most 3 bytes to finish a character cut at its end.
+            expect(read.newOffset - offset).toBeGreaterThanOrEqual(1);
+            expect(read.newOffset - offset).toBeLessThanOrEqual(1_003);
+            expect(read.fileSize).toBe(raw.length);
+            text += read.content;
+            offset = read.newOffset;
+          }
+          execs = execSpy.mock.calls.length;
+        } finally {
+          execSpy.mockRestore();
         }
         expect(offset).toBe(raw.length);
         expect(text).toBe(decode(raw));
-      }
+        // A remote page is one size probe plus one tail read, and a local page runs no exec.
+        expect(execs).toBe(kind === "remote" ? 2 * pages : 0);
+      },
+      30_000
     );
 
     // A decoder strips U+FEFF at the start of its input as a byte-order mark, and the offset
@@ -501,4 +592,163 @@ describe("spawnProcess", () => {
       }
     );
   });
+});
+
+describe("failed migration settlement", () => {
+  const cleanupDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(
+      cleanupDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true }))
+    );
+  });
+
+  async function failMigration(directoryCreationFails = false) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "bg-failed-migration-"));
+    cleanupDirs.push(root);
+    const outputDir = path.join(root, "workspace", "failed");
+    if (directoryCreationFails) {
+      await fs.writeFile(path.join(root, "workspace"), "not a directory");
+    } else {
+      // A directory at output.log fails the initial write after mkdir succeeds.
+      await fs.mkdir(path.join(outputDir, "output.log"), { recursive: true });
+    }
+    const exit = Promise.withResolvers<number>();
+    void exit.promise.catch(() => undefined);
+    const stream: ExecStream = {
+      stdout: new ReadableStream(),
+      stderr: new ReadableStream(),
+      stdin: new WritableStream(),
+      exitCode: exit.promise,
+      duration: Promise.resolve(0),
+    };
+    const result = await migrateToBackground(
+      stream,
+      {
+        cwd: root,
+        workspaceId: "workspace",
+        processId: "failed",
+        script: "unused",
+        existingOutput: [],
+      },
+      root
+    );
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error("Migration unexpectedly succeeds");
+    return { result, exit, outputDir, marker: path.join(outputDir, BG_EXIT_CODE_FILENAME) };
+  }
+
+  it("returns failure before exit and joins confirmed marker publication", async () => {
+    const { result, exit, marker } = await failMigration();
+    let settled = false;
+    const settlement = result.exitCode.then((code) => {
+      settled = true;
+      return code;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(await fs.stat(marker).catch(() => null)).toBeNull();
+    exit.resolve(7);
+    expect(await settlement).toBe(7);
+    expect(await fs.readFile(marker, "utf8")).toBe("7");
+  });
+
+  it("keeps a rejected exit unknown", async () => {
+    const { result, exit, marker } = await failMigration();
+    const error = new Error("transport lost");
+    const rejected = result.exitCode.catch((failure: unknown) => failure);
+    exit.reject(error);
+    expect(await rejected).toBe(error);
+    expect(await fs.stat(marker).catch(() => null)).toBeNull();
+  });
+
+  it("preserves an existing exit marker", async () => {
+    const { result, exit, marker } = await failMigration();
+    await fs.writeFile(marker, "3");
+    exit.resolve(7);
+    expect(await result.exitCode).toBe(7);
+    expect(await fs.readFile(marker, "utf8")).toBe("3");
+  });
+
+  it("does not recreate a removed output directory", async () => {
+    const { result, exit, marker, outputDir } = await failMigration();
+    await fs.rm(outputDir, { recursive: true });
+    exit.resolve(7);
+    expect(await result.exitCode).toBe(7);
+    expect(await fs.stat(outputDir).catch(() => null)).toBeNull();
+    expect(await fs.stat(marker).catch(() => null)).toBeNull();
+  });
+
+  it("returns the original exit promise when directory creation fails", async () => {
+    const { result, exit } = await failMigration(true);
+    expect(result.exitCode).toBe(exit.promise);
+    exit.resolve(7);
+    expect(await result.exitCode).toBe(7);
+  });
+});
+
+describe("migrateToBackground process identity", () => {
+  it.each(["local", "remote"] as const)(
+    "keeps %s evidence after the stream finishes",
+    async (kind) => {
+      const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-migrated-identity-"));
+      const controller = new AbortController();
+      const stream = await new LocalRuntime(hostDir).exec('printf "%s" "$$"; read -r _; exit 7', {
+        cwd: hostDir,
+        timeout: 5,
+        abortSignal: controller.signal,
+      });
+      // Remote exec streams do not carry host-local evidence.
+      if (kind === "remote") delete stream.localProcess;
+      const evidence = stream.localProcess;
+      let handle: BackgroundHandle | undefined;
+      try {
+        const result = await migrateToBackground(
+          stream,
+          {
+            cwd: hostDir,
+            workspaceId: "workspace",
+            processId: "migrated",
+            script: "read -r _; exit 7",
+            existingOutput: [],
+            kill: () => controller.abort(),
+          },
+          hostDir
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) throw new Error(result.error);
+        handle = result.handle;
+        expect(handle.localProcess).toBe(evidence);
+        if (kind === "local") {
+          expect(evidence).toBeDefined();
+          if (!evidence) throw new Error("Missing local process identity");
+          expect(evidence.identity).toEqual({
+            ...getSelfIdentity(),
+            birth: linuxBirth(evidence.pid),
+          });
+        }
+        await stream.stdin.close();
+        expect(await stream.exitCode).toBe(7);
+        expect(await waitForExit(handle)).toBe(7);
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const output = await handle.readOutput(0);
+          if (output.content.trim().length > 0 && !stream.stdout.locked && !stream.stderr.locked) {
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(stream.stdout.locked).toBe(false);
+        expect(stream.stderr.locked).toBe(false);
+        expect((await handle.readOutput(0)).content.trim()).toMatch(/^\d+$/);
+        await handle.dispose();
+        expect(handle.localProcess).toBe(evidence);
+      } finally {
+        controller.abort();
+        await stream.exitCode;
+        await handle?.terminate();
+        await handle?.dispose();
+        await fs.rm(hostDir, { recursive: true, force: true });
+      }
+    },
+    15_000
+  );
 });

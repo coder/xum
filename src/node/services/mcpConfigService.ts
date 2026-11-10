@@ -13,6 +13,7 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import type {
   MCPConfig,
+  MCPConfigProblem,
   MCPHeaderValue,
   MCPServerInfo,
   MCPServerTransport,
@@ -40,6 +41,8 @@ import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { isSecretReferenceValue } from "@/common/types/secrets";
 import { getMcpServerUrlError } from "@/common/utils/mcp/serverUrl";
+import { formatMcpConfigProblem } from "@/common/utils/mcp/configProblem";
+import { parseMcpConfigServers } from "@/node/services/mcpConfigParse";
 
 /**
  * Canonical `plugin:<16-hex>:<server>` keys are RESERVED for Agent Plugin
@@ -107,6 +110,30 @@ export function acquireGlobalMcpConfigLock(
     signal: options.signal,
   });
 }
+
+/** A config file as read, with what Xum skipped in it (#2060). */
+type ReadMCPConfig = MCPConfig & { problems: MCPConfigProblem[] };
+
+/**
+ * A save rewrites the whole file from the parsed servers, so a skipped entry would be lost: the
+ * user fixes the file first (#2060).
+ */
+function refuseSaveWithProblems(filePath: string, problems: MCPConfigProblem[]): void {
+  const [problem] = problems;
+  if (problem !== undefined) {
+    throw new Error(`Fix ${filePath} first. ${formatMcpConfigProblem(problem)}`);
+  }
+}
+
+/** A fresh value: callers edit the servers they get. */
+const noConfig = (): ReadMCPConfig => ({ servers: {}, enabledPluginServers: [], problems: [] });
+
+/**
+ * A skipped entry stays as a disabled server, so it still shadows a lower layer (a global server,
+ * Claude Design) and an earlier duplicate, as when jsonc.parse normalized it: a typo must never
+ * start another command (#2060). The problem list says why it is there.
+ */
+const skippedServer = (): MCPServerInfo => ({ transport: "stdio", command: "", disabled: true });
 
 export class MCPConfigService {
   private readonly config: Config;
@@ -178,7 +205,7 @@ export class MCPConfigService {
     url?: string;
     headers?: Record<string, MCPHeaderValue>;
   }): Promise<Result<void>> {
-    const existingServer = (await this.listServers())[input.name];
+    const existingServer = getOwn(await this.listServers(), input.name);
     if (existingServer?.transport !== "stdio" && existingServer?.managed)
       return Err("Claude Design is managed in its settings card");
     const transport = input.transport ?? "stdio";
@@ -403,15 +430,14 @@ export class MCPConfigService {
     };
   }
 
-  private async readConfigFile(filePath: string): Promise<MCPConfig> {
+  private async readConfigFile(filePath: string): Promise<ReadMCPConfig> {
     try {
       const exists = await this.pathExists(filePath);
       if (!exists) {
-        return { servers: {}, enabledPluginServers: [] };
+        return noConfig();
       }
 
       const raw = await fs.promises.readFile(filePath, "utf-8");
-      const parsed = jsonc.parse(raw) as { servers?: Record<string, unknown> } | undefined;
 
       let enabledPluginServers: string[] = [];
       try {
@@ -420,35 +446,69 @@ export class MCPConfigService {
         // Corrupt consent fails closed without hiding ordinary server definitions.
       }
 
-      // A field-only plugin toggle need not create a servers property.
+      // A field-only plugin toggle need not create a servers property. A broken entry is
+      // reported and kept disabled (skippedServer), never as a usable server without a command (#2060).
+      const parsed = parseMcpConfigServers(raw);
       const servers: Record<string, MCPServerInfo> = {};
-      for (const [name, entry] of Object.entries(parsed?.servers ?? {})) {
-        servers[name] = this.normalizeEntry(entry);
+      for (const entry of parsed.entries) {
+        servers[entry.name] =
+          "skipped" in entry ? skippedServer() : this.normalizeEntry(entry.value);
       }
-      return { servers, enabledPluginServers };
+      this.warnConfigProblems(filePath, parsed.problems);
+      return {
+        servers,
+        enabledPluginServers,
+        problems: parsed.problems,
+      };
     } catch (error) {
       // Defensive: never crash on startup due to corrupt config.
       log.error("Failed to read MCP config", { filePath, error });
-      return { servers: {}, enabledPluginServers: [] };
+      // The errno code only: the message can hold other paths.
+      const code = (error as NodeJS.ErrnoException).code ?? "error";
+      // A problem too, so no Settings write replaces a file Xum could not read.
+      const problems = [
+        { line: null, column: null, server: null, message: `Xum cannot read this file (${code})` },
+      ];
+      this.warnConfigProblems(filePath, problems);
+      return { ...noConfig(), problems };
     }
   }
 
-  private async getGlobalConfig(): Promise<MCPConfig> {
+  /** The last problems logged per file: a config is read on every listing, so warn on change. */
+  private readonly loggedProblems = new Map<string, string>();
+
+  private warnConfigProblems(filePath: string, problems: MCPConfigProblem[]): void {
+    const signature = JSON.stringify(problems);
+    if (this.loggedProblems.get(filePath) === signature) return;
+    this.loggedProblems.set(filePath, signature);
+    if (problems.length === 0) return;
+    log.warn(`[MCP] Xum skipped part of ${filePath}`, {
+      problems: problems.map(formatMcpConfigProblem),
+    });
+  }
+
+  /** Syntax errors and invalid entries in the global mcp.jsonc, for Settings → MCP. */
+  async getConfigProblems(): Promise<{ path: string; problems: MCPConfigProblem[] }> {
+    const { problems } = await this.getGlobalConfig();
+    return { path: this.getGlobalConfigPath(), problems };
+  }
+
+  private async getGlobalConfig(): Promise<ReadMCPConfig> {
     return this.readConfigFile(this.getGlobalConfigPath());
   }
 
-  private async getRepoOverrideConfig(projectPath: string): Promise<MCPConfig> {
+  private async getRepoOverrideConfig(projectPath: string): Promise<ReadMCPConfig> {
     for (const filePath of this.getRepoOverridePaths(projectPath)) {
       if (await this.pathExists(filePath)) return this.readConfigFile(filePath);
     }
-    return { servers: {}, enabledPluginServers: [] };
+    return noConfig();
   }
 
   /** Caller must hold runExclusive; never acquires the lock itself. */
-  private async saveGlobalConfig(config: MCPConfig): Promise<void> {
-    await this.ensureMuxRootDir();
-
+  private async saveGlobalConfig(config: ReadMCPConfig): Promise<void> {
     const filePath = this.getGlobalConfigPath();
+    refuseSaveWithProblems(filePath, config.problems);
+    await this.ensureMuxRootDir();
 
     // Write minimal format:
     // - string for stdio servers without extra settings

@@ -76,6 +76,45 @@ test.each([
   expect(copied.stdout).toBe("");
 });
 
+const ENTRY = `${"a".repeat(64)}.json`;
+test("stage copies the git-ignored story cache seed for a story job only", () => {
+  write(".gitignore", "tests/bugbash/.e2e/\ntests/stories/.e2e-cache-seed/\n");
+  write(`tests/stories/.e2e-cache-seed/${ENTRY}`, "{}");
+  expect(stage(root, into(), { cacheSeed: true })).toBe(4); // three tracked files and the entry
+  const seed = path.join(into(), "tests/stories/.e2e-cache-seed");
+  expect(fs.readdirSync(seed)).toEqual([ENTRY]);
+  // Any other job: no copy, not even a check of the seed.
+  const other = `${into()}-other`; // beside the stage, removed with it below
+  try {
+    expect(stage(root, other)).toBe(3);
+    expect(fs.existsSync(path.join(other, "tests/stories/.e2e-cache-seed"))).toBe(false);
+  } finally {
+    fs.rmSync(other, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  ["a symlinked entry", () => fs.symlinkSync(path.join(outside, "secret"), seedPath(ENTRY))],
+  ["a file that is not an entry", () => fs.writeFileSync(seedPath("notes.txt"), "x")],
+  ["a folder", () => fs.mkdirSync(seedPath(`${"b".repeat(64)}.json`))],
+  [
+    "a symlinked seed folder",
+    () => {
+      fs.rmSync(seedPath(""), { recursive: true });
+      fs.symlinkSync(outside, seedPath(""));
+    },
+  ],
+])("stage refuses a seed with %s and copies no host file", (_name, plant) => {
+  fs.mkdirSync(seedPath(""), { recursive: true });
+  plant();
+  expect(() => stage(root, into(), { cacheSeed: true })).toThrow(Refusal);
+  const copied = spawnSync("grep", ["-r", "host secret", into()], { encoding: "utf8" });
+  expect(copied.stdout).toBe("");
+});
+function seedPath(name: string) {
+  return path.join(root, "tests/stories/.e2e-cache-seed", name);
+}
+
 test("a mount source must be a plain folder of the checkout", () => {
   fs.mkdirSync(path.join(root, "dist"));
   expect(checkMountSource(root, "dist")).toBe(path.join(root, "dist"));
@@ -93,12 +132,14 @@ test("a mount source must be a plain folder of the checkout", () => {
 });
 
 test("the container env passes only allowlisted names, and never a credential", () => {
+  // GH_TOKEN: the host's gh verifies the image's attestation with it; the container never gets it.
   const host = { BUGBASH_AI: "mock", HOME: "/home/u", ANTHROPIC_API_KEY: "sk", GH_TOKEN: "t" };
   expect(containerEnv(host, jobEnv(".e2e/r"))).toEqual({
     HOME: "/home/bugbash",
     TMPDIR: "/tmp",
     BUGBASH_AI: "mock",
     BUGBASH_APP_LOG: ".e2e/r/app.log",
+    BUGBASH_CACHE_DIR: ".e2e/r/cache",
     E2E_TELEMETRY_DISABLED: "1",
     BUGBASH_CONTAINER: "1",
   });

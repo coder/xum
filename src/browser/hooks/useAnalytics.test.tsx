@@ -9,7 +9,8 @@ import type { AppRouter } from "@/node/orpc/router";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only server fixture, never bundled into the renderer
 import { createOrpcServer, type OrpcServer } from "@/node/orpc/server";
 import type { ORPCContext } from "@/node/orpc/context";
-import { APIProvider } from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import type { SavedQuery } from "@/common/types/savedQueries";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import {
@@ -90,23 +91,15 @@ function createHttpClient(baseUrl: string): RouterClient<AppRouter> {
     origin: baseUrl,
     url: "/orpc",
   });
-
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- typed test helper
-  return createORPCClient(link) as RouterClient<AppRouter>;
+  return createORPCClient<RouterClient<AppRouter>>(link);
 }
 
 function createFakeAnalyticsApiClient(
-  overrides: {
-    getSavedQueries?: () => Promise<{ queries: SavedQuery[] }>;
-    updateSavedQuery?: (input: {
-      id: string;
-      label?: string;
-      sql?: string;
-      chartType?: string | null;
-      order?: number;
-    }) => Promise<SavedQuery>;
-  } = {}
-): RouterClient<AppRouter> {
+  overrides: Pick<
+    TestApiOverrides<APIClient["analytics"]>,
+    "getSavedQueries" | "updateSavedQuery"
+  > = {}
+): APIClient {
   // Regression guard: getAnalyticsNamespace validates a full analytics namespace before exposing
   // saved-query helpers, so this fake includes the required surface even though these tests only
   // exercise saved-query loading/update flows.
@@ -131,9 +124,7 @@ function createFakeAnalyticsApiClient(
     ...overrides,
   };
 
-  return {
-    analytics: analyticsNamespace,
-  } as unknown as RouterClient<AppRouter>;
+  return createTestApiClient({ analytics: analyticsNamespace });
 }
 
 type AnalyticsServiceStub = Pick<

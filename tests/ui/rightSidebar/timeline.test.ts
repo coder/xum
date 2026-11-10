@@ -875,9 +875,9 @@ describe("TimelinePanel", () => {
   });
 
   test("ignores the reveal shortcut in a panel hidden behind an open modal", async () => {
-    // A CSS-hidden sidebar keeps its panel mounted while the mobile timeline dialog mounts a
-    // second one; Radix marks content outside the open modal aria-hidden. The hidden panel's
-    // window-level shortcut listener must not fire a competing reveal.
+    // A CSS-hidden sidebar keeps its panel mounted while a modal is open; Radix marks content
+    // outside the open modal aria-hidden. The hidden panel's window-level shortcut listener must
+    // not fire a reveal behind the modal.
     const event = makeEvent("anchored", "turn.completed", 1, {
       anchor: { messageId: "loaded-message" },
     });

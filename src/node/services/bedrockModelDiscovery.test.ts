@@ -13,6 +13,14 @@ import { Config } from "@/node/config";
 import { ProviderService } from "./providerService";
 import { discoverBedrockModels } from "./bedrockModelDiscovery";
 
+// undici lists destroy()'s promise overload last, so `.call` on the bare method picks it. The
+// promise form re-enters the mocked destroy, so these mocks call the callback overload.
+type DestroyWithCallback = (
+  this: EnvHttpProxyAgent,
+  err: Error | null,
+  callback: () => void
+) => void;
+
 let root: string, config: Config, service: ProviderService;
 let server: ReturnType<typeof Bun.serve>, agent: Pool;
 let respond: (request: Request) => Response | Promise<Response>;
@@ -366,7 +374,7 @@ it.each(["request", "teardown"])(
       }
       if (phase === "teardown") {
         // eslint-disable-next-line @typescript-eslint/unbound-method
-        const destroy = EnvHttpProxyAgent.prototype.destroy;
+        const destroy = EnvHttpProxyAgent.prototype.destroy as DestroyWithCallback;
         watch(EnvHttpProxyAgent.prototype, "destroy").mockImplementation(function (
           this: EnvHttpProxyAgent
         ) {

@@ -45,14 +45,25 @@ export function createBackendCpuProfiler(deps: BackendCpuProfilerDeps = nodeDeps
 
       const session = deps.createSession();
       let connected = false;
-      const release = () => {
-        if (!connected) return;
-        connected = false;
+      // One release per session; an overlapping caller gets the same promise, so it never
+      // resolves while the session is still connected.
+      let releasing: Promise<void> | null = null;
+      const disconnect = async () => {
+        // While a session is connected, V8 keeps every console.* argument logged (up to ~1000
+        // messages), and disconnect does not free them: a request body logged during a capture
+        // stayed in the heap for the life of the process (F12, #6754).
+        await session.post("Runtime.discardConsoleEntries").catch(() => undefined);
         try {
           session.disconnect();
         } catch {
           // Best effort: disconnecting also ends this session's profiling.
         }
+      };
+      const release = (): Promise<void> => {
+        if (!connected) return releasing ?? Promise.resolve();
+        connected = false;
+        releasing = disconnect();
+        return releasing;
       };
 
       try {
@@ -62,7 +73,7 @@ export function createBackendCpuProfiler(deps: BackendCpuProfilerDeps = nodeDeps
         await session.post("Profiler.setSamplingInterval", { interval: samplingIntervalUs });
         await session.post("Profiler.start");
       } catch (error) {
-        release();
+        await release();
         throw error;
       }
 
@@ -77,17 +88,14 @@ export function createBackendCpuProfiler(deps: BackendCpuProfilerDeps = nodeDeps
           }
           return result.profile;
         } finally {
-          release();
+          await release();
         }
       };
       return {
         ok: true,
         run: {
           stop: () => (stopping ??= stop()),
-          cancel: () => {
-            release();
-            return Promise.resolve();
-          },
+          cancel: () => release(),
         },
       };
     },

@@ -1,0 +1,52 @@
+# The Python tools that development, CI and the Terminal-Bench runs use (Xum ships no Python).
+# uv.lock pins every package of every group, with its digests. Run a group's tools with
+#   uv run --locked --only-group <group> <command>
+# which installs that group into .venv and fails when uv.lock no longer matches this file.
+# After editing a group, run `uv lock`; `uv lock --upgrade-package <name>` moves one package.
+[project]
+name = "xum-dev-tools"
+version = "0"
+requires-python = "==3.12.*"
+
+[dependency-groups]
+test = ["pytest"]
+# Crapper is the CRAP scorer (scripts/crap/), and the DRY and mutation gates take their function
+# names from it. Cyclomatic complexity counts and DRY fingerprints come from the tree-sitter
+# grammar, so pin the grammars exactly with the Crapper SHA: a grammar bump can move every score.
+crap = [
+  "crapper @ git+https://github.com/unclebob/crapper@9f1bead298b5a9d576bdd6319289fcf426e5b18a",
+  "tree-sitter==0.26.0",
+  "tree-sitter-language-pack==1.21.3",
+]
+# dryer gives the structural fingerprints and the Jaccard score (scripts/dry/); Crapper names the
+# functions, so a DRY finding names the same function that crap-check names.
+dry = [
+  { include-group = "crap" },
+  "dryer @ git+https://github.com/unclebob/dryer@66ff6d21a42c04afcad89c78a80066176d1294b0",
+]
+# mutator gives the mutation sites (scripts/mutate/).
+mutate = [
+  { include-group = "crap" },
+  "mutator @ git+https://github.com/unclebob/mutator@a5a0cb803b66e0cdb8bf471b3b08af701d424a41",
+]
+# Harbor runs Terminal-Bench (make benchmark-terminal), and CI tests the agent adapter against the
+# same version, so pin it to keep scheduled runs off future CLI or adapter API drift. The daytona
+# floor keeps the Daytona SDK on its cursor-pagination API.
+harbor = ["harbor[daytona]==0.6.4", "daytona>=0.180.0,<2"]
+bigquery = ["google-cloud-bigquery"]
+ruff = ["ruff"]
+
+[tool.uv]
+# Install the groups only; this directory is no Python package.
+package = false
+# Older uv cannot read the relative exclude-newer below from uv.lock.
+required-version = ">=0.11.8"
+# Lock only releases that are at least a week old. Harbor allows any litellm >=1.83.14, and on
+# 2026-10-21 an unlocked install got litellm 1.107.0, a compromised upload that ran a credential
+# stealer at every Python start (BerriAI/litellm#47826, #7227). Such uploads are usually pulled
+# within days. To take a newer release on purpose (an urgent fix), add it to exclude-newer-package.
+exclude-newer = "7 days"
+# certifi 2026.10.19 drops the emSign root whose intermediate CA keys leaked (GHSA-6q48-6c7w-9gw2,
+# critical); the harbor and bigquery groups send credentials over TLS. The date admits that release
+# and no newer one. Remove the entry after 2026-10-27: before that, uv lock would downgrade certifi.
+exclude-newer-package = { certifi = "2026-10-21T00:00:00Z" }

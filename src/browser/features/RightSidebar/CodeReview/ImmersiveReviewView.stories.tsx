@@ -1,4 +1,5 @@
-import { within, waitFor } from "@storybook/test";
+import { expect, within, waitFor } from "storybook/test";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useRef, useState } from "react";
 import type { ComponentProps, ComponentType, FC, ReactNode } from "react";
@@ -534,6 +535,14 @@ export const ImmersiveNotesSidebarActionFooter: Story = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
+    // The "pending" status badge reaches WCAG AA in every theme; muted text on its own muted
+    // tint was 3.2-4.3:1 (#6544).
+    // The notes count badge sits on the same kind of tint over the dark notes panel.
+    const pending = await canvas.findAllByText("pending", {}, { timeout: 10_000 });
+    const count = await canvas.findByTestId("immersive-notes-count");
+    // The "checked" badge sits on a success tint; success text on it was 3.71:1 in dark (#6767).
+    const checked = await canvas.findAllByText("checked");
+    await expect(textsBelowAaInThemes(() => [...pending, count, ...checked]).join("\n")).toBe("");
 
     await waitFor(
       () => {

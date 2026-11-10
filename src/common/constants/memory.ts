@@ -17,8 +17,6 @@
  *                agents see the scope only in token-budget mode.
  */
 
-import { EVALUATION_MAX_QUESTIONS } from "@/constants/evaluation";
-
 /** Virtual root prefix all memory paths are expressed under. */
 export const MEMORY_VIRTUAL_ROOT = "/memories";
 
@@ -74,29 +72,6 @@ export const MEMORY_INDEX_DESCRIPTION_PREFIX_BYTES = 4 * 1024;
 export const MEMORY_VIEW_MAX_DEPTH = 2;
 
 /**
- * Hot-set budgets: user-pinned + frequently-used memory files are preloaded
- * into context (the second tier between the always-present index and
- * tool-call cold reads). The hot set is recomputed on first use of a model in
- * a session segment and at compaction boundaries so repeated turns keep
- * prompt-cache-stable bytes.
- */
-/** Maximum bytes of a single preloaded memory file (longer files are truncated). */
-export const MEMORY_HOT_SET_MAX_ITEM_BYTES = 4 * 1024;
-/**
- * Maximum UTF-8 bytes of the rendered <hot_memories> block. Bytes, not a
- * stand-in tokenizer count: the densest current tokenizers (Opus/Haiku 5.5)
- * bill ~2.5 bytes per token on memory text (44,805 chars billed 17,802
- * tokens), so 10 KiB stays within ~4k billed tokens on every supported model.
- */
-export const MEMORY_HOT_SET_MAX_BLOCK_BYTES = 10 * 1024;
-/** Maximum number of memory files preloaded into the system prompt. */
-export const MEMORY_HOT_SET_MAX_ITEMS = 8;
-/** Maximum ranked candidates to read while filling the hot set. */
-export const MEMORY_HOT_SET_MAX_SELECTION_ATTEMPTS = 64;
-/** Half-life of the recency decay applied to access counts when ranking auto-hot files. */
-export const MEMORY_HOT_SET_DECAY_HALF_LIFE_MS = 7 * 24 * 60 * 60 * 1000;
-
-/**
  * Memory consolidation ("dream" agent, issue #3534): maximum mutating memory
  * commands per consolidation run. Reads are unlimited; the budget bounds churn
  * from a misbehaving model.
@@ -104,6 +79,60 @@ export const MEMORY_HOT_SET_DECAY_HALF_LIFE_MS = 7 * 24 * 60 * 60 * 1000;
 export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
 /** Generous step ceiling for the consolidation stream (reads + budgeted mutations). */
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
+/**
+ * Rows of one run's journal that the guarded memory tool fills with refused commands (out of scope,
+ * denied, credential-like, over budget). A refusal spends no budget, and one step can issue many
+ * parallel calls, so without a bound a misbehaving model grows the journal, which is saved in the
+ * run's sidecar record and returned over IPC. 32 is the organizer's step ceiling: a model that
+ * has one command refused per step still gets every refusal journaled. Past it, the last row says
+ * the rest are not recorded. Budgeted commands (applied, dry-run, failed) are at most the op budget
+ * and are always journaled, so the cap never hides a change.
+ */
+export const MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES = 32;
+/**
+ * Longest path (characters, virtual `/memories/...` form) a mutating command may name. The tool
+ * schema bounds no length, and the journal stores the path of every row and quotes it in refusal
+ * notes. 512 is twice the 255-byte name limit of common filesystems and far above any real memory
+ * path (the index shows 200-character descriptions, and names are short); a longer one is refused
+ * before it is parsed or journaled in full.
+ */
+export const MEMORY_CONSOLIDATION_PATH_MAX_CHARS = 512;
+/**
+ * Memory analyzer (the harvest of one closed or open compaction epoch): mutating memory
+ * commands for the whole epoch. All of its transcript chunks, a retry of the epoch, and
+ * every later run of the same epoch (an archive after new rows, the compaction that
+ * closes it) spend one budget, so a long epoch cannot out-write a short one.
+ */
+export const MEMORY_ANALYZER_OP_BUDGET = 8;
+/** Step ceiling for one analyzer chunk (reads of related memory + budgeted edits). */
+export const MEMORY_ANALYZER_MAX_STEPS = 12;
+/**
+ * Output cap of one model call (one step) of the analyzer and of the organizer. The dream's cost
+ * ceiling stops a run only after a step whose measured cost reaches it, so the step in flight
+ * can still go past the ceiling. The cap bounds what that step can write, so it applies only to a
+ * run that has a ceiling (see SpendMeter.maxOutputTokens). A step that hits it finishes with
+ * `length`, and the SDK runs no valid tool call of such a step. A call cut off mid-input comes
+ * back to the model as a tool error it can retry from; a stream whose last step still ends at the
+ * limit is an incomplete run for both callers (see SpendMeter.endedAtOutputLimit).
+ */
+export const MEMORY_MAX_OUTPUT_TOKENS_PER_STEP = 4_096;
+/** Smallest dream cost ceiling a user can set, in USD: the cent, the unit a stopped run reports in. */
+export const MEMORY_DREAM_COST_CEILING_MIN_USD = 0.01;
+/**
+ * Largest dream cost ceiling a user can set, in USD. Far above what a dream run costs, so it is
+ * the same as no ceiling; the cap keeps the saved number short enough that `String()` never
+ * prints it in exponent notation (1e+21), which the ceiling field would then read as invalid.
+ */
+export const MEMORY_DREAM_COST_CEILING_MAX_USD = 100_000;
+/**
+ * Memory harvest: transcript chunks one epoch's harvest reads. Each chunk is a model call of at
+ * most 40,000 characters of transcript, and the per-part caps leave an epoch's total unbounded
+ * (thousands of parallel tool calls, or megabytes of pasted text, make hundreds of chunks). 12 is
+ * about 480,000 characters, or 120,000 tokens: a context window's worth of rendered transcript,
+ * and a run that fits the dream's timeout when each chunk takes under half a minute. Past it the
+ * transcript is cut, at its end, and the last chunk says so.
+ */
+export const MEMORY_HARVEST_MAX_CHUNKS = 12;
 /** Minimum gap between consolidation runs for one workspace (debounce across triggers). */
 export const MEMORY_CONSOLIDATION_DEBOUNCE_MS = 6 * 60 * 60 * 1000;
 /** Launch sweep: a workspace qualifies after this much user inactivity. */
@@ -114,34 +143,10 @@ export const MEMORY_CONSOLIDATION_IDLE_MS = 24 * 60 * 60 * 1000;
  */
 export const MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP = 3;
 /**
- * Hard wall-clock ceiling per consolidation run. Without it a half-alive
+ * Hard wall-clock ceiling per consolidation stream. Without it a half-alive
  * provider stream (keepalives but no progress) would hold the workspace's
- * in-flight lock forever and block every future trigger.
+ * in-flight lock, and the service-wide dream queue, forever. It starts when the
+ * stream starts: time spent waiting behind another workspace's stream does not
+ * count.
  */
 export const MEMORY_CONSOLIDATION_TIMEOUT_MS = 5 * 60 * 1000;
-
-/** Read-only intuition runs are deliberately smaller than consolidation passes. */
-export const MEMORY_INTUITION_RECOGNITION_THRESHOLD = 0.7;
-export const MEMORY_INTUITION_CANDIDATE_THRESHOLD = 0.3;
-export const MEMORY_INTUITION_MAX_STEPS = 6;
-export const MEMORY_INTUITION_TIMEOUT_MS = 20_000;
-/**
- * Per-step output cap. MEMORY_INTUITION_MAX_RESULTS full-length excerpts already
- * need about 2k tokens, and thinking (always on for Opus 5.5 and Fable/Mythos)
- * counts toward the same cap. MEMORY_INTUITION_TIMEOUT_MS still bounds wall time.
- */
-export const MEMORY_INTUITION_MAX_OUTPUT_TOKENS = 4096;
-export const MEMORY_INTUITION_MAX_USES_PER_TURN = 3;
-export const MEMORY_INTUITION_MAX_RESULTS = 6;
-export const MEMORY_INTUITION_MAX_EXCERPT_CHARS = 1200;
-export const MEMORY_INTUITION_MAX_CUE_CHARS = 2000;
-export const MEMORY_INTUITION_MAX_READ_BYTES = 256 * 1024;
-export const MEMORY_INTUITION_MAX_INDEX_ENTRIES = 200;
-export const MEMORY_INTUITION_MAX_INDEX_BYTES = 32 * 1024;
-export const MEMORY_INTUITION_INDEX_AUTH_CONCURRENCY = 4;
-/**
- * Evaluation recall: index entries judged by stage 1 and memory chunks scored by
- * stage 2. Each stage is one request, so both follow the shared per-request cap.
- */
-export const MEMORY_INTUITION_EVAL_MAX_ENTRIES = EVALUATION_MAX_QUESTIONS;
-export const MEMORY_INTUITION_EVAL_MAX_CHUNKS = EVALUATION_MAX_QUESTIONS;

@@ -55,6 +55,8 @@ interface WorkspaceAiSelectionInput {
   defaultModel: string;
   agentAiDefaults: AgentAiDefaults;
   agentBaseById?: ReadonlyMap<string, string | undefined>;
+  /** Hooks pass the AI-selection store version (see useAutoRouting). */
+  selectionVersion?: number;
 }
 
 /**
@@ -152,7 +154,7 @@ export function useWorkspaceAiSelection(
   agentId?: string,
   agentBaseById?: ReadonlyMap<string, string | undefined>
 ): WorkspaceAiSelection {
-  useSyncExternalStore(subscribeAiSelection, getAiSelectionVersion);
+  const selectionVersion = useSyncExternalStore(subscribeAiSelection, getAiSelectionVersion);
   const selectedAgentId = useScopedAiDefault(workspaceId, "agentId");
   // Subscribed for creation scopes, which resolve like getWorkspaceAiSelection.
   const scopedModel = useScopedAiDefault(workspaceId, "model");
@@ -177,6 +179,7 @@ export function useWorkspaceAiSelection(
     defaultModel,
     agentAiDefaults,
     agentBaseById,
+    selectionVersion,
   });
 }
 
@@ -187,6 +190,8 @@ function resolveAutoRouting(input: {
   agentId: string;
   agentAiDefaults: AgentAiDefaults;
   agentBaseById?: ReadonlyMap<string, string | undefined>;
+  /** Hooks pass the AI-selection store version (see useAutoRouting). */
+  selectionVersion?: number;
 }): boolean {
   const agentId = normalizeAgentId(input.agentId, WORKSPACE_DEFAULTS.agentId);
   const flag = AUTO_ROUTING_FLAG[input.dimension];
@@ -223,7 +228,9 @@ export function useAutoRouting(
   dimension: AutoRoutingDimension,
   agentBaseById?: ReadonlyMap<string, string | undefined>
 ): boolean {
-  useSyncExternalStore(subscribeAiSelection, getAiSelectionVersion);
+  // The result reads module-level picks, so the React Compiler must see the store version as an
+  // input: otherwise it reuses the result while the arguments stay the same (a memoized map).
+  const selectionVersion = useSyncExternalStore(subscribeAiSelection, getAiSelectionVersion);
   const agentId = useScopeAgentId(scopeId);
   const agentAiDefaults = useAgentAiDefaults();
   return resolveAutoRouting({
@@ -232,5 +239,6 @@ export function useAutoRouting(
     agentId,
     agentAiDefaults,
     agentBaseById,
+    selectionVersion,
   });
 }

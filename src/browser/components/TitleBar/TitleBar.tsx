@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { cn } from "@/common/lib/utils";
 import { VERSION } from "@/version";
 import { SettingsButton } from "../SettingsButton/SettingsButton";
-import { GatewayIcon } from "../icons/GatewayIcon/GatewayIcon";
 import { ProviderIcon } from "../ProviderIcon/ProviderIcon";
 import { Button } from "../Button/Button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
@@ -15,10 +14,6 @@ import { useRouter } from "@/browser/contexts/RouterContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import {
-  formatMuxGatewayBalance,
-  useMuxGatewayAccountStatus,
-} from "@/browser/hooks/useMuxGatewayAccountStatus";
 import {
   isDesktopMode,
   getTitlebarLeftInset,
@@ -35,6 +30,7 @@ import {
 } from "@/common/utils/ai/models";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { isConnectionLostError, isStreamFailure } from "@/browser/contexts/connectionLink";
+import { LeftSidebarToggleBarSpacer } from "../SidebarCollapseButton/SidebarCollapseButton";
 
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
@@ -97,12 +93,6 @@ export function TitleBar(props: TitleBarProps) {
     : routing.resolveRoute(canonicalActiveModel);
   const activeRouteProvider = activeRoute.route;
   const isNonDirectRoute = activeRouteProvider !== "direct";
-  const isMuxGatewayRoute = activeRouteProvider === "mux-gateway";
-  const {
-    data: muxGatewayAccountStatus,
-    error: muxGatewayAccountError,
-    refresh: refreshMuxGatewayAccountStatus,
-  } = useMuxGatewayAccountStatus();
 
   const gitDescribe = getGitDescribe(VERSION satisfies unknown);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ type: "idle" });
@@ -193,18 +183,25 @@ export function TitleBar(props: TitleBarProps) {
   return (
     <div
       className={cn(
-        "bg-sidebar border-border-light font-primary text-muted titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center justify-between border-b px-4 text-[11px] select-none",
+        // No left padding: the spacer for the app shell's fixed sidebar toggle bar sits at the edge
+        // and carries the bar's titlebar inset.
+        "bg-sidebar border-border-light font-primary text-muted flex shrink-0 items-center justify-between border-b pr-4 text-[11px] select-none",
+        // Phone touch layout: as tall as the toggle bar and page headers (44px touch targets).
+        "[@media(max-width:768px)_and_(pointer:coarse)]:min-h-11",
         isDesktop ? DESKTOP_TITLEBAR_HEIGHT_CLASS : "h-8",
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag"
       )}
     >
+      <LeftSidebarToggleBarSpacer showNewChat={false} />
       <div
         // Desktop titlebar: this wrapper is `flex-1` (for version ellipsis) so it fills the gap.
         // Keep it draggable; apply `titlebar-no-drag` only to the interactive controls inside.
+        // `items-start` on macOS: the column's default stretch would widen the no-drag version
+        // button over the whole gap, and the window would not drag from it.
         className={cn(
-          "mr-4 flex min-w-0 flex-1",
-          leftInset > 0 ? "flex-col" : "items-center gap-2"
+          "mr-4 ml-2 flex min-w-0 flex-1",
+          leftInset > 0 ? "flex-col items-start" : "items-center gap-2"
         )}
       >
         <Tooltip open={versionTooltipOpen} onOpenChange={setVersionTooltipOpen}>
@@ -231,7 +228,7 @@ export function TitleBar(props: TitleBarProps) {
                 {gitDescribe ?? "(dev)"}
               </div>
               {updateBadgeIcon && (
-                <div className="text-accent flex h-3.5 w-3.5 items-center justify-center">
+                <div className="text-accent-text flex h-3.5 w-3.5 items-center justify-center">
                   {updateBadgeIcon}
                 </div>
               )}
@@ -251,61 +248,26 @@ export function TitleBar(props: TitleBarProps) {
               <button
                 type="button"
                 onClick={handleOpenRouteSettings}
-                onMouseEnter={() => {
-                  if (isMuxGatewayRoute) {
-                    void refreshMuxGatewayAccountStatus();
-                  }
-                }}
                 className="border-border-light text-muted-foreground hover:border-border-medium/80 hover:bg-toggle-bg/70 flex h-5 w-5 cursor-pointer items-center justify-center rounded border transition-opacity hover:opacity-70"
                 aria-label={`${activeRoute.displayName} routing`}
               >
-                {isMuxGatewayRoute ? (
-                  <GatewayIcon className="h-3.5 w-3.5" aria-hidden />
-                ) : (
-                  <ProviderIcon provider={activeRouteProvider} className="h-3.5 w-3.5" />
-                )}
+                <ProviderIcon provider={activeRouteProvider} className="h-3.5 w-3.5" />
               </button>
             </TooltipTrigger>
-            <TooltipContent align="end" className={cn(isMuxGatewayRoute ? "w-56" : "w-64")}>
+            <TooltipContent align="end" className="w-64">
               <div className="text-foreground text-[11px] font-medium">
                 {activeRoute.displayName}
               </div>
-              {isMuxGatewayRoute ? (
-                <>
-                  <div className="mt-1.5 space-y-0.5 text-[11px]">
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-muted">Balance</span>
-                      <span className="text-foreground font-mono">
-                        {formatMuxGatewayBalance(muxGatewayAccountStatus?.remaining_microdollars)}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-muted">Concurrent requests</span>
-                      <span className="text-foreground font-mono">
-                        {muxGatewayAccountStatus?.ai_gateway_concurrent_requests_per_user ?? "—"}
-                      </span>
-                    </div>
-                  </div>
-                  {muxGatewayAccountError && (
-                    <div className="text-destructive mt-1.5 text-[10px]">
-                      {muxGatewayAccountError}
-                    </div>
-                  )}
-                </>
-              ) : (
-                <div className="text-muted mt-1.5 text-[11px]">
-                  Requests for this model route via {activeRoute.displayName}.
-                </div>
-              )}
+              <div className="text-muted mt-1.5 text-[11px]">
+                Requests for this model route via {activeRoute.displayName}.
+              </div>
               <div className="border-separator-light mt-2 border-t pt-1.5 text-[10px]">
                 <button
                   type="button"
                   className={TOOLTIP_CTA_CLASSNAME}
                   onClick={handleOpenRouteSettings}
                 >
-                  {isMuxGatewayRoute
-                    ? "Click to open gateway settings"
-                    : "Click to open provider settings"}
+                  Click to open provider settings
                 </button>
               </div>
             </TooltipContent>

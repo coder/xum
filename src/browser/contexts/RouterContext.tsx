@@ -699,16 +699,13 @@ export function RouterProvider(props: { children: ReactNode; embedded?: boolean 
   );
   if (startup.usesBrowserHistory) {
     return (
-      <BrowserRouter
-        basename={INITIAL_APP_PROXY_BASE_PATH ?? undefined}
-        unstable_useTransitions={false}
-      >
+      <BrowserRouter basename={INITIAL_APP_PROXY_BASE_PATH ?? undefined} useTransitions={false}>
         {inner}
       </BrowserRouter>
     );
   }
   return (
-    <MemoryRouter initialEntries={[startup.initialRoute]} unstable_useTransitions={false}>
+    <MemoryRouter initialEntries={[startup.initialRoute]} useTransitions={false}>
       {inner}
     </MemoryRouter>
   );

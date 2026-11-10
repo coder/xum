@@ -13,6 +13,10 @@ import {
   normalizeEditorConfig,
   normalizeTerminalBadgeConfig,
 } from "@/common/constants/storage";
+import {
+  MEMORY_DREAM_COST_CEILING_MAX_USD,
+  MEMORY_DREAM_COST_CEILING_MIN_USD,
+} from "@/common/constants/memory";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import { REVIEW_FILE_TREE_VIEW_MODES, REVIEW_SORT_ORDERS } from "@/common/types/review";
 import { ThinkingLevelSchema, coerceThinkingLevel } from "@/common/types/thinking";
@@ -27,7 +31,6 @@ export const ThemePreferenceSchema = z.enum([
   "flexoki-light",
   "flexoki-dark",
 ]);
-export type ThemePreferenceConfig = z.infer<typeof ThemePreferenceSchema>;
 
 export const LaunchBehaviorSchema = z.enum(["dashboard", "new-chat", "last-workspace"]);
 
@@ -55,7 +58,7 @@ const BranchSchema = repairOnLoad(nonBlankString(), trimmedNonBlank);
 
 function repairModelString(value: unknown): string | undefined {
   const model = trimmedNonBlank(value);
-  if (!model || (model.startsWith("mux-gateway:") && !model.includes("/"))) return undefined;
+  if (!model) return undefined;
   const normalized = normalizeSelectedModel(model);
   return isValidModelFormat(normalized) ? normalized : undefined;
 }
@@ -69,7 +72,7 @@ const USAGE_VIEW_MODES = ["session", "last-request"] as const;
 export type UsageViewMode = (typeof USAGE_VIEW_MODES)[number];
 const OUTPUT_LOG_LEVELS = ["error", "warn", "info", "debug"] as const;
 export type OutputLogLevel = (typeof OUTPUT_LOG_LEVELS)[number];
-const ANALYTICS_TIME_RANGES = ["7d", "30d", "90d", "all"] as const;
+const ANALYTICS_TIME_RANGES = ["7d", "30d", "90d", "month-utc", "all"] as const;
 export type AnalyticsTimeRange = (typeof ANALYTICS_TIME_RANGES)[number];
 const ANALYTICS_TIMING_METRICS = ["ttft", "duration", "tps"] as const;
 const ANALYTICS_TIME_ZONE_MODES = ["local", "utc"] as const;
@@ -176,6 +179,20 @@ export const UserPreferencesSchema = z.object({
       sortOrder: z.enum(REVIEW_SORT_ORDERS).optional(),
       fileTreeViewMode: z.enum(REVIEW_FILE_TREE_VIEW_MODES).optional(),
       showRead: z.boolean().optional(),
+    })
+    .optional(),
+  memory: z
+    .object({
+      /**
+       * A dream run (an analyzer job or an organizer run) stops once its measured spend, in USD,
+       * reaches this. The step in flight can go past it, so it is not a hard cap on the bill.
+       * Absent means no ceiling.
+       */
+      dreamCostCeilingUsd: z
+        .number()
+        .min(MEMORY_DREAM_COST_CEILING_MIN_USD)
+        .max(MEMORY_DREAM_COST_CEILING_MAX_USD)
+        .optional(),
     })
     .optional(),
   ui: z

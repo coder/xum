@@ -24,8 +24,14 @@ const RENDERED_ENTRY_OVERHEAD = renderPluginHookContextEntry({ pluginId: "", tex
 /** A user row's rendered hook-context blocks, or undefined when it has none. */
 export function renderPluginHookContextBlocks(message: MuxMessage): string | undefined {
   if (message.role !== "user") return undefined;
-  const entries = readPersistedEntries(message.metadata?.pluginHookContext);
+  const entries = readPersistedPluginHookContext(message.metadata?.pluginHookContext);
   return entries.length > 0 ? entries.map(renderPluginHookContextEntry).join("\n") : undefined;
+}
+
+/** The rendered blocks as a list: one item, or none when the row has no hook context. */
+export function pluginHookContextTexts(message: MuxMessage): string[] {
+  const blocks = renderPluginHookContextBlocks(message);
+  return blocks != null ? [blocks] : [];
 }
 
 /** A user row's provider-visible text: its text parts, then its hook-context blocks. */
@@ -40,7 +46,7 @@ export function providerVisibleUserText(message: MuxMessage): string {
  * A malformed value or entry is dropped, and entries past the cap are cut, so one bad row never
  * fails or overflows every later request.
  */
-function readPersistedEntries(value: unknown): PluginHookContextEntry[] {
+export function readPersistedPluginHookContext(value: unknown): PluginHookContextEntry[] {
   if (!Array.isArray(value)) return [];
   const entries: unknown[] = value;
   const kept: PluginHookContextEntry[] = [];

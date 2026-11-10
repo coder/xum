@@ -6,7 +6,8 @@ import * as path from "path";
 import type { ArtifactToolResult } from "@/common/utils/tools/toolDefinitions";
 import { getToolsForModel } from "@/common/utils/tools/tools";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { getArtifactId, readArtifactIndex } from "@/node/services/artifactVersionStore";
+import * as artifactsOperationsModule from "@/node/services/artifactsOperations";
+import { getArtifactId, readArtifactRecord } from "@/node/services/artifactRecordStore";
 import { createArtifactTool } from "./artifact";
 import { createArtifactListTool } from "./artifact_list";
 import { createArtifactReadTool } from "./artifact_read";
@@ -59,14 +60,12 @@ describe("artifact tool", () => {
     expect((await toolsFor({ ...on, xumEnv: {} })).artifact).toBeUndefined();
   });
 
-  test("publishes labeled versions and persists a pin request", async () => {
+  test("publishing records one title, kind and pin per path, and republishing updates them", async () => {
     const file = path.join(scratchDir, "artifacts", "chart.html");
     await fs.writeFile(file, "<p>1</p>");
     const first = await run({ path: "chart.html", title: "interactive chart", pin: "project" });
     expect(first).toEqual({
       success: true,
-      id: getArtifactId("chart.html"),
-      version: 1,
       path: "chart.html",
       bytes: 8,
       kind: "html",
@@ -76,18 +75,24 @@ describe("artifact tool", () => {
     await fs.writeFile(file, "<p>two</p>");
     // Absolute path inside the artifacts dir; no title → file name; omitted pin keeps "project".
     const second = await run({ path: file });
-    expect(second).toMatchObject({
+    expect(second).toEqual({
       success: true,
-      version: 2,
+      path: "chart.html",
+      bytes: 10,
+      kind: "html",
       title: "chart.html",
       pin: "project",
     });
-    expect((await readArtifactIndex(sessionDir, getArtifactId("chart.html")))?.pin).toBe("project");
+    expect(await readArtifactRecord(sessionDir, getArtifactId("chart.html"))).toMatchObject({
+      title: "chart.html",
+      pin: "project",
+    });
   });
 
-  test("kind override is stored with the version", async () => {
+  test("kind override is stored with the record", async () => {
     await fs.writeFile(path.join(scratchDir, "artifacts", "flow.txt"), "graph TD; a-->b");
     expect(await run({ path: "flow.txt", kind: "mermaid" })).toMatchObject({ kind: "mermaid" });
+    expect((await readArtifactRecord(sessionDir, getArtifactId("flow.txt")))?.kind).toBe("mermaid");
   });
 
   test("refuses paths outside the artifacts dir and missing files", async () => {
@@ -104,25 +109,25 @@ describe("artifact tool", () => {
     const runtime = new LocalRuntime(tempDir);
     const execSpy = spyOn(runtime, "exec");
     const result = await run({ path: "r.md" }, configFor("ssh", runtime));
-    expect(result).toMatchObject({ success: true, version: 1, bytes: 8 });
+    expect(result).toMatchObject({ success: true, bytes: 8 });
     expect(execSpy).toHaveBeenCalledTimes(1);
   });
 
-  test("artifact_list shows the latest version per artifact", async () => {
+  test("artifact_list shows the title of published artifacts", async () => {
     await fs.writeFile(path.join(scratchDir, "artifacts", "a.md"), "a");
     await fs.writeFile(path.join(scratchDir, "artifacts", "b.md"), "b");
     await run({ path: "a.md", title: "Alpha" });
     const listed = (await createArtifactListTool(configFor()).execute!({}, options)) as {
-      artifacts: Array<{ path: string; latestVersion?: number; latestLabel?: string | null }>;
+      artifacts: Array<{ path: string; title?: string }>;
     };
     // Both files can share an mtime millisecond, so the listing order is not part of this check.
     expect(
       listed.artifacts
-        .map(({ path, latestVersion, latestLabel }) => ({ path, latestVersion, latestLabel }))
+        .map(({ path, title }) => ({ path, title }))
         .sort((a, b) => a.path.localeCompare(b.path))
     ).toEqual([
-      { path: "a.md", latestVersion: 1, latestLabel: "Alpha" },
-      { path: "b.md", latestVersion: undefined, latestLabel: undefined },
+      { path: "a.md", title: "Alpha" },
+      { path: "b.md", title: undefined },
     ]);
   });
 });
@@ -154,7 +159,7 @@ describe("artifact tool shelf pin (M5c)", () => {
     projects,
   });
 
-  test("pin copies the published version to the shelf; artifact_list and artifact_read see it", async () => {
+  test("pin copies the file to the shelf; artifact_list and artifact_read see it", async () => {
     await fs.writeFile(path.join(scratchDir, "artifacts", "plan.md"), "# Plan v1");
     const config = configFor();
     expect(
@@ -162,7 +167,7 @@ describe("artifact tool shelf pin (M5c)", () => {
         { path: "plan.md", title: "migration plan", pin: "project" },
         options
       )
-    ).toMatchObject({ success: true, version: 1, pin: "project" });
+    ).toMatchObject({ success: true, pin: "project" });
 
     // Another workspace of the same project (same identity, its own session dir) lists it.
     const other = { ...configFor(), workspaceSessionDir: path.join(tempDir, "other-session") };
@@ -188,6 +193,42 @@ describe("artifact tool shelf pin (M5c)", () => {
     ).toMatchObject({ success: true, content: "# Plan v1", title: "migration plan" });
   });
 
+  test("a cancelled publish pins nothing, and the cancel signal reaches both reads", async () => {
+    await fs.writeFile(path.join(scratchDir, "artifacts", "plan.md"), "# Plan");
+    const config = configFor();
+    const controller = new AbortController();
+    const readOriginal = artifactsOperationsModule.readArtifactBytesAtLocation;
+    const signals: Array<AbortSignal | undefined> = [];
+    const read = spyOn(artifactsOperationsModule, "readArtifactBytesAtLocation");
+    read.mockImplementation((...args) => {
+      signals.push(args[3]);
+      return readOriginal(...args);
+    });
+    try {
+      expect(
+        await createArtifactTool(config).execute!(
+          { path: "plan.md", pin: "global" },
+          { ...options, abortSignal: controller.signal }
+        )
+      ).toMatchObject({ success: true, pin: "global" });
+      controller.abort();
+      expect(
+        await createArtifactTool(config).execute!(
+          { path: "plan.md", title: "again", pin: "project" },
+          { ...options, abortSignal: controller.signal }
+        )
+      ).toEqual({ success: false, error: "Publish was interrupted" });
+    } finally {
+      read.mockRestore();
+    }
+    // The first call read the file twice (publish, then pin), each with the tool's signal.
+    expect(signals.slice(0, 2)).toEqual([controller.signal, controller.signal]);
+    const shelf = (await createArtifactListTool(config).execute!({ scope: "shelf" }, options)) as {
+      shelf: Array<{ scope: string }>;
+    };
+    expect(shelf.shelf.map((entry) => entry.scope)).toEqual(["global"]);
+  });
+
   test("a project pin from a multi-project workspace is refused before publishing", async () => {
     await fs.writeFile(path.join(scratchDir, "artifacts", "x.md"), "x");
     const config = configFor([
@@ -197,7 +238,7 @@ describe("artifact tool shelf pin (M5c)", () => {
     expect(
       await createArtifactTool(config).execute!({ path: "x.md", pin: "project" }, options)
     ).toEqual({ success: false, error: PROJECT_SHELF_MULTI_PROJECT_ERROR });
-    expect(await readArtifactIndex(sessionDir, getArtifactId("x.md"))).toBeNull();
+    expect(await readArtifactRecord(sessionDir, getArtifactId("x.md"))).toBeNull();
     // Global pins still work there.
     expect(
       await createArtifactTool(config).execute!({ path: "x.md", pin: "global" }, options)

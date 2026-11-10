@@ -42,6 +42,31 @@ export function attachModelOnlyToolNotifications(
 }
 
 /**
+ * The model-only notifications attached to a tool result, or undefined when it has none.
+ *
+ * StreamManager persists them beside the stripped output (MuxToolPart.modelOnlyNotifications)
+ * and the request build attaches them again: the next turn must resend the tool_result bytes
+ * the in-turn step sent, or the prompt cache misses from there and Anthropic rejects every
+ * later thinking block of the turn ("Content before this block differs").
+ */
+export function readModelOnlyToolNotifications(result: unknown): string[] | undefined {
+  if (!canCarryModelOnlyToolNotifications(result)) return undefined;
+  const notifications: unknown = (result as Record<string, unknown>)[
+    MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD
+  ];
+  if (!Array.isArray(notifications)) return undefined;
+  const strings = notifications.filter((item): item is string => typeof item === "string");
+  return strings.length > 0 ? strings : undefined;
+}
+
+/** The persisted tool part field for readModelOnlyToolNotifications' notes (none: no field). */
+export function modelOnlyNotificationsField(notifications: string[] | undefined): {
+  modelOnlyNotifications?: string[];
+} {
+  return notifications === undefined ? {} : { modelOnlyNotifications: notifications };
+}
+
+/**
  * Strip model-only fields from tool results before persisting them to history/partial.
  */
 export function stripInternalToolResultFields(result: unknown): unknown {

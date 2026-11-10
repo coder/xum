@@ -265,6 +265,17 @@ describe("resolveInlineSkillReferences", () => {
     ).toEqual([{ skillName: "tdd", scope: "project", source: "inline" }]);
   });
 
+  test("a qualified $pstack:tdd selects the plugin skill that won its bare name", async () => {
+    expect(
+      await resolveInlineSkillReferences({
+        candidates: [candidate("pstack:tdd")],
+        agentSkillDescriptors: [{ ...descriptor("tdd"), pluginName: "pstack" }],
+        api: null,
+        discovery: null,
+      })
+    ).toEqual([{ skillName: "pstack:tdd", scope: "global", source: "inline" }]);
+  });
+
   test("collapses duplicate candidates", async () => {
     expect(
       await resolveInlineSkillReferences({
@@ -359,5 +370,95 @@ describe("resolveInlineSkillReferences", () => {
         skillName: "workspace-skill",
       },
     ]);
+  });
+});
+
+describe("plugin skill namespaces ($plugin:skill)", () => {
+  test("extracts qualified references with their bare prefix; a trailing `.` or `:` stays text", () => {
+    expect(
+      extractInlineSkillReferenceCandidates("Use $pstack:tdd, $a.b:c-d. $tdd: $pstack:")
+    ).toEqual([
+      {
+        skillName: "pstack:tdd",
+        startIndex: 4,
+        endIndex: 15,
+        fallback: { skillName: "pstack", startIndex: 4, endIndex: 11 },
+      },
+      {
+        skillName: "a.b:c-d",
+        startIndex: 17,
+        endIndex: 25,
+        fallback: { skillName: "a", startIndex: 17, endIndex: 19 },
+      },
+      { skillName: "tdd", startIndex: 27, endIndex: 31 },
+      { skillName: "pstack", startIndex: 33, endIndex: 40 },
+    ]);
+  });
+
+  test("resolves a known qualified name, else falls back to the bare prefix", async () => {
+    const refs = await resolveInlineSkillReferences({
+      candidates: extractInlineSkillReferenceCandidates("$pstack:tdd then $tdd:notes"),
+      agentSkillDescriptors: [descriptor("tdd"), { ...descriptor("tdd"), name: "pstack:tdd" }],
+      api: null,
+      discovery: null,
+    });
+    expect(refs.map((ref) => ref.skillName)).toEqual(["pstack:tdd", "tdd"]);
+  });
+
+  test("a qualified token followed by `_` is no candidate, like a bare `$tdd_notes`", () => {
+    expect(extractInlineSkillReferenceCandidates("$pstack:tdd_notes and $tdd_notes")).toEqual([
+      { skillName: "pstack", startIndex: 0, endIndex: 7 },
+    ]);
+  });
+
+  test("prose like $tdd:one resolves a loaded bare tdd with no remote lookup", async () => {
+    let remoteCalls = 0;
+    const refs = await resolveInlineSkillReferences({
+      candidates: extractInlineSkillReferenceCandidates("$tdd:one and $tdd:two"),
+      agentSkillDescriptors: [descriptor("tdd")],
+      api: apiClient(() => {
+        remoteCalls++;
+        return Promise.reject(new Error("not found"));
+      }),
+      discovery: { kind: "project", projectPath: "/repo" },
+    });
+    expect(refs).toEqual([{ skillName: "tdd", scope: "global", source: "inline" }]);
+    expect(remoteCalls).toBe(0);
+  });
+
+  test("does not fall back to the bare prefix when the qualifier names a known plugin", async () => {
+    // `$pstack:missing` meant a pstack skill: attaching an unrelated bare `pstack` would be wrong,
+    // and the client cannot tell a missing skill from an unreadable one.
+    const refs = await resolveInlineSkillReferences({
+      candidates: extractInlineSkillReferenceCandidates("$pstack:missing"),
+      agentSkillDescriptors: [descriptor("pstack"), { ...descriptor("tdd"), pluginName: "pstack" }],
+      api: apiClient(() => Promise.reject(new Error("EACCES"))),
+      discovery: { kind: "project", projectPath: "/repo" },
+    });
+    expect(refs).toEqual([]);
+  });
+
+  test("keeps the typed qualified name when the remote fallback resolves it", async () => {
+    // The backend package carries the bare frontmatter name; `tdd` alone could load another skill.
+    const api = apiClient(() => Promise.resolve(skillPackage("tdd")));
+    expect(
+      await resolveInlineSkillReferences({
+        candidates: extractInlineSkillReferenceCandidates("$pstack:tdd"),
+        agentSkillDescriptors: [],
+        api,
+        discovery: { kind: "project", projectPath: "/repo" },
+      })
+    ).toEqual([{ skillName: "pstack:tdd", scope: "global", source: "inline" }]);
+  });
+
+  test("suggests while typing the qualified form, but not after trailing punctuation", () => {
+    expect(findInlineSkillReferenceAtCursor("Use $pstack:", 12)).toEqual({
+      partial: "pstack:",
+      startIndex: 4,
+      endIndex: 12,
+    });
+    expect(findInlineSkillReferenceAtCursor("$pstack:t", 9)?.partial).toBe("pstack:t");
+    expect(findInlineSkillReferenceAtCursor("$tdd.", 5)).toBeNull();
+    expect(findInlineSkillReferenceAtCursor("Use $td.", 7)?.partial).toBe("td");
   });
 });

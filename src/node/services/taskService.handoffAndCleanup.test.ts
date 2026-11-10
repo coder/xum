@@ -54,6 +54,7 @@ import {
   upsertTestSubagentReports,
   writePendingBestOfParentPartial,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -228,6 +229,7 @@ describe("TaskService", () => {
       [currentChildTwoId, "Current report two", "Current option two"],
     ] as const) {
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: parentId,
         workspaceSessionDir: path.join(config.sessionsDir, parentId),
         childTaskId,
@@ -341,6 +343,7 @@ describe("TaskService", () => {
 
     const parentSessionDir = path.join(config.sessionsDir, parentId);
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childOneId,
@@ -351,6 +354,7 @@ describe("TaskService", () => {
       nowMs: Date.now(),
     });
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childTwoId,
@@ -459,6 +463,7 @@ describe("TaskService", () => {
 
     const parentSessionDir = path.join(config.sessionsDir, parentId);
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childOneId,
@@ -469,6 +474,7 @@ describe("TaskService", () => {
       nowMs: Date.now(),
     });
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childTwoId,
@@ -598,6 +604,7 @@ describe("TaskService", () => {
     expect((await partialService.writePartial(parentId, parentPartial)).success).toBe(true);
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childOneId,
@@ -731,6 +738,7 @@ describe("TaskService", () => {
     expect((await partialService.writePartial(parentId, parentPartial)).success).toBe(true);
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childOneId,
@@ -818,6 +826,7 @@ describe("TaskService", () => {
       ).success
     ).toBe(true);
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childOneId,
@@ -903,6 +912,7 @@ describe("TaskService", () => {
       ).success
     ).toBe(true);
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childOneId,
@@ -997,6 +1007,7 @@ describe("TaskService", () => {
     expect((await partialService.writePartial(parentId, parentPartial)).success).toBe(true);
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childOneId,
@@ -1125,6 +1136,7 @@ describe("TaskService", () => {
 
     const parentSessionDir = path.join(config.sessionsDir, parentId);
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childOneId,
@@ -1135,6 +1147,7 @@ describe("TaskService", () => {
       nowMs: Date.now(),
     });
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childTwoId,
@@ -1264,6 +1277,7 @@ describe("TaskService", () => {
       [childTwoId, "Report from child two (pre-continuation)"],
     ] as const) {
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: parentId,
         workspaceSessionDir: parentSessionDir,
         childTaskId,
@@ -1349,6 +1363,7 @@ describe("TaskService", () => {
       [childTwoId, "Report from child two"],
     ] as const) {
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: parentId,
         workspaceSessionDir: parentSessionDir,
         childTaskId,
@@ -3044,6 +3059,7 @@ describe("TaskService", () => {
     // while a racing stream-end still finalized agent_report). Report
     // monotonicity: a completed report must win over the failure.
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
@@ -3054,6 +3070,7 @@ describe("TaskService", () => {
       nowMs: Date.now(),
     });
     await upsertSubagentFailureArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,

@@ -1,5 +1,6 @@
 import assert from "@/common/utils/assert";
 import { renderTodoItemsAsMarkdownList } from "@/common/utils/todoList";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 
 import type {
@@ -29,11 +30,14 @@ function isReminderDue(toolCallsSinceLastTodoWrite: number): boolean {
 
 export class TodoListReminderSource implements NotificationSource {
   private readonly workspaceSessionDir: string;
+  /** The session files that todo_write writes. */
+  private readonly sessionFiles: SessionFiles;
   private toolCallsSinceLastTodoWrite = 0;
 
-  constructor(args: { workspaceSessionDir: string }) {
+  constructor(args: { workspaceSessionDir: string; sessionFiles: SessionFiles }) {
     assert(typeof args.workspaceSessionDir === "string", "workspaceSessionDir must be a string");
     this.workspaceSessionDir = args.workspaceSessionDir;
+    this.sessionFiles = args.sessionFiles;
   }
 
   async poll(ctx: NotificationPollContext): Promise<AgentNotification[]> {
@@ -52,7 +56,7 @@ export class TodoListReminderSource implements NotificationSource {
       return [];
     }
 
-    const todos = await readTodosForSessionDir(this.workspaceSessionDir);
+    const todos = await readTodosForSessionDir(this.workspaceSessionDir, this.sessionFiles);
     if (todos.length === 0) {
       return [];
     }

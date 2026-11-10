@@ -217,7 +217,7 @@ export function SqlExplorer(props: SqlExplorerProps) {
 
         <div className="text-muted text-[10px]">
           Use <code className="text-foreground">{TIME_FILTER_PLACEHOLDER}</code> in a WHERE clause
-          to filter by the selected date range (7D/30D/90D/All).
+          to filter by the selected date range.
         </div>
 
         {error && (

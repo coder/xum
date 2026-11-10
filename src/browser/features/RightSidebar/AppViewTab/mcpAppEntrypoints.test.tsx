@@ -3,7 +3,8 @@ import { act, cleanup, render, renderHook, waitFor } from "@testing-library/reac
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   useWorkspaceStoreRaw,
   type WorkspaceState,
@@ -12,7 +13,10 @@ import {
 import { createTestApiClient } from "@/browser/testUtils";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
+  collectAllTabs,
   getDefaultRightSidebarLayoutState,
+  getFocusedActiveTab,
+  parseRightSidebarLayoutState,
   selectOrAddTab,
 } from "@/browser/utils/rightSidebarLayout";
 import {
@@ -20,12 +24,12 @@ import {
   publishProjectTrustChanged,
   publishWorkspaceMcpOverridesSaved,
 } from "@/browser/utils/workspaceMcpMutations";
-import { getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import { appViewTabFor } from "./appViewTabs";
 import { useLoadMcpAppEntrypoints, useMcpAppEntrypoints } from "./mcpAppEntrypoints";
 import { useMcpAppView, useMcpAppViews } from "../ArtifactsTab/mcpAppViewsStore";
-import { AppViewTabLabel, AppViewTabTooltip } from "./AppViewTab";
+import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab";
 import { openMcpAppEntrypoint, openMcpAppEntrypointInNewTab } from "./openMcpAppEntrypoint";
 
 function entrypoint(title: string): McpAppEntrypoint {
@@ -444,6 +448,164 @@ describe("MCP App entry points", () => {
     }
   });
 
+  // #6181: a failed re-list says nothing about the entry point, so its open tab keeps its view.
+  test("an opened entry point keeps its view when a re-list fails", async () => {
+    let fail = false;
+    let release: (() => void) | null = null;
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () =>
+          new Promise<McpAppEntrypoint[]>((resolve, reject) => {
+            release = () =>
+              fail ? reject(new Error("backend busy")) : resolve([entrypoint("Library")]);
+          }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const viewKey = entrypoint("Library").viewKey;
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-relist-fails", true);
+          return useMcpAppView("ws-relist-fails", viewKey);
+        },
+        { wrapper }
+      );
+      const list = renderHook(() => useMcpAppEntrypoints("ws-relist-fails"), { wrapper }).result;
+      await waitFor(() => expect(release).not.toBeNull());
+      act(() => release?.());
+      await waitFor(() => expect(result.current).toMatchObject({ toolCallId: viewKey }));
+      const shown = result.current;
+
+      release = null;
+      fail = true;
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(release).not.toBeNull());
+      expect(list.current).toBeUndefined();
+      act(() => release?.());
+      // The failed listing settled (the launcher shows none), and the tab kept its view.
+      await waitFor(() => expect(list.current).toEqual([]));
+      expect(result.current).toBe(shown);
+    } finally {
+      restore();
+    }
+  });
+
+  // #6181: one open after a failed re-list is no full list, so it retires no other entry point.
+  test("an open after a failed re-list keeps the other entry points' views", async () => {
+    const library = entrypoint("Library");
+    const board = {
+      ...entrypoint("Board"),
+      toolName: "cad.board",
+      resourceUri: "ui://cad/board",
+      viewKey: "entrypoint:cad:cad.board:global",
+    };
+    let fail = false;
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () =>
+          fail ? Promise.reject(new Error("backend busy")) : Promise.resolve([library, board]),
+        openEntrypoint: () => Promise.resolve({ success: true as const, data: library }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-open-after-fail", true);
+          return {
+            list: useMcpAppEntrypoints("ws-open-after-fail"),
+            board: useMcpAppView("ws-open-after-fail", board.viewKey),
+          };
+        },
+        { wrapper }
+      );
+      await waitFor(() => expect(result.current.list).toHaveLength(2));
+      const shown = result.current.board;
+      expect(shown).toMatchObject({ toolCallId: board.viewKey });
+      fail = true;
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.list).toEqual([]));
+      await act(async () => {
+        expect(await openMcpAppEntrypoint(client, "ws-open-after-fail", library)).toBeNull();
+      });
+      expect(result.current.board).toBe(shown);
+    } finally {
+      restore();
+    }
+  });
+
+  // An entry point that a successful list retired, then opened after a failed re-list.
+  test("an open after a failed re-list brings back an entry point an earlier list retired", async () => {
+    const library = entrypoint("Library");
+    let listing: () => Promise<McpAppEntrypoint[]> = () => Promise.resolve([library]);
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () => listing(),
+        openEntrypoint: () => Promise.resolve({ success: true as const, data: library }),
+        // No current record: each open runs the tool again.
+        getViewRecords: (input: { toolCallIds: string[] }) =>
+          Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({ toolCallId, view: null })),
+          }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-reopen-retired", true);
+          return {
+            list: useMcpAppEntrypoints("ws-reopen-retired"),
+            view: useMcpAppView("ws-reopen-retired", library.viewKey),
+          };
+        },
+        { wrapper }
+      );
+      await waitFor(() =>
+        expect(result.current.view).toMatchObject({ toolCallId: library.viewKey })
+      );
+      // A list without it retires it; then a re-list fails.
+      listing = () => Promise.resolve([]);
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.view).toBeNull());
+      listing = () => Promise.reject(new Error("backend busy"));
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.list).toEqual([]));
+      await act(async () => {
+        expect(await openMcpAppEntrypoint(client, "ws-reopen-retired", library)).toBeNull();
+      });
+      expect(result.current.view).toMatchObject({ toolCallId: library.viewKey });
+
+      // The same while the failing re-list is still pending when the open completes.
+      listing = () => Promise.resolve([]);
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.view).toBeNull());
+      let reject: () => void = () => undefined;
+      listing = () => new Promise((_resolve, fail) => (reject = () => fail(new Error("busy"))));
+      act(() => publishGlobalMcpEnablementChanged());
+      await waitFor(() => expect(result.current.list).toBeUndefined());
+      await act(async () => {
+        expect(await openMcpAppEntrypoint(client, "ws-reopen-retired", library)).toBeNull();
+      });
+      act(() => reject());
+      await waitFor(() => expect(result.current.list).toEqual([]));
+      expect(result.current.view).toMatchObject({ toolCallId: library.viewKey });
+    } finally {
+      restore();
+    }
+  });
+
   test("with the experiment off the list settles empty, so a restored tab stops loading", async () => {
     const client = createTestApiClient({ mcpApps: { getViewRecords: viewRecords([]) } });
     const wrapper = (props: { children: React.ReactNode }) => (
@@ -525,6 +687,327 @@ describe("MCP App entry points", () => {
       await view.findByText("bits-and-bolts · tray");
       expect(view.container.textContent).toContain("Parts Tray · bits-and-bolts · tray");
       expect(view.container.textContent).not.toContain("0123456789abcdef");
+    } finally {
+      restore();
+    }
+  });
+
+  test("re-lists when a server announces a changed tool catalog", async () => {
+    let title = "Library";
+    const ticks: Array<() => void> = [];
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () => Promise.resolve([entrypoint(title)]),
+        onEntrypointsChanged: (_input: unknown, options?: { signal?: AbortSignal }) =>
+          Promise.resolve(
+            (async function* () {
+              for (;;) {
+                const tick = Promise.withResolvers<void>();
+                ticks.push(tick.resolve);
+                options?.signal?.addEventListener("abort", () => tick.resolve(), { once: true });
+                await tick.promise;
+                if (options?.signal?.aborted === true) return;
+                yield undefined;
+              }
+            })()
+          ),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const { result } = renderHook(
+      () => {
+        useLoadMcpAppEntrypoints("ws-catalog", true);
+        return useMcpAppEntrypoints("ws-catalog");
+      },
+      { wrapper }
+    );
+    await waitFor(() => expect(result.current?.[0]?.title).toBe("Library"));
+    await waitFor(() => expect(ticks.length).toBeGreaterThan(0));
+
+    // tools/list_changed on one of the workspace's servers.
+    title = "Library 2";
+    act(() => ticks.at(-1)?.());
+    await waitFor(() => expect(result.current?.[0]?.title).toBe("Library 2"));
+  });
+
+  test("after a restart, a tab whose entry point is gone shows unavailable, not its record", async () => {
+    // A fresh workspace ID stands in for a restarted renderer: no ref or retired key is held.
+    const target = entrypoint("Library");
+    const client = createTestApiClient({
+      mcpApps: {
+        // The server was disabled: the list lacks the entry point.
+        listEntrypoints: () => Promise.resolve([]),
+        // Its record outlives the server and says it belongs to an entry point.
+        getViewRecords: (input: { toolCallIds: string[] }) =>
+          Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({
+              toolCallId,
+              view: {
+                serverName: "cad",
+                toolName: "cad.library",
+                resourceUri: "ui://cad/library",
+                arguments: {},
+                entrypoint: true,
+              },
+            })),
+          }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-restarted", true);
+          return useMcpAppView("ws-restarted", target.viewKey);
+        },
+        { wrapper }
+      );
+      await waitFor(() => expect(result.current).toBeNull());
+      // It stays unavailable: the record never brings it back as a tool call's view, so the
+      // tab never takes the record's tool name as its label either.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(result.current).toBeNull();
+      const label = render(
+        <APIProvider client={client}>
+          <AppViewTabLabel workspaceId="ws-restarted" toolCallId={target.viewKey} />
+        </APIProvider>
+      );
+      expect(label.container.textContent).toBe("App view");
+    } finally {
+      restore();
+    }
+  });
+
+  // #6181: a failed listing says nothing about the entry point, unlike a list that lacks it:
+  // the loader lists again, and a restored tab gets its view then.
+  test("after a restart, a failed listing is retried and the tab gets its view", async () => {
+    const target = entrypoint("Library");
+    let calls = 0;
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () => {
+          calls += 1;
+          return calls === 1
+            ? Promise.reject(new Error("backend busy"))
+            : Promise.resolve([target]);
+        },
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-list-retried", true);
+          return useMcpAppView("ws-list-retried", target.viewKey);
+        },
+        { wrapper }
+      );
+      await waitFor(() => expect(result.current).toMatchObject({ toolCallId: target.viewKey }), {
+        timeout: 3_000,
+      });
+      expect(calls).toBe(2);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a thread entry point's tab names its scope", async () => {
+    const thread = {
+      ...entrypoint("Library"),
+      type: "thread" as const,
+      viewKey: "entrypoint:cad:cad.library:thread",
+    };
+    const client = createTestApiClient({
+      mcpApps: { listEntrypoints: () => Promise.resolve([entrypoint("Library"), thread]) },
+    });
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    function Tabs() {
+      useLoadMcpAppEntrypoints("ws-scope", true);
+      return (
+        <>
+          <div data-testid="global">
+            <AppViewTabLabel workspaceId="ws-scope" toolCallId={entrypoint("Library").viewKey} />
+            <AppViewTabTooltip workspaceId="ws-scope" toolCallId={entrypoint("Library").viewKey} />
+          </div>
+          <div data-testid="thread">
+            <AppViewTabLabel workspaceId="ws-scope" toolCallId={thread.viewKey} />
+            <AppViewTabTooltip workspaceId="ws-scope" toolCallId={thread.viewKey} />
+          </div>
+        </>
+      );
+    }
+    try {
+      const view = render(
+        <APIProvider client={client}>
+          <Tabs />
+        </APIProvider>
+      );
+      await waitFor(() => expect(view.getByTestId("thread").textContent).toContain("Library"));
+      expect(view.getByTestId("thread").textContent).toBe(
+        "Librarycad · this chatLibrary · cad · this chat"
+      );
+      expect(view.getByTestId("global").textContent).toBe("LibrarycadLibrary · cad");
+    } finally {
+      restore();
+    }
+  });
+
+  test("an open keeps the entry point's place in the list", async () => {
+    const first = entrypoint("Library");
+    const second = {
+      ...entrypoint("Board"),
+      toolName: "cad.board",
+      viewKey: "entrypoint:cad:cad.board:global",
+    };
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () => Promise.resolve([first, second]),
+        openEntrypoint: () =>
+          Promise.resolve({ success: true as const, data: { ...first, title: "Library v2" } }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const { result } = renderHook(
+      () => {
+        useLoadMcpAppEntrypoints("ws-order", true);
+        return useMcpAppEntrypoints("ws-order");
+      },
+      { wrapper }
+    );
+    await waitFor(() => expect(result.current).toHaveLength(2));
+    await act(async () => {
+      await openMcpAppEntrypoint(client, "ws-order", first, () => undefined);
+    });
+    expect(result.current?.map((listed) => listed.title)).toEqual(["Library v2", "Board"]);
+  });
+
+  test("a palette open whose workspace has no mounted sidebar still saves its tab", async () => {
+    // The user switched workspace while the open ran: no sidebar listens for the workspace.
+    let opens = 0;
+    const target = entrypoint("Library");
+    const client = createTestApiClient({
+      mcpApps: {
+        openEntrypoint: () => {
+          opens += 1;
+          return Promise.resolve({ success: true as const, data: target });
+        },
+        getViewRecords: viewRecords([target.viewKey]),
+      },
+    });
+    updatePersistedState(
+      getRightSidebarLayoutKey("ws-unmounted"),
+      selectOrAddTab(getDefaultRightSidebarLayoutState(), "costs")
+    );
+    expect(await openMcpAppEntrypoint(client, "ws-unmounted", target)).toBeNull();
+    const layout = parseRightSidebarLayoutState(
+      readPersistedState<unknown>(getRightSidebarLayoutKey("ws-unmounted"), null)
+    );
+    expect(collectAllTabs(layout.root)).toContain(appViewTabFor(target.viewKey));
+    // Saved, not focused: the workspace was not on screen.
+    expect(getFocusedActiveTab(layout, "review")).toBe("costs");
+    // The next pick finds the tab and does not run the tool again.
+    expect(await openMcpAppEntrypoint(client, "ws-unmounted", target)).toBeNull();
+    expect(opens).toBe(1);
+  });
+
+  test("a saved palette tab keeps the tool a new layout starts with", async () => {
+    // No saved layout yet; the user asked new layouts to start on Costs (RightSidebar reads
+    // RIGHT_SIDEBAR_TAB_KEY for its default layout).
+    const target = entrypoint("Library");
+    const client = createTestApiClient({
+      mcpApps: {
+        openEntrypoint: () => Promise.resolve({ success: true as const, data: target }),
+      },
+    });
+    updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "costs");
+    try {
+      expect(await openMcpAppEntrypoint(client, "ws-unsaved", target)).toBeNull();
+      const layout = parseRightSidebarLayoutState(
+        readPersistedState<unknown>(getRightSidebarLayoutKey("ws-unsaved"), null)
+      );
+      expect(collectAllTabs(layout.root)).toEqual(["costs", appViewTabFor(target.viewKey)]);
+      expect(getFocusedActiveTab(layout, "review")).toBe("costs");
+    } finally {
+      updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
+    }
+  });
+
+  test("a rerun of an entry point whose tab is mounted reloads its frame", async () => {
+    const target = entrypoint("Library");
+    let stored: string[] = [target.viewKey];
+    let loads = 0;
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () => Promise.resolve([target]),
+        openEntrypoint: () => {
+          stored = [target.viewKey];
+          return Promise.resolve({ success: true as const, data: target });
+        },
+        getViewRecords: (input: { toolCallIds: string[] }) => viewRecords(stored)(input),
+        getView: () => {
+          loads += 1;
+          return Promise.resolve({
+            success: true as const,
+            data: {
+              html: "<p>view</p>",
+              csp: {},
+              prefersBorder: null,
+              resultAvailable: true,
+              result: { content: [] },
+              invocation: null,
+            },
+          });
+        },
+      },
+    });
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    function Tab() {
+      useLoadMcpAppEntrypoints("ws-rerun", true);
+      return (
+        <AppViewTabPanel
+          workspaceId="ws-rerun"
+          toolCallId={target.viewKey}
+          onClose={() => undefined}
+        />
+      );
+    }
+    try {
+      updatePersistedState(
+        getRightSidebarLayoutKey("ws-rerun"),
+        selectOrAddTab(getDefaultRightSidebarLayoutState(), appViewTabFor(target.viewKey))
+      );
+      const view = render(
+        <ThemeProvider forcedTheme="dark">
+          <APIProvider client={client}>
+            <Tab />
+          </APIProvider>
+        </ThemeProvider>
+      );
+      await view.findByTestId("mcp-app-frame");
+      await waitFor(() => expect(loads).toBe(1));
+      // The result store evicted the record: a pick runs the entry point again.
+      stored = [];
+      await act(async () => {
+        await openMcpAppEntrypoint(client, "ws-rerun", target, () => undefined);
+      });
+      await waitFor(() => expect(loads).toBe(2));
+      // Exactly one reload: waitFor alone would also pass on the way to a third load. Flush
+      // React's pending renders and effects, then check that no further load started.
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(loads).toBe(2);
     } finally {
       restore();
     }

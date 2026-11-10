@@ -45,6 +45,7 @@ export const CommandIds = {
   navToggleHideSubAgents: () => "nav:toggle-hide-subagents" as const,
   navToggleFlatChatList: () => "nav:toggle-flat-chat-list" as const,
   navToggleTerminalBadge: () => "nav:toggle-terminal-badge" as const,
+  navRightSidebarToggle: () => "nav:rightSidebar:toggle" as const,
   navRightSidebarFocusTerminal: () => "nav:rightSidebar:focusTerminal" as const,
   navRightSidebarSplitHorizontal: () => "nav:rightSidebar:splitHorizontal" as const,
   navRightSidebarSplitVertical: () => "nav:rightSidebar:splitVertical" as const,
@@ -56,6 +57,7 @@ export const CommandIds = {
   navOpenLogFile: () => "nav:open-log-file" as const,
   navOpenArtifacts: () => "nav:open-artifacts" as const,
   navOpenAppView: (toolCallId: string) => `nav:open-app-view:${toolCallId}` as const,
+  navReloadAppView: (toolCallId: string) => `nav:reload-app-view:${toolCallId}` as const,
   navOpenAppEntrypoint: (viewKey: string) => `nav:open-app-entrypoint:${viewKey}` as const,
   navOpenFileAsArtifact: () => "nav:open-file-as-artifact" as const,
 
@@ -102,9 +104,6 @@ export const CommandIds = {
   // Analytics commands
   analyticsRebuildDatabase: () => "analytics:rebuild-database" as const,
 
-  // Layout commands
-  layoutApplySlot: (slot: number) => `layout:apply-slot:${slot}` as const,
-  layoutCaptureSlot: (slot: number) => `layout:capture-slot:${slot}` as const,
   // Settings commands
   settingsOpen: () => "settings:open" as const,
   settingsOpenSection: (section: string) => `settings:open:${section}` as const,
@@ -117,12 +116,15 @@ export const CommandIds = {
 
   // Agent Plugin commands
   pluginsInstall: () => "plugins:install" as const,
+  mcpAppsRevokeViewDomains: () => "mcp-apps:revoke-view-domains" as const,
   pluginsManageComponents: () => "plugins:manage-components" as const,
   pluginsReviewHooks: () => "plugins:review-hooks" as const,
+  pluginsReviewComponents: () => "plugins:review-components" as const,
   pluginsUninstall: () => "plugins:uninstall" as const,
   pluginsCheckUpdates: () => "plugins:check-updates" as const,
   pluginsUpdateAll: () => "plugins:update-all" as const,
   pluginsUpdateOne: () => "plugins:update-one" as const,
+  pluginsSignOutServers: () => "plugins:sign-out-servers" as const,
 
   // Help commands
   helpKeybinds: () => "help:keybinds" as const,

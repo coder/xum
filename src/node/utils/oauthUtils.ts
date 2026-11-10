@@ -7,7 +7,7 @@ import { Err, Ok } from "@/common/types/result";
  * Shared OAuth utility functions extracted from the individual OAuth service files.
  *
  * These are verbatim-duplicated across codexOauthService, copilotOauthService,
- * muxGatewayOauthService, and mcpOauthService.
+ * coderOauthService, and mcpOauthService.
  */
 
 /**
@@ -16,8 +16,7 @@ import { Err, Ok } from "@/common/types/result";
  * handlerGen router procedures. The error type is constrained to carry the
  * exact user-facing string in `reason`, so the fold maps it 1:1 onto
  * `Err(reason)` without reformatting; failures without `reason` (e.g. a tag a
- * caller must branch on first, like MuxGatewaySessionExpiredError) are
- * rejected at compile time.
+ * caller must branch on first) are rejected at compile time.
  */
 export function toWireResult<A, E extends { readonly reason: string }>(
   effect: Effect.Effect<A, E>
@@ -67,27 +66,18 @@ export interface RenderOAuthCallbackHtmlOptions {
   message: string;
   /** When true, the page auto-closes via `window.close()`. */
   success: boolean;
-  /**
-   * Optional extra content injected into `<head>` (e.g. an external CSS link).
-   *
-   * WARNING: This string is injected unescaped into the returned HTML. Only pass
-   * trusted, static HTML (never user-controlled input).
-   */
-  extraHead?: string;
 }
 
 /**
  * Render the HTML page returned to the browser after an OAuth callback.
  *
- * All three loopback-based services (Gateway, Codex, MCP) return an
+ * The loopback-based services (Codex, Coder, MCP) return an
  * HTML page with a title, message, and auto-close script on success. The
  * structure mirrors the common pattern found across those services:
  *
  * - `<!doctype html>` with basic inline styling (centered, system font)
  * - Title in `<h1>`, message in `<p>`
  * - Auto-close `<script>` that calls `window.close()` on success
- * - Support for `extraHead` for provider-specific customization (e.g.
- *   Gateway uses an external CSS link)
  */
 export function renderOAuthCallbackHtml(options: RenderOAuthCallbackHtmlOptions): string {
   const title = escapeHtml(options.title);
@@ -104,7 +94,7 @@ export function renderOAuthCallbackHtml(options: RenderOAuthCallbackHtmlOptions)
       body { font-family: system-ui, sans-serif; max-width: 600px; margin: 4rem auto; padding: 1rem; }
       h1 { margin-bottom: 1rem; }
       .muted { color: #666; }
-    </style>${options.extraHead ? `\n    ${options.extraHead}` : ""}
+    </style>
   </head>
   <body>
     <h1>${title}</h1>

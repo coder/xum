@@ -65,7 +65,7 @@ type BadgeTone = "enabled" | "disabled" | "cleared";
 // same across tool cards; amber means "kept but won't progress" (paused);
 // muted means "not scheduled" (cleared / not set).
 const BADGE_CLASSES: Record<BadgeTone, string> = {
-  enabled: "bg-success/10 text-success border-success/40",
+  enabled: "bg-success/10 text-success-text border-success/40",
   disabled: "bg-warning-overlay text-warning border-warning/40",
   cleared: "bg-white/5 text-secondary border-white/10",
 };
@@ -268,7 +268,7 @@ export const HeartbeatToolCall: React.FC<HeartbeatToolCallProps> = (props) => {
                 <HeartbeatStat
                   label="State"
                   value={
-                    <span className={live ? "text-success" : "text-warning"}>
+                    <span className={live ? "text-success-text" : "text-warning"}>
                       {live ? "Enabled" : "Paused"}
                     </span>
                   }

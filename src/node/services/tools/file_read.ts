@@ -3,6 +3,7 @@ import type { FileReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { resolvePathWithinCwd, validateFileSize } from "./fileCommon";
+import { skillFileReadNote } from "./skillFileHint";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -98,6 +99,7 @@ export const createFileReadTool: ToolFactory = (config: ToolConfiguration) => {
 
         const numberedLines: string[] = [];
         let totalBytesAccumulated = 0;
+        let cutLongLine = false;
         const MAX_LINE_BYTES = 1024;
         const MAX_LINES = 1000;
         const MAX_TOTAL_BYTES = 16 * 1024; // 16KB
@@ -119,6 +121,7 @@ export const createFileReadTool: ToolFactory = (config: ToolConfiguration) => {
               .subarray(0, MAX_LINE_BYTES)
               .toString("utf-8");
             processedLine += "... [truncated]";
+            cutLongLine = true;
           }
 
           // Format line with number prefix
@@ -148,6 +151,9 @@ export const createFileReadTool: ToolFactory = (config: ToolConfiguration) => {
         // Join lines with newlines
         const content = numberedLines.join("\n");
 
+        // A cut skill file names the agent_skill_read_file call that returns it whole.
+        const skillNote = await skillFileReadNote(config, resolvedPath, cutLongLine);
+
         // Return file info and content
         return {
           success: true,
@@ -156,6 +162,7 @@ export const createFileReadTool: ToolFactory = (config: ToolConfiguration) => {
           lines_read: numberedLines.length,
           content,
           ...(pathWarning && { warning: pathWarning }),
+          ...skillNote,
         };
       } catch (error) {
         // Handle specific errors

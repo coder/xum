@@ -1,6 +1,7 @@
 import * as fs from "fs";
 
 import { describe, it, expect, mock, spyOn } from "bun:test";
+import { nodeClock } from "@/node/utils/hostClock";
 import type { ToolExecutionOptions } from "ai";
 
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
@@ -927,6 +928,38 @@ describe("task_await tool", () => {
         results: [{ status: "running", taskId: "t1", elapsed_ms: 3000 }],
       });
       expect(waitForAgentReport).toHaveBeenCalledTimes(0);
+    } finally {
+      dateNowSpy.mockRestore();
+    }
+  });
+
+  it("measures active agent task elapsed time on the wall clock when the session clock trails it", async () => {
+    // TaskService stamps createdAt with Date.now(), so elapsed time reads the wall clock too
+    // (#7282). On a session clock months behind it, elapsed_ms would clamp to 0.
+    using tempDir = new TestTempDir("test-task-await-tool-agent-elapsed-wall-clock");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const nowMs = Date.parse("2026-10-01T00:00:05.000Z");
+    const dateNowSpy = spyOn(Date, "now").mockReturnValue(nowMs);
+    try {
+      const taskServices = createFakeTaskServices({
+        listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => "running" as const),
+        getAgentTaskTimestamps: mock(() => ({ createdAt: "2026-10-01T00:00:02.000Z" })),
+      });
+      const tool = createTaskAwaitTool({
+        ...baseConfig,
+        ...taskServices,
+        clock: { ...nodeClock, nowMs: () => Date.parse("2026-01-01T00:00:00.000Z") },
+      });
+
+      const result: unknown = await Promise.resolve(
+        tool.execute!({ timeout_secs: 0 }, mockToolCallOptions)
+      );
+
+      expect(result).toEqual({
+        results: [{ status: "running", taskId: "t1", elapsed_ms: 3000 }],
+      });
     } finally {
       dateNowSpy.mockRestore();
     }

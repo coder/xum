@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { hasDraftBlock, removeDraftBlock, removeSentText } from "./composerDraftText";
+import { hasDraftBlock, removeDraftBlock, removeSentText, takeSentText } from "./composerDraftText";
 
 describe("removeSentText", () => {
   test("a send of the whole composer text empties it", () => {
@@ -26,6 +26,36 @@ describe("removeSentText", () => {
 
   test("an attachment-only send (no text) leaves the composer text", () => {
     expect(removeSentText("restored draft", "")).toBe("restored draft");
+  });
+});
+
+// #6405: the composer stays on from Enter, so keys typed before the send takes its draft follow
+// the sent text directly.
+describe("takeSentText", () => {
+  test("keys typed right after the sent text stay exactly as typed, without the sent text", () => {
+    expect(takeSentText("first messagex", "first message", "typed-after")).toBe("x");
+    expect(takeSentText("first message", "first message", "typed-after")).toBe("");
+    expect(takeSentText("first message  indented", "first message", "typed-after")).toBe(
+      "  indented"
+    );
+    expect(takeSentText("first message\nmore", "first message", "typed-after")).toBe("\nmore");
+    expect(takeSentText("restored draft", "", "typed-after")).toBe("restored draft");
+  });
+
+  // #6585: a select-all paste or a deleted and retyped text can start with the sent text.
+  test("a text the user edited through the composer since Enter stays whole", () => {
+    expect(takeSentText("Fix the bug in parser.ts", "Fix the bug", "edited")).toBe(
+      "Fix the bug in parser.ts"
+    );
+    expect(takeSentText("yes please", "yes", "edited")).toBe("yes please");
+  });
+
+  test("a text replaced or restored otherwise keeps the whitespace-boundary rule", () => {
+    expect(takeSentText("yesterday", "yes", "unknown")).toBe("yesterday");
+    expect(takeSentText("restored\n\nyes", "yes", "unknown")).toBe("restored");
+    expect(takeSentText("hello\n\nfrom the other window", "hello", "unknown")).toBe(
+      "from the other window"
+    );
   });
 });
 

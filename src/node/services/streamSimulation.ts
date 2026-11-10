@@ -27,7 +27,6 @@ export interface SimulationContext {
   workspaceId: string;
   assistantMessageId: string;
   canonicalModelString: string;
-  routedThroughGateway: boolean;
   routeProvider?: string;
   historySequence: number;
   systemMessageTokens: number;
@@ -46,7 +45,6 @@ function createSimulatedStreamStart(ctx: SimulationContext): StreamStartEvent {
     workspaceId: ctx.workspaceId,
     messageId: ctx.assistantMessageId,
     model: ctx.canonicalModelString,
-    routedThroughGateway: ctx.routedThroughGateway,
     ...(ctx.routeProvider != null ? { routeProvider: ctx.routeProvider } : {}),
     historySequence: ctx.historySequence,
     startTime: Date.now(),
@@ -80,7 +78,6 @@ export async function simulateContextLimitError(
       historySequence: ctx.historySequence,
       timestamp: Date.now(),
       model: ctx.canonicalModelString,
-      routedThroughGateway: ctx.routedThroughGateway,
       ...(ctx.routeProvider != null ? { routeProvider: ctx.routeProvider } : {}),
       systemMessageTokens: ctx.systemMessageTokens,
       agentId: ctx.effectiveAgentId,
@@ -123,7 +120,6 @@ export async function simulateToolPolicyNoop(
   const noopMessage = createMuxMessage(ctx.assistantMessageId, "assistant", "", {
     timestamp: Date.now(),
     model: ctx.canonicalModelString,
-    routedThroughGateway: ctx.routedThroughGateway,
     ...(ctx.routeProvider != null ? { routeProvider: ctx.routeProvider } : {}),
     systemMessageTokens: ctx.systemMessageTokens,
     agentId: ctx.effectiveAgentId,
@@ -171,7 +167,6 @@ export async function simulateToolPolicyNoop(
       agentId: ctx.effectiveAgentId,
       ...(ctx.metadataMode != null ? { mode: ctx.metadataMode } : {}),
       thinkingLevel: ctx.effectiveThinkingLevel,
-      routedThroughGateway: ctx.routedThroughGateway,
       ...(ctx.routeProvider != null ? { routeProvider: ctx.routeProvider } : {}),
       systemMessageTokens: ctx.systemMessageTokens,
     },

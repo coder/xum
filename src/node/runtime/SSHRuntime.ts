@@ -48,6 +48,7 @@ import {
   type SSHRuntimeConfig,
   getControlPath,
   appendOpenSSHHostKeyPolicyArgs,
+  makeAgentHostKey,
   sshConnectionPool,
 } from "./sshConnectionPool";
 import { buildSourceRefSnapshotCommand, getOriginUrlForBundle } from "./gitBundleSync";
@@ -509,7 +510,22 @@ async function fastReadGitHeadsRefs(projectPath: string): Promise<string | null>
 /** Trunk-like names SSH cleanups never `branch -D`, even when they look orphaned. */
 const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
 
+/**
+ * #6426: how often this process made or removed a checkout on each SSH host. Module level, because
+ * a runtime object is made per call. It is part of getAgentHostKey, so a checkout that Xum removed
+ * and made again at the same path never reuses the old one's cached plugin snapshot. Bumped AFTER
+ * the change: a snapshot is keyed when its read starts, so a read that raced it keeps the old key.
+ * Keyed by the host string only, so every spelling of a host (port unset or 22, another identity
+ * file) sees the change. An extra bump only costs one cold listing.
+ */
+const checkoutGenerations = new Map<string, number>();
+
 export class SSHRuntime extends RemoteRuntime {
+  /** Runtime.mode. A prototype getter, like `location`, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- same as location: Object.create(X.prototype) doubles would read undefined from a readonly field
+  get mode(): "ssh" {
+    return "ssh";
+  }
   private readonly config: SSHRuntimeConfig;
   private readonly transport: SSHTransport;
   private readonly ensureReadyProjectPath?: string;
@@ -1101,6 +1117,17 @@ export class SSHRuntime extends RemoteRuntime {
   // ===== RemoteRuntime abstract method implementations =====
 
   protected readonly commandPrefix: string = "SSH";
+
+  override getAgentHostKey(): string {
+    const generation = checkoutGenerations.get(this.config.host) ?? 0;
+    return JSON.stringify([makeAgentHostKey(this.config), generation]);
+  }
+
+  /** After a checkout on this host is made or removed (see checkoutGenerations). */
+  private bumpCheckoutGeneration(): void {
+    const host = this.config.host;
+    checkoutGenerations.set(host, (checkoutGenerations.get(host) ?? 0) + 1);
+  }
 
   protected getBasePath(): string {
     return this.config.srcBaseDir;
@@ -1908,6 +1935,14 @@ export class SSHRuntime extends RemoteRuntime {
     }
 
     initLogger.logStep("Creating git bundle...");
+    // Start the remote writer before git: when git exits before anything reads its stdout,
+    // Node discards the unread output, and a slow ssh start uploaded an empty bundle.
+    const remoteAbortController = createAbortController(300_000, abortSignal);
+    const remoteStream = await this.exec(`cat > ${this.quoteForRemote(remoteBundlePath)}`, {
+      cwd: "~",
+      abortSignal: remoteAbortController.signal,
+    });
+
     // Use --branches --tags instead of --all to exclude refs/remotes/origin/*
     // from the bundle. Those tracking refs are from the local machine's last
     // fetch and can be arbitrarily stale — importing them into the shared bare
@@ -1931,12 +1966,6 @@ export class SSHRuntime extends RemoteRuntime {
       for (const line of chunk.split("\n").filter(Boolean)) {
         initLogger.logStderr(line);
       }
-    });
-
-    const remoteAbortController = createAbortController(300_000, abortSignal);
-    const remoteStream = await this.exec(`cat > ${this.quoteForRemote(remoteBundlePath)}`, {
-      cwd: "~",
-      abortSignal: remoteAbortController.signal,
     });
 
     try {
@@ -2546,7 +2575,7 @@ export class SSHRuntime extends RemoteRuntime {
     // Disable git hooks for untrusted projects (prevents post-checkout execution)
     const nhp = gitNoHooksPrefix(params.trusted);
 
-    return runWorkspaceInitHook({
+    const result = await runWorkspaceInitHook({
       params,
       runtimeType: "ssh",
       findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
@@ -2566,6 +2595,9 @@ export class SSHRuntime extends RemoteRuntime {
         );
       },
     });
+    // The checkout now exists (or changed); see checkoutGenerations.
+    this.bumpCheckoutGeneration();
+    return result;
   }
 
   /**
@@ -3230,15 +3262,18 @@ export class SSHRuntime extends RemoteRuntime {
     const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
 
     try {
+      // quoteForRemote expands a leading ~ remotely: a deferred-access runtime (Coder) keeps
+      // the unresolved `~/...` path, and a quoted `~` would make a dirty checkout look missing.
+      const deletedPathArg = this.quoteForRemote(deletedPath);
       // Combine all pre-deletion checks into a single bash script to minimize round trips
       // Exit codes: 0=ok to delete, 1=uncommitted changes, 2=unpushed commits, 3=doesn't exist
       const checkScript = force
         ? // When force=true, only check existence
-          `test -d ${shescape.quote(deletedPath)} || exit 3`
+          `test -d ${deletedPathArg} || exit 3`
         : // When force=false, perform all safety checks
           `
-            test -d ${shescape.quote(deletedPath)} || exit 3
-            cd ${shescape.quote(deletedPath)} || exit 1
+            test -d ${deletedPathArg} || exit 3
+            cd ${deletedPathArg} || exit 1
             git diff --quiet --exit-code && git diff --quiet --cached --exit-code || exit 1
             if git remote | grep -q .; then
               # First, check the original condition: any commits not in any remote
@@ -3327,6 +3362,7 @@ export class SSHRuntime extends RemoteRuntime {
       // Handle check results
       if (checkExitCode === 3) {
         // Directory doesn't exist - deletion is idempotent (success).
+        this.bumpCheckoutGeneration();
         return { success: true, deletedPath };
       }
 
@@ -3461,6 +3497,7 @@ export class SSHRuntime extends RemoteRuntime {
         }
       }
 
+      this.bumpCheckoutGeneration();
       return { success: true, deletedPath };
     } catch (error) {
       return { success: false, error: `Failed to delete directory: ${getErrorMessage(error)}` };
@@ -3851,6 +3888,7 @@ export class SSHRuntime extends RemoteRuntime {
       // `worktree add -b` refuses an existing branch, so only the worktree path demonstrably made
       // the fork's branch; the copy fallback may have checked out an existing one. Rollbacks
       // delete the branch only when this is true (#5119).
+      this.bumpCheckoutGeneration();
       return {
         success: true,
         workspacePath: newWorkspacePath,

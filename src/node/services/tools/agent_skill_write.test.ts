@@ -1,7 +1,8 @@
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, spyOn } from "bun:test";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { FILE_EDIT_DIFF_OMITTED_MESSAGE } from "@/common/types/tools";
 import type { AgentSkillReadToolResult, AgentSkillWriteToolResult } from "@/common/types/tools";
@@ -16,6 +17,8 @@ import {
   readRefinementEvents,
   seedForeignTargetLock,
 } from "@/node/services/refinement/refinementTestHelpers";
+import { targetMutationLockFilePath } from "@/node/services/refinement/targetMutationLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import { createAgentSkillReadTool } from "./agent_skill_read";
 import {
   createAgentSkillWriteTool,
@@ -53,6 +56,31 @@ async function createWriteTool(
 }
 
 describe("agent_skill_write", () => {
+  it("takes the target lock from the config's session locks", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-locks");
+    // A copy of the Node locks whose file lock records its calls (#7326).
+    const locks = { ...nodeSessionLocks };
+    const acquire = spyOn(locks, "acquireProcessFileLock");
+    const tool = createAgentSkillWriteTool({
+      ...createTestToolConfig(tempDir.path, {
+        workspaceId: GLOBAL_WORKSPACE_ID,
+        sessionsDir: await createWorkspaceSessionDir(tempDir.path, GLOBAL_WORKSPACE_ID),
+      }),
+      sessionLocks: locks,
+    });
+
+    const result = (await tool.execute!(
+      { name: "demo-skill", content: skillMarkdown("demo-skill") },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    expect(result.success).toBe(true);
+    const skillsRoot = path.resolve(tempDir.path, "skills");
+    expect(acquire.mock.calls.map(([options]) => options.lockPath)).toContain(
+      targetMutationLockFilePath(tempDir.path, skillsRoot)
+    );
+  });
+
   it("creates SKILL.md for a new global skill", async () => {
     using tempDir = new TestTempDir("test-agent-skill-write-create");
 
@@ -71,6 +99,33 @@ describe("agent_skill_write", () => {
       "utf-8"
     );
     expect(stored).toBe(content);
+  });
+
+  it("writes a global skill to the Xum home even when ~/.mux/skills has one of that name", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-legacy-mux");
+    const xumHome = path.join(tempDir.path, "xum-home");
+    const legacySkillFile = path.join(tempDir.path, ".mux", "skills", "shared", SKILL_FILENAME);
+    await writeSkill(path.join(tempDir.path, ".mux", "skills"), "shared");
+    const legacyContent = await fs.readFile(legacySkillFile, "utf-8");
+    const homedirSpy = spyOn(os, "homedir").mockReturnValue(tempDir.path);
+    try {
+      const tool = await createWriteTool(xumHome);
+      const content = skillMarkdown("shared", { body: "Written by Xum" });
+
+      const result = (await tool.execute!(
+        { name: "shared", content },
+        mockToolCallOptions
+      )) as AgentSkillWriteToolResult;
+
+      expect(result.success).toBe(true);
+      // ~/.mux/skills is read-only: the write lands in the Xum home only.
+      expect(
+        await fs.readFile(path.join(xumHome, "skills", "shared", SKILL_FILENAME), "utf-8")
+      ).toBe(content);
+      expect(await fs.readFile(legacySkillFile, "utf-8")).toBe(legacyContent);
+    } finally {
+      homedirSpy.mockRestore();
+    }
   });
 
   it("recreates deleted global xum home before validating skill writes", async () => {
@@ -157,17 +212,18 @@ describe("agent_skill_write", () => {
     expect((await fs.lstat(path.join(legacyRoot, "demo-skill"))).isSymbolicLink()).toBe(true);
   });
 
-  it("merges a legacy package into an incomplete canonical package before writing", async () => {
+  // The canonical manifest decides the merge: one discovery rejects (no description)
+  // takes the legacy package; one discovery loads (a display name) stays as is.
+  it.each([
+    ["merges a legacy package into an incomplete", "---\nname: demo-skill\n---\n", true],
+    ["keeps a display-name", "---\nname: Demo Skill\ndescription: Canonical\n---\n", false],
+  ] as const)("%s canonical package before writing", async (_label, manifest, merges) => {
     using tempDir = new TestTempDir("test-agent-skill-write-legacy-partial-canonical");
     const projectRoot = path.join(tempDir.path, "project");
     const canonicalRoot = path.join(projectRoot, ".xum", "skills");
     const legacyRoot = path.join(projectRoot, ".mux", "skills");
     await fs.mkdir(path.join(canonicalRoot, "demo-skill", "references"), { recursive: true });
-    await fs.writeFile(
-      path.join(canonicalRoot, "demo-skill", SKILL_FILENAME),
-      "---\nname: wrong-name\ndescription: Invalid canonical manifest\n---\n",
-      "utf-8"
-    );
+    await fs.writeFile(path.join(canonicalRoot, "demo-skill", SKILL_FILENAME), manifest, "utf-8");
     await fs.writeFile(
       path.join(canonicalRoot, "demo-skill", "references", "canonical.txt"),
       "canonical",
@@ -190,15 +246,20 @@ describe("agent_skill_write", () => {
 
     expect(result.success).toBe(true);
     const canonicalDir = path.join(canonicalRoot, "demo-skill");
-    expect(await fs.readFile(path.join(canonicalDir, SKILL_FILENAME), "utf-8")).toContain(
-      "name: demo-skill"
-    );
+    const writtenManifest = await fs.readFile(path.join(canonicalDir, SKILL_FILENAME), "utf-8");
+    if (merges) {
+      expect(writtenManifest).toContain("name: demo-skill\ndescription:");
+    } else {
+      expect(writtenManifest).toBe(manifest);
+    }
     expect(await fs.readFile(path.join(canonicalDir, "references/canonical.txt"), "utf-8")).toBe(
       "canonical"
     );
-    expect(await fs.readFile(path.join(canonicalDir, "references/legacy.txt"), "utf-8")).toBe(
-      "legacy"
+    const legacyCopied = await fs.stat(path.join(canonicalDir, "references/legacy.txt")).then(
+      () => true,
+      () => false
     );
+    expect(legacyCopied).toBe(merges);
     expect(await fs.readFile(path.join(canonicalDir, "references/new.txt"), "utf-8")).toBe("new");
   });
 

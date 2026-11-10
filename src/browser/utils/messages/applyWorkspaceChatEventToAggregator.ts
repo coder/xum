@@ -1,8 +1,12 @@
 import assert from "@/common/utils/assert";
-import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
-import { publishChatError } from "@/browser/utils/chatErrorToasts";
-import type { DeleteMessage, StreamErrorMessage, WorkspaceChatMessage } from "@/common/orpc/types";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { publishChatError, publishChatInfo } from "@/browser/utils/chatErrorToasts";
+import type {
+  DeleteMessage,
+  PluginHookNoticeEvent,
+  StreamErrorMessage,
+  WorkspaceChatMessage,
+} from "@/common/orpc/types";
 import {
   isBashOutputEvent,
   isCaughtUpMessage,
@@ -94,8 +98,8 @@ export interface WorkspaceChatEventAggregator {
 
 /**
  * Desktop perf harness (XUM_REPLAY_TAPES, exposed by preload): chat events come from a recorded
- * session tape, so they must not trigger app side effects (gateway dialogs, skill refreshes,
- * child-goal toasts, git/review refreshes).
+ * session tape, so they must not trigger app side effects (skill refreshes, child-goal toasts,
+ * git/review refreshes).
  */
 export function isSessionTapeReplayRenderer(): boolean {
   return typeof window !== "undefined" && window.api?.isSessionTapeReplay === true;
@@ -104,11 +108,6 @@ export function isSessionTapeReplayRenderer(): boolean {
 function dispatchSkillsRefreshRequested(): void {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED));
-}
-
-function dispatchMuxGatewaySessionExpired(): void {
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED));
 }
 
 /**
@@ -120,9 +119,9 @@ function dispatchMuxGatewaySessionExpired(): void {
  * - "ignored": event does not affect the aggregator
  */
 /**
- * A hook's systemMessage can be up to 16 KiB, but the chat-input toast has no height limit or
- * scrolling and an error toast stays until dismissed: a long one covers the chat and pushes its
- * dismiss control off screen. Show only the start of it.
+ * A hook's systemMessage can be up to 16 KiB, and an error toast stays until dismissed: show only
+ * the start of it. ChatInputToast also caps the message's height, since 500 wide glyphs still wrap
+ * to many lines on a phone.
  */
 const PLUGIN_HOOK_NOTICE_MAX_CHARS = 500;
 
@@ -130,6 +129,11 @@ function boundPluginHookNotice(message: string): string {
   if (message.length <= PLUGIN_HOOK_NOTICE_MAX_CHARS) return message;
   // Cut by code point so the cut never splits a surrogate pair.
   return `${Array.from(message).slice(0, PLUGIN_HOOK_NOTICE_MAX_CHARS).join("").trimEnd()}…`;
+}
+
+function publishPluginHookNotice(event: PluginHookNoticeEvent): void {
+  const publish = event.severity === "info" ? publishChatInfo : publishChatError;
+  publish(event.workspaceId, `Plugin ${event.plugin}: ${boundPluginHookNotice(event.message)}`);
 }
 
 export function applyWorkspaceChatEventToAggregator(
@@ -169,12 +173,6 @@ export function applyWorkspaceChatEventToAggregator(
   }
 
   if (isStreamError(event)) {
-    if (allowSideEffects && event.error === MUX_GATEWAY_SESSION_EXPIRED_MESSAGE) {
-      // Dispatch session-expired event; useGateway() listens for it and
-      // optimistically marks the gateway as unconfigured to stop routing.
-      dispatchMuxGatewaySessionExpired();
-    }
-
     aggregator.handleStreamError(event);
     // Match stream-end / stream-abort: drop the per-message deltaHistory entry
     // so a subsequent stream isn't influenced by leaked TPS/token state from
@@ -227,11 +225,7 @@ export function applyWorkspaceChatEventToAggregator(
 
   if (isPluginHookNoticeEvent(event)) {
     // A plugin hook's systemMessage: a toast for the user, never a transcript row.
-    if (allowSideEffects)
-      publishChatError(
-        event.workspaceId,
-        `Plugin ${event.plugin}: ${boundPluginHookNotice(event.message)}`
-      );
+    if (allowSideEffects) publishPluginHookNotice(event);
     return "ignored";
   }
 

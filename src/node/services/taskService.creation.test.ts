@@ -5,6 +5,7 @@ import * as path from "path";
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { existsSync } from "fs";
+import { execFileSync } from "node:child_process";
 import { Config, type ProjectsConfig, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import type { TaskService } from "@/node/services/taskService";
@@ -47,7 +48,7 @@ import {
   createNullInitLogger,
   createTaskServiceHarness,
   createTaskServiceTestRoot,
-  registerLiveWorkspaceTurnHandle,
+  startLiveWorkspaceTurn,
   removeTaskServiceTestRoot,
   waitForWorkspaceTaskStatus,
 } from "@/node/services/taskService.shared.testHarness";
@@ -1793,6 +1794,107 @@ describe("TaskService", () => {
     }
   }, 20_000);
 
+  for (const launch of ["create", "createMany"] as const) {
+    test(`a burst of forks from one parent (${launch}) runs one origin fetch and bases every child on it`, async () => {
+      const config = await createTestConfig(rootDir);
+      stubStableIds(config, ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"], "eeeeeeeeee");
+      const projectPath = await createTestProject(rootDir);
+      const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+      const runtime = createRuntime(runtimeConfig, { projectPath });
+      const parentName = "parent";
+      await runtime.createWorkspace({
+        projectPath,
+        branchName: parentName,
+        trunkBranch: "main",
+        directoryName: parentName,
+        initLogger: createNullInitLogger(),
+      });
+
+      const git = (cwd: string, ...args: string[]) =>
+        execFileSync("git", ["-C", cwd, ...args])
+          .toString()
+          .trim();
+      const originPath = path.join(rootDir, "origin.git");
+      execFileSync("git", ["clone", "--quiet", "--bare", projectPath, originPath]);
+      const remoteOnly = git(
+        originPath,
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@example.com",
+        "commit-tree",
+        `${parentName}^{tree}`,
+        "-p",
+        parentName,
+        "-m",
+        "pushed to the parent branch by someone else"
+      );
+      git(originPath, "update-ref", `refs/heads/${parentName}`, remoteOnly);
+      const countFile = path.join(rootDir, "upload-pack-runs");
+      const uploadPack = path.join(rootDir, "counting-upload-pack.sh");
+      await fsPromises.writeFile(
+        uploadPack,
+        `#!/bin/sh\necho run >> "${countFile}"\nexec git upload-pack "$@"\n`,
+        { mode: 0o755 }
+      );
+      git(projectPath, "remote", "add", "origin", originPath);
+      git(projectPath, "config", "remote.origin.uploadpack", uploadPack);
+
+      const parentId = "1111111111";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          {
+            path: runtime.getWorkspacePath(projectPath, parentName),
+            id: parentId,
+            name: parentName,
+            createdAt: new Date().toISOString(),
+            runtimeConfig,
+          },
+        ],
+        testTaskSettings(4, 3)
+      );
+      const { taskService } = createTaskServiceHarness(config);
+
+      const prompts = ["task 1", "task 2", "task 3", "task 4"];
+      const taskIds: string[] = [];
+      if (launch === "create") {
+        for (const prompt of prompts) {
+          const created = await createAgentTask(taskService, parentId, prompt);
+          assert(created.success, `create failed: ${created.success ? "" : created.error}`);
+          taskIds.push(created.data.taskId);
+        }
+      } else {
+        const created = await taskService.createMany(
+          prompts.map((prompt) => ({
+            parentWorkspaceId: parentId,
+            kind: "agent" as const,
+            agentId: "explore",
+            prompt,
+            title: "Test task",
+          }))
+        );
+        assert(created.success, `createMany failed: ${created.success ? "" : created.error}`);
+        for (const task of created.data) {
+          await waitForWorkspaceTaskStatus(config, task.taskId, "running");
+          taskIds.push(task.taskId);
+        }
+      }
+      const childHeads = taskIds.map((taskId) => {
+        const childPath = findWorkspaceInConfig(config, taskId)?.path;
+        assert(childPath, "the child has a checkout");
+        return git(childPath, "rev-parse", "HEAD");
+      });
+
+      const uploadPackRuns = (await fsPromises.readFile(countFile, "utf-8"))
+        .split("\n")
+        .filter(Boolean).length;
+      expect(uploadPackRuns).toBe(1);
+      expect(childHeads).toEqual([remoteOnly, remoteOnly, remoteOnly, remoteOnly]);
+    }, 30_000);
+  }
+
   test("configures MultiProjectRuntime envResolver before queued task background init", async () => {
     const config = await createTestConfig(rootDir);
 
@@ -2023,6 +2125,66 @@ describe("TaskService", () => {
       forkSpy.mockRestore();
     }
   }, 20_000);
+
+  test.each(["single", "many"] as const)(
+    "%s: a task sharing an auto-named worktree parent records the branch its checkout is on",
+    async (mode) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = await createTestProject(rootDir);
+      const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+      const runtime = createRuntime(runtimeConfig, { projectPath });
+      await runtime.createWorkspace({
+        projectPath,
+        branchName: "workspace-1",
+        trunkBranch: "main",
+        directoryName: "workspace-1",
+        initLogger: createNullInitLogger(),
+      });
+      // workspace.create renames an auto-named workspace's branch only; its name stays.
+      execFileSync("git", ["branch", "-m", "workspace-1", "sidebar-k3m9"], { cwd: projectPath });
+      const parentId = "1111111111";
+      const childTaskId = "2222222222";
+      stubStableIds(config, [childTaskId]);
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          {
+            path: runtime.getWorkspacePath(projectPath, "workspace-1"),
+            id: parentId,
+            name: "workspace-1",
+            createdAt: new Date().toISOString(),
+            runtimeConfig,
+          },
+        ],
+        testTaskSettings()
+      );
+      const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
+        () => Promise.resolve(undefined)
+      );
+      try {
+        const { workspaceService } = createWorkspaceServiceMocks();
+        const { taskService } = createTaskServiceHarness(config, { workspaceService });
+        const args = {
+          parentWorkspaceId: parentId,
+          kind: "agent" as const,
+          agentType: "explore",
+          prompt: "read-only analysis",
+          title: "Test task",
+          isolation: "none" as const,
+        };
+        const result =
+          mode === "single" ? await taskService.create(args) : await taskService.createMany([args]);
+
+        expect(result.success).toBe(true);
+        // The review panel's base for this task's checkout.
+        expect(findWorkspaceInConfig(config, childTaskId)?.taskTrunkBranch).toBe("sidebar-k3m9");
+      } finally {
+        runBackgroundInitSpy.mockRestore();
+      }
+    },
+    20_000
+  );
 
   async function setUpSharedChild(
     childFields: Partial<WorkspaceConfigEntry> = { taskStatus: "reported" }
@@ -3070,7 +3232,12 @@ describe("TaskService", () => {
     });
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_live", parentId);
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: parentId,
+      workspaceId: "target",
+      handleId: "wst_live",
+      ownerCreatedWorkspace: true,
+    });
 
     const created = await createAgentTask(taskService, parentId, "Inspect", { isolation: "none" });
     assert(created.success);

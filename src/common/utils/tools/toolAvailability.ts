@@ -9,6 +9,8 @@ import type { AgentId } from "@/common/types/agentDefinition";
 export interface ToolAvailabilityContext {
   workspaceId: string;
   parentWorkspaceId?: string | null;
+  /** A scratch chat (no repository). */
+  scratchWorkspace?: boolean;
 }
 
 /**
@@ -138,8 +140,11 @@ export function getToolAvailabilityOptions(context: ToolAvailabilityContext) {
     enableAgentReport: Boolean(context.parentWorkspaceId),
     // The Review pane is a user-facing parent-workspace concept. Sub-agents
     // (child task workspaces, identified by a parentWorkspaceId) shouldn't pin
-    // code to it, so withhold the review_pane_* tools from them.
-    enableReviewPane: !context.parentWorkspaceId,
+    // code to it, so withhold the review_pane_* tools from them. Scratch chats
+    // have no repository to review.
+    enableReviewPane: !context.parentWorkspaceId && !context.scratchWorkspace,
+    // Scratch sub-agents share the chat's folder and never produce patches.
+    enableGitPatches: !context.scratchWorkspace,
     // skills_catalog_* tools are always available; agent tool policy controls access.
   } as const;
 }

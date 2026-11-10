@@ -43,7 +43,6 @@ import {
   MAX_RENDERED_MODELS,
   MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
 } from "@/common/constants/ui";
-import { CUSTOM_MODEL_HIDDEN_PROVIDERS } from "@/common/constants/providers";
 import {
   matchesModelQueryTokens,
   tokenizeModelQuery,
@@ -162,13 +161,7 @@ export function ModelsSection() {
   // Page belongs to the filter it was chosen under, so a new filter shows page 1.
   const [customPage, setCustomPage] = useState({ filter: "", index: 0 });
 
-  const allowedProviders = useMemo(
-    () =>
-      getProviderIdsForUi(config).filter(
-        (provider) => !CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)
-      ),
-    [config]
-  );
+  const allowedProviders = useMemo(() => getProviderIdsForUi(config), [config]);
 
   useEffect(() => {
     if (config === null || !lastProvider || allowedProviders.includes(lastProvider)) {
@@ -208,12 +201,6 @@ export function ModelsSection() {
   // input on success (a rejected duplicate keeps the typed ID visible).
   const addModel = (provider: string, modelId: string): boolean => {
     if (!config) return false;
-
-    // mux-gateway is a routing layer, not a provider users should add models under.
-    if (CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)) {
-      setError("Xum Gateway models can't be added directly. Enable Gateway per-model instead.");
-      return false;
-    }
 
     // Check for duplicates
     if (modelExists(provider, modelId)) {
@@ -648,7 +635,6 @@ export function ModelsSection() {
     );
   }
 
-  // Get all custom models across providers (excluding hidden providers like mux-gateway)
   const getCustomModels = (): Array<{
     provider: string;
     modelId: string;
@@ -665,8 +651,6 @@ export function ModelsSection() {
     }> = [];
 
     for (const [provider, providerConfig] of Object.entries(config)) {
-      // Skip hidden providers (mux-gateway models are routed, not managed as a standalone list)
-      if (CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)) continue;
       if (!providerConfig.models) continue;
 
       for (const modelEntry of providerConfig.models) {
@@ -1122,7 +1106,7 @@ export function ModelsSection() {
 
       <div className="border-border-medium bg-background-secondary/40 text-muted rounded-md border px-3 py-2.5 text-xs">
         <div className="flex items-start gap-2">
-          <Info className="text-accent mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+          <Info className="text-accent-text mt-0.5 h-4 w-4 shrink-0" aria-hidden />
           <div className="space-y-1">
             <p>
               Agent-specific model defaults and thinking levels (Compact and others) are configured
@@ -1133,7 +1117,7 @@ export function ModelsSection() {
               variant="link"
               size="sm"
               onClick={() => openSettings("tasks")}
-              className="text-accent h-auto px-0 py-0 text-xs"
+              className="text-accent-text h-auto px-0 py-0 text-xs"
             >
               Open Agents settings
               <ArrowRight className="h-3.5 w-3.5" />
@@ -1153,19 +1137,19 @@ export function ModelsSection() {
           </p>
           <div className="text-muted space-y-0.5 font-mono">
             <div>
-              <span className="text-accent">/sonnet</span> explain this code
+              <span className="text-accent-text">/sonnet</span> explain this code
               <span className="text-muted/60 ml-2">— send one message with Sonnet</span>
             </div>
             <div>
-              <span className="text-accent">/opus+high</span> deep review
+              <span className="text-accent-text">/opus+high</span> deep review
               <span className="text-muted/60 ml-2">— Opus with high thinking</span>
             </div>
             <div>
-              <span className="text-accent">/haiku+0</span> quick answer
+              <span className="text-accent-text">/haiku+0</span> quick answer
               <span className="text-muted/60 ml-2">— Haiku with thinking off</span>
             </div>
             <div>
-              <span className="text-accent">/+2</span> analyze this
+              <span className="text-accent-text">/+2</span> analyze this
               <span className="text-muted/60 ml-2">— current model, thinking level 2</span>
             </div>
           </div>

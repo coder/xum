@@ -4,7 +4,15 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import type { BlobRef } from "@/common/types/durableEvent";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { DurableEventJournal, sharedDurableEventJournal } from "./durableEventJournal";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import {
+  BLOBS_DIR_NAME,
+  DURABLE_EVENTS_FILE_NAME,
+  DurableEventJournal,
+  sharedDurableEventJournal,
+} from "./durableEventJournal";
 
 describe("DurableEventJournal", () => {
   test("appends drafts for every schema kind and reads them back in order", async () => {
@@ -335,5 +343,115 @@ describe("DurableEventJournal", () => {
 
     const rows = await writerA.read();
     expect(rows.map((row) => row.seq)).toEqual([0, 1, 2]);
+  });
+});
+
+describe("DurableEventJournal session files", () => {
+  test("keeps the rows and the blobs in the SessionFiles it was given", async () => {
+    // The Node locks write their lock files in the temp dir. The rows and the blobs must go to the
+    // memory volume only.
+    using tmp = new DisposableTempDir("durable-journal-files");
+    const files = buildSessionFiles(SessionFilesMemory);
+    const journal = new DurableEventJournal(tmp.path, nodeSessionLocks, files);
+
+    const { ref, size } = await journal.blobs.put("payload");
+    await journal.append({
+      workspaceId: "ws-1",
+      kind: "result-handle",
+      data: { handle: "vars.payload", preview: "payload", blobHash: ref, size },
+    });
+
+    expect((await journal.read()).map((event) => event.kind)).toEqual(["result-handle"]);
+    expect(await journal.blobs.getText(ref)).toBe("payload");
+    // The mention index stats the journal file through the same SessionFiles.
+    const mentions = await journal.withBlobLock(() => journal.blobMentionIndex());
+    expect(mentions.get(ref)?.kinds).toEqual(new Set(["result-handle"]));
+    const memoryRows = await files.promises.readFile(
+      path.join(tmp.path, DURABLE_EVENTS_FILE_NAME),
+      "utf-8"
+    );
+    expect(memoryRows).toContain(ref);
+    const onDisk = await fs.readdir(tmp.path);
+    expect(onDisk).not.toContain(DURABLE_EVENTS_FILE_NAME);
+    expect(onDisk).not.toContain(BLOBS_DIR_NAME);
+  });
+});
+
+describe("sharedDurableEventJournal layers", () => {
+  test("gives each pair of layers its own journal, on its own files", async () => {
+    // AIService passes its history's layers. A memory graph must not get the Node journal of the
+    // same session dir, and its writers must still share one journal (one seq counter).
+    using tmp = new DisposableTempDir("shared-journal-layers");
+    const layers = { files: buildSessionFiles(SessionFilesMemory), locks: nodeSessionLocks };
+    const journal = sharedDurableEventJournal(tmp.path, layers);
+    expect(sharedDurableEventJournal(tmp.path, layers)).toBe(journal);
+    expect(sharedDurableEventJournal(tmp.path)).not.toBe(journal);
+
+    await journal.append({
+      workspaceId: "ws",
+      kind: "hook-context",
+      data: { hookId: "plugin:demo", placement: "system-prompt", text: "a1" },
+    });
+
+    expect((await journal.read()).map((row) => row.seq)).toEqual([0]);
+    expect(await fs.readdir(tmp.path)).not.toContain(DURABLE_EVENTS_FILE_NAME);
+  });
+});
+
+describe("DurableEventJournal createSessionDir: false (#7474)", () => {
+  const draft = (ref: BlobRef) => ({
+    workspaceId: "ws-removed",
+    kind: "refinement" as const,
+    data: {
+      kind: "skill" as const,
+      action: { op: "write" as const, skillName: "demo", filePath: "SKILL.md" },
+      inverse: { op: "restore-files" as const, files: [{ path: "/s/SKILL.md", blobRef: ref }] },
+      evidence: { workspaceId: "ws-removed", toolName: "agent_skill_write" },
+    },
+  });
+  const failureOf = (write: Promise<unknown>) =>
+    write.then(
+      () => null,
+      (error: unknown) => error
+    );
+  const exists = (p: string) =>
+    fs.stat(p).then(
+      () => true,
+      () => false
+    );
+
+  test("a write never recreates a session dir that removal deletes, before or during the write", async () => {
+    using tmp = new DisposableTempDir("durable-journal-test");
+    const sessionDir = path.join(tmp.path, "session");
+    await fs.mkdir(sessionDir);
+    const journal = new DurableEventJournal(sessionDir);
+    const noCreate = { createSessionDir: false };
+    const { ref } = await journal.blobs.put("live payload", { createParentDir: false });
+    await journal.append(draft(ref), noCreate);
+
+    // Removal does not take the blob lock, so it can delete the dir while a
+    // writer holds it: the put and the append inside must not recreate it.
+    await journal.withBlobLock(async () => {
+      await fs.rm(sessionDir, { recursive: true, force: true });
+      expect(
+        await failureOf(journal.blobs.put("late payload", { createParentDir: false }))
+      ).toMatchObject({ code: "ENOENT" });
+      expect(await failureOf(journal.append(draft(ref), noCreate))).toMatchObject({
+        code: "ENOENT",
+      });
+    }, noCreate);
+    expect(await exists(sessionDir)).toBe(false);
+
+    // A write that starts after removal fails at the blob lock.
+    expect(await failureOf(journal.publishWithBlob("late payload", draft, noCreate))).toMatchObject(
+      {
+        code: "ENOENT",
+      }
+    );
+    expect(await exists(sessionDir)).toBe(false);
+
+    // The default still creates the directory for callers that did not opt in.
+    await journal.publishWithBlob("first payload", draft);
+    expect(await exists(path.join(sessionDir, DURABLE_EVENTS_FILE_NAME))).toBe(true);
   });
 });

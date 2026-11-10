@@ -6,6 +6,7 @@ import * as fsPromises from "fs/promises";
 import { writeFile } from "node:fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { buildRequestHeaders, MUX_WORKSPACE_ID_HEADER } from "@/common/utils/ai/providerOptions";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -39,9 +40,9 @@ async function saveRoutePriority(
   await config.editConfig(() => ({ ...config.loadConfigOrDefault(), ...overrides, routePriority }));
 }
 
-function saveMuxGatewayConfig(config: Config): void {
+function saveOpenRouterConfig(config: Config): void {
   new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-    "mux-gateway": { couponCode: "gateway-token" },
+    openrouter: { apiKey: "sk-or-test" },
   });
 }
 
@@ -76,6 +77,9 @@ const PROVIDER_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_BASE_URL",
+  "GOOGLE_VERTEX_PROJECT",
+  "GOOGLE_VERTEX_LOCATION",
+  "GOOGLE_APPLICATION_CREDENTIALS",
 ] as const;
 
 function withProviderEnv(
@@ -247,6 +251,65 @@ describe("ProviderService.getConfig", () => {
     });
   });
 
+  it("reports Google Vertex AI settings without exposing the API key or key file", () => {
+    withProviderEnv({ GOOGLE_APPLICATION_CREDENTIALS: "/secrets/env-sa.json" }, () => {
+      withTempConfig((config, service) => {
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+          "google-vertex": {
+            apiKey: "vertex-secret-key",
+            keyFilename: "/secrets/vertex-sa.json",
+            project: "my-project",
+            location: "us-central1",
+          },
+        });
+
+        const vertexConfig = service.getConfig()["google-vertex"];
+
+        expect(vertexConfig).toMatchObject({
+          apiKeySet: true,
+          isConfigured: true,
+          googleVertex: {
+            project: "my-project",
+            location: "us-central1",
+            keyFilenameSet: true,
+            // The saved key file wins, so the env one is not reported.
+            envKeyFilenameSet: false,
+          },
+        });
+        const serialized = JSON.stringify(vertexConfig);
+        expect(serialized).not.toContain("vertex-secret-key");
+        expect(serialized).not.toContain("vertex-sa.json");
+        expect(serialized).not.toContain("env-sa.json");
+      });
+    });
+  });
+
+  it("reports blank saved Google Vertex AI values as unset and env values separately", () => {
+    withProviderEnv(
+      {
+        GOOGLE_VERTEX_PROJECT: "env-project",
+        GOOGLE_VERTEX_LOCATION: "us",
+        GOOGLE_APPLICATION_CREDENTIALS: "/secrets/env-sa.json",
+      },
+      () => {
+        withTempConfig((config, service) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            "google-vertex": { project: "   ", location: "europe-west4", keyFilename: "  " },
+          });
+
+          expect(service.getConfig()["google-vertex"]?.googleVertex).toEqual({
+            project: undefined,
+            location: "europe-west4",
+            envProject: "env-project",
+            envLocation: undefined,
+            keyFilenameSet: false,
+            envKeyFilenameSet: true,
+          });
+        });
+      }
+    );
+  });
+
   it("reports legacy op:// API key references as not set", () => {
     withTempConfig((config, service) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
@@ -272,29 +335,6 @@ describe("ProviderService.getConfig", () => {
       expect(cfg.openai.apiKeySet).toBe(true);
       expect(cfg.openai.isEnabled).toBe(false);
       expect(cfg.openai.isConfigured).toBe(false);
-    });
-  });
-
-  it("marks mux-gateway disabled when muxGatewayEnabled is false in main config", () => {
-    withTempConfig((config, service) => {
-      saveMuxGatewayConfig(config);
-
-      const defaultMainConfig = config.loadConfigOrDefault();
-      const loadConfigSpy = spyOn(config, "loadConfigOrDefault");
-      loadConfigSpy.mockReturnValue({
-        ...defaultMainConfig,
-        muxGatewayEnabled: false,
-      });
-
-      try {
-        const cfg = service.getConfig();
-
-        expect(cfg["mux-gateway"].couponCodeSet).toBe(true);
-        expect(cfg["mux-gateway"].isEnabled).toBe(false);
-        expect(cfg["mux-gateway"].isConfigured).toBe(false);
-      } finally {
-        loadConfigSpy.mockRestore();
-      }
     });
   });
 
@@ -906,6 +946,44 @@ describe("ProviderService custom provider mutations", () => {
     });
   });
 
+  it("saves a valid session header name and rejects invalid or reserved ones", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        "local-vllm": localVllmConfig(),
+      });
+
+      for (const name of ["Authorization", "x session"]) {
+        const rejected = await service.setConfig("local-vllm", ["sessionHeader"], name);
+        expect(rejected.success).toBe(false);
+      }
+      expect(service.getConfig()["local-vllm"]?.sessionHeader).toBeUndefined();
+
+      const saved = await service.setConfig("local-vllm", ["sessionHeader"], "x-opencode-session");
+      expect(saved.success).toBe(true);
+      expect(service.getConfig()["local-vllm"]?.sessionHeader).toBe("x-opencode-session");
+
+      // An empty value clears the setting, like every other text field.
+      expect((await service.setConfig("local-vllm", ["sessionHeader"], "")).success).toBe(true);
+      expect(service.getConfig()["local-vllm"]?.sessionHeader).toBeUndefined();
+    });
+  });
+
+  // providers.jsonc is hand-editable and loads without schema validation: a
+  // non-string name must be dropped, not reach the request path and throw.
+  it("drops a non-string session header from a hand-edited config", () => {
+    withTempConfig((config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        "local-vllm": { ...localVllmConfig(), sessionHeader: 123 },
+      } as unknown as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+
+      const providersConfig = service.getConfig();
+      expect(providersConfig["local-vllm"]?.sessionHeader).toBeUndefined();
+      expect(
+        buildRequestHeaders("local-vllm:qwen3-coder", undefined, "ws-1", providersConfig)
+      ).toEqual({ [MUX_WORKSPACE_ID_HEADER]: "ws-1" });
+    });
+  });
+
   it("adds a custom OpenAI-compatible provider and returns provider info", async () => {
     await withTempConfigAsync(async (config, service) => {
       const result = await service.addCustomProvider({
@@ -1413,20 +1491,6 @@ describe("ProviderService custom provider mutations", () => {
 });
 
 describe("ProviderService.setConfig", () => {
-  it("seeds first-time mux-gateway defaults", async () => {
-    await withTempConfigAsync(async (config, service) => {
-      const result = await service.setConfig("mux-gateway", ["couponCode"], "gateway-token");
-      expect(result.success).toBe(true);
-
-      const providersConfig = new ProvidersConfigStore(config.rootDir).loadProvidersConfig();
-      expect(providersConfig?.["mux-gateway"]?.models).toEqual([
-        "anthropic/claude-sonnet-5-5",
-        "anthropic/claude-opus-5-5",
-        "openai/gpt-6.1-sol",
-      ]);
-    });
-  });
-
   it("removes legacy baseURL alias when editing canonical baseUrl", async () => {
     await withTempConfigAsync(async (config, service) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
@@ -1817,19 +1881,19 @@ describe("ProviderService gateway lifecycle", () => {
     await withTempConfigAsync(async (config, service) => {
       await saveRoutePriority(config, ["direct"]);
 
-      const result = await service.setConfig("mux-gateway", ["couponCode"], "gateway-token");
+      const result = await service.setConfig("openrouter", ["apiKey"], "sk-or-test");
 
       expect(result.success).toBe(true);
-      expect(config.loadConfigOrDefault().routePriority).toEqual(["mux-gateway", "direct"]);
+      expect(config.loadConfigOrDefault().routePriority).toEqual(["openrouter", "direct"]);
     });
   });
 
   it("does not auto-insert configured-but-disabled gateways into routePriority", async () => {
     await withTempConfigAsync(async (config, service) => {
       await saveRoutePriority(config, ["direct"]);
-      saveMuxGatewayConfig(config);
+      saveOpenRouterConfig(config);
 
-      const result = await service.setConfig("mux-gateway", ["enabled"], false);
+      const result = await service.setConfig("openrouter", ["enabled"], false);
 
       expect(result.success).toBe(true);
       expect(config.loadConfigOrDefault().routePriority).toEqual(["direct"]);
@@ -1838,10 +1902,10 @@ describe("ProviderService gateway lifecycle", () => {
 
   it("auto-removes gateway from routePriority when disabled", async () => {
     await withTempConfigAsync(async (config, service) => {
-      await saveRoutePriority(config, ["mux-gateway", "direct"]);
-      saveMuxGatewayConfig(config);
+      await saveRoutePriority(config, ["openrouter", "direct"]);
+      saveOpenRouterConfig(config);
 
-      const result = await service.setConfig("mux-gateway", ["enabled"], false);
+      const result = await service.setConfig("openrouter", ["enabled"], false);
 
       expect(result.success).toBe(true);
       expect(config.loadConfigOrDefault().routePriority).toEqual(["direct"]);
@@ -1906,30 +1970,17 @@ describe("ProviderService gateway lifecycle", () => {
     });
   });
 
-  it("clears legacy muxGatewayEnabled: false when adding gateway to routePriority", async () => {
-    await withTempConfigAsync(async (config, service) => {
-      await saveRoutePriority(config, ["direct"], { muxGatewayEnabled: false });
-
-      const result = await service.setConfig("mux-gateway", ["couponCode"], "token");
-
-      expect(result.success).toBe(true);
-      const updatedConfig = config.loadConfigOrDefault();
-      expect(updatedConfig.routePriority).toEqual(["mux-gateway", "direct"]);
-      expect(updatedConfig.muxGatewayEnabled).toBeUndefined();
-    });
-  });
-
   it("preserves user order when inserting a second gateway before direct", async () => {
     await withTempConfigAsync(async (config, service) => {
-      await saveRoutePriority(config, ["mux-gateway", "direct"]);
-      saveMuxGatewayConfig(config);
+      await saveRoutePriority(config, ["openrouter", "direct"]);
+      saveOpenRouterConfig(config);
 
-      const result = await service.setConfig("openrouter", ["apiKey"], "sk-or-test");
+      const result = await service.setConfig("github-copilot", ["apiKey"], "ghu-test");
 
       expect(result.success).toBe(true);
       expect(config.loadConfigOrDefault().routePriority).toEqual([
-        "mux-gateway",
         "openrouter",
+        "github-copilot",
         "direct",
       ]);
     });
@@ -1937,41 +1988,34 @@ describe("ProviderService gateway lifecycle", () => {
 
   it("appends gateway when direct is absent from routePriority", async () => {
     await withTempConfigAsync(async (config, service) => {
-      await saveRoutePriority(config, ["mux-gateway"]);
-      saveMuxGatewayConfig(config);
+      await saveRoutePriority(config, ["openrouter"]);
+      saveOpenRouterConfig(config);
 
-      const result = await service.setConfig("openrouter", ["apiKey"], "sk-or-test");
+      const result = await service.setConfig("github-copilot", ["apiKey"], "ghu-test");
 
       expect(result.success).toBe(true);
-      expect(config.loadConfigOrDefault().routePriority).toEqual(["mux-gateway", "openrouter"]);
+      expect(config.loadConfigOrDefault().routePriority).toEqual(["openrouter", "github-copilot"]);
     });
   });
 
   it("auto-removes gateway from routePriority when deconfigured", async () => {
-    await withTempConfigAsync(async (config, service) => {
-      await saveRoutePriority(config, ["mux-gateway", "direct"]);
-      saveMuxGatewayConfig(config);
+    // An ambient env key would keep OpenRouter configured after the config key is cleared.
+    const savedEnvKey = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    try {
+      await withTempConfigAsync(async (config, service) => {
+        await saveRoutePriority(config, ["openrouter", "direct"]);
+        saveOpenRouterConfig(config);
 
-      const result = await service.setConfig("mux-gateway", ["couponCode"], "");
+        const result = await service.setConfig("openrouter", ["apiKey"], "");
 
-      expect(result.success).toBe(true);
-      const updatedPriority = config.loadConfigOrDefault().routePriority ?? ["direct"];
-      expect(updatedPriority).not.toContain("mux-gateway");
-    });
-  });
-
-  it("clears stale muxGatewayEnabled: false when gateway is already in routePriority", async () => {
-    await withTempConfigAsync(async (config, service) => {
-      await saveRoutePriority(config, ["mux-gateway", "direct"], { muxGatewayEnabled: false });
-
-      const result = await service.setConfig("mux-gateway", ["couponCode"], "test-token");
-
-      expect(result.success).toBe(true);
-      const updatedConfig = config.loadConfigOrDefault();
-      expect(updatedConfig.routePriority).toEqual(["mux-gateway", "direct"]);
-      expect(updatedConfig.muxGatewayEnabled).toBeUndefined();
-      expect(service.getConfig()["mux-gateway"].isEnabled).toBe(true);
-    });
+        expect(result.success).toBe(true);
+        const updatedPriority = config.loadConfigOrDefault().routePriority ?? ["direct"];
+        expect(updatedPriority).not.toContain("openrouter");
+      });
+    } finally {
+      if (savedEnvKey !== undefined) process.env.OPENROUTER_API_KEY = savedEnvKey;
+    }
   });
 
   it("reports success when the section write lands but the route sync fails", async () => {
@@ -2017,13 +2061,13 @@ describe("ProviderService gateway lifecycle", () => {
 
   it("does not duplicate gateway already in routePriority", async () => {
     await withTempConfigAsync(async (config, service) => {
-      await saveRoutePriority(config, ["mux-gateway", "direct"]);
+      await saveRoutePriority(config, ["openrouter", "direct"]);
 
-      const result = await service.setConfig("mux-gateway", ["couponCode"], "gateway-token");
+      const result = await service.setConfig("openrouter", ["apiKey"], "sk-or-test");
 
       expect(result.success).toBe(true);
       const updatedPriority = config.loadConfigOrDefault().routePriority ?? [];
-      expect(updatedPriority.filter((provider) => provider === "mux-gateway")).toHaveLength(1);
+      expect(updatedPriority.filter((provider) => provider === "openrouter")).toHaveLength(1);
     });
   });
 
@@ -2043,10 +2087,10 @@ describe("ProviderService gateway lifecycle", () => {
     await withTempConfigAsync(async (config, service) => {
       await saveRoutePriority(config, ["direct"]);
 
-      const result = await service.setConfigValue("mux-gateway", ["couponCode"], "gateway-token");
+      const result = await service.setConfigValue("openrouter", ["apiKey"], "sk-or-test");
 
       expect(result.success).toBe(true);
-      expect(config.loadConfigOrDefault().routePriority).toEqual(["mux-gateway", "direct"]);
+      expect(config.loadConfigOrDefault().routePriority).toEqual(["openrouter", "direct"]);
     });
   });
 });
@@ -2065,7 +2109,7 @@ describe("ProviderService mutation interruption", () => {
         // abort landing while the mutation is in flight (handlerGen
         // interrupts the handler fiber on abort).
         const fiber = Effect.runFork(
-          service.setConfigEffect("mux-gateway", ["couponCode"], "gateway-token")
+          service.setConfigEffect("openrouter", ["apiKey"], "sk-or-test")
         );
         await Effect.runPromise(Fiber.interrupt(fiber));
 
@@ -2073,12 +2117,11 @@ describe("ProviderService mutation interruption", () => {
         // change notification, and the gateway routePriority sync must all
         // have completed — a write that lands without its post-write steps
         // would leave observers and routing state inconsistent.
-        const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.[
-          "mux-gateway"
-        ] as Record<string, unknown>;
-        expect(stored.couponCode).toBe("gateway-token");
+        const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
+          ?.openrouter as Record<string, unknown>;
+        expect(stored.apiKey).toBe("sk-or-test");
         expect(notified).toBe(1);
-        expect(config.loadConfigOrDefault().routePriority).toEqual(["mux-gateway", "direct"]);
+        expect(config.loadConfigOrDefault().routePriority).toEqual(["openrouter", "direct"]);
       } finally {
         unsubscribe();
       }

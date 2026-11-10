@@ -37,8 +37,15 @@ import {
 } from "@/common/constants/ui";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { RuntimeConfigSchema } from "@/common/orpc/schemas";
-import type { OnChatMode, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
+import type {
+  OnChatEvent,
+  OnChatMode,
+  SendMessageOptions,
+  WorkspaceChatMessage,
+} from "@/common/orpc/types";
+import { singleChatEvent } from "@/common/orpc/singleChatEvent";
 import type { AgentSkillDescriptor, AgentSkillListResult } from "@/common/types/agentSkill";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import type { CompactionRequestData } from "@/common/types/message";
 import { buildAgentSkillMetadata } from "@/common/types/message";
 import { isWorktreeRuntime, type RuntimeConfig, type RuntimeMode } from "@/common/types/runtime";
@@ -93,6 +100,16 @@ const ACP_DELEGATION_CANDIDATE_TOOLS = [
   "file_edit_insert",
   "bash",
 ] as const;
+/**
+ * ACP clients have no answer path for ask_user_question (it waits on Xum's desktop/mobile
+ * form), so an ACP prompt that called it would hang until cancelled. Deny it per turn, like
+ * headless `xum run`, now that Exec (the default ACP mode) exposes it.
+ */
+function withAcpToolPolicy(
+  toolPolicy: SendMessageOptions["toolPolicy"]
+): NonNullable<SendMessageOptions["toolPolicy"]> {
+  return [...(toolPolicy ?? []), { regex_match: "ask_user_question", action: "disable" }];
+}
 const DEFAULT_DISCONNECT_CLEANUP_MAX_WAIT_MS = 10_000;
 /**
  * Xum does not implement the session/close RPC yet. Keep idle sessions bounded so
@@ -222,10 +239,7 @@ export class MuxAgent implements Agent {
    */
   private readonly firstCaughtUpBySessionId = new Map<string, Promise<void>>();
   /** Async iterators for active onChat streams so we can cancel on mode switch/eviction. */
-  private readonly chatIteratorsBySessionId = new Map<
-    string,
-    AsyncIterator<WorkspaceChatMessage>
-  >();
+  private readonly chatIteratorsBySessionId = new Map<string, AsyncIterator<OnChatEvent>>();
   private readonly turnCompletions = new Map<string, TurnCompletion>();
   private readonly latestUsageBySessionId = new Map<string, Usage>();
   /** Last activity timestamp (Date.now) per session for idle eviction. */
@@ -739,6 +753,7 @@ export class MuxAgent implements Agent {
         message: args.message,
         options: {
           ...optionsWithPromptCorrelation,
+          toolPolicy: withAcpToolPolicy(optionsWithPromptCorrelation.toolPolicy),
           fileParts:
             args.fileParts != null && args.fileParts.length > 0 ? args.fileParts : undefined,
         },
@@ -911,248 +926,317 @@ export class MuxAgent implements Agent {
     parsedPrompt: ParsedPrompt,
     parsedCommand: ParsedAcpSlashCommand
   ): Promise<PromptResponse> {
+    // One handler per command keeps each command's flow readable on its own.
     switch (parsedCommand.kind) {
       case "invalid":
         return this.respondToCommand(sessionId, parsedCommand.message);
-
-      case "send-held": {
-        const lookup = this.streamTranslator.resolveHeldInput(sessionId, parsedCommand.number);
-        if (lookup.kind === "refused") {
-          return this.respondToCommand(sessionId, lookup.message);
-        }
-        // The backend re-sends the held payload as THIS prompt (#5170): the correlation replaces
-        // the one it was queued with, so the turn binds only its own stream. A resend that is
-        // queued and then refused at dequeue is held again under this id and settles the turn
-        // (settleTurnHeldBeforeStart). A refused resend is reported with the backend's reason,
-        // which says whether the input is still held (it may have been sent or discarded
-        // elsewhere since the notice).
-        let refusal: string | undefined;
-        const response = await this.dispatchAndAwaitTurn(
-          { sessionId, workspaceId, requiresExactCorrelation: true },
-          async (promptCorrelationId) => {
-            const delegatedToolNames = this.getDelegatedToolNames(sessionId);
-            const sendResult = await this.server.client.workspace.sendHeldInput({
-              workspaceId,
-              heldInputId: lookup.heldInput.id,
-              acpCorrelation: {
-                acpPromptId: promptCorrelationId,
-                delegatedToolNames: delegatedToolNames.length > 0 ? delegatedToolNames : undefined,
-              },
-            });
-            if (!sendResult.success) {
-              refusal = formatSendMessageError(sendResult.error).message;
-              throw new Error(`send-held: workspace.sendHeldInput failed: ${refusal}`);
-            }
-          }
-        ).catch((error: unknown) => {
-          if (refusal == null) throw error;
-          return null;
-        });
-        if (response != null) {
-          return response;
-        }
-        assert(refusal != null, "send-held: a failed resend records its refusal");
-        return this.respondToCommand(
+      case "send-held":
+        return this.handleSendHeldCommand(sessionId, workspaceId, parsedCommand);
+      case "discard-held":
+        return this.handleDiscardHeldCommand(sessionId, workspaceId, parsedCommand);
+      case "clear":
+        return this.handleClearCommand(sessionId, workspaceId);
+      case "compact":
+        return this.handleCompactCommand(
           sessionId,
-          `Could not send unsent message ${lookup.number}: ${refusal}`
+          workspaceId,
+          sessionState,
+          parsedPrompt,
+          parsedCommand
         );
-      }
-
-      case "discard-held": {
-        // The ACP counterpart of the desktop banner's Discard (#4944). ACP cannot put text back
-        // into the client's prompt, so the held-input notice shows each message's full text;
-        // sending it is tracked in #5170.
-        const lookup = this.streamTranslator.resolveHeldInput(sessionId, parsedCommand.number);
-        if (lookup.kind === "refused") {
-          return this.respondToCommand(sessionId, lookup.message);
-        }
-        const discardResult = await this.server.client.workspace.discardHeldInput({
-          workspaceId,
-          heldInputId: lookup.heldInput.id,
-        });
-        return this.respondToCommand(
+      case "skill":
+        return this.handleSkillCommand(
           sessionId,
-          discardResult.success
-            ? `Discarded unsent message ${lookup.number}.`
-            : `Could not discard unsent message ${lookup.number}: ${discardResult.error}`
+          workspaceId,
+          sessionState,
+          parsedPrompt,
+          parsedCommand
         );
-      }
-
-      case "clear": {
-        const clearResult = await this.server.client.workspace.truncateHistory({
-          workspaceId,
-          percentage: 1.0,
-        });
-        if (!clearResult.success) {
-          return this.respondToCommand(
-            sessionId,
-            `Failed to clear chat history: ${clearResult.error ?? "unknown error"}`
-          );
-        }
-
-        return this.respondToCommand(sessionId, "Cleared chat history.");
-      }
-
-      case "compact": {
-        let compactionPayload: { message: string; options: SendMessageOptions };
-        try {
-          compactionPayload = await this.buildCompactionPayload(
-            parsedCommand,
-            parsedPrompt,
-            sessionState,
-            workspaceId
-          );
-        } catch (error) {
-          if (error instanceof InvalidExplicitAiSettingError) {
-            return this.respondToCommand(sessionId, error.message);
-          }
-          throw error;
-        }
-
-        return this.sendWorkspaceMessageAndAwaitTurn({
-          sessionId,
-          workspaceId,
-          message: compactionPayload.message,
-          options: compactionPayload.options,
-        });
-      }
-
-      case "skill": {
-        const options: SendMessageOptions = {
-          model: sessionState.aiSettings.model,
-          thinkingLevel: sessionState.aiSettings.thinkingLevel,
-          reasoningMode: sessionState.aiSettings.reasoningMode,
-          agentId: sessionState.agentId,
-          muxMetadata: buildAgentSkillMetadata({
-            rawCommand: parsedCommand.rawCommand,
-            commandPrefix: parsedCommand.commandPrefix,
-            skillName: parsedCommand.descriptor.name,
-            scope: parsedCommand.descriptor.scope,
-            arguments: parsedCommand.argumentText,
-          }),
-        };
-
-        return this.sendWorkspaceMessageAndAwaitTurn({
-          sessionId,
-          workspaceId,
-          message: parsedCommand.formattedMessage,
-          options,
-          fileParts: parsedPrompt.fileParts,
-        });
-      }
-
-      case "fork": {
-        const workspaceInfo = await this.server.client.workspace.getInfo({ workspaceId });
-        if (workspaceInfo == null) {
-          return this.respondToCommand(
-            sessionId,
-            "Failed to fork workspace: current workspace metadata is unavailable."
-          );
-        }
-        await this.ensureAcpProjectTrusted(workspaceInfo.projectPath);
-
-        const forkResult = await this.server.client.workspace.fork({
-          sourceWorkspaceId: workspaceId,
-          pendingAutoTitle:
-            parsedCommand.startMessage != null && parsedCommand.startMessage.trim().length > 0,
-        });
-        if (!forkResult.success) {
-          return this.respondToCommand(
-            sessionId,
-            `Failed to fork workspace: ${forkResult.error ?? "unknown error"}`
-          );
-        }
-
-        const newWorkspaceId = forkResult.metadata.id;
-        let response = `Created forked workspace \`${newWorkspaceId}\`.`;
-
-        if (parsedCommand.startMessage != null && parsedCommand.startMessage.trim().length > 0) {
-          const startMessageResult = await this.server.client.workspace.sendMessage({
-            workspaceId: newWorkspaceId,
-            message: parsedCommand.startMessage,
-            options: {
-              model: sessionState.aiSettings.model,
-              thinkingLevel: sessionState.aiSettings.thinkingLevel,
-              reasoningMode: sessionState.aiSettings.reasoningMode,
-              agentId: sessionState.agentId,
-            },
-          });
-
-          response += startMessageResult.success
-            ? " Queued the optional start message in the forked workspace."
-            : ` Could not queue the optional start message: ${stringifyUnknown(startMessageResult.error)}`;
-        }
-
-        return this.respondToCommand(sessionId, response);
-      }
-
-      case "new": {
-        const workspaceInfo = await this.server.client.workspace.getInfo({ workspaceId });
-        if (workspaceInfo == null) {
-          return this.respondToCommand(
-            sessionId,
-            "Failed to create workspace: current workspace metadata is unavailable."
-          );
-        }
-
-        const workspaceScope = await this.ensureAcpProjectTrusted(
-          workspaceInfo.subProjectPath ?? workspaceInfo.projectPath
-        );
-
-        // Resolve trunk from project defaults — /new no longer accepts overrides
-        // (it now mirrors /fork's seamless flow).
-        const branchInfo = await this.server.client.projects.listBranches({
-          projectPath: workspaceScope.projectPath,
-        });
-        const trunkBranch = branchInfo.recommendedTrunk ?? DEFAULT_TRUNK_BRANCH;
-
-        const hasStartMessage =
-          parsedCommand.startMessage != null && parsedCommand.startMessage.trim().length > 0;
-
-        const createResult = await this.server.client.workspace.create({
-          projectPath: workspaceScope.projectPath,
-          // branchName intentionally omitted — backend auto-generates (like /fork).
-          trunkBranch,
-          // Mirror /fork: when a start message accompanies /new, defer the title
-          // selection until the first message can drive LLM-based generation.
-          pendingAutoTitle: hasStartMessage,
-          subProjectPath: workspaceScope.subProjectPath,
-        });
-
-        if (!createResult.success) {
-          return this.respondToCommand(
-            sessionId,
-            `Failed to create workspace: ${createResult.error ?? "unknown error"}`
-          );
-        }
-
-        const newWorkspaceId = createResult.metadata.id;
-        const displayName = createResult.metadata.title ?? createResult.metadata.name;
-        let response = `Created workspace \`${displayName}\` (id: \`${newWorkspaceId}\`).`;
-
-        if (hasStartMessage && parsedCommand.startMessage != null) {
-          const startMessageResult = await this.server.client.workspace.sendMessage({
-            workspaceId: newWorkspaceId,
-            message: parsedCommand.startMessage,
-            options: {
-              model: sessionState.aiSettings.model,
-              thinkingLevel: sessionState.aiSettings.thinkingLevel,
-              reasoningMode: sessionState.aiSettings.reasoningMode,
-              agentId: sessionState.agentId,
-            },
-          });
-
-          response += startMessageResult.success
-            ? " Queued the optional start message in the new workspace."
-            : ` Could not queue the optional start message: ${stringifyUnknown(startMessageResult.error)}`;
-        }
-
-        return this.respondToCommand(sessionId, response);
-      }
-
+      case "fork":
+        return this.handleForkCommand(sessionId, workspaceId, sessionState, parsedCommand);
+      case "new":
+        return this.handleNewCommand(sessionId, workspaceId, sessionState, parsedCommand);
       default:
         return this.respondToCommand(sessionId, "This slash command is not supported in ACP yet.");
     }
+  }
+
+  private async handleSendHeldCommand(
+    sessionId: string,
+    workspaceId: string,
+    parsedCommand: HeldInputSlashCommand
+  ): Promise<PromptResponse> {
+    const lookup = this.streamTranslator.resolveHeldInput(sessionId, parsedCommand.number);
+    if (lookup.kind === "refused") {
+      return this.respondToCommand(sessionId, lookup.message);
+    }
+    // The backend re-sends the held payload as THIS prompt (#5170): the correlation replaces
+    // the one it was queued with, so the turn binds only its own stream. A resend that is
+    // queued and then refused at dequeue is held again under this id and settles the turn
+    // (settleTurnHeldBeforeStart). A refused resend is reported with the backend's reason,
+    // which says whether the input is still held (it may have been sent or discarded
+    // elsewhere since the notice).
+    let refusal: string | undefined;
+    const response = await this.dispatchAndAwaitTurn(
+      { sessionId, workspaceId, requiresExactCorrelation: true },
+      async (promptCorrelationId) => {
+        const delegatedToolNames = this.getDelegatedToolNames(sessionId);
+        const sendResult = await this.server.client.workspace.sendHeldInput({
+          workspaceId,
+          heldInputId: lookup.heldInput.id,
+          acpCorrelation: {
+            acpPromptId: promptCorrelationId,
+            delegatedToolNames: delegatedToolNames.length > 0 ? delegatedToolNames : undefined,
+          },
+        });
+        if (!sendResult.success) {
+          refusal = formatSendMessageError(sendResult.error).message;
+          throw new Error(`send-held: workspace.sendHeldInput failed: ${refusal}`);
+        }
+      }
+    ).catch((error: unknown) => {
+      if (refusal == null) throw error;
+      return null;
+    });
+    if (response != null) {
+      return response;
+    }
+    assert(refusal != null, "send-held: a failed resend records its refusal");
+    return this.respondToCommand(
+      sessionId,
+      `Could not send unsent message ${lookup.number}: ${refusal}`
+    );
+  }
+
+  private async handleDiscardHeldCommand(
+    sessionId: string,
+    workspaceId: string,
+    parsedCommand: HeldInputSlashCommand
+  ): Promise<PromptResponse> {
+    // The ACP counterpart of the desktop banner's Discard (#4944). ACP cannot put text back
+    // into the client's prompt, so the held-input notice shows each message's full text;
+    // sending it is tracked in #5170.
+    const lookup = this.streamTranslator.resolveHeldInput(sessionId, parsedCommand.number);
+    if (lookup.kind === "refused") {
+      return this.respondToCommand(sessionId, lookup.message);
+    }
+    const discardResult = await this.server.client.workspace.discardHeldInput({
+      workspaceId,
+      heldInputId: lookup.heldInput.id,
+    });
+    return this.respondToCommand(
+      sessionId,
+      discardResult.success
+        ? `Discarded unsent message ${lookup.number}.`
+        : `Could not discard unsent message ${lookup.number}: ${discardResult.error}`
+    );
+  }
+
+  private async handleClearCommand(
+    sessionId: string,
+    workspaceId: string
+  ): Promise<PromptResponse> {
+    const clearResult = await this.server.client.workspace.truncateHistory({
+      workspaceId,
+      percentage: 1.0,
+    });
+    if (!clearResult.success) {
+      return this.respondToCommand(
+        sessionId,
+        `Failed to clear chat history: ${clearResult.error ?? "unknown error"}`
+      );
+    }
+
+    return this.respondToCommand(sessionId, "Cleared chat history.");
+  }
+
+  private async handleCompactCommand(
+    sessionId: string,
+    workspaceId: string,
+    sessionState: SessionState,
+    parsedPrompt: ParsedPrompt,
+    parsedCommand: Extract<ParsedAcpSlashCommand, { kind: "compact" }>
+  ): Promise<PromptResponse> {
+    let compactionPayload: { message: string; options: SendMessageOptions };
+    try {
+      compactionPayload = await this.buildCompactionPayload(
+        parsedCommand,
+        parsedPrompt,
+        sessionState,
+        workspaceId
+      );
+    } catch (error) {
+      if (error instanceof InvalidExplicitAiSettingError) {
+        return this.respondToCommand(sessionId, error.message);
+      }
+      throw error;
+    }
+
+    return this.sendWorkspaceMessageAndAwaitTurn({
+      sessionId,
+      workspaceId,
+      message: compactionPayload.message,
+      options: compactionPayload.options,
+    });
+  }
+
+  private async handleSkillCommand(
+    sessionId: string,
+    workspaceId: string,
+    sessionState: SessionState,
+    parsedPrompt: ParsedPrompt,
+    parsedCommand: Extract<ParsedAcpSlashCommand, { kind: "skill" }>
+  ): Promise<PromptResponse> {
+    const options: SendMessageOptions = {
+      model: sessionState.aiSettings.model,
+      thinkingLevel: sessionState.aiSettings.thinkingLevel,
+      reasoningMode: sessionState.aiSettings.reasoningMode,
+      agentId: sessionState.agentId,
+      muxMetadata: buildAgentSkillMetadata({
+        rawCommand: parsedCommand.rawCommand,
+        commandPrefix: parsedCommand.commandPrefix,
+        skillName: parsedCommand.descriptor.name,
+        scope: parsedCommand.descriptor.scope,
+        arguments: parsedCommand.argumentText,
+      }),
+    };
+
+    return this.sendWorkspaceMessageAndAwaitTurn({
+      sessionId,
+      workspaceId,
+      message: parsedCommand.formattedMessage,
+      options,
+      fileParts: parsedPrompt.fileParts,
+    });
+  }
+
+  private async handleForkCommand(
+    sessionId: string,
+    workspaceId: string,
+    sessionState: SessionState,
+    parsedCommand: Extract<ParsedAcpSlashCommand, { kind: "fork" }>
+  ): Promise<PromptResponse> {
+    const workspaceInfo = await this.server.client.workspace.getInfo({ workspaceId });
+    if (workspaceInfo == null) {
+      return this.respondToCommand(
+        sessionId,
+        "Failed to fork workspace: current workspace metadata is unavailable."
+      );
+    }
+    await this.ensureAcpProjectTrusted(workspaceInfo.projectPath);
+
+    const startMessage = nonBlankStartMessage(parsedCommand.startMessage);
+    const forkResult = await this.server.client.workspace.fork({
+      sourceWorkspaceId: workspaceId,
+      pendingAutoTitle: startMessage != null,
+    });
+    if (!forkResult.success) {
+      return this.respondToCommand(
+        sessionId,
+        `Failed to fork workspace: ${forkResult.error ?? "unknown error"}`
+      );
+    }
+
+    const newWorkspaceId = forkResult.metadata.id;
+    let response = `Created forked workspace \`${newWorkspaceId}\`.`;
+
+    if (startMessage != null) {
+      response += await this.queueStartMessage(
+        newWorkspaceId,
+        startMessage,
+        sessionState,
+        "forked workspace"
+      );
+    }
+
+    return this.respondToCommand(sessionId, response);
+  }
+
+  private async handleNewCommand(
+    sessionId: string,
+    workspaceId: string,
+    sessionState: SessionState,
+    parsedCommand: Extract<ParsedAcpSlashCommand, { kind: "new" }>
+  ): Promise<PromptResponse> {
+    const workspaceInfo = await this.server.client.workspace.getInfo({ workspaceId });
+    if (workspaceInfo == null) {
+      return this.respondToCommand(
+        sessionId,
+        "Failed to create workspace: current workspace metadata is unavailable."
+      );
+    }
+
+    const workspaceScope = await this.ensureAcpProjectTrusted(
+      workspaceInfo.subProjectPath ?? workspaceInfo.projectPath
+    );
+
+    // Resolve trunk from project defaults — /new no longer accepts overrides
+    // (it now mirrors /fork's seamless flow).
+    const branchInfo = await this.server.client.projects.listBranches({
+      projectPath: workspaceScope.projectPath,
+    });
+    const trunkBranch = branchInfo.recommendedTrunk ?? DEFAULT_TRUNK_BRANCH;
+
+    const startMessage = nonBlankStartMessage(parsedCommand.startMessage);
+
+    const createResult = await this.server.client.workspace.create({
+      projectPath: workspaceScope.projectPath,
+      // branchName intentionally omitted — backend auto-generates (like /fork).
+      trunkBranch,
+      // Mirror /fork: when a start message accompanies /new, defer the title
+      // selection until the first message can drive LLM-based generation.
+      pendingAutoTitle: startMessage != null,
+      subProjectPath: workspaceScope.subProjectPath,
+    });
+
+    if (!createResult.success) {
+      return this.respondToCommand(
+        sessionId,
+        `Failed to create workspace: ${createResult.error ?? "unknown error"}`
+      );
+    }
+
+    const newWorkspaceId = createResult.metadata.id;
+    const displayName = createResult.metadata.title ?? createResult.metadata.name;
+    let response = `Created workspace \`${displayName}\` (id: \`${newWorkspaceId}\`).`;
+
+    if (startMessage != null) {
+      response += await this.queueStartMessage(
+        newWorkspaceId,
+        startMessage,
+        sessionState,
+        "new workspace"
+      );
+    }
+
+    return this.respondToCommand(sessionId, response);
+  }
+
+  /**
+   * Sends the optional start message of /fork or /new to the workspace it
+   * created, with this session's AI settings. Returns the sentence that the
+   * command's response appends.
+   */
+  private async queueStartMessage(
+    newWorkspaceId: string,
+    startMessage: string,
+    sessionState: SessionState,
+    workspaceLabel: "forked workspace" | "new workspace"
+  ): Promise<string> {
+    const startMessageResult = await this.server.client.workspace.sendMessage({
+      workspaceId: newWorkspaceId,
+      message: startMessage,
+      options: {
+        model: sessionState.aiSettings.model,
+        thinkingLevel: sessionState.aiSettings.thinkingLevel,
+        reasoningMode: sessionState.aiSettings.reasoningMode,
+        agentId: sessionState.agentId,
+      },
+    });
+
+    return startMessageResult.success
+      ? ` Queued the optional start message in the ${workspaceLabel}.`
+      : ` Could not queue the optional start message: ${stringifyUnknown(startMessageResult.error)}`;
   }
 
   private async buildCompactionPayload(
@@ -1400,7 +1484,7 @@ export class MuxAgent implements Agent {
       const result = await this.server.client.agentSkills.list({ workspaceId });
       if (!isLatestRead()) return;
       this.cacheSessionSkills(sessionId, result);
-      advertisedSkills = result.skills;
+      advertisedSkills = listInvocableSkills(result);
     } catch (error) {
       // Command advertisement should not block session creation/loading.
       console.error("[acp] Failed to load skills while publishing slash commands", error);
@@ -1455,12 +1539,12 @@ export class MuxAgent implements Agent {
     const isLatestRead = this.startSkillsRead(sessionId);
     const result = await this.server.client.agentSkills.list({ workspaceId });
     if (!isLatestRead()) {
-      return mapSkillsByName(result.skills);
+      return mapSkillsByName(listInvocableSkills(result));
     }
     const skillsByName = this.cacheSessionSkills(sessionId, result);
     // No cache means the client was last sent a partial list (or none), so its
     // command picker is stale too: send it the list just read.
-    await this.publishSessionCommands(sessionId, result.skills);
+    await this.publishSessionCommands(sessionId, listInvocableSkills(result));
     return skillsByName;
   }
 
@@ -1468,7 +1552,8 @@ export class MuxAgent implements Agent {
     sessionId: string,
     result: AgentSkillListResult
   ): Map<string, AgentSkillDescriptor> {
-    const skillsByName = mapSkillsByName(result.skills);
+    // Shadowed plugin skills join under `<plugin>:<skill>` (e.g. /pstack:tdd).
+    const skillsByName = mapSkillsByName(listInvocableSkills(result));
     // The cache holds only the latest complete list. After a partial list (e.g.
     // SSH host unreachable) the next prompt asks again, and an older complete
     // list cannot keep accepting commands the partial list no longer has.
@@ -1800,32 +1885,6 @@ export class MuxAgent implements Agent {
     let droppedNonTerminalEventCount = 0;
     let hasCaughtUp = onChatMode.type !== "full";
 
-    const isTerminalStreamEvent = (event: WorkspaceChatMessage): boolean =>
-      event.type === "stream-end" ||
-      event.type === "stream-abort" ||
-      event.type === "stream-error" ||
-      event.type === "error";
-
-    const isDroppableUnderBackpressure = (event: WorkspaceChatMessage): boolean => {
-      const isReplayMessageEvent =
-        event.type === "message" &&
-        ((event as { replay?: boolean }).replay === true || !hasCaughtUp);
-
-      return (
-        event.type === "stream-delta" ||
-        event.type === "reasoning-delta" ||
-        event.type === "tool-call-delta" ||
-        event.type === "usage-delta" ||
-        event.type === "session-usage-delta" ||
-        event.type === "bash-output" ||
-        event.type === "init-output" ||
-        event.type === "init-progress" ||
-        // Drop replay history messages under saturation, but keep live message
-        // events so ACP clients do not miss real-time conversation updates.
-        isReplayMessageEvent
-      );
-    };
-
     // Drain the oRPC stream: observe events for turn resolution, buffer
     // for translation. push() is non-blocking so handleStreamEvent always
     // runs immediately — even when consumeAndForward is blocked on stdout.
@@ -1837,7 +1896,7 @@ export class MuxAgent implements Agent {
     // the oRPC subscription until the server eventually closes it.
     const chatIterator = chatStream[Symbol.asyncIterator]();
     this.chatIteratorsBySessionId.set(sessionId, chatIterator);
-    const chatIterable: AsyncIterable<WorkspaceChatMessage> = {
+    const chatIterable: AsyncIterable<OnChatEvent> = {
       [Symbol.asyncIterator]: () => chatIterator,
     };
 
@@ -1846,7 +1905,9 @@ export class MuxAgent implements Agent {
 
     const drainPromise = (async () => {
       try {
-        for await (const event of chatIterable) {
+        for await (const received of chatIterable) {
+          // ACP does not pass batchReplay, so every event is a single one.
+          const event = singleChatEvent(received);
           // Subscription replacement is best-effort; stopChatSubscription can
           // time out waiting for the old iterator to unwind. Guard each event
           // so stale streams cannot mutate active turn state after mode-switch
@@ -1858,11 +1919,7 @@ export class MuxAgent implements Agent {
           this.handleStreamEvent(sessionId, event);
           if (event.type === "caught-up") {
             hasCaughtUp = true;
-            if (event.historyReplayStatus === "failed") {
-              this.historyReplayFailedSessionIds.add(sessionId);
-            } else if (event.replay !== "live") {
-              this.historyReplayFailedSessionIds.delete(sessionId);
-            }
+            this.recordHistoryReplayStatus(sessionId, event);
             firstCaughtUp.resolve();
           }
           // Skip heartbeats from the queue: they produce no sessionUpdate
@@ -1872,22 +1929,14 @@ export class MuxAgent implements Agent {
             const shouldDropForBackpressure =
               queuedEventCount >= MAX_BUFFERED_CHAT_EVENTS &&
               !isTerminalStreamEvent(event) &&
-              isDroppableUnderBackpressure(event);
+              isDroppableUnderBackpressure(event, hasCaughtUp);
             if (shouldDropForBackpressure) {
               droppedNonTerminalEventCount += 1;
-              if (
-                droppedNonTerminalEventCount === 1 ||
-                droppedNonTerminalEventCount % 1_000 === 0
-              ) {
-                console.warn(
-                  `[acp] Dropping high-volume onChat events under stdout backpressure for session ${sessionId}`,
-                  {
-                    droppedNonTerminalEventCount,
-                    bufferedEvents: queuedEventCount,
-                    lastDroppedEventType: event.type,
-                  }
-                );
-              }
+              warnOnSampledBackpressureDrop(sessionId, {
+                droppedNonTerminalEventCount,
+                bufferedEvents: queuedEventCount,
+                lastDroppedEventType: event.type,
+              });
               continue;
             }
 
@@ -1959,6 +2008,18 @@ export class MuxAgent implements Agent {
     }
   }
 
+  /** A full replay that failed marks the session; any other non-live caught-up clears the mark. */
+  private recordHistoryReplayStatus(
+    sessionId: string,
+    event: Extract<WorkspaceChatMessage, { type: "caught-up" }>
+  ): void {
+    if (event.historyReplayStatus === "failed") {
+      this.historyReplayFailedSessionIds.add(sessionId);
+    } else if (event.replay !== "live") {
+      this.historyReplayFailedSessionIds.delete(sessionId);
+    }
+  }
+
   private handleStreamEvent(sessionId: string, event: WorkspaceChatMessage): void {
     const isReplayEvent = (event as { replay?: boolean }).replay === true;
     this.touchSession(sessionId);
@@ -1984,48 +2045,8 @@ export class MuxAgent implements Agent {
       return;
     }
 
-    // Correlate the turn with the correct message. `stream-start` is emitted
-    // once per assistant message and carries the definitive messageId.
     if (event.type === "stream-start") {
-      const completion = this.turnCompletions.get(sessionId);
-      if (completion == null || event.messageId.trim().length === 0) {
-        return;
-      }
-
-      const hasMatchingCorrelation = event.acpPromptId === completion.promptCorrelationId;
-      const canFallbackToUncorrelatedStart =
-        completion.messageId == null &&
-        completion.requiresExactCorrelation !== true &&
-        // The backend publishes a dequeue before that entry's stream starts, so an uncorrelated
-        // start while this prompt is still queued belongs to an entry ahead of it (#5198).
-        completion.queued !== true &&
-        completion.dispatchedAtMs != null &&
-        !isReplayEvent &&
-        event.acpPromptId == null &&
-        Number.isFinite(event.startTime) &&
-        event.startTime >= completion.dispatchedAtMs;
-
-      if (!hasMatchingCorrelation && !canFallbackToUncorrelatedStart) {
-        return;
-      }
-
-      if (canFallbackToUncorrelatedStart) {
-        console.warn(
-          `[acp] stream-start missing acpPromptId after prompt dispatch; using best-effort fallback for session ${sessionId}`,
-          {
-            promptCorrelationId: completion.promptCorrelationId,
-            messageId: event.messageId,
-            eventStartTime: event.startTime,
-            turnDispatchedAtMs: completion.dispatchedAtMs,
-          }
-        );
-        // Fallback stream-start lacks acpPromptId, so generic correlation
-        // refresh cannot observe it. Refresh timeout explicitly when we
-        // accept this start event for the active prompt.
-        this.resetTurnInactivityTimeout(sessionId);
-      }
-
-      completion.messageId = event.messageId;
+      this.bindTurnToStreamStart(sessionId, event, isReplayEvent);
       return;
     }
 
@@ -2040,49 +2061,90 @@ export class MuxAgent implements Agent {
       return;
     }
 
+    if (isTerminalStreamEvent(event)) {
+      this.settleTurnFromTerminalEvent(sessionId, event);
+    }
+  }
+
+  /**
+   * Correlate the turn with the correct message. `stream-start` is emitted
+   * once per assistant message and carries the definitive messageId.
+   */
+  private bindTurnToStreamStart(
+    sessionId: string,
+    event: Extract<WorkspaceChatMessage, { type: "stream-start" }>,
+    isReplayEvent: boolean
+  ): void {
+    const completion = this.turnCompletions.get(sessionId);
+    if (completion == null || event.messageId.trim().length === 0) {
+      return;
+    }
+
+    const hasMatchingCorrelation = event.acpPromptId === completion.promptCorrelationId;
+    const canFallbackToUncorrelatedStart = canBindUncorrelatedStreamStart(
+      completion,
+      event,
+      isReplayEvent
+    );
+
+    if (!hasMatchingCorrelation && !canFallbackToUncorrelatedStart) {
+      return;
+    }
+
+    if (canFallbackToUncorrelatedStart) {
+      console.warn(
+        `[acp] stream-start missing acpPromptId after prompt dispatch; using best-effort fallback for session ${sessionId}`,
+        {
+          promptCorrelationId: completion.promptCorrelationId,
+          messageId: event.messageId,
+          eventStartTime: event.startTime,
+          turnDispatchedAtMs: completion.dispatchedAtMs,
+        }
+      );
+      // Fallback stream-start lacks acpPromptId, so generic correlation
+      // refresh cannot observe it. Refresh timeout explicitly when we
+      // accept this start event for the active prompt.
+      this.resetTurnInactivityTimeout(sessionId);
+    }
+
+    completion.messageId = event.messageId;
+  }
+
+  private settleTurnFromTerminalEvent(sessionId: string, event: TerminalStreamEvent): void {
+    // stream-end is a normal completion. Prefer exact message-id matching
+    // once stream-start identifies the turn, but also allow correlation-id
+    // fallback while pending so a dropped stream-start cannot hang prompt().
+    //
+    // Do not blanket-drop replay events here: during initial full replay,
+    // a newly queued prompt can receive correlated stream terminal events
+    // before caught-up. Correlation gates below ensure only the active turn
+    // can complete.
+    //
+    // stream-abort can arrive before stream-start when the user cancels
+    // immediately, and errors must be propagated even before stream-start, so
+    // every terminal event settles a pending turn and prompt() never hangs.
+    if (!this.isActiveTurnMessageOrPending(sessionId, event.messageId, event.acpPromptId)) {
+      return;
+    }
     if (event.type === "stream-end") {
-      // stream-end is a normal completion. Prefer exact message-id matching
-      // once stream-start identifies the turn, but also allow correlation-id
-      // fallback while pending so a dropped stream-start cannot hang prompt().
-      //
-      // Do not blanket-drop replay events here: during initial full replay,
-      // a newly queued prompt can receive correlated stream terminal events
-      // before caught-up. Correlation gates below ensure only the active turn
-      // can complete.
-      if (!this.isActiveTurnMessageOrPending(sessionId, event.messageId, event.acpPromptId)) {
-        return;
-      }
-      const usage =
-        event.metadata.usage != null
-          ? convertToAcpUsage(event.metadata.usage)
-          : this.latestUsageBySessionId.get(sessionId);
+      const usage = this.terminalTurnUsage(sessionId, event.metadata.usage);
       this.resolveTurn(sessionId, { stopReason: "end_turn", usage });
       return;
     }
-
     if (event.type === "stream-abort") {
-      // stream-abort can arrive before stream-start when the user cancels
-      // immediately.  Always honour abort for any pending turn so prompt()
-      // doesn't hang forever.
-      if (!this.isActiveTurnMessageOrPending(sessionId, event.messageId, event.acpPromptId)) {
-        return;
-      }
-      const usage =
-        event.metadata?.usage != null
-          ? convertToAcpUsage(event.metadata.usage)
-          : this.latestUsageBySessionId.get(sessionId);
+      const usage = this.terminalTurnUsage(sessionId, event.metadata?.usage);
       this.resolveTurn(sessionId, { stopReason: "cancelled", usage });
       return;
     }
+    this.rejectTurn(sessionId, new Error(`prompt stream failed: ${event.error}`));
+  }
 
-    if (event.type === "stream-error" || event.type === "error") {
-      // Like abort, errors must be propagated even before stream-start to
-      // prevent hanging turns.
-      if (!this.isActiveTurnMessageOrPending(sessionId, event.messageId, event.acpPromptId)) {
-        return;
-      }
-      this.rejectTurn(sessionId, new Error(`prompt stream failed: ${event.error}`));
-    }
+  /** The terminal event's own usage, else the latest usage-delta seen for the session. */
+  private terminalTurnUsage(
+    sessionId: string,
+    usage: Parameters<typeof convertToAcpUsage>[0] | null | undefined
+  ): Usage | undefined {
+    return usage != null ? convertToAcpUsage(usage) : this.latestUsageBySessionId.get(sessionId);
   }
 
   /**
@@ -2553,6 +2615,99 @@ async function readGitTopLevelForAcpScope(projectPath: string): Promise<string |
   } catch {
     return null;
   }
+}
+
+/** Events that end a stream; runChatSubscription never drops them under backpressure. */
+const TERMINAL_STREAM_EVENT_TYPES: ReadonlySet<WorkspaceChatMessage["type"]> = new Set([
+  "stream-end",
+  "stream-abort",
+  "stream-error",
+  "error",
+]);
+
+/** The start message of /fork or /new, or undefined when it is absent or blank. */
+function nonBlankStartMessage(startMessage: string | undefined): string | undefined {
+  return startMessage != null && startMessage.trim().length > 0 ? startMessage : undefined;
+}
+
+/** /send-held and /discard-held share one parsed shape. */
+type HeldInputSlashCommand = Extract<ParsedAcpSlashCommand, { kind: "send-held" | "discard-held" }>;
+
+type TerminalStreamEvent = Extract<
+  WorkspaceChatMessage,
+  { type: "stream-end" | "stream-abort" | "stream-error" | "error" }
+>;
+
+function isTerminalStreamEvent(event: WorkspaceChatMessage): event is TerminalStreamEvent {
+  return TERMINAL_STREAM_EVENT_TYPES.has(event.type);
+}
+
+/**
+ * Whether an uncorrelated stream-start (no acpPromptId) may bind to the pending
+ * turn: only a turn that is dispatched, unbound, not queued, and not limited to
+ * exact correlation, and only for a live start at or after the dispatch.
+ */
+function canBindUncorrelatedStreamStart(
+  completion: TurnCompletion,
+  event: Extract<WorkspaceChatMessage, { type: "stream-start" }>,
+  isReplayEvent: boolean
+): boolean {
+  if (!turnAcceptsUncorrelatedStart(completion)) return false;
+  const dispatchedAtMs = completion.dispatchedAtMs;
+  return (
+    dispatchedAtMs != null &&
+    !isReplayEvent &&
+    event.acpPromptId == null &&
+    Number.isFinite(event.startTime) &&
+    event.startTime >= dispatchedAtMs
+  );
+}
+
+function turnAcceptsUncorrelatedStart(completion: TurnCompletion): boolean {
+  return (
+    completion.messageId == null &&
+    completion.requiresExactCorrelation !== true &&
+    // The backend publishes a dequeue before that entry's stream starts, so an uncorrelated
+    // start while this prompt is still queued belongs to an entry ahead of it (#5198).
+    completion.queued !== true
+  );
+}
+
+/** High-volume events runChatSubscription drops once its forwarding queue is saturated. */
+const BACKPRESSURE_DROPPABLE_EVENT_TYPES: ReadonlySet<WorkspaceChatMessage["type"]> = new Set([
+  "stream-delta",
+  "reasoning-delta",
+  "tool-call-delta",
+  "usage-delta",
+  "session-usage-delta",
+  "bash-output",
+  "init-output",
+  "init-progress",
+]);
+
+function isDroppableUnderBackpressure(event: WorkspaceChatMessage, hasCaughtUp: boolean): boolean {
+  // Drop replay history messages under saturation, but keep live message
+  // events so ACP clients do not miss real-time conversation updates.
+  const isReplayMessageEvent =
+    event.type === "message" && ((event as { replay?: boolean }).replay === true || !hasCaughtUp);
+  return BACKPRESSURE_DROPPABLE_EVENT_TYPES.has(event.type) || isReplayMessageEvent;
+}
+
+/** Warns on the first backpressure drop and on every 1,000th after it, so a long stall logs a few lines. */
+function warnOnSampledBackpressureDrop(
+  sessionId: string,
+  details: {
+    droppedNonTerminalEventCount: number;
+    bufferedEvents: number;
+    lastDroppedEventType: WorkspaceChatMessage["type"];
+  }
+): void {
+  const dropped = details.droppedNonTerminalEventCount;
+  if (dropped !== 1 && dropped % 1_000 !== 0) return;
+  console.warn(
+    `[acp] Dropping high-volume onChat events under stdout backpressure for session ${sessionId}`,
+    details
+  );
 }
 
 function findProjectPathByNormalizedPath(

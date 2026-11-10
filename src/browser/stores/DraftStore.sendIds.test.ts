@@ -5,14 +5,14 @@
  */
 import * as fs from "fs/promises";
 import * as path from "path";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { DraftAttachment, DraftEvent, PendingSend } from "@/common/orpc/schemas/drafts";
 import type { FilePart } from "@/common/orpc/types";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
-import { DraftService } from "@/node/services/draftService";
+import { DRAFT_CHANGE_EVENT, DraftService } from "@/node/services/draftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import type { WorkspaceService } from "@/node/services/workspaceService";
@@ -92,7 +92,12 @@ async function createHarness(tempDir: TestTempDir) {
   /** Test hooks around the transport: hold an update, or lose a beginSend reply. */
   const hooks = {
     beforeUpdate: null as null | (() => Promise<void>),
+    beforeBeginSend: null as null | (() => Promise<void>),
+    /** Holds the next subscription's snapshot (a slow reconnect). */
+    beforeSubscribe: null as null | (() => Promise<void>),
     loseBeginSendReply: false,
+    /** Snapshots the store finished handling (it asks for the next event only after that). */
+    snapshotsHandled: 0,
   };
   const drafts = {
     list: () => service.list(),
@@ -104,6 +109,9 @@ async function createHarness(tempDir: TestTempDir) {
       return service.update(input, acceptance);
     },
     beginSend: async (input: Parameters<DraftService["beginSend"]>[0]) => {
+      const hold = hooks.beforeBeginSend;
+      hooks.beforeBeginSend = null;
+      await hold?.();
       const reply = await service.beginSend(input, acceptance);
       if (hooks.loseBeginSendReply) {
         hooks.loseBeginSendReply = false;
@@ -119,13 +127,16 @@ async function createHarness(tempDir: TestTempDir) {
         input
       ),
     subscribe: async (_input: void, opts?: { signal?: AbortSignal }) => {
+      const hold = hooks.beforeSubscribe;
+      hooks.beforeSubscribe = null;
+      await hold?.();
       const queue: DraftEvent[] = [];
       let wake: (() => void) | null = null;
       const listener = (event: DraftEvent) => {
         queue.push(event);
         wake?.();
       };
-      service.on(DraftService.CHANGE_EVENT, listener);
+      service.on(DRAFT_CHANGE_EVENT, listener);
       queue.unshift(await service.getSnapshotEvent());
       return (async function* () {
         try {
@@ -133,6 +144,7 @@ async function createHarness(tempDir: TestTempDir) {
             const next = queue.shift();
             if (next) {
               yield next;
+              if (next.type === "snapshot") hooks.snapshotsHandled++;
               continue;
             }
             await new Promise<void>((resolve) => {
@@ -141,7 +153,7 @@ async function createHarness(tempDir: TestTempDir) {
             });
           }
         } finally {
-          service.off(DraftService.CHANGE_EVENT, listener);
+          service.off(DRAFT_CHANGE_EVENT, listener);
         }
       })();
     },
@@ -183,7 +195,9 @@ async function createHarness(tempDir: TestTempDir) {
     },
   };
   const client = createTestApiClient({ drafts, workspace } as never);
-  return { service, client, receiver: receiver.control, hooks, receiverHooks };
+  /** A new connection to this same backend (a reconnect makes a new client). */
+  const reconnect = () => createTestApiClient({ drafts, workspace } as never);
+  return { service, client, reconnect, receiver: receiver.control, hooks, receiverHooks };
 }
 
 function pendingSend(sendId: string, text: string, receiverId: string, ids: string[] = []) {
@@ -334,6 +348,94 @@ describe("DraftStore idempotent sends", () => {
       "hello\n\nvisible",
     ]);
     expect((await service.get(SCOPE)).text).toBe("hello\n\nvisible");
+  });
+
+  // #6405: the composer stays on from Enter until the send takes its draft.
+  describe("keys typed between Enter and the take", () => {
+    /** Each edit is a setText; `{ edited }` is a composer edit other than typing at the end. */
+    async function takeAfter(
+      edits: Array<string | { edited: string }>,
+      options?: { flushFirst: boolean }
+    ) {
+      using tempDir = new TestTempDir("draft-sends-typed-after");
+      const { service, client } = await createHarness(tempDir);
+      const store = createStore(client);
+      await store.whenReady();
+      store.setText(SCOPE, "yes");
+      store.markSendStart(SCOPE, "yes");
+      for (const edit of edits) {
+        if (typeof edit === "string") {
+          store.setText(SCOPE, edit);
+          continue;
+        }
+        store.markSendEdited(SCOPE);
+        store.setText(SCOPE, edit.edited);
+      }
+      if (options?.flushFirst) await store.flush(SCOPE);
+      const send = pendingSend("s1", "yes", RECEIVER);
+      await store.beginSend(SCOPE, {
+        sendId: send.sendId,
+        text: send.text,
+        attachments: [],
+        request: send.request,
+      });
+      await store.flush(SCOPE);
+      return { composer: store.getText(SCOPE), stored: (await service.get(SCOPE)).text };
+    }
+
+    test("keys typed after the sent text stay, without it", async () => {
+      expect(await takeAfter(["yesx", "yesx  y"])).toEqual({ composer: "x  y", stored: "x  y" });
+    });
+
+    test("keys typed after the sent text and saved before the take stay, without it", async () => {
+      const taken = { composer: "x", stored: "x" };
+      expect(await takeAfter(["yesx"], { flushFirst: true })).toEqual(taken);
+    });
+
+    test("a text edited other than by appending since Enter stays whole", async () => {
+      const kept = { composer: "yesterday", stored: "yesterday" };
+      expect(await takeAfter(["yesx", "yes", "yesterday"])).toEqual(kept);
+    });
+
+    test("a text retyped since Enter that starts with the sent text stays whole", async () => {
+      const kept = { composer: "yesterday", stored: "yesterday" };
+      expect(await takeAfter(["y", "yesterday"])).toEqual(kept);
+    });
+
+    // #6585: the same text shape as typing after the sent text, from a select-all paste.
+    test("a composer edit other than typing at the end keeps the whole text", async () => {
+      const kept = { composer: "yes please", stored: "yes please" };
+      expect(await takeAfter([{ edited: "yes please" }])).toEqual(kept);
+      expect(await takeAfter([{ edited: "yes please" }], { flushFirst: true })).toEqual(kept);
+      // Typing at the end afterwards does not make the edit typing.
+      expect(await takeAfter([{ edited: "yes" }, "yes please"])).toEqual(kept);
+    });
+
+    // A draft near the size limit must still fit the request: the take adds no copy of it.
+    test("the request carries the composer text once, saved or not", async () => {
+      using tempDir = new TestTempDir("draft-sends-one-copy");
+      const { service, client } = await createHarness(tempDir);
+      const sent = spyOn(service, "beginSend");
+      const store = createStore(client);
+      await store.whenReady();
+      for (const flushFirst of [false, true]) {
+        store.setText(SCOPE, "yes");
+        store.markSendStart(SCOPE, "yes");
+        store.markSendEdited(SCOPE);
+        store.setText(SCOPE, "yes please");
+        if (flushFirst) await store.flush(SCOPE);
+        const send = pendingSend(`s-${flushFirst}`, "yes", RECEIVER);
+        await store.beginSend(SCOPE, {
+          sendId: send.sendId,
+          text: send.text,
+          attachments: [],
+          request: send.request,
+        });
+        const input = sent.mock.calls.at(-1)?.[0];
+        const copies = [input?.text, input?.localTake?.from].filter((text) => text !== undefined);
+        expect(copies).toEqual(["yes please"]);
+      }
+    });
   });
 
   test("a window with unsaved text puts a not-accepted send back into it once", async () => {
@@ -523,6 +625,26 @@ describe("DraftStore idempotent sends", () => {
     await sender.flush(SCOPE);
     expect((await service.get(SCOPE)).text).toBe("hello");
     await waitFor(() => sender.getText(SCOPE) === "hello");
+  });
+
+  // #6405: the composer stays on during the request, so keys typed then follow the take.
+  test("a lost beginSend reply puts the text back beside text typed meanwhile", async () => {
+    using tempDir = new TestTempDir("draft-sends-begin-lost-typed");
+    const { client, hooks } = await createHarness(tempDir);
+    const sender = createStore(client);
+    await sender.whenReady();
+    sender.setText(SCOPE, "ok");
+    sender.markSendStart(SCOPE, "ok");
+    hooks.beforeBeginSend = () => {
+      sender.setText(SCOPE, "okay");
+      return Promise.resolve();
+    };
+    hooks.loseBeginSendReply = true;
+    const request = pendingSend("s1", "ok", RECEIVER).request;
+    await sender
+      .beginSend(SCOPE, { sendId: "s1", text: "ok", attachments: [], request })
+      .catch(() => undefined);
+    expect(sender.getText(SCOPE)).toBe("ok\n\nokay");
   });
 
   test("a lost beginSend reply: while the backend holds the send, a save does not show it twice", async () => {
@@ -760,5 +882,139 @@ describe("DraftStore idempotent sends", () => {
       fileParts: [{ url: image.url, mediaType: image.mediaType }, foreignPart],
     });
     expect([rest.text, rest.fileParts]).toEqual(["from elsewhere", [foreignPart]]);
+  });
+
+  // #6438: the reply of a send begun on the old backend arrived after the switch. Its view
+  // carried the old backend's (higher) revisions, so every write reply of the new backend lost
+  // to it and the old text came back over typing. It also counted as begun, so the message went
+  // out while the current backend had no record of the send and no copy of its text.
+  test("a send whose reply came from a replaced backend is refused, and its text is kept", async () => {
+    using oldDir = new TestTempDir("draft-sends-old-backend");
+    using newDir = new TestTempDir("draft-sends-new-backend");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    store.setText(SCOPE, "hello");
+    let release: () => void = () => undefined;
+    old.hooks.beforeBeginSend = () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    const request = pendingSend("s1", "hello", RECEIVER).request;
+    const sending = store
+      .beginSend(SCOPE, { sendId: "s1", text: "hello", attachments: [], request })
+      .then(
+        () => "began",
+        () => "refused"
+      );
+    await waitFor(() => old.hooks.beforeBeginSend === null);
+
+    // A new backend process whose clock is behind numbers its revisions lower.
+    const realNow = Date.now;
+    Date.now = () => realNow() - 3_600_000;
+    let next: Awaited<ReturnType<typeof createHarness>>;
+    try {
+      next = await createHarness(newDir);
+    } finally {
+      Date.now = realNow;
+    }
+    store.setClient(next.client);
+    await waitFor(() => next.hooks.snapshotsHandled > 0);
+    release();
+    // The new backend holds neither the send nor its text removal: the send must not go out,
+    // and its text comes back and is saved there.
+    expect(await sending).toBe("refused");
+    expect(store.getText(SCOPE)).toBe("hello");
+    await store.flush(SCOPE);
+    expect((await next.service.get(SCOPE)).text).toBe("hello");
+
+    store.setText(SCOPE, "typed after the switch");
+    await store.flush(SCOPE);
+    expect(store.getText(SCOPE)).toBe("typed after the switch");
+  });
+
+  // #6438: a reconnect forgets the backend's views, not the pending sends: until its snapshot,
+  // the send stays retained (its text hidden, its id pending), so it is never shown twice.
+  test("a reconnect keeps the pending sends until the new snapshot", async () => {
+    using tempDir = new TestTempDir("draft-sends-reconnect-pending");
+    const { client, receiver, hooks } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(SCOPE, "hello");
+    receiver.statuses.set("s1", "pending");
+    const request = pendingSend("s1", "hello", RECEIVER).request;
+    await store.beginSend(SCOPE, { sendId: "s1", text: "hello", attachments: [], request });
+    expect(await store.settleSend(SCOPE, "s1")).toBe("pending");
+
+    store.setClient(null);
+    let releaseSnapshot: () => void = () => undefined;
+    hooks.beforeSubscribe = () =>
+      new Promise<void>((resolve) => {
+        releaseSnapshot = resolve;
+      });
+    const handled = hooks.snapshotsHandled;
+    store.setClient(client);
+    expect([...store.getPendingSendIds(SCOPE)]).toEqual(["s1"]);
+    expect(store.getText(SCOPE)).toBe("");
+    releaseSnapshot();
+    await waitFor(() => hooks.snapshotsHandled > handled);
+    expect([...store.getPendingSendIds(SCOPE)]).toEqual(["s1"]);
+    expect(store.getText(SCOPE)).toBe("");
+  });
+
+  // #6542: a reconnect (a new client to the same backend) during a send. Its reply comes from the
+  // replaced client, so the send is refused and its text comes back. That text is saved only
+  // after the new snapshot, and the backend's pending-send record never brings it back twice.
+  test("a reconnect during a send refuses it, and its text comes back once after the snapshot", async () => {
+    using tempDir = new TestTempDir("draft-sends-reconnect-during-send");
+    const { service, client, reconnect, receiver, hooks } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(SCOPE, "hello");
+    await store.flush(SCOPE);
+
+    const next = reconnect();
+    let releaseSnapshot: () => void = () => undefined;
+    hooks.beforeBeginSend = () => {
+      hooks.beforeSubscribe = () =>
+        new Promise<void>((resolve) => {
+          releaseSnapshot = resolve;
+        });
+      store.setClient(next);
+      return Promise.resolve();
+    };
+    const request = pendingSend("s1", "hello", RECEIVER).request;
+    const outcome = await store
+      .beginSend(SCOPE, { sendId: "s1", text: "hello", attachments: [], request })
+      .then(
+        () => "began",
+        () => "refused"
+      );
+    expect(outcome).toBe("refused");
+    expect(store.getText(SCOPE)).toBe("hello");
+    // Before the new snapshot nothing is written: a save waits, and the backend still holds the
+    // send's take.
+    const saving = store.flush(SCOPE).then(
+      () => "",
+      (error: unknown) => String(error)
+    );
+    const before = await service.get(SCOPE);
+    expect([before.text, before.pendingSends?.map(({ sendId }) => sendId)]).toEqual(["", ["s1"]]);
+
+    releaseSnapshot();
+    expect(await saving).toBe("");
+    await waitFor(() => hooks.snapshotsHandled > 1);
+    await waitFor(async () => {
+      const draft = await service.get(SCOPE);
+      return draft.text === "hello" && draft.pendingSends === undefined;
+    });
+    expect(store.getText(SCOPE)).toBe("hello");
+    expect(receiver.sends).toHaveLength(0);
+    // A reloaded window shows it once (its snapshot can trail the resolution's write).
+    const reloaded = createStore(reconnect());
+    await reloaded.whenReady();
+    await waitFor(() => reloaded.getText(SCOPE) === "hello");
+    expect((await service.get(SCOPE)).text).toBe("hello");
+    expect(store.getText(SCOPE)).toBe("hello");
   });
 });

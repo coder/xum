@@ -12,6 +12,7 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { workspace as workspaceApi } from "@/common/orpc/schemas/api";
 import { createMuxMessage } from "@/common/types/message";
 import { HistoryService } from "@/node/services/historyService";
+import { TaskHandleStore } from "@/node/services/taskHandleStore";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import {
@@ -145,6 +146,26 @@ describe("delegated target default consent (#4453)", () => {
   async function crashBeforeRecord(options: { disposable?: boolean } = {}) {
     const [created, paused] = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
     const a = await setUp({ afterCreate: () => (created.resolve(), paused.promise) });
+    // #7694: the target's background init ends with one more metadata publish (the service's own
+    // init-end listener starts refreshAndEmitMetadata without awaiting it), at a time CI load
+    // decides. A test that counts publishes awaits that refresh first. Another TARGET publish
+    // can come first, so wait for the refresh call itself: the prepended listener runs just
+    // before the service's listener makes that call, in the same synchronous emit.
+    const initPublished = Promise.withResolvers<void>();
+    let initRefreshNext = false;
+    a.initStateManager.prependListener("init-end", (event: { workspaceId: string }) => {
+      initRefreshNext = event.workspaceId === TARGET;
+    });
+    const refresh = a.real.refreshAndEmitMetadata.bind(a.real);
+    spyOn(a.real, "refreshAndEmitMetadata").mockImplementation(async (workspaceId) => {
+      const isInitRefresh = initRefreshNext && workspaceId === TARGET;
+      initRefreshNext = false;
+      try {
+        await refresh(workspaceId);
+      } finally {
+        if (isInitRefresh) initPublished.resolve();
+      }
+    });
     const creating = createTurn(a.manager, a.parentId, {
       mode: "new",
       disposable: options.disposable,
@@ -156,7 +177,7 @@ describe("delegated target default consent (#4453)", () => {
       paused.resolve();
       await creating;
     };
-    return { ...a, finish };
+    return { ...a, finish, initPublished: initPublished.promise };
   }
 
   const handleRecordPath = (parentId: string) =>
@@ -659,6 +680,7 @@ describe("delegated target default consent (#4453)", () => {
     await (await backend()).manager.resolveOrphanedDelegatedTargets();
     expect(await flagOf()).toBe(true);
 
+    await a.initPublished;
     const published: unknown[] = [];
     a.real.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
       if (event.workspaceId !== TARGET) return;
@@ -764,6 +786,7 @@ describe("delegated target default consent (#4453)", () => {
     expect((await (await backend()).real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(
       true
     );
+    await a.initPublished;
     const published: unknown[] = [];
     a.real.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
       if (event.workspaceId !== TARGET) return;
@@ -793,4 +816,93 @@ describe("delegated target default consent (#4453)", () => {
     expect(mark(a.config)?.interruptedAt).toBeString();
     await a.finish();
   });
+
+  // #5569 (user-created roots): the active-turn lookup may answer "no turn" for a root that was
+  // born without delegation only while these birth facts hold.
+  /** The TARGET row as the first config write that makes it visible left it. */
+  function recordFirstVisibleTarget(config: Config) {
+    const firstVisible: unknown[] = [];
+    const edit = config.editConfig.bind(config);
+    spyOn(config, "editConfig").mockImplementation(async (...args) => {
+      await edit(...args);
+      const row = findWorkspaceEntry(config.loadConfigOrDefault(), TARGET)?.workspace;
+      if (row != null && firstVisible.length === 0) {
+        firstVisible.push({
+          mark: row.delegatedCreation,
+          tags: row.tags,
+          stamp: row.bornWithoutDelegation,
+        });
+      }
+    });
+    return firstVisible;
+  }
+  for (const owner of ["project", "scratch"] as const) {
+    test(`a mode new target's first config write already binds its creator (${owner} owner, #5569)`, async () => {
+      const a = owner === "project" ? await setUp() : await setUpScratchOwner();
+      const firstVisible = recordFirstVisibleTarget(a.config);
+      await start(a.manager, a.parentId, { mode: "new" });
+
+      expect(firstVisible).toEqual([
+        {
+          mark: { handleId: "wst_handle", ownerWorkspaceId: a.parentId },
+          tags: {
+            "mux.taskHandleId": "wst_handle",
+            "mux.taskOwnerWorkspaceId": a.parentId,
+            "mux.taskTurnId": "turn",
+          },
+          stamp: undefined,
+        },
+      ]);
+      // The stamp is written only at birth, so a delegated target never gets one later either.
+      expect(
+        findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace
+      ).not.toHaveProperty("bornWithoutDelegation");
+    });
+  }
+
+  for (const birth of ["create", "createScratch"] as const) {
+    test(`a root born without delegation never gets a turn, even with copied claim tags (${birth}, #5569)`, async () => {
+      const other = "bbbbbbbbbb";
+      const a = await setUp({ stableIds: ["handle", "turn", other, TARGET, "handle2", "turn2"] });
+      // The owner has a running turn on another target it created.
+      await start(a.manager, a.parentId, { mode: "new" });
+      const tags = { "mux.taskHandleId": "wst_handle", "mux.taskOwnerWorkspaceId": a.parentId };
+      const firstVisible = recordFirstVisibleTarget(a.config);
+      const born =
+        birth === "create"
+          ? await a.real.create(
+              a.projectPath,
+              "public",
+              "main",
+              undefined,
+              { type: "local" },
+              undefined,
+              false,
+              tags
+            )
+          : await a.real.createScratch(undefined, tags);
+      expect(born.success ? born.data.metadata.id : born.error).toBe(TARGET);
+      // Its background init must not outlive the test's temp root.
+      await a.initStateManager.waitForInit(TARGET);
+      expect(mark(a.config)).toBeUndefined();
+      // S1: the birth write itself stamps it, even with the copied claim tags.
+      expect(firstVisible).toEqual([{ mark: undefined, tags, stamp: true }]);
+      const bornRow = findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)?.workspace;
+      expect(bornRow?.bornWithoutDelegation).toBe(true);
+
+      const refused = await createTurn(a.manager, a.parentId, {
+        mode: "existing",
+        workspaceId: TARGET,
+      });
+      expect(refused.success ? "" : refused.error).toContain("invalid_scope");
+
+      // Same answer as the global scan: the owner's only records target the other workspace.
+      const records = await new TaskHandleStore(a.config).listAllWorkspaceTurns();
+      expect(records.map((record) => record.workspaceId)).toEqual([other]);
+      expect(await a.manager.getActiveWorkspaceTurnMuxMetadataForWorkspace(TARGET)).toBeUndefined();
+      expect(await a.manager.getActiveWorkspaceTurnMuxMetadataForWorkspace(other)).toMatchObject({
+        taskHandleId: "wst_handle",
+      });
+    });
+  }
 });

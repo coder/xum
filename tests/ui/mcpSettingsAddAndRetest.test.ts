@@ -1,6 +1,6 @@
 import "./dom";
 import { createServer, type Server, type ServerResponse } from "http";
-import { fireEvent, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
 import type { BoundFunctions, queries } from "@testing-library/react";
 import { shouldRunIntegrationTests } from "../testUtils";
 import { preloadTestModules } from "../ipc/setup";
@@ -187,6 +187,80 @@ describeIntegration("MCP settings add and re-test", () => {
       });
     } finally {
       startServerFlow.mockRestore();
+      await new Promise<void>((resolve) => oauthServer.close(() => resolve()));
+    }
+  }, 60000);
+
+  test("Cancel during a stalled OAuth start cancels the flow the start registers (#6565)", async () => {
+    const oauthServer: Server = createServer((_req, res) => {
+      res.statusCode = 401;
+      res.setHeader("WWW-Authenticate", `Bearer scope="mcp.read"`);
+      res.end("Unauthorized");
+    });
+    await new Promise<void>((resolve) => oauthServer.listen(0, "127.0.0.1", resolve));
+    const address = oauthServer.address();
+    if (!address || typeof address === "string") throw new Error("oauth server did not bind");
+    const oauthUrl = `http://127.0.0.1:${address.port}/mcp`;
+    // The start stalls (for example on discovery) until the test releases it.
+    let releaseStart!: () => void;
+    const startReleased = new Promise<void>((resolve) => (releaseStart = resolve));
+    const service = app.env.services.mcpOauthService;
+    const startServerFlow = jest
+      .spyOn(service, "startServerFlowForApi")
+      .mockImplementation(async () => {
+        await startReleased;
+        // What the backend answers for a flow cancelled while it started.
+        return { success: false, error: "OAuth flow cancelled" };
+      });
+    const cancelServerFlow = jest.spyOn(service, "cancelServerFlow");
+
+    try {
+      const canvas = await openSettingsDialog(app.view.container);
+      fireEvent.click(await canvas.findByRole("button", { name: "MCP" }));
+      await canvas.findByRole("switch", { name: `Toggle ${SERVER} enabled` }, { timeout: 10000 });
+
+      fireEvent.change(canvas.getByLabelText("Name"), { target: { value: "stalled" } });
+      const body = within(app.view.container.ownerDocument.body);
+      const transport = canvas.getByText("Transport").parentElement!;
+      fireEvent.click(within(transport).getByRole("combobox"));
+      fireEvent.click(await body.findByRole("option", { name: /HTTP \(Streamable\)/ }));
+      fireEvent.change(await canvas.findByLabelText("URL"), { target: { value: oauthUrl } });
+      fireEvent.click(canvas.getByRole("button", { name: "Test" }));
+      const login = await canvas.findByRole(
+        "button",
+        { name: "Login via OAuth" },
+        { timeout: 10000 }
+      );
+      const loginRow = login.parentElement!;
+      fireEvent.click(login);
+      await waitFor(() => expect(startServerFlow).toHaveBeenCalled(), { timeout: 10000 });
+
+      fireEvent.click(
+        await within(loginRow.parentElement!).findByRole("button", { name: "Cancel" })
+      );
+      const startedId = (startServerFlow.mock.calls[0]?.[0] as { flowId?: string }).flowId;
+      expect(startedId).toBeDefined();
+      await waitFor(() => expect(cancelServerFlow).toHaveBeenCalledWith(startedId), {
+        timeout: 10000,
+      });
+
+      // The start's late answer belongs to the cancelled attempt: the row is idle again.
+      releaseStart();
+      await within(loginRow.parentElement!).findByRole(
+        "button",
+        { name: "Login via OAuth" },
+        { timeout: 10000 }
+      );
+      // Let the component handle the late answer before the negative checks.
+      await act(async () => {
+        await startServerFlow.mock.results[0]?.value;
+      });
+      expect(within(loginRow.parentElement!).queryByText(/OAuth error/)).toBeNull();
+      expect(within(loginRow.parentElement!).queryByRole("button", { name: "Cancel" })).toBeNull();
+    } finally {
+      releaseStart();
+      startServerFlow.mockRestore();
+      cancelServerFlow.mockRestore();
       await new Promise<void>((resolve) => oauthServer.close(() => resolve()));
     }
   }, 60000);

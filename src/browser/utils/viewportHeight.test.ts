@@ -1,12 +1,13 @@
 import "../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { installDom } from "../../../tests/ui/dom";
 import {
   APP_VIEWPORT_HEIGHT_PROPERTY,
   installIosFocusZoomGuard,
+  installIphoneDuoStatusBarStyle,
   installViewportHeightSync,
 } from "./viewportHeight";
 
@@ -24,8 +25,38 @@ function setInnerHeight(value: number) {
   });
 }
 
+/**
+ * A stand-in visual viewport; iOS resizes it, and not the window, for the software keyboard. Like
+ * the real one, its height is a getter on the prototype; `nativeHeight` sets what that returns.
+ */
+function installVisualViewport(height: number, scale = 1) {
+  class StubVisualViewport extends window.EventTarget {
+    nativeHeight = height;
+    scale = scale;
+    get height(): number {
+      return this.nativeHeight;
+    }
+  }
+  const viewport = new StubVisualViewport();
+  Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
+  return viewport;
+}
+
 function appViewportHeight(): string {
   return document.documentElement.style.getPropertyValue(APP_VIEWPORT_HEIGHT_PROPERTY);
+}
+
+function withResizeObserver(value: unknown, run: () => void) {
+  const originalResizeObserver = window.ResizeObserver;
+  Object.defineProperty(window, "ResizeObserver", { configurable: true, value });
+  try {
+    run();
+  } finally {
+    Object.defineProperty(window, "ResizeObserver", {
+      configurable: true,
+      value: originalResizeObserver,
+    });
+  }
 }
 
 describe("iOS standalone viewport", () => {
@@ -102,6 +133,172 @@ describe("iOS standalone viewport", () => {
     window.dispatchEvent(new window.Event("resize"));
     expect(appViewportHeight()).toBe("");
   });
+
+  test("follows the keyboard, which resizes only the visual viewport", () => {
+    setStandalone(true);
+    setInnerHeight(657);
+    const viewport = installVisualViewport(657);
+    cleanupSync = installViewportHeightSync();
+
+    viewport.nativeHeight = 324;
+    viewport.dispatchEvent(new window.Event("resize"));
+    expect(appViewportHeight()).toBe("324px");
+
+    viewport.nativeHeight = 657;
+    viewport.dispatchEvent(new window.Event("resize"));
+    expect(appViewportHeight()).toBe("657px");
+  });
+
+  test("replaces the bogus visual viewport height iOS reports after the Duo folds", () => {
+    setStandalone(true);
+    setInnerHeight(678);
+    const viewport = installVisualViewport(678);
+    cleanupSync = installViewportHeightSync();
+    expect(window.visualViewport?.height).toBe(678);
+
+    viewport.nativeHeight = 324;
+    expect(window.visualViewport?.height).toBe(324);
+
+    viewport.nativeHeight = -33554432;
+    expect(window.visualViewport?.height).toBe(678);
+    viewport.dispatchEvent(new window.Event("resize"));
+    expect(appViewportHeight()).toBe("678px");
+
+    cleanupSync();
+    cleanupSync = null;
+    expect(window.visualViewport?.height).toBe(-33554432);
+  });
+
+  test("leaves the visual viewport height alone outside iOS standalone", () => {
+    setStandalone(undefined);
+    setInnerHeight(678);
+    installVisualViewport(-33554432);
+    cleanupSync = installViewportHeightSync();
+
+    expect(window.visualViewport?.height).toBe(-33554432);
+  });
+
+  test("still syncs the height when the visual viewport height cannot be corrected", () => {
+    setStandalone(true);
+    setInnerHeight(678);
+    const viewport = Object.preventExtensions(installVisualViewport(678));
+    const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      cleanupSync = installViewportHeightSync();
+
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      viewport.nativeHeight = 324;
+      viewport.dispatchEvent(new window.Event("resize"));
+      expect(appViewportHeight()).toBe("324px");
+
+      viewport.nativeHeight = -33554432;
+      viewport.dispatchEvent(new window.Event("resize"));
+      expect(appViewportHeight()).toBe("678px");
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  test("keeps the full height while pinch zoomed in", () => {
+    setStandalone(true);
+    setInnerHeight(657);
+    const viewport = installVisualViewport(657);
+    cleanupSync = installViewportHeightSync();
+
+    viewport.nativeHeight = 328.5;
+    viewport.scale = 2;
+    viewport.dispatchEvent(new window.Event("resize"));
+
+    expect(appViewportHeight()).toBe("657px");
+  });
+
+  test("keeps the full height when the Duo folds while pinch zoomed in", () => {
+    setStandalone(true);
+    setInnerHeight(678);
+    const viewport = installVisualViewport(339, 2);
+    cleanupSync = installViewportHeightSync();
+
+    viewport.nativeHeight = -33554432;
+    viewport.dispatchEvent(new window.Event("resize"));
+
+    expect(window.visualViewport?.height).toBe(339);
+    expect(appViewportHeight()).toBe("678px");
+  });
+
+  test("undoes the window scroll iOS adds for the keyboard, but not a zoomed-in pan", () => {
+    setStandalone(true);
+    setInnerHeight(657);
+    const viewport = installVisualViewport(657);
+    const scrollTo = spyOn(window, "scrollTo").mockImplementation(() => undefined);
+    Object.defineProperty(window, "scrollY", { configurable: true, get: () => 333 });
+    try {
+      cleanupSync = installViewportHeightSync();
+      expect(scrollTo).toHaveBeenLastCalledWith(0, 0);
+
+      scrollTo.mockClear();
+      viewport.scale = 2;
+      viewport.dispatchEvent(new window.Event("scroll"));
+      expect(scrollTo).not.toHaveBeenCalled();
+    } finally {
+      scrollTo.mockRestore();
+    }
+  });
+
+  test("syncs again when the rotated layout resizes the viewport after a stale resize event", () => {
+    const callbacks: Array<() => void> = [];
+    class RecordingResizeObserver {
+      constructor(callback: () => void) {
+        callbacks.push(callback);
+      }
+      observe() {
+        return undefined;
+      }
+      disconnect() {
+        return undefined;
+      }
+    }
+    withResizeObserver(RecordingResizeObserver, () => {
+      setStandalone(true);
+      setInnerHeight(820);
+      cleanupSync = installViewportHeightSync();
+
+      // iPad landscape to portrait: the resize event still sees the landscape height.
+      window.dispatchEvent(new window.Event("resize"));
+      setInnerHeight(1180);
+      for (const callback of callbacks) callback();
+
+      expect(appViewportHeight()).toBe("1180px");
+    });
+  });
+
+  test("keeps the resize sync and removes the probe when the viewport cannot be observed", () => {
+    class FailingResizeObserver {
+      observe() {
+        throw new Error("observe failed");
+      }
+      disconnect() {
+        return undefined;
+      }
+    }
+    const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      withResizeObserver(FailingResizeObserver, () => {
+        setStandalone(true);
+        setInnerHeight(852);
+        const bodyChildren = document.body.childElementCount;
+
+        cleanupSync = installViewportHeightSync();
+
+        expect(document.body.childElementCount).toBe(bodyChildren);
+        expect(consoleError).toHaveBeenCalledTimes(1);
+        setInnerHeight(500);
+        window.dispatchEvent(new window.Event("resize"));
+        expect(appViewportHeight()).toBe("500px");
+      });
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
 });
 
 describe("iOS focus-zoom guard", () => {
@@ -153,5 +350,41 @@ describe("iOS focus-zoom guard", () => {
     installIosFocusZoomGuard();
 
     expect(meta.content).toBe(original);
+  });
+});
+
+describe("iPhone Duo status-bar style", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  function statusBarStyle(width: number, height: number): string | null | undefined {
+    Object.defineProperty(window.screen, "width", { configurable: true, get: () => width });
+    Object.defineProperty(window.screen, "height", { configurable: true, get: () => height });
+    installIphoneDuoStatusBarStyle();
+    return document
+      .querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')
+      ?.getAttribute("content");
+  }
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("goes black-translucent on the Duo, which reports one screen size on both displays", () => {
+    expect(statusBarStyle(466, 678)).toBe("black-translucent");
+  });
+
+  test("leaves other screens on the native status-bar layout, even one that shares a side", () => {
+    for (const [width, height] of [
+      [402, 874],
+      [466, 874],
+      [402, 678],
+    ]) {
+      expect(statusBarStyle(width, height)).toBeUndefined();
+    }
   });
 });

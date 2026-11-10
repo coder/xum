@@ -22,6 +22,32 @@ export function removeSentText(current: string, sent: string): string {
 }
 
 /**
+ * How a send's take finds its text in the composer (DraftStore.takeSendMark):
+ * "typed-after": every edit since Enter typed at the end, so the text is the sent text followed
+ * only by those keys (#6405). "edited": the user changed the text through the composer some other
+ * way since Enter (a selection replaced, an edit before the end, #6585). "unknown": anything else
+ * (no mark, or a restore or another window's push changed the text).
+ */
+export type SendTake = "typed-after" | "edited" | "unknown";
+
+/**
+ * The composer text after its own send took `sent`, the text it held at Enter. "typed-after":
+ * exactly the sent prefix goes, and the keys after it stay as typed ("first messagex" -> "x").
+ * "edited": nothing goes. What the composer holds is the user's own text now, also when it
+ * starts with the sent text (a select-all paste of "Fix the bug in parser.ts" over "Fix the
+ * bug"), so the sent text can stay visible: a duplicate beats a loss. "unknown": removeSentText's
+ * whitespace rule.
+ */
+export function takeSentText(current: string, sent: string, take: SendTake): string {
+  if (take === "unknown") return removeSentText(current, sent);
+  return take === "typed-after" ? withoutSentPrefix(current, sent) : current;
+}
+
+function withoutSentPrefix(current: string, sent: string): string {
+  return current.startsWith(sent) ? current.slice(sent.length) : removeSentText(current, sent);
+}
+
+/**
  * Where the whitespace run next to `index` ends, walking in `step` direction (-1: before it,
  * 1: from it), and whether that run holds a blank line (two line breaks).
  */

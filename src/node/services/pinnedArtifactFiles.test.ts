@@ -2,10 +2,13 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as artifactStoreModule from "./artifactStore";
 import type { ArtifactsContext } from "./artifactsOperations";
 import {
+  PINNED_FILES_DEVCONTAINER_OUTSIDE_REASON,
   PINNED_FILES_MULTI_PROJECT_REASON,
   addPinnedPath,
   listPinnedFiles,
@@ -23,6 +26,8 @@ describe("pinned workspace files", () => {
   let projects: Array<{ projectPath: string; projectName: string }> | undefined;
   let subProjectPath: string | undefined;
   let runtimeConfig: Record<string, unknown>;
+  let workspaceName: string;
+  let projectPath: string;
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pinned-files-"));
@@ -33,6 +38,8 @@ describe("pinned workspace files", () => {
     projects = undefined;
     subProjectPath = undefined;
     runtimeConfig = { type: "worktree", srcBaseDir: tempDir };
+    workspaceName = "checkout";
+    projectPath = tempDir;
     context = {
       config: { sessionsDir: path.join(tempDir, "sessions") },
       workspaceService: {
@@ -41,8 +48,8 @@ describe("pinned workspace files", () => {
             workspaceId === "ws"
               ? {
                   id: "ws",
-                  name: "checkout",
-                  projectPath: tempDir,
+                  name: workspaceName,
+                  projectPath,
                   projectName: "project",
                   namedWorkspacePath: checkout,
                   runtimeConfig,
@@ -96,6 +103,175 @@ describe("pinned workspace files", () => {
     ]);
   });
 
+  test("a file outside the checkout pins by its absolute path and reads live", async () => {
+    // File tool cards offer "Open as artifact" for any path the agent read, such as a plan or a
+    // skill file under the home folder.
+    const outside = path.join(await fs.realpath(tempDir), "notes", "plan.md");
+    await fs.mkdir(path.dirname(outside), { recursive: true });
+    await fs.writeFile(outside, "# Plan");
+    expect(await pinFile(context, { workspaceId: "ws", path: outside })).toEqual({
+      success: true,
+      data: { path: outside },
+    });
+    // A tool-cwd path that leaves the checkout names the same file.
+    expect(
+      await pinFile(context, {
+        workspaceId: "ws",
+        path: "../notes/plan.md",
+        relativeTo: "tool-cwd",
+      })
+    ).toEqual({ success: true, data: { path: outside } });
+
+    const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+    if (!listed.success || !listed.data.available) throw new Error("expected pinned files");
+    expect(listed.data.files.map(({ path, kind, size }) => ({ path, kind, size }))).toEqual([
+      { path: outside, kind: "markdown", size: 6 },
+    ]);
+
+    await fs.writeFile(outside, "# Changed");
+    expect(await readPinnedFile(context, { workspaceId: "ws", path: outside })).toMatchObject({
+      success: true,
+      data: { status: "ok", content: "# Changed" },
+    });
+
+    await unpinFile(context, { workspaceId: "ws", path: outside });
+    expect(await readPinnedFile(context, { workspaceId: "ws", path: outside })).toEqual({
+      success: false,
+      error: `File is not pinned: ${outside}`,
+    });
+  });
+
+  test("one file reached through a symlinked folder is one pin", async () => {
+    const real = await fs.realpath(tempDir);
+    await fs.mkdir(path.join(real, "notes"));
+    await fs.writeFile(path.join(real, "notes", "plan.md"), "# Plan");
+    await fs.symlink(path.join(real, "notes"), path.join(real, "notes-link"));
+    await fs.mkdir(path.join(checkout, "docs"));
+    await fs.writeFile(path.join(checkout, "docs", "x.md"), "x");
+    await fs.symlink(path.join(checkout, "docs"), path.join(real, "docs-link"));
+
+    // An alias of an outside folder stores the real path, so both spellings are one pin.
+    for (const alias of ["notes", "notes-link"]) {
+      expect(
+        await pinFile(context, { workspaceId: "ws", path: path.join(real, alias, "plan.md") })
+      ).toEqual({ success: true, data: { path: path.join(real, "notes", "plan.md") } });
+    }
+    // An alias that leads into the checkout is a checkout pin.
+    expect(
+      await pinFile(context, { workspaceId: "ws", path: path.join(real, "docs-link", "x.md") })
+    ).toEqual({ success: true, data: { path: "docs/x.md" } });
+    const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+    expect(listed.success && listed.data.available && listed.data.files.map((f) => f.path)).toEqual(
+      [path.join(real, "notes", "plan.md"), "docs/x.md"]
+    );
+  });
+
+  test("an SSH checkout pins and reads an outside file in a symlinked folder", async () => {
+    // A LocalRuntime stands in for the SSH host: pins and reads run the real runtime scripts.
+    const real = await fs.realpath(tempDir);
+    runtimeConfig = { type: "ssh", host: "example", srcBaseDir: real };
+    // An in-place workspace (name equals project path) roots the checkout at the project path.
+    projectPath = workspaceName = path.join(real, "checkout");
+    const create = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue(
+      new LocalRuntime(real)
+    );
+    try {
+      await fs.mkdir(path.join(real, "notes"));
+      await fs.writeFile(path.join(real, "notes", "plan.md"), "# Plan");
+      await fs.symlink(path.join(real, "notes"), path.join(real, "notes-link"));
+      const stored = path.join(real, "notes", "plan.md");
+      expect(
+        await pinFile(context, {
+          workspaceId: "ws",
+          path: path.join(real, "notes-link", "plan.md"),
+        })
+      ).toEqual({ success: true, data: { path: stored } });
+      expect(await readPinnedFile(context, { workspaceId: "ws", path: stored })).toMatchObject({
+        success: true,
+        data: { status: "ok", content: "# Plan" },
+      });
+      expect(create).toHaveBeenCalled();
+    } finally {
+      create.mockRestore();
+    }
+  });
+
+  test("pinning on an SSH checkout resolves only stored pins with the same file name", async () => {
+    // Each folder resolution is one exec on the SSH host; other outside pins cannot be aliases.
+    const real = await fs.realpath(tempDir);
+    runtimeConfig = { type: "ssh", host: "example", srcBaseDir: real };
+    projectPath = workspaceName = path.join(real, "checkout");
+    const resolved: string[] = [];
+    class CountingRuntime extends LocalRuntime {
+      override exec(command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
+        if (command.includes("XUMREALDIR1")) resolved.push(options.pathEnv?.XUM_DIR ?? "");
+        return super.exec(command, options);
+      }
+    }
+    const create = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue(
+      new CountingRuntime(real)
+    );
+    try {
+      const sessionDir = path.join(tempDir, "sessions", "ws");
+      for (const name of ["a.md", "b.md", "c.md"]) {
+        await addPinnedPath(sessionDir, path.join(real, "old", name));
+      }
+      await fs.mkdir(path.join(real, "notes"));
+      await fs.writeFile(path.join(real, "notes", "plan.md"), "# Plan");
+      expect(
+        await pinFile(context, { workspaceId: "ws", path: path.join(real, "notes", "plan.md") })
+      ).toEqual({ success: true, data: { path: path.join(real, "notes", "plan.md") } });
+      // The new pin's folder and the checkout root, nothing for a.md, b.md or c.md.
+      expect(resolved.filter((dir) => dir.startsWith(path.join(real, "old")))).toEqual([]);
+    } finally {
+      create.mockRestore();
+    }
+  });
+
+  test("re-pinning an alias stored before real folder paths keeps the one entry", async () => {
+    const real = await fs.realpath(tempDir);
+    await fs.mkdir(path.join(real, "notes"));
+    await fs.writeFile(path.join(real, "notes", "plan.md"), "# Plan");
+    await fs.symlink(path.join(real, "notes"), path.join(real, "notes-link"));
+    const alias = path.join(real, "notes-link", "plan.md");
+    // An older build stored the alias as given.
+    await addPinnedPath(path.join(tempDir, "sessions", "ws"), alias);
+    for (const request of [alias, path.join(real, "notes", "plan.md")]) {
+      expect(await pinFile(context, { workspaceId: "ws", path: request })).toEqual({
+        success: true,
+        data: { path: alias },
+      });
+    }
+    const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+    expect(listed.success && listed.data.available && listed.data.files.map((f) => f.path)).toEqual(
+      [alias]
+    );
+  });
+
+  test("a drive-letter entry on a POSIX host is invalid, not a path below the backend's folder", async () => {
+    if (process.platform === "win32") return;
+    // Only a hand edit of the store can add one. Read as a folder `C:` it would resolve against
+    // the backend's working folder.
+    const sessionDir = path.join(tempDir, "sessions", "ws");
+    await addPinnedPath(sessionDir, "C:/x.md");
+    const read = await readPinnedFile(context, { workspaceId: "ws", path: "C:/x.md" });
+    expect(read.success).toBe(false);
+    expect(read).not.toHaveProperty("missing");
+    const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+    expect(listed.success && listed.data.available && listed.data.files).toEqual([]);
+  });
+
+  test("refuses outside files that are missing, folders or symlinks", async () => {
+    const notes = path.join(tempDir, "notes");
+    await fs.mkdir(notes, { recursive: true });
+    await fs.symlink(path.join(checkout, "README.md"), path.join(notes, "link.md"));
+    for (const target of [path.join(notes, "missing.md"), notes, path.join(notes, "link.md")]) {
+      expect((await pinFile(context, { workspaceId: "ws", path: target })).success).toBe(false);
+    }
+    const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+    expect(listed.success && listed.data.available && listed.data.files).toEqual([]);
+  });
+
   test("a checkout root that is itself a symlink can pin and read files", async () => {
     const linked = path.join(tempDir, "linked-checkout");
     await fs.symlink(checkout, linked);
@@ -118,6 +294,7 @@ describe("pinned workspace files", () => {
     expect(await readPinnedFile(context, { workspaceId: "ws", path: "README.md" })).toEqual({
       success: false,
       error: "Artifact not found: README.md",
+      missing: true,
     });
   });
 
@@ -205,6 +382,13 @@ describe("pinned workspace files", () => {
         for (const call of read.mock.calls) {
           expect(call[3]).toMatchObject({ requireDescriptorPaths: true });
         }
+        // Tool paths outside the checkout name container files, not host files.
+        const outside = path.join(tempDir, "outside.md");
+        await fs.writeFile(outside, "x");
+        expect(await pinFile(context, { workspaceId: "ws", path: outside })).toEqual({
+          success: false,
+          error: PINNED_FILES_DEVCONTAINER_OUTSIDE_REASON,
+        });
       } finally {
         read.mockRestore();
       }

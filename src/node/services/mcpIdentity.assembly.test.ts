@@ -170,7 +170,6 @@ describe("MCP identity through real turn assembly", () => {
             canonicalProviderName: "anthropic",
             canonicalModelId: HAIKU_MODEL.slice(HAIKU_MODEL.indexOf(":") + 1),
             wireProviderName: "anthropic",
-            routedThroughGateway: false,
           } satisfies ResolveAndCreateModelResult)
         )
       );

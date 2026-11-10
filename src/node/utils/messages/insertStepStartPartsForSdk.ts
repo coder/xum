@@ -1,29 +1,12 @@
 import type { StepStartUIPart } from "ai";
 
 import type { MuxMessage } from "@/common/types/message";
+import { isTrustedStepStartList } from "@/common/utils/messages/stepStartPartIndices";
 
 /** A MuxMessage whose assistant parts may carry the SDK's request-only step boundaries. */
 export type MuxMessageWithStepStarts = Omit<MuxMessage, "parts"> & {
   parts: Array<MuxMessage["parts"][number] | StepStartUIPart>;
 };
-
-/**
- * Indices this helper can trust: safe integers in strictly ascending order that start at 0.
- * Every producer seeds the list with 0 (the first step), so a list without it is corrupted.
- */
-export function isTrustedStepStartList(indices: unknown): indices is number[] {
-  return (
-    Array.isArray(indices) &&
-    indices[0] === 0 &&
-    indices.every(
-      (index: unknown, position) =>
-        typeof index === "number" &&
-        Number.isSafeInteger(index) &&
-        index >= 0 &&
-        (position === 0 || index > (indices[position - 1] as number))
-    )
-  );
-}
 
 /**
  * Request-only: put a `step-start` part before every later step of an assistant row, at the

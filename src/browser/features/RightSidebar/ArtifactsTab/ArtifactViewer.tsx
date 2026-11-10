@@ -14,6 +14,7 @@ import { DiffArtifact } from "./DiffArtifact";
 import { ImageArtifact } from "./ImageArtifact";
 import { JsonArtifact } from "./JsonArtifact";
 import { MarkdownArtifact } from "./MarkdownArtifact";
+import type { ArtifactFrameInterruptKey } from "./artifactBridge";
 import { SandboxedArtifactFrame, type ArtifactFrameKey } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
 import type { ArtifactAnnotationPick } from "./artifactAnnotation";
@@ -128,9 +129,11 @@ export function ArtifactViewer(props: {
   artifactsDir?: string | null;
   /** Escape / Shift+F pressed inside a sandboxed HTML/SVG frame. */
   onFrameKey?: (key: ArtifactFrameKey) => void;
+  /** Set only for the main pane's status page: see SandboxedArtifactFrame's prop. */
+  mainPaneInterruptKey?: ArtifactFrameInterruptKey;
   /**
    * Resolve relative images/assets through the artifacts folder (default). Off for pinned
-   * checkout files, whose neighbours live in the checkout, not the artifacts folder.
+   * files, whose neighbours live outside the artifacts folder.
    */
   readRelativeAssets?: boolean;
   /** Host side of artifact interactions (M5b); absent where artifacts are read-only. */
@@ -140,7 +143,7 @@ export function ArtifactViewer(props: {
   /** Bumped by panel refreshes; renderers that read referenced files re-read them (canvas). */
   reloadToken?: number;
   /**
-   * Identifies the shown file version. Renderers keep view choices (the JSON mode) per key, so
+   * Identifies the shown file content. Renderers keep view choices (the JSON mode) per key, so
    * they survive remounts such as fullscreen or a sidebar tab switch.
    */
   viewKey?: string;
@@ -193,6 +196,7 @@ export function ArtifactViewer(props: {
           kind={result.kind}
           content={result.content}
           onFrameKey={props.onFrameKey}
+          mainPaneInterruptKey={props.mainPaneInterruptKey}
           interactions={props.interactions}
           onAnnotate={props.onFrameAnnotate}
         />

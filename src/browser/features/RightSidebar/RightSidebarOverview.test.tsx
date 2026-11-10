@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
@@ -18,10 +18,15 @@ import type { ArtifactEntry } from "@/common/orpc/schemas/artifacts";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
 import type { GoalSnapshot } from "@/common/types/goal";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
-import type { WorkspaceSidebarState, WorkspaceUsageState } from "@/browser/stores/WorkspaceStore";
+import type {
+  WorkspaceSidebarState,
+  WorkspaceState,
+  WorkspaceUsageState,
+} from "@/browser/stores/WorkspaceStore";
 import type { TabType } from "@/browser/types/rightSidebar";
 import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RealGitStatusStoreModule from "@/browser/stores/GitStatusStore";
+import * as RealHeartbeatModalModule from "@/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal";
 
 // The card subscribes to the workspace and git stores directly; stubbing those hooks keeps
 // these tests on the card's own gating and navigation.
@@ -31,6 +36,10 @@ let workspaceUsage: WorkspaceUsageState = { totalTokens: 0 };
 restoreModulesAfterSuite([
   ["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }],
   ["@/browser/stores/GitStatusStore", { ...RealGitStatusStoreModule }],
+  [
+    "@/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal",
+    { ...RealHeartbeatModalModule },
+  ],
 ]);
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...RealWorkspaceStoreModule,
@@ -41,9 +50,20 @@ void mock.module("@/browser/stores/GitStatusStore", () => ({
   ...RealGitStatusStoreModule,
   useGitStatus: () => gitStatus,
 }));
+// The real modal needs the heartbeat API; these tests only check which workspace's settings open.
+void mock.module("@/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal", () => ({
+  WorkspaceHeartbeatModal: (props: { workspaceId: string; open: boolean }) =>
+    props.open ? (
+      <div role="dialog" aria-label={`Heartbeat settings for ${props.workspaceId}`} />
+    ) : null,
+}));
 
 import { OVERVIEW_MAX_LIST_ROWS, RightSidebarOverview } from "./RightSidebarOverview";
-import { openMcpAppViewTab, type McpAppViewRef } from "./ArtifactsTab/mcpAppViewsStore";
+import {
+  getMcpAppViews,
+  openMcpAppViewTab,
+  type McpAppViewRef,
+} from "./ArtifactsTab/mcpAppViewsStore";
 import { appViewTabFor } from "./AppViewTab/appViewTabs";
 
 const WORKSPACE_ID = "ws-main";
@@ -96,11 +116,26 @@ function artifact(path: string, modifiedMs: number): ArtifactEntry {
   return { path, kind: "markdown", size: 10, modifiedMs };
 }
 
+/** An API whose Artifacts listing is empty: the Outputs section shows app views only. */
+function emptyArtifactsClient() {
+  return createTestApiClient({
+    artifacts: {
+      list: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { available: true as const, dir: "/a", entries: [], truncated: false },
+        }),
+    },
+  });
+}
+
 function renderOverview(
   workspaces: FrontendWorkspaceMetadata[],
   options: {
     canStartSideChat?: boolean;
     artifactsEnabled?: boolean;
+    /** Defaults to artifactsEnabled: most cases list files and app views together. */
+    mcpAppsEnabled?: boolean;
     unreadAssisted?: number;
     client?: APIClient;
     /** A workspace of its own, for app views: the session list of opened views has no reset. */
@@ -108,7 +143,6 @@ function renderOverview(
   } = {}
 ) {
   const opened: TabType[] = [];
-  let expanded = 0;
   let terminalOpens = 0;
   let newSideChats = 0;
   const value: WorkspaceMetadataContextValue = {
@@ -117,14 +151,11 @@ function renderOverview(
     loaded: true,
     loadError: null,
   };
-  const card = (
+  const cardFor = (flags: { artifactsEnabled?: boolean; mcpAppsEnabled?: boolean }) => (
     <WorkspaceContext.Provider value={value as WorkspaceContextValue}>
       <TooltipProvider>
         <RightSidebarOverview
           workspaceId={options.workspaceId ?? WORKSPACE_ID}
-          onExpand={() => {
-            expanded += 1;
-          }}
           onOpenTab={(tab) => opened.push(tab)}
           onOpenTerminals={() => {
             terminalOpens += 1;
@@ -137,19 +168,22 @@ function renderOverview(
                 }
           }
           creatingSideChat={false}
-          artifactsEnabled={options.artifactsEnabled ?? false}
+          artifactsEnabled={flags.artifactsEnabled ?? false}
+          mcpAppsEnabled={flags.mcpAppsEnabled ?? flags.artifactsEnabled ?? false}
           unreadAssisted={options.unreadAssisted ?? 0}
         />
       </TooltipProvider>
     </WorkspaceContext.Provider>
   );
-  const view = render(
-    options.client != null ? <APIProvider client={options.client}>{card}</APIProvider> : card
-  );
+  const wrap = (card: React.ReactElement) =>
+    options.client != null ? <APIProvider client={options.client}>{card}</APIProvider> : card;
+  const view = render(wrap(cardFor(options)));
   return {
     view,
+    /** Re-renders the same card with other experiment flags. */
+    rerender: (flags: { artifactsEnabled: boolean; mcpAppsEnabled: boolean }) =>
+      view.rerender(wrap(cardFor(flags))),
     opened,
-    expandCount: () => expanded,
     terminalOpenCount: () => terminalOpens,
     newSideChatCount: () => newSideChats,
   };
@@ -219,8 +253,17 @@ describe("RightSidebarOverview", () => {
 
   test("shows no stats before the session has usage", () => {
     const { view } = renderOverview([workspace({ id: WORKSPACE_ID })]);
-    expect(view.queryByRole("button", { name: /\$/ })).toBeNull();
-    expect(view.getByRole("button", { name: "Expand sidebar" })).toBeTruthy();
+    expect(view.queryByRole("button", { name: /\$|tokens/ })).toBeNull();
+    expect(view.getByRole("region", { name: "Side chats" })).toBeTruthy();
+  });
+
+  // globals.css hides a card whose content is empty, so a workspace with nothing to summarize
+  // shows no empty bordered box over the chat.
+  test("renders no content when the workspace has nothing to summarize", () => {
+    const { view } = renderOverview([workspace({ id: WORKSPACE_ID, kind: "scratch" })], {
+      canStartSideChat: false,
+    });
+    expect(view.container.firstElementChild?.childElementCount).toBe(0);
   });
 
   test("lists this workspace's side chats newest first, capped, and opens the picked one", () => {
@@ -235,7 +278,7 @@ describe("RightSidebarOverview", () => {
       title: "Someone else's side chat",
       sideChatParentWorkspaceId: "ws-other",
     });
-    const { view, opened, expandCount } = renderOverview([
+    const { view, opened } = renderOverview([
       workspace({ id: WORKSPACE_ID }),
       ...chats,
       otherParentChat,
@@ -260,7 +303,7 @@ describe("RightSidebarOverview", () => {
     // A hidden side chat may have no open tab, so "more" lists every chat in the card and hands
     // focus to the first one it revealed, instead of expanding the sidebar.
     fireEvent.click(rows[3]);
-    expect(expandCount()).toBe(0);
+    expect(opened).toEqual(["side:side-new"]);
     const revealed = section.getByRole("button", { name: "Oldest question" });
     expect(document.activeElement).toBe(revealed);
     expect(section.queryByRole("button", { name: /more$/ })).toBeNull();
@@ -460,9 +503,171 @@ describe("RightSidebarOverview", () => {
         "1 more",
       ])
     );
-    // An app view opens in its own app tab: the Artifacts tab lists only files.
+    // An app view opens in its own app tab (the Artifacts tab lists only files), through the
+    // card's onOpenTab, which moves focus into the opened tab.
     fireEvent.click(section.getByRole("button", { name: /Roll dice/ }));
     expect(opened).toEqual([appViewTabFor("call-new")]);
+  });
+
+  // #6760: each experiment gates its own rows.
+  test("lists files only with Artifacts on and app views only with MCP Apps on", async () => {
+    const client = createTestApiClient({
+      artifacts: {
+        list: () =>
+          Promise.resolve({
+            success: true as const,
+            data: {
+              available: true as const,
+              dir: "/a",
+              entries: [artifact("a.md", 1)],
+              truncated: false,
+            },
+          }),
+      },
+    });
+    const appsWorkspace = "ws-apps-gates";
+    openMcpAppViewTab(appsWorkspace, {
+      toolCallId: "call-gate",
+      serverName: "dice",
+      resourceUri: "ui://dice/roll",
+      toolName: "roll",
+      label: "Roll dice",
+      arguments: {},
+      cancelled: false,
+      failed: false,
+    });
+    const rows = async (artifactsEnabled: boolean, mcpAppsEnabled: boolean) => {
+      const { view } = renderOverview([workspace({ id: appsWorkspace })], {
+        artifactsEnabled,
+        mcpAppsEnabled,
+        client,
+        workspaceId: appsWorkspace,
+      });
+      const section = within(await view.findByRole("region", { name: "Outputs" }));
+      const labels = await waitFor(() => {
+        const found = section.getAllByRole("button").map((row) => row.textContent);
+        expect(found.length).toBeGreaterThan(0);
+        return found;
+      });
+      view.unmount();
+      return labels;
+    };
+    expect(await rows(true, false)).toEqual(["a.md"]);
+    expect(await rows(false, true)).toEqual(["Roll dice"]);
+  });
+
+  test("turning Artifacts back on never shows the files listed before it went off", async () => {
+    let entries = [artifact("old.md", 1)];
+    let release: (() => void) | null = null;
+    const client = createTestApiClient({
+      artifacts: {
+        list: () => {
+          const data = { available: true as const, dir: "/a", entries, truncated: false };
+          // The read after re-enabling stays pending, so only stale state could show a row.
+          if (entries.length === 0) {
+            return new Promise((resolve) => {
+              release = () => resolve({ success: true as const, data });
+            });
+          }
+          return Promise.resolve({ success: true as const, data });
+        },
+      },
+    });
+    const { view, rerender } = renderOverview([workspace({ id: WORKSPACE_ID })], {
+      artifactsEnabled: true,
+      mcpAppsEnabled: true,
+      client,
+    });
+    await view.findByRole("button", { name: /old\.md/ });
+    entries = [];
+    rerender({ artifactsEnabled: false, mcpAppsEnabled: true });
+    rerender({ artifactsEnabled: true, mcpAppsEnabled: true });
+    expect(view.queryByRole("button", { name: /old\.md/ })).toBeNull();
+    (release as (() => void) | null)?.();
+  });
+
+  // A view from the transcript only: after compaction drops its call, the tab still needs the
+  // ref, as when the tool card or the palette opened it.
+  test("an app row keeps its view's ref when it opens the view", async () => {
+    const appsWorkspace = "ws-apps-transcript";
+    const store = RealWorkspaceStoreModule.useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
+      (id) => id === appsWorkspace
+    );
+    const state = spyOn(store, "getWorkspaceState").mockImplementation(
+      () =>
+        ({
+          messages: [
+            {
+              type: "tool",
+              toolCallId: "call-transcript",
+              toolName: "dice_roll",
+              args: {},
+              status: "completed",
+              mcpServer: {
+                connection: { key: "dice", transport: "stdio" },
+                identity: { name: "dice", version: "1.0.0" },
+                source: "connection",
+                app: { resourceUri: "ui://dice/roll" },
+              },
+            },
+          ],
+          loading: false,
+          isHydratingTranscript: false,
+        }) as unknown as WorkspaceState
+    );
+    try {
+      const { view } = renderOverview([workspace({ id: appsWorkspace })], {
+        artifactsEnabled: true,
+        client: emptyArtifactsClient(),
+        workspaceId: appsWorkspace,
+      });
+      const section = within(await view.findByRole("region", { name: "Outputs" }));
+      expect(getMcpAppViews(appsWorkspace)).toEqual([]);
+      fireEvent.click(section.getByRole("button", { name: /dice_roll/ }));
+      expect(getMcpAppViews(appsWorkspace).map((v) => v.toolCallId)).toEqual(["call-transcript"]);
+    } finally {
+      registered.mockRestore();
+      state.mockRestore();
+    }
+  });
+
+  // The Artifacts tab lists only files, so More cannot lead there for hidden app views.
+  test("More lists the hidden app views in the card", async () => {
+    const appsWorkspace = "ws-apps-more";
+    const addView = (id: string) =>
+      openMcpAppViewTab(appsWorkspace, {
+        toolCallId: id,
+        serverName: "dice",
+        resourceUri: "ui://dice/roll",
+        toolName: "roll",
+        label: `Roll ${id}`,
+        arguments: {},
+        cancelled: false,
+        failed: false,
+      });
+    for (const id of ["v1", "v2", "v3", "v4"]) addView(id);
+    const { view, opened } = renderOverview([workspace({ id: appsWorkspace })], {
+      artifactsEnabled: true,
+      client: emptyArtifactsClient(),
+      workspaceId: appsWorkspace,
+    });
+    const section = within(await view.findByRole("region", { name: "Outputs" }));
+    const rows = () => section.getAllByRole("button").map((row) => row.textContent);
+    await waitFor(() => expect(rows()).toEqual(["Roll v4", "Roll v3", "Roll v2", "1 more"]));
+    fireEvent.click(section.getByRole("button", { name: "1 more" }));
+    expect(rows()).toEqual(["Roll v4", "Roll v3", "Roll v2", "Roll v1"]);
+    expect(opened).toEqual([]);
+    expect(document.activeElement?.textContent).toBe("Roll v1");
+
+    // A newer view arrives on top and shifts the rows: focus stays where the user moved it.
+    const composer = document.createElement("textarea");
+    document.body.appendChild(composer);
+    composer.focus();
+    act(() => addView("v5"));
+    await waitFor(() => expect(rows()[0]).toBe("Roll v5"));
+    expect(document.activeElement).toBe(composer);
+    composer.remove();
   });
 
   test("tells repeated MCP app calls apart and marks failed ones", async () => {
@@ -518,6 +723,126 @@ describe("RightSidebarOverview", () => {
     ]);
     const activity = view.getByRole("region", { name: "Activity" });
     expect(activity.textContent).toContain("Every 5m");
+  });
+
+  test("the heartbeat row opens this workspace's heartbeat settings", async () => {
+    const { view } = renderOverview([
+      workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: 300_000 } }),
+    ]);
+    fireEvent.click(view.getByRole("button", { name: /Heartbeat/ }));
+    await view.findByRole("dialog", { name: `Heartbeat settings for ${WORKSPACE_ID}` });
+  });
+
+  test("a sub-agent's heartbeat row opens nothing: heartbeats never fire there", () => {
+    const { view } = renderOverview([
+      workspace({
+        id: WORKSPACE_ID,
+        parentWorkspaceId: "ws-parent",
+        heartbeat: { enabled: true, intervalMs: 300_000 },
+      }),
+    ]);
+    const activity = view.getByRole("region", { name: "Activity" });
+    expect(activity.textContent).toContain("Every 5m");
+    expect(within(activity).queryByRole("button", { name: /Heartbeat/ })).toBeNull();
+  });
+
+  test("shows when the next heartbeat is due, with the cadence under it", async () => {
+    const dayMs = 24 * 60 * 60 * 1000;
+    const { view } = renderOverview(
+      [workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: dayMs } })],
+      {
+        client: createTestApiClient({
+          workspace: {
+            heartbeat: { next: () => Promise.resolve(3 * 60 * 60 * 1000) },
+          },
+        }),
+      }
+    );
+    const activity = view.getByRole("region", { name: "Activity" });
+    await waitFor(() => expect(activity.textContent).toContain("Next in 3h"));
+    expect(activity.textContent).toContain("Every 24h");
+  });
+
+  test("a passed deadline reads Due now, and a finished turn asks for the new one", async () => {
+    sidebarState = { canInterrupt: true };
+    // The API reports milliseconds until the slot: zero or less is due.
+    let dueInMs = -1000;
+    const nextCalls: string[] = [];
+    const { rerender, view } = renderOverview(
+      [workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: 300_000 } })],
+      {
+        client: createTestApiClient({
+          workspace: {
+            heartbeat: {
+              next: (input: { workspaceId: string }) => {
+                nextCalls.push(input.workspaceId);
+                return Promise.resolve(dueInMs);
+              },
+            },
+          },
+        }),
+      }
+    );
+    const activity = view.getByRole("region", { name: "Activity" });
+    await waitFor(() => expect(activity.textContent).toContain("Due now"));
+
+    // The heartbeat's turn ended, and the scheduler moved the deadline.
+    dueInMs = 4 * 60 * 1000 + 30_000;
+    sidebarState = { canInterrupt: false };
+    rerender({ artifactsEnabled: false, mcpAppsEnabled: false });
+    await waitFor(() => expect(activity.textContent).toContain("Next in 5m"));
+    expect(nextCalls).toEqual([WORKSPACE_ID, WORKSPACE_ID]);
+  });
+
+  test("each clock tick reads the deadline again, so it follows moves the renderer cannot see", async () => {
+    // Captures the countdown's timer so the test fires its ticks, with the clock moved along.
+    const realSetInterval = globalThis.setInterval;
+    const ticks: Array<() => void> = [];
+    const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((
+      handler: () => void,
+      ms?: number
+    ) => {
+      if (ms === 30_000) ticks.push(handler);
+      return realSetInterval(handler, ms);
+    }) as typeof setInterval);
+    const startMs = Date.now();
+    // The scheduler does not track the workspace yet (its first minute), then reports a
+    // deadline, then moves it (an idle trigger's reset on activity the card does not show).
+    const answers = [null, 10 * 60_000, 2 * 60 * 60_000];
+    let calls = 0;
+    // Moves this browser's clock to `atMs` (it stays there, so the read it starts is stamped with
+    // the same clock) and fires the countdown's tick.
+    const dateSpies: Array<{ mockRestore: () => void }> = [];
+    const tick = (atMs: number) => {
+      dateSpies.pop()?.mockRestore();
+      dateSpies.push(spyOn(Date, "now").mockReturnValue(atMs));
+      act(() => ticks.forEach((fire) => fire()));
+    };
+    try {
+      const { view } = renderOverview(
+        [workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: 300_000 } })],
+        {
+          client: createTestApiClient({
+            workspace: {
+              heartbeat: { next: () => Promise.resolve(answers[Math.min(calls++, 2)]) },
+            },
+          }),
+        }
+      );
+      const activity = view.getByRole("region", { name: "Activity" });
+      await waitFor(() => expect(calls).toBe(1));
+      expect(activity.textContent).not.toContain("Next in");
+
+      // The browser's clock runs an hour off the server's: durations keep the label right.
+      tick(startMs + 60 * 60_000);
+      await waitFor(() => expect(activity.textContent).toContain("Next in 10m"));
+      tick(startMs + 60 * 60_000 + 1000);
+      await waitFor(() => expect(activity.textContent).toContain("Next in 2h"));
+      expect(calls).toBe(3);
+    } finally {
+      dateSpies.pop()?.mockRestore();
+      setIntervalSpy.mockRestore();
+    }
   });
 
   test("a heartbeat without its own interval shows the default cadence", () => {
@@ -587,7 +912,7 @@ describe("RightSidebarOverview", () => {
       const callsBefore = listCalls;
       const off = renderOverview([workspace({ id: WORKSPACE_ID })], { client });
       await waitFor(() =>
-        expect(off.view.getByRole("button", { name: "Expand sidebar" })).toBeTruthy()
+        expect(off.view.getByRole("region", { name: "Side chats" })).toBeTruthy()
       );
       expect(off.view.queryByRole("region", { name: "Outputs" })).toBeNull();
       expect(listCalls).toBe(callsBefore);

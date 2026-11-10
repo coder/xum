@@ -60,8 +60,8 @@ Otherwise, tests that live in `src/` run under `bun test` (generally these are u
 
 - Never kill the running Xum process; rely on the following for local validation:
   - `make typecheck`
-  - `make static-check` (fast local lint/typecheck/fmt path)
-  - `make static-check-full` (adds docs link and bench-agent validation used in CI)
+  - `make static-check` (fast local lint/typecheck/fmt path; oxlint only, no type-aware lint rules)
+  - `make static-check-full` (adds type-aware ESLint on all files, docs link and bench-agent validation used in CI)
   - targeted test invocations (e.g. `bun x jest tests/ipc/sendMessage.test.ts -t "pattern"`)
 - Only wait on CI to pass when local, targeted checks pass.
 - Prefer surgical test invocations over running full suites.
@@ -79,7 +79,7 @@ Otherwise, tests that live in `src/` run under `bun test` (generally these are u
 - Ensure all UI changes are captured by at least one story.
   - Many changes will already be captured by an existing story.
 - Only use full-app stories (`App.*.stories.tsx`). Do not add isolated component stories, even for small UI changes (they are not used/accepted in this repo).
-- Use play functions with `@storybook/test` utilities (`within`, `userEvent`, `waitFor`) to interact with the UI and set up the desired visual state. Do not add props to production components solely for storybook convenience.
+- Use play functions with `storybook/test` utilities (`within`, `userEvent`, `waitFor`) to interact with the UI and set up the desired visual state. Do not add props to production components solely for storybook convenience.
 - Keep story data deterministic: avoid `Math.random()`, `Date.now()`, or other non-deterministic values in story setup. Pass explicit values when ordering or timing matters for visual stability.
 - Scroll stabilization: After async operations that change element sizes (Shiki highlighting, Mermaid rendering, tool expansion), wait for `useAutoScroll`'s ResizeObserver RAF to complete. Use double-RAF: `await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))`.
 

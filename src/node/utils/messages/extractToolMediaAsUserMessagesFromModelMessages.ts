@@ -1,5 +1,6 @@
 import type { FilePart, ImagePart, ModelMessage, TextPart, ToolResultPart } from "ai";
 import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
+import { isRasterAttachmentMediaType } from "@/node/utils/attachments/resizeRasterImageAttachment";
 import { sanitizeAnthropicDocumentFilename } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import {
   coalesceAttachmentPlaceholders,
@@ -31,71 +32,13 @@ type ToolResultOutput = ToolResultPart["output"];
  * holdsDeferredProviderToolCall).
  */
 export async function extractToolMediaAsUserMessagesFromModelMessages(
-  messages: ModelMessage[]
+  input: ModelMessage[]
 ): Promise<ModelMessage[]> {
-  // Pass 1 — extract once per tool-result part. The request-wide media cap
-  // needs the TOTAL before any emission so the NEWEST attachments survive,
-  // and the extraction walk must not run twice per part (see the MuxMessage
-  // variant in extractToolMediaAsUserMessages.ts).
-  const extractionsByPart = new Map<
-    object,
-    NonNullable<ReturnType<typeof extractAttachmentsFromToolOutput>>
-  >();
-  let totalAttachments = 0;
-  // Existing media parts share the same per-request provider limits as new
-  // extractions (r31), but they split into two pools:
-  // - reserved: genuine user uploads (unmarked) — consume the allowance and
-  //   are never evicted.
-  // - synthetic tool media (marker from a prior history-level extraction) —
-  //   evictable oldest-first so a fresh screenshot from the current tool call
-  //   still reaches the model at saturation (r34).
-  let reservedMediaParts = 0;
-  const syntheticMediaParts: unknown[] = [];
-  for (const message of messages) {
-    if (!Array.isArray(message.content)) continue;
-    for (const part of message.content) {
-      const partType = (part as { type?: unknown }).type;
-      if (partType === "image" || partType === "file") {
-        if (isSyntheticToolMediaPart(part)) {
-          syntheticMediaParts.push(part);
-        } else {
-          reservedMediaParts++;
-        }
-      }
-    }
-    if (message.role !== "assistant" && message.role !== "tool") continue;
-    for (const part of message.content) {
-      if (part.type !== "tool-result") continue;
-      // Media an earlier step already inlined into a tool result (deferred
-      // server tool, see holdsDeferredProviderToolCall) stays where it is, so
-      // it reserves its share of the request-wide cap.
-      if (part.output.type === "content") {
-        reservedMediaParts += part.output.value.filter(isSyntheticToolMediaPart).length;
-      }
-      const extracted = extractAttachmentsFromToolOutput(part.output as unknown);
-      if (extracted == null) continue;
-      extractionsByPart.set(part, extracted);
-      totalAttachments += extracted.attachments.length;
-    }
-  }
-  if (extractionsByPart.size === 0) return messages;
-
-  // Request-wide cap (r28 security): capture bounds bytes and per-container
-  // parts, not distinct records, so a looped bridged media tool could
-  // otherwise fan out tens of thousands of synthetic provider parts.
-  // Chronologically OLDEST tool media is dropped first: prior synthetic parts
-  // (all older — they were extracted from earlier turns' tool results) are
-  // evicted before new extractions are omitted behind bounded placeholders.
-  const budget = Math.max(0, MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - reservedMediaParts);
-  const overBudget = Math.max(0, syntheticMediaParts.length + totalAttachments - budget);
-  // syntheticMediaParts is collected in message order, so a prefix slice is
-  // the chronologically oldest set.
-  const evictedSyntheticParts = new Set(
-    syntheticMediaParts.slice(0, Math.min(overBudget, syntheticMediaParts.length))
-  );
-  const capState = {
-    omitRemaining: overBudget - evictedSyntheticParts.size,
-  };
+  const { messages, pools, evictedSyntheticParts, omittedByPart } =
+    await planWithInlineMedia(input);
+  const { extractionsByPart } = pools;
+  const nothingToRewrite = extractionsByPart.size === 0 && evictedSyntheticParts.size === 0;
+  if (nothingToRewrite) return messages;
 
   const result: ModelMessage[] = [];
 
@@ -131,7 +74,9 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
         }
         const extracted = extractionsByPart.get(part);
         if (extracted === undefined) {
-          return part;
+          const evicted = evictToolResultMedia(part, evictedSyntheticParts);
+          if (evicted !== part) changedMessage = true;
+          return evicted;
         }
 
         changedMessage = true;
@@ -140,8 +85,7 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
         // omitted, and their per-item output placeholders are coalesced so a
         // flooded transcript cannot keep megabytes of placeholder JSON in
         // every request (r29 security).
-        const omittedHere = Math.min(capState.omitRemaining, extracted.attachments.length);
-        capState.omitRemaining -= omittedHere;
+        const omittedHere = omittedByPart.get(part) ?? 0;
         omittedForMessage += omittedHere;
         const keptHere = extracted.attachments.slice(omittedHere);
         // Excess per-item placeholders (cap omission OR same-payload dedup —
@@ -252,6 +196,294 @@ async function createInlineMediaOutput(
     });
   }
   return { type: "content", value };
+}
+
+/**
+ * Rounds of inline-media preparation per request. Each round prepares only the inline images
+ * the cap keeps; an unreadable one becomes a text note and frees its slot, so the next round
+ * plans again and prepares the older image that now fits. The bound keeps a flood of corrupt
+ * images to a few cap-sized batches of header reads. Past it, an inline image the cap keeps
+ * but no round prepared is evicted instead: unprepared bytes (oversized or unreadable) would
+ * fail every later request, while losing it only costs context.
+ */
+const MAX_INLINE_MEDIA_PREPARE_ROUNDS = 3;
+
+/** Plans the cap and prepares the inline media it keeps (see MAX_INLINE_MEDIA_PREPARE_ROUNDS). */
+async function planWithInlineMedia(input: ModelMessage[]) {
+  let messages = input;
+  for (let round = 0; ; round++) {
+    const pools = collectToolMedia(messages);
+    const plan = planRequestMediaCap(pools);
+    if (round === MAX_INLINE_MEDIA_PREPARE_ROUNDS) {
+      const evicted = new Set(plan.evictedSyntheticParts);
+      for (const item of unpreparedInlineMedia(messages)) evicted.add(item);
+      return { messages, pools, ...plan, evictedSyntheticParts: evicted };
+    }
+    const prepared = await prepareInlineMediaForProvider(messages, plan.evictedSyntheticParts);
+    if (prepared === messages) return { messages, pools, ...plan };
+    messages = prepared;
+  }
+}
+
+/** Inline tool-result media that no preparation round has read (see preparedInlineMedia). */
+function unpreparedInlineMedia(messages: ModelMessage[]): object[] {
+  return messages.flatMap((message) =>
+    (message.role === "assistant" || message.role === "tool") && Array.isArray(message.content)
+      ? message.content.flatMap((part) =>
+          part.type === "tool-result" && part.output.type === "content"
+            ? part.output.value.filter(
+                (item) =>
+                  isInlineMediaItem(item) &&
+                  !isSyntheticToolMediaPart(item) &&
+                  !preparedInlineMedia.has(item)
+              )
+            : []
+        )
+      : []
+  );
+}
+
+/**
+ * Request-wide cap (r28 security): capture bounds bytes and per-container parts, not distinct
+ * records, so a looped bridged media tool could otherwise fan out tens of thousands of
+ * synthetic provider parts. Chronologically OLDEST tool media is dropped first, across both
+ * kinds: media already in the request (synthetic parts, MCP images inside tool results) is
+ * evicted, and new extractions are omitted behind bounded placeholders. One order for both
+ * keeps a rebuild (which extracts every step's media again) and an in-turn step (which sees
+ * earlier steps' media as synthetic parts) dropping the same items.
+ */
+function planRequestMediaCap(pools: ToolMediaPools) {
+  const budget = Math.max(0, MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - pools.reservedMediaParts);
+  const overBudget = Math.max(
+    0,
+    pools.syntheticMediaParts.length + pools.totalAttachments - budget
+  );
+  return planMediaCap(pools.order, overBudget);
+}
+
+/**
+ * Pass 1 of extractToolMediaAsUserMessagesFromModelMessages: the tool-result parts to extract
+ * and the media the request already carries, split into the cap's pools.
+ */
+function collectToolMedia(messages: ModelMessage[]) {
+  // Pass 1 — extract once per tool-result part. The request-wide media cap
+  // needs the TOTAL before any emission so the NEWEST attachments survive,
+  // and the extraction walk must not run twice per part.
+  const pools: ToolMediaPools = {
+    extractionsByPart: new Map(),
+    totalAttachments: 0,
+    reservedMediaParts: 0,
+    syntheticMediaParts: [],
+    order: [],
+  };
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) collectMessageMedia(part, pools);
+    if (message.role !== "assistant" && message.role !== "tool") continue;
+    for (const part of message.content) {
+      if (part.type === "tool-result") collectToolResultMedia(part, pools);
+    }
+  }
+  return pools;
+}
+
+/**
+ * Existing media parts share the same per-request provider limits as new
+ * extractions (r31), but they split into two pools:
+ * - reserved: genuine user uploads (unmarked) — consume the allowance and
+ *   are never evicted.
+ * - synthetic tool media (marker from a prior history-level extraction) —
+ *   evictable oldest-first so a fresh screenshot from the current tool call
+ *   still reaches the model at saturation (r34).
+ */
+interface ToolMediaPools {
+  extractionsByPart: Map<object, NonNullable<ReturnType<typeof extractAttachmentsFromToolOutput>>>;
+  totalAttachments: number;
+  reservedMediaParts: number;
+  syntheticMediaParts: unknown[];
+  /** Evictable media and extractions in message order, oldest first (see planMediaCap). */
+  order: Array<{ key: object; count: number; extraction: boolean }>;
+}
+
+/** Drops the oldest `overBudget` media items of `order`: evicts existing ones, omits extractions. */
+function planMediaCap(order: ToolMediaPools["order"], overBudget: number) {
+  const evictedSyntheticParts = new Set<unknown>();
+  const omittedByPart = new Map<object, number>();
+  let remaining = overBudget;
+  for (const entry of order) {
+    if (remaining === 0) break;
+    const dropped = Math.min(remaining, entry.count);
+    remaining -= dropped;
+    if (entry.extraction) omittedByPart.set(entry.key, dropped);
+    else evictedSyntheticParts.add(entry.key);
+  }
+  return { evictedSyntheticParts, omittedByPart };
+}
+
+function addEvictableMedia(pools: ToolMediaPools, parts: object[]): void {
+  pools.syntheticMediaParts.push(...parts);
+  for (const key of parts) pools.order.push({ key, count: 1, extraction: false });
+}
+
+function collectMessageMedia(part: unknown, pools: ToolMediaPools): void {
+  const partType = (part as { type?: unknown }).type;
+  if (partType !== "image" && partType !== "file") return;
+  if (isSyntheticToolMediaPart(part)) {
+    addEvictableMedia(pools, [part as object]);
+  } else {
+    pools.reservedMediaParts++;
+  }
+}
+
+function collectToolResultMedia(part: ToolResultPart, pools: ToolMediaPools): void {
+  const extracted = extractAttachmentsFromToolOutput(part.output as unknown);
+  if (extracted == null) {
+    // Media a tool result carries inline stays where it is: MCP images (mcpToModelOutput,
+    // unmarked) and media an earlier extraction inlined after a deferred server tool (marked,
+    // see holdsDeferredProviderToolCall). Both are evictable oldest-first like synthetic tool
+    // media, or a screenshot loop could pass the provider's limit, and a rebuild (which
+    // extracts that media again) and an in-turn step would drop different items.
+    addEvictableMedia(pools, inlineToolResultMedia(part.output));
+    return;
+  }
+  // This part is extracted again, which leaves its inline media in place: it reserves its share.
+  if (part.output.type === "content") {
+    pools.reservedMediaParts += part.output.value.filter(isSyntheticToolMediaPart).length;
+  }
+  pools.extractionsByPart.set(part, extracted);
+  pools.totalAttachments += extracted.attachments.length;
+  pools.order.push({ key: part, count: extracted.attachments.length, extraction: true });
+}
+
+/** Media items a tool result carries inline (see collectToolResultMedia). */
+function inlineToolResultMedia(output: ToolResultOutput): object[] {
+  if (output.type !== "content") return [];
+  return output.value.filter(isInlineMediaItem);
+}
+
+function isInlineMediaItem(item: ContentOutputItem): boolean {
+  const type = (item as { type?: unknown }).type;
+  return type === "file" || type === "file-data" || type === "image-data";
+}
+
+/** Replaces evicted inline media of one tool result with one cap note (same part if none). */
+function evictToolResultMedia(part: ToolResultPart, evicted: ReadonlySet<unknown>): ToolResultPart {
+  if (evicted.size === 0 || part.output.type !== "content") return part;
+  const value = part.output.value;
+  const kept = value.filter((item) => !evicted.has(item));
+  const evictedHere = value.length - kept.length;
+  if (evictedHere === 0) return part;
+  const note = { type: "text" as const, text: createOmittedToolAttachmentText(evictedHere) };
+  return { ...part, output: { type: "content", value: [...kept, note] } };
+}
+
+/**
+ * Prepared inline media by item (original or rewritten). StreamManager runs this transform before every step
+ * on the same growing message list, and the SDK keeps each step's tool-result items (and the
+ * earlier step transforms keep media item identity), so a screenshot loop reads each image
+ * header once instead of once per step. A rebuild creates new items: once per request.
+ */
+const preparedInlineMedia = new WeakMap<object, Promise<ContentOutputItem>>();
+
+/**
+ * Prepares the media tool results carry inline (see collectToolResultMedia) for the provider.
+ * MCP images skip extraction, so this is their only self-healing: oversized images are resized
+ * and unreadable ones become a text note, as the MuxMessage-level extraction once did on
+ * replay. The in-turn step and the rebuild both run it, so a provider-ready image keeps the
+ * same bytes in both. Returns the same array when nothing changes.
+ */
+async function prepareInlineMediaForProvider(
+  messages: ModelMessage[],
+  evicted: ReadonlySet<unknown>
+): Promise<ModelMessage[]> {
+  const result = await Promise.all(
+    messages.map((message) => prepareMessageInlineMedia(message, evicted))
+  );
+  return result.every((message, index) => message === messages[index]) ? messages : result;
+}
+
+async function prepareMessageInlineMedia(
+  message: ModelMessage,
+  evicted: ReadonlySet<unknown>
+): Promise<ModelMessage> {
+  if (message.role !== "assistant" && message.role !== "tool") return message;
+  if (!Array.isArray(message.content)) return message;
+  const content: unknown[] = await Promise.all(
+    message.content.map((part) =>
+      part.type === "tool-result"
+        ? prepareToolResultInlineMedia(part, evicted)
+        : Promise.resolve(part)
+    )
+  );
+  if (content.every((part, index) => part === message.content[index])) return message;
+  // The content arrays are structurally identical for both roles (see the main loop).
+  const rewritten: Record<string, unknown> = { ...message, content };
+  return rewritten as ModelMessage;
+}
+
+async function prepareToolResultInlineMedia(
+  part: ToolResultPart,
+  evicted: ReadonlySet<unknown>
+): Promise<ToolResultPart> {
+  if (part.output.type !== "content") return part;
+  const value = part.output.value;
+  // Evicted items never reach the provider: leave them for evictToolResultMedia, unread.
+  const prepared = await Promise.all(
+    value.map((item) => (evicted.has(item) ? Promise.resolve(item) : prepareInlineMediaItem(item)))
+  );
+  if (prepared.every((item, index) => item === value[index])) return part;
+  return { ...part, output: { type: "content", value: prepared } };
+}
+
+function prepareInlineMediaItem(item: ContentOutputItem): Promise<ContentOutputItem> {
+  if (!isInlineMediaItem(item)) return Promise.resolve(item);
+  let prepared = preparedInlineMedia.get(item);
+  if (prepared === undefined) {
+    prepared = prepareInlineRasterItem(item).then((result) => {
+      // The SDK can carry the transformed step messages into the next step, so a resized
+      // item comes back under its new identity: it is provider-ready too.
+      if (result !== item) preparedInlineMedia.set(result, Promise.resolve(result));
+      return result;
+    });
+    preparedInlineMedia.set(item, prepared);
+  }
+  return prepared;
+}
+
+/**
+ * Resizes an oversized inline raster (prepareExtractedToolAttachmentForProvider) or replaces
+ * unreadable bytes with its note. Returns the same item when it is provider-ready already.
+ */
+async function prepareInlineRasterItem(item: ContentOutputItem): Promise<ContentOutputItem> {
+  const raster = inlineRaster(item);
+  if (raster == null) return item;
+  const prepared = await prepareExtractedToolAttachmentForProvider(raster);
+  if (prepared.type === "text") return { type: "text", text: prepared.text };
+  const { data, mediaType } = prepared.attachment;
+  if (data === raster.data && mediaType === raster.mediaType) return item;
+  // Same item shape (see inlineRaster), new bytes.
+  const rewritten: Record<string, unknown> = {
+    ...item,
+    mediaType,
+    data: raster.nested ? { type: "data", data } : data,
+  };
+  return rewritten as ContentOutputItem;
+}
+
+/** The base64 raster an unmarked inline media item carries, or null for anything else. */
+function inlineRaster(
+  item: ContentOutputItem
+): { data: string; mediaType: string; nested: boolean } | null {
+  if (isSyntheticToolMediaPart(item)) return null;
+  const record = item as { mediaType?: unknown; data?: unknown };
+  if (typeof record.mediaType !== "string" || !isRasterAttachmentMediaType(record.mediaType)) {
+    return null;
+  }
+  // mcpToModelOutput emits `file` parts with `{ type: "data", data }`; older shapes hold the
+  // base64 string directly.
+  const nested = (record.data as { type?: unknown } | null)?.type === "data";
+  const data = nested ? (record.data as { data?: unknown }).data : record.data;
+  return typeof data === "string" ? { data, mediaType: record.mediaType, nested } : null;
 }
 
 /**

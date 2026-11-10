@@ -31,8 +31,8 @@ describe("sanitizeModelFallbackChain", () => {
   it("canonicalizes gateway-prefixed entries (and self-checks against the canonical form)", () => {
     expect(
       sanitizeModelFallbackChain(SOURCE, [
-        "mux-gateway:openai/gpt-5.5",
-        "mux-gateway:anthropic/claude-sonnet-4-5", // self via gateway prefix
+        "openrouter:openai/gpt-5.5",
+        "openrouter:anthropic/claude-sonnet-4-5", // self via gateway prefix
       ])
     ).toEqual([FALLBACK_A]);
   });
@@ -76,7 +76,7 @@ describe("resolveModelFallbackChain", () => {
     expect(
       resolveModelFallbackChain(
         { [SOURCE]: { models: [FALLBACK_A] } },
-        "mux-gateway:anthropic/claude-sonnet-4-5"
+        "openrouter:anthropic/claude-sonnet-4-5"
       )
     ).toEqual([FALLBACK_A]);
   });
@@ -163,7 +163,7 @@ describe("sanitizeModelFallbacks", () => {
   it("canonicalizes keys and preserves enabled/triggers", () => {
     expect(
       sanitizeModelFallbacks({
-        "mux-gateway:anthropic/claude-sonnet-4-5": {
+        "openrouter:anthropic/claude-sonnet-4-5": {
           enabled: true,
           triggers: ["model_refusal"],
           models: [FALLBACK_A],

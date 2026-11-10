@@ -30,62 +30,8 @@ import { SummaryCards } from "./SummaryCards";
 import { TimingChart } from "./TimingChart";
 import { TokensByModelChart } from "./TokensByModelChart";
 import { formatProjectDisplayName } from "./analyticsUtils";
+import { computeDateRange } from "./dateRange";
 import { buildTimeFilterPredicate } from "./sqlTimeFilter";
-import type { AnalyticsTimeRange } from "@/common/config/schemas/userPreferences";
-
-/** Build a calendar-date boundary for the selected timezone. */
-function getDateKeyInTimeZone(date: Date, timeZone: string): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(date);
-  const values = new Map(parts.map((part) => [part.type, part.value]));
-  const year = values.get("year");
-  const month = values.get("month");
-  const day = values.get("day");
-  if (year == null || month == null || day == null) {
-    throw new Error(`Unable to format date for timezone ${timeZone}`);
-  }
-
-  return `${year}-${month}-${day}`;
-}
-
-function dateFromDateKey(dateKey: string): Date {
-  const [year, month, day] = dateKey.split("-").map(Number);
-  return new Date(Date.UTC(year, month - 1, day));
-}
-
-function daysAgoInTimeZone(days: number, timeZone: string): Date {
-  const dateKey = getDateKeyInTimeZone(new Date(), timeZone);
-  const date = dateFromDateKey(dateKey);
-  date.setUTCDate(date.getUTCDate() - days);
-  return date;
-}
-
-function computeDateRange(
-  timeRange: AnalyticsTimeRange,
-  timeZone: string
-): {
-  from: Date | null;
-  to: Date | null;
-  granularity: "hour" | "day" | "week";
-} {
-  switch (timeRange) {
-    case "7d":
-      return { from: daysAgoInTimeZone(6, timeZone), to: null, granularity: "day" };
-    case "30d":
-      return { from: daysAgoInTimeZone(29, timeZone), to: null, granularity: "day" };
-    case "90d":
-      return { from: daysAgoInTimeZone(89, timeZone), to: null, granularity: "week" };
-    case "all":
-      return { from: null, to: null, granularity: "week" };
-    default:
-      // Self-heal: unknown persisted value → safe default.
-      return { from: daysAgoInTimeZone(29, timeZone), to: null, granularity: "day" };
-  }
-}
 
 function getBrowserTimeZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -113,7 +59,7 @@ export function AnalyticsDashboard(props: { focusReturn: ReturnType<typeof useMo
         aria-describedby={undefined}
         onOpenAutoFocus={props.focusReturn.onOpenAutoFocus}
         onCloseAutoFocus={props.focusReturn.onCloseAutoFocus}
-        className="max-md:ios-standalone:top-px max-md:ios-standalone:h-[calc(100%-1px)] top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:rounded-lg md:border"
+        className="max-md:ios-standalone:top-px max-md:ios-standalone:h-[calc(100%-1px)] top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] max-md:pr-(--safe-area-right) max-md:pl-[env(safe-area-inset-left)] md:top-[50%] md:left-[calc(50%_+_(env(safe-area-inset-left,0px)_-_var(--safe-area-right))/2)] md:h-[min(880px,88vh)] md:w-[min(1100px,calc((100vw_-_env(safe-area-inset-left,0px)_-_var(--safe-area-right))*0.92))] md:translate-x-[-50%] md:translate-y-[-50%] md:rounded-lg md:border"
       >
         {/* Mounted only while open, so closed analytics issues no queries. */}
         <AnalyticsDashboardContent />
@@ -125,7 +71,7 @@ export function AnalyticsDashboard(props: { focusReturn: ReturnType<typeof useMo
           // the compact Settings-style button. Placed by its center (translate classes) so the
           // touch 44px minimum cannot push it below the title at exactly 768px, where the md: size
           // and that minimum both apply.
-          className="absolute top-[calc(env(safe-area-inset-top)+1.5rem)] right-[1.625rem] h-11 w-11 translate-x-1/2 -translate-y-1/2 md:right-7 md:h-6 md:w-6"
+          className="absolute top-[calc(env(safe-area-inset-top)+1.5rem)] right-[calc(1.625rem+var(--safe-area-right))] h-11 w-11 translate-x-1/2 -translate-y-1/2 md:right-7 md:h-6 md:w-6"
           aria-label="Close analytics"
         >
           <X className="h-4 w-4" />
@@ -164,6 +110,7 @@ function AnalyticsDashboardContent() {
     from: spendDateRange.from,
     to: spendDateRange.to,
     timeZone,
+    filterTimeZone: spendDateRange.filterTimeZone,
   });
   const spendByProject = useAnalyticsSpendByProject({
     from: dateRange.from,
@@ -263,6 +210,7 @@ function AnalyticsDashboardContent() {
                 ["7d", "7D"],
                 ["30d", "30D"],
                 ["90d", "90D"],
+                ["month-utc", "This month (UTC)"],
                 ["all", "All"],
               ] as const
             ).map(([range, label]) => (

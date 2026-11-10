@@ -8,6 +8,11 @@ import type { AIService } from "@/node/services/aiService";
 import type { StreamDeltaEvent, StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
 import { buildMockStreamEventsFromReply } from "./mockAiStreamAdapter";
 import { createTestHistoryService } from "../testHistoryService";
+import { DisposableTempDir } from "@/node/services/tempDir";
+import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import * as path from "node:path";
+import * as tokenizerModule from "@/node/utils/main/tokenizer";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 
 function readWorkspaceId(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object") return undefined;
@@ -644,6 +649,36 @@ describe("MockAiStreamPlayer", () => {
     expect(extractText(assistantMessage)).toContain("Here are three programming languages");
   });
 
+  // #7204: each backend gets a new player; its first reply must not reuse an earlier backend's id.
+  test("a new player (a restarted backend) gives its reply a new message id", async () => {
+    const workspaceId = "workspace-restart-ids";
+    const replyWithNewPlayer = async (text: string) => {
+      const player = new MockAiStreamPlayer({
+        historyService,
+        aiService: new EventEmitter() as unknown as AIService,
+      });
+      const user = createMuxMessage(`user-${text}`, "user", `[mock:list-languages] ${text}`, {
+        timestamp: Date.now(),
+      });
+      const appended = await historyService.appendToHistory(workspaceId, user);
+      expect(appended.success).toBe(true);
+      const history = await historyService.getLastMessages(workspaceId, 10);
+      const played = await player.play(history.success ? history.data : [user], workspaceId);
+      if (!played.success || !played.data) throw new Error("expected a stream handle");
+      expect(await played.data.completion).toMatchObject({ status: "completed" });
+    };
+
+    await replyWithNewPlayer("first backend");
+    await replyWithNewPlayer("second backend");
+
+    const history = await historyService.getLastMessages(workspaceId, 10);
+    const assistantIds = (history.success ? history.data : [])
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.id);
+    expect(assistantIds).toHaveLength(2);
+    expect(new Set(assistantIds).size).toBe(2);
+  });
+
   test("keeps the streamed partial with its error details on stream error, like StreamManager", async () => {
     const aiServiceStub = new EventEmitter();
     aiServiceStub.on("error", () => undefined);
@@ -803,6 +838,43 @@ describe("MockAiStreamPlayer", () => {
       thinkingLevel: "high",
       muxMetadata,
     });
+  });
+
+  test("a canned todo_write writes its list only once its tool call completes", async () => {
+    using sessionsDir = new DisposableTempDir("mock-todo-write");
+    const emitter = new EventEmitter();
+    emitter.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: emitter as unknown as AIService,
+      sessionsDir: sessionsDir.path,
+    });
+    const workspaceId = "workspace-mock-todo-write";
+    const sessionDir = path.join(sessionsDir.path, workspaceId);
+    const user = (id: string, text: string) =>
+      createMuxMessage(id, "user", text, { timestamp: Date.now() });
+
+    // Aborted while its stream start is held: the todo_write never ran, so no list.
+    const abort = new AbortController();
+    const held = player.play(
+      [user("u-held", "[mock:wait-start] [mock:todo-nudge] held")],
+      workspaceId,
+      {
+        abortSignal: abort.signal,
+      }
+    );
+    abort.abort();
+    expect((await held).success).toBe(true);
+    expect(await readTodosForSessionDir(sessionDir, nodeSessionFiles)).toEqual([]);
+
+    // A finished stream leaves the list on disk before it ends (the turn-end nudge reads it).
+    const result = await player.play([user("u-done", "[mock:todo-nudge] go")], workspaceId);
+    if (!result.success || !result.data) throw new Error("expected a stream handle");
+    expect(await result.data.completion).toMatchObject({ status: "completed" });
+    expect(await readTodosForSessionDir(sessionDir, nodeSessionFiles)).toEqual([
+      { content: "Fixed the bug", status: "completed" },
+      { content: "Verify the fix", status: "pending" },
+    ]);
   });
 
   describe("a reply that holds its tool calls", () => {
@@ -1009,6 +1081,48 @@ describe("MockAiStreamPlayer", () => {
       }
     }
   );
+  test("keeps its delta pacing and partial writes while the tokenizer is still loading", async () => {
+    // Regression (#7065): each stream-delta raced the tokenizer against a 150 ms fallback, so
+    // while the tokenizer loaded (~2 s cold in the e2e app) every 25 ms delta held the event
+    // queue for 150 ms. The throttled partial write queued behind that backlog, and partial.json
+    // first appeared ~1.9 s into a mock stream that the row already showed as streaming.
+    const tokenizerLoad = Promise.withResolvers<never>();
+    const tokenizerSpy = spyOn(tokenizerModule, "getTokenizerForModel").mockImplementation(
+      () => tokenizerLoad.promise
+    );
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+    const workspaceId = "workspace-cold-tokenizer";
+    let deltaCount = 0;
+    aiServiceStub.on("stream-delta", () => {
+      deltaCount++;
+    });
+
+    const user = createMuxMessage("user-1", "user", "[mock:long-stream] keep streaming", {
+      timestamp: Date.now(),
+    });
+    try {
+      const playResult = await player.play([user], workspaceId);
+      expect(playResult.success).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      // The schedule has ~20 deltas due by now; a 150 ms wait per delta emits at most 4.
+      expect(deltaCount).toBeGreaterThanOrEqual(8);
+      await waitForCondition(
+        async () => (await historyService.readPartial(workspaceId)) !== null,
+        1000
+      );
+    } finally {
+      await player.stop(workspaceId);
+      // Later tests in this file must keep the real tokenizer.
+      tokenizerSpy.mockRestore();
+      tokenizerLoad.reject(new Error("test done"));
+    }
+  });
+
   test("dispatches text deltas in schedule order when a later timer fires before an earlier one", async () => {
     // Regression (tests/ui bottomLayoutShift under 4-worker load): each scheduled event has an
     // independent setTimeout, and when several are overdue the runtime may fire the later-delay

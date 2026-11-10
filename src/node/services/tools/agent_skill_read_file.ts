@@ -2,20 +2,31 @@ import { tool } from "ai";
 
 import type { AgentSkillReadFileToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
-import { SkillNameSchema } from "@/common/orpc/schemas";
-import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
+import {
+  readAgentSkill,
+  type ResolvedAgentSkill,
+} from "@/node/services/agentSkills/agentSkillsService";
+import { pluginSiblingNoteFor } from "@/node/services/agentSkills/pluginSiblingNote";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import { readPluginFileWithinRootCapped } from "@/node/services/agentPlugins/discovery";
-import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  resolveSkillStorageContext,
+  type SkillStorageContext,
+} from "@/node/services/agentSkills/skillStorageContext";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { readBuiltInSkillFile } from "@/node/services/agentSkills/builtInSkillDefinitions";
-import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
-import { RuntimeError } from "@/node/runtime/Runtime";
+import { RuntimeError, isRemoteRuntime, type Runtime } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
 import { resolveContainedSkillFilePath } from "./skillFileUtils";
-import { resolveContainedSkillFilePathOnRuntime } from "./runtimeSkillPathUtils";
+import {
+  resolveContainedSkillFilePathOnRuntime,
+  resolveSkillFilePathForRuntime,
+} from "./runtimeSkillPathUtils";
 
 function readContentWithFileReadLimits(input: {
   fullContent: string;
@@ -114,6 +125,84 @@ function numberPageLines(
 }
 
 /**
+ * Files of a plugin skill (playbooks, references) name sibling skills by bare
+ * name too, so they carry the plugin sibling note. It is a separate field so
+ * `content` line numbers stay exact.
+ */
+function withPluginSkillNote(
+  result: AgentSkillReadFileToolResult,
+  resolvedSkill: ResolvedAgentSkill,
+  availableSkills: readonly InvocableSkill[] | undefined
+): AgentSkillReadFileToolResult {
+  if (!result.success) return result;
+  const note = pluginSiblingNoteFor(resolvedSkill, availableSkills);
+  return note == null ? result : { ...result, pluginSkillNote: note };
+}
+
+/**
+ * Where `filePath` (relative to the skill directory) resolves under the
+ * containment agent_skill_read_file reads with. Throws when the path escapes
+ * the skill directory, also through a symlink.
+ */
+export async function resolveSkillFileTarget(
+  resolvedSkill: ResolvedAgentSkill,
+  skillRuntime: Runtime,
+  containment: SkillStorageContext["containment"],
+  filePath: string
+): Promise<string> {
+  const shouldUseRuntimeContainment =
+    isRemoteRuntime(skillRuntime) ||
+    (resolvedSkill.package.scope === "project" && containment.kind === "runtime");
+  const { resolvedPath } = shouldUseRuntimeContainment
+    ? await resolveContainedSkillFilePathOnRuntime(skillRuntime, resolvedSkill.skillDir, filePath)
+    : await resolveContainedSkillFilePath(resolvedSkill.skillDir, filePath);
+  return resolvedPath;
+}
+
+/**
+ * #6426: a remote plugin skill's file, read from its snapshot with the plugin-root rules and kept
+ * inside the skill folder. Null when the skill has no snapshot.
+ */
+async function readSnapshotSkillFile(
+  resolvedSkill: ResolvedAgentSkill,
+  skillRuntime: Runtime,
+  filePath: string,
+  page: { offset?: number | null; limit?: number | null }
+): Promise<AgentSkillReadFileToolResult | null> {
+  const snapshotFs = resolvedSkill.pluginFs;
+  const pluginRoot = resolvedSkill.pluginRoot;
+  if (snapshotFs == null || pluginRoot == null) return null;
+  try {
+    const { resolvedPath } = resolveSkillFilePathForRuntime(
+      skillRuntime,
+      resolvedSkill.skillDir,
+      filePath
+    );
+    const read = await snapshotFs.readFileCapped({
+      filePath: await snapshotFs.ensureContained(resolvedSkill.skillDir, resolvedPath),
+      pluginRoot,
+      maxBytes: MAX_FILE_SIZE,
+      label: `plugin skill file '${filePath}'`,
+    });
+    return readContentWithFileReadLimits({
+      fullContent: read.content,
+      fileSize: read.byteSize,
+      modifiedTime: read.modifiedTime.toISOString(),
+      offset: page.offset,
+      limit: page.limit,
+    });
+  } catch (error) {
+    const message = getErrorMessage(error);
+    return {
+      success: false,
+      error: /escape|outside/i.test(message)
+        ? `Resolved file path points outside the skill directory: ${filePath}`
+        : message,
+    };
+  }
+}
+
+/**
  * Agent Skill read_file tool factory.
  * Reads a file within a skill directory with file_read's paging and page caps,
  * but without its per-line cut (see readContentWithFileReadLimits).
@@ -135,17 +224,18 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
       const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
       const skillCtx = resolveSkillStorageContext({
         runtime: config.runtime,
+        runtimeFactory: toolRuntimeFactory(config),
         workspacePath,
         xumScope: config.xumScope ?? null,
         includeClaudeSkills,
       });
 
       // Defensive: validate again even though inputSchema should guarantee shape.
-      const parsedName = SkillNameSchema.safeParse(name);
-      if (!parsedName.success) {
+      const lookup = parseSkillLookupName(name);
+      if (lookup == null) {
         return {
           success: false,
-          error: parsedName.error.message,
+          error: `Invalid skill name: ${name}`,
         };
       }
 
@@ -157,20 +247,17 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           };
         }
 
-        const resolvedSkill = await readAgentSkill(
-          skillCtx.runtime,
-          skillCtx.workspacePath,
-          parsedName.data,
-          {
-            roots: skillCtx.roots,
-            containment: skillCtx.containment,
-            includeClaudeSkills,
-          }
-        );
+        const resolvedSkill = await readAgentSkill(skillCtx.runtime, skillCtx.workspacePath, name, {
+          roots: skillCtx.roots,
+          containment: skillCtx.containment,
+          runtimeFactory: toolRuntimeFactory(config),
+          includeClaudeSkills,
+        });
 
         // Built-in skills are embedded in the app bundle (no filesystem access).
         if (resolvedSkill.package.scope === "built-in") {
-          const builtIn = readBuiltInSkillFile(parsedName.data, filePath);
+          assert(lookup.pluginName == null, "qualified skill lookups never resolve to built-ins");
+          const builtIn = readBuiltInSkillFile(lookup.skillName, filePath);
           return readContentWithFileReadLimits({
             fullContent: builtIn.content,
             fileSize: Buffer.byteLength(builtIn.content, "utf-8"),
@@ -187,24 +274,23 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           );
         }
 
-        const shouldUseRuntimeContainment =
-          skillRuntime instanceof RemoteRuntime ||
-          (resolvedSkill.package.scope === "project" && skillCtx.containment.kind === "runtime");
+        // #6426: a remote plugin skill reads from its cached snapshot (no remote round trip).
+        const snapshotRead = await readSnapshotSkillFile(resolvedSkill, skillRuntime, filePath, {
+          offset,
+          limit,
+        });
+        if (snapshotRead != null) {
+          return withPluginSkillNote(snapshotRead, resolvedSkill, config.availableSkills);
+        }
 
         let targetPath: string;
         try {
-          if (shouldUseRuntimeContainment) {
-            ({ resolvedPath: targetPath } = await resolveContainedSkillFilePathOnRuntime(
-              skillRuntime,
-              resolvedSkill.skillDir,
-              filePath
-            ));
-          } else {
-            ({ resolvedPath: targetPath } = await resolveContainedSkillFilePath(
-              resolvedSkill.skillDir,
-              filePath
-            ));
-          }
+          targetPath = await resolveSkillFileTarget(
+            resolvedSkill,
+            skillRuntime,
+            skillCtx.containment,
+            filePath
+          );
         } catch (error) {
           const message = getErrorMessage(error);
 
@@ -212,13 +298,6 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
             return {
               success: false,
               error: `Resolved file path points outside the skill directory: ${filePath}`,
-            };
-          }
-
-          if (/symbolic link/i.test(message)) {
-            return {
-              success: false,
-              error: message,
             };
           }
 
@@ -296,13 +375,17 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           throw err;
         }
 
-        return readContentWithFileReadLimits({
-          fullContent,
-          fileSize: resultFileSize,
-          modifiedTime: resultModifiedTime,
-          offset,
-          limit,
-        });
+        return withPluginSkillNote(
+          readContentWithFileReadLimits({
+            fullContent,
+            fileSize: resultFileSize,
+            modifiedTime: resultModifiedTime,
+            offset,
+            limit,
+          }),
+          resolvedSkill,
+          config.availableSkills
+        );
       } catch (error) {
         return {
           success: false,

@@ -4,7 +4,7 @@ import * as path from "node:path";
 
 import { describe, it, expect, spyOn } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
@@ -14,7 +14,14 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { createAgentSkillReadTool } from "./agent_skill_read";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
+import type { ToolConfiguration } from "@/common/utils/tools/tools";
+import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import { extractLoadedSkillSnapshotsFromMessages } from "@/node/services/agentSkills/loadedSkillSnapshots";
+import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { createTestToolConfig, TestTempDir, TrueRemotePathMappedRuntime } from "./testHelpers";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -261,6 +268,45 @@ describe("agent_skill_read", () => {
     }
   });
 
+  // #6426: an untrusted project's plugin skill must not load by name either.
+  it.each([false, true])(
+    "reads a project plugin skill only in a trusted project (trusted: %s)",
+    async (projectPluginsTrusted) => {
+      using tempDir = new TestTempDir("test-agent-skill-read-plugin-trust");
+      const pluginDir = path.join(tempDir.path, ".xum", "plugins", "repo-plugin");
+      await fs.mkdir(path.join(pluginDir, "skills", "repo-skill"), { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: "repo-plugin",
+        })
+      );
+      await fs.writeFile(
+        path.join(pluginDir, "skills", "repo-skill", "SKILL.md"),
+        "---\nname: repo-skill\ndescription: from a project plugin\n---\nPlugin body\n"
+      );
+      const tool = createAgentSkillReadTool(
+        createTestToolConfig(tempDir.path, {
+          workspaceId: "regular-workspace",
+          xumScope: {
+            type: "project",
+            xumHome: path.join(tempDir.path, "home"),
+            projectRoot: tempDir.path,
+            projectStorageAuthority: "host-local",
+            projectPluginsTrusted,
+          },
+        })
+      );
+
+      const parsed = AgentSkillReadToolResultSchema.safeParse(
+        await Promise.resolve(tool.execute!({ name: "repo-skill" }, mockToolCallOptions))
+      );
+      if (!parsed.success) throw new Error(parsed.error.message);
+      expect(parsed.data.success).toBe(projectPluginsTrusted);
+    }
+  );
+
   it("rejects project skill when skill directory symlink escapes project root", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-project-escape");
 
@@ -396,7 +442,7 @@ describe("agent_skill_read", () => {
     }
   });
 
-  function skillIndexLines(availableSkills: AgentSkillDescriptor[]): string[] {
+  function skillIndexLines(availableSkills: InvocableSkill[]): string[] {
     using tempDir = new TestTempDir("test-agent-skill-read-index");
     const tool = createAgentSkillReadTool({
       ...createTestToolConfig(tempDir.path),
@@ -430,6 +476,39 @@ describe("agent_skill_read", () => {
     expect(withoutLine).not.toContain("When to use:");
   });
 
+  it("leaves path-scoped skills out of the index but still reads them by name", async () => {
+    const lines = skillIndexLines([
+      { name: "ts-rules", description: "TS rules", scope: "project", paths: ["**/*.ts"] },
+      { name: "general", description: "General", scope: "project" },
+    ]);
+    expect(lines.some((line) => line.startsWith("- general:"))).toBe(true);
+    expect(lines.some((line) => line.includes("ts-rules"))).toBe(false);
+
+    using tempDir = new TestTempDir("test-agent-skill-read-path-scoped");
+    const skillDir = path.join(tempDir.path, ".mux", "skills", "ts-rules");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      '---\nname: ts-rules\ndescription: TS rules\npaths: ["**/*.ts"]\n---\nBody\n',
+      "utf-8"
+    );
+    const tool = createAgentSkillReadTool(
+      createTestToolConfig(tempDir.path, {
+        workspaceId: "regular-workspace",
+        xumScope: {
+          type: "project",
+          xumHome: tempDir.path,
+          projectRoot: tempDir.path,
+          projectStorageAuthority: "host-local",
+        },
+      })
+    );
+    const parsed = AgentSkillReadToolResultSchema.parse(
+      await Promise.resolve(tool.execute!({ name: "ts-rules" }, mockToolCallOptions))
+    );
+    expect(parsed.success).toBe(true);
+  });
+
   it("keeps each index description on one line within the length cap", () => {
     const lines = skillIndexLines([
       {
@@ -451,6 +530,149 @@ describe("agent_skill_read", () => {
     expect(long?.endsWith("…")).toBe(true);
     expect(descriptionOf("short")).toBe("Short description");
     expect(descriptionOf("multi-line")).toBe("First line second line");
+  });
+
+  // The index lists whatever availableSkills holds; buildStreamSystemContext owns adding
+  // `pstack:tdd` to it (turnContextAssembler.test.ts). This test owns the read itself.
+  it("reads a shadowed plugin skill by <plugin>:<skill>", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-read-plugin-namespace");
+    await writeGlobalSkill(tempDir.path, "tdd", { description: "global tdd", body: "GLOBAL" });
+    const pluginDir = path.join(tempDir.path, "plugins", "pstack");
+    await fs.mkdir(pluginDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+    await writeGlobalSkill(pluginDir, "tdd", { description: "pstack tdd", body: "PSTACK" });
+
+    const tool = createAgentSkillReadTool(createTestToolConfig(tempDir.path));
+
+    const bodyOf = async (name: string) => {
+      const parsed = AgentSkillReadToolResultSchema.parse(
+        await Promise.resolve(tool.execute!({ name }, mockToolCallOptions))
+      );
+      return parsed.success ? parsed.skill.body.trim() : parsed.error;
+    };
+    expect(await bodyOf("tdd")).toBe("GLOBAL");
+    expect(await bodyOf("pstack:tdd")).toBe("PSTACK");
+  });
+
+  describe("plugin sibling note", () => {
+    async function writePlugin(
+      xumHome: string,
+      pluginName: string,
+      skills: Record<string, string>
+    ): Promise<void> {
+      const pluginDir = path.join(xumHome, "plugins", pluginName);
+      await fs.mkdir(pluginDir, { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: pluginName,
+        })
+      );
+      for (const [name, body] of Object.entries(skills)) {
+        await writeGlobalSkill(pluginDir, name, { body });
+      }
+    }
+
+    // Production passes the turn's invocable list (turnContextAssembler); build it
+    // the same way from the same roots.
+    async function readBody(config: ToolConfiguration, name: string): Promise<string> {
+      const ctx = resolveSkillStorageContext({
+        runtime: config.runtime,
+        workspacePath: config.cwd,
+        xumScope: config.xumScope,
+        runtimeFactory,
+      });
+      const discovery = await discoverAgentSkills(ctx.runtime, ctx.workspacePath, {
+        roots: ctx.roots,
+        containment: ctx.containment,
+        runtimeFactory,
+      });
+      const tool = createAgentSkillReadTool({
+        ...config,
+        availableSkills: listInvocableSkills(discovery),
+      });
+      const parsed = AgentSkillReadToolResultSchema.parse(
+        await Promise.resolve(tool.execute!({ name }, mockToolCallOptions))
+      );
+      if (!parsed.success) throw new Error(parsed.error);
+      // trimEnd only: a stray leading separator would change the body.
+      return parsed.skill.body.trimEnd();
+    }
+
+    it("maps shadowed siblings to qualified names on plugin skills only", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-plugin-sibling-note");
+      await writeGlobalSkill(tempDir.path, "tdd", { body: "GLOBAL TDD" });
+      await writeGlobalSkill(tempDir.path, "how", { body: "GLOBAL HOW" });
+      await writePlugin(tempDir.path, "pstack", {
+        tdd: "PSTACK TDD",
+        how: "PSTACK HOW",
+        "poteto-mode": "POTETO",
+      });
+      const config = createTestToolConfig(tempDir.path);
+
+      const poteto = await readBody(config, "poteto-mode");
+      expect(poteto).toContain("`pstack:tdd`");
+      expect(poteto).toContain("`pstack:how`");
+      expect(poteto.endsWith("\n\nPOTETO")).toBe(true);
+
+      // Bare lookups keep their precedence, and non-plugin skills get no note.
+      expect(await readBody(config, "tdd")).toBe("GLOBAL TDD");
+
+      // A plugin skill never maps itself.
+      const pstackTdd = await readBody(config, "pstack:tdd");
+      expect(pstackTdd).toContain("`pstack:how`");
+      expect(pstackTdd).not.toContain("`pstack:tdd`");
+      expect(pstackTdd.endsWith("\n\nPSTACK TDD")).toBe(true);
+    });
+
+    it("lists only the reading plugin's siblings", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-plugin-sibling-two-plugins");
+      await writeGlobalSkill(tempDir.path, "tdd", { body: "GLOBAL TDD" });
+      await writeGlobalSkill(tempDir.path, "review", { body: "GLOBAL REVIEW" });
+      await writePlugin(tempDir.path, "alpha", { tdd: "ALPHA TDD", "alpha-main": "ALPHA" });
+      // beta's shadowed `review` (and `tdd`) are no siblings of alpha's skills.
+      await writePlugin(tempDir.path, "beta", { tdd: "BETA TDD", review: "BETA REVIEW" });
+
+      const alpha = await readBody(createTestToolConfig(tempDir.path), "alpha-main");
+      const mappedTargets = [...alpha.matchAll(/`[^`]+` -> `([^`]+)`/g)].map((m) => m[1]);
+      expect(mappedTargets).toEqual(["alpha:tdd"]);
+    });
+
+    it("keeps a project plugin's note apart from a same-named global plugin", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-plugin-sibling-same-name");
+      const xumHome = path.join(tempDir.path, "home");
+      const projectRoot = path.join(tempDir.path, "project");
+      await writeGlobalSkill(xumHome, "tdd", { body: "GLOBAL TDD" });
+      // Only the global install ships `tdd`; `pstack:tdd` is not the project plugin's skill.
+      await writePlugin(xumHome, "pstack", { tdd: "GLOBAL PSTACK TDD" });
+      await writePlugin(path.join(projectRoot, ".xum"), "pstack", { main: "PROJECT MAIN" });
+      const config = createTestToolConfig(projectRoot, {
+        xumScope: {
+          type: "project",
+          xumHome,
+          projectRoot,
+          projectStorageAuthority: "host-local",
+          projectPluginsTrusted: true,
+        },
+      });
+
+      expect(await readBody(config, "pstack:main")).toBe("PROJECT MAIN");
+    });
+
+    it("leaves the body unchanged when no sibling is shadowed", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-plugin-sibling-none");
+      await writeGlobalSkill(tempDir.path, "unrelated", { body: "GLOBAL" });
+      await writePlugin(tempDir.path, "solo", { "solo-main": "SOLO", helper: "HELPER" });
+
+      expect(await readBody(createTestToolConfig(tempDir.path), "solo-main")).toBe("SOLO");
+    });
   });
 
   it("does not split a surrogate pair at the length cap", () => {
@@ -495,6 +717,28 @@ describe("agent_skill_read skill directory", () => {
     return parsed;
   }
 
+  /** The snapshot body Xum re-injects after compaction for this agent_skill_read result. */
+  function reinjectedBody(name: string, output: Awaited<ReturnType<typeof readSkill>>): string {
+    const [snapshot] = extractLoadedSkillSnapshotsFromMessages([
+      {
+        id: `read-${name}`,
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: `call-${name}`,
+            toolName: "agent_skill_read",
+            state: "output-available",
+            input: { name },
+            output,
+          },
+        ],
+      },
+    ]);
+    if (snapshot == null) throw new Error(`no snapshot for ${name}`);
+    return snapshot.body;
+  }
+
   /** Run the body's `sh ...` line the way the model would: through bash in the workspace. */
   async function runBodyCommand(runtime: Runtime, cwd: string, body: string): Promise<string> {
     const command = body.split("\n").find((line) => line.startsWith("sh "));
@@ -536,6 +780,7 @@ describe("agent_skill_read skill directory", () => {
           xumHome,
           projectRoot,
           projectStorageAuthority: "host-local",
+          projectPluginsTrusted: true,
         },
       });
 
@@ -549,6 +794,10 @@ describe("agent_skill_read skill directory", () => {
           expect(result.skillDirUnavailable).toBeUndefined();
           expect(result.pluginRoot).toBe(name === "plugin-skill" ? pluginRoot : undefined);
           expect(await runBodyCommand(runtime, projectRoot, result.skill.body)).toBe(`ran-${name}`);
+          // After compaction the re-injected copy still names the directory (#6704).
+          const firstLine = reinjectedBody(name, result).split("\n")[0];
+          expect(firstLine).toContain(`\`${dir}\``);
+          if (name === "plugin-skill") expect(firstLine).toContain(`\`${pluginRoot}\``);
         }
       } finally {
         homedirSpy.mockRestore();
@@ -584,6 +833,7 @@ describe("agent_skill_read skill directory", () => {
           xumHome: hostXumHome,
           projectRoot: "/remote/workspace",
           projectStorageAuthority: "runtime",
+          projectPluginsTrusted: true,
         },
       }),
       cwd: "/remote/workspace",
@@ -600,6 +850,11 @@ describe("agent_skill_read skill directory", () => {
       expect(result.pluginRoot).toBeUndefined();
       expect(result.skillDirUnavailable).toContain("agent_skill_read_file");
       expect(result.skill.body).toContain("sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh");
+      // After compaction the re-injected copy keeps the off-host note before the
+      // unexpanded placeholder (#6704).
+      const lines = reinjectedBody("host-plugin-skill", result).split("\n");
+      expect(lines[0]).toBe(result.skillDirUnavailable!);
+      expect(lines.indexOf("sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh")).toBeGreaterThan(0);
     } finally {
       if (previousRoot === undefined) delete process.env.XUM_ROOT;
       else process.env.XUM_ROOT = previousRoot;
@@ -631,6 +886,7 @@ describe("agent_skill_read skill directory", () => {
         xumHome: path.join(projectRoot, "xum-home"),
         projectRoot,
         projectStorageAuthority: "host-local",
+        projectPluginsTrusted: true,
       },
     });
 

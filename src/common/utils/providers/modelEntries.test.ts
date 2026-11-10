@@ -218,7 +218,7 @@ describe("normalizeUsageModelKey", () => {
   });
 
   test("canonicalizes non-Coder gateway strings like normalizeToCanonical", () => {
-    expect(normalizeUsageModelKey("mux-gateway:anthropic/claude-opus-4-5")).toBe(
+    expect(normalizeUsageModelKey("openrouter:anthropic/claude-opus-4-5")).toBe(
       "anthropic:claude-opus-4-5"
     );
     expect(normalizeUsageModelKey("anthropic:claude-opus-4-5")).toBe("anthropic:claude-opus-4-5");

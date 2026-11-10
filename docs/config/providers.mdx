@@ -16,21 +16,22 @@ Most providers only need an API key. The UI handles validation and shows which p
 
 ## Supported Providers
 
-| Provider           | Models                      | Get API Key                                             |
-| ------------------ | --------------------------- | ------------------------------------------------------- |
-| **Anthropic**      | Claude Opus, Sonnet, Haiku  | [console.anthropic.com](https://console.anthropic.com/) |
-| **OpenAI**         | GPT-6                       | [platform.openai.com](https://platform.openai.com/)     |
-| **Google**         | Gemini Pro, Flash           | [aistudio.google.com](https://aistudio.google.com/)     |
-| **xAI**            | Grok                        | [console.x.ai](https://console.x.ai/)                   |
-| **Meta**           | Muse Wonder                 | [dev.meta.ai](https://dev.meta.ai/docs)                 |
-| **DeepSeek**       | DeepSeek Chat, Reasoner     | [platform.deepseek.com](https://platform.deepseek.com/) |
-| **Moonshot AI**    | Kimi K3                     | [platform.moonshot.ai](https://platform.moonshot.ai/)   |
-| **Z.ai**           | GLM 5.3 Flash               | [z.ai](https://z.ai/model-api)                          |
-| **OpenRouter**     | 300+ models                 | [openrouter.ai](https://openrouter.ai/)                 |
-| **Ollama**         | Local models                | [ollama.com](https://ollama.com/) (no key needed)       |
-| **Bedrock**        | Claude via AWS              | AWS Console                                             |
-| **GitHub Copilot** | GPT-4o, Claude Sonnet, etc. | [GitHub Copilot](https://github.com/features/copilot)   |
-| **Coder**          | Models via AI Gateway       | Your Coder deployment (Login with Coder, no key needed) |
+| Provider             | Models                      | Get API Key                                             |
+| -------------------- | --------------------------- | ------------------------------------------------------- |
+| **Anthropic**        | Claude Opus, Sonnet, Haiku  | [console.anthropic.com](https://console.anthropic.com/) |
+| **OpenAI**           | GPT-6                       | [platform.openai.com](https://platform.openai.com/)     |
+| **Google**           | Gemini Pro, Flash           | [aistudio.google.com](https://aistudio.google.com/)     |
+| **Google Vertex AI** | Gemini via Google Cloud     | Google Cloud Console (or gcloud credentials)            |
+| **xAI**              | Grok                        | [console.x.ai](https://console.x.ai/)                   |
+| **Meta**             | Muse Wonder                 | [dev.meta.ai](https://dev.meta.ai/docs)                 |
+| **DeepSeek**         | DeepSeek Chat, Reasoner     | [platform.deepseek.com](https://platform.deepseek.com/) |
+| **Moonshot AI**      | Kimi K3                     | [platform.moonshot.ai](https://platform.moonshot.ai/)   |
+| **Z.ai**             | GLM 5.3 Flash               | [z.ai](https://z.ai/model-api)                          |
+| **OpenRouter**       | 300+ models                 | [openrouter.ai](https://openrouter.ai/)                 |
+| **Ollama**           | Local models                | [ollama.com](https://ollama.com/) (no key needed)       |
+| **Bedrock**          | Claude via AWS              | AWS Console                                             |
+| **GitHub Copilot**   | GPT-4o, Claude Sonnet, etc. | [GitHub Copilot](https://github.com/features/copilot)   |
+| **Coder**            | Models via AI Gateway       | Your Coder deployment (Login with Coder, no key needed) |
 
 For catalog suggestions and manual model IDs, see [Add custom models](/config/models#add-custom-models).
 
@@ -40,34 +41,36 @@ Providers also read from environment variables as fallback:
 
 {/* BEGIN PROVIDER_ENV_VARS */}
 
-| Provider       | Environment Variable                               |
-| -------------- | -------------------------------------------------- |
-| Anthropic      | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`      |
-| OpenAI         | `OPENAI_API_KEY`                                   |
-| Google         | `GOOGLE_GENERATIVE_AI_API_KEY` or `GOOGLE_API_KEY` |
-| xAI            | `XAI_API_KEY`                                      |
-| OpenRouter     | `OPENROUTER_API_KEY`                               |
-| meta           | `META_MODEL_API_KEY` or `MODEL_API_KEY`            |
-| DeepSeek       | `DEEPSEEK_API_KEY`                                 |
-| Moonshot AI    | `MOONSHOT_API_KEY`                                 |
-| Z.ai           | `ZAI_API_KEY`                                      |
-| github-copilot | `GITHUB_COPILOT_TOKEN`                             |
-| Bedrock        | `AWS_REGION` (credentials via AWS SDK chain)       |
+| Provider         | Environment Variable                                                    |
+| ---------------- | ----------------------------------------------------------------------- |
+| Anthropic        | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`                           |
+| OpenAI           | `OPENAI_API_KEY`                                                        |
+| Google           | `GOOGLE_GENERATIVE_AI_API_KEY` or `GOOGLE_API_KEY`                      |
+| xAI              | `XAI_API_KEY`                                                           |
+| OpenRouter       | `OPENROUTER_API_KEY`                                                    |
+| meta             | `META_MODEL_API_KEY` or `MODEL_API_KEY`                                 |
+| DeepSeek         | `DEEPSEEK_API_KEY`                                                      |
+| Moonshot AI      | `MOONSHOT_API_KEY`                                                      |
+| Z.ai             | `ZAI_API_KEY`                                                           |
+| github-copilot   | `GITHUB_COPILOT_TOKEN`                                                  |
+| Bedrock          | `AWS_REGION` (credentials via AWS SDK chain)                            |
+| Google Vertex AI | `GOOGLE_VERTEX_PROJECT` (ADC) or `GOOGLE_VERTEX_API_KEY` (express mode) |
 
 <details>
 <summary>Additional environment variables</summary>
 
-| Provider     | Variable                   | Purpose             |
-| ------------ | -------------------------- | ------------------- |
-| Anthropic    | `ANTHROPIC_BASE_URL`       | Custom API endpoint |
-| OpenAI       | `OPENAI_BASE_URL`          | Custom API endpoint |
-| OpenAI       | `OPENAI_ORG_ID`            | Organization ID     |
-| Google       | `GOOGLE_BASE_URL`          | Custom API endpoint |
-| xAI          | `XAI_BASE_URL`             | Custom API endpoint |
-| Azure OpenAI | `AZURE_OPENAI_API_KEY`     | API key             |
-| Azure OpenAI | `AZURE_OPENAI_ENDPOINT`    | Endpoint URL        |
-| Azure OpenAI | `AZURE_OPENAI_DEPLOYMENT`  | Deployment name     |
-| Azure OpenAI | `AZURE_OPENAI_API_VERSION` | API version         |
+| Provider         | Variable                   | Purpose             |
+| ---------------- | -------------------------- | ------------------- |
+| Anthropic        | `ANTHROPIC_BASE_URL`       | Custom API endpoint |
+| OpenAI           | `OPENAI_BASE_URL`          | Custom API endpoint |
+| OpenAI           | `OPENAI_ORG_ID`            | Organization ID     |
+| Google           | `GOOGLE_BASE_URL`          | Custom API endpoint |
+| xAI              | `XAI_BASE_URL`             | Custom API endpoint |
+| Google Vertex AI | `GOOGLE_VERTEX_LOCATION`   | GCP location        |
+| Azure OpenAI     | `AZURE_OPENAI_API_KEY`     | API key             |
+| Azure OpenAI     | `AZURE_OPENAI_ENDPOINT`    | Endpoint URL        |
+| Azure OpenAI     | `AZURE_OPENAI_DEPLOYMENT`  | Deployment name     |
+| Azure OpenAI     | `AZURE_OPENAI_API_VERSION` | API version         |
 
 Azure OpenAI env vars configure the OpenAI provider with Azure backend.
 
@@ -126,6 +129,11 @@ For advanced options not exposed in the UI, edit `~/.xum/providers.jsonc` direct
   "bedrock": {
     "region": "us-east-1",
     // Uses AWS credential chain if no explicit credentials
+  },
+  "google-vertex": {
+    "project": "my-gcp-project",
+    "location": "global", // Optional, defaults to "global"
+    // Uses Google Application Default Credentials if no API key
   },
   "ollama": {
     "baseUrl": "http://your-server:11434/api", // Custom Ollama server
@@ -232,14 +240,15 @@ provider setups continue to use Chat Completions.
 | `openai-responses`   | `@ai-sdk/openai` Responses API | `/v1/responses`        |
 | `anthropic-messages` | `@ai-sdk/anthropic`            | `/v1/messages`         |
 
-| Option         | Required | Description                                                                                        |
-| -------------- | -------- | -------------------------------------------------------------------------------------------------- |
-| `providerType` | Yes      | API format for this custom provider. Use one of the three values above.                            |
-| `baseUrl`      | Yes      | API base URL. Xum normalizes it according to `providerType` before the SDK adds the endpoint path. |
-| `apiKey`       | No       | Optional API key. Keyless local servers do not need a placeholder key.                             |
-| `apiKeyFile`   | No       | Path to a file containing the API key. Supports `~` for home directory.                            |
-| `displayName`  | No       | Optional UI label shown instead of the provider ID.                                                |
-| `models`       | No       | Discovery list shown in the model picker. You can still type any model ID at runtime.              |
+| Option          | Required | Description                                                                                        |
+| --------------- | -------- | -------------------------------------------------------------------------------------------------- |
+| `providerType`  | Yes      | API format for this custom provider. Use one of the three values above.                            |
+| `baseUrl`       | Yes      | API base URL. Xum normalizes it according to `providerType` before the SDK adds the endpoint path. |
+| `apiKey`        | No       | Optional API key. Keyless local servers do not need a placeholder key.                             |
+| `apiKeyFile`    | No       | Path to a file containing the API key. Supports `~` for home directory.                            |
+| `displayName`   | No       | Optional UI label shown instead of the provider ID.                                                |
+| `models`        | No       | Discovery list shown in the model picker. You can still type any model ID at runtime.              |
+| `sessionHeader` | No       | Header name that carries the workspace ID on each chat request. See below.                         |
 
 Base URL normalization depends on the selected format:
 
@@ -253,6 +262,14 @@ Base URL normalization depends on the selected format:
 Base URLs must not contain a query string or fragment: the SDK appends endpoint paths directly to
 the base URL string, so a query would swallow the endpoint path. Pass authentication through
 `apiKey` or `apiKeyFile` instead of query parameters.
+
+Some gateways want one stable ID per conversation in a header that they name. OpenCode Go, for
+example, asks for `x-opencode-session`. Set `sessionHeader` (the **Session header** field in
+Settings) to that name, and Xum sends the workspace ID in it on each chat request. Xum refuses
+names that are not valid HTTP header names, auth or Xum-owned headers such as `Authorization` and
+`x-api-key`, and the headers that fetch forbids, such as `Connection` and `Sec-` names. Chat
+requests and their compaction summaries carry the header. Other background requests, such as
+title generation, status, and memory, do not.
 
 To configure a single OpenAI-shaped gateway through the built-in `openai` provider instead, see
 [OpenAI wire format](#openai-wire-format).
@@ -416,11 +433,35 @@ Bedrock supports multiple authentication methods (tried in order):
 
 If you're already authenticated with AWS CLI (`aws sso login`), Xum uses those credentials automatically.
 
+### Google Vertex AI
+
+The **Google Vertex AI** provider (`google-vertex`) sends Gemini requests to Vertex AI instead of the Gemini API, so usage is billed and governed by your Google Cloud project. It supports two authentication modes:
+
+1. **Application Default Credentials (ADC)**: set **Project** (or `GOOGLE_VERTEX_PROJECT`). Xum authenticates with Google's standard credential lookup: `gcloud auth application-default login`, the `GOOGLE_APPLICATION_CREDENTIALS` key file, or the metadata server on Google Cloud. To use a specific service account instead, set **Service account key file** (`keyFilename`) to the path of its JSON key.
+2. **Express mode**: set **Express mode API key** (or `GOOGLE_VERTEX_API_KEY`). Requests go to the global Vertex endpoint with the key; project, location, and the key file are not used, and tuned (`endpoints/...`) models are not supported.
+
+When an API key is set, express mode wins. **Location** (or `GOOGLE_VERTEX_LOCATION`) defaults to `global`, which serves the latest Gemini models; set a region such as `us-central1` or a multi-region (`us`, `eu`) for data residency.
+
+**Base URL** is optional and replaces the whole Vertex endpoint prefix, so its format depends on the mode. Xum appends `/models/{model}:streamGenerateContent` to it:
+
+- Express mode: `https://aiplatform.googleapis.com/v1/publishers/google`
+- ADC: `https://{location}-aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{location}/publishers/google` (the host is `aiplatform.googleapis.com` for `global` and `aiplatform.{us|eu}.rep.googleapis.com` for `us`/`eu`)
+
+Vertex models are not listed in the model catalog. Add them by ID, for example `google-vertex:gemini-2.5-pro` (see [Add custom models](/config/models#add-custom-models)). They use the same thinking levels as `google` models.
+
+The Gemini Cyber models, `gemini-3.8-flash-cyber` and `gemini-4-argon-cyber-permissive`, are available only on Vertex AI, to projects that Google has allowlisted for each model, and only in the `global` and `us` locations. The Gemini API does not serve them: a `google:` Cyber model fails with "not found for API version v1beta". Add them as `google-vertex:gemini-3.8-flash-cyber` or `google-vertex:gemini-4-argon-cyber-permissive`.
+
 ### Anthropic Fast mode
 
-Claude Opus 5.5, Opus 5, and Opus 4.8 support Anthropic's [Fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) research preview: up to 2.5× faster output at 2× token pricing. Toggle it from the thinking selector's **Fast mode** row, the command palette (**Toggle Fast Mode**), or its keyboard shortcut. Xum stores the preference as `"speed": "fast"` under `anthropic` in `providers.jsonc`.
+Claude Fable 5.2, Mythos 5.2, Opus 5.5, Opus 5, and Opus 4.8 support Anthropic's [Fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode): up to 2.5× faster output at 2× token pricing. Toggle it from the thinking selector's **Fast mode** row, the command palette (**Toggle Fast Mode**), `/fast`, or its keyboard shortcut. Like the thinking level, the choice is saved per chat and stays with the chat when you switch models. Chats without a choice use `"speed": "fast"` under `anthropic` in `providers.jsonc` as their default.
 
-Fast mode is only sent on the direct Anthropic API with an account that has Fast mode access. It is hidden for gateway routes (Xum Gateway, OpenRouter, Bedrock, Coder), custom Anthropic-compatible providers, a non-`api.anthropic.com` base URL, and when Anthropic beta features are disabled for ZDR. Costs are priced from the speed Anthropic reports for each response.
+Fast mode is only sent on the direct Anthropic API with an account that has Fast mode access. It is hidden for gateway routes (OpenRouter, Bedrock, Coder), custom Anthropic-compatible providers, a non-`api.anthropic.com` base URL, and when Anthropic beta features are disabled for ZDR. Costs are priced from the speed Anthropic reports for each response.
+
+### Prompt cache duration
+
+Anthropic caches each request's prompt prefix for 5 minutes by default. Set **Prompt cache TTL** for Anthropic in **Settings → Providers** (`"cacheTtl": "1h"` under `anthropic` in `providers.jsonc`) to keep it for 1 hour. This global value applies to every Anthropic route: the direct API, custom Anthropic providers and Coder Anthropic routes. A per-agent value in **Settings → Agents** or an agent's `ai.cacheTtl` wins over it; see [Prompt cache duration](/agents#prompt-cache-duration).
+
+The tradeoff is cost. A 5-minute cache write costs 1.25× the input price, a 1-hour write costs 2×, and a cache read costs 0.1× or less, depending on the model. A 1-hour cache pays off when an agent waits more than 5 minutes between requests (CI, sub-agents, monitors) and then reuses the same context: with a 5-minute cache, the whole context is written again. Short or one-shot runs gain nothing from it.
 
 ### OpenRouter Provider Routing
 

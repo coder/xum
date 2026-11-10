@@ -23,16 +23,11 @@ import { askUserQuestionManager } from "./askUserQuestionManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { advanceAnchoredDeadline, HeartbeatService } from "./heartbeatService";
 import { IdleDispatcher } from "./idleDispatcher";
-import { InitStateManager } from "./initStateManager";
 import type { TaskService } from "./taskService";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
+import type { WorkspaceService } from "./workspaceService";
 import { createTestHistoryService } from "./testHistoryService";
-import {
-  createMockAIService,
-  createTestBackgroundProcessManager,
-} from "./workspaceService.testHarness";
+import { createWorkspaceServiceForTest } from "./workspaceService.testHarness";
 
 async function waitForCondition(
   condition: () => boolean,
@@ -233,16 +228,11 @@ describe("HeartbeatService", () => {
   ): WorkspaceService {
     // Shares the suite's real Config/HistoryService; chat history still flows through the
     // getChatHistory override where a test drives it.
-    const aiService = createMockAIService();
-    const realWorkspaceService = new WorkspaceService(
+    const realWorkspaceService = createWorkspaceServiceForTest({
       config,
       historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      new InitStateManager(config),
       extensionMetadata,
-      createTestBackgroundProcessManager()
-    );
+    });
     Object.assign(realWorkspaceService, overrides);
     return realWorkspaceService;
   }
@@ -744,6 +734,35 @@ describe("HeartbeatService", () => {
       expect(initialDeadline).toBe(defaultHeartbeatIntervalMs);
       expect(resetDeadline).toBeDefined();
       expect(resetDeadline).toBeGreaterThan(initialDeadline!);
+    });
+
+    test("reports the time until the tracked deadline, and none for an untracked workspace", async () => {
+      service.start();
+      await getInternals().resyncFromConfig(0);
+      // resyncFromConfig(0) puts the first deadline one interval after time 0.
+      expect(service.getMsUntilNextHeartbeat(testWorkspaceId, 1000)).toBe(
+        defaultHeartbeatIntervalMs - 1000
+      );
+      // A passed deadline reads as due (zero or less), not as a wrapped or absent value.
+      expect(
+        service.getMsUntilNextHeartbeat(testWorkspaceId, defaultHeartbeatIntervalMs + 5000)
+      ).toBe(-5000);
+      expect(service.getMsUntilNextHeartbeat("untracked-ws", 1000)).toBeNull();
+
+      // The report follows the countdown an idle trigger resets on new activity.
+      const activityAt = Date.now();
+      wsEmitter.emit("activity", {
+        workspaceId: testWorkspaceId,
+        activity: { recency: activityAt, streaming: false },
+      });
+      const deadline = getInternals().nextEligibleAtByWorkspaceId.get(testWorkspaceId);
+      expect(deadline).toBeGreaterThanOrEqual(activityAt + defaultHeartbeatIntervalMs);
+      expect(service.getMsUntilNextHeartbeat(testWorkspaceId, activityAt)).toBe(
+        (deadline ?? Number.NaN) - activityAt
+      );
+
+      service.stop();
+      expect(service.getMsUntilNextHeartbeat(testWorkspaceId)).toBeNull();
     });
 
     test("activity event does not reset the countdown for interval-triggered workspaces", async () => {
@@ -2071,6 +2090,32 @@ describe("HeartbeatService", () => {
       await internals.resyncFromConfig(now);
 
       expect(internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)).toBe(recency + intervalMs);
+    });
+
+    test("with no firing on record, a newer schedule edit still anchors the deadline (#5741)", async () => {
+      // A global default change stamps scheduleUpdatedAt but does not touch activity recency
+      // (a per-workspace edit persists both), so the recency fallback alone could fire at once.
+      const internals = getInternals();
+      const intervalMs = 30 * 60 * 1000;
+      const now = 4 * 60 * 60 * 1000;
+      const recency = now - 2 * 60 * 60 * 1000;
+      const scheduleUpdatedAt = now - 5 * 60 * 1000;
+      await setProjectsConfig(
+        makeProjectsConfig([
+          makeWorkspaceEntry({
+            heartbeat: { enabled: true, intervalMs, trigger: "interval", scheduleUpdatedAt },
+          }),
+        ])
+      );
+      getAllSnapshotsMock.mockResolvedValueOnce(
+        makeSnapshotMap([[testWorkspaceId, makeSnapshot({ recency, streaming: false })]])
+      );
+
+      await internals.resyncFromConfig(now);
+
+      expect(internals.nextEligibleAtByWorkspaceId.get(testWorkspaceId)).toBe(
+        scheduleUpdatedAt + intervalMs
+      );
     });
 
     test("makes overdue workspaces eligible on the first post-start check", async () => {

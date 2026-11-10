@@ -6,7 +6,7 @@
  * It is refreshed when a goal is set, replaced, edited or completed, when a goal continuation
  * turn starts, and after successful todo_write/propose_plan calls. When the last goal is cleared
  * the board says "No active goal" (a write, not a delete: deletes would need their own
- * containment). It is a live file: no artifact versions are published for it.
+ * containment). It is a live file: the artifact tool does not publish it.
  *
  * Board errors never affect turns: every refresh runs in the background, failures are logged at
  * debug level, and the PR section degrades to "PR status unavailable".
@@ -19,6 +19,7 @@ import { assert } from "@/common/utils/assert";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { shescape } from "@/node/runtime/streamUtils";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { resolveArtifactsLocation, writeArtifactAtLocation } from "./artifactsOperations";
@@ -473,7 +474,8 @@ export class GoalStatusBoardService {
       goal == null
         ? [[], { kind: "none" as const }]
         : await Promise.all([
-            readTodosForSessionDir(path.join(this.deps.sessionsDir, workspaceId)),
+            // Outside the agent loop: the host's session files.
+            readTodosForSessionDir(path.join(this.deps.sessionsDir, workspaceId), nodeSessionFiles),
             fetchGoalBoardPrSection(workspaceId, this.deps.runBash).catch(
               (): GoalBoardPrSection => ({ kind: "unavailable" })
             ),

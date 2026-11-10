@@ -33,6 +33,21 @@ export function substituteSkillArguments(
   argumentText: string
 ): { body: string; substituted: boolean } {
   assert(typeof body === "string", "substituteSkillArguments requires a string body");
+  return argumentSubstitution(argumentText)(body);
+}
+
+/**
+ * substituteSkillArguments for many texts with one argument text: it tokenizes the arguments
+ * once, so a caller that substitutes line by line does not redo that work per line.
+ */
+export function createSkillArgumentSubstituter(argumentText: string): (text: string) => string {
+  const substitute = argumentSubstitution(argumentText);
+  return (text) => substitute(text).body;
+}
+
+function argumentSubstitution(
+  argumentText: string
+): (body: string) => { body: string; substituted: boolean } {
   assert(
     typeof argumentText === "string",
     "substituteSkillArguments requires string argument text"
@@ -42,23 +57,24 @@ export function substituteSkillArguments(
   // Guard the empty case: "".split(/\s+/) yields [""], not [].
   const positionalArguments = trimmedArguments.length > 0 ? trimmedArguments.split(/\s+/) : [];
 
-  let substituted = false;
-  const substitutedBody = body.replace(
-    SKILL_ARGUMENT_PLACEHOLDER_RE,
-    (match, placeholder: string) => {
-      substituted = true;
-      if (placeholder === "ARGUMENTS") {
-        return trimmedArguments;
+  return (body) => {
+    let substituted = false;
+    const substitutedBody = body.replace(
+      SKILL_ARGUMENT_PLACEHOLDER_RE,
+      (match, placeholder: string) => {
+        substituted = true;
+        if (placeholder === "ARGUMENTS") {
+          return trimmedArguments;
+        }
+
+        const position = Number(placeholder);
+        assert(
+          Number.isInteger(position) && position >= 1 && position <= 9,
+          `unexpected positional placeholder: ${match}`
+        );
+        return positionalArguments[position - 1] ?? "";
       }
-
-      const position = Number(placeholder);
-      assert(
-        Number.isInteger(position) && position >= 1 && position <= 9,
-        `unexpected positional placeholder: ${match}`
-      );
-      return positionalArguments[position - 1] ?? "";
-    }
-  );
-
-  return { body: substitutedBody, substituted };
+    );
+    return { body: substitutedBody, substituted };
+  };
 }

@@ -8,7 +8,7 @@ import type {
   SubagentGitProjectPatchArtifact,
 } from "@/common/utils/tools/toolDefinitions";
 import { log } from "@/node/services/log";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 export interface SubagentGitPatchArtifactsFile {
   version: 2;
@@ -348,8 +348,11 @@ export async function updateSubagentGitPatchArtifactsFile(params: {
   workspaceId: string;
   workspaceSessionDir: string;
   update: (file: SubagentGitPatchArtifactsFile) => void;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<SubagentGitPatchArtifactsFile> {
-  return workspaceFileLocks.withLock(params.workspaceId, async () => {
+  const fileLocks = params.locks.workspaceFiles;
+  return fileLocks.withLock(params.workspaceId, async () => {
     const file = await readSubagentGitPatchArtifactsFile(params.workspaceSessionDir);
     params.update(file);
     file.version = SUBAGENT_GIT_PATCH_ARTIFACTS_FILE_VERSION;
@@ -375,12 +378,15 @@ export async function upsertSubagentGitPatchArtifact(params: {
   workspaceSessionDir: string;
   childTaskId: string;
   updater: (existing: SubagentGitPatchArtifact | null) => SubagentGitPatchArtifact;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<SubagentGitPatchArtifact> {
   let updated: SubagentGitPatchArtifact | null = null;
 
   await updateSubagentGitPatchArtifactsFile({
     workspaceId: params.workspaceId,
     workspaceSessionDir: params.workspaceSessionDir,
+    locks: params.locks,
     update: (file) => {
       const existing = file.artifactsByChildTaskId[params.childTaskId] ?? null;
       updated = normalizeSubagentGitPatchArtifact(params.updater(existing));
@@ -401,12 +407,15 @@ export async function markSubagentGitPatchArtifactApplied(params: {
   childTaskId: string;
   projectPath: string;
   appliedAtMs: number;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<SubagentGitPatchArtifact | null> {
   let updated: SubagentGitPatchArtifact | null = null;
 
   await updateSubagentGitPatchArtifactsFile({
     workspaceId: params.workspaceId,
     workspaceSessionDir: params.workspaceSessionDir,
+    locks: params.locks,
     update: (file) => {
       const existing = file.artifactsByChildTaskId[params.childTaskId] ?? null;
       if (!existing) {

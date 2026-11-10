@@ -19,6 +19,7 @@ function pluginWithCommands(
     containerPath: "/plugins",
     dirName: name,
     manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name, contributes },
+    notApplied: [],
   };
 }
 

@@ -1,16 +1,26 @@
 import { afterEach, beforeEach, describe, it, expect, spyOn } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { buildBashToolDescription, createBashTool } from "./bash";
 import type { BashOutputEvent } from "@/common/types/stream";
 import type { ProjectRef } from "@/common/types/workspace";
 import type { BashToolArgs, BashToolResult } from "@/common/types/tools";
 import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
+import { EXIT_CODE_ABORTED } from "@/common/constants/exitCodes";
+import { shellQuote } from "@/common/utils/shell";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import * as path from "path";
 import * as fs from "fs";
 import { execFileSync } from "child_process";
-import { TestTempDir, createTestToolConfig, getTestDeps, mockToolCallOptions } from "./testHelpers";
+import { randomUUID } from "crypto";
+import {
+  TestTempDir,
+  createTestToolConfig as createBaseToolConfig,
+  getTestDeps,
+  mockToolCallOptions,
+} from "./testHelpers";
+
 // A static import, not a require("...?real=1") copy: Bun's LCOV keeps only the last-loaded copy of
 // a file, so a copy would replace runtimeFactory.test.ts's coverage of runtimeFactory.ts.
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -27,7 +37,21 @@ import {
   BackgroundProcessManager,
   SPAWN_NAME_LOCK_FILENAME,
 } from "@/node/services/backgroundProcessManager";
+import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+
+// Unique workspace IDs per run (#7256): spawn records live in the shared
+// /tmp/mux-bashes/<workspaceId>, and the loop-test runner runs several test files at once. A fixed
+// "test-workspace" let one file's cleanup delete another file's records, as #5591 fixed for
+// backgroundProcessManager.test.ts.
+const RUN_ID = randomUUID().slice(0, 12);
+const TEST_WS = `test-workspace-${RUN_ID}`;
+const createTestToolConfig = (
+  tempDir: string,
+  options?: Parameters<typeof createBaseToolConfig>[1]
+): ReturnType<typeof createBaseToolConfig> =>
+  createBaseToolConfig(tempDir, { workspaceId: TEST_WS, ...options });
 
 // Helper to create bash tool with test configuration
 // Returns both tool and disposable temp directory
@@ -515,9 +539,138 @@ describe("bash tool", () => {
     tempDir[Symbol.dispose]();
   });
 
+  // #6732: the truncate policy keeps 1 MB and then stops a command that is still writing. Closing
+  // its output alone did not stop it reliably: here it ignores the broken pipe, sleeps and fails
+  // with its own status, which the old code then reported. The stop makes the result ours.
+  it(
+    "should stop a command that is still writing once truncation keeps 1 MB",
+    async () => {
+      using tempDir = new TestTempDir("test-bash-truncate-stop");
+      const config = createTestToolConfig(process.cwd());
+      config.runtimeTempDir = tempDir.path;
+      config.overflow_policy = "truncate";
+      const tool = createBashTool(config);
+
+      const args: BashToolArgs = {
+        script:
+          "trap '' PIPE; perl -e '$| = 1; for (1..1300) { print \"A\" x 900 . \"\\n\" }' 2>/dev/null; sleep 5; exit 42",
+        timeout_secs: 30,
+        run_in_background: false,
+        display_name: "test",
+      };
+
+      const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
+
+      expect(result).toMatchObject({ success: true, exitCode: 0 });
+      if (result.success && "truncated" in result) {
+        expect(result.truncated?.reason).toContain("exceed");
+      }
+      expect(result.output?.length).toBeGreaterThan(1000000);
+      // Stopped at the cut, not after its 5 s sleep.
+      expect(result.wall_duration_ms).toBeLessThan(4000);
+    },
+    { timeout: 20_000 }
+  );
+
+  // #6873: after the truncate policy stops a command, a stream read or the exit status can fail
+  // because of that stop: RemoteRuntime rejects its exit status when the child errors after our
+  // kill (an SSH2 channel that closes without an exit status), and a stream can error instead of
+  // ending. That failure says nothing about the command, so the result stays the truncated
+  // success instead of "Failed to execute command".
+  it.each([
+    ["a stream read rejects", "stream"],
+    ["the exit status rejects", "exit"],
+  ] as const)(
+    "keeps the truncated success when %s after the stop at the file limit",
+    async (_name, failure) => {
+      const encoder = new TextEncoder();
+      using tempDir = new TestTempDir("test-bash-truncate-stop-failure");
+      // A real runtime for the tool's own file checks; only the command's streams are scripted.
+      class StoppedCommandRuntime extends LocalRuntime {
+        override exec(_command: string, options: ExecOptions): Promise<ExecStream> {
+          const signal = options.abortSignal;
+          const failAfterStop = new Error("SSH2 channel failed after the stop");
+          return Promise.resolve({
+            stdout: new ReadableStream<Uint8Array>({
+              start(controller) {
+                // 1.17 MB: over the 1 MB file limit, and the command keeps running.
+                for (let i = 0; i < 1300; i++)
+                  controller.enqueue(encoder.encode(`${"A".repeat(900)}\n`));
+              },
+            }),
+            // Still open when the stop comes; errors on it in the "stream" case.
+            stderr: new ReadableStream<Uint8Array>({
+              start(controller) {
+                signal?.addEventListener("abort", () => {
+                  if (failure === "stream") controller.error(failAfterStop);
+                  else controller.close();
+                });
+              },
+            }),
+            stdin: new WritableStream(),
+            exitCode: new Promise<number>((resolve, reject) => {
+              signal?.addEventListener("abort", () => {
+                if (failure === "exit") reject(failAfterStop);
+                else resolve(EXIT_CODE_ABORTED);
+              });
+            }),
+            duration: Promise.resolve(0),
+          });
+        }
+      }
+      // An empty, trusted directory: no git discovery or hook runs before the command.
+      const config = createTestToolConfig(tempDir.path);
+      config.runtime = new StoppedCommandRuntime(tempDir.path);
+      config.trusted = true;
+      config.overflow_policy = "truncate";
+      const tool = createBashTool(config);
+
+      const result = (await tool.execute!(
+        { script: "flood", timeout_secs: 30, run_in_background: false, display_name: "test" },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(result).toMatchObject({ success: true, exitCode: 0 });
+      if (result.success && "truncated" in result) {
+        expect(result.truncated?.reason).toContain("exceed");
+      }
+      expect(result.output?.length).toBeGreaterThan(1000000);
+    }
+  );
+
+  // #6873: SSH and Docker share RemoteRuntime.exec, which stops a command with SIGTERM to its
+  // client and reports EXIT_CODE_ABORTED. The truncate policy's stop must give the same result
+  // there as on a local runtime: the kept output, as a success.
+  it("stops a command at the file limit through RemoteRuntime.exec", async () => {
+    using tempDir = new TestTempDir("test-bash-truncate-stop-remote");
+    const config = createTestToolConfig(tempDir.path);
+    config.runtime = new ShellRemoteRuntime(tempDir.path);
+    config.trusted = true;
+    config.overflow_policy = "truncate";
+    const tool = createBashTool(config);
+
+    const result = (await tool.execute!(
+      {
+        script:
+          "trap '' PIPE; perl -e '$| = 1; for (1..1300) { print \"A\" x 900 . \"\\n\" }' 2>/dev/null; exit 42",
+        timeout_secs: 30,
+        run_in_background: false,
+        display_name: "test",
+      },
+      mockToolCallOptions
+    )) as BashToolResult;
+
+    expect(result).toMatchObject({ success: true, exitCode: 0 });
+    if (result.success && "truncated" in result) {
+      expect(result.truncated?.reason).toContain("exceed");
+    }
+    expect(result.output?.length).toBeGreaterThan(1000000);
+  });
+
   it("should reject single overlong line before storing it (IPC mode)", async () => {
     const tempDir = new TestTempDir("test-bash-overlong-line");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -526,8 +679,11 @@ describe("bash tool", () => {
     });
 
     const args: BashToolArgs = {
-      // Generate a single 2MB line (exceeds 1MB total limit)
-      script: 'perl -e \'print "A" x 2000000 . "\\n"\'',
+      // Generate a single 2MB line (exceeds 1MB total limit). LC_ALL=C: perl
+      // prints a multi-line locale warning to stderr when it cannot load an
+      // inherited locale (Python sets LC_CTYPE=C.UTF-8 for its children, PEP 538),
+      // and those lines would count toward totalLines (#7516).
+      script: 'LC_ALL=C perl -e \'print "A" x 2000000 . "\\n"\'',
       timeout_secs: 5,
       run_in_background: false,
       display_name: "test",
@@ -555,6 +711,7 @@ describe("bash tool", () => {
   it("should reject overlong line at boundary (IPC mode)", async () => {
     const tempDir = new TestTempDir("test-bash-boundary");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -565,7 +722,8 @@ describe("bash tool", () => {
     const args: BashToolArgs = {
       // First line: 500KB (within limit)
       // Second line: 600KB (would exceed 1MB when added)
-      script: 'perl -e \'print "A" x 500000 . "\\n"; print "B" x 600000 . "\\n"\'',
+      // LC_ALL=C keeps perl's locale warning out of the counted lines (#7516).
+      script: 'LC_ALL=C perl -e \'print "A" x 500000 . "\\n"; print "B" x 600000 . "\\n"\'',
       timeout_secs: 5,
       run_in_background: false,
       display_name: "test",
@@ -596,6 +754,7 @@ describe("bash tool", () => {
   it("should use tmpfile policy by default when overflow_policy not specified", async () => {
     const tempDir = new TestTempDir("test-bash-default");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -634,6 +793,7 @@ describe("bash tool", () => {
   it("should preserve up to 100KB in temp file even after 16KB display limit", async () => {
     const tempDir = new TestTempDir("test-bash-100kb");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -691,6 +851,7 @@ describe("bash tool", () => {
   it("should stop collection at 100KB file limit", async () => {
     const tempDir = new TestTempDir("test-bash-100kb-limit");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -739,6 +900,7 @@ describe("bash tool", () => {
   it("should NOT kill process at display limit (16KB) - verify command completes naturally", async () => {
     const tempDir = new TestTempDir("test-bash-no-kill-display");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -785,6 +947,7 @@ describe("bash tool", () => {
   it("should kill process immediately when single line exceeds per-line limit", async () => {
     const tempDir = new TestTempDir("test-bash-per-line-kill");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -830,6 +993,7 @@ describe("bash tool", () => {
   it("should handle output just under 16KB without truncation", async () => {
     const tempDir = new TestTempDir("test-bash-under-limit");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -863,6 +1027,7 @@ describe("bash tool", () => {
   it("should trigger display truncation at exactly 300 lines", async () => {
     const tempDir = new TestTempDir("test-bash-exact-limit");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -1266,6 +1431,67 @@ describe("bash tool", () => {
     }
   });
 
+  describe("interactive TUI launches", () => {
+    function createSpiedBashTool() {
+      const tempDir = new TestTempDir("test-bash-tui");
+      const config = createTestToolConfig(process.cwd());
+      config.runtimeTempDir = tempDir.path;
+      const exec = spyOn(config.runtime, "exec").mockImplementation(() =>
+        Promise.resolve(createExecStream("ran\n"))
+      );
+      return {
+        tool: createBashTool(config),
+        exec,
+        [Symbol.dispose]() {
+          exec.mockRestore();
+          tempDir[Symbol.dispose]();
+        },
+      };
+    }
+
+    it.each([
+      "view",
+      "  vim notes.md  ",
+      "/usr/bin/top",
+      "vim 'notes&draft'",
+      'view "report(1).txt"',
+      "vim notes\\;draft",
+    ])("rejects %p without spawning it", async (script) => {
+      using testEnv = createSpiedBashTool();
+
+      const result = (await testEnv.tool.execute!(
+        { script, run_in_background: false, display_name: "test" },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(result).toMatchObject({ success: false, exitCode: -1, wall_duration_ms: 0 });
+      expect(testEnv.exec).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      "top -l 1",
+      "vim -es -c q file",
+      "vim +q file",
+      "top | head",
+      "view < f",
+      "vim 'a' | tee 'b'",
+      'vim "it\'s" | tee "b\'s"',
+      "nano f",
+      "./top",
+      "bin/view notes.md",
+    ])("still runs %s", async (script) => {
+      using testEnv = createSpiedBashTool();
+
+      const result = (await testEnv.tool.execute!(
+        { script, run_in_background: false, display_name: "test" },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(testEnv.exec).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+    });
+  });
+
   describe("script sanitization", () => {
     const shouldRewriteNullRedirects = process.platform === "win32";
 
@@ -1400,38 +1626,42 @@ describe("bash tool", () => {
     }
   });
 
-  it("should use default timeout (3s) when timeout_secs is undefined", async () => {
-    using testEnv = createTestBashTool();
-    const tool = testEnv.tool;
-    const args = {
-      script: "echo hello",
-      timeout_secs: undefined,
-    };
-
-    const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
-
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.output).toBe("hello");
-      expect(result.exitCode).toBe(0);
+  it("should bound a foreground call whose timeout_secs is omitted with the default deadline", async () => {
+    // timeout_secs is optional, so an omitted value must still reach the runtime as a deadline.
+    // 60 is the mode and median of the values models pass when they pass one; a shorter default
+    // would cut ordinary git, bun and make work off mid-run.
+    using tempDir = new TestTempDir("test-bash-timeout");
+    const deadlines: Array<number | undefined> = [];
+    class DeadlineRecordingRuntime extends LocalRuntime {
+      override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+        deadlines.push(options.timeout);
+        return super.exec(command, options);
+      }
     }
-  });
+    const config = createTestToolConfig(process.cwd(), {
+      runtime: new DeadlineRecordingRuntime(process.cwd()),
+    });
+    config.runtimeTempDir = tempDir.path;
+    // Trusted: an untrusted repo runs an extra git-automation probe per call.
+    config.trusted = true;
+    const tool = createBashTool(config);
 
-  it("should use default timeout (3s) when timeout_secs is omitted", async () => {
-    using testEnv = createTestBashTool();
-    const tool = testEnv.tool;
-    const args = {
-      script: "echo hello",
-      // timeout_secs omitted entirely
-    };
+    const omitted = (await tool.execute!(
+      { script: "echo hello", display_name: "test" },
+      mockToolCallOptions
+    )) as BashToolResult;
 
-    const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
+    expect(omitted.success).toBe(true);
+    expect(deadlines.at(-1)).toBe(60);
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.output).toBe("hello");
-      expect(result.exitCode).toBe(0);
-    }
+    deadlines.length = 0;
+    const explicit = (await tool.execute!(
+      { script: "echo hello", timeout_secs: 7, display_name: "test" },
+      mockToolCallOptions
+    )) as BashToolResult;
+
+    expect(explicit.success).toBe(true);
+    expect(deadlines.at(-1)).toBe(7);
   });
 
   // Note: Zero and negative timeout_secs are rejected by Zod schema validation
@@ -1968,6 +2198,7 @@ describe("SSH runtime redundant cd detection", () => {
     sshConnectionPool.markHealthy(sshConfig);
 
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd,
       runtime: sshRuntime,
@@ -2219,6 +2450,42 @@ describe("bash tool - background execution", () => {
     tempDir[Symbol.dispose]();
   });
 
+  it("should pass an absent background timeout through as no auto-terminate deadline", async () => {
+    // The foreground default must not leak into a background spawn: BackgroundProcessManager arms
+    // auto-termination only for a number, so a dev server started without timeout_secs keeps
+    // running until task_stop. The schema also allows null now, which must not become a deadline.
+    using tempDir = new TestTempDir("test-bash-bg-timeout");
+    const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg"));
+    const workspaceId = path.basename(tempDir.path);
+    const config = createTestToolConfig(tempDir.path, { workspaceId });
+    config.backgroundProcessManager = manager;
+    const spawn = spyOn(manager, "spawn");
+    const tool = createBashTool(config);
+
+    try {
+      for (const [timeout_secs, display_name] of [
+        [undefined, "bg-no-timeout"],
+        [null, "bg-null-timeout"],
+        [3600, "bg-explicit-timeout"],
+      ] as const) {
+        const result = (await tool.execute!(
+          { script: "sleep 30", run_in_background: true, display_name, timeout_secs },
+          mockToolCallOptions
+        )) as BashToolResult;
+        expect(result.success).toBe(true);
+      }
+
+      expect(spawn.mock.calls.map(([, , , options]) => options.timeoutSecs)).toEqual([
+        undefined,
+        undefined,
+        3600,
+      ]);
+    } finally {
+      await manager.terminateAll();
+      fs.rmSync(`/tmp/mux-bashes/${workspaceId}`, { recursive: true, force: true });
+    }
+  });
+
   it("should start background process and return process ID", async () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 
@@ -2251,6 +2518,152 @@ describe("bash tool - background execution", () => {
     await manager.terminateAll();
     fs.rmSync(`/tmp/mux-bashes/${workspaceId}`, { recursive: true, force: true });
     tempDir[Symbol.dispose]();
+  });
+
+  describe("live queued-message backgrounding", () => {
+    it.each([
+      { phase: "running", emitEvents: true, backgrounds: true },
+      { phase: "running", emitEvents: false, backgrounds: true },
+      { phase: "preparation", emitEvents: true, backgrounds: true },
+      { phase: "registration", emitEvents: true, backgrounds: true },
+      { phase: "never", emitEvents: true, backgrounds: false },
+      { phase: "withdrawn", emitEvents: true, backgrounds: false },
+    ] as const)(
+      "$phase (chat events: $emitEvents)",
+      async ({ phase, emitEvents, backgrounds }) => {
+        using tempDir = new TestTempDir("test-bash-live-queue");
+        const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+        const config = createTestToolConfig(tempDir.path);
+        config.backgroundProcessManager = manager;
+        if (emitEvents) config.emitChatEvent = () => undefined;
+
+        const processReady = Promise.withResolvers<void>();
+        const sampledWhileReady = Promise.withResolvers<void>();
+        let runtimeReady = false;
+        let queued = phase === "preparation" || phase === "withdrawn";
+        const dispatchModes: Array<"tool-end" | "turn-end" | undefined> = [];
+        config.hasQueuedMessages = (dispatchMode?: "tool-end" | "turn-end") => {
+          dispatchModes.push(dispatchMode);
+          if (runtimeReady) sampledWhileReady.resolve();
+          return queued;
+        };
+
+        // Publish/withdraw the live decision before registration is ready, without notifying
+        // the manager. A withdrawn preparation-time decision must not become a pending flag.
+        const register = manager.registerForegroundProcess.bind(manager);
+        const registrationSpy = spyOn(manager, "registerForegroundProcess").mockImplementation(
+          (...args) => {
+            if (phase === "registration") queued = true;
+            if (phase === "withdrawn") queued = false;
+            return register(...args);
+          }
+        );
+
+        // Keep the actual runtime/manager: wait for the process to install its completion
+        // watcher before returning its real ExecStream. No sleeps or exit-grace coordination.
+        const exec = config.runtime.exec.bind(config.runtime);
+        const execSpy = spyOn(config.runtime, "exec").mockImplementation(
+          async (script, options) => {
+            const stream = await exec(script, options);
+            const reader = stream.stdout.getReader();
+            try {
+              if ((await reader.read()).done) throw new Error("Process exited before readiness");
+            } finally {
+              reader.releaseLock();
+            }
+            runtimeReady = true;
+            processReady.resolve();
+            return stream;
+          }
+        );
+
+        const completionFile = path.join(tempDir.path, "complete");
+        const scriptFile = path.join(tempDir.path, "gated.cjs");
+        fs.writeFileSync(completionFile, "");
+        fs.writeFileSync(
+          scriptFile,
+          `const fs = require("node:fs");
+const completionFile = ${JSON.stringify(completionFile)};
+const watcher = fs.watch(completionFile, () => {
+  if (fs.readFileSync(completionFile, "utf8") !== "complete") return;
+  watcher.close();
+  console.log("done");
+  process.exitCode = 3;
+});
+console.log("ready");
+`
+        );
+        const abortController = new AbortController();
+        let settled = false;
+        const resultPromise = (
+          createBashTool(config).execute!(
+            {
+              script: `${shellQuote(process.execPath)} ${shellQuote(scriptFile)}`,
+              timeout_secs: 10,
+              run_in_background: false,
+              display_name: "live-queue",
+            },
+            {
+              ...mockToolCallOptions,
+              abortSignal: AbortSignal.any([abortController.signal, AbortSignal.timeout(5000)]),
+            }
+          ) as Promise<BashToolResult>
+        ).then((result) => {
+          settled = true;
+          return result;
+        });
+        const waitForSignal = (signal: Promise<void>) =>
+          Promise.race([signal.then(() => true), resultPromise.then(() => false)]);
+
+        try {
+          expect(await waitForSignal(processReady.promise)).toBe(true);
+          // Already-true decisions can background immediately on registration; the other
+          // cases must observe the live interval while the actual process is still running.
+          if (phase === "running" || !backgrounds) {
+            expect(await waitForSignal(sampledWhileReady.promise)).toBe(true);
+          }
+
+          if (phase === "running") {
+            expect(settled).toBe(false);
+            // A live decision can change without any new enqueue event (e.g. compaction ends).
+            queued = true;
+          }
+
+          if (backgrounds) {
+            const result = await resultPromise;
+            expect(result.success).toBe(true);
+            if (!(result.success && "backgroundProcessId" in result)) {
+              throw new Error("Expected the running Bash process to background");
+            }
+            const running = await manager.list(config.workspaceId);
+            expect(running).toHaveLength(1);
+            expect(running[0]).toMatchObject({ id: result.backgroundProcessId, status: "running" });
+            expect(manager.getForegroundToolCallIds(config.workspaceId!)).toEqual([]);
+          } else {
+            // A false/withdrawn live decision must leave Bash waiting on the actual process.
+            expect(settled).toBe(false);
+            expect(manager.getForegroundToolCallIds(config.workspaceId!)).toEqual([
+              mockToolCallOptions.toolCallId,
+            ]);
+            expect(await manager.list(config.workspaceId)).toEqual([]);
+            fs.writeFileSync(completionFile, "complete");
+            const result = await resultPromise;
+            // A nonzero process exit stays a foreground failure, not a successful background task.
+            expect(result).toMatchObject({ success: false, exitCode: 3, output: "done" });
+            expect(manager.getForegroundToolCallIds(config.workspaceId!)).toEqual([]);
+          }
+          expect(dispatchModes.length).toBeGreaterThan(0);
+          expect(dispatchModes.every((mode) => mode === "tool-end")).toBe(true);
+        } finally {
+          abortController.abort();
+          await resultPromise.catch(() => undefined);
+          await manager.cleanup(config.workspaceId!);
+          execSpy.mockRestore();
+          registrationSpy.mockRestore();
+        }
+      },
+      15000
+    );
   });
 
   it("terminates the process and fails when foreground-to-background migration fails", async () => {
@@ -2344,6 +2757,16 @@ describe("bash tool - background execution", () => {
 
     const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
     expect(pid).toBeGreaterThan(1);
+    if (!result.success || !("backgroundProcessId" in result)) throw new Error("Migration failed");
+    const migrated = await manager.getProcess(result.backgroundProcessId);
+    expect(migrated?.pid).toBe(pid);
+    const identity = { ...getSelfIdentity(), birth: linuxBirth(pid) };
+    expect(migrated?.identity).toEqual(identity);
+    const meta = JSON.parse(
+      fs.readFileSync(path.join(migrated!.outputDir, "meta.json"), "utf8")
+    ) as { pid: number; identity: unknown };
+    expect(meta.pid).toBe(pid);
+    expect(meta.identity).toEqual(identity);
     await manager.cleanup(config.workspaceId!);
 
     // cleanup() joins the exit, so the process is gone as soon as it returns.
@@ -2479,7 +2902,7 @@ describe("bash tool - background execution", () => {
         expect(isAlive(pid)).toBe(false);
       } finally {
         resumeCommand.resolve();
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         if (pid > 1 && isAlive(pid)) process.kill(pid, "SIGKILL");
         tempDir[Symbol.dispose]();
       }
@@ -2531,7 +2954,7 @@ describe("bash tool - background execution", () => {
       } finally {
         finishTerminate.resolve();
         await otherClaim?.[Symbol.asyncDispose]();
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         if (pid > 1 && isAlive(pid)) process.kill(pid, "SIGKILL");
         tempDir[Symbol.dispose]();
       }
@@ -2571,7 +2994,7 @@ describe("bash tool - background execution", () => {
       expect(result.success).toBe(true);
       const processId = "backgroundProcessId" in result ? result.backgroundProcessId : undefined;
       expect(processId).toBeDefined();
-      const proc = (await manager.list("test-workspace")).find((p) => p.id === processId);
+      const proc = (await manager.list(TEST_WS)).find((p) => p.id === processId);
       expect(proc).toBeDefined();
       return proc!.outputDir;
     }
@@ -2599,7 +3022,7 @@ describe("bash tool - background execution", () => {
         const dirs = await Promise.all(managers.map((m, i) => migratedOutputDir(m, settled[i])));
         expect(dirs[0]).not.toBe(dirs[1]);
       } finally {
-        await Promise.all(managers.map((m) => m.cleanup("test-workspace")));
+        await Promise.all(managers.map((m) => m.cleanup(TEST_WS)));
         tempDir[Symbol.dispose]();
       }
     }, 20000);
@@ -2622,7 +3045,7 @@ describe("bash tool - background execution", () => {
         // Another backend holds the spawn-name lock while this one sends its command to the
         // background; the command exits before the lock frees up.
         const otherBackendLock = await acquireProcessFileLock({
-          lockPath: path.join(bgRoot, "test-workspace", SPAWN_NAME_LOCK_FILENAME),
+          lockPath: path.join(bgRoot, TEST_WS, SPAWN_NAME_LOCK_FILENAME),
           timeoutMs: 5000,
           label: "test: other backend's spawn lock",
         });
@@ -2649,9 +3072,9 @@ describe("bash tool - background execution", () => {
         const result = await resultPromise;
         expect("backgroundProcessId" in result).toBe(false);
         expect(result.exitCode).toBe(3);
-        expect(await manager.list("test-workspace")).toEqual([]);
+        expect(await manager.list(TEST_WS)).toEqual([]);
       } finally {
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         tempDir[Symbol.dispose]();
       }
     }, 20000);
@@ -2659,7 +3082,7 @@ describe("bash tool - background execution", () => {
     it("does not inherit a previous session's exit marker", async () => {
       const tempDir = new TestTempDir("test-bash-migrate-stale-marker");
       const bgRoot = path.join(tempDir.path, "bg-root");
-      const staleDir = path.join(bgRoot, "test-workspace", "stale-job");
+      const staleDir = path.join(bgRoot, TEST_WS, "stale-job");
       fs.mkdirSync(staleDir, { recursive: true });
       fs.writeFileSync(path.join(staleDir, "exit_code"), "0");
       fs.writeFileSync(
@@ -2682,7 +3105,7 @@ describe("bash tool - background execution", () => {
         // backend's name probe and to crash-orphan archive gating.
         expect(fs.existsSync(path.join(outputDir, "exit_code"))).toBe(false);
       } finally {
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         tempDir[Symbol.dispose]();
       }
     }, 20000);

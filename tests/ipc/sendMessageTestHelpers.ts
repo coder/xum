@@ -17,7 +17,6 @@ import {
   cleanupTempGitRepo,
   generateBranchName,
   createStreamCollector,
-  INIT_HOOK_WAIT_MS,
   trustProject,
 } from "./helpers";
 import { detectDefaultTrunkBranch } from "../../src/node/git";
@@ -131,12 +130,11 @@ export async function withSharedWorkspace(
   // Wait for subscription to be ready
   await collector.waitForSubscription();
 
-  // Wait for init to complete (if there's an init hook)
-  try {
-    await collector.waitForEvent("init-end", INIT_HOOK_WAIT_MS);
-  } catch {
-    // Init hook might not exist - that's OK
-  }
+  // Wait until workspace setup has ended, as createAppHarness does: while it runs, setup-gated
+  // UI (the row's actions menu, the Review panel) is not there yet (#7543). The old 1.5 s
+  // best-effort wait let tests start during setup on a slow runner. waitForInit never throws,
+  // and with no init hook setup ends once the checkout is ready.
+  await env.services.initStateManager.waitForInit(workspaceId);
 
   try {
     await testFn({ env, workspaceId, metadata, collector });

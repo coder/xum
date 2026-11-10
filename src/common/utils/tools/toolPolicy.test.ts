@@ -2,9 +2,13 @@ import {
   applyToolPolicy,
   applyToolPolicyToNames,
   buildRequiredToolPatterns,
+  resolveLegacyTodoNudgeToolPolicy,
   type ToolPolicy,
 } from "./toolPolicy";
 import { tool } from "ai";
+import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { LEGACY_TODO_TURN_END_NUDGES } from "@/common/utils/machineTurnPrompts";
 import { z } from "zod";
 
 // Create mock tools for testing
@@ -383,5 +387,50 @@ describe("buildRequiredToolPatterns", () => {
   test("returns empty for undefined or require-free policies", () => {
     expect(buildRequiredToolPatterns(undefined)).toEqual([]);
     expect(buildRequiredToolPatterns([{ regex_match: "bash", action: "disable" }])).toEqual([]);
+  });
+});
+
+describe("resolveLegacyTodoNudgeToolPolicy", () => {
+  const legacy = { regex_match: "(?!todo_write$).*", action: "disable" } as const;
+  const nudge = (toolPolicy: ToolPolicy, extra: { synthetic?: boolean } = {}) =>
+    createMuxMessage("nudge", "user", LEGACY_TODO_TURN_END_NUDGES[0], {
+      synthetic: true,
+      toolPolicy,
+      ...extra,
+    });
+
+  test("heals through copied rows, newest first", () => {
+    const rows = [
+      createMuxMessage("wake", "user", "wake", { synthetic: true, toolPolicy: [legacy, legacy] }),
+      nudge([legacy, legacy]),
+      nudge([legacy]),
+    ];
+    expect(resolveLegacyTodoNudgeToolPolicy([legacy, legacy], rows)).toBeUndefined();
+  });
+
+  test("keeps the rule when the chain does not prove a nudge added it", () => {
+    // Reset markers are assistant rows; the nudge before it is pre-reset history.
+    const reset = createMuxMessage("reset", "assistant", "reset", {
+      contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+    });
+    const cases: Array<[ToolPolicy, MuxMessage[]]> = [
+      // The row has the nudge text, but a user wrote it (not synthetic).
+      [[legacy], [nudge([legacy], { synthetic: false })]],
+      // A synthetic row with the legacy text but another policy did not add this one.
+      [[legacy], [nudge([{ regex_match: "bash", action: "disable" }, legacy])]],
+      // A nudge appends: a rule that is not last was not its rule.
+      [
+        [legacy, { regex_match: "bash", action: "disable" }],
+        [nudge([legacy, { regex_match: "bash", action: "disable" }])],
+      ],
+      [[legacy], [reset, nudge([legacy])]],
+      [[legacy], []],
+    ];
+    for (const [policy, rows] of cases) {
+      expect(resolveLegacyTodoNudgeToolPolicy(policy, rows)).toEqual(policy);
+    }
+    // Corrupt persisted metadata passes through instead of throwing.
+    const corrupt = { regex_match: ".*" } as unknown as ToolPolicy;
+    expect(resolveLegacyTodoNudgeToolPolicy(corrupt, [nudge([legacy])])).toBe(corrupt);
   });
 });

@@ -2,7 +2,7 @@ import * as path from "path";
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
-import { mock } from "bun:test";
+import { mock, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { execSync } from "node:child_process";
 
@@ -388,6 +388,42 @@ function withoutTaskTreeLock<A extends unknown[], R>(
   };
 }
 
+/**
+ * Starts a sub-agent Stop and returns once the Stop has done its own work and waits for its
+ * latches to drop (#6727), with the still-pending Stop. For tests that settle what holds a latch
+ * themselves: awaiting the Stop first would wait for that settlement, up to its 40 s bound.
+ * `onWait` runs synchronously when the Stop enters its release wait, before the wait reads the
+ * clock or arms anything, with the wait's deadline.
+ */
+export async function startStopAwaitingRelease(
+  taskService: TaskService,
+  ancestorWorkspaceId: string,
+  taskId: string,
+  options: { onWait?: (deadlineMs: number) => void } = {}
+): Promise<{ stopped: ReturnType<TaskService["stopDescendantAgentTask"]> }> {
+  const internals = taskService as unknown as {
+    waitForWorkspaceStopsToRelease(ids: readonly string[], deadlineMs: number): Promise<void>;
+  };
+  const realWait = internals.waitForWorkspaceStopsToRelease.bind(taskService);
+  const waiting = Promise.withResolvers<void>();
+  const spy = spyOn(internals, "waitForWorkspaceStopsToRelease").mockImplementation(
+    (ids, deadlineMs) => {
+      spy.mockRestore();
+      options.onWait?.(deadlineMs);
+      waiting.resolve();
+      return realWait(ids, deadlineMs);
+    }
+  );
+  const stopped = taskService.stopDescendantAgentTask(ancestorWorkspaceId, taskId);
+  try {
+    // A Stop that fails (or never latched) resolves without waiting.
+    await Promise.race([waiting.promise, stopped]);
+  } finally {
+    spy.mockRestore();
+  }
+  return { stopped };
+}
+
 export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverrides = {}) {
   const isWorkflowInvocationCurrent =
     overrides.isWorkflowInvocationCurrent ?? mock(() => Promise.resolve(true));
@@ -400,6 +436,7 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
       overrides.resumeStream ??
       mock((): Promise<Result<{ started: boolean }>> => Promise.resolve(Ok({ started: true }))),
     clearQueue: overrides.clearQueue ?? mock((): Result<void> => Ok(undefined)),
+    abandonAutoRetry: overrides.abandonAutoRetry ?? mock(() => undefined),
     removeQueuedWorkspaceTurn:
       overrides.removeQueuedWorkspaceTurn ?? mock((): Result<boolean> => Ok(true)),
     isBusyForMessage: overrides.isBusyForMessage ?? mock(() => false),

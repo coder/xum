@@ -26,6 +26,7 @@ import { WorkspaceGoalService } from "./workspaceGoalService";
 import { drainPendingDispatches, waitForCondition } from "./testDispatchHelpers";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import type { BashMonitorWakeReconciler } from "./bashMonitorWakeReconciler";
+import type { ContextMutationGate } from "./contextMutationGate";
 import { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
 import {
   createCompactionAdmissionMocks,
@@ -548,10 +549,10 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       const internal = workspaceService as unknown as {
         bashMonitorRecoveryPromise: Promise<void>;
         bashMonitorWakeReconciler: BashMonitorWakeReconciler;
-        contextMutationEpochs: Map<string, number>;
+        contextMutationGate: ContextMutationGate;
       };
       await internal.bashMonitorRecoveryPromise;
-      const priorEpoch = internal.contextMutationEpochs.get(id) ?? 0;
+      const priorEpoch = internal.contextMutationGate.epoch(id);
       const finish = spyOn(internal.bashMonitorWakeReconciler, "finishFullHistoryClear");
       const emit = spyOn(h.session, "emitChatEvent");
       if (failure === "barrier") {
@@ -579,7 +580,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         failure === "barrier" ? ["old"] : []
       );
       expect(await storage.read()).toBeNull();
-      expect(internal.contextMutationEpochs.get(id) ?? 0).toBe(
+      expect(internal.contextMutationGate.epoch(id)).toBe(
         priorEpoch + (failure === "post-deletion" ? 1 : 0)
       );
       if (failure === "post-deletion") {

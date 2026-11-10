@@ -26,13 +26,13 @@ interface NewTabLauncherProps {
   onOpenSideChat?: () => void;
   creatingSideChat: boolean;
   /**
-   * Focus the first row once shown. Set only when the user asked for a New tab ("+" or the
-   * shortcut), never for the New tab a fresh workspace starts with, so the launcher does not
-   * steal focus from the chat input.
+   * Focus the first row once shown. Set only when the user asked for a New tab (the strip's "+"
+   * button or the shortcut), never for the New tab a fresh workspace starts with, so the
+   * launcher does not steal focus from the chat input.
    */
   autoFocus: boolean;
   onAutoFocusConsumed: () => void;
-  /** MCP App entry points of the workspace's enabled servers (artifacts experiment). */
+  /** MCP App entry points of the workspace's enabled servers (mcp-apps experiment). */
   entrypoints?: readonly McpAppEntrypoint[];
   /**
    * Open (or focus) an entry point's app tab; resolves to an error message or null. The open

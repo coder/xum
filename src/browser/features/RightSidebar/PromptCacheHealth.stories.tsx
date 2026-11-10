@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, within } from "@storybook/test";
+import { expect, within } from "storybook/test";
 
 import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";

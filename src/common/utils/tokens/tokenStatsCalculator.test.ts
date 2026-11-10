@@ -16,6 +16,8 @@ import {
   calculateTokenStats,
   type TokenCountJob,
 } from "./tokenStatsCalculator";
+import { getTotalCost } from "./usageAggregator";
+import { accumulateStepsProviderMetadata, addUsage } from "./usageHelpers";
 
 describe("calculateTokenStats", () => {
   afterEach(() => {
@@ -458,6 +460,50 @@ test("resolves mapped metadata model for usage history costs", () => {
   expect(result.usageHistory.length).toBe(1);
   expect(result.usageHistory[0].input.cost_usd).not.toBeUndefined();
   expect(result.usageHistory[0].input.cost_usd).toBeGreaterThan(0);
+});
+
+test("keeps a recorded long-context share only under a model with the same threshold", () => {
+  const recordingModel = "anthropic:claude-haiku-5-5"; // 100K threshold
+  const priceUnder = (mappedToModel: string, prompts: number[]) => {
+    const steps = prompts.map((inputTokens) => ({
+      usage: { inputTokens, outputTokens: 500, totalTokens: inputTokens + 500 },
+    }));
+    const usage = steps.reduce<LanguageModelV2Usage | undefined>(
+      (sum, step) => addUsage(sum, step.usage),
+      undefined
+    )!;
+    const message: MuxMessage = {
+      id: "1",
+      role: "assistant",
+      parts: [],
+      metadata: {
+        usage,
+        model: "ollama:custom",
+        metadataModel: recordingModel,
+        providerMetadata: accumulateStepsProviderMetadata(steps, recordingModel),
+      },
+    };
+    const providersConfig = {
+      ollama: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "custom", mappedToModel }],
+      },
+    };
+    const [priced] = extractSyncMetadata([message], "ollama:custom", providersConfig).usageHistory;
+    return { priced: getTotalCost(priced), usage };
+  };
+  const oneRequest = (usage: LanguageModelV2Usage, model: string) =>
+    getTotalCost(createDisplayUsage(usage, "ollama:custom", undefined, model));
+
+  // Two 75K requests, each under the threshold, still price at base rates.
+  const sameThreshold = priceUnder(recordingModel, [75_000, 75_000]);
+  expect(sameThreshold.priced).toBeLessThan(oneRequest(sameThreshold.usage, recordingModel)!);
+
+  // A 150K request classified long under Haiku 5.5 is under GPT-6 Sol's 272K threshold.
+  const remapped = priceUnder("openai:gpt-6-sol", [150_000]);
+  expect(remapped.priced).toBeCloseTo(oneRequest(remapped.usage, "openai:gpt-6-sol")!, 12);
 });
 
 describe("getConsumerInfoForToolCall", () => {

@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { fn } from "@storybook/test";
+import { fn } from "storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "./ContextSwitchWarning.js";
 

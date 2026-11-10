@@ -1,9 +1,10 @@
 import type { McpAppCspDeclaration } from "@/common/orpc/schemas/mcpApps";
 import { mcpAppGrantableOrigin } from "@/common/utils/mcpApps";
 import { ARTIFACT_IN_PAGE_LINK_SCRIPT } from "./artifactBridge";
+import { mcpAppDocumentChannelScript } from "./frameDocumentChannel";
 
 /**
- * CSP for MCP Apps views (artifacts experiment).
+ * CSP for MCP Apps views (mcp-apps experiment).
  *
  * Views run in the same sandbox as HTML artifacts (srcdoc, sandbox exactly "allow-scripts",
  * opaque origin), with this policy instead of the artifact one. The base is the spec's default
@@ -58,17 +59,21 @@ export function grantMcpAppCsp(
  * reference, and `frame-src 'none'` keeps it from reaching a fresh window's constructors through
  * a child frame. HTML artifacts get the same removal from their bridge script.
  * It also makes in-page `#` links jump within the view instead of navigating it away (same
- * reason as for HTML artifacts: ARTIFACT_IN_PAGE_LINK_SCRIPT).
+ * reason as for HTML artifacts: ARTIFACT_IN_PAGE_LINK_SCRIPT), and gives the view its host
+ * channel, bound to this document (mcpAppDocumentChannelScript).
  */
-export const MCP_APP_PREAMBLE_SCRIPT = `(function () {
+export function mcpAppPreambleScript(nonce: string): string {
+  return `(function () {
   "use strict";
   Object.getOwnPropertyNames(window).forEach(function (name) {
     if (/^(webkit)?RTC/.test(name)) {
       try { delete window[name]; } catch (error) {}
     }
   });
+  ${mcpAppDocumentChannelScript(nonce)}
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
+}
 
 export function buildMcpAppCsp(granted: GrantedMcpAppCsp): string {
   const resources = granted.resourceDomains;

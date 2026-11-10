@@ -17,7 +17,7 @@ import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelp
 
 /**
  * AI-generated sidebar status: emoji + short verb-led phrase, matching
- * WorkspaceAgentStatus so the frontend renders it through the same
+ * ExtensionAgentStatus so the frontend renders it through the same
  * WorkspaceStatusIndicator path as displayStatus / todoStatus.
  */
 export interface WorkspaceAgentStatusPayload {
@@ -314,7 +314,7 @@ function attemptCandidate(
         yield* Effect.tryPromise({
           try: async () =>
             options.recordUsage?.(modelString, usage, {
-              providerMetadata: accumulateStepsProviderMetadata(steps),
+              providerMetadata: accumulateStepsProviderMetadata(steps, created.metadataModel),
               metadataModel: created.metadataModel,
             }),
           catch: (error) => error,

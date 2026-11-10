@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { within, waitFor } from "@storybook/test";
+import { within, waitFor } from "storybook/test";
 import { useRef, useState, type ComponentType, type FC, type ReactNode } from "react";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";

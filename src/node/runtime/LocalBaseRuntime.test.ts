@@ -3,8 +3,12 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
+import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
+import { LocalRuntime } from "./LocalRuntime";
+import { setAgentCgroupEnrollmentTargets } from "./agentCgroupEnrollment";
 import type {
+  InitLogger,
   WorkspaceCreationParams,
   WorkspaceCreationResult,
   WorkspaceInitParams,
@@ -50,6 +54,12 @@ class TestLocalRuntime extends LocalBaseRuntime {
       workspacePath: "/tmp/workspace",
       sourceBranch: "main",
     });
+  }
+}
+
+class InitHookTestRuntime extends TestLocalRuntime {
+  runHook(workspacePath: string, hookPath: string, logger: InitLogger): Promise<void> {
+    return this.runInitHook(workspacePath, hookPath, {}, logger);
   }
 }
 
@@ -103,6 +113,35 @@ describe("LocalBaseRuntime.resolvePath", () => {
   });
 });
 
+describe("LocalBaseRuntime.exec process identity", () => {
+  it("keeps the child identity after exit", async () => {
+    const stream = await new TestLocalRuntime().exec('printf "%s" "$$"; read -r _; exit 7', {
+      cwd: os.tmpdir(),
+      timeout: 5,
+    });
+    const stdout = readStreamAsString(stream.stdout);
+    const stderr = readStreamAsString(stream.stderr);
+    try {
+      const evidence = stream.localProcess;
+      expect(evidence).toBeDefined();
+      if (!evidence) throw new Error("Missing local process identity");
+      expect(evidence.pid).not.toBe(process.pid);
+      expect(evidence.identity).toEqual({ ...getSelfIdentity(), birth: linuxBirth(evidence.pid) });
+      if (process.platform === "linux") {
+        expect(evidence.identity?.birth).toStartWith("linux-ticks:");
+      }
+      await stream.stdin.close();
+      expect(await stream.exitCode).toBe(7);
+      const shellPid = await stdout;
+      if (process.platform !== "win32") expect(shellPid).toBe(String(evidence.pid));
+      expect(stream.localProcess).toBe(evidence);
+    } finally {
+      await stream.stdin.close().catch(() => undefined);
+      await Promise.all([stream.exitCode, stdout, stderr]);
+    }
+  });
+});
+
 describe("LocalBaseRuntime.exec PATH handling", () => {
   it("canonicalizes pathEnv values with file I/O semantics (tilde and product home)", async () => {
     const xumRoot = await fs.mkdtemp(path.join(os.tmpdir(), "xum-root-"));
@@ -148,21 +187,26 @@ describe("LocalBaseRuntime.exec PATH handling", () => {
       process.env.MUX_VENDORED_BIN_DIR = vendoredBinDir;
       process.env.AGENT_BROWSER_SESSION = "mux-leaked-session";
 
-      const stream = await runtime.exec(
-        'printf "%s\\n" "${AGENT_BROWSER_SESSION-unset}" && mux-path-probe',
-        {
-          cwd: os.tmpdir(),
-          timeout: 5,
-          env: { PATH: `${vendoredBinDir}:${tempBinDir}:/usr/bin:/bin` },
-        }
-      );
-      const [stdout, exitCode] = await Promise.all([
-        readStreamAsString(stream.stdout),
-        stream.exitCode,
-      ]);
+      // #6509: the minimal host env drops the vendored-bin pointer, but PATH
+      // sanitization must still see it.
+      for (const hostEnv of ["inherit", "minimal"] as const) {
+        const stream = await runtime.exec(
+          'printf "%s\\n" "${AGENT_BROWSER_SESSION-unset}" && mux-path-probe',
+          {
+            cwd: os.tmpdir(),
+            timeout: 5,
+            env: { PATH: `${vendoredBinDir}:${tempBinDir}:/usr/bin:/bin` },
+            hostEnv,
+          }
+        );
+        const [stdout, exitCode] = await Promise.all([
+          readStreamAsString(stream.stdout),
+          stream.exitCode,
+        ]);
 
-      expect(exitCode).toBe(0);
-      expect(stdout.trim()).toBe("unset\ncaller-path");
+        expect(exitCode).toBe(0);
+        expect(stdout.trim()).toBe("unset\ncaller-path");
+      }
     } finally {
       if (originalVendoredBinDir == null) {
         delete process.env.MUX_VENDORED_BIN_DIR;
@@ -176,6 +220,125 @@ describe("LocalBaseRuntime.exec PATH handling", () => {
       }
       await fs.rm(tempBinDir, { recursive: true, force: true });
       await fs.rm(vendoredBinDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("LocalBaseRuntime.exec hostEnv", () => {
+  // #6509: plugin stdio MCP servers must not inherit the user's shell secrets.
+  async function runEnvProbe(hostEnv: "inherit" | "minimal" | undefined) {
+    const runtime = new TestLocalRuntime();
+    const stream = await runtime.exec(
+      'printf "%s|%s|%s" "${XUM_TEST_HOST_SECRET-unset}" "${XUM_TEST_DECLARED-unset}" "${HOME-unset}"',
+      {
+        cwd: os.tmpdir(),
+        timeout: 5,
+        env: { XUM_TEST_DECLARED: "declared" },
+        ...(hostEnv !== undefined ? { hostEnv } : {}),
+      }
+    );
+    await stream.stdin.close();
+    const [stdout, exitCode] = await Promise.all([
+      readStreamAsString(stream.stdout),
+      stream.exitCode,
+    ]);
+    expect(exitCode).toBe(0);
+    return stdout;
+  }
+
+  it("keeps only allowlisted host variables plus the declared env for minimal", async () => {
+    const original = process.env.XUM_TEST_HOST_SECRET;
+    process.env.XUM_TEST_HOST_SECRET = "leaked";
+    try {
+      expect(await runEnvProbe("minimal")).toBe(`unset|declared|${process.env.HOME ?? "unset"}`);
+      // Default exec (user MCP servers, the bash tool) still inherits the host env.
+      expect(await runEnvProbe(undefined)).toBe(`leaked|declared|${process.env.HOME ?? "unset"}`);
+    } finally {
+      if (original === undefined) {
+        delete process.env.XUM_TEST_HOST_SECRET;
+      } else {
+        process.env.XUM_TEST_HOST_SECRET = original;
+      }
+    }
+  });
+});
+
+describe("LocalBaseRuntime agent cgroup enrollment", () => {
+  it("moves each command's shell into the agent cgroup before the command runs", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-enroll-"));
+    const procsFile = path.join(dir, "cgroup.procs");
+    setAgentCgroupEnrollmentTargets({ fallback: procsFile, byProject: new Map() });
+    try {
+      const stream = await new TestLocalRuntime().exec("echo $$", { cwd: dir, timeout: 5 });
+      await stream.stdin.close();
+      const [stdout, exitCode] = await Promise.all([
+        readStreamAsString(stream.stdout),
+        stream.exitCode,
+      ]);
+
+      expect(exitCode).toBe(0);
+      expect(stdout).toMatch(/^\d+\n$/);
+      expect(await fs.readFile(procsFile, "utf-8")).toBe(stdout);
+    } finally {
+      setAgentCgroupEnrollmentTargets(null);
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("moves a command into the cgroup of its project, and others into the shared one", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-enroll-"));
+    const sharedProcs = path.join(dir, "shared.procs");
+    const projectProcs = path.join(dir, "project.procs");
+    const otherProject = path.join(dir, "other");
+    await fs.mkdir(otherProject);
+    setAgentCgroupEnrollmentTargets({
+      fallback: sharedProcs,
+      byProject: new Map([[dir, projectProcs]]),
+    });
+    const run = async (projectPath: string) => {
+      const stream = await new LocalRuntime(projectPath).exec("echo $$", {
+        cwd: projectPath,
+        timeout: 5,
+      });
+      await stream.stdin.close();
+      return readStreamAsString(stream.stdout);
+    };
+    try {
+      const projectPid = await run(dir);
+      const otherPid = await run(otherProject);
+
+      expect(await fs.readFile(projectProcs, "utf-8")).toBe(projectPid);
+      expect(await fs.readFile(sharedProcs, "utf-8")).toBe(otherPid);
+    } finally {
+      setAgentCgroupEnrollmentTargets(null);
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("moves the init hook's shell into the agent cgroup", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-enroll-"));
+    const procsFile = path.join(dir, "cgroup.procs");
+    const hookPath = path.join(dir, "init");
+    await fs.writeFile(hookPath, '#!/usr/bin/env bash\necho "$$ $PPID"\n', { mode: 0o755 });
+    const stdoutLines: string[] = [];
+    const exitCodes: number[] = [];
+    const logger = {
+      logStep: () => undefined,
+      logStdout: (line: string) => stdoutLines.push(line),
+      logStderr: () => undefined,
+      logComplete: (exitCode: number) => exitCodes.push(exitCode),
+    };
+    setAgentCgroupEnrollmentTargets({ fallback: procsFile, byProject: new Map() });
+    try {
+      await new InitHookTestRuntime().runHook(dir, hookPath, logger);
+
+      expect(exitCodes).toEqual([0]);
+      // bash may run the hook as its own child or exec it in place.
+      const [hookPid, hookParentPid] = (stdoutLines[0] ?? "").split(" ");
+      expect([hookPid, hookParentPid]).toContain((await fs.readFile(procsFile, "utf-8")).trim());
+    } finally {
+      setAgentCgroupEnrollmentTargets(null);
+      await fs.rm(dir, { recursive: true, force: true });
     }
   });
 });

@@ -2,12 +2,13 @@
  * Welcome/Empty state and workspace creation stories
  */
 
-import { within, userEvent, waitFor, expect } from "@storybook/test";
+import { within, userEvent, waitFor, expect } from "storybook/test";
 
 import { expandProjects } from "@/browser/stories/helpers/uiState";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { createArchivedWorkspace, NOW } from "@/browser/stories/mocks/workspaces";
+import { openLeftSidebar } from "@/browser/stories/storyPlayHelpers";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import type { ProjectConfig } from "@/node/config";
 
@@ -43,18 +44,11 @@ function createSessionUsage(cost: number): MockSessionUsage {
 async function openFirstProjectCreationView(storyRoot: HTMLElement): Promise<void> {
   // Navigate to the first project's creation page so creation/banner UI is visible.
 
+  // Phones start with the drawer closed, and a previous story's play may have left the wide
+  // sidebar collapsed.
+  await openLeftSidebar(storyRoot);
   const projectRow = await waitFor(
     () => {
-      // Guard: a previous story's play-function may have left the sidebar
-      // collapsed via localStorage. Check the canonical data-attribute on
-      // <html> (set by App.tsx) which works for both desktop (width-based)
-      // and mobile (transform-based) collapse modes.
-      if (document.documentElement.dataset.leftSidebarCollapsed === "true") {
-        const expandBtn = storyRoot.querySelector<HTMLElement>("[aria-label='Expand sidebar']");
-        if (expandBtn) expandBtn.click();
-        throw new Error("Sidebar collapsed – expanding…");
-      }
-
       const el = storyRoot.querySelector("[data-project-path][aria-controls]");
       if (!el) throw new Error("Project row not found");
       return el;
@@ -140,8 +134,7 @@ export const CreateWorkspaceWithSections: AppStory = {
     <AppWithMocks
       setup={() => {
         expandProjects(["/Users/dev/my-project"]);
-        // Ensure the sidebar starts expanded so the play function can click
-        // the project row even in mobile viewport modes.
+        // Start the wide sidebar expanded so the play function can click the project row.
         localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(false));
         return createMockORPCClient({
           projects: new Map([
@@ -193,7 +186,8 @@ export const CreateWorkspaceWithSections: AppStory = {
       const sidebar = storyRoot.querySelector<HTMLElement>("[data-testid='left-sidebar']");
       const sidebarIsExpanded = sidebar && sidebar.getBoundingClientRect().width > 40;
       if (sidebarIsExpanded) {
-        const collapseBtn = sidebar.querySelector<HTMLElement>("[aria-label='Collapse sidebar']");
+        // The toggle lives in the app shell's toggle bar, outside the sidebar.
+        const collapseBtn = storyRoot.querySelector<HTMLElement>("[aria-label='Collapse sidebar']");
         if (collapseBtn) {
           await userEvent.click(collapseBtn);
         }

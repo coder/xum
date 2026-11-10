@@ -49,6 +49,7 @@ import {
   removeTaskServiceTestRoot,
   startWorkspaceTurnForTest,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -223,6 +224,7 @@ describe("TaskService", () => {
 
     const parentSessionDir = path.join(config.sessionsDir, parentId);
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childId,
@@ -2173,6 +2175,77 @@ describe("TaskService", () => {
     expect(wakeCall).toBeUndefined();
     expect(await attentionStore.get(parentId, staleVersionedId)).toMatchObject({
       status: "superseded",
+    });
+  });
+
+  describe("a drain whose snapshot holds a wake of a stopped handle", () => {
+    // A Stop of a restart-settled turn deletes the restart outcome's wake only after its write, so
+    // a drain's listPending snapshot can still hold that wake when it rereads the Stop's record.
+    const handleId = "wst_stopped_after_restart";
+    const stoppedAt = "2026-08-11T00:00:05.000Z";
+
+    /** Drains one pending wake (`generationId` unset: a legacy wake, created now). */
+    async function drainWakeOf(params: { stoppedAt: string; generationId?: string }) {
+      const config = await createTestConfig(rootDir);
+      const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+      const sendMessage = mock(
+        (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+      );
+      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      await new TaskHandleStore(config).upsertWorkspaceTurn(
+        workspaceTurnRecord(parentId, parentId, handleId, "interrupted", {
+          attentionPolicy: "notify_on_terminal",
+          updatedAt: params.stoppedAt,
+        })
+      );
+      const attentionStore = new TerminalAttentionStore(config);
+      await attentionStore.enqueueIfAbsent({
+        ownerWorkspaceId: parentId,
+        sourceKind: "workspace_turn",
+        sourceId: handleId,
+        ...(params.generationId != null ? { generationId: params.generationId } : {}),
+        terminalOutcome: "interrupted",
+      });
+
+      taskService.scheduleTerminalAttentionDrain(parentId);
+      await flushTerminalAttentionDrains(taskService);
+
+      const wake = await attentionStore.get(
+        parentId,
+        TerminalAttentionStore.notificationId("workspace_turn", handleId, params.generationId)
+      );
+      return {
+        woke: sendMessage.mock.calls.some((call) => String(call[1]).includes(handleId)),
+        status: wake?.status,
+      };
+    }
+
+    test("drops the wake of the restart outcome that the Stop replaced", async () => {
+      expect(
+        await drainWakeOf({
+          stoppedAt,
+          generationId: `${handleId}:interrupted:2026-08-11T00:00:01.000Z`,
+        })
+      ).toEqual({ woke: false, status: "superseded" });
+    });
+
+    test("delivers a wake of the Stop's own outcome", async () => {
+      expect(
+        await drainWakeOf({ stoppedAt, generationId: `${handleId}:interrupted:${stoppedAt}` })
+      ).toEqual({ woke: true, status: "delivered" });
+    });
+
+    test("drops a legacy wake older than the Stop", async () => {
+      const later = new Date(Date.now() + 60_000).toISOString();
+      expect(await drainWakeOf({ stoppedAt: later })).toEqual({
+        woke: false,
+        status: "superseded",
+      });
+    });
+
+    test("delivers a legacy wake newer than the Stop", async () => {
+      expect(await drainWakeOf({ stoppedAt })).toEqual({ woke: true, status: "delivered" });
     });
   });
 

@@ -15,6 +15,7 @@ import {
   type ArtifactBytesOutcome,
   type ArtifactReadOptions,
   type ArtifactReadOutcome,
+  type ArtifactWriteOptions,
 } from "./artifactStore";
 
 /**
@@ -30,6 +31,7 @@ import {
  */
 
 const LIST_MAGIC = "XUMARTIFACTS1";
+const REAL_DIR_MAGIC = "XUMREALDIR1";
 const READ_MAGIC = "XUMREAD1";
 const WRITE_MAGIC = "XUMWRITE1";
 const EXEC_TIMEOUT_SECONDS = 30;
@@ -151,6 +153,38 @@ export function parseArtifactListOutput(stdout: string): RuntimeArtifactListing 
   }
 }
 
+/**
+ * Real path of a folder on the runtime (symlinks resolved), or null when it is missing or not a
+ * folder. Pins outside the checkout store it: the read script refuses a symlinked root folder.
+ */
+export async function resolveRealDirOnRuntime(
+  runtime: Runtime,
+  dir: string,
+  abortSignal?: AbortSignal
+): Promise<string | null> {
+  const result = await execBuffered(
+    runtime,
+    `cd -P -- "$XUM_DIR" 2>/dev/null || exit 0\nprintf '${REAL_DIR_MAGIC}\\0'\npwd -P\n`,
+    {
+      cwd: "/",
+      pathEnv: { XUM_DIR: dir },
+      timeout: EXEC_TIMEOUT_SECONDS,
+      abortSignal,
+      maxOutputBytes: READ_OUTPUT_SLACK_BYTES,
+    }
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `Resolving a folder failed (exit ${result.exitCode}): ${result.stderr.trim().slice(0, 500)}`
+    );
+  }
+  // A login banner can come first; pwd ends its line with one newline.
+  const start = result.stdout.indexOf(`${REAL_DIR_MAGIC}\0`);
+  if (start < 0) return null;
+  const real = result.stdout.slice(start + REAL_DIR_MAGIC.length + 1).replace(/\n$/, "");
+  return real.startsWith("/") ? real : null;
+}
+
 export async function listArtifactsOnRuntime(
   runtime: Runtime,
   artifactsDir: string,
@@ -197,21 +231,29 @@ d=$XUM_ARTIFACTS_DIR
 if [ -L "$d" ] || [ ! -d "$d" ]; then xum_missing; fi
 cd -- "$d" 2>/dev/null || xum_missing
 xum_root=$(pwd -P) || xum_missing
-xum_parent=$(cd -P -- "$` +
+xum_up=$` +
     "{d%/*}" +
+    String.raw`
+xum_parent=$(cd -P -- "$` +
+    "{xum_up:-/}" +
     String.raw`" 2>/dev/null && pwd -P) || xum_missing
-if [ "$xum_root" != "$xum_parent/${rootName}" ]; then xum_missing; fi
+if [ "$xum_root" != "$` +
+    "{xum_parent%/}" +
+    String.raw`/${rootName}" ]; then xum_missing; fi
+xum_pre=$` +
+    "{xum_root%/}" +
+    String.raw`/
 for xum_seg in ${dirSegments.join(" ")}; do
   if [ -L "$xum_seg" ] || [ ! -d "$xum_seg" ]; then xum_missing; fi
   cd -- "$xum_seg" 2>/dev/null || xum_missing
 done
-case $(pwd -P) in "$xum_root"/*|"$xum_root") ;; *) xum_missing ;; esac
+case $(pwd -P) in "$xum_pre"*|"$xum_root") ;; *) xum_missing ;; esac
 xum_leaf=${leaf}
 if [ -L "$xum_leaf" ] || [ ! -f "$xum_leaf" ]; then xum_missing; fi
 ${STAT_PRELUDE}
 xum_send() {
   if xum_fd=$(readlink "/proc/$$/fd/3" 2>/dev/null); then
-    case $xum_fd in "$xum_root"/*) ;; *) xum_missing ;; esac
+    case $xum_fd in "$xum_pre"*) ;; *) xum_missing ;; esac
   fi
   if [ -L "$xum_leaf" ]; then xum_missing; fi
   xum_m=$(xum_meta "./$xum_leaf") || xum_missing
@@ -250,17 +292,8 @@ async function collectBytesWithCeiling(
   return Buffer.concat(chunks, total);
 }
 
-/** Parse buildArtifactReadScript output into the shared wire result. */
-export function parseArtifactReadOutput(
-  stdout: Buffer,
-  relPath: string,
-  maxBytes: number
-): ArtifactReadOutcome {
-  return toArtifactReadOutcome(relPath, parseArtifactReadBytes(stdout, maxBytes), maxBytes);
-}
-
 /** Parse buildArtifactReadScript output into raw bytes. Throws on malformed output. */
-export function parseArtifactReadBytes(stdout: Buffer, maxBytes: number): ArtifactBytesOutcome {
+function parseArtifactReadBytes(stdout: Buffer, maxBytes: number): ArtifactBytesOutcome {
   const start = stdout.indexOf(`${READ_MAGIC}\0`);
   if (start === -1) throw new Error("Artifact read output has no header");
   let offset = start + READ_MAGIC.length + 1;
@@ -307,7 +340,8 @@ export async function readArtifactOnRuntime(
       abortSignal,
       options
     ),
-    maxBytes
+    maxBytes,
+    options?.kind
   );
 }
 
@@ -340,6 +374,25 @@ export async function readArtifactBytesOnRuntime(
   return parseArtifactReadBytes(stdout, maxBytes);
 }
 
+const WRITE_TEMP_SCRIPT = String.raw`xum_tmp=".$xum_leaf.$$.tmp"
+rm -f -- "$xum_tmp"
+set -C
+(umask 022; cat > "$xum_tmp") || { rm -f -- "$xum_tmp"; exit 1; }`;
+
+const REPLACE_LEAF_SCRIPT = String.raw`${WRITE_TEMP_SCRIPT}
+mv -f -- "$xum_tmp" "$xum_leaf" || { rm -f -- "$xum_tmp"; exit 1; }`;
+
+// A hard link fails on a name that exists (-n: even a symlink to a folder), so the finished temp
+// file becomes the leaf only if nothing wrote one meanwhile. An existing leaf skips the write;
+// stdin is drained so the writer does not see a broken pipe.
+const CREATE_LEAF_SCRIPT = String.raw`if [ -e "$xum_leaf" ]; then cat >/dev/null; else
+${WRITE_TEMP_SCRIPT}
+if ! ln -n -- "$xum_tmp" "$xum_leaf" && [ ! -e "$xum_leaf" ] && [ ! -L "$xum_leaf" ]; then
+  rm -f -- "$xum_tmp"; exit 1
+fi
+rm -f -- "$xum_tmp"
+fi`;
+
 /**
  * Writes one host-maintained artifact (the goal status board) through the Runtime. Only the
  * artifacts folder itself is created (no `mkdir -p`): the scratch dir above it is deleted when
@@ -347,11 +400,16 @@ export async function readArtifactBytesOnRuntime(
  * reads: cd one folder at a time (creating missing ones), refusing symlinked
  * folders, the final cwd must stay under the root's real path, and an existing leaf must be a
  * regular file. Content arrives on stdin into a hidden temp file (noclobber) that is renamed
- * over the leaf, so readers never see a partial board. Runtime.writeFile is not used: on SSH it
- * deliberately writes through symlinks, which would let the agent redirect a host write.
+ * over the leaf, so readers never see a partial board. `createOnly` (see ArtifactWriteOptions)
+ * hard-links the finished temp file to the leaf instead, which fails on a leaf that exists, so
+ * it never replaces one. Runtime.writeFile is not used: on SSH it deliberately writes through
+ * symlinks, which would let the agent redirect a host write.
  * Prints `MAGIC ok` or `MAGIC refused reason`.
  */
-export function buildArtifactWriteScript(segments: string[]): string {
+export function buildArtifactWriteScript(
+  segments: string[],
+  options?: ArtifactWriteOptions
+): string {
   assert(segments.length > 0, "segments must not be empty");
   const dirSegments = segments.slice(0, -1).map((segment) => shescape.quote(segment));
   const leaf = shescape.quote(segments[segments.length - 1]);
@@ -370,11 +428,7 @@ case $(pwd -P) in "$xum_root"/*|"$xum_root") ;; *) xum_refuse folder ;; esac
 xum_leaf=${leaf}
 if [ -L "$xum_leaf" ]; then xum_refuse leaf; fi
 if [ -e "$xum_leaf" ] && [ ! -f "$xum_leaf" ]; then xum_refuse leaf; fi
-xum_tmp=".$xum_leaf.$$.tmp"
-rm -f -- "$xum_tmp"
-set -C
-(umask 022; cat > "$xum_tmp") || { rm -f -- "$xum_tmp"; exit 1; }
-mv -f -- "$xum_tmp" "$xum_leaf" || { rm -f -- "$xum_tmp"; exit 1; }
+${options?.createOnly === true ? CREATE_LEAF_SCRIPT : REPLACE_LEAF_SCRIPT}
 printf '${WRITE_MAGIC}\0ok\0'
 `;
 }
@@ -384,15 +438,15 @@ export async function writeArtifactOnRuntime(
   artifactsDir: string,
   relPath: string,
   content: string,
-  abortSignal?: AbortSignal
+  options?: ArtifactWriteOptions & { abortSignal?: AbortSignal }
 ): Promise<void> {
   const segments = parseArtifactRelativePath(relPath);
   if (typeof segments === "string") throw new Error(segments);
-  const result = await execBuffered(runtime, buildArtifactWriteScript(segments), {
+  const result = await execBuffered(runtime, buildArtifactWriteScript(segments, options), {
     cwd: "/",
     pathEnv: { XUM_ARTIFACTS_DIR: artifactsDir },
     timeout: EXEC_TIMEOUT_SECONDS,
-    abortSignal,
+    abortSignal: options?.abortSignal,
     stdin: content,
     maxOutputBytes: READ_OUTPUT_SLACK_BYTES,
   });

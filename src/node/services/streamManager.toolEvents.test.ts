@@ -1,10 +1,16 @@
-import { describe, test, expect, setSystemTime } from "bun:test";
+import { describe, test, expect } from "bun:test";
 import { tool, type ToolExecutionOptions } from "ai";
 import { z } from "zod";
 import { ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
-import { createLiveStreamHarness, eventsOfType } from "./streamManager.liveStream.testHarness";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
+import {
+  createLiveStreamHarness,
+  eventsOfType,
+  toolCallChunk,
+  toolResultChunk,
+} from "./streamManager.liveStream.testHarness";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -12,7 +18,12 @@ import {
   testStartOptions,
   appendPartialAssistantForTests,
   createStreamResultForTests,
+  runTurnForTests,
+  scriptedStreamText,
+  STOP_FINISH,
+  type ScriptedAttempt,
 } from "./streamManager.suite.testHarness";
+import type { TurnEngineEvent } from "./streamManager";
 
 installStreamManagerTestHistory();
 
@@ -281,6 +292,56 @@ describe("StreamManager - nested kernel call race and replay", () => {
     await live.finish();
   });
 
+  test("re-delivers a nested call that started and ended before its parent, after the parent start", async () => {
+    const harness = createLiveStreamHarness();
+    const workspaceId = "nested-early-end-workspace";
+    const messageId = "nested-early-end-message";
+    const scope = { workspaceId, messageId, token: "test" };
+    const live = await harness.start({ workspaceId, messageId });
+    const timestamp = Date.now();
+    const nested = {
+      callId: "nested-early",
+      toolName: "bash",
+      args: { script: "true" },
+      parentToolCallId: "code-exec-early",
+      startTime: timestamp,
+    };
+    // execute() runs the whole nested call before the fullStream consumer stores the parent.
+    harness.streamManager.emitNestedToolEvent(scope, { ...nested, type: "tool-call-start" });
+    harness.streamManager.emitNestedToolEvent(scope, {
+      ...nested,
+      type: "tool-call-end",
+      result: { ok: true },
+      endTime: timestamp + 5,
+    });
+
+    const pushStart = harness.events.length;
+    await live.push(dynamicToolCall("code-exec-early", "code_execution", { code: "mux.bash()" }));
+
+    // The renderer dropped the raced events (no parent row yet), so they come again,
+    // in order, after the parent's own start.
+    const merged = harness.events
+      .slice(pushStart)
+      .map((event) => [
+        event.type,
+        "toolCallId" in event ? event.toolCallId : undefined,
+        "parentToolCallId" in event ? event.parentToolCallId : undefined,
+      ]);
+    expect(merged).toEqual([
+      ["tool-call-start", "code-exec-early", undefined],
+      ["tool-call-start", "nested-early", "code-exec-early"],
+      ["tool-call-end", "nested-early", "code-exec-early"],
+    ]);
+    const parts = liveParts(harness, workspaceId);
+    expect(parts).toHaveLength(1);
+    expect(parts[0]).toMatchObject({
+      nestedCalls: [
+        { toolCallId: "nested-early", state: "output-available", output: { ok: true } },
+      ],
+    });
+    await live.finish();
+  });
+
   test("replays persisted nested calls (start, attachment, end) with the parent part", async () => {
     const harness = createLiveStreamHarness();
     const workspaceId = "nested-replay-workspace";
@@ -463,38 +524,67 @@ describe("StreamManager - tool execution start timing", () => {
   }
 
   test("stamps executionStartedAt and emits tool-call-execution-start when the part already exists", async () => {
+    // A raw clock reading for the execution start could equal the tool-call part
+    // timestamp in the same millisecond; reconnect replay's `executionStartedAt > cursor`
+    // repair predicate would then never fire for a cursor at that part. Part timestamps
+    // read the wall clock until #7282, and this file may not patch Date.now, so the
+    // test cannot hold that clock still: it checks the ordering only.
     const harness = createLiveStreamHarness();
     const workspaceId = "execution-start-workspace";
     const messageId = "execution-start-message";
     const live = await harness.start({ workspaceId, messageId, tools: { bash } });
-
-    // Freeze the wall clock so a raw Date.now() execution start would equal the
-    // tool-call part timestamp; reconnect replay's `executionStartedAt > cursor`
-    // repair predicate would then never fire for a cursor at that part.
-    setSystemTime(new Date(Date.now()));
-    let partTimestamp: number | undefined;
     try {
       await live.push(dynamicToolCall("tool-call-1", "bash"));
-      partTimestamp = eventsOfType(harness.events, "tool-call-start")[0]?.timestamp;
+      const partTimestamp = eventsOfType(harness.events, "tool-call-start")[0]?.timestamp;
       await executeTool(harness, "tool-call-1");
-    } finally {
-      setSystemTime();
-    }
 
-    const events = eventsOfType(harness.events, "tool-call-execution-start");
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
-      type: "tool-call-execution-start",
-      workspaceId,
-      messageId,
-      toolCallId: "tool-call-1",
+      const events = eventsOfType(harness.events, "tool-call-execution-start");
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        type: "tool-call-execution-start",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-call-1",
+      });
+      // Cursor-monotonic: strictly after the tool-call part timestamp even when the wall
+      // clock has not advanced past it.
+      if (partTimestamp == null) throw new Error("Expected tool-call-start");
+      expect(events[0].timestamp).toBeGreaterThan(partTimestamp);
+      expect(liveParts(harness, workspaceId)[0].executionStartedAt).toBe(events[0].timestamp);
+    } finally {
+      await live.finish();
+    }
+  });
+
+  test("stamps part timestamps on the wall clock, not on the stream's TestClock", async () => {
+    // Part timestamps are record times: history, the renderer and replay compare them with
+    // Date.now() times, so they stay on the wall clock until #7282. The TestClock starts
+    // months before the wall clock, so a part stamped on it falls outside the bounds.
+    const clock = makeTestEffectRunner();
+    const harness = createLiveStreamHarness({ runner: clock.runner });
+    const before = Date.now();
+    const live = await harness.start({
+      workspaceId: "wall-clock-workspace",
+      messageId: "wall-clock-message",
+      tools: { bash },
     });
-    // Cursor-monotonic: strictly after the tool-call part timestamp even when the wall
-    // clock has not advanced past it.
-    if (partTimestamp == null) throw new Error("Expected tool-call-start");
-    expect(events[0].timestamp).toBeGreaterThan(partTimestamp);
-    expect(liveParts(harness, workspaceId)[0].executionStartedAt).toBe(events[0].timestamp);
-    await live.finish();
+    try {
+      await live.push(dynamicToolCall("tool-call-wall", "bash"));
+      await executeTool(harness, "tool-call-wall");
+      const after = Date.now();
+      const stamps = [
+        eventsOfType(harness.events, "tool-call-start")[0]?.timestamp,
+        eventsOfType(harness.events, "tool-call-execution-start")[0]?.timestamp,
+      ];
+      for (const stamp of stamps) {
+        expect(stamp).toBeGreaterThanOrEqual(before);
+        // nextPartTimestamp adds 1 ms per same-millisecond part.
+        expect(stamp).toBeLessThanOrEqual(after + stamps.length);
+      }
+    } finally {
+      await live.finish();
+      await clock.dispose();
+    }
   });
 
   test("applies execution starts that arrive before the tool part lands", async () => {
@@ -514,5 +604,135 @@ describe("StreamManager - tool execution start timing", () => {
     expect(events[0].toolCallId).toBe("tool-call-race");
     expect(liveParts(harness, workspaceId)[0].executionStartedAt).toBe(events[0].timestamp);
     await live.finish();
+  });
+});
+
+describe("StreamManager - step effects", () => {
+  function recordingManager(attempt: ScriptedAttempt, countTokens = () => Promise.resolve(0)) {
+    const events: TurnEngineEvent[] = [];
+    const streamManager = createStreamManagerForTests(historyService, {
+      eventSink: (event) => {
+        events.push(event);
+      },
+      tokenTracker: { setModel: () => Promise.resolve(), countTokens },
+      streamText: scriptedStreamText([attempt]),
+    });
+    return { events, streamManager };
+  }
+
+  test("a reasoning block ends with a reasoning-end event", async () => {
+    const workspaceId = "step-effects-reasoning-end";
+    const { events, streamManager } = recordingManager({
+      chunks: [
+        { type: "reasoning-start", id: "r1" },
+        { type: "reasoning-delta", id: "r1", text: "thinking" },
+        { type: "reasoning-end", id: "r1" },
+        { type: "text-delta", text: "answer" },
+        STOP_FINISH,
+      ],
+    });
+    const { completion } = await runTurnForTests(streamManager, { workspaceId });
+    expect(completion.status).toBe("completed");
+    expect(eventsOfType(events, "reasoning-end")).toHaveLength(1);
+  });
+
+  test("an ask_user_question call is on disk before the stream continues", async () => {
+    // The tool blocks on the user, so a restart during the wait must find the call.
+    const workspaceId = "step-effects-ask-user-flush";
+    let partialAfterCall: Awaited<ReturnType<typeof historyService.readPartial>> | undefined;
+    const { streamManager } = recordingManager({
+      chunks: [
+        dynamicToolCall("ask-1", "ask_user_question", { question: "Which?" }),
+        async () => {
+          partialAfterCall = await historyService.readPartial(workspaceId);
+        },
+        STOP_FINISH,
+      ],
+    });
+    await runTurnForTests(streamManager, { workspaceId });
+    expect(partialAfterCall?.parts).toMatchObject([
+      { type: "dynamic-tool", toolCallId: "ask-1", toolName: "ask_user_question" },
+    ]);
+  });
+
+  test("a tool-call delta part emits tool-call-delta with its token count", async () => {
+    const workspaceId = "step-effects-tool-call-delta";
+    const { events, streamManager } = recordingManager(
+      {
+        chunks: [
+          { type: "tool-call-delta", toolCallId: "t1", toolName: "bash", argsTextDelta: '{"a":1}' },
+          { type: "text-delta", text: "done" },
+          STOP_FINISH,
+        ],
+      },
+      () => Promise.resolve(7)
+    );
+    await runTurnForTests(streamManager, { workspaceId });
+    expect(eventsOfType(events, "tool-call-delta")).toMatchObject([
+      { toolCallId: "t1", toolName: "bash", delta: '{"a":1}', tokens: 7 },
+    ]);
+  });
+
+  test("a result without a tool-call part takes the workflow run that attached before it", async () => {
+    // The run attached while no part existed for the call, so it waits as pending;
+    // the result's fallback part is the first part that can carry it.
+    const workspaceId = "step-effects-orphan-attachment";
+    const messageId = `${workspaceId}-message`;
+    const timestamp = Date.now();
+    let partialAfterResult: Awaited<ReturnType<typeof historyService.readPartial>> | undefined;
+    const { events, streamManager } = recordingManager({
+      chunks: [
+        async () => {
+          const attached = await streamManager.attachWorkflowRunToToolCall({
+            type: "workflow-run-attached",
+            workspaceId,
+            messageId,
+            toolCallId: "wf-1",
+            runId: "wfr_orphan",
+            timestamp,
+          });
+          expect(attached).toBe(true);
+        },
+        toolResultChunk("wf-1", "workflow_run"),
+        async () => {
+          partialAfterResult = await historyService.readPartial(workspaceId);
+        },
+        STOP_FINISH,
+      ],
+    });
+    await runTurnForTests(streamManager, { workspaceId, messageId });
+    expect(eventsOfType(events, "workflow-run-attached")).toEqual([
+      {
+        type: "workflow-run-attached",
+        workspaceId,
+        messageId,
+        toolCallId: "wf-1",
+        runId: "wfr_orphan",
+        timestamp,
+      },
+    ]);
+    expect(partialAfterResult?.parts).toMatchObject([
+      { type: "dynamic-tool", toolCallId: "wf-1", workflowRun: { runId: "wfr_orphan", timestamp } },
+    ]);
+  });
+
+  test("a soft stop during a tool call ends the stream when the tool finishes", async () => {
+    const workspaceId = "step-effects-soft-stop-after-tool";
+    const { events, streamManager } = recordingManager({
+      chunks: [
+        toolCallChunk("t1"),
+        async () => {
+          const stopped = await streamManager.stopStream(workspaceId, { soft: true });
+          expect(stopped.success).toBe(true);
+        },
+        toolResultChunk("t1"),
+        { type: "text-delta", text: "after the tool" },
+        STOP_FINISH,
+      ],
+    });
+    const { completion } = await runTurnForTests(streamManager, { workspaceId });
+    expect(completion.status).toBe("aborted");
+    expect(eventsOfType(events, "tool-call-end")).toMatchObject([{ toolCallId: "t1" }]);
+    expect(eventsOfType(events, "stream-delta")).toEqual([]);
   });
 });

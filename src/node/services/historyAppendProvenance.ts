@@ -1,13 +1,12 @@
 import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
 import assert from "node:assert";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { constants } from "node:fs";
-import * as fs from "node:fs/promises";
+import type * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { ensurePrivateDir } from "@/node/utils/fs";
-import writeFileAtomic from "@/node/utils/writeFileAtomic";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { log } from "./log";
 
 export const HISTORY_APPEND_PROVENANCE_FILE = "history-append-provenance.json";
@@ -72,7 +71,10 @@ export class HistoryAppendProvenance {
   readonly receiptPath: string;
   readonly chatPath: string;
   readonly archivePath: string;
-  constructor(readonly sessionDir: string) {
+  constructor(
+    readonly sessionDir: string,
+    private readonly files: SessionFiles = nodeSessionFiles
+  ) {
     assert(path.isAbsolute(sessionDir), "history provenance requires an absolute session path");
     this.receiptPath = path.join(sessionDir, HISTORY_APPEND_PROVENANCE_FILE);
     this.chatPath = path.join(sessionDir, CHAT_FILE_NAME);
@@ -87,7 +89,7 @@ export class HistoryAppendProvenance {
   async stamps(): Promise<HistoryFileStamps> {
     const stamp = async (filePath: string) => {
       try {
-        const stat = await fs.stat(filePath, { bigint: true });
+        const stat = await this.files.promises.stat(filePath, { bigint: true });
         if (!stat.isFile()) throw new Error("History artifact is not a file");
         return {
           dev: String(stat.dev),
@@ -109,9 +111,11 @@ export class HistoryAppendProvenance {
     let bytesRead = 0;
     try {
       // Reject special files without blocking on a FIFO before the descriptor check below.
-      handle = await fs.open(
+      handle = await this.files.promises.open(
         this.receiptPath,
-        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
+        this.files.constants.O_RDONLY |
+          (this.files.constants.O_NOFOLLOW ?? 0) |
+          (this.files.constants.O_NONBLOCK ?? 0)
       );
       const stat = await handle.stat();
       if (!stat.isFile() || stat.size > HISTORY_PROVENANCE_MAX_RECEIPT_BYTES)
@@ -132,7 +136,7 @@ export class HistoryAppendProvenance {
   private async syncDirectory(): Promise<void> {
     // Windows cannot fsync directory handles; rename durability follows its API.
     if (process.platform === "win32") return;
-    const handle = await fs.open(this.sessionDir, "r");
+    const handle = await this.files.promises.open(this.sessionDir, "r");
     try {
       await handle.sync();
     } finally {
@@ -150,7 +154,7 @@ export class HistoryAppendProvenance {
       "history receipt exceeds its bound"
     );
     const temporary = `${this.receiptPath}.${randomUUID()}.tmp`;
-    const handle = await fs.open(temporary, "wx", 0o600);
+    const handle = await this.files.promises.open(temporary, "wx", 0o600);
     try {
       try {
         await handle.writeFile(bytes);
@@ -160,10 +164,10 @@ export class HistoryAppendProvenance {
       }
       // Rename replaces a destination symlink rather than following it.
       if (assertStillOwned) await assertStillOwned();
-      await fs.rename(temporary, this.receiptPath);
+      await this.files.promises.rename(temporary, this.receiptPath);
       await this.syncDirectory();
     } finally {
-      await fs.rm(temporary, { force: true });
+      await this.files.promises.rm(temporary, { force: true });
     }
   }
 
@@ -179,7 +183,7 @@ export class HistoryAppendProvenance {
       return { receipt, bytesRead };
     }
     if (epoch != null) throw new Error("stale_cursor");
-    await ensurePrivateDir(this.sessionDir);
+    await this.files.ensurePrivateDir(this.sessionDir);
     const replacement: HistoryAppendReceipt = {
       version: 1,
       state: "stable",
@@ -222,7 +226,7 @@ export class HistoryAppendProvenance {
       // No mutation may begin while an old stable receipt remains trusted.
       // Deletion is the fallback; if that too fails, abort BEFORE the operation.
       if (assertStillOwned) await assertStillOwned();
-      await fs.rm(this.receiptPath, { force: true });
+      await this.files.promises.rm(this.receiptPath, { force: true });
       await this.syncDirectory();
       tracking = false;
       log.warn("History append tracking unavailable; invalidated receipt", { error });
@@ -270,9 +274,9 @@ export class HistoryAppendProvenance {
       JSON.stringify(after.archive) !== JSON.stringify(before.archive)
     )
       return false;
-    if (replacement) return (await fs.readFile(this.chatPath)).equals(replacement);
+    if (replacement) return (await this.files.promises.readFile(this.chatPath)).equals(replacement);
     if (start > BigInt(Number.MAX_SAFE_INTEGER)) return false;
-    const handle = await fs.open(this.chatPath, "r");
+    const handle = await this.files.promises.open(this.chatPath, "r");
     try {
       const tail = Buffer.alloc(bytes.length);
       let offset = 0;
@@ -306,10 +310,12 @@ export class HistoryAppendProvenance {
     let replacement: Buffer | undefined;
     try {
       if (atomic) {
-        const existing = await fs.readFile(this.chatPath).catch((error: NodeJS.ErrnoException) => {
-          if (error.code === "ENOENT") return Buffer.alloc(0);
-          throw error;
-        });
+        const existing = await this.files.promises
+          .readFile(this.chatPath)
+          .catch((error: NodeJS.ErrnoException) => {
+            if (error.code === "ENOENT") return Buffer.alloc(0);
+            throw error;
+          });
         if (BigInt(existing.length) !== BigInt(before.chat?.size ?? 0))
           transaction.certified = false;
         // Keep prior bytes verbatim, including invalid UTF-8. Torn-tail repair
@@ -321,13 +327,15 @@ export class HistoryAppendProvenance {
         replacement = Buffer.concat([existing, bytes]);
         // HistoryService supplies its commit-point observer without duplicating
         // raw-byte preservation, torn-tail repair, or append certification here.
-        await (publishAtomic ?? writeFileAtomic)(this.chatPath, replacement);
+        await (publishAtomic
+          ? publishAtomic(this.chatPath, replacement)
+          : this.files.writeFileAtomic(this.chatPath, replacement));
         published = true;
       } else {
         const size = Number(before.chat?.size ?? 0);
         assert(Number.isSafeInteger(size), "chat tail offset must be representable");
         if (size > 0) {
-          const tailHandle = await fs.open(this.chatPath, "r");
+          const tailHandle = await this.files.promises.open(this.chatPath, "r");
           try {
             const tail = Buffer.alloc(1);
             const read = await tailHandle.read(tail, 0, 1, size - 1);
@@ -343,9 +351,9 @@ export class HistoryAppendProvenance {
           }
         }
         if (publishAppend) await publishAppend(this.chatPath, bytes, before.chat == null);
-        else await fs.appendFile(this.chatPath, bytes);
+        else await this.files.promises.appendFile(this.chatPath, bytes);
         published = true;
-        const handle = await fs.open(this.chatPath, "r");
+        const handle = await this.files.promises.open(this.chatPath, "r");
         try {
           await handle.sync();
         } finally {

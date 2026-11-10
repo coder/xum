@@ -40,9 +40,17 @@ describe("mux.schema.union", () => {
   });
 
   test("rejects a member without a type, a non-object member, and a non-array argument", () => {
-    expect(() => schemaOf('mux.schema.union([{ enum: ["a"] }])')).toThrow();
-    expect(() => schemaOf('mux.schema.union(["string"])')).toThrow();
-    expect(() => schemaOf("mux.schema.union(mux.schema.string())")).toThrow();
+    // Match the messages: each case must fail in its own guard. A bare toThrow() passes even
+    // when the schema-object guard is gone, because `"string".type` then fails the type check.
+    expect(() => schemaOf('mux.schema.union([{ enum: ["a"] }])')).toThrow(
+      "union member must have a type"
+    );
+    expect(() => schemaOf('mux.schema.union(["string"])')).toThrow(
+      "union member must be a schema object"
+    );
+    expect(() => schemaOf("mux.schema.union(mux.schema.string())")).toThrow(
+      "union schemas must be an array"
+    );
   });
 });
 

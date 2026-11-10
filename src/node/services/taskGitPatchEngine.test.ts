@@ -12,6 +12,7 @@ import {
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function initGitRepo(repoPath: string): void {
   execSync("git init -b main", { cwd: repoPath, stdio: "ignore" });
@@ -89,6 +90,7 @@ async function writePatchArtifact(params: {
   >;
 }) {
   await upsertSubagentGitPatchArtifact({
+    locks: nodeSessionLocks,
     workspaceId: params.workspaceId,
     workspaceSessionDir: params.sessionDir,
     childTaskId: params.childTaskId,
@@ -205,6 +207,7 @@ describe("task git patch engine", () => {
       ],
     });
     const config = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -270,6 +273,7 @@ describe("task git patch engine", () => {
       ],
     });
     const config = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -453,6 +457,7 @@ describe("task git patch engine", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: rootWorkspaceId,
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -539,6 +544,7 @@ describe("task git patch engine", () => {
     });
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepoA,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -609,6 +615,9 @@ describe("task git patch engine", () => {
         stdio: "ignore",
       }
     );
+    // `git init` creates `.git/info` only from its template; a global
+    // `init.templateDir` without that folder leaves it missing.
+    await fsPromises.mkdir(path.join(targetRepo, ".git", "info"), { recursive: true });
     await fsPromises.writeFile(
       path.join(targetRepo, ".git", "info", "attributes"),
       "*.md merge=evil\n",
@@ -645,6 +654,7 @@ describe("task git patch engine", () => {
       ],
     });
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -718,6 +728,7 @@ describe("task git patch engine", () => {
       ],
     });
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -763,6 +774,9 @@ describe("task git patch engine", () => {
       stdio: "ignore",
     });
     execSync("git config filter.evil.required true", { cwd: targetRepo, stdio: "ignore" });
+    // `git init` creates `.git/info` only from its template; a global
+    // `init.templateDir` without that folder leaves it missing.
+    await fsPromises.mkdir(path.join(targetRepo, ".git", "info"), { recursive: true });
     await fsPromises.writeFile(
       path.join(targetRepo, ".git", "info", "attributes"),
       "*.md filter=evil\n",
@@ -801,6 +815,7 @@ describe("task git patch engine", () => {
     });
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -878,6 +893,7 @@ describe("task git patch engine", () => {
     }).trim();
 
     const config = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -962,6 +978,7 @@ describe("task git patch engine", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1028,6 +1045,7 @@ describe("task git patch engine", () => {
     }).trim();
 
     const config = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1117,6 +1135,7 @@ describe("task git patch engine", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1175,6 +1194,7 @@ describe("task git patch engine", () => {
     });
 
     const config = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1233,6 +1253,7 @@ describe("task git patch engine", () => {
     await fsPromises.mkdir(path.dirname(escapedPath), { recursive: true });
     await fsPromises.writeFile(escapedPath, "do not delete", "utf-8");
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1306,6 +1327,7 @@ describe("task git patch engine", () => {
     await fsPromises.mkdir(path.dirname(escapedPath), { recursive: true });
     await fsPromises.writeFile(escapedPath, "do not delete", "utf-8");
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1375,6 +1397,7 @@ describe("task git patch engine", () => {
       encoding: "utf-8",
     }).trim();
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1462,6 +1485,7 @@ describe("task git patch engine", () => {
     });
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepoA,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1560,6 +1584,7 @@ describe("task git patch engine", () => {
     });
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepoA,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1636,6 +1661,7 @@ describe("task git patch engine", () => {
     });
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1708,6 +1734,7 @@ describe("task git patch engine", () => {
     const markReadyCalls: Array<Promise<void>> = [];
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1773,6 +1800,7 @@ describe("task git patch engine", () => {
     const startedAtMs = Date.now();
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1851,6 +1879,7 @@ describe("task git patch engine", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: "test-workspace",
         cwd: targetRepoA,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -1940,6 +1969,7 @@ describe("task git patch engine", () => {
     const startedAtMs = Date.now();
     const result = await taskGitPatchEngine.applyPatch(
       {
+        sessionLocks: nodeSessionLocks,
         workspaceId: currentWorkspaceId,
         cwd: targetRepoA,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -2005,6 +2035,7 @@ describe("task git patch engine", () => {
     );
     const appliedAtMs = Date.now();
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: ancestorWorkspaceId,
       workspaceSessionDir: ancestorSessionDir,
       childTaskId,
@@ -2064,6 +2095,7 @@ describe("task git patch engine", () => {
     );
 
     const engineConfig = {
+      sessionLocks: nodeSessionLocks,
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),

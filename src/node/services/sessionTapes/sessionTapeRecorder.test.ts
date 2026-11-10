@@ -4,8 +4,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { getXumPerfTapesDir } from "@/common/constants/paths";
-import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
-import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
+import { OnChatEventSchema } from "@/common/orpc/schemas";
+import type { OnChatMode, OnChatEvent } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import {
   SessionTapeEventLineSchema,
@@ -70,8 +70,8 @@ function loadTapeStrictly(lines: unknown[]) {
       json: eventLine.event,
       meta: eventLine.meta as never,
     });
-    const parsed = WorkspaceChatMessageSchema.parse(decoded);
-    expect(parsed).toEqual(decoded as WorkspaceChatMessage);
+    const parsed = OnChatEventSchema.parse(decoded);
+    expect(parsed).toEqual(decoded as OnChatEvent);
     return parsed;
   });
   return { header, events, trailer };
@@ -139,7 +139,7 @@ describe("session tapes through workspace.onChat", () => {
       const iterator = subscribeWorkspaceChat(context, { workspaceId }, undefined, {
         validateOutput: true,
       });
-      const delivered: WorkspaceChatMessage[] = [];
+      const delivered: OnChatEvent[] = [];
       for (;;) {
         const result = await iterator.next();
         if (result.done) break;
@@ -226,7 +226,7 @@ describe("session tapes through workspace.onChat", () => {
 });
 
 describe("maybeRecordWorkspaceChat captures", () => {
-  async function* fromEvents(events: WorkspaceChatMessage[]) {
+  async function* fromEvents(events: OnChatEvent[]) {
     for (const event of events) {
       // Settle each event on its own microtask, like a real subscription stream.
       await Promise.resolve();
@@ -242,13 +242,13 @@ describe("maybeRecordWorkspaceChat captures", () => {
     }
   }
 
-  async function drain(iterator: AsyncGenerator<WorkspaceChatMessage>) {
-    const delivered: WorkspaceChatMessage[] = [];
+  async function drain(iterator: AsyncGenerator<OnChatEvent>) {
+    const delivered: OnChatEvent[] = [];
     for await (const event of iterator) delivered.push(event);
     return delivered;
   }
 
-  function delta(messageId: string, text: string): WorkspaceChatMessage {
+  function delta(messageId: string, text: string): OnChatEvent {
     return {
       type: "stream-delta",
       workspaceId,
@@ -261,7 +261,7 @@ describe("maybeRecordWorkspaceChat captures", () => {
 
   function record(
     rootDir: string,
-    events: AsyncGenerator<WorkspaceChatMessage> | WorkspaceChatMessage[],
+    events: AsyncGenerator<OnChatEvent> | OnChatEvent[],
     flags = experimentFlags(true)
   ) {
     return maybeRecordWorkspaceChat(
@@ -372,7 +372,7 @@ describe("maybeRecordWorkspaceChat captures", () => {
   test("records the value captured at delivery even if the producer mutates it later", async () => {
     using root = new DisposableTempDir("session-tape-snapshot");
     const result = { output: "abcd" };
-    async function* mutatingProducer(): AsyncGenerator<WorkspaceChatMessage> {
+    async function* mutatingProducer(): AsyncGenerator<OnChatEvent> {
       await Promise.resolve();
       yield {
         type: "tool-call-end",
@@ -558,7 +558,7 @@ describe("maybeRecordWorkspaceChat captures", () => {
         throw new Error("unreadable");
       },
     };
-    const broken: WorkspaceChatMessage = {
+    const broken: OnChatEvent = {
       type: "tool-call-end",
       workspaceId,
       messageId: "m-2",

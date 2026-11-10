@@ -9,6 +9,7 @@ import { AttachmentService } from "./attachmentService";
 import { upsertSubagentReportArtifact } from "./subagentReportArtifacts";
 import { DisposableTempDir } from "./tempDir";
 import { WorkflowRunStore } from "./workflows/WorkflowRunStore";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 const WORKSPACE_ID = "workspace-reports-test";
 
@@ -23,6 +24,7 @@ async function writeTaskReport(
   }
 ): Promise<void> {
   await upsertSubagentReportArtifact({
+    locks: nodeSessionLocks,
     workspaceId: WORKSPACE_ID,
     workspaceSessionDir: sessionDir,
     childTaskId: params.childTaskId,

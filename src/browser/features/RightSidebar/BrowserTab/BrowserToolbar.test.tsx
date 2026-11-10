@@ -341,7 +341,7 @@ describe("BrowserToolbar", () => {
     });
 
     await waitFor(() => {
-      expect(view.queryByText("Reload failed")).toBeNull();
+      expect(view.queryByText("Reload failed") === null).toBe(true);
     });
 
     fireEvent.click(view.getByLabelText("Reload"));

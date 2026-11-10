@@ -21,3 +21,62 @@ test(
     await expect(panel).toHaveAttribute("data-shortcut-focus", "true");
   }
 );
+
+// User request (2026-10-26): while the Artifacts tab shows and focus is elsewhere,
+// OPEN_ARTIFACTS_TAB moves focus into the tab instead of hiding the sidebar. Only a press from
+// inside the tab hides it.
+test(
+  "Ctrl+Shift+K focuses the showing Artifacts tab first, and hides the sidebar from inside it",
+  { tags: ["bugbash", "artifacts-key-focus-first"] },
+  async ({ app, screen, browser }) => {
+    await browser.setViewport({ width: 1440, height: 900 });
+    await openPlayground(app, screen, browser);
+    const input = screen.getByRole("textbox", "Message");
+    const panel = screen.getByTestId("artifacts-panel");
+    await input.tap();
+    await browser.keyboard.press("Control+Shift+K");
+    await expect(panel).toBeFocused();
+
+    // The tab shows, focus is back in the chat: the key only moves focus.
+    await input.tap();
+    await browser.keyboard.press("Control+Shift+K");
+    await expect(panel).toBeFocused();
+    await expect(screen.getByRole("button", "Collapse right sidebar")).toBeVisible();
+
+    // Focus is in the tab: the key hides the sidebar.
+    await browser.keyboard.press("Control+Shift+K");
+    await expect(screen.getByRole("button", "Expand right sidebar")).toBeFocused();
+  }
+);
+
+// artifacts-key-focus-race (#7599 CI): a press right after the focus step collapsed the sidebar and
+// moved focus to the header toggle, then the panel's pending autofocus ran again and took focus
+// back, and the collapse dropped it on <body>. CI's fast key presses hit it on every run.
+test(
+  "Ctrl+Shift+K right after the focus step hides the sidebar and keeps focus on the toggle",
+  { tags: ["bugbash", "artifacts-key-focus-race"] },
+  async ({ app, screen, browser }) => {
+    await browser.setViewport({ width: 1440, height: 900 });
+    await openPlayground(app, screen, browser);
+    const input = screen.getByRole("textbox", "Message");
+    const panel = screen.getByTestId("artifacts-panel");
+    await input.tap();
+    await browser.keyboard.press("Control+Shift+K");
+    await expect(panel).toBeFocused();
+    await input.tap();
+    // Queue the next press for the moment the focus step focuses the panel, before React renders
+    // the panel's low-priority "autofocus consumed" update.
+    await browser.evaluate(() => {
+      const el = document.querySelector('[data-testid="artifacts-panel"]');
+      const chord = { key: "K", code: "KeyK", ctrlKey: true, shiftKey: true, bubbles: true };
+      el?.addEventListener(
+        "focus",
+        () => queueMicrotask(() => el.dispatchEvent(new KeyboardEvent("keydown", chord))),
+        { once: true }
+      );
+      return null;
+    });
+    await browser.keyboard.press("Control+Shift+K");
+    await expect(screen.getByRole("button", "Expand right sidebar")).toBeFocused();
+  }
+);

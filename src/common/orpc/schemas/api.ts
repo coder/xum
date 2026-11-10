@@ -16,12 +16,13 @@ import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constant
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { MAX_RENDERED_MODELS } from "@/common/constants/ui";
+import { PROJECT_ICON_NAMES } from "@/common/constants/projectIcons";
 import {
   MAX_STAGED_ATTACHMENT_BASE64_CHARS,
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
 } from "@/common/constants/stagedAttachments";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
-import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
+import { ChatStatsSchema, ChatUsageDisplaySchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
   NameGenerationErrorSchema,
@@ -66,10 +67,9 @@ import {
 import {
   ArtifactCapabilitiesSchema,
   ArtifactListingSchema,
-  ArtifactReadResultSchema,
+  ArtifactReadOutcomeSchema,
   ArtifactShelfListingSchema,
   ArtifactShelfScopeSchema,
-  ArtifactVersionListSchema,
   PinnedArtifactFilesSchema,
 } from "./artifacts";
 import { ResultSchema } from "./result";
@@ -79,6 +79,7 @@ import {
   McpAppApproveDomainsRequestSchema,
   McpAppEntrypointSchema,
   McpAppModelContextRequestSchema,
+  McpAppWidgetStateRequestSchema,
   McpAppOpenEntrypointRequestSchema,
   McpAppViewDomainsSchema,
   McpAppResourceReadRequestSchema,
@@ -107,6 +108,7 @@ import {
   ToolPolicySchema,
   UpdateStatusSchema,
   WorkspaceChatMessageSchema,
+  OnChatEventSchema,
 } from "./stream";
 import {
   TimelineListInputSchema,
@@ -115,7 +117,6 @@ import {
   TimelinePreviewSchema,
   TimelineSubscriptionEventSchema,
 } from "./timeline";
-import { LayoutPresetsConfigSchema } from "./uiLayouts";
 import {
   TerminalCreateParamsSchema,
   TerminalResizeParamsSchema,
@@ -135,8 +136,6 @@ import {
   DraftEventSchema,
   DraftGetOutputSchema,
   DraftImportLegacyOutputSchema,
-  DraftListEntrySchema,
-  DraftListSchema,
   DraftResolveSendsInputSchema,
   DraftResolveSendsOutputSchema,
   DraftRevisionOutputSchema,
@@ -147,6 +146,13 @@ import {
   DraftUpdateInputSchema,
   DraftWriteOutputSchema,
   RemovedCreationDraftSchema,
+  CreationDraftDeleteInputSchema,
+  CreationDraftImportLegacyInputSchema,
+  CreationDraftListSchema,
+  CreationDraftSchema,
+  CreationDraftScopeSchema,
+  CreationDraftUpdateInputSchema,
+  CreationDraftUpdateOutputSchema,
 } from "./drafts";
 import {
   AgentMessageDispatchModeSchema,
@@ -160,7 +166,11 @@ import {
   WorkspaceHeartbeatSettingsSchema,
 } from "./workspace";
 import { WorkspaceAgentAISettingsSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
-import { AgentSkillListResultSchema, AgentSkillPackageSchema, SkillNameSchema } from "./agentSkill";
+import {
+  AgentSkillListResultSchema,
+  AgentSkillPackageSchema,
+  SkillLookupNameSchema,
+} from "./agentSkill";
 import {
   AvailableWorkflowSchema,
   WorkflowRunIdSchema,
@@ -174,6 +184,7 @@ import {
   AgentIdSchema,
 } from "./agentDefinition";
 import { PluginSlashCommandDescriptorSchema, WorkspaceCompositionSchema } from "./agentPlugins";
+import { SkillsCliCommandInputSchema, SkillsCliCommandSchema } from "./skillsCli";
 import {
   MCPAddGlobalParamsSchema,
   MCPAddParamsSchema,
@@ -183,8 +194,11 @@ import {
   MCPRemoveParamsSchema,
   MCPServerMapSchema,
   MCPSettingsReadInputSchema,
-  MCPSettingsSnapshotSchema,
+  MCPSettingsReadSnapshotSchema,
   MCPSettingsUpdateParamsSchema,
+  MCPSettingsRunToolParamsSchema,
+  MCPSettingsRunToolResultSchema,
+  MCPSettingsOpenAppResultSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
@@ -199,10 +213,13 @@ import {
 import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
-  AgentPluginInstallPreviewSchema,
+  AgentPluginInstallMethodSchema,
+  AgentPluginSourcePreviewSchema,
   AgentPluginComponentsSchema,
+  AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
   AgentPluginListItemSchema,
+  AgentPluginPendingSignOutsSchema,
   AgentPluginUpdateCheckSchema,
   AgentPluginUpdateConsentSchema,
   AgentPluginUpdateReviewSchema,
@@ -281,6 +298,9 @@ export { perf } from "./perfFlightRecorder";
 
 // Re-export triggered CPU profile schemas
 export { perfCaptures } from "./perfCaptures";
+
+// Re-export agent resource limit schemas
+export { agentResourceLimits } from "./agentResourceLimits";
 
 // Re-export "Report slowness" bundle schemas
 export { perfReports } from "./perfReports";
@@ -374,6 +394,18 @@ export const AWSCredentialStatusSchema = z.object({
   secretAccessKeySet: z.boolean(),
 });
 
+export const GoogleVertexCredentialStatusSchema = z.object({
+  project: z.string().optional(),
+  location: z.string().optional(),
+  /** Values from GOOGLE_VERTEX_* env vars, set only when the config value is unset. */
+  envProject: z.string().optional(),
+  envLocation: z.string().optional(),
+  /** Service-account key file path is never sent to the frontend, only whether one is set. */
+  keyFilenameSet: z.boolean(),
+  /** Whether an env var supplies the key file; set only when the saved one is unset. */
+  envKeyFilenameSet: z.boolean().optional(),
+});
+
 export const ProviderConfigInfoSchema = z.object({
   apiKeySet: z.boolean(),
   /** Whether this provider is enabled for model requests */
@@ -388,6 +420,8 @@ export const ProviderConfigInfoSchema = z.object({
   baseUrlSource: z.enum(["config", "env"]).nullish(),
   /** Active base URL for display only. Env values must not be persisted from this field. */
   baseUrlResolved: z.string().nullish(),
+  /** Header name that carries the workspace id on chat requests (see sessionHeader.ts). */
+  sessionHeader: z.string().optional(),
   providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
   displayName: z.string().optional(),
   isCustom: z.boolean().optional(),
@@ -415,10 +449,8 @@ export const ProviderConfigInfoSchema = z.object({
   codexOauthDefaultAuth: CodexOauthDefaultAuthSchema.optional(),
   /** AWS-specific fields (only present for bedrock provider) */
   aws: AWSCredentialStatusSchema.optional(),
-  /** Xum Gateway-specific fields */
-  couponCodeSet: z.boolean().optional(),
-  /** Xum Gateway-specific: which models are enabled for gateway routing */
-  gatewayModels: z.array(z.string()).optional(),
+  /** Google Vertex AI-specific fields (only present for google-vertex provider) */
+  googleVertex: GoogleVertexCredentialStatusSchema.optional(),
   /** Coder-only: deployment access URL (e.g. https://coder.example.com) */
   deploymentUrl: z.string().optional(),
   /** Coder-only: whether Coder OAuth tokens are present in providers.jsonc */
@@ -602,34 +634,6 @@ export const providers = {
   },
 };
 
-// Xum Gateway OAuth (desktop login flow)
-export const muxGatewayOauth = {
-  startDesktopFlow: {
-    input: z.void(),
-    output: ResultSchema(
-      z.object({
-        flowId: z.string(),
-        authorizeUrl: z.string(),
-        redirectUri: z.string(),
-      }),
-      z.string()
-    ),
-  },
-  waitForDesktopFlow: {
-    input: z
-      .object({
-        flowId: z.string(),
-        timeoutMs: z.number().int().positive().optional(),
-      })
-      .strict(),
-    output: ResultSchema(z.void(), z.string()),
-  },
-  cancelDesktopFlow: {
-    input: z.object({ flowId: z.string() }).strict(),
-    output: z.void(),
-  },
-};
-
 // GitHub Copilot OAuth (Device Code Flow)
 export const copilotOauth = {
   startDeviceFlow: {
@@ -748,20 +752,6 @@ export const coderOauth = {
   },
 };
 
-// Xum Gateway
-export const muxGateway = {
-  getAccountStatus: {
-    input: z.void(),
-    output: ResultSchema(
-      z.object({
-        remaining_microdollars: z.number().int().nonnegative(),
-        ai_gateway_concurrent_requests_per_user: z.number().int().nonnegative(),
-      }),
-      z.string()
-    ),
-  },
-};
-
 const MCPOAuthPendingServerSchema = z
   .object({
     // OAuth is only supported for remote transports.
@@ -772,12 +762,22 @@ const MCPOAuthPendingServerSchema = z
 
 // MCP OAuth
 export const mcpOauth = {
+  /**
+   * The credential key (`serverUrl` of getAuthStatus) each time a refused request records a
+   * sign-in prompt (#6739), after the keys that have one at attach time: re-read that row.
+   */
+  onInsufficientScope: {
+    input: z.void(),
+    output: eventIterator(z.string()),
+  },
   startDesktopFlow: {
     input: z
       .object({
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -808,6 +808,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -841,6 +843,7 @@ export const mcpOauth = {
       hasRefreshToken: z.boolean(),
       scope: z.string().optional(),
       updatedAtMs: z.number().optional(),
+      insufficientScopes: z.array(z.string()).optional(),
     }),
   },
   logout: {
@@ -964,6 +967,15 @@ export const projects = {
       .passthrough(),
     output: z.void(),
   },
+  setIcon: {
+    input: z
+      .object({
+        projectPath: z.string(),
+        icon: z.enum(PROJECT_ICON_NAMES).nullish(),
+      })
+      .passthrough(),
+    output: z.void(),
+  },
   setCustomInstructions: {
     input: z
       .object({
@@ -1015,6 +1027,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1045,6 +1058,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1082,6 +1096,7 @@ export const projects = {
         hasRefreshToken: z.boolean(),
         scope: z.string().optional(),
         updatedAtMs: z.number().optional(),
+        insufficientScopes: z.array(z.string()).optional(),
       }),
     },
     logout: {
@@ -1152,7 +1167,7 @@ export const mcp = {
         z.string(),
         ResultSchema(
           z
-            .union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })])
+            .union([MCPSettingsReadSnapshotSchema, z.object({ notConnected: z.literal(true) })])
             .nullable(),
           z.string()
         )
@@ -1160,7 +1175,18 @@ export const mcp = {
     },
     update: {
       input: MCPSettingsUpdateParamsSchema,
-      output: ResultSchema(MCPSettingsSnapshotSchema.shape.values, z.string()),
+      /** The snapshot the server shows after the update (its schema can change). */
+      output: ResultSchema(MCPSettingsReadSnapshotSchema, z.string()),
+    },
+    /** Run a layout tool action (a regular tool) and return its text result. */
+    runTool: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsRunToolResultSchema, z.string()),
+    },
+    /** Open a layout tool action's MCP App: call the tool and store its view record. */
+    openApp: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsOpenAppResultSchema, z.string()),
     },
   },
   configureDesign: {
@@ -1224,15 +1250,30 @@ export const agentPlugins = {
       input: z.string(),
       ref: z.string().nullish(),
       subpath: z.string().nullish(),
+      /** Absent: the first method that fits (see AgentPluginInstallMethodSchema). */
+      method: AgentPluginInstallMethodSchema.nullish(),
     }),
-    output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
+    /** A plugin preview, or the entries of a Claude Code marketplace repository. */
+    output: ResultSchema(AgentPluginSourcePreviewSchema, z.string()),
+  },
+  /**
+   * The pinned skills CLI command for the "Skills CLI" method, for the user to run in a terminal
+   * (Xum does not run it). The error branch is invalid input.
+   */
+  skillsCliCommand: {
+    input: SkillsCliCommandInputSchema,
+    output: ResultSchema(SkillsCliCommandSchema, z.string()),
   },
   /** Fetch the consented SHA, promote into ~/.mux/plugins, write the registry entry. */
   install: {
     input: z.object({
       source: AgentPluginGitSourceSchema,
+      /** The preview's `method`: install refuses a clone that this method does not fit. */
+      method: AgentPluginInstallMethodSchema,
       /** SHA from the preview the user consented to. */
       expectedSha: z.string(),
+      /** `consentDigest` of that preview: install refuses other components (#6777). */
+      expectedConsentDigest: z.string(),
       importedComponents: AgentPluginImportedComponentsSchema.optional(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
@@ -1257,6 +1298,8 @@ export const agentPlugins = {
       key: z.string(),
       hash: z.string(),
       state: z.enum(["trusted", "disabled"]).nullable(),
+      /** `getHooks().fileReview.digest`: required to trust while that review is shown. */
+      fileReviewDigest: z.string().optional(),
     }),
     output: ResultSchema(z.void(), z.string()),
   },
@@ -1274,6 +1317,27 @@ export const agentPlugins = {
         data: AgentPluginInstallEntrySchema,
         cleanupWarning: z.string().optional(),
       }),
+      z.object({ success: z.literal(false), error: z.string() }),
+    ]),
+  },
+  /** Settings → Plugins: the list and the pending sign-out record in one call (#6627). */
+  listForSettings: {
+    input: z.void(),
+    output: z.object({
+      list: ResultSchema(z.array(AgentPluginListItemSchema), z.string()),
+      pendingSignOuts: AgentPluginPendingSignOutsSchema,
+    }),
+  },
+  /** The pending sign-out record that keeps managed plugins closed (#6627). */
+  pendingSignOuts: {
+    input: z.void(),
+    output: AgentPluginPendingSignOutsSchema,
+  },
+  /** Signs out of every plugin MCP server, then deletes a pending sign-out record (#6627). */
+  signOutPluginServers: {
+    input: z.void(),
+    output: z.discriminatedUnion("success", [
+      z.object({ success: z.literal(true) }),
       z.object({ success: z.literal(false), error: z.string() }),
     ]),
   },
@@ -1314,6 +1378,26 @@ export const agentPlugins = {
       consent: AgentPluginUpdateConsentSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+  },
+  /**
+   * Component review of the installed tree (#6498): every imported skill or MCP server whose
+   * current fingerprint the user has not reviewed, in the update review shape (fromSha = toSha).
+   */
+  previewComponentReview: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginUpdateReviewSchema, z.string()),
+  },
+  /** Record consent for the reviewed components that still match the installed tree. */
+  confirmComponentReview: {
+    input: z.object({
+      name: z.string(),
+      expectedLockedSha: z.string(),
+      reviewed: z.array(AgentPluginComponentRefSchema),
+    }),
+    output: ResultSchema(
+      z.object({ entry: AgentPluginInstallEntrySchema, cleanupWarning: z.string().optional() }),
+      z.string()
+    ),
   },
 };
 
@@ -1377,6 +1461,10 @@ const DebugLlmRequestSnapshotSchema = z
 const ArchiveLossyUntrackedFilesConfirmationSchema = z.object({
   kind: z.literal("confirm-lossy-untracked-files"),
   paths: z.array(z.string()),
+  /** Sub-agents the archive cascades over whose snapshot archives would lose these paths. */
+  subagents: z
+    .array(z.object({ workspaceId: z.string(), title: z.string(), paths: z.array(z.string()) }))
+    .optional(),
 });
 
 const ArchivePreflightResultSchema = z.discriminatedUnion("kind", [
@@ -1405,26 +1493,12 @@ export const artifacts = {
       /** Lower read cap (clamped to the server's): larger files return too_large, no bytes. */
       maxBytes: z.number().int().positive().nullish(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Runtime tooling probes (cached per workspace); never fails, null means unknown. */
   capabilities: {
     input: z.object({ workspaceId: z.string() }),
     output: ArtifactCapabilitiesSchema,
-  },
-  /** Versions of the artifact at `path` (relative to the artifacts dir), newest first. */
-  listVersions: {
-    input: z.object({ workspaceId: z.string(), path: z.string() }),
-    output: ResultSchema(ArtifactVersionListSchema, z.string()),
-  },
-  /** One stored version, in the same shape as `read` (modifiedMs = version creation time). */
-  readVersion: {
-    input: z.object({
-      workspaceId: z.string(),
-      artifactId: z.string(),
-      version: z.number().int().positive(),
-    }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
   },
   /** Pinned workspace files with their current size/mtime (live, no snapshots). */
   listPinned: {
@@ -1432,9 +1506,9 @@ export const artifacts = {
     output: ResultSchema(PinnedArtifactFilesSchema, z.string()),
   },
   /**
-   * Pin a checkout file; `path` may be absolute inside the checkout. A relative `path` resolves
-   * from the checkout root, or from the tool cwd (a sub-project dir) with `relativeTo:
-   * "tool-cwd"`, as file tools resolve it. Returns the stored checkout-relative path.
+   * Pin a file; `path` may be absolute. A relative `path` resolves from the checkout root, or
+   * from the tool cwd (a sub-project dir) with `relativeTo: "tool-cwd"`, as file tools resolve
+   * it. Returns the stored path: checkout-relative, or absolute for a file outside the checkout.
    */
   pinFile: {
     input: z.object({
@@ -1448,10 +1522,10 @@ export const artifacts = {
     input: z.object({ workspaceId: z.string(), path: z.string() }),
     output: ResultSchema(z.void(), z.string()),
   },
-  /** Read a pinned file (same shape and cap as `read`; path relative to the checkout). */
+  /** Read a pinned file (same shape and cap as `read`; `path` as `pinFile` returned it). */
   readPinned: {
     input: z.object({ workspaceId: z.string(), path: z.string() }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Shelf entries visible from this workspace: its project shelf, then the global shelf. */
   listShelf: {
@@ -1465,14 +1539,13 @@ export const artifacts = {
       scope: ArtifactShelfScopeSchema,
       name: z.string(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
-  /** User pin: copy one stored version to the project or global shelf. */
+  /** User pin: copy the artifact's current bytes to the project or global shelf. */
   pinToShelf: {
     input: z.object({
       workspaceId: z.string(),
-      artifactId: z.string(),
-      version: z.number().int().positive(),
+      path: z.string(),
       scope: ArtifactShelfScopeSchema,
     }),
     output: ResultSchema(z.object({ name: z.string() }), z.string()),
@@ -1488,21 +1561,19 @@ export const artifacts = {
     output: ResultSchema(z.void(), z.string()),
   },
   /**
-   * A send the user confirmed in the Artifacts tab (window.xum.send or a canvas button). The
+   * A send the user clicked or confirmed in the Artifacts tab (window.xum.send or a canvas button). The
    * backend persists it, then delivers it as a user message at the next tool boundary (M5b).
-   * `version: null` targets the live file (latest stored version).
    */
   sendInteraction: {
     input: z.object({
       workspaceId: z.string(),
       path: z.string(),
-      version: z.number().int().nonnegative().nullable(),
       text: z.string(),
       data: z.unknown().optional(),
     }),
     output: ResultSchema(z.object({ id: z.string() }), z.string()),
   },
-  /** Persisted window.xum.state of an artifact (null when none); one state for all versions. */
+  /** Persisted window.xum.state of an artifact (null when none). */
   getState: {
     input: z.object({
       workspaceId: z.string(),
@@ -1521,7 +1592,7 @@ export const artifacts = {
 };
 
 /**
- * MCP Apps views in the Artifacts tab (artifacts experiment): the view resource plus the
+ * MCP Apps views in the Artifacts tab (mcp-apps experiment): the view resource plus the
  * host-only tool result, and tools/call and resources/read issued by a view.
  */
 export const mcpApps = {
@@ -1545,23 +1616,44 @@ export const mcpApps = {
   },
   approveViewDomains: {
     input: McpAppApproveDomainsRequestSchema,
-    output: ResultSchema(z.object({ approvedDomains: z.array(z.string()) }), z.string()),
+    output: ResultSchema(
+      z.object({ approvedDomains: z.array(z.string()), revision: z.number() }),
+      z.string()
+    ),
   },
   listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
+  /**
+   * Every project's approvals with the revision of this read, newer than every list committed
+   * before it: the live follow of mounted views re-reads after each config change (#6181).
+   */
+  readViewDomains: {
+    input: z.void(),
+    output: z.object({ revision: z.number(), approvals: z.array(McpAppViewDomainsSchema) }),
+  },
   /** Mounted views of the server in this renderer reload under the narrower policy. */
   revokeViewDomains: {
     input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),
-    output: z.void(),
+    output: z.object({ revision: z.number() }),
   },
   /** ui/update-model-context of a view; used by the workspace's next requests. */
   updateModelContext: {
     input: McpAppModelContextRequestSchema,
     output: ResultSchema(z.object({}), z.string()),
   },
+  /** window.openai.setWidgetState of a view; kept in its result record (#6178). */
+  setWidgetState: {
+    input: McpAppWidgetStateRequestSchema,
+    output: ResultSchema(z.object({}), z.string()),
+  },
   /** Entry points of the servers enabled in the workspace (starts them like prompt discovery). */
   listEntrypoints: {
     input: z.object({ workspaceId: z.string().min(1) }),
     output: z.array(McpAppEntrypointSchema),
+  },
+  /** Ticks when a server of the workspace sends tools/list_changed: re-list entry points. */
+  onEntrypointsChanged: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(z.void()),
   },
   /** Call an entry point's tool with `{}` and store its view record (no chat row). */
   openEntrypoint: {
@@ -1695,6 +1787,28 @@ export const refinements = {
  */
 const WorkspaceTagKeySchema = z.string().regex(/\S/, "Workspace tag keys must be non-empty");
 
+/** A `workspace.history.tail` row. `text` is null when the static view cannot draw the row. */
+export const WorkspaceViewTailRowSchema = z.object({
+  id: z.string(),
+  role: z.enum(["user", "assistant", "other"]),
+  text: z.string().nullable(),
+  timestamp: z.number().nullable(),
+  /** The meta row's model label and provider icon, formatted by the server. */
+  model: z
+    .object({ label: z.string(), provider: z.string(), via: z.string().nullable() })
+    .nullable(),
+  /** The row's element tree (a StaticNode), or null. The page runs validateStaticTree on it. */
+  tree: z.unknown().nullable(),
+});
+
+export const WorkspaceViewTailSchema = z.object({
+  title: z.string(),
+  project: z.string(),
+  rows: z.array(WorkspaceViewTailRowSchema),
+});
+export type WorkspaceViewTail = z.infer<typeof WorkspaceViewTailSchema>;
+export type WorkspaceViewTailRow = z.infer<typeof WorkspaceViewTailRowSchema>;
+
 export const workspace = {
   list: {
     input: z
@@ -1717,9 +1831,8 @@ export const workspace = {
     input: z.object({
       projectPath: z.string(),
       /**
-       * Workspace branch name. When omitted, the backend auto-generates a name
-       * based on the trunk branch (e.g., "main-1", "main-2"), similar to how
-       * /fork derives a name from the parent workspace.
+       * Workspace branch name. When omitted, the backend picks a free random
+       * Docker-style name such as "calm-otters-sing" (as /new does).
        */
       branchName: z.string().optional(),
       /** Trunk branch to fork from - only required for worktree/SSH runtimes, ignored for local */
@@ -1739,6 +1852,25 @@ export const workspace = {
        * rendered in the UI). Used by orchestration callers for stable identity.
        */
       tags: z.record(WorkspaceTagKeySchema, z.string()).optional(),
+      /**
+       * Name the workspace in the backend after it is announced, so creation does not wait for
+       * the naming model: it opens under a random name, gets the generated title when it arrives,
+       * and its git branch is renamed before the init hook runs (the directory and workspace
+       * name stay). Worktree runtime only; omit `branchName` and `title`.
+       */
+      nameGeneration: z
+        .object({
+          /** The message to name the workspace after. */
+          message: z.string(),
+          /** Caller fallback models, as for nameGeneration.generate. */
+          candidates: z.array(z.string()),
+          /**
+           * The creation form's nameGeneration.generate request for this message, running or
+           * finished: its result names the workspace instead of a second model call.
+           */
+          draftNamingId: z.string().optional(),
+        })
+        .optional(),
     }),
     output: z.discriminatedUnion("success", [
       z.object({ success: z.literal(true), metadata: FrontendWorkspaceMetadataSchema }),
@@ -1773,6 +1905,8 @@ export const workspace = {
         .object({
           force: z.boolean().optional(),
           acknowledgedDescendantIds: z.array(z.string()).optional(),
+          // A separate user confirmation; force alone never accepts unknown activity.
+          acknowledgedUnknownProcessRecords: z.array(z.string()).optional(),
         })
         .optional(),
     }),
@@ -1855,6 +1989,15 @@ export const workspace = {
       }),
       output: ResultSchema(z.void(), z.string()),
     },
+    // Milliseconds until the next heartbeat slot opens; null while the scheduler does not track
+    // the workspace (see HeartbeatService.getMsUntilNextHeartbeat).
+    next: {
+      // Not blank: the service asserts on it, and client input must fail validation instead.
+      input: z.object({
+        workspaceId: z.string().refine((id) => id.trim().length > 0, "workspaceId is blank"),
+      }),
+      output: z.number().nullable(),
+    },
   },
   goalDefaults: {
     // Per-workspace override of the global `goalDefaults` block. `get`
@@ -1917,6 +2060,8 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       acknowledgedUntrackedPaths: z.array(z.string()).nullish(),
+      /** Per sub-agent workspace ID: the untracked paths the user confirmed losing. */
+      acknowledgedSubagentUntrackedPaths: z.record(z.string(), z.array(z.string())).optional(),
     }),
     output: ResultSchema(ArchiveWorkspaceResultSchema, z.string()),
   },
@@ -2082,6 +2227,16 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       enabled: z.boolean(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  // User-only messaging tag for a root chat (see WorkspaceMetadata.messagingTag). There is
+  // deliberately no UI for it: users set it through the API (e.g. `xum api workspace
+  // set-messaging-tag`), and no agent tool may set a tag. `tag: null` (or empty) clears it.
+  setMessagingTag: {
+    input: z.object({
+      workspaceId: z.string(),
+      tag: z.string().nullable(),
     }),
     output: ResultSchema(z.void(), z.string()),
   },
@@ -2324,6 +2479,11 @@ export const workspace = {
         notPageable: z.boolean().optional(),
       }),
     },
+    /** The static first view's newest rows (T3 #5971): fixed server caps, null = no view. */
+    tail: {
+      input: z.object({ workspaceId: z.string().trim().min(1) }),
+      output: WorkspaceViewTailSchema.nullable(),
+    },
     /** Searches full history, including prompts before the replay boundary. */
     lastUserPrompt: {
       input: z.object({ workspaceId: z.string() }),
@@ -2403,7 +2563,7 @@ export const workspace = {
       // do not send it get the whole active epoch, as before.
       replayWindow: z.boolean().optional(),
     }),
-    output: eventIterator(WorkspaceChatMessageSchema), // Stream event
+    output: eventIterator(OnChatEventSchema), // Stream event (with onChat-only batches)
   },
   onMetadata: {
     // `archived` selects the snapshot list exactly like `workspace.list`.
@@ -2437,6 +2597,11 @@ export const workspace = {
             type: z.literal("activity"),
             workspaceId: z.string(),
             activity: WorkspaceActivitySnapshotSchema.nullable(),
+          }),
+          // A write changed this workspace's session usage (its ledger or a running stream's).
+          z.object({
+            type: z.literal("usage-changed"),
+            workspaceId: z.string(),
           }),
           HeartbeatEventSchema,
         ])
@@ -2632,6 +2797,22 @@ export const workspace = {
     input: z.object({ workspaceId: z.string() }),
     output: SessionUsageFileSchema.optional(),
   },
+  /**
+   * Usage of the workspace's sub-agents that still exist (not yet rolled into its ledger).
+   * The Costs tab adds it to the session cost so delegated spend is visible before removal.
+   */
+  getSubagentUsage: {
+    input: z.object({ workspaceId: z.string() }),
+    output: z.object({
+      children: z.record(
+        z.string(),
+        z.object({
+          byModel: z.record(z.string(), ChatUsageDisplaySchema),
+          workspaceCount: z.number().int().nonnegative(),
+        })
+      ),
+    }),
+  },
   /** Batch fetch session usage for multiple workspaces (for archived workspaces cost display) */
   getSessionUsageBatch: {
     input: z.object({ workspaceIds: z.array(z.string()) }),
@@ -2712,6 +2893,9 @@ export const workspace = {
 };
 
 export type WorkspaceSendMessageOutput = z.infer<typeof workspace.sendMessage.output>;
+export type WorkspaceNameGenerationRequest = NonNullable<
+  z.infer<typeof workspace.create.input>["nameGeneration"]
+>;
 export type ArchiveLossyUntrackedFilesConfirmation = z.infer<
   typeof ArchiveLossyUntrackedFilesConfirmationSchema
 >;
@@ -2827,7 +3011,8 @@ export const agentSkills = {
     output: AgentSkillListResultSchema,
   },
   get: {
-    input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillNameSchema })),
+    // `<plugin>:<skill>` reaches a plugin skill shadowed by a higher-precedence one.
+    input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillLookupNameSchema })),
     output: AgentSkillPackageSchema,
   },
 };
@@ -2942,6 +3127,11 @@ export const nameGeneration = {
        * first, then these; gateway routing is resolved in createModel.
        */
       candidates: z.array(z.string()),
+      /**
+       * Set by the creation form, unique per request: a workspace.create that hands this request
+       * off (nameGeneration.draftNamingId) takes its result over.
+       */
+      draftNamingId: z.string().optional(),
     }),
     output: ResultSchema(
       z.object({
@@ -3198,8 +3388,6 @@ export const config = {
     output: z.object({
       userPreferences: UserPreferencesSchema.optional(),
       taskSettings: ResolvedTaskSettingsSchema,
-      muxGatewayEnabled: z.boolean().optional(),
-      muxGatewayModels: z.array(z.string()).optional(),
       routePriority: z.array(z.string()).optional(),
       routeOverrides: z.record(z.string(), z.string()).optional(),
       minThinkingLevelByModel: z.record(z.string(), ThinkingLevelSchema).optional(),
@@ -3247,13 +3435,6 @@ export const config = {
   updateAgentAiDefaults: {
     input: z.object({
       agentAiDefaults: AgentAiDefaultsSchema,
-    }),
-    output: z.void(),
-  },
-  updateMuxGatewayPrefs: {
-    input: z.object({
-      muxGatewayEnabled: z.boolean(),
-      muxGatewayModels: z.array(z.string()),
     }),
     output: z.void(),
   },
@@ -3697,43 +3878,31 @@ export const drafts = {
     input: DraftResolveSendsInputSchema,
     output: DraftResolveSendsOutputSchema,
   },
-  /**
-   * The creation draft list, strictly: rejects when it cannot be read (the subscription snapshot
-   * falls back to an empty list instead). For the renderer's storage GC.
-   */
-  getList: {
+  /** Creation draft rows (metadata kept in backend memory). */
+  listCreation: {
     input: z.void(),
-    output: DraftListSchema,
+    output: CreationDraftListSchema,
   },
-  /** Add a creation draft to the list, or update its sub-project. Output: the list revision. */
-  putListEntry: {
-    input: DraftListEntrySchema,
-    output: DraftRevisionOutputSchema,
+  /** One creation draft with payloads; null when it has no record. */
+  getCreation: {
+    input: z.object({ scope: CreationDraftScopeSchema }),
+    output: CreationDraftSchema.nullable(),
   },
-  /** One-way import of the legacy localStorage list (never clobbers). Output: the list revision. */
-  importLegacyList: {
-    input: z.object({ entries: z.array(DraftListEntrySchema) }),
-    output: DraftRevisionOutputSchema,
+  updateCreation: {
+    input: CreationDraftUpdateInputSchema,
+    output: CreationDraftUpdateOutputSchema,
+  },
+  deleteCreation: {
+    input: CreationDraftDeleteInputSchema,
+    output: z.void(),
+  },
+  importLegacyCreation: {
+    input: CreationDraftImportLegacyInputSchema,
+    output: z.void(),
   },
   subscribe: {
     input: z.void(),
     output: eventIterator(DraftEventSchema),
-  },
-};
-
-// UI Layouts (global settings)
-export const uiLayouts = {
-  getAll: {
-    input: z.void(),
-    output: LayoutPresetsConfigSchema,
-  },
-  saveAll: {
-    input: z
-      .object({
-        layoutPresets: LayoutPresetsConfigSchema,
-      })
-      .strict(),
-    output: z.void(),
   },
 };
 
@@ -3854,8 +4023,10 @@ export const general = {
     input: z.object({
       workspaceId: z.string(),
       launchToken: z.string().min(1).max(128),
+      // An SSH checkout path the editor opens; one under `~` comes back resolved on the host.
+      remotePath: z.string().nullish(),
     }),
-    output: ResultSchema(z.void(), z.string()),
+    output: ResultSchema(z.object({ remotePath: z.string() }).nullish(), z.string()),
   },
   /**
    * Undo a recordEditorOpen whose deep-link launch provably never happened (the renderer's

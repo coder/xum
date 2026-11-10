@@ -80,7 +80,7 @@ const INACTIVE_CHILD_RETENTION_NOTE = `Inactive persistent children remain avail
 
 const TREE_SCOPE_NOTE =
   'Rows (including the root "workspace" row) are addressable via task_send_message, except your own "self" row, best-of candidate rows (`bestOf` metadata, refused to preserve candidate independence), and non-descendant rows in terminal states like reported/interrupted (peers cannot reactivate a task — only its parent can); ' +
-  "the relationship field is computed relative to this workspace. main_chat/side_chat rows are direct side-chat ↔ own-main links for explicit messaging only, not task ancestry or lifecycle control.";
+  "the relationship field is computed relative to this workspace. main_chat/side_chat rows are direct side-chat ↔ own-main links, and tagged rows are root chats sharing your user-set messaging @tag; all are explicit-messaging addresses only, not task ancestry or lifecycle control.";
 
 const TREE_SCOPE_RESTRICTED_NOTE =
   "This workspace cannot send or receive peer messages (best-of candidates stay independent; workflow-owned tasks communicate through the workflow journal), so only self/descendant rows are listed; descendants remain addressable via task_send_message guidance.";

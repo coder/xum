@@ -6,7 +6,7 @@ import {
   parsePlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type {
-  PlanReviewFeedbackComment,
+  PlanReviewFeedbackRecord,
   PlanReviewRecord,
 } from "@/common/utils/planReview/planReviewRecord";
 import {
@@ -38,7 +38,7 @@ describe("preparePlanReviewFeedback reply thread context", () => {
     await historyHandle.cleanup();
   });
 
-  async function seed(comments: PlanReviewFeedbackComment[]): Promise<void> {
+  async function seed(comments: PlanReviewFeedbackRecord["comments"]): Promise<void> {
     const records: PlanReviewRecord[] = [
       {
         v: 1,

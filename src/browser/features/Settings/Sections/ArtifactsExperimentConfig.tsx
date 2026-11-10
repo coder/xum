@@ -9,13 +9,13 @@ export function ArtifactsExperimentConfig() {
   return (
     <div className="bg-background-secondary flex items-center justify-between gap-4 px-4 py-3">
       <div className="flex-1">
-        <div className="text-foreground text-sm">Allow CDN scripts in artifacts</div>
+        <div className="text-foreground text-sm">Allow CDN assets in artifacts</div>
         <div className="text-muted text-xs">
           HTML and SVG artifacts run in a sandbox whose content policy blocks network requests,
-          except scripts from a few public CDNs (cdnjs, unpkg, jsDelivr, jQuery, Tailwind) and
-          Google Fonts. This is not a full network block: a hostile artifact could still leak data,
-          for example through WebRTC or the paths of those CDN requests. Turn this off to block
-          every CDN.
+          except scripts, styles and fonts from a few public CDNs (cdnjs, unpkg, jsDelivr, jQuery,
+          Tailwind) and Google Fonts. This is not a full network block: a hostile artifact could
+          still leak data, for example through WebRTC or the paths of those CDN requests. Turn this
+          off to block every CDN.
         </div>
       </div>
       <Switch
@@ -23,7 +23,7 @@ export function ArtifactsExperimentConfig() {
         onCheckedChange={(checked) =>
           updateUserPreferences({ ui: { artifactsAllowCdnScripts: checked } })
         }
-        aria-label="Toggle CDN scripts in artifacts"
+        aria-label="Toggle CDN assets in artifacts"
       />
     </div>
   );

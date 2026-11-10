@@ -1,11 +1,11 @@
 /**
  * First-run onboarding wizard (#5944): the step indicator has an accessible name, and the
  * wizard's text meets WCAG AA contrast in every theme. Lighthouse scored the light theme's
- * muted text at 3.6-3.8:1 before the fix. Links are not measured: the dark theme's accent is
- * below 4.5:1 on the dialog, and that token is outside this fix.
+ * muted text at 3.6-3.8:1 before the fix. Every theme also checks the step's accent link,
+ * which uses the text-only accent token (#5946, #6449).
  */
 
-import { expect, waitFor, within } from "@storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { textContrast } from "@/browser/stories/helpers/contrast";
@@ -18,7 +18,7 @@ export default {
   title: "App/OnboardingWizard",
 };
 
-/** A first run: no splash seen and no provider configured, so the wizard opens on its Gateway step. */
+/** A first run: no splash seen and no provider configured, so the wizard opens on providers. */
 const renderFirstRun = () => (
   <AppWithMocks
     setup={() => createMockORPCClient({ viewedSplashScreens: [], providersConfig: {} })}
@@ -35,14 +35,28 @@ async function expectAccessibleWizard(canvasElement: HTMLElement) {
 
   const texts = [
     await dialog.findByText(/^1 \/ \d+$/),
-    await dialog.findByText(/^OSS contributors with GitHub accounts/),
-    await dialog.findByText(/^vouchers which you can/),
+    await dialog.findByText(/^Xum is provider-agnostic/),
+    await dialog.findByText("No providers configured yet."),
   ];
   await waitFor(async () => {
     for (const text of texts) {
       await expect(textContrast(text)).toBeGreaterThanOrEqual(4.5);
     }
   });
+}
+
+/**
+ * The step's accent link reaches 4.5:1 on the dialog in every theme. Dark #0070cc was 3.36:1 here
+ * (#5946). The light themes pass on this dialog; the check guards their accent text token (#6449).
+ */
+async function expectReadableWizardLinks(canvasElement: HTMLElement) {
+  const dialog = within(await within(canvasElement.ownerDocument.body).findByRole("dialog"));
+  const links = [dialog.getByRole("button", { name: "Settings → Providers" })];
+  const failing = links
+    .map((link) => ({ name: link.textContent ?? "", ratio: textContrast(link) }))
+    .filter((link) => link.ratio < 4.5)
+    .map((link) => `${link.ratio.toFixed(2)}:1 "${link.name}"`);
+  await expect(failing.join("\n")).toBe("");
 }
 
 // Behavioral contract only, so Pixel snapshots are off. The screenshots on #5944's PR show the
@@ -53,6 +67,7 @@ const contractStory = (theme: ThemeMode): AppStory => ({
   render: renderFirstRun,
   play: async ({ canvasElement }) => {
     await expectAccessibleWizard(canvasElement);
+    await expectReadableWizardLinks(canvasElement);
   },
 });
 

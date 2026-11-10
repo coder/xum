@@ -328,6 +328,42 @@ describe("spend over time timezone buckets", () => {
     ]);
   });
 
+  test("bounds the dates in the filter timezone and buckets in the selected one", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "ws-timezone-filter";
+
+    // The UTC month starts at 2026-10-01T00:00Z, still Sept 30 in Los Angeles.
+    await insertEvent(conn, {
+      workspaceId,
+      date: "2026-09-30",
+      timestamp: BigInt(Date.parse("2026-09-30T20:00:00.000Z")),
+      model: "openai:gpt-4",
+      inputTokens: 1,
+      outputTokens: 1,
+      totalCostUsd: 50,
+    });
+    await insertEvent(conn, {
+      workspaceId,
+      date: "2026-10-01",
+      timestamp: BigInt(Date.parse("2026-10-01T03:00:00.000Z")),
+      model: "openai:gpt-4",
+      inputTokens: 1,
+      outputTokens: 1,
+      totalCostUsd: 100,
+    });
+
+    const rows = z.array(SpendOverTimeRowSchema).parse(
+      await executeNamedQuery(conn, "getSpendOverTime", {
+        granularity: "day",
+        from: "2026-10-01",
+        timeZone: "America/Los_Angeles",
+        filterTimeZone: "UTC",
+      })
+    );
+
+    expect(rows).toEqual([{ bucket: "2026-09-30", model: "openai:gpt-4", cost_usd: 100 }]);
+  });
+
   test("uses UTC when the timezone is omitted", async () => {
     const conn = await createTestConn();
     const workspaceId = "ws-timezone-default";

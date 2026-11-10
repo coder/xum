@@ -1,6 +1,6 @@
 // #5767: at phone width the right sidebar is hidden, and with it the only way to open Stats.
 // Proves the workspace actions menu reaches Stats there: its Sidebar row shows the sidebar
-// full-screen, and the sidebar's New tab launcher opens Stats.
+// full-screen, and the sidebar's New tab launcher (from its "+" button) opens Stats.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { openPlayground } from "./helpers";

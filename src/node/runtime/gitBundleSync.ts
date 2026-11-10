@@ -71,7 +71,10 @@ export function buildSourceRefSnapshotCommand(gitPrefix = ""): string {
   // the reference-transaction hook, while for-each-ref runs no repository automation.
   return (
     `git for-each-ref '--format=delete %(refname)' ${ns} | ${gitPrefix}git update-ref --stdin && ` +
-    `git for-each-ref '--format=update ${ns}%(refname) %(objectname)' refs/heads/ refs/remotes/ refs/stash | ${gitPrefix}git update-ref --stdin`
+    `git for-each-ref '--format=update ${ns}%(refname) %(objectname)' refs/heads/ refs/remotes/ refs/stash | ${gitPrefix}git update-ref --stdin && ` +
+    // refs/stash names only the newest entry; a `cp` copy also inherits the older ones in its
+    // reflog (#5163). rev-list fails when there is no stash: the loop then records nothing.
+    `{ git rev-list --walk-reflogs refs/stash 2>/dev/null || true; } | while read -r sha; do echo "update ${ns}stash-reflog/$sha $sha"; done | ${gitPrefix}git update-ref --stdin`
   );
 }
 

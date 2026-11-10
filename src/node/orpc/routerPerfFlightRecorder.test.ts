@@ -10,7 +10,7 @@ import { FLIGHT_RECORDER_MAX_LOAF_PER_BATCH } from "@/constants/perfFlightRecord
 import { FlightRecorder } from "@/node/services/perf/flightRecorder";
 import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
 import { PerfReportService } from "@/node/services/perf/perfReportService";
-import type { ORPCContext } from "./context";
+import { orpcContextFromDoubles } from "./orpcContextDoubles.testHarness";
 import { router } from "./router";
 
 const tempDirs: string[] = [];
@@ -73,7 +73,7 @@ function createClient(
     },
     isExperimentEnabled: (experimentId) => overrides.get(experimentId) === true,
   });
-  const context = {
+  const context = orpcContextFromDoubles({
     perfFlightRecorder: recorder,
     perfCaptures,
     perfReports,
@@ -85,7 +85,7 @@ function createClient(
       },
       isExperimentEnabled: (experimentId: ExperimentId) => overrides.get(experimentId) === true,
     },
-  } as unknown as ORPCContext;
+  });
   return { client: createRouterClient(router(), { context }) };
 }
 

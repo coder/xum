@@ -1,5 +1,7 @@
 import { createRequire } from "node:module";
 import type sharp from "sharp";
+// sharp 0.35 types are ES modules: Metadata is a named export, not on the default namespace.
+import type { Metadata } from "sharp";
 import { MAX_IMAGE_DIMENSION, SVG_MEDIA_TYPE } from "@/common/constants/imageAttachments";
 import {
   computeResizedDimensions,
@@ -49,7 +51,7 @@ export function orientationSwapsDimensions(orientation: number | undefined): boo
   return orientation != null && orientation >= 5 && orientation <= 8;
 }
 
-export function getRasterImageDimensionsFromMetadata(metadata: sharp.Metadata): {
+export function getRasterImageDimensionsFromMetadata(metadata: Metadata): {
   width: number;
   height: number;
 } | null {

@@ -111,14 +111,43 @@ describe("step budget decisions", () => {
     }
   );
 
-  test("a next-request estimate below the ceiling does not move the advisory stages", () => {
-    // Only the hard stop uses the floor: advisories keep the provider-based projection, so the
-    // estimator's overshoot cannot fire the warning or handoff early.
-    expect(evaluate({ contextTokens: 40_000, nextRequestTokens: 75_000 })).toMatchObject({
-      decision: "continue",
-      projected: 40_000,
-    });
-    // It still withholds advisories that the forced stop would pre-empt.
+  // #5223: the next-request estimate runs k times above provider usage (OpenAI 1.3-1.6, Claude
+  // about 1.04-1.36). Stages opened on provider usage then lost their band to the hard stop,
+  // which uses the estimate: no final prompt above k ≈ 1.033 and no handoff above k ≈ 1.35.
+  test.each([1, 1.05, 1.36, 1.6])(
+    "with the estimate %d times provider usage, a 200k window offers both stages before the rollover",
+    (k) => {
+      const decisions: Array<{ decision: string; estimate: number }> = [];
+      let handoffRequested = false;
+      for (let usage = 50_000; decisions.at(-1)?.decision !== "rollover"; usage += 250) {
+        const nextRequestTokens = Math.round(usage * k);
+        const { decision } = evaluate({
+          modelContextLimit: 200_000,
+          contextTokens: usage,
+          nextRequestTokens,
+          handoffRequested,
+          finalHandoffAvailable: true,
+        });
+        if (decision === "continue") continue;
+        decisions.push({ decision, estimate: nextRequestTokens });
+        // A delivered prompt is claimed; the next one is the final prompt or the rollover.
+        handoffRequested = true;
+        if (decision === "final") break;
+      }
+      expect(decisions.map(({ decision }) => decision)).toEqual(["handoff", "final"]);
+      // Each opens on the first step whose estimate reaches its point, not earlier or later.
+      const points = [
+        getContextBudgetHandoffPoint(200_000, 0.7),
+        getContextBudgetHardCeiling(200_000) - FINAL_HANDOFF_RESERVE_TOKENS,
+      ];
+      decisions.forEach(({ estimate }, index) => {
+        expect(estimate).toBeGreaterThanOrEqual(points[index]);
+        expect(estimate).toBeLessThanOrEqual(points[index] + Math.ceil(250 * k));
+      });
+    }
+  );
+
+  test("an estimate whose reserve no longer fits withholds the advisory for the forced stop", () => {
     expect(
       evaluate({ contextTokens: 60_000, nextRequestTokens: 91_808 - WARNING_RESERVE_TOKENS })
         .decision

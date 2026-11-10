@@ -119,7 +119,7 @@ describe("leaderboard", () => {
     });
     // A and B run in an unmapped .js bundle; a leaderboard warns too, not only a diff.
     expect(report.warnings).toEqual([
-      expect.stringContaining("1.1 ms of self time in unmapped bundle frames"),
+      expect.stringContaining("1.1 ms of self time in unmapped bundle frames") as string,
     ]);
   });
 
@@ -157,7 +157,11 @@ describe("readCpuProfile", () => {
       )
     );
     expect(result.profile.stacks).toEqual([
-      { frames: [expect.objectContaining({ functionName: "A" })], weightUs: 500, count: 3 },
+      {
+        frames: [expect.objectContaining({ functionName: "A" }) as Frame],
+        weightUs: 500,
+        count: 3,
+      },
     ]);
     expect(result.warnings).toEqual(["1 negative timeDeltas clamped to 0 (sample reordering)"]);
   });
@@ -171,7 +175,7 @@ describe("readCpuProfile", () => {
       [2],
       [10]
     );
-    (json.nodes as Array<Record<string, unknown>>)[1].parent = 1;
+    (json.nodes as Record<string, unknown>[])[1].parent = 1;
     expect(read(json).profile.stacks[0].frames.map((f) => f.functionName)).toEqual(["A"]);
   });
 
@@ -243,7 +247,7 @@ describe("frame category", () => {
 
 describe("diff", () => {
   /** One profile with a flat list of functions and one sample each; wall time in µs. */
-  function flat(wallUs: number, functions: Array<[string, number]>): Record<string, unknown> {
+  function flat(wallUs: number, functions: [string, number][]): Record<string, unknown> {
     return cpuProfile(
       [
         { id: 1, name: "(root)", children: functions.map((_, i) => i + 2) },
@@ -509,10 +513,10 @@ test.each<[string, boolean]>([
   expect(looksLikeCpuProfile(prefix)).toBe(expected);
 });
 
-function runCli(args: string[]) {
+function runCli(args: string[], env?: Record<string, string>) {
   const proc = Bun.spawnSync(
     [process.execPath, join(import.meta.dir, "analyzeProfiles.ts"), ...args],
-    { stdout: "pipe", stderr: "pipe" }
+    { stdout: "pipe", stderr: "pipe", ...(env ? { env: { ...process.env, ...env } } : {}) }
   );
   return {
     exitCode: proc.exitCode,
@@ -636,6 +640,63 @@ test("CLI falls back to a sibling map when the sourceMappingURL comment is malfo
   }
 });
 
+test("CLI maps scrubbed file://~ script URLs from a report bundle against the home folder", () => {
+  const home = mkdtempSync(join(tmpdir(), "analyze-profiles-home-"));
+  try {
+    mkdirSync(join(home, "app"));
+    writeFileSync(join(home, "app", "main.js"), "function a(){}\n");
+    writeFileSync(join(home, "app", "main.js.map"), mapTo("orig.ts"));
+    // POSIX homes scrub to file://~/..., Windows homes (file:///C:/Users/x) to file:///~/...
+    for (const url of ["file://~/app/main.js", "file:///~/app/main.js"]) {
+      const profile = join(home, "p.cpuprofile");
+      writeFileSync(profile, JSON.stringify(oneFrame(url)));
+      const proc = runCli(["--format", "json", profile], { HOME: home, USERPROFILE: home });
+      expect(proc.exitCode).toBe(0);
+      expect(locations(proc.stdout)).toEqual(["orig.ts"]);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("CLI maps <xum> script paths from a report bundle against --app-root only", () => {
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    const root = join(dir, "app");
+    mkdirSync(join(root, "dist", "node"), { recursive: true });
+    mkdirSync(join(dir, "maps"));
+    for (const [script, source] of [
+      [join(root, "dist", "node", "main.js"), "orig.ts"],
+      [join(dir, "outside.js"), "outside.ts"],
+    ]) {
+      writeFileSync(script, "function a(){}\n");
+      writeFileSync(`${script}.map`, mapTo(source));
+    }
+    const run = (url: string, args: string[], side: "candidate" | "baseline" = "candidate") => {
+      const profile = join(dir, "p.cpuprofile");
+      writeFileSync(profile, JSON.stringify(oneFrame(url)));
+      const proc = runCli(["--format", "json", ...args, profile]);
+      expect(proc.exitCode).toBe(0);
+      return locations(proc.stdout, side);
+    };
+    for (const url of ["file://<xum>/dist/node/main.js", "<xum>/dist/node/main.js"]) {
+      expect(run(url, ["--app-root", root])).toEqual(["orig.ts"]);
+      expect(run(url, [])).toEqual([url]);
+    }
+    // Diff mode: a baseline with its own maps never reads the candidate's --app-root.
+    const [app, base] = ["<xum>/dist/node/main.js", join(dir, "base.cpuprofile")];
+    writeFileSync(base, JSON.stringify(oneFrame(app)));
+    const maps = ["--baseline-map-dir", join(dir, "maps")];
+    expect(run(app, ["--app-root", root, "--baseline", base, ...maps], "baseline")).toEqual([app]);
+    // Profiles are input data: a path must not climb out of --app-root.
+    for (const url of ["<xum>/../outside.js", "<xum>/%2e%2e%2foutside.js"]) {
+      expect(run(url, ["--app-root", root])).toEqual([url]);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("CLI never looks up --map-dir maps outside the directory", () => {
   const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
   try {
@@ -727,7 +788,7 @@ test("CLI maps each diff side with its own maps when bundle names are stable", (
       ["cand.ts"],
     ]);
     expect((JSON.parse(unmatched.stdout) as Report).warnings).toContainEqual(
-      expect.stringContaining("--baseline-map-dir matched no profiled script")
+      expect.stringContaining("--baseline-map-dir matched no profiled script") as string
     );
     // Without --baseline there is no baseline side for the option to map.
     const noBaseline = runCli([
@@ -756,7 +817,9 @@ test("folded stacks keep scripts that share a file name apart", () => {
     .trimEnd()
     .split("\n");
   expect(lines).toHaveLength(2);
-  expect(lines.map((l) => Number(l.split(" ").pop()))).toEqual(expect.arrayContaining([1, 2]));
+  expect(lines.map((l) => Number(l.split(" ").pop()))).toEqual(
+    expect.arrayContaining([1, 2]) as number[]
+  );
 });
 
 test("mapped frames with one name on one original line stay apart by original column", () => {

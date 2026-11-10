@@ -2,6 +2,7 @@ import { getCompactionFollowUpContent } from "@/common/types/message";
 import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/message";
 import type { StreamErrorType } from "@/common/types/errors";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import { TODO_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 
 export interface MockAiRouterRequest {
   messages: MuxMessage[];
@@ -271,6 +272,66 @@ function buildToolReadmeReply(): MockAiRouterReply {
   };
 }
 
+/**
+ * `[mock:todo-nudge]`: a turn that writes a TODO list, finishes one item and ends with one item
+ * still pending. The mock player writes the list to disk like the real tool, so Xum sends its
+ * real turn-end TODO nudge after this turn (needsTodoTurnEndNudge).
+ */
+function buildTodoNudgeReply(): MockAiRouterReply {
+  return {
+    assistantText: "I fixed the bug. Verifying the fix is still open.",
+    toolCalls: [
+      {
+        toolCallId: "tool-todo-write-open",
+        toolName: "todo_write",
+        args: {
+          todos: [
+            { content: "Fixed the bug", status: "completed" },
+            { content: "Verify the fix", status: "pending" },
+          ],
+        },
+        result: { success: true, count: 2 },
+      },
+    ],
+  };
+}
+
+/**
+ * The reply to Xum's turn-end TODO nudge: the nudged turn keeps the turn's tools, so it finishes
+ * the open item with a non-todo tool, then marks the list complete.
+ */
+function buildTodoNudgeContinuationReply(): MockAiRouterReply {
+  return {
+    assistantText: "Verified the fix in README.md. The TODO list is complete.",
+    toolCalls: [
+      {
+        toolCallId: "tool-file-read-verify",
+        toolName: "file_read",
+        args: { path: "README.md" },
+        result: {
+          success: true,
+          file_size: 64,
+          modifiedTime: "2024-01-01T00:00:00.000Z",
+          lines_read: 1,
+          content: "1\tMock README content for tool flow test.",
+          lease: "lease-todo-nudge-verify",
+        },
+      },
+      {
+        toolCallId: "tool-todo-write-done",
+        toolName: "todo_write",
+        args: {
+          todos: [
+            { content: "Fixed the bug", status: "completed" },
+            { content: "Verify the fix", status: "completed" },
+          ],
+        },
+        result: { success: true, count: 2 },
+      },
+    ],
+  };
+}
+
 function buildToolListDirectoryReply(): MockAiRouterReply {
   return {
     assistantText: ["Directory listing:", "- README.md", "- package.json", "- src"].join("\n"),
@@ -512,6 +573,15 @@ const defaultHandlers: MockAiRouterHandler[] = [
       hasMockMarker(request.latestUserText, "tool:file-read") ||
       normalizeText(request.latestUserText) === "what's in readme.md?",
     respond: () => buildToolReadmeReply(),
+  },
+  {
+    match: (request) => hasMockMarker(request.latestUserText, "todo-nudge"),
+    respond: () => buildTodoNudgeReply(),
+  },
+  {
+    // Exact prompt match: a nudge joined to a plugin's turn.stop prompt gets the default reply.
+    match: (request) => request.latestUserText.trim() === TODO_TURN_END_NUDGE.trim(),
+    respond: () => buildTodoNudgeContinuationReply(),
   },
   {
     match: (request) =>

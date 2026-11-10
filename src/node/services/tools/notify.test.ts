@@ -13,6 +13,7 @@ import { createNotifyTool } from "./notify";
 import { createTestToolConfig, TestTempDir } from "./testHelpers";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import type { NotifyToolResult } from "@/common/types/tools";
+import { createRecordingDesktopNotifications } from "@/node/services/desktopNotifications/recordingDesktopNotifications.testHarness";
 
 describe("notify tool", () => {
   let config: ToolConfiguration;
@@ -119,5 +120,42 @@ describe("notify tool", () => {
     if (result.success) {
       expect(result.ui_only?.notify?.workspaceId).toBe("test-workspace-123");
     }
+  });
+
+  it("shows the notification through config.desktopNotifications", async () => {
+    const notifications = createRecordingDesktopNotifications();
+    const tool = createNotifyTool({
+      ...config,
+      workspaceId: "ws-1",
+      desktopNotifications: notifications,
+    });
+    const execute = tool.execute as (args: {
+      title: string;
+      message?: string;
+    }) => Promise<NotifyToolResult>;
+
+    const result = await execute({ title: `  ${"t".repeat(70)}  `, message: " body " });
+
+    const title = `${"t".repeat(63)}…`;
+    expect(notifications.requests).toEqual([{ title, body: "body", workspaceId: "ws-1" }]);
+    expect(result).toMatchObject({
+      success: true,
+      title,
+      ui_only: { notify: { notifiedVia: "electron", workspaceId: "ws-1" } },
+    });
+  });
+
+  it("falls back to the browser when desktopNotifications shows nothing", async () => {
+    const notifications = createRecordingDesktopNotifications({ success: false, error: "no" });
+    const tool = createNotifyTool({ ...config, desktopNotifications: notifications });
+    const execute = tool.execute as (args: { title: string }) => Promise<NotifyToolResult>;
+
+    const result = await execute({ title: "Done" });
+
+    expect(notifications.requests).toHaveLength(1);
+    expect(result).toMatchObject({
+      success: true,
+      ui_only: { notify: { notifiedVia: "browser" } },
+    });
   });
 });

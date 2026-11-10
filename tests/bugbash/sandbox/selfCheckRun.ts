@@ -97,6 +97,8 @@ export async function runSelfCheck(
       BUGBASH_MODEL: "anthropic:claude-haiku-5-5",
       PATH: process.env.PATH,
       HOME: process.env.HOME,
+      // CI's warning annotation for a local image.
+      GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
     };
     const stamp = `${Date.now()}-${process.pid}`;
     const job = async (extra: string[], name: string) => {

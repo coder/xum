@@ -1,8 +1,9 @@
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { getAutoExpandPrefsKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
+import { textsBelowAaInThemes } from "./helpers/contrast";
 import { PhoneSubagentReportDecorator } from "./helpers/subagentReportStory";
 import { collapseLeftSidebar, collapseRightSidebar } from "./helpers/uiState";
 import { createAssistantMessage } from "./mocks/messages";
@@ -100,6 +101,9 @@ export const Outgoing: AppStory = {
     await expect(toggle).toHaveAttribute("aria-expanded", "false");
     await userEvent.keyboard(" ");
     await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    // "Sent" is success text on the message surface: 2.68:1 in light before #6882.
+    const sent = await canvas.findAllByText(/^Sent/);
+    await expect(textsBelowAaInThemes(() => sent).join("\n")).toBe("");
     await new Promise<void>((resolve) =>
       requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
     );
@@ -190,7 +194,7 @@ export const Compacted: AppStory = {
     for (const card of cards) {
       const status = within(card as HTMLElement).getByRole("status");
       await expect(status).not.toHaveClass("text-danger");
-      await expect(status).not.toHaveClass("text-success");
+      await expect(status).not.toHaveClass("text-success-text");
       await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
     }
   },
@@ -242,7 +246,7 @@ export const Queued: AppStory = {
       // Queued is neither a failure nor a completed delivery.
       const status = within(card as HTMLElement).getByRole("status");
       await expect(status).not.toHaveClass("text-danger");
-      await expect(status).not.toHaveClass("text-success");
+      await expect(status).not.toHaveClass("text-success-text");
       await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
     }
   },

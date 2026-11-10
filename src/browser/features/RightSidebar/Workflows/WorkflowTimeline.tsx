@@ -269,7 +269,7 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
         </span>
       )}
       {step.status === "running" && (
-        <span className="text-accent shrink-0 text-[11px]">running…</span>
+        <span className="text-accent-text shrink-0 text-[11px]">running…</span>
       )}
       {step.status === "failed" && (
         <span className="shrink-0 text-[11px]" style={{ color }}>
@@ -484,7 +484,7 @@ const WorkflowPhaseSection: React.FC<WorkflowPhaseSectionProps> = (props) => {
         ) : phase.failed ? (
           <AlertTriangle className="h-3 w-3" style={{ color: WORKFLOW_TONE_VAR.destructive }} />
         ) : allDone ? (
-          <Check className="text-success h-3 w-3" />
+          <Check className="text-success-text h-3 w-3" />
         ) : null}
         {hasBody &&
           (open ? (

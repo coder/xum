@@ -34,6 +34,7 @@ import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
+import { parseAskUserQuestionAnswerMetadata } from "@/common/utils/tools/askUserQuestionSummary";
 
 /**
  * Check if a tool result indicates success (for tools that return { success: boolean })
@@ -55,32 +56,6 @@ export function hasFailureResult(result: unknown): boolean {
   // Implicit failure - error field present
   if ("error" in result && result.error) return true;
   return false;
-}
-
-export function resolveRouteProvider(
-  routeProvider: string | undefined,
-  routedThroughGateway: boolean | undefined
-): string | undefined {
-  return routeProvider ?? (routedThroughGateway === true ? "mux-gateway" : undefined);
-}
-
-export function normalizeMessageRouteProvider(message: MuxMessage): MuxMessage {
-  const routeProvider = resolveRouteProvider(
-    message.metadata?.routeProvider,
-    message.metadata?.routedThroughGateway
-  );
-
-  if (!message.metadata || routeProvider === message.metadata.routeProvider) {
-    return message;
-  }
-
-  return {
-    ...message,
-    metadata: {
-      ...message.metadata,
-      routeProvider,
-    },
-  };
 }
 
 /**
@@ -341,10 +316,7 @@ function toArtifactInteractionDisplay(value: unknown): ArtifactInteractionMetada
     typeof meta.artifactPath !== "string" ||
     typeof meta.title !== "string" ||
     typeof meta.text !== "string" ||
-    meta.action !== "send" ||
-    typeof meta.version !== "number" ||
-    !Number.isInteger(meta.version) ||
-    meta.version < 0
+    meta.action !== "send"
   ) {
     return undefined;
   }
@@ -352,7 +324,6 @@ function toArtifactInteractionDisplay(value: unknown): ArtifactInteractionMetada
     id: meta.id,
     artifactPath: meta.artifactPath,
     title: meta.title,
-    version: meta.version,
     action: "send",
     text: meta.text,
     ...(meta.data !== undefined ? { data: meta.data } : {}),
@@ -448,6 +419,7 @@ function buildUserDisplayedMessages(options: {
       compactionRequest,
       reviews: muxMeta?.reviews,
       artifactInteraction: toArtifactInteractionDisplay(muxMeta?.artifactInteraction),
+      askUserQuestionAnswers: parseAskUserQuestionAnswerMetadata(muxMeta),
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
       // Only genuine machine rows get collapsed; corrupted metadata must not hide human input.
       contextBudgetWarning:
@@ -478,12 +450,19 @@ function buildUserDisplayedMessages(options: {
   ];
 }
 
+// Some local models (Qwen via oMLX) emit a separate "\n\n" text part between
+// reasoning and each tool call. Rendering it would add an empty assistant row
+// (a visible gap) and steal last-part status, so whitespace-only text is hidden
+// here while persisted history keeps it byte-identical. The typeof check keeps a
+// corrupted history part without text from crashing the transcript.
+function isVisibleTextPart(
+  part: MuxMessage["parts"][number]
+): part is Extract<MuxMessage["parts"][number], { type: "text" }> {
+  return part.type === "text" && typeof part.text === "string" && part.text.trim().length > 0;
+}
+
 function isRenderableDisplayPart(part: MuxMessage["parts"][number]): boolean {
-  return (
-    part.type === "reasoning" ||
-    (part.type === "text" && Boolean(part.text)) ||
-    isDynamicToolPart(part)
-  );
+  return part.type === "reasoning" || isVisibleTextPart(part) || isDynamicToolPart(part);
 }
 
 function getRenderablePartStats(parts: MuxMessage["parts"]): {
@@ -568,11 +547,7 @@ function appendAssistantTextRow(
     isCompacted: !!message.metadata?.compacted,
     isIdleCompacted: message.metadata?.compacted === "idle",
     model: message.metadata?.model,
-    routedThroughGateway: message.metadata?.routedThroughGateway,
-    routeProvider: resolveRouteProvider(
-      message.metadata?.routeProvider,
-      message.metadata?.routedThroughGateway
-    ),
+    routeProvider: message.metadata?.routeProvider,
     modelFallback: message.metadata?.modelFallback,
     autoModelRouting: message.metadata?.autoModelRouting,
     mode: message.metadata?.mode,
@@ -760,7 +735,6 @@ function appendStreamErrorRows(
       errorType,
       historySequence: options.historySequence,
       model: options.message.metadata?.model,
-      routedThroughGateway: options.message.metadata?.routedThroughGateway,
       timestamp: options.baseTimestamp,
     });
   };
@@ -839,7 +813,7 @@ function buildAssistantDisplayedMessages(options: {
       return;
     }
 
-    if (part.type === "text" && part.text) {
+    if (isVisibleTextPart(part)) {
       appendAssistantTextRow(displayedMessages, {
         message,
         part,

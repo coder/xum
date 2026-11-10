@@ -162,7 +162,7 @@ describe("GoalTab", () => {
     // user knows what to click next; the icon confirms the affordance.
     const resume = getByLabelText("Resume goal");
     expect(resume.querySelector("svg")).not.toBeNull();
-    expect(resume.className).toContain("text-success");
+    expect(resume.className).toContain("text-success-text");
   });
 
   test("renders accounting breakdown", () => {

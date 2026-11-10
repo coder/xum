@@ -8,7 +8,6 @@ import { ProviderModelEntrySchema } from "./providerModelEntry";
 export const CacheTtlSchema = z.enum(["5m", "1h"]);
 /** Anthropic request speed; "fast" opts into Fast mode (see anthropicFastMode.ts). */
 export const AnthropicSpeedSchema = z.enum(["standard", "fast"]);
-export type AnthropicSpeed = z.infer<typeof AnthropicSpeedSchema>;
 // "ultrafast" is OpenAI's model-gated premium tier (DevDay 2026-09-29); requests for
 // models without it drop the tier (see openaiModelSupportsServiceTier).
 export const ServiceTierSchema = z.enum(["auto", "default", "flex", "priority", "ultrafast"]);
@@ -21,7 +20,6 @@ export const FastModePreviousServiceTierSchema = z.enum([
   "ultrafast",
   "unset",
 ]);
-export type FastModePreviousServiceTier = z.infer<typeof FastModePreviousServiceTierSchema>;
 export const XAIServiceTierSchema = z.enum(["default", "priority"]);
 export type XAIServiceTier = z.infer<typeof XAIServiceTierSchema>;
 export const XAIFastModePreviousServiceTierSchema = z.enum(["default", "unset"]);
@@ -34,6 +32,8 @@ export const BaseProviderConfigSchema = z
     baseUrl: z.string().optional(),
     baseURL: z.string().optional(),
     headers: z.record(z.string(), z.string()).optional(),
+    /** Header name that carries the workspace id on chat requests (see sessionHeader.ts). */
+    sessionHeader: z.string().optional(),
     enabled: z.boolean().optional(),
     providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
     displayName: z.string().min(1).optional(),
@@ -68,6 +68,13 @@ export const BedrockProviderConfigSchema = BaseProviderConfigSchema.extend({
   secretAccessKey: z.string().optional(),
 });
 
+export const GoogleVertexProviderConfigSchema = BaseProviderConfigSchema.extend({
+  project: z.string().optional(),
+  location: z.string().optional(),
+  /** Service-account JSON key file; unset uses Google Application Default Credentials. */
+  keyFilename: z.string().optional(),
+});
+
 export const OpenRouterProviderConfigSchema = BaseProviderConfigSchema.extend({
   order: z.string().optional(),
   allow_fallbacks: z.boolean().optional(),
@@ -83,11 +90,6 @@ export const XAIProviderConfigSchema = BaseProviderConfigSchema.extend({
   searchParameters: z.record(z.string(), z.unknown()).optional(),
   serviceTier: XAIServiceTierSchema.optional(),
   fastModePreviousServiceTier: XAIFastModePreviousServiceTierSchema.optional(),
-});
-
-export const MuxGatewayProviderConfigSchema = BaseProviderConfigSchema.extend({
-  couponCode: z.string().optional(),
-  voucher: z.string().optional(),
 });
 
 export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
@@ -190,8 +192,8 @@ export const ProvidersConfigSchema = z
     openrouter: OpenRouterProviderConfigSchema.optional(),
     xai: XAIProviderConfigSchema.optional(),
     meta: MetaProviderConfigSchema.optional(),
-    "mux-gateway": MuxGatewayProviderConfigSchema.optional(),
     google: GoogleProviderConfigSchema.optional(),
+    "google-vertex": GoogleVertexProviderConfigSchema.optional(),
     deepseek: DeepSeekProviderConfigSchema.optional(),
     moonshotai: MoonshotAIProviderConfigSchema.optional(),
     zai: ZaiProviderConfigSchema.optional(),
@@ -204,7 +206,7 @@ export const ProvidersConfigSchema = z
 export type BaseProviderConfig = z.infer<typeof BaseProviderConfigSchema>;
 export type OpenAIProviderConfig = z.infer<typeof OpenAIProviderConfigSchema>;
 export type BedrockProviderConfig = z.infer<typeof BedrockProviderConfigSchema>;
-export type MuxGatewayProviderConfig = z.infer<typeof MuxGatewayProviderConfigSchema>;
+export type GoogleVertexProviderConfig = z.infer<typeof GoogleVertexProviderConfigSchema>;
 export type CoderProviderConfig = z.infer<typeof CoderProviderConfigSchema>;
 
 export type ProvidersConfig = z.infer<typeof ProvidersConfigSchema>;

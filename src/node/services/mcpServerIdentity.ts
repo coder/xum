@@ -209,7 +209,7 @@ export function buildToolCallDisplay(input: {
   identity: MCPServerIdentity | undefined;
   source: MCPToolCallDisplaySource;
   iconRef?: string;
-  /** MCP Apps view of the tool (artifacts experiment). */
+  /** MCP Apps view of the tool (mcp-apps experiment). */
   app?: { resourceUri: string };
 }): MCPToolCallDisplay | undefined {
   if (!input.identity) {

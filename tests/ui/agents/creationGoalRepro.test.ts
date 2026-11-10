@@ -26,10 +26,11 @@ import {
   cleanupView,
   openProjectCreationView,
   setupTestDom,
-  waitForLatestDraftId,
+  waitForOpenDraftId,
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { getDraftScopeId } from "@/common/constants/storage";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
@@ -44,10 +45,12 @@ async function setupCreationView() {
   const view = renderApp({ apiClient: env.orpc });
   const projectPath = await addProjectViaUI(view, getSharedRepoPath());
   await openProjectCreationView(view, projectPath);
-  const draftId = await waitForLatestDraftId(projectPath);
-  const scope: DraftScope = { kind: "creation", projectPath, draftId };
-  const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), scope);
-  return { env, projectPath, view, cleanupDom, chat, scope };
+  const draftId = await waitForOpenDraftId();
+  const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
+    kind: "creation",
+    draftId,
+  });
+  return { env, projectPath, view, cleanupDom, chat, draftId };
 }
 
 function workspaceIdsOf(env: ReturnType<typeof getSharedEnv>, projectPath: string): string[] {
@@ -61,7 +64,7 @@ const NOT_YET = "objective not found yet";
 async function whereTheObjectiveLives(
   env: ReturnType<typeof getSharedEnv>,
   projectPath: string,
-  scope: DraftScope,
+  draftId: string,
   container: HTMLElement,
   /** Workspaces that existed before this test (an earlier test's leftovers in the shared repo). */
   preexisting: ReadonlySet<string>
@@ -70,8 +73,8 @@ async function whereTheObjectiveLives(
   for (const textarea of container.querySelectorAll("textarea")) {
     if (textarea.value.includes(OBJECTIVE)) found.push("visible composer");
   }
-  await getDraftStore().flush(scope);
-  if ((await env.services.draftService.get(scope)).text.includes(OBJECTIVE)) {
+  await getCreationDraftStore().flush(draftId);
+  if ((await env.services.draftService.creation.get(draftId))?.text.includes(OBJECTIVE)) {
     found.push("creation draft");
   }
   for (const workspaceId of workspaceIdsOf(env, projectPath)) {
@@ -97,7 +100,7 @@ describeIntegration("composer drafts: /goal in a creation composer", () => {
   });
 
   test("a refused /goal keeps the objective the user typed", async () => {
-    const { env, projectPath, view, cleanupDom, chat, scope } = await setupCreationView();
+    const { env, projectPath, view, cleanupDom, chat, draftId } = await setupCreationView();
     const before = new Set(workspaceIdsOf(env, projectPath));
     const setGoal = jest.spyOn(env.services.workspaceGoalService, "setGoal").mockResolvedValue({
       success: false,
@@ -122,7 +125,7 @@ describeIntegration("composer drafts: /goal in a creation composer", () => {
       let found: string[] = [];
       await waitFor(
         async () => {
-          found = await whereTheObjectiveLives(env, projectPath, scope, view.container, before);
+          found = await whereTheObjectiveLives(env, projectPath, draftId, view.container, before);
           if (found.length === 0) throw new Error(NOT_YET);
         },
         { timeout: 5_000 }
@@ -139,7 +142,7 @@ describeIntegration("composer drafts: /goal in a creation composer", () => {
   }, 90_000);
 
   test("control: an accepted /goal turns the objective into the new workspace's goal", async () => {
-    const { env, projectPath, view, cleanupDom, chat, scope } = await setupCreationView();
+    const { env, projectPath, view, cleanupDom, chat, draftId } = await setupCreationView();
     const before = new Set(workspaceIdsOf(env, projectPath));
     try {
       await chat.send(`/goal ${OBJECTIVE}`);
@@ -159,7 +162,7 @@ describeIntegration("composer drafts: /goal in a creation composer", () => {
           const found = await whereTheObjectiveLives(
             env,
             projectPath,
-            scope,
+            draftId,
             view.container,
             before
           );

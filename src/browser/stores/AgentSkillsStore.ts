@@ -1,9 +1,11 @@
 import { useSyncExternalStore } from "react";
 import type { APIClient } from "@/browser/contexts/API";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
+import { subscribeProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import type { AgentSkillListResult } from "@/common/types/agentSkill";
+import type { AgentSkillListResult, InvocableSkill } from "@/common/types/agentSkill";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import { MapStore } from "./MapStore";
 
 /** The input of `agentSkills.list`: a workspace, or a project before its workspace exists. */
@@ -34,7 +36,7 @@ function getDiscoveryKey(discovery: AgentSkillsDiscovery): string {
  * the command palette, so they show the same list and refresh on the same
  * signals. No event says when an SSH host becomes reachable, so a list that
  * missed a source refreshes on window focus, skill tool calls, plugin changes,
- * or when the user starts a `$` or `/` token.
+ * project trust changes, or when the user starts a `$` or `/` token.
  */
 export class AgentSkillsStore {
   private readonly versions = new MapStore<string, AgentSkillListResult>();
@@ -131,11 +133,14 @@ export class AgentSkillsStore {
     this.refreshController.bindListeners();
     const refresh = () => this.refreshController.requestImmediate();
     const unsubscribePlugins = subscribeAgentPluginsMutated(refresh);
+    // #6426: project plugin skills load only in a trusted project, so the list changes with trust.
+    const unsubscribeTrust = subscribeProjectTrustChanged(refresh);
     if (typeof window !== "undefined") {
       window.addEventListener(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED, refresh);
     }
     this.unbindSignals = () => {
       unsubscribePlugins();
+      unsubscribeTrust();
       if (typeof window !== "undefined") {
         window.removeEventListener(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED, refresh);
       }
@@ -191,6 +196,14 @@ export function useAgentSkills(discovery: AgentSkillsDiscovery | null): AgentSki
     (listener) => (discovery ? store.subscribe(discovery, listener) : () => undefined),
     () => (discovery ? store.getResult(discovery) : EMPTY_RESULT)
   );
+}
+
+/**
+ * Skills for user invocation surfaces (slash menu, `$` suggestions, command
+ * palette): shadowed plugin skills join under `<plugin>:<skill>`.
+ */
+export function useInvocableSkills(discovery: AgentSkillsDiscovery | null): InvocableSkill[] {
+  return listInvocableSkills(useAgentSkills(discovery));
 }
 
 /** False while the first answer for `discovery` is pending (see AgentSkillsStore.hasResult). */

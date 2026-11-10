@@ -2,17 +2,22 @@ import { useEffect, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { requireTestModule } from "@/browser/testUtils";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
+import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealLottieModule from "lottie-react";
 import { APIContext } from "@/browser/contexts/API";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { PHONE_TOUCH_QUERY } from "@/browser/utils/env";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as RealConfiguredProvidersBarModule from "@/browser/components/ConfiguredProvidersBar/ConfiguredProvidersBar";
 import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RealChatInputModule from "@/browser/features/ChatInput/index";
 import type * as ProjectPageModule from "@/browser/components/ProjectPage/ProjectPage";
+import type * as ScratchPageModule from "@/browser/components/ScratchPage/ScratchPage";
 import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 
 let cleanupDom: (() => void) | null = null;
@@ -142,9 +147,18 @@ function ConnectingAPIWrapper(props: { children: ReactNode }) {
         retry: () => undefined,
       }}
     >
-      {props.children}
+      <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
     </APIContext.Provider>
   );
+}
+
+function stubPhoneScreen() {
+  const original = window.matchMedia.bind(window);
+  window.matchMedia = (query: string) => {
+    const list = original(query);
+    if (query === PHONE_TOUCH_QUERY) Object.defineProperty(list, "matches", { value: true });
+    return list;
+  };
 }
 
 describe("ProjectPage", () => {
@@ -172,11 +186,13 @@ describe("ProjectPage", () => {
       WorkspaceProvider: typeof WorkspaceContextModule.WorkspaceProvider;
     }>("@/browser/contexts/WorkspaceContext");
 
+    // The composer renders once its draft resolved; a draft made in this window is ready at once.
+    const pendingDraftId = getCreationDraftStore().create("/projects/demo", null);
     const baseProps = {
+      pendingDraftId,
       projectPath: "/projects/demo",
       projectName: "demo",
       leftSidebarCollapsed: true,
-      onToggleLeftSidebarCollapsed: () => undefined,
       onWorkspaceCreated: () => undefined,
     };
 
@@ -209,5 +225,63 @@ describe("ProjectPage", () => {
 
     // Focus should not be re-triggered (would move caret to end).
     expect(focusMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("leaves the creation input unfocused on a phone, so the keyboard stays closed", async () => {
+    const { ProjectPage } = requireTestModule<{
+      ProjectPage: typeof ProjectPageModule.ProjectPage;
+    }>("@/browser/components/ProjectPage/ProjectPage");
+    const { WorkspaceProvider } = requireTestModule<{
+      WorkspaceProvider: typeof WorkspaceContextModule.WorkspaceProvider;
+    }>("@/browser/contexts/WorkspaceContext");
+    stubPhoneScreen();
+
+    render(
+      <RouterProvider>
+        <SettingsProvider>
+          <WorkspaceProvider>
+            <ProjectPage
+              pendingDraftId={getCreationDraftStore().create("/projects/demo", null)}
+              projectPath="/projects/demo"
+              projectName="demo"
+              leftSidebarCollapsed={true}
+              onWorkspaceCreated={() => undefined}
+            />
+          </WorkspaceProvider>
+        </SettingsProvider>
+      </RouterProvider>,
+      { wrapper: ConnectingAPIWrapper }
+    );
+
+    await waitFor(() => expect(readyCalls).toBe(1));
+    expect(focusMock).not.toHaveBeenCalled();
+  });
+
+  test("leaves the scratch creation input unfocused on a phone too", async () => {
+    const { ScratchPage } = requireTestModule<{
+      ScratchPage: typeof ScratchPageModule.ScratchPage;
+    }>("@/browser/components/ScratchPage/ScratchPage");
+    const { WorkspaceProvider } = requireTestModule<{
+      WorkspaceProvider: typeof WorkspaceContextModule.WorkspaceProvider;
+    }>("@/browser/contexts/WorkspaceContext");
+    stubPhoneScreen();
+
+    render(
+      <RouterProvider>
+        <SettingsProvider>
+          <WorkspaceProvider>
+            <ScratchPage
+              pendingDraftId={getCreationDraftStore().create(SCRATCH_PROJECT_CONFIG_KEY, null)}
+              leftSidebarCollapsed={true}
+              onWorkspaceCreated={() => undefined}
+            />
+          </WorkspaceProvider>
+        </SettingsProvider>
+      </RouterProvider>,
+      { wrapper: ConnectingAPIWrapper }
+    );
+
+    await waitFor(() => expect(readyCalls).toBe(1));
+    expect(focusMock).not.toHaveBeenCalled();
   });
 });

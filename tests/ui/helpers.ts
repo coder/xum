@@ -5,7 +5,7 @@
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import type { RenderedApp } from "./renderReviewPanel";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { useGitStatusStoreRaw } from "@/browser/stores/GitStatusStore";
@@ -25,6 +25,14 @@ export async function openAnalyticsDialog(container: HTMLElement): Promise<HTMLE
   fireEvent.click(await within(container).findByTestId("analytics-button"));
   const body = container.ownerDocument.body;
   return within(body).findByRole("dialog", { name: "Analytics" }, { timeout: 30000 });
+}
+
+/**
+ * Open (or show) the New tab of the right sidebar pane inside `scope` with the "+" button after
+ * its tabs.
+ */
+export async function openSidebarNewTab(scope: HTMLElement): Promise<void> {
+  fireEvent.click(await within(scope).findByRole("button", { name: "New tab" }));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -118,7 +126,9 @@ async function waitForPageSettled(container: HTMLElement): Promise<void> {
 export async function setupWorkspaceView(
   view: RenderedApp,
   metadata: FrontendWorkspaceMetadata,
-  workspaceId: string
+  workspaceId: string,
+  /** False for a test that acts during workspace setup (#7449). */
+  options: { waitForSetup?: boolean } = {}
 ): Promise<void> {
   await view.waitForReady();
 
@@ -144,7 +154,8 @@ export async function setupWorkspaceView(
     () => {
       const el = view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
       if (!el) throw new Error("Workspace not found in sidebar");
-      // Wait until the workspace is selectable (not still creating) before clicking.
+      // Wait until the workspace is selectable before clicking. aria-disabled covers only
+      // removing and archiving; the setup wait comes after the click.
       if (el.getAttribute("aria-disabled") === "true") {
         throw new Error("Workspace still disabled");
       }
@@ -154,6 +165,24 @@ export async function setupWorkspaceView(
   );
   fireEvent.click(workspaceElement);
   await waitForPageSettled(view.container);
+
+  // Wait until the row has left workspace setup: while setup runs, it shows a cancel button in
+  // place of its actions menu, hides quick archive, and the Review tab shows a placeholder. Tests
+  // that used those controls right away raced setup on slow runners (#7450, #7541, #7543).
+  // Positive signal, not copy: the row's actions-menu trigger (the only popover trigger carrying
+  // the row's data-workspace-id) renders only once setup has ended. If it is ever removed, this
+  // wait fails loudly instead of passing at once.
+  if (options.waitForSetup !== false) {
+    await waitFor(
+      () => {
+        const menuTrigger = view.container.querySelector(
+          `button[data-workspace-id="${workspaceId}"][aria-haspopup]`
+        );
+        if (!menuTrigger) throw new Error("Workspace still in setup (no actions menu yet)");
+      },
+      { timeout: 30_000 }
+    );
+  }
 
   // Ensure the workspace is registered and activated in the store so that
   // runOnChatSubscription starts. In the real app, WorkspaceContext handles
@@ -294,32 +323,29 @@ export async function addProjectViaUI(view: RenderedApp, projectPath: string): P
 }
 
 export function getWorkspaceDraftIds(projectPath: string): string[] {
-  const draftsForProject = getDraftStore().getCreationDraftsByProject()[projectPath] ?? [];
+  const draftsForProject = getCreationDraftStore().getDraftsByProject()[projectPath] ?? [];
   return draftsForProject.map((draft) => draft.draftId);
 }
 
-/** Delete every listed creation draft of a project (the list lives on the backend). */
+/** Delete every listed creation draft of a project (records live on the backend). */
 export async function clearWorkspaceDrafts(projectPath: string): Promise<void> {
-  await getDraftStore().whenReady();
   await Promise.all(
-    getWorkspaceDraftIds(projectPath).map((draftId) =>
-      getDraftStore().deleteDraft({ kind: "creation", projectPath, draftId })
-    )
+    getWorkspaceDraftIds(projectPath).map((draftId) => getCreationDraftStore().delete(draftId))
   );
 }
 
-export async function waitForLatestDraftId(
-  projectPath: string,
-  timeoutMs = 5_000
-): Promise<string> {
+/**
+ * The creation draft the open project page shows (its `draft` route parameter). A new draft is
+ * not listed until it has content, so the route is the only place to read its id from.
+ */
+export async function waitForOpenDraftId(timeoutMs = 5_000): Promise<string> {
   return waitFor(
     () => {
-      const drafts = getWorkspaceDraftIds(projectPath);
-      const latestDraft = drafts[drafts.length - 1];
-      if (!latestDraft) {
-        throw new Error("Draft not registered yet");
+      const draftId = new URLSearchParams(window.location.search).get("draft");
+      if (!draftId) {
+        throw new Error("No draft in the route yet");
       }
-      return latestDraft;
+      return draftId;
     },
     { timeout: timeoutMs }
   );
@@ -358,11 +384,18 @@ export function setupTestDom(options?: { enableTutorial?: boolean }): () => void
   const { installDom } = require("./dom") as typeof import("./dom");
   const cleanupDom = installDom();
 
-  if (!options?.enableTutorial) {
-    disableTutorial();
+  if (options?.enableTutorial) {
+    return cleanupDom;
   }
-
-  return cleanupDom;
+  // The workspace tutorial opens 300 ms after a workspace view mounts and moves focus into its
+  // bubble, so focus and blur assertions would race it (#7120). Cleanup restores the flag, so later
+  // renders in the same test file keep their own tutorial setting.
+  const previousTutorialOptIn = globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__;
+  disableTutorial();
+  return () => {
+    cleanupDom();
+    globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = previousTutorialOptIn;
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

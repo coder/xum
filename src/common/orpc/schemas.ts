@@ -156,6 +156,7 @@ export {
   UpdateStatusSchema,
   UsageDeltaEventSchema,
   WorkspaceChatMessageSchema,
+  OnChatEventSchema,
   WorkspaceInitEventSchema,
 } from "./schemas/stream";
 
@@ -169,7 +170,6 @@ export {
   browser,
   devtools,
   drafts,
-  uiLayouts,
   desktop,
   general,
   menu,
@@ -183,6 +183,7 @@ export {
   mcp,
   memory,
   artifacts,
+  agentResourceLimits,
   mcpApps,
   refinements,
   secrets,
@@ -193,8 +194,6 @@ export {
   ModelCatalogEntrySchema,
   ModelCatalogSearchInputSchema,
   ModelCatalogSearchResultSchema,
-  muxGateway,
-  muxGatewayOauth,
   copilotOauth,
   codexOauth,
   coderOauth,

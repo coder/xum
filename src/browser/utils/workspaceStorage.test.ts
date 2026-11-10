@@ -1,19 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
-import { QuotaLimitedStorage, restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
 
+import { copyWorkspaceStorage, deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import {
-  copyWorkspaceStorage,
-  deleteWorkspaceStorage,
-  migrateWorkspaceStorage,
-} from "@/browser/utils/workspaceStorage";
-import {
-  getAutoExpandPrefsKey,
-  getDraftScopeId,
   getReviewsKey,
-  getPersistedKeyRegistration,
-  getWorkspaceNameStateKey,
   getDesktopPopoutKey,
   getMCPTestResultsKey,
   getPinnedTodoExpandedKey,
@@ -77,79 +68,6 @@ describe("deleteWorkspaceStorage", () => {
 
     for (const key of removed) expect(localStorage.getItem(key)).toBeNull();
     for (const key of kept) expect(localStorage.getItem(key)).toBe("value");
-  });
-});
-
-describe("migrateWorkspaceStorage", () => {
-  beforeEach(() => {
-    saveDomGlobals();
-  });
-
-  afterEach(() => {
-    restoreDomGlobals();
-  });
-
-  // The copy no longer throws when a write fails; deleting the source anyway would erase the
-  // only persisted copy of the scope's model/review/name state.
-  test("keeps the source keys when a destination write fails", () => {
-    const storage = new QuotaLimitedStorage(60);
-    const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
-    Object.defineProperty(domWindow, "localStorage", { value: storage, configurable: true });
-    globalThis.window = domWindow;
-    globalThis.document = domWindow.document;
-    globalThis.localStorage = storage;
-    const sourceKey = getAutoExpandPrefsKey("__pending__/repo");
-    storage.setItem(sourceKey, JSON.stringify("anthropic:claude-opus"));
-
-    migrateWorkspaceStorage("__pending__/repo", "ws-destination");
-
-    expect(storage.getItem(sourceKey)).toBe(JSON.stringify("anthropic:claude-opus"));
-  });
-
-  // A value over the destination's budget can only live there in memory, so without an owner bound
-  // the source must stay the durable copy.
-  test("keeps a source value without an owner bound that is over its budget at the destination", () => {
-    const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
-    globalThis.window = domWindow;
-    globalThis.document = domWindow.document;
-    globalThis.localStorage = domWindow.localStorage;
-    const sourceKey = getAutoExpandPrefsKey("__pending__/repo2");
-    const budget = getPersistedKeyRegistration(sourceKey)!.maxValueChars;
-    const legacyValue = JSON.stringify("m".repeat(budget));
-    localStorage.setItem(sourceKey, legacyValue);
-
-    migrateWorkspaceStorage("__pending__/repo2", "ws-destination2");
-
-    expect(localStorage.getItem(sourceKey)).toBe(legacyValue);
-  });
-
-  // Older builds stored the whole creation message in workspaceNameState; its owner bound shrinks
-  // it, so the moved draft keeps its name state after a restart.
-  test("moves an oversized legacy workspace name state in bounded form", () => {
-    const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
-    globalThis.window = domWindow;
-    globalThis.document = domWindow.document;
-    globalThis.localStorage = domWindow.localStorage;
-    const sourceKey = getWorkspaceNameStateKey("__pending__/repo3");
-    const destinationScopeId = getDraftScopeId("/repo3", "draft-1");
-    const destinationKey = getWorkspaceNameStateKey(destinationScopeId);
-    const generatedIdentity = { name: "sidebar-a1b2", title: "Fix sidebar" };
-    localStorage.setItem(
-      sourceKey,
-      JSON.stringify({
-        generatedIdentity,
-        manualName: "my-name",
-        autoGenerate: false,
-        lastGeneratedFor: "m".repeat(10_000),
-      })
-    );
-
-    migrateWorkspaceStorage("__pending__/repo3", destinationScopeId);
-    const restarted = restartLocalStorage();
-
-    const moved: unknown = JSON.parse(restarted.getItem(destinationKey) ?? "null");
-    expect(moved).toMatchObject({ generatedIdentity, manualName: "my-name", autoGenerate: false });
-    expect(restarted.getItem(sourceKey)).toBeNull();
   });
 });
 

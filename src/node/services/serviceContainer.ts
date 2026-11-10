@@ -9,6 +9,7 @@ import {
   replayPendingArtifactInteractions,
 } from "@/node/services/artifactInteractions";
 import { log } from "@/node/services/log";
+import { installBrotliResponseGuard } from "@/node/utils/network/brotliResponseGuard";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
@@ -23,7 +24,6 @@ import type { ComputerUseService } from "@/node/services/computerUse/computerUse
 import type { ComputerUseHostBridge } from "@/node/services/computerUse/hostBridge";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type { ProjectService } from "@/node/services/projectService";
-import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { CopilotOauthService } from "@/node/services/copilotOauthService";
@@ -58,6 +58,7 @@ import {
 } from "@/common/constants/paths";
 import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
 import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
+import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
 import { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
@@ -136,7 +137,6 @@ import {
   MemoryConsolidation,
   MemoryMeta,
   MenuEvent,
-  MuxGatewayOauth,
   Project,
   Provider,
   ProvidersConfigStoreTag,
@@ -245,7 +245,6 @@ export class ServiceContainer {
   public readonly backgroundProcessManager: CoreServices["backgroundProcessManager"];
   // Desktop-only services (`di/layers/desktop.ts`)
   public readonly projectService: ProjectService;
-  public readonly muxGatewayOauthService: MuxGatewayOauthService;
   public readonly codexOauthService: CodexOauthService;
   public readonly coderOauthService: CoderOauthService;
   public readonly copilotOauthService: CopilotOauthService;
@@ -283,6 +282,8 @@ export class ServiceContainer {
   // "Report slowness" bundles (same experiment): writes only when asked.
   public readonly perfReports: PerfReportService;
   public readonly sessionTapes: SessionTapeFolderService;
+  // Constructed directly (no DI tag): it needs only the config and holds one config listener.
+  public readonly agentResourceLimits: AgentResourceLimitsService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -320,6 +321,8 @@ export class ServiceContainer {
   private disposePromise: Promise<void> | null = null;
 
   constructor(stores: ConfigStores) {
+    // Desktop, `xum server` and ACP all build this before any service can fetch (#7358).
+    installBrotliResponseGuard();
     // Built eagerly and synchronously: a layer body that throws fails the
     // constructor, like any service constructor did before the graph existed.
     this.runtime = makeAppRuntime(AppLive(stores));
@@ -327,6 +330,7 @@ export class ServiceContainer {
     this.appFiberScope = get(AppFiberScopeTag);
     this.workflowRuntimeFactory = get(QuickJSRuntimeFactoryTag);
     this.config = get(ConfigTag);
+    this.agentResourceLimits = new AgentResourceLimitsService(this.config);
     this.perfCaptures = new PerfCaptureService({
       dir: getXumPerfCapturesDir(this.config.rootDir),
       recorder: this.perfFlightRecorder,
@@ -368,7 +372,6 @@ export class ServiceContainer {
     this.extensionMetadata = get(ExtensionMetadata);
     this.backgroundProcessManager = get(BackgroundProcessManagerTag);
     this.projectService = get(Project);
-    this.muxGatewayOauthService = get(MuxGatewayOauth);
     this.codexOauthService = get(CodexOauth);
     this.coderOauthService = get(CoderOauth);
     this.copilotOauthService = get(CopilotOauth);
@@ -460,6 +463,20 @@ export class ServiceContainer {
     // Bash commands that outlived a restart still hold the proxy URL and key: bind the saved
     // port again before clients connect. Best-effort: a proxy problem never blocks startup.
     { name: "bashAiProxy.restore", run: () => this.bashAiProxy.restore(), bestEffort: true },
+    // #7621: a trust change from `xum trust` or another config.json writer drops the remote
+    // plugin snapshots. Never throws (best-effort anyway).
+    {
+      name: "projectService.watchProjectTrust",
+      run: () => Promise.resolve(this.projectService.watchProjectTrust()),
+      bestEffort: true,
+    },
+    // Before task recovery, so commands of recovered tasks start under the agent resource limit.
+    // Best-effort: a limit that cannot apply is reported in Settings and never blocks startup.
+    {
+      name: "agentResourceLimits.start",
+      run: () => this.agentResourceLimits.start(),
+      bestEffort: true,
+    },
     // Best-effort: a slow or failing recovery (e.g. a large instance re-launching many tasks)
     // must not keep the server from starting, and a fatal timeout crash-loops under a supervisor
     // that restarts xum, re-driving the same partial recovery each time. The listener still waits
@@ -667,10 +684,6 @@ export class ServiceContainer {
         log.warn("[MemoryConsolidation] launch sweep failed", { error });
       });
 
-    // Creation drafts of projects removed while this build was not running. Best-effort and
-    // internally non-throwing; fire-and-forget so it never delays startup.
-    void this.draftService.collectOrphanedCreationDrafts();
-
     // Refresh xum-owned Coder SSH config in background (handles binary path changes on restart)
     // Skip getCoderInfo() to avoid caching "unavailable" if coder isn't installed yet
     void this.coderService.ensureMuxCoderSSHConfig().catch((error: unknown) => {
@@ -745,7 +758,6 @@ export class ServiceContainer {
       workspaceService: this.workspaceService,
       taskService: this.taskService,
       providerService: this.providerService,
-      muxGatewayOauthService: this.muxGatewayOauthService,
       codexOauthService: this.codexOauthService,
       coderOauthService: this.coderOauthService,
       copilotOauthService: this.copilotOauthService,
@@ -771,6 +783,7 @@ export class ServiceContainer {
       experimentsService: this.experimentsService,
       perfFlightRecorder: this.perfFlightRecorder,
       perfCaptures: this.perfCaptures,
+      agentResourceLimits: this.agentResourceLimits,
       perfReports: this.perfReports,
       sessionTapes: this.sessionTapes,
       sessionUsageService: this.sessionUsageService,
@@ -812,6 +825,7 @@ export class ServiceContainer {
     this.agentStatusService.stop();
     this.perfFlightRecorder.stop();
     await this.perfCaptures.dispose();
+    this.agentResourceLimits.dispose();
     this.idleCompactionService.stop();
     await this.browserBridgeServer.stop();
     await this.bashAiProxy.stop();
@@ -943,7 +957,7 @@ export class ServiceContainer {
       }
     });
     // Interrupt and await the runtime's supervised fibers — the stream engine's
-    // per-stream supervisors (StreamManager.superviseEngine): every in-flight
+    // per-stream scopes (TurnRegistry.superviseEngine): every in-flight
     // stream is aborted as "system" and its partial committed to chat.jsonl —
     // while every dependency they touch during finalization is still alive.
     // Fixed here (before the explicit teardown) so clients still receive the
@@ -977,6 +991,7 @@ export class ServiceContainer {
     shutdownStep("agentStatusService.stop", () => this.agentStatusService.stop());
     shutdownStep("perfFlightRecorder.stop", () => this.perfFlightRecorder.stop());
     await shutdownStep("perfCaptures.dispose", () => this.perfCaptures.dispose());
+    shutdownStep("agentResourceLimits.dispose", () => this.agentResourceLimits.dispose());
     await shutdownStep("browserBridgeServer.stop", () => this.browserBridgeServer.stop());
     await shutdownStep("bashAiProxy.stop", () => this.bashAiProxy.stop());
     shutdownStep("browserSessionStateHub.dispose", () => this.browserSessionStateHub.dispose());
@@ -986,9 +1001,6 @@ export class ServiceContainer {
     await shutdownStep("analyticsService.dispose", () => this.analyticsService.dispose());
     shutdownStep("mcpServerManager.dispose", () => this.mcpServerManager.dispose());
     await shutdownStep("mcpOauthService.dispose", () => this.mcpOauthService.dispose());
-    await shutdownStep("muxGatewayOauthService.dispose", () =>
-      this.muxGatewayOauthService.dispose()
-    );
     await shutdownStep("codexOauthService.dispose", () => this.codexOauthService.dispose());
     await shutdownStep("coderOauthService.dispose", () => this.coderOauthService.dispose());
 
@@ -999,6 +1011,9 @@ export class ServiceContainer {
       this.backgroundProcessManager.terminateAll()
     );
     await shutdownStep("timelineService.flush", () => this.timelineService.flush());
+    // Config change listeners (MemoryService and others) never unsubscribe: close the
+    // config.json watches so a torn-down container gets no more foreign-edit callbacks.
+    shutdownStep("config.stopWatchingConfigFile", () => this.config.stopWatchingConfigFile());
     // Last: close the Effect runtime's scope. No layer owns finalizers yet, so
     // this only releases the runtime; the position (after every explicit
     // teardown step) is fixed now for later scope-owned occupants.

@@ -19,7 +19,7 @@ import {
   addProjectViaUI,
   openProjectCreationView,
   setupTestDom,
-  waitForLatestDraftId,
+  waitForOpenDraftId,
 } from "../helpers";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
 import { ChatHarness } from "../harness";
@@ -83,10 +83,9 @@ async function createCreationHarness(options?: {
     const projectPath = await addProjectViaUI(view, repoPath);
     await openProjectCreationView(view, projectPath);
     await waitForSourceBranch(view);
-    const draftId = await waitForLatestDraftId(projectPath);
+    const draftId = await waitForOpenDraftId();
     const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
       kind: "creation",
-      projectPath,
       draftId,
     });
 
@@ -241,8 +240,9 @@ describe("New chat streaming flash regression", () => {
           const text = app.view.container.textContent ?? "";
           expect(text.toLowerCase()).toContain("starting");
           expect(
-            app.view.container.querySelector('[data-testid="transcript-hydration-placeholder"]')
-          ).toBeNull();
+            app.view.container.querySelector('[data-testid="transcript-hydration-placeholder"]') ===
+              null
+          ).toBe(true);
           expect(text).not.toContain("No Messages Yet");
         },
         { timeout: 5_000 }

@@ -1,5 +1,6 @@
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getDraftStore, type DraftStoreScope } from "@/browser/stores/DraftStore";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
@@ -7,9 +8,20 @@ export class ChatHarness {
   constructor(
     private readonly container: HTMLElement,
     private readonly workspaceId: string,
-    /** The composer's draft scope; a creation composer passes its creation draft scope. */
-    private readonly draftScope: DraftStoreScope = { kind: "workspace", workspaceId }
+    /** The composer's draft scope; a creation composer passes its creation draft id. */
+    private readonly draftScope: DraftStoreScope | { kind: "creation"; draftId: string } = {
+      kind: "workspace",
+      workspaceId,
+    }
   ) {}
+
+  private setDraftText(text: string): void {
+    if (this.draftScope.kind === "creation") {
+      getCreationDraftStore().update(this.draftScope.draftId, { text });
+    } else {
+      getDraftStore().setText(this.draftScope, text);
+    }
+  }
 
   private async getActiveTextarea(): Promise<HTMLTextAreaElement> {
     return waitFor(
@@ -44,7 +56,7 @@ export class ChatHarness {
     // ChatInput renders the draft store, so writing the draft there is both deterministic
     // and exercises the real UI state path.
     act(() => {
-      getDraftStore().setText(this.draftScope, text);
+      this.setDraftText(text);
     });
 
     await waitFor(
@@ -78,6 +90,17 @@ export class ChatHarness {
     );
 
     fireEvent.click(sendButton);
+  }
+
+  async startHeldToolTurn(label: string): Promise<void> {
+    // Foreground Bash belongs to a live turn; an idle send bypasses queued input.
+    await this.send(`[mock:tool:parallel-step] ${label}`);
+    await waitFor(
+      () => {
+        expect(workspaceStore.getWorkspaceSidebarState(this.workspaceId).canInterrupt).toBe(true);
+      },
+      { timeout: 30_000 }
+    );
   }
 
   async expectTranscriptContains(needle: string | RegExp, timeoutMs = 30_000): Promise<void> {
@@ -141,7 +164,7 @@ export class ChatHarness {
     textarea.focus();
 
     act(() => {
-      getDraftStore().setText(this.draftScope, text);
+      this.setDraftText(text);
     });
 
     await waitFor(

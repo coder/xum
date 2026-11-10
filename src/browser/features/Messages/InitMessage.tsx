@@ -81,12 +81,12 @@ export function InitMessage(props: InitMessageProps) {
                     {isLast && isRunning ? (
                       <Loader2
                         aria-label="In progress"
-                        className="text-accent size-3.5 animate-spin"
+                        className="text-accent-text size-3.5 animate-spin"
                       />
                     ) : isLast && isError ? (
                       <AlertCircle aria-label="Failed" className="text-error size-3.5" />
                     ) : (
-                      <CheckCircle2 aria-label="Completed" className="text-accent size-3.5" />
+                      <CheckCircle2 aria-label="Completed" className="text-accent-text size-3.5" />
                     )}
                     <span className="text-foreground truncate">{step.line}</span>
                     {isLast && isRunning && message.progress && (

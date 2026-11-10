@@ -23,7 +23,13 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 zizmor_version="1.20.0"
-image_tag="ghcr.io/zizmorcore/zizmor:${zizmor_version}"
+# The image and the release archives are pinned by digest, so a moved tag or a replaced
+# release asset cannot run here. A version bump needs every digest anew: the image's from
+# `crane digest ghcr.io/zizmorcore/zizmor:<version>` (or `docker buildx imagetools inspect`),
+# and each archive's from a `sha256sum` of your own download, checked against the digest
+# GitHub computed at upload (`gh api repos/zizmorcore/zizmor/releases/tags/v<version> --jq
+# '.assets[] | .name + " " + .digest'`).
+image="ghcr.io/zizmorcore/zizmor:${zizmor_version}@sha256:4a574a15fc2bfb6c3b30db75410f1faeb7a94b5355d46dcbd32309047dd6d097"
 
 docker_args=(
   "--rm"
@@ -54,7 +60,7 @@ fi
 # fall back to the prebuilt binary.
 if command -v docker &>/dev/null && docker info &>/dev/null; then
   set +e
-  docker run "${docker_args[@]}" "$image_tag" "$@"
+  docker run "${docker_args[@]}" "$image" "$@"
   status=$?
   set -e
 
@@ -79,30 +85,34 @@ fi
 os="$(uname -s)"
 arch="$(uname -m)"
 
-target=""
 case "$os-$arch" in
-  Darwin-arm64) target="aarch64-apple-darwin" ;;
-  Darwin-x86_64) target="x86_64-apple-darwin" ;;
-  Linux-x86_64) target="x86_64-unknown-linux-gnu" ;;
-  Linux-aarch64 | Linux-arm64) target="aarch64-unknown-linux-gnu" ;;
+  Darwin-arm64) target="aarch64-apple-darwin" sha256="f28ef0570f06e6eb5278a354b314bb314575bb10871efdbd6f49cee74f36e9c5" ;;
+  Darwin-x86_64) target="x86_64-apple-darwin" sha256="a409946504c47587b474e1454eac10e38dc2eb8c144607cb8423afd851758540" ;;
+  Linux-x86_64) target="x86_64-unknown-linux-gnu" sha256="42fc3dcb9242261309fef0156213c5cb7a7179c1a0693ac8d067cc308f3a55cf" ;;
+  Linux-aarch64 | Linux-arm64) target="aarch64-unknown-linux-gnu" sha256="055abb0d8fdb56be5014226343509ef5b0e8f5481a115d673345718d8dcf616a" ;;
   *)
     echo "❌ Unsupported platform for zizmor binary fallback: $os/$arch"
     exit 1
     ;;
 esac
 
-cache_dir="node_modules/.cache/mux-tools/zizmor/v${zizmor_version}/${target}"
+# Keyed by the archive digest, so only a binary from a verified download is reused.
+cache_dir="node_modules/.cache/mux-tools/zizmor/${sha256}"
 bin_path="${cache_dir}/zizmor"
 
 if [[ ! -x "$bin_path" ]]; then
   mkdir -p "$cache_dir"
 
-  tmp_dir="$(mktemp -d)"
   archive_name="zizmor-${target}.tar.gz"
   url="https://github.com/zizmorcore/zizmor/releases/download/v${zizmor_version}/${archive_name}"
+  # download-verified.sh retries a github.com 504 for 15 minutes, gives up at once on a 404, and
+  # lets only bytes with the pinned digest reach the archive path. A copy that already matches
+  # (CI can cache this directory) costs no download.
+  archive="${RELEASE_ASSETS_DIR:-$HOME/.cache/xum-release-assets}/zizmor-${zizmor_version}-${target}.tar.gz"
+  ./scripts/ci/download-verified.sh "$url" "$sha256" "$archive"
 
-  curl -fsSL "$url" -o "${tmp_dir}/${archive_name}"
-  tar -xzf "${tmp_dir}/${archive_name}" -C "$tmp_dir"
+  tmp_dir="$(mktemp -d)"
+  tar -xzf "$archive" -C "$tmp_dir"
   mv "${tmp_dir}/zizmor" "$bin_path"
   chmod +x "$bin_path"
   rm -rf "$tmp_dir"

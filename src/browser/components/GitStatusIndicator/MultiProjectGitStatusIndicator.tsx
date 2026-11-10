@@ -16,6 +16,8 @@ interface MultiProjectGitStatusIndicatorProps {
   workspaceId: string;
   tooltipPosition?: "right" | "bottom";
   isWorking?: boolean;
+  /** Shows only the most urgent category so the chip fits a phone footer; the dialog keeps the full breakdown. */
+  compact?: boolean;
 }
 
 interface ChipPresentation {
@@ -94,7 +96,7 @@ function getChipPresentation(
         summary.dirtyProjectCount > 0
           ? [formatCategoryCount(summary.dirtyProjectCount, "dirty")]
           : [],
-      className: "border-accent/30 text-accent hover:bg-accent/10 hover:text-accent",
+      className: "border-accent/30 text-accent-text hover:bg-accent/10 hover:text-accent-text",
     };
   }
 
@@ -112,7 +114,7 @@ function getChipPresentation(
     primaryLabel: formatRepoCount(summary.totalProjectCount),
     secondaryLabels: [],
     className: isWorking
-      ? "border-accent/30 text-accent hover:bg-accent/10 hover:text-accent"
+      ? "border-accent/30 text-accent-text hover:bg-accent/10 hover:text-accent-text"
       : "border-border-light/40 text-muted-light hover:border-foreground/40 hover:text-foreground",
   };
 }
@@ -121,6 +123,7 @@ export const MultiProjectGitStatusIndicator: React.FC<MultiProjectGitStatusIndic
   workspaceId,
   tooltipPosition = "right",
   isWorking = false,
+  compact = false,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const trimmedWorkspaceId = workspaceId.trim();
@@ -154,7 +157,7 @@ export const MultiProjectGitStatusIndicator: React.FC<MultiProjectGitStatusIndic
           >
             {presentation.icon}
             <span className="counter-nums whitespace-nowrap">{presentation.primaryLabel}</span>
-            {presentation.secondaryLabels.map((label) => (
+            {(compact ? [] : presentation.secondaryLabels).map((label) => (
               <span key={label} className="text-muted whitespace-nowrap">
                 · <span className="counter-nums">{label}</span>
               </span>

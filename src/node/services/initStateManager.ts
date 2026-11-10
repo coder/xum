@@ -10,13 +10,10 @@ import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import { clamp } from "@/common/utils/clamp";
 import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
-import { initRecordLockDir, workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
+import { initRecordLockDir } from "@/node/services/workspaceUseLeases";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import {
-  acquireCrossProcessLock,
-  inspectCrossProcessLock,
-} from "@/node/utils/main/crossProcessLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /**
  * Output line with timestamp for replay timing.
@@ -129,13 +126,25 @@ export class InitStateManager extends EventEmitter {
   /** Record-lock releases in flight: a restarted init takes the lock again only after them. */
   private readonly recordReleases = new Map<string, Promise<void>>();
 
-  constructor(private readonly config: Config) {
+  /**
+   * `locks` takes the init lease probe, the init-record lock, its probe and the write barrier
+   * (phase 4: SessionLocks). The app keeps the Node default (core.ts).
+   */
+  constructor(
+    private readonly config: Config,
+    private readonly locks: SessionLocks = nodeSessionLocks
+  ) {
     super();
+    // No listener cap, for the same reason as AIService: each live AgentSession adds one
+    // listener per init event, so the count tracks live sessions, not a leak.
+    this.setMaxListeners(0);
     this.store = new EventStore(
       config,
       "init-status.json",
       (state) => this.serializeInitEvents(state),
       (event) => this.emit(event.type, event),
+      // The same locks as the record claim: releaseRecordClaim drains this store's FIFO.
+      this.locks,
       "InitStateManager"
     );
   }
@@ -465,16 +474,22 @@ export class InitStateManager extends EventEmitter {
         // ran it is gone and the checkout may be empty or partial. Record the failure once so
         // this and every later replay show the creation as failed.
         const endTime = Date.now();
-        await this.store.persist(workspaceId, {
-          ...persisted,
-          status: "error",
-          exitCode: -1,
-          endTime,
-          lines: [
-            ...(persisted.lines ?? []),
-            { line: INTERRUPTED_INIT_LINE, isError: true, timestamp: endTime },
-          ],
-        });
+        await this.store.persist(
+          workspaceId,
+          {
+            ...persisted,
+            status: "error",
+            exitCode: -1,
+            endTime,
+            lines: [
+              ...(persisted.lines ?? []),
+              { line: INTERRUPTED_INIT_LINE, isError: true, timestamp: endTime },
+            ],
+          },
+          // #5391: a startInit that began during this replay owns the record now; its
+          // "running" must not be overwritten by the crashed run's failure.
+          { shouldWrite: () => !this.store.hasState(workspaceId) }
+        );
       }
     }
     // Pass workspaceId as context for serialization
@@ -492,7 +507,7 @@ export class InitStateManager extends EventEmitter {
     if ((await this.store.readPersisted(workspaceId))?.status !== "running") return null;
     // #4918: the record lock covers the whole time an owner can write the record; the init lease
     // is still probed for owners running an older build.
-    if (await workspaceUseLeasesFor(this.config).isHeld(workspaceId, "init")) return null;
+    if (await this.locks.useLeasesFor(this.config).isHeld(workspaceId, "init")) return null;
     if (await this.isRecordLockHeld(workspaceId)) return null;
     const persisted = await this.store.readPersisted(workspaceId);
     return persisted?.status === "running" ? persisted : null;
@@ -503,7 +518,7 @@ export class InitStateManager extends EventEmitter {
     // The lock path is this backend's own: an earlier claim's release must finish first.
     await this.recordReleases.get(workspaceId);
     try {
-      return await acquireCrossProcessLock({
+      return await this.locks.acquireCrossProcessLock({
         lockPath: path.join(
           initRecordLockDir(this.config.rootDir, workspaceId),
           `${this.recordLockToken}.lock`
@@ -530,7 +545,7 @@ export class InitStateManager extends EventEmitter {
     const releasing = (async () => {
       // A status write already past its shouldWrite check still lands: drain the workspace's
       // queued writes (a no-op turn on their lock) before a replay may judge the record.
-      await workspaceFileLocks.withLock(workspaceId, () => Promise.resolve());
+      await this.locks.workspaceFiles.withLock(workspaceId, () => Promise.resolve());
       const release = await claim.lock;
       await release?.().catch((error: unknown) => {
         // A failed release leaves the lock held (fail closed): replays leave the record alone.
@@ -558,7 +573,9 @@ export class InitStateManager extends EventEmitter {
       // Only published lock files: the kit's temp and takeover-guard files end differently. This
       // backend's own is skipped: with no in-memory state here (replayInit), it is being released.
       if (!name.endsWith(".lock") || name === `${this.recordLockToken}.lock`) continue;
-      if ((await inspectCrossProcessLock(path.join(dir, name))).state === "held") return true;
+      if ((await this.locks.inspectCrossProcessLock(path.join(dir, name))).state === "held") {
+        return true;
+      }
     }
     return false;
   }

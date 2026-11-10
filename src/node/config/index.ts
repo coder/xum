@@ -9,6 +9,8 @@ import { Effect, Semaphore } from "effect";
 import { ORPCError } from "@orpc/server";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
+import { getErrorMessage } from "@/common/utils/errors";
+import { rememberLogKey } from "@/node/utils/logDedupe";
 import { EXPERIMENT_OVERRIDES_FILE_NAME } from "@/node/services/experimentsService";
 import { ProvidersConfigStore } from "./providersConfigStore";
 import { FileLeaseManager } from "./fileLeaseManager";
@@ -32,12 +34,18 @@ import type {
 } from "@/common/config/schemas";
 import {
   DEFAULT_MODEL_FALLBACKS,
+  FABLE_5_1_DEFAULT_MODEL_FALLBACKS,
+  FABLE_5_DEFAULT_MODEL_FALLBACKS,
   LEGACY_DEFAULT_MODEL_FALLBACKS,
   SEEDED_MODEL_FALLBACKS,
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
 import { PREVIOUS_TASK_SETTINGS_DEFAULTS } from "@/common/config/schemas/taskSettings";
+import {
+  normalizeAgentResourceLimits,
+  type AgentResourceLimits,
+} from "@/common/config/schemas/agentResourceLimits";
 import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
@@ -50,11 +58,6 @@ import {
 } from "@/common/config/schemas/userPreferences";
 import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
-import {
-  isLayoutPresetsConfigEmpty,
-  normalizeLayoutPresetsConfig,
-  type LayoutPresetsConfig,
-} from "@/common/types/uiLayouts";
 import {
   deriveLegacySubagentAiDefaultsProjection,
   mergeLegacySubagentAiDefaults,
@@ -86,6 +89,8 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+// process.platform-based: the common helper reads navigator, which Node 20 lacks (#6485).
+import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
 import { sharesPlanDirectory } from "@/common/utils/planStorage";
 import { stableStringify } from "@/common/utils/stableStringify";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -96,6 +101,7 @@ import {
 } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
+  getValidMessagingTag,
   getValidUnrelatedWorkspaceConsent,
 } from "@/common/orpc/schemas/workspace";
 import {
@@ -106,6 +112,7 @@ import {
   isHeartbeatTrigger,
   isHeartbeatWhenBusy,
   isValidHeartbeatScheduleUpdatedAt,
+  resolveHeartbeatSchedulePolicy,
 } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import {
@@ -551,11 +558,6 @@ function normalizeOptionalModelString(value: unknown): string | undefined {
     return undefined;
   }
 
-  // Reject malformed mux-gateway strings ("mux-gateway:provider" without "/model").
-  if (trimmed.startsWith("mux-gateway:") && !trimmed.includes("/")) {
-    return undefined;
-  }
-
   const normalized = normalizeSelectedModel(trimmed);
   if (!isValidModelFormat(normalized)) {
     return undefined;
@@ -679,6 +681,76 @@ function migrateRaisedTaskSettingsDefaults(
   if (migrations.taskSettingsDefaultsRaised === true) return configModified;
   parsed.taskSettings = raisePreviousTaskSettingsDefaults(parsed.taskSettings);
   parsed.migrations = { ...migrations, taskSettingsDefaultsRaised: true };
+  return true;
+}
+
+/**
+ * One-time seed passes for the default refusal-fallback chains (e.g. Fable →
+ * Opus), one per migration flag. Each fable alias move adds a pass: older
+ * configs only have a chain for the old source key, and the new key is a new
+ * default that deserves one seed of its own (still never overwriting an
+ * existing chain for it).
+ *
+ * Each chain is gated on its own flag. Claiming a flag tells a downgraded build
+ * (whose FABLE is that era's id) that its own default was seeded, so the pass
+ * that claims a flag must carry that era's chain, or a downgrade would silently
+ * lose refusal fallback. A flag that is already set is never re-run, so users
+ * who later edit or delete a default chain are not overridden.
+ * SEEDED_MODEL_FALLBACKS, not DEFAULT_MODEL_FALLBACKS: chains added after these
+ * flags shipped reach fresh installs only (#5087).
+ */
+const MODEL_FALLBACK_SEED_PASSES = [
+  ["defaultModelFallbacksSeeded", FABLE_5_DEFAULT_MODEL_FALLBACKS],
+  ["defaultModelFallbacksSeededFable51", FABLE_5_1_DEFAULT_MODEL_FALLBACKS],
+  ["defaultModelFallbacksSeededFable52", SEEDED_MODEL_FALLBACKS],
+] as const;
+
+/** Every seed-pass flag claimed; fresh installs start with all of them. */
+const ALL_MODEL_FALLBACK_SEED_FLAGS = Object.fromEntries(
+  MODEL_FALLBACK_SEED_PASSES.map(([flag]) => [flag, true])
+) as Record<(typeof MODEL_FALLBACK_SEED_PASSES)[number][0], true>;
+
+/**
+ * Run the pending MODEL_FALLBACK_SEED_PASSES on `parsed` (mutated in place).
+ * Returns true when it changed the config (it then claims every pass flag).
+ */
+function seedDefaultModelFallbacks(
+  parsed: Partial<AppConfigOnDisk> & Record<string, unknown>
+): boolean {
+  const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
+  const pendingPasses = MODEL_FALLBACK_SEED_PASSES.filter(
+    ([flag]) => migrationsBeforeSeed[flag] !== true
+  );
+  if (pendingPasses.length === 0) {
+    return false;
+  }
+  // Gap-check against the RAW on-disk map with canonicalized keys, not the
+  // sanitized map: a hand-edited entry whose chain sanitizes away (e.g.
+  // {enabled:false, models:[]}) is still user intent and must not be
+  // overwritten. Merging into the raw map also keeps unrelated chains
+  // byte-identical on disk (lenient-on-read preserved).
+  const rawFallbacks =
+    typeof parsed.modelFallbacks === "object" &&
+    parsed.modelFallbacks !== null &&
+    !Array.isArray(parsed.modelFallbacks)
+      ? (parsed.modelFallbacks as Record<string, unknown>)
+      : {};
+  const existingCanonicalKeys = new Set(
+    Object.keys(rawFallbacks).map((key) => normalizeToCanonical(key).trim())
+  );
+  const missingDefaults = Object.fromEntries(
+    pendingPasses
+      .flatMap(([, chains]) => Object.entries(chains))
+      .filter(([sourceModel]) => !existingCanonicalKeys.has(sourceModel))
+  );
+  if (Object.keys(missingDefaults).length > 0) {
+    // Write through the raw-record view: user entries are deliberately kept
+    // unvalidated on disk (normalizeModelFallbacks sanitizes on every read),
+    // so the merged map is not a ModelFallbacks yet.
+    const rawParsed: Record<string, unknown> = parsed;
+    rawParsed.modelFallbacks = { ...rawFallbacks, ...missingDefaults };
+  }
+  parsed.migrations = { ...migrationsBeforeSeed, ...ALL_MODEL_FALLBACK_SEED_FLAGS };
   return true;
 }
 
@@ -900,6 +972,34 @@ function normalizePersistedWorkspace(
   return nextWorkspace;
 }
 
+/**
+ * #5569: only `true` on a row without a creation mark is a birth stamp. Anything else (hand edit,
+ * corruption) reads as absent, so the active-turn lookup falls back to its global scan. Runs before
+ * normalizePersistedWorkspace, so a malformed mark (dropped there) still cancels the stamp.
+ */
+function normalizeBirthStamp(
+  workspace: ProjectConfig["workspaces"][number]
+): ProjectConfig["workspaces"][number] {
+  const stamp: unknown = workspace.bornWithoutDelegation;
+  if (!Object.hasOwn(workspace, "bornWithoutDelegation")) return workspace;
+  if (stamp === true && workspace.delegatedCreation === undefined) return workspace;
+  const { bornWithoutDelegation: _dropped, ...rest } = workspace;
+  return rest;
+}
+
+const HAND_EDITABLE_STRING_PROJECT_FIELDS = [
+  "customInstructions",
+  "codeWorkspaceSyncPath",
+  "icon",
+] as const;
+
+/** Store the valid limits in `value` on the project, or remove its limits when there are none. */
+function setProjectAgentResourceLimits(project: ProjectConfig, value: unknown): void {
+  const normalized = normalizeAgentResourceLimits(value);
+  if (normalized) project.agentResourceLimits = normalized;
+  else delete project.agentResourceLimits;
+}
+
 function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectConfig {
   // Per-project runtime overrides are optional; keep config.json sparse by persisting only explicit
   // overrides (false enablement + explicit default runtime selections).
@@ -914,6 +1014,7 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     projectKind?: unknown;
     customInstructions?: unknown;
     codeWorkspaceSyncPath?: unknown;
+    icon?: unknown;
   };
   const runtimeEnablement = normalizeRuntimeEnablementOverrides(record.runtimeEnablement);
   const defaultRuntime = normalizeRuntimeEnablementId(record.defaultRuntime);
@@ -940,7 +1041,9 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
   }
 
   const workspaces = Array.isArray(record.workspaces) ? record.workspaces : [];
-  next.workspaces = workspaces.map(normalizePersistedWorkspace);
+  next.workspaces = workspaces.map((workspace) =>
+    normalizePersistedWorkspace(normalizeBirthStamp(workspace))
+  );
 
   const projectKind = normalizeProjectKind(record.projectKind);
   if (projectKind !== undefined) {
@@ -949,21 +1052,22 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     delete next.projectKind;
   }
 
-  // config.json is hand-editable: a non-string customInstructions would fail
+  // config.json is hand-editable: a non-string value in these fields would fail
   // the projects.list output schema (z.string()) and brick the whole project
   // list, so discard malformed values here where both load and save pass.
-  if (typeof record.customInstructions === "string" && record.customInstructions.trim()) {
-    next.customInstructions = record.customInstructions;
-  } else {
-    delete next.customInstructions;
+  // Unknown icon names are kept so a newer version's icon survives a downgrade;
+  // the sidebar shows the initial for them.
+  for (const field of HAND_EDITABLE_STRING_PROJECT_FIELDS) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim()) {
+      next[field] = value;
+    } else {
+      delete next[field];
+    }
   }
 
-  // Same hand-edit hazard as customInstructions above.
-  if (typeof record.codeWorkspaceSyncPath === "string" && record.codeWorkspaceSyncPath.trim()) {
-    next.codeWorkspaceSyncPath = record.codeWorkspaceSyncPath;
-  } else {
-    delete next.codeWorkspaceSyncPath;
-  }
+  // Hand-editable too: an out-of-range limit is dropped instead of failing projects.list.
+  setProjectAgentResourceLimits(next, record.agentResourceLimits);
 
   // Legacy named workflow schedules are intentionally dropped while workflow
   // scheduling is disabled during the explicit script_path migration.
@@ -1034,7 +1138,150 @@ function mergeProjectAliases(group: StoredProjectEntry[]): {
   return { config: merged, conflictingIds: [...conflictingIds] };
 }
 
-/** An alias group whose merge kept one of two different rows with the same id. */
+/**
+ * The ids of the rows that have one, by checkout path. Rows without a string path are left out:
+ * config.json rows are not schema-checked, and a load must not throw on a malformed row (#5929).
+ */
+function idRowIdsByPath(workspaces: ProjectConfig["workspaces"]): Map<string, string[]> {
+  const idsByPath = new Map<string, string[]>();
+  for (const workspace of workspaces) {
+    if (!workspace.id || typeof workspace.path !== "string") continue;
+    const ids = idsByPath.get(workspace.path);
+    if (ids) ids.push(workspace.id);
+    else idsByPath.set(workspace.path, [workspace.id]);
+  }
+  return idsByPath;
+}
+
+/**
+ * Drop each id-less legacy row that is the same workspace as an id row on its checkout path
+ * (#5929). One alias can hold a legacy row while another holds its migrated copy. The read-time
+ * id migration would give the legacy row that same id, and config.json would then keep two rows
+ * with one id. `resolveLegacyId` returns the id the migration would give a row, or undefined
+ * when that id is unknown. An unknown or different id keeps both rows: the legacy row is then
+ * another identity with its own session history. Returns the ids whose legacy copy was dropped.
+ */
+function dropLegacyDuplicateRows(
+  workspaces: ProjectConfig["workspaces"],
+  resolveLegacyId: (workspace: Workspace) => string | undefined,
+  idsByPath = idRowIdsByPath(workspaces)
+): string[] {
+  const dropped: string[] = [];
+  for (let index = workspaces.length - 1; index >= 0; index--) {
+    const workspace = workspaces[index];
+    // Only a legacy row that shares its path with an id row costs a lookup. idsByPath holds only
+    // string paths, so a row without one never matches.
+    const pathIds = workspace.id ? undefined : idsByPath.get(workspace.path);
+    if (pathIds === undefined) continue;
+    const resolvedId = resolveLegacyId(workspace);
+    if (resolvedId === undefined || !pathIds.includes(resolvedId)) continue;
+    workspaces.splice(index, 1);
+    dropped.push(resolvedId);
+  }
+  return dropped;
+}
+
+/**
+ * The non-empty string `id` that a legacy metadata.json names. Null when the file does not exist,
+ * undefined when it cannot be read or parsed, or names no id.
+ */
+function readLegacyMetadataId(file: string): string | null | undefined {
+  try {
+    const id = (JSON.parse(fs.readFileSync(file, "utf-8")) as { id?: unknown } | null)?.id;
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  } catch (error) {
+    return isEnoentError(error) ? null : undefined;
+  }
+}
+
+/**
+ * One stored key can also hold an id-less legacy row next to its migrated copy (a hand edit or
+ * another tool; Xum's own migration fills in the id on the same row). Drop the legacy copy the
+ * same way as in an alias group (#6595). Gated on an id-less row with a string path, so a
+ * migrated project pays one in-memory pass on a cold load and no file access.
+ */
+function dropSingleKeyLegacyCopies(
+  key: string,
+  entry: StoredProjectEntry,
+  conflicts: ProjectAliasConflict[],
+  resolveLegacyId: (projectPath: string, workspace: Workspace) => string | undefined
+): void {
+  const workspaces = entry.config.workspaces;
+  if (!workspaces.some((workspace) => !workspace.id && typeof workspace.path === "string")) return;
+  const conflictingIds = dropLegacyDuplicateRows(workspaces, (workspace) =>
+    resolveLegacyId(key, workspace)
+  );
+  if (conflictingIds.length > 0) {
+    conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds });
+  }
+}
+
+/**
+ * True when two rows share a workspace id. Allocates nothing for 0 or 1 rows, and stops at the
+ * first duplicate.
+ */
+function hasDuplicateRowId(workspaces: ProjectConfig["workspaces"]): boolean {
+  if (workspaces.length < 2) return false;
+  const seen = new Set<string>();
+  for (const workspace of workspaces) {
+    if (!workspace.id) continue;
+    if (seen.has(workspace.id)) return true;
+    seen.add(workspace.id);
+  }
+  return false;
+}
+
+/** The ids that more than one row holds, each once, in one pass. */
+function duplicateRowIds(workspaces: ProjectConfig["workspaces"]): string[] {
+  const seen = new Set<string>();
+  const duplicated = new Set<string>();
+  for (const workspace of workspaces) {
+    if (!workspace.id) continue;
+    if (seen.has(workspace.id)) duplicated.add(workspace.id);
+    else seen.add(workspace.id);
+  }
+  return [...duplicated];
+}
+
+/**
+ * The ids that one alias entry holds in more than one row. The alias merge keeps an identical
+ * copy once without a conflict, so without this list a save would drop the copy with no backup.
+ */
+function aliasEntryDuplicateIds(group: StoredProjectEntry[]): string[] {
+  return group.flatMap((entry) =>
+    hasDuplicateRowId(entry.config.workspaces) ? duplicateRowIds(entry.config.workspaces) : []
+  );
+}
+
+/**
+ * One stored key can already hold two rows with one workspace id: an earlier build saved them, and
+ * no merge repairs them, because neither row is an alias or a legacy copy (#6717). Keep the first
+ * row for each id: the row lookups and the task index already resolve a repeated id to its first
+ * row (#4550), so the user sees the same workspace and parent as before. Record a conflict for every repair, an identical copy
+ * included, so the original bytes are backed up before any save drops a row. All copies share the
+ * id's session folder, so no session history is lost. A copy on another checkout path loses only
+ * its config row: its checkout stays on disk and its row stays in the backup.
+ */
+function healSingleKeyDuplicateIds(
+  key: string,
+  entry: StoredProjectEntry,
+  conflicts: ProjectAliasConflict[]
+): ProjectConfig {
+  if (!hasDuplicateRowId(entry.config.workspaces)) return entry.config;
+  const duplicatedIds = duplicateRowIds(entry.config.workspaces);
+  const keptIds = new Set<string>();
+  // The rows only: settings and trust stay exactly as stored for a single key.
+  entry.config.workspaces = entry.config.workspaces.filter((workspace) => {
+    if (!workspace.id) return true;
+    if (keptIds.has(workspace.id)) return false;
+    keptIds.add(workspace.id);
+    return true;
+  });
+  conflicts.push({ path: key, storedKeys: [entry.storedKey], conflictingIds: duplicatedIds });
+  return entry.config;
+}
+
+/** A stored project whose rows needed a repair that a save would persist (see the callers). */
 interface ProjectAliasConflict {
   path: string;
   storedKeys: string[];
@@ -1045,12 +1292,14 @@ interface ProjectAliasConflict {
  * Build the project map from the loaded entries. Stored keys that normalize to the same path
  * ("/repo" and "/repo/") are aliases of one project. `new Map(pairs)` used to keep only the last
  * alias, so the next save dropped the other aliases' workspace rows. Group every alias first,
- * then merge the group's rows. Groups with a same-id conflict go to `conflicts`, so the caller
- * can back up the original bytes before a save drops the other variant (#5929).
+ * then merge the group's rows. Groups with a same-id conflict, or with a legacy copy of an id row
+ * (see dropLegacyDuplicateRows), go to `conflicts`, so the caller can back up the original bytes
+ * before a save drops the other row (#5929).
  */
 function buildProjectsFromStoredEntries(
   entries: StoredProjectEntry[],
-  conflicts: ProjectAliasConflict[]
+  conflicts: ProjectAliasConflict[],
+  resolveLegacyId: (projectPath: string, workspace: Workspace) => string | undefined
 ): Map<string, ProjectConfig> {
   const groups = new Map<string, StoredProjectEntry[]>();
   for (const entry of entries) {
@@ -1061,13 +1310,30 @@ function buildProjectsFromStoredEntries(
   const projects = new Map<string, ProjectConfig>();
   for (const [key, group] of groups) {
     if (group.length === 1) {
-      projects.set(key, group[0].config);
+      // Legacy copies first: the heal can drop the only id row on a legacy row's path, and the
+      // id migration would then give that legacy row the same id again.
+      dropSingleKeyLegacyCopies(key, group[0], conflicts, resolveLegacyId);
+      projects.set(key, healSingleKeyDuplicateIds(key, group[0], conflicts));
       continue;
     }
     const storedKeys = group.map((entry) => entry.storedKey);
+    // Legacy copies first, against the id rows of every alias (#6869): the merge can drop the
+    // only id row on a legacy row's path, and the id migration would then give that legacy row
+    // the same id again.
+    const idsByPath = idRowIdsByPath(group.flatMap((entry) => entry.config.workspaces));
+    const legacyIds = group.flatMap((entry) =>
+      dropLegacyDuplicateRows(
+        entry.config.workspaces,
+        (workspace) => resolveLegacyId(key, workspace),
+        idsByPath
+      )
+    );
     const merged = mergeProjectAliases(group);
-    if (merged.conflictingIds.length > 0) {
-      conflicts.push({ path: key, storedKeys, conflictingIds: merged.conflictingIds });
+    const conflictingIds = [
+      ...new Set([...merged.conflictingIds, ...aliasEntryDuplicateIds(group), ...legacyIds]),
+    ];
+    if (conflictingIds.length > 0) {
+      conflicts.push({ path: key, storedKeys, conflictingIds });
     } else {
       log.warn("Merged project config entries with the same path", { path: key, storedKeys });
     }
@@ -1187,7 +1453,26 @@ const configLoadFailureStates = new Map<string, ConfigLoadFailureState>();
 // Config files whose last load merged conflicting alias rows but could not back up the bytes
 // (#5929): the backup error for the edit refusal, and a log-dedupe signature (content hash plus
 // errno code: fs messages embed the timestamped sidecar path). Process-scoped as above.
-const aliasConflictBackupFailures = new Map<string, { message: string; signature: string }>();
+const aliasConflictBackupFailures = new Map<string, { message: string }>();
+
+// Failed alias-conflict backups already logged, per config file: sha256 of the bytes plus the
+// errno code (#5929). While backups keep failing, a content that comes back does not log again.
+// A load that needs no backup, or a backup that succeeds, clears it. Capped, so a file that
+// keeps changing cannot grow it without bound.
+const loggedAliasBackupFailures = new Map<string, Set<string>>();
+const MAX_LOGGED_ALIAS_BACKUP_FAILURES = 16;
+/** Distinct workspace metadata load failures one Config remembers (see logMetadataLoadFailure). */
+export const MAX_LOGGED_METADATA_LOAD_FAILURES = 64;
+
+/** Record `signature` for `configFile`; true when it was not recorded before. */
+function rememberAliasBackupFailure(configFile: string, signature: string): boolean {
+  let seen = loggedAliasBackupFailures.get(configFile);
+  if (seen === undefined) {
+    seen = new Set();
+    loggedAliasBackupFailures.set(configFile, seen);
+  }
+  return rememberLogKey(seen, signature, MAX_LOGGED_ALIAS_BACKUP_FAILURES);
+}
 
 /**
  * A `config.json.<tag>-*` sidecar that already holds exactly `rawBytes`, tightened to 0600, or
@@ -1220,6 +1505,10 @@ function findIdenticalConfigSidecar(
     }
   }
   return null;
+}
+
+function sha256Hex(bytes: Buffer): string {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
 /**
@@ -1388,6 +1677,17 @@ export interface WorkspaceMetadataOptions {
    */
   legacyAliasIds?: Set<string>;
   /**
+   * Out-parameter collecting the ids of entries that a lenient build made from the config row
+   * alone, because the entry's own legacy metadata.json could not be read or parsed. Defaults
+   * fill the name and runtime that file holds, so the entry's checkout path may be wrong:
+   * callers that read files in that checkout must not trust such an entry.
+   *
+   * A row with no legacy metadata.json at all is not listed: no file holds another name or
+   * runtime, and the build persists the defaults as the row's own (the read-time migration), so
+   * every reader, the runtime included, resolves the same checkout from them.
+   */
+  fallbackIds?: Set<string>;
+  /**
    * Probe each worktree checkout's existence (fs.access) to classify
    * transcript-only workspaces. Default true. Callers that only need the
    * registry (ids, paths, runtime, parent links) pass false: one stalled
@@ -1417,12 +1717,20 @@ export interface WorkspaceMetadataOptions {
 
 /**
  * Memoized registry-only enumeration for one loaded config snapshot. The
- * build's own alias collection is retained so later callers passing their
- * own `legacyAliasIds` out-parameter still receive every alias.
+ * build's own alias and fallback collections are retained so later callers
+ * passing their own `legacyAliasIds` or `fallbackIds` out-parameter still
+ * receive every id.
  */
 interface WorkspaceMetadataMemoEntry {
   result: Promise<FrontendWorkspaceMetadata[]>;
   legacyAliasIds: Set<string>;
+  fallbackIds: Set<string>;
+}
+
+/** Copies a memo entry's ids into a caller's out-parameter, when it passed one. */
+function addAll(target: Set<string> | undefined, ids: ReadonlySet<string>): void {
+  if (target === undefined) return;
+  for (const id of ids) target.add(id);
 }
 
 /**
@@ -1435,6 +1743,153 @@ interface WorkspaceMetadataBuildOptions extends WorkspaceMetadataOptions {
   degraded?: { value: boolean };
 }
 
+/** A config row field that metadata carries with the same type. */
+type ConfigTreeField = {
+  [K in keyof Workspace & keyof WorkspaceMetadata]: NonNullable<Workspace[K]> extends NonNullable<
+    WorkspaceMetadata[K]
+  >
+    ? K
+    : never;
+}[keyof Workspace & keyof WorkspaceMetadata];
+
+/**
+ * Task-tree fields: the parent link, the agent, the task state and how the task holds its
+ * checkout. A legacy row takes them from its config row alone, as a current-format row does, and
+ * its legacy metadata.json supplies none of them. The last build that wrote such files (v0.3.0-rc.2) wrote only the id, name, project and
+ * createdAt, #303 stopped every write in v0.3.0, and parentWorkspaceId came later (#1219), in
+ * config.json only. Read from the file, a value would hold only until the read-time migration (a
+ * migrated row reads the row alone): a stray file could attach a legacy row to a parent, or detach
+ * one, for a single read. None of these fields is copied from the file either. TaskService reads
+ * them from config rows, except listLegacyTaskVariantWorkspaces: the in-memory variant registry
+ * (rememberLegacyTaskVariantWorkspace) still takes a legacy variant's parent link and taskStatus
+ * from the file, for the first build only.
+ */
+export const CONFIG_TREE_FIELDS = [
+  "parentWorkspaceId",
+  "agentType",
+  "agentId",
+  "workflowTask",
+  "taskStatus",
+  "taskPendingGuidance",
+  "taskLaunchError",
+  "reportedAt",
+  "taskModelString",
+  "taskThinkingLevel",
+  "taskPrompt",
+  "taskTrunkBranch",
+  "taskIsolation",
+  "sideChatParentWorkspaceId",
+  "taskDesktopOwnerWorkspaceId",
+  "taskSticky",
+  "taskExecutionId",
+  "taskExecutionStatus",
+] as const satisfies readonly ConfigTreeField[];
+
+/** Sets each CONFIG_TREE_FIELDS value of `metadata` to the config row's, absent included. */
+function takeTreeFieldsFromConfig(metadata: WorkspaceMetadata, row: Workspace): void {
+  for (const key of CONFIG_TREE_FIELDS) Object.assign(metadata, { [key]: row[key] });
+}
+
+/** Marks a build degraded; `fallbackId` names an entry built from its config row alone. */
+function markDegraded(
+  options: WorkspaceMetadataBuildOptions | undefined,
+  fallbackId?: string
+): void {
+  if (options?.degraded) options.degraded.value = true;
+  if (fallbackId !== undefined) options?.fallbackIds?.add(fallbackId);
+}
+
+/** Symlinks a config.json watch follows before it stops, like the kernel's ELOOP bound. */
+const CONFIG_FILE_WATCH_MAX_LINKS = 40;
+/** Watch reinstalls one event does while config.json keeps changing; the next event retries. */
+const CONFIG_FILE_WATCH_MAX_REINSTALLS = 8;
+/** Separators in a symlink's text: Windows also accepts "/", POSIX allows a backslash in names. */
+const LINK_TEXT_SEPARATOR = path.sep === "\\" ? /[\\/]/ : /\//;
+
+/**
+ * The dirs a config.json watch needs, each with the entry names that matter there. Watch dirs,
+ * not files: atomic saves rename a temp file over the target, and a file watch follows the old
+ * inode. The walk resolves the path one entry at a time, as realpath does, and watches:
+ * - the parent of every symlink on the way (repointing a link changes only its parent dir),
+ * - the target's dir (writeFileAtomic renames over a symlink's target, not the link),
+ * - for a missing entry (a dangling link), its nearest existing ancestor, so its creation
+ *   shows up as an event.
+ */
+function configFileWatchDirs(configFile: string): Map<string, Set<string>> {
+  const dirs = new Map<string, Set<string>>();
+  const watch = (dir: string, name: string) =>
+    dirs.set(dir, (dirs.get(dir) ?? new Set<string>()).add(name));
+  const absolute = path.resolve(configFile);
+  // `resolved` never contains a symlink, so ".." can drop its last entry, as the kernel does.
+  let resolved = path.parse(absolute).root;
+  const pending = absolute.slice(resolved.length).split(path.sep);
+  let links = 0;
+  for (let name = pending.shift(); name !== undefined; name = pending.shift()) {
+    if (name === "..") {
+      resolved = path.dirname(resolved);
+      continue;
+    }
+    const entry = path.join(resolved, name);
+    const stat = walkableEntryStat(entry, pending.length > 0);
+    if (stat === null) {
+      watch(resolved, name);
+      return dirs;
+    }
+    if (!stat.isSymbolicLink()) {
+      resolved = entry;
+      continue;
+    }
+    watch(resolved, name);
+    links += 1;
+    if (links > CONFIG_FILE_WATCH_MAX_LINKS) return dirs;
+    const step = symlinkWalkStep(entry, resolved);
+    if (step === null) return dirs;
+    resolved = step.from;
+    pending.unshift(...step.entries);
+  }
+  watch(path.dirname(resolved), path.basename(resolved));
+  return dirs;
+}
+
+/**
+ * The entry's stat when the walk can go on through it, else null. With entries left, a file
+ * in a folder's place counts as missing: a watch on the file would follow its inode, and the
+ * folder that replaces it would go unseen.
+ */
+function walkableEntryStat(entry: string, entriesLeft: boolean): fs.Stats | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(entry);
+  } catch {
+    return null;
+  }
+  const walkable = !entriesLeft || stat.isDirectory() || stat.isSymbolicLink();
+  return walkable ? stat : null;
+}
+
+/** Where a path walk goes on from a symlink: the dir its text starts from, and its entries. */
+function symlinkWalkStep(
+  link: string,
+  linkParent: string
+): { from: string; entries: string[] } | null {
+  let text: string;
+  try {
+    text = fs.readlinkSync(link);
+  } catch {
+    return null;
+  }
+  const root = path.isAbsolute(text) ? path.parse(text).root : "";
+  const entries = text
+    .slice(root.length)
+    .split(LINK_TEXT_SEPARATOR)
+    .filter((name) => name !== "" && name !== ".");
+  return { from: root === "" ? linkParent : root, entries };
+}
+
+function configFileWatchDirsKey(dirs: ReadonlyMap<string, ReadonlySet<string>>): string {
+  return JSON.stringify(Array.from(dirs, ([dir, names]) => [dir, Array.from(names)]));
+}
+
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
@@ -1443,8 +1898,8 @@ export class Config {
   /**
    * Cheap durable change signal for config.json: one stat, no parse. Any
    * backend's rewrite changes size/mtime (atomic replace also changes the
-   * inode), so a memo built against a previous stamp knows to rebuild —
-   * unlike onConfigChanged, which only fires for THIS process's edits. A
+   * inode), so a memo built against a previous stamp knows to rebuild, even
+   * before onConfigChanged's watcher delivers another backend's edit. A
    * missing/unreadable file yields a distinct stamp.
    */
   configFileStamp(): string {
@@ -1554,15 +2009,229 @@ export class Config {
       .map((workspace) => ({ ...workspace, bestOf: { ...workspace.bestOf } }));
   }
 
+  /**
+   * Fires after every config.json change: this process's own edits (notified right after the
+   * write), and rewrites by another Xum backend (seen through a watch on the config dir).
+   */
   onConfigChanged(callback: () => void): () => void {
     this.emitter.on("configChanged", callback);
+    this.ensureConfigFileWatcher();
     return () => {
       this.emitter.off("configChanged", callback);
+      this.closeUnusedConfigFileWatcher();
     };
+  }
+
+  /**
+   * Watches on the config dir (and on a symlinked config.json's target dir); open only while
+   * onConfigChanged has listeners.
+   */
+  private configFileWatchers: fs.FSWatcher[] = [];
+  /**
+   * The config.json stamp the last notification covers. Own saves set it before they
+   * notify, so the watcher's echo of an own save compares equal and stays silent. A stamp
+   * read after a foreign rename that raced an own save is adopted too, but the own save's
+   * notification then fires after that rename, so listeners still re-read the foreign bytes.
+   */
+  private notifiedConfigFileStamp = "missing";
+
+  /** configFileWatchDirsKey of the dirs the open watches cover (see startConfigFileWatchers). */
+  private watchedConfigFileDirsKey: string | null = null;
+
+  /** Set by stopWatchingConfigFile: a disposed backend never watches again. */
+  private configFileWatchStopped = false;
+
+  /** Closes the config.json watches for good (service teardown). Own edits still notify. */
+  stopWatchingConfigFile(): void {
+    this.configFileWatchStopped = true;
+    this.closeConfigFileWatcher();
+  }
+
+  private ensureConfigFileWatcher(): void {
+    if (this.configFileWatchers.length > 0 || this.configFileWatchStopped) return;
+    // The baseline comes before the watch: a rewrite between the two then reads as a new
+    // stamp in the check below instead of being adopted silently.
+    const baseline = this.configFileStamp();
+    try {
+      // Another backend can create the root with its first save; a watch needs it to exist.
+      ensurePrivateDirSync(this.rootDir);
+    } catch (error) {
+      log.debug("Config dir not created for the config file watcher", { error });
+    }
+    this.startConfigFileWatchers();
+    // Set without a watch too: the read that starts one later then reports the edits since.
+    this.notifiedConfigFileStamp = baseline;
+    // Without a watch, the next read of a changed config.json or this process's next save
+    // retries.
+    if (this.configFileWatchers.length === 0) return;
+    // Relink-aware: the link can also change between the realpath read and the root watch.
+    this.handleConfigFileEventWithRelink();
+  }
+
+  private startConfigFileWatchers(dirs = configFileWatchDirs(this.configFile)): void {
+    let complete = true;
+    for (const [dir, fileNames] of dirs) {
+      const watcher = this.watchConfigDir(dir, fileNames);
+      if (watcher) this.configFileWatchers.push(watcher);
+      else complete = false;
+    }
+    // A dir whose watch failed to start is retried by the next relink check (the next event)
+    // or by the next read of a changed config.json (retryIncompleteConfigFileWatch).
+    this.watchedConfigFileDirsKey = complete ? configFileWatchDirsKey(dirs) : null;
+  }
+
+  /** A config.json event: re-resolve a replaced symlink first, so the watch follows it. */
+  private handleConfigFileEventWithRelink(): void {
+    this.followConfigFileRelinks();
+    this.handleConfigFileEvent();
+  }
+
+  /** Moves the watches to the dirs config.json resolves through now. */
+  private followConfigFileRelinks(): void {
+    // A relink that lands while the watches are reinstalled can reach no watch, so resolve
+    // again until the watched dirs match the links.
+    // A watch that failed to start gets one retry per check, not one per loop pass.
+    let tried: string | null = null;
+    for (let reinstalls = 0; reinstalls < CONFIG_FILE_WATCH_MAX_REINSTALLS; reinstalls += 1) {
+      const dirs = configFileWatchDirs(this.configFile);
+      const key = configFileWatchDirsKey(dirs);
+      if (key === this.watchedConfigFileDirsKey || key === tried) return;
+      tried = key;
+      // Keep the notified stamp: the new target's bytes still count as a change.
+      this.closeConfigFileWatcher();
+      this.startConfigFileWatchers(dirs);
+    }
+  }
+
+  private watchConfigDir(dir: string, fileNames: ReadonlySet<string>): fs.FSWatcher | null {
+    let watcher: fs.FSWatcher;
+    try {
+      watcher = fs.watch(dir, { persistent: false }, (_event, filename) =>
+        this.handleConfigDirEvent(dir, fileNames, filename)
+      );
+    } catch (error) {
+      log.debug("Config file watcher not started", { dir, error });
+      return null;
+    }
+    watcher.on("error", (error) => {
+      log.debug("Config file watcher stopped", { dir, error });
+      if (!this.configFileWatchers.includes(watcher)) return;
+      // Rebuild the set instead of closing every watch for good: the relink check reopens
+      // each dir that still resolves (a vanished dir moves to an existing ancestor), and
+      // the stamp check after it reports an edit made while the watch was down.
+      this.watchedConfigFileDirsKey = null;
+      this.configFileWatchErrorDir = dir;
+      this.retryIncompleteConfigFileWatch("error");
+    });
+    return watcher;
+  }
+
+  /**
+   * The config.json stamp of the last retry each trigger started. Separate per trigger: a
+   * read that repaired the set must not hold back the rebuild for a later watcher error.
+   */
+  private readonly configFileWatchRetryStamps: Record<"read" | "error", string | null> = {
+    read: null,
+    error: null,
+  };
+  /** The dir of the last watch that raised an error (see the watch callback). */
+  private configFileWatchErrorDir: string | null = null;
+
+  /**
+   * Rebuilds a watch set with a failed watch, at most once per config.json stamp and trigger.
+   * A read retries a watch that failed to start, so the retry needs no event from another
+   * watch. The error bound stops an error that every new watch raises from rebuilding the set
+   * at the pace of the OS errors: the next rebuild waits for a watch event or a changed stamp.
+   * No timer: until the stamp changes, a retry would see no new edit to report.
+   */
+  private retryIncompleteConfigFileWatch(trigger: "read" | "error"): void {
+    if (!this.configFileWatchIncomplete()) return;
+    const stamp = this.configFileStamp();
+    if (stamp === this.configFileWatchRetryStamps[trigger]) return;
+    this.configFileWatchRetryStamps[trigger] = stamp;
+    this.handleConfigFileEventWithRelink();
+  }
+
+  /**
+   * A listener needs a watch that is missing: one failed to start or raised an error. An
+   * empty set with listeners counts too: every watch failed to start.
+   */
+  private configFileWatchIncomplete(): boolean {
+    if (this.configFileWatchStopped || this.emitter.listenerCount("configChanged") === 0) {
+      return false;
+    }
+    return this.configFileWatchers.length === 0 || this.watchedConfigFileDirsKey === null;
+  }
+
+  /** An event from the watch on `dir`, which covers the entries in `fileNames`. */
+  private handleConfigDirEvent(
+    dir: string,
+    fileNames: ReadonlySet<string>,
+    filename: string | null
+  ): void {
+    // An event from the replacement of the failed watch shows it works, so its next error
+    // may rebuild again. An event from another dir proves nothing about it.
+    if (dir === this.configFileWatchErrorDir) this.configFileWatchRetryStamps.error = null;
+    // Some platforms omit the filename; treat that as a possible config.json change.
+    if (filename != null && !fileNames.has(filename)) return;
+    this.handleConfigFileEventWithRelink();
+  }
+
+  private closeConfigFileWatcher(): void {
+    for (const watcher of this.configFileWatchers) watcher.close();
+    this.configFileWatchers = [];
+  }
+
+  private closeUnusedConfigFileWatcher(): void {
+    if (this.emitter.listenerCount("configChanged") === 0) this.closeConfigFileWatcher();
+  }
+
+  /**
+   * writeFileAtomic for config.json that keeps the watcher from echoing this write.
+   * `beforeRename`: the edit's unchanged-file check (#6568). A refused or failed write records
+   * no stamp, so the watcher still announces the foreign bytes that made it refuse.
+   */
+  private async writeConfigFileTracked(
+    text: string,
+    beforeRename: (() => void) | undefined
+  ): Promise<void> {
+    // The watcher can see the rename before this write's stamp is recorded. It holds
+    // events until then, so the echo of this write compares equal and stays silent.
+    this.configSavesInFlight += 1;
+    try {
+      await writeFileAtomic(this.configFile, text, { encoding: "utf-8", beforeRename });
+      this.notifiedConfigFileStamp = this.configFileStamp();
+    } finally {
+      this.configSavesInFlight -= 1;
+      if (this.configSavesInFlight === 0 && this.configFileEventHeld) {
+        this.configFileEventHeld = false;
+        this.handleConfigFileEvent();
+      }
+    }
+    // The first save creates the root dir, which a listener's earlier watch attempt lacked.
+    if (this.emitter.listenerCount("configChanged") > 0) this.ensureConfigFileWatcher();
+  }
+
+  private configSavesInFlight = 0;
+  private configFileEventHeld = false;
+
+  private handleConfigFileEvent(): void {
+    if (this.configSavesInFlight > 0) {
+      this.configFileEventHeld = true;
+      return;
+    }
+    const stamp = this.configFileStamp();
+    // Xum replaces config.json by rename, so it never goes missing between writes. A deleted
+    // file is not an edit to announce: a listener reading it would see defaults.
+    if (stamp === "missing" || stamp === this.notifiedConfigFileStamp) return;
+    this.notifiedConfigFileStamp = stamp;
+    this.notifyConfigChangedByAnotherProcess();
   }
 
   private deferredChangeNotificationDepth = 0;
   private changeNotificationPending = false;
+  /** A foreign edit's notification deferred by a batch: its flush keeps the listener guard. */
+  private foreignChangeNotificationPending = false;
 
   /** Flush config changes once after the outermost operation, including partial failures. */
   async withDeferredChangeNotifications<T>(operation: () => Promise<T>): Promise<T> {
@@ -1571,11 +2240,22 @@ export class Config {
       return await operation();
     } finally {
       this.deferredChangeNotificationDepth -= 1;
-      if (this.deferredChangeNotificationDepth === 0 && this.changeNotificationPending) {
-        this.changeNotificationPending = false;
-        this.notifyConfigChanged();
-      }
+      if (this.deferredChangeNotificationDepth === 0) this.flushDeferredChangeNotification();
     }
+  }
+
+  /**
+   * A batch with only own edits notifies as an own save does. A batch with a foreign edit
+   * keeps the listener guard of notifyConfigChangedByAnotherProcess.
+   */
+  private flushDeferredChangeNotification(): void {
+    const own = this.changeNotificationPending;
+    const foreign = this.foreignChangeNotificationPending;
+    this.changeNotificationPending = false;
+    this.foreignChangeNotificationPending = false;
+    // A foreign edit has no caller to throw to, so it keeps the guard even next to an own edit.
+    if (foreign) this.notifyConfigChangedByAnotherProcess();
+    else if (own) this.notifyConfigChanged();
   }
 
   private notifyConfigChanged(): void {
@@ -1585,6 +2265,25 @@ export class Config {
       return;
     }
     this.emitter.emit("configChanged");
+  }
+
+  /**
+   * An own save's notification lets a listener's throw reach the caller of the save. Another
+   * backend's edit arrives in an fs.watch callback with no caller, where a throw would be an
+   * uncaught exception: log it and still notify the other listeners.
+   */
+  private notifyConfigChangedByAnotherProcess(): void {
+    if (this.deferredChangeNotificationDepth > 0) {
+      this.foreignChangeNotificationPending = true;
+      return;
+    }
+    for (const listener of this.emitter.listeners("configChanged")) {
+      try {
+        (listener as () => void)();
+      } catch (error) {
+        log.error("Config change listener failed", { error });
+      }
+    }
   }
 
   /**
@@ -1823,30 +2522,75 @@ export class Config {
   private preserveAliasConflictBytes(rawBytes: Buffer, conflicts: ProjectAliasConflict[]): boolean {
     if (conflicts.length === 0) {
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       return true;
     }
     try {
+      // Every degraded load retries in full, including the search for an identical sidecar: that
+      // search is how a backup that becomes readable again is found (#5929).
       const sidecar = writeConfigBytesSidecar(this.configFile, "alias-conflict", rawBytes);
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       // A reused sidecar means an earlier load already logged this content.
       if (!sidecar.reused) {
         log.error(
-          `Project config entries share a path but hold different rows with the same id. Xum keeps the last alias's row for each such id. The original config.json bytes, with every variant, were backed up to ${sidecar.path}.`,
+          `config.json holds more than one row for the same workspace. Xum keeps one row per workspace. The original config.json bytes, with every row, were backed up to ${sidecar.path}.`,
           { conflicts }
         );
       }
       return true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const signature = `${crypto.createHash("sha256").update(rawBytes).digest("hex")}:${(error as NodeJS.ErrnoException).code ?? message}`;
-      if (aliasConflictBackupFailures.get(this.configFile)?.signature !== signature) {
-        log.error(
-          `Project config entries share a path but hold different rows with the same id, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
-          { conflicts }
-        );
-      }
-      aliasConflictBackupFailures.set(this.configFile, { message, signature });
+      this.recordAliasBackupFailure(rawBytes, error, conflicts);
       return false;
+    }
+  }
+
+  /** Arm the edit gate for a failed alias-conflict backup, and log it once per signature. */
+  private recordAliasBackupFailure(
+    rawBytes: Buffer,
+    error: unknown,
+    conflicts: ProjectAliasConflict[]
+  ): void {
+    const message = error instanceof Error ? error.message : String(error);
+    // fs messages embed the timestamped sidecar path: dedupe on the errno code instead.
+    const signature = `${sha256Hex(rawBytes)}:${(error as NodeJS.ErrnoException).code ?? message}`;
+    if (rememberAliasBackupFailure(this.configFile, signature)) {
+      log.error(
+        `config.json holds more than one row for the same workspace, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
+        { conflicts }
+      );
+    }
+    aliasConflictBackupFailures.set(this.configFile, { message });
+  }
+
+  /**
+   * The stamp an edit records before its fresh read: configFileStamp, the same stamp the
+   * cross-process watcher compares, so the two never disagree on what "changed" means.
+   */
+  private readEditStatKey(): string {
+    return this.configFileStamp();
+  }
+
+  /** The beforeRename check for a save, or undefined when the save has no read to compare. */
+  private unchangedConfigCheck(expectedStatKey: string): () => void {
+    return () => this.assertConfigFileUnchanged(expectedStatKey);
+  }
+
+  /**
+   * Throw when config.json changed since the edit read it (#5929): a writer that skips the
+   * registration lock (a manual editor, an older build) replaced it, and this save would drop
+   * that write. One stat, right before the rename. An in-place rewrite with the same inode,
+   * size and mtime still passes; a content hash would cost a read per save.
+   */
+  private assertConfigFileUnchanged(expectedStatKey: string): void {
+    // configFileStamp stats the configured path, not the writer's resolved target: a
+    // config.json symlink retargeted after the writer resolved it then shows up as changed.
+    // Any stat failure reads as "missing", which refuses unless the edit also read none.
+    const currentKey = this.configFileStamp();
+    if (currentKey !== expectedStatKey) {
+      throw new Error(
+        `config.json changed on disk while Xum was saving it (${this.configFile}). Your change was not saved. Retry the change.`
+      );
     }
   }
 
@@ -1874,6 +2618,13 @@ export class Config {
     ProjectsConfig,
     Map<string, WorkspaceMetadataMemoEntry>
   >();
+  /**
+   * Metadata load failures already logged with their stack, by checkout path and message. A
+   * degraded entry fails the same way on every lenient build, and MCP override reads build once
+   * per read (the tool-call gate reads on every call), so each distinct failure logs its stack
+   * once and a one-line debug after. Capped (MAX_LOGGED_METADATA_LOAD_FAILURES).
+   */
+  private readonly loggedMetadataLoadFailures = new Set<string>();
   private workspaceIndex = new Map<
     string,
     {
@@ -1907,12 +2658,19 @@ export class Config {
   }
 
   // File-backed snapshots are shared and read-only; mutations must use editConfig's fresh read.
+  // A read can have side effects (#6699): a read that sees a changed file retries a failed
+  // config.json watch, and that retry can notify onConfigChanged listeners synchronously,
+  // before this call returns. A listener that reads config again gets this read's snapshot.
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
     const key = this.readConfigStatKey();
     if (key !== undefined && this.configSnapshot?.key === key) {
       return this.configSnapshot.config;
     }
-    return this.readConfigOrDefault(options, key);
+    const config = this.readConfigOrDefault(options, key);
+    // A changed file: retry a failed watch after the read, so a listener it notifies reads
+    // the snapshot this read stored.
+    this.retryIncompleteConfigFileWatch("read");
+    return config;
   }
 
   private readConfigOrDefault(
@@ -1970,9 +2728,11 @@ export class Config {
       // The last load decides the alias-conflict gate (#5929): a missing or corrupt file has
       // no merged rows to protect, and the corrupt-file gate below covers the latter.
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       configLoadFailureStates.delete(this.configFile);
     } catch (error) {
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       this.handleConfigLoadFailure(rawBytes, error);
       if (options?.throwOnError) throw error;
     }
@@ -1994,8 +2754,7 @@ export class Config {
         ? { agentHeartbeatsEnabled: true }
         : {}),
       migrations: {
-        defaultModelFallbacksSeeded: true,
-        defaultModelFallbacksSeededFable51: true,
+        ...ALL_MODEL_FALLBACK_SEED_FLAGS,
         persistentSubagentsDefaulted: true,
         agentHeartbeatsSeeded: true,
         taskSettingsDefaultsRaised: true,
@@ -2086,6 +2845,28 @@ export class Config {
     }
   }
 
+  /**
+   * The one id that an id-less legacy row stands for, or undefined when that is not certain. The
+   * read-time migration reads sessions/<legacy id>/metadata.json, and findWorkspace also resolves
+   * the old layout's sessions/<checkout basename>/metadata.json. Every such file that exists must
+   * name the same id. Two different ids, a file that cannot be read, or a file without an id
+   * give undefined, so the caller keeps the row: dropping it would hide the other identity from
+   * known-id checks that delete data (#5929). With no file, the row stands for the legacy id.
+   */
+  private resolveLegacyRowId(projectPath: string, workspace: Workspace): string | undefined {
+    const legacyId = this.generateLegacyId(projectPath, workspace.path);
+    // The same basename as buildWorkspaceMetadata and findWorkspace; PlatformPaths also splits on
+    // "\\" on Windows, where checkout paths use backslashes (#6485).
+    const basename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
+    const ids = new Set<string | undefined>();
+    for (const candidate of basename === legacyId ? [legacyId] : [legacyId, basename]) {
+      const id = readLegacyMetadataId(path.join(this.sessionsDir, candidate, "metadata.json"));
+      if (id !== null) ids.add(id);
+    }
+    if (ids.size === 0) return legacyId;
+    return ids.size === 1 ? [...ids][0] : undefined;
+  }
+
   private normalizeConfigProjects(
     projects: AppConfigOnDisk["projects"] | undefined,
     aliasConflicts: ProjectAliasConflict[]
@@ -2124,7 +2905,9 @@ export class Config {
           config: normalizeProjectRuntimeSettings(projectConfig),
         };
       });
-    return buildProjectsFromStoredEntries(storedEntries, aliasConflicts);
+    return buildProjectsFromStoredEntries(storedEntries, aliasConflicts, (projectPath, workspace) =>
+      this.resolveLegacyRowId(projectPath, workspace)
+    );
   }
 
   private normalizeParsedConfig(
@@ -2161,58 +2944,6 @@ export class Config {
       return modified;
     };
 
-    const normalizeLegacyGatewayModel = (value: string): string | undefined => {
-      const trimmed = value.trim();
-      if (!trimmed) {
-        return undefined;
-      }
-
-      const legacyModelString = trimmed.includes(":") ? trimmed : trimmed.replace("/", ":");
-      const canonicalModel = normalizeToCanonical(legacyModelString);
-      return isValidModelFormat(canonicalModel) ? canonicalModel : undefined;
-    };
-
-    // Migrate legacy gateway settings to the new route-based system.
-    // Legacy keys are intentionally preserved on disk for downgrade compatibility —
-    // older versions still read muxGatewayEnabled / muxGatewayModels directly.
-    if (
-      (parsed.muxGatewayModels != null || parsed.muxGatewayEnabled != null) &&
-      !Array.isArray(parsed.routePriority)
-    ) {
-      let nextPriority = this.seedRoutePriorityFromProviders() ?? ["direct"];
-      if (parsed.muxGatewayEnabled === false) {
-        nextPriority = nextPriority.filter((route) => route !== "mux-gateway");
-        if (nextPriority.length === 0) {
-          nextPriority = ["direct"];
-        }
-      }
-      parsed.routePriority = nextPriority;
-      configModified = true;
-
-      if (parsed.muxGatewayEnabled !== false) {
-        const legacyModels = parseOptionalStringArray(parsed.muxGatewayModels) ?? [];
-        if (legacyModels.length > 0) {
-          const mergedRouteOverrides = normalizeRouteOverridesRecord(parsed.routeOverrides) ?? {};
-          let routeOverridesModified = false;
-
-          for (const legacyModel of legacyModels) {
-            const canonicalModel = normalizeLegacyGatewayModel(legacyModel);
-            if (!canonicalModel || Object.hasOwn(mergedRouteOverrides, canonicalModel)) {
-              continue;
-            }
-
-            mergedRouteOverrides[canonicalModel] = "mux-gateway";
-            routeOverridesModified = true;
-          }
-
-          if (routeOverridesModified) {
-            parsed.routeOverrides = mergedRouteOverrides;
-            shouldInvalidateSessionUsageCaches = true;
-          }
-        }
-      }
-    }
-
     // Seed routePriority only when the field does not exist yet.
     // Once routePriority is an array, it becomes user-owned state, so
     // read-time backfill is intentionally skipped here. Credential-driven
@@ -2224,17 +2955,6 @@ export class Config {
         parsed.routePriority = seeded;
         configModified = true;
       }
-    }
-
-    if (
-      Array.isArray(parsed.routePriority) &&
-      parsed.routePriority.includes("mux-gateway") &&
-      parsed.muxGatewayEnabled === false
-    ) {
-      // Once routePriority exists, it is the authoritative routing signal. Clear a stale
-      // legacy disable flag so downgrade-compat data cannot veto an explicitly enabled gateway.
-      delete parsed.muxGatewayEnabled;
-      configModified = true;
     }
 
     // Normalize persisted model preferences while preserving explicit gateway selections.
@@ -2342,67 +3062,14 @@ export class Config {
     configModified = migrateRaisedTaskSettingsDefaults(parsed, configModified);
     const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
-    const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
-    const muxGatewayModels = parseOptionalStringArray(parsed.muxGatewayModels);
     const routePriority = parseOptionalStringArray(parsed.routePriority);
     const routeOverrides = normalizeRouteOverridesRecord(parsed.routeOverrides);
     const minThinkingLevelByModel = normalizeMinThinkingLevelByModel(
       parsed.minThinkingLevelByModel
     );
-    // One-time seed of the default refusal-fallback chains (e.g. Fable →
-    // Opus). Guarded by migrations.defaultModelFallbacksSeeded so the
-    // seed is applied exactly once: users who later edit or delete the
-    // default chains are not overridden on subsequent loads/updates.
-    // defaultModelFallbacksSeededFable51 re-runs the gap-check once after
-    // the fable alias moved to Fable 5.1: pre-5.1 configs only have a
-    // chain for the old source key, and the new key is a new default that
-    // deserves one seed of its own (still never overwriting an existing
-    // 5.1 chain).
-    const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
-    if (
-      migrationsBeforeSeed.defaultModelFallbacksSeeded !== true ||
-      migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true
-    ) {
-      // Gap-check against the RAW on-disk map with canonicalized keys, not
-      // the sanitized map: a hand-edited entry whose chain sanitizes away
-      // (e.g. {enabled:false, models:[]}) is still user intent and must not
-      // be overwritten. Merging into the raw map also keeps unrelated
-      // chains byte-identical on disk (lenient-on-read preserved).
-      const rawFallbacks =
-        typeof parsed.modelFallbacks === "object" &&
-        parsed.modelFallbacks !== null &&
-        !Array.isArray(parsed.modelFallbacks)
-          ? (parsed.modelFallbacks as Record<string, unknown>)
-          : {};
-      const existingCanonicalKeys = new Set(
-        Object.keys(rawFallbacks).map((key) => normalizeToCanonical(key).trim())
-      );
-      // Completing the original seed pass claims defaultModelFallbacksSeeded,
-      // which downgraded builds trust for their own (pre-5.1) default keys;
-      // seed those legacy chains too so a downgrade keeps refusal fallback.
-      // SEEDED_MODEL_FALLBACKS, not DEFAULT_MODEL_FALLBACKS: chains added
-      // after these flags shipped reach fresh installs only (#5087).
-      const seedDefaults =
-        migrationsBeforeSeed.defaultModelFallbacksSeeded !== true
-          ? { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...SEEDED_MODEL_FALLBACKS }
-          : SEEDED_MODEL_FALLBACKS;
-      const missingDefaults = Object.fromEntries(
-        Object.entries(seedDefaults).filter(
-          ([sourceModel]) => !existingCanonicalKeys.has(sourceModel)
-        )
-      );
-      if (Object.keys(missingDefaults).length > 0) {
-        // Write through the raw-record view: user entries are deliberately
-        // kept unvalidated on disk (normalizeModelFallbacks sanitizes on
-        // every read), so the merged map is not a ModelFallbacks yet.
-        const rawParsed: Record<string, unknown> = parsed;
-        rawParsed.modelFallbacks = { ...rawFallbacks, ...missingDefaults };
-      }
-      parsed.migrations = {
-        ...migrationsBeforeSeed,
-        defaultModelFallbacksSeeded: true,
-        defaultModelFallbacksSeededFable51: true,
-      };
+    // One-time seed passes of the default refusal-fallback chains (see
+    // MODEL_FALLBACK_SEED_PASSES).
+    if (seedDefaultModelFallbacks(parsed)) {
       configModified = true;
     }
 
@@ -2499,11 +3166,6 @@ export class Config {
     );
     const migrations = normalizeConfigMigrations(parsed.migrations);
 
-    const layoutPresetsRaw = normalizeLayoutPresetsConfig(parsed.layoutPresets);
-    const layoutPresets = isLayoutPresetsConfigEmpty(layoutPresetsRaw)
-      ? undefined
-      : layoutPresetsRaw;
-
     const config: LegacyAdvisorProjectsConfig = {
       projects: projectsMap,
       apiServerBindHost: parseOptionalNonEmptyString(parsed.apiServerBindHost),
@@ -2516,10 +3178,8 @@ export class Config {
       defaultProjectDir: parseOptionalNonEmptyString(parsed.defaultProjectDir),
       viewedSplashScreens: parsed.viewedSplashScreens,
       userPreferences,
-      layoutPresets,
       taskSettings,
       chatTranscriptFullWidth: parseOptionalBoolean(parsed.chatTranscriptFullWidth),
-      muxGatewayEnabled,
       llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
       keepScreenAwake: parseOptionalBoolean(parsed.keepScreenAwake),
       toolSearchEnabled: parseOptionalBoolean(parsed.toolSearchEnabled),
@@ -2529,9 +3189,10 @@ export class Config {
       heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
         parsed.heartbeatDefaultIntervalMs
       ),
+      agentResourceLimits: normalizeAgentResourceLimits(parsed.agentResourceLimits),
+      agentResourceLimitsEnabled: parseOptionalBoolean(parsed.agentResourceLimitsEnabled),
       goalDefaults: normalizeGoalDefaults(parsed.goalDefaults),
       evaluationDefaults: normalizeEvaluationDefaults(parsed.evaluationDefaults),
-      muxGatewayModels,
       routePriority,
       routeOverrides,
       minThinkingLevelByModel,
@@ -2600,8 +3261,13 @@ export class Config {
    * Kept as a Promise facade (tests spy on it with Promise mocks to simulate a write
    * that did not land); saveConfigEffect below holds the actual pipeline.
    */
-  private saveConfig(config: ProjectsConfig): Promise<void> {
-    return Effect.runPromise(this.saveConfigEffect(config));
+  /**
+   * `expectedStatKey`: the stat key of the bytes the edit read. The save then fails without
+   * writing when config.json no longer has it. Required, so no save path can skip the check
+   * (#6595).
+   */
+  private saveConfig(config: ProjectsConfig, expectedStatKey: string): Promise<void> {
+    return Effect.runPromise(this.saveConfigEffect(config, expectedStatKey));
   }
 
   /**
@@ -2609,7 +3275,10 @@ export class Config {
    * atomic write) happens before the rename, so a failure means the previous bytes are
    * still on disk; nothing after the write can fail.
    */
-  private saveConfigEffect(config: LegacyAdvisorProjectsConfig): Effect.Effect<void, unknown> {
+  private saveConfigEffect(
+    config: LegacyAdvisorProjectsConfig,
+    expectedStatKey: string
+  ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -2643,11 +3312,6 @@ export class Config {
         taskSettings: config.taskSettings ?? DEFAULT_TASK_SETTINGS,
       };
       deriveSharedTaskCheckouts(new Map(data.projects));
-
-      const muxGatewayEnabled = parseOptionalBoolean(config.muxGatewayEnabled);
-      if (muxGatewayEnabled !== undefined) {
-        data.muxGatewayEnabled = muxGatewayEnabled;
-      }
 
       const chatTranscriptFullWidth = parseOptionalBoolean(config.chatTranscriptFullWidth);
       if (chatTranscriptFullWidth === true) {
@@ -2690,6 +3354,10 @@ export class Config {
         data.heartbeatDefaultIntervalMs = heartbeatDefaultIntervalMs;
       }
 
+      // Undefined (no limit set, or the limits are off) leaves the key out of the JSON.
+      data.agentResourceLimits = normalizeAgentResourceLimits(config.agentResourceLimits);
+      data.agentResourceLimitsEnabled = parseOptionalBoolean(config.agentResourceLimitsEnabled);
+
       if (config.goalDefaults) {
         data.goalDefaults = normalizeGoalDefaults(config.goalDefaults);
       }
@@ -2697,11 +3365,6 @@ export class Config {
       const evaluationDefaults = normalizeEvaluationDefaults(config.evaluationDefaults);
       if (evaluationDefaults !== undefined) {
         data.evaluationDefaults = evaluationDefaults;
-      }
-
-      const muxGatewayModels = parseOptionalStringArray(config.muxGatewayModels);
-      if (muxGatewayModels !== undefined) {
-        data.muxGatewayModels = muxGatewayModels;
       }
 
       const defaultModel = normalizeOptionalModelString(config.defaultModel);
@@ -2781,12 +3444,6 @@ export class Config {
         data.userPreferences = userPreferences;
       }
 
-      if (config.layoutPresets) {
-        const normalized = normalizeLayoutPresetsConfig(config.layoutPresets);
-        if (!isLayoutPresetsConfigEmpty(normalized)) {
-          data.layoutPresets = normalized;
-        }
-      }
       if (config.viewedSplashScreens) {
         data.viewedSplashScreens = config.viewedSplashScreens;
       }
@@ -2910,7 +3567,7 @@ export class Config {
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () => writeFileAtomic(self.configFile, text, "utf-8"),
+        try: () => self.writeConfigFileTracked(text, self.unchangedConfigCheck(expectedStatKey)),
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.
@@ -3062,8 +3719,6 @@ export class Config {
     return {
       userPreferences: config.userPreferences,
       taskSettings: config.taskSettings ?? DEFAULT_TASK_SETTINGS,
-      muxGatewayEnabled: config.muxGatewayEnabled,
-      muxGatewayModels: config.muxGatewayModels,
       routePriority: config.routePriority,
       routeOverrides: config.routeOverrides,
       minThinkingLevelByModel: config.minThinkingLevelByModel,
@@ -3089,17 +3744,6 @@ export class Config {
       goalDefaults: normalizeGoalDefaults(config.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
       evaluationDefaults: normalizeEvaluationDefaults(config.evaluationDefaults),
     };
-  }
-
-  async updateMuxGatewayPrefs(input: {
-    muxGatewayEnabled: boolean;
-    muxGatewayModels: string[];
-  }): Promise<void> {
-    await this.editConfig((config) => ({
-      ...config,
-      muxGatewayEnabled: input.muxGatewayEnabled ? undefined : false,
-      muxGatewayModels: [...new Set(input.muxGatewayModels)].sort(),
-    }));
   }
 
   async updateCoderPrefs(input: {
@@ -3164,8 +3808,68 @@ export class Config {
 
   async updateHeartbeatDefaultIntervalMs(intervalMs: number | null | undefined): Promise<void> {
     await this.editConfig((config) => {
+      const resolveDefault = (value: unknown) =>
+        isValidHeartbeatIntervalMs(value) ? value : HEARTBEAT_DEFAULT_INTERVAL_MS;
+      const before = resolveDefault(config.heartbeatDefaultIntervalMs);
       if (intervalMs != null) config.heartbeatDefaultIntervalMs = intervalMs;
       else delete config.heartbeatDefaultIntervalMs;
+      // A fixed-interval heartbeat that follows the default anchors its first deadline
+      // after a restart on max(last firing, scheduleUpdatedAt), so a default change must
+      // stamp it like a cadence edit does (#5741). In this same edit: no extra read or write.
+      if (resolveDefault(config.heartbeatDefaultIntervalMs) !== before) {
+        const now = Date.now();
+        for (const project of config.projects.values()) {
+          for (const workspace of project.workspaces) {
+            const heartbeat = workspace.heartbeat;
+            if (
+              heartbeat?.enabled === true &&
+              !isValidHeartbeatIntervalMs(heartbeat.intervalMs) &&
+              resolveHeartbeatSchedulePolicy(heartbeat).trigger === "interval"
+            ) {
+              heartbeat.scheduleUpdatedAt = now;
+            }
+          }
+        }
+      }
+      return config;
+    });
+  }
+
+  async updateAgentResourceLimits(limits: AgentResourceLimits): Promise<void> {
+    await this.editConfig((config) => {
+      const normalized = normalizeAgentResourceLimits(limits);
+      if (normalized) config.agentResourceLimits = normalized;
+      else delete config.agentResourceLimits;
+      return config;
+    });
+  }
+
+  async updateAgentResourceLimitsEnabled(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) config.agentResourceLimitsEnabled = true;
+      else delete config.agentResourceLimitsEnabled;
+      return config;
+    });
+  }
+
+  /** Replaces both limits of one project: an omitted field removes that limit. */
+  async updateProjectAgentResourceLimits(
+    projectPath: string,
+    limits: AgentResourceLimits
+  ): Promise<void> {
+    await this.editConfig((config) => {
+      const project = config.projects.get(projectPath);
+      if (!project) {
+        throw new Error(`Project not found: ${projectPath}`);
+      }
+      // Sub-project workspaces belong to the parent's checkout, and their commands join the
+      // parent's cgroup, so a limit of its own would never apply. Clearing one is still allowed.
+      if (project.parentProjectPath && normalizeAgentResourceLimits(limits)) {
+        throw new Error(
+          `Sub-project ${projectPath} shares the resource limits of its parent project ${project.parentProjectPath}.`
+        );
+      }
+      setProjectAgentResourceLimits(project, limits);
       return config;
     });
   }
@@ -3204,16 +3908,6 @@ export class Config {
       const viewed = config.viewedSplashScreens ?? [];
       if (!viewed.includes(splashId)) viewed.push(splashId);
       return { ...config, viewedSplashScreens: viewed };
-    });
-  }
-
-  async saveLayoutPresets(layoutPresets: LayoutPresetsConfig): Promise<void> {
-    await this.editConfig((config) => {
-      const normalized = normalizeLayoutPresetsConfig(layoutPresets);
-      return {
-        ...config,
-        layoutPresets: isLayoutPresetsConfigEmpty(normalized) ? undefined : normalized,
-      };
     });
   }
 
@@ -3422,7 +4116,14 @@ export class Config {
      * pure (callers run their own updaters and record results inside it): only after the
      * edit holds the lock it will write under, so no invocation's result is discarded.
      */
-    const transform = (): ProjectsConfig => fn(self.readConfigOrDefault({ keepSnapshot: true }));
+    // The stat key of config.json just before the edit's fresh read: the save refuses to replace
+    // bytes this edit did not read (#5929). A rename between this stat and the read only makes
+    // the save refuse (fail closed), never overwrite.
+    let readStatKey: string | undefined;
+    const transform = (): ProjectsConfig => {
+      readStatKey = self.readEditStatKey();
+      return fn(self.readConfigOrDefault({ keepSnapshot: true }));
+    };
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
       lock: ProjectRegistrationLockHandle
@@ -3441,8 +4142,14 @@ export class Config {
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
       // spies on saveConfig keep intercepting the serialized write. A failed save rejects
       // the edit and skips the change notification below (#4444).
-      yield* Effect.tryPromise({ try: () => self.saveConfig(newConfig), catch: (error) => error });
-      // Backend-initiated config edits (for example gateway auth changes) use this signal
+      // transform() always runs before write and records the key.
+      const expectedStatKey = readStatKey;
+      assert(expectedStatKey !== undefined, "config edit saved without a fresh read");
+      yield* Effect.tryPromise({
+        try: () => self.saveConfig(newConfig, expectedStatKey),
+        catch: (error) => error,
+      });
+      // Backend-initiated config edits (for example provider auth changes) use this signal
       // so frontend subscribers can refresh derived state without polling.
       self.notifyConfigChanged();
     });
@@ -3863,6 +4570,7 @@ export class Config {
     workspaceName?: string;
     parentWorkspaceId?: string;
     pendingAutoTitle?: boolean;
+    kind?: Workspace["kind"];
   } | null {
     const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
 
@@ -3883,6 +4591,7 @@ export class Config {
         workspaceName: workspace.name,
         parentWorkspaceId: workspace.parentWorkspaceId,
         pendingAutoTitle: workspace.pendingAutoTitle,
+        kind: workspace.kind,
       };
     }
 
@@ -3891,8 +4600,7 @@ export class Config {
       // LEGACY FORMAT: Fall back to metadata.json and legacy ID for unmigrated workspaces
       if (!workspace.id) {
         // Extract workspace basename (could be stable ID or legacy name)
-        const workspaceBasename =
-          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+        const workspaceBasename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
 
         // Try loading metadata with basename as ID (works for old workspaces)
         const metadataPath = path.join(
@@ -4057,13 +4765,15 @@ export class Config {
       // Memoize the in-flight promise: the startup burst issues several
       // enumerations before the first one resolves.
       const legacyAliasIds = new Set<string>();
+      const fallbackIds = new Set<string>();
       const degraded = { value: false };
       const result = this.buildWorkspaceMetadata(config, config.projects, {
         ...options,
         legacyAliasIds,
+        fallbackIds,
         degraded,
       });
-      const created: WorkspaceMetadataMemoEntry = { result, legacyAliasIds };
+      const created: WorkspaceMetadataMemoEntry = { result, legacyAliasIds, fallbackIds };
       entry = created;
       memo.set(memoKey, created);
       const forget = () => {
@@ -4082,9 +4792,8 @@ export class Config {
       }, forget);
     }
     const metadata = await entry.result;
-    if (options.legacyAliasIds !== undefined) {
-      for (const aliasId of entry.legacyAliasIds) options.legacyAliasIds.add(aliasId);
-    }
+    addAll(options.legacyAliasIds, entry.legacyAliasIds);
+    addAll(options.fallbackIds, entry.fallbackIds);
     // Fresh array, shared entries (see the probeCheckouts CONTRACT): the copy keeps one
     // caller's in-place filter/sort from leaking into another.
     return metadata.slice();
@@ -4135,15 +4844,25 @@ export class Config {
     return metadata.find((candidate) => candidate.id === workspaceId) ?? null;
   }
 
+  /** See loggedMetadataLoadFailures. */
+  private logMetadataLoadFailure(workspacePath: string, error: unknown): void {
+    const key = `${workspacePath}\0${getErrorMessage(error)}`;
+    if (!rememberLogKey(this.loggedMetadataLoadFailures, key, MAX_LOGGED_METADATA_LOAD_FAILURES)) {
+      log.debug("Failed to load/migrate workspace metadata (stack logged before)", {
+        workspacePath,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    log.error(`Failed to load/migrate workspace metadata:`, error);
+  }
+
   private async buildWorkspaceMetadata(
     config: ProjectsConfig,
     projects: Iterable<[string, ProjectConfig]>,
     options?: WorkspaceMetadataBuildOptions
   ): Promise<FrontendWorkspaceMetadata[]> {
     const probeCheckouts = options?.probeCheckouts ?? true;
-    const markDegraded = () => {
-      if (options?.degraded) options.degraded.value = true;
-    };
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
     // Read-time migrations recorded here are re-applied to a FRESH config snapshot inside
     // editConfig below. Persisting the local `config` snapshot directly (the old
@@ -4185,8 +4904,7 @@ export class Config {
           tags: storedWorkspace.tags ? { ...storedWorkspace.tags } : undefined,
         };
         // Extract workspace basename from path (could be stable ID or legacy name)
-        const workspaceBasename =
-          workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+        const workspaceBasename = NodePlatformPaths.basename(workspace.path) ?? "unknown";
 
         // Captured BEFORE any in-memory migration mutates workspace.id: the queued
         // replay must retarget by persisted identity, never by path alone — paths are
@@ -4237,6 +4955,8 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              // Fail closed: a corrupted/invalid tag publishes as absent (untagged).
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
               agentMessageDispatchMode: getValidAgentMessageDispatchMode(
                 workspace.agentMessageDispatchMode
               ),
@@ -4360,7 +5080,7 @@ export class Config {
                 // closed — the unreadable alias file may hide a registered
                 // identity.
                 if (legacyMetadataRaw !== undefined && !options?.throwOnError) {
-                  markDegraded();
+                  markDegraded(options);
                   continue;
                 }
                 throw readError;
@@ -4390,7 +5110,7 @@ export class Config {
               if (options?.throwOnError) {
                 throw parseError;
               }
-              markDegraded();
+              markDegraded(options);
             }
             const aliasId = aliasMetadata?.id;
             if (typeof aliasId === "string" && aliasId.length > 0) {
@@ -4431,25 +5151,12 @@ export class Config {
             metadata.aiSettings ??= workspace.aiSettings;
             metadata.heartbeat ??= workspace.heartbeat;
 
-            // Preserve tree/task metadata when present in config (metadata.json won't have it)
-            metadata.parentWorkspaceId ??= workspace.parentWorkspaceId;
-            metadata.agentType ??= workspace.agentType;
-            metadata.agentId ??= workspace.agentId;
-            metadata.workflowTask ??= workspace.workflowTask;
-            metadata.bestOf = isLegacyTaskVariantGroup(metadata.bestOf)
-              ? undefined
-              : (normalizeWorkspaceBestOf(metadata.bestOf) ??
-                normalizeWorkspaceBestOf(workspace.bestOf));
-            metadata.taskStatus ??= workspace.taskStatus;
-            metadata.taskPendingGuidance ??= workspace.taskPendingGuidance;
-            metadata.taskLaunchError ??= workspace.taskLaunchError;
-            metadata.delegatedCreationInterrupted ??=
+            // Tree/task metadata comes from config alone (see CONFIG_TREE_FIELDS), the grouping
+            // and the interrupted-creation mark too.
+            takeTreeFieldsFromConfig(metadata, workspace);
+            metadata.bestOf = normalizeWorkspaceBestOf(workspace.bestOf);
+            metadata.delegatedCreationInterrupted =
               delegatedCreationInterruptedField(workspace).delegatedCreationInterrupted;
-            metadata.reportedAt ??= workspace.reportedAt;
-            metadata.taskModelString ??= workspace.taskModelString;
-            metadata.taskThinkingLevel ??= workspace.taskThinkingLevel;
-            metadata.taskPrompt ??= workspace.taskPrompt;
-            metadata.taskTrunkBranch ??= workspace.taskTrunkBranch;
             // Preserve archived timestamps from config
             metadata.archivedAt ??= workspace.archivedAt;
             metadata.unarchivedAt ??= workspace.unarchivedAt;
@@ -4519,7 +5226,12 @@ export class Config {
               });
             }
 
-            workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
+            // The messaging tag lives only in config (legacy metadata.json predates it), so
+            // overlay the validated config value or a tag write would publish stale metadata.
+            workspaceMetadata.push({
+              ...this.addPathsToMetadata(metadata, workspace.path),
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
+            });
             metadataFound = true;
           }
 
@@ -4546,6 +5258,8 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              // Fail closed: a corrupted/invalid tag publishes as absent (untagged).
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
               agentMessageDispatchMode: getValidAgentMessageDispatchMode(
                 workspace.agentMessageDispatchMode
               ),
@@ -4608,8 +5322,7 @@ export class Config {
           if (options?.throwOnError) {
             throw error;
           }
-          markDegraded();
-          log.error(`Failed to load/migrate workspace metadata:`, error);
+          this.logMetadataLoadFailure(workspace.path, error);
           // Fallback to basic metadata if migration fails
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
           const metadata: WorkspaceMetadata = {
@@ -4630,6 +5343,7 @@ export class Config {
             unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
               workspace.unrelatedWorkspaceConsent
             ),
+            messagingTag: getValidMessagingTag(workspace.messagingTag),
             agentMessageDispatchMode: getValidAgentMessageDispatchMode(
               workspace.agentMessageDispatchMode
             ),
@@ -4666,6 +5380,7 @@ export class Config {
             subProjectPath: workspace.subProjectPath,
           };
 
+          markDegraded(options, metadata.id);
           workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
         }
       }
@@ -4864,6 +5579,7 @@ export class Config {
         unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
           metadata.unrelatedWorkspaceConsent
         ),
+        messagingTag: getValidMessagingTag(metadata.messagingTag),
         agentMessageDispatchMode: getValidAgentMessageDispatchMode(
           metadata.agentMessageDispatchMode
         ),
@@ -4911,7 +5627,12 @@ export class Config {
           pendingRemoval: existing.pendingRemoval,
           pendingArchive: existing.pendingArchive,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
+          // Server-owned and unpublished on metadata: a round trip must not drop it,
+          // or in-flight tagged sends would read a spurious revocation.
+          messagingTagGeneration: existing.messagingTagGeneration,
           delegatedCreation: existing.delegatedCreation,
+          // Written only at birth (#5569): kept from the row, never taken from metadata.
+          bornWithoutDelegation: existing.bornWithoutDelegation,
           // Monotone (#5174): a metadata round trip never un-marks a migrated plan.
           remotePlanMigrated: existing.remotePlanMigrated,
         };

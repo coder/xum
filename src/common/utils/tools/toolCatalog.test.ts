@@ -5,7 +5,6 @@ import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   applyNativeToolSearchReplay,
   buildToolCatalog,
-  buildToolCatalogOverview,
   buildToolSearchModelOutput,
   collectDeferLoadingToolNames,
   dedupeNativeToolReferences,
@@ -25,6 +24,7 @@ import {
   TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS,
   TOOL_SEARCH_TOOL_NAME,
   type ToolCatalogEntry,
+  type ToolCatalogOverviewMemo,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
 
@@ -61,6 +61,36 @@ function baseTools(): Record<string, Tool> {
       title: { description: "Issue title" },
     }),
   };
+}
+
+/**
+ * The overview prepareToolSearch appends to tool_catalog_search's description when `catalog` is
+ * the deferred MCP surface. The search tool's own description is empty, so the result is the
+ * overview alone, and "" when nothing is deferred (prepareToolSearch then drops the tool).
+ */
+function advertisedOverview(catalog: readonly ToolCatalogEntry[]): string {
+  const prepared = prepareToolSearch({
+    tools: {
+      tool_catalog_search: fakeTool(""),
+      ...Object.fromEntries(
+        catalog.map((entry) => [
+          entry.name,
+          mcpTool(
+            entry.description,
+            entry.paramText ? { p: { description: entry.paramText } } : {}
+          ),
+        ])
+      ),
+    },
+    mcpToolNames: catalog.map((entry) => entry.name),
+    mcpToolServers: Object.fromEntries(
+      catalog.flatMap((entry) =>
+        entry.serverName === undefined ? [] : [[entry.name, entry.serverName]]
+      )
+    ),
+  });
+  const description = prepared.tools[TOOL_SEARCH_TOOL_NAME]?.description;
+  return typeof description === "string" ? description : "";
 }
 
 /**
@@ -149,17 +179,17 @@ describe("catalog advertising (overview + server names)", () => {
     expect(byName.get("github_create_issue")).toBe("github");
   });
 
-  test("buildToolCatalogOverview groups deferred tool names by server, deterministically", () => {
+  test("the overview groups deferred tool names by server, deterministically", () => {
     const { catalog } = buildToolCatalog({
       tools: baseTools(),
       mcpToolNames: MCP_NAMES,
       mcpToolServers: MCP_TOOL_SERVERS,
     });
-    const overview = buildToolCatalogOverview(catalog);
+    const overview = advertisedOverview(catalog);
     expect(overview).toBe(
       "Deferred tool catalog overview (search to activate):\n" +
-        "- github (1 tool): github_create_issue\n" +
-        "- slack (2 tools): slack_list_channels, slack_send_message\n" +
+        "- github: github_create_issue\n" +
+        "- slack: slack_list_channels, slack_send_message\n" +
         "(end of deferred tool catalog overview)"
     );
   });
@@ -171,19 +201,18 @@ describe("catalog advertising (overview + server names)", () => {
       paramText: `SECRET_PARAM_${i}`,
       serverName: "srv",
     }));
-    const overview = buildToolCatalogOverview(catalog);
-    expect(overview).toContain("- srv (10 tools):");
-    expect(overview).toContain("(+2 more)");
+    const overview = advertisedOverview(catalog);
+    expect(overview).toContain(
+      "- srv: srv_tool_0, srv_tool_1, srv_tool_2, srv_tool_3, srv_tool_4, srv_tool_5, srv_tool_6, srv_tool_7, and more\n"
+    );
     expect(overview).not.toContain("SECRET_DESCRIPTION");
     expect(overview).not.toContain("SECRET_PARAM");
   });
 
   test("overview is empty for an empty catalog and groups unknown servers as 'other tools'", () => {
-    expect(buildToolCatalogOverview([])).toBe("");
-    const overview = buildToolCatalogOverview([
-      { name: "mystery_tool", description: "", paramText: "" },
-    ]);
-    expect(overview).toContain("- other tools (1 tool): mystery_tool");
+    expect(advertisedOverview([])).toBe("");
+    const overview = advertisedOverview([{ name: "mystery_tool", description: "", paramText: "" }]);
+    expect(overview).toContain("- other tools: mystery_tool");
   });
 
   test("prepareToolSearch advertises the overview in tool_catalog_search's description", () => {
@@ -195,8 +224,8 @@ describe("catalog advertising (overview + server names)", () => {
     expect(prep.state).toBeDefined();
     const description = prep.tools[TOOL_SEARCH_TOOL_NAME].description;
     expect(description).toContain("Search deferred tools");
-    expect(description).toContain("- slack (2 tools):");
-    expect(description).toContain("- github (1 tool): github_create_issue");
+    expect(description).toContain("- slack: slack_list_channels");
+    expect(description).toContain("- github: github_create_issue");
     // Deferred MCP tool records themselves are untouched (schemas stay deferred).
     expect(prep.tools.slack_send_message.description).toBe("Send a message to a Slack channel");
   });
@@ -299,7 +328,7 @@ describe("catalog advertising (overview + server names)", () => {
     const clampedCatalog: ToolCatalogEntry[] = [
       { name: "long_tool", description: "", paramText: "", serverName: longServer },
     ];
-    const clamped = buildToolCatalogOverview(clampedCatalog);
+    const clamped = advertisedOverview(clampedCatalog);
     expect(clamped).not.toContain(longServer);
     expect(clamped).toContain(`${"s".repeat(63)}…`);
 
@@ -310,7 +339,7 @@ describe("catalog advertising (overview + server names)", () => {
       paramText: "",
       serverName: `server-${String(i).padStart(3, "0")}`,
     }));
-    const bounded = buildToolCatalogOverview(bigCatalog);
+    const bounded = advertisedOverview(bigCatalog);
     expect(bounded.length).toBeLessThan(2200);
     expect(bounded).toMatch(/…and \d+ more servers \(use this tool to discover their tools\)/);
   });
@@ -402,7 +431,7 @@ describe("catalog advertising (overview + server names)", () => {
       paramText: "",
       serverName: evilServer,
     }));
-    const overview = buildToolCatalogOverview(catalog);
+    const overview = advertisedOverview(catalog);
     const matches = searchToolCatalog(catalog, "evil");
     const elapsedMs = performance.now() - startedAt;
     // Bounded work: must not stall stream startup (generous CI headroom).
@@ -419,7 +448,7 @@ describe("catalog advertising (overview + server names)", () => {
     const catalog: ToolCatalogEntry[] = [
       { name: "t1_do_thing", description: "unrelated words", paramText: "", serverName: longToken },
     ];
-    const overview = buildToolCatalogOverview(catalog);
+    const overview = advertisedOverview(catalog);
     const advertisedLabel = `${"a".repeat(63)}…`;
     expect(overview).toContain(advertisedLabel);
     // Querying with the visible label (as a model would copy it) must match.
@@ -463,6 +492,111 @@ describe("catalog advertising (overview + server names)", () => {
       },
     ];
     expect(searchToolCatalog(renamed, "github").map((m) => m.name)).toEqual(["gh1_create_issue"]);
+  });
+});
+
+// tool_catalog_search's description sits in Anthropic's cached tools prefix, so
+// a remote server listing one tool more or less on a refetch must not change it.
+describe("overview stability across MCP tool refetches", () => {
+  /** A remote server's catalog as one refetch returns it (sorted names keep the order obvious). */
+  function refetch(
+    namesByServer: Record<string, readonly string[]>,
+    memo?: ToolCatalogOverviewMemo
+  ) {
+    const tools: Record<string, Tool> = { tool_catalog_search: fakeTool("Search deferred tools") };
+    const servers: Record<string, string> = {};
+    for (const [server, names] of Object.entries(namesByServer)) {
+      for (const name of names) {
+        tools[name] = mcpTool(`Tool ${name}`);
+        servers[name] = server;
+      }
+    }
+    const prepared = prepareToolSearch({
+      tools,
+      mcpToolNames: Object.keys(servers),
+      mcpToolServers: servers,
+      overviewMemo: memo,
+    });
+    expect(prepared.state).toBeDefined();
+    const description = prepared.tools[TOOL_SEARCH_TOOL_NAME].description;
+    if (typeof description !== "string") throw new Error("Expected a string description");
+    return {
+      description,
+      catalog: prepared.state?.catalog ?? [],
+    };
+  }
+  const notion = (count: number) =>
+    Array.from({ length: count }, (_, i) => `notion_tool_${String(i).padStart(2, "0")}`);
+
+  test("one more tool beyond the listed names keeps the description, even without a memo", () => {
+    const before = refetch({ notion: notion(55) });
+    const after = refetch({ notion: notion(56) });
+    expect(after.description).toBe(before.description);
+  });
+
+  test("a new tool that sorts into the listed names keeps the memoized description and stays searchable", () => {
+    const memo: ToolCatalogOverviewMemo = {};
+    const before = refetch({ notion: notion(55), linear: ["linear_list_issues"] }, memo);
+    const after = refetch(
+      { notion: ["notion_aaa_check_next_steps", ...notion(55)], linear: ["linear_list_issues"] },
+      memo
+    );
+    expect(after.description).toBe(before.description);
+    expect(searchToolCatalog(after.catalog, "check next steps").map((m) => m.name)).toContain(
+      "notion_aaa_check_next_steps"
+    );
+  });
+
+  test("the memo is replaced when a listed tool disappears or the server set changes", () => {
+    const memo: ToolCatalogOverviewMemo = {};
+    const first = refetch({ notion: notion(55) }, memo);
+    // notion_tool_00 is listed: keeping the old overview would advertise a missing tool.
+    const removed = refetch({ notion: notion(55).slice(1) }, memo);
+    expect(removed.description).not.toBe(first.description);
+    expect(removed.description).not.toContain("notion_tool_00");
+    const withLinear = refetch(
+      { notion: notion(55).slice(1), linear: ["linear_list_issues"] },
+      memo
+    );
+    expect(withLinear.description).toContain("linear_list_issues");
+    const linearOnly = refetch({ linear: ["linear_list_issues"] }, memo);
+    expect(linearOnly.description).not.toContain("notion");
+  });
+
+  test("the memo is replaced when a server drops to the listed count, kept when it grows past it", () => {
+    const memo: ToolCatalogOverviewMemo = {};
+    const nine = refetch({ notion: notion(9) }, memo);
+    expect(nine.description).toContain(", and more");
+    // Only the unlisted 9th tool goes: every listed name stays, but "and more" is now false.
+    const eight = refetch({ notion: notion(8) }, memo);
+    expect(eight.description).not.toContain(", and more");
+    expect(eight.description).toContain("notion_tool_07");
+    // Growing past the listed count leaves the line incomplete, not false: it is kept.
+    expect(refetch({ notion: notion(9) }, memo).description).toBe(eight.description);
+  });
+
+  test("the memo is replaced when a listed name moves to another server", () => {
+    // Two server/tool pairs can normalize to one MCP key: once the first pair
+    // goes, the key belongs to the other server while both servers stay.
+    const memo: ToolCatalogOverviewMemo = {};
+    refetch({ alpha: ["shared_tool", "alpha_other"], beta: ["beta_other"] }, memo);
+    const moved = { alpha: ["alpha_other"], beta: ["beta_other", "shared_tool"] };
+    expect(refetch(moved, memo).description).toBe(refetch(moved).description);
+  });
+
+  test("a reused overview is still stripped, not stacked, on a rebuild", () => {
+    const memo: ToolCatalogOverviewMemo = {};
+    const first = refetch({ notion: notion(12) }, memo);
+    const rebuilt = prepareToolSearch({
+      tools: {
+        ...Object.fromEntries(notion(13).map((n) => [n, mcpTool(`Tool ${n}`)])),
+        tool_catalog_search: fakeTool(first.description),
+      },
+      mcpToolNames: notion(13),
+      mcpToolServers: Object.fromEntries(notion(13).map((n) => [n, "notion"])),
+      overviewMemo: memo,
+    });
+    expect(rebuilt.tools[TOOL_SEARCH_TOOL_NAME].description).toBe(first.description);
   });
 });
 

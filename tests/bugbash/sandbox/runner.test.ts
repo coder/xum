@@ -6,27 +6,53 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { startFakeUpstream } from "./fakeUpstream";
-import { checkDocker, exitFor, launch, launchJob, ownerState, probeApp, recover } from "./launch";
+import {
+  checkDocker,
+  exitFor,
+  launch,
+  launchJob,
+  ownerState,
+  preflight,
+  probeApp,
+  recover,
+} from "./launch";
 import * as proxyModule from "./proxy";
 import { Ledger } from "./proxyPolicy";
-import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
+import { groupState, Refusal, Session, Stopped } from "./runner";
 import { checkSet, CONTAINER_CHECKS, runSelfCheck, selfCheckExit } from "./selfCheckRun";
 
-// Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
-// runner gives docker a stripped env, so the fake reads its answers from bin/fake.env.
+// Each test runs the real build.sh in a throwaway git repo and a fake `docker` and `gh` on PATH.
+// The runner gives both a stripped env, so the fakes read their answers from bin/fake.env.
 const SANDBOX = "tests/bugbash/sandbox";
 const DIGEST = `sha256:${"61".repeat(32)}`;
 const REF = `ghcr.io/coder/xum-bugbash-sandbox@${DIGEST}`;
+/** The ID of build.sh's local image in the fake. */
+const LOCAL_ID = `sha256:${"b1".repeat(32)}`;
 const FAKE = `#!/bin/sh
 bin=$(dirname "$0"); . "$bin/fake.env"
 unregister() { awk -v id="$1" '$1!=id' "$bin/containers" > "$bin/c.tmp"; mv "$bin/c.tmp" "$bin/containers"; }
 echo "$* [home=\${HOME-} cfg=\${DOCKER_CONFIG-}]" >> "$bin/calls.log"
+env | grep -oE '^(GH|XDG|DBUS)_[A-Z_]*' | sed 's/^/docker got /' >> "$bin/calls.log"
+# A client that ignores SIGTERM. The call line above comes before the trap, so a test that signals
+# on it can kill the shell first: it signals on this line, written only once the trap is set.
+ignore_term() { trap '' TERM; echo "term ignored $1" >> "$bin/calls.log"; exec sleep 30; }
 case "$1" in
-  context) if [ "\${CONTEXT-}" = hang ]; then trap '' TERM; exec sleep 30; fi; echo "$HOST" ;;
+  context) if [ "\${CONTEXT-}" = hang ]; then ignore_term context; fi; echo "$HOST" ;;
   info) echo "$INFO" ;;
-  images) [ "$IMAGES_RC" = 0 ] || { echo "daemon down" >&2; exit 1; }; echo "$IMAGES" ;;
+  images) [ "$IMAGES_RC" = 0 ] || { echo "daemon down" >&2; exit 1; }
+    case "$*" in *xum-bugbash-sandbox:inputs-*) echo "$LOCAL" ;; *) echo "$IMAGES" ;; esac ;;
+  # The stable tag's lookup (TAG): its digest, quoted as by {{json}}, or the registry's error.
+  # Else build.sh's local build: it prints the ID of its tag with \`image inspect\` next.
+  buildx) if [ "$2" = imagetools ]; then for tag in "$@"; do :; done
+      case "$TAG" in
+        found) echo "\\"$DIGEST\\"" ;;
+        garbage) echo "$DIGEST" ;;
+        missing) echo "ERROR: $tag: not found" >&2; exit 1 ;;
+        *) echo "ERROR: $tag: dial tcp: lookup ghcr.io: no such host" >&2; exit 1 ;;
+      esac; exit 0; fi
+    [ "$BUILD" = fail ] && { echo "build failed" >&2; exit 1; }; exit 0 ;;
   pull)
-    if [ "$PULL" = hang ]; then trap '' TERM; exec sleep 30; fi
+    if [ "$PULL" = hang ]; then ignore_term pull; fi
     # A grandchild that holds no pipe: only a signal to the whole group reaches it.
     # The leader ends on SIGTERM, but its grandchild ignores it and holds no pipe (#5878 review).
     if [ "$PULL" = orphan ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; sleep 30; fi
@@ -35,7 +61,7 @@ case "$1" in
     if [ "$PULL" = fail ]; then echo "pull failed" >&2; exit 1; fi
     # Exits at once and leaves a member in its group (cleanup item 7).
     if [ "$PULL" = leave ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; fi ;;
-  image) echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}" ;;
+  image) if [ "$4" = "{{.Id}}" ]; then echo "$LOCAL_ID"; else echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}"; fi ;;
   # Lines of bin/containers: id name owner checkout. ps prints the ids that match every filter.
   ps) [ "$PS_RC" = 0 ] || exit 1
     n=""; o=""; c=""
@@ -55,7 +81,7 @@ case "$1" in
     if [ "$RUN" = swap ]; then echo "$id xbb-other other:pid abc" >> "$bin/containers"; else echo "$id $n$l" >> "$bin/containers"; fi
     echo "$id" > "$cid"; echo "created $id" >> "$bin/calls.log"
     case "$RUN" in
-      stuck) trap '' TERM; exec sleep 30 ;;
+      stuck) ignore_term run ;;
       slowcreate|swap) cat >/dev/null; exit 0 ;;
       hang) cat >/dev/null; echo "stdin closed" >> "$bin/calls.log"; unregister "$id"; exit 0 ;;
       badframe) printf 'not a frame\n'; cat >/dev/null; unregister "$id"; exit 0 ;;
@@ -80,6 +106,14 @@ case "$1" in
   rm) shift 2; [ "\${RM-}" = slow ] && sleep 1; [ "\${RM-}" = noop ] && exit 0; for id in "$@"; do unregister "$id"; done ;;
   *) exit 9 ;;
 esac
+`;
+
+// gh attestation verify: exits GH_RC with GH_ERR on stderr, and logs the env names it reads for
+// the user's login.
+const FAKE_GH = `#!/bin/sh
+bin=$(dirname "$0"); . "$bin/fake.env"
+echo "gh $* [token=\${GH_TOKEN-} config=\${GH_CONFIG_DIR-} xdg=\${XDG_CONFIG_HOME-} bus=\${DBUS_SESSION_BUS_ADDRESS-} run=\${XDG_RUNTIME_DIR-}]" >> "$bin/calls.log"
+[ "$GH_RC" = 0 ] || { echo "$GH_ERR" >&2; exit "$GH_RC"; }
 `;
 
 let root = "";
@@ -107,10 +141,10 @@ beforeEach(() => {
     encoding: "utf8",
   }).stdout.trim();
   expect(key).toMatch(/^[0-9a-f]{64}$/);
-  lock(key);
   bin = path.join(root, "bin");
   fs.mkdirSync(bin);
   fs.writeFileSync(path.join(bin, "docker"), FAKE, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "gh"), FAKE_GH, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, "containers"), "");
   fake();
   process.env.PATH = `${bin}:${savedPath ?? ""}`;
@@ -129,22 +163,19 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function lock(inputsKey: string, digest = DIGEST) {
-  const record = {
-    image: "ghcr.io/coder/xum-bugbash-sandbox",
-    digest,
-    inputsKey,
-    playwrightCore: "1.63.0",
-    publishedFrom: "7".repeat(40),
-  };
-  fs.writeFileSync(path.join(root, SANDBOX, "image.json"), JSON.stringify(record));
-}
 function fake(over: Record<string, string> = {}) {
   const vars = {
     HOST: "unix:///var/run/docker.sock",
     INFO: '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","Architecture":"x86_64","SecurityOptions":["name=seccomp"]}',
+    TAG: "found",
+    DIGEST,
+    GH_RC: "0",
+    GH_ERR: "",
     IMAGES_RC: "0",
     IMAGES: "",
+    LOCAL: "",
+    LOCAL_ID,
+    BUILD: "ok",
     PULL: "ok",
     LABEL: key,
     PS_RC: "0",
@@ -182,26 +213,34 @@ const session = (stop = new AbortController(), graceMs?: number) => {
   return s;
 };
 
-test("the committed image.json is a valid lock, and a malformed one refuses", () => {
-  expect(readImageLock().digest).toMatch(/^sha256:[0-9a-f]{64}$/);
-  lock(key, "sha256:short");
-  expect(() => readImageLock(root)).toThrow(Refusal);
-});
+/** A session whose log lines (the fallback reason) the test reads. */
+const logged = () => {
+  const lines: string[] = [];
+  const s = new Session(new AbortController().signal, { root, log: (l) => lines.push(l) });
+  sessions.push(s);
+  return { s, lines };
+};
+const WORKFLOW = "coder/xum/.github/workflows/bugbash-sandbox-image.yml";
 
-test("a stale inputs key refuses before any docker command", async () => {
-  lock("0".repeat(64));
-  expect(await failure(session().ensureImage())).toThrow(/stale image/);
-  await Bun.sleep(0);
-  expect(calls()).toBe("");
-});
-
-test("a missing image is pulled by digest, with a private client config", async () => {
-  const s = session();
-  expect(await s.ensureImage()).toBe(REF);
+test("a verified image of the stable tag is pulled by digest, with a private client config", async () => {
+  const { s, lines: log } = logged();
+  expect(await s.ensureImage()).toEqual({ ref: REF, local: null });
+  // One log line, and it names the image that runs.
+  expect(log).toHaveLength(1);
+  expect(log[0]).toContain(REF);
   const lines = calls().trim().split("\n");
-  expect(lines.map((l) => l.split(" ")[0])).toEqual(["context", "info", "images", "pull", "image"]);
-  expect(lines[3]).toStartWith(`pull --quiet ${REF} `);
-  // After `context inspect`, docker gets no HOME and an empty config folder that cleanup removes.
+  const kinds = lines.map((l) => l.split(" ")[0]);
+  expect(kinds).toEqual(["context", "info", "buildx", "gh", "images", "pull", "image"]);
+  // The lookup is of this key's stable tag. gh accepts only main's publish workflow of coder/xum.
+  expect(lines[2]).toStartWith(
+    `buildx imagetools inspect --format {{json .Manifest.Digest}} ghcr.io/coder/xum-bugbash-sandbox:inputs-${key} `
+  );
+  expect(lines[3]).toStartWith(
+    `gh attestation verify oci://${REF} --repo coder/xum --bundle-from-oci --source-ref refs/heads/main --signer-workflow ${WORKFLOW} `
+  );
+  expect(lines[5]).toStartWith(`pull --quiet ${REF} `);
+  // After `context inspect`, docker (the lookup too) gets no HOME and an empty config folder
+  // that cleanup removes.
   const cfg = /cfg=(\S+)\]/.exec(lines[2])![1];
   expect(lines[2]).toContain("[home= ");
   expect(fs.readdirSync(cfg)).toEqual([]);
@@ -209,9 +248,9 @@ test("a missing image is pulled by digest, with a private client config", async 
   expect(fs.existsSync(cfg)).toBe(false);
 });
 
-test("a present image is not pulled", async () => {
+test("a present verified image is not pulled", async () => {
   fake({ IMAGES: "sha256:abc" });
-  expect(await session().ensureImage()).toBe(REF);
+  expect(await session().ensureImage()).toEqual({ ref: REF, local: null });
   expect(calls()).not.toContain("pull");
 });
 
@@ -249,13 +288,83 @@ test("U6: an arm64 daemon refuses before the pull, naming the fix", async () => 
   expect(error).toThrow(/linux\/amd64/);
   expect(error).toThrow(/aarch64/);
   expect(error).toThrow(/use an amd64 host/);
-  expect(calls()).not.toMatch(/^(images|pull)/m);
+  expect(calls()).not.toMatch(/^(images|pull|buildx)/m);
 });
 
 test("U6: an amd64 daemon pulls the image", async () => {
   fake();
-  expect(await session().ensureImage()).toBe(REF);
+  expect((await session().ensureImage()).ref).toBe(REF);
   expect(calls()).toContain("pull");
+});
+
+// The local build: without a verified image of main's publish workflow for this key, build.sh
+// builds one from this checkout. The reason goes to the log and to the caller (the warning).
+test.each([
+  ["a tag that is not published", { TAG: "missing" }, /:inputs-[0-9a-f]{64} is not published$/],
+  ["a failed tag lookup", { TAG: "down" }, /lookup of \S+ failed: .*no such host$/],
+  ["a lookup with no digest", { TAG: "garbage" }, /lookup of \S+ gave "sha256:6161/],
+  [
+    "an attestation that does not verify",
+    { GH_RC: "1", GH_ERR: "Error: verifying with issuer: no matching attestations" },
+    /@sha256:(61){32} is not verified \(gh exit 1\): Error: verifying .*no matching attestations$/,
+  ],
+  ["no gh login", { GH_RC: "4", GH_ERR: "try authenticating with:  gh auth login" }, /no gh token/],
+])(
+  "local build: %s builds through build.sh, with the private client config",
+  async (_name, over, why) => {
+    fake(over);
+    const { s, lines: log } = logged();
+    const image = await s.ensureImage();
+    expect(image.ref).toBe(LOCAL_ID);
+    expect(image.local).toMatch(why);
+    expect(log).toContain(`no verified image for inputs key ${key.slice(0, 16)}: ${image.local}`);
+    const lines = calls().trim().split("\n");
+    const build = lines.find((l) => l.startsWith("buildx build "))!;
+    expect(build).toContain(` --load --tag xum-bugbash-sandbox:inputs-${key} `);
+    const cfg = /cfg=(\S+)\]/.exec(lines[2])![1];
+    expect(build).toEndWith(`[home= cfg=${cfg}]`);
+    // gh runs only for a digest the lookup found.
+    expect(lines.some((l) => l.startsWith("gh "))).toBe("GH_RC" in over);
+    // The label check is of the built image. Nothing is pulled, pushed or logged in to.
+    expect(lines.at(-1)).toStartWith(`image inspect --format {{json .Config.Labels}} ${LOCAL_ID} `);
+    expect(calls()).not.toMatch(/^(pull|push|login)|--push/m);
+  }
+);
+
+test("local build: without gh on PATH, the image is built, not refused", async () => {
+  // A PATH of every system command but gh: the real gh must not answer for the fake.
+  const nogh = path.join(root, "nogh");
+  fs.mkdirSync(nogh);
+  const linked = new Set(["gh"]);
+  for (const dir of (savedPath ?? "").split(":"))
+    for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : [])
+      if (!linked.has(name)) {
+        linked.add(name);
+        fs.symlinkSync(path.join(dir, name), path.join(nogh, name));
+      }
+  fs.rmSync(path.join(bin, "gh"));
+  process.env.PATH = `${bin}:${nogh}`;
+  const image = await session().ensureImage();
+  expect(image).toEqual({ ref: LOCAL_ID, local: "gh is not installed" });
+  expect(calls()).toMatch(/^buildx build /m);
+});
+
+test("local build: a present local image of the key is reused, not built again", async () => {
+  fake({ TAG: "missing", LOCAL: LOCAL_ID });
+  expect((await session().ensureImage()).ref).toBe(LOCAL_ID);
+  expect(calls()).not.toMatch(/^(buildx build|pull)/m);
+});
+
+test.each([
+  [
+    "a label for other inputs",
+    { LABEL: "f".repeat(64) },
+    /label org.xum.bugbash.inputs is f+, not/,
+  ],
+  ["a failed build", { BUILD: "fail" }, /build\.sh: build failed/],
+])("local build: a local image with %s refuses", async (_name, over, message) => {
+  fake({ TAG: "missing", ...over });
+  expect(await failure(session().ensureImage())).toThrow(message);
 });
 
 const JOB = { name: "xbb-1", owner: "boot:pid", checkout: "abc" };
@@ -270,7 +379,7 @@ test("a stop ends a running pull; cleanup removes only the owned container, no i
   const stop = new AbortController();
   const s = session(stop);
   const pending = s.ensureImage();
-  while (!calls().includes("pull ")) await Bun.sleep(20);
+  while (!calls().includes("term ignored pull")) await Bun.sleep(20);
   s.own(JOB);
   const stoppedAt = Date.now();
   stop.abort("SIGTERM");
@@ -374,7 +483,7 @@ test("#5877 item 4: a stop during the endpoint lookup leaves no private client f
   const stop = new AbortController();
   const s = session(stop);
   const pending = s.ensureImage();
-  while (!calls().includes("context ")) await Bun.sleep(20);
+  while (!calls().includes("term ignored context")) await Bun.sleep(20);
   stop.abort("SIGINT");
   expect(await failure(pending)).toThrow(Stopped);
   expect(await s.cleanup()).toBe("none");
@@ -409,7 +518,7 @@ test("C1: a stop during the create never signals `docker run`; cleanup removes t
 
 test("C2: a client that ignores the lifeline is killed after the grace period", async () => {
   const { s, stop, job } = await jobSession({ RUN: "stuck" }, 300);
-  while (!calls().includes("created ")) await Bun.sleep(20);
+  while (!calls().includes("term ignored run")) await Bun.sleep(20);
   stop.abort("SIGTERM");
   const started = Date.now();
   await job;
@@ -610,6 +719,9 @@ function prepare(over: Record<string, string> = {}, leftovers: string[] = []) {
     fs.mkdirSync(path.join(real, dir), { recursive: true });
   fs.writeFileSync(path.join(bin, "containers"), [...FOREIGN, ...leftovers].join("\n") + "\n");
   fs.writeFileSync(path.join(real, "tests/bugbash/e2e.mcpapps.config.ts"), "export default {}");
+  fs.mkdirSync(path.join(real, "tests/stories"), { recursive: true });
+  fs.writeFileSync(path.join(real, "tests/stories/e2e.config.ts"), "export default {}");
+  fs.writeFileSync(path.join(real, "tests/stories/e2e.electron.config.ts"), "export default {}");
   fake({ IMAGES: "sha256:abc", SWAP: path.join(real, "node_modules"), ...over });
   return path.join(real, "tests/bugbash");
 }
@@ -653,8 +765,8 @@ test("an unknown container state after cleanup outranks the job's result (exit 3
 
 test.each([
   ["before the launch", {}, null],
-  ["during the endpoint lookup", { CONTEXT: "hang" }, "context "],
-  ["during the pull", { IMAGES: "", PULL: "hang" }, "pull "],
+  ["during the endpoint lookup", { CONTEXT: "hang" }, "term ignored context"],
+  ["during the pull", { IMAGES: "", PULL: "hang" }, "term ignored pull"],
   ["while the job runs", { RUN: "hang" }, "run "],
 ])(
   "a stop %s leaves nothing behind",
@@ -963,11 +1075,18 @@ test("C2: recover reports an unknown cleanup state (exit 3)", async () => {
 // The MCP Apps suite (plan PR B1): model-driven, through a proxy for the job.
 const MCP_ARGS = ["run", "--config", "e2e.mcpapps.config.ts", "--output", ".e2e/m"];
 const UPSTREAM_KEY = "sk-host-upstream-key-for-the-launch-test";
+/** A model-driven `e2e run` job: its args, and its cwd under the checkout. */
+interface DrivenRun {
+  args: string[];
+  folder: string;
+}
+const MCP_APPS: DrivenRun = { args: MCP_ARGS, folder: "tests/bugbash" };
 async function mcpLaunch(
   over: Record<string, string>,
   env: Record<string, string> = {},
   stop = new AbortController(),
-  upstreamMode?: string
+  upstreamMode?: string,
+  job = MCP_APPS
 ) {
   const upstream = await startFakeUpstream();
   upstream.setMode(upstreamMode);
@@ -984,9 +1103,9 @@ async function mcpLaunch(
       (line: string) => void logged.push(line)
     );
     try {
-      const cwd = prepare(over);
+      const cwd = path.join(prepare(over), "..", "..", job.folder);
       const options = { root: fs.realpathSync(root), cwd, env: host };
-      const code = await launch(MCP_ARGS, { ...options, stop: stop.signal }).catch(
+      const code = await launch(job.args, { ...options, stop: stop.signal }).catch(
         (e: unknown) => e
       );
       return {
@@ -1055,7 +1174,212 @@ test("B1: an MCP Apps job reaches the model only through its proxy, with the hos
     /proxy: 1 settled, 0 kept in full, 0 refused \{\}, \$0\.\d+ of \$1\.0000/
   );
   expect(logged.join("\n")).not.toContain(UPSTREAM_KEY);
+  // The job's spend beside its record: the settled cost of both calls, and no key or URL.
+  const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+  expect(fs.statSync(spendFile).mode & 0o777).toBe(0o600);
+  const spendText = fs.readFileSync(spendFile, "utf8");
+  const spend = JSON.parse(spendText) as Record<string, unknown>;
+  // Two settled calls: the probe and the job's call, as in the proxy record (Codex review of #7012).
+  expect(spend).toMatchObject({ capUsd: 1, settled: 2, kept: 0, refused: 0, released: 0 });
+  expect(spend.spentUsd).toBeGreaterThan(0);
+  expect(spend.spentUsd).toBeLessThan(1);
+  expect(spendText).not.toContain(UPSTREAM_KEY);
+  expect(spendText).not.toContain("127.0.0.1");
   expectNothingLeft(); // the job folder with the proxy socket is gone too
+});
+
+// The story suite and the agent repros (`make test-stories`): model-driven `e2e run` jobs.
+const STORIES: DrivenRun = {
+  args: [
+    "run",
+    "--config",
+    "e2e.config.ts",
+    "--exclude-tag",
+    "known-failure",
+    "--output",
+    ".e2e/m",
+  ],
+  folder: "tests/stories",
+};
+const ELECTRON_STORIES: DrivenRun = {
+  // prettier-ignore
+  args: ["run", "--config", "e2e.electron.config.ts", "--exclude-tag", "known-failure",
+    "--output", ".e2e/m"],
+  folder: "tests/stories",
+};
+/** The Electron binary that `make electron-binary` downloads. */
+function electronBinary() {
+  const binary = path.join(fs.realpathSync(root), "node_modules/electron/dist/electron");
+  fs.mkdirSync(path.dirname(binary), { recursive: true });
+  fs.writeFileSync(binary, "");
+}
+const AGENT_REPROS: DrivenRun = {
+  // prettier-ignore
+  args: ["run", "--config", "e2e.config.ts", "--tag", "agent", "--exclude-tag", "known-failure",
+    "--pass-with-no-tests", "--output", ".e2e/m"],
+  folder: "tests/bugbash",
+};
+
+test.each([
+  ["the story suite", STORIES],
+  ["the Electron stories", ELECTRON_STORIES],
+  ["the agent repros", AGENT_REPROS],
+])("%s is a model-driven job: probe, proxy and model, in its own folder", async (_name, job) => {
+  electronBinary();
+  const { code, requests } = await mcpLaunch({ RUN: "proxycall" }, {}, undefined, undefined, job);
+  expect(code).toBe(7);
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!;
+  expect(run).toContain("--env BUGBASH_MODEL=anthropic:claude-sonnet-5-5");
+  expect(run).toContain("--env BUGBASH_MODEL_DRIVEN=1");
+  expect(run).toContain("--env BUGBASH_AI_RESOLVED=mock");
+  expect(run).not.toContain(UPSTREAM_KEY);
+  // Its cwd, its output tmpfs and the export: the job's folder. entry.ts stays in tests/bugbash.
+  expect(run).toContain(`--tmpfs /repo/${job.folder}/.e2e:rw,`);
+  expect(run).toContain(`--workdir /repo/${job.folder} --entrypoint bun`);
+  // Only the Electron job gets Xvfb (entry.ts).
+  if (job === ELECTRON_STORIES) expect(run).toContain("--env BUGBASH_ELECTRON=1");
+  else expect(run).not.toContain("BUGBASH_ELECTRON");
+  const entry = job === AGENT_REPROS ? "sandbox/entry.ts" : "../bugbash/sandbox/entry.ts";
+  expect(run).toMatch(new RegExp(` ${entry.replace(/\./g, "\\.")} --export \\.e2e/m -- node `));
+  expect(fs.readFileSync(path.join(root, job.folder, ".e2e/m/app.log"), "utf8")).toBe("ok");
+  expect(requests).toHaveLength(2); // the probe, then the job's call
+  expectNothingLeft();
+});
+
+const JUDGE = { BUGBASH_JUDGE_MODEL: "anthropic:claude-opus-5-5" };
+test("a story job gets BUGBASH_JUDGE_MODEL, and its proxy lets the judge through", async () => {
+  const { code, requests } = await mcpLaunch(
+    { RUN: "proxycall", CALLMODEL: "claude-opus-5-5" },
+    JUDGE,
+    undefined,
+    undefined,
+    STORIES
+  );
+  expect(code).toBe(7);
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!;
+  expect(run).toContain("--env BUGBASH_JUDGE_MODEL=anthropic:claude-opus-5-5");
+  // A probe of each model, then the judge's call.
+  expect(requests.map((r) => (JSON.parse(r.body) as { model: string }).model)).toEqual([
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
+    "claude-opus-5-5",
+  ]);
+  expectNothingLeft();
+});
+
+test("a story job refuses a judge its key cannot use before the container starts", async () => {
+  const { code } = await mcpLaunch({ RUN: "proxycall" }, JUDGE, undefined, "403opus", STORIES);
+  expect(code).toBeInstanceOf(Refusal);
+  expect((code as Error).message).toContain("claude-opus-5-5 (BUGBASH_JUDGE_MODEL)");
+  expect(calls()).not.toContain("created ");
+});
+
+test("the agent repros read no judge: no judge env, and the proxy refuses its model", async () => {
+  const { code, requests } = await mcpLaunch(
+    { RUN: "proxycall", CALLMODEL: "claude-opus-5-5" },
+    JUDGE,
+    undefined,
+    undefined,
+    AGENT_REPROS
+  );
+  expect(code).toBe(7);
+  expect(calls()).not.toContain("BUGBASH_JUDGE_MODEL");
+  expect(calls()).toContain("model: not allowed");
+  expect(requests).toHaveLength(1); // the probe only
+});
+
+test("a judge spec that a story job would refuse does not stop a non-story job", async () => {
+  const { code } = await mcpLaunch(
+    { RUN: "proxycall" },
+    { BUGBASH_JUDGE_MODEL: "openai:gpt-6.1-sol" },
+    undefined,
+    undefined,
+    AGENT_REPROS
+  );
+  expect(code).toBe(7);
+});
+
+test.each([
+  ["an OpenAI judge", "openai:gpt-6.1-sol", /BUGBASH_JUDGE_MODEL .*only anthropic/],
+  ["a judge the proxy cannot price", "anthropic:claude-x-9", /BUGBASH_JUDGE_MODEL .*no price/],
+])("a story job refuses %s before any docker command", async (_name, spec, message) => {
+  const { code } = await mcpLaunch(
+    {},
+    { BUGBASH_JUDGE_MODEL: spec },
+    undefined,
+    undefined,
+    STORIES
+  );
+  expect(code).toBeInstanceOf(Refusal);
+  expect((code as Error).message).toMatch(message);
+  expect(calls()).toBe("");
+});
+
+test.each([
+  ["the story suite without a budget", STORIES, { BUGBASH_BUDGET_USD: "" }, /BUGBASH_BUDGET_USD/],
+  ["the agent repros without a budget", AGENT_REPROS, { BUGBASH_BUDGET_USD: "" }, /BUDGET/],
+  ["the story suite with the real app AI", STORIES, { BUGBASH_AI: "real" }, /only the mock/],
+  [
+    "the Electron stories without the Electron binary",
+    ELECTRON_STORIES,
+    {},
+    /node_modules\/electron\/dist\/electron is missing: run make electron-binary/,
+  ],
+  [
+    "the story config from tests/bugbash",
+    {
+      args: ["run", "--config", "../stories/e2e.config.ts", "--output", ".e2e/m"],
+      folder: "tests/bugbash",
+    },
+    {},
+    /--config must be given once/,
+  ],
+  ["the story args from the checkout root", { ...STORIES, folder: "." }, {}, /the cwd must be/],
+  [
+    "the MCP Apps config from tests/stories",
+    { args: MCP_ARGS, folder: "tests/stories" },
+    {},
+    /--config must be given once/,
+  ],
+  [
+    "a story file as an extra positional",
+    { ...STORIES, args: [...STORIES.args, "smoke.e2e.ts"] },
+    {},
+    /the argument "smoke\.e2e\.ts"/,
+  ],
+  [
+    "the agent repros with a second --tag",
+    { ...AGENT_REPROS, args: [...AGENT_REPROS.args, "--tag", "mock-only"] },
+    {},
+    /`--tag agent` alone/,
+  ],
+  [
+    "the agent repros with --tag-mode",
+    { ...AGENT_REPROS, args: [...AGENT_REPROS.args, "--tag-mode", "any"] },
+    {},
+    /`--tag agent` alone/,
+  ],
+  [
+    "the agent tag in a comma list",
+    {
+      ...AGENT_REPROS,
+      args: ["run", "--config", "e2e.config.ts", "--tag=agent,x", "--output", ".e2e/m"],
+    },
+    {},
+    /`--tag agent` alone/,
+  ],
+] as const)("%s refuses before any docker command", async (_name, job, env, message) => {
+  const { code } = await mcpLaunch({}, env, undefined, undefined, {
+    args: [...job.args],
+    folder: job.folder,
+  });
+  expect(code).toBeInstanceOf(Refusal);
+  expect((code as Error).message).toMatch(message);
+  expect(calls()).toBe("");
 });
 
 test("U2: an MCP Apps job whose upstream cannot be reached refuses before the container", async () => {
@@ -1092,13 +1416,42 @@ test("U2: a bound miss in the MCP Apps probe is a proxy fault (exit 5), before t
     };
   });
   try {
-    const { code, logged } = await mcpLaunch({ RUN: "proxycall" });
+    const { code, logged, records } = await mcpLaunch({ RUN: "proxycall" });
     expect(code).toBe(5);
     expect(logged.join("\n")).toContain("cost more than their reserved bound: the job stops");
     expect(calls()).not.toMatch(/^run /m);
+    // The probe's call is still in the proxy record and the spend file, though its proxy's
+    // close() rejected (Codex review of #7051).
+    const outcomes = fs
+      .readFileSync(records, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => (JSON.parse(line) as { outcome: string }).outcome);
+    expect(outcomes).toEqual(["settled"]);
+    const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+    const spend = JSON.parse(fs.readFileSync(spendFile, "utf8")) as Record<string, unknown>;
+    expect(spend).toMatchObject({ settled: 1, kept: 0, refused: 0, released: 0 });
   } finally {
     start.mockRestore();
   }
+  expectNothingLeft();
+});
+
+test("#7023: a probe that the budget refuses names its refusal in the spend file", async () => {
+  // Positive, but too small to reserve even the probe call: the probe's proxy answers 402.
+  const { code, records } = await mcpLaunch({ RUN: "proxycall" }, { BUGBASH_BUDGET_USD: "0.0001" });
+  expect(code).toBeInstanceOf(Refusal);
+  expect(calls()).not.toMatch(/^run /m);
+  const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+  const spend = JSON.parse(fs.readFileSync(spendFile, "utf8")) as Record<string, unknown>;
+  expect(spend).toMatchObject({
+    spentUsd: 0,
+    settled: 0,
+    kept: 0,
+    refused: 1,
+    released: 0,
+    refusedBy: { "budget: call does not fit the remaining budget": 1 },
+  });
   expectNothingLeft();
 });
 
@@ -1133,6 +1486,14 @@ test.each(["401", "401html"])(
     expect(message).not.toMatch(/\/v1|sk-host/);
     expect(calls()).not.toMatch(/^run /m);
     expect(fs.existsSync(records)).toBe(true); // the probe's record stays
+    // The probe charged the job's own ledger, so its spend file is written too, with no job
+    // proxy (#7023).
+    const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+    expect(fs.statSync(spendFile).mode & 0o777).toBe(0o600);
+    const spend = JSON.parse(fs.readFileSync(spendFile, "utf8")) as Record<string, unknown>;
+    // The probe's one call, kept in full: the 401 answer carries no usage to settle it with.
+    expect(spend).toMatchObject({ capUsd: 1, settled: 0, kept: 1, refused: 0, released: 0 });
+    expect(spend.spentUsd).toBeGreaterThan(0);
     expectNothingLeft();
   }
 );
@@ -1232,6 +1593,7 @@ test("B2: an explore job spends from the run's ledger and writes its output to t
     expect(upstream.requests).toHaveLength(1);
     expect(lines.join("\n")).toContain("(the run's budget)");
     expect(lines.join("\n")).not.toContain("at list price"); // run.ts reports the run totals once
+    expect(fs.existsSync(path.join(cwd, ".e2e/x.spend.json"))).toBe(false); // nor a spend file
     expect(fs.readFileSync(logFile, "utf8")).toContain("job says hi");
     expectNothingLeft();
   } finally {
@@ -1239,7 +1601,11 @@ test("B2: an explore job spends from the run's ledger and writes its output to t
   }
 });
 
-async function selfCheckLaunch(over: Record<string, string>, args: string[]) {
+async function selfCheckLaunch(
+  over: Record<string, string>,
+  args: string[],
+  extra: Record<string, string> = {}
+) {
   const upstream = await startFakeUpstream();
   try {
     const cwd = prepare(over);
@@ -1249,6 +1615,7 @@ async function selfCheckLaunch(over: Record<string, string>, args: string[]) {
       ANTHROPIC_API_KEY: UPSTREAM_KEY,
       ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
       BUGBASH_MODEL: "anthropic:claude-haiku-5-5",
+      ...extra,
     };
     const o = { root: fs.realpathSync(root), cwd, env, stop: new AbortController().signal };
     const outcome = await launchJob(args, { ...o, log: () => undefined }).catch((e: unknown) => e);
@@ -1669,7 +2036,7 @@ test("U1: the Docker preflight reports an unknown cleanup instead of a refusal o
     expect(await checkDocker(o)).toBe("unknown: process groups 9 still run");
     cleanup.mockResolvedValue("none");
     expect(await checkDocker(o).catch((e: unknown) => e)).toBeInstanceOf(Refusal);
-    ensure.mockResolvedValue("ref");
+    ensure.mockResolvedValue({ ref: "ref", local: null });
     expect(await checkDocker(o)).toBe("none");
     // A stop that lands during the cleanup still ends the preflight as a stop.
     const stop = new AbortController();
@@ -1682,6 +2049,128 @@ test("U1: the Docker preflight reports an unknown cleanup instead of a refusal o
   } finally {
     ensure.mockRestore();
     cleanup.mockRestore();
+    error.mockRestore();
+  }
+});
+
+// Every job kind resolves its image the same way: main's verified image, else a local build of
+// its checkout with a warning. Only the image differs, never a container flag.
+const SELF_CHECK_ARGS = ["self-check", "--output", ".e2e/s"];
+const KINDS = {
+  "an exact-step repro": "repro",
+  "a self-check": "self-check",
+  "an explore charter": "explore",
+  "the MCP Apps suite": MCP_APPS,
+  "the story suite": STORIES,
+  "the agent repros": AGENT_REPROS,
+} as const;
+type Kind = (typeof KINDS)[keyof typeof KINDS];
+/** One job's `docker run` line and stderr, without its per-job values (name, folders, nonce). */
+async function jobRun(kind: Kind, env: Record<string, string>, over: Record<string, string> = {}) {
+  for (const dir of ["tests/bugbash/.e2e", "tests/stories/.e2e"])
+    fs.rmSync(path.join(root, dir), { recursive: true, force: true });
+  fs.rmSync(path.join(bin, "calls.log"), { force: true });
+  let stderr: string[] = [];
+  const error = spyOn(console, "error").mockImplementation(
+    (line: string) => void stderr.push(line)
+  );
+  try {
+    if (typeof kind !== "string") {
+      error.mockRestore(); // mcpLaunch reads stderr itself
+      const driven = await mcpLaunch(over, env, undefined, undefined, kind);
+      expect(driven.code).toBe(7);
+      stderr = driven.logged;
+    } else {
+      const outcome =
+        kind === "repro"
+          ? await launchJob(ARGS, {
+              root: fs.realpathSync(root),
+              cwd: prepare(over),
+              env: { ...HOST_ENV, ...env },
+              stop: new AbortController().signal,
+              log: () => undefined,
+            })
+          : kind === "self-check"
+            ? (await selfCheckLaunch(over, SELF_CHECK_ARGS, env)).outcome
+            : (await exploreLaunch(over, env)).outcome;
+      expect(outcome).toMatchObject({ code: 7, cleanup: "removed" });
+    }
+  } finally {
+    error.mockRestore();
+  }
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!
+    .replace(/xbb-[0-9a-f]{6}-[0-9a-f]{6}/g, "JOB")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "NONCE")
+    .replace(/xum-bugbash-docker-\w+/g, "CFG");
+  return { run, stderr, built: /^buildx build /m.test(calls()) };
+}
+
+test.each(Object.entries(KINDS))(
+  "local build: without a verified image, %s gets a local image with the same container flags",
+  async (_name, kind) => {
+    const verified = await jobRun(kind, { GITHUB_ACTIONS: "true" });
+    expect(verified.built).toBe(false);
+    expect(verified.run).toContain(` ${REF} `);
+    expect(verified.stderr.filter((l) => l.startsWith("::warning::"))).toEqual([]);
+    const local = await jobRun(kind, { GITHUB_ACTIONS: "true" }, { TAG: "missing" });
+    expect(local.built).toBe(true);
+    // Only the image differs: every hardening flag stays.
+    expect(local.run).toContain(` ${LOCAL_ID} `);
+    expect(local.run.replace(LOCAL_ID, REF)).toBe(verified.run);
+    // One annotation in CI's log, with the reason.
+    const warnings = local.stderr.filter((l) => l.startsWith("::warning::"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/LOCAL IMAGE sha256:b1b1.*:inputs-[0-9a-f]{64} is not published/);
+  }
+);
+
+test("the gh login env reaches gh on the host, and never docker or the job container", async () => {
+  // A token, a custom config folder, and the keyring's session bus.
+  const gh = {
+    GH_TOKEN: "ghs_hosttoken",
+    GH_CONFIG_DIR: "/home/u/.gh-custom",
+    XDG_CONFIG_HOME: "/home/u/.cfg",
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+    XDG_RUNTIME_DIR: "/run/user/1000",
+  };
+  const saved = Object.fromEntries(Object.keys(gh).map((name) => [name, process.env[name]]));
+  Object.assign(process.env, gh);
+  try {
+    // The launcher's env is the host env (launch.ts's main passes process.env).
+    const { run } = await jobRun("repro", gh);
+    expect(run).toContain(` ${REF} `);
+    expect(calls()).toContain(
+      "[token=ghs_hosttoken config=/home/u/.gh-custom xdg=/home/u/.cfg " +
+        "bus=unix:path=/run/user/1000/bus run=/run/user/1000]"
+    );
+    expect(calls()).not.toMatch(/docker got/);
+    for (const [name, value] of Object.entries(gh)) {
+      expect(run).not.toContain(name);
+      expect(run).not.toContain(value);
+    }
+  } finally {
+    for (const [name, value] of Object.entries(saved))
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+  }
+});
+
+test("local build: the Docker preflight builds the local image instead of refusing", async () => {
+  const stop = new AbortController().signal;
+  const o = { root: fs.realpathSync(root), stop };
+  // run.ts's preflight (make bug-bash), then launch.ts --preflight (make mcp-apps-e2e).
+  const error = spyOn(console, "error").mockImplementation(() => undefined);
+  try {
+    fake({ TAG: "missing" });
+    expect(await checkDocker(o)).toBe("none");
+    expect(calls()).toMatch(/^buildx build /m);
+    const cwd = prepare({ TAG: "missing" });
+    fs.rmSync(path.join(bin, "calls.log"), { force: true });
+    expect(await preflight(ARGS, { ...o, cwd, env: HOST_ENV })).toBe("none");
+    expect(calls()).toMatch(/^buildx build /m);
+  } finally {
     error.mockRestore();
   }
 });

@@ -60,7 +60,7 @@ export const ReviewPaneUpdateToolCall: React.FC<ReviewPaneUpdateToolCallProps> =
         <span className="text-muted-foreground flex min-w-0 flex-1 items-center gap-1 italic">
           <span className="truncate">{summary}</span>
           {rejectedCount > 0 && (
-            <span className="text-warning-light shrink-0">· {rejectedCount} rejected</span>
+            <span className="text-warning-light-text shrink-0">· {rejectedCount} rejected</span>
           )}
         </span>
         {errorMessage && <span className="text-error-foreground">({errorMessage})</span>}
@@ -99,7 +99,7 @@ export const ReviewPaneUpdateToolCall: React.FC<ReviewPaneUpdateToolCallProps> =
           {successResult && successResult.rejected.length > 0 && (
             <div className="border-border-light mt-1 border-t px-2 py-1.5">
               <div className="text-muted text-[10px] tracking-wide uppercase">Rejected</div>
-              <ul className="font-monospace text-warning-light mt-1 flex flex-col gap-0.5 text-[11px]">
+              <ul className="font-monospace text-warning-light-text mt-1 flex flex-col gap-0.5 text-[11px]">
                 {successResult.rejected.map((entry, i) => (
                   <li key={`${entry}-${i}`} className="break-all">
                     {entry}

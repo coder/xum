@@ -1,6 +1,7 @@
-import type { RuntimeConfig } from "@/common/types/runtime";
+import type { RuntimeConfig, RuntimeMode } from "@/common/types/runtime";
 import type { RuntimeStatusEvent as StreamRuntimeStatusEvent } from "@/common/types/stream";
 import type { Result } from "@/common/types/result";
+import type { HolderEvidence } from "@/node/utils/concurrency/processLiveness";
 
 /**
  * Runtime abstraction for executing tools in different environments.
@@ -56,6 +57,14 @@ export interface ExecOptions {
   /** Host-namespace paths to translate before exposing them as environment variables. */
   pathEnv?: Record<string, string>;
   /**
+   * Base environment taken from the Xum host process before `env` is applied.
+   * "inherit" (default) passes all of process.env; "minimal" passes only
+   * pickMinimalChildEnv's allowlist (#6509: managed plugin stdio MCP servers
+   * must not inherit the user's shell secrets). Only host-local runtimes read the
+   * host environment, so remote runtimes ignore this field.
+   */
+  hostEnv?: "inherit" | "minimal";
+  /**
    * Timeout in seconds.
    *
    * When provided, prevents zombie processes by ensuring spawned processes are killed.
@@ -85,6 +94,8 @@ export type BackgroundMonitorProbeResult<T> =
 export interface BackgroundHandle {
   /** Output directory containing output.log, meta.json, exit_code */
   readonly outputDir: string;
+  /** Host-local process evidence retained after exit. */
+  readonly localProcess?: HolderEvidence;
 
   /**
    * Get the exit code if the process has exited.
@@ -157,6 +168,8 @@ export interface BackgroundOutputRead {
  * Streaming result from executing a command
  */
 export interface ExecStream {
+  /** Host-local child identity for later migration and liveness checks. */
+  localProcess?: HolderEvidence;
   /** Standard output stream */
   stdout: ReadableStream<Uint8Array>;
   /** Standard error stream */
@@ -253,8 +266,8 @@ export interface WorkspaceCreationParams {
   /** Whether the project is trusted — when false, git hooks are disabled */
   trusted?: boolean;
   /**
-   * Return once the checkout is reserved and leave populating its files to
-   * materializeWorkspace(), so that work streams to a workspace that is already announced.
+   * Return once the checkout is reserved and leave populating its files (and any origin fetch)
+   * to materializeWorkspace(), so that work streams to a workspace that is already announced.
    * Runtimes whose creation never populates files ignore this.
    */
   deferMaterialization?: boolean;
@@ -264,6 +277,23 @@ export interface WorkspaceCreationParams {
 export interface PendingMaterialization {
   /** The branch already existed and should fast-forward to origin/<trunkBranch> once checked out. */
   fastForwardFromOrigin: boolean;
+  /**
+   * Set when the reservation skipped the origin fetch so the workspace could be announced
+   * without waiting on the network: materializeWorkspace() fetches origin/<trunkBranch> before
+   * the checkout and then updates the branch.
+   */
+  deferredOriginSync?: {
+    /** The branch existed before this creation; it fast-forwards after the checkout. */
+    existingBranch: boolean;
+    /**
+     * Tip of the branch this creation made from the trunk. The branch moves to the fetched
+     * origin/<trunkBranch> only while it still points here. Absent when nothing may move it
+     * (an existing branch, or an explicit start point).
+     */
+    createdBranchTip?: string;
+    /** The created branch started from origin/<trunkBranch>, so its upstream is already set. */
+    createdFromOrigin: boolean;
+  };
 }
 
 /** Init params for materializeWorkspace(), plus how far a cancellation may reach. */
@@ -437,6 +467,19 @@ export type EnsureReadyResult =
  */
 export const WORKSPACE_REPO_MISSING_ERROR = "Workspace setup incomplete: repository not found.";
 
+/** See Runtime.location. */
+export type RuntimeLocation = "local" | "devcontainer" | "remote";
+
+/** Same answer as `runtime instanceof LocalBaseRuntime` (local, worktree, devcontainer). */
+export function isLocalBaseRuntime(runtime: Runtime | undefined): boolean {
+  return runtime?.location === "local" || runtime?.location === "devcontainer";
+}
+
+/** Same answer as `runtime instanceof RemoteRuntime` (SSH, Coder SSH, Docker). */
+export function isRemoteRuntime(runtime: Runtime | undefined): boolean {
+  return runtime?.location === "remote";
+}
+
 /**
  * Runtime interface - minimal, low-level abstraction for tool execution environments.
  *
@@ -449,6 +492,27 @@ export interface Runtime {
    * If not provided, defaults to standard behavior (no flags set).
    */
   readonly createFlags?: RuntimeCreateFlags;
+  /**
+   * The runtime family, for code that branches on it without importing a runtime class
+   * (agent-loop files may not: local/no-host-imports). LocalBaseRuntime gives "local",
+   * DevcontainerRuntime (a LocalBaseRuntime) gives "devcontainer", and RemoteRuntime gives
+   * "remote", as prototype getters that subclasses and Object.create doubles inherit.
+   * MultiProjectRuntime and object doubles leave it absent, as instanceof is false for them.
+   */
+  readonly location?: RuntimeLocation;
+  /**
+   * The runtime type of a workspace config (`ssh`, `docker`, `devcontainer`), for text that names
+   * the runtime to a user or a model. SSHRuntime (and CoderSSHRuntime), DockerRuntime and
+   * DevcontainerRuntime give it as prototype getters, like `location`. Other runtimes and
+   * doubles leave it absent: fall back to `location`.
+   */
+  readonly mode?: RuntimeMode;
+  /**
+   * The runtimes this one delegates to (MultiProjectRuntime: one per project), for code that
+   * must look through a wrapper without importing its class. Such a wrapper leaves `location`
+   * and `mode` absent: its answer is its projects' answers.
+   */
+  readonly wrappedRuntimes?: readonly Runtime[];
   /**
    * Execute a bash command with streaming I/O.
    * cwd and pathEnv values are host-namespace paths translated by the adapter.
@@ -672,6 +736,19 @@ export interface Runtime {
     | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
     | { success: false; error: string }
   >;
+
+  /**
+   * Rename only the git branch of a workspace; its directory and name stay. Implemented by
+   * WorktreeRuntime, for a workspace created before its generated name existed. The workspace's
+   * branch record moves with the branch, so deletion removes the renamed branch.
+   */
+  renameWorkspaceBranch?(
+    projectPath: string,
+    workspaceName: string,
+    oldBranchName: string,
+    newBranchName: string,
+    trusted?: boolean
+  ): Promise<{ success: true } | { success: false; error: string }>;
 
   /**
    * Delete workspace directory

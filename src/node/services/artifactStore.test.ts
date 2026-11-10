@@ -294,14 +294,22 @@ describe("artifactStore", () => {
       await write("real.md", "inside");
       await fs.symlink(path.join(artifactsDir, "real.md"), path.join(artifactsDir, "alias.md"));
       const result = await readArtifactFromDir(artifactsDir, "alias.md", 1024);
-      expect(result).toEqual({ success: false, error: "Artifact not found: alias.md" });
+      expect(result).toEqual({
+        success: false,
+        error: "Artifact not found: alias.md",
+        missing: true,
+      });
     });
 
     test("refuses files reached through a symlinked folder that leaves the artifacts dir", async () => {
       await fs.writeFile(path.join(tempDir, "secret.txt"), "secret");
       await fs.symlink(tempDir, path.join(artifactsDir, "escape"));
       const result = await readArtifactFromDir(artifactsDir, "escape/secret.txt", 1024);
-      expect(result).toEqual({ success: false, error: "Artifact not found: escape/secret.txt" });
+      expect(result).toEqual({
+        success: false,
+        error: "Artifact not found: escape/secret.txt",
+        missing: true,
+      });
     });
 
     test("refuses traversal and missing files", async () => {
@@ -313,6 +321,7 @@ describe("artifactStore", () => {
       expect(await readArtifactFromDir(artifactsDir, "missing.md", 1024)).toEqual({
         success: false,
         error: "Artifact not found: missing.md",
+        missing: true,
       });
     });
 
@@ -320,7 +329,11 @@ describe("artifactStore", () => {
       // Opening a FIFO with no writer blocks; the read must refuse it before open().
       execFileSync("mkfifo", [path.join(artifactsDir, "pipe.txt")]);
       const result = await readArtifactFromDir(artifactsDir, "pipe.txt", 1024);
-      expect(result).toEqual({ success: false, error: "Artifact not found: pipe.txt" });
+      expect(result).toEqual({
+        success: false,
+        error: "Artifact not found: pipe.txt",
+        missing: true,
+      });
     });
 
     test("reads files larger than one read chunk completely", async () => {
@@ -342,6 +355,7 @@ describe("artifactStore", () => {
       expect(await readArtifactFromDir(linkedDir, "notes.md", 1024)).toEqual({
         success: false,
         error: "Artifact not found: notes.md",
+        missing: true,
       });
     });
 
@@ -361,7 +375,11 @@ describe("artifactStore", () => {
       try {
         const result = await readArtifactFromDir(artifactsDir, "reports/summary.md", 1024);
         expect(openSpy).toHaveBeenCalledTimes(1);
-        expect(result).toEqual({ success: false, error: "Artifact not found: reports/summary.md" });
+        expect(result).toEqual({
+          success: false,
+          error: "Artifact not found: reports/summary.md",
+          missing: true,
+        });
       } finally {
         openSpy.mockRestore();
       }
@@ -386,6 +404,7 @@ describe("artifactStore", () => {
         expect(await readArtifactFromDir(artifactsDir, "secret.md", 1024)).toEqual({
           success: false,
           error: "Artifact not found: secret.md",
+          missing: true,
         });
         expect(realpathSpy).toHaveBeenCalled();
       } finally {
@@ -501,6 +520,7 @@ describe("artifactStore", () => {
         expect(await readArtifactFromDir(artifactsDir, "reports/summary.md", 1024)).toEqual({
           success: false,
           error: "Artifact not found: reports/summary.md",
+          missing: true,
         });
         // Without a swap the fallback still reads normally.
         await write("plain.md", "ok");
@@ -555,7 +575,11 @@ describe("artifactStore", () => {
           await readArtifactFromDir(artifactsDir, "reports/summary.md", 1024, {
             requireDescriptorPaths: true,
           })
-        ).toEqual({ success: false, error: "Artifact not found: reports/summary.md" });
+        ).toEqual({
+          success: false,
+          error: "Artifact not found: reports/summary.md",
+          missing: true,
+        });
         expect(openSpy).toHaveBeenCalled();
       } finally {
         openSpy.mockRestore();
@@ -569,6 +593,7 @@ describe("artifactStore", () => {
       expect(await readArtifactFromDir(artifactsDir, "folder", 1024)).toEqual({
         success: false,
         error: "Artifact not found: folder",
+        missing: true,
       });
     });
   });

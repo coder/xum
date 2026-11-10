@@ -8,9 +8,8 @@ import {
   withSharedWorkspace,
 } from "../../ipc/sendMessageTestHelpers";
 
-import { installDom } from "../dom";
 import { renderReviewPanel } from "../renderReviewPanel";
-import { cleanupView, setupWorkspaceView } from "../helpers";
+import { cleanupView, setupTestDom, setupWorkspaceView } from "../helpers";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -25,7 +24,9 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
 
   test("Cmd/Ctrl+2 focuses the review panel so j/k navigation works without clicking", async () => {
     await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
-      const cleanupDom = installDom();
+      // The tutorial bubbles take focus when they open (#7120). This test checks where focus lands,
+      // so it turns them off. CI timed out here twice with focus outside the panel (#7645).
+      const cleanupDom = setupTestDom();
 
       const view = renderReviewPanel({
         apiClient: env.orpc,
@@ -38,6 +39,18 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
         // The strip holds only opened tabs: open Stats, then Review (tabs 1 and 2).
         await view.selectTab("costs");
         await view.selectTab("review");
+
+        // While the workspace is still in setup, the Review tab shows a placeholder without the
+        // panel, and Ctrl+2 then has nothing to focus (#7436). Wait for the real panel, which
+        // mounts when setup ends: setupWorkspaceView does not wait for setup.
+        await waitFor(
+          () => {
+            if (!view.container.querySelector('[data-testid="review-panel"]')) {
+              throw new Error("Review panel not mounted (workspace setup not finished)");
+            }
+          },
+          { timeout: 30_000 }
+        );
 
         // Ensure focus starts outside the review panel.
         await view.selectTab("costs");

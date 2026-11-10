@@ -147,16 +147,17 @@ jobs:
 
       - uses: ./.github/actions/setup-xum
 
-      - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # Harbor and the Python helpers below run from pyproject.toml's groups, as uv.lock pins them
+      # (pr.yml's static-check job explains the uv version).
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.17"
+          enable-cache: false
 
       - name: Install Python 3.12 (Harbor requires >=3.12)
         run: |
           uv python install 3.12
           uv --version
-          uvx --version
 
       - name: Generate version file
         run: ./scripts/generate-version.sh
@@ -166,7 +167,7 @@ jobs:
 
       # Best-effort snapshot of existing Daytona sandboxes so post-run cleanup
       # only deletes sandboxes created by *this* job, not ones from parallel jobs.
-      # continue-on-error: transient API/pip failures must not block the benchmark.
+      # continue-on-error: transient API/install failures must not block the benchmark.
       - name: Snapshot Daytona sandboxes
         if: inputs.env == 'daytona'
         continue-on-error: true
@@ -176,9 +177,8 @@ jobs:
           if [ -z "$DAYTONA_API_KEY" ]; then
             exit 0
           fi
-          pip install --quiet 'daytona>=0.180.0,<2'
-          python3 -c 'import importlib.metadata as m; print("daytona", m.version("daytona"))'
-          python3 scripts/daytona_sandbox_cleanup.py snapshot > /tmp/daytona-pre-existing.txt
+          uv run --locked --quiet --only-group harbor python -c 'import importlib.metadata as m; print("daytona", m.version("daytona"))'
+          uv run --locked --quiet --only-group harbor python scripts/daytona_sandbox_cleanup.py snapshot > /tmp/daytona-pre-existing.txt
           echo "Snapshot $(wc -l < /tmp/daytona-pre-existing.txt) pre-existing sandbox(es)"
 
       - name: Run Terminal-Bench
@@ -225,9 +225,8 @@ jobs:
             echo "No pre-run snapshot found, skipping cleanup to avoid deleting unrelated sandboxes"
             exit 0
           fi
-          pip install --quiet 'daytona>=0.180.0,<2'
-          python3 -c 'import importlib.metadata as m; print("daytona", m.version("daytona"))'
-          python3 scripts/daytona_sandbox_cleanup.py cleanup --pre-existing-file /tmp/daytona-pre-existing.txt
+          uv run --locked --quiet --only-group harbor python -c 'import importlib.metadata as m; print("daytona", m.version("daytona"))'
+          uv run --locked --quiet --only-group harbor python scripts/daytona_sandbox_cleanup.py cleanup --pre-existing-file /tmp/daytona-pre-existing.txt
 
       - name: Print results summary
         if: always()
@@ -275,8 +274,7 @@ jobs:
           fi
           echo "$GCP_SA_KEY" > /tmp/gcp-sa.json
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-sa.json
-          pip install --quiet google-cloud-bigquery
-          python scripts/upload-tbench-results.py
+          uv run --locked --quiet --only-group bigquery python scripts/upload-tbench-results.py
           rm -f /tmp/gcp-sa.json
 
       - name: Upload Harbor results to BigQuery
@@ -294,6 +292,5 @@ jobs:
           fi
           echo "$GCP_SA_KEY" > /tmp/gcp-sa.json
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp-sa.json
-          pip install --quiet google-cloud-bigquery
-          python scripts/upload-harbor-results.py
+          uv run --locked --quiet --only-group bigquery python scripts/upload-harbor-results.py
           rm -f /tmp/gcp-sa.json

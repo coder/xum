@@ -1,0 +1,5 @@
+# Config of `make test-host-proof` only. The host trap must load before tests/setup.ts:
+# a CLI --preload runs after the preloads of bunfig.toml, so this file replaces it.
+[test]
+root = "src"
+preload = ["./tests/hostTrap.preload.ts", "./tests/setup.ts"]

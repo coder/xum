@@ -6,7 +6,9 @@ import { FALLBACK_AGENTS } from "@/browser/features/Settings/Sections/TasksSecti
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { createDesktopTools } from "@/node/services/tools/desktopTools";
 import { createTestToolConfig, TestTempDir } from "@/node/services/tools/testHelpers";
+import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
+import { resolveToolPolicyForAgent } from "./resolveToolPolicy";
 
 describe("built-in agent definitions", () => {
   test("Settings fallback inventory mirrors built-ins, including hidden agents", () => {
@@ -20,6 +22,20 @@ describe("built-in agent definitions", () => {
     expect(fallbackIds).toEqual(builtInIds);
   });
 
+  test("Settings fallback inventory mirrors built-in AI defaults", () => {
+    // Without a workspace, Settings > Agents labels Inherit from the fallback's
+    // aiDefaults, so a missing frontmatter value there shows the wrong inherited
+    // value (for example the global 1h prompt cache TTL for Explore).
+    const builtInAiDefaults = Object.fromEntries(
+      getBuiltInAgentDefinitions().map((pkg) => [pkg.id, pkg.frontmatter.ai])
+    );
+    const fallbackAiDefaults = Object.fromEntries(
+      FALLBACK_AGENTS.map((agent) => [agent.id, agent.aiDefaults])
+    );
+
+    expect(fallbackAiDefaults).toEqual(builtInAiDefaults);
+  });
+
   test("does not include a built-in auto agent", () => {
     const pkgs = getBuiltInAgentDefinitions();
     const ids = pkgs.map((pkg) => pkg.id);
@@ -27,14 +43,6 @@ describe("built-in agent definitions", () => {
     expect(ids).not.toContain("auto");
     expect(ids).toContain("exec");
     expect(ids).toContain("plan");
-  });
-
-  test("intuition cannot run as an interactive agent or child workspace", () => {
-    const intuition = getBuiltInAgentDefinitions().find((agent) => agent.id === "intuition");
-    expect(intuition?.frontmatter.ui?.hidden).toBe(true);
-    expect(intuition?.frontmatter.subagent?.runnable).toBe(false);
-    expect(intuition?.frontmatter.subagent?.workflow_runnable).not.toBe(true);
-    expect(intuition?.frontmatter.tools?.require).toEqual(["memory_read", "intuition_report"]);
   });
 
   test("desktop agent gets exactly the desktop tool registry and cannot spawn tasks", () => {
@@ -114,5 +122,20 @@ describe("built-in agent definitions", () => {
     const explore = byId.get("explore");
     expect(explore).toBeTruthy();
     expect(explore?.frontmatter.tools?.remove ?? []).toContain("task_apply_git_patch");
+  });
+
+  test("exec can ask the user questions at top level but not as a sub-agent", () => {
+    const exec = getBuiltInAgentDefinitions().find((pkg) => pkg.id === "exec");
+    expect(exec).toBeTruthy();
+    const agents = [{ tools: exec?.frontmatter.tools }];
+
+    const resolveNames = (isSubagent: boolean) =>
+      applyToolPolicyToNames(
+        ["ask_user_question", "propose_plan"],
+        resolveToolPolicyForAgent({ agents, isSubagent, disableTaskToolsForDepth: false })
+      );
+
+    expect(resolveNames(false)).toEqual(["ask_user_question"]);
+    expect(resolveNames(true)).toEqual([]);
   });
 });

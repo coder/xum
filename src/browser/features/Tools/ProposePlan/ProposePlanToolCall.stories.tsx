@@ -1,5 +1,5 @@
 import { isPixel } from "@coder/pixel-storybook/storyapi";
-import { waitFor, within } from "@storybook/test";
+import { waitFor, within } from "storybook/test";
 
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
@@ -21,6 +21,7 @@ const PLAN_TOC_PIXEL_MATRIX = { viewports: ["desktop"] } as const;
  * Tests the plan card rendering with icon action buttons at the bottom.
  */
 export const ProposePlan: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() =>
@@ -96,6 +97,7 @@ graph TD
  * Shows the Implement button (no Continue in Auto).
  */
 export const ProposePlanInPlanMode: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() => {
@@ -174,6 +176,8 @@ graph TD
  */
 export const ProposePlanMobile: AppStory = {
   ...ProposePlan,
+  // Storybook reads tags only from string literals, so the spread does not carry them.
+  tags: ["paint-check"],
   parameters: {
     ...ProposePlan.parameters,
     viewport: { defaultViewport: "mobile1" },
@@ -197,6 +201,7 @@ export const ProposePlanMobile: AppStory = {
  * the TOC alongside the plan.
  */
 export const ProposePlanWithTableOfContents: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() =>
@@ -281,9 +286,8 @@ Blue/green cutover with automatic rollback on auth-error spikes.
 
     const canvas = within(canvasElement);
     const toc = await canvas.findByTestId("plan-toc-nav");
-    // Explicit timeout: preview.tsx's configure({ asyncUtilTimeout }) targets the
-    // storybook/test module, not this @storybook/test import, so waitFor would
-    // otherwise give up after 1s while the container query settles on loaded CI runners.
+    // Explicit timeout, above preview.tsx's 5 s default: the container query can settle late on
+    // loaded CI runners.
     await waitFor(
       () => {
         // Fail if the pinned viewport no longer reveals the full sticky ToC.

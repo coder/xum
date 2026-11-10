@@ -74,6 +74,21 @@ describe("MCPServerManager workspace use leases", () => {
     }
   }
 
+  /**
+   * A released lease leaves heldCount() before its file is unlinked (WorkspaceUseLeases.hold's
+   * release awaits the unlink after the count drops), so the other backend can still see the file
+   * for a moment: poll its gate instead of asserting right after the count reads 0.
+   */
+  async function otherBackendMutationOnceReleased(): Promise<string> {
+    const deadline = performance.now() + 2_000;
+    let outcome = await otherBackendMutation();
+    while (outcome !== "allowed" && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      outcome = await otherBackendMutation();
+    }
+    return outcome;
+  }
+
   test("a running server refuses the other backend's mutation until its process exits", async () => {
     servers.serve(command);
     const started = await start();
@@ -85,7 +100,7 @@ describe("MCPServerManager workspace use leases", () => {
 
     await manager.stopServers(workspaceId);
     await waitFor(() => heldCount() === 0);
-    expect(await otherBackendMutation()).toBe("allowed");
+    expect(await otherBackendMutationOnceReleased()).toBe("allowed");
   });
 
   test("a server whose process exits on its own releases its lease", async () => {
@@ -125,7 +140,7 @@ describe("MCPServerManager workspace use leases", () => {
     expect(started.stats.failedServerNames).toEqual(["srv"]);
 
     await waitFor(() => heldCount() === 0);
-    expect(await otherBackendMutation()).toBe("allowed");
+    expect(await otherBackendMutationOnceReleased()).toBe("allowed");
   });
 
   test("a startup abandoned at its deadline releases its lease", async () => {

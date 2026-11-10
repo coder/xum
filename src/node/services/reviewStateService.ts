@@ -4,6 +4,7 @@ import * as path from "path";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import { SessionFileManager } from "@/node/utils/sessionFile";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import { log } from "@/node/services/log";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
@@ -79,7 +80,8 @@ export class ReviewStateService extends EventEmitter {
   constructor(config: Config) {
     super();
     this.config = config;
-    this.file = new SessionFileManager<unknown>(config, REVIEW_STATE_FILE_NAME);
+    // No SessionLocks to inherit: the service takes only Config, so it uses the Node FIFO.
+    this.file = new SessionFileManager<unknown>(config, REVIEW_STATE_FILE_NAME, nodeSessionLocks);
   }
 
   static changeEventName(workspaceId: string): string {

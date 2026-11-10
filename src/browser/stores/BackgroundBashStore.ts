@@ -67,7 +67,6 @@ export class BackgroundBashStore {
   private stateKnownStore = new MapStore<string, boolean>();
 
   private processesCache = new Map<string, BackgroundProcessInfo[]>();
-  private autoBackgroundFetches = new Map<string, Promise<void>>();
   private foregroundIdsCache = new Map<string, Set<string>>();
   private terminatingIdsCache = new Map<string, Set<string>>();
   // Workspaces whose background-bash state is KNOWN (the live subscription
@@ -251,79 +250,6 @@ export class BackgroundBashStore {
     if (!result.success) {
       throw new Error(result.error);
     }
-  }
-
-  autoBackgroundOnSend(workspaceId: string): void {
-    const foregroundIds = this.foregroundIdsCache.get(workspaceId);
-    if (foregroundIds && foregroundIds.size > 0) {
-      for (const toolCallId of foregroundIds) {
-        this.sendToBackground(workspaceId, toolCallId).catch(() => {
-          // Ignore failures - bash may have completed before the request.
-        });
-      }
-      return;
-    }
-
-    void this.fetchForegroundIdsForAutoBackground(workspaceId);
-  }
-
-  private fetchForegroundIdsForAutoBackground(workspaceId: string): Promise<void> {
-    const existing = this.autoBackgroundFetches.get(workspaceId);
-    if (existing) {
-      return existing;
-    }
-
-    const client = this.client;
-    if (!client) {
-      return Promise.resolve();
-    }
-
-    const controller = new AbortController();
-    const { signal } = controller;
-
-    const task = (async () => {
-      let iterator: AsyncIterator<{
-        processes: BackgroundProcessInfo[];
-        foregroundToolCallIds: string[];
-      }> | null = null;
-
-      try {
-        const subscribedIterator = await client.workspace.backgroundBashes.subscribe(
-          { workspaceId },
-          { signal }
-        );
-        iterator = subscribedIterator;
-
-        for await (const state of subscribedIterator) {
-          controller.abort();
-          void subscribedIterator.return?.();
-
-          const latestForegroundIds = new Set(state.foregroundToolCallIds);
-          this.foregroundIdsCache.set(workspaceId, latestForegroundIds);
-
-          if (latestForegroundIds.size === 0) {
-            return;
-          }
-
-          for (const toolCallId of latestForegroundIds) {
-            this.sendToBackground(workspaceId, toolCallId).catch(() => {
-              // Ignore failures - bash may have completed before the request.
-            });
-          }
-          return;
-        }
-      } catch (err) {
-        if (!signal.aborted) {
-          console.error("Failed to read foreground bash state:", err);
-        }
-      } finally {
-        void iterator?.return?.();
-        this.autoBackgroundFetches.delete(workspaceId);
-      }
-    })();
-
-    this.autoBackgroundFetches.set(workspaceId, task);
-    return task;
   }
 
   private trackSubscription(workspaceId: string): void {

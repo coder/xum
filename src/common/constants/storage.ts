@@ -3,8 +3,6 @@
  * These keys are used for persisting state in localStorage
  */
 
-import { DEFAULT_CREATION_DRAFT_ID, DRAFT_ID_PATTERN } from "@/constants/drafts";
-
 /**
  * Scope ID Helpers
  * These create consistent scope identifiers for storage keys
@@ -42,9 +40,33 @@ export function getDraftScopeId(projectPath: string, draftId: string): string {
 const DRAFT_SCOPE_ID_PREFIX = "__draft__/";
 
 /**
+ * A creation draft composer's scope: keyed by the draft id alone, so a project change keeps
+ * every choice made in it (CreationDraftStore holds them in the draft's record).
+ */
+export function getCreationDraftScopeId(draftId: string): string {
+  return `${CREATION_DRAFT_SCOPE_ID_PREFIX}${draftId}`;
+}
+
+/** The draft id of a getCreationDraftScopeId scope, else null. */
+export function parseCreationDraftScopeId(scopeId: string): string | null {
+  return scopeId.startsWith(CREATION_DRAFT_SCOPE_ID_PREFIX)
+    ? scopeId.slice(CREATION_DRAFT_SCOPE_ID_PREFIX.length)
+    : null;
+}
+
+const CREATION_DRAFT_SCOPE_ID_PREFIX = "__creation__/";
+
+/**
  * Global scope ID for workspace-independent preferences
  */
 export const GLOBAL_SCOPE_ID = "__global__";
+
+const NON_WORKSPACE_SCOPE_PREFIXES = [
+  getProjectScopeId(""),
+  getPendingScopeId(""),
+  DRAFT_SCOPE_ID_PREFIX,
+  CREATION_DRAFT_SCOPE_ID_PREFIX,
+];
 
 /**
  * Global, project, pending and draft composer scopes. Every other id is a workspace id,
@@ -53,9 +75,7 @@ export const GLOBAL_SCOPE_ID = "__global__";
 export function isNonWorkspaceScopeId(scopeId: string): boolean {
   return (
     scopeId === GLOBAL_SCOPE_ID ||
-    scopeId.startsWith(getProjectScopeId("")) ||
-    scopeId.startsWith(getPendingScopeId("")) ||
-    scopeId.startsWith(DRAFT_SCOPE_ID_PREFIX)
+    NON_WORKSPACE_SCOPE_PREFIXES.some((prefix) => scopeId.startsWith(prefix))
   );
 }
 
@@ -186,6 +206,8 @@ export function getInputKey(workspaceId: string): string {
 /**
  * Get the localStorage key for the pinned TODO panel expansion state.
  * Format: "pinnedTodoExpanded:{workspaceId}"
+ * Legacy: no longer read, since the TODO chip's panel starts closed. Kept registered so
+ * deleteWorkspaceStorage still clears values that earlier versions wrote.
  */
 export function getPinnedTodoExpandedKey(workspaceId: string): string {
   return `pinnedTodoExpanded:${workspaceId}`;
@@ -194,6 +216,7 @@ export function getPinnedTodoExpandedKey(workspaceId: string): string {
 /**
  * Get the localStorage key for the sub-agent chat decoration expansion state.
  * Format: "subAgentTasksExpanded:{workspaceId}"
+ * Read by the VS Code webview's tray only; the desktop chip's panel starts closed.
  */
 export function getSubAgentTasksExpandedKey(workspaceId: string): string {
   return `subAgentTasksExpanded:${workspaceId}`;
@@ -540,10 +563,21 @@ export const MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY = "mobile-left-sidebar:scroll-to
 export const RIGHT_SIDEBAR_TAB_KEY = "right-sidebar-tab";
 
 /**
- * Right sidebar collapsed state (global, manual toggle)
+ * Legacy global right sidebar collapsed state, replaced by getRightSidebarCollapsedKey.
+ * Never read or written again; still registered so the stored value is accounted for.
  * Format: "right-sidebar:collapsed"
  */
-export const RIGHT_SIDEBAR_COLLAPSED_KEY = "right-sidebar:collapsed";
+export const LEGACY_RIGHT_SIDEBAR_COLLAPSED_KEY = "right-sidebar:collapsed";
+
+/**
+ * Right sidebar collapsed state per workspace (manual toggle). Per workspace so a new workspace
+ * starts collapsed (RIGHT_SIDEBAR_DEFAULT_COLLAPSED) instead of inheriting an open sidebar from
+ * the last workspace, where it would only show the New tab launcher.
+ * Format: "right-sidebar:workspace-collapsed:{workspaceId}"
+ */
+export function getRightSidebarCollapsedKey(workspaceId: string): string {
+  return `right-sidebar:workspace-collapsed:${workspaceId}`;
+}
 
 /**
  * Right sidebar width (unified across all tabs)
@@ -554,7 +588,7 @@ export const RIGHT_SIDEBAR_WIDTH_KEY = "right-sidebar:width";
 /**
  * Get the localStorage key for right sidebar dock-lite layout per workspace.
  * Each workspace can have its own split/tab configuration (e.g., different
- * numbers of terminals). Width and collapsed state remain global.
+ * numbers of terminals). Width remains global.
  * Format: "right-sidebar:layout:{workspaceId}"
  */
 export function getRightSidebarLayoutKey(workspaceId: string): string {
@@ -563,13 +597,25 @@ export function getRightSidebarLayoutKey(workspaceId: string): string {
 
 /**
  * Artifacts tab selection for the most recently used workspaces, as one global map
- * `{ [workspaceId]: { scope, path, version } }` (artifactSelection.ts). Per-workspace keys would
+ * `{ [workspaceId]: { scope, path } }` (artifactSelection.ts). Per-workspace keys would
  * multiply by every workspace ever opened; the map is bounded instead.
  */
 export const ARTIFACTS_SELECTION_KEY = "artifacts:selection";
 export const ARTIFACTS_SELECTION_MAX_WORKSPACES = 16;
 /** Room for 16 entries with paths of about 1,000 chars; older workspaces drop first. */
 export const ARTIFACTS_SELECTION_MAX_CHARS = 20_000;
+
+/**
+ * Explicit Agent interface view choices ("status" or "chat") for the most recently used
+ * workspaces, as one bounded global map `{ [workspaceId]: view }` (agentInterfaceView.ts).
+ * Only explicit choices are stored; a workspace without one follows the default.
+ */
+export const AGENT_INTERFACE_VIEW_KEY = "artifacts:agentInterfaceView";
+export const AGENT_INTERFACE_VIEW_MAX_WORKSPACES = 64;
+export const AGENT_INTERFACE_VIEW_MAX_CHARS = 4096;
+
+/** Whether the Agent interface status bar's transcript peek is open (boolean, all workspaces). */
+export const AGENT_INTERFACE_TRANSCRIPT_PEEK_KEY = "artifacts:agentInterfaceTranscriptPeek";
 
 /**
  * Get the localStorage key for terminal titles per workspace.
@@ -688,13 +734,6 @@ export const TERMINAL_TITLES_MAX_CHARS = 768;
 export const SIDEBAR_EXPANSION_MAP_MAX_CHARS = 16 * 1024;
 /** archivedWorkspaces:{projectPath}: the cache keeps the first archived entries that fit. */
 export const ARCHIVED_WORKSPACES_CACHE_MAX_CHARS = 6 * 1024;
-/** workspaceNameState stores at most this much (serialized) of the message it was generated for. */
-export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
-/**
- * workspaceNameState stores at most this much (serialized) of a typed manual name. Valid names are
- * at most 64 chars (validateWorkspaceBranchName), so only invalid names are cut.
- */
-export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
 /**
  * Model preferences hold a "provider:modelId" string. Custom model ids are checked against it
  * where they are entered (getModelIdLengthError); built-in ids are far shorter.
@@ -734,13 +773,6 @@ export const MAX_PERSISTED_KEY_CHARS = 8192;
 export type PersistedKeyKind = "ui" | "cache" | "workspace-scoped" | "draft";
 
 /**
- * `workspaceId` keys append a scope id to a fixed prefix. The scope id is usually a workspace id,
- * but creation drafts reuse the same keys with getDraftScopeId()/getPendingScopeId() scope ids and
- * some keys also accept project/global scope ids.
- */
-export type PersistedKeyScope = "global" | "workspaceId";
-
-/**
  * Which scope ids a workspace key is written under, for the budget model: "workspace" keys are
  * counted for every workspace and creation draft, "draft" keys only for creation drafts.
  * "webview" keys are written only by the VS Code webview, whose origin has its own quota, so they
@@ -758,7 +790,7 @@ export interface WorkspaceKeyRegistration {
   scope: "workspaceId";
   getKey: (scopeId: string) => string;
   kind: PersistedKeyKind;
-  /** Copied to the new workspace on fork (and to the new scope on migrateWorkspaceStorage). */
+  /** Copied to the new workspace on fork. */
   copyOnFork: boolean;
   /** Longest accepted serialized value (UTF-16 code units); 0 refuses every write. */
   maxValueChars: number;
@@ -866,6 +898,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getPinnedTodoExpandedKey, "ui", false, 16),
   workspaceKey(getSubAgentTasksExpandedKey, "ui", false, 16),
   workspaceKey(getRightSidebarLayoutKey, "ui", false, RIGHT_SIDEBAR_LAYOUT_MAX_CHARS),
+  workspaceKey(getRightSidebarCollapsedKey, "ui", false, 16),
   // Record<terminalSessionId, title>, pruned when sessions close.
   workspaceKey(getTerminalTitlesKey, "ui", false, TERMINAL_TITLES_MAX_CHARS),
   workspaceKey(getReviewFileFilterKey, "ui", false, 512),
@@ -879,6 +912,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Paint cache for the first-run view's early script, written by SplashScreenProvider.
   globalKey(ONBOARDING_VIEWED_KEY, "cache", 8),
   globalKey(ARTIFACTS_SELECTION_KEY, "ui", ARTIFACTS_SELECTION_MAX_CHARS),
+  globalKey(AGENT_INTERFACE_VIEW_KEY, "ui", AGENT_INTERFACE_VIEW_MAX_CHARS),
+  globalKey(AGENT_INTERFACE_TRANSCRIPT_PEEK_KEY, "ui", 8),
   globalKey(LAST_CUSTOM_MODEL_PROVIDER_KEY, "ui", 128),
   // { workspaceId } (older builds also stored paths; readers use only the id).
   globalKey(SELECTED_WORKSPACE_KEY, "ui", 256),
@@ -892,7 +927,9 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY, "ui", 32),
   // Legacy global tab; still read as a fallback for the per-workspace layout.
   globalKey(RIGHT_SIDEBAR_TAB_KEY, "ui", 64),
-  globalKey(RIGHT_SIDEBAR_COLLAPSED_KEY, "ui", 16),
+  // Legacy global flag, now per workspace (getRightSidebarCollapsedKey). Never written again, so
+  // no budget (0).
+  globalKey(LEGACY_RIGHT_SIDEBAR_COLLAPSED_KEY, "ui", 0),
   globalKey(RIGHT_SIDEBAR_WIDTH_KEY, "ui", 16),
   globalKey(REMOTE_CONNECTION_URL_KEY, "ui", 2048),
   // Server tokens have no length limit elsewhere; a token kept only in memory would log the user
@@ -1034,43 +1071,5 @@ export function findOrphanedWorkspaceStorageKeys(
   return candidateKeys.filter((key) => {
     const ownerId = getWorkspaceStorageGcOwnerId(key);
     return ownerId !== null && !knownWorkspaceIds.has(ownerId);
-  });
-}
-
-/**
- * The listed creation draft that owns a registered draft-scope settings key
- * (`<key>:__draft__/<project>/<id>`), or null for every other key: the default composer's fixed
- * draft id, ids the backend would never list, and "draft"-kind keys, which hold typed input (the
- * legacy draft text its migration still owns, a typed workspace name) and are never collected.
- */
-function getCreationDraftStorageOwner(
-  key: string
-): { projectPath: string; draftId: string } | null {
-  if (getPersistedKeyKind(key) === "draft") return null;
-  const scopeId = getWorkspaceScopeIdFromKey(key);
-  if (scopeId?.startsWith(DRAFT_SCOPE_ID_PREFIX) !== true) return null;
-  const rest = scopeId.slice(DRAFT_SCOPE_ID_PREFIX.length);
-  const separator = rest.lastIndexOf("/");
-  const projectPath = rest.slice(0, separator);
-  const draftId = rest.slice(separator + 1);
-  if (separator <= 0 || !DRAFT_ID_PATTERN.test(draftId) || draftId === DEFAULT_CREATION_DRAFT_ID) {
-    return null;
-  }
-  return { projectPath, draftId };
-}
-
-/** Whether the creation-draft storage GC could ever collect `key` (see creationDraftStorageGc.ts). */
-export function isCreationDraftStorageGcCandidateKey(key: string): boolean {
-  return getCreationDraftStorageOwner(key) !== null;
-}
-
-/** Pick the candidate keys whose creation draft `isKept` rejects. */
-export function findOrphanedCreationDraftStorageKeys(
-  candidateKeys: readonly string[],
-  isKept: (projectPath: string, draftId: string) => boolean
-): string[] {
-  return candidateKeys.filter((key) => {
-    const owner = getCreationDraftStorageOwner(key);
-    return owner !== null && !isKept(owner.projectPath, owner.draftId);
   });
 }

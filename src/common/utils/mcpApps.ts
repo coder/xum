@@ -1,6 +1,6 @@
 /**
  * MCP Apps (SEP-1865, `io.modelcontextprotocol/ui`, spec 2026-01-26) shared constants and pure
- * helpers. Gated by the artifacts experiment: with it off, Xum neither announces the extension
+ * helpers. Gated by the mcp-apps experiment: with it off, Xum neither announces the extension
  * nor keeps any `_meta.ui`.
  */
 
@@ -19,6 +19,8 @@ export const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
 export const MCP_APP_RESOURCE_URI_MAX_CHARS = 512;
 /** Largest ui/update-model-context text (UTF-8 bytes) a view may store; larger is -32602. */
 export const MCP_APP_MODEL_CONTEXT_MAX_BYTES = 16 * 1024;
+/** Largest window.openai widget state (JSON, UTF-8 bytes) a view instance may store. */
+export const MCP_APP_WIDGET_STATE_MAX_BYTES = 64 * 1024;
 /** Most domains in one declared CSP list (`_meta.ui.csp`, or `openai/widgetCSP` when it omits the list). */
 export const MCP_APP_CSP_DOMAINS_MAX = 32;
 /** Most approved view domains kept per server and project. */
@@ -202,6 +204,14 @@ export function mcpAppEntrypointKey(
   type: MCPAppEntrypointType
 ): string {
   return `entrypoint:${encodeKeyPart(serverName)}:${encodeKeyPart(toolName)}:${type}`;
+}
+
+/**
+ * The result-store key of a settings layout tool action that opens an MCP App (one view record
+ * per server and tool), encoded like mcpAppEntrypointKey.
+ */
+export function mcpSettingsAppKey(serverName: string, toolName: string): string {
+  return `settings:${encodeKeyPart(serverName)}:${encodeKeyPart(toolName)}`;
 }
 
 /**

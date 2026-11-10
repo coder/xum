@@ -1,32 +1,20 @@
-import React, { useSyncExternalStore } from "react";
+import React from "react";
 import { cn } from "@/common/lib/utils";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { LEFT_SIDEBAR_COLLAPSED_WIDTH_PX, LEFT_SIDEBAR_DEFAULT_WIDTH_PX } from "@/constants/layout";
 import ProjectSidebar from "../ProjectSidebar/ProjectSidebar";
 import { TitleBar } from "../TitleBar/TitleBar";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
+import { useNarrowViewport } from "@/browser/hooks/useNarrowViewport";
 
 interface LeftSidebarProps {
   collapsed: boolean;
   onToggleCollapsed: () => void;
   widthPx?: number;
   isResizing?: boolean;
-  onStartResize?: (e: React.MouseEvent) => void;
+  onStartResize?: (e: React.PointerEvent) => void;
   sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>;
   workspaceRecency: Record<string, number>;
-}
-
-const MOBILE_OVERLAY_QUERY = "(max-width: 768px)";
-
-function readMobileOverlayQuery(): boolean {
-  return typeof window !== "undefined" && window.matchMedia(MOBILE_OVERLAY_QUERY).matches;
-}
-
-function subscribeToMobileOverlayQuery(onChange: () => void): () => void {
-  const query = window.matchMedia(MOBILE_OVERLAY_QUERY);
-  query.addEventListener("change", onChange);
-  return () => query.removeEventListener("change", onChange);
 }
 
 export function LeftSidebar(props: LeftSidebarProps) {
@@ -38,15 +26,11 @@ export function LeftSidebar(props: LeftSidebarProps) {
     onStartResize,
     ...projectSidebarProps
   } = props;
-  const isDesktop = isDesktopMode();
   // Match the CSS gate for the mobile "overlay" sidebar (width-only, any pointer
   // type); we don't show a drag handle in that mode since CSS pins the width. Subscribed, so a
-  // window resized into the overlay width also gets the drawer's Escape handling.
-  const isMobileOverlay = useSyncExternalStore(
-    subscribeToMobileOverlayQuery,
-    readMobileOverlayQuery,
-    () => false
-  );
+  // window resized into the overlay width also gets the drawer's Escape handling. App's drawer
+  // state (useLeftSidebarState) reads the same query, so the two cannot disagree.
+  const isMobileOverlay = useNarrowViewport();
 
   // The drawer covers the page like a modal, so Escape closes it the way a backdrop tap does
   // (#5685), unless a popover, menu or dialog inside it owns Escape.
@@ -85,12 +69,9 @@ export function LeftSidebar(props: LeftSidebarProps) {
           "h-full bg-sidebar border-r border-border flex flex-col shrink-0 overflow-hidden relative z-20",
           !isResizing && "transition-[width] duration-200",
           "mobile-sidebar",
-          collapsed && "mobile-sidebar-collapsed",
-          // In desktop mode when collapsed, start border below titlebar height (32px)
-          // so it aligns with titlebar bottom edge and doesn't cut through traffic lights
-          isDesktop &&
-            collapsed &&
-            "border-r-0 after:absolute after:right-0 after:top-8 after:bottom-0 after:w-px after:bg-border"
+          // Collapsed, the sidebar is zero-width (no strip, like the right sidebar): the app shell's
+          // fixed toggle bar reopens it.
+          collapsed && "mobile-sidebar-collapsed border-r-0"
         )}
         style={{ width }}
       >
@@ -105,10 +86,10 @@ export function LeftSidebar(props: LeftSidebarProps) {
           <div
             data-testid="left-sidebar-resize-handle"
             className={cn(
-              "absolute right-0 top-0 bottom-0 w-0.5 z-10 cursor-col-resize transition-[background] duration-150",
+              "absolute right-0 top-0 bottom-0 w-0.5 z-10 cursor-col-resize touch-none transition-[background] duration-150",
               isResizing ? "bg-accent" : "bg-border-light hover:bg-accent"
             )}
-            onMouseDown={(e) => onStartResize(e)}
+            onPointerDown={(e) => onStartResize(e)}
           />
         )}
       </div>

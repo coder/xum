@@ -45,7 +45,7 @@ import {
 import {
   collectFullHistory,
   createTaskServiceHarness,
-  registerLiveWorkspaceTurnHandle,
+  startLiveWorkspaceTurn,
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
@@ -290,32 +290,29 @@ describe("TaskService", () => {
     test("omits stopped, stopping and delegated roots before counting, and restores them when eligible", async () => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
-      await saveWorkspaces(
-        config,
-        projectPath,
-        ["available", "stopped", "stopping", "pending", "accepted"].map((id) =>
+      await saveWorkspaces(config, projectPath, [
+        ...["available", "stopped", "stopping", "pending", "accepted"].map((id) =>
           optedInWorkspace(projectPath, id, id)
-        )
-      );
+        ),
+        // Not opted in, so not listed: it delegated turns to the two roots it created.
+        projectWorkspace(projectPath, "owner", "owner"),
+      ]);
       const isBusyForMessage = mock(() => false);
       const { workspaceService } = createWorkspaceServiceMocks({ isBusyForMessage });
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       taskService.markParentWorkspaceInterrupted("stopped");
       const release = taskService.latchWorkspaceStopsInProgress(["stopping"]);
-      await registerLiveWorkspaceTurnHandle(
-        taskService,
-        "pending",
-        "wst_pending",
-        "owner",
-        "reserved"
-      );
-      await registerLiveWorkspaceTurnHandle(
-        taskService,
-        "accepted",
-        "wst_accepted",
-        "owner",
-        "accepted"
-      );
+      for (const id of ["pending", "accepted"]) {
+        await startLiveWorkspaceTurn(taskService, config, {
+          ownerWorkspaceId: "owner",
+          workspaceId: id,
+          handleId: `wst_${id}`,
+          ownerCreatedWorkspace: true,
+          accept: id === "accepted",
+        });
+      }
+      // Count only the listing's activity probes, not the delegations' own busy checks.
+      isBusyForMessage.mockClear();
       try {
         const result = taskService.listInstanceWorkspaces("available", { limit: 1 });
         expect(result.rows.map((row) => row.workspaceId)).toEqual(["available"]);

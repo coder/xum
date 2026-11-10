@@ -64,18 +64,6 @@ export interface HunkReadState {
 }
 
 /**
- * Workspace review state (persisted to localStorage)
- */
-export interface ReviewState {
-  /** Workspace ID this review belongs to */
-  workspaceId: string;
-  /** Read state keyed by hunk ID */
-  readState: Record<string, HunkReadState>;
-  /** Timestamp of last update */
-  lastUpdated: number;
-}
-
-/**
  * Sort order options for review panel hunks
  */
 export const REVIEW_SORT_ORDERS = ["file-order", "last-edit"] as const;
@@ -207,8 +195,6 @@ export type ArtifactAnnotationAnchor =
   | { kind: "point"; x: number; y: number; selector?: string };
 
 export interface ArtifactAnnotationRef {
-  /** Artifact version the comment was made on (0: the live file had no stored version). */
-  version: number;
   anchor: ArtifactAnnotationAnchor;
 }
 
@@ -227,19 +213,6 @@ export interface Review {
   createdAt: number;
   /** Timestamp when status changed (checked/unchecked) */
   statusChangedAt?: number;
-}
-
-/**
- * Persisted state for reviews (per workspace)
- * Contains reviews in all states: pending, attached, and checked
- */
-export interface ReviewsState {
-  /** Workspace ID */
-  workspaceId: string;
-  /** All reviews keyed by ID */
-  reviews: Record<string, Review>;
-  /** Last update timestamp */
-  lastUpdated: number;
 }
 
 /**
@@ -416,7 +389,7 @@ export function formatReviewForModel(data: ReviewNoteData): string {
       comment: data.userNote.trim(),
     }).replace(/</g, "\\u003c");
     return (
-      `<artifact_annotation artifact="${escapeXml(data.filePath)}" version="${data.artifact.version}">` +
+      `<artifact_annotation artifact="${escapeXml(data.filePath)}">` +
       `${body}</artifact_annotation>`
     );
   }

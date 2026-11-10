@@ -3,6 +3,7 @@ import { EventEmitter } from "events";
 import { log } from "./log";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { AgentSession } from "./agentSession";
 import * as fs from "fs";
 import * as os from "os";
@@ -58,7 +59,6 @@ import {
   MemoryConsolidation,
   MemoryMeta,
   MenuEvent,
-  MuxGatewayOauth,
   Project,
   Provider,
   ProvidersConfigStoreTag,
@@ -101,25 +101,29 @@ import type {
 import type { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
 import type { TurnCoordinator } from "@/node/services/turnCoordinator";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
+import type { PreflightCounter } from "@/node/services/preflightCounter";
 
 /**
  * Independent field → tag listing for every DI-built ORPC context field (the
  * production mapping lives in the Layer files); `Record<keyof …>` keeps it
  * exhaustive, so a field added to `ORPCContext` without a tag fails to compile
- * here. `perfFlightRecorder`, `perfCaptures`, `perfReports` and `sessionTapes` are
- * container-owned (constructed directly by ServiceContainer, outside the DI graph) and are
- * checked separately below.
+ * here. `perfFlightRecorder`, `perfCaptures`, `perfReports`, `sessionTapes` and
+ * `agentResourceLimits` are container-owned (constructed directly by ServiceContainer, outside
+ * the DI graph) and are checked separately below. `rowTreeClient` is added by `xum server` only
+ * (src/cli/server.ts).
  */
 const ORPC_FIELD_TAGS: Record<
   keyof Omit<
     ORPCContext,
     | "headers"
+    | "rowTreeClient"
     | "effect/context"
     | "effect/wrap"
     | "perfFlightRecorder"
     | "perfCaptures"
     | "perfReports"
     | "sessionTapes"
+    | "agentResourceLimits"
   >,
   Context.Key<AppTags, unknown>
 > = {
@@ -136,7 +140,6 @@ const ORPC_FIELD_TAGS: Record<
   workspaceService: Workspace,
   taskService: Task,
   providerService: Provider,
-  muxGatewayOauthService: MuxGatewayOauth,
   codexOauthService: CodexOauth,
   coderOauthService: CoderOauth,
   copilotOauthService: CopilotOauth,
@@ -215,7 +218,7 @@ describe("ServiceContainer", () => {
       dispatchBashMonitorWake(
         dispatch: BashMonitorWakeDispatch
       ): Promise<BashMonitorWakeDispatchOutcome>;
-      drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+      bashMonitorPersistence: { drainBashMonitorPersistence(workspaceId: string): Promise<void> };
       scheduleBashMonitorWakeReconcile(workspaceId: string): void;
     };
     await internal.bashMonitorRecoveryPromise;
@@ -290,7 +293,7 @@ describe("ServiceContainer", () => {
       expect(container.collectRestartBlockers()).toEqual(blocked);
 
       container.backgroundProcessManager.emit("monitor:armed", armed.workspaceId, armed);
-      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence(armed.workspaceId);
       await container.refreshRestartBlockers();
       expect(container.collectRestartBlockers()).toEqual([]);
 
@@ -401,7 +404,7 @@ describe("ServiceContainer", () => {
     try {
       upsert.mockRejectedValueOnce(new Error("registry write failed"));
       container.backgroundProcessManager.emit("monitor:armed", armed.workspaceId, armed);
-      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence(armed.workspaceId);
       await container.refreshRestartBlockers();
       expect(container.collectRestartBlockers()).toEqual([
         { kind: "background-processes", count: 1 },
@@ -418,7 +421,7 @@ describe("ServiceContainer", () => {
       ]);
     } finally {
       releaseWrite?.();
-      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence(armed.workspaceId);
       upsert.mockRestore();
       processes.clear();
     }
@@ -501,9 +504,11 @@ describe("ServiceContainer", () => {
     };
     const project = services.projectService as unknown as { activeGitInits: Set<string> };
     let releaseWorkflow: (() => void) | undefined;
+    let executingAdmission: Disposable | undefined;
+    let sendingAdmission: Disposable | undefined;
     const workspace = services.workspaceService as unknown as {
-      preflightSendCounts: Map<string, number>;
-      preflightExecCounts: Map<string, number>;
+      sendPreflight: { sends: PreflightCounter };
+      operationAdmission: { exec: PreflightCounter };
       initSettlementPromises: Map<string, Promise<void>>;
       initAbortControllers: Map<string, AbortController>;
       removingWorkspaces: Set<string>;
@@ -530,8 +535,8 @@ describe("ServiceContainer", () => {
       processes.processes.set("running", { status: "running", isForeground: false });
       processes.processes.set("foreground", { status: "running", isForeground: true });
       processes.processes.set("finished", { status: "exited", isForeground: false });
-      workspace.preflightSendCounts.set("preflight", 1);
-      workspace.preflightExecCounts.set("executing", 1);
+      sendingAdmission = workspace.sendPreflight.sends.acquire("preflight");
+      executingAdmission = workspace.operationAdmission.exec.acquire("executing");
       expect(services.collectRestartBlockers()).toEqual([
         { kind: "pending-turns", count: 1 },
         { kind: "workspace-inits", count: 3 },
@@ -547,8 +552,8 @@ describe("ServiceContainer", () => {
       streams.workspaceStreams.clear();
       terminals.pendingSessionCreations.clear();
       processes.processes.clear();
-      workspace.preflightSendCounts.clear();
-      workspace.preflightExecCounts.clear();
+      sendingAdmission?.[Symbol.dispose]();
+      executingAdmission?.[Symbol.dispose]();
       workspace.initSettlementPromises.clear();
       workspace.initAbortControllers.clear();
       services.initStateManager.clearInMemoryState("finishing");
@@ -584,6 +589,16 @@ describe("ServiceContainer", () => {
     expect(terminalError).toBeInstanceOf(Error);
     expect(String(terminalError)).toContain("shutting down");
     await disposal;
+  });
+
+  it("hands workspace metadata events to AIService, so removal drops its request caches", () => {
+    services = new ServiceContainer(stores);
+    const handleWorkspaceMetadata = spyOn(services.aiService, "handleWorkspaceMetadata");
+    const event = { workspaceId: "removed-workspace", metadata: null };
+
+    services.workspaceService.emit("metadata", event);
+
+    expect(handleWorkspaceMetadata).toHaveBeenCalledWith(event);
   });
 
   it("attributes multi-project stream-end analytics to the primary project path", async () => {
@@ -912,6 +927,8 @@ describe("ServiceContainer", () => {
     "coderOauthService.separateDiscoveredModels",
     "experimentsService.initialize",
     "bashAiProxy.restore",
+    "projectService.watchProjectTrust",
+    "agentResourceLimits.start",
     "taskService.recoverInterruptedTasks",
   ];
 
@@ -1203,7 +1220,7 @@ describe("ServiceContainer", () => {
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
-  it("initializeCore records the six core steps and re-runs them when called again", async () => {
+  it("initializeCore records the eight core steps and re-runs them when called again", async () => {
     services = new ServiceContainer(stores);
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
       undefined
@@ -1329,6 +1346,10 @@ describe("ServiceContainer", () => {
     expect(services.appFiberScope.state._tag).toBe("Closed");
   });
 
+  // Real work, end to end: a container, a real stream, durable history writes and the analytics
+  // worker's DuckDB shutdown (about 0.2 s of its own). It takes 0.1 to 0.4 s of CPU alone and
+  // 5.2 to 7.0 s with eight busy processes per core, so the default 5 s limit failed it while
+  // nothing was wrong.
   it.each([false, true])(
     "dispose() joins engine and session policy before bridge teardown (session=%s)",
     async (throughSession) => {
@@ -1507,7 +1528,8 @@ describe("ServiceContainer", () => {
             part.type === "text" && part.text === "hello from a stream shutdown must not lose"
         )
       ).toBe(true);
-    }
+    },
+    20_000
   );
 
   it("joins cleanup enqueued by a closing session callback before dependency teardown", async () => {
@@ -1633,6 +1655,18 @@ describe("ServiceContainer", () => {
     // IdleCompactionService.checkAllWorkspaces reads the config synchronously
     // at the start of every check.
     const loadConfigSpy = spyOn(services.config, "loadConfigOrDefault");
+    // HeartbeatService's first tick reads the extension metadata file and then the config, so it
+    // makes a loadConfigOrDefault call of its own. That read is real I/O: with a warm disk cache
+    // the call landed 0.3 to 0.5 ms after the clock advance below, racing the count (CI read 2).
+    // Hold the read until the count is asserted, so the count is the idle worker's alone.
+    const snapshotGate = Promise.withResolvers<void>();
+    const snapshotsSpy = spyOn(
+      ExtensionMetadataService.prototype,
+      "getAllSnapshots"
+    ).mockImplementation(async () => {
+      await snapshotGate.promise;
+      return new Map();
+    });
     // HeartbeatService's observable lifecycle contract: the scheduler fiber is
     // held in `startupTimeout` during the startup delay and moves to
     // `checkInterval` once ticking (same shape heartbeatService.test.ts pins).
@@ -1641,21 +1675,29 @@ describe("ServiceContainer", () => {
       checkInterval: unknown;
     };
 
-    services.idleCompactionService.start();
-    services.heartbeatService.start();
-    expect(loadConfigSpy).not.toHaveBeenCalled();
-    expect(heartbeatInternals.startupTimeout).not.toBeNull();
-    expect(heartbeatInternals.checkInterval).toBeNull();
+    try {
+      services.idleCompactionService.start();
+      services.heartbeatService.start();
+      expect(loadConfigSpy).not.toHaveBeenCalled();
+      expect(heartbeatInternals.startupTimeout).not.toBeNull();
+      expect(heartbeatInternals.checkInterval).toBeNull();
 
-    // Both workers wait one minute before their first tick.
-    await runtime.runPromise(TestClock.adjust(Duration.minutes(1)));
+      // Both workers wait one minute before their first tick.
+      await runtime.runPromise(TestClock.adjust(Duration.minutes(1)));
 
-    expect(loadConfigSpy).toHaveBeenCalledTimes(1);
-    expect(heartbeatInternals.startupTimeout).toBeNull();
-    expect(heartbeatInternals.checkInterval).not.toBeNull();
+      expect(loadConfigSpy).toHaveBeenCalledTimes(1);
+      // The held read is the heartbeat's first tick, so exactly one tick started on the clock.
+      expect(snapshotsSpy).toHaveBeenCalledTimes(1);
+      expect(heartbeatInternals.startupTimeout).toBeNull();
+      expect(heartbeatInternals.checkInterval).not.toBeNull();
 
-    services.heartbeatService.stop();
-    services.idleCompactionService.stop();
+      services.heartbeatService.stop();
+      services.idleCompactionService.stop();
+    } finally {
+      // Let the held tick finish against the stopped service, and give later tests the real read.
+      snapshotGate.resolve();
+      snapshotsSpy.mockRestore();
+    }
   });
 
   it("serves every DI-built ORPC context field through its tag (one instance each)", () => {
@@ -1672,6 +1714,7 @@ describe("ServiceContainer", () => {
     expect(orpcContext.perfCaptures).toBe(services.perfCaptures);
     expect(orpcContext.perfReports).toBe(services.perfReports);
     expect(orpcContext.sessionTapes).toBe(services.sessionTapes);
+    expect(orpcContext.agentResourceLimits).toBe(services.agentResourceLimits);
     expect(services.runtime.get(IdleDispatcherTag)).toBe(services.idleDispatcher);
     expect(services.runtime.get(StreamManagerTag).effectRunner).toBe(
       services.runtime.get(EffectRunnerTag)

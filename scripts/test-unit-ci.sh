@@ -7,15 +7,19 @@
 # (~15 min on the 16-core runner while the rest of the pipeline finished in ~11),
 # so each shard runs a size-balanced slice of the files in its own process.
 #
-# Usage: SHARD_INDEX=<1..N> SHARD_TOTAL=<N> ./scripts/test-unit-ci.sh [--list | --list-all]
+# Usage: SHARD_INDEX=<1..N> SHARD_TOTAL=<N> ./scripts/test-unit-ci.sh [--list | --list-all | --list-no-coverage]
 #        (defaults to 1/1, i.e. the whole suite in one shard)
 #        --list      prints this shard's shared-process files
 #        --list-all  prints every file this lane runs (isolated, tooling and shared)
 #                    across all shards; consumed by scripts/check-test-routing.sh
+#        --list-no-coverage  prints the isolated files that run without coverage;
+#                    consumed by scripts/mutate/check.ts
+#        --list-isolated  prints every isolated file (they each need their own process);
+#                    consumed by `make test-unit`
 set -euo pipefail
 
 mode="${1:-}"
-if [[ "$mode" == "--list-all" ]]; then
+if [[ "$mode" == "--list-all" || "$mode" == "--list-no-coverage" || "$mode" == "--list-isolated" ]]; then
   SHARD_INDEX=1
   SHARD_TOTAL=1
 fi
@@ -75,9 +79,24 @@ isolated_unit_tests=(
   # reliable in its own process. Took the merge queue down on 2026-08-29
   # when runner file enumeration order changed.
   src/browser/components/ChatPane/WorkspaceFooterBar.test.tsx
+  # Its lazy-import test counts calls of a mock.module factory for the heartbeat
+  # modal. When an earlier file in the shared process (AgentListItem.test.tsx)
+  # already imported that module, Bun runs the factory at registration, so the
+  # count is 1 before the menu opens. The size-balanced shard split decides
+  # whether such a file runs first: a PR that only added Node tests moved
+  # AgentListItem.test.tsx into the same shard and failed the merge queue
+  # (#7029, #7031). Verified on origin/main with a two-file run.
+  src/browser/components/WorkspaceMenuBar/WorkspaceMenuBar.test.tsx
   # Post-login catalog refreshes can outlive their test and hit a later global fetch mock,
   # making catalog-call assertions order-dependent in the shared process.
   src/node/services/coderOauthService.test.ts
+  # Asserts that forced full GCs collect a WeakRef target. In the shared process,
+  # other suites' state or conservative stack scanning can keep it alive: it failed
+  # 3 of 3 CI runs once the size-balanced split moved it into a different shard
+  # (#7057), and in a merge group whose tree passed PR CI (#7061), but passes alone.
+  # Coverage stays on: the failures were in coverage processes, and it passes in
+  # its own one.
+  src/node/services/agentSession.preparationRetention.test.ts
   # Loads the native sharp/libvips addon into the test process. In the shared
   # coverage process Bun hit an allocator panic ("pas panic: deallocation did
   # fail", exit 133) as this file started on main run 35782976621, with zero
@@ -87,9 +106,6 @@ isolated_unit_tests=(
   # (document/window set to undefined, a replaced baseline window), which would
   # perturb later suites in a shared process.
   ./tests/ui/domIsolation.test.ts
-  # Spawns a bun child that forces the Bun 1.3.12 test.each GC window (#6020); bun-only, so
-  # Jest skips it.
-  ./tests/bunEachTableGc.test.ts
 )
 # Strip the marker so every later use of isolated_unit_tests sees plain paths, and
 # record it per index, so the coverage choice cannot drift from the list.
@@ -193,11 +209,15 @@ bun_test_retrying_crashes() {
     exit_code=0
     coverage_args=()
     if [[ -n "$coverage_dir" ]]; then
-      rm -f "$coverage_dir/lcov.info"
+      rm -f "$coverage_dir/lcov.info" "$coverage_dir/ran-without-coverage.txt"
       if ((attempt < 3)); then
         coverage_args=(--coverage --coverage-reporter=lcov "--coverage-dir=$coverage_dir")
       else
         echo "::warning::bun crashed twice under coverage on $label; the last attempt runs without coverage"
+        # Quality / CRAP reads this marker (scripts/crap/ci.ts, RAN_WITHOUT_COVERAGE):
+        # the shard's coverage is incomplete, so coverage-based findings only warn.
+        mkdir -p "$coverage_dir"
+        printf '%s\n' "$label" >"$coverage_dir/ran-without-coverage.txt"
       fi
     fi
     # The ${a[@]+...} form expands an empty array under `set -u` on Bash 3.2 (macOS).
@@ -235,7 +255,9 @@ done
 # guard) and tooling tests under scripts/. check-startup-imports.test.ts and
 # check-test-seam-comments.test.ts are excluded because their static-check make
 # targets run them right before the guard itself; crap/check.test.ts and
-# crap/agentGate.test.ts need uv (make test-crap-scripts runs them); orpcConnection.integration.test.ts
+# crap/agentGate.test.ts need uv (make test-crap-scripts runs them), as do
+# dry/check.test.ts and mutate/check.test.ts (make test-dry-scripts and
+# test-mutate-scripts); orpcConnection.integration.test.ts
 # needs a live xum server (see scripts/check-test-routing.sh for every file run
 # outside this lane).
 #
@@ -245,7 +267,7 @@ done
 # src shards: a single ./ path switches `bun test` from filter mode (files run in
 # bun's own traversal order) to path mode (argument order), which reorders the whole
 # shard and exposed order-dependent module mocks that the usual order hides.
-tooling_roots=(./tests/ui/storybook ./tests/bugbash ./vscode/src ./scripts)
+tooling_roots=(./tests/ui/storybook ./tests/bugbash ./tests/stories ./vscode/src ./scripts)
 tooling_files=()
 while IFS= read -r tooling_file; do
   tooling_files+=("$tooling_file")
@@ -255,6 +277,8 @@ done < <(
     ! -path ./scripts/check-test-seam-comments.test.ts \
     ! -path ./scripts/crap/check.test.ts \
     ! -path ./scripts/crap/agentGate.test.ts \
+    ! -path ./scripts/dry/check.test.ts \
+    ! -path ./scripts/mutate/check.test.ts \
     ! -path ./vscode/src/api/orpcConnection.integration.test.ts \
     "${find_excludes[@]}" | LC_ALL=C sort
 )
@@ -295,6 +319,18 @@ if [[ "$mode" == "--list" ]]; then
 fi
 if [[ "$mode" == "--list-all" ]]; then
   printf '%s\n' "${isolated_unit_tests[@]}" "${tooling_files[@]}" "${unit_files[@]}"
+  exit 0
+fi
+if [[ "$mode" == "--list-isolated" ]]; then
+  printf '%s\n' "${isolated_unit_tests[@]}"
+  exit 0
+fi
+if [[ "$mode" == "--list-no-coverage" ]]; then
+  for i in "${!isolated_unit_tests[@]}"; do
+    if ((isolated_coverage[i] == 0)); then
+      printf '%s\n' "${isolated_unit_tests[$i]}"
+    fi
+  done
   exit 0
 fi
 

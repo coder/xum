@@ -1,0 +1,470 @@
+import "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import { APIProvider } from "@/browser/contexts/API";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
+import { createTestApiClient } from "@/browser/testUtils";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { GlobalWindow } from "happy-dom";
+import type { ReactNode } from "react";
+
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
+import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
+import type { DisplayedMessage } from "@/common/types/message";
+import type { AskUserQuestionQuestion } from "@/common/types/tools";
+import { buildAskUserQuestionAnswerMessage } from "@/common/utils/tools/askUserQuestionSummary";
+
+// The same harness as AskUserQuestionToolCall.test.tsx: the real APIProvider with a test client,
+// and the WorkspaceStore overlay serving this suite's transcript.
+let messages: DisplayedMessage[] = [];
+// A stable snapshot per transcript: the blocking card reads it through useSyncExternalStore.
+let workspaceState = {
+  autoRetryStatus: null,
+  isStreamStarting: false,
+  canInterrupt: false,
+  messages,
+};
+function getWorkspaceState() {
+  if (workspaceState.messages !== messages) {
+    workspaceState = { ...workspaceState, messages };
+  }
+  return workspaceState;
+}
+
+const sendMessageData: Record<string, never> = {};
+const sendMessage = mock((_input: unknown) =>
+  Promise.resolve({ success: true as const, data: sendMessageData })
+);
+const apiClient = createTestApiClient({ workspace: { sendMessage } });
+
+const actualWorkspaceStore = { ...RealWorkspaceStoreModule };
+restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...actualWorkspaceStore }]]);
+void mock.module("@/browser/stores/WorkspaceStore", () => ({
+  ...actualWorkspaceStore,
+  useWorkspaceStoreRaw: () =>
+    overlayWorkspaceStoreRaw(actualWorkspaceStore.useWorkspaceStoreRaw(), {
+      subscribeKey: (_workspaceId: string, _listener: () => void) => () => undefined,
+      getWorkspaceState: (_workspaceId: string) => getWorkspaceState(),
+    }),
+}));
+
+// Evaluating the lazy chunk publishes the tool cards, the chained form among them.
+import "@/browser/features/Tools/Shared/toolCardsLoader";
+import { AskUserQuestionDock } from "./AskUserQuestionDock";
+import { findOpenAskUserQuestions } from "@/browser/utils/messages/openAskUserQuestions";
+
+const STORAGE: AskUserQuestionQuestion = {
+  question: "Which storage backend?",
+  header: "Storage",
+  options: [
+    { label: "SQLite", description: "One file" },
+    { label: "In memory", description: "Fastest" },
+  ],
+  multiSelect: false,
+};
+const PLATFORMS: AskUserQuestionQuestion = {
+  question: "Which platforms?",
+  header: "Platforms",
+  options: [
+    { label: "macOS", description: "Desktop" },
+    { label: "Linux", description: "Servers" },
+  ],
+  multiSelect: true,
+};
+const REGION: AskUserQuestionQuestion = {
+  question: "Which region?",
+  header: "Region",
+  options: [
+    { label: "US East", description: "Virginia" },
+    { label: "EU West", description: "Ireland" },
+  ],
+  multiSelect: false,
+};
+
+function questionRow(
+  id: string,
+  toolCallId: string,
+  questions: AskUserQuestionQuestion[],
+  answers?: Record<string, string>
+): Extract<DisplayedMessage, { type: "tool" }> {
+  return {
+    type: "tool",
+    id,
+    historyId: `history-${id}`,
+    toolCallId,
+    toolName: "ask_user_question",
+    args: { questions, answers },
+    result: {
+      summary: "Questions shown to the user.",
+      ui_only: { ask_user_question: { questions, answers: {}, answerDelivery: "message" } },
+    },
+    status: "completed",
+    isPartial: false,
+    historySequence: 1,
+  };
+}
+
+/** The row while its call still executes: no result yet, so it renders as its own card. */
+function executing(row: Extract<DisplayedMessage, { type: "tool" }>): DisplayedMessage {
+  return { ...row, result: undefined, status: "executing" };
+}
+
+const ROW_A = questionRow("row-a", "ask-a", [STORAGE]);
+const ROW_B = questionRow("row-b", "ask-b", [PLATFORMS]);
+/** Another client's answer to ask-a. */
+const ANSWER_A: DisplayedMessage = {
+  type: "user",
+  id: "answer-a",
+  historyId: "history-answer-a",
+  content: "answers",
+  historySequence: 2,
+  askUserQuestionAnswers: [{ toolCallId: "ask-a", answers: { [STORAGE.question]: "" } }],
+};
+
+function dock(workspaceId: string) {
+  return (
+    <TooltipProvider>
+      <AskUserQuestionDock workspaceId={workspaceId} />
+    </TooltipProvider>
+  );
+}
+
+function Wrapper(props: { children: ReactNode }) {
+  return <APIProvider client={apiClient}>{props.children}</APIProvider>;
+}
+
+function sentInput(): { message: string; options: { muxMetadata?: unknown } } {
+  expect(sendMessage).toHaveBeenCalledTimes(1);
+  return (
+    sendMessage.mock.calls[0] as [{ message: string; options: { muxMetadata?: unknown } }]
+  )[0];
+}
+
+describe("AskUserQuestionDock", () => {
+  // Accepted answers, drafts and the active tab outlive the dock, so each test has its own workspace.
+  let workspaceId = "";
+  let workspaceCount = 0;
+
+  beforeEach(() => {
+    saveDomGlobals();
+    globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
+    globalThis.document = globalThis.window.document;
+    workspaceCount += 1;
+    workspaceId = `ws-ask-dock-${workspaceCount}`;
+    messages = [];
+    spyOn(actualWorkspaceStore.workspaceStore, "isWorkspaceTranscriptCaughtUp").mockImplementation(
+      () => true
+    );
+    sendMessage.mockClear();
+  });
+
+  afterEach(() => {
+    cleanup();
+    mock.restore();
+    restoreDomGlobals();
+  });
+
+  test("open question sets share one form and one answer message", async () => {
+    messages = [ROW_A, ROW_B];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+
+    expect(view.getAllByRole("button", { name: "Next" })).toHaveLength(1);
+    expect(view.getByRole("button", { name: "Storage" })).toBeTruthy();
+    expect(view.getByRole("button", { name: "Platforms" })).toBeTruthy();
+
+    // A single-select pick advances across the call boundary.
+    fireEvent.click(view.getByText("SQLite"));
+    expect(view.getByText(PLATFORMS.question)).toBeTruthy();
+    fireEvent.click(view.getByText("Linux"));
+    fireEvent.click(view.getByRole("button", { name: "Next" }));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+    const input = sentInput();
+    expect(input.message).toContain("Tool call ask-a:\n- Question 1: option 1\n");
+    expect(input.message).toContain("Tool call ask-b:\n- Question 1: option 2\n");
+    expect(input.options.muxMetadata).toEqual({
+      type: "normal",
+      askUserQuestionAnswer: [
+        { toolCallId: "ask-a", answers: { [STORAGE.question]: "SQLite" } },
+        { toolCallId: "ask-b", answers: { [PLATFORMS.question]: "Linux" } },
+      ],
+    });
+    // Both rows closed, so the dock drops the form once the send settled.
+    expect(findOpenAskUserQuestions(workspaceId, messages)).toEqual([]);
+    await waitFor(() =>
+      expect(view.container.querySelector('[data-component="AskUserQuestionDock"]') === null).toBe(
+        true
+      )
+    );
+  });
+
+  test("one open question set sends the single card's message", async () => {
+    messages = [ROW_A];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+
+    fireEvent.click(view.getByText("SQLite"));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+    const input = sentInput();
+    expect(input.message).toBe(
+      buildAskUserQuestionAnswerMessage("ask-a", [{ optionNumbers: [1], otherText: "" }])
+    );
+    // The object shape: the only one older builds read.
+    expect(input.options.muxMetadata).toEqual({
+      type: "normal",
+      askUserQuestionAnswer: { toolCallId: "ask-a", answers: { [STORAGE.question]: "SQLite" } },
+    });
+  });
+
+  test("refuses the whole message when one question set closed right before sending", async () => {
+    messages = [ROW_A, ROW_B];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(view.getByRole("button", { name: "Summary" }));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+    // A later call reuses ask-b's id while the preferences flush: an answer would go to it.
+    messages = [...messages, questionRow("row-b2", "ask-b", [PLATFORMS])];
+
+    await waitFor(() => expect(view.getByText(/later question replaced/)).toBeTruthy());
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("a blocking question keeps its own card after the chained form", () => {
+    // Plan mode: the call still executes and waits for its answer, so it has no result yet.
+    const blocking = executing(questionRow("row-plan", "ask-plan", [PLATFORMS]));
+    messages = [blocking, ROW_A];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+
+    // Two forms: the chain (first, despite the blocking row coming first) and the blocking card.
+    const nextButtons = view.getAllByRole("button", { name: "Next" });
+    expect(nextButtons).toHaveLength(2);
+    const storage = view.getByText(STORAGE.question);
+    const platforms = view.getByText(PLATFORMS.question);
+    expect(
+      storage.compareDocumentPosition(platforms) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+  });
+
+  test("drafts and the active tab survive a remount", () => {
+    messages = [ROW_A, ROW_B];
+    const first = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(first.getByText("SQLite"));
+    first.unmount();
+
+    const second = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(second.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(second.getByText("1/2 answered")).toBeTruthy();
+  });
+
+  test("drafts and the active tab survive the call returning without waiting", () => {
+    messages = [executing(questionRow("row-x", "ask-x", [STORAGE, PLATFORMS]))];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(view.getByText("SQLite"));
+    expect(view.getByText(PLATFORMS.question)).toBeTruthy();
+
+    // It returned without waiting: the row moves into the chained form.
+    messages = [questionRow("row-x", "ask-x", [STORAGE, PLATFORMS])];
+    view.rerender(dock(workspaceId));
+
+    expect(view.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(view.getByText("1/2 answered")).toBeTruthy();
+  });
+
+  test("a card left on its Summary reopens on the chained Summary", () => {
+    messages = [executing(questionRow("row-x", "ask-x", [STORAGE, PLATFORMS]))];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(view.getByRole("button", { name: "Summary" }));
+
+    messages = [questionRow("row-x", "ask-x", [STORAGE, PLATFORMS])];
+    view.rerender(dock(workspaceId));
+
+    expect(view.getByRole("button", { name: "Submit answers" })).toBeTruthy();
+    expect(view.queryByText(STORAGE.question)).toBeNull();
+    expect(view.queryByText(PLATFORMS.question)).toBeNull();
+  });
+
+  test("a remount keeps the form's tab, not the tab of a card that joined it", () => {
+    messages = [ROW_B, executing(questionRow("row-x", "ask-x", [STORAGE, REGION]))];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    // The card moves on to its second question.
+    fireEvent.click(view.getByText("SQLite"));
+
+    messages = [ROW_B, questionRow("row-x", "ask-x", [STORAGE, REGION])];
+    view.rerender(dock(workspaceId));
+    expect(view.getByText(PLATFORMS.question)).toBeTruthy();
+    view.unmount();
+
+    const second = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(second.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(second.queryByText(REGION.question)).toBeNull();
+  });
+
+  test("a call earlier in the transcript joins without moving the untouched form", () => {
+    const rowX = questionRow("row-x", "ask-x", [REGION]);
+    messages = [executing(rowX), ROW_A];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(view.getByText(STORAGE.question)).toBeTruthy();
+
+    // ask-x returned after ask-a: its tabs go before the one the user is reading.
+    messages = [rowX, ROW_A];
+    view.rerender(dock(workspaceId));
+    expect(view.getByText(STORAGE.question)).toBeTruthy();
+    expect(view.queryByText(REGION.question)).toBeNull();
+  });
+
+  test("a call that returned while the workspace was away opens on its card's tab", () => {
+    const rowX = questionRow("row-x", "ask-x", [REGION, PLATFORMS]);
+    messages = [ROW_A, executing(rowX)];
+    const first = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(first.getByText("US East"));
+    expect(first.getByText(PLATFORMS.question)).toBeTruthy();
+    first.unmount();
+
+    // While away: another client answered ask-a, and ask-x returned without waiting.
+    messages = [ROW_A, ANSWER_A, rowX];
+    const second = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(second.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(second.queryByText(REGION.question)).toBeNull();
+  });
+
+  test("a retry after a lost response resends only the sent question sets, with the same id", async () => {
+    messages = [ROW_A, ROW_B];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    // The backend took the first send, but its response never arrived.
+    sendMessage.mockImplementationOnce(() => Promise.reject(new Error("connection lost")));
+    fireEvent.click(view.getByRole("button", { name: "Summary" }));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+    await waitFor(() => expect(view.getByText(/connection lost/)).toBeTruthy());
+
+    messages = [ROW_A, ROW_B, questionRow("row-c", "ask-c", [STORAGE])];
+    view.rerender(dock(workspaceId));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2));
+    const [sent, retried] = sendMessage.mock.calls.map(
+      (call) => (call as [{ message: string; options: { sendId?: string } }])[0]
+    );
+    expect(retried.message).toBe(sent.message);
+    expect(retried.options.sendId).toBe(sent.options.sendId);
+    // ask-c joined after that send: it stays open for the next Submit.
+    await waitFor(() =>
+      expect(findOpenAskUserQuestions(workspaceId, messages).map((row) => row.id)).toEqual([
+        "row-c",
+      ])
+    );
+  });
+
+  test("a changed answer after a failed send goes out under a new id", async () => {
+    messages = [ROW_A, ROW_B];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    sendMessage.mockImplementationOnce(() => Promise.reject(new Error("connection lost")));
+    fireEvent.click(view.getByRole("button", { name: "Summary" }));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+    await waitFor(() => expect(view.getByText(/connection lost/)).toBeTruthy());
+
+    fireEvent.click(view.getByRole("button", { name: "Storage" }));
+    fireEvent.click(view.getByText("SQLite"));
+    fireEvent.click(view.getByRole("button", { name: "Summary" }));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2));
+    const [sent, resent] = sendMessage.mock.calls.map(
+      (call) => (call as [{ message: string; options: { sendId?: string } }])[0]
+    );
+    expect(resent.message).toContain("Tool call ask-a:\n- Question 1: option 1\n");
+    // A different message under the old id would be dropped as a repeat of the first send.
+    expect(resent.options.sendId).not.toBe(sent.options.sendId);
+  });
+
+  test("a question set that arrives while answering joins the mounted form", () => {
+    // Prefilled Other text (typing does not reach React state in this happy-dom setup).
+    messages = [questionRow("row-a", "ask-a", [STORAGE], { [STORAGE.question]: "use redis" })];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    const textarea = view.getByPlaceholderText("Type your answer");
+    textarea.focus();
+
+    messages = [...messages, ROW_B];
+    view.rerender(dock(workspaceId));
+
+    // Same node: the form did not remount, so the typed text and focus stay.
+    expect(view.getByPlaceholderText("Type your answer")).toBe(textarea);
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea).toHaveProperty("value", "use redis");
+    expect(view.getByRole("button", { name: "Platforms" })).toBeTruthy();
+    expect(view.getByText("1/2 answered")).toBeTruthy();
+  });
+
+  test("a question set that arrives after the user collapsed the form re-opens it", () => {
+    messages = [ROW_A];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(view.getByText("ask_user_question"));
+    expect(view.queryByText(STORAGE.question)).toBeNull();
+
+    messages = [ROW_A, ROW_B];
+    view.rerender(dock(workspaceId));
+
+    expect(view.getByRole("button", { name: "Platforms" })).toBeTruthy();
+  });
+
+  test("the active question stays put when an earlier question set closes", () => {
+    messages = [ROW_A, ROW_B];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(view.getByRole("button", { name: "Platforms" }));
+
+    // Another client answered ask-a: its tabs leave, and ask-b's question moves to the front.
+    messages = [ROW_A, ROW_B, ANSWER_A];
+    view.rerender(dock(workspaceId));
+
+    expect(view.queryByRole("button", { name: "Storage" })).toBeNull();
+    expect(view.getByText(PLATFORMS.question)).toBeTruthy();
+  });
+
+  test("when the active question set closes, the next opens where its card was left", () => {
+    const rowX = questionRow("row-x", "ask-x", [REGION, PLATFORMS]);
+    messages = [ROW_A, executing(rowX)];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    // The card moves on to its second question, then its call joins the form.
+    fireEvent.click(view.getByText("US East"));
+    messages = [ROW_A, rowX];
+    view.rerender(dock(workspaceId));
+    expect(view.getByText(STORAGE.question)).toBeTruthy();
+
+    // Another client answered ask-a, the set the user is on.
+    messages = [ROW_A, rowX, ANSWER_A];
+    view.rerender(dock(workspaceId));
+
+    expect(view.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(view.queryByText(REGION.question)).toBeNull();
+  });
+
+  test("a Summary left before a workspace switch does not open a set that arrived meanwhile", () => {
+    messages = [ROW_A];
+    const first = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(first.getByRole("button", { name: "Summary" }));
+    first.unmount();
+
+    // While away: another client answered ask-a, and ask-b arrived. Live, the form would have
+    // reset when ask-a closed, so ask-b would open on its question.
+    messages = [ROW_A, ANSWER_A, ROW_B];
+    const second = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(second.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(second.queryByRole("button", { name: "Submit answers" })).toBeNull();
+  });
+
+  test("a Summary left before a workspace switch stays while a set that joined it is open", () => {
+    messages = [ROW_A];
+    const first = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(first.getByRole("button", { name: "Summary" }));
+    messages = [ROW_A, ROW_B];
+    first.rerender(dock(workspaceId));
+    first.unmount();
+
+    // While away: another client answered ask-a. Live, the Summary would stay: ask-b is open.
+    messages = [ROW_A, ROW_B, ANSWER_A];
+    const second = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(second.getByRole("button", { name: "Submit answers" })).toBeTruthy();
+    expect(second.queryByText(PLATFORMS.question)).toBeNull();
+  });
+});

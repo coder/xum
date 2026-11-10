@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createRouterClient, type RouterClient } from "@orpc/server";
 
 import { createTestComputerUseService } from "@/node/services/computerUse/computerUseTestFixtures";
-import type { ORPCContext } from "./context";
+import { orpcContextFromDoubles } from "./orpcContextDoubles.testHarness";
 import { router } from "./router";
 
 type Client = RouterClient<ReturnType<typeof router>>;
@@ -18,7 +18,7 @@ describe("computerUse procedures", () => {
     const { service } = createTestComputerUseService({
       runtimes: { ssh: { type: "ssh", host: "example", srcBaseDir: "/home/me/src" } },
     });
-    const context = { computerUseService: service } as unknown as ORPCContext;
+    const context = orpcContextFromDoubles({ computerUseService: service });
     const client = createRouterClient(router(), { context });
 
     const error = await request(client).then(

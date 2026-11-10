@@ -21,9 +21,12 @@
  *
  * The flexoki-light workspace story and the code stories' branch name check flexoki-light's
  * muted and secondary token, and the Models story checks light `--color-muted-light` (#5984).
+ *
+ * The accent-link stories check markdown links and the selected Settings section in all four
+ * themes, which use the text-only accent token (#5946 dark, #6449 light).
  */
 
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
@@ -32,10 +35,10 @@ import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   colorContrastOn,
   flatGradientColor,
-  opaqueBackgroundOwner,
-  textContrastOnBase,
+  textContrast,
   textContrasts,
   tokenTextContrasts,
+  textsBelowAaInThemes,
   type TextContrast,
 } from "@/browser/stories/helpers/contrast";
 import {
@@ -64,7 +67,7 @@ export default {
 
 const TOKENS = ["--color-muted", "--color-secondary"];
 
-/** The token texts under `root`. Project badges have their own stories (#5978). */
+/** The token texts under `root`. Project avatars have their own stories (#5978). */
 const checkedTokenTexts = (root: HTMLElement) => tokenTextContrasts(root, TOKENS);
 
 /**
@@ -123,7 +126,9 @@ export const Home: AppStory = {
   render: () => <AppWithMocks setup={() => createMockORPCClient()} />,
   play: async ({ canvasElement }) => {
     await within(canvasElement).findByText("No projects", {}, { timeout: 15_000 });
-    await expectTokenTextsReadable(canvasElement, { "--color-muted": 1 });
+    // No minimum: home shows no muted or secondary text (the sidebar toggle is an icon), and the
+    // scan still checks any that a later change adds.
+    await expectTokenTextsReadable(canvasElement, {});
   },
 };
 
@@ -159,7 +164,7 @@ function setupWorkspaceWithSidebars(options: { flatSidebar: boolean }) {
   });
   // setupSimpleChatStory collapses the right sidebar; open both for this screen.
   expandLeftSidebar();
-  expandRightSidebar();
+  expandRightSidebar("ws-light-tokens");
   updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "review");
   return client;
 }
@@ -201,27 +206,24 @@ export const WorkspaceWithFlatSidebar: AppStory = {
   },
 };
 
-// ─── Flat-sidebar project badges (#5978) ─────────────────────────────────────────────────────
+// ─── Flat-sidebar project avatars (#5978) ────────────────────────────────────────────────────
 
 /** Every palette color, plus the two custom hex extremes a user can type. */
-const BADGE_COLORS = [...SECTION_COLOR_PALETTE.map(([name]) => name), "#000000", "#ffffff"];
+const AVATAR_COLORS = [...SECTION_COLOR_PALETTE.map(([name]) => name), "#000000", "#ffffff"];
 
-const badgeProjectName = (color: string) => `badge-${color.replace("#", "hex-").toLowerCase()}`;
+const avatarProjectName = (color: string) => `avatar-${color.replace("#", "hex-").toLowerCase()}`;
 
-/**
- * A flat sidebar with one chat and one draft per badge color. The first chat is selected, so
- * one row shows the selected background and the rest the unselected one.
- */
-function setupProjectBadges() {
-  const workspaces = BADGE_COLORS.map((color) =>
+/** A flat sidebar with one chat and one draft per avatar color. */
+function setupProjectAvatars() {
+  const workspaces = AVATAR_COLORS.map((color) =>
     createWorkspace({
-      id: `ws-${badgeProjectName(color)}`,
-      name: `chat-${badgeProjectName(color)}`,
-      projectName: badgeProjectName(color),
+      id: `ws-${avatarProjectName(color)}`,
+      name: `chat-${avatarProjectName(color)}`,
+      projectName: avatarProjectName(color),
     })
   );
   const projects = groupWorkspacesByProject(workspaces);
-  for (const [index, color] of BADGE_COLORS.entries()) {
+  for (const [index, color] of AVATAR_COLORS.entries()) {
     const path = workspaces[index].projectPath;
     const config = projects.get(path);
     if (!config) throw new Error(`no project config for ${path}`);
@@ -238,71 +240,53 @@ function setupProjectBadges() {
 }
 
 /**
- * Every chat and draft badge reaches 4.5:1 on an unselected row and on the selected row. Hovered
- * rows use the selected row's background (`hover:bg-surface-secondary`), and `:hover` cannot be
- * triggered from a play, so the selected color stands in for both.
+ * Every chat and draft avatar letter reaches 4.5:1 on the avatar's own opaque tint, so the row
+ * state (rest, hover, selected) behind the avatar does not matter.
  */
-async function expectProjectBadgesReadable(canvasElement: HTMLElement) {
-  const badges = await waitFor(
+async function expectProjectAvatarsReadable(canvasElement: HTMLElement) {
+  const avatars = await waitFor(
     () => {
       const found = [
-        ...canvasElement.querySelectorAll<HTMLElement>('[data-testid^="workspace-project-badge-"]'),
+        ...canvasElement.querySelectorAll<HTMLElement>(
+          '[data-testid^="workspace-project-avatar-"]'
+        ),
       ];
-      const drafts = found.filter((badge) => badge.dataset.testid?.includes("-draft-"));
+      const drafts = found.filter((avatar) => avatar.dataset.testid?.includes("-draft-"));
       if (
-        found.length - drafts.length < BADGE_COLORS.length ||
-        drafts.length < BADGE_COLORS.length
+        found.length - drafts.length < AVATAR_COLORS.length ||
+        drafts.length < AVATAR_COLORS.length
       ) {
         throw new Error(
-          `expected ${BADGE_COLORS.length} chat and draft badges, found ${found.length}`
+          `expected ${AVATAR_COLORS.length} chat and draft avatars, found ${found.length}`
         );
       }
       return found;
     },
     { timeout: 15_000 }
   );
-  const rowBackground = (badge: HTMLElement) => {
-    const row = opaqueBackgroundOwner(badge);
-    if (!row) throw new Error(`no opaque row behind "${badge.textContent}"`);
-    return getComputedStyle(row).backgroundColor;
-  };
-  const selected = badges.find((badge) =>
-    badge.dataset.testid?.endsWith(`ws-${badgeProjectName(BADGE_COLORS[0])}`)
-  );
-  if (!selected) throw new Error("no badge on the selected chat");
-  const selectedBackground = rowBackground(selected);
-  const unselectedBackground = rowBackground(badges[badges.length - 1]);
-  // Both row states must be on screen, or one of them would pass by absence.
-  await expect(selectedBackground).not.toBe(unselectedBackground);
-
   await expectReadable(
-    badges.flatMap((badge) =>
-      [
-        ["unselected", unselectedBackground],
-        ["selected or hovered", selectedBackground],
-      ].map(([state, base]) => ({
-        element: badge,
-        text: badge.textContent ?? "",
-        ratio: textContrastOnBase(badge, base),
-        label: `${badge.dataset.testid?.includes("-draft-") ? "draft" : "chat"} badge, ${state} row`,
-      }))
-    )
+    avatars.map((avatar) => ({
+      element: avatar,
+      text: avatar.textContent ?? "",
+      ratio: textContrast(avatar),
+      label: avatar.dataset.testid ?? "project avatar",
+    }))
   );
 }
 
-const projectBadgeStory = (theme: ThemeMode): AppStory => ({
+const projectAvatarStory = (theme: ThemeMode): AppStory => ({
   globals: { theme },
   parameters: lightContract,
-  render: () => <AppWithMocks setup={setupProjectBadges} />,
+  render: () => <AppWithMocks setup={setupProjectAvatars} />,
   play: async ({ canvasElement }) => {
-    await expectProjectBadgesReadable(canvasElement);
+    await expectProjectAvatarsReadable(canvasElement);
   },
 });
 
-export const ProjectBadgesLight = projectBadgeStory("light");
-export const ProjectBadgesFlexokiLight = projectBadgeStory("flexoki-light");
-export const ProjectBadgesDark = projectBadgeStory("dark");
-export const ProjectBadgesFlexokiDark = projectBadgeStory("flexoki-dark");
+export const ProjectAvatarsLight = projectAvatarStory("light");
+export const ProjectAvatarsFlexokiLight = projectAvatarStory("flexoki-light");
+export const ProjectAvatarsDark = projectAvatarStory("dark");
+export const ProjectAvatarsFlexokiDark = projectAvatarStory("flexoki-dark");
 
 export const Settings: AppStory = {
   globals: { theme: "light" },
@@ -414,7 +398,7 @@ function setupCodeWorkspace(tab: "review" | "costs", withGutterReview = false) {
     },
   });
   expandLeftSidebar();
-  expandRightSidebar();
+  expandRightSidebar("ws-light-code");
   updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, tab);
   // The per-workspace layout remembers the last tab across stories; drop it so `tab` applies.
   updatePersistedState(getRightSidebarLayoutKey("ws-light-code"), null);
@@ -686,3 +670,71 @@ const darkSecondaryStory = (theme: ThemeMode): AppStory => ({
 
 export const SecondaryTextDark = darkSecondaryStory("dark");
 export const SecondaryTextFlexokiDark = darkSecondaryStory("flexoki-dark");
+
+// ─── Accent text (#5946 dark, #6449 light) ───────────────────────────────────────────────────
+
+/** An assistant answer with markdown links on the main surface, then Settings. */
+function setupAccentLinkWorkspace() {
+  return setupSimpleChatStory({
+    workspaceId: "ws-dark-accent",
+    workspaceName: "feature/dark-accent",
+    projectName: "my-app",
+    messages: [
+      createUserMessage("u1", "Where is the setup guide?", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP - 60_000,
+      }),
+      createAssistantMessage(
+        "a1",
+        "See the [setup guide](https://example.com/setup) and the [release notes](https://example.com/notes).",
+        { historySequence: 2, timestamp: STABLE_TIMESTAMP }
+      ),
+    ],
+  });
+}
+
+const accentLinkStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={setupAccentLinkWorkspace} />,
+  play: async ({ canvasElement }) => {
+    const links = await findTexts("markdown link", 2, () => [
+      ...canvasElement.querySelectorAll<HTMLElement>(".markdown-content a"),
+    ]);
+    // The selected Settings section is accent text on an accent tint: the lowest-contrast place
+    // it renders (light: 3.46:1 before #6449, flexoki-dark: 3.87:1 before #5946).
+    const dialog = await openSettingsDialog(canvasElement);
+    const section = await findTexts("selected Settings section", 1, () => [
+      within(dialog).getByRole("button", { name: "General" }),
+    ]);
+    await expectReadable([...links, ...section]);
+  },
+});
+
+export const AccentLinksLight = accentLinkStory("light");
+export const AccentLinksFlexokiLight = accentLinkStory("flexoki-light");
+export const AccentLinksDark = accentLinkStory("dark");
+export const AccentLinksFlexokiDark = accentLinkStory("flexoki-dark");
+
+// ─── Dark muted text on raised surfaces (#6544) ──────────────────────────────────────────────
+
+/**
+ * Every `--color-muted` text on the Settings > Agents cards (`bg-background-secondary`) reaches
+ * 4.5:1 in dark and flexoki-dark. Dark muted at 53% was 4.16:1 on these cards.
+ */
+export const MutedOnRaisedSurfacesDark: AppStory = {
+  globals: { theme: "dark" },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  play: async ({ canvasElement }) => {
+    const dialog = await openSettingsDialog(canvasElement);
+    await userEvent.click(await within(dialog).findByRole("button", { name: "Agents" }));
+    await within(dialog).findByRole("group", { name: "Exec defaults" });
+    // Read the muted texts per theme: the token resolves to a different color in each one.
+    const mutedTexts = () => tokenTextContrasts(dialog, ["--color-muted"]).map((e) => e.element);
+    await waitFor(() => {
+      if (mutedTexts().length < 5) throw new Error("expected 5+ muted texts on the Agents cards");
+    });
+    await expect(textsBelowAaInThemes(mutedTexts, ["dark", "flexoki-dark"]).join("\n")).toBe("");
+  },
+};

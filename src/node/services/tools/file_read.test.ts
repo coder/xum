@@ -7,6 +7,9 @@ import { createFileReadTool } from "./file_read";
 import type { FileReadToolArgs, FileReadToolResult } from "@/common/types/tools";
 import type { ToolExecutionOptions } from "ai";
 import { TestTempDir, createTestToolConfig, getTestDeps } from "./testHelpers";
+import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+import { writeFileString } from "@/node/utils/runtime/helpers";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 // Mock ToolCallOptions for testing
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -373,6 +376,7 @@ describe("file_read tool", () => {
     expectedContent: string
   ): Promise<void> {
     const tool = createFileReadTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: new LocalRuntime(testDir),
@@ -428,6 +432,7 @@ describe("file_read tool", () => {
       await fs.writeFile(planPath, planContent);
 
       const tool = createFileReadTool({
+        sessionLocks: nodeSessionLocks,
         ...getTestDeps(),
         cwd: testDir,
         runtime: new LocalRuntime(testDir),
@@ -457,6 +462,7 @@ describe("file_read tool", () => {
       await fs.writeFile(ancestorPlanPath, "# Ancestor Plan\n\n- Context");
 
       const tool = createFileReadTool({
+        sessionLocks: nodeSessionLocks,
         ...getTestDeps(),
         cwd: testDir,
         runtime: new LocalRuntime(testDir),
@@ -487,6 +493,7 @@ describe("file_read tool", () => {
       await fs.writeFile(otherPath, "# Other\n");
 
       const tool = createFileReadTool({
+        sessionLocks: nodeSessionLocks,
         ...getTestDeps(),
         cwd: testDir,
         runtime: new LocalRuntime(testDir),
@@ -518,6 +525,7 @@ describe("file_read tool", () => {
       await fs.writeFile(otherPath, "# Other\n");
 
       const tool = createFileReadTool({
+        sessionLocks: nodeSessionLocks,
         ...getTestDeps(),
         cwd: testDir,
         runtime: new LocalRuntime(testDir),
@@ -537,5 +545,21 @@ describe("file_read tool", () => {
     } finally {
       await fs.rm(planDir, { recursive: true, force: true });
     }
+  });
+});
+
+// The in-memory loop proof (5b PR 9) reads a file through this tool on a FakeRuntime: the tool
+// must give the same result there as on the host, without a host call.
+describe("file_read tool on a FakeRuntime", () => {
+  it("reads a file of the memory volume with line numbers", async () => {
+    const host = createMemoryHost();
+    await writeFileString(host.runtime, "~/ws/README.md", "# hello\nworld");
+    const config = createTestToolConfig("/home/u/ws", { runtime: host.runtime });
+    config.runtimeTempDir = host.paths.tmpDir();
+    const result = (await createFileReadTool(config).execute!(
+      { path: "README.md" },
+      mockToolCallOptions
+    )) as FileReadToolResult;
+    expect(result).toMatchObject({ success: true, lines_read: 2, content: "1\t# hello\n2\tworld" });
   });
 });

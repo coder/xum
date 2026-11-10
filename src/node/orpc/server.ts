@@ -42,11 +42,13 @@ import { createFlowControlledWebSocket, type FlowControlObserver } from "@/node/
 import { perfEpochNowMs } from "@/common/utils/perf/clock";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
+import { injectWorkspaceView } from "@/node/orpc/staticWorkspaceView/workspaceViewPage";
 import {
   SERVER_AUTH_SESSION_COOKIE_NAME,
   SERVER_AUTH_SESSION_MAX_AGE_SECONDS,
 } from "@/node/services/serverAuthService";
 import { attachStreamErrorHandler, isIgnorableStreamError } from "@/node/utils/streamErrors";
+import { withPrivateUnixSocketPath } from "@/node/utils/privateUnixSocket";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createHealthProbe } from "@/node/orpc/healthProbe";
 import { HEALTH_FS_PROBE_TIMEOUT_MS } from "@/constants/startup";
@@ -56,9 +58,15 @@ import {
   CODER_OAUTH_SERVER_CALLBACK_PATH,
   CODER_OAUTH_SERVER_START_PATH,
 } from "@/common/constants/coderOAuth";
-import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { assert } from "@/common/utils/assert";
 import {
+  FIRST_RUN_EARLY_SCRIPT,
+  FIRST_RUN_MODULES_ID,
+  FIRST_RUN_TEMPLATE_ID,
+  FIRST_RUN_VIEW_HTML,
+} from "@/node/orpc/firstRunView";
+import {
+  deferAppModules,
   findFirstViewFont,
   firstViewFontPreload,
   isHashedStaticAssetName,
@@ -100,6 +108,13 @@ export interface OrpcServerOptions {
    * Keep disabled by default and only enable when TLS is terminated before mux.
    */
   allowHttpOrigin?: boolean;
+  /**
+   * Also listen on this Unix socket, in a private folder (see withPrivateUnixSocketPath). A
+   * client that connects there reaches this server or nothing, because no other user can create a
+   * name in that folder. The dev server's Vite proxy uses it, since the TCP port is free for any
+   * local account to bind while the backend restarts.
+   */
+  unixSocketPath?: string;
 }
 
 export interface OrpcServer {
@@ -200,6 +215,32 @@ function injectBaseHref(
 function escapeJsonForHtmlScript(value: unknown): string {
   // Prevent `</script>` injection when embedding untrusted strings in an inline <script>.
   return JSON.stringify(value).replaceAll("<", "\\u003c");
+}
+
+/**
+ * T3 C step 2 (plan section 5.6, PR 4b), for "/" only (`isAppRoot`): the static first-run view in a <template>
+ * before </body>, and JS-after-paint. Vite's module tags move into a JSON list after the <base>,
+ * then the early script, which shows the view and loads the app from that list once the view has
+ * painted, or at once (fact list: paint-cache key, hidden tab, a failed or slow POST, rule says no).
+ * The list must precede the early script, which can load the app before the parser goes on, and
+ * both precede the stylesheet, so the script does not wait for the CSS. A page without exactly one
+ * module script, a <base> and a </body> is served as is.
+ * Split origin (VITE_BACKEND_URL, a renderer served apart from its backend): the early script posts
+ * to this page's own `api/`. There those POSTs fail, and the script loads the app with no view, as
+ * today (PR 4a's failed-POST tests). Known limit: no static view on a split origin.
+ */
+function injectFirstRunView(html: string, isAppRoot: boolean): string {
+  const deferred = isAppRoot ? deferAppModules(html) : null;
+  if (!deferred || !/<base\b[^>]*>/i.test(deferred.html) || !/<\/body>/i.test(deferred.html)) {
+    return html;
+  }
+  const list = escapeJsonForHtmlScript(deferred.modules);
+  const head = `\n    <script type="application/json" id="${FIRST_RUN_MODULES_ID}">${list}</script>\n    <script>${FIRST_RUN_EARLY_SCRIPT}</script>`;
+  const template = `<template id="${FIRST_RUN_TEMPLATE_ID}">${FIRST_RUN_VIEW_HTML}</template>\n  `;
+  // Function replacers: the inserted text holds `$` signs, which string replacements would expand.
+  return deferred.html
+    .replace(/<base\b[^>]*>/i, (base) => base + head)
+    .replace(/<\/body>/i, (end) => template + end);
 }
 
 function getBrowserProxyUriTemplate(): string | null {
@@ -754,7 +795,6 @@ function buildPublicAbsoluteUrl(
 }
 
 const OAUTH_CALLBACK_ORIGIN_BYPASS_PATHS = new Set<string>([
-  "/auth/mux-gateway/callback",
   "/auth/mcp-oauth/callback",
   CODER_OAUTH_SERVER_CALLBACK_PATH,
 ]);
@@ -787,6 +827,48 @@ function listenOnce(server: net.Server, port: number, host: string): Promise<voi
       resolve();
     });
   });
+}
+
+/**
+ * A second HTTP server that re-emits its request, upgrade, and clientError events on `primary`, so
+ * it shares the primary's handlers. (Handing raw sockets over with emit("connection") works in
+ * Node but not in Bun.)
+ */
+function createForwardingServer(primary: http.Server, name: string): http.Server {
+  const secondary = http.createServer();
+  attachStreamErrorHandler(secondary, name, { logger: log });
+  for (const event of ["request", "upgrade", "clientError"] as const) {
+    secondary.on(event, (...args: unknown[]) => primary.emit(event, ...args));
+  }
+  return secondary;
+}
+
+/** Listen on `socketPath` (made private first) and serve it with the primary's handlers. */
+async function listenOnUnixSocket(primary: http.Server, socketPath: string): Promise<http.Server> {
+  const unixServer = createForwardingServer(primary, "orpc-http-server-unix");
+  // The lock is held until the socket listens, so a second start on this path sees it as in use.
+  await withPrivateUnixSocketPath(
+    socketPath,
+    () =>
+      new Promise<void>((resolve, reject) => {
+        unixServer.once("error", reject);
+        unixServer.listen(socketPath, () => {
+          unixServer.removeListener("error", reject);
+          resolve();
+        });
+      })
+  );
+  return unixServer;
+}
+
+/** Drop the connections of a listener that feeds the primary server, then stop it if it listens. */
+async function closeSecondaryListener(server: http.Server | null): Promise<void> {
+  if (!server) return;
+  server.closeIdleConnections?.();
+  server.closeAllConnections?.();
+  if (server.listening) {
+    await closeListener(server);
+  }
 }
 
 function closeListener(server: net.Server): Promise<void> {
@@ -855,11 +937,7 @@ async function listenOnBothLoopbacks(
     };
     httpServer.on("connection", trackSocket);
 
-    const ipv6Server = http.createServer();
-    attachStreamErrorHandler(ipv6Server, "orpc-http-server-ipv6", { logger: log });
-    for (const event of ["request", "upgrade", "clientError"] as const) {
-      ipv6Server.on(event, (...args: unknown[]) => httpServer.emit(event, ...args));
-    }
+    const ipv6Server = createForwardingServer(httpServer, "orpc-http-server-ipv6");
     try {
       await listenOnce(ipv6Server, address.port, "::1");
       return ipv6Server;
@@ -903,6 +981,7 @@ export async function createOrpcServer({
   context,
   serveStatic = false,
   allowHttpOrigin = false,
+  unixSocketPath,
   // Default for non-bundled mode: from dist/node/orpc/, go up 2 levels to dist/.
   // In bundled mode (dist/runtime/), serverService computes the static dir.
   staticDir = path.join(__dirname, "../.."),
@@ -1015,8 +1094,12 @@ export async function createOrpcServer({
 
   // OAuth providers may use POST redirects (307/308) or response_mode=form_post.
   // Support both JSON API requests and form-encoded callback payloads.
-  app.use(express.json({ limit: "50mb" }));
-  app.use(express.urlencoded({ extended: false }));
+  // inflate: false answers 415 for any Content-Encoding but identity before body-parser creates a
+  // decompression stream. These parsers run before auth, so otherwise any client that reaches the
+  // port could feed bytes to Node's Brotli decoder (CVE-2026-111497, which runs code on affected
+  // Node releases, including the desktop app's Electron). No xum client compresses request bodies.
+  app.use(express.json({ limit: "50mb", inflate: false }));
+  app.use(express.urlencoded({ extended: false, inflate: false }));
 
   // Health check. Must be registered ahead of express.static: serve-static stats
   // "<staticDir>/health" on every request before falling through, so a wedged libuv threadpool
@@ -1294,29 +1377,18 @@ export async function createOrpcServer({
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#0e0e0e" />
     <title>${title}</title>
-    <link rel="stylesheet" href="${MUX_GATEWAY_ORIGIN}/static/css/site.css" />
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 600px; margin: 4rem auto; padding: 1rem; }
+      h1 { margin-bottom: 1rem; }
+      .muted { opacity: 0.7; }
+    </style>
   </head>
   <body>
-    <div class="page">
-      <header class="site-header">
-        <div class="container">
-          <div class="header-title">xum</div>
-        </div>
-      </header>
-
-      <main class="site-main">
-        <div class="container">
-          <div class="content-surface">
-            <h1>${title}</h1>
-            <p>${description}</p>
-            ${input.result.success ? '<p class="muted">This tab should close automatically.</p>' : ""}
-            <p><a class="btn primary" href="${returnPathHref}">Return to Xum</a></p>
-          </div>
-        </div>
-      </main>
-    </div>
+    <h1>${title}</h1>
+    <p>${description}</p>
+    ${input.result.success ? '<p class="muted">This tab should close automatically.</p>' : ""}
+    <p><a href="${returnPathHref}">Return to Xum</a></p>
 
     <script>
       (() => {
@@ -1373,46 +1445,6 @@ export async function createOrpcServer({
     res.setHeader("Content-Type", "text/html");
     res.send(html);
   }
-
-  // --- Xum Gateway OAuth (unauthenticated bootstrap routes) ---
-  // These are raw Express routes (not oRPC) because the OAuth provider cannot
-  // send a mux Bearer token during the redirect callback.
-  app.get("/auth/mux-gateway/start", async (req, res) => {
-    if (!(await isHttpRequestAuthenticated(req))) {
-      res.status(401).json({ error: "Invalid or missing auth token/session" });
-      return;
-    }
-
-    const redirectUri = buildPublicAbsoluteUrl(req, "/auth/mux-gateway/callback", allowHttpOrigin);
-    if (!redirectUri) {
-      res.status(400).json({ error: "Missing or invalid Host header" });
-      return;
-    }
-    const { authorizeUrl, state } = context.muxGatewayOauthService.startServerFlow({ redirectUri });
-    res.json({ authorizeUrl, state });
-  });
-
-  app.all("/auth/mux-gateway/callback", async (req, res) => {
-    // Some providers use 307/308 redirects that preserve POST, or response_mode=form_post.
-    if (req.method !== "GET" && req.method !== "POST") {
-      res.sendStatus(405);
-      return;
-    }
-
-    const state = getStringParamFromQueryOrBody(req, "state");
-    const code = getStringParamFromQueryOrBody(req, "code");
-    const error = getStringParamFromQueryOrBody(req, "error");
-    const errorDescription = getStringParamFromQueryOrBody(req, "error_description") ?? undefined;
-
-    const result = await context.muxGatewayOauthService.handleServerCallbackAndExchange({
-      state,
-      code,
-      error,
-      errorDescription,
-    });
-
-    sendOAuthCallbackPage(req, res, { type: "mux-gateway-oauth", state, result });
-  });
 
   // --- MCP OAuth (unauthenticated redirect callback) ---
   // The OAuth provider cannot attach a mux Bearer token during redirects.
@@ -1645,10 +1677,17 @@ export async function createOrpcServer({
       }
 
       if (rawSpaIndexHtml !== null) {
+        const isAppRoot = shouldInjectSlashlessRootRedirect(req);
         const spaIndexHtml = injectProxyUriTemplate(
-          injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
-            includeSlashlessRootRedirect: shouldInjectSlashlessRootRedirect(req),
-          }),
+          injectWorkspaceView(
+            injectFirstRunView(
+              injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
+                includeSlashlessRootRedirect: isAppRoot,
+              }),
+              isAppRoot
+            ),
+            { path: req.path, headers: req.headers }
+          ),
           getBrowserProxyUriTemplate()
         );
         varyPublicBasePathHeaders(res);
@@ -1854,12 +1893,16 @@ export async function createOrpcServer({
 
   // Start listening
   let ipv6LoopbackServer: http.Server | null = null;
+  let unixSocketServer: http.Server | null = null;
   try {
     // Hostnames are case-insensitive; normalize like ServerService.isLoopbackHost.
     if (host.trim().toLowerCase() === "localhost") {
       ipv6LoopbackServer = await listenOnBothLoopbacks(httpServer, port);
     } else {
       await listenOnce(httpServer, port, host);
+    }
+    if (unixSocketPath != null) {
+      unixSocketServer = await listenOnUnixSocket(httpServer, unixSocketPath);
     }
   } catch (error) {
     // The caller gets no OrpcServer to close, and desktop startup keeps running after a
@@ -1869,6 +1912,9 @@ export async function createOrpcServer({
       ws.terminate();
     }
     wsServer.close();
+    // A failed socket bind comes after the TCP listeners were bound.
+    await closeSecondaryListener(ipv6LoopbackServer);
+    await closeSecondaryListener(httpServer);
     throw error;
   }
 
@@ -1912,14 +1958,9 @@ export async function createOrpcServer({
         await browserBridgeServer.stop();
       }
 
-      // Then close HTTP server (and the IPv6 loopback listener feeding it).
-      if (ipv6LoopbackServer) {
-        ipv6LoopbackServer.closeIdleConnections?.();
-        ipv6LoopbackServer.closeAllConnections?.();
-        if (ipv6LoopbackServer.listening) {
-          await closeListener(ipv6LoopbackServer);
-        }
-      }
+      // Then close HTTP server (and the IPv6 loopback and Unix socket listeners feeding it).
+      await closeSecondaryListener(ipv6LoopbackServer);
+      await closeSecondaryListener(unixSocketServer);
       httpServer.closeIdleConnections?.();
       httpServer.closeAllConnections?.();
       if (httpServer.listening) {

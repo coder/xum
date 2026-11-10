@@ -38,10 +38,12 @@ const SINGLE_HEADERS = new Set(
 /**
  * Nano-dollars per token at list price, checked 2026-10-10 against
  * https://platform.claude.com/docs/en/about-claude/pricing: Opus 5.5 $4 / $20 per million
- * (cache read $0.20), Sonnet 5.5 $2 / $10 ($0.10). Haiku 5.5 (checked 2026-10-13) is priced by
- * prompt length: $0.10 / $0.50 ($0.01) up to 100,000 prompt tokens and $0.50 / $2.50 ($0.05)
- * above. checkRequest admits prompts up to 200k tokens, so the table holds the higher tier: a
- * bound must not undercount, and the ledger then overcounts a short prompt.
+ * (cache read $0.20), Sonnet 5.5 $2 / $10 ($0.10). Haiku 5.5 (checked 2026-10-21, same page,
+ * "Long context pricing") is priced by prompt length: $0.10 / $0.50 ($0.01) up to 100,000 prompt
+ * tokens and $0.50 / $2.50 ($0.05) above, where the prompt counts input, cache write and cache
+ * read tokens. checkRequest admits prompts up to 200k tokens, so the table holds the higher tier
+ * and every bound uses it: a bound must not undercount. usageCost settles a call at the tier of
+ * its own prompt (LOW_TIER).
  * A cache write costs 2x input (the 1-hour rate, the higher one). The vision docs
  * (https://platform.claude.com/docs/en/build-with-claude/vision) cap one image at 4,784 visual
  * tokens on the high-resolution tier (Opus 4.7 and later) and 1,568 on other models, after
@@ -51,6 +53,13 @@ const PRICES = new Map([
   ["claude-opus-5-5", { input: 4000, output: 20_000, cacheRead: 200 }],
   ["claude-sonnet-5-5", { input: 2000, output: 10_000, cacheRead: 100 }],
   ["claude-haiku-5-5", { input: 500, output: 2500, cacheRead: 50 }],
+]);
+/**
+ * A model's lower tier: a call whose prompt is `maxPrompt` tokens or fewer settles at these
+ * rates. Haiku 5.5's is 1/5 of its PRICES row. Only usageCost reads it, never a bound.
+ */
+const LOW_TIER = new Map([
+  ["claude-haiku-5-5", { maxPrompt: 100_000, input: 100, output: 500, cacheRead: 10 }],
 ]);
 const VISUAL_TOKENS = 4784;
 
@@ -255,9 +264,12 @@ function readUsage(usage: unknown): Usage | undefined {
 
 /** List-price cost of an Anthropic usage record in nano-dollars, or undefined if unreadable. */
 export function usageCost(model: string, usage: unknown): number | undefined {
-  const price = PRICES.get(model);
+  const table = PRICES.get(model);
   const read = readUsage(usage);
-  if (!price || !read) return undefined;
+  if (!table || !read) return undefined;
+  const low = LOW_TIER.get(model);
+  const prompt = read.input + read.cacheWrite + read.cacheRead;
+  const price = low && prompt <= low.maxPrompt ? low : table;
   const input = read.input + 2 * read.cacheWrite;
   return input * price.input + read.cacheRead * price.cacheRead + read.output * price.output;
 }

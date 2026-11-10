@@ -4,7 +4,6 @@ import React, { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Route, Zap } from "lucide-react";
 import { UltrafastIcon } from "@/browser/components/icons/UltrafastIcon/UltrafastIcon";
 
-import { useAPI } from "@/browser/contexts/API";
 import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
@@ -12,9 +11,8 @@ import { useRouting } from "@/browser/hooks/useRouting";
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
-  applyFastModeToggle,
   getFastModeProvider,
-  isFastModeActive,
+  resolveChatServiceTier,
   toggleServiceTier,
   type PremiumServiceTier,
   ultrafastModeAvailable as getUltrafastModeAvailable,
@@ -68,8 +66,6 @@ interface ThinkingSelectorControlProps {
   modelCapabilitiesDeferred?: boolean;
   /** Independent of effort/model inheritance; false denotes an explicit mode override. */
   reasoningModeInherited?: boolean;
-  /** Nested tools enforce model capabilities without the chat-specific effort floor. */
-  applyMinimumThinkingLevel?: boolean;
   thinkingLevel: ThinkingLevel;
   onThinkingLevelChange: (level: ThinkingLevel) => void;
   reasoningMode: OpenAIReasoningMode;
@@ -100,12 +96,10 @@ interface ThinkingSelectorControlProps {
  * supply the current values and persistence callbacks.
  */
 export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (props) => {
-  const { api } = useAPI();
   const { getMinimum } = useMinThinkingLevels();
-  const { config: providersConfig, refresh, updateOptimistically } = useProvidersConfig();
+  const { config: providersConfig } = useProvidersConfig();
   const routing = useRouting();
   const [isOpen, setIsOpen] = useState(false);
-  const [fastModeSaving, setFastModeSaving] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const variant = props.variant ?? "composer";
@@ -136,8 +130,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
     }
 
     assert(props.modelString, "A model is required unless capabilities are deferred");
-    const minimum =
-      props.applyMinimumThinkingLevel === false ? undefined : getMinimum(props.modelString);
+    const minimum = getMinimum(props.modelString);
     const resolvedRoute = routing.resolveRoute(normalizeToCanonical(props.modelString)).route;
     return {
       allowed: getAvailableThinkingLevels(props.modelString, minimum, providersConfig),
@@ -186,13 +179,13 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
     !reasoningModeInherited && proModeAvailable && props.reasoningMode === "pro";
   const cyberModeActive =
     !reasoningModeInherited && cyberModeAvailable && props.reasoningMode === "cyber";
-  const openaiServiceTier = props.serviceTier ?? providersConfig?.openai?.serviceTier;
-  const fastModeActive =
-    fastModeProvider === "openai"
-      ? openaiServiceTier === "priority"
-      : fastModeProvider != null &&
-        isFastModeActive(fastModeProvider, providersConfig?.[fastModeProvider]);
-  const ultrafastModeActive = ultrafastModeAvailable && openaiServiceTier === "ultrafast";
+  // Like the thinking level, speed is the chat's choice for every provider.
+  const chatServiceTier =
+    fastModeProvider != null
+      ? resolveChatServiceTier(fastModeProvider, props.serviceTier, providersConfig)
+      : undefined;
+  const fastModeActive = chatServiceTier === "priority";
+  const ultrafastModeActive = ultrafastModeAvailable && chatServiceTier === "ultrafast";
   const hasMenu =
     allowed.length > 1 ||
     proModeAvailable ||
@@ -216,32 +209,9 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [isOpen]);
 
-  const handleFastModeToggle = async (targetServiceTier: PremiumServiceTier = "priority") => {
-    if (fastModeSaving || providersConfig == null || fastModeProvider == null) return;
-
-    if (fastModeProvider === "openai") {
-      props.onServiceTierChange?.(toggleServiceTier(openaiServiceTier, targetServiceTier));
-      return;
-    }
-    if (!api) return;
-    setFastModeSaving(true);
-    try {
-      const patch = await applyFastModeToggle(
-        api.providers,
-        fastModeProvider,
-        providersConfig[fastModeProvider],
-        targetServiceTier
-      );
-      if (patch) {
-        updateOptimistically(fastModeProvider, patch);
-      } else {
-        await refresh();
-      }
-    } catch {
-      await refresh();
-    } finally {
-      setFastModeSaving(false);
-    }
+  const handleFastModeToggle = (targetServiceTier: PremiumServiceTier = "priority") => {
+    if (providersConfig == null || fastModeProvider == null) return;
+    props.onServiceTierChange?.(toggleServiceTier(chatServiceTier, targetServiceTier));
   };
 
   if (!hasMenu) {
@@ -269,7 +239,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
       <button
         type="button"
         data-thinking-selector-trigger
-        className="text-foreground hover:bg-hover focus-visible:bg-hover focus-visible:text-accent flex shrink-0 cursor-pointer items-center gap-0.5 rounded-sm bg-transparent py-0 pr-0.5 text-[11px] font-medium transition-colors focus-visible:outline-none"
+        className="text-foreground hover:bg-hover focus-visible:bg-hover focus-visible:text-accent-text flex shrink-0 cursor-pointer items-center gap-0.5 rounded-sm bg-transparent py-0 pr-0.5 text-[11px] font-medium transition-colors focus-visible:outline-none"
         aria-expanded={isOpen}
         aria-haspopup="listbox"
         aria-label={`Thinking: ${autoActive ? "Auto" : effectiveThinkingLevel}${proModeActive ? ", pro mode" : ""}${cyberModeActive ? ", cyber mode" : ""}${fastModeActive ? ", fast mode" : ""}${ultrafastModeActive ? ", ultrafast mode" : ""}`}
@@ -447,11 +417,11 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
               >
                 <Route
                   aria-hidden
-                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent" : "text-muted")}
+                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent-text" : "text-muted")}
                 />
                 <span className="text-foreground min-w-0 flex-1">Auto</span>
                 <span className="text-muted shrink-0 text-[10px]">Route by difficulty</span>
-                {autoActive && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                {autoActive && <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />}
               </button>
             )}
             {props.inheritOption && (
@@ -467,7 +437,9 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                 onClick={props.inheritOption.onSelect}
               >
                 <span className="text-foreground min-w-0 flex-1">{props.inheritOption.label}</span>
-                {inheritSelected && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                {inheritSelected && (
+                  <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />
+                )}
               </button>
             )}
             {allowed.map((level) => {
@@ -487,7 +459,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                   onClick={() => props.onThinkingLevelChange(level)}
                 >
                   <span className="text-foreground min-w-0 flex-1">{label}</span>
-                  {selected && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                  {selected && <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />}
                 </button>
               );
             })}
@@ -545,11 +517,8 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                   type="button"
                   data-component="FastModeToggle"
                   aria-pressed={fastModeActive}
-                  disabled={fastModeSaving}
                   className="hover:bg-hover disabled:text-muted flex w-full items-center gap-2.5 px-2.5 py-1.5 text-left transition-colors disabled:cursor-default"
-                  onClick={() => {
-                    handleFastModeToggle().catch(() => undefined);
-                  }}
+                  onClick={() => handleFastModeToggle()}
                 >
                   <span className="min-w-0 flex-1">
                     <span className="text-foreground block text-[11px] font-medium">Fast mode</span>
@@ -557,7 +526,9 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                       Faster responses at higher cost
                     </span>
                   </span>
-                  {fastModeActive && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                  {fastModeActive && (
+                    <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />
+                  )}
                 </button>
               )}
 
@@ -566,11 +537,8 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                   type="button"
                   data-component="UltrafastModeToggle"
                   aria-pressed={ultrafastModeActive}
-                  disabled={fastModeSaving}
                   className="hover:bg-hover disabled:text-muted flex w-full items-center gap-2.5 px-2.5 py-1.5 text-left transition-colors disabled:cursor-default"
-                  onClick={() => {
-                    handleFastModeToggle("ultrafast").catch(() => undefined);
-                  }}
+                  onClick={() => handleFastModeToggle("ultrafast")}
                 >
                   <span className="min-w-0 flex-1">
                     <span className="text-foreground block text-[11px] font-medium">
@@ -581,7 +549,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                     </span>
                   </span>
                   {ultrafastModeActive && (
-                    <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />
+                    <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />
                   )}
                 </button>
               )}

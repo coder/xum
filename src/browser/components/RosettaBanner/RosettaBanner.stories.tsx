@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { within } from "@storybook/test";
+import { within } from "storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { RosettaBanner } from "./RosettaBanner.js";
 

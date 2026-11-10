@@ -38,6 +38,33 @@ describe("ACP slash command support", () => {
     },
   ];
 
+  it("resolves /<plugin>:<skill> for a plugin skill that won its bare name", () => {
+    const pluginSkill: AgentSkillDescriptor = {
+      name: "plug-tdd",
+      description: "Plugin skill",
+      scope: "global",
+      pluginName: "pstack",
+    };
+    const parsed = parseAcpSlashCommand("/pstack:plug-tdd now", mapSkillsByName([pluginSkill]));
+    expect(parsed).toMatchObject({ kind: "skill", descriptor: { name: "pstack:plug-tdd" } });
+    // The alias is a lookup only: the advertised command list stays bare.
+    expect(buildAcpAvailableCommands([pluginSkill]).map((command) => command.name)).not.toContain(
+      "pstack:plug-tdd"
+    );
+  });
+
+  it("labels a display-name skill in the ACP command list but keeps its ID as the command", () => {
+    const [command] = buildAcpAvailableCommands([
+      {
+        name: "poteto-mode",
+        displayName: "Poteto Mode",
+        description: "poteto's style",
+        scope: "global",
+      },
+    ]).filter((candidate) => candidate.name === "poteto-mode");
+    expect(command?.description.startsWith("Poteto Mode")).toBe(true);
+  });
+
   it("builds ACP available command list with server commands and user-invocable skills", () => {
     const availableCommands = buildAcpAvailableCommands(skills);
     const commandNames = availableCommands.map((command) => command.name);
@@ -112,20 +139,6 @@ describe("ACP slash command support", () => {
     }
 
     expect(parsed.model).toBe("openrouter:openai/gpt-5");
-  });
-
-  it("preserves mux-gateway prefix in /compact -m model", () => {
-    const parsed = parseAcpSlashCommand(
-      "/compact -m mux-gateway:anthropic/claude-sonnet-4-6",
-      mapSkillsByName(skills)
-    );
-
-    expect(parsed?.kind).toBe("compact");
-    if (parsed?.kind !== "compact") {
-      throw new Error("Expected /compact command with mux-gateway prefix to parse");
-    }
-
-    expect(parsed.model).toBe("mux-gateway:anthropic/claude-sonnet-4-6");
   });
 
   it("rejects invalid model ids in /compact -m", () => {

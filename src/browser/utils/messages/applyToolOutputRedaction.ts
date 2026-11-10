@@ -4,6 +4,7 @@
  */
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
 import { sanitizeUnknownForProviderOutput } from "@/common/utils/providerOutputSanitization";
+import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalToolResultFields";
 import { stripToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 import { stripWorkflowRunRecordForModel } from "@/common/utils/workflowRunMessages";
 
@@ -85,6 +86,10 @@ function stripLegacyImageToolOutputForModel(output: unknown): unknown {
   return stripped;
 }
 
+function withModelOnlyNotes(output: unknown, notes: string[] | undefined): unknown {
+  return notes === undefined ? output : attachModelOnlyToolNotifications(output, notes);
+}
+
 export function applyToolOutputRedaction(messages: MuxMessage[]): MuxMessage[] {
   return messages.map((msg) => {
     if (msg.role !== "assistant") return msg;
@@ -94,9 +99,11 @@ export function applyToolOutputRedaction(messages: MuxMessage[]): MuxMessage[] {
       const providerPart = stripWorkflowRunAttachment(part);
       if (providerPart.state !== "output-available") return providerPart;
 
+      // The in-turn result carried these notes at its end, so the rebuild sends the same bytes.
+      const { modelOnlyNotifications, ...partWithoutNotes } = providerPart;
       const outputWithoutUiOnly = stripWorkflowRunRecordForModel(
         providerPart.toolName,
-        stripToolOutputUiOnly(providerPart.output)
+        stripToolOutputUiOnly(withModelOnlyNotes(providerPart.output, modelOnlyNotifications))
       );
       const sanitizedOutput = sanitizeUnknownForProviderOutput(
         stripLegacyImageToolOutputForModel(outputWithoutUiOnly)
@@ -117,7 +124,7 @@ export function applyToolOutputRedaction(messages: MuxMessage[]): MuxMessage[] {
         };
       });
       return {
-        ...providerPart,
+        ...partWithoutNotes,
         ...(nestedCalls ? { nestedCalls } : {}),
         output: sanitizedOutput,
       };

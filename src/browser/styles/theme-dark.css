@@ -70,10 +70,19 @@
     --color-content-secondary: hsla(240, 5%, 65%);
     --color-content-tertiary: hsla(240, 5%, 34%);
     --color-content-disabled: hsl(240, 5%, 26%);
+    /* Coder product link and highlight colors, from coder/coder site/src/index.css via Coder Kit.
+       Light values live in globals.css. */
+    --color-content-link: hsl(213 94% 68%);
+    --color-highlight-purple: hsl(269 100% 74%);
+    --color-highlight-sky: hsl(188 75% 80%);
+    --color-highlight-orange: hsl(31 100% 70%);
+    --color-highlight-magenta: hsl(292 100% 78%);
+    --color-highlight-green: hsl(141 79% 85%);
+    --color-highlight-red: hsl(0 91% 71%);
     --color-muted-foreground: hsl(0 0% 60%);
     /* Lightened to reach WCAG AA (4.5:1) on the dark surfaces, down to the slash command rows
-       (#262626, 5.05:1) (#6021). It is now lighter than --color-muted (53%): the user accepted
-       that order change for AA. Also reaches the VS Code webview, which imports this file. */
+       (#262626, 5.05:1) (#6021). It is about the same gray as --color-muted (#999999, #6544): the
+       user accepted that the two read alike. Also reaches the VS Code webview, which imports this file. */
     --color-secondary: #969696;
     --color-surface-primary: hsla(240, 10%, 4%, 1);
     --color-surface-secondary: hsla(240, 6%, 10%, 1);
@@ -193,7 +202,10 @@
     --color-input-border-focus: hsl(193 91% 64%);
 
     /* Additional Semantic Colors */
-    --color-muted: hsl(0 0% 53%); /* #888 - muted text */
+    /* WCAG AA (4.5:1) on every raised dark surface, down to tooltips #313130 (4.57:1). 53% was
+       4.16:1 on cards (#272726) and 3.78:1 on modals (#6544). It matches --color-muted-foreground
+       and is nearly --color-secondary: the user accepted that muted and secondary read alike. */
+    --color-muted: hsl(0 0% 60%); /* #999 - muted text */
     --color-muted-light: hsl(0 0% 50%); /* #808080 - muted light */
     --color-muted-dark: hsl(0 0% 43%); /* #6e6e6e - muted darker */
     --color-placeholder: hsl(0 0% 42%); /* #6b6b6b - placeholder */
@@ -240,10 +252,20 @@
     --color-accent-button-hover: var(--color-accent-dark);
     --color-accent-darker: hsl(202 100% 23%); /* #094771 - even darker accent */
     --color-accent-light: hsl(198 100% 65%); /* #4db8ff - lighter accent */
+    /* Accent as a text color (links, accent labels). --color-accent stays the button fill and focus
+       ring: white text on it needs that darker blue. This one reaches WCAG AA (4.5:1) on every dark
+       surface, down to the modal background #2e2e2e (4.51:1); #0070cc was 3.36:1 on dialogs (#5946). */
+    --color-accent-text: #1a98ff;
     --color-accent-foreground: hsl(0 0% 100%); /* readable text/icons on accent surfaces */
 
     --color-success: hsl(122 39% 49%); /* #4caf50 - success green */
     --color-success-light: hsl(123 46% 64%); /* #4ade80 - lighter success */
+    /* Success as a text color. The dark themes' success already reaches WCAG AA as text, so it is
+       the same color here. The light themes set a darker one (#6882). */
+    --color-success-text: var(--color-success);
+    /* Text-only variant of --color-success-light. Dark keeps the lighter green: it reaches AA as
+       text. The light themes set the success text color (#6885). */
+    --color-success-light-text: var(--color-success-light);
     --color-on-success: hsl(0 0% 100%);
 
     --color-danger: hsl(4 90% 58%); /* #f44336 - error red */
@@ -253,6 +275,9 @@
 
     --color-warning: hsl(45 100% 51%); /* #ffc107 - warning yellow */
     --color-warning-light: hsl(0 91% 71%); /* #f87171 - lighter warning/error */
+    /* Text-only variant of --color-warning-light. Dark keeps the same color: it reaches AA as
+       text. The light themes set a darker one (#6935). */
+    --color-warning-light-text: var(--color-warning-light);
     --color-warning-text: var(--color-warning);
 
     /* Code syntax highlighting */
@@ -323,6 +348,14 @@
   }
 
   --plan-mode-rgb: 31, 107, 184;
+
+  /* The folded iPhone Duo's cover display keeps an 84 pt status column on the right of its 466 pt
+     width. iOS 27.1 reports it as `env(safe-area-inset-right)`; iOS 27.2 reports nothing and lays
+     the page out without it, and iosCoverColumn.ts lays the page out across it again and sets
+     `--ios-cover-column`. This is the right inset either way, so overlays that keep clear of a
+     right inset keep clear of the column. Shared components (Dialog, toasts) read it, so the
+     webview defines it too. */
+  --safe-area-right: max(env(safe-area-inset-right, 0px), var(--ios-cover-column, 0px));
 
   --font-primary:
     -apple-system, BlinkMacSystemFont, "Geist", system-ui, "Segoe UI", "Roboto", "Helvetica Neue",

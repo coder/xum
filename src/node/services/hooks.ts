@@ -324,7 +324,9 @@ export async function runWithHook<T>(
       clearTimeout(preTimeoutHandle);
       preTimeoutHandle = undefined;
     }
-    log.error("[hooks] Failed to spawn hook", { hookPath, error: err });
+    // context.abortSignal is the caller's cancel. The internal controller also aborts on the
+    // pre-hook timeout, which must stay an error.
+    logHookFailure("Tool hook", hookPath, err, context.abortSignal);
     if (toolInputPath) {
       try {
         await execBuffered(runtime, `rm -f ${shellQuote(toolInputPath)}`, {
@@ -642,7 +644,7 @@ export async function runPreHook(
       exitCode: result.exitCode ?? -1,
     };
   } catch (err) {
-    log.error("[hooks] Pre-hook execution failed", { hookPath, error: err });
+    logHookFailure("Pre-hook", hookPath, err, context.abortSignal);
     return {
       allowed: false,
       output: `Pre-hook failed: ${getErrorMessage(err)}`,
@@ -756,7 +758,7 @@ export async function runPostHook(
       exitCode: result.exitCode ?? -1,
     };
   } catch (err) {
-    log.error("[hooks] Post-hook execution failed", { hookPath, error: err });
+    logHookFailure("Post-hook", hookPath, err, context.abortSignal);
     return {
       success: false,
       output: `Post-hook failed: ${getErrorMessage(err)}`,
@@ -764,6 +766,20 @@ export async function runPostHook(
     };
   } finally {
     await cleanup();
+  }
+}
+
+function logHookFailure(
+  phase: "Tool hook" | "Pre-hook" | "Post-hook",
+  hookPath: string,
+  err: unknown,
+  abortSignal: AbortSignal | undefined
+): void {
+  // A cancelled tool call (user interrupt) aborts its hook before or during exec. That is expected, so it is not an error.
+  if (abortSignal?.aborted) {
+    log.debug(`[hooks] ${phase} skipped: tool call aborted`, { hookPath, error: err });
+  } else {
+    log.error(`[hooks] ${phase} execution failed`, { hookPath, error: err });
   }
 }
 

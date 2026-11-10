@@ -44,7 +44,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import {
   DEFAULT_GOAL_CONTINUATION_COOLDOWN_MS,
   GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS,
@@ -609,7 +609,14 @@ export interface WorkspaceGoalServiceOptions {
 }
 
 export class WorkspaceGoalService {
-  private readonly fileLocks = workspaceFileLocks;
+  /**
+   * The one workspace FIFO, from the HistoryService's SessionLocks (phase 4), so a
+   * memory or foreign-holder layer reaches these writes too. Read at each use, not
+   * at construction: tests that pass a partial HistoryService keep working.
+   */
+  private get fileLocks(): SessionLocks["workspaceFiles"] {
+    return this.historyService.locks.workspaceFiles;
+  }
   private readonly continuationCooldownMs: number;
   private readonly allowUserOriginBudgetWrapup: boolean;
   private readonly suppressKickoffContinuation: boolean;
@@ -5116,8 +5123,7 @@ export class WorkspaceGoalService {
               : originKind;
           this.recordLastGoalStream(input.workspaceId, stampOriginKind, current.goalId);
         }
-        await this.pushSnapshot(input.workspaceId, current);
-        return current;
+        return this.chargePausedGoalStream(input, current, costMicroCentsThisStream);
       }
 
       // Only count goal-attributable turns. A rare `user`-origin stream that
@@ -5139,6 +5145,35 @@ export class WorkspaceGoalService {
       this.emitBudgetLimited(input.workspaceId, next, current.status);
       return next;
     });
+  }
+
+  /**
+   * A paused goal still pays for its own workspace's streams: the user's message pauses the
+   * goal (pausedBy "manual_user"), so the worker turns that follow are goal spend the counter
+   * otherwise never sees. Cost only: no turn, and no updatedAtMs bump, so a heartbeat or wake
+   * turn still does not look like goal work. Compaction stays uncharged (recordStreamAccounting
+   * returns before this), as for every status. Other non-running goals are not charged.
+   * Caller holds the goal file lock.
+   */
+  private async chargePausedGoalStream(
+    input: StreamAccountingInput,
+    current: GoalRecordV1,
+    costMicroCents: number
+  ): Promise<GoalRecordV1> {
+    if (current.status !== "paused" || costMicroCents <= 0) {
+      await this.pushSnapshot(input.workspaceId, current);
+      return current;
+    }
+    const charged = GoalRecordV1Schema.parse({
+      ...current,
+      ...this.applyCostAccounting(current, costMicroCents),
+    });
+    if (input.streamStartedAtMs != null) {
+      this.recordedStreamStartedAtMsByWorkspace.set(input.workspaceId, input.streamStartedAtMs);
+    }
+    await this.writeGoal(input.workspaceId, charged);
+    await this.pushSnapshot(input.workspaceId, charged);
+    return charged;
   }
 
   /**

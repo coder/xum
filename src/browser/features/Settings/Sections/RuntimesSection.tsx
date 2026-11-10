@@ -183,9 +183,9 @@ function CodeWorkspaceSyncField(props: { projectPath: string }) {
     <div className="border-border-light bg-background-secondary rounded-md border px-3 py-2">
       <div className="text-foreground text-sm">VS Code workspace file</div>
       <div className="text-muted text-xs">
-        Path of a <code className="text-accent">.code-workspace</code> file kept in sync with this
-        project&apos;s active worktrees (absolute, <code className="text-accent">~</code>, or
-        relative to the project). Leave empty to disable.
+        Path of a <code className="text-accent-text">.code-workspace</code> file kept in sync with
+        this project&apos;s active worktrees (absolute, <code className="text-accent-text">~</code>,
+        or relative to the project). Leave empty to disable.
       </div>
       <div className="mt-2 flex items-center gap-2">
         <Input

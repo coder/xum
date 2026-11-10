@@ -76,8 +76,9 @@ export function runBackgroundInit(
   return withInitUseLease(useLeases, workspaceId, () => runFullInit(runtime, params)).then(
     () => undefined,
     (error: unknown) => {
+      // Log the message: an Error object serializes to `{}` in the log.
       const errorMsg = getErrorMessage(error);
-      logger?.error(`Workspace init failed for ${workspaceId}:`, { error });
+      logger?.error(`Workspace init failed for ${workspaceId}:`, { error: errorMsg });
       params.initLogger.logStderr(`Initialization failed: ${errorMsg}`);
       params.initLogger.logComplete(-1);
     }

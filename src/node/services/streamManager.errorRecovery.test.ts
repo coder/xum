@@ -27,6 +27,8 @@ import {
   REFUSAL_FINISH,
 } from "./streamManager.suite.testHarness";
 import { Ok } from "@/common/types/result";
+import { clampErrorMessage } from "@/common/utils/errors";
+import { ERROR_MESSAGE_CLAMP_MAX_CHARS } from "@/constants/errors";
 
 installStreamManagerTestHistory();
 
@@ -98,6 +100,7 @@ function createRecoveryHarness() {
   let attempts: Attempt[] = [];
   let calls: StreamTextOptions[] = [];
   let streamUsage: unknown = TEST_USAGE;
+  let streamSteps: unknown[] = [];
   let workspaceId = "";
   let stops: Array<Promise<unknown>> = [];
   const context: AttemptContext = {
@@ -122,6 +125,7 @@ function createRecoveryHarness() {
         ...createStreamResultForTests(attempt(options, context)),
         usage: Promise.resolve(streamUsage),
         totalUsage: Promise.resolve(streamUsage),
+        steps: Promise.resolve(streamSteps),
       };
     }),
   });
@@ -137,6 +141,8 @@ function createRecoveryHarness() {
     initialMetadata?: Partial<MuxMetadata>;
     /** SDK-reported total usage for every attempt of this turn. */
     streamUsage?: unknown;
+    /** SDK-reported steps for every attempt of this turn; omitted means none. */
+    streamSteps?: unknown[];
     requestOptions?: Partial<TurnExecutionOptions>;
   }) {
     const historySequence = input.historySequence ?? 1;
@@ -146,6 +152,7 @@ function createRecoveryHarness() {
     calls = [];
     stops = [];
     streamUsage = "streamUsage" in input ? input.streamUsage : TEST_USAGE;
+    streamSteps = input.streamSteps ?? [];
     await appendPartialAssistantForTests(input.workspaceId, messageId, historySequence);
     const result = await streamManager.startStream(
       testStartOptions({
@@ -266,13 +273,18 @@ describe("StreamManager - previousResponseId recovery", () => {
     const { calls, messageId } = await harness.run({
       workspaceId,
       providerOptions: { openai: { previousResponseId: "resp_abc123" } },
-      // The SDK total covers only the restarted stream, not the completed first step.
+      // The SDK total and steps cover only the restarted stream, not the completed first step.
       streamUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      streamSteps: [{ usage: { inputTokens: 4, outputTokens: 5, totalTokens: 9 } }],
       attempts: [
         async function* (options) {
           yield { type: "start-step" };
           yield { type: "text-delta", text: "step one" };
-          yield { type: "finish-step", usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } };
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+            providerMetadata: { anthropic: { cacheCreationInputTokens: 30 } },
+          };
           await prepareStepForTests(options, stepMessages, 1);
           yield {
             type: "error",
@@ -297,11 +309,15 @@ describe("StreamManager - previousResponseId recovery", () => {
     expect(harness.errors()).toEqual([]);
     const [streamEnd] = harness.streamEnds();
     expect(partTexts(streamEnd)).toEqual(["step one", "step two"]);
-    // Step-boundary retries report the per-step accumulation, not the restarted SDK total.
+    // Step-boundary retries report the per-step accumulation, not the restarted SDK total,
+    // and keep the first step's cache writes in the provider metadata priced with it.
     expect(streamEnd?.metadata.usage).toMatchObject({
       inputTokens: 5,
       outputTokens: 7,
       totalTokens: 12,
+    });
+    expect(streamEnd?.metadata.providerMetadata).toMatchObject({
+      anthropic: { cacheCreationInputTokens: 30 },
     });
     // The retried step reuses its start index instead of recording a duplicate.
     expect(await committedStepStarts(workspaceId, messageId)).toEqual([0, 1]);
@@ -881,29 +897,6 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
       expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
     });
   }
-
-  for (const [modelId, repaired] of [
-    ["openai/gpt-5.2-codex", true],
-    ["anthropic/claude-opus-4-5", false],
-  ] as const) {
-    test(`Xum gateway ${modelId} ${repaired ? "is" : "is not"} eligible for the repair`, async () => {
-      const harness = createRecoveryHarness();
-
-      const { calls } = await runReplayTurn(harness, {
-        workspaceId: "replay-gateway",
-        model: createTestLanguageModel(modelId, "gateway"),
-        modelString: `mux-gateway:${modelId}`,
-        attempts: repaired
-          ? [failingAttempt(openAIReasoningReplayRejections[0].error), successfulAttempt]
-          : [failingAttempt(openAIReasoningReplayRejections[0].error)],
-      });
-
-      expect(calls).toHaveLength(repaired ? 2 : 1);
-      expect(harness.streamEnds()).toHaveLength(repaired ? 1 : 0);
-      expect(harness.errors()).toHaveLength(repaired ? 0 : 1);
-      expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
-    });
-  }
 });
 
 describe("StreamManager - error partial ordering", () => {
@@ -965,6 +958,20 @@ describe("StreamManager - stream error classification", () => {
     return harness.errors()[0]?.errorType;
   }
 
+  test("clamps a huge provider error message before it is persisted and emitted", async () => {
+    const harness = createRecoveryHarness();
+    const huge = `head ${"x".repeat(ERROR_MESSAGE_CLAMP_MAX_CHARS * 2)} tail`;
+    await harness.run({
+      workspaceId: "clamp-error",
+      attempts: [failingAttempt(new Error(huge))],
+    });
+    const emitted = harness.errors()[0]?.error ?? "";
+    expect(emitted).toBe(clampErrorMessage(huge));
+    expect(emitted.length).toBeLessThan(huge.length);
+    const partial = await historyService.readPartial("clamp-error");
+    expect(partial?.metadata?.error).toBe(emitted);
+  });
+
   test("unwraps RetryError.lastError to classify model_not_found", async () => {
     const apiError = createApiCallErrorForTests({
       message: "The model `gpt-5.2-codex` does not exist or you do not have access to it.",
@@ -994,6 +1001,34 @@ describe("StreamManager - stream error classification", () => {
     });
 
     expect(await errorTypeForStreamFailure(apiError)).toBe("model_not_found");
+  });
+
+  // Google Vertex AI ADC: google-auth-library reads the GOOGLE_APPLICATION_CREDENTIALS
+  // file locally, so a retry fails the same way and auto-retry must stop.
+  test.each([
+    "The incoming JSON object does not contain a client_email field",
+    // On its own, "refresh_token" would read as a context window error.
+    "The incoming JSON object does not contain a refresh_token field",
+  ])(
+    "classifies an unusable GOOGLE_APPLICATION_CREDENTIALS file as authentication: %s",
+    async (reason) => {
+      const error = new Error(
+        "Unable to read the credential file specified by the GOOGLE_APPLICATION_CREDENTIALS " +
+          `environment variable: ${reason}`
+      );
+
+      expect(await errorTypeForStreamFailure(error)).toBe("authentication");
+    }
+  );
+
+  // Google Vertex AI ADC: google-auth-library could not reach Google's OAuth token endpoint
+  // (offline, a proxy, a firewall). A retry can succeed; compacting the chat cannot help.
+  test("classifies a failed connection to Google's token endpoint as a network error", async () => {
+    const error = new Error(
+      "request to https://oauth2.googleapis.com/token failed, reason: connect ECONNREFUSED 142.250.0.1:443"
+    );
+
+    expect(await errorTypeForStreamFailure(error)).toBe("network");
   });
 
   describe("OpenAI Daybreak access program rejections", () => {
@@ -1075,13 +1110,12 @@ describe("StreamManager - stream error classification", () => {
     {
       name: "classifies 402 payment required as quota (avoid auto-retry)",
       error: createApiCallErrorForTests({
-        message: "Insufficient balance. Please add credits to continue.",
-        url: "https://gateway.xum.cdr.dev/api/v1/ai-gateway/v1/ai/language-model",
+        message: "Payment required",
+        url: "https://openrouter.ai/api/v1/chat/completions",
         statusCode: 402,
-        responseBody:
-          '{"error":{"message":"Insufficient balance. Please add credits to continue.","type":"invalid_request_error"}}',
+        responseBody: '{"error":{"message":"Payment required","code":402}}',
         isRetryable: false,
-        data: { error: { message: "Insufficient balance. Please add credits to continue." } },
+        data: { error: { message: "Payment required", code: 402 } },
       }),
       expected: "quota",
     },
@@ -1118,6 +1152,17 @@ describe("StreamManager - stream error classification", () => {
         isRetryable: true,
       }),
       expected: "rate_limit",
+    },
+    {
+      // 500 is the lowest status that counts as a provider outage.
+      name: "classifies HTTP 500 as server_error",
+      error: createApiCallErrorForTests({
+        message: "Internal server error",
+        statusCode: 500,
+        responseBody: '{"error":{"message":"Internal server error"}}',
+        isRetryable: true,
+      }),
+      expected: "server_error",
     },
   ];
 
@@ -1178,6 +1223,95 @@ describe("StreamManager - stream error classification", () => {
     );
     expect(await retryAfterForStreamFailure(rateLimited({ "retry-after": "-5" }))).toBe(undefined);
   });
+});
+
+describe("StreamManager - Anthropic mid-stream overload", () => {
+  /** A real Anthropic model whose stream starts, then sends one SSE `error` event. */
+  function anthropicStreamFailingWith(error: Record<string, unknown>) {
+    const events = [
+      {
+        type: "message_start",
+        message: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          model: "claude-opus-5-5",
+          content: [],
+          stop_reason: null,
+          usage: { input_tokens: 10, output_tokens: 0 },
+        },
+      },
+      { type: "error", error },
+    ];
+    return createAnthropic({
+      apiKey: "test-key",
+      fetch: Object.assign(
+        () =>
+          Promise.resolve(
+            new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+              headers: { "content-type": "text/event-stream" },
+            })
+          ),
+        { preconnect: fetch.preconnect.bind(fetch) }
+      ),
+    })("claude-opus-5-5");
+  }
+  /** Forwards the request to the real SDK, so the stream error is built as in production. */
+  const realSdkAttempt: Attempt = async function* (options) {
+    const result = aiSdk.streamText({ model: options.model, prompt: "continue", maxRetries: 0 });
+    yield* result.fullStream;
+  };
+
+  // Seen live: a proxy in front of Anthropic wraps the provider's overloaded_error event in
+  // the message of a generic `error`, so the SDK's StreamProviderError has no 529 status, is
+  // not retryable, and showed the raw "unknown stream error" text.
+  const wrappedOverload = {
+    type: "error",
+    message:
+      'unknown stream error: received error while streaming: {"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_1"}\n',
+  };
+  // The SDK's own form of the same event: type overloaded_error, status 529.
+  const nativeOverload = { type: "overloaded_error", message: "Overloaded" };
+
+  test.each([
+    ["a proxy-wrapped", wrappedOverload],
+    ["a native", nativeOverload],
+  ])("%s overloaded_error event is reported like an HTTP 529", async (_name, error) => {
+    const harness = createRecoveryHarness();
+    await harness.run({
+      workspaceId: "anthropic-overload",
+      model: anthropicStreamFailingWith(error),
+      modelString: "anthropic:claude-opus-5-5",
+      attempts: [realSdkAttempt],
+    });
+
+    expect(harness.errors()).toHaveLength(1);
+    expect(harness.errors()[0]).toMatchObject({
+      error: "Anthropic is temporarily overloaded (HTTP 529). Please try again later.",
+      errorType: "server_error",
+    });
+  });
+
+  // Validation messages can echo request text (a tool description), which can hold an
+  // overload body. Only the generic wrapper's embedded body counts.
+  test.each([
+    ["mentions", "tool description: retry on overloaded_error"],
+    ["embeds", 'tool description: {"error":{"type":"overloaded_error"}}'],
+  ])(
+    "an invalid_request_error whose text %s overloaded_error keeps its own message",
+    async (_name, message) => {
+      const harness = createRecoveryHarness();
+      await harness.run({
+        workspaceId: "anthropic-not-overload",
+        model: anthropicStreamFailingWith({ type: "invalid_request_error", message }),
+        modelString: "anthropic:claude-opus-5-5",
+        attempts: [realSdkAttempt],
+      });
+
+      expect(harness.errors()).toHaveLength(1);
+      expect(harness.errors()[0]?.error).toBe(message);
+    }
+  );
 });
 
 describe("StreamManager - Anthropic thinking signature recovery", () => {
@@ -1536,6 +1670,8 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
 
   test("a step-0 thinking rebuild after the repair sends no thinking", async () => {
     // #5886: the rebuild reads history, which does not hold this turn's receipt yet.
+    const rebuiltTail = { text: "\n\n[Warning: B]", placement: "row" as const };
+    const rebuiltInstructions = { text: "\n<custom-instructions>\nB\n</custom-instructions>" };
     const thinkingOverrideState: NonNullable<TurnExecutionOptions["thinkingOverrideState"]> = {
       applied: "medium",
     };
@@ -1569,12 +1705,29 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
           effectiveLevel: level,
           providerOptions: {},
         }),
-        // History-based rebuild: still holds the earlier signed thinking.
-        rebuildFirstStepForThinkingLevel: () => Promise.resolve(messages()),
+        // History-based rebuild: still holds the earlier signed thinking. Its volatile-tail
+        // record (mechanism 10) and system token count replace the ones the turn started with.
+        rebuildFirstStepForThinkingLevel: () =>
+          Promise.resolve({
+            messages: messages(),
+            systemRecords: {
+              volatileSystemTail: rebuiltTail,
+              customInstructions: { ...rebuiltInstructions, placement: "row" },
+            },
+            systemMessageTokens: 4321,
+          }),
       },
     });
 
     expect(harness.streamEnds()).toHaveLength(1);
+    const history = await historyService.getHistoryFromLatestBoundary("anthropic-receipt-rebuild");
+    if (!history.success) throw new Error(history.error);
+    expect(history.data.at(-1)?.metadata?.volatileSystemTail).toEqual(rebuiltTail);
+    expect(history.data.at(-1)?.metadata?.customInstructions).toEqual({
+      ...rebuiltInstructions,
+      placement: "row",
+    });
+    expect(history.data.at(-1)?.metadata?.systemMessageTokens).toBe(4321);
     expect(thinkingOverrideState.applied).toBe("high");
     expect(requestBlockTypes).toHaveLength(2);
     expect(requestBlockTypes[1]).not.toContain("thinking");

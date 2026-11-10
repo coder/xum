@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { execFileSync } from "child_process";
+import { type ChildProcess, execFileSync, spawn } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -8,6 +8,7 @@ import { DevcontainerRuntime } from "./DevcontainerRuntime";
 import type { ExecOptions, ExecStream } from "./Runtime";
 import { MISSING_CWD_COMMANDS, MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 
 interface RuntimeState {
   remoteHomeDir?: string;
@@ -247,6 +248,137 @@ describe("DevcontainerRuntime.exec pathEnv", () => {
       expect(unknown).toContain(`XUM_TEST_INSIDE=${hostWorkspace}/nested/file`);
     }
   );
+});
+
+describe("DevcontainerRuntime.exec output streams", () => {
+  // Bun 1.4.3: a child pipe can emit `data` after the caller cancelled its reader (the bash tool
+  // does on output overflow). Readable.toWeb then enqueues on a closed controller and throws from
+  // the emitter, an uncaught exception that ends the CLI (nodeReadableToWeb).
+  it.skipIf(process.platform === "win32")(
+    "drops output that arrives after the caller cancels its readers",
+    async () => {
+      let child: ChildProcess | undefined;
+      const spawnSpy = spyOn(devcontainerCli, "spawnDevcontainer").mockImplementation(
+        (_args, options) => {
+          // A later spawn is the abort's in-container stop (#6923); nothing to stop here.
+          if (child) return spawn("true", [], options);
+          child = spawn("sleep", ["30"], options);
+          return child;
+        }
+      );
+      const abort = new AbortController();
+      const runtime = createRuntime({ currentWorkspacePath: os.tmpdir() });
+      try {
+        const stream = await runtime.exec("sleep 30", {
+          cwd: os.tmpdir(),
+          abortSignal: abort.signal,
+        });
+        expect(child).toBeDefined();
+        await stream.stdout.cancel();
+        await stream.stderr.cancel();
+        expect(() => child?.stdout?.emit("data", Buffer.from("late"))).not.toThrow();
+        expect(() => child?.stderr?.emit("data", Buffer.from("late"))).not.toThrow();
+        abort.abort();
+        await stream.exitCode;
+        await runtime.awaitPendingStops();
+      } finally {
+        spawnSpy.mockRestore();
+        child?.kill("SIGKILL");
+      }
+    }
+  );
+});
+
+describe("DevcontainerRuntime.exec stops the command in the container (#6923)", () => {
+  // The stop is a second `devcontainer exec` with a 10 s timeout. A hung container engine makes
+  // it time out too, and its own cleanup must not start yet another stop.
+  it.skipIf(process.platform === "win32")(
+    "a stop that times out starts no further stop",
+    async () => {
+      const spawned: ChildProcess[] = [];
+      const spawnSpy = spyOn(devcontainerCli, "spawnDevcontainer").mockImplementation(
+        (_args, options) => {
+          const child = spawn("sleep", ["30"], options);
+          spawned.push(child);
+          return child;
+        }
+      );
+      const abort = new AbortController();
+      const runtime = createRuntime({ currentWorkspacePath: os.tmpdir() });
+      try {
+        const stream = await runtime.exec("sleep 30", {
+          cwd: os.tmpdir(),
+          abortSignal: abort.signal,
+        });
+        abort.abort();
+        await stream.exitCode;
+        expect(spawned).toHaveLength(2);
+        // The stop hangs until its own 10 s timeout ends it.
+        await runtime.awaitPendingStops();
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(spawned).toHaveLength(2);
+      } finally {
+        spawnSpy.mockRestore();
+        for (const child of spawned) child.kill("SIGKILL");
+      }
+    },
+    { timeout: 20_000 }
+  );
+
+  // DevcontainerRuntime has no remote timeout wrapper: a timed-out command kept running in the
+  // container too, so its timeout starts the same stop as an abort.
+  it.skipIf(process.platform === "win32")(
+    "a timed-out command starts one stop for its marker",
+    async () => {
+      const spawned: Array<{ args: string[]; child: ChildProcess }> = [];
+      const spawnSpy = spyOn(devcontainerCli, "spawnDevcontainer").mockImplementation(
+        (spawnArgs, options) => {
+          const child = spawn(spawned.length === 0 ? "sleep" : "true", ["30"], options);
+          spawned.push({ args: spawnArgs, child });
+          return child;
+        }
+      );
+      const runtime = createRuntime({ currentWorkspacePath: os.tmpdir() });
+      try {
+        const stream = await runtime.exec("sleep 30", { cwd: os.tmpdir(), timeout: 0.2 });
+        expect(await stream.exitCode).toBe(EXIT_CODE_TIMEOUT);
+        await runtime.awaitPendingStops();
+        expect(spawned).toHaveLength(2);
+        const marker = spawned[0].args.find((arg) => arg.startsWith("XUM_EXEC_ID="));
+        expect(marker).toMatch(/^XUM_EXEC_ID=[0-9a-f-]{36}$/);
+        expect(spawned[1].args.join(" ")).toContain(marker!);
+      } finally {
+        spawnSpy.mockRestore();
+        for (const { child } of spawned) child.kill("SIGKILL");
+      }
+    }
+  );
+
+  // A caller's XUM_EXEC_ID would replace the marker and hide the command from the stop.
+  it("passes the marker and drops a caller's value for its key", async () => {
+    let args: string[] = [];
+    const spawnSpy = spyOn(devcontainerCli, "spawnDevcontainer").mockImplementation(
+      (spawnArgs, options) => {
+        args = spawnArgs;
+        return spawn("true", [], options);
+      }
+    );
+    try {
+      const stream = await createRuntime({ currentWorkspacePath: os.tmpdir() }).exec("true", {
+        cwd: os.tmpdir(),
+        env: { XUM_EXEC_ID: "spoofed", OTHER: "kept" },
+      });
+      await stream.exitCode;
+      const remoteEnv = args.filter((_arg, i) => args[i - 1] === "--remote-env");
+      expect(remoteEnv.filter((entry) => entry.startsWith("XUM_EXEC_ID="))).toHaveLength(1);
+      expect(remoteEnv.find((entry) => entry.startsWith("XUM_EXEC_ID="))).toMatch(
+        /^XUM_EXEC_ID=[0-9a-f-]{36}$/
+      );
+      expect(remoteEnv).toContain("OTHER=kept");
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
 });
 
 describe("DevcontainerRuntime.exec multi-line commands", () => {

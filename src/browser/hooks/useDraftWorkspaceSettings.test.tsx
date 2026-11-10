@@ -9,6 +9,7 @@ import { CODER_RUNTIME_PLACEHOLDER } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "./useDraftWorkspaceSettings";
 import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 
 function createStubApiClient(
@@ -64,6 +65,7 @@ describe("useDraftWorkspaceSettings", () => {
   let originalWindow: typeof globalThis.window;
   let originalDocument: typeof globalThis.document;
   let originalLocalStorage: typeof globalThis.localStorage;
+  let draftId: string;
 
   beforeEach(() => {
     originalWindow = globalThis.window;
@@ -74,10 +76,12 @@ describe("useDraftWorkspaceSettings", () => {
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
     globalThis.localStorage.clear();
+    draftId = getCreationDraftStore().create("/tmp/project", null);
   });
 
   afterEach(() => {
     cleanup();
+    getCreationDraftStore().forgetProject("/tmp/project");
     getAppConfigStore().updateOptimistically({
       userPreferences: undefined,
       defaultModel: undefined,
@@ -94,44 +98,79 @@ describe("useDraftWorkspaceSettings", () => {
 
     const wrapper = createWrapper(projectPath, { ai: { globalDefaults: { agentId: "ask" } } });
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
 
     await waitFor(() => {
       expect(result.current.settings.agentId).toBe("ask");
     });
   });
 
-  test("prefers project agent over global default", async () => {
+  test("an unpicked draft agent uses the global default over a stale project agent", async () => {
     const projectPath = "/tmp/project";
 
     const wrapper = createWrapper(projectPath, {
       ai: {
-        globalDefaults: { agentId: "ask" },
-        projectDefaults: { [projectPath]: { agentId: "plan" } },
+        globalDefaults: { agentId: "plan" },
+        projectDefaults: { [projectPath]: { agentId: "ask" } },
       },
     });
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
 
     await waitFor(() => {
       expect(result.current.settings.agentId).toBe("plan");
     });
+
+    act(() => {
+      getCreationDraftStore().updateExecution(draftId, { agent: { id: "ask", scope: "project" } });
+    });
+    await waitFor(() => {
+      expect(result.current.settings.agentId).toBe("ask");
+    });
   });
 
-  test("preserves explicit gateway model in the project preference", async () => {
+  test("an unset draft model uses the project's model over the global default", async () => {
     const projectPath = "/tmp/project";
+    getAppConfigStore().updateOptimistically({ defaultModel: "openai:gpt-5" });
 
     const wrapper = createWrapper(projectPath, {
-      ai: { projectDefaults: { [projectPath]: { model: "openrouter:openai/gpt-5" } } },
+      ai: { projectDefaults: { [projectPath]: { model: "anthropic:claude-sonnet-4-5" } } },
     });
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
+
+    await waitFor(() => {
+      expect(result.current.settings.model).toBe("anthropic:claude-sonnet-4-5");
     });
+  });
+
+  test("preserves explicit gateway model in the draft", async () => {
+    const projectPath = "/tmp/project";
+    getCreationDraftStore().update(draftId, { ai: { model: "openrouter:openai/gpt-5" } });
+
+    const wrapper = createWrapper(projectPath);
+
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
 
     await waitFor(() => {
       expect(result.current.settings.model).toBe("openrouter:openai/gpt-5");
@@ -145,9 +184,12 @@ describe("useDraftWorkspaceSettings", () => {
 
     const wrapper = createWrapper(projectPath);
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
 
     await waitFor(() => {
       expect(result.current.settings.model).toBe("openrouter:openai/gpt-5");
@@ -159,9 +201,12 @@ describe("useDraftWorkspaceSettings", () => {
 
     const wrapper = createWrapper(projectPath);
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
 
     act(() => {
       result.current.setSelectedRuntime({ mode: "ssh", host: "dev@host" });
@@ -182,34 +227,15 @@ describe("useDraftWorkspaceSettings", () => {
       "docker"
     );
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
     expect(result.current.settings.selectedRuntime).toMatchObject({ image: "" });
     await waitFor(() => {
       expect(result.current.settings.selectedRuntime).toMatchObject({ image: "ubuntu:22.04" });
-    });
-  });
-
-  test("a live Settings default runtime change replaces an explicit pick", async () => {
-    const projectPath = "/tmp/project";
-    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, {}));
-
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
-    await waitFor(() => expect(getUserPreferences().workspaceCreation).toBeDefined());
-
-    act(() => {
-      result.current.setSelectedRuntime({ mode: "local" });
-    });
-    expect(result.current.settings.selectedRuntime).toEqual({ mode: "local" });
-
-    act(() => {
-      getAppConfigStore().updateOptimistically({ defaultRuntime: "docker" });
-    });
-    await waitFor(() => {
-      expect(result.current.settings.selectedRuntime).toMatchObject({ mode: "docker" });
     });
   });
 
@@ -222,9 +248,12 @@ describe("useDraftWorkspaceSettings", () => {
 
     const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
 
     await waitFor(() => expect(getUserPreferences().workspaceCreation).toBeDefined());
     act(() => {
@@ -249,9 +278,12 @@ describe("useDraftWorkspaceSettings", () => {
 
     const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
 
     await waitFor(() => expect(getUserPreferences().workspaceCreation).toBeDefined());
     act(() => {
@@ -282,9 +314,12 @@ describe("useDraftWorkspaceSettings", () => {
 
     const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
 
     await waitFor(() => {
       expect(result.current.settings.defaultRuntimeMode).toBe("coder");
@@ -310,9 +345,12 @@ describe("useDraftWorkspaceSettings", () => {
 
     const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
 
     await waitFor(() => {
       expect(result.current.coderConfigFallback).toEqual(savedCoderConfig);
@@ -330,9 +368,12 @@ describe("useDraftWorkspaceSettings", () => {
 
     const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
+    const { result } = renderHook(
+      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
+      {
+        wrapper,
+      }
+    );
 
     await waitFor(() => {
       expect(result.current.sshHostFallback).toBe("dev@host");

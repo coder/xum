@@ -1,7 +1,8 @@
 import { tool } from "ai";
+import { clockOf, nodeClock } from "@/node/utils/hostClock";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import assert from "node:assert/strict";
 // NOTE: We avoid readline; consume Web Streams directly to prevent race conditions
-import * as fs from "fs";
 import * as path from "path";
 import {
   BASH_DEFAULT_TIMEOUT_SECS,
@@ -18,14 +19,15 @@ import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCod
 import type { BashOutputEvent } from "@/common/types/stream";
 import type { ProjectRef } from "@/common/types/workspace";
 import type { BashToolResult } from "@/common/types/tools";
+import { describeReceivedCommandLine } from "@/common/utils/tools/bashCommandAlias";
 import { resolveBashDisplayName } from "@/common/utils/tools/bashDisplayName";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { toBashTaskId } from "./taskId";
 import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
-import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
+import { isLocalBaseRuntime } from "@/node/runtime/Runtime";
 import {
   combineGitNoRepoAutomationEnvs,
   gitHooksAllowed,
@@ -36,10 +38,19 @@ import {
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
+import { skillFileBashHint } from "./skillFileHint";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
 const CAT_FILE_READ_NOTICE =
   "Use the `file_read` tool to read files instead of `cat`, `rg`, or `grep`: bash output may be truncated or auto-filtered, which can hide parts of the file, and file_read supports offset/limit paging.";
+
+/**
+ * Built at module level so the closure captures only the controller, not the tool's execute
+ * scope: a migrated record outlives the turn, and that scope holds the ToolConfiguration.
+ */
+function abortOnKill(controller: AbortController): () => void {
+  return () => controller.abort();
+}
 
 function prependToolNote(existing: string | undefined, extra: string): string {
   if (!existing) {
@@ -533,7 +544,50 @@ function validateScript(script: string, config: ToolConfiguration): BashToolResu
     }
   }
 
+  const interactiveError = rejectInteractiveTui(script);
+  if (interactiveError) return interactiveError;
+
   return null; // Valid
+}
+
+// Programs that wait for a terminal when stdout is a pipe and stdin is closed, as in this tool.
+// Probed on macOS: these hang until the timeout; nano, less, more, man and ed exit at once, so
+// they are not listed.
+const INTERACTIVE_TUI_PROGRAMS = new Set(["vi", "vim", "view", "vimdiff", "nvim", "top", "htop"]);
+// A path names one of those programs only in a system bin directory: a project's own `./top`
+// or `bin/view` can be anything.
+const SYSTEM_BIN_DIRS = new Set(["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]);
+// Pipes, redirects, lists, subshells and expansions make the script more than a bare TUI launch.
+const SHELL_COMPOSITION_CHARS = /[|&;<>()$`\n]/;
+// Quoted and backslash-escaped text is literal to bash, so it composes nothing: `vim 'a&b'` still
+// launches Vim. Double quotes keep `$` and backticks live, but those only build an argument.
+const SHELL_LITERAL_TEXT = /\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*"/g;
+
+function isInteractiveTuiProgram(program: string): boolean {
+  if (!INTERACTIVE_TUI_PROGRAMS.has(path.posix.basename(program))) return false;
+  return !program.includes("/") || SYSTEM_BIN_DIRS.has(path.posix.dirname(program));
+}
+
+/**
+ * Models that mistake bash for another tool send `view <file>` (Vim) and wait the whole
+ * timeout for nothing. Reject only a bare launch: any flag (`top -l 1`, `vim -es`) or `+cmd`
+ * argument, or any shell composition outside quotes, may make the program exit on its own.
+ */
+function rejectInteractiveTui(script: string): BashToolResult | null {
+  const trimmed = script.trim();
+  if (SHELL_COMPOSITION_CHARS.test(trimmed.replace(SHELL_LITERAL_TEXT, ""))) return null;
+  const [program, ...args] = trimmed.split(/\s+/);
+  if (!isInteractiveTuiProgram(program)) return null;
+  if (args.some((arg) => arg.startsWith("-") || arg.startsWith("+"))) return null;
+  return {
+    success: false,
+    error:
+      `${describeReceivedCommandLine("script", trimmed)} starts an interactive program that waits for a terminal; ` +
+      "bash has no terminal, so it would hang until the timeout. " +
+      "To read a file, call file_read; for /memories paths, call the memory tool; otherwise run a non-interactive command line.",
+    exitCode: -1,
+    wall_duration_ms: 0,
+  };
 }
 
 /**
@@ -742,6 +796,73 @@ function createLineHandler(
 }
 
 /**
+ * What the file limit does to a command that is still running; returns whether it stopped it.
+ *
+ * The truncate policy returns the output it kept as a success, so it stops the command itself
+ * (#6732). Cancelling the output streams alone does not stop it reliably: the child's stdout is a
+ * Unix socket, and closing one that still holds unread data gives the writer ECONNRESET, not
+ * SIGPIPE. The command then exits with its own error status (perl: 1), which says nothing about
+ * the command, so the old code reported that cut as a failure. The tmpfile policy reports the
+ * overflow without the exit status, and keeps its old behavior.
+ */
+const AT_FILE_LIMIT: Record<
+  "tmpfile" | "truncate",
+  (running: boolean, stop: () => void) => boolean
+> = {
+  truncate: (running, stop) => {
+    if (running) stop();
+    return running;
+  },
+  tmpfile: () => false,
+};
+
+/**
+ * The result when waiting for the command failed (a stream read or the exit status rejected).
+ * A user abort wins. Then our own stop at the file limit: it can make a read or the exit status
+ * fail (a RemoteRuntime child that errors after the kill), which says nothing about the command,
+ * so the result stays the truncated success (#6873). Otherwise the failure itself.
+ */
+function failedWaitResult(
+  err: unknown,
+  state: {
+    aborted: boolean;
+    stoppedAtFileLimit: boolean;
+    lines: string[];
+    overflowReason: string | null;
+    overflowPolicy: "tmpfile" | "truncate";
+    effectiveTimeout: number;
+    wall_duration_ms: number;
+  }
+): BashToolResult {
+  if (state.aborted) {
+    return {
+      success: false,
+      error: "Command execution was aborted",
+      exitCode: -1,
+      wall_duration_ms: state.wall_duration_ms,
+    };
+  }
+  if (state.stoppedAtFileLimit) {
+    return formatResult(
+      EXIT_CODE_ABORTED,
+      state.lines,
+      true,
+      state.overflowReason,
+      state.wall_duration_ms,
+      state.overflowPolicy,
+      state.effectiveTimeout,
+      true
+    );
+  }
+  return {
+    success: false,
+    error: `Failed to execute command: ${getErrorMessage(err)}`,
+    exitCode: -1,
+    wall_duration_ms: state.wall_duration_ms,
+  };
+}
+
+/**
  * Formats the final bash tool result based on exit code and truncation state
  */
 function formatResult(
@@ -751,9 +872,21 @@ function formatResult(
   overflowReason: string | null,
   wall_duration_ms: number,
   overflowPolicy: "tmpfile" | "truncate",
-  effectiveTimeout: number
+  effectiveTimeout: number,
+  stoppedAtFileLimit = false
 ): BashToolResult {
   const output = lines.join("\n");
+
+  // The truncate policy stopped this command at the file limit, so its status is ours (#6732).
+  if (stoppedAtFileLimit) {
+    return {
+      success: true,
+      output,
+      exitCode: 0,
+      wall_duration_ms,
+      truncated: { reason: overflowReason ?? "unknown reason", totalLines: lines.length },
+    };
+  }
 
   // Check for special error codes from runtime
   if (exitCode === EXIT_CODE_ABORTED) {
@@ -877,12 +1010,28 @@ export function buildBashToolDescription(cwd: string, projects: ProjectRef[]): s
  * instead; remote discovery already fails on a missing cwd.
  */
 async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
-  const stats = await fs.promises.stat(repoPath).catch(() => null);
+  const stats = await nodeHostFiles.promises.stat(repoPath).catch(() => null);
   if (!stats?.isDirectory()) {
     throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
       cause: new Error(`Repository directory does not exist: ${repoPath}`),
     });
   }
+}
+
+/**
+ * Foreground kill deadline. Providers send null for an omitted optional input, so null and absent
+ * both mean the model named no deadline and it gets the shared default.
+ */
+function foregroundTimeoutSecs(requested: number | null | undefined): number {
+  return requested ?? BASH_DEFAULT_TIMEOUT_SECS;
+}
+
+/**
+ * Background max lifetime, in the shape BackgroundProcessManager wants: absence stays absence, so a
+ * dev server started without a timeout outlives the foreground default until it is stopped.
+ */
+function backgroundTimeoutSecs(requested: number | null | undefined): number | undefined {
+  return requested ?? undefined;
 }
 
 /**
@@ -949,7 +1098,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             : [config.cwd];
         const repoEnvs: Array<Record<string, string>> = [];
         for (const repoPath of repoPaths) {
-          if (config.runtime instanceof LocalBaseRuntime) {
+          if (isLocalBaseRuntime(config.runtime)) {
             await assertLocalRepoDirectoryExists(repoPath);
             repoEnvs.push(await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true));
           } else {
@@ -972,7 +1121,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       // Since the bash tool runs via bash, `nul` becomes a real file in the workspace.
       // Only rewrite for local Windows runtimes so non-Windows scripts keep their semantics.
       const shouldRewriteNullRedirects =
-        process.platform === "win32" && config.runtime instanceof LocalBaseRuntime;
+        process.platform === "win32" && isLocalBaseRuntime(config.runtime);
       const nulRedirectRewrite = shouldRewriteNullRedirects
         ? rewriteWindowsNullRedirects(script)
         : { script, didRewrite: false };
@@ -1069,7 +1218,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
             ...(monitorConfig ? { monitor: monitorConfig } : {}),
-            timeoutSecs: timeout_secs, // Auto-terminate after this duration
+            timeoutSecs: backgroundTimeoutSecs(timeout_secs),
           }
         );
 
@@ -1096,7 +1245,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       }
 
       // Setup execution parameters
-      const effectiveTimeout = timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS;
+      const effectiveTimeout = foregroundTimeoutSecs(timeout_secs);
       const startTime = performance.now();
       const totalBytesRef = { current: 0 }; // Use ref for shared access in line handler
       let overflowReason: string | null = null;
@@ -1122,6 +1271,11 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
         });
       }
 
+      const sendToBackground = () => {
+        backgroundedRef.current = true;
+        // Both explicit backgrounding and queued input unblock the same foreground wait.
+        if (backgroundResolve) backgroundResolve();
+      };
       // Register foreground process for "send to background" feature
       // Only if manager is available (AI tool calls, not IPC)
       const fgRegistration =
@@ -1131,13 +1285,21 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
               toolCallId,
               script,
               safeDisplayName,
-              () => {
-                backgroundedRef.current = true;
-                // Resolve the background promise to unblock the wait
-                if (backgroundResolve) backgroundResolve();
-              }
+              sendToBackground
             )
           : null;
+      const backgroundForQueuedMessage = () => {
+        if (
+          fgRegistration &&
+          !foregroundCompleted &&
+          !backgroundedRef.current &&
+          config.hasQueuedMessages?.("tool-end") === true
+        ) {
+          sendToBackground();
+        }
+      };
+      // Input can arrive during Bash preparation, before a foreground registration exists.
+      backgroundForQueuedMessage();
 
       // Execute using runtime interface (works for both local and SSH)
       const scriptWithClosedStdin = `exec </dev/null
@@ -1172,6 +1334,8 @@ ${scriptWithEnv}`;
       // Collect output concurrently from Web Streams to avoid readline race conditions.
       const lines: string[] = [];
       let truncated = false;
+      // Set when the truncate policy stopped the command at the file limit (#6732).
+      let stoppedAtFileLimit = false;
 
       // Helper to trigger display truncation (stop showing to agent, keep collecting)
       const triggerDisplayTruncation = (reason: string) => {
@@ -1183,6 +1347,10 @@ ${scriptWithEnv}`;
 
       // Helper to trigger file truncation (stop collecting, close streams)
       const triggerFileTruncation = (reason: string) => {
+        // Runs once: the line handler stops calling it after the file limit is hit.
+        stoppedAtFileLimit = AT_FILE_LIMIT[overflowPolicy](!exitCodeResolved, () =>
+          wrappedAbortController.abort()
+        );
         truncationState.fileTruncated = true;
         truncationState.displayTruncated = true;
         truncated = true;
@@ -1235,13 +1403,17 @@ ${scriptWithEnv}`;
             toolCallId,
             text,
             isError,
-            timestamp: Date.now(),
+            // Record time: wall clock until #7282 moves its consumers to HostClock.
+            timestamp: nodeClock.nowMs(),
           } satisfies BashOutputEvent,
           "bash"
         );
       };
 
       const flushLiveOutput = (): void => {
+        // Admission probes have no change event. Reuse this wait's existing cadence rather
+        // than cache a decision that cancellation/withdrawal can invalidate between enqueues.
+        backgroundForQueuedMessage();
         if (liveOutputStopped) return;
 
         const flush = (isError: boolean, buffer: string): void => {
@@ -1279,7 +1451,7 @@ ${scriptWithEnv}`;
         liveStderrBuffer = "";
       };
 
-      if (config.emitChatEvent && config.workspaceId && toolCallId) {
+      if (config.hasQueuedMessages || (config.emitChatEvent && config.workspaceId && toolCallId)) {
         liveOutputTimer = setInterval(flushLiveOutput, LIVE_FLUSH_INTERVAL_MS);
       }
 
@@ -1465,7 +1637,7 @@ ${scriptWithEnv}`;
             (await Promise.race([
               execStream.exitCode.then(() => true).catch(() => true),
               new Promise<boolean>((resolve) =>
-                setTimeout(() => resolve(false), BACKGROUND_EXIT_GRACE_MS)
+                clockOf(config).setTimer(() => resolve(false), BACKGROUND_EXIT_GRACE_MS)
               ),
             ]));
 
@@ -1510,6 +1682,7 @@ ${scriptWithEnv}`;
                 : claim?.success === false
                   ? claim.error
                   : "background process manager unavailable";
+            let failedMigrationExit = execStream.exitCode;
             if (config.backgroundProcessManager && config.workspaceId && claimLock) {
               const processId = claimLock.processId;
 
@@ -1521,6 +1694,7 @@ ${scriptWithEnv}`;
                 stdin: execStream.stdin,
                 exitCode: execStream.exitCode,
                 duration: execStream.duration,
+                localProcess: execStream.localProcess,
               };
 
               const migrateResult = await migrateToBackground(
@@ -1533,7 +1707,7 @@ ${scriptWithEnv}`;
                   existingOutput: lines,
                   // Abort is detached from the tool call once backgrounded, so the wrapped
                   // controller now only fires through the handle's terminate (#4760).
-                  kill: () => wrappedAbortController.abort(),
+                  kill: abortOnKill(wrappedAbortController),
                 },
                 config.backgroundProcessManager.getBgOutputDir()
               );
@@ -1563,7 +1737,8 @@ ${scriptWithEnv}`;
               // name reserved until the aborted process's exit actually settles; if it never
               // does, leaking the name for the session is the safe fail-closed behavior.
               migrationError = migrateResult.error;
-              void execStream.exitCode
+              failedMigrationExit = migrateResult.exitCode;
+              void failedMigrationExit
                 .catch(() => undefined)
                 .finally(() => claimLock.releaseName());
             }
@@ -1591,12 +1766,14 @@ ${scriptWithEnv}`;
             // disposal, which deletes nothing, does not wait for a stopping migration (#5589).
             migrationHandedToExit = true;
             migration?.markStopping();
-            void execStream.exitCode.then(
+            // Publish confirmed-exit evidence before a removal finishes draining this migration.
+            void failedMigrationExit.then(
               () => migration?.[Symbol.dispose](),
               () => undefined
             );
-            await raceWithAbortAndTimeout(execStream.exitCode, {
+            await raceWithAbortAndTimeout(failedMigrationExit, {
               timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
+              clock: config.clock,
             }).catch(() => undefined);
             return withNotice({
               success: false,
@@ -1613,21 +1790,17 @@ ${scriptWithEnv}`;
         // Unregister on error
         fgRegistration?.unregister();
 
-        // Check if this was an abort
-        if (abortSignal?.aborted) {
-          return withNotice({
-            success: false,
-            error: "Command execution was aborted",
-            exitCode: -1,
+        return withNotice(
+          failedWaitResult(err, {
+            aborted: abortSignal?.aborted === true,
+            stoppedAtFileLimit,
+            lines,
+            overflowReason,
+            overflowPolicy,
+            effectiveTimeout,
             wall_duration_ms: Math.round(performance.now() - startTime),
-          });
-        }
-        return withNotice({
-          success: false,
-          error: `Failed to execute command: ${getErrorMessage(err)}`,
-          exitCode: -1,
-          wall_duration_ms: Math.round(performance.now() - startTime),
-        });
+          })
+        );
       } finally {
         stopLiveOutput(true);
       }
@@ -1675,11 +1848,13 @@ ${scriptWithEnv}`;
           await writerInstance.write(encoder.encode(fullOutput));
           await writerInstance.close();
 
+          // A script that reads a skill file by path gets the call that returns it whole.
+          const skillFileHint = await skillFileBashHint(config, script);
           const noticeBase = `[OUTPUT OVERFLOW - ${overflowReason ?? "unknown reason"}]
 
 Full output (${lines.length} lines) saved to ${overflowPath}
 
-Use selective filtering tools (e.g. grep) to extract relevant information and continue your task
+${skillFileHint}Use selective filtering tools (e.g. grep) to extract relevant information and continue your task
 
 File will be automatically cleaned up when stream ends.`;
 
@@ -1711,7 +1886,8 @@ File will be automatically cleaned up when stream ends.`;
           overflowReason,
           wall_duration_ms,
           config.overflow_policy ?? "tmpfile",
-          effectiveTimeout
+          effectiveTimeout,
+          stoppedAtFileLimit
         )
       );
     },

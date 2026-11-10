@@ -86,16 +86,9 @@ export function staticMetadataLiteralMayDeclareKey(source: string, key: string):
   // The strict locator is NOT used for the object extent: it throws on template
   // interpolation, which would hide a `phases` key sitting next to one.
   const masked = maskStaticJavaScriptSource(source);
-  const match = matchTopLevelMetaDeclaration(masked);
-  if (match == null) return false;
-  // Transparent parentheses around the literal (`meta = ({ ... })`) change nothing.
-  let start = skipStaticWhitespace(masked, match.end);
-  while (masked[start] === "(") {
-    start = skipStaticWhitespace(masked, start + 1);
-  }
-  if (masked[start] !== "{") return false;
-  const end = findMaskedObjectEnd(masked, start);
-  if (end === -1) return false;
+  const literal = locateMaskedMetaLiteral(masked);
+  if (literal == null) return false;
+  const { start, end } = literal;
   // An identifier escape (`pha\u0073es:`) defeats textual key reading; the
   // masked text has no string/comment/regex bodies, so any remaining backslash
   // is one, and the literal may declare anything.
@@ -105,22 +98,10 @@ export function staticMetadataLiteralMayDeclareKey(source: string, key: string):
   for (let index = start + 1; index < end; index += 1) {
     const char = masked[index];
     if (depth === 0 && expectKey && char === "[") {
-      // Computed key. A static string literal names the key outright
-      // (`["phases"]`, escapes decoded by the strict parser); anything dynamic
-      // (`[k]`) could evaluate to it, so it counts as "may declare".
-      const close = masked.indexOf("]", index);
-      if (close === -1) return true;
       expectKey = false;
-      try {
-        const decoded = new StaticMetadataLiteralParser(
-          source.slice(index + 1, close),
-          new Set()
-        ).parseValue();
-        if (decoded === key) return true;
-      } catch {
-        return true;
-      }
-      index = close;
+      const computed = scanComputedMetaKey(source, masked, index, key);
+      if (computed.mayDeclare) return true;
+      index = computed.close;
       continue;
     }
     if (depth === 0 && expectKey && masked.startsWith("...", index)) {
@@ -142,32 +123,93 @@ export function staticMetadataLiteralMayDeclareKey(source: string, key: string):
     }
     if (!expectKey || /\s/u.test(char ?? "")) continue;
     expectKey = false;
+    let token: { value: string; end: number };
     try {
-      // Method/accessor syntax the strict parser never accepts still has a
-      // definite key: `helper() {}` → helper, `get phases() {}` → phases,
-      // `*phases() {}` → phases. Read past a generator star and past a
-      // get/set/async modifier that is followed by another key token.
-      let keyStart = index;
-      if (masked[keyStart] === "*") keyStart = skipStaticWhitespace(masked, keyStart + 1);
-      let token = readStaticObjectKey(source, keyStart);
-      const next = skipStaticWhitespace(masked, token.end);
-      const isModifier =
-        (token.value === "get" || token.value === "set" || token.value === "async") &&
-        next < end &&
-        ![":", ",", "}", "("].includes(masked[next] ?? "");
-      if (isModifier) {
-        const realKeyStart = masked[next] === "*" ? skipStaticWhitespace(masked, next + 1) : next;
-        token = readStaticObjectKey(source, realKeyStart);
-      }
-      if (token.value === key) return true;
-      // Parameters and bodies that follow are skipped by the depth tracking.
-      index = token.end - 1;
+      token = readMetaMemberKey(source, masked, index, end);
     } catch {
       // Unreadable key syntax: may declare anything.
       return true;
     }
+    if (token.value === key) return true;
+    // Parameters and bodies that follow are skipped by the depth tracking.
+    index = token.end - 1;
   }
   return false;
+}
+
+/**
+ * The `{ ... }` extent of the top-level `export const meta =` literal in masked
+ * source (`start` at the `{`, `end` at its matching `}`), or null when no object
+ * literal follows the declaration.
+ */
+function locateMaskedMetaLiteral(masked: string): { start: number; end: number } | null {
+  const match = matchTopLevelMetaDeclaration(masked);
+  if (match == null) return null;
+  // Transparent parentheses around the literal (`meta = ({ ... })`) change nothing.
+  let start = skipStaticWhitespace(masked, match.end);
+  while (masked[start] === "(") {
+    start = skipStaticWhitespace(masked, start + 1);
+  }
+  if (masked[start] !== "{") return null;
+  const end = findMaskedObjectEnd(masked, start);
+  if (end === -1) return null;
+  return { start, end };
+}
+
+/**
+ * Reads the computed key whose `[` is at `index`. A static string literal names
+ * the key outright (`["phases"]`, escapes decoded by the strict parser);
+ * anything dynamic (`[k]`) could evaluate to `key`, so it counts as "may declare".
+ */
+function scanComputedMetaKey(
+  source: string,
+  masked: string,
+  index: number,
+  key: string
+): { mayDeclare: true } | { mayDeclare: false; close: number } {
+  const close = masked.indexOf("]", index);
+  if (close === -1) return { mayDeclare: true };
+  try {
+    const decoded = new StaticMetadataLiteralParser(
+      source.slice(index + 1, close),
+      new Set()
+    ).parseValue();
+    if (decoded === key) return { mayDeclare: true };
+  } catch {
+    return { mayDeclare: true };
+  }
+  return { mayDeclare: false, close };
+}
+
+/**
+ * Reads the key of the object member starting at `index`. Method/accessor
+ * syntax the strict parser never accepts still has a definite key:
+ * `helper() {}` → helper, `get phases() {}` → phases, `*phases() {}` → phases.
+ * Reads past a generator star and past a get/set/async modifier that is
+ * followed by another key token. Throws on unreadable key syntax.
+ */
+function readMetaMemberKey(
+  source: string,
+  masked: string,
+  index: number,
+  end: number
+): { value: string; end: number } {
+  let keyStart = index;
+  if (masked[keyStart] === "*") keyStart = skipStaticWhitespace(masked, keyStart + 1);
+  const token = readStaticObjectKey(source, keyStart);
+  const next = skipStaticWhitespace(masked, token.end);
+  if (!isMemberKeyModifier(token.value, masked, next, end)) return token;
+  const realKeyStart = masked[next] === "*" ? skipStaticWhitespace(masked, next + 1) : next;
+  return readStaticObjectKey(source, realKeyStart);
+}
+
+/** Whether `value` is a get/set/async modifier, i.e. another key token follows it at `next`. */
+function isMemberKeyModifier(value: string, masked: string, next: number, end: number): boolean {
+  return (
+    (value === "get" || value === "set" || value === "async") &&
+    next < end &&
+    ![":", ",", "}", "("].includes(masked[next] ?? "")
+  );
 }
 
 /** Reads an identifier or quoted object key at `start` (used to scan the meta literal's top-level keys). */
@@ -721,134 +763,169 @@ function staticAssert(condition: unknown, message: string): asserts condition {
  * balanced for the depth trackers.
  */
 function maskStaticJavaScriptSource(source: string): string {
-  let output = "";
-  let index = 0;
+  const scan: MaskScan = { source, output: "", index: 0 };
+  maskCode(scan, false);
+  staticAssert(
+    scan.output.length === source.length,
+    "maskStaticJavaScriptSource must preserve indexes"
+  );
+  return scan.output;
+}
 
-  // Masks a string/template literal starting at `index` (which points at the
-  // opening quote). Template interpolations hand control back to maskCode.
-  const maskStringLiteral = (quote: string): void => {
-    // Keep the quote delimiters (mask only the contents) so isRegExpLiteralStart
-    // still sees a value token after the literal and `"10" / 2` stays division.
-    output += quote;
-    index += 1;
-    while (index < source.length) {
-      const stringCurrent = source[index];
-      staticAssert(
-        stringCurrent != null,
-        "maskStaticJavaScriptSource: string character is required"
-      );
-      if (isStaticTemplateInterpolationStart(source, index, quote)) {
-        output += "${";
-        index += 2;
-        maskCode(true);
-        if (index < source.length) {
-          // maskCode stopped at the `}` closing the interpolation.
-          output += "}";
-          index += 1;
-        }
-        continue;
-      }
-      index += 1;
-      if (stringCurrent === quote) {
-        output += quote;
-        break;
-      }
-      output += stringCurrent === "\n" ? "\n" : " ";
-      if (stringCurrent === "\\") {
-        if (index < source.length) {
-          const escaped = source[index];
-          staticAssert(
-            escaped != null,
-            "maskStaticJavaScriptSource: escaped character is required"
-          );
-          output += escaped === "\n" ? "\n" : " ";
-          index += 1;
-        }
-      }
+/** Shared cursor of one maskStaticJavaScriptSource pass: `output` is the masked prefix of `source[0, index)`. */
+interface MaskScan {
+  readonly source: string;
+  output: string;
+  index: number;
+}
+
+// Masks code until the source ends or, inside a template interpolation, until
+// the unmatched `}` that closes it (left unconsumed for maskStringLiteral).
+function maskCode(scan: MaskScan, inInterpolation: boolean): void {
+  let braceDepth = 0;
+  while (scan.index < scan.source.length) {
+    const current = scan.source[scan.index];
+    staticAssert(current != null, "maskStaticJavaScriptSource: current character is required");
+    if (maskCommentOrLiteral(scan, current)) continue;
+    if (inInterpolation) {
+      // Braces inside the interpolation (object literals, arrow bodies) nest;
+      // the first unmatched `}` ends the interpolation.
+      braceDepth = nextInterpolationBraceDepth(current, braceDepth);
+      if (braceDepth === -1) return;
     }
-  };
+    scan.output += current;
+    scan.index += 1;
+  }
+}
 
-  // Masks code until the source ends or, inside a template interpolation, until
-  // the unmatched `}` that closes it (left unconsumed for maskStringLiteral).
-  const maskCode = (inInterpolation: boolean): void => {
-    let braceDepth = 0;
-    while (index < source.length) {
-      const current = source[index];
-      const next = source[index + 1];
-      staticAssert(current != null, "maskStaticJavaScriptSource: current character is required");
-      if (current === "/" && next === "/") {
-        output += "  ";
-        index += 2;
-        while (index < source.length && source[index] !== "\n") {
-          output += " ";
-          index += 1;
-        }
-        continue;
-      }
-      if (current === "/" && next === "*") {
-        output += "  ";
-        index += 2;
-        while (index < source.length) {
-          const blockCurrent = source[index];
-          const blockNext = source[index + 1];
-          staticAssert(
-            blockCurrent != null,
-            "maskStaticJavaScriptSource: block character is required"
-          );
-          if (blockCurrent === "*" && blockNext === "/") {
-            output += "  ";
-            index += 2;
-            break;
-          }
-          output += blockCurrent === "\n" ? "\n" : " ";
-          index += 1;
-        }
-        continue;
-      }
-      if (current === "/" && isRegExpLiteralStart(output)) {
-        // Mask regex literal bodies: characters like "//", "(", or "[" inside a regex
-        // (e.g. /https:\/\// or /\/\*[\s\S]*?\*\//) must not be misread as comments or
-        // counted toward bracket depth, which would unbalance the masked source.
-        // Regex literals cannot span lines, so a candidate without a closing "/" on the
-        // same line must be division whose left operand the heuristic did not recognize
-        // (e.g. `count++ / total` or `{ valueOf() {...} } / 2`); leave it unmasked
-        // instead of swallowing the rest of the line and hiding real exports.
-        const closingIndex = findRegExpLiteralEnd(source, index);
-        if (closingIndex !== -1) {
-          // Keep the "/" delimiters (mask only the body) so isRegExpLiteralStart still
-          // sees the literal as a value and `/x/ / 2` stays division.
-          output += "/";
-          index += 1;
-          while (index < closingIndex) {
-            output += " ";
-            index += 1;
-          }
-          output += "/";
-          index += 1;
-          continue;
-        }
-      }
-      if (current === '"' || current === "'" || current === "`") {
-        maskStringLiteral(current);
-        continue;
-      }
-      if (inInterpolation) {
-        // Braces inside the interpolation (object literals, arrow bodies) nest;
-        // the first unmatched `}` ends the interpolation.
-        if (current === "{") braceDepth += 1;
-        else if (current === "}") {
-          if (braceDepth === 0) return;
-          braceDepth -= 1;
-        }
-      }
-      output += current;
-      index += 1;
+/**
+ * Masks the comment, regex, string, or template literal that `current` (the
+ * character at `scan.index`) opens. Returns false, consuming nothing, when
+ * `current` is plain code.
+ */
+function maskCommentOrLiteral(scan: MaskScan, current: string): boolean {
+  if (current === "/") return maskSlashToken(scan);
+  if (current !== '"' && current !== "'" && current !== "`") return false;
+  maskStringLiteral(scan, current);
+  return true;
+}
+
+/** Brace depth after `current` inside an interpolation, or -1 when `current` is the `}` that closes it. */
+function nextInterpolationBraceDepth(current: string, braceDepth: number): number {
+  if (current === "{") return braceDepth + 1;
+  if (current !== "}") return braceDepth;
+  return braceDepth === 0 ? -1 : braceDepth - 1;
+}
+
+/**
+ * Masks the comment or regex literal opened by the "/" at `scan.index`. Returns
+ * false, consuming nothing, when the "/" is division.
+ */
+function maskSlashToken(scan: MaskScan): boolean {
+  const next = scan.source[scan.index + 1];
+  if (next === "/") {
+    maskLineComment(scan);
+    return true;
+  }
+  if (next === "*") {
+    maskBlockComment(scan);
+    return true;
+  }
+  return maskRegExpLiteral(scan);
+}
+
+function maskLineComment(scan: MaskScan): void {
+  scan.output += "  ";
+  scan.index += 2;
+  while (scan.index < scan.source.length && scan.source[scan.index] !== "\n") {
+    scan.output += " ";
+    scan.index += 1;
+  }
+}
+
+function maskBlockComment(scan: MaskScan): void {
+  scan.output += "  ";
+  scan.index += 2;
+  while (scan.index < scan.source.length) {
+    const blockCurrent = scan.source[scan.index];
+    const blockNext = scan.source[scan.index + 1];
+    staticAssert(blockCurrent != null, "maskStaticJavaScriptSource: block character is required");
+    if (blockCurrent === "*" && blockNext === "/") {
+      scan.output += "  ";
+      scan.index += 2;
+      return;
     }
-  };
+    scan.output += blockCurrent === "\n" ? "\n" : " ";
+    scan.index += 1;
+  }
+}
 
-  maskCode(false);
-  staticAssert(output.length === source.length, "maskStaticJavaScriptSource must preserve indexes");
-  return output;
+function maskRegExpLiteral(scan: MaskScan): boolean {
+  if (!isRegExpLiteralStart(scan.output)) return false;
+  // Mask regex literal bodies: characters like "//", "(", or "[" inside a regex
+  // (e.g. /https:\/\// or /\/\*[\s\S]*?\*\//) must not be misread as comments or
+  // counted toward bracket depth, which would unbalance the masked source.
+  // Regex literals cannot span lines, so a candidate without a closing "/" on the
+  // same line must be division whose left operand the heuristic did not recognize
+  // (e.g. `count++ / total` or `{ valueOf() {...} } / 2`); leave it unmasked
+  // instead of swallowing the rest of the line and hiding real exports.
+  const closingIndex = findRegExpLiteralEnd(scan.source, scan.index);
+  if (closingIndex === -1) return false;
+  // Keep the "/" delimiters (mask only the body) so isRegExpLiteralStart still
+  // sees the literal as a value and `/x/ / 2` stays division.
+  scan.output += "/";
+  scan.index += 1;
+  while (scan.index < closingIndex) {
+    scan.output += " ";
+    scan.index += 1;
+  }
+  scan.output += "/";
+  scan.index += 1;
+  return true;
+}
+
+// Masks a string/template literal starting at `scan.index` (which points at the
+// opening quote). Template interpolations hand control back to maskCode.
+function maskStringLiteral(scan: MaskScan, quote: string): void {
+  // Keep the quote delimiters (mask only the contents) so isRegExpLiteralStart
+  // still sees a value token after the literal and `"10" / 2` stays division.
+  scan.output += quote;
+  scan.index += 1;
+  while (scan.index < scan.source.length) {
+    const stringCurrent = scan.source[scan.index];
+    staticAssert(stringCurrent != null, "maskStaticJavaScriptSource: string character is required");
+    if (isStaticTemplateInterpolationStart(scan.source, scan.index, quote)) {
+      maskTemplateInterpolation(scan);
+      continue;
+    }
+    scan.index += 1;
+    if (stringCurrent === quote) {
+      scan.output += quote;
+      return;
+    }
+    scan.output += stringCurrent === "\n" ? "\n" : " ";
+    if (stringCurrent === "\\") maskEscapedCharacter(scan);
+  }
+}
+
+function maskTemplateInterpolation(scan: MaskScan): void {
+  scan.output += "${";
+  scan.index += 2;
+  maskCode(scan, true);
+  if (scan.index < scan.source.length) {
+    // maskCode stopped at the `}` closing the interpolation.
+    scan.output += "}";
+    scan.index += 1;
+  }
+}
+
+/** Masks the character after a backslash in a string body, if the source has one. */
+function maskEscapedCharacter(scan: MaskScan): void {
+  if (scan.index >= scan.source.length) return;
+  const escaped = scan.source[scan.index];
+  staticAssert(escaped != null, "maskStaticJavaScriptSource: escaped character is required");
+  scan.output += escaped === "\n" ? "\n" : " ";
+  scan.index += 1;
 }
 
 /**

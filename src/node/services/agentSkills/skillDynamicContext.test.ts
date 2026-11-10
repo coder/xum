@@ -4,8 +4,10 @@ import {
   injectSkillDynamicContext,
   MAX_SKILL_DYNAMIC_COMMANDS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
+  substituteSkillBodyForDirectives,
   type SkillDynamicExecResult,
 } from "./skillDynamicContext";
+import { createSkillArgumentSubstituter } from "./skillArguments";
 
 function okExec(stdout: string): SkillDynamicExecResult {
   return { stdout, stderr: "", exitCode: 0 };
@@ -193,5 +195,28 @@ describe("injectSkillDynamicContext", () => {
 
     expect(result.body).toContain("[output of: bad unavailable: nope]");
     expect(result.body).toContain("fine");
+  });
+});
+
+describe("substituteSkillBodyForDirectives", () => {
+  test("a directive that an argument splits across lines does not run or shift later ones", async () => {
+    // Codex PRRT_kwDOPxxmWM6s2_dk: `[^\`]+` matches a newline, so the split directive must not
+    // count as one line, or every later runnable index points at the wrong line.
+    const prepared = substituteSkillBodyForDirectives({
+      rawBody: "!`echo $ARGUMENTS`\n!`echo second`",
+      substituteArguments: createSkillArgumentSubstituter("a\nb"),
+      substituteText: (text) => text,
+    });
+    const executed: string[] = [];
+    const result = await injectSkillDynamicContext({
+      body: prepared.body,
+      runnableLines: prepared.runnableLines,
+      execute: (command) => {
+        executed.push(command);
+        return Promise.resolve({ stdout: "ok", stderr: "", exitCode: 0 });
+      },
+    });
+    expect(executed).toEqual(["echo second"]);
+    expect(result.body.startsWith("!`echo a\nb`\n")).toBe(true);
   });
 });

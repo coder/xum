@@ -1,8 +1,7 @@
-import { describe, it, expect, mock, vi } from "bun:test";
+import { afterEach, beforeEach, describe, it, expect, mock, vi } from "bun:test";
 
+import { advanceClock } from "@/browser/testFakeClock";
 import { RefreshController } from "./RefreshController";
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -16,25 +15,33 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-// NOTE: Bun's Jest-compat layer does not currently expose timer controls like
-// jest.advanceTimersByTime(), so these tests use real timers.
-
+// The controller runs on timers (debounce, cooldown) and a promise pipeline: a fake clock makes
+// every wait exact. Assert on onRefresh calls, not on the fake clock's timer count: that count is
+// global, so a timer leaked by an earlier file in the same process breaks it.
 describe("RefreshController", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("schedule() rate-limits and does not reset to the last call", async () => {
     const onRefresh = mock<() => void>(() => undefined);
     const controller = new RefreshController({ onRefresh, debounceMs: 200 });
 
     controller.schedule();
-    await sleep(100);
+    await advanceClock(100);
     controller.schedule();
 
     // After 230ms total: >200ms since the first call, but only 130ms since the second call.
     // If schedule() reset the timer, we would not have refreshed yet.
-    await sleep(130);
+    await advanceClock(130);
     expect(onRefresh).toHaveBeenCalledTimes(1);
 
     // Ensure the second call didn't schedule another refresh.
-    await sleep(250);
+    await advanceClock(250);
     expect(onRefresh).toHaveBeenCalledTimes(1);
 
     controller.dispose();
@@ -50,7 +57,7 @@ describe("RefreshController", () => {
 
     expect(onRefresh).not.toHaveBeenCalled();
 
-    await sleep(80);
+    await advanceClock(80);
 
     expect(onRefresh).toHaveBeenCalledTimes(1);
 
@@ -65,11 +72,11 @@ describe("RefreshController", () => {
     expect(onRefresh).not.toHaveBeenCalled();
 
     controller.requestImmediate();
-    await sleep(10);
+    await advanceClock(10);
     expect(onRefresh).toHaveBeenCalledTimes(1);
 
-    // Original timer should be cleared.
-    await sleep(120);
+    // The original debounce timer is cleared: no second refresh follows.
+    await advanceClock(120);
     expect(onRefresh).toHaveBeenCalledTimes(1);
 
     controller.dispose();
@@ -87,7 +94,7 @@ describe("RefreshController", () => {
 
     controller.requestImmediate();
     // Wait for the promise pipeline to invoke onRefresh
-    await sleep(10);
+    await advanceClock(10);
     expect(onRefresh).toHaveBeenCalledTimes(1);
     expect(controller.isRefreshing).toBe(true);
 
@@ -100,13 +107,13 @@ describe("RefreshController", () => {
     refreshes[0].resolve();
 
     // Allow the success handler + the queued trailing debounce refresh.
-    await sleep(80);
+    await advanceClock(80);
 
     expect(onRefresh).toHaveBeenCalledTimes(2);
 
     expect(refreshes).toHaveLength(2);
     refreshes[1].resolve();
-    await sleep(10);
+    await advanceClock(10);
 
     expect(controller.isRefreshing).toBe(false);
 
@@ -126,7 +133,7 @@ describe("RefreshController", () => {
     expect(controller.isRefreshing).toBe(true);
 
     refresh.resolve();
-    await sleep(10);
+    await advanceClock(10);
 
     expect(controller.isRefreshing).toBe(false);
 
@@ -140,7 +147,7 @@ describe("RefreshController", () => {
     controller.schedule();
     controller.dispose();
 
-    await sleep(80);
+    await advanceClock(80);
 
     expect(onRefresh).not.toHaveBeenCalled();
   });
@@ -153,7 +160,7 @@ describe("RefreshController", () => {
     controller.schedule();
     controller.requestImmediate();
 
-    await sleep(80);
+    await advanceClock(80);
 
     expect(onRefresh).not.toHaveBeenCalled();
   });
@@ -182,7 +189,7 @@ describe("RefreshController", () => {
 
     // First call throws — controller must still clear inFlight
     controller.requestImmediate();
-    await sleep(10);
+    await advanceClock(10);
     expect(controller.isRefreshing).toBe(false);
     expect(controller.lastRefreshInfo).toBeNull();
     expect(onComplete).toHaveBeenCalledTimes(0);
@@ -191,7 +198,7 @@ describe("RefreshController", () => {
 
     // Second call succeeds — must not be blocked by stale inFlight
     controller.requestImmediate();
-    await sleep(10);
+    await advanceClock(10);
     expect(onRefresh).toHaveBeenCalledTimes(2);
     expect(onComplete).toHaveBeenCalledTimes(1);
 
@@ -221,7 +228,7 @@ describe("RefreshController", () => {
     expect(controller.isRefreshing).toBe(true);
 
     refresh.reject(new Error("async boom"));
-    await sleep(10);
+    await advanceClock(10);
 
     expect(controller.isRefreshing).toBe(false);
     expect(controller.lastRefreshInfo).toBeNull();
@@ -245,14 +252,14 @@ describe("RefreshController", () => {
     });
 
     controller.requestImmediate();
-    await sleep(10);
+    await advanceClock(10);
 
     expect(controller.isRefreshing).toBe(false);
     expect(onRefresh).toHaveBeenCalledTimes(1);
     expect(onRefreshComplete).toHaveBeenCalledTimes(1);
 
     controller.requestImmediate();
-    await sleep(10);
+    await advanceClock(10);
 
     expect(controller.isRefreshing).toBe(false);
     expect(onRefresh).toHaveBeenCalledTimes(2);
@@ -276,14 +283,14 @@ describe("RefreshController", () => {
     });
 
     controller.requestImmediate();
-    await sleep(10);
+    await advanceClock(10);
 
     expect(controller.isRefreshing).toBe(false);
     expect(onRefresh).toHaveBeenCalledTimes(1);
     expect(onRefreshError).toHaveBeenCalledTimes(1);
 
     controller.requestImmediate();
-    await sleep(10);
+    await advanceClock(10);
 
     expect(controller.isRefreshing).toBe(false);
     expect(onRefresh).toHaveBeenCalledTimes(2);
@@ -298,7 +305,7 @@ describe("RefreshController", () => {
 
     controller.requestImmediate();
     controller.dispose();
-    await sleep(10);
+    await advanceClock(10);
 
     // onRefresh should never have been called — dispose fenced the deferred pipeline.
     expect(onRefresh).toHaveBeenCalledTimes(0);
@@ -317,7 +324,7 @@ describe("RefreshController", () => {
     });
 
     controller.requestImmediate();
-    await sleep(10);
+    await advanceClock(10);
     expect(onRefresh).toHaveBeenCalledTimes(1);
     expect(controller.isRefreshing).toBe(true);
 
@@ -327,7 +334,7 @@ describe("RefreshController", () => {
 
     // Let the deferred promise resolve — callbacks should be suppressed.
     d.resolve();
-    await sleep(10);
+    await advanceClock(10);
 
     expect(onRefreshComplete).toHaveBeenCalledTimes(0);
   });
@@ -344,13 +351,13 @@ describe("RefreshController", () => {
     });
 
     controller.requestImmediate();
-    await sleep(10);
+    await advanceClock(10);
     expect(onRefresh).toHaveBeenCalledTimes(1);
 
     controller.dispose();
 
     d.reject(new Error("too late"));
-    await sleep(10);
+    await advanceClock(10);
 
     expect(onRefreshError).toHaveBeenCalledTimes(0);
     expect(controller.isRefreshing).toBe(false);

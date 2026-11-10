@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { getErrorMessage } from "@/common/utils/errors";
 import { Command } from "cmdk";
 import { useCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { getAgentSkillsStore, useAgentSkills } from "@/browser/stores/AgentSkillsStore";
+import { getAgentSkillsStore, useInvocableSkills } from "@/browser/stores/AgentSkillsStore";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import {
   formatKeybind,
@@ -12,15 +13,26 @@ import {
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { resolveSlashCommandExperimentValue } from "@/browser/utils/slashCommands/experimentVisibility";
-import { getSlashCommandSuggestions } from "@/browser/utils/slashCommands/suggestions";
+import { paletteSlashCommands } from "./LazyCommandPalette";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import {
+  COMMAND_PALETTE_INPUT_CLASSES,
+  COMMAND_PALETTE_OVERLAY_CLASSES,
+  COMMAND_PALETTE_PANEL_CLASSES,
+  COMMAND_PALETTE_PLACEHOLDER,
+} from "./commandPaletteChrome";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { filterCommandsByPrefix } from "@/browser/utils/commandPaletteFiltering";
 import { rankByPaletteQuery } from "@/browser/utils/commandPaletteRanking";
 
+const { getSlashCommandSuggestions, resolveSlashCommandExperimentValue } = paletteSlashCommands;
+
 interface CommandPaletteProps {
   getSlashContext?: () => { workspaceId?: string };
+  /** Focus to restore on close, captured before the first open's loading input took focus. */
+  openOrigin?: HTMLElement | null;
+  /** Enter was pressed in the first open's loading input. Read once, at mount. */
+  enterPressedWhileLoading?: boolean;
 }
 
 type PromptDef = NonNullable<NonNullable<CommandAction["prompt"]>>;
@@ -28,7 +40,7 @@ type PromptField = PromptDef["fields"][number];
 
 function getCommandInputPlaceholder(field: PromptField | null): string {
   if (!field) {
-    return "Switch workspaces or type > for all commands, / for slash commands…";
+    return COMMAND_PALETTE_PLACEHOLDER;
   }
 
   if (field.type === "text") {
@@ -55,7 +67,60 @@ interface PaletteGroup {
   items: PaletteItem[];
 }
 
-export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext }) => {
+/**
+ * What a select prompt shows instead of options; undefined when it has results. `alert` marks a
+ * failed load, which screen readers announce: it appears after the prompt opened.
+ */
+function selectPromptEmptyText(state: {
+  isLoadingOptions: boolean;
+  resultCount: number;
+  optionCount: number;
+  optionsError: string | null;
+}): { text: string | undefined; alert: boolean } {
+  if (state.isLoadingOptions) return { text: "Loading options...", alert: false };
+  if (state.resultCount > 0) return { text: undefined, alert: false };
+  if (state.optionCount > 0) return { text: "No results", alert: false };
+  return state.optionsError != null
+    ? { text: `Could not load options: ${state.optionsError}`, alert: true }
+    : { text: "No options", alert: false };
+}
+
+function PaletteEmptyText(props: { text: string | undefined; alert: boolean }) {
+  return (
+    <div
+      role={props.alert ? "alert" : undefined}
+      className="p-4 text-[13px] text-[var(--color-command-subdued)]"
+    >
+      {props.text ?? "No results"}
+    </div>
+  );
+}
+
+/**
+ * #6997: the first open shows a plain input until this chunk arrives, and a quick paste + Enter
+ * lands there. On mount, run that Enter as Enter runs in the palette: on the first option, which
+ * cmdk selects. An effect, because only this chunk knows the options. The ref keeps it to the
+ * open that pressed it.
+ */
+function useEnterPressedWhileLoading(
+  enterPressed: boolean | undefined,
+  groupsWithItems: PaletteGroup[],
+  selectItem: (item: PaletteItem) => void
+) {
+  const enterPendingRef = useRef(enterPressed);
+  useEffect(() => {
+    if (!enterPendingRef.current) return;
+    enterPendingRef.current = false;
+    const firstItem = groupsWithItems[0]?.items[0];
+    if (firstItem) selectItem(firstItem);
+  });
+}
+
+export const CommandPalette: React.FC<CommandPaletteProps> = ({
+  getSlashContext,
+  openOrigin,
+  enterPressedWhileLoading,
+}) => {
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationExperimentEnabled = useExperimentValue(
     EXPERIMENT_IDS.MEMORY_CONSOLIDATION
@@ -66,14 +131,15 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   const slashWorkspaceId = slashContext?.workspaceId;
 
   const commandPanelRef = useRef<HTMLDivElement | null>(null);
-  const paletteOpenOriginRef = useRef<HTMLElement | null>(null);
+  const paletteOpenOriginRef = useRef<HTMLElement | null>(openOrigin ?? null);
   const { isOpen, initialQuery, close, getActions, addRecent, recent } = useCommandRegistry();
-  const agentSkills = useAgentSkills(
+  const agentSkills = useInvocableSkills(
     isOpen && slashWorkspaceId
       ? { workspaceId: slashWorkspaceId, disableWorkspaceAgents: false }
       : null
-  ).skills;
-  const [query, setQuery] = useState("");
+  );
+  // Starts at the open's query, so the mount below selects from the same options it renders.
+  const [query, setQuery] = useState(initialQuery);
   const [activePrompt, setActivePrompt] = useState<null | {
     title?: string;
     fields: PromptDef["fields"];
@@ -148,27 +214,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
       values: {},
     });
   }, []);
-
-  // Listen for EXECUTE_COMMAND events
-  useEffect(() => {
-    const handleExecuteCommand = (e: Event) => {
-      const customEvent = e as CustomEvent<{ commandId: string }>;
-      const { commandId } = customEvent.detail;
-
-      const action = getActions().find((a) => a.id === commandId);
-      if (!action) {
-        console.warn(`Command not found: ${commandId}`);
-        return;
-      }
-
-      // Run the action directly
-      void action.run();
-      addRecent(action.id);
-    };
-
-    window.addEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
-    return () => window.removeEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
-  }, [getActions, startPrompt, addRecent]);
 
   const handlePromptValue = useCallback(
     (value: string) => {
@@ -347,6 +392,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
     Array<{ id: string; label: string; keywords?: string[] }>
   >([]);
   const [isLoadingOptions, setIsLoadingOptions] = useState(false);
+  // Why the current select prompt has no options: shown in the open palette, where a toast would
+  // render under the overlay.
+  const [optionsError, setOptionsError] = useState<string | null>(null);
 
   const currentField: PromptField | null = activePrompt
     ? (activePrompt.fields[activePrompt.idx] ?? null)
@@ -410,6 +458,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
       }
 
       setIsLoadingOptions(true);
+      setOptionsError(null);
       try {
         const rawOptions = await Promise.resolve(
           currentField.getOptions(activePrompt?.values ?? {})
@@ -426,6 +475,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
         if (!cancelled) {
           console.error("Failed to resolve prompt select options", error);
           setSelectOptions([]);
+          setOptionsError(getErrorMessage(error));
         }
       } finally {
         if (!cancelled) {
@@ -443,6 +493,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   let groups: PaletteGroup[] = generalResults.groups;
   let emptyText: string | undefined = generalResults.emptyText;
+  let emptyIsAlert = false;
 
   if (currentField) {
     const promptTitle = activePrompt?.title ?? currentField.label ?? "Provide details";
@@ -469,15 +520,12 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
           })),
         },
       ];
-      if (isLoadingOptions) {
-        emptyText = "Loading options...";
-      } else if (rankedOptions.length > 0) {
-        emptyText = undefined;
-      } else if (selectOptions.length > 0) {
-        emptyText = "No results";
-      } else {
-        emptyText = "No options";
-      }
+      ({ text: emptyText, alert: emptyIsAlert } = selectPromptEmptyText({
+        isLoadingOptions,
+        resultCount: rankedOptions.length,
+        optionCount: selectOptions.length,
+        optionsError,
+      }));
     } else {
       const typed = query.trim();
       const fallbackHint = currentField.placeholder ?? "Type value and press Enter";
@@ -500,6 +548,30 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
     }
   }
 
+  const groupsWithItems = groups.filter((group) => group.items.length > 0);
+
+  // What Enter (or a click) on an item runs.
+  const selectItem = (item: PaletteItem) => {
+    if ("prompt" in item && item.prompt) {
+      addRecent(item.id);
+      startPrompt(item);
+      return;
+    }
+
+    if (currentField) {
+      void item.run();
+      return;
+    }
+
+    addRecent(item.id);
+    close();
+    setTimeout(() => {
+      void item.run();
+    }, 0);
+  };
+
+  useEnterPressedWhileLoading(enterPressedWhileLoading, groupsWithItems, selectItem);
+
   // Capture during render before Command.Input autoFocus moves focus into the palette.
   if (isOpen && !paletteOpenOriginRef.current) {
     paletteOpenOriginRef.current =
@@ -508,29 +580,20 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   if (!isOpen) return null;
 
-  const groupsWithItems = groups.filter((group) => group.items.length > 0);
   const hasAnyItems = groupsWithItems.length > 0;
 
   return (
-    <div
-      // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
-      // sampler ignores this fixed overlay (same pattern as Dialog/LeftSidebar).
-      className="fixed inset-0 z-[2000] flex items-start justify-center pt-[10vh] before:absolute before:inset-0 before:bg-black/40"
-      onMouseDown={dismissPalette}
-    >
+    <div className={COMMAND_PALETTE_OVERLAY_CLASSES} onMouseDown={dismissPalette}>
       <Command
         label={currentField?.label ?? "Command palette"}
         ref={commandPanelRef}
-        // relative keeps the panel painted above (and hit-tested before) the wrapper's
-        // absolutely positioned ::before backdrop, so clicks land on the palette instead
-        // of the wrapper's dismiss handler.
-        className="font-primary relative w-[min(720px,92vw)] overflow-hidden rounded-lg border border-[var(--color-command-border)] bg-[var(--color-command-surface)] text-[var(--color-command-foreground)] shadow-[0_10px_40px_rgba(0,0,0,0.4)]"
+        className={COMMAND_PALETTE_PANEL_CLASSES}
         onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
         onKeyDown={trapPromptFocus}
         shouldFilter={false}
       >
         <Command.Input
-          className="w-full border-b border-[var(--color-command-input-border)] bg-[var(--color-command-input)] px-3.5 py-3 text-sm text-[var(--color-command-foreground)] outline-none placeholder:text-[var(--color-command-subdued)]"
+          className={COMMAND_PALETTE_INPUT_CLASSES}
           value={query}
           onValueChange={handleQueryChange}
           placeholder={getCommandInputPlaceholder(currentField)}
@@ -588,24 +651,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
                     keywords={itemKeywords}
                     aria-label={item.title}
                     className="hover:bg-hover aria-selected:bg-hover mx-1 my-0.5 grid cursor-pointer grid-cols-[1fr_auto] items-center gap-2 rounded-md px-3 py-2 text-[13px] aria-selected:text-[var(--color-command-foreground)]"
-                    onSelect={() => {
-                      if ("prompt" in item && item.prompt) {
-                        addRecent(item.id);
-                        startPrompt(item);
-                        return;
-                      }
-
-                      if (currentField) {
-                        void item.run();
-                        return;
-                      }
-
-                      addRecent(item.id);
-                      close();
-                      setTimeout(() => {
-                        void item.run();
-                      }, 0);
-                    }}
+                    onSelect={() => selectItem(item)}
                   >
                     <div>
                       {item.title}
@@ -628,11 +674,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
               })}
             </Command.Group>
           ))}
-          {!hasAnyItems && (
-            <div className="p-4 text-[13px] text-[var(--color-command-subdued)]">
-              {emptyText ?? "No results"}
-            </div>
-          )}
+          {!hasAnyItems && <PaletteEmptyText text={emptyText} alert={emptyIsAlert} />}
         </Command.List>
       </Command>
     </div>

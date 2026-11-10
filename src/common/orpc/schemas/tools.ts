@@ -32,6 +32,13 @@ export const BashToolResultSchema = z.discriminatedUnion("success", [
       output: z.string(),
       exitCode: z.literal(0),
       note: z.string().optional(),
+      /**
+       * Set when the output was cut at a limit: `output` is partial. With the truncate policy
+       * (IPC executeBash), a command still running at the file limit is stopped by the tool, and
+       * `exitCode` 0 is then the tool's status, not the command's (#6732). Callers must read
+       * completeness from this field, never from `exitCode`; no caller needs to tell "stopped
+       * at the limit" apart from "exited 0 with more output than the limit" (#6873).
+       */
       truncated: z
         .object({
           reason: z.string(),

@@ -3,14 +3,17 @@ import { isPixel } from "@coder/pixel-storybook/storyapi";
 import { ThemeProvider, type ThemeMode } from "../src/browser/contexts/ThemeContext";
 import "../src/browser/styles/globals.css";
 import {
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   EXPANDED_PROJECTS_KEY,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
 } from "../src/common/constants/storage";
 import { NOW } from "../src/browser/stories/storyTime";
+import { collapseRightSidebar } from "../src/browser/stories/helpers/uiState";
 import { updatePersistedState } from "../src/browser/hooks/usePersistedState";
 import { configure } from "storybook/test";
+// Tool cards load lazily in the app (toolCardsStore); load them up front so snapshots never
+// catch a row before its card arrives.
+import "../src/browser/features/Tools/Shared/toolCardsLoader";
 
 // Signal Storybook runtime to modules that need to stabilize for visual snapshots
 // (e.g. the ChatInput placeholder tip carousel pins to its lead tip so
@@ -24,6 +27,8 @@ import { configure } from "storybook/test";
 // explicit `{ timeout }` unless they intentionally want a longer budget.
 // Prevents flakes on CPU-constrained CI runners where React re-renders
 // after userEvent.click can exceed the 1 s default.
+// Stories must import from `storybook/test`: the old `@storybook/test` bundled its own Testing
+// Library, which kept the 1 s default (#6389, #6533).
 configure({ asyncUtilTimeout: 5000 });
 
 const PIXEL_STABILITY_CSS = `
@@ -88,13 +93,6 @@ globalThis.Date = new Proxy(RealDate, {
     property === "now" ? () => NOW : Reflect.get(target, property, receiver),
 });
 
-// Collapse right sidebar by default to ensure deterministic snapshots
-// Stories that need expanded sidebar call expandRightSidebar() in their setup
-function collapseRightSidebar() {
-  if (typeof localStorage !== "undefined") {
-    localStorage.setItem(RIGHT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(true));
-  }
-}
 // Reset the left sidebar to the app's viewport default before each story render.
 // This prevents stories from inheriting whichever open/closed state a previous
 // story left behind, while still allowing individual stories to override it.

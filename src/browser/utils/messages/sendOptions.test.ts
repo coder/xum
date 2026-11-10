@@ -82,7 +82,7 @@ describe("getSendOptionsFromStorage", () => {
 
   test("preserves explicit gateway-scoped saved workspace models", () => {
     const workspaceId = "ws-1";
-    const rawModel = "mux-gateway:anthropic/claude-haiku-4-5";
+    const rawModel = "coder:anthropic/claude-haiku-4-5";
 
     setWorkspaceAiMetadata(workspaceId, {
       aiSettingsByAgent: { exec: { model: rawModel, thinkingLevel: "off" } },

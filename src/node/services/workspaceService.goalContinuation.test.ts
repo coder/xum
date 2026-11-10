@@ -18,6 +18,7 @@ import { AIService } from "./aiService";
 import { ProviderService } from "./providerService";
 import { ProvidersConfigStore } from "@/node/config/providersConfigStore";
 import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
+import type { PreflightCounter } from "./preflightCounter";
 import {
   createWorkspaceServiceHarness,
   type WorkspaceServiceHarness,
@@ -77,11 +78,11 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
     const service = await makeService(undefined);
     expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(false);
 
-    const counts = (service as unknown as { preflightSendCounts: Map<string, number> })
-      .preflightSendCounts;
-    counts.set("ws-1", 1);
+    const sends = (service as unknown as { sendPreflight: { sends: PreflightCounter } })
+      .sendPreflight.sends;
+    const admission = sends.acquire("ws-1");
     expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(true);
-    counts.delete("ws-1");
+    admission[Symbol.dispose]();
     expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(false);
   });
 

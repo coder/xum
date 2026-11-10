@@ -210,9 +210,14 @@ describeIntegration("compaction of a native-1M request", () => {
             }
 
             if (isAnthropicOverload && process.env.CI) {
-              console.warn(
-                `[tests] Treating repeated Anthropic overload as inconclusive after ` +
-                  `${MAX_PROVIDER_OVERLOAD_ATTEMPTS} CI attempts.`
+              // Inconclusive, not failed: a provider outage must not fail every PR. CI runs Jest
+              // with --silent, which drops console.warn, so write a GitHub warning annotation to
+              // stderr: Jest passes a worker's stderr through, and the Actions runner reads
+              // workflow commands from stderr too (#4856).
+              process.stderr.write(
+                `::warning title=Live native-1M compaction check inconclusive::` +
+                  `Anthropic was overloaded (HTTP 529) on all ${MAX_PROVIDER_OVERLOAD_ATTEMPTS} ` +
+                  `CI attempts, so the test passed without checking compaction.\n`
               );
               return;
             }

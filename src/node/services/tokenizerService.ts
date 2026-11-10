@@ -10,7 +10,10 @@ import type { ChatStats } from "@/common/types/chatStats";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import assert from "@/common/utils/assert";
 import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
-import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailability";
+import {
+  getToolAvailabilityOptions,
+  type ToolAvailabilityContext,
+} from "@/common/utils/tools/toolAvailability";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
@@ -23,6 +26,17 @@ import { VERSION } from "@/version";
 
 /** The cache has no usageHistory, and the renderer drops it anyway. */
 export type WorkspaceTokenStats = Omit<ChatStats, "usageHistory">;
+
+/** The workspace facts that decide which tool definitions the count includes. */
+function toolAvailabilityWorkspace(
+  metadata: Awaited<ReturnType<AIService["getWorkspaceMetadata"]>>
+): Required<Omit<ToolAvailabilityContext, "workspaceId">> {
+  if (!metadata.success) return { parentWorkspaceId: null, scratchWorkspace: false };
+  return {
+    parentWorkspaceId: metadata.data.parentWorkspaceId ?? null,
+    scratchWorkspace: metadata.data.kind === "scratch",
+  };
+}
 
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
   let max: number | undefined;
@@ -99,7 +113,7 @@ export class TokenizerService {
     ]);
     const providersConfig = this.providerService.getConfig();
     const providersFingerprint = computeProvidersConfigFingerprint(providersConfig);
-    const parentWorkspaceId = metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null;
+    const workspace = toolAvailabilityWorkspace(metadata);
     // Built from the exact objects that go into the count, never re-read after an await.
     // createHash, not crypto.hash: the headless CLI still accepts Node 20 before 20.12.
     const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -107,7 +121,8 @@ export class TokenizerService {
       JSON.stringify({
         v: 1,
         partial: partial === null ? null : sha256(JSON.stringify(partial)),
-        hasParent: Boolean(parentWorkspaceId),
+        hasParent: Boolean(workspace.parentWorkspaceId),
+        scratch: workspace.scratchWorkspace,
         app: [VERSION.git_describe, VERSION.git_commit],
         approx: shouldUseApproxTokenizer(),
       })
@@ -162,7 +177,7 @@ export class TokenizerService {
         mergeTranscriptPartial(messages, partial),
         input.model,
         providersConfig,
-        parentWorkspaceId,
+        workspace,
         source,
         // Closed before the claim is read: a request joining later could no longer hand its
         // claim to this pass, so it must run its own.
@@ -229,7 +244,7 @@ export class TokenizerService {
       messages,
       model,
       providersConfig,
-      parentWorkspaceId
+      { parentWorkspaceId }
     );
   }
 
@@ -239,7 +254,7 @@ export class TokenizerService {
     messages: MuxMessage[],
     model: string,
     providersConfig: ProvidersConfigMap | null,
-    parentWorkspaceId: string | null,
+    workspace: Omit<ToolAvailabilityContext, "workspaceId">,
     source?: SessionUsageTokenStatsCacheV1["source"],
     beforeClaim?: () => void
   ): Promise<ChatStats> {
@@ -263,7 +278,7 @@ export class TokenizerService {
       countedMessages,
       model,
       providersConfig,
-      getToolAvailabilityOptions({ workspaceId, parentWorkspaceId })
+      getToolAvailabilityOptions({ workspaceId, ...workspace })
     );
 
     // Only persist the cache for the most recently-started calculation.

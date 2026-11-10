@@ -30,6 +30,22 @@ If multiple organizations have templates with the same name, Xum shows the organ
 
 Xum writes and maintains a Xum-owned SSH config block before connecting, creating aliases like `<workspace-name>.mux--coder` in `~/.ssh/config`.
 
+## Run Xum inside a Coder workspace
+
+The sections above run Xum on your machine and use Coder workspaces as remote hosts. To run Xum itself in a Coder workspace instead, add the [Mux module](https://registry.coder.com/modules/coder/mux) from the Coder registry to your template. The module installs Xum in the workspace, starts the Xum server, and adds a **Mux** app that opens Xum in your browser:
+
+```tf
+module "mux" {
+  count    = data.coder_workspace.me.start_count
+  source   = "registry.coder.com/coder/mux/coder"
+  # Pin this to the latest version on the module page.
+  version  = "2.0.0"
+  agent_id = coder_agent.main.id
+}
+```
+
+The module page lists its options, for example `port`, `package_manager`, `registry_url`, `install_version`, and `add_project`.
+
 ## Notes
 
 - If the **Use Coder Workspace** checkbox is missing, verify that the Coder CLI is found on the PATH.

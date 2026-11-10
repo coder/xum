@@ -1,7 +1,9 @@
 import * as fs from "fs/promises";
 import { canBindMountHostPathsIntoContainers } from "./runtimeScratchDir";
 import * as path from "path";
-import { Readable, Writable } from "stream";
+import { Writable } from "stream";
+import assert from "@/common/utils/assert";
+import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import type {
   RuntimeCreateFlags,
   WorkspaceCreationParams,
@@ -16,6 +18,7 @@ import type {
   EnsureReadyOptions,
   FileStat,
   ReadFileOptions,
+  RuntimeLocation,
 } from "./Runtime";
 import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { buildGuardedCommand, buildShellPathExport } from "./shellEnv";
@@ -46,6 +49,13 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { isGitRepository, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
+import {
+  createExecMarker,
+  PendingStops,
+  stopMarkedCommand,
+  withoutExecMarkerKey,
+  type ExecMarker,
+} from "./remoteExecMarker";
 import {
   buildRegularFileReadCommand,
   CAT_VIA_EXEC_COMMAND,
@@ -91,8 +101,20 @@ export function containerLabel(workspacePath: string): string {
 }
 
 export class DevcontainerRuntime extends LocalBaseRuntime {
+  override get location(): RuntimeLocation {
+    return "devcontainer";
+  }
+
+  /** Runtime.mode. A prototype getter, like `location`, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- same as location: Object.create(X.prototype) doubles would read undefined from a readonly field
+  get mode(): "devcontainer" {
+    return "devcontainer";
+  }
+
   private readonly worktreeManager: WorktreeManager;
   private readonly configPath: string;
+  /** In-container stops started by aborts and timeouts and not finished yet (#6923). */
+  private readonly pendingStops = new PendingStops();
 
   // Cached env used for credential forwarding
   private lastCredentialEnv?: Record<string, string>;
@@ -508,10 +530,38 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
   }
 
   /**
+   * Stops the processes of an aborted or timed-out exec inside the container (#6923). The
+   * abort's or timeout's result does not wait for it, so a slow or broken container cannot delay
+   * that answer; failures are logged. Not for the stop command itself (`enabled` false): its own
+   * timeout would start another stop, every 10 s, while the container engine hangs.
+   */
+  private stopInContainer(marker: ExecMarker, workspaceFolder: string, enabled: boolean): void {
+    if (!enabled) return;
+    this.pendingStops.track(
+      stopMarkedCommand(
+        (script) => this.exec(script, { cwd: workspaceFolder, timeout: 10 }, false),
+        marker,
+        "Devcontainer"
+      ),
+      "Devcontainer"
+    );
+  }
+
+  /** Resolves once every in-container stop started so far has finished. */
+  awaitPendingStops(): Promise<void> {
+    return this.pendingStops.settled();
+  }
+
+  /**
    * Execute a command inside the devcontainer.
    * Overrides LocalBaseRuntime.exec() to use `devcontainer exec`.
    */
-  override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+  override exec(
+    command: string,
+    options: ExecOptions,
+    // Internal: `false` for the stop command itself (see stopInContainer).
+    stopOnCleanup = true
+  ): Promise<ExecStream> {
     const startTime = performance.now();
 
     // Short-circuit if already aborted
@@ -533,18 +583,28 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     // Merge cached container credential env + caller env + non-interactive vars.
     // Spread order: container env (lowest) < caller env < NON_INTERACTIVE (highest).
-    const mappedPathEnv = Object.fromEntries(
-      Object.entries(options.pathEnv ?? {}).map(([key, value]) => [key, this.mapPathForExec(value)])
+    // The marker key is reserved: a caller's value would hide the command from a stop (#6923).
+    const mappedPathEnv = withoutExecMarkerKey(
+      Object.fromEntries(
+        Object.entries(options.pathEnv ?? {}).map(([key, value]) => [
+          key,
+          this.mapPathForExec(value),
+        ])
+      )
     );
-    const envVars = {
+    const envVars = withoutExecMarkerKey({
       ...this.containerEnv,
       ...options.env,
       ...mappedPathEnv,
       ...NON_INTERACTIVE_ENV_VARS,
-    };
+    });
     for (const [key, value] of Object.entries(envVars)) {
       args.push("--remote-env", `${key}=${value}`);
     }
+    // Every process of this exec in the container carries the marker, so an abort or timeout can
+    // stop them: killing the local `devcontainer exec` leaves them running (#6923).
+    const marker = createExecMarker();
+    args.push("--remote-env", marker);
 
     // Build the full command with cd
     // Map host workspace path to container path; fall back to container workspace if unmappable
@@ -576,13 +636,15 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       if (childProcess.pid === undefined) return;
       killProcessTree(childProcess.pid);
       forceCloseStdio(childProcess);
+      this.stopInContainer(marker, workspaceFolder, stopOnCleanup);
     });
 
-    // Convert Node.js streams to Web Streams (casts required for ExecStream compatibility)
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stdout = Readable.toWeb(childProcess.stdout!) as unknown as ReadableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stderr = Readable.toWeb(childProcess.stderr!) as unknown as ReadableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+    // Convert Node.js streams to Web Streams. Not Readable.toWeb: on Bun 1.4.3 it can throw an
+    // uncaught error when the bash tool cancels a reader on output overflow (nodeReadableToWeb).
+    assert(childProcess.stdout, "spawned with piped stdout");
+    assert(childProcess.stderr, "spawned with piped stderr");
+    const stdout = nodeReadableToWeb(childProcess.stdout);
+    const stderr = nodeReadableToWeb(childProcess.stderr);
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stdin = Writable.toWeb(childProcess.stdin!) as unknown as WritableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
 

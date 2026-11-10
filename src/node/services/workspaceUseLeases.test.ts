@@ -200,6 +200,15 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
     expect(names.size).toBe(hostileIds.length + 1);
   });
 
+  test("a backend's own lease is not foreign use; another backend's is, with its kind", async () => {
+    const lease = await a.hold(workspaceId, "turn");
+    expect(await a.findForeignUse(workspaceId)).toBeNull();
+    const foreign = await b.findForeignUse(workspaceId);
+    expect(foreign?.kind).toBe("turn");
+    expect(foreign?.holder).toContain(`pid ${process.pid}`);
+    await lease.release();
+  });
+
   describe("withMutationGate", () => {
     const idle = { hasRunningBackgroundProcesses: () => Promise.resolve(false) };
 
@@ -355,6 +364,23 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
 
       expect(await a.withMutationGate([workspaceId], idle, () => Promise.resolve(1))).toBe(1);
       expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(dead);
+    });
+
+    test("a failed gate release is rethrown, and the other gates are still released", async () => {
+      const failure = new Error("release failed");
+      const acquire = lockKit.acquireCrossProcessLock;
+      // Gates release in reverse id order: the failing one ("ws-lease") goes first.
+      spyOn(lockKit, "acquireCrossProcessLock").mockImplementation(async (options) => {
+        const release = await acquire(options);
+        if (options.lockPath !== workspaceMutationLockPath(rootDir, workspaceId)) return release;
+        return async () => {
+          await release();
+          throw failure;
+        };
+      });
+      const release = await a.acquireMutationGate([workspaceId, "ws-b"], idle);
+      expect(await release().catch((error: unknown) => error)).toBe(failure);
+      expect(await gateState("ws-b")).toBe("absent");
     });
 
     test("a running background process refuses, and every listed workspace is scanned", async () => {

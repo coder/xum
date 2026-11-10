@@ -1,16 +1,41 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import type { MCPServerInfo } from "@/common/types/mcp";
+import assert from "@/common/utils/assert";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import {
+  isolateHostHome,
+  type IsolatedHostHome,
+} from "@/node/services/hostHomeIsolation.testHarness";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { buildWorkspaceComposition } from "./composition";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { createTestPluginInstallEntry, reviewedComponentConsent } from "./testFixtures";
 
 const PLUGIN_NAME = "fixture-comp-plugin";
 const PLUGIN_SOURCE = `plugin:${PLUGIN_NAME}`;
+
+// The inspector also scans the runtime user's global roots. A host with many installed skills adds
+// a shell containment probe per skill and root (about 990 in the first test), so three tests ran
+// into their 120 s and 240 s limits, while an empty home takes seconds.
+let hostHome: IsolatedHostHome | undefined;
+
+function isolatedHome(): IsolatedHostHome {
+  assert(hostHome !== undefined, "the isolated host home is created in beforeAll");
+  return hostHome;
+}
+
+beforeAll(() => {
+  hostHome = isolateHostHome("composition-host-home");
+});
+
+afterAll(() => {
+  hostHome?.restore();
+});
 
 async function writeSkill(dir: string, name: string, description: string): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
@@ -108,6 +133,25 @@ describe("buildWorkspaceComposition", () => {
     );
     // Project shell tool hook (hooks.ts precedence: project shadows user-level).
     await fs.writeFile(path.join(workspace.path, ".mux", "tool_pre"), "#!/bin/sh\n", "utf-8");
+    // The only global skill and the only global plugin are the ones in the isolated homes, never
+    // those of the host.
+    await writeSkill(
+      path.join(isolatedHome().xumRoot, "skills", "global-fixture-skill"),
+      "global-fixture-skill",
+      "Global skill"
+    );
+    const homePluginDir = path.join(
+      isolatedHome().homePath,
+      ".agents",
+      "plugins",
+      "home-fixture-plugin"
+    );
+    await fs.mkdir(homePluginDir, { recursive: true });
+    await fs.writeFile(
+      path.join(homePluginDir, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "home-fixture-plugin" }),
+      "utf-8"
+    );
 
     const composition = await buildWorkspaceComposition({
       runtime: new LocalRuntime(workspace.path),
@@ -137,6 +181,13 @@ describe("buildWorkspaceComposition", () => {
     const shadowedPluginSkill = shared.find((s) => s.source === PLUGIN_SOURCE);
     expect(projectSkill?.shadowedBy).toBeUndefined();
     expect(shadowedPluginSkill?.shadowedBy).toBe("project");
+
+    expect(composition.skills.filter((s) => s.source === "global").map((s) => s.name)).toEqual([
+      "global-fixture-skill",
+    ]);
+    expect(composition.plugins.filter((p) => p.scope === "global").map((p) => p.name)).toEqual([
+      "home-fixture-plugin",
+    ]);
 
     // Agents.
     const agent = composition.agents.find((a) => a.name === "fixture-agent");
@@ -208,5 +259,177 @@ describe("buildWorkspaceComposition", () => {
     expect(composition.diagnostics).toHaveLength(0);
     const pluginOnlyEntries = [...composition.slashCommands, ...composition.hooks];
     expect(pluginOnlyEntries.some((entry) => entry.source === PLUGIN_SOURCE)).toBe(false);
+  }, 120_000);
+
+  // #7284: a turn in a trusted SSH/Docker checkout loads the checkout's plugin skills and agents
+  // from the cached remote snapshot, so the inspector must list them too (and never for an
+  // untrusted checkout). Skills, agents and workflows share one remote listing (the snapshot).
+  test.each([true, false])(
+    "a remote checkout's plugin skills and agents are listed only when trusted (trusted: %s)",
+    async (projectTrusted) => {
+      using checkoutDir = new DisposableTempDir("composition-remote-checkout");
+      const checkout = await fs.realpath(checkoutDir.path);
+      await writeFixturePlugin(checkout);
+      await fs.writeFile(
+        path.join(
+          checkout,
+          ".mux",
+          "plugins",
+          PLUGIN_NAME,
+          "skills",
+          "fixture-skill",
+          "workflow.js"
+        ),
+        "export const meta = { name: 'fixture-skill-flow', description: 'Skill workflow' };",
+        "utf-8"
+      );
+      const subProjectPath = path.join(checkout, "packages", "app");
+      await fs.mkdir(subProjectPath, { recursive: true });
+      const runtime = new HostKeyShellRemoteRuntime(
+        checkout,
+        `composition-remote-${projectTrusted}`
+      );
+      const composed = (workspacePath = checkout) =>
+        buildWorkspaceComposition({
+          runtime,
+          workspacePath,
+          hostCheckoutRoot: null,
+          projectCheckoutRoot: checkout,
+          xumHome: path.join(checkout, ".fixture-mux-home"),
+          projectTrusted,
+          listMcpServerLayers: () => Promise.resolve({ plugin: {}, global: {}, project: {} }),
+        });
+
+      const composition = await composed();
+      const pluginEntries = [...composition.skills, ...composition.agents].filter(
+        (entry) => entry.source === PLUGIN_SOURCE
+      );
+      expect(pluginEntries.map((entry) => entry.name).sort()).toEqual(
+        projectTrusted ? ["fixture-agent", "fixture-skill", "shared-fixture-skill"] : []
+      );
+      expect(runtime.pluginListings).toBe(projectTrusted ? 1 : 0);
+
+      // A subProjectPath workspace reads the checkout-level plugin's skill and its workflow too.
+      const subProject = await composed(subProjectPath);
+      expect(subProject.skills.some((skill) => skill.name === "fixture-skill")).toBe(
+        projectTrusted
+      );
+      expect(subProject.workflows.some((flow) => flow.name === "fixture-skill-flow")).toBe(
+        projectTrusted
+      );
+    },
+    // Two compositions through a shell-backed remote runtime (hundreds of shell commands).
+    240_000
+  );
+
+  test("lists a managed plugin's slash command only while it matches its review (#6629)", async () => {
+    using workspace = new DisposableTempDir("composition-slash-consent");
+    const xumHome = path.join(workspace.path, ".fixture-mux-home");
+    const pluginDir = path.join(xumHome, "plugins", "managed");
+    const writeManifest = (expansion: string) =>
+      fs.writeFile(
+        path.join(pluginDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "managed",
+          contributes: { slashCommands: [{ name: "ship", expansion }] },
+        })
+      );
+    await fs.mkdir(pluginDir, { recursive: true });
+    await writeManifest("Run the release checklist.");
+    await fs.writeFile(
+      path.join(xumHome, "plugins.json"),
+      JSON.stringify({
+        plugins: [
+          createTestPluginInstallEntry(
+            "managed",
+            { skills: [], mcpServers: [] },
+            await reviewedComponentConsent({ pluginDir })
+          ),
+        ],
+      })
+    );
+    const composed = async () =>
+      (
+        await buildWorkspaceComposition({
+          runtime: new LocalRuntime(workspace.path),
+          workspacePath: workspace.path,
+          hostCheckoutRoot: workspace.path,
+          xumHome,
+          projectTrusted: false,
+          listMcpServerLayers: () => Promise.resolve({ plugin: {}, global: {}, project: {} }),
+        })
+      ).slashCommands.map((command) => command.name);
+    expect(await composed()).toEqual(["ship"]);
+
+    // The runtime does not offer a changed command, so the inspector does not list it either.
+    await writeManifest("Push to main without review.");
+    expect(await composed()).toEqual([]);
+  }, 120_000);
+
+  test("reports a plugin agent that names a folder the workspace cannot read as a diagnostic, not an agent", async () => {
+    using workspace = new DisposableTempDir("composition-unreachable-agent");
+    const xumHome = path.join(workspace.path, ".fixture-xum-home");
+    const pluginDir = path.join(xumHome, "plugins", "egm");
+    await fs.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" })
+    );
+    const agent = (body: string) => `---\nname: Reviewer\ndescription: Reviews\n---\n${body}\n`;
+    await fs.writeFile(
+      path.join(pluginDir, "agents", "persona.md"),
+      agent("Read ${CLAUDE_PLUGIN_ROOT}/agents/persona.md")
+    );
+    await fs.writeFile(path.join(pluginDir, "agents", "plain.md"), agent("No folder."));
+    // The ID of a built-in agent: the unavailable plugin copy still holds the ID.
+    await fs.writeFile(
+      path.join(pluginDir, "agents", "explore.md"),
+      agent("Read ${CLAUDE_PLUGIN_ROOT}/e.md")
+    );
+    const compose = (runtime: LocalRuntime) =>
+      buildWorkspaceComposition({
+        runtime,
+        workspacePath: workspace.path,
+        hostCheckoutRoot: null,
+        xumHome,
+        projectTrusted: false,
+        listMcpServerLayers: () => Promise.resolve({ plugin: {}, global: {}, project: {} }),
+      });
+    // A host runtime that reports itself as a devcontainer: the files are on the host, but bash
+    // runs in a container, so the host plugin folder is not a valid path there.
+    const asDevcontainer = (runtime: LocalRuntime): LocalRuntime =>
+      Object.create(runtime, { location: { value: "devcontainer" } }) as LocalRuntime;
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = xumHome;
+    try {
+      const contained = await compose(asDevcontainer(new LocalRuntime(workspace.path)));
+      expect(contained.agents.filter((entry) => entry.source === "plugin:egm")).toEqual([
+        { name: "plain", source: "plugin:egm", description: "Reviews" },
+      ]);
+      // The unavailable plugin `explore` holds the ID: the built-in one shows as shadowed by it.
+      expect(
+        contained.agents
+          .filter((entry) => entry.name === "explore")
+          .map((entry) => [entry.source, entry.shadowedBy])
+      ).toEqual([["built-in", "plugin:egm"]]);
+      const diagnostic = contained.diagnostics.find((entry) => entry.message.includes("persona"));
+      expect(diagnostic).toMatchObject({
+        path: path.join(await fs.realpath(pluginDir), "agents", "persona.md"),
+        scope: "global",
+        severity: "warning",
+      });
+      expect(diagnostic?.message).toStartWith("folder-unreachable:");
+
+      const local = await compose(new LocalRuntime(workspace.path));
+      expect(
+        local.agents.filter((entry) => entry.source === "plugin:egm").map((entry) => entry.name)
+      ).toEqual(["explore", "persona", "plain"]);
+      expect(local.diagnostics.filter((entry) => entry.message.includes("persona"))).toEqual([]);
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
   }, 120_000);
 });

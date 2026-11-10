@@ -56,7 +56,36 @@ async function readOverridesFile(filePath: string): Promise<Map<ExperimentId, bo
   } catch {
     // Ignore missing/corrupt overrides
   }
+  applyMcpAppsUpgradeDefault(overrides);
   return overrides;
+}
+
+/**
+ * #6760 upgrade default: before MCP Apps had their own experiment, the Artifacts experiment
+ * gated them. A file without an mcp-apps entry predates the split, so MCP Apps stay on for users
+ * who had Artifacts on and use MCP Apps today. freezeMcpAppsUpgradeDefault persists the entry
+ * before Artifacts changes, so from then on the two experiments are independent.
+ */
+function applyMcpAppsUpgradeDefault(overrides: Map<ExperimentId, boolean>): void {
+  if (!overrides.has(EXPERIMENT_IDS.MCP_APPS) && overrides.get(EXPERIMENT_IDS.ARTIFACTS) === true) {
+    overrides.set(EXPERIMENT_IDS.MCP_APPS, true);
+  }
+}
+
+/**
+ * After a write to Artifacts or MCP Apps, store an MCP Apps entry, so the upgrade default never
+ * applies again: turning Artifacts on must not turn MCP Apps on, turning it off must not turn
+ * them off, and clearing the MCP Apps override must stay "off" after a restart. The read already
+ * derived "on" where it applies, so a missing entry here means "off".
+ */
+function freezeMcpAppsUpgradeDefault(
+  overrides: Map<ExperimentId, boolean>,
+  changed: ExperimentId
+): void {
+  const relevant = changed === EXPERIMENT_IDS.ARTIFACTS || changed === EXPERIMENT_IDS.MCP_APPS;
+  if (relevant && !overrides.has(EXPERIMENT_IDS.MCP_APPS)) {
+    overrides.set(EXPERIMENT_IDS.MCP_APPS, false);
+  }
 }
 
 /**
@@ -145,6 +174,7 @@ export class ExperimentsService {
       const value = this.isExperimentSupported(experimentId) ? enabled : null;
       if (value == null) next.delete(experimentId);
       else next.set(experimentId, value);
+      freezeMcpAppsUpgradeDefault(next, experimentId);
       await lease.assertStillOwned();
       await this.writeOverridesToDisk(next);
       // A successful acknowledgement means the change survives a restart.

@@ -5,28 +5,31 @@
  * e2e.config.ts runs this as the target's `app.command` with `--port {port}`, so every
  * explorer gets its own app on its own free port, and explorers never see each other's edits.
  *
- * Usage: bun tests/bugbash/startApp.ts --port <port> [--mcp-apps]   (needs `make build`: dist/ +
- *        renderer). --mcp-apps adds an MCP Apps server and a chat with its tool calls
- *        (mcpapps/seed.ts); e2e.mcpapps.config.ts passes it.
+ * Usage: bun tests/bugbash/startApp.ts --port <port> [--mcp-apps | --electron]   (needs `make
+ *        build`: dist/ + renderer). --mcp-apps adds an MCP Apps server and a chat with its tool
+ *        calls (mcpapps/seed.ts); e2e.mcpapps.config.ts passes it. --electron serves no `xum
+ *        server`: see serveElectronApp (tests/stories/e2e.electron.config.ts passes it).
  *
  * Steps:
  * 1. Create a temp root holding XUM_ROOT, HOME and a throwaway git repo.
  * 2. Start the server on a private port and seed it through the HTTP API: the demo project
- *    (trusted), one workspace with a few artifacts (one with stored versions), onboarding marked
- *    seen, the artifacts experiment, and a fake Anthropic provider on a dead loopback port.
+ *    (trusted), one workspace with a few artifacts (one published), onboarding marked
+ *    seen, the artifacts and mcp-apps experiments, and a fake Anthropic provider on a dead loopback port.
  * 3. Stop that server, then serve the same root on `--port`. e2e polls `--port` for readiness,
- *    so no explorer can open the app before seeding has finished.
+ *    so no explorer can open the app before seeding has finished. SIGUSR2 restarts that server
+ *    on the same port and root (serve, appControl.ts).
  *
  * AI mode (aiMode.ts, BUGBASH_AI, default auto): real mode configures the app's provider with the
  * real key and base URL, makes the app model the default, and starts the server with
  * XUM_DISABLE_AGENT_TOOLS=1: no agent turn sends a tool to the model, whatever agent, project
  * file or plugin defines it, so chat replies cannot read files or run commands. Callers with
- * their own tools (refinement, memory harvest and intuition, continuous compaction) do not check
- * the flag, and none of them runs shell commands here (src/node/utils/agentToolsDisabled.ts). Agent
+ * their own tools (refinement, memory harvest, continuous compaction) do not check the flag, and none of them runs shell commands here (src/node/utils/agentToolsDisabled.ts). Agent
  * overrides also tell the built-in agents they have no tools, so replies say so. Real mode also
  * sets XUM_DISABLE_TERMINALS and XUM_DISABLE_PROJECT_AUTOMATION: AI replies are untrusted input
  * for the explorer, so the terminal and project init hooks are closed.
  * Mock mode sets XUM_MOCK_AI=1 and points the provider at a dead loopback port.
+ * BUGBASH_SCENARIO=scripted-tools is the one app with agent tools on: its only model is a fixed
+ * loopback script (scriptedModel.ts), and it starts only in an exact-step sandbox job (main()).
  *
  * Safety: the server process gets only PATH, HOME (the temp one), the temp-dir variables and the
  * XUM_* values set here. In real mode the provider key reaches the app only through the temp
@@ -44,10 +47,19 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { type AiMode, AiModeError, resolveAiMode } from "./aiMode";
-import { proxySocketMounted, sandboxShaped } from "./sandbox/inContainer";
+import {
+  appControlPath,
+  electronControlPath,
+  writeAppControl,
+  writeElectronControl,
+} from "./appControl";
+import { inSandbox, proxySocketMounted, sandboxShaped } from "./sandbox/inContainer";
 import { startFakeProvider } from "./fakeProvider";
+import { startScriptedModel } from "./scriptedModel";
+import { scriptedModelLogPath } from "./appControl";
 import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
 import { seedPluginHooks, writePluginSources } from "./pluginHookFixtures";
+import { writeInstallSources } from "./pluginInstallFixtures";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "../..");
 const SERVER_ENTRY = path.join(REPO_ROOT, "dist/cli/index.js");
@@ -165,16 +177,49 @@ export function modelDrivenGuard(
   return null;
 }
 
+export const SCENARIOS = ["", "bash-ai-proxy", "scripted-tools"] as const;
+export type Scenario = (typeof SCENARIOS)[number];
+
+/**
+ * Why BUGBASH_SCENARIO=`scenario` must not start here, or null. Both scenarios turn a kill switch
+ * off (bash-ai-proxy needs project automation, scripted-tools agent tools), so neither runs in a
+ * model-driven job. scripted-tools also runs only inside the sandbox, and the env marker alone
+ * could be dropped: a mounted proxy socket refuses it too. `root` is for tests.
+ */
+export function scenarioRefusal(
+  scenario: string,
+  mode: "mock" | "real",
+  env: NodeJS.ProcessEnv = process.env,
+  root = "/"
+): string | null {
+  if (!(SCENARIOS as readonly string[]).includes(scenario))
+    return `BUGBASH_SCENARIO must be empty, bash-ai-proxy or scripted-tools, got "${scenario}"`;
+  if (scenario === "") return null;
+  if (mode !== "mock")
+    return `BUGBASH_SCENARIO=${scenario} replaces the mock: run it with BUGBASH_AI=mock`;
+  if (env.BUGBASH_MODEL_DRIVEN === "1")
+    return `BUGBASH_SCENARIO=${scenario} turns a kill switch off: not in a model-driven job`;
+  if (scenario === "scripted-tools" && (!inSandbox(env, root) || proxySocketMounted(root)))
+    return "BUGBASH_SCENARIO=scripted-tools runs only in an exact-step job of the bug-bash sandbox (make test-bugbash-repros-sandbox)";
+  return null;
+}
+
 /** The mode and kill-switch env of the app server. */
 export function appSwitches(
   mode: "mock" | "real",
-  fakeProvider: boolean,
+  scenario: Scenario,
   modelDriven: boolean
 ): Record<string, string> {
   // No agent tools and no terminal (AGENTS.md: not until the app runs in a sandbox). Project
   // automation stays on: its kill switch also makes the bash AI proxy refuse every call, the
   // fake's replies are fixed text, and the seeded demo repo has no hooks.
-  if (fakeProvider) return { XUM_DISABLE_AGENT_TOOLS: "1", XUM_DISABLE_TERMINALS: "1" };
+  if (scenario === "bash-ai-proxy")
+    return { XUM_DISABLE_AGENT_TOOLS: "1", XUM_DISABLE_TERMINALS: "1" };
+  // The one app with agent tools on (#7027, #7029): its only model is scriptedModel.ts, whose
+  // fixed script calls todo_write and file_read of README.md, and main() starts it only in an
+  // exact-step sandbox job. No mock either: Xum must build real requests for the fake to log.
+  if (scenario === "scripted-tools")
+    return { XUM_DISABLE_TERMINALS: "1", XUM_DISABLE_PROJECT_AUTOMATION: "1" };
   const all = {
     XUM_DISABLE_AGENT_TOOLS: "1",
     XUM_DISABLE_TERMINALS: "1",
@@ -270,11 +315,23 @@ async function seed(
   child: ChildProcess,
   ai: AiMode,
   fakeProviderOrigin: string | undefined,
+  /** False for scripted-tools: with agent tools on, the trusted PreToolUse hook would register. */
+  pluginHooks: boolean,
   pluginSources: Map<string, string>,
-  gitEnv: NodeJS.ProcessEnv
+  gitEnv: NodeJS.ProcessEnv,
+  electron: boolean
 ): Promise<string> {
   await api(base, "splashScreens/markSplashScreenViewed", { splashId: "onboarding-wizard-v1" });
+  // Web stories turn tutorials off per test over the app's HTTP API (repros/helpers.ts
+  // disableTutorials). Xum Electron serves no HTTP API (XUM_NO_API_SERVER=1), so its seed does it.
+  if (electron) {
+    await api(base, "config/updateUserPreferences", {
+      patches: [{ ui: { tutorialState: { disabled: true } } }],
+    });
+  }
   await api(base, "experiments/set", { experimentId: "artifacts", enabled: true });
+  // MCP App views have their own experiment (#6760); the MCP Apps suite and repros need it.
+  await api(base, "experiments/set", { experimentId: "mcp-apps", enabled: true });
   if (ai.mode === "real") {
     await api(base, "providers/setProviderConfig", {
       provider: ai.provider,
@@ -297,7 +354,7 @@ async function seed(
   } else {
     // The composer refuses to send without a configured provider. Mock AI never calls it, and
     // the dead loopback port keeps any stray background call from leaving the machine. The
-    // bash-ai-proxy scenario points both providers at the loopback fake instead.
+    // bash-ai-proxy and scripted-tools scenarios point both providers at their loopback fake.
     const providerBase = fakeProviderOrigin ?? "http://127.0.0.1:9";
     await api(base, "providers/setProviderConfig", {
       provider: "anthropic",
@@ -370,21 +427,62 @@ async function seed(
   );
   fs.writeFileSync(path.join(artifactsDir, "notes.txt"), "Plain text artifact.\n");
   // Codex-format plugin hooks: installable sources and a few installed plugins to review.
-  await seedPluginHooks(
-    (route, body) => api(base, route, body),
-    pluginSources,
-    gitEnv,
-    artifactsDir
-  );
+  if (pluginHooks)
+    await seedPluginHooks(
+      (route, body) => api(base, route, body),
+      pluginSources,
+      gitEnv,
+      artifactsDir
+    );
   // An HTML artifact with in-page "#" links (repros/artifactsInPageLinks.e2e.ts). Dated an hour
   // back so it lists last and the newest artifact stays the one the tab opens by default.
   const guide = path.join(artifactsDir, "guide.html");
   fs.writeFileSync(guide, GUIDE_ARTIFACT_HTML);
   const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
   fs.utimesSync(guide, anHourAgo, anHourAgo);
-  await seedVersionedArtifact(base, xumRoot, workspaceId, artifactsDir);
+  // A hash-router page (repros/artifactsHashRouter.e2e.ts), dated back like the guide.
+  const hashRouter = path.join(artifactsDir, "hash-router.html");
+  fs.writeFileSync(hashRouter, HASH_ROUTER_ARTIFACT_HTML);
+  fs.utimesSync(hashRouter, anHourAgo, anHourAgo);
+  // Artifacts that send a message to the agent: an HTML page that sends on a click (at once) and
+  // from a timer after a click (the confirm strip asks), and a canvas whose button sends at once.
+  // Dated back like the guide, so the default artifact stays the same.
+  for (const [name, body] of [
+    ["feedback.html", FEEDBACK_ARTIFACT_HTML],
+    ["decision.canvas.json", DECISION_ARTIFACT_CANVAS],
+  ] as const) {
+    const file = path.join(artifactsDir, name);
+    fs.writeFileSync(file, body);
+    fs.utimesSync(file, anHourAgo, anHourAgo);
+  }
+  await seedPublishedArtifact(base, xumRoot, workspaceId, artifactsDir);
   return workspaceId;
 }
+
+/** A form that sends its answer with window.xum.send: on a click, and from a timer 7 s after one. */
+const FEEDBACK_ARTIFACT_HTML = `<!doctype html>
+<html>
+  <body>
+    <h1>Feedback</h1>
+    <label>Answer <input id="answer" value="Ship plan B" /></label>
+    <button id="send" onclick="window.xum.send(document.getElementById('answer').value)">
+      Send to agent
+    </button>
+    <button id="later" onclick="setTimeout(() => window.xum.send('Sent by a timer'), 7000)">
+      Send in 7 seconds
+    </button>
+  </body>
+</html>
+`;
+
+/** A canvas with one button that sends a message. */
+const DECISION_ARTIFACT_CANVAS = JSON.stringify({
+  $xum: "canvas",
+  blocks: [
+    { type: "markdown", text: "Plan **B** keeps the old path for a week." },
+    { type: "button", label: "Approve plan B", send: "Approve plan B.", data: { plan: "B" } },
+  ],
+});
 
 /** Contents, two tall sections with a link back to the top, and a status line its own script updates on scroll. */
 const GUIDE_ARTIFACT_HTML = `<!doctype html>
@@ -409,9 +507,63 @@ const GUIDE_ARTIFACT_HTML = `<!doctype html>
 `;
 
 /**
- * Same id as getArtifactId (src/node/services/artifactVersionStore.ts): a slug plus a short hash
- * of the exact path. The harness imports nothing from src/, so seedVersionedArtifact checks the
- * result through the listVersions route instead of trusting this copy.
+ * A hash router: it renders the route from location.hash on every hashchange, and has a link, a
+ * location.hash button and a history.replaceState button for each way an app moves between routes.
+ */
+const HASH_ROUTER_ARTIFACT_HTML = `<!doctype html>
+<html>
+  <body>
+    <nav>
+      <a href="#/">Home</a>
+      <a href="#/s/alpha">Alpha</a>
+      <a href="#/s/beta">Beta</a>
+      <button id="set-hash" type="button">Gamma by hash</button>
+      <button id="replace" type="button">Delta by replaceState</button>
+    </nav>
+    <p id="route"></p>
+    <p id="click"></p>
+    <script>
+      function render() {
+        document.getElementById("route").textContent =
+          "Route is " + (location.hash.replace(/^#/, "") || "/") + ".";
+      }
+      addEventListener("hashchange", render);
+      // Counts the hashchange events that arrive between the start of a click and a window click
+      // listener of the artifact's own. The bridge script runs first, so this listener comes after its
+      // click listener.
+      var hashchanges = 0;
+      var atClickStart = 0;
+      addEventListener("hashchange", function () {
+        hashchanges++;
+      });
+      addEventListener(
+        "click",
+        function () {
+          atClickStart = hashchanges;
+        },
+        true
+      );
+      addEventListener("click", function () {
+        document.getElementById("click").textContent =
+          "Hashchanges before this click handler: " + (hashchanges - atClickStart) + ".";
+      });
+      document.getElementById("set-hash").addEventListener("click", function () {
+        location.hash = "#/s/gamma";
+      });
+      document.getElementById("replace").addEventListener("click", function () {
+        history.replaceState(null, "", "#/s/delta");
+        render();
+      });
+      render();
+    </script>
+  </body>
+</html>
+`;
+
+/**
+ * Same id as getArtifactId (src/node/services/artifactRecordStore.ts): a slug plus a short hash
+ * of the exact path. The harness imports nothing from src/, so seedPublishedArtifact checks the
+ * result through the list route instead of trusting this copy.
  */
 function artifactId(relPath: string): string {
   const slug = relPath
@@ -439,61 +591,175 @@ lru.onchange = save; ttl.onchange = save; show();
 }
 
 /**
- * A published HTML artifact with two stored versions, so explorers can use the version menu and
- * window.xum.setState without a model publishing anything (real mode has no agent tools). The
- * index is in the format older builds wrote: v1 is a turn-end snapshot and the index keeps the
- * old bookkeeping fields, so the run also covers reading old history.
+ * A published HTML artifact, so explorers can use window.xum.setState without a model
+ * publishing anything (real mode has no agent tools). `artifact-versions` is
+ * ARTIFACT_STORE_DIR_NAME, kept from older builds.
  */
-async function seedVersionedArtifact(
+async function seedPublishedArtifact(
   base: string,
   xumRoot: string,
   workspaceId: string,
   artifactsDir: string
 ): Promise<void> {
   const relPath = "options.html";
-  const id = artifactId(relPath);
-  const dir = path.join(xumRoot, "sessions", workspaceId, "artifact-versions", id);
+  const dir = path.join(xumRoot, "sessions", workspaceId, "artifact-versions", artifactId(relPath));
   fs.mkdirSync(dir, { recursive: true });
   const now = Date.now();
-  const versions = [
-    { title: "Options v1", label: null, source: "turn-end", at: now - 3_600_000 },
-    { title: "Options v2", label: "Options v2", source: "publish", at: now - 600_000 },
-  ].map((entry, i) => {
-    const bytes = Buffer.from(optionsPage(entry.title));
-    fs.writeFileSync(path.join(dir, `v${i + 1}`), bytes);
-    return {
-      version: i + 1,
-      label: entry.label,
-      source: entry.source,
-      createdAtMs: entry.at,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      size: bytes.length,
-      path: relPath,
-      sourceModifiedMs: entry.at,
-    };
-  });
   fs.writeFileSync(
-    path.join(dir, "index.json"),
-    JSON.stringify({ id, path: relPath, pin: null, lastPublishedAtMs: now - 600_000, versions })
+    path.join(dir, "record.json"),
+    JSON.stringify({ path: relPath, title: "Options", pin: null, publishedAtMs: now - 600_000 })
   );
   // Dated back like guide.html, so the artifact the tab opens by default stays the same.
   const live = path.join(artifactsDir, relPath);
-  fs.writeFileSync(live, optionsPage("Options v2"));
+  fs.writeFileSync(live, optionsPage("Options"));
   const anHourAgo = new Date(now - 60 * 60 * 1000);
   fs.utimesSync(live, anHourAgo, anHourAgo);
-  const listed = await api<{ success: boolean; data?: { versions: unknown[] } }>(
+  const listed = await api<{ success: boolean; data?: { publishedPaths?: string[] } }>(
     base,
-    "artifacts/listVersions",
-    { workspaceId, path: relPath }
+    "artifacts/list",
+    { workspaceId }
   );
-  if (!listed.success || listed.data?.versions.length !== versions.length) {
-    fail(`seeded ${relPath} versions are not listed: ${JSON.stringify(listed).slice(0, 300)}`);
+  if (!listed.success || !listed.data?.publishedPaths?.includes(relPath)) {
+    fail(`seeded ${relPath} is not listed as published: ${JSON.stringify(listed).slice(0, 300)}`);
+  }
+}
+
+/** What the signal handlers act on: the server that runs now, and what comes after it. */
+export interface ServerSlot {
+  current: ChildProcess | null;
+  /** SIGINT or SIGTERM came: no server starts again. */
+  stopping: boolean;
+  /** serve() runs the app server (seeding is over). */
+  serving: boolean;
+  /** SIGUSR2 came: serve() starts a new server once the current one exits. */
+  restarting: boolean;
+}
+
+/**
+ * e2e stops the app with a signal, possibly while seeding: SIGINT and SIGTERM go to whichever
+ * server runs. SIGUSR2 restarts the app server (appControl.ts): a story checks what survives a
+ * restart, and e2e's `app.restart()` only opens a new page. It is ignored while seeding, so it
+ * cannot cut the seed short, and during a restart.
+ */
+export function handleSignals(slot: ServerSlot): void {
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      slot.stopping = true;
+      slot.current?.kill(signal);
+    });
+  }
+  process.on("SIGUSR2", () => {
+    if (!slot.serving || slot.stopping || slot.restarting) return;
+    slot.restarting = true;
+    slot.current?.kill("SIGTERM");
+  });
+}
+
+/**
+ * Serves the app on `port` until a server exits without a restart, and returns its exit code.
+ * After each server is healthy it writes the control file (appControl.ts), and it removes the
+ * file at the end. `start` must serve the same env each time.
+ */
+export async function serve(
+  slot: ServerSlot,
+  port: number,
+  start: () => ChildProcess
+): Promise<number | null> {
+  // A crashed earlier run on this port can leave a file that names a dead pid.
+  fs.rmSync(appControlPath(port), { force: true });
+  slot.serving = true;
+  let generation = 0;
+  let code: number | null = null;
+  try {
+    while (!slot.stopping) {
+      slot.restarting = false;
+      const child = start();
+      slot.current = child;
+      // e2e polls the port itself on start; this probe tells a restarting story that the new
+      // server is up. It ends when the server exits, so awaiting both cannot hang.
+      const healthy = waitForHealth(`http://127.0.0.1:${port}`, child).then(
+        () => {
+          if (slot.current === child && !slot.stopping && !slot.restarting) {
+            generation += 1;
+            writeAppControl(port, { pid: process.pid, generation, ready: true });
+          }
+        },
+        (error: unknown) => {
+          if (slot.current === child && !slot.stopping && !slot.restarting) {
+            console.error(error instanceof Error ? error.message : error);
+          }
+        }
+      );
+      [code] = await Promise.all([waitForExit(child), healthy]);
+      if (!slot.restarting) break;
+      console.log(`[bugbash startApp] SIGUSR2: restarting the app server on port ${port}`);
+    }
+  } finally {
+    fs.rmSync(appControlPath(port), { force: true });
+  }
+  return code;
+}
+
+/** The built renderer's file for a URL path, or null when the path leaves `dist`. */
+export function distFile(dist: string, urlPath: string): string | null {
+  let rel: string;
+  try {
+    rel = decodeURIComponent(urlPath);
+  } catch {
+    return null;
+  }
+  const file = path.resolve(dist, `.${rel === "/" ? "/index.html" : rel}`);
+  return file === dist || file.startsWith(`${dist}${path.sep}`) ? file : null;
+}
+
+/**
+ * `--electron`: the app of the Electron story target. The seeded XUM_ROOT stays, and no `xum
+ * server` serves it: Xum Electron (tests/stories/electronProvider.ts) runs the backend in its
+ * main process. This process serves the built renderer on 127.0.0.1:`port` (Electron's
+ * XUM_DEVSERVER_PORT, and the target's app URL that e2e polls), after it wrote the control file
+ * (appControl.ts) that tells the provider the root, the port and the app switches. Not the Vite
+ * dev server: it writes node_modules/.vite, which the sandbox mounts read-only. Not file://: e2e
+ * needs an http app URL. Returns once SIGINT or SIGTERM came.
+ */
+async function serveElectronApp(
+  slot: ServerSlot,
+  port: number,
+  root: string,
+  switches: Record<string, string>
+): Promise<void> {
+  const dist = path.join(REPO_ROOT, "dist");
+  const stopped = new Promise<void>((resolve) => {
+    for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => resolve());
+  });
+  if (slot.stopping) return; // a signal during the seed
+  writeElectronControl({ pid: process.pid, port, root, switches, ready: true });
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    async fetch(request) {
+      const file = distFile(dist, new URL(request.url).pathname);
+      if (file == null) return new Response("not found", { status: 404 });
+      const found = Bun.file(file);
+      // A client-side route: the renderer's own router resolves it.
+      return (await found.exists())
+        ? new Response(found)
+        : new Response(Bun.file(path.join(dist, "index.html")));
+    },
+  });
+  console.log(`[bugbash startApp] serving ${dist} for Xum Electron on 127.0.0.1:${port}`);
+  try {
+    await stopped;
+  } finally {
+    await server.stop(true);
+    fs.rmSync(electronControlPath(), { force: true });
   }
 }
 
 async function main(): Promise<void> {
   const port = parsePort(process.argv.slice(2));
   const mcpApps = process.argv.includes("--mcp-apps");
+  const electron = process.argv.includes("--electron");
+  if (mcpApps && electron) fail("--mcp-apps and --electron do not combine");
   if (!fs.existsSync(SERVER_ENTRY) || !fs.existsSync(path.join(REPO_ROOT, "dist/index.html"))) {
     fail("dist/ is missing the server or the renderer: run `make build` first");
   }
@@ -513,22 +779,25 @@ async function main(): Promise<void> {
   // the proxy itself with that workspace's key, so the proxy, the Cost tab and Analytics see
   // real traffic while agent tools stay off. Nothing leaves the machine. It replaces the mock,
   // so the explorer context (e2e.config.ts) must not describe a real model.
-  const scenario = process.env.BUGBASH_SCENARIO ?? "";
-  if (scenario !== "" && scenario !== "bash-ai-proxy") {
-    fail(`BUGBASH_SCENARIO must be empty or bash-ai-proxy, got "${scenario}"`);
-  }
-  if (scenario !== "" && ai.mode !== "mock") {
-    fail("BUGBASH_SCENARIO=bash-ai-proxy replaces the mock: run it with BUGBASH_AI=mock");
-  }
+  // BUGBASH_SCENARIO=scripted-tools: the app runs with agent tools on, and its only model is the
+  // loopback scripted model (scriptedModel.ts), which logs each request's tool block for
+  // repros/toolBlockAcrossNudge.e2e.ts. Only in an exact-step job of the bug-bash sandbox: no
+  // network, no provider proxy and no explorer model, so no model output reaches the app or the
+  // test, and the script's two tool calls are the only ones that run.
+  const scenario = (process.env.BUGBASH_SCENARIO ?? "") as Scenario;
+  const refused = scenarioRefusal(scenario, ai.mode);
+  if (refused != null) fail(refused);
   // A model-driven job (the sandbox launcher sets this): a model reads every reply and page, so
-  // the app gets all three switches in both AI modes. bash-ai-proxy needs project automation.
+  // the app gets all three switches in both AI modes.
   const modelDriven = process.env.BUGBASH_MODEL_DRIVEN === "1";
-  if (modelDriven && scenario !== "") {
-    fail("BUGBASH_SCENARIO=bash-ai-proxy needs project automation: not in a model-driven job");
-  }
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-"));
   const xumRoot = path.join(tempRoot, "xum");
-  const fakeProvider = scenario === "bash-ai-proxy" ? await startFakeProvider(xumRoot) : undefined;
+  const fakeProvider =
+    scenario === "bash-ai-proxy"
+      ? await startFakeProvider(xumRoot)
+      : scenario === "scripted-tools"
+        ? await startScriptedModel(scriptedModelLogPath(port))
+        : undefined;
   const home = path.join(tempRoot, "home");
   const projectPath = path.join(tempRoot, PROJECT_NAME);
   const env: NodeJS.ProcessEnv = {
@@ -539,7 +808,7 @@ async function main(): Promise<void> {
     // Real mode: a real model answers in the app on this host. It gets no tools, and the explorer
     // gets no terminal or project init hooks, so injected text in a reply that the explorer
     // follows cannot run host commands through them (see the header).
-    ...appSwitches(ai.mode, fakeProvider != null, modelDriven),
+    ...appSwitches(ai.mode, scenario, modelDriven),
     // Bug-bash clicks are not product usage.
     XUM_DISABLE_TELEMETRY: "1",
     // Git inside the app must not read or write the user's real ~/.gitconfig.
@@ -548,48 +817,58 @@ async function main(): Promise<void> {
   const unguarded = modelDrivenGuard(env);
   if (unguarded != null) fail(`${unguarded}: the app does not start`);
 
-  // e2e stops the app with a signal, possibly while seeding: pass it to whichever server runs.
-  let current: ChildProcess | null = null;
-  let stopping = false;
-  for (const signal of ["SIGINT", "SIGTERM"] as const) {
-    process.on(signal, () => {
-      stopping = true;
-      current?.kill(signal);
-    });
-  }
+  const slot: ServerSlot = { current: null, stopping: false, serving: false, restarting: false };
+  handleSignals(slot);
 
   let code: number | null = null;
   try {
     fs.mkdirSync(home, { recursive: true });
     if (ai.mode === "real") writeNoToolAgents(xumRoot);
     createDemoRepo(projectPath, env);
-    const pluginSources = writePluginSources(path.join(tempRoot, "plugin-sources"), env);
+    const sourcesRoot = path.join(tempRoot, "plugin-sources");
+    // Hook fixtures, then the install-method fixtures (Claude plugin, marketplace, skills repo):
+    // plugin-sources.md lists both.
+    const pluginSources = new Map([
+      ...writePluginSources(sourcesRoot, env),
+      ...writeInstallSources(sourcesRoot, env),
+    ]);
     if (mcpApps) writeMcpConfig(xumRoot);
 
     const seedPort = await getFreePort();
-    current = startServer(seedPort, env);
+    const seedServer = startServer(seedPort, env);
+    slot.current = seedServer;
     let workspaceId: string;
     try {
-      await waitForHealth(`http://127.0.0.1:${seedPort}`, current);
+      await waitForHealth(`http://127.0.0.1:${seedPort}`, seedServer);
       workspaceId = await seed(
         `http://127.0.0.1:${seedPort}`,
         projectPath,
         xumRoot,
-        current,
+        seedServer,
         ai,
         fakeProvider?.origin,
+        scenario !== "scripted-tools",
         pluginSources,
-        env
+        env,
+        electron
       );
     } finally {
-      current.kill("SIGTERM");
-      await waitForExit(current);
+      seedServer.kill("SIGTERM");
+      await waitForExit(seedServer);
     }
     if (mcpApps) seedMcpChat(xumRoot, workspaceId);
 
-    if (!stopping) {
-      current = startServer(port, env);
-      code = await waitForExit(current);
+    if (electron) {
+      // XUM_MOCK_AI and the three kill switches: what the server env got from appSwitches.
+      const switches = Object.fromEntries(
+        ["XUM_MOCK_AI", ...SWITCHES].flatMap((name) =>
+          env[name] == null ? [] : [[name, env[name]]]
+        )
+      ) as Record<string, string>;
+      await serveElectronApp(slot, port, xumRoot, switches);
+    } else {
+      // Every restart serves this same env, XUM_ROOT included: the temp root goes only below.
+      code = await serve(slot, port, () => startServer(port, env));
     }
   } finally {
     fakeProvider?.close();

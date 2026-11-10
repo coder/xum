@@ -7,8 +7,7 @@ const pillClassName =
 
 /**
  * "from artifact" label on a user message sent from an artifact (M5b design C). Shown only for
- * backend-written metadata. Clicking opens the artifact at the version the user interacted with
- * (version 0 means the file had no stored version: open the live file).
+ * backend-written metadata. Clicking opens the artifact.
  */
 export function ArtifactInteractionPill(props: {
   interaction: ArtifactInteractionMetadata;
@@ -26,13 +25,7 @@ export function ArtifactInteractionPill(props: {
   return (
     <button
       type="button"
-      onClick={() =>
-        openArtifact({
-          workspaceId,
-          path: props.interaction.artifactPath,
-          versionId: props.interaction.version > 0 ? props.interaction.version : null,
-        })
-      }
+      onClick={() => openArtifact({ workspaceId, path: props.interaction.artifactPath })}
       aria-label={`Open ${props.interaction.title} in Artifacts`}
       className={`${pillClassName} hover:text-foreground`}
     >

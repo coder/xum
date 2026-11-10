@@ -9,20 +9,30 @@ import type { AIService } from "./aiService";
 import type { MemorySessionContext } from "./memoryService";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { MEMORY_CONTEXT_FILE_NAME } from "./memoryContextPersistence";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Err } from "@/common/types/result";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 
 /**
- * Behavior under test: the memory session context (index snapshot +
- * hot-memories block) is computed once per model in a context window and
- * recomputed only at window boundaries (compaction, rollover, reset) or in a
- * new session, never after a memory write, so the injected bytes stay
- * prompt-cache-stable (#5248).
+ * Behavior under test: the memory session context (index snapshot) is
+ * computed once per model in a context window and
+ * recomputed only at window boundaries (compaction, rollover, reset), never
+ * after a memory write or a server restart, so the injected bytes stay
+ * prompt-cache-stable (#5248) and replayed Anthropic thinking stays valid.
  */
 
-const WORKSPACE_ID = "workspace-hot-memories-test";
+const WORKSPACE_ID = "workspace-memory-context-test";
+
+/** A context whose index names `label`, so assertions can tell builds apart. */
+function contextNamed(label: string): MemorySessionContext {
+  return { indexEntries: [{ path: `/memories/global/${label}.md`, description: "note" }] };
+}
+
+function nameOf(context: MemorySessionContext | undefined): string | undefined {
+  return context?.indexEntries[0]?.path;
+}
 
 async function createSession(args: {
   historyService: HistoryService;
@@ -48,12 +58,23 @@ async function createSession(args: {
 interface PrivateSessionAccess {
   resolveMemoryContext: (
     modelString: string,
-    options?: Parameters<AIService["buildMemorySessionContext"]>[2],
-    cache?: Map<string, unknown>
+    cache?: Map<string, unknown>,
+    persistence?: { windowKey: string | undefined }
   ) => Promise<MemorySessionContext | undefined>;
   getPostCompactionAttachmentsIfNeeded: () => Promise<unknown>;
   clearPostCompactionState: () => Promise<void>;
   applyContextResetSideEffects: () => Promise<void>;
+}
+
+/** Resolve as a stream of the context window whose first history row is `windowKey`. */
+function resolveInWindow(
+  session: AgentSession,
+  modelString: string,
+  windowKey = "window-1"
+): Promise<MemorySessionContext | undefined> {
+  return (session as unknown as PrivateSessionAccess).resolveMemoryContext(modelString, undefined, {
+    windowKey,
+  });
 }
 
 async function writePendingPostCompactionState(sessionDir: string): Promise<void> {
@@ -77,10 +98,7 @@ describe("AgentSession memory context", () => {
     let version = 0;
     const buildMemorySessionContext = mock(() => {
       version++;
-      return Promise.resolve<MemorySessionContext>({
-        indexEntries: [{ path: `/memories/global/v${version}.md`, description: "note" }],
-        hotMemoriesBlock: `<hot_memories>v${version}</hot_memories>`,
-      });
+      return Promise.resolve(contextNamed(`v${version}`));
     });
     const aiEmitter = new EventEmitter();
     const session = await createSession({
@@ -93,8 +111,8 @@ describe("AgentSession memory context", () => {
 
     try {
       const first = await priv.resolveMemoryContext("test-model");
-      // The agent's own successful write: before #5248 this rebuilt the index and
-      // hot set, rewriting the memory tool description and the system prompt.
+      // The agent's own successful write: before #5248 this rebuilt the index,
+      // rewriting the memory tool description.
       aiEmitter.emit("tool-call-end", {
         type: "tool-call-end",
         workspaceId: WORKSPACE_ID,
@@ -121,10 +139,7 @@ describe("AgentSession memory context", () => {
       let version = 0;
       const buildMemorySessionContext = mock(() => {
         version++;
-        return Promise.resolve<MemorySessionContext>({
-          indexEntries: [],
-          hotMemoriesBlock: `<hot_memories>v${version}</hot_memories>`,
-        });
+        return Promise.resolve(contextNamed(`v${version}`));
       });
       const session = await createSession({ historyService, config, buildMemorySessionContext });
       const priv = session as unknown as PrivateSessionAccess;
@@ -144,53 +159,12 @@ describe("AgentSession memory context", () => {
     }
   );
 
-  test("upgrades an index-only memory context when hot memories are requested", async () => {
-    const { historyService, config, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
-    const buildMemorySessionContext = mock(
-      (_workspaceId: string, modelString: string, options?: { includeHotMemories?: boolean }) =>
-        Promise.resolve({
-          indexEntries: [],
-          hotMemoriesBlock:
-            options?.includeHotMemories === false
-              ? null
-              : `<hot_memories>${modelString}</hot_memories>`,
-        })
-    );
-    const session = await createSession({
-      historyService,
-      config,
-      buildMemorySessionContext,
-    });
-    const priv = session as unknown as PrivateSessionAccess;
-
-    try {
-      expect(
-        (await priv.resolveMemoryContext("model-a", { includeHotMemories: false }))
-          ?.hotMemoriesBlock
-      ).toBeNull();
-      expect((await priv.resolveMemoryContext("model-a"))?.hotMemoriesBlock).toBe(
-        "<hot_memories>model-a</hot_memories>"
-      );
-      expect((await priv.resolveMemoryContext("model-a"))?.hotMemoriesBlock).toBe(
-        "<hot_memories>model-a</hot_memories>"
-      );
-      expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
-    } finally {
-      await session.dispose();
-    }
-  });
-
   test("caches memory context separately per model", async () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const buildMemorySessionContext = mock((_workspaceId: string, modelString: string) =>
-      Promise.resolve({
-        indexEntries: [],
-        hotMemoriesBlock: `<hot_memories>${modelString}</hot_memories>`,
-      })
+      Promise.resolve(contextNamed(modelString))
     );
     const session = await createSession({
       historyService,
@@ -200,14 +174,14 @@ describe("AgentSession memory context", () => {
     const priv = session as unknown as PrivateSessionAccess;
 
     try {
-      expect((await priv.resolveMemoryContext("model-a"))?.hotMemoriesBlock).toBe(
-        "<hot_memories>model-a</hot_memories>"
+      expect(nameOf(await priv.resolveMemoryContext("model-a"))).toBe(
+        "/memories/global/model-a.md"
       );
-      expect((await priv.resolveMemoryContext("model-b"))?.hotMemoriesBlock).toBe(
-        "<hot_memories>model-b</hot_memories>"
+      expect(nameOf(await priv.resolveMemoryContext("model-b"))).toBe(
+        "/memories/global/model-b.md"
       );
-      expect((await priv.resolveMemoryContext("model-a"))?.hotMemoriesBlock).toBe(
-        "<hot_memories>model-a</hot_memories>"
+      expect(nameOf(await priv.resolveMemoryContext("model-a"))).toBe(
+        "/memories/global/model-a.md"
       );
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
@@ -236,47 +210,246 @@ describe("AgentSession memory context", () => {
     }
   });
 
-  test("invalidates Memory/HotSet gate changes without losing model-specific caching", async () => {
+  test("invalidates a Memory gate change without losing model-specific caching", async () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
     let memoryEnabled = true;
-    let hotSetEnabled = true;
     const buildMemorySessionContext = mock<AIService["buildMemorySessionContext"]>(
-      (_workspace, model, options) =>
-        Promise.resolve(
-          memoryEnabled
-            ? {
-                indexEntries: [],
-                hotMemoriesBlock:
-                  hotSetEnabled && options?.includeHotMemories !== false ? model : null,
-              }
-            : null
-        )
+      (_workspace, model) => Promise.resolve(memoryEnabled ? contextNamed(model) : null)
     );
     const session = await createSession({
       historyService,
       config,
       buildMemorySessionContext,
-      isExperimentEnabled: (id) =>
-        (id === EXPERIMENT_IDS.MEMORY && memoryEnabled) ||
-        (id === EXPERIMENT_IDS.MEMORY_HOT_SET && hotSetEnabled),
+      isExperimentEnabled: (id) => id === EXPERIMENT_IDS.MEMORY && memoryEnabled,
     });
     const priv = session as unknown as PrivateSessionAccess;
     try {
-      expect((await priv.resolveMemoryContext("primary"))?.hotMemoriesBlock).toBe("primary");
+      expect(nameOf(await priv.resolveMemoryContext("primary"))).toBe(
+        "/memories/global/primary.md"
+      );
       await priv.resolveMemoryContext("primary");
-      // An index-only lookup reuses the fuller cached context.
-      await priv.resolveMemoryContext("primary", { includeHotMemories: false });
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
-      expect((await priv.resolveMemoryContext("fallback"))?.hotMemoriesBlock).toBe("fallback");
+      expect(nameOf(await priv.resolveMemoryContext("fallback"))).toBe(
+        "/memories/global/fallback.md"
+      );
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
-      hotSetEnabled = false;
-      expect((await priv.resolveMemoryContext("primary"))?.hotMemoriesBlock).toBeNull();
       memoryEnabled = false;
       expect(await priv.resolveMemoryContext("primary")).toBeUndefined();
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(3);
       memoryEnabled = true;
-      hotSetEnabled = true;
-      expect((await priv.resolveMemoryContext("primary"))?.hotMemoriesBlock).toBe("primary");
+      expect(nameOf(await priv.resolveMemoryContext("primary"))).toBe(
+        "/memories/global/primary.md"
+      );
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(4);
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  // A server restart creates a new AgentSession for the same context window. Before the
+  // context was saved in the session dir, the restart rebuilt it from memory files that
+  // other agents had changed. Anthropic then rejected every replayed thinking block ("The
+  // `system` prompt / `tools` list differs"), and the prompt cache missed.
+  test("keeps the window's context across a server restart", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    let version = 0;
+    const buildMemorySessionContext = mock(() => {
+      version++;
+      return Promise.resolve(contextNamed(`v${version}`));
+    });
+
+    const before = await createSession({ historyService, config, buildMemorySessionContext });
+    let first: MemorySessionContext | undefined;
+    try {
+      first = await resolveInWindow(before, "test-model");
+    } finally {
+      await before.dispose();
+    }
+
+    const after = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      expect(await resolveInWindow(after, "test-model")).toEqual(first);
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
+      // A model the old process never resolved still gets its own fresh context.
+      expect(nameOf(await resolveInWindow(after, "other-model"))).toBe("/memories/global/v2.md");
+    } finally {
+      await after.dispose();
+    }
+  });
+
+  // An upgrade from a build with the Memory Hot Set experiment: its file carries three
+  // retired fields. The saved context must still be reused, or the rebuilt index can change
+  // and Anthropic rejects the replayed thinking blocks.
+  test.each([
+    ["index-only", { includesHotMemories: false, hotMemoriesBlock: null }],
+    [
+      "hot block",
+      { includesHotMemories: true, hotMemoriesBlock: "<hot_memories>x</hot_memories>" },
+    ],
+  ] as const)("reuses a context saved by a Hot Set build (%s)", async (_label, saved) => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    const sessionDir = path.join(config.sessionsDir, WORKSPACE_ID);
+    await fs.mkdir(sessionDir, { recursive: true });
+    const indexEntries = [{ path: "/memories/global/saved.md", description: "note" }];
+    await fs.writeFile(
+      path.join(sessionDir, MEMORY_CONTEXT_FILE_NAME),
+      JSON.stringify({
+        version: 1,
+        windowKey: "window-1",
+        contexts: {
+          "test-model": {
+            context: { indexEntries, hotMemoriesBlock: saved.hotMemoriesBlock },
+            includesHotMemories: saved.includesHotMemories,
+            memoryEnabled: true,
+            hotSetEnabled: false,
+          },
+        },
+      })
+    );
+    const buildMemorySessionContext = mock(() => Promise.resolve(contextNamed("rebuilt")));
+    const session = await createSession({
+      historyService,
+      config,
+      buildMemorySessionContext,
+      isExperimentEnabled: (id) => id === EXPERIMENT_IDS.MEMORY,
+    });
+    try {
+      expect(await resolveInWindow(session, "test-model")).toStrictEqual({ indexEntries });
+      expect(buildMemorySessionContext).not.toHaveBeenCalled();
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  test.each(["reset", "new segment", "compaction"] as const)(
+    "rebuilds after a restart when a %s boundary ended the saved window",
+    async (boundary) => {
+      const { historyService, config, cleanup } = await createTestHistoryService();
+      historyCleanup = cleanup;
+
+      let version = 0;
+      const buildMemorySessionContext = mock(() => {
+        version++;
+        return Promise.resolve(contextNamed(`v${version}`));
+      });
+
+      const before = await createSession({ historyService, config, buildMemorySessionContext });
+      try {
+        const priv = before as unknown as PrivateSessionAccess;
+        await resolveInWindow(before, "test-model");
+        if (boundary === "reset") await priv.applyContextResetSideEffects();
+        else if (boundary === "new segment") await priv.clearPostCompactionState();
+        else {
+          await writePendingPostCompactionState(path.join(config.sessionsDir, WORKSPACE_ID));
+          await priv.getPostCompactionAttachmentsIfNeeded();
+        }
+      } finally {
+        await before.dispose();
+      }
+
+      const after = await createSession({ historyService, config, buildMemorySessionContext });
+      try {
+        expect(nameOf(await resolveInWindow(after, "test-model"))).toBe("/memories/global/v2.md");
+      } finally {
+        await after.dispose();
+      }
+    }
+  );
+
+  // A file can outlive its window: a failed delete, or an older build that crossed a
+  // boundary without knowing the file. The next window's first row differs, so it is ignored.
+  test("rebuilds after a restart when the saved file names another window", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    let version = 0;
+    const buildMemorySessionContext = mock(() => {
+      version++;
+      return Promise.resolve(contextNamed(`v${version}`));
+    });
+    const before = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      await resolveInWindow(before, "test-model", "window-1");
+    } finally {
+      await before.dispose();
+    }
+
+    const after = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      expect(nameOf(await resolveInWindow(after, "test-model", "window-2"))).toBe(
+        "/memories/global/v2.md"
+      );
+    } finally {
+      await after.dispose();
+    }
+  });
+
+  test("retries a failed save on the next cache hit", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    let version = 0;
+    const buildMemorySessionContext = mock(() => {
+      version++;
+      return Promise.resolve(contextNamed(`v${version}`));
+    });
+    // A directory at the file's path makes the first write fail.
+    const filePath = path.join(config.sessionsDir, WORKSPACE_ID, MEMORY_CONTEXT_FILE_NAME);
+    await fs.mkdir(filePath, { recursive: true });
+    const before = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      await resolveInWindow(before, "test-model");
+      await fs.rm(filePath, { recursive: true });
+      await resolveInWindow(before, "test-model");
+    } finally {
+      await before.dispose();
+    }
+
+    const after = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      expect(nameOf(await resolveInWindow(after, "test-model"))).toBe("/memories/global/v1.md");
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
+    } finally {
+      await after.dispose();
+    }
+  });
+
+  // History deserialization accepts an empty row id. A corrupted first row must only skip
+  // persistence, not fail every send of the workspace.
+  test("builds the context without saving when the window key is blank", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    const buildMemorySessionContext = mock(() => Promise.resolve(contextNamed("v1")));
+    const session = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      expect(nameOf(await resolveInWindow(session, "test-model", ""))).toBe(
+        "/memories/global/v1.md"
+      );
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  test("rebuilds the context when the saved file is malformed", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    const sessionDir = path.join(config.sessionsDir, WORKSPACE_ID);
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(path.join(sessionDir, MEMORY_CONTEXT_FILE_NAME), "{not json");
+    const buildMemorySessionContext = mock(() => Promise.resolve(contextNamed("fresh")));
+    const session = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      expect(nameOf(await resolveInWindow(session, "test-model"))).toBe(
+        "/memories/global/fresh.md"
+      );
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(1);
     } finally {
       await session.dispose();
     }
@@ -287,12 +460,7 @@ describe("AgentSession memory context", () => {
     historyCleanup = cleanup;
 
     let version = 1;
-    const buildMemorySessionContext = mock(() =>
-      Promise.resolve({
-        indexEntries: [],
-        hotMemoriesBlock: `<hot_memories>v${version}</hot_memories>`,
-      })
-    );
+    const buildMemorySessionContext = mock(() => Promise.resolve(contextNamed(`v${version}`)));
     const session = await createSession({
       historyService,
       config,
@@ -301,18 +469,14 @@ describe("AgentSession memory context", () => {
     const priv = session as unknown as PrivateSessionAccess;
 
     try {
-      expect((await priv.resolveMemoryContext("test-model"))?.hotMemoriesBlock).toBe(
-        "<hot_memories>v1</hot_memories>"
-      );
+      expect(nameOf(await priv.resolveMemoryContext("test-model"))).toBe("/memories/global/v1.md");
 
       // Consume a pending compaction boundary (first stream after compaction).
       version = 2;
       await writePendingPostCompactionState(path.join(config.sessionsDir, WORKSPACE_ID));
       await priv.getPostCompactionAttachmentsIfNeeded();
 
-      expect((await priv.resolveMemoryContext("test-model"))?.hotMemoriesBlock).toBe(
-        "<hot_memories>v2</hot_memories>"
-      );
+      expect(nameOf(await priv.resolveMemoryContext("test-model"))).toBe("/memories/global/v2.md");
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
       await session.dispose();

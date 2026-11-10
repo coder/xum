@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 
 import { AgentReportToolCall } from "../AgentReportToolCall";
 import { GenericToolCall } from "../GenericToolCall";
-import { IntuitionToolCall } from "../IntuitionToolCall";
 import { GoogleSearchToolCall } from "../GoogleSearchToolCall";
 import { ToolSearchToolCall } from "../ToolSearchToolCall";
 import { WorkspaceLifecycleToolCall } from "../WorkspaceLifecycleToolCall";
@@ -17,6 +16,15 @@ describe("getToolComponent", () => {
     const args = { script: "cat huge.json", timeout_secs: 60, display_name: "Dump" };
     expect(getToolComponent("bash", args, TOOL_PAYLOAD_DEPTH_REJECTION)).toBe(GenericToolCall);
     expect(getToolComponent("bash", args, { success: true, output: "ok" })).toBe(BashToolCall);
+  });
+
+  test("routes bash args that omit timeout_secs to the real card", () => {
+    // timeout_secs is optional and the handler applies the default, so stored args
+    // without it validate and the row keeps its dedicated card. They used to fail the
+    // required field and lose the card, which only showed up in the ui lane.
+    expect(getToolComponent("bash", { script: "ls" }, { success: true, output: "" })).toBe(
+      BashToolCall
+    );
   });
 
   test("falls back to generic rendering for removed or unknown tools", () => {
@@ -95,16 +103,6 @@ describe("getToolComponent", () => {
     expect(
       getToolComponent("server:GOOGLE_SEARCH_WEB", { queries: "not-an-array" }, undefined)
     ).toBe(GenericToolCall);
-  });
-
-  test("uses the intuition card only for valid cue arguments", () => {
-    expect(getToolComponent("intuition", { cue: "Recall deployment constraints" }, undefined)).toBe(
-      IntuitionToolCall
-    );
-    expect(getToolComponent("intuition", { cue: "" }, undefined)).toBe(GenericToolCall);
-    expect(getToolComponent("intuition", { cue: { nested: true } }, undefined)).toBe(
-      GenericToolCall
-    );
   });
 
   test("renders legacy tool_search transcript calls", () => {

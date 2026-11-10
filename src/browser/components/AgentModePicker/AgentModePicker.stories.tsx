@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { MODEL_ABBREVIATION_EXAMPLES } from "@/common/constants/knownModels";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";

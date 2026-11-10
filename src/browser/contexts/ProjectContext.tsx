@@ -8,22 +8,22 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import type { ProjectConfig } from "@/common/types/project";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { Result } from "@/common/types/result";
-import { getDraftScopeId } from "@/common/constants/storage";
-import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
+import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { getFirstTopLevelProjectPath } from "@/common/utils/subProjects";
+import type { ProjectIconName } from "@/common/constants/projectIcons";
 import {
   normalizeProjectPathForComparison,
   resolveProjectPathFromProjectQuery,
@@ -101,6 +101,7 @@ export interface ProjectContext {
   updateSecrets: (projectPath: string, secrets: Secret[]) => Promise<void>;
   updateDisplayName: (projectPath: string, displayName: string | null) => Promise<Result<void>>;
   updateColor: (projectPath: string, color: string | null) => Promise<Result<void>>;
+  updateIcon: (projectPath: string, icon: ProjectIconName | null) => Promise<Result<void>>;
   updateCustomInstructions: (
     projectPath: string,
     customInstructions: string | null
@@ -141,6 +142,54 @@ function findSystemProjectPath(projects: Map<string, ProjectConfig>): string | n
   return [...projects.entries()].find(([, cfg]) => cfg.projectKind === "system")?.[0] ?? null;
 }
 
+/** One project-settings write followed by a project list refresh, as a Result. */
+async function runProjectMutation(
+  liveApi: APIClient | null,
+  refreshProjects: () => Promise<void>,
+  mutate: (api: APIClient) => Promise<void>
+): Promise<Result<void>> {
+  if (!liveApi) return { success: false, error: "API not connected" };
+  try {
+    await mutate(liveApi);
+    await refreshProjects();
+    return { success: true, data: undefined };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+/** A project's effective trust: its parent project's when it has one (isProjectTrustedIn). */
+function effectiveProjectTrust(
+  projects: ReadonlyMap<string, ProjectConfig>,
+  projectPath: string
+): boolean {
+  const trustOwnerPath = projects.get(projectPath)?.parentProjectPath ?? projectPath;
+  return projects.get(trustOwnerPath)?.trusted === true;
+}
+
+/**
+ * #7216: trust changed by the `xum trust` CLI or another client reaches this renderer only as a
+ * config change and the re-list after it, so publish a trust change (it refreshes the
+ * trust-gated lists: project plugin skills, MCP servers) when a project listed in both snapshots
+ * changed its effective trust (a new untrusted parent project changes its child's too). The
+ * first list has nothing to compare with.
+ */
+function publishRelistedTrustChanges(
+  previous: ReadonlyMap<string, ProjectConfig> | null,
+  next: ReadonlyMap<string, ProjectConfig>
+): void {
+  if (previous == null) return;
+  for (const projectPath of next.keys()) {
+    if (
+      previous.has(projectPath) &&
+      effectiveProjectTrust(previous, projectPath) !== effectiveProjectTrust(next, projectPath)
+    ) {
+      publishProjectTrustChanged();
+      return;
+    }
+  }
+}
+
 export function ProjectProvider(props: { children: ReactNode }) {
   const { api } = useAPI();
   // Handlers use only the live client: offline they keep returning their result (for example
@@ -178,6 +227,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
     pending: boolean;
     promise: Promise<void> | null;
   }>({ api, pending: false, promise: null });
+  // Last list from the backend, to notice trust changes that arrive with a re-list.
+  const listedProjectsRef = useRef<Map<string, ProjectConfig> | null>(null);
 
   const refreshProjects = useCallback((): Promise<void> => {
     const refresh = projectsRefreshRef.current;
@@ -198,9 +249,13 @@ export function ProjectProvider(props: { children: ReactNode }) {
           try {
             const projectsList = await requestApi.projects.list();
             if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
-            setAllProjectsInternal(new Map(projectsList));
+            const listedProjects = new Map(projectsList);
+            const previousListedProjects = listedProjectsRef.current;
+            listedProjectsRef.current = listedProjects;
+            setAllProjectsInternal(listedProjects);
             setLoaded(true);
             setLoadError(null);
+            publishRelistedTrustChanges(previousListedProjects, listedProjects);
           } catch (error) {
             if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
             // A lost connection is no load error: the reconnect reloads.
@@ -300,9 +355,6 @@ export function ProjectProvider(props: { children: ReactNode }) {
         };
       }
       try {
-        const draftIds = (getDraftStore().getCreationDraftsByProject()[path] ?? []).map(
-          (draft) => draft.draftId
-        );
         const result = await liveApi.projects.remove({
           projectPath: path,
           force: options?.force,
@@ -314,17 +366,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
             return next;
           });
 
-          // The backend deleted the project's creation drafts. Clean up their localStorage
-          // settings: the drafts it deleted (this store's list may not have hydrated) and the ids
-          // captured before the call (optimistic rows the backend never saw), then drop them from
-          // memory.
-          for (const draft of result.data.removedCreationDrafts) {
-            deleteWorkspaceStorage(getDraftScopeId(draft.projectPath, draft.draftId));
-          }
-          for (const draftId of draftIds) {
-            deleteWorkspaceStorage(getDraftScopeId(path, draftId));
-          }
-          getDraftStore().forgetProject(path);
+          // The backend deleted the project's creation drafts (by their project field).
+          getCreationDraftStore().forgetProject(path);
 
           await refreshProjects();
           return { success: true };
@@ -639,19 +682,14 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateCustomInstructions,
       // Defined inline (not useCallback): the repo bans new manual useCallback
       // memoization, and inlining keeps exhaustive-deps satisfied via `liveApi`.
-      updateCodeWorkspaceSyncPath: async (
-        projectPath: string,
-        codeWorkspaceSyncPath: string | null
-      ): Promise<Result<void>> => {
-        if (!liveApi) return { success: false, error: "API not connected" };
-        try {
-          await liveApi.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath });
-          await refreshProjects();
-          return { success: true, data: undefined };
-        } catch (error) {
-          return { success: false, error: getErrorMessage(error) };
-        }
-      },
+      updateIcon: (projectPath: string, icon: ProjectIconName | null) =>
+        runProjectMutation(liveApi, refreshProjects, (api) =>
+          api.projects.setIcon({ projectPath, icon })
+        ),
+      updateCodeWorkspaceSyncPath: (projectPath: string, codeWorkspaceSyncPath: string | null) =>
+        runProjectMutation(liveApi, refreshProjects, (api) =>
+          api.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath })
+        ),
       assignWorkspaceToSubProject,
     }),
     [

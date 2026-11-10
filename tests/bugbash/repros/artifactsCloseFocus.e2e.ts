@@ -12,11 +12,18 @@ test(
     // layout hides the right sidebar, so it has no tab to close.
     await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
+    // Closing the only tab closes the sidebar, so Stats opens first: the close then reveals it.
+    await screen.getByRole("button", "Expand right sidebar").tap();
+    // The launcher row's name includes its description.
+    await screen.getByRole("button", /^Stats\b/).tap();
+    await expect(screen.getByRole("tab", /^Stats\b/)).toBeVisible();
     await screen.getByRole("textbox", "Message").tap();
     await browser.keyboard.press("Control+Shift+K");
     await expect(screen.getByTestId("artifacts-panel")).toBeFocused();
 
-    // The issue's steps: two Shift+Tabs reach the tab's X.
+    // The issue's steps: Shift+Tab past the strip's All tabs and "+" buttons reaches the tab's
+    // X (the right sidebar toggle comes before the sidebar in Tab order).
+    await browser.keyboard.press("Shift+Tab");
     await browser.keyboard.press("Shift+Tab");
     await browser.keyboard.press("Shift+Tab");
     const close = screen.getByRole("button", "Close Artifacts");

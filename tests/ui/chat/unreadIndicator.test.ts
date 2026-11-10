@@ -315,7 +315,7 @@ describe("Unread indicator (mock AI router)", () => {
 
       // Simulate the user alt-tabbing back while settings still covers the chat.
       const lastReadBeforeFocus = getLastReadTimestamp(app.workspaceId);
-      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new window.Event("focus"));
 
       expect(getLastReadTimestamp(app.workspaceId)).toBe(lastReadBeforeFocus);
       expect(getWorkspaceUnreadState(app.workspaceId).isUnread(lastReadBeforeFocus)).toBe(true);
@@ -597,7 +597,7 @@ describe("Unread indicator (mock AI router)", () => {
 
       await openWorkspaceActionsMenu(otherWorkspace.displayTitle);
       await waitFor(() => {
-        expect(queryMenuItem("Mark unread")).toBeNull();
+        expect(queryMenuItem("Mark unread") === null).toBe(true);
       });
     });
 
@@ -616,7 +616,7 @@ describe("Unread indicator (mock AI router)", () => {
 
       await openWorkspaceActionsMenu(selectedDisplayTitle);
       await waitFor(() => {
-        expect(queryMenuItem("Mark unread")).toBeNull();
+        expect(queryMenuItem("Mark unread") === null).toBe(true);
       });
     });
   });

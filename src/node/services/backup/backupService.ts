@@ -19,6 +19,8 @@ import {
   type BackupCredentialKind,
   type BackupFileChange,
   type BackupOperationError,
+  type BackupPluginReport,
+  type BackupPluginRemoval,
   type BackupProjectImport,
   type BackupProjectImportResult,
 } from "@/common/orpc/schemas/backup";
@@ -84,6 +86,8 @@ export interface BackupPayloadStore {
     secretApproval: string;
     /** Artifact shelf files left out of the export, with the reason (M5c). */
     shelfSkipped?: string[];
+    /** What this export removes from the checked-out backup's plugin list; absent when nothing. */
+    pluginRemoval?: BackupPluginRemoval;
   }>;
   previewRestore(options: {
     repositoryRoot: string;
@@ -97,6 +101,9 @@ export interface BackupPayloadStore {
     projectBundleSkipped: boolean;
     /** Shelf files a restore would not write, with the reason (M5c). */
     shelfSkipped?: string[];
+    /** The backup's plugin list against this machine's installs; a restore installs none. */
+    plugins: BackupPluginReport;
+    symlinkSkipped?: string[];
   }>;
   validateRestore(options: {
     repositoryRoot: string;
@@ -111,6 +118,7 @@ export interface BackupPayloadStore {
      * to; restore writes only these exact pairs, never a newer or different match.
      */
     matchedProjects: BackupMatchedProject[];
+    symlinkSkipped?: string[];
   }>;
   /** Core settings only; matched project memory is snapshotted by `restore` under its lock. */
   writeSafetySnapshot(snapshotRoot: string, contents: BackupContents): Promise<void>;
@@ -122,11 +130,15 @@ export interface BackupPayloadStore {
     /** Receives the matched project memory snapshot, taken in the write's lock window. */
     snapshotPath: string;
     matchedProjects: readonly BackupMatchedProject[];
+    /** The preflight's skip set, so the write skips exactly what the snapshot left out. */
+    symlinkSkipped?: readonly string[];
   }): Promise<{
     changedFiles: string[];
     localOnlyFiles: string[];
     projectBundleSkipped: boolean;
     shelfSkipped?: string[];
+    plugins: BackupPluginReport;
+    symlinkSkipped?: string[];
     /** Matched memory actually written, per registered project, for change notification. */
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
   }>;
@@ -305,7 +317,8 @@ export class BackupServiceError extends Error {
     public readonly code: BackupErrorCode,
     message: string,
     public readonly files?: string[],
-    public readonly secretApproval?: string
+    public readonly secretApproval?: string,
+    public readonly pluginRemoval?: BackupPluginRemoval
   ) {
     super(message);
     this.name = "BackupServiceError";
@@ -319,6 +332,7 @@ function toOperationError(error: unknown): BackupOperationError {
       message: error.message,
       files: error.files,
       secretApproval: error.secretApproval,
+      pluginRemoval: error.pluginRemoval,
     };
   }
 
@@ -484,10 +498,17 @@ function normalizeBackupSettings(settings: SettingsBackupInput): SettingsBackupI
   return parsed.data;
 }
 
-export class BackupService {
-  /** Keeps quick switches among recent repository settings from forcing a fresh clone. */
-  static readonly RETAINED_INACTIVE_CACHES = 2;
+/** Keeps quick switches among recent repository settings from forcing a fresh clone. */
+const RETAINED_INACTIVE_CACHES = 2;
 
+/**
+ * A snapshot is an unredacted copy of the whole local payload, and one is kept per restore as
+ * its only recovery path, so they would otherwise grow without limit. Older ones are dropped
+ * once this many newer released recovery points exist.
+ */
+export const RETAINED_SNAPSHOTS = 3;
+
+export class BackupService {
   private readonly locks = new MutexMap<string>();
 
   /**
@@ -566,6 +587,8 @@ export class BackupService {
         projectBundleSkipped: boolean;
         /** Artifact shelf files left out of the push or the restore, with the reason. */
         shelfSkipped: string[];
+        plugins: BackupPluginReport;
+        symlinkSkipped?: string[];
         pushError: string | null;
       },
       BackupOperationError
@@ -611,14 +634,24 @@ export class BackupService {
           ...("pushError" in exported ? [] : (exported.shelfSkipped ?? [])),
           ...(restorePreview.shelfSkipped ?? []),
         ],
+        plugins: restorePreview.plugins,
+        symlinkSkipped: restorePreview.symlinkSkipped,
         pushError: "pushError" in exported ? exported.pushError : null,
       });
     });
   }
 
-  pushWithApproval(input: SettingsBackupInput & { approvedSecretDigest?: string | null }) {
-    const { approvedSecretDigest, ...settings } = input;
-    return this.push(settings, { approvedSecretDigest: approvedSecretDigest ?? undefined });
+  pushWithApproval(
+    input: SettingsBackupInput & {
+      approvedSecretDigest?: string | null;
+      approvedPluginRemovalDigest?: string | null;
+    }
+  ) {
+    const { approvedSecretDigest, approvedPluginRemovalDigest, ...settings } = input;
+    return this.push(settings, {
+      approvedSecretDigest: approvedSecretDigest ?? undefined,
+      approvedPluginRemovalDigest: approvedPluginRemovalDigest ?? undefined,
+    });
   }
 
   restoreWithApproval(
@@ -636,7 +669,7 @@ export class BackupService {
 
   async push(
     settings: SettingsBackupInput,
-    options: { approvedSecretDigest?: string } = {}
+    options: { approvedSecretDigest?: string; approvedPluginRemovalDigest?: string } = {}
   ): Promise<
     Result<
       {
@@ -649,7 +682,7 @@ export class BackupService {
       BackupOperationError
     >
   > {
-    const approvedSecretDigest = options.approvedSecretDigest;
+    const { approvedSecretDigest, approvedPluginRemovalDigest } = options;
     return this.withRepoLock(settings, async (normalized) => {
       const repository = await this.prepareRepository(normalized);
       const exported = await this.withLocalPayload(() =>
@@ -659,6 +692,22 @@ export class BackupService {
           contents: resolveBackupContents(normalized),
         })
       );
+      // The list is rewritten from this machine's installs, so a plugin only the backup lists
+      // (a restore installs none) disappears from it. Removing is the user's call, bound to
+      // exactly the removed names like the secret override below. This check runs first: the
+      // Backup section drops a secret override when any other refusal comes back, so asking for
+      // the removal second would make the user approve the secrets twice.
+      const removal = exported.pluginRemoval;
+      if (removal !== undefined && approvedPluginRemovalDigest !== removal.approval) {
+        throw new BackupServiceError(
+          "PLUGIN_REMOVAL_APPROVAL_REQUIRED",
+          "This backup would remove plugins from the backup's plugin list",
+          undefined,
+          undefined,
+          removal
+        );
+      }
+
       // Approval is bound to the exact flagged bytes, so an override the user granted for
       // one payload cannot publish a different one another window wrote in between.
       if (exported.secretFiles.length > 0 && approvedSecretDigest !== exported.secretApproval) {
@@ -701,6 +750,8 @@ export class BackupService {
         projectImportResults: BackupProjectImportResult[];
         projectBundleSkipped: boolean;
         shelfSkipped: string[];
+        plugins: BackupPluginReport;
+        symlinkSkipped?: string[];
         /**
          * Candidates the restore did not import because no approval was given — a restore
          * run without a preview, or with candidates left unchecked. Reported so a
@@ -785,6 +836,7 @@ export class BackupService {
               contents,
               snapshotPath,
               matchedProjects: validated.matchedProjects,
+              symlinkSkipped: validated.symlinkSkipped,
             });
             // Announced as soon as the memory is on disk: a failure recording the commit below
             // must not leave subscribers showing pre-restore contents.
@@ -819,6 +871,8 @@ export class BackupService {
               projectImportResults,
               projectBundleSkipped: restored.projectBundleSkipped,
               shelfSkipped: restored.shelfSkipped ?? [],
+              plugins: restored.plugins,
+              symlinkSkipped: restored.symlinkSkipped,
               unapprovedProjectImports: [
                 ...unapprovedProjectImports,
                 ...validated.projectImports.filter((candidate) =>
@@ -1384,7 +1438,7 @@ export class BackupService {
     }
     inactive.sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name));
 
-    const stale = inactive.slice(BackupService.RETAINED_INACTIVE_CACHES);
+    const stale = inactive.slice(RETAINED_INACTIVE_CACHES);
     for (const cache of stale) {
       await discardInactiveCache(cache.cachePath).catch(() => undefined);
     }
@@ -1450,13 +1504,6 @@ export class BackupService {
     return persisted;
   }
 
-  /**
-   * A snapshot is an unredacted copy of the whole local payload, and one is kept per restore as
-   * its only recovery path, so they would otherwise grow without limit. Older ones are dropped
-   * once this many newer released recovery points exist.
-   */
-  static readonly RETAINED_SNAPSHOTS = 3;
-
   private async reapOldSnapshots(cacheRoot: string, keepFrom: string): Promise<void> {
     const entries = await fs.readdir(cacheRoot, { withFileTypes: true }).catch(() => []);
     const released = new Set(
@@ -1474,7 +1521,7 @@ export class BackupService {
       .map((entry) => entry.name)
       .filter((name) => name !== keepName && released.has(name))
       .sort((a, b) => (snapshotOrder(a) < snapshotOrder(b) ? 1 : -1));
-    for (const stale of reapable.slice(BackupService.RETAINED_SNAPSHOTS - 1)) {
+    for (const stale of reapable.slice(RETAINED_SNAPSHOTS - 1)) {
       // Per entry, because one snapshot nobody can delete must not stop the rest from being
       // reclaimed, and the restore it belongs to has already returned either way.
       await fs

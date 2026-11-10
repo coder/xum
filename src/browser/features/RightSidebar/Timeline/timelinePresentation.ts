@@ -140,8 +140,8 @@ const DEFAULT_AGENT_TINT: TimelineRowTint = {
 const AGENT_EVENT_TINTS: Partial<Record<string, TimelineRowTint>> = {
   milestone: {
     row: "border-success/25 bg-success/10",
-    icon: "border-success/40 text-success",
-    badge: "border-success/30 text-success",
+    icon: "border-success/40 text-success-text",
+    badge: "border-success/30 text-success-text",
   },
   decision: {
     row: "border-info/25 bg-info/10",

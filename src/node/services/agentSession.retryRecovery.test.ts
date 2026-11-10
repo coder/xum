@@ -3,7 +3,7 @@ import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import { Effect } from "effect";
 import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
-import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createTestStreamManager } from "./agentSession.testHarness";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { StartupRecoveryOutcome } from "./startupRecovery";
@@ -60,7 +60,7 @@ test("an admitted marker clear commits after its generation retires while queued
 
 async function recoveryHarness(workspaceId: string) {
   const clock = makeTestEffectRunner();
-  const streamManager = { ...createStreamLifecycleMocks(), effectRunner: clock.runner };
+  const streamManager = createTestStreamManager(undefined, clock.runner);
   const h = await createAgentSessionHarness({ workspaceId, captureEvents: true, streamManager });
   await h.historyService.appendToHistory(
     workspaceId,
@@ -320,7 +320,7 @@ test("a retry's issued marker unlink cannot delete a later durable opt-out", asy
   const h = await createAgentSessionHarness({
     workspaceId: "retry-marker-order",
     captureEvents: true,
-    streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+    streamManager: createTestStreamManager(undefined, clock.runner),
   });
   const preferencePath = path.join(
     h.config.sessionsDir,
@@ -441,7 +441,7 @@ test("disabling a retry held on pricing prevents admission without abandoning th
   const h = await createAgentSessionHarness({
     workspaceId: "retry-pricing-canceled",
     captureEvents: true,
-    streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+    streamManager: createTestStreamManager(undefined, clock.runner),
     workspaceGoalService: {
       assertPricedModelForBudgetedGoal: async () => {
         entered.resolve();
@@ -509,7 +509,7 @@ test("a rate-limited turn schedules its auto-retry after the provider's Retry-Af
   const h = await createAgentSessionHarness({
     workspaceId,
     captureEvents: true,
-    streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+    streamManager: createTestStreamManager(undefined, clock.runner),
     aiServiceOverrides: {
       streamMessage: () =>
         Promise.resolve(

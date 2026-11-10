@@ -108,25 +108,27 @@ export const ConfirmationModal: React.FC<ConfirmationModalProps> = (props) => {
           </WarningBox>
         )}
 
-        <DialogFooter className="justify-center">
+        {/* Wrap long action labels so the buttons stay inside the phone dialog. */}
+        <DialogFooter className="min-w-0 flex-wrap justify-center">
           <Button variant="secondary" onClick={onCancel} disabled={isConfirming}>
             {props.cancelLabel ?? "Cancel"}
             <span
               aria-hidden="true"
-              className="ml-2 inline-flex items-center rounded border border-current/25 px-1.5 py-0.5 font-mono text-[10px] leading-none opacity-60"
+              className="ml-2 hidden items-center rounded border border-current/25 px-1.5 py-0.5 font-mono text-[10px] leading-none opacity-60 md:inline-flex"
             >
               N
             </span>
           </Button>
           <Button
             variant={props.confirmVariant ?? "destructive"}
+            className="h-auto min-h-9 max-w-full min-w-0 break-words whitespace-normal"
             onClick={() => void handleConfirm()}
             disabled={isConfirming}
           >
             {isConfirming ? "Processing..." : (props.confirmLabel ?? "Confirm")}
             <span
               aria-hidden="true"
-              className="ml-2 inline-flex items-center rounded border border-current/25 px-1.5 py-0.5 font-mono text-[10px] leading-none opacity-60"
+              className="ml-2 hidden items-center rounded border border-current/25 px-1.5 py-0.5 font-mono text-[10px] leading-none opacity-60 md:inline-flex"
             >
               Y
             </span>

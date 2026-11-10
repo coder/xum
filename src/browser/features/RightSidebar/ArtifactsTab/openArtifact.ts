@@ -6,10 +6,8 @@ import { readArtifactSelection, writeArtifactSelection } from "./artifactSelecti
 
 export interface OpenArtifactTarget {
   workspaceId: string;
-  /** Artifacts-relative path, or a checkout-relative path when `pinned`. */
+  /** Artifacts-relative path, or the stored pin path (checkout-relative or absolute) when `pinned`. */
   path: string;
-  /** Version to show; null/absent means "Latest (live)". Ignored for pinned files. */
-  versionId?: number | null;
   /** A pinned workspace file (Concept C) rather than an artifact. */
   pinned?: boolean;
 }
@@ -24,21 +22,14 @@ export function openArtifact(target: OpenArtifactTarget): void {
   assert(target.workspaceId.length > 0, "openArtifact: workspaceId is required");
   assert(target.path.length > 0, "openArtifact: path is required");
   const pinned = target.pinned === true;
-  const versionId = pinned ? null : (target.versionId ?? null);
-  assert(
-    versionId == null || (Number.isInteger(versionId) && versionId > 0),
-    "openArtifact: versionId must be a positive integer"
-  );
   writeArtifactSelection(target.workspaceId, {
     scope: pinned ? "pinned" : "artifact",
     path: target.path,
-    version: versionId,
   });
   window.dispatchEvent(
     createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, {
       workspaceId: target.workspaceId,
       path: target.path,
-      ...(versionId != null ? { versionId } : {}),
       ...(pinned ? { pinned: true } : {}),
     })
   );
@@ -51,12 +42,11 @@ export function openArtifact(target: OpenArtifactTarget): void {
  */
 export function openArtifactsTab(workspaceId: string): void {
   assert(workspaceId.length > 0, "openArtifactsTab: workspaceId is required");
-  const { path, scope, version: versionId } = readArtifactSelection(workspaceId);
+  const { path, scope } = readArtifactSelection(workspaceId);
   window.dispatchEvent(
     createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, {
       workspaceId,
       path: path ?? "",
-      ...(versionId != null && scope === "artifact" ? { versionId } : {}),
       ...(scope === "pinned" ? { pinned: true } : {}),
     })
   );
@@ -67,8 +57,8 @@ const latestPinRequest = new Map<string, number>();
 let nextPinRequestId = 0;
 
 /**
- * "Open as artifact" for any checkout file: pin it (absolute inside the checkout or relative),
- * then open the stored checkout-relative path. Failures surface as a chat toast, the same
+ * "Open as artifact" for any file: pin it (absolute, or relative to the checkout), then open the
+ * stored pin path. Failures surface as a chat toast, the same
  * channel the command palette uses for feedback. `relativeTo: "tool-cwd"` resolves a relative
  * path like file tools do (a sub-project's cwd), instead of from the checkout root.
  */

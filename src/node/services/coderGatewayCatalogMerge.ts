@@ -6,14 +6,18 @@
  * lock. The rules that decide what each provider contributes live here so they
  * can be tested without the OAuth service, the lock or the network.
  */
-import { parseCoderGatewayProviders } from "@/common/constants/coderOAuth";
+import {
+  CODER_GATEWAY_DEFAULT_PROVIDER_NAMES,
+  parseCoderGatewayProviders,
+} from "@/common/constants/coderOAuth";
 import type { CoderGatewayProvider } from "@/common/constants/coderOAuth";
 
 /** One provider catalog request, classified (see fetchProviderCatalogEffect). */
 export type CoderProviderCatalogResult =
   | { kind: "ok"; ids: string[] }
   | { kind: "unavailable" }
-  | { kind: "error" };
+  // `reason` names the last attempt's failure for the user-facing error (#5659).
+  | { kind: "error"; reason: string };
 
 /** Catalog state persisted before this refresh, read INSIDE the locked mutation. */
 export interface PriorCoderCatalog {
@@ -55,6 +59,28 @@ export function readPriorCoderCatalog(
     stale: stringEntries(section?.staleDiscoveredModels),
     providers: parseCoderGatewayProviders(section?.discoveredProviders),
   };
+}
+
+/**
+ * The provider set to probe when the admin-only listing is unavailable. For
+ * the same name a later source wins: stored discovery metadata (its type may
+ * come from an authoritative listing) replaces the name === type default, and
+ * the user-managed additionalProviders win over both.
+ */
+export function probeCoderGatewayProviders(
+  section: Record<string, unknown> | undefined
+): CoderGatewayProvider[] {
+  const known = new Map<string, CoderGatewayProvider>();
+  for (const name of CODER_GATEWAY_DEFAULT_PROVIDER_NAMES) {
+    known.set(name, { name, type: name });
+  }
+  for (const provider of [
+    ...parseCoderGatewayProviders(section?.discoveredProviders),
+    ...parseCoderGatewayProviders(section?.additionalProviders),
+  ]) {
+    known.set(provider.name, provider);
+  }
+  return [...known.values()];
 }
 
 function idsUnderProvider(ids: string[], providerName: string): string[] {
@@ -159,4 +185,27 @@ export function reconcileProviderCatalog(
   // conclusively serves no catalog), and probe-default names carry no
   // recorded metadata — the route is conclusively absent; drop it.
   return { ids: [], providers: [], inconclusive: false };
+}
+
+/**
+ * The user-facing error of an inconclusive catalog refresh. It names each provider whose fetch
+ * failed, with its last failure: "anthropic (HTTP 502)" (#5659). A refresh can also be
+ * inconclusive with no failed fetch (a probed provider's 404 without a known catalog): then the
+ * message stays generic.
+ */
+export function catalogRefreshFailureMessage(
+  results: ReadonlyArray<{ provider: CoderGatewayProvider; result: CoderProviderCatalogResult }>,
+  everyFetchFailed: boolean
+): string {
+  const failures = results
+    .flatMap(({ provider, result }) =>
+      result.kind === "error" ? [`${provider.name} (${result.reason})`] : []
+    )
+    .join(", ");
+  if (everyFetchFailed) {
+    return `Model discovery failed for every AI Gateway provider: ${failures}`;
+  }
+  return failures.length > 0
+    ? `Model discovery failed for AI Gateway providers: ${failures}; try refreshing again`
+    : "Model discovery failed for at least one AI Gateway provider; try refreshing again";
 }

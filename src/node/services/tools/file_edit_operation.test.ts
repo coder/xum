@@ -6,6 +6,7 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 
 import { getTestDeps, TestTempDir } from "./testHelpers";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("executeFileEditOperation", () => {
   test("should use runtime.normalizePath for path resolution, not Node's path.resolve", async () => {
@@ -51,6 +52,7 @@ describe("executeFileEditOperation", () => {
 
     await executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: testCwd,
         runtime: mockRuntime,
         runtimeTempDir: "/tmp",
@@ -86,6 +88,7 @@ describe("executeFileEditOperation outside-cwd access", () => {
 
     const result = await executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: workspaceCwd,
         runtime: new LocalRuntime(workspaceCwd),
         runtimeTempDir: tempDir.path,
@@ -111,6 +114,7 @@ describe("executeFileEditOperation outside-cwd access", () => {
 
     const result = await executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: workspaceCwd,
         runtime: new LocalRuntime(workspaceCwd),
         runtimeTempDir: tempDir.path,
@@ -162,6 +166,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
 
     const result = await executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: TEST_CWD,
         runtime: mockRuntime,
         runtimeTempDir: "/tmp",
@@ -193,6 +198,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
 
     const result = await executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: workspaceCwd,
         runtime: new LocalRuntime(workspaceCwd),
         runtimeTempDir: tempDir.path,
@@ -215,6 +221,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
 
     const result = await executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: tempDir.path,
         runtime: new LocalRuntime(tempDir.path),
         runtimeTempDir: tempDir.path,
@@ -236,6 +243,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
 
     const result = await executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: tempDir.path,
         runtime: new LocalRuntime(tempDir.path),
         runtimeTempDir: tempDir.path,
@@ -260,6 +268,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
 
     const result = await executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: workspaceCwd,
         runtime: new LocalRuntime(workspaceCwd),
         runtimeTempDir: tempDir.path,
@@ -303,6 +312,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
 
     const result = await executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: "/home/user/project",
         runtime: mockRuntime,
         runtimeTempDir: "/tmp",
@@ -336,6 +346,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
     await fs.writeFile(testFile, "start\n");
 
     const config = {
+      sessionLocks: nodeSessionLocks,
       cwd: tempDir.path,
       runtime: new LocalRuntime(tempDir.path),
       runtimeTempDir: tempDir.path,
@@ -398,6 +409,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
     await fs.writeFile(testFile, "start\n");
 
     const config = {
+      sessionLocks: nodeSessionLocks,
       cwd: tempDir.path,
       runtime: new LocalRuntime(tempDir.path),
       runtimeTempDir: tempDir.path,
@@ -520,6 +532,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
 
     const firstEdit = executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: "/workspace",
         runtime: firstRuntime,
         runtimeTempDir: "/tmp",
@@ -541,6 +554,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
 
     const secondEdit = executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: "/workspace",
         runtime: secondRuntime,
         runtimeTempDir: "/tmp",
@@ -619,6 +633,7 @@ describe("executeFileEditOperation plan mode enforcement", () => {
     const abortController = new AbortController();
     const editResultPromise = executeFileEditOperation({
       config: {
+        sessionLocks: nodeSessionLocks,
         cwd: "/workspace",
         runtime: mockRuntime,
         runtimeTempDir: "/tmp",

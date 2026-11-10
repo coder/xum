@@ -362,9 +362,14 @@ describe("disposableExec", () => {
   });
 
   test("maxOutputBytes rejects after an overflowing command exits cleanly", async () => {
-    using proc = execFileAsync("sh", ["-c", "printf '%02000d' 0"], {
-      maxOutputBytes: 1024,
-    });
+    // The output must arrive only after the shell has exited and been reaped (`kill -0` fails).
+    // A plain `printf` raced the cap: under load the parent read the output while printf was
+    // still running and SIGKILLed it, so exitCode was null (#7529).
+    using proc = execFileAsync(
+      "sh",
+      ["-c", "(while kill -0 $$ 2>/dev/null; do :; done; printf '%02000d' 0) & exit 0"],
+      { maxOutputBytes: 1024 }
+    );
     const child = (proc as unknown as { child: ChildProcess }).child;
 
     await expect(proc.result).rejects.toThrow(/more than 1024 bytes of output/);

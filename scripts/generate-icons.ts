@@ -13,7 +13,7 @@
  *
  * If no command is given, defaults to: png icns
  */
-import { mkdir, rm, copyFile, readFile, writeFile } from "node:fs/promises";
+import { mkdir, rm, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import sharp from "sharp";
@@ -79,13 +79,6 @@ type RasterTargetConfig = {
   cropViewBox?: string;
 };
 
-type SvgTargetConfig = {
-  svg: true;
-  source: string;
-};
-
-type LogoTargetConfig = RasterTargetConfig | SvgTargetConfig;
-
 // Keep the source + background pairing centralized so targets stay DRY.
 const MONO_ICON = { source: SOURCE_BLACK, bg: false } as const;
 const APP_ICON = { source: SOURCE_WHITE, bg: true } as const;
@@ -100,9 +93,6 @@ const TRAY_MARK_CROP = "8 24 56 24";
 const LOGO_TARGETS = {
   // VS Code extension (Black on Transparent)
   "vscode/icon.png": { size: 128, ...MONO_ICON },
-
-  // Browser asset (Vector)
-  "src/browser/assets/icons/xum.svg": { svg: true, source: SOURCE_BLACK },
 
   // Docs (docs.json points at logo-black/logo-white directly to avoid duplicates)
   "docs/img/logo.webp": { size: 512, ...MONO_ICON, format: "webp" },
@@ -148,7 +138,7 @@ const LOGO_TARGETS = {
     bg: false,
     cropViewBox: TRAY_MARK_CROP,
   },
-} satisfies Record<string, LogoTargetConfig>;
+} satisfies Record<string, RasterTargetConfig>;
 
 const APP_ICON_PADDING_RATIO = 0.2;
 
@@ -286,14 +276,8 @@ async function updateAllLogos() {
 
   for (const [relativePath, config] of Object.entries(LOGO_TARGETS)) {
     const outputPath = path.join(ROOT, relativePath);
-
-    if ("svg" in config) {
-      // For SVG target, just copy the source SVG (optimize/clean if needed, but direct copy is safe)
-      await copyFile(config.source, outputPath);
-    } else {
-      const img = await generateRasterIcon(config);
-      await img.toFile(outputPath);
-    }
+    const img = await generateRasterIcon(config);
+    await img.toFile(outputPath);
     console.log(`✓ ${relativePath}`);
   }
 

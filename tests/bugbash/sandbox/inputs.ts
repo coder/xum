@@ -13,13 +13,15 @@
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { CACHE_SEED, checkSeed } from "./cacheSeed";
 import { Refusal } from "./runner";
 
 /** The git-listed inputs that the container reads. A symlink among them stops the launch. */
-export const INPUTS = ["src", "tests/bugbash", "tsconfig.json", "package.json"];
+export const INPUTS = ["src", "tests/bugbash", "tests/stories", "tsconfig.json", "package.json"];
 /** The host env names that e2e.config.ts and startApp.ts read. No other host value passes. */
 // Not BUGBASH_AI_REASON: after a failed probe it holds the provider URL and response text.
-// Not BUGBASH_MODEL: the launcher sets it per job kind, and only for a model-driven job.
+// Not BUGBASH_MODEL: the launcher sets it per job kind, and only for a model-driven job. Not
+// BUGBASH_JUDGE_MODEL either: the launcher sets it for story jobs only.
 const PASS_ENV = ["BUGBASH_AI", "BUGBASH_AI_RESOLVED", "BUGBASH_APP_MODEL", "BUGBASH_EFFORT",
   "BUGBASH_SCENARIO", "E2E_TELEMETRY_DISABLED"]; // prettier-ignore
 // Any name that looks like a credential, anywhere in it (AWS_SECRET_ACCESS_KEY, GH_TOKEN), or a
@@ -48,7 +50,7 @@ export function plainFolders(base: string, rel: string, create: boolean, seen = 
  * Tracked files, and new files that git does not ignore (a new repro). Ignored files stay out:
  * old .e2e runs, app logs and local env files. Each must be a regular file under plain folders.
  */
-export function stage(root: string, into: string): number {
+export function stage(root: string, into: string, o: { cacheSeed?: boolean } = {}): number {
   // prettier-ignore
   const listArgs = ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--deduplicate"];
   const listed = spawnSync("git", ["-C", root, ...listArgs, "--", ...INPUTS], {
@@ -68,8 +70,22 @@ export function stage(root: string, into: string): number {
     fs.copyFileSync(path.join(root, rel), path.join(into, rel), fs.constants.COPYFILE_EXCL);
     count += 1;
   }
-  // Mount points for the read-only build outputs and the job's tmpfs.
-  for (const dir of ["dist", "node_modules", "tests/bugbash/.e2e"])
+  // The story replay-cache seed (cacheSeed.ts): git-ignored, so git lists none of it. Only a
+  // story job reads it, so no other job copies it (Codex review of #7012).
+  const seed = path.join(root, CACHE_SEED);
+  const entries = o.cacheSeed ? checkSeed(seed, (reason) => new Refusal(`stage: ${reason}`)) : [];
+  if (entries.length > 0) {
+    plainFolders(root, path.dirname(CACHE_SEED), false, seen);
+    fs.mkdirSync(path.join(into, CACHE_SEED), { recursive: true });
+  }
+  for (const name of entries) {
+    const rel = path.join(CACHE_SEED, name);
+    fs.copyFileSync(path.join(root, rel), path.join(into, rel), fs.constants.COPYFILE_EXCL);
+    count += 1;
+  }
+  // Mount points for the read-only build outputs and the job's tmpfs (a story job's output is
+  // under tests/stories, every other job's under tests/bugbash).
+  for (const dir of ["dist", "node_modules", "tests/bugbash/.e2e", "tests/stories/.e2e"])
     fs.mkdirSync(path.join(into, dir), { recursive: true });
   return count;
 }
@@ -104,10 +120,16 @@ export function containerEnv(
 
 /**
  * The job's own env values. The app log always goes into the output folder, so it comes back
- * with the report: an inherited BUGBASH_APP_LOG (run.ts sets a sibling path) is ignored.
+ * with the report: an inherited BUGBASH_APP_LOG (run.ts sets a sibling path) is ignored. The
+ * replay cache dir too (cacheSeed.ts): only the story config reads it, and its entries come
+ * back with the output.
  */
 export function jobEnv(output: string): Record<string, string> {
-  return { BUGBASH_APP_LOG: `${output}/app.log`, E2E_TELEMETRY_DISABLED: "1" };
+  return {
+    BUGBASH_APP_LOG: `${output}/app.log`,
+    BUGBASH_CACHE_DIR: `${output}/cache`,
+    E2E_TELEMETRY_DISABLED: "1",
+  };
 }
 
 // The `e2e run` options that a repro run may use: selection and output only. Not allowed, among
@@ -123,8 +145,9 @@ const RUN_FLAGS = ["--pass-with-no-tests", "--last-failed", "--debug"];
 /**
  * Why these e2e args are not an `e2e run` with `config`, or null. With the default repro config
  * its tests are repros/**, and its agents hold no model (hostPause.ts). The launcher also
- * accepts the MCP Apps config, whose agents get a model only through the job's proxy. e2e
- * resolves --config from its cwd, so the cwd must be tests/bugbash and the config a regular file.
+ * accepts the MCP Apps config and the story config (`dir` tests/stories), whose agents get a
+ * model only through the job's proxy. e2e resolves --config from its cwd, so the cwd must be
+ * `dir` and the config a regular file.
  */
 export function exactStepRefusal(
   args: string[],
@@ -145,7 +168,9 @@ export function exactStepRefusal(
   }
   if (configs.length !== 1 || configs[0] !== config)
     return `--config must be given once as ${config}, got ${JSON.stringify(configs)}`;
-  if (fs.realpathSync(cwd) !== fs.realpathSync(dir)) return `the cwd must be ${dir}, got ${cwd}`;
+  // A missing `dir` (a checkout without tests/stories) refuses instead of throwing.
+  const realDir = fs.existsSync(dir) ? fs.realpathSync(dir) : null;
+  if (fs.realpathSync(cwd) !== realDir) return `the cwd must be ${dir}, got ${cwd}`;
   if (fs.lstatSync(path.join(dir, config), { throwIfNoEntry: false })?.isFile() !== true)
     return `${dir}/${config} is not a regular file (a symlink?)`;
   return null;

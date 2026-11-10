@@ -18,6 +18,15 @@ describe("ChatInputToasts", () => {
       expect(toast.message).toContain("API key");
     });
 
+    test("does not ask for an API key when Google Vertex AI is not configured", () => {
+      // Vertex authenticates with Google Cloud credentials by default; an API key is optional.
+      const toast = createErrorToast({ type: "api_key_not_found", provider: "google-vertex" });
+
+      expect(toast.title).not.toBe("API Key Not Found");
+      expect(toast.title).toContain("Google Vertex AI");
+      expect(toast.message).not.toContain("requires an API key");
+    });
+
     test("should create generic toast for oauth_not_connected error", () => {
       const error: SendMessageError = {
         type: "oauth_not_connected",

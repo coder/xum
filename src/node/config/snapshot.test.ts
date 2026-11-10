@@ -379,7 +379,7 @@ describe("Config snapshots", () => {
         failedRead = true;
         throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
       }
-      return readFileSync(file, options);
+      return options === undefined ? readFileSync(file) : readFileSync(file, options);
     }) as typeof readFileSync);
     const logError = spyOn(log, "error").mockImplementation(() => undefined);
     let transformRan = false;

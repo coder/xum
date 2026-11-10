@@ -209,8 +209,8 @@ Keep hooks fast—if you need longer operations, consider running them asynchron
 
 Some models get tools that run on the provider's servers instead of in Xum. Hooks cannot see those calls.
 
-- **Web fetch is always hooked.** In trusted projects (the only projects where hooks run), Xum gives every model its own `web_fetch`, so `tool_pre` and `tool_post` run for every fetch. Claude's native web fetch and Gemini's URL Context are not offered there.
-- **Native web search is not hooked.** `web_search` (Claude, OpenAI, Grok), `x_search` (Grok) and `google_search` (Gemini) run on the provider, and hooks never run for them. Do not rely on a hook to restrict web search.
+- **Web fetch is always hooked.** In trusted projects (the only projects where hooks run), Xum gives every model its own `web_fetch`, so `tool_pre` and `tool_post` run for every fetch. Claude's native web fetch is not offered there. It is also offered only on the first-party Claude API: with a proxy or Anthropic-compatible base URL, a custom provider, or a Bedrock-backed route, Claude uses Xum's own `web_fetch` too.
+- **Native web search is not hooked.** `web_search` (Claude, OpenAI, Grok) and `x_search` (Grok) run on the provider, and hooks never run for them. Do not rely on a hook to restrict web search.
 
 </Accordion>
 
@@ -222,7 +222,7 @@ Xum also provides flattened tool input env vars so hook scripts can stay compact
 - Nested objects become `XUM_TOOL_INPUT_<PARENT>_<CHILD>`
 - Arrays also include `..._COUNT` and per-index variables like `..._<INDEX>`
 
-If a value is too large for the environment, it may be omitted (not set). Xum also caps the number of flattened env vars and array elements to keep hook execution reliable.
+If a value is too large for the environment or contains a NUL byte, Xum omits it (not set). Xum also caps the number of flattened env vars and array elements to keep hook execution reliable.
 
 {/* BEGIN TOOL_HOOK_ENV_VARS */}
 
@@ -260,21 +260,21 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 <details>
 <summary>agent_skill_read (1)</summary>
 
-| Env var               | JSON path | Type   | Description          |
-| --------------------- | --------- | ------ | -------------------- |
-| `XUM_TOOL_INPUT_NAME` | `name`    | string | Skill directory name |
+| Env var               | JSON path | Type   | Description                                                      |
+| --------------------- | --------- | ------ | ---------------------------------------------------------------- |
+| `XUM_TOOL_INPUT_NAME` | `name`    | string | Skill name, or &lt;plugin&gt;:&lt;skill&gt; for a plugin's skill |
 
 </details>
 
 <details>
 <summary>agent_skill_read_file (4)</summary>
 
-| Env var                    | JSON path  | Type   | Description                                            |
-| -------------------------- | ---------- | ------ | ------------------------------------------------------ |
-| `XUM_TOOL_INPUT_FILE_PATH` | `filePath` | string | Path inside the skill directory (relative; no ~ or ..) |
-| `XUM_TOOL_INPUT_LIMIT`     | `limit`    | number | Max lines from offset (default all)                    |
-| `XUM_TOOL_INPUT_NAME`      | `name`     | string | Skill directory name                                   |
-| `XUM_TOOL_INPUT_OFFSET`    | `offset`   | number | 1-based start line (default 1)                         |
+| Env var                    | JSON path  | Type   | Description                                                      |
+| -------------------------- | ---------- | ------ | ---------------------------------------------------------------- |
+| `XUM_TOOL_INPUT_FILE_PATH` | `filePath` | string | Path inside the skill directory (relative; no ~ or ..)           |
+| `XUM_TOOL_INPUT_LIMIT`     | `limit`    | number | Max lines from offset (default all)                              |
+| `XUM_TOOL_INPUT_NAME`      | `name`     | string | Skill name, or &lt;plugin&gt;:&lt;skill&gt; for a plugin's skill |
+| `XUM_TOOL_INPUT_OFFSET`    | `offset`   | number | 1-based start line (default 1)                                   |
 
 </details>
 
@@ -308,11 +308,11 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 
 | Env var                | JSON path | Type    | Description                                                                                                        |
 | ---------------------- | --------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
-| `XUM_TOOL_INPUT_FOCUS` | `focus`   | boolean | Open the Artifacts tab on this version.                                                                            |
+| `XUM_TOOL_INPUT_FOCUS` | `focus`   | boolean | Open the Artifacts tab on this file.                                                                               |
 | `XUM_TOOL_INPUT_KIND`  | `kind`    | enum    | Viewer; default by file extension.                                                                                 |
 | `XUM_TOOL_INPUT_PATH`  | `path`    | string  | Relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it.                                                     |
 | `XUM_TOOL_INPUT_PIN`   | `pin`     | enum    | Also copy it to the project or global shelf for later agents' artifact_read; re-pinning a path replaces its entry. |
-| `XUM_TOOL_INPUT_TITLE` | `title`   | string  | Version label. Default: file name.                                                                                 |
+| `XUM_TOOL_INPUT_TITLE` | `title`   | string  | Card title. Default: file name.                                                                                    |
 
 </details>
 
@@ -376,7 +376,7 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 | `XUM_TOOL_INPUT_MONITOR_WAKE_ON_EXIT`   | `monitor.wake_on_exit`   | boolean | Also wake when the process settles, even without a match (default true).                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `XUM_TOOL_INPUT_RUN_IN_BACKGROUND`      | `run_in_background`      | boolean | Run without blocking, for commands over ~5s (builds, dev servers, watchers); not for quick, interactive (no stdin), or real-time-output commands. Returns a taskId (bash:&lt;processId&gt;) at once: task_await reads new output, task_stop stops it, task_list lists it. Lives until timeout_secs, termination, or workspace removal. Without a monitor it never wakes you. Do not task_await it in the same parallel batch as this call, and do not poll task_await while it runs; await only when you need the output. |
 | `XUM_TOOL_INPUT_SCRIPT`                 | `script`                 | string  | Bash script to run                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `XUM_TOOL_INPUT_TIMEOUT_SECS`           | `timeout_secs`           | number  | Seconds: foreground kill deadline, or background max lifetime. Start small; raise on retry.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `XUM_TOOL_INPUT_TIMEOUT_SECS`           | `timeout_secs`           | number  | Seconds: foreground kill deadline, or background max lifetime. Omitted: foreground gets a 60s kill deadline; a command started in the background has no kill deadline. Start small; raise on retry.                                                                                                                                                                                                                                                                                                                       |
 
 </details>
 
@@ -588,15 +588,6 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 </details>
 
 <details>
-<summary>intuition (1)</summary>
-
-| Env var              | JSON path | Type   | Description |
-| -------------------- | --------- | ------ | ----------- |
-| `XUM_TOOL_INPUT_CUE` | `cue`     | string | —           |
-
-</details>
-
-<details>
 <summary>mcp_prompt_get (3)</summary>
 
 | Env var                          | JSON path          | Type   | Description                                                                  |
@@ -751,6 +742,15 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 </details>
 
 <details>
+<summary>status_update (1)</summary>
+
+| Env var                 | JSON path | Type   | Description                 |
+| ----------------------- | --------- | ------ | --------------------------- |
+| `XUM_TOOL_INPUT_UPDATE` | `update`  | string | The update, in plain words. |
+
+</details>
+
+<details>
 <summary>task (17)</summary>
 
 | Env var                                        | JSON path                     | Type    | Description                                                                                                                                                                                               |
@@ -759,12 +759,12 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 | `XUM_TOOL_INPUT_DESKTOP`                       | `desktop`                     | enum    | Child desktop: "shared" (yours) or "isolated"; default shared for agentId="desktop". One active shared child at a time; n &gt; 1 needs isolated. Human, shell and CDP input still reach a shared desktop. |
 | `XUM_TOOL_INPUT_ISOLATION`                     | `isolation`                   | enum    | "fork" (default): an isolated copy from committed state. "none": this checkout (sees uncommitted changes, skips fork and init); only for read-only work or a child told not to edit shared files.         |
 | `XUM_TOOL_INPUT_KIND`                          | `kind`                        | enum    | Default "subagent".                                                                                                                                                                                       |
-| `XUM_TOOL_INPUT_MODEL`                         | `model`                       | string  | Model override (alias or provider:model; see models_list). Only when the user asked; default inherits yours. Stays pinned when reawakened.                                                                |
+| `XUM_TOOL_INPUT_MODEL`                         | `model`                       | string  | Model override (alias, provider:model, or a skill's slug such as opus-xhigh; see models_list). Only when the user or an invoked skill asks; default inherits yours. Stays pinned when reawakened.         |
 | `XUM_TOOL_INPUT_N`                             | `n`                           | number  | Best-of count; omit for a single task.                                                                                                                                                                    |
 | `XUM_TOOL_INPUT_PROMPT`                        | `prompt`                      | string  | —                                                                                                                                                                                                         |
 | `XUM_TOOL_INPUT_RUN_IN_BACKGROUND`             | `run_in_background`           | boolean | —                                                                                                                                                                                                         |
 | `XUM_TOOL_INPUT_SUBAGENT_TYPE`                 | `subagent_type`               | string  | —                                                                                                                                                                                                         |
-| `XUM_TOOL_INPUT_THINKING`                      | `thinking`                    | string  | Thinking override: off, low, medium, high, xhigh, max, or a numeric index for the chosen model. Only when the user asked; default inherits yours. Stays pinned when reawakened.                           |
+| `XUM_TOOL_INPUT_THINKING`                      | `thinking`                    | string  | Thinking override: off, low, medium, high, xhigh, max, or a numeric index for the chosen model. Only when the user or an invoked skill asks; default inherits yours. Stays pinned when reawakened.        |
 | `XUM_TOOL_INPUT_TITLE`                         | `title`                       | string  | A short reusable role name (e.g. Reviewer), not the assignment; for kind="workspace", a normal chat title.                                                                                                |
 | `XUM_TOOL_INPUT_WORKSPACE_BRANCH_NAME`         | `workspace.branchName`        | string  | —                                                                                                                                                                                                         |
 | `XUM_TOOL_INPUT_WORKSPACE_DISPOSABLE`          | `workspace.disposable`        | boolean | —                                                                                                                                                                                                         |

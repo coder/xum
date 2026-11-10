@@ -28,7 +28,11 @@ import { CSS } from "@dnd-kit/utilities";
 
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import {
+  GOOGLE_VERTEX_DEFAULT_LOCATION,
+  PROVIDER_DEFINITIONS,
+  type ProviderName,
+} from "@/common/constants/providers";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
@@ -37,10 +41,6 @@ import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import {
-  formatMuxGatewayBalance,
-  useMuxGatewayAccountStatus,
-} from "@/browser/hooks/useMuxGatewayAccountStatus";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { Button } from "@/browser/components/Button/Button";
 import {
@@ -82,15 +82,16 @@ import {
   type CustomProviderType,
 } from "@/common/utils/providers/customProviders";
 import type { AddCustomProviderInput, ProviderConfigInfo } from "@/common/orpc/types";
+import { sessionHeaderNameError } from "@/common/utils/providers/sessionHeader";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import type { Result } from "@/common/types/result";
+import { createOAuthFlowId } from "@/browser/utils/oauth/flowId";
 import {
   CODER_CANONICAL_ROUTE_ORIGINS,
   CODER_OAUTH_SERVER_START_PATH,
   resolveCoderCanonicalRouteInstance,
 } from "@/common/constants/coderOAuth";
 
-type MuxGatewayLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
 type CodexOauthFlowStatus = "idle" | "starting" | "waiting" | "error";
 type CopilotLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
 
@@ -125,28 +126,9 @@ interface CodexOauthDeviceFlow {
   verifyUrl: string;
 }
 
-interface OAuthMessage {
-  type?: unknown;
-  state?: unknown;
-  ok?: unknown;
-  error?: unknown;
-}
-
 function getServerAuthToken(): string | null {
   const urlToken = new URLSearchParams(window.location.search).get("token")?.trim();
   return urlToken?.length ? urlToken : getStoredAuthToken();
-}
-
-/**
- * Flow ID for a Coder login. It doubles as the OAuth `state` (CSRF token), so
- * it must be unguessable: derived from getRandomValues, which — unlike
- * Crypto.randomUUID — is available outside secure contexts too (Xum's browser
- * UI can be served from a plain-HTTP remote origin, where randomUUID is
- * undefined and would throw before the login even started).
- */
-function createCoderLoginFlowId(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /**
@@ -241,6 +223,15 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
         placeholder: "https://api.example.com/v1",
         type: "text",
       },
+      {
+        // Header that carries the workspace id on chat requests, for gateways
+        // that want one stable id per conversation (#4231).
+        key: "sessionHeader",
+        label: "Session header",
+        placeholder: "x-session-id",
+        type: "text",
+        optional: true,
+      },
     ];
   }
 
@@ -282,8 +273,39 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
     ];
   }
 
-  if (provider === "mux-gateway") {
-    return [];
+  if (provider === "google-vertex") {
+    // Google Application Default Credentials by default; an API key selects express mode.
+    return [
+      { key: "project", label: "Project", placeholder: "my-gcp-project", type: "text" },
+      {
+        key: "location",
+        label: "Location",
+        placeholder: GOOGLE_VERTEX_DEFAULT_LOCATION,
+        type: "text",
+        optional: true,
+      },
+      {
+        key: "keyFilename",
+        label: "Service account key file",
+        placeholder: "~/.config/gcloud/service-account.json",
+        type: "secret",
+        optional: true,
+      },
+      {
+        key: "apiKey",
+        label: "Express mode API key",
+        placeholder: "GOOGLE_VERTEX_API_KEY",
+        type: "secret",
+        optional: true,
+      },
+      {
+        key: "baseUrl",
+        label: "Base URL",
+        placeholder: "https://aiplatform.googleapis.com/v1/publishers/google",
+        type: "text",
+        optional: true,
+      },
+    ];
   }
 
   if (provider === "github-copilot") {
@@ -324,6 +346,108 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
       optional: true,
     },
   ];
+}
+
+type ProviderStatusReader<T> = (providerConfig: ProviderConfigInfo) => T | undefined;
+
+// Provider-specific settings the backend reports in a nested status object,
+// keyed by `${provider}.${field}`.
+const NESTED_FIELD_VALUES = new Map<string, ProviderStatusReader<string>>([
+  ["bedrock.region", (info) => info.aws?.region],
+  ["bedrock.profile", (info) => info.aws?.profile],
+  ["google-vertex.project", (info) => info.googleVertex?.project],
+  ["google-vertex.location", (info) => info.googleVertex?.location],
+]);
+
+// Values resolved from env vars, shown when the config value is unset.
+const NESTED_ENV_FIELD_VALUES = new Map<string, ProviderStatusReader<string>>([
+  ["google-vertex.project", (info) => info.googleVertex?.envProject],
+  ["google-vertex.location", (info) => info.googleVertex?.envLocation],
+]);
+
+// Secrets are never sent to the UI, only whether each one is set.
+const NESTED_SECRET_SET_FLAGS = new Map<string, ProviderStatusReader<boolean>>([
+  ["bedrock.bearerToken", (info) => info.aws?.bearerTokenSet],
+  ["bedrock.accessKeyId", (info) => info.aws?.accessKeyIdSet],
+  ["bedrock.secretAccessKey", (info) => info.aws?.secretAccessKeySet],
+  ["google-vertex.keyFilename", (info) => info.googleVertex?.keyFilenameSet],
+]);
+
+function getProviderFieldValue(
+  provider: string,
+  field: string,
+  providerConfig: ProviderConfigInfo
+): string | undefined {
+  const readNested = NESTED_FIELD_VALUES.get(`${provider}.${field}`);
+  if (readNested) return readNested(providerConfig);
+  // Standard fields like baseUrl
+  const value = providerConfig[field as keyof ProviderConfigInfo];
+  return typeof value === "string" ? value : undefined;
+}
+
+/** Why the edited value cannot be saved, or null. Empty clears the field. */
+function getEditFieldError(field: string, value: string): string | null {
+  return field === "sessionHeader" && value !== "" ? sessionHeaderNameError(value) : null;
+}
+
+/** Shows under the input why the edited value cannot be saved. */
+function FieldEditError(props: { field: string; value: string; editing: boolean }) {
+  const error = props.editing ? getEditFieldError(props.field, props.value) : null;
+  return error ? <p className="text-destructive mt-1 text-xs">{error}</p> : null;
+}
+
+/** Optimistic patch for an optional plain-text field: the edited text, empty clears it. */
+function plainTextFieldPatch(field: string, value: string): Partial<ProviderConfigInfo> | null {
+  const next = value || undefined;
+  switch (field) {
+    case "displayName":
+      return { displayName: next };
+    case "apiKeyFile":
+      return { apiKeyFile: next };
+    case "sessionHeader":
+      return { sessionHeader: next };
+    default:
+      return null;
+  }
+}
+
+function isProviderSecretSet(
+  provider: string,
+  field: string,
+  providerConfig: ProviderConfigInfo
+): boolean {
+  if (field === "apiKey") return providerConfig.apiKeySet ?? false;
+  return NESTED_SECRET_SET_FLAGS.get(`${provider}.${field}`)?.(providerConfig) ?? false;
+}
+
+/**
+ * Where a field's value comes from when it is not saved in config. The API key
+ * note renders here only for providers without a "Get API Key" link, which
+ * already shows it.
+ */
+function getFieldSourceNote(params: {
+  field: string;
+  fieldValue: string | undefined;
+  fieldDisplayValue: string | undefined;
+  fieldIsSet: boolean;
+  hasKeyUrl: boolean;
+  providerInfo: ProviderConfigInfo | undefined;
+}): string | null {
+  const { field, providerInfo } = params;
+  if (field === "apiKey") {
+    if (params.hasKeyUrl || params.fieldIsSet) return null;
+    if (providerInfo?.apiKeySource === "file") return "Set by API key file.";
+    return providerInfo?.apiKeySource === "env" ? "Set by env vars." : null;
+  }
+  if (field === "baseUrl") {
+    return providerInfo?.baseUrlSource === "env" && providerInfo.baseUrlResolved
+      ? "Set by env vars."
+      : null;
+  }
+  if (field === "keyFilename") {
+    return providerInfo?.googleVertex?.envKeyFilenameSet ? "Set by env vars." : null;
+  }
+  return !params.fieldValue && params.fieldDisplayValue ? "Set by env vars." : null;
 }
 
 /**
@@ -487,12 +611,6 @@ export function ProvidersSection() {
   const { config, loading: configLoading, refresh, updateOptimistically } = useProvidersConfig();
   const { refreshWorkspaceMetadata } = useWorkspaceContext();
   const visibleProviders = useMemo(() => getProviderIdsForUi(config), [config]);
-  const {
-    data: muxGatewayAccountStatus,
-    error: muxGatewayAccountError,
-    isLoading: muxGatewayAccountLoading,
-    refresh: refreshMuxGatewayAccountStatus,
-  } = useMuxGatewayAccountStatus();
 
   const [openaiServiceTierSelectOverride, setOpenaiServiceTierSelectOverride] =
     useState<OpenAIServiceTierSelectValue | null>(null);
@@ -562,13 +680,6 @@ export function ProvidersSection() {
   );
 
   const backendBaseUrl = getBrowserBackendBaseUrl();
-  const backendOrigin = (() => {
-    try {
-      return new URL(backendBaseUrl).origin;
-    } catch {
-      return window.location.origin;
-    }
-  })();
 
   const isDesktop = !!window.api;
 
@@ -836,7 +947,6 @@ export function ProvidersSection() {
     }
   };
 
-  const [muxGatewayLoginStatus, setMuxGatewayLoginStatus] = useState<MuxGatewayLoginStatus>("idle");
   const cancelCodexOauth = () => {
     codexOauthAttemptRef.current++;
 
@@ -855,218 +965,6 @@ export function ProvidersSection() {
     setCodexOauthStatus("idle");
     setCodexOauthError(null);
   };
-
-  const [muxGatewayLoginError, setMuxGatewayLoginError] = useState<string | null>(null);
-
-  const muxGatewayLoginAttemptRef = useRef(0);
-  const [muxGatewayDesktopFlowId, setMuxGatewayDesktopFlowId] = useState<string | null>(null);
-  const [muxGatewayServerState, setMuxGatewayServerState] = useState<string | null>(null);
-
-  const [muxGatewayAuthorizeUrl, setMuxGatewayAuthorizeUrl] = useState<string | null>(null);
-
-  const cancelMuxGatewayLogin = () => {
-    muxGatewayLoginAttemptRef.current++;
-
-    if (isDesktop && api && muxGatewayDesktopFlowId) {
-      void api.muxGatewayOauth.cancelDesktopFlow({ flowId: muxGatewayDesktopFlowId });
-    }
-
-    setMuxGatewayDesktopFlowId(null);
-    setMuxGatewayServerState(null);
-    setMuxGatewayAuthorizeUrl(null);
-    setMuxGatewayLoginStatus("idle");
-    setMuxGatewayLoginError(null);
-  };
-
-  const clearMuxGatewayCredentials = () => {
-    if (!api) {
-      return;
-    }
-
-    cancelMuxGatewayLogin();
-    updateOptimistically("mux-gateway", { couponCodeSet: false });
-
-    void api.providers.setProviderConfig({
-      provider: "mux-gateway",
-      keyPath: ["couponCode"],
-      value: "",
-    });
-    void api.providers.setProviderConfig({
-      provider: "mux-gateway",
-      keyPath: ["voucher"],
-      value: "",
-    });
-  };
-
-  const startMuxGatewayLogin = async () => {
-    const attempt = ++muxGatewayLoginAttemptRef.current;
-
-    try {
-      setMuxGatewayLoginError(null);
-      setMuxGatewayDesktopFlowId(null);
-      setMuxGatewayServerState(null);
-      setMuxGatewayAuthorizeUrl(null);
-
-      if (isDesktop) {
-        if (!liveApi) {
-          setMuxGatewayLoginStatus("error");
-          setMuxGatewayLoginError("Xum API not connected.");
-          return;
-        }
-
-        setMuxGatewayLoginStatus("starting");
-        const startResult = await liveApi.muxGatewayOauth.startDesktopFlow();
-
-        if (attempt !== muxGatewayLoginAttemptRef.current) {
-          if (startResult.success) {
-            void liveApi.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
-          }
-          return;
-        }
-
-        if (!startResult.success) {
-          setMuxGatewayLoginStatus("error");
-          setMuxGatewayLoginError(startResult.error);
-          return;
-        }
-
-        const { flowId, authorizeUrl } = startResult.data;
-        setMuxGatewayDesktopFlowId(flowId);
-        setMuxGatewayAuthorizeUrl(authorizeUrl);
-        setMuxGatewayLoginStatus("waiting");
-
-        if (attempt !== muxGatewayLoginAttemptRef.current) {
-          return;
-        }
-
-        const waitResult = await liveApi.muxGatewayOauth.waitForDesktopFlow({ flowId });
-
-        if (attempt !== muxGatewayLoginAttemptRef.current) {
-          return;
-        }
-
-        if (waitResult.success) {
-          setMuxGatewayLoginStatus("success");
-          void refreshMuxGatewayAccountStatus();
-
-          return;
-        }
-
-        setMuxGatewayAuthorizeUrl(null);
-        setMuxGatewayLoginStatus("error");
-        setMuxGatewayLoginError(waitResult.error);
-        return;
-      }
-
-      // Browser/server mode: use unauthenticated bootstrap route.
-      setMuxGatewayLoginStatus("starting");
-
-      const startUrl = new URL(`${backendBaseUrl}/auth/mux-gateway/start`);
-      const authToken = getServerAuthToken();
-
-      const res = await fetch(startUrl, {
-        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-      });
-
-      const contentType = res.headers.get("content-type") ?? "";
-      if (!contentType.includes("application/json")) {
-        const body = await res.text();
-        const prefix = body.trim().slice(0, 80);
-        throw new Error(
-          `Unexpected response from ${startUrl.toString()} (expected JSON, got ${
-            contentType || "unknown"
-          }): ${prefix}`
-        );
-      }
-
-      const json = (await res.json()) as {
-        authorizeUrl?: unknown;
-        state?: unknown;
-        error?: unknown;
-      };
-
-      if (!res.ok) {
-        const message = typeof json.error === "string" ? json.error : `HTTP ${res.status}`;
-        throw new Error(message);
-      }
-
-      if (attempt !== muxGatewayLoginAttemptRef.current) {
-        return;
-      }
-
-      if (typeof json.authorizeUrl !== "string" || typeof json.state !== "string") {
-        throw new Error(`Invalid response from ${startUrl.pathname}`);
-      }
-
-      setMuxGatewayServerState(json.state);
-      setMuxGatewayAuthorizeUrl(json.authorizeUrl);
-      setMuxGatewayLoginStatus("waiting");
-    } catch (err) {
-      if (attempt !== muxGatewayLoginAttemptRef.current) {
-        return;
-      }
-
-      const message = getErrorMessage(err);
-      setMuxGatewayAuthorizeUrl(null);
-      setMuxGatewayLoginStatus("error");
-      setMuxGatewayLoginError(message);
-    }
-  };
-
-  useEffect(() => {
-    const attempt = muxGatewayLoginAttemptRef.current;
-
-    if (isDesktop || muxGatewayLoginStatus !== "waiting" || !muxGatewayServerState) {
-      return;
-    }
-
-    const handleMessage = (event: MessageEvent<OAuthMessage>) => {
-      if (event.origin !== backendOrigin) return;
-      if (muxGatewayLoginAttemptRef.current !== attempt) return;
-
-      const data = event.data;
-      if (!data || typeof data !== "object") return;
-      if (data.type !== "mux-gateway-oauth") return;
-      if (data.state !== muxGatewayServerState) return;
-
-      if (data.ok === true) {
-        setMuxGatewayAuthorizeUrl(null);
-        setMuxGatewayLoginStatus("success");
-        void refreshMuxGatewayAccountStatus();
-
-        return;
-      }
-
-      const msg = typeof data.error === "string" ? data.error : "Login failed";
-      setMuxGatewayAuthorizeUrl(null);
-      setMuxGatewayLoginStatus("error");
-      setMuxGatewayLoginError(msg);
-    };
-
-    window.addEventListener("message", handleMessage);
-    return () => window.removeEventListener("message", handleMessage);
-  }, [
-    isDesktop,
-    muxGatewayLoginStatus,
-    muxGatewayServerState,
-    backendOrigin,
-    refreshMuxGatewayAccountStatus,
-  ]);
-  const muxGatewayCouponCodeSet = config?.["mux-gateway"]?.couponCodeSet ?? false;
-  const muxGatewayLoginInProgress =
-    muxGatewayLoginStatus === "waiting" || muxGatewayLoginStatus === "starting";
-  const muxGatewayIsLoggedIn = muxGatewayCouponCodeSet || muxGatewayLoginStatus === "success";
-
-  const muxGatewayAuthStatusText = muxGatewayIsLoggedIn ? "Logged in" : "Not logged in";
-
-  const muxGatewayLoginButtonLabel =
-    muxGatewayLoginStatus === "error"
-      ? "Try again"
-      : muxGatewayLoginInProgress
-        ? "Waiting for login..."
-        : muxGatewayIsLoggedIn
-          ? "Re-login to Xum Gateway"
-          : "Login to Xum Gateway";
 
   // --- GitHub Copilot Device Code Flow ---
   const [copilotLoginStatus, setCopilotLoginStatus] = useState<CopilotLoginStatus>("idle");
@@ -1294,7 +1192,7 @@ export function ProvidersSection() {
     // startDesktopFlow can stall on backend network calls, and Cancel must be
     // able to reach the attempt (the backend pre-cancels IDs it hasn't
     // registered yet) instead of abandoning only the frontend state.
-    const flowId = createCoderLoginFlowId();
+    const flowId = createOAuthFlowId();
     setCoderFlowId(flowId);
 
     try {
@@ -1434,29 +1332,6 @@ export function ProvidersSection() {
     void startCoderLogin();
   }, [providersStartCoderLogin, setProvidersStartCoderLogin, configLoading, startCoderLogin]);
 
-  useEffect(() => {
-    if (expandedProvider !== "mux-gateway" || !muxGatewayIsLoggedIn) {
-      return;
-    }
-
-    // Fetch lazily when the user expands the Xum Gateway provider.
-    //
-    // Important: avoid auto-retrying after a failure. If the request fails,
-    // `muxGatewayAccountStatus` remains null and we'd otherwise trigger a refresh
-    // on every render while the provider stays expanded.
-    if (muxGatewayAccountStatus || muxGatewayAccountLoading || muxGatewayAccountError) {
-      return;
-    }
-
-    void refreshMuxGatewayAccountStatus();
-  }, [
-    expandedProvider,
-    muxGatewayAccountError,
-    muxGatewayAccountLoading,
-    muxGatewayAccountStatus,
-    muxGatewayIsLoggedIn,
-    refreshMuxGatewayAccountStatus,
-  ]);
   const [editingField, setEditingField] = useState<{
     provider: string;
     field: string;
@@ -1467,9 +1342,6 @@ export function ProvidersSection() {
   const handleToggleProvider = (provider: string) => {
     setExpandedProvider((prev) => {
       const next = prev === provider ? null : provider;
-      if (prev === "mux-gateway" && next !== "mux-gateway") {
-        cancelMuxGatewayLogin();
-      }
       if (prev === "github-copilot" && next !== "github-copilot") {
         cancelCopilotLogin();
       }
@@ -1496,15 +1368,18 @@ export function ProvidersSection() {
     if (!editingField || !api) return;
 
     const { provider, field } = editingField;
+    // The input shows the reason; the backend would refuse the write anyway.
+    if (getEditFieldError(field, editValue) != null) return;
 
     // Optimistic update for instant feedback
+    const textPatch = plainTextFieldPatch(field, editValue);
     if (field === "apiKey") {
       updateOptimistically(provider, {
         apiKeySet: editValue !== "",
         apiKeySource: editValue !== "" ? "config" : undefined,
       });
-    } else if (field === "displayName") {
-      updateOptimistically(provider, { displayName: editValue || undefined });
+    } else if (textPatch) {
+      updateOptimistically(provider, textPatch);
     } else if (field === "baseUrl") {
       const nextBaseUrl = editValue || undefined;
       updateOptimistically(provider, {
@@ -1512,8 +1387,6 @@ export function ProvidersSection() {
         baseUrlSource: nextBaseUrl ? "config" : undefined,
         baseUrlResolved: nextBaseUrl,
       });
-    } else if (field === "apiKeyFile") {
-      updateOptimistically(provider, { apiKeyFile: editValue || undefined });
     } else if (field === "deploymentUrl") {
       // The Coder login handler reads config.coder.deploymentUrl; without this
       // optimistic update, clicking Login right after saving would use the
@@ -1627,7 +1500,7 @@ export function ProvidersSection() {
 
   const handleProviderEnabledChange = useCallback(
     (provider: string, nextEnabled: boolean) => {
-      if (!api || provider === "mux-gateway") {
+      if (!api) {
         return;
       }
 
@@ -1648,25 +1521,19 @@ export function ProvidersSection() {
 
   const getFieldValue = (provider: string, field: string): string | undefined => {
     const providerConfig = config?.[provider];
-    if (!providerConfig) return undefined;
-
-    // For bedrock, check aws nested object for region/profile
-    if (provider === "bedrock" && (field === "region" || field === "profile")) {
-      return field === "region" ? providerConfig.aws?.region : providerConfig.aws?.profile;
-    }
-
-    // For standard fields like baseUrl
-    const value = providerConfig[field as keyof typeof providerConfig];
-    return typeof value === "string" ? value : undefined;
+    return providerConfig ? getProviderFieldValue(provider, field, providerConfig) : undefined;
   };
 
   const getFieldDisplayValue = (provider: string, field: string): string | undefined => {
     const fieldValue = getFieldValue(provider, field);
+    const providerConfig = config?.[provider];
     if (field !== "baseUrl") {
-      return fieldValue;
+      return (
+        fieldValue ??
+        (providerConfig && NESTED_ENV_FIELD_VALUES.get(`${provider}.${field}`)?.(providerConfig))
+      );
     }
 
-    const providerConfig = config?.[provider];
     if (providerConfig?.baseUrlSource && typeof providerConfig.baseUrlResolved === "string") {
       return providerConfig.baseUrlResolved;
     }
@@ -1677,26 +1544,9 @@ export function ProvidersSection() {
   const isFieldSet = (provider: string, field: string, fieldConfig: FieldConfig): boolean => {
     const providerConfig = config?.[provider];
     if (!providerConfig) return false;
-
-    if (fieldConfig.type === "secret") {
-      // For apiKey, we have apiKeySet from the sanitized config
-      if (field === "apiKey") return providerConfig.apiKeySet ?? false;
-
-      // For AWS secrets, check the aws nested object
-      if (provider === "bedrock" && providerConfig.aws) {
-        const { aws } = providerConfig;
-        switch (field) {
-          case "bearerToken":
-            return aws.bearerTokenSet ?? false;
-          case "accessKeyId":
-            return aws.accessKeyIdSet ?? false;
-          case "secretAccessKey":
-            return aws.secretAccessKeySet ?? false;
-        }
-      }
-      return false;
-    }
-    return !!getFieldValue(provider, field);
+    return fieldConfig.type === "secret"
+      ? isProviderSecretSet(provider, field, providerConfig)
+      : !!getProviderFieldValue(provider, field, providerConfig);
   };
 
   const markCustomProviderFieldTouched = (field: keyof typeof customProviderTouchedFields) => {
@@ -1922,7 +1772,7 @@ export function ProvidersSection() {
     <div className="space-y-2">
       <p className="text-muted mb-4 text-xs">
         Configure API keys and endpoints for AI providers. Keys are stored in{" "}
-        <code className="text-accent">~/.xum/providers.jsonc</code>
+        <code className="text-accent-text">~/.xum/providers.jsonc</code>
       </p>
 
       {customProviderNotice && (
@@ -2034,26 +1884,24 @@ export function ProvidersSection() {
                           using your custom configuration.
                         </div>
                       )}
-                      {provider !== "mux-gateway" && (
-                        <div className="flex items-center justify-between gap-3">
-                          <div>
-                            <label className="text-foreground block text-xs font-medium">
-                              Enabled
-                            </label>
-                            <span className="text-muted text-xs">
-                              Disable this provider without deleting saved credentials.
-                            </span>
-                          </div>
-                          <Switch
-                            checked={enabled}
-                            onCheckedChange={(nextChecked) =>
-                              handleProviderEnabledChange(provider, nextChecked)
-                            }
-                            aria-label={`Toggle ${provider} provider`}
-                            disabled={!api}
-                          />
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <label className="text-foreground block text-xs font-medium">
+                            Enabled
+                          </label>
+                          <span className="text-muted text-xs">
+                            Disable this provider without deleting saved credentials.
+                          </span>
                         </div>
-                      )}
+                        <Switch
+                          checked={enabled}
+                          onCheckedChange={(nextChecked) =>
+                            handleProviderEnabledChange(provider, nextChecked)
+                          }
+                          aria-label={`Toggle ${provider} provider`}
+                          disabled={!api}
+                        />
+                      </div>
 
                       {/* Quick link to get API key */}
                       {providerKeyUrl && (
@@ -2062,7 +1910,7 @@ export function ProvidersSection() {
                             href={providerKeyUrl}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="text-muted hover:text-accent inline-flex items-center gap-1 text-xs transition-colors"
+                            className="text-muted hover:text-accent-text inline-flex items-center gap-1 text-xs transition-colors"
                           >
                             Get API Key
                             <ExternalLink className="h-2.5 w-2.5" />
@@ -2093,124 +1941,6 @@ export function ProvidersSection() {
                               )
                               .join(", ")}
                           </span>
-                        </div>
-                      )}
-
-                      {provider === "mux-gateway" && (
-                        <div className="space-y-2">
-                          <div>
-                            <label className="text-foreground block text-xs font-medium">
-                              Authentication
-                            </label>
-                            <span className="text-muted text-xs">{muxGatewayAuthStatusText}</span>
-                          </div>
-
-                          <div className="space-y-2">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <Button
-                                size="sm"
-                                onClick={() => {
-                                  void startMuxGatewayLogin();
-                                }}
-                                disabled={muxGatewayLoginInProgress}
-                              >
-                                {muxGatewayLoginButtonLabel}
-                              </Button>
-
-                              {muxGatewayLoginStatus === "waiting" && muxGatewayAuthorizeUrl && (
-                                <Button
-                                  size="sm"
-                                  aria-label="Copy and open Xum Gateway authorization page"
-                                  onClick={() => {
-                                    void navigator.clipboard.writeText(muxGatewayAuthorizeUrl);
-                                    window.open(muxGatewayAuthorizeUrl, "_blank", "noopener");
-                                  }}
-                                  className="h-8 px-3 text-xs"
-                                >
-                                  Copy & Open Xum Gateway
-                                </Button>
-                              )}
-
-                              {muxGatewayLoginInProgress && (
-                                <Button
-                                  variant="secondary"
-                                  size="sm"
-                                  onClick={cancelMuxGatewayLogin}
-                                >
-                                  Cancel
-                                </Button>
-                              )}
-
-                              {muxGatewayIsLoggedIn && (
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  onClick={clearMuxGatewayCredentials}
-                                >
-                                  Log out
-                                </Button>
-                              )}
-                            </div>
-
-                            {muxGatewayLoginStatus === "waiting" && (
-                              <p className="text-muted inline-flex items-center gap-2 text-xs">
-                                <Loader2 aria-hidden className="h-3.5 w-3.5 animate-spin" />
-                                Waiting for authorization...
-                              </p>
-                            )}
-
-                            {muxGatewayLoginStatus === "error" && muxGatewayLoginError && (
-                              <p className="text-destructive text-xs">
-                                Login failed: {muxGatewayLoginError}
-                              </p>
-                            )}
-                          </div>
-                        </div>
-                      )}
-
-                      {provider === "mux-gateway" && muxGatewayIsLoggedIn && (
-                        <div className="border-border-light space-y-2 border-t pt-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <div>
-                              <label className="text-foreground block text-xs font-medium">
-                                Account
-                              </label>
-                              <span className="text-muted text-xs">
-                                Balance and limits from Xum Gateway
-                              </span>
-                            </div>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => {
-                                void refreshMuxGatewayAccountStatus();
-                              }}
-                              disabled={muxGatewayAccountLoading}
-                            >
-                              {muxGatewayAccountLoading ? "Refreshing..." : "Refresh"}
-                            </Button>
-                          </div>
-
-                          <div className="flex items-center justify-between gap-4">
-                            <span className="text-muted text-xs">Balance</span>
-                            <span className="text-foreground font-mono text-xs">
-                              {formatMuxGatewayBalance(
-                                muxGatewayAccountStatus?.remaining_microdollars
-                              )}
-                            </span>
-                          </div>
-
-                          <div className="flex items-center justify-between gap-4">
-                            <span className="text-muted text-xs">Concurrent requests per user</span>
-                            <span className="text-foreground font-mono text-xs">
-                              {muxGatewayAccountStatus?.ai_gateway_concurrent_requests_per_user ??
-                                "—"}
-                            </span>
-                          </div>
-
-                          {muxGatewayAccountError && (
-                            <p className="text-destructive text-xs">{muxGatewayAccountError}</p>
-                          )}
                         </div>
                       )}
 
@@ -2301,6 +2031,14 @@ export function ProvidersSection() {
                         const fieldValue = getFieldValue(provider, fieldConfig.key);
                         const fieldDisplayValue = getFieldDisplayValue(provider, fieldConfig.key);
                         const fieldIsSet = isFieldSet(provider, fieldConfig.key, fieldConfig);
+                        const fieldSourceNote = getFieldSourceNote({
+                          field: fieldConfig.key,
+                          fieldValue,
+                          fieldDisplayValue,
+                          fieldIsSet,
+                          hasKeyUrl: !!providerKeyUrl,
+                          providerInfo,
+                        });
                         const showOpenAIBaseUrlHint =
                           fieldConfig.key === "baseUrl" &&
                           provider === "openai" &&
@@ -2356,7 +2094,7 @@ export function ProvidersSection() {
                                   variant="ghost"
                                   size="icon"
                                   onClick={handleSaveEdit}
-                                  className="h-6 w-6 text-green-500 hover:text-green-400"
+                                  className="text-success-text h-6 w-6"
                                 >
                                   <Check className="h-4 w-4" />
                                 </Button>
@@ -2371,8 +2109,9 @@ export function ProvidersSection() {
                               </div>
                             ) : (
                               <>
-                                <div className="flex items-center justify-between">
-                                  <span className="text-foreground flex items-center gap-1 font-mono text-xs">
+                                <div className="flex items-center justify-between gap-2">
+                                  {/* min-w-0 + break-all: long values (Base URLs) wrap instead of pushing the buttons off-screen on narrow widths. */}
+                                  <span className="text-foreground flex min-w-0 items-center gap-1 font-mono text-xs break-all">
                                     {fieldConfig.type === "secret"
                                       ? fieldIsSet
                                         ? "••••••••"
@@ -2381,7 +2120,7 @@ export function ProvidersSection() {
                                           : "Not set"
                                       : (fieldDisplayValue ?? "Default")}
                                   </span>
-                                  <div className="flex gap-2">
+                                  <div className="flex shrink-0 gap-2">
                                     {(fieldConfig.type === "text"
                                       ? !!fieldValue
                                       : fieldConfig.type === "secret" && fieldIsSet) && (
@@ -2400,19 +2139,22 @@ export function ProvidersSection() {
                                       onClick={() =>
                                         handleStartEdit(provider, fieldConfig.key, fieldConfig)
                                       }
-                                      className="text-accent hover:text-accent-light h-auto px-1 py-0 text-xs"
+                                      className="text-accent-text hover:text-accent-light h-auto px-1 py-0 text-xs"
                                     >
                                       {fieldIsSet || fieldValue ? "Change" : "Set"}
                                     </Button>
                                   </div>
                                 </div>
-                                {fieldConfig.key === "baseUrl" &&
-                                  config?.[provider]?.baseUrlSource === "env" &&
-                                  config?.[provider]?.baseUrlResolved && (
-                                    <div className="text-muted mt-1 text-xs">Set by env vars.</div>
-                                  )}
+                                {fieldSourceNote && (
+                                  <div className="text-muted mt-1 text-xs">{fieldSourceNote}</div>
+                                )}
                               </>
                             )}
+                            <FieldEditError
+                              field={fieldConfig.key}
+                              value={editValue}
+                              editing={isEditing}
+                            />
                             {showOpenAIBaseUrlHint && (
                               <p className="text-muted mt-1 text-xs">
                                 The OpenAI provider uses the Responses API by default. For
@@ -2802,7 +2544,7 @@ export function ProvidersSection() {
                                   </label>
                                   <p className="text-muted text-xs">
                                     Applies to models that support both ChatGPT OAuth and API keys
-                                    (e.g. <code className="text-accent">gpt-6.1-sol</code>).
+                                    (e.g. <code className="text-accent-text">gpt-6.1-sol</code>).
                                   </p>
                                 </div>
 

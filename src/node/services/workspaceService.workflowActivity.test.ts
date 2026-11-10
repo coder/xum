@@ -50,7 +50,7 @@ describe("WorkspaceService workflow activity", () => {
       });
       const metadataSpy = spyOn(config, "getAllWorkspaceMetadata");
       const internals = workspaceService as unknown as {
-        activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>>;
+        workflowRuns: { activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>> };
       };
       const activity = await workspaceService.getActivityList();
       expect(activity?.active?.activeWorkflowRunIds).toEqual(["wfr_active"]);
@@ -62,7 +62,7 @@ describe("WorkspaceService workflow activity", () => {
       );
       // The list walk installs caches only for the stores it actually bootstrapped; a dormant
       // archived workspace gets no placeholder entry.
-      expect([...internals.activeWorkflowRunIdsByWorkspace.keys()].sort()).toEqual([
+      expect([...internals.workflowRuns.activeWorkflowRunIdsByWorkspace.keys()].sort()).toEqual([
         "active",
         "unarchived",
       ]);
@@ -72,7 +72,7 @@ describe("WorkspaceService workflow activity", () => {
         runId: "wfr_live",
         status: "running",
       });
-      expect(internals.activeWorkflowRunIdsByWorkspace.has("archived")).toBe(true);
+      expect(internals.workflowRuns.activeWorkflowRunIdsByWorkspace.has("archived")).toBe(true);
       expect((await workspaceService.getActivityList())?.archived?.activeWorkflowRunIds).toEqual([
         "wfr_live",
       ]);
@@ -175,13 +175,15 @@ describe("WorkspaceService workflow activity", () => {
         ),
       });
       const internals = workspaceService as unknown as {
-        getActiveWorkflowRunIds: (workspaceId: string) => Promise<ReadonlySet<string>>;
-        activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>>;
+        workflowRuns: {
+          getActiveWorkflowRunIds: (workspaceId: string) => Promise<ReadonlySet<string>>;
+          activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>>;
+        };
       };
 
       // The list-style read resolves its (dormant, detached) answer synchronously; the event
       // lands in the microtask gap before the read's continuation runs.
-      const read = internals.getActiveWorkflowRunIds("archived");
+      const read = internals.workflowRuns.getActiveWorkflowRunIds("archived");
       const event = workspaceService.emitWorkflowRunActivity({
         workspaceId: "archived",
         runId: "wfr_live",
@@ -189,7 +191,9 @@ describe("WorkspaceService workflow activity", () => {
       });
       await event;
       expect([...(await read)]).toEqual(["wfr_live"]);
-      expect(internals.activeWorkflowRunIdsByWorkspace.get("archived")).toBe(await read);
+      expect(internals.workflowRuns.activeWorkflowRunIdsByWorkspace.get("archived")).toBe(
+        await read
+      );
       // Dormant stores are never scanned on either path.
       expect(scanSpy).not.toHaveBeenCalled();
     } finally {
@@ -556,12 +560,14 @@ describe("WorkspaceService activity list scoping", () => {
         extensionMetadata,
       });
       const internals = workspaceService as unknown as {
-        getActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>>;
+        workflowRuns: { getActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> };
         evictWorkspaceActivityCaches(workspaceId: string): void;
       };
-      const realGetActiveWorkflowRunIds = internals.getActiveWorkflowRunIds.bind(workspaceService);
+      const realGetActiveWorkflowRunIds = internals.workflowRuns.getActiveWorkflowRunIds.bind(
+        internals.workflowRuns
+      );
       let evicted = false;
-      internals.getActiveWorkflowRunIds = async (targetWorkspaceId: string) => {
+      internals.workflowRuns.getActiveWorkflowRunIds = async (targetWorkspaceId: string) => {
         const result = await realGetActiveWorkflowRunIds(targetWorkspaceId);
         if (!evicted && targetWorkspaceId === workspaceId) {
           evicted = true;
@@ -1113,9 +1119,9 @@ describe("WorkspaceService activity list scoping", () => {
       const first = await workspaceService.getActivityList();
       expect(first?.[workspaceId]?.recency).toBe(42);
       const internals = workspaceService as unknown as {
-        activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>>;
+        workflowRuns: { activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>> };
       };
-      expect(internals.activeWorkflowRunIdsByWorkspace.has(workspaceId)).toBe(true);
+      expect(internals.workflowRuns.activeWorkflowRunIdsByWorkspace.has(workspaceId)).toBe(true);
       // Another backend removes the workspace between the second list's
       // initial and fresh raw reads (its metadata cleanup may lag).
       const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
@@ -1132,7 +1138,7 @@ describe("WorkspaceService activity list scoping", () => {
       try {
         const second = await workspaceService.getActivityList();
         expect(second?.[workspaceId]).toBeUndefined();
-        expect(internals.activeWorkflowRunIdsByWorkspace.has(workspaceId)).toBe(false);
+        expect(internals.workflowRuns.activeWorkflowRunIdsByWorkspace.has(workspaceId)).toBe(false);
       } finally {
         snapshotsSpy.mockRestore();
       }
@@ -2101,7 +2107,7 @@ describe("WorkspaceService activity list scoping", () => {
         ),
       });
       const internals = workspaceService as unknown as {
-        getActiveWorkflowRunIds(id: string): Promise<Set<string>>;
+        workflowRuns: { getActiveWorkflowRunIds(id: string): Promise<Set<string>> };
         evictWorkspaceActivityCaches(id: string): void;
       };
       const releaseFirstScan = createDeferred<void>();
@@ -2125,7 +2131,7 @@ describe("WorkspaceService activity list scoping", () => {
         return [];
       });
 
-      const read = internals.getActiveWorkflowRunIds(workspaceId);
+      const read = internals.workflowRuns.getActiveWorkflowRunIds(workspaceId);
       // Removal + re-registration land while the bootstrap is parked.
       internals.evictWorkspaceActivityCaches(workspaceId);
       releaseFirstScan.resolve();

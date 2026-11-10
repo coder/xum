@@ -16,9 +16,8 @@ export {
  * turns. Rendering it from chat.jsonl keeps the system prompt (the cached prefix) byte-stable and
  * lets replay rebuild the request with no extra envelope field.
  *
- * The blocks go inside the row's first text part: mergeConsecutiveUserMessages keeps only the
- * first text part of each message, so a separate or later part (an inlined SVG attachment) would
- * be dropped when this row merges with a neighbour.
+ * The blocks go inside the row's first text part, so they stay at the start of the row's text
+ * when it merges with a neighbour (mergeConsecutiveUserMessages keeps each row's parts in order).
  * A rendered row drops the metadata field, so a second pass renders nothing: the token-budget
  * history-ID tag must stay last, so the request assembler renders before it tags.
  *

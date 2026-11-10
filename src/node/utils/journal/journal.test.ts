@@ -193,3 +193,68 @@ describe("Journal", () => {
     expect(ok.seq).toBe(0);
   });
 });
+
+// Each test kills a mutant that the phase 4 mutation runs left alive (#7475).
+describe("Journal option bounds and append sizes", () => {
+  const options = (filePath: string, appendLockTimeoutMs?: number) => ({
+    filePath,
+    schema: RowSchema,
+    getSeq: (row: Row) => row.seq,
+    getId: (row: Row) => row.id,
+    appendLockTimeoutMs,
+  });
+
+  test("the constructor rejects an empty path and a zero lock timeout", () => {
+    expect(() => new Journal<Row>(options(""))).toThrow("Journal requires a file path");
+    expect(() => new Journal<Row>(options("j", 0))).toThrow(
+      "Journal appendLockTimeoutMs must be positive"
+    );
+    // One character and one millisecond are the smallest valid values.
+    expect(() => new Journal<Row>(options("j", 1))).not.toThrow();
+  });
+
+  // #7474: a late append into a removed session dir must fail and must not recreate it.
+  test("createParentDir false fails with ENOENT and leaves a removed folder removed", async () => {
+    using tmp = new DisposableTempDir("journal-test");
+    const dir = path.join(tmp.path, "session");
+    const journal = new Journal<Row>(options(path.join(dir, "test.jsonl")));
+    await journal.append((seq) => ({ seq, id: "a", value: "first" }));
+    // Workspace removal deletes the session dir under a slow writer.
+    await fs.rm(dir, { recursive: true, force: true });
+    const failure = await journal
+      .append((seq) => ({ seq, id: "b", value: "late" }), { createParentDir: false })
+      .then(
+        () => "resolved",
+        (error: unknown) => (error as NodeJS.ErrnoException).code
+      );
+    expect(failure).toBe("ENOENT");
+    expect(
+      await fs.stat(dir).then(
+        () => "exists",
+        () => "missing"
+      )
+    ).toBe("missing");
+    // The default still creates the folder.
+    const row = await journal.append((seq) => ({ seq, id: "c", value: "again" }));
+    expect(row.seq).toBe(0);
+    expect((await fs.stat(dir)).isDirectory()).toBe(true);
+  });
+
+  test("onAppended reports the file size after each append", async () => {
+    using tmp = new DisposableTempDir("journal-test");
+    const filePath = path.join(tmp.path, "test.jsonl");
+    const sizes: Array<{ preAppendFileSize: number; postAppendFileSize: number }> = [];
+    const journal = new Journal<Row>({
+      ...options(filePath),
+      onAppended: (_row, observed) => sizes.push(observed),
+    });
+    await journal.append((seq) => ({ seq, id: "a", value: "first" }));
+    const afterFirst = (await fs.stat(filePath)).size;
+    await journal.append((seq) => ({ seq, id: "b", value: "second" }));
+    const afterSecond = (await fs.stat(filePath)).size;
+    expect(sizes).toEqual([
+      { preAppendFileSize: 0, postAppendFileSize: afterFirst },
+      { preAppendFileSize: afterFirst, postAppendFileSize: afterSecond },
+    ]);
+  });
+});

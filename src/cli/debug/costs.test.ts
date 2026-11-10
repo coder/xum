@@ -68,6 +68,23 @@ describe("costsCommand", () => {
     );
   });
 
+  it("withholds review-pane and git-patch tools for scratch workspaces", async () => {
+    spyOn(defaultConfig, "findWorkspace").mockReturnValue({
+      workspacePath: "/tmp/ws",
+      projectPath: "/tmp/proj",
+      kind: "scratch",
+    });
+
+    await costsCommand("scratch-workspace");
+
+    expect(calculateStatsSpy).toHaveBeenCalledWith(
+      expect.any(Array),
+      expect.any(String),
+      null,
+      expect.objectContaining({ enableReviewPane: false, enableGitPatches: false })
+    );
+  });
+
   it("passes enableAgentReport false when workspace not found", async () => {
     spyOn(defaultConfig, "findWorkspace").mockReturnValue(null);
 

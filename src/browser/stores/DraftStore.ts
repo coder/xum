@@ -1,3 +1,4 @@
+import assert from "@/common/utils/assert";
 import { useSyncExternalStore } from "react";
 import type { APIClient } from "@/browser/contexts/API";
 import type {
@@ -11,30 +12,31 @@ import {
 } from "@/browser/hooks/usePersistedState";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
-  getDraftScopeId,
   getInputAttachmentsKey,
   getInputKey,
-  getPendingScopeId,
   getProjectScopeId,
   GLOBAL_SCOPE_ID,
-  WORKSPACE_DRAFTS_BY_PROJECT_KEY,
 } from "@/common/constants/storage";
-import { migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import type {
   BasisSend,
   DraftAttachment,
   DraftAttachmentMetadata,
   DraftEvent,
-  DraftList,
-  DraftListEntry,
   DraftScope,
   DraftSummary,
   DraftWriteOutput,
   PendingSend,
+  LocalTake,
   SendStatus,
 } from "@/common/orpc/schemas/drafts";
 import type { FilePart } from "@/common/orpc/types";
-import { hasDraftBlock, joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
+import {
+  hasDraftBlock,
+  joinDraftText,
+  removeSentText,
+  takeSentText,
+  type SendTake,
+} from "@/common/utils/composerDraftText";
 import {
   draftJsonBytes,
   draftScopeKey,
@@ -45,12 +47,7 @@ import {
   toDraftAttachmentMetadata,
 } from "@/common/utils/drafts";
 import { getErrorMessage } from "@/common/utils/errors";
-import {
-  DEFAULT_CREATION_DRAFT_ID,
-  DRAFT_ID_PATTERN,
-  DRAFT_STORE_READY_TIMEOUT_MS,
-  MAX_DRAFT_JSON_BYTES,
-} from "@/constants/drafts";
+import { DRAFT_STORE_READY_TIMEOUT_MS, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 
 /**
  * Frontend cache for composer drafts persisted by the backend DraftService (they used to live in
@@ -77,24 +74,6 @@ export interface PendingDraftScope {
 }
 
 export type DraftStoreScope = DraftScope | PendingDraftScope;
-
-/**
- * Draft id a legacy pending-scope draft is imported under. Fixed (not generated) so that an
- * import retried on a later start (see migrateLegacyDrafts) finds its earlier copy ("present")
- * instead of creating a second draft. Generated ids are UUIDs, so this never collides.
- */
-const LEGACY_PENDING_DRAFT_ID = "legacy-pending";
-
-/**
- * The scope the project's default creation composer edits. It is a real backend scope: on main
- * this text survived a reload in localStorage, and a memory-only scope lost it. WorkspaceContext
- * moves it into the first listed creation draft it creates (moveDraft).
- */
-export function defaultCreationDraftScope(projectPath: string): DraftStoreScope {
-  return projectPath.length > 0
-    ? { kind: "creation", projectPath, draftId: DEFAULT_CREATION_DRAFT_ID }
-    : { kind: "pending", projectPath };
-}
 
 export interface DraftView {
   /** The visible text (without the text pending sends retain). */
@@ -206,6 +185,16 @@ interface Entry {
    */
   basisSends: Map<string, BasisSend>;
   /**
+   * #6405: the composer text at Enter (`sent`) while its send has not taken it. `last` is the
+   * text the latest setText wrote; `intact` stays true while every edit since Enter came through
+   * setText and appended to the text before it (keys typed after `sent`). Only then does the take cut
+   * exactly that prefix: a replaced or restored text keeps the whitespace rule (removeSentText).
+   * `edited` (#6585): the user edited the composer since Enter other than by typing at its end,
+   * which the text alone cannot show (a select-all paste can look like typing). Then the take
+   * removes nothing (see SendTake).
+   */
+  sendMark: { sent: string; last: string; intact: boolean; edited: boolean } | null;
+  /**
    * The newest server view (any push, snapshot or write reply). A field with an unsaved edit
    * keeps the edit; once its write is confirmed, the field takes this view.
    */
@@ -219,6 +208,8 @@ interface Entry {
 }
 
 const FLUSH_DEBOUNCE_MS = 300;
+/** No snapshot of the current client: its wait timed out or failed (cold start or reconnect). */
+const DRAFTS_NOT_LOADED = "Draft save failed: drafts are not loaded";
 const RETRY_BASE_MS = 250;
 const RETRY_MAX_MS = 5_000;
 const EMPTY_VIEW: DraftView = {
@@ -235,12 +226,105 @@ const SEND_RETRY_MAX_MS = 16_000;
 const PENDING_SCOPE_PREFIX = "__pending__";
 const DRAFT_SCOPE_PREFIX = "__draft__/";
 
-function retryDelayMs(attempt: number): number {
+export function retryDelayMs(attempt: number): number {
   return Math.min(RETRY_BASE_MS * 2 ** attempt, RETRY_MAX_MS);
 }
 
 export function draftStoreScopeKey(scope: DraftStoreScope): string {
   return scope.kind === "pending" ? `pending:${scope.projectPath}` : draftScopeKey(scope);
+}
+
+/** A one-shot readiness signal (DraftStore.release); settling twice keeps the first outcome. */
+interface Release {
+  /** After setClient(null): no client to wait for, so waiters reject at once. */
+  readonly disconnected: boolean;
+  readonly promise: Promise<"ready" | "changed">;
+  readonly settled: boolean;
+  settle(outcome: "ready" | "changed"): void;
+}
+
+function createRelease(disconnected = false): Release {
+  let resolve: (outcome: "ready" | "changed") => void = () => undefined;
+  const promise = new Promise<"ready" | "changed">((res) => {
+    resolve = res;
+  });
+  const release = {
+    disconnected,
+    promise,
+    settled: false,
+    settle(outcome: "ready" | "changed") {
+      if (release.settled) return;
+      release.settled = true;
+      resolve(outcome);
+    },
+  };
+  return release;
+}
+
+/**
+ * Waits until the release that `current` returns is ready and still current: a replaced release
+ * hands the wait to the one after it. Rejects on a disconnected release (no client to wait for).
+ */
+async function awaitCurrentRelease(current: () => Release): Promise<void> {
+  for (;;) {
+    const release = current();
+    if (release.disconnected) throw new Error("Draft save failed: not connected");
+    const outcome = await release.promise;
+    if (outcome === "ready" && current() === release) return;
+  }
+}
+
+/** Marks the field versions a confirmed write sent as saved (only the fields it wrote). */
+function confirmWrite(
+  entry: Entry,
+  wrote: { text: boolean; attachments: boolean },
+  versions: { text: number; attachments: number }
+): void {
+  if (wrote.text) {
+    entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, versions.text);
+  }
+  if (wrote.attachments) {
+    entry.confirmedAttachmentsVersion = Math.max(
+      entry.confirmedAttachmentsVersion,
+      versions.attachments
+    );
+  }
+}
+
+/**
+ * A local edit to `next` keeps the send mark only if it appends to the text the mark last saw
+ * (so the sent text stays its prefix). A delete or a replace ends it.
+ */
+function followSendMark(entry: Entry, next: string): void {
+  const mark = entry.sendMark;
+  if (!mark) return;
+  mark.intact &&= entry.text === mark.last && next.startsWith(mark.last);
+  mark.last = next;
+}
+
+/** The take a send's mark allows for `sent` when the composer holds `text` (see SendTake). */
+function sendTakeOf(mark: Entry["sendMark"], sent: string, text: string | undefined): SendTake {
+  if (mark?.sent !== sent) return "unknown";
+  if (mark.edited) return "edited";
+  return mark.intact && mark.last === text ? "typed-after" : "unknown";
+}
+
+/**
+ * The sender's own take, for the backend to repeat on the same text (DraftBeginSendInput). The
+ * text goes once: as `text` when it is unsaved, else as `from`.
+ */
+function localTakeField(
+  take: SendTake,
+  from: string,
+  unsavedText: string | undefined
+): { localTake?: LocalTake } {
+  if (take === "unknown") return {};
+  return { localTake: { kind: take, ...(unsavedText === undefined ? { from } : {}) } };
+}
+
+function cancelScheduledFlush(entry: Entry): void {
+  if (entry.flushTimer) clearTimeout(entry.flushTimer);
+  entry.flushTimer = null;
 }
 
 function isTextDirty(entry: Entry): boolean {
@@ -371,21 +455,8 @@ function matchesServerAttachments(
  * Map a legacy localStorage scope id (getDraftScopeId/getPendingScopeId/workspace id) to the
  * store scope that now owns it. Null for ids that never held a draft of a known kind.
  */
-function legacyScopeFor(scopeId: string): DraftStoreScope | null {
-  if (scopeId.startsWith(PENDING_SCOPE_PREFIX)) {
-    const projectPath = scopeId.slice(PENDING_SCOPE_PREFIX.length);
-    return projectPath.length > 0 ? { kind: "pending", projectPath } : null;
-  }
-  if (scopeId.startsWith(DRAFT_SCOPE_PREFIX)) {
-    const rest = scopeId.slice(DRAFT_SCOPE_PREFIX.length);
-    const separator = rest.lastIndexOf("/");
-    const projectPath = rest.slice(0, separator);
-    const draftId = rest.slice(separator + 1);
-    return separator > 0 && DRAFT_ID_PATTERN.test(draftId)
-      ? { kind: "creation", projectPath, draftId }
-      : null;
-  }
-  // Other ids are workspace ids, including legacy `<project basename>-<branch>` ids that start
+function legacyScopeFor(scopeId: string): DraftScope | null {
+  // Ids are workspace ids, including legacy `<project basename>-<branch>` ids that start
   // with "__" (the backend answers "orphaned" for unknown ones). Only reserved scopes are skipped.
   if (
     scopeId.length === 0 ||
@@ -412,66 +483,6 @@ function readLegacyJson(key: string): unknown {
   }
 }
 
-/** A listed creation draft (a sidebar row under its project); see DraftListEntrySchema. */
-export interface WorkspaceDraft {
-  draftId: string;
-  subProjectPath: string | null;
-  createdAt: number;
-}
-
-export type CreationDraftsByProject = Record<string, WorkspaceDraft[]>;
-
-interface PendingListPut {
-  entry: DraftListEntry;
-  attempt: number;
-  /** List revision of the backend's reply; the put is done once the list reached it. */
-  confirmedRevision: number | null;
-  /** The request in flight: one at a time per draft, so an older value never lands last. */
-  sending: Promise<void> | null;
-}
-
-function listEntryKey(entry: { projectPath: string; draftId: string }): string {
-  return draftScopeKey({
-    kind: "creation",
-    projectPath: entry.projectPath,
-    draftId: entry.draftId,
-  });
-}
-
-/** Parse the legacy `workspaceDraftsByProject` value; malformed entries are dropped. */
-function parseLegacyDraftList(raw: unknown): DraftListEntry[] {
-  if (typeof raw !== "object" || raw === null) return [];
-  const entries: DraftListEntry[] = [];
-  for (const [projectPath, drafts] of Object.entries(raw as Record<string, unknown>)) {
-    if (projectPath.length === 0 || !Array.isArray(drafts)) continue;
-    for (const draft of drafts as unknown[]) {
-      const record = draft as { draftId?: unknown; subProjectPath?: unknown; createdAt?: unknown };
-      if (
-        typeof record !== "object" ||
-        record === null ||
-        typeof record.draftId !== "string" ||
-        !DRAFT_ID_PATTERN.test(record.draftId) ||
-        record.draftId === DEFAULT_CREATION_DRAFT_ID ||
-        typeof record.createdAt !== "number" ||
-        !Number.isFinite(record.createdAt)
-      ) {
-        continue;
-      }
-      const subProjectPath =
-        typeof record.subProjectPath === "string" && record.subProjectPath.trim().length > 0
-          ? record.subProjectPath
-          : null;
-      entries.push({
-        projectPath,
-        draftId: record.draftId,
-        subProjectPath,
-        createdAt: record.createdAt,
-      });
-    }
-  }
-  return entries;
-}
-
 export class DraftStore {
   private client: APIClient | null = null;
   private readonly entries = new Map<string, Entry>();
@@ -485,20 +496,13 @@ export class DraftStore {
    */
   private readonly pendingDeletes = new Map<string, DraftScope>();
   /**
-   * The creation draft list (sidebar rows), owned by the backend (drafts/list.json). The view
-   * overlays puts the list has not reflected yet and hides pending deletes.
+   * Deletes still waiting for a write or list put of their scope to land (count per scope key).
+   * The backend pushes that write's change event, and it can arrive before the write's reply:
+   * applied, it would recreate the dropped entry, and the delete would take it for a new edit and
+   * give up, leaving the draft file behind (#6724). Server state for such a key must not recreate
+   * its entry. A local edit during the wait recreates it, and then server state applies as usual.
    */
-  private serverList: DraftListEntry[] = [];
-  private serverListRevision = Number.NEGATIVE_INFINITY;
-  private readonly pendingListPuts = new Map<string, PendingListPut>();
-  /**
-   * The legacy localStorage list, shown (where the backend list lacks an entry) until its import
-   * is reflected, or for the whole session when the import failed (the next start retries).
-   */
-  private legacyListFallback: DraftListEntry[] = [];
-  private legacyListFallbackRevision: number | null = null;
-  private creationDrafts: CreationDraftsByProject = {};
-  private readonly listListeners = new Set<() => void>();
+  private readonly deletesAwaitingWrites = new Map<string, number>();
   private readyTimer: ReturnType<typeof setTimeout> | null = null;
   private subscription: AbortController | null = null;
   /** Idempotent sends, per workspace draft key (see SendTracking). */
@@ -507,14 +511,23 @@ export class DraftStore {
   private receiver: { client: APIClient; receiverId: string } | null = null;
   private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
   private resubscribeAttempt = 0;
-  /** A real snapshot was applied: writes may go out (they could clobber unseen data before). */
+  /** A real snapshot was applied once (composers and the draft GC read this; never reset). */
   private hydrated = false;
+  /**
+   * The client whose snapshot (and legacy import) this store applied: writes go only to it. A
+   * new client may reach another backend, and a write before its snapshot could clobber drafts
+   * the store has not seen yet (#6542). Separate from `hydrated`, which other readers use.
+   */
+  private snapshotClient: APIClient | null = null;
   /** Composers may render: hydrated, or the first subscription failed (self-heal). */
   private ready = false;
-  private resolveReady: () => void = () => undefined;
-  private readonly readyPromise = new Promise<void>((resolve) => {
-    this.resolveReady = resolve;
-  });
+  /**
+   * The current client's readiness: its snapshot opened writes, or the wait for it timed out or
+   * failed (self-heal), as for the first client on a cold start. whenReady, flush and beginSend
+   * wait for it, so after a reconnect they wait for the new client's snapshot instead of seeing
+   * an earlier client's readiness (#6748). Replaced (settled "changed") on every client change.
+   */
+  private release = createRelease();
 
   /** Delay before automatic send retry `attempt` (bounded backoff; injectable for tests). */
   private readonly sendRetryDelayMs: (attempt: number) => number;
@@ -535,8 +548,14 @@ export class DraftStore {
   setClient(client: APIClient | null): void {
     if (client === this.client) return;
     this.client = client;
-    // A new connection may reach another backend process: ask for its receiver id again.
+    // A new connection may reach another backend process: ask for its receiver id again, and
+    // hold writes until its snapshot (canWrite). Edits stay in memory; the snapshot saves them.
     this.receiver = null;
+    this.snapshotClient = null;
+    // Waiters follow the new client (whenReady).
+    const replaced = this.release;
+    this.release = createRelease(client === null);
+    replaced.settle("changed");
     // A retry scheduled for the old connection must not outlive it; the new connection's
     // snapshot resolves the entries again and re-arms retries.
     for (const tracking of this.sendTracking.values()) {
@@ -561,8 +580,13 @@ export class DraftStore {
     return () => this.readyListeners.delete(listener);
   };
 
+  /**
+   * Resolves once the current client is ready (see `release`). Before the first client it waits
+   * for one; it follows a client change while waiting, and rejects once the client is removed
+   * (setClient(null)).
+   */
   whenReady(): Promise<void> {
-    return this.readyPromise;
+    return awaitCurrentRelease(() => this.release);
   }
 
   subscribe = (scope: DraftStoreScope, listener: () => void): (() => void) => {
@@ -586,119 +610,6 @@ export class DraftStore {
       set.delete(listener);
       if (set.size === 0) this.errorListeners.delete(key);
     };
-  }
-
-  subscribeCreationDrafts = (listener: () => void): (() => void) => {
-    this.listListeners.add(listener);
-    return () => this.listListeners.delete(listener);
-  };
-
-  /** Listed creation drafts by project, in list order (a stable reference between changes). */
-  getCreationDraftsByProject(): CreationDraftsByProject {
-    return this.creationDrafts;
-  }
-
-  /**
-   * List a creation draft, or change a listed draft's sub-project. Shown at once; sent (and
-   * retried) until the backend confirms.
-   */
-  putCreationDraft(projectPath: string, draft: WorkspaceDraft): void {
-    const entry: DraftListEntry = { projectPath, ...draft };
-    const key = listEntryKey(entry);
-    let pending = this.pendingListPuts.get(key);
-    if (pending) {
-      // A request in flight sends this value once it settles (see sendListPut).
-      pending.entry = entry;
-      pending.confirmedRevision = null;
-    } else {
-      pending = { entry, attempt: 0, confirmedRevision: null, sending: null };
-      this.pendingListPuts.set(key, pending);
-    }
-    this.recomputeList();
-    this.startListPut(key, pending);
-  }
-
-  private startListPut(key: string, pending: PendingListPut): void {
-    if (pending.sending) return;
-    const sending = this.sendListPut(key, pending).finally(() => {
-      if (pending.sending === sending) pending.sending = null;
-    });
-    pending.sending = sending;
-  }
-
-  /** Never rejects. */
-  private async sendListPut(key: string, pending: PendingListPut): Promise<void> {
-    const client = this.client;
-    // Puts wait for hydration: the legacy list import runs first, and the first import (before a
-    // list.json exists) also lists orphaned draft bodies. The snapshot handler resends.
-    if (!client || !this.hydrated || this.pendingListPuts.get(key) !== pending) return;
-    const sent = pending.entry;
-    try {
-      const { revision } = await client.drafts.putListEntry(sent);
-      if (this.pendingListPuts.get(key) !== pending) return;
-      // Changed while in flight: send the latest value (still one request at a time).
-      if (pending.entry !== sent) return await this.sendListPut(key, pending);
-      pending.confirmedRevision = revision;
-      this.settleList();
-    } catch (error) {
-      console.warn("Failed to list a creation draft; retrying:", error);
-      // Retried through whichever client is current: a reconnect's resend was skipped while this
-      // request was in flight.
-      setTimeout(() => this.startListPut(key, pending), retryDelayMs(pending.attempt++));
-    }
-  }
-
-  private applyList(list: DraftList): void {
-    this.serverList = list.entries;
-    this.serverListRevision = list.revision;
-    this.settleList();
-  }
-
-  /** Drop overlays the backend list now reflects, then recompute the view. */
-  private settleList(): void {
-    for (const [key, pending] of this.pendingListPuts) {
-      if (
-        pending.confirmedRevision !== null &&
-        pending.confirmedRevision <= this.serverListRevision
-      ) {
-        this.pendingListPuts.delete(key);
-      }
-    }
-    if (
-      this.legacyListFallbackRevision !== null &&
-      this.legacyListFallbackRevision <= this.serverListRevision
-    ) {
-      this.legacyListFallback = [];
-      this.legacyListFallbackRevision = null;
-    }
-    this.recomputeList();
-  }
-
-  private recomputeList(): void {
-    const merged = new Map<string, DraftListEntry>();
-    for (const entry of this.serverList) merged.set(listEntryKey(entry), entry);
-    for (const entry of this.legacyListFallback) {
-      const key = listEntryKey(entry);
-      if (!merged.has(key)) merged.set(key, entry);
-    }
-    for (const [key, { entry }] of this.pendingListPuts) merged.set(key, entry);
-    for (const key of this.pendingDeletes.keys()) merged.delete(key);
-    const byProject: CreationDraftsByProject = {};
-    for (const { projectPath, ...draft } of merged.values()) {
-      (byProject[projectPath] ??= []).push(draft);
-    }
-    this.creationDrafts = byProject;
-    for (const listener of this.listListeners) listener();
-  }
-
-  /** Drop a creation draft from the local list (the backend delete delists it too). */
-  private dropListEntry(key: string): void {
-    this.pendingListPuts.delete(key);
-    this.serverList = this.serverList.filter((entry) => listEntryKey(entry) !== key);
-    this.legacyListFallback = this.legacyListFallback.filter(
-      (entry) => listEntryKey(entry) !== key
-    );
-    this.recomputeList();
   }
 
   getView(scope: DraftStoreScope): DraftView {
@@ -760,10 +671,35 @@ export class DraftStore {
     const entry = this.getOrCreateEntry(scope);
     const next = typeof value === "function" ? value(entry.text) : value;
     if (next === entry.text) return;
+    followSendMark(entry, next);
     entry.text = next;
     entry.textVersion++;
     this.recompute(entry);
     this.scheduleFlush(entry);
+  }
+
+  /** #6405: Enter on `text`; keys typed until its send takes it follow it (see Entry.sendMark). */
+  markSendStart(scope: DraftStoreScope, text: string): void {
+    const entry = this.getOrCreateEntry(scope);
+    entry.sendMark = { sent: text, last: entry.text, intact: entry.text === text, edited: false };
+  }
+
+  /**
+   * #6585: the user edited the composer other than by typing at its end. A send not yet taken
+   * then removes nothing from it (see Entry.sendMark).
+   */
+  markSendEdited(scope: DraftStoreScope): void {
+    const mark = this.entries.get(draftStoreScopeKey(scope))?.sendMark;
+    if (mark) mark.edited = true;
+  }
+
+  /** How the send of `sent` takes its text (SendTake). Ends the mark: one take per Enter. */
+  takeSendMark(scope: DraftStoreScope, sent: string): SendTake {
+    const entry = this.entries.get(draftStoreScopeKey(scope));
+    if (!entry) return "unknown";
+    const mark = entry.sendMark;
+    entry.sendMark = null;
+    return sendTakeOf(mark, sent, entry.text);
   }
 
   /**
@@ -881,19 +817,22 @@ export class DraftStore {
 
   /**
    * Resolves once the backend confirmed the scope's current text and attachments (the #4448
-   * restore ack waits for this). Rejects when a write fails or the drafts never hydrated; the
-   * change stays in memory and is retried.
+   * restore ack waits for this). Waits for the current client's snapshot like a cold start waits
+   * for the first one, also after a reconnect (#6748). Rejects when a write fails, the wait for
+   * the snapshot timed out or failed, or the client is removed meanwhile; the change stays in
+   * memory and is retried.
    */
   async flush(scope: DraftStoreScope): Promise<void> {
     if (scope.kind === "pending") return;
-    const entry = this.entries.get(draftStoreScopeKey(scope));
+    const key = draftStoreScopeKey(scope);
+    if (!this.entries.has(key)) return;
+    await this.whenReady();
+    if (!this.canWrite(this.client)) throw new Error(DRAFTS_NOT_LOADED);
+    // The entry after the wait: a delete and a new edit meanwhile replace it, and the new one is
+    // what the caller needs saved.
+    const entry = this.entries.get(key);
     if (!entry) return;
-    if (entry.flushTimer) {
-      clearTimeout(entry.flushTimer);
-      entry.flushTimer = null;
-    }
-    await this.readyPromise;
-    if (!this.hydrated) throw new Error("Draft save failed: drafts are not loaded");
+    cancelScheduledFlush(entry);
     // An attachment update waiting for the payloads is not saved yet: apply it (by loading them)
     // first, so this never confirms a draft without it. A failed load rejects.
     if (entry.queuedAttachmentUpdates.length > 0) await this.ensurePayloads(scope);
@@ -911,9 +850,9 @@ export class DraftStore {
     input: BeginSendInput
   ): Promise<void> {
     const key = draftScopeKey(scope);
-    await this.readyPromise;
+    await this.whenReady();
     const client = this.client;
-    if (!client || !this.hydrated) throw new Error("Draft save failed: drafts are not loaded");
+    if (!this.canWrite(client)) throw new Error(DRAFTS_NOT_LOADED);
     const entry = this.getOrCreateEntry(scope);
     const tracking = this.trackingFor(key);
     // From now until the send's reply this window never looks the id up (see SendTracking).
@@ -941,6 +880,10 @@ export class DraftStore {
       };
       const textBefore = entry.text;
       const unsavedText = isTextDirty(entry) ? textBefore : undefined;
+      // #6405: keys typed after Enter follow the sent text, and the take cuts exactly that prefix
+      // (takeSentText). The backend repeats this take only on this same text (saved or not),
+      // never on a newer one another window wrote.
+      const take = this.takeSendMark(scope, input.text);
       const missing = input.attachments.filter(
         (sent) => !entry.attachments.some(({ id }) => id === sent.id)
       );
@@ -951,7 +894,7 @@ export class DraftStore {
         entry.attachments = [...entry.attachments, ...missing];
         entry.attachmentCount += missing.length;
       }
-      const textAfter = removeSentText(textBefore, input.text);
+      const textAfter = takeSentText(textBefore, input.text, take);
       if (textAfter !== textBefore) {
         entry.text = textAfter;
         entry.textVersion++;
@@ -970,8 +913,13 @@ export class DraftStore {
           pendingSend,
           attachments: input.attachments,
           ...(unsavedText !== undefined ? { text: unsavedText } : {}),
+          ...localTakeField(take, textBefore, unsavedText),
           ...(basisSends.length > 0 ? { basisSends } : {}),
         });
+        // A replaced backend's reply: the current one holds neither the removal nor the
+        // pending send, so handle it as a lost reply below (the text comes back and is saved
+        // to the current backend, and the caller does not send) (#6438).
+        this.assertCurrentClient(client);
         // The backend took the same text out of the same (or this window's unsaved) text.
         entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, removalVersion);
         entry.localSends.delete(pendingSend.sendId);
@@ -991,7 +939,10 @@ export class DraftStore {
           attachmentIds: pendingSend.attachmentIds,
           undone: true,
         });
-        if (entry.text !== textBefore && removeSentText(entry.text, input.text) === entry.text) {
+        // Put the text back unless the composer holds it again as a whole block: keys can be
+        // typed during this request (#6405), so a text that merely starts with it ("okay" after
+        // "ok") gets it back beside it.
+        if (textAfter !== textBefore && !hasDraftBlock(entry.text, input.text)) {
           entry.text = joinDraftText(input.text, entry.text);
           entry.textVersion++;
         }
@@ -1327,16 +1278,20 @@ export class DraftStore {
     const key = draftStoreScopeKey(scope);
     const entry = this.dropEntry(key);
     if (scope.kind === "pending") return;
-    const listPut = this.pendingListPuts.get(key)?.sending;
-    if (scope.kind === "creation") this.dropListEntry(key);
     // Let a write in flight land first, so it cannot recreate the file after the delete; the same
     // for a list put, which would relist the draft.
-    await entry?.inFlight;
-    await listPut;
+    this.deletesAwaitingWrites.set(key, (this.deletesAwaitingWrites.get(key) ?? 0) + 1);
+    try {
+      await entry?.inFlight;
+    } finally {
+      const waiting = this.deletesAwaitingWrites.get(key) ?? 0;
+      assert(waiting > 0, "deleteDraft: unbalanced wait count");
+      if (waiting === 1) this.deletesAwaitingWrites.delete(key);
+      else this.deletesAwaitingWrites.set(key, waiting - 1);
+    }
+    // Only a local edit meanwhile recreates the entry: it makes the draft live again, so keep it.
     if (this.entries.has(key)) return;
     this.pendingDeletes.set(key, scope);
-    // A list event while waiting above may have shown the row again; hide it now.
-    if (scope.kind === "creation") this.recomputeList();
     await this.sendDelete(key, 0);
   }
 
@@ -1348,8 +1303,6 @@ export class DraftStore {
     try {
       await client.drafts.delete({ scope });
       if (this.pendingDeletes.get(key) === scope) this.pendingDeletes.delete(key);
-      // The backend delisted it; a list event from before the delete must not show it again.
-      if (scope.kind === "creation") this.dropListEntry(key);
     } catch (error) {
       console.warn("Failed to delete draft; retrying:", error);
       setTimeout(() => {
@@ -1358,79 +1311,25 @@ export class DraftStore {
     }
   }
 
-  /**
-   * Move a draft to another scope (default creation draft -> listed creation draft). The source
-   * is deleted only once the backend confirmed the destination: if that write fails, both stay
-   * (the destination keeps retrying) rather than risking the only persisted copy. Never rejects.
-   */
-  async moveDraft(from: DraftStoreScope, to: DraftStoreScope): Promise<void> {
-    const key = draftStoreScopeKey(from);
-    const source = this.entries.get(key);
-    if (!source || (source.view.text.length === 0 && source.view.attachmentCount === 0)) return;
-    this.setText(to, source.text);
-    // Captured with the copy it describes: an edit during the payload load below must keep the
-    // source (the text was copied before it).
-    const textVersion = source.textVersion;
-    if (!source.payloadsLoaded) {
-      // A hydrated source may not have its attachment payloads yet. Deleting it before they
-      // arrive would lose the attachments, so move them once loaded; on failure the source stays.
-      try {
-        await this.ensurePayloads(from);
-      } catch (error) {
-        console.warn("Failed to load draft attachments to move; keeping the source draft:", error);
-        return;
-      }
-      if (this.entries.get(key) !== source || !source.payloadsLoaded) return;
-    }
-    if (source.attachments.length > 0) this.setAttachments(to, source.attachments);
-    const attachmentsVersion = source.attachmentsVersion;
-    try {
-      await this.flush(to);
-    } catch (error) {
-      console.warn("Failed to save the moved draft; keeping the source draft:", error);
-      return;
-    }
-    // An edit of the source meanwhile makes it a different draft: keep it.
-    if (
-      this.entries.get(key) !== source ||
-      source.textVersion !== textVersion ||
-      source.attachmentsVersion !== attachmentsVersion
-    ) {
-      return;
-    }
-    await this.deleteDraft(from);
-  }
-
   /** Drop local state of a removed workspace (its session dir, and draft, are gone). */
   forgetWorkspace(workspaceId: string): void {
     this.dropEntry(draftScopeKey({ kind: "workspace", workspaceId }));
   }
 
-  /** Drop local state of a removed project's creation drafts (the backend deletes the files). */
-  forgetProject(projectPath: string): void {
-    for (const [key, entry] of [...this.entries]) {
-      const scope = entry.scope;
-      if (scope.kind !== "workspace" && scope.projectPath === projectPath) this.dropEntry(key);
-    }
-    const otherProject = (entry: DraftListEntry) => entry.projectPath !== projectPath;
-    this.serverList = this.serverList.filter(otherProject);
-    this.legacyListFallback = this.legacyListFallback.filter(otherProject);
-    for (const [key, { entry }] of [...this.pendingListPuts]) {
-      if (!otherProject(entry)) this.pendingListPuts.delete(key);
-    }
-    this.recomputeList();
-  }
-
   private dropEntry(key: string): Entry | undefined {
     const entry = this.entries.get(key);
     if (!entry) return undefined;
-    if (entry.flushTimer) clearTimeout(entry.flushTimer);
-    entry.flushTimer = null;
+    cancelScheduledFlush(entry);
     if (entry.payloadRetryTimer) clearTimeout(entry.payloadRetryTimer);
     entry.payloadRetryTimer = null;
     this.entries.delete(key);
     this.notify(key);
     return entry;
+  }
+
+  /** True while a delete of `key` waits and no local edit has recreated its entry. */
+  private isDeletedWhileWaiting(key: string): boolean {
+    return this.deletesAwaitingWrites.has(key) && !this.entries.has(key);
   }
 
   private getOrCreateEntry(scope: DraftStoreScope): Entry {
@@ -1460,10 +1359,12 @@ export class DraftStore {
       pendingSends: [],
       localSends: new Map(),
       basisSends: new Map(),
+      sendMark: null,
       serverView: null,
       view: EMPTY_VIEW,
     };
-    if (this.pendingDeletes.delete(key)) {
+    // A delete still waiting for a write counts too: server state it skipped is not in the entry.
+    if (this.pendingDeletes.delete(key) || this.deletesAwaitingWrites.has(key)) {
       // Editing a scope whose delete is unconfirmed cancels that delete. Mark both fields
       // unconfirmed so the next write replaces the whole stored draft, not just the edited field.
       entry.textVersion = 1;
@@ -1537,9 +1438,9 @@ export class DraftStore {
 
   private markReady(): void {
     this.clearReadyTimer();
+    this.release.settle("ready");
     if (this.ready) return;
     this.ready = true;
-    this.resolveReady();
     for (const listener of this.readyListeners) listener();
   }
 
@@ -1617,9 +1518,11 @@ export class DraftStore {
   private applySnapshot(drafts: DraftSummary[]): void {
     const seen = new Set<string>();
     for (const summary of drafts) {
-      if (this.pendingDeletes.has(draftStoreScopeKey(summary.scope))) continue;
+      const summaryKey = draftStoreScopeKey(summary.scope);
+      if (this.pendingDeletes.has(summaryKey)) continue;
+      if (this.isDeletedWhileWaiting(summaryKey)) continue;
+      seen.add(summaryKey);
       const entry = this.getOrCreateEntry(summary.scope);
-      seen.add(draftStoreScopeKey(summary.scope));
       // Each subscription restarts the revision sequence, so a restarted backend is never ignored.
       entry.revision = summary.revision;
       this.applyServerState(entry, summary.text, summary.attachments, summary.pendingSends ?? []);
@@ -1634,7 +1537,7 @@ export class DraftStore {
 
   private applyEvent(event: Extract<DraftEvent, { type: "changed" | "deleted" }>): void {
     const key = draftScopeKey(event.scope);
-    if (this.pendingDeletes.has(key)) return;
+    if (this.pendingDeletes.has(key) || this.isDeletedWhileWaiting(key)) return;
     const existing = this.entries.get(key);
     // Pushes that trail a newer write reply (or the snapshot) are stale.
     const stale = existing !== undefined && event.revision <= existing.revision;
@@ -1658,13 +1561,15 @@ export class DraftStore {
     const controller = new AbortController();
     this.subscription = controller;
     const { signal } = controller;
-    if (!this.ready && !this.readyTimer) {
-      // Startup must never hang on drafts (a subscription that never yields, a stuck legacy
-      // import): let composers render after a bound. Writes still wait for hydration, and a late
-      // snapshot never overwrites a field with an unconfirmed local change.
+    this.forgetServerViews();
+    if (!this.release.settled && !this.readyTimer) {
+      // Startup (and a reconnect) must never hang on drafts (a subscription that never yields, a
+      // stuck legacy import): let composers render and waiting saves give up after a bound.
+      // Writes still wait for the snapshot, and a late snapshot never overwrites a field with an
+      // unconfirmed local change.
       this.readyTimer = setTimeout(() => {
         this.readyTimer = null;
-        if (this.ready) return;
+        if (this.release.settled) return;
         console.warn(
           `Drafts did not load within ${DRAFT_STORE_READY_TIMEOUT_MS} ms; continuing while they load`
         );
@@ -1682,30 +1587,14 @@ export class DraftStore {
           this.resubscribeAttempt = 0;
           if (event.type === "snapshot") {
             this.applySnapshot(event.drafts);
-            this.applyList(event.list);
             // Before `ready`: composers must not start editing a scope whose legacy draft is still
             // being imported (the import would then find a backend draft and drop it). Runs on
             // every (re)subscription: keys whose import failed are retried, and without keys the
             // scan is cheap.
             await this.migrateLegacyDrafts(client);
-            this.hydrated = true;
-            this.markReady();
-            for (const entry of this.entries.values()) this.scheduleFlush(entry);
-            for (const key of [...this.pendingDeletes.keys()]) {
-              this.sendDelete(key, 0).catch(() => undefined);
-            }
-            for (const [key, pending] of this.pendingListPuts) {
-              if (pending.confirmedRevision === null) this.startListPut(key, pending);
-            }
-            // Load and every reconnect (a new subscription): resolve every pending send.
-            for (const entry of this.entries.values()) {
-              if (entry.scope.kind === "workspace" && entry.pendingSends.length > 0) {
-                this.triggerSendResolution(entry.scope.workspaceId, { afterStop: true });
-              }
-            }
-          } else if (event.type === "list") {
-            // Pushes that trail a newer snapshot are stale.
-            if (event.revision > this.serverListRevision) this.applyList(event);
+            // A replaced run must not open writes for the client after it (#6542).
+            if (signal.aborted || this.client !== client) break;
+            this.openWrites(client);
           } else {
             this.applyEvent(event);
           }
@@ -1736,6 +1625,39 @@ export class DraftStore {
     run().catch((error: unknown) => console.error("Draft subscription failed:", error));
   }
 
+  /** `client`'s snapshot (and legacy import) applied: its writes may go out, held ones first. */
+  private openWrites(client: APIClient): void {
+    this.snapshotClient = client;
+    this.hydrated = true;
+    this.markReady();
+    for (const entry of this.entries.values()) this.scheduleFlush(entry);
+    for (const key of [...this.pendingDeletes.keys()]) {
+      this.sendDelete(key, 0).catch(() => undefined);
+    }
+    // Load and every reconnect (a new subscription): resolve every pending send.
+    for (const entry of this.entries.values()) {
+      if (entry.scope.kind === "workspace" && entry.pendingSends.length > 0) {
+        this.triggerSendResolution(entry.scope.workspaceId, { afterStop: true });
+      }
+    }
+  }
+
+  /**
+   * A subscription may reach another backend process (a new client, or a restarted backend),
+   * which numbers its revisions anew, possibly lower (its clock behind). The views and revisions
+   * of the backend before would outrank all of its replies and pushes, and put old text back
+   * over typing (#6438). Only the views: the composer keeps showing its fields, pending sends
+   * stay retained (`pendingSends`, `basisSends`), and unsaved edits keep winning over the
+   * snapshot (applyServerState). A write may go out before the new snapshot: with no view
+   * left, its reply is taken as it comes.
+   */
+  private forgetServerViews(): void {
+    for (const entry of this.entries.values()) {
+      entry.serverView = null;
+      entry.revision = Number.NEGATIVE_INFINITY;
+    }
+  }
+
   private stopSubscription(): void {
     this.clearReadyTimer();
     this.subscription?.abort();
@@ -1747,15 +1669,13 @@ export class DraftStore {
   }
 
   /**
-   * One-way migration of the legacy `input:<scope>` / `inputAttachments:<scope>` keys. The
-   * backend stores a draft only when it has none (another origin, whose localStorage is separate,
-   * may have imported or edited it already), and the keys are removed only after it answered.
-   * On failure they stay and the next start retries. Legacy pending-scope drafts become new
-   * creation drafts of their project, so the text stays visible; drafts of unknown workspaces or
-   * projects are dropped ("orphaned").
+   * One-way migration of the legacy workspace `input:<scope>` / `inputAttachments:<scope>` keys.
+   * The backend stores a draft only when it has none (another origin, whose localStorage is
+   * separate, may have imported or edited it already), and the keys are removed only after it
+   * answered. On failure they stay and the next start retries. Drafts of unknown workspaces are
+   * dropped ("orphaned"). Creation scopes' keys are CreationDraftStore's to import.
    */
   private async migrateLegacyDrafts(client: APIClient): Promise<void> {
-    await this.importLegacyDraftList(client);
     const inputPrefix = getInputKey("");
     const attachmentsPrefix = getInputAttachmentsKey("");
     let scopeIds: Set<string>;
@@ -1769,6 +1689,9 @@ export class DraftStore {
       return;
     }
     for (const scopeId of scopeIds) {
+      if (scopeId.startsWith(PENDING_SCOPE_PREFIX) || scopeId.startsWith(DRAFT_SCOPE_PREFIX)) {
+        continue;
+      }
       const inputKey = getInputKey(scopeId);
       const attachmentsKey = getInputAttachmentsKey(scopeId);
       const removeKeys = () => {
@@ -1778,19 +1701,11 @@ export class DraftStore {
       const text = readPersistedString(inputKey) ?? "";
       // Malformed entries are dropped (the rest still migrates); unparseable values read as none.
       const { attachments } = sanitizeDraftAttachments(readLegacyJson(attachmentsKey));
-      const legacyScope = legacyScopeFor(scopeId);
-      if (legacyScope === null || (text.length === 0 && attachments.length === 0)) {
+      const scope = legacyScopeFor(scopeId);
+      if (scope === null || (text.length === 0 && attachments.length === 0)) {
         removeKeys();
         continue;
       }
-      const scope: DraftScope =
-        legacyScope.kind === "pending"
-          ? {
-              kind: "creation",
-              projectPath: legacyScope.projectPath,
-              draftId: LEGACY_PENDING_DRAFT_ID,
-            }
-          : legacyScope;
       try {
         const reply = await client.drafts.importLegacy({ scope, text, attachments });
         if (reply.result === "applied") {
@@ -1804,66 +1719,6 @@ export class DraftStore {
               entry.payloadsLoaded = true;
             }
             this.recompute(entry);
-          }
-        }
-        if (legacyScope.kind === "pending" && scope.kind === "creation") {
-          if (reply.result !== "orphaned") {
-            // Only a list entry leads a composer to the imported draft. Both keys stay until it
-            // is listed, so a failed listing is retried on the next start (the fixed draft id
-            // makes the re-import find this copy, and listing is idempotent) (#5226 item 10).
-            const entry: DraftListEntry = {
-              projectPath: scope.projectPath,
-              draftId: scope.draftId,
-              subProjectPath: null,
-              createdAt: Date.now(),
-            };
-            try {
-              const listed = await client.drafts.putListEntry(entry);
-              const key = listEntryKey(entry);
-              if (!this.pendingListPuts.has(key)) {
-                this.pendingListPuts.set(key, {
-                  entry,
-                  attempt: 0,
-                  confirmedRevision: listed.revision,
-                  sending: null,
-                });
-                this.settleList();
-              }
-            } catch (error) {
-              console.warn(
-                "Could not list an imported legacy draft; will retry on next start:",
-                error
-              );
-              continue;
-            }
-          }
-          removeKeys();
-          if (reply.result !== "orphaned") {
-            // Scope-bound composer settings (model, workspace name...) follow the draft, as when
-            // createWorkspaceDraft moves the default draft. Best-effort: settings, not the draft.
-            try {
-              migrateWorkspaceStorage(
-                getPendingScopeId(scope.projectPath),
-                getDraftScopeId(scope.projectPath, scope.draftId)
-              );
-            } catch (error) {
-              console.warn("Failed to move legacy pending draft settings:", error);
-            }
-          }
-          continue;
-        }
-        if (scope.kind === "creation" && reply.result !== "orphaned") {
-          // Its row may have fallen out of the over-budget legacy list (#5225), and the list import
-          // above ran before this body existed on the backend. A legacy list import relists every
-          // owned body without a row; if it fails, the keys stay and the next start retries.
-          try {
-            await client.drafts.importLegacyList({ entries: [] });
-          } catch (error) {
-            console.warn(
-              "Could not list an imported legacy draft; will retry on next start:",
-              error
-            );
-            continue;
           }
         }
         removeKeys();
@@ -1883,30 +1738,6 @@ export class DraftStore {
     }
   }
 
-  /**
-   * One-way import of the legacy localStorage draft list (`workspaceDraftsByProject`, whose size
-   * budget dropped newer entries after a restart, #5225). The key is removed only after the
-   * backend answered; until then (or for this session, when the import fails) its entries are
-   * shown where the backend list lacks them. Downgrading after the import hides these drafts in
-   * the older build (their bodies stay on the backend) until the next upgrade.
-   */
-  private async importLegacyDraftList(client: APIClient): Promise<void> {
-    if (readPersistedString(WORKSPACE_DRAFTS_BY_PROJECT_KEY) === undefined) return;
-    // An unparseable value imports as empty (and is then removed): the import still runs, so a
-    // missing backend list is created and relists the draft bodies.
-    const entries = parseLegacyDraftList(readLegacyJson(WORKSPACE_DRAFTS_BY_PROJECT_KEY));
-    this.legacyListFallback = entries;
-    this.recomputeList();
-    try {
-      const { revision } = await client.drafts.importLegacyList({ entries });
-      updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, undefined);
-      this.legacyListFallbackRevision = revision;
-      this.settleList();
-    } catch (error) {
-      console.warn("Failed to import the legacy draft list; will retry on next start:", error);
-    }
-  }
-
   private scheduleFlush(entry: Entry): void {
     if (entry.scope.kind === "pending" || entry.flushTimer) return;
     if (!isTextDirty(entry) && !isAttachmentsDirty(entry)) return;
@@ -1917,17 +1748,14 @@ export class DraftStore {
   }
 
   private flushInBackground(entry: Entry): void {
-    if (!this.hydrated) return;
+    if (!this.canWrite(this.client)) return;
     // Failures already scheduled a retry inside drain().
     this.drain(entry).catch(() => undefined);
   }
 
   private flushAllInBackground(): void {
     for (const entry of this.entries.values()) {
-      if (entry.flushTimer) {
-        clearTimeout(entry.flushTimer);
-        entry.flushTimer = null;
-      }
+      cancelScheduledFlush(entry);
       if (isTextDirty(entry) || isAttachmentsDirty(entry)) this.flushInBackground(entry);
     }
   }
@@ -1957,8 +1785,7 @@ export class DraftStore {
         await entry.inFlight;
         continue;
       }
-      const client = this.client;
-      if (!client) throw new Error("Draft save failed: not connected");
+      const client = this.writableClient();
       // The backend refuses drafts over the limit. That failure is permanent, so check here and
       // wait for the next change instead of pushing a multi-MB payload through the transport on
       // every retry. Only a loaded draft is measurable; otherwise the backend check applies.
@@ -1989,17 +1816,19 @@ export class DraftStore {
           // lost reply is retried with the same basis, which merges the same way again.
           ...(entry.basisSends.size > 0 ? { basisSends: [...entry.basisSends.values()] } : {}),
         });
+        // A reply of a replaced backend confirms nothing: the edit must reach the current one,
+        // so the loop writes it again there (#6438).
+        if (this.client !== client) continue;
         entry.flushAttempt = 0;
         entry.failing = false;
-        if (sendText) {
-          entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, textVersion);
-        }
-        if (sendAttachments) {
-          entry.confirmedAttachmentsVersion = Math.max(
-            entry.confirmedAttachmentsVersion,
-            attachmentsVersion
-          );
-        }
+        confirmWrite(
+          entry,
+          { text: sendText, attachments: sendAttachments },
+          {
+            text: textVersion,
+            attachments: attachmentsVersion,
+          }
+        );
       } catch (error) {
         this.reportSaveError(entry, key, error);
         // The backend's size refusal (measurable only there while payloads are unloaded) is
@@ -2019,6 +1848,33 @@ export class DraftStore {
       }
       this.applyWriteReply(entry, reply, { text: sendText, attachments: sendAttachments });
     }
+  }
+
+  /** The client a write may go to: connected, and its snapshot applied. */
+  private writableClient(): APIClient {
+    const client = this.client;
+    if (!client) throw new Error("Draft save failed: not connected");
+    if (!this.canWrite(client)) throw new Error(DRAFTS_NOT_LOADED);
+    return client;
+  }
+
+  /**
+   * Writes of draft fields (drain, beginSend, flush) wait for the snapshot of the client they go
+   * to (#6542): before it, the store does not know that backend's drafts and could overwrite them.
+   * Not held, on purpose (#6726), because none of them writes text the store would have to merge:
+   * - `sendDelete`: the user's delete. It removes whatever the backend holds, and the snapshot
+   *   handler (openWrites) resends pending deletes anyway.
+   * - `resolveSends`: the backend resolves its own pending-send records against the receiver.
+   * - `setSendReceiver`: moves a pending send the backend holds to the current receiver. A
+   *   backend that does not hold it answers `present: false`, and nothing is written.
+   */
+  private canWrite(client: APIClient | null): client is APIClient {
+    return client !== null && this.snapshotClient === client;
+  }
+
+  /** Throws when `client` was replaced (a new backend): its replies are not the current one's. */
+  private assertCurrentClient(client: APIClient): void {
+    if (this.client !== client) throw new Error("Draft save failed: the drafts backend changed");
   }
 
   /**
@@ -2053,20 +1909,21 @@ export function getDraftStore(): DraftStore {
   return storeInstance;
 }
 
+/**
+ * Drop the singleton so the next getDraftStore() starts unhydrated. A store kept from an earlier
+ * test file is already ready, so whenReady() no longer waits for the next client's snapshot.
+ */
+export function resetDraftStoreForTests(): void {
+  storeInstance?.setClient(null);
+  storeInstance = null;
+}
+
 /** The draft of one scope; re-renders only when that scope changes. */
 export function useDraft(scope: DraftStoreScope): DraftView {
   const store = getDraftStore();
   return useSyncExternalStore(
     (listener) => store.subscribe(scope, listener),
     () => store.getView(scope)
-  );
-}
-
-/** Listed creation drafts by project; re-renders only when the list changes. */
-export function useCreationDraftsByProject(): CreationDraftsByProject {
-  const store = getDraftStore();
-  return useSyncExternalStore(store.subscribeCreationDrafts, () =>
-    store.getCreationDraftsByProject()
   );
 }
 

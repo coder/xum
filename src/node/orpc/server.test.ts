@@ -9,9 +9,16 @@ import { WebSocket, WebSocketServer } from "ws";
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
 import type { RouterClient } from "@orpc/server";
-import { createOrpcServer, DESKTOP_WS_PATH, ORPC_WS_PATH } from "./server";
+import { BROWSER_BRIDGE_WS_PATH, createOrpcServer, DESKTOP_WS_PATH, ORPC_WS_PATH } from "./server";
+import {
+  FIRST_RUN_EARLY_SCRIPT,
+  FIRST_RUN_MODULES_ID,
+  FIRST_RUN_TEMPLATE_ID,
+  FIRST_RUN_VIEW_HTML,
+} from "./firstRunView";
 import { log } from "@/node/services/log";
 import type { ORPCContext } from "./context";
+import { orpcContextFromDoubles, type OrpcContextDoubles } from "./orpcContextDoubles.testHarness";
 import type { AppRouter } from "./router";
 
 function getErrorCode(error: unknown): string | null {
@@ -116,9 +123,7 @@ function createHttpClient(
     url: "/orpc",
     headers,
   });
-
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- test helper
-  return createORPCClient(link) as RouterClient<AppRouter>;
+  return createORPCClient<RouterClient<AppRouter>>(link);
 }
 
 async function withProxyUriTemplateEnv<T>(
@@ -174,7 +179,7 @@ function expectSlashlessRootRedirectBeforeBase(html: string, baseHref: string): 
 async function createStaticTestServer(
   options: {
     files?: Record<string, string>;
-    context?: Partial<ORPCContext>;
+    context?: OrpcContextDoubles;
     authToken?: string;
   } = {}
 ): Promise<{
@@ -200,7 +205,7 @@ async function createStaticTestServer(
     server = await createOrpcServer({
       host: "127.0.0.1",
       port: 0,
-      context: (options.context ?? {}) as ORPCContext,
+      context: orpcContextFromDoubles(options.context ?? {}),
       authToken: options.authToken,
       serveStatic: true,
       staticDir: tempDir,
@@ -316,7 +321,7 @@ interface RawResponse {
 function rawRequest(
   baseUrl: string,
   urlPath: string,
-  options: { method?: string; headers?: Record<string, string> } = {}
+  options: { method?: string; headers?: Record<string, string>; body?: Buffer } = {}
 ): Promise<RawResponse> {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -336,7 +341,7 @@ function rawRequest(
       }
     );
     req.on("error", reject);
-    req.end();
+    req.end(options.body);
   });
 }
 
@@ -375,6 +380,72 @@ function varyIncludesAcceptEncoding(headers: http.IncomingHttpHeaders): boolean 
       .includes("accept-encoding") ?? false
   );
 }
+
+describe("createOrpcServer compressed request bodies", () => {
+  // CVE-2026-111497: body-parser runs before auth and would inflate a br body with Node's
+  // Brotli decoder, so the server must refuse every compressed body without decoding it.
+  async function postWait(
+    contentType: string,
+    body: Buffer,
+    contentEncoding?: string
+  ): Promise<{ status: number; flowIds: string[] }> {
+    const flowIds: string[] = [];
+    const context: OrpcContextDoubles = {
+      serverAuthService: {
+        waitForGithubDeviceFlow: (flowId: string) => {
+          flowIds.push(flowId);
+          return Promise.resolve({ success: false, error: "stub" });
+        },
+        cancelGithubDeviceFlow: () => undefined,
+      },
+    };
+    // The server requires a token and the request sends none: the 415 must come from body-parser,
+    // which an unauthenticated client reaches.
+    const server = await createOrpcServer({
+      host: "127.0.0.1",
+      port: 0,
+      authToken: "test-token",
+      context: orpcContextFromDoubles(context),
+    });
+    try {
+      const headers: Record<string, string> = { "Content-Type": contentType };
+      if (contentEncoding !== undefined) headers["Content-Encoding"] = contentEncoding;
+      const res = await rawRequest(server.baseUrl, "/auth/server-login/github/wait", {
+        method: "POST",
+        headers,
+        body,
+      });
+      return { status: res.status, flowIds };
+    } finally {
+      await server.close();
+    }
+  }
+
+  const json = Buffer.from(JSON.stringify({ flowId: "flow-1" }));
+  const form = Buffer.from("flowId=flow-1");
+
+  test.each([
+    ["br JSON", "application/json", zlib.brotliCompressSync(json), "br"],
+    ["br form", "application/x-www-form-urlencoded", zlib.brotliCompressSync(form), "br"],
+    ["gzip JSON", "application/json", zlib.gzipSync(json), "gzip"],
+  ] as const)(
+    "refuses a %s body with 415 before auth and before the route",
+    async (_name, contentType, body, encoding) => {
+      const result = await postWait(contentType, body, encoding);
+      expect(result.status).toBe(415);
+      expect(result.flowIds).toEqual([]);
+    }
+  );
+
+  test.each([
+    ["JSON", "application/json", json],
+    ["form", "application/x-www-form-urlencoded", form],
+  ] as const)("still parses an uncompressed %s body", async (_name, contentType, body) => {
+    const result = await postWait(contentType, body);
+    expect(result.status).not.toBe(415);
+    expect(result.flowIds).toEqual(["flow-1"]);
+  });
+});
 
 describe("createOrpcServer hashed static asset compression", () => {
   const HASHED_JS = "main-AbCd1234.js";
@@ -623,6 +694,95 @@ describe("createOrpcServer SPA fallback compression and font preloads", () => {
   });
 });
 
+// T3 C step 2 (plan section 5.6, PR 4b): only "/" gets the static first-run view and loads the app
+// JS after it paints. Catches the view on another route, a module tag left in <head>, a module
+// list after the early script (a paint-cache visit loads at once and needs it), an early script
+// after the stylesheet (it would wait for the CSS), a view on a page with no module script, and
+// a write to dist/index.html.
+describe("createOrpcServer static first-run view on /", () => {
+  const MODULES =
+    '<script type="module" crossorigin src="./main-AAAAAAAA.js"></script>\n    <link rel="modulepreload" crossorigin href="./API-BBBBBBBB.js">\n';
+  const indexHtml = `<!doctype html><html><head><title>mux</title>\n    ${MODULES}    <link rel="stylesheet" crossorigin href="./API-CCITiHZd.css"></head><body><div id="root"></div></body></html>`;
+  const decode = (res: RawBuffer) => {
+    const encoding = res.headers["content-encoding"];
+    if (encoding === "br") return zlib.brotliDecompressSync(res.body).toString("utf-8");
+    if (encoding === "gzip") return zlib.gunzipSync(res.body).toString("utf-8");
+    return res.body.toString("utf-8");
+  };
+  const at = (html: string, needle: string) => {
+    expect(countOccurrences(html, needle), needle).toBe(1);
+    return html.indexOf(needle);
+  };
+
+  test("serves / with the view's template, the module list and the early script, in order", async () => {
+    const { server, tempDir, close } = await createStaticTestServer({
+      files: { "index.html": indexHtml },
+    });
+    try {
+      for (const [urlPath, encoding] of [
+        ["/", "br"],
+        ["/", "gzip"],
+        ["/?token=t", "identity"],
+      ]) {
+        const res = await rawRequestBuffer(server.baseUrl, urlPath, {
+          headers: { "Accept-Encoding": encoding },
+        });
+        expect(res.headers["content-encoding"], urlPath).toBe(
+          encoding === "identity" ? undefined : encoding
+        );
+        const html = decode(res);
+        expect(html).not.toContain('<script type="module"');
+        expect(html).not.toContain('<link rel="modulepreload"');
+        const list = `<script type="application/json" id="${FIRST_RUN_MODULES_ID}">`;
+        const listJson = html.slice(
+          at(html, list) + list.length,
+          html.indexOf("</script>", at(html, list))
+        );
+        expect(JSON.parse(listJson)).toEqual({
+          script: "./main-AAAAAAAA.js",
+          preload: ["./API-BBBBBBBB.js"],
+        });
+        const order = [
+          at(html, "<base "),
+          at(html, list),
+          at(html, `<script>${FIRST_RUN_EARLY_SCRIPT}</script>`),
+          at(html, 'rel="stylesheet"'),
+          at(html, '<div id="root"></div>'),
+          at(html, `<template id="${FIRST_RUN_TEMPLATE_ID}">${FIRST_RUN_VIEW_HTML}</template>`),
+          at(html, "</body>"),
+        ];
+        expect(order, urlPath).toEqual([...order].sort((a, b) => a - b));
+      }
+      expect(await fs.readFile(path.join(tempDir, "index.html"), "utf-8")).toBe(indexHtml);
+    } finally {
+      await close();
+    }
+  });
+
+  test("leaves every other route, and a / without one module script, as before", async () => {
+    const noModules = indexHtml.replace(MODULES, "");
+    for (const [page, urlPaths] of [
+      [indexHtml, ["/workspace/a1b2c3d4e5", "/project?path=%2Ftmp%2Fp", "/index.html"]],
+      [noModules, ["/"]],
+    ] as const) {
+      const { server, close } = await createStaticTestServer({ files: { "index.html": page } });
+      try {
+        for (const urlPath of urlPaths) {
+          const html = decode(await rawRequestBuffer(server.baseUrl, urlPath));
+          // Without the base, redirect and proxy-template injections the page is dist's, byte for byte.
+          const stripped = html
+            .replace(/\n {4}<script>\(\(\)=>\{const pathname=[^\n]*<\/script>/, "")
+            .replace(/\n {4}<script>window\.__MUX_PROXY_URI_TEMPLATE__ = [^<]*<\/script>/, "")
+            .replace(/\n {4}<base href="[^"]*" \/>/, "");
+          expect(stripped, urlPath).toBe(page);
+        }
+      } finally {
+        await close();
+      }
+    }
+  });
+});
+
 // #5945: crawlers and agents probe /robots.txt, /llms.txt and /.well-known/*. Answering them with
 // the SPA page (status 200, text/html) makes Lighthouse report invalid files instead of absent ones.
 describe("createOrpcServer SPA fallback for file and well-known paths", () => {
@@ -715,7 +875,7 @@ describe("createOrpcServer SPA fallback for file and well-known paths", () => {
 describe("createOrpcServer", () => {
   test("serveStatic fallback does not swallow /api routes", async () => {
     // Minimal context stub - router won't be exercised by this test.
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
 
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-static-"));
     const indexHtml =
@@ -729,7 +889,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         authToken: "test-token",
         serveStatic: true,
         staticDir: tempDir,
@@ -810,10 +970,10 @@ describe("createOrpcServer", () => {
 
   test("routes direct app-proxy HTTP requests to root-mounted handlers", async () => {
     const mainJs = "console.log('prefixed asset');";
-    const authContext: Partial<ORPCContext> = {
+    const authContext: OrpcContextDoubles = {
       serverAuthService: {
         isGithubDeviceFlowEnabled: () => true,
-      } as unknown as ORPCContext["serverAuthService"],
+      },
     };
     const { server, close } = await createStaticTestServer({
       files: { "assets/main.js": mainJs },
@@ -878,14 +1038,14 @@ describe("createOrpcServer", () => {
   });
 
   test("keeps origin validation active after direct app-proxy prefix stripping", async () => {
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
 
     try {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       const rootResponse = await fetch(`${server.baseUrl}/orpc`, {
@@ -927,7 +1087,7 @@ describe("createOrpcServer", () => {
   });
 
   test("accepts direct app-proxy WebSocket upgrades", async () => {
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
     let ws: WebSocket | null = null;
 
@@ -935,7 +1095,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       ws = new WebSocket(
@@ -952,15 +1112,18 @@ describe("createOrpcServer", () => {
   });
 
   test("includes app-proxy base paths in OAuth redirect and callback return URLs", async () => {
-    let muxGatewayRedirectUri = "";
-    const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
+    const redirectUris: string[] = [];
+    const stubContext: OrpcContextDoubles = {
+      coderOauthService: {
         startServerFlow: (input: { redirectUri: string }) => {
-          muxGatewayRedirectUri = input.redirectUri;
-          return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway" };
+          redirectUris.push(input.redirectUri);
+          return Promise.resolve({
+            success: true,
+            data: { flowId: "flow", authorizeUrl: "https://coder.test/authorize" },
+          });
         },
-        handleServerCallbackAndExchange: () => Promise.resolve({ success: true, data: undefined }),
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+        handleServerCallback: () => Promise.resolve({ success: true, data: undefined }),
+      },
     };
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
 
@@ -968,23 +1131,24 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         authToken: "test-token",
       });
 
-      const startResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/start`, {
-        headers: {
-          Authorization: "Bearer test-token",
-          "X-Forwarded-Prefix": APP_PROXY_BASE_PATH,
-        },
-      });
-      expect(startResponse.status).toBe(200);
-      expect(muxGatewayRedirectUri).toBe(
-        `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/mux-gateway/callback`
+      const startResponse = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`,
+        {
+          headers: {
+            Authorization: "Bearer test-token",
+            "X-Forwarded-Prefix": APP_PROXY_BASE_PATH,
+          },
+        }
       );
+      expect(startResponse.status).toBe(200);
+      expect(redirectUris).toEqual([`${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback`]);
 
       const callbackResponse = await fetch(
-        `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/mux-gateway/callback?state=test&code=test`
+        `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback?state=test&code=test`
       );
       expect(callbackResponse.status).toBe(200);
       const callbackHtml = await callbackResponse.text();
@@ -996,7 +1160,7 @@ describe("createOrpcServer", () => {
   });
 
   test("injects proxy URI template into SPA fallback HTML when env is set", async () => {
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
 
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-static-proxy-template-"));
     const indexHtml =
@@ -1010,7 +1174,7 @@ describe("createOrpcServer", () => {
         const server = await createOrpcServer({
           host: "127.0.0.1",
           port: 0,
-          context: stubContext as ORPCContext,
+          context: orpcContextFromDoubles(stubContext),
           authToken: "test-token",
           serveStatic: true,
           staticDir: tempDir,
@@ -1044,7 +1208,7 @@ describe("createOrpcServer", () => {
   });
 
   test("injects null proxy URI template into SPA fallback HTML when env vars are absent", async () => {
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
 
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-static-proxy-template-null-"));
     const indexHtml =
@@ -1057,7 +1221,7 @@ describe("createOrpcServer", () => {
         const server = await createOrpcServer({
           host: "127.0.0.1",
           port: 0,
-          context: stubContext as ORPCContext,
+          context: orpcContextFromDoubles(stubContext),
           authToken: "test-token",
           serveStatic: true,
           staticDir: tempDir,
@@ -1087,7 +1251,7 @@ describe("createOrpcServer", () => {
   test("does not apply origin validation to static and SPA fallback routes", async () => {
     // Static app shell must remain reachable even if proxy/header rewriting makes
     // request Origin values unexpected. API/WS/auth routes are validated separately.
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
 
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-static-origin-"));
     const indexHtml =
@@ -1105,7 +1269,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         authToken: "test-token",
         serveStatic: true,
         staticDir: tempDir,
@@ -1142,10 +1306,10 @@ describe("createOrpcServer", () => {
 
   test("reports whether GitHub device-flow login is enabled", async () => {
     async function runCase(enabled: boolean): Promise<void> {
-      const stubContext: Partial<ORPCContext> = {
+      const stubContext: OrpcContextDoubles = {
         serverAuthService: {
           isGithubDeviceFlowEnabled: () => enabled,
-        } as unknown as ORPCContext["serverAuthService"],
+        },
       };
 
       let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1154,7 +1318,7 @@ describe("createOrpcServer", () => {
         server = await createOrpcServer({
           host: "127.0.0.1",
           port: 0,
-          context: stubContext as ORPCContext,
+          context: orpcContextFromDoubles(stubContext),
         });
 
         const response = await fetch(`${server.baseUrl}/auth/server-login/options`);
@@ -1172,14 +1336,14 @@ describe("createOrpcServer", () => {
   });
 
   test("returns 429 when GitHub device-flow start is rate limited", async () => {
-    const stubContext: Partial<ORPCContext> = {
+    const stubContext: OrpcContextDoubles = {
       serverAuthService: {
         startGithubDeviceFlow: () =>
           Promise.resolve({
             success: false,
             error: "Too many concurrent GitHub login attempts. Please wait and try again.",
           }),
-      } as unknown as ORPCContext["serverAuthService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1188,7 +1352,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       const response = await fetch(`${server.baseUrl}/auth/server-login/github/start`, {
@@ -1201,15 +1365,17 @@ describe("createOrpcServer", () => {
   });
 
   test("uses HTTPS redirect URIs for OAuth start routes when allowHttpOrigin is enabled", async () => {
-    let muxGatewayRedirectUri = "";
-
-    const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
+    const redirectUris: string[] = [];
+    const stubContext: OrpcContextDoubles = {
+      coderOauthService: {
         startServerFlow: (input: { redirectUri: string }) => {
-          muxGatewayRedirectUri = input.redirectUri;
-          return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway" };
+          redirectUris.push(input.redirectUri);
+          return Promise.resolve({
+            success: true,
+            data: { flowId: "flow", authorizeUrl: "https://coder.test/authorize" },
+          });
         },
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1218,7 +1384,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         authToken: "test-token",
         allowHttpOrigin: true,
       });
@@ -1230,29 +1396,30 @@ describe("createOrpcServer", () => {
         "X-Forwarded-Proto": "http",
       };
 
-      const muxGatewayResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/start`, {
-        headers: sharedHeaders,
-      });
-      expect(muxGatewayResponse.status).toBe(200);
-
-      expect(muxGatewayRedirectUri).toBe(
-        "https://mux-public.example.com/auth/mux-gateway/callback"
+      const response = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`,
+        { headers: sharedHeaders }
       );
+      expect(response.status).toBe(200);
+
+      expect(redirectUris).toEqual(["https://mux-public.example.com/auth/coder/callback"]);
     } finally {
       await server?.close();
     }
   });
 
   test("uses HTTP redirect URIs for OAuth start routes when client-facing proto is HTTP", async () => {
-    let muxGatewayRedirectUri = "";
-
-    const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
+    const redirectUris: string[] = [];
+    const stubContext: OrpcContextDoubles = {
+      coderOauthService: {
         startServerFlow: (input: { redirectUri: string }) => {
-          muxGatewayRedirectUri = input.redirectUri;
-          return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway-http" };
+          redirectUris.push(input.redirectUri);
+          return Promise.resolve({
+            success: true,
+            data: { flowId: "flow", authorizeUrl: "https://coder.test/authorize" },
+          });
         },
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1261,27 +1428,30 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         authToken: "test-token",
       });
 
-      const response = await fetch(`${server.baseUrl}/auth/mux-gateway/start`, {
-        headers: {
-          Authorization: "Bearer test-token",
-          Origin: server.baseUrl,
-          "X-Forwarded-Proto": "http,https",
-        },
-      });
+      const response = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`,
+        {
+          headers: {
+            Authorization: "Bearer test-token",
+            Origin: server.baseUrl,
+            "X-Forwarded-Proto": "http,https",
+          },
+        }
+      );
 
       expect(response.status).toBe(200);
-      expect(muxGatewayRedirectUri).toBe(`${server.baseUrl}/auth/mux-gateway/callback`);
+      expect(redirectUris).toEqual([`${server.baseUrl}/auth/coder/callback`]);
     } finally {
       await server?.close();
     }
   });
 
   test("scopes mux_session cookie path to forwarded app base path", async () => {
-    const stubContext: Partial<ORPCContext> = {
+    const stubContext: OrpcContextDoubles = {
       serverAuthService: {
         waitForGithubDeviceFlow: () =>
           Promise.resolve({
@@ -1291,7 +1461,7 @@ describe("createOrpcServer", () => {
         cancelGithubDeviceFlow: () => {
           // no-op for this test
         },
-      } as unknown as ORPCContext["serverAuthService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1300,7 +1470,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       const response = await fetch(`${server.baseUrl}/auth/server-login/github/wait`, {
@@ -1323,7 +1493,7 @@ describe("createOrpcServer", () => {
   });
 
   test("sets Secure mux_session cookie when allowHttpOrigin is enabled", async () => {
-    const stubContext: Partial<ORPCContext> = {
+    const stubContext: OrpcContextDoubles = {
       serverAuthService: {
         waitForGithubDeviceFlow: () =>
           Promise.resolve({
@@ -1333,7 +1503,7 @@ describe("createOrpcServer", () => {
         cancelGithubDeviceFlow: () => {
           // no-op for this test
         },
-      } as unknown as ORPCContext["serverAuthService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1342,7 +1512,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         allowHttpOrigin: true,
       });
 
@@ -1368,7 +1538,7 @@ describe("createOrpcServer", () => {
   });
 
   test("does not set Secure mux_session cookie when client-facing proto is HTTP", async () => {
-    const stubContext: Partial<ORPCContext> = {
+    const stubContext: OrpcContextDoubles = {
       serverAuthService: {
         waitForGithubDeviceFlow: () =>
           Promise.resolve({
@@ -1378,7 +1548,7 @@ describe("createOrpcServer", () => {
         cancelGithubDeviceFlow: () => {
           // no-op for this test
         },
-      } as unknown as ORPCContext["serverAuthService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1387,7 +1557,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       const response = await fetch(`${server.baseUrl}/auth/server-login/github/wait`, {
@@ -1414,13 +1584,13 @@ describe("createOrpcServer", () => {
     const createMultiProjectMock = mock(() => {
       throw new Error("workspaceService.createMultiProject should not be called");
     });
-    const stubContext: Partial<ORPCContext> = {
+    const stubContext: OrpcContextDoubles = {
       workspaceService: {
         createMultiProject: createMultiProjectMock,
-      } as unknown as ORPCContext["workspaceService"],
+      },
       experimentsService: {
         isExperimentEnabled: () => false,
-      } as unknown as ORPCContext["experimentsService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1429,7 +1599,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         authToken: "test-token",
       });
 
@@ -1466,7 +1636,7 @@ describe("createOrpcServer", () => {
   });
 
   test("accepts ORPC requests authenticated via mux_session cookie", async () => {
-    const stubContext: Partial<ORPCContext> = {
+    const stubContext: OrpcContextDoubles = {
       serverAuthService: {
         validateSessionToken: (token: string) => {
           if (token === "valid-session-token") {
@@ -1474,7 +1644,7 @@ describe("createOrpcServer", () => {
           }
           return Promise.resolve(null);
         },
-      } as unknown as ORPCContext["serverAuthService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1483,7 +1653,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         authToken: "test-token",
       });
 
@@ -1516,10 +1686,10 @@ describe("createOrpcServer", () => {
   });
 
   test("OAuth callback routes accept POST redirects (query + form_post)", async () => {
-    const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
-        handleServerCallbackAndExchange: () => Promise.resolve({ success: true, data: undefined }),
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+    const stubContext: OrpcContextDoubles = {
+      coderOauthService: {
+        handleServerCallback: () => Promise.resolve({ success: true, data: undefined }),
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1528,12 +1698,12 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       // Some OAuth providers issue 307/308 redirects which preserve POST.
       const queryRes = await fetch(
-        `${server.baseUrl}/auth/mux-gateway/callback?state=test-state&code=test-code`,
+        `${server.baseUrl}/auth/coder/callback?state=test-state&code=test-code`,
         { method: "POST" }
       );
       expect(queryRes.status).toBe(200);
@@ -1541,7 +1711,7 @@ describe("createOrpcServer", () => {
       expect(queryText).toContain("Login complete");
 
       // response_mode=form_post delivers params in the request body.
-      const formRes = await fetch(`${server.baseUrl}/auth/mux-gateway/callback`, {
+      const formRes = await fetch(`${server.baseUrl}/auth/coder/callback`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "state=test-state&code=test-code",
@@ -1558,13 +1728,13 @@ describe("createOrpcServer", () => {
     // The MCP SDK rejects the code exchange for issuers that advertise RFC 9207
     // unless the route passes `iss` through (Linear login regression).
     const callbackInputs: unknown[] = [];
-    const stubContext: Partial<ORPCContext> = {
+    const stubContext: OrpcContextDoubles = {
       mcpOauthService: {
         handleServerCallbackAndExchange: (input: unknown) => {
           callbackInputs.push(input);
           return Promise.resolve({ success: true, data: undefined });
         },
-      } as unknown as ORPCContext["mcpOauthService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1573,7 +1743,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       const issuer = "https://mcp.linear.app";
@@ -1603,17 +1773,15 @@ describe("createOrpcServer", () => {
   });
 
   test("allows cross-origin POST requests on OAuth callback routes", async () => {
-    const handleSuccessfulCallback = () => Promise.resolve({ success: true, data: undefined });
-    const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
-        handleServerCallbackAndExchange: handleSuccessfulCallback,
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+    const handleSuccessfulCallback = () =>
+      Promise.resolve({ success: true as const, data: undefined });
+    const stubContext: OrpcContextDoubles = {
       mcpOauthService: {
         handleServerCallbackAndExchange: handleSuccessfulCallback,
-      } as unknown as ORPCContext["mcpOauthService"],
+      },
       coderOauthService: {
         handleServerCallback: handleSuccessfulCallback,
-      } as unknown as ORPCContext["coderOauthService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1622,7 +1790,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       const callbackHeaders = {
@@ -1637,14 +1805,6 @@ describe("createOrpcServer", () => {
       });
       expect(coderOauthResponse.status).toBe(200);
       expect(coderOauthResponse.headers.get("access-control-allow-origin")).toBeNull();
-
-      const muxGatewayResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/callback`, {
-        method: "POST",
-        headers: callbackHeaders,
-        body: "state=test-state&code=test-code",
-      });
-      expect(muxGatewayResponse.status).toBe(200);
-      expect(muxGatewayResponse.headers.get("access-control-allow-origin")).toBeNull();
 
       const mcpOauthResponse = await fetch(`${server.baseUrl}/auth/mcp-oauth/callback`, {
         method: "POST",
@@ -1665,7 +1825,7 @@ describe("createOrpcServer", () => {
       code: string | null;
       error: string | null;
     }> = [];
-    const stubContext: Partial<ORPCContext> = {
+    const stubContext: OrpcContextDoubles = {
       coderOauthService: {
         startServerFlow: (input: {
           deploymentUrl: string;
@@ -1693,7 +1853,7 @@ describe("createOrpcServer", () => {
               : { success: false, error: "Unknown or expired OAuth state" }
           );
         },
-      } as unknown as ORPCContext["coderOauthService"],
+      },
     };
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
 
@@ -1701,7 +1861,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         authToken: "test-token",
       });
 
@@ -1765,11 +1925,11 @@ describe("createOrpcServer", () => {
     // Regression: binding "localhost" used to take only the first resolved family,
     // leaving the other loopback address free for another dev server on the same port.
     // Mixed case also exercises hostname normalization.
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
     const server = await createOrpcServer({
       host: "LocalHost",
       port: 0,
-      context: stubContext as ORPCContext,
+      context: orpcContextFromDoubles(stubContext),
       authToken: "test-token",
     });
 
@@ -1829,13 +1989,13 @@ describe("createOrpcServer", () => {
     const port = address.port;
 
     try {
-      const stubContext: Partial<ORPCContext> = {};
+      const stubContext: OrpcContextDoubles = {};
       let caught: unknown = null;
       try {
         const server = await createOrpcServer({
           host: "localhost",
           port,
-          context: stubContext as ORPCContext,
+          context: orpcContextFromDoubles(stubContext),
           authToken: "test-token",
         });
         await server.close();
@@ -1858,7 +2018,7 @@ describe("createOrpcServer", () => {
 
   test("brackets IPv6 hosts in returned URLs", async () => {
     // Minimal context stub - router won't be exercised by this test.
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
 
@@ -1866,7 +2026,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "::1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         authToken: "test-token",
       });
     } catch (error) {
@@ -2004,7 +2164,7 @@ describe("createOrpcServer", () => {
   }
 
   test("routes desktop WebSocket connections to the bridge server without ORPC origin validation", async () => {
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
     const desktopRelayServer = new WebSocketServer({ noServer: true });
     let desktopRelayServerStopped = false;
     const desktopRequests: Array<{ origin: string | null; url: string | undefined }> = [];
@@ -2044,7 +2204,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
         desktopBridgeServer,
       });
 
@@ -2201,14 +2361,14 @@ describe("createOrpcServer", () => {
   });
 
   test("returns restrictive CORS preflight headers for same-origin requests", async () => {
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
     try {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       const response = await fetch(`${server.baseUrl}/api/spec.json`, {
@@ -2237,10 +2397,10 @@ describe("createOrpcServer", () => {
 
   test("general.restartApp delegates to the window service restart hook", async () => {
     const restartApp = mock(() => Promise.resolve({ supported: true as const }));
-    const stubContext: Partial<ORPCContext> = {
+    const stubContext: OrpcContextDoubles = {
       windowService: {
         restartApp,
-      } as unknown as ORPCContext["windowService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -2248,7 +2408,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       const client = createHttpClient(server.baseUrl);
@@ -2262,7 +2422,7 @@ describe("createOrpcServer", () => {
   });
 
   test("general.restartApp reports unsupported when no restart handler is registered", async () => {
-    const stubContext: Partial<ORPCContext> = {
+    const stubContext: OrpcContextDoubles = {
       windowService: {
         restartApp: mock(() =>
           Promise.resolve({
@@ -2270,7 +2430,7 @@ describe("createOrpcServer", () => {
             message: "Restart is only available in the desktop app.",
           })
         ),
-      } as unknown as ORPCContext["windowService"],
+      },
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -2278,7 +2438,7 @@ describe("createOrpcServer", () => {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       const client = createHttpClient(server.baseUrl);
@@ -2294,14 +2454,14 @@ describe("createOrpcServer", () => {
   });
 
   test("rejects CORS preflight requests from cross-origin callers", async () => {
-    const stubContext: Partial<ORPCContext> = {};
+    const stubContext: OrpcContextDoubles = {};
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
     try {
       server = await createOrpcServer({
         host: "127.0.0.1",
         port: 0,
-        context: stubContext as ORPCContext,
+        context: orpcContextFromDoubles(stubContext),
       });
 
       const response = await fetch(`${server.baseUrl}/api/spec.json`, {
@@ -2318,3 +2478,142 @@ describe("createOrpcServer", () => {
     }
   });
 });
+
+// PR5b-2: a phone's workspace page carries the static view's script and no request or workspace
+// data: the service worker caches every GET, also for other routes and windows.
+describe("the static workspace view on a phone's workspace page", () => {
+  const PHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Mobile/15E148 Safari/604.1";
+  const DESKTOP = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/140.0 Safari/537.36";
+  const indexHtml =
+    '<!doctype html><html><head><title>x</title><meta name="viewport" content="width=device-width"><script type="module" src="./main-A.js"></script></head><body><div id="root"></div></body></html>';
+
+  test("only a phone gets the script, the same for every workspace, with the same headers", async () => {
+    const { server, close } = await createStaticTestServer({ files: { "index.html": indexHtml } });
+    try {
+      const read = async (route: string, userAgent: string) => {
+        const res = await fetch(`${server.baseUrl}${route}`, {
+          headers: { "Accept-Encoding": "identity", "User-Agent": userAgent },
+        });
+        const skip = new Set(["date", "content-length", "etag"]); // etag: a body hash
+        const headers = Object.fromEntries([...res.headers].filter(([name]) => !skip.has(name)));
+        return { headers, body: await res.text() };
+      };
+      const phone = await read("/workspace/a1b2c3d4e5", PHONE);
+      const desktop = await read("/workspace/a1b2c3d4e5", DESKTOP);
+      expect(phone.body).toContain("buildWorkspaceView");
+      expect(desktop.body).toContain('<script type="module" src="./main-A.js">');
+      expect(desktop.body).not.toContain("buildWorkspaceView");
+      expect(phone.headers).toEqual(desktop.headers);
+      expect((await read("/workspace/other-ws", PHONE)).body).toBe(phone.body);
+      expect(phone.body).not.toContain("a1b2c3d4e5");
+    } finally {
+      await close();
+    }
+  });
+});
+
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `rejects` as non-thenable */
+describe("createOrpcServer unixSocketPath", () => {
+  type Upgrade = Parameters<
+    NonNullable<Parameters<typeof createOrpcServer>[0]["desktopBridgeServer"]>["handleUpgrade"]
+  >;
+
+  function requestOverSocket(socketPath: string, route: string, upgrade: boolean) {
+    return new Promise<{ status: number; upgraded: boolean }>((resolve, reject) => {
+      const req = http.request({
+        socketPath,
+        path: route,
+        headers: upgrade
+          ? {
+              Connection: "Upgrade",
+              Upgrade: "websocket",
+              "Sec-WebSocket-Version": "13",
+              "Sec-WebSocket-Key": Buffer.from("0123456789abcdef").toString("base64"),
+            }
+          : {},
+      });
+      req.once("response", (res) => {
+        res.resume();
+        resolve({ status: res.statusCode ?? 0, upgraded: false });
+      });
+      req.once("upgrade", (res, socket) => {
+        socket.destroy();
+        resolve({ status: res.statusCode ?? 0, upgraded: true });
+      });
+      req.once("error", reject);
+      req.end();
+    });
+  }
+
+  test("serves HTTP and all three WebSocket routes over a private socket, then removes it", async () => {
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), "xum-orpc-sock-"));
+    const socketPath = path.join(base, "run", "b.sock");
+    const bridged: string[] = [];
+    const bridge = {
+      handleUpgrade(...[req, socket]: Upgrade) {
+        bridged.push(req.url ?? "");
+        socket.destroy();
+      },
+      stop: () => Promise.resolve(),
+    };
+    let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
+    try {
+      server = await createOrpcServer({
+        host: "127.0.0.1",
+        port: 0,
+        context: orpcContextFromDoubles({}),
+        authToken: "test-token",
+        unixSocketPath: socketPath,
+        desktopBridgeServer: bridge,
+        browserBridgeServer: bridge,
+      });
+
+      expect((await fs.stat(path.dirname(socketPath))).mode & 0o777).toBe(0o700);
+      expect(await requestOverSocket(socketPath, "/version", false)).toEqual({
+        status: 200,
+        upgraded: false,
+      });
+      expect(await requestOverSocket(`${socketPath}`, `${ORPC_WS_PATH}?token=T`, true)).toEqual({
+        status: 101,
+        upgraded: true,
+      });
+      await requestOverSocket(socketPath, `${DESKTOP_WS_PATH}?token=T`, true).catch(() => null);
+      await requestOverSocket(socketPath, `${BROWSER_BRIDGE_WS_PATH}?token=T`, true).catch(
+        () => null
+      );
+      expect(bridged).toEqual([`${DESKTOP_WS_PATH}?token=T`, `${BROWSER_BRIDGE_WS_PATH}?token=T`]);
+
+      // TCP keeps serving: the CLI and scripts use it.
+      expect((await fetch(`${server.baseUrl}/version`)).status).toBe(200);
+    } finally {
+      await server?.close();
+    }
+    await expect(fs.lstat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await fs.rm(base, { recursive: true, force: true });
+  });
+
+  test("a socket path that cannot be used fails startup and leaves no TCP listener", async () => {
+    const probe = net.createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = (probe.address() as net.AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+    const tooLong = path.join(os.tmpdir(), "x".repeat(200), "b.sock");
+    await expect(
+      createOrpcServer({
+        host: "127.0.0.1",
+        port,
+        context: orpcContextFromDoubles({}),
+        unixSocketPath: tooLong,
+      })
+    ).rejects.toThrow(/too long/);
+
+    const reuse = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      reuse.once("error", reject);
+      reuse.listen(port, "127.0.0.1", () => resolve());
+    });
+    await new Promise<void>((resolve) => reuse.close(() => resolve()));
+  });
+});
+/* eslint-enable @typescript-eslint/await-thenable */

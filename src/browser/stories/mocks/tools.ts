@@ -172,6 +172,19 @@ export function createGenericTool(
   };
 }
 
+/** A non-blocking (Exec) ask_user_question: it returned at once and its form stays open. */
+export function createAsyncAskUserQuestionTool(toolCallId: string, questions: object[]): MuxPart {
+  return createGenericTool(
+    toolCallId,
+    "ask_user_question",
+    { questions },
+    {
+      summary: "Questions shown to the user.",
+      ui_only: { ask_user_question: { questions, answers: {}, answerDelivery: "message" } },
+    }
+  );
+}
+
 /** Create a propose_plan tool call with markdown plan content */
 export function createProposePlanTool(
   toolCallId: string,

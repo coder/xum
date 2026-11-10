@@ -47,6 +47,7 @@ import { ReviewControls } from "./ReviewControls";
 import { preloadHighlightedDiff } from "../../Shared/DiffRenderer";
 import { ImmersiveReviewView } from "./ImmersiveReviewView";
 import { listExistingRevisions } from "./reviewBaseRefs";
+import { preserveHunkReferences } from "./preserveHunkReferences";
 import { FileTree } from "./FileTree";
 import { UntrackedStatus } from "./UntrackedStatus";
 import { shellQuote } from "@/common/utils/shell";
@@ -109,6 +110,7 @@ import { workspaceStore, useWorkspaceStoreRaw } from "@/browser/stores/Workspace
 import { invalidateGitStatus } from "@/browser/stores/GitStatusStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import { runWithCatch, runWithCatchFinally } from "@/browser/utils/compilerSafeControlFlow";
+import { useReviewFocusRequest } from "./useReviewFocusRequest";
 
 /** Stats reported to parent for tab display */
 interface ReviewPanelStats {
@@ -173,31 +175,6 @@ const REVIEW_PANEL_CACHE_MAX_ENTRIES = 20;
 const REVIEW_PANEL_CACHE_MAX_SIZE_BYTES = 20 * 1024 * 1024; // 20MB
 /** Stable empty list for the immersive view while review state hydrates. */
 const NO_HUNKS: DiffHunk[] = [];
-
-/**
- * Preserve object references for unchanged hunks to prevent re-renders.
- * Compares by ID and content - if a hunk exists in prev with same content, reuse it.
- */
-function preserveHunkReferences(prev: DiffHunk[], next: DiffHunk[]): DiffHunk[] {
-  if (prev.length === 0) return next;
-
-  const prevById = new Map(prev.map((h) => [h.id, h]));
-  let allSame = prev.length === next.length;
-
-  const result = next.map((hunk, i) => {
-    const prevHunk = prevById.get(hunk.id);
-    // Fast path: same ID and content means unchanged (content hash is part of ID)
-    if (prevHunk?.content === hunk.content) {
-      if (allSame && prev[i]?.id !== hunk.id) allSame = false;
-      return prevHunk;
-    }
-    allSame = false;
-    return hunk;
-  });
-
-  // If all hunks are reused in same order, return prev array to preserve top-level reference
-  return allSame ? prev : result;
-}
 
 interface ReviewPanelDiffCacheValue {
   hunks: DiffHunk[];
@@ -1320,12 +1297,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     controllerRef.current?.requestImmediate();
   };
 
-  // Focus panel when focusTrigger changes (preserves current hunk selection)
-  useEffect(() => {
-    if (focusTrigger && focusTrigger > 0) {
-      panelRef.current?.focus();
-    }
-  }, [focusTrigger]);
+  useReviewFocusRequest(panelRef, focusTrigger, isCreating);
 
   // Debounce search input
   useEffect(() => {

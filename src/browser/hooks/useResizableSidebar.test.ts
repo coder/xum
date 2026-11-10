@@ -41,7 +41,7 @@ describe("resolveInitialResizableSidebarWidth", () => {
   });
 });
 
-describe("useResizableSidebar drag-to-collapse", () => {
+describe("useResizableSidebar drag", () => {
   let cleanupDom: (() => void) | null = null;
 
   beforeEach(() => {
@@ -68,13 +68,17 @@ describe("useResizableSidebar drag-to-collapse", () => {
       })
     );
     act(() => {
-      hook.result.current.startResize({ clientX: 1000 } as React.MouseEvent);
+      hook.result.current.startResize({ clientX: 1000, pointerId: 1 } as React.PointerEvent);
     });
-    const dragTo = (clientX: number) =>
+    const dragTo = (clientX: number, pointerId = 1) =>
       act(() => {
-        document.dispatchEvent(new window.MouseEvent("mousemove", { clientX }));
+        document.dispatchEvent(new window.PointerEvent("pointermove", { clientX, pointerId }));
       });
-    return { hook, dragTo };
+    const endDrag = (type: "pointerup" | "pointercancel", pointerId = 1) =>
+      act(() => {
+        document.dispatchEvent(new window.PointerEvent(type, { pointerId }));
+      });
+    return { hook, dragTo, endDrag };
   }
 
   test("snaps closed past half the minimum width and reopens when dragged back", () => {
@@ -103,5 +107,24 @@ describe("useResizableSidebar drag-to-collapse", () => {
     const { hook, dragTo } = renderSidebar();
     dragTo(1400);
     expect(hook.result.current.width).toBe(300);
+  });
+
+  test("follows only the pointer that grabbed the handle", () => {
+    const { hook, dragTo, endDrag } = renderSidebar();
+    // A second finger moving or lifting elsewhere neither resizes nor ends the drag.
+    dragTo(900, 2);
+    endDrag("pointerup", 2);
+    expect(hook.result.current.width).toBe(400);
+    dragTo(900);
+    expect(hook.result.current.width).toBe(500);
+  });
+
+  test("a cancelled touch ends the drag", () => {
+    const { hook, dragTo, endDrag } = renderSidebar();
+    dragTo(950);
+    endDrag("pointercancel");
+    expect(hook.result.current.isResizing).toBe(false);
+    dragTo(800);
+    expect(hook.result.current.width).toBe(450);
   });
 });

@@ -270,7 +270,7 @@ export const UserMessage: React.FC<UserMessageProps> = ({
       <span
         className={cn(
           "flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase",
-          isInProgress ? "bg-backgrounded/10 text-backgrounded" : "bg-success/10 text-success"
+          isInProgress ? "bg-backgrounded/10 text-backgrounded" : "bg-success/10 text-success-text"
         )}
       >
         <Bot aria-hidden="true" className="h-3 w-3" />

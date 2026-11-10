@@ -113,6 +113,37 @@ describe("TokenizerService", () => {
       }
     });
 
+    test("counts no definition for a tool the scratch chat no longer gets", async () => {
+      // A scratch chat from an older version can hold calls to tools it no longer gets.
+      await seedHistory({
+        id: "msg1",
+        role: "assistant",
+        metadata: { historySequence: 1 },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "review_pane_get",
+            toolCallId: "call-1",
+            state: "output-available",
+            input: {},
+            output: { hunks: [] },
+          },
+        ],
+      });
+      const definitionTokens = async (metadata: Partial<WorkspaceMetadata>) => {
+        const stats = await new TokenizerService(
+          sessionUsageService,
+          { getWorkspaceMetadata: () => Promise.resolve(Ok(metadata as WorkspaceMetadata)) },
+          { getConfig: () => ({}) },
+          historyService
+        ).calculateWorkspaceStats({ workspaceId: WS, model: "anthropic:claude-sonnet-4-5" });
+        return stats.consumers.find((consumer) => consumer.name === "review_pane_get")?.fixedTokens;
+      };
+
+      expect(await definitionTokens({})).toBeGreaterThan(0);
+      expect(await definitionTokens({ kind: "scratch" })).toBeUndefined();
+    });
+
     test("counts prompt-hook context as the provider request renders it", async () => {
       // Codex P2 (PRRT_kwDOPxxmWM6rNI3g): the context is metadata in history, text in the request.
       await seedHistory(
@@ -425,6 +456,7 @@ describe("TokenizerService", () => {
         expect(statsSpy).toHaveBeenCalledWith(messages, "gpt-4", null, {
           enableAgentReport: false,
           enableReviewPane: true,
+          enableGitPatches: true,
         });
         expect(persistSpy).toHaveBeenCalledWith(
           "test-workspace",
@@ -471,6 +503,7 @@ describe("TokenizerService", () => {
       expect(statsSpy).toHaveBeenCalledWith([messages[1]], "gpt-4", null, {
         enableAgentReport: false,
         enableReviewPane: true,
+        enableGitPatches: true,
       });
       expect(persistSpy).toHaveBeenCalledWith(
         "test-workspace",
@@ -502,10 +535,12 @@ describe("TokenizerService", () => {
       expect(statsSpy).toHaveBeenNthCalledWith(1, messages, "gpt-4", null, {
         enableAgentReport: false,
         enableReviewPane: true,
+        enableGitPatches: true,
       });
       expect(statsSpy).toHaveBeenNthCalledWith(2, messages, "gpt-4", null, {
         enableAgentReport: false,
         enableReviewPane: true,
+        enableGitPatches: true,
       });
 
       statsSpy.mockRestore();
@@ -529,6 +564,7 @@ describe("TokenizerService", () => {
       expect(statsSpy).toHaveBeenCalledWith(messages, "gpt-4", null, {
         enableAgentReport: true,
         enableReviewPane: false,
+        enableGitPatches: true,
       });
 
       statsSpy.mockRestore();

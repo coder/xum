@@ -14,6 +14,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { waitForCondition } from "@/node/services/testDispatchHelpers";
 import assert from "node:assert";
 import {
+  createAIServiceMocks,
   createTestConfig,
   createWorkspaceServiceMocks,
   findWorkspaceInConfig,
@@ -194,6 +195,106 @@ describe("WorkspaceTurnManager", () => {
     expect(findWorkspaceInConfig(config, "shared-orphan")?.taskStatus).toBe("reported");
     expect(findWorkspaceInConfig(config, "running-orphan")?.taskStatus).toBe("running");
     expect(await ownerInput()).toBe("clicked");
+  });
+
+  // Startup reconciliation used to rewrite every terminal mirror with its own config edit, even when
+  // the mirror already named its newest handle and status: on a large config that pass alone ran
+  // for minutes (#6511). Only a mirror that changes is written.
+  test("startup writes only the terminal execution mirrors that change", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const child = (id: string, taskExecutionId: string) =>
+      projectWorkspace(projectPath, id, id, {
+        parentWorkspaceId: parentId,
+        agentId: "explore",
+        taskStatus: "reported",
+        runtimeConfig: { type: "local" },
+        taskExecutionId,
+        taskExecutionStatus: "completed",
+      });
+    await config.editConfig((cfg) => {
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.push(child("settled", "wst_settled"), child("superseded", "wst_old"));
+      return cfg;
+    });
+    const { taskService } = createWorkspaceTurnManagerHarness(config);
+    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
+      .taskHandleStore;
+    await taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "settled", "wst_settled", "completed")
+    );
+    await taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "superseded", "wst_old", "completed")
+    );
+    await taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "superseded", "wst_new", "interrupted", {
+        updatedAt: "2026-06-19T00:00:02.000Z",
+      })
+    );
+
+    const edits = spyOn(config, "editConfig");
+    try {
+      await taskService.reconcileAgentTaskExecutionIds();
+      expect(edits).toHaveBeenCalledTimes(1);
+    } finally {
+      edits.mockRestore();
+    }
+    expect(findWorkspaceInConfig(config, "settled")).toMatchObject({
+      taskExecutionId: "wst_settled",
+      taskExecutionStatus: "completed",
+    });
+    expect(findWorkspaceInConfig(config, "superseded")).toMatchObject({
+      taskExecutionId: "wst_new",
+      taskExecutionStatus: "interrupted",
+    });
+  });
+
+  test("startup registers a recovered live handle unaccepted and leaves another handle's registration alone", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.workspaces.push(
+        projectWorkspace(projectPath, "child", "child", {
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          taskStatus: "reported",
+          runtimeConfig: { type: "local" },
+          taskExecutionId: "wst_live",
+          taskExecutionStatus: "running",
+        })
+      );
+      return cfg;
+    });
+    // The child still streams, so the scan reads its handle as live.
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock((workspaceId: string) => workspaceId === "child"),
+    });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, { aiService });
+    const internals = taskService as unknown as {
+      taskHandleStore: TaskHandleStore;
+      activeWorkspaceTurnHandleByWorkspaceId: Map<
+        string,
+        { handleId: string; ownerWorkspaceId: string; accepted: boolean }
+      >;
+    };
+    await internals.taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "child", "wst_live", "running")
+    );
+
+    // No registration (a restart): the recovered registration fails closed.
+    await taskService.reconcileAgentTaskExecutionIds();
+    expect(taskService.getLiveWorkspaceTurnRegistration("child")).toEqual({
+      handleId: "wst_live",
+      ownerWorkspaceId: parentId,
+      accepted: false,
+    });
+
+    // Another handle's accepted registration: the pass does not claim the child or replace it.
+    const other = { handleId: "wst_other", ownerWorkspaceId: parentId, accepted: true };
+    internals.activeWorkspaceTurnHandleByWorkspaceId.set("child", other);
+    await taskService.reconcileAgentTaskExecutionIds();
+    expect(taskService.getLiveWorkspaceTurnRegistration("child")).toEqual(other);
   });
 
   test("shared desktop active mirror refuses a missing target or competing child", async () => {

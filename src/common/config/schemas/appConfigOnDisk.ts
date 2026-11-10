@@ -6,14 +6,15 @@ import { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablemen
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { CODER_ARCHIVE_BEHAVIORS } from "../coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "../worktreeArchiveBehavior";
+import { CacheTtlSchema } from "./providersConfig";
 import { UserPreferencesSchema } from "./userPreferences";
 import { TaskSettingsSchema } from "./taskSettings";
+import { AgentResourceLimitsSchema } from "./agentResourceLimits";
 import { SettingsBackupSchema } from "./settingsBackup";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 
 export { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
-export type { RuntimeEnablementOverrides } from "../../schemas/runtimeEnablement";
 export { UserPreferencesSchema } from "./userPreferences";
 export type { UserPreferences } from "./userPreferences";
 export { TaskSettingsSchema } from "./taskSettings";
@@ -25,11 +26,7 @@ export {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallSourceSchema,
 } from "./agentPluginInstalls";
-export type {
-  AgentPluginGitSource,
-  AgentPluginInstallEntry,
-  AgentPluginInstallSource,
-} from "./agentPluginInstalls";
+export type { AgentPluginGitSource, AgentPluginInstallEntry } from "./agentPluginInstalls";
 
 /**
  * Sparse delegated-run (sub-agent) override profile nested under an agent's
@@ -52,6 +49,9 @@ export const AgentAiDefaultsEntrySchema = z.object({
   autoModelRouting: z.boolean().optional(),
   autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
+  // Anthropic prompt-cache TTL for this agent's runs (interactive and delegated alike);
+  // absent inherits the base chain, then the global providers.jsonc anthropic.cacheTtl.
+  cacheTtl: CacheTtlSchema.optional(),
   subagent: AgentAiSubagentProfileSchema.optional(),
 });
 
@@ -141,6 +141,8 @@ export const AppConfigMigrationsSchema = z
      * source key.
      */
     defaultModelFallbacksSeededFable51: z.boolean().optional(),
+    /** Same one-time re-seed for the fable alias move to Fable 5.2. */
+    defaultModelFallbacksSeededFable52: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
     /** One-time move of task limits still at PREVIOUS_TASK_SETTINGS_DEFAULTS to the new defaults. */
@@ -167,11 +169,17 @@ export const AppConfigOnDiskSchema = z
     serverAuthGithubOwner: z.string().optional(),
     defaultProjectDir: z.string().optional(),
     viewedSplashScreens: z.array(z.string()).optional(),
-    layoutPresets: z.unknown().optional(),
     userPreferences: UserPreferencesSchema.optional(),
     taskSettings: TaskSettingsSchema.optional(),
+    /**
+     * CPU and memory that all local agent processes share (Linux cgroup v2). Absent = no limit.
+     * `.catch`: a hand-edited value out of range degrades to no limit instead of failing the
+     * whole document.
+     */
+    agentResourceLimits: AgentResourceLimitsSchema.optional().catch(undefined),
+    /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
+    agentResourceLimitsEnabled: z.boolean().optional(),
     chatTranscriptFullWidth: z.boolean().optional(),
-    muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
     /** Desktop only: hold a display-sleep blocker while any local agent is working. */
     keepScreenAwake: z.boolean().optional(),
@@ -190,7 +198,6 @@ export const AppConfigOnDiskSchema = z
       .optional(),
     goalDefaults: GoalDefaultsSchema.optional(),
     evaluationDefaults: EvaluationDefaultsSchema.optional(),
-    muxGatewayModels: z.array(z.string()).optional(),
     routePriority: z.array(z.string()).optional(),
     routeOverrides: z.record(z.string(), z.string()).optional(),
     /**

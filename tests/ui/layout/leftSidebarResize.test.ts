@@ -68,9 +68,9 @@ describeIntegration("LeftSidebar (UI)", () => {
 
         expect(sidebar.style.width).toBe("288px");
 
-        fireEvent.mouseDown(handle, { clientX: 200 });
-        fireEvent.mouseMove(document, { clientX: 300 });
-        fireEvent.mouseUp(document);
+        fireEvent.pointerDown(handle, { clientX: 200 });
+        fireEvent.pointerMove(document, { clientX: 300 });
+        fireEvent.pointerUp(document);
 
         // +100px wider from default.
         await waitFor(() => expect(sidebar.style.width).toBe("388px"));

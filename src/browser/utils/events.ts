@@ -31,3 +31,17 @@ export function stopKeyboardPropagation(e: React.KeyboardEvent | KeyboardEvent):
   // Native KeyboardEvent - stop propagation directly
   e.stopPropagation();
 }
+
+/**
+ * Adds a window listener only while `enabled` (for example its experiment is on) and returns the
+ * cleanup, a no-op when nothing was added. Keeps one effect free of a branch per gated event.
+ */
+export function addWindowListenerWhile(
+  enabled: boolean,
+  type: string,
+  listener: (event: Event) => void
+): () => void {
+  if (!enabled) return () => undefined;
+  window.addEventListener(type, listener);
+  return () => window.removeEventListener(type, listener);
+}

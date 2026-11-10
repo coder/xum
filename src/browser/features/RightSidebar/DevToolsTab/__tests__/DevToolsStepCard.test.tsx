@@ -5,33 +5,14 @@ import { restoreDomGlobals, saveDomGlobals } from "../../../../../../tests/ui/do
 import type { DevToolsStep } from "@/common/types/devtools";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { DevToolsStepCard } from "../DevToolsStepCard";
+import { makeDevToolsStep } from "./devToolsStepFixture";
 
 // Characterization tests for the step card header, its metadata pills, and the
 // sections the pills open. Steps come from replayed JSONL, so several inputs are
 // deliberately malformed: the card must render them instead of crashing.
 
 function makeStep(overrides: Partial<DevToolsStep> = {}): DevToolsStep {
-  return {
-    id: "step-1",
-    runId: "run-1",
-    stepNumber: 3,
-    type: "stream",
-    modelId: "claude-sonnet",
-    provider: "anthropic",
-    startedAt: "2026-10-13T00:00:00.000Z",
-    durationMs: null,
-    input: null,
-    output: null,
-    usage: null,
-    error: null,
-    rawRequest: null,
-    requestHeaders: null,
-    responseHeaders: null,
-    rawResponse: null,
-    rawChunks: null,
-    inputTransformations: null,
-    ...overrides,
-  };
+  return makeDevToolsStep({ stepNumber: 3, provider: "anthropic", ...overrides });
 }
 
 function renderExpanded(step: DevToolsStep, toolPolicy?: ToolPolicy) {

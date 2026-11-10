@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { nodeClock } from "@/node/utils/hostClock";
 
 import { tool, type Tool } from "ai";
 import type { z } from "zod";
@@ -15,9 +16,14 @@ import {
   runtimeModeSupportsSharedTaskWorkspace,
   type RuntimeMode,
 } from "@/common/types/runtime";
+import type { Result } from "@/common/types/result";
 import type { TaskCreatedEvent } from "@/common/types/stream";
 import { log } from "@/node/services/log";
-import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
+import {
+  ForegroundWaitBackgroundedError,
+  type TaskCreateResult,
+} from "@/node/services/taskService";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
 import { buildTaskGroupLaunches } from "@/common/utils/tools/taskGroups";
 import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
@@ -32,9 +38,12 @@ import { getErrorMessage } from "@/common/utils/errors";
 import {
   coerceThinkingLevel,
   parseThinkingInput,
+  THINKING_LEVELS,
   type ParsedThinkingInput,
   type ThinkingLevel,
 } from "@/common/types/thinking";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import type { AvailableModel } from "@/common/types/tools";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { coerceNonEmptyString } from "@/node/services/taskUtils";
 
@@ -85,6 +94,14 @@ function supportsSharedIsolation(config: ToolConfiguration): boolean {
   );
 }
 
+// The built-in desktop agent is listed only where a desktop session exists, so this hint rides
+// with it instead of sitting in every exec prompt. A project or global desktop.md replaces that
+// agent (see turnContextAssembler) and may not drive a GUI.
+const DESKTOP_DELEGATION_HINT =
+  "Delegate repeated screenshot, act and verify loops on a desktop GUI (clicking through application UIs, filling desktop app forms, visually verifying GUI state) to `desktop` instead of automating them inline. This does not apply to the `computer` tool: it controls the user's real computer, which sub-agents cannot use, so use it directly.";
+
+const BACKGROUND_HINT = "[meant to run in the background (run_in_background=true)]";
+
 /**
  * Build dynamic task tool description with runtime-specific workspace visibility
  * guidance and the currently available sub-agents.
@@ -102,10 +119,17 @@ function buildTaskDescription(config: ToolConfiguration): string {
 
   const subagentLines = subagents.map((agent) => {
     const desc = agent.description ? `: ${agent.description}` : "";
-    return `- ${agent.id}${desc}`;
+    // A hint only (Cursor plugin RFC, D12): run_in_background keeps its default.
+    const hint = agent.backgroundHint === true ? ` ${BACKGROUND_HINT}` : "";
+    return `- ${agent.id}${desc}${hint}`;
   });
 
-  return `${baseDescription}\n\nAvailable sub-agents (use \`agentId\` parameter):\n${subagentLines.join("\n")}`;
+  const desktopHint = subagents.some(
+    (agent) => agent.id === "desktop" && agent.scope === "built-in"
+  )
+    ? `\n\n${DESKTOP_DELEGATION_HINT}`
+    : "";
+  return `${baseDescription}\n\nAvailable sub-agents (use \`agentId\` parameter):\n${subagentLines.join("\n")}${desktopHint}`;
 }
 
 function buildParentRuntimeAiSettings(
@@ -124,6 +148,80 @@ function buildParentRuntimeAiSettings(
   };
 }
 
+// `<base>[-<thinking level>][-fast]`; the lazy base leaves both suffixes to the groups.
+const EFFORT_SLUG_PATTERN = new RegExp(`^(.+?)(?:-(${THINKING_LEVELS.join("|")}))?(?:-fast)?$`);
+
+/**
+ * Map a `<model>-<effort>[-fast]` slug (pstack's form, e.g. `claude-opus-5-5-xhigh`,
+ * `grok-4.7-xhigh-fast`) to a known model ID plus thinking level. The base must be a
+ * Xum alias or a known provider model ID. Xum has no per-task speed mode, so `-fast`
+ * runs the same model at standard speed. Returns null when the slug does not map.
+ */
+function mapEffortSlug(raw: string): { model: string; effort?: ThinkingLevel } | null {
+  const match = EFFORT_SLUG_PATTERN.exec(raw.trim().toLowerCase());
+  if (match == null) return null;
+  const [, base, effortToken] = match;
+  const effort = THINKING_LEVELS.find((level) => level === effortToken);
+  const model =
+    normalizeModelInput(base).model ??
+    Object.values(KNOWN_MODELS).find((known) => known.providerModelId === base)?.id;
+  return model == null ? null : { model, effort };
+}
+
+/** The configured-model catalog, or undefined when this context has none or it throws. */
+function readAvailableModels(
+  listAvailableModels: (() => AvailableModel[]) | undefined
+): AvailableModel[] | undefined {
+  try {
+    return listAvailableModels?.();
+  } catch (error) {
+    // Same policy as models_list: log on the Node side. Without a catalog a mapped slug
+    // is accepted like any provider:model string, which is never availability-checked.
+    log.error("[task tool] failed to compute the model catalog", { error });
+    return undefined;
+  }
+}
+
+/** Error suffix naming the configured models, so a caller can retry with a valid one. */
+function formatAvailableModels(available: AvailableModel[] | undefined): string {
+  if (available == null || available.length === 0) return ".";
+  const MAX_LISTED = 30;
+  const names = available.map((entry) => entry.aliases[0] ?? entry.model);
+  const more = names.length > MAX_LISTED ? `, +${names.length - MAX_LISTED} more` : "";
+  return `. Configured: ${names.slice(0, MAX_LISTED).join(", ")}${more} (see models_list).`;
+}
+
+/**
+ * Resolve a task `model` input: an alias or `provider:model` as the UI does, else a
+ * skill's `<model>-<effort>[-fast]` slug. Throws when neither resolves.
+ */
+function resolveTaskModel(
+  raw: string,
+  listAvailableModels: (() => AvailableModel[]) | undefined
+): { modelString: string; thinkingLevel?: ThinkingLevel } {
+  const normalized = normalizeModelInput(raw).model;
+  if (normalized != null) return { modelString: normalized };
+  // Skills written for other harnesses (e.g. pstack for Cursor) name models as
+  // `<model>-<effort>[-fast]` slugs. Map them so a skill's per-role routing works
+  // unedited, instead of failing or silently inheriting the parent's model.
+  const slug = mapEffortSlug(raw);
+  const available = readAvailableModels(listAvailableModels);
+  // A slug is a translation guess, so it must land on a model this host can run.
+  // Otherwise reject at launch with the configured models: pstack retries with the
+  // closest valid option from this error, rather than starting a child that fails.
+  if (slug == null || (available != null && !available.some((m) => m.model === slug.model))) {
+    throw new Error(
+      `task tool: ${slug == null ? "invalid" : "unavailable"} model "${raw}". ` +
+        `Provide a known alias, a "provider:model" string, or "<model>-<effort>"` +
+        formatAvailableModels(available)
+    );
+  }
+  return {
+    modelString: slug.model,
+    ...(slug.effort != null ? { thinkingLevel: slug.effort } : {}),
+  };
+}
+
 /**
  * Parse the optional `model`/`thinking` overrides supplied on a task launch,
  * reusing the exact parsing the UI uses (`normalizeModelInput` for model alias
@@ -135,20 +233,17 @@ function buildParentRuntimeAiSettings(
  * Exported so the models_list tests can prove every advertised model/alias/level
  * is accepted by exactly this parser.
  */
-export function parseTaskAiOverrides(args: { model?: string | null; thinking?: string | null }): {
+export function parseTaskAiOverrides(
+  args: { model?: string | null; thinking?: string | null },
+  listAvailableModels?: () => AvailableModel[]
+): {
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
 } {
   const overrides: { modelString?: string; thinkingLevel?: ParsedThinkingInput } = {};
 
   if (args.model != null) {
-    const normalized = normalizeModelInput(args.model);
-    if (normalized.model == null) {
-      throw new Error(
-        `task tool: invalid model "${args.model}". Provide a known alias or a "provider:model" string.`
-      );
-    }
-    overrides.modelString = normalized.model;
+    Object.assign(overrides, resolveTaskModel(args.model, listAvailableModels));
   }
 
   if (args.thinking != null) {
@@ -221,10 +316,42 @@ function emitTaskCreatedEvent(params: {
       workspaceId: params.workspaceId,
       toolCallId: params.toolCallId,
       taskId: params.taskId,
-      timestamp: Date.now(),
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      timestamp: nodeClock.nowMs(),
     } satisfies TaskCreatedEvent,
     "task"
   );
+}
+
+/**
+ * Splits a task(n) call's create settlements into the spawned tasks and the failures, both in
+ * launch order (not settle order: the result and the live card's candidate labels follow it).
+ * An Err becomes an Error; a rejection keeps its reason.
+ */
+function collectTaskGroupCreates(
+  settlements: ReadonlyArray<PromiseSettledResult<Result<TaskCreateResult, string>>>
+): { createdTasks: SpawnedTaskInfo[]; failures: unknown[] } {
+  const createdTasks: SpawnedTaskInfo[] = [];
+  const failures: unknown[] = [];
+  for (const settlement of settlements) {
+    if (settlement.status === "rejected") {
+      failures.push(settlement.reason);
+      continue;
+    }
+    const created = settlement.value;
+    if (!created.success) {
+      failures.push(new Error(created.error));
+      continue;
+    }
+    createdTasks.push({
+      taskId: created.data.taskId,
+      status: created.data.status,
+      modelString: created.data.modelString,
+      thinkingLevel: created.data.thinkingLevel,
+      desktopOwnerWorkspaceId: created.data.desktopOwnerWorkspaceId,
+    });
+  }
+  return { createdTasks, failures };
 }
 
 function toAggregatePendingStatus(
@@ -455,7 +582,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       // Explicit per-launch model/thinking overrides. Omitted by default so delegated work
       // inherits the parent's live settings unless the caller requests an override.
-      const aiOverrides = parseTaskAiOverrides({ model, thinking });
+      const aiOverrides = parseTaskAiOverrides({ model, thinking }, config.listAvailableModels);
 
       const workspaceId = requireWorkspaceId(config, "task");
       const taskService = requireTaskService(config, "task");
@@ -603,73 +730,78 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
       // Parent runtime model and thinking are forwarded as a low-priority fallback so
       // unconfigured delegated runs still inherit the parent's live model. Do not
       // restore the previous top-priority forwarding through explicit task args.
-      const createdTasks: SpawnedTaskInfo[] = [];
-      for (const launch of taskGroupLaunches) {
-        if (abortSignal?.aborted) {
-          throw new Error("Interrupted");
-        }
+      // Every create starts in this one synchronous pass, so tree-lock order (and the createdAt
+      // and queue order behind it) is launch order. Each create holds its locks only until its
+      // child's first turn is admitted, so the children's first sends overlap. The async mapper
+      // turns a synchronous throw into a rejection, so no started create is left unobserved.
+      const creating = Promise.allSettled(
+        taskGroupLaunches.map(async (launch) =>
+          taskService.create({
+            parentWorkspaceId: workspaceId,
+            kind: "agent",
+            agentId: requestedAgentId,
+            // Legacy alias (persisted for older clients / on-disk compatibility).
+            agentType: requestedAgentId,
+            prompt: launch.prompt,
+            title,
+            ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
+            ...(aiOverrides.thinkingLevel != null
+              ? { thinkingLevel: aiOverrides.thinkingLevel }
+              : {}),
+            ...(isolation != null ? { isolation } : {}),
+            ...(desktop != null ? { desktop } : {}),
+            ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
+            // Background launches are non-blocking with terminal wake-up; foreground/default block.
+            attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
+            abortSignal,
+            bestOf:
+              taskGroupId != null
+                ? {
+                    groupId: taskGroupId,
+                    index: launch.index,
+                    total: launch.total,
+                  }
+                : undefined,
+          })
+        )
+      );
 
-        const created = await taskService.create({
-          parentWorkspaceId: workspaceId,
-          kind: "agent",
-          agentId: requestedAgentId,
-          // Legacy alias (persisted for older clients / on-disk compatibility).
-          agentType: requestedAgentId,
-          prompt: launch.prompt,
-          title,
-          ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
-          ...(aiOverrides.thinkingLevel != null
-            ? { thinkingLevel: aiOverrides.thinkingLevel }
-            : {}),
-          ...(isolation != null ? { isolation } : {}),
-          ...(desktop != null ? { desktop } : {}),
-          ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
-          // Background launches are non-blocking with terminal wake-up; foreground/default block.
-          attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
-          bestOf:
-            taskGroupId != null
-              ? {
-                  groupId: taskGroupId,
-                  index: launch.index,
-                  total: launch.total,
-                }
-              : undefined,
-        });
-
-        if (!created.success) {
-          if (createdTasks.length > 0) {
-            return parseToolResult(
-              TaskToolResultSchema,
-              buildPendingTaskResult({
-                tasks: createdTasks,
-                note:
-                  `Grouped task creation stopped after spawning ${createdTasks.length} of ${taskGroupCount} task(s): ${created.error}. ` +
-                  "Use task_await on the returned task metadata before retrying, or you may duplicate work.",
-                forceGrouped: taskGroupCount > 1,
-              }),
-              "task"
-            );
-          }
-
-          throw new Error(created.error);
-        }
-
-        const task = {
-          taskId: created.data.taskId,
-          status: created.data.status,
-          modelString: created.data.modelString,
-          thinkingLevel: created.data.thinkingLevel,
-          desktopOwnerWorkspaceId: created.data.desktopOwnerWorkspaceId,
-        } satisfies SpawnedTaskInfo;
-        createdTasks.push(task);
-
-        // UI-only signal: expose spawned taskIds as soon as the workspaces exist.
+      // An abort (the parent's Stop) does not wait for the children's first sends: the Stop's
+      // cascade runs only once this turn ended, so waiting would let every admitted child reach
+      // its provider. Each create still short of its gate refuses on the aborted signal, and each
+      // one past it writes its row before the cascade's snapshot (both hold the global mutex).
+      const created = await raceWithAbortAndTimeout(creating, { signal: abortSignal });
+      if (created.kind !== "ok") {
+        throw new Error("Interrupted");
+      }
+      const { createdTasks, failures } = collectTaskGroupCreates(created.value);
+      for (const task of createdTasks) {
+        // UI-only signal: expose spawned taskIds once every create of this call settled.
         emitTaskCreatedEvent({
           config,
           workspaceId,
           toolCallId,
           taskId: task.taskId,
         });
+      }
+
+      // A stop-latch refusal without an abort (a queued workspace-turn handle's task_stop) is
+      // reported like any failed create, so the spawned children are listed.
+      if (failures.length > 0) {
+        if (createdTasks.length === 0) {
+          throw failures[0];
+        }
+        return parseToolResult(
+          TaskToolResultSchema,
+          buildPendingTaskResult({
+            tasks: createdTasks,
+            note:
+              `Grouped task creation spawned ${createdTasks.length} of ${taskGroupCount} task(s); ${failures.length} failed: ${getErrorMessage(failures[0])}. ` +
+              "Use task_await on the returned task metadata before retrying, or you may duplicate work.",
+            forceGrouped: taskGroupCount > 1,
+          }),
+          "task"
+        );
       }
 
       if (run_in_background) {

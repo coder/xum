@@ -1,6 +1,6 @@
 import { useState, type ComponentProps, type ReactNode, useEffect, useMemo } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, within } from "@storybook/test";
+import { expect, fn, userEvent, within } from "storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
@@ -127,6 +127,7 @@ const DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS: Omit<
   projectPath: "/home/user/projects/my-app",
   userProjects: new Map(),
   onSelectedProjectPathChange: fn(),
+  projectSelectDisabled: false,
   projectName: "my-app",
   nameState: {
     name: "devcontainer-story",
@@ -342,6 +343,7 @@ const CREATION_ERROR_BASE_CONTROLS_PROPS = {
   projectPath: CREATION_PROJECT_PATH,
   userProjects: new Map(),
   onSelectedProjectPathChange: fn(),
+  projectSelectDisabled: false,
   projectName: "my-project",
   runtimeAvailabilityState: BASE_ARGS.runtimeAvailabilityState,
   nameState: BASE_CREATION_NAME_STATE,

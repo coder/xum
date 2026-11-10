@@ -10,6 +10,7 @@ import * as path from "path";
 import { ORPCError } from "@orpc/server";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ArtifactCapabilities, ArtifactListing } from "@/common/orpc/schemas/artifacts";
+import type { ArtifactKind } from "@/common/utils/artifactKind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -23,7 +24,13 @@ import { MAX_ATTACH_FILE_SIZE_BYTES } from "@/node/utils/attachments/attachmentL
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { log } from "@/node/services/log";
 import { getArtifactCapabilities } from "./artifactCapabilities";
-import { listArtifactIndexes } from "./artifactVersionStore";
+import {
+  getArtifactId,
+  listArtifactRecords,
+  readArtifactRecord,
+  withPublishedKinds,
+  type ArtifactRecord,
+} from "./artifactRecordStore";
 import {
   listArtifactsOnRuntime,
   readArtifactBytesOnRuntime,
@@ -41,6 +48,7 @@ import {
   type ArtifactBytesOutcome,
   type ArtifactReadOptions,
   type ArtifactReadOutcome,
+  type ArtifactWriteOptions,
 } from "./artifactStore";
 
 export type ArtifactsContext = Pick<
@@ -96,8 +104,6 @@ export async function resolveArtifactsLocation(
   metadata: ArtifactsWorkspaceMetadata,
   options?: {
     createRuntime?: (metadata: ArtifactsWorkspaceMetadata) => Runtime;
-    canBindMountHostPaths?: () => Promise<boolean>;
-    hostSupportsDescriptorPaths?: () => Promise<boolean>;
     abortSignal?: AbortSignal;
   }
 ): Promise<ArtifactsLocation> {
@@ -112,7 +118,6 @@ export async function resolveArtifactsLocation(
     sessionsDir,
     runtime: { getXumHome: () => getRuntime().getXumHome() },
     multiProject: (metadata.projects?.length ?? 0) > 1, // isMultiProject, on a narrower type
-    canBindMountHostPaths: options?.canBindMountHostPaths,
   });
   switch (spec.kind) {
     case "host":
@@ -134,10 +139,7 @@ export async function resolveArtifactsLocation(
       // can be raced from there. Hosts with descriptor paths (Linux) pin every folder; elsewhere
       // the dir is read inside the container, where a swap reaches nothing the container could
       // not already read.
-      const pinnable = await (
-        options?.hostSupportsDescriptorPaths ?? hostSupportsDescriptorPaths
-      )();
-      if (!pinnable) {
+      if (!(await hostSupportsDescriptorPaths())) {
         return { kind: "runtime", runtime: getRuntime(), dir: getArtifactsDir(spec.dir) };
       }
       return { kind: "host", dir: getArtifactsDir(spec.dir), containerWritable: true };
@@ -196,11 +198,13 @@ export async function listArtifacts(
   if (location.kind === "unavailable") {
     return { success: true, data: { available: false, reason: location.reason } };
   }
-  const versionedPaths = await listVersionedArtifactPaths(context, input.workspaceId);
+  const records = await listPublishedArtifacts(context, input.workspaceId);
+  const publishedPaths = records.map((record) => record.path);
   if (location.kind === "runtime") {
     try {
       const listing = await listArtifactsOnRuntime(location.runtime, location.dir, abortSignal);
-      return { success: true, data: { available: true, ...listing, versionedPaths } };
+      const entries = withPublishedKinds(listing.entries, records);
+      return { success: true, data: { available: true, ...listing, entries, publishedPaths } };
     } catch (error) {
       return unreachableError(error);
     }
@@ -210,24 +214,46 @@ export async function listArtifacts(
   });
   return {
     success: true,
-    data: { available: true, dir: location.dir, entries, truncated, versionedPaths },
+    data: {
+      available: true,
+      dir: location.dir,
+      entries: withPublishedKinds(entries, records),
+      truncated,
+      publishedPaths,
+    },
   };
 }
 
 /**
- * Paths with stored versions (host session dir), so the tab keeps deleted working files
- * reachable through their versions. Unreadable indexes leave the list short, never fail it.
+ * Records of published artifacts (host session dir): the tab lists published files first and
+ * shows each as its published kind. Unreadable records leave the list short, never fail it.
  */
-async function listVersionedArtifactPaths(
+async function listPublishedArtifacts(
   context: ArtifactsContext,
   workspaceId: string
-): Promise<string[]> {
+): Promise<ArtifactRecord[]> {
   try {
-    const indexes = await listArtifactIndexes(path.join(context.config.sessionsDir, workspaceId));
-    return indexes.filter((index) => index.versions.length > 0).map((index) => index.path);
+    return await listArtifactRecords(path.join(context.config.sessionsDir, workspaceId));
   } catch (error) {
-    log.debug("Could not list artifact version indexes", { error: getErrorMessage(error) });
+    log.debug("Could not list artifact records", { error: getErrorMessage(error) });
     return [];
+  }
+}
+
+async function readKindOverride(
+  context: ArtifactsContext,
+  workspaceId: string,
+  relPath: string
+): Promise<ArtifactKind | undefined> {
+  try {
+    const record = await readArtifactRecord(
+      path.join(context.config.sessionsDir, workspaceId),
+      getArtifactId(relPath)
+    );
+    return record?.kind;
+  } catch (error) {
+    log.debug("Could not read artifact record", { error: getErrorMessage(error) });
+    return undefined;
   }
 }
 
@@ -246,6 +272,7 @@ export async function readArtifact(
   const location = await resolveForWorkspace(context, input.workspaceId, abortSignal);
   if (!location) return { success: false, error: `Workspace not found: ${input.workspaceId}` };
   if (location.kind === "unavailable") return { success: false, error: location.reason };
+  const kind = await readKindOverride(context, input.workspaceId, input.path);
   if (location.kind === "runtime") {
     try {
       return await readArtifactOnRuntime(
@@ -253,7 +280,8 @@ export async function readArtifact(
         location.dir,
         input.path,
         maxBytes,
-        abortSignal
+        abortSignal,
+        { kind }
       );
     } catch (error) {
       return unreachableError(error);
@@ -261,24 +289,32 @@ export async function readArtifact(
   }
   return readArtifactFromDir(location.dir, input.path, maxBytes, {
     requireDescriptorPaths: location.containerWritable,
+    kind,
   });
 }
 
 /**
  * Write one host-maintained artifact (e.g. the goal status board) wherever the location lives,
  * with the same containment rules as reads. Throws on failure; callers decide whether to care.
+ * `createOnly` writes only a missing file, atomically: a file that exists, or appears while
+ * the write runs, is left as it is.
  */
 export async function writeArtifactAtLocation(
   location: Exclude<ArtifactsLocation, { kind: "unavailable" }>,
   relPath: string,
-  content: string
+  content: string,
+  options?: ArtifactWriteOptions & { abortSignal?: AbortSignal }
 ): Promise<void> {
   if (location.kind === "runtime") {
-    await writeArtifactOnRuntime(location.runtime, location.dir, relPath, content);
+    await writeArtifactOnRuntime(location.runtime, location.dir, relPath, content, {
+      abortSignal: options?.abortSignal,
+      createOnly: options?.createOnly,
+    });
     return;
   }
   await writeArtifactToDir(location.dir, relPath, content, {
     requireDescriptorPaths: location.containerWritable,
+    createOnly: options?.createOnly,
   });
 }
 

@@ -81,7 +81,6 @@ class MuxAgent(BaseInstalledAgent):
 
     _CONFIG_ENV_KEYS: Sequence[str] = (
         "MUX_AGENT_GIT_URL",
-        "MUX_BUN_INSTALL_URL",
         "MUX_PROJECT_PATH",
         "MUX_PROJECT_CANDIDATES",
         "MUX_MODEL",

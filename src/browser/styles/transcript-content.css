@@ -154,7 +154,7 @@
 }
 
 .markdown-content a {
-  color: var(--color-accent);
+  color: var(--color-accent-text);
   text-decoration: none;
 }
 
@@ -174,6 +174,14 @@
   border: 1px solid var(--color-border);
   padding: 6px 12px;
   text-align: left;
+}
+
+/* Streamdown puts utility classes on table parts (bg-muted/80 on thead, bg-muted/40 on tbody).
+   They fill with a text gray. These rules are unlayered, so they beat Tailwind's utilities layer
+   and keep the look below even when some source file makes Tailwind generate those utilities. */
+.markdown-content table thead,
+.markdown-content table tbody {
+  background: none;
 }
 
 .markdown-content table th {
@@ -201,29 +209,59 @@
   opacity: 0.6;
 }
 
-/* Mermaid diagrams */
-.markdown-content .mermaid-container {
+/* Mermaid diagrams. Pele reads these variables. Not under .markdown-content: the artifact
+   viewer renders diagrams outside it. --pele-font must match the fontFamily that Mermaid.tsx
+   measures with, or labels overflow their boxes. */
+.mermaid-container {
+  --pele-bg: var(--color-code-bg);
+  --pele-fg: var(--color-content-primary);
+  --pele-muted: var(--color-content-secondary);
+  --pele-line: var(--color-content-secondary);
+  --pele-surface: var(--color-surface-secondary);
+  --pele-surface-alt: var(--color-surface-tertiary);
+  --pele-border: var(--color-border-medium);
+  --pele-accent: var(--color-content-link);
+  --pele-critical: var(--color-highlight-red);
+  --pele-error: var(--color-highlight-red);
+  /* Coder series order. */
+  --pele-series-1: var(--color-highlight-purple);
+  --pele-series-2: var(--color-highlight-sky);
+  --pele-series-3: var(--color-highlight-orange);
+  --pele-series-4: var(--color-highlight-magenta);
+  --pele-series-5: var(--color-highlight-green);
+  --pele-series-6: var(--color-highlight-red);
+  --pele-series-7: var(--color-content-link);
+  --pele-series-8: var(--color-content-secondary);
+  --pele-font: var(--font-primary);
+  --pele-font-mono: var(--font-monospace);
+  --pele-radius: 6px;
   display: flex;
-  justify-content: center;
+  /* safe: Pele SVGs keep their measured width, so a wide diagram overflows. Plain center
+     would push its left edge out of the scrollable area. */
+  justify-content: safe center;
   align-items: center;
   overflow: auto;
+  /* The sanitized SVG keeps Pele's class and style attributes, and an app class such as fixed or
+     an inline position:fixed on its root would otherwise cover the page outside the diagram.
+     Paint containment clips everything to this box, positioned descendants included. */
+  contain: paint;
   max-width: 100%;
 }
 
-.markdown-content .mermaid-container svg {
-  min-width: min-content;
-  max-width: none;
-  max-height: var(--diagram-max-height, 300px);
-  height: auto;
-  /* Electron is Chromium-only; zoom affects layout/scrollbars, unlike transform. */
-  zoom: var(--diagram-zoom, 1);
+/* Mermaid.tsx computes the diagram's pixel size from the size Pele measured. Nothing else may
+   size the box: engines disagree on intrinsic sizing, min-content, aspect-ratio transfer from
+   max-height and CSS zoom, and iPhone Safari painted a diagram far outside its frame. */
+.mermaid-container > svg {
+  flex: none;
+  width: var(--diagram-width);
+  height: var(--diagram-height);
 }
 
-/* Mermaid in modal - allow larger sizing */
-.markdown-content .mermaid-modal svg {
-  max-width: none;
-  width: auto;
-  max-height: 80vh;
+/* The expand dialog's Close button (Mermaid.tsx) takes this class in the desktop app only. The rule
+   lives here, not in globals.css, because vscode/src/webview/webviewCss.test.ts fails when the
+   webview bundle names a class that only globals.css defines. */
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
 }
 
 /* Zoom wrapper for mermaid */
@@ -379,11 +417,20 @@ span.search-highlight {
   transition: opacity 0.2s;
 }
 
-.code-block-wrapper:hover .code-run-button {
-  opacity: 1;
+/* Revealed on hover only where hover exists. Touch screens have no hover, so the buttons stay
+   visible there; a reveal on a tap's :hover made iOS drop that tap's click. */
+@media (hover: hover) {
+  .code-block-wrapper:hover .code-run-button,
+  .code-block-wrapper:hover .code-copy-button {
+    opacity: 1;
+  }
 }
-.code-block-wrapper:hover .code-copy-button {
-  opacity: 1;
+
+@media (hover: none) {
+  .code-run-button,
+  .code-copy-button {
+    opacity: 1;
+  }
 }
 
 /* Single-line code block: inline copy button at top-right */

@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { BackupProjectImport, SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import {
+  EMPTY_BACKUP_PLUGIN_REPORT,
+  type BackupProjectImport,
+  type SettingsBackupInput,
+} from "@/common/orpc/schemas/backup";
 import { Err, Ok } from "@/common/types/result";
 import { BackupNonFastForwardError, backupCachePath, isBackupCacheName } from "./gitRepo";
 import { BackupRemoteUnreachableError } from "./credentials";
@@ -17,6 +21,7 @@ import {
   type BackupProjectImporter,
   type BackupProjectRegistrar,
   BackupServiceError,
+  RETAINED_SNAPSHOTS,
   type BackupGitRepo,
   type BackupPayloadStore,
   type PreparedBackupRepository,
@@ -93,6 +98,7 @@ function createPayload(overrides: Partial<BackupPayloadStore> = {}): BackupPaylo
         commandApprovals: [],
         projectImports: [],
         projectBundleSkipped: false,
+        plugins: EMPTY_BACKUP_PLUGIN_REPORT,
       }),
     validateRestore: () =>
       Promise.resolve({ hasProjectBundle: false, projectImports: [], matchedProjects: [] }),
@@ -102,6 +108,7 @@ function createPayload(overrides: Partial<BackupPayloadStore> = {}): BackupPaylo
         changedFiles: [],
         localOnlyFiles: [],
         projectBundleSkipped: false,
+        plugins: EMPTY_BACKUP_PLUGIN_REPORT,
         restoredProjectMemory: [],
       }),
     prepareProjectImports: () =>
@@ -185,6 +192,7 @@ describe("BackupService", () => {
             changedFiles: ["AGENTS.md"],
             localOnlyFiles: ["skills/local/SKILL.md"],
             projectBundleSkipped: false,
+            plugins: EMPTY_BACKUP_PLUGIN_REPORT,
             restoredProjectMemory: [],
           });
         },
@@ -253,7 +261,7 @@ describe("BackupService", () => {
     if (!first.success) throw new Error(first.error.message);
     // The path handed to the caller has to stay readable for as many later restores as the
     // retention promises, which is what makes it usable after the call returns.
-    for (let later = 0; later < BackupService.RETAINED_SNAPSHOTS - 1; later++) {
+    for (let later = 0; later < RETAINED_SNAPSHOTS - 1; later++) {
       const next = await service.restore(SETTINGS);
       if (!next.success) throw new Error(next.error.message);
       expect(await fs.readFile(path.join(first.data.snapshotPath, "AGENTS.md"), "utf8")).toBe(
@@ -380,6 +388,7 @@ describe("BackupService", () => {
             commandApprovals: [],
             projectImports: [],
             projectBundleSkipped: false,
+            plugins: EMPTY_BACKUP_PLUGIN_REPORT,
           };
         },
       }),
@@ -425,6 +434,7 @@ describe("BackupService", () => {
             changedFiles: ["AGENTS.md"],
             localOnlyFiles: [],
             projectBundleSkipped: false,
+            plugins: EMPTY_BACKUP_PLUGIN_REPORT,
             restoredProjectMemory: [],
           };
         },
@@ -539,6 +549,7 @@ describe("BackupService", () => {
             commandApprovals: [],
             projectImports: [],
             projectBundleSkipped: false,
+            plugins: EMPTY_BACKUP_PLUGIN_REPORT,
           });
         },
         exportTo: () => {
@@ -575,6 +586,7 @@ describe("BackupService", () => {
             commandApprovals: [],
             projectImports: [],
             projectBundleSkipped: false,
+            plugins: EMPTY_BACKUP_PLUGIN_REPORT,
           });
         },
         exportTo: (options) => {
@@ -595,6 +607,7 @@ describe("BackupService", () => {
             changedFiles: [],
             localOnlyFiles: [],
             projectBundleSkipped: false,
+            plugins: EMPTY_BACKUP_PLUGIN_REPORT,
             restoredProjectMemory: [],
           });
         },
@@ -2617,6 +2630,7 @@ describe("BackupService project imports", () => {
             changedFiles: [],
             localOnlyFiles: [],
             projectBundleSkipped: false,
+            plugins: EMPTY_BACKUP_PLUGIN_REPORT,
             restoredProjectMemory: [],
           });
         },
@@ -2650,6 +2664,7 @@ describe("BackupService project imports", () => {
             changedFiles: ["memory/project/matched-abc/deep/notes.md"],
             localOnlyFiles: [],
             projectBundleSkipped: false,
+            plugins: EMPTY_BACKUP_PLUGIN_REPORT,
             restoredProjectMemory: [
               {
                 projectPath: "/home/dev/src/matched",
@@ -2749,6 +2764,7 @@ describe("BackupService project imports", () => {
             changedFiles: ["memory/project/alpha-abc/notes.md"],
             localOnlyFiles: [],
             projectBundleSkipped: false,
+            plugins: EMPTY_BACKUP_PLUGIN_REPORT,
             restoredProjectMemory: [
               { projectPath: "/home/dev/src/alpha", files: ["memory/project/alpha-abc/notes.md"] },
             ],
@@ -2833,6 +2849,7 @@ describe("BackupService project imports", () => {
             commandApprovals: [],
             projectImports: [fresh],
             projectBundleSkipped: false,
+            plugins: EMPTY_BACKUP_PLUGIN_REPORT,
           }),
         exportTo: () => Promise.reject(new Error("Backup has more than 256 projects")),
       }),

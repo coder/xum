@@ -10,7 +10,7 @@ import {
 } from "@/common/utils/mcpApps";
 
 /**
- * MCP Apps views in the Artifacts tab (artifacts experiment). The view HTML comes from the
+ * MCP Apps views in the Artifacts tab (mcp-apps experiment). The view HTML comes from the
  * server's resources/read; the tool result comes from the host-only side store, never from
  * chat history.
  */
@@ -36,11 +36,23 @@ export const McpAppViewSchema = z.object({
   result: z.unknown().nullable(),
   /** Origins the user allowed this view's server to reach in this project (mcpAppViewDomains). */
   approvedDomains: z.array(z.string()).optional(),
+  /** Backend commit revision of `approvedDomains` (mcpAppsOperations.ts): newer lists win. */
+  approvedDomainsRevision: z.number().optional(),
   /**
    * The project whose approvals the view's server uses (a multi-project workspace's server
    * project, never the shared `_multi` bucket); null when none can be approved.
    */
   approvalProjectPath: z.string().nullable().optional(),
+  /**
+   * The view instance's window.openai widget state (setWidgetState), stored in its result record;
+   * null without one. Seeds `window.openai.widgetState` (mcpAppOpenAiShim.ts).
+   */
+  widgetState: z.unknown().optional(),
+  /**
+   * What binds widget-state writes to this view's result record (random per record); null
+   * without a record. A write with another record's binding is refused (#6178).
+   */
+  widgetStateBinding: z.string().nullable().optional(),
   /**
    * The tool call the side-store record names: its server, server-local tool name and the
    * sanitized arguments the server received. When present the view is bound to it (toolInfo,
@@ -81,6 +93,10 @@ export const McpAppViewRecordSchema = z
     toolName: z.string().min(1),
     resourceUri: z.string().refine(isMcpAppResourceUri, "resourceUri must be a ui:// URI"),
     arguments: z.unknown(),
+    /** The record is an entry point's view, not a tool call's (only an open writes it). */
+    entrypoint: z.literal(true).optional(),
+    /** How a call without a result ended (McpAppResultRecord.outcome); absent when it completed. */
+    outcome: z.enum(["failed", "interrupted"]).optional(),
   })
   .nullable();
 export type McpAppViewRecord = z.infer<typeof McpAppViewRecordSchema>;
@@ -127,6 +143,16 @@ export const McpAppResourceReadRequestSchema = z.object({
  * ui/update-model-context of a view: `text` replaces the view's previous context (empty
  * clears it). The view is bound by its tool call's result record, like getView.
  */
+/** window.openai.setWidgetState of a view, bound to its result record (widgetStateBinding). */
+export const McpAppWidgetStateRequestSchema = z.object({
+  workspaceId: z.string().min(1),
+  toolCallId: z.string().min(1),
+  serverName: z.string().min(1),
+  binding: z.string().min(1),
+  /** JSON of at most MCP_APP_WIDGET_STATE_MAX_BYTES; null clears it. */
+  state: z.unknown(),
+});
+
 export const McpAppModelContextRequestSchema = z.object({
   workspaceId: z.string().min(1),
   toolCallId: z.string().min(1),

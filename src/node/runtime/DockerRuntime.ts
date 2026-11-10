@@ -66,6 +66,9 @@ function sanitizeContainerUserId(rawValue: string): string {
   return /^\d+$/.test(trimmedValue) ? trimmedValue : "0";
 }
 
+/** The `docker exec` arguments that print the home of the container's default user. */
+const PRINT_HOME_ARGS = ["sh", "-c", "echo $HOME"];
+
 interface ContainerUserInfo {
   uid: string;
   gid: string;
@@ -200,6 +203,19 @@ function buildCredentialArgs(): string[] {
 }
 
 /**
+ * #6426: how often this process created or deleted each container name. Module level, because a
+ * runtime object is made per call. It is part of getAgentHostKey, so a container that Xum created
+ * again under the same name never reuses the cached plugin snapshot of the old one, and no docker
+ * process runs to tell them apart. Bumped AFTER each create attempt and removal: a snapshot is
+ * keyed when its read starts, so a read that raced the change keeps the old key.
+ */
+const containerGenerations = new Map<string, number>();
+
+function bumpContainerGeneration(containerName: string): void {
+  containerGenerations.set(containerName, (containerGenerations.get(containerName) ?? 0) + 1);
+}
+
+/**
  * Run docker run with streaming output (for image pull progress).
  * Streams stdout/stderr to initLogger for visibility during image pulls.
  */
@@ -320,6 +336,11 @@ export function getContainerName(projectPath: string, workspaceName: string): st
  * Extends RemoteRuntime for shared exec/file operations.
  */
 export class DockerRuntime extends RemoteRuntime {
+  /** Runtime.mode. A prototype getter, like `location`, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- same as location: Object.create(X.prototype) doubles would read undefined from a readonly field
+  get mode(): "docker" {
+    return "docker";
+  }
   private readonly config: DockerRuntimeConfig;
   /** Container name - set during construction (for existing) or createWorkspace (for new) */
   private containerName?: string;
@@ -345,6 +366,17 @@ export class DockerRuntime extends RemoteRuntime {
   // ===== RemoteRuntime abstract method implementations =====
 
   protected readonly commandPrefix = "Docker";
+
+  override getAgentHostKey(): string | undefined {
+    // Without a name the container is not known yet.
+    return this.containerName !== undefined
+      ? JSON.stringify([
+          "docker",
+          this.containerName,
+          containerGenerations.get(this.containerName) ?? 0,
+        ])
+      : undefined;
+  }
 
   protected getBasePath(): string {
     return CONTAINER_SRC_DIR;
@@ -411,24 +443,44 @@ export class DockerRuntime extends RemoteRuntime {
   }
   // ===== Runtime interface implementations =====
 
-  resolvePath(filePath: string): Promise<string> {
+  async resolvePath(filePath: string): Promise<string> {
     // DockerRuntime uses a fixed workspace base (/src), but we still want reasonable shell-style
     // behavior for callers that pass "~" or "~/...".
-    //
-    // NOTE: Some base images (e.g., codercom/*-base) run as a non-root user (like "coder"), so
-    // "~" should resolve to that user's home (e.g., /home/coder), not /root.
-    const home = this.containerHome ?? "/root";
-
     if (filePath === "~") {
-      return Promise.resolve(home);
+      return this.resolveContainerHome();
     }
     if (filePath.startsWith("~/")) {
-      return Promise.resolve(path.posix.join(home, filePath.slice(2)));
+      return path.posix.join(await this.resolveContainerHome(), filePath.slice(2));
     }
 
-    return Promise.resolve(
-      filePath.startsWith("/") ? filePath : path.posix.join(CONTAINER_SRC_DIR, filePath)
+    return filePath.startsWith("/") ? filePath : path.posix.join(CONTAINER_SRC_DIR, filePath);
+  }
+
+  // Task.create and the agent routes build a runtime per call and read ~/.xum/agents before
+  // ensureReady detects the container user. For a non-root user, a guessed /root (mode 700) fails
+  // every such read with EACCES. A failed probe is not cached.
+  private async resolveContainerHome(): Promise<string> {
+    if (this.containerHome !== undefined) return this.containerHome;
+    // Before createWorkspace there is no container to ask.
+    if (this.containerName === undefined) return "/root";
+
+    const probe = await runContainerSpawnCommand(
+      ["exec", this.containerName, ...PRINT_HOME_ARGS],
+      5000
     );
+    const home = probe.stdout.trim();
+    if (probe.exitCode !== 0 || home === "") {
+      // A negative exit code means the CLI did not finish (it timed out, or could not start), so
+      // the container's state is unknown.
+      const unavailable =
+        probe.exitCode < 0 || isContainerUnavailableExit(probe.exitCode, probe.stderr);
+      throw new RuntimeError(
+        `Failed to resolve the home of container ${this.containerName}: ${probe.stderr.trim()}`,
+        unavailable ? "network" : "exec"
+      );
+    }
+    this.containerHome = home;
+    return home;
   }
 
   getWorkspacePath(_projectPath: string, _workspaceName: string): string {
@@ -552,7 +604,7 @@ export class DockerRuntime extends RemoteRuntime {
     }
 
     // Do NOT delete container on hook failure - user can debug.
-    return runWorkspaceInitHook({
+    const result = await runWorkspaceInitHook({
       params,
       runtimeType: "docker",
       findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
@@ -568,6 +620,9 @@ export class DockerRuntime extends RemoteRuntime {
         );
       },
     });
+    // #6426: the checkout is populated now; a snapshot read while it was being made is stale.
+    bumpContainerGeneration(this.containerName);
+    return result;
   }
 
   /**
@@ -622,7 +677,7 @@ export class DockerRuntime extends RemoteRuntime {
     const [uidResult, gidResult, homeResult] = await Promise.all([
       runDockerCommand(`exec ${containerName} id -u`, 5000, abortSignal),
       runDockerCommand(`exec ${containerName} id -g`, 5000, abortSignal),
-      runDockerCommand(`exec ${containerName} sh -c 'echo $HOME'`, 5000, abortSignal),
+      runContainerSpawnCommand(["exec", containerName, ...PRINT_HOME_ARGS], 5000, abortSignal),
     ]);
 
     return {
@@ -750,6 +805,8 @@ export class DockerRuntime extends RemoteRuntime {
       abortSignal,
       shareCredentials: this.config.shareCredentials,
     });
+    // #6426: after the attempt (even a failed run can leave a container under this name).
+    bumpContainerGeneration(containerName);
     if (runResult.exitCode !== 0) {
       await runDockerCommand(`rm -f ${containerName}`, 10000);
       throw new Error(`Failed to create container: ${runResult.stderr}`);
@@ -972,6 +1029,7 @@ export class DockerRuntime extends RemoteRuntime {
       if (inspectResult.exitCode !== 0) {
         // Only treat as "doesn't exist" if Docker says so
         if (inspectResult.stderr.toLowerCase().includes("no such object")) {
+          bumpContainerGeneration(containerName);
           return { success: true, deletedPath };
         }
         return {
@@ -1040,6 +1098,7 @@ export class DockerRuntime extends RemoteRuntime {
 
       // Stop and remove container
       const rmResult = await runDockerCommand(`rm -f ${containerName}`, 30000);
+      bumpContainerGeneration(containerName);
 
       if (rmResult.exitCode !== 0) {
         return {
@@ -1137,6 +1196,7 @@ export class DockerRuntime extends RemoteRuntime {
       dockerArgs.push(this.config.image, "sleep", "infinity");
       throwIfAborted();
       const runResult = await runContainerSpawnCommand(dockerArgs, 60000, abortSignal);
+      bumpContainerGeneration(destContainerName);
       if (runResult.exitCode !== 0) {
         // Handle TOCTOU race - container may have been created between check and run
         if (runResult.stderr.includes("already in use")) {
@@ -1292,6 +1352,8 @@ export class DockerRuntime extends RemoteRuntime {
       forkSucceeded = true;
       // Update containerName so subsequent initWorkspace() targets the forked container
       this.containerName = destContainerName;
+      // #6426: the clone is complete; a snapshot read while it was cloning is stale.
+      bumpContainerGeneration(destContainerName);
       return { success: true, workspacePath: CONTAINER_SRC_DIR, sourceBranch };
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };

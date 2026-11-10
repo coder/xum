@@ -552,7 +552,7 @@ export interface TranscriptAnchor {
 
 /**
  * A message sent from an agent-written artifact (Artifacts M5b): `window.xum.send` or a canvas
- * button, confirmed by the user in the host-owned strip. Only the backend sets it (generic sends
+ * button, sent by the user's click in the artifact or confirmed in the host-owned strip. Only the backend sets it (generic sends
  * refuse it), so the "from artifact" label cannot be faked by typing the model-facing tag.
  */
 export interface ArtifactInteractionMetadata {
@@ -561,12 +561,17 @@ export interface ArtifactInteractionMetadata {
   /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
   artifactPath: string;
   title: string;
-  /** Artifact version the user interacted with (0 when the file had no stored version). */
-  version: number;
   action: "send";
   text: string;
   /** Optional JSON payload from the artifact. */
   data?: unknown;
+}
+
+/** Answers to a non-blocking ask_user_question, delivered as a user message. */
+export interface AskUserQuestionAnswerMetadata {
+  toolCallId: string;
+  /** Keyed by question text; an empty string means the user skipped that question. */
+  answers: Record<string, string>;
 }
 
 /** Base fields common to all metadata types */
@@ -577,6 +582,17 @@ interface MuxMessageMetadataBase {
   reviews?: ReviewNoteDataForDisplay[];
   /** Set by the backend only: this user message came from an artifact (Artifacts M5b). */
   artifactInteraction?: ArtifactInteractionMetadata;
+  /**
+   * Set by the question card: this user message delivers the answers to a non-blocking
+   * ask_user_question (answerDelivery "message"). A display hint only, like Codex dropping a
+   * pending question once its reply is in history: the card shows these answers instead of the
+   * form. Nothing gates on it, so a missing or forged value only changes which card looks open.
+   *
+   * One answered call is an object (the only shape older builds read). The dock's chained form
+   * answers several open calls in one message and sends an array, one entry per call; an older
+   * build drops the array as malformed and keeps showing those calls as open (display-only).
+   */
+  askUserQuestionAnswer?: AskUserQuestionAnswerMetadata | AskUserQuestionAnswerMetadata[];
   /** Command prefix to highlight in UI (e.g., "/compact -m sonnet" or "/react-effects") */
   commandPrefix?: string;
   /**
@@ -1022,6 +1038,21 @@ export interface PluginHookContextEntry {
  * chain order (the requested model is always the first entry). The effective
  * (answering) model is recorded separately as the message's `model`.
  */
+/** MuxMetadata.volatileSystemTail: where a turn sent the volatile system tail, and its text. */
+export interface VolatileSystemTailRecord {
+  text: string;
+  placement: "system" | "row";
+}
+
+/** A turn's system-section records (prompt-cache mechanism 10), as its assistant row holds them. */
+export const SYSTEM_SECTION_RECORD_FIELDS = [
+  "volatileSystemTail",
+  "customInstructions",
+  "skillIndex",
+  "toolInstructions",
+] as const;
+export type SystemSectionRecords = Pick<MuxMetadata, (typeof SYSTEM_SECTION_RECORD_FIELDS)[number]>;
+
 export interface ModelFallbackRecord {
   requestedModel: string;
   refusedModels: string[];
@@ -1054,8 +1085,6 @@ export interface MuxMetadata {
   metadataModel?: string;
   /** Effective thinking/reasoning level used for this response (after model policy clamping). */
   thinkingLevel?: ThinkingLevel;
-  /** @deprecated Legacy gateway flag; prefer routeProvider for source attribution. */
-  routedThroughGateway?: boolean;
   routeProvider?: string;
   /**
    * Legacy marker for usage that the app classified as subscription-covered.
@@ -1096,6 +1125,32 @@ export interface MuxMetadata {
    * loses it.
    */
   anthropicThinkingReplayFromStep?: number | "end";
+  /**
+   * The volatile system-prompt tail (MCP warning, context-window ids) this
+   * turn's request sent (prompt-cache mechanism 10). "system": at the end of the system
+   * prompt, where it stays frozen for the rest of the context segment. "row": as a
+   * mid-conversation system row right before this row, because the tail changed inside the
+   * segment. See src/node/utils/messages/volatileSystemTail.ts.
+   */
+  volatileSystemTail?: VolatileSystemTailRecord;
+  /**
+   * The `<custom-instructions>` block (AGENTS.md files, project instructions) this turn's
+   * request sent, with the same rule as volatileSystemTail: "system" freezes it in the cached
+   * system prompt for the rest of the segment, "row" sent a changed block as a system row
+   * right before this row. Without it an AGENTS.md change rewrote the whole cached history.
+   */
+  customInstructions?: VolatileSystemTailRecord;
+  /**
+   * The "Available skills" index of the agent_skill_read tool description this turn's request
+   * sent, with the same rule: "system" freezes it in the cached tool block for the segment,
+   * "row" sent a changed index as a system row right before this row.
+   */
+  skillIndex?: VolatileSystemTailRecord;
+  /**
+   * The `Tool: <name>` instructions the tool descriptions of this turn's request sent (text: the
+   * JSON map of tool to instructions, "" for none), with the same rule as skillIndex.
+   */
+  toolInstructions?: VolatileSystemTailRecord;
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
@@ -1274,6 +1329,7 @@ export interface MuxReasoningPart {
    * - OpenAI/xAI Responses (esp. store=false/ZDR): itemId + reasoningEncryptedContent
    *   so the next turn can restore encrypted reasoning without server-side storage.
    * - Google: { google: { thoughtSignature } }
+   * - Google Vertex AI: { googleVertex: { thoughtSignature } }
    */
   providerOptions?: {
     anthropic?: {
@@ -1293,6 +1349,9 @@ export interface MuxReasoningPart {
       reasoningEncryptedContent?: string | null;
     };
     google?: {
+      thoughtSignature?: string;
+    };
+    googleVertex?: {
       thoughtSignature?: string;
     };
   };
@@ -1390,6 +1449,8 @@ export type DisplayedMessage =
       reviews?: ReviewNoteDataForDisplay[];
       /** Message sent from an artifact (from muxMetadata); drives the "from artifact" pill. */
       artifactInteraction?: ArtifactInteractionMetadata;
+      /** Answers to non-blocking ask_user_question calls, one entry per call (from muxMetadata). */
+      askUserQuestionAnswers?: AskUserQuestionAnswerMetadata[];
       /** Present when this synthetic turn is a background bash monitor wake-up. */
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];
@@ -1428,7 +1489,6 @@ export type DisplayedMessage =
       /** True when this assistant row predates the latest Context Boundary. */
       isBeforeLatestContextBoundary?: boolean;
       model?: string;
-      routedThroughGateway?: boolean;
       routeProvider?: string;
       /** Present when a fallback model answered after the requested model refused. */
       modelFallback?: ModelFallbackRecord;
@@ -1523,7 +1583,6 @@ export type DisplayedMessage =
       historySequence: number; // Global ordering across all messages
       timestamp?: number;
       model?: string;
-      routedThroughGateway?: boolean;
       errorCount?: number; // Number of consecutive identical errors merged into this message
     }
   | {

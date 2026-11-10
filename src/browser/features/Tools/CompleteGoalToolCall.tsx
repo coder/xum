@@ -123,7 +123,7 @@ export const CompleteGoalToolCall: React.FC<CompleteGoalToolCallProps> = ({
   const summary = (goal?.completionSummary ?? args.summary).trim();
   const succeeded = status === "completed" && !errorResult;
   const iconClassName = succeeded
-    ? "text-success inline-flex shrink-0 items-center [&_svg]:size-3.5"
+    ? "text-success-text inline-flex shrink-0 items-center [&_svg]:size-3.5"
     : "text-secondary inline-flex shrink-0 items-center [&_svg]:size-3.5";
 
   return (

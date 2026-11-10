@@ -10,7 +10,7 @@
  */
 
 import type { ExperimentId } from "@/common/constants/experiments";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { PluginSlashCommandDescriptor } from "@/common/orpc/schemas/agentPlugins";
 import type { ParsedThinkingInput } from "@/common/types/thinking";
@@ -102,7 +102,7 @@ export interface SlashSuggestion {
 }
 
 export interface SlashSuggestionContext extends SlashCommandVisibilityContext {
-  agentSkills?: AgentSkillDescriptor[];
+  agentSkills?: InvocableSkill[];
   mcpPrompts?: MCPPromptDescriptor[];
   /** Agent Plugins: manifest-contributed commands (name -> expansion). */
   pluginCommands?: PluginSlashCommandDescriptor[];

@@ -1,4 +1,4 @@
-import { userEvent, waitFor } from "@storybook/test";
+import { userEvent, waitFor } from "storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks, PIXEL_DUAL_THEME } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";

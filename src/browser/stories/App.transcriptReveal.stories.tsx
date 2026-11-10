@@ -8,10 +8,11 @@
  * A transcript above the automatic rows budget pauses there; "Load older messages" mounts more.
  */
 import type { ComponentType } from "react";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ChatMuxMessage } from "@/common/orpc/types";
 import {
+  TRANSCRIPT_MAX_MOUNTED_ROWS,
   TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
   TRANSCRIPT_REVEAL_CHUNK_ROWS,
   TRANSCRIPT_REVEAL_TAIL_ROWS,
@@ -21,10 +22,10 @@ import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js"
 import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
+import { openLeftSidebar } from "./storyPlayHelpers";
 import {
   collapseLeftSidebar,
   collapseRightSidebar,
-  expandLeftSidebar,
   expandProjects,
   selectWorkspace,
 } from "./helpers/uiState";
@@ -80,7 +81,7 @@ function setup(largeRows = LARGE_ROWS): APIClient {
 }
 
 async function switchToLargeWorkspace(canvasElement: HTMLElement): Promise<void> {
-  expandLeftSidebar();
+  await openLeftSidebar(canvasElement);
   const row = await waitFor(async () => {
     const element = canvasElement.querySelector<HTMLElement>(
       `[data-workspace-id="${largeWorkspace.id}"][role="button"]`
@@ -224,6 +225,94 @@ function topVisibleRowId(scrollport: HTMLElement): string | null {
   return null;
 }
 
+function describeElement(element: Element | null): string {
+  if (element === null) return "null";
+  const id =
+    element.getAttribute("data-message-id") ??
+    element.getAttribute("data-testid") ??
+    element.getAttribute("role") ??
+    element.classList.item(0);
+  return id === null ? element.tagName : `${element.tagName}[${id}]`;
+}
+
+/**
+ * Evidence for #6758, printed only in the assertion messages below. The story failed once in CI
+ * (never locally in 36 full-suite runs): the first chunk mounted above the reader without the
+ * browser's scroll-anchoring adjustment, so the top row moved by exactly that chunk's height.
+ * Each sample is taken in a ResizeObserver callback, after the layout and its anchoring
+ * adjustment: `contentHeight/scrollTop/mountedRows`. Running animations and class/style
+ * changes on the anchor row or its ancestors are recorded because a change to a property like
+ * `transform` there makes Chromium skip that layout's adjustment (an unproven hypothesis).
+ */
+function recordRevealEvidence(scrollport: HTMLElement, anchor: Element): { stop: () => string } {
+  const content = scrollport.querySelector<HTMLElement>('[role="log"]');
+  if (content === null) throw new Error("the transcript content element is missing");
+  const rows = () => scrollport.querySelectorAll("[data-message-id]").length;
+  // Animations inside the scrollport or on its ancestors; the left sidebar's transitions are noise.
+  // A "*" marks one on the anchor row or an ancestor of it.
+  const transcriptAnimations = () =>
+    document.getAnimations().flatMap((animation) => {
+      const target = animation.effect instanceof KeyframeEffect ? animation.effect.target : null;
+      if (target === null || !(scrollport.contains(target) || target.contains(scrollport))) {
+        return [];
+      }
+      const name =
+        animation instanceof CSSAnimation
+          ? animation.animationName
+          : animation instanceof CSSTransition
+            ? animation.transitionProperty
+            : "script";
+      const onAnchorPath = target.contains(anchor) ? "*" : "";
+      return [`${name}@${describeElement(target)}${onAnchorPath}:${animation.playState}`];
+    });
+  const sample = () => {
+    const animations = transcriptAnimations().filter((entry) => entry.includes("*"));
+    const height = Math.round(content.getBoundingClientRect().height);
+    const geometry = `${height}/${Math.round(scrollport.scrollTop)}/${rows()}`;
+    return animations.length === 0 ? geometry : `${geometry} ${animations.join(",")}`;
+  };
+  const start = sample();
+  const samples: string[] = [];
+  const resizeObserver = new ResizeObserver(() => {
+    if (samples.length < 30) samples.push(sample());
+  });
+  resizeObserver.observe(content);
+  const ancestorChanges: string[] = [];
+  const mutationObserver = new MutationObserver((records) => {
+    for (const record of records) {
+      if (!(record.target instanceof Element) || !record.target.contains(anchor)) continue;
+      if (ancestorChanges.length < 10) {
+        ancestorChanges.push(`${describeElement(record.target)}.${record.attributeName ?? "?"}`);
+      }
+    }
+  });
+  mutationObserver.observe(scrollport, {
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["class", "style"],
+  });
+  const animations = Array.from(new Set(transcriptAnimations())).slice(0, 10);
+  const scrollportBox = scrollport.getBoundingClientRect();
+  const topEdge = document.elementFromPoint(
+    scrollportBox.left + scrollportBox.width / 2,
+    scrollportBox.top + 1
+  );
+  const atRelease = {
+    start,
+    overflowAnchor: getComputedStyle(content).overflowAnchor,
+    topEdge: describeElement(topEdge),
+    activeElement: describeElement(document.activeElement),
+    animations,
+  };
+  return {
+    stop: () => {
+      resizeObserver.disconnect();
+      mutationObserver.disconnect();
+      return JSON.stringify({ ...atRelease, samples, ancestorChanges, end: sample() });
+    },
+  };
+}
+
 export const ScrollUpMidReveal: AppStory = {
   render: () => <AppWithMocks setup={setup} />,
   play: async ({ canvasElement, step }) => {
@@ -260,6 +349,7 @@ export const ScrollUpMidReveal: AppStory = {
             throw new Error("no transcript row is visible after scrolling up");
           const anchorElement = () => scrollport.querySelector(`[data-message-id="${anchorRow}"]`)!;
           const anchorTop = anchorElement().getBoundingClientRect().top;
+          const evidence = recordRevealEvidence(scrollport, anchorElement());
 
           transcriptRevealFrameScheduler.schedule = realSchedule;
           held.shift()!();
@@ -269,13 +359,15 @@ export const ScrollUpMidReveal: AppStory = {
           await new Promise<void>((resolve) =>
             requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
           );
-          await expect(topVisibleRowId(scrollport), "top visible row after the reveal").toBe(
-            anchorRow
-          );
+          const report = evidence.stop();
+          await expect(
+            topVisibleRowId(scrollport),
+            `top visible row after the reveal; evidence (#6758): ${report}`
+          ).toBe(anchorRow);
           // Native scroll anchoring restores the row within a sub-pixel of its previous position.
           await expect(
             Math.abs(anchorElement().getBoundingClientRect().top - anchorTop),
-            "anchor row displacement (px)"
+            `anchor row displacement (px); evidence (#6758): ${report}`
           ).toBeLessThanOrEqual(1);
         }
       );
@@ -357,11 +449,34 @@ export const PauseAtBudget: AppStory = {
   play: pauseAtBudget,
 };
 
+/**
+ * The phone width in a frame no taller than the window (#7517). The test-runner window is 720 px
+ * tall, so a full 844 px frame overflows it and the page's outer containers can scroll. A trace
+ * of a throttled failing run (in #7517) showed them still scrolled when the read row was
+ * measured, and scrolled back mid-reveal after the click: the read row moved on screen without
+ * any transcript change, and the load-older pin, which compares screen positions, cannot undo
+ * that (#7549). The frame is shorter in that window (720 px instead of 844 px), which the
+ * assertions do not depend on; only the width must be a phone's.
+ */
+function IPhone16eWindowDecorator(Story: ComponentType) {
+  return (
+    <div
+      style={{
+        width: IPHONE_16E.width,
+        height: `min(${IPHONE_16E.height}px, 100vh)`,
+        overflow: "hidden",
+      }}
+    >
+      <Story />
+    </div>
+  );
+}
+
 export const PauseAtBudgetPhone: AppStory = {
   globals: { viewport: { value: "mobile1", isRotated: false } },
   render: () => <AppWithMocks setup={setupOverBudget} />,
   // The decorator forces the phone width for the test-runner, which applies no viewport.
-  decorators: [IPhone16eDecorator],
+  decorators: [IPhone16eWindowDecorator],
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async (context) => {
     await waitFor(() =>
@@ -373,4 +488,130 @@ export const PauseAtBudgetPhone: AppStory = {
     );
     await pauseAtBudget(context);
   },
+};
+
+/** Displayed rows (every user prompt is kept) beyond the mounted-row cap by over one budget. */
+const CAPPED_ROWS = 2 * (TRANSCRIPT_MAX_MOUNTED_ROWS + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS);
+const setupCapped = () => setup(CAPPED_ROWS);
+
+/**
+ * Waits for `find` to return an element, throwing a plain `Error` on each miss. A failed Testing
+ * Library query (findBy*) builds its error with prettyDOM of the WHOLE DOM, so with ~1,000 rows
+ * mounted each poll cost 250-350 ms, about 17 times per Load-older press, and the play took 21 s
+ * instead of 8 s (#7548). A timeout still prints the DOM once (waitFor's onTimeout).
+ */
+async function waitForElement<T extends HTMLElement>(
+  find: () => T | undefined,
+  what: string,
+  timeout: number
+): Promise<T> {
+  return waitFor(
+    () => {
+      const element = find();
+      if (!element) throw new Error(`Not found: ${what}`);
+      return element;
+    },
+    { timeout }
+  );
+}
+
+/** The button whose text is `name` (its accessible name: these buttons have no aria-label). */
+function buttonNamed(root: HTMLElement, name: string): HTMLButtonElement | undefined {
+  return Array.from(root.querySelectorAll("button")).find(
+    (button) => button.textContent?.trim() === name
+  );
+}
+
+/** The innermost element of a transcript row whose whole text is `text`. */
+function rowTextElement(scrollport: HTMLElement, text: string): HTMLElement | undefined {
+  for (const row of scrollport.querySelectorAll<HTMLElement>("[data-message-id]")) {
+    if (!row.textContent?.includes(text)) continue;
+    return Array.from(row.querySelectorAll<HTMLElement>("*"))
+      .reverse()
+      .find((element) => element.textContent?.trim() === text);
+  }
+  return undefined;
+}
+
+// F20 PR3a-3: reading back past the cap detaches the transcript from the live tail.
+// `releaseLock: false` walks back with the bottom lock still on (Load older never scrolls up).
+async function detachedPastCap(
+  { canvasElement, step }: Parameters<NonNullable<AppStory["play"]>>[0],
+  releaseLock: boolean
+) {
+  const canvas = within(canvasElement);
+  await findVisibleText(canvasElement, "A short transcript.");
+  const newest = rowText(CAPPED_ROWS - 1);
+  const scrollport = () =>
+    canvasElement.querySelector<HTMLElement>('[data-testid="message-window"]')!;
+  const rows = () => scrollport().querySelectorAll<HTMLElement>('[data-testid="chat-message"]');
+  // The DOM-only waits below avoid a whole-DOM dump per failed poll (see waitForElement).
+  const findVisibleRowText = async (text: string) => {
+    const element = await waitForElement(
+      () => rowTextElement(scrollport(), text),
+      `row "${text}"`,
+      15_000
+    );
+    await waitFor(() => expect(element).toBeVisible());
+  };
+  await step("Load older past the cap unmounts the newest rows", async () => {
+    await switchToLargeWorkspace(canvasElement);
+    await findVisibleRowText(newest);
+    if (releaseLock) {
+      scrollport().dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
+    }
+    for (let press = 0; press < 3; press += 1) {
+      const button = await waitForElement(
+        () => buttonNamed(canvasElement, "Load older messages"),
+        "Load older messages button",
+        15_000
+      );
+      if (releaseLock) scrollport().scrollTop = 0;
+      await userEvent.click(button);
+    }
+    // The last walk ends at the oldest row; Show newer appears as soon as the slice detaches.
+    await waitForElement(() => rowTextElement(scrollport(), rowText(0)), "row 0", 15_000);
+    await waitForElement(
+      () => buttonNamed(canvasElement, "Show newer messages"),
+      "Show newer messages button",
+      15_000
+    );
+    await expect(canvas.queryByText(newest)).toBeNull();
+    await expect(rows().length).toBeLessThanOrEqual(TRANSCRIPT_MAX_MOUNTED_ROWS);
+  });
+  await step("Show newer mounts rows below the reader without moving the read row", async () => {
+    const button = canvas.getByRole("button", { name: "Show newer messages" });
+    // A lock still on keeps the reader at the slice bottom, where the button already is.
+    if (releaseLock) button.scrollIntoView({ block: "end", behavior: "instant" });
+    // Tracked by id: what must hold is the reader's position, not one DOM node.
+    const idRows = () => scrollport().querySelectorAll<HTMLElement>("[data-message-id]");
+    const readId = idRows()[idRows().length - 1].dataset.messageId!;
+    const readRow = () => scrollport().querySelector(`[data-message-id="${readId}"]`)!;
+    const readRowTop = readRow().getBoundingClientRect().top;
+    await userEvent.click(button);
+    await waitFor(() => expect(idRows()[idRows().length - 1].dataset.messageId).not.toBe(readId));
+    await expect(Math.abs(readRow().getBoundingClientRect().top - readRowTop)).toBeLessThanOrEqual(
+      1
+    );
+  });
+  await step("Jump to bottom returns to the live tail", async () => {
+    await userEvent.click(canvas.getByRole("button", { name: /Jump to bottom/ }));
+    await findVisibleRowText(newest);
+    await waitFor(() =>
+      expect(buttonNamed(canvasElement, "Show newer messages") ?? null).toBeNull()
+    );
+  });
+}
+
+export const DetachedPastCap: AppStory = {
+  render: () => <AppWithMocks setup={setupCapped} />,
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: (context) => detachedPastCap(context, true),
+};
+
+// Show newer releases a lock that is still on, so the bottom pin never moves the read row.
+export const DetachedPastCapLocked: AppStory = {
+  render: () => <AppWithMocks setup={setupCapped} />,
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: (context) => detachedPastCap(context, false),
 };

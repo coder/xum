@@ -3,7 +3,11 @@ import type { WorkspaceService } from "./workspaceService";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import path from "path";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import {
+  ASK_USER_QUESTION_ASYNC_SUMMARY,
+  ASK_USER_QUESTION_NOT_WAITING_MESSAGE,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import { createTestHistoryService } from "./testHistoryService";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { AIService } from "./aiService";
@@ -87,6 +91,66 @@ describe("WorkspaceService rename lock", () => {
     if (!result.success) {
       expect(result.error).toContain("stream is active");
     }
+  });
+
+  describe("answering a question that is not waiting", () => {
+    const workspaceId = "ask-not-waiting";
+    const questions = [
+      {
+        header: "Choice",
+        question: "Which option?",
+        options: [
+          { label: "First", description: "Use first" },
+          { label: "Second", description: "Use second" },
+        ],
+        multiSelect: false,
+      },
+    ];
+    const answers = { "Which option?": "First" };
+
+    test("refuses while the stream runs instead of finalizing its partial", async () => {
+      // An Exec question seen before its immediate result: the live stream rewrites the partial
+      // from memory, so finalizing it here would drop the answer.
+      spyOn(harness.aiService, "isStreaming").mockReturnValue(true);
+      const question = createMuxMessage("question", "assistant", "", {}, [
+        {
+          type: "dynamic-tool",
+          state: "input-available",
+          toolCallId: "ask-live",
+          toolName: "ask_user_question",
+          input: { questions },
+        },
+      ]);
+      await harness.historyService.writePartial(workspaceId, question);
+
+      expect(
+        await workspaceService.answerAskUserQuestion(workspaceId, "ask-live", answers)
+      ).toEqual(Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE));
+      expect((await harness.historyService.readPartial(workspaceId))?.parts[0]).toMatchObject({
+        state: "input-available",
+      });
+    });
+
+    test("does not report a non-blocking question as answered", async () => {
+      const question = createMuxMessage("question", "assistant", "", {}, [
+        {
+          type: "dynamic-tool",
+          state: "output-available",
+          toolCallId: "ask-async",
+          toolName: "ask_user_question",
+          input: { questions },
+          output: {
+            summary: ASK_USER_QUESTION_ASYNC_SUMMARY,
+            ui_only: { ask_user_question: { questions, answers: {}, answerDelivery: "message" } },
+          },
+        },
+      ]);
+      await harness.historyService.appendToHistory(workspaceId, question);
+
+      expect(
+        await workspaceService.answerAskUserQuestion(workspaceId, "ask-async", answers)
+      ).toEqual(Err(ASK_USER_QUESTION_NOT_WAITING_MESSAGE));
+    });
   });
 
   test("an SSH rename is serialized through the workspace's MCP-overrides lock", async () => {

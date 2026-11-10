@@ -9,7 +9,7 @@ import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { ModelsSection } from "./ModelsSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 
@@ -71,7 +71,7 @@ export const ModelsEmpty: Story = {
     await userEvent.type(canvas.getByRole("combobox", { name: "Model ID" }), "fable");
     const option = await canvas.findByRole("option", { name: /claude-fable-5$/ });
     await expect(option).toHaveTextContent("Anthropic");
-    await expect(canvas.queryByRole("option", { name: /claude-fable-5-1/ })).toBeNull();
+    await expect(canvas.queryByRole("option", { name: /claude-fable-5-2/ })).toBeNull();
   },
 };
 

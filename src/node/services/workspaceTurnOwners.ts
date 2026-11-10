@@ -25,10 +25,17 @@ import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
  * No code rewrites `parentWorkspaceId`, so the ancestors now are the ancestors at admission. This
  * assumes only `mode: "new"` writes creating records and creates roots only. A missing or
  * duplicated row on the chain, or more than MAX_ANCESTOR_LEVELS levels (a cycle), falls back.
+ *
+ * A ROOT stamped `bornWithoutDelegation` (the public create wrote it in the row's birth write)
+ * has no owner at all: only `mode: "new"` writes a creating record, and only for a row it created
+ * with a `delegatedCreation` mark, so no turn can target it ("none", no file read). The stamp
+ * counts only on the single config row of its ID, and never beside a mark. Config load already
+ * drops it otherwise (normalizeBirthStamp); the check here keeps that rule local.
  */
 export type WorkspaceTurnOwners =
   | { kind: "creator"; ownerWorkspaceId: string }
   | { kind: "ancestors"; ownerWorkspaceIds: string[] }
+  | { kind: "none" }
   | { kind: "fallback"; reason: string };
 
 // Admission walks at most 32 levels (isDescendantAgentTaskUsingParentById), so 64 covers it.
@@ -44,20 +51,29 @@ export function resolveWorkspaceTurnOwners(
   );
   if (rows.length !== 1) return { kind: "fallback", reason: `${rows.length} config rows` };
   const row = rows[0];
-  if (row.parentWorkspaceId != null) return resolveAncestors(config, row);
+  return row.parentWorkspaceId != null ? resolveAncestors(config, row) : resolveRoot(row);
+}
+
+// A root: no owner when stamped at birth, else its claimed creator.
+function resolveRoot(row: WorkspaceConfigEntry): WorkspaceTurnOwners {
+  if (row.bornWithoutDelegation === true && row.delegatedCreation == null) return { kind: "none" };
 
   // Config loading keeps tag values as written, so a hand-edited tag can be a non-string.
   const claim: unknown =
     row.delegatedCreation?.ownerWorkspaceId ??
     row.tags?.[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId];
-  if (typeof claim !== "string" || claim.trim() === "") {
-    return { kind: "fallback", reason: "no creator claim" };
-  }
-  // The claim becomes a sessions/<owner> path segment; refuse anything that could leave it.
-  if (path.basename(claim) !== claim || claim === "." || claim === ".." || claim.includes("\0")) {
-    return { kind: "fallback", reason: "creator claim is not a path segment" };
+  if (typeof claim !== "string") return { kind: "fallback", reason: "no creator claim" };
+  if (!isPathSegment(claim)) {
+    return { kind: "fallback", reason: "creator claim is empty or not a path segment" };
   }
   return { kind: "creator", ownerWorkspaceId: claim };
+}
+
+// An owner ID becomes a sessions/<owner> path segment; refuse anything that could leave it.
+function isPathSegment(id: string): boolean {
+  return (
+    id.trim() !== "" && path.basename(id) === id && id !== "." && id !== ".." && !id.includes("\0")
+  );
 }
 
 // Only agent tasks build the row map; root targets keep the single filter above (#5569).
@@ -77,8 +93,7 @@ function resolveAncestors(config: ProjectsConfig, row: WorkspaceConfigEntry): Wo
     }
     const parent = rowsById.get(parentId);
     // The ID becomes a sessions/<owner> path segment, as a creator claim does.
-    const segment = path.basename(parentId) === parentId && parentId !== "." && parentId !== "..";
-    if (parent == null || !segment || parentId.trim() === "" || parentId.includes("\0")) {
+    if (parent == null || !isPathSegment(parentId)) {
       return { kind: "fallback", reason: `ancestor ${parentId}: missing, duplicate or unsafe row` };
     }
     ownerWorkspaceIds.push(parentId);

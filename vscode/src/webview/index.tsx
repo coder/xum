@@ -4,6 +4,9 @@ import { createRoot } from "react-dom/client";
 import { ErrorBoundary } from "xum/browser/components/ErrorBoundary/ErrorBoundary";
 import { removeDroppedCacheKeys } from "xum/browser/utils/legacyLocalStorageCleanup";
 import { App } from "./App";
+// The webview loads from local disk: publish the lazy tool cards (toolCardsStore) before the
+// first render, so its transcript never shows a card's loading header.
+import "xum/browser/features/Tools/Shared/toolCardsLoader";
 import { getVscodeBridge } from "./vscodeBridge";
 
 const bridge = getVscodeBridge();

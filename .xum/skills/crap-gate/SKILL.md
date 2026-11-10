@@ -18,33 +18,44 @@ rules live in `scripts/crap/policy.ts` with thresholds in
   Exit 0 pass, 1 violations, 2 tool error.
 - The agent hook: after a `git commit` or `git push` bash call, Xum appends the
   report to the tool result (warn mode). In block mode the hook stops the
-  command before it runs. `scripts/crap/agent-gate.sh` holds the mode.
-- CI: the `Quality / CRAP` job summary and its annotations. It is informational.
+  command before it runs. `scripts/crap/agent-gate.sh` holds the mode. A bash
+  call that exits non-zero gets no report, even when a `git commit` in it
+  succeeded before a later command failed. Run `make crap-check` then.
+- CI: the `Quality / CRAP` job summary and its annotations. When the repo
+  variable `CRAP_MODE` is `block`, its violations fail `Required`. Otherwise it
+  is informational.
 
 Without coverage, scores are CC. With `--coverage <lcov>`, scores are CRAP.
 
 ## Reading a finding
 
 ```
-VIOLATION floor-cc     src/x.ts:10-25 normalizeAgentId: CC 3 -> 4 (must not grow)
+VIOLATION floor-cc     src/x.ts:10-25 route: CC 30 -> 31 (head CRAP 31 above 30: must not grow)
 ```
 
-| Rule           | Meaning                                                                          |
-| -------------- | -------------------------------------------------------------------------------- |
-| `floor-cc`     | An existing function gained CC.                                                  |
-| `floor-crap`   | With coverage on both sides, an existing function gained CRAP.                   |
-| `new-function` | A new function (or a renamed one, or one moved to another file) is above 8.      |
-| `crap-tax`     | You touched a function whose base score is above 30, and its score did not drop. |
+| Rule           | Meaning                                                                                  |
+| -------------- | ---------------------------------------------------------------------------------------- |
+| `floor-cc`     | An existing function gained CC and ends above the growth line.                           |
+| `floor-crap`   | With coverage on both sides, an existing function gained CRAP and ends above CRAP 30.    |
+| `new-function` | A new function (or a renamed one, or one moved to another file) is above CRAP 15 (CC 8). |
+| `crap-tax`     | A warning: you touched a function whose base score is above 30, and it did not drop.     |
 
-- A `crap-tax` finding without coverage on both sides is a warning: a comment
-  or one-line fix in a hotspot passes, with a nudge to shrink it.
+- The growth line is CRAP 30 with coverage, CC 10 without. An existing function
+  may grow while its head stays at or below the line. Above it, CC and CRAP
+  must not grow. A reduction always passes, at any size, so a hotspot can
+  shrink one step at a time.
+- The new-function limit is CRAP 15 with coverage and CC 8 without.
+- `crap-tax` is always a warning: a comment or one-line fix in a hotspot
+  passes, with a nudge to shrink it.
 - When the changed files' total CC drops, `new-function` findings are warnings
   (net-extraction relief): splitting a hotspot is allowed even if one piece is
-  still above 8.
+  still above the limit.
 - Moving a step out of a function raises the total CC by 1. Such a move is
   also a warning (move relief) when the kept functions lost at least as much
   CC as the new functions hold decision points (CC − 1 each), and the new
   function is at most CC 20. A rename gets no relief.
+- With coverage, both reliefs need the new function at CRAP 30 or less. An
+  untested piece above that stays a violation: test it or shrink it.
 - The function name and line range are in the report. Identity is
   `path::namespace::name`, so renaming a function makes it new.
 
@@ -56,8 +67,24 @@ VIOLATION floor-cc     src/x.ts:10-25 normalizeAgentId: CC 3 -> 4 (must not grow
 2. Test it. Coverage lowers CRAP, so this repairs only reports with coverage
    (`--coverage <lcov>`, the CI job's new-function findings). The hook and a
    plain `make crap-check` score CC alone: tests cannot clear their `floor-cc`
-   or `new-function` findings, so shrink the function instead. A test must
+   or `new-function` findings, so shrink the function instead (or keep it at
+   CC 10 or less). A test must
    assert behavior that would fail if the code broke.
+
+To shrink an async function, keep its awaits and locks where they are:
+
+- Every `await` stays where it was. A step with no `await` is a plain
+  function, because an `async` wrapper adds a microtask, and one extra
+  microtask before a lock acquire has failed a race test.
+- Split from the tail. Each step calls the next one right after its own last
+  `await`.
+- Inside a lock or `await using` scope, call each step with `return await`.
+  A bare `return promise` releases the lock while the step still runs.
+- Shared `let` variables go on one record that the steps share. A copied
+  boolean that a callback sets reads `false` forever.
+- Each extracted async step still settles the outer promise one or more
+  microtasks later. When a caller or a test depends on that completion order,
+  check it with a race test at the call boundary, or keep the tail inline.
 
 ## Anti-gaming rules
 
@@ -75,6 +102,14 @@ Never do these to lower a score:
 ## Crap-Debt
 
 When a violation cannot be fixed in this change (a hotfix, a generated file),
-add a `Crap-Debt: <reason>` trailer to the commit, or the `crap-debt` label to
-the PR in CI. Every violation becomes a warning, and the report lists each use.
-Name the follow-up in the reason.
+use the escape hatch for where the check runs. Every violation becomes a
+warning, and the report lists each use. Name the follow-up in the reason.
+
+- Local (the commit hook, `make crap-check`): add a `Crap-Debt: <reason>`
+  trailer to the commit.
+- CI (`Quality / CRAP`): add the `crap-debt` label to the PR. CI reads no
+  trailers, and the label does not affect the local hook.
+
+Agents: ask the maintainer first, and add the trailer or label only after an
+explicit approval for that PR. The label skips every CI block, and agent PRs run
+as the maintainer's account, so GitHub cannot show who added it.

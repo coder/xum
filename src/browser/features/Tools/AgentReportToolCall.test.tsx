@@ -154,7 +154,7 @@ describe("AgentReportToolCall", () => {
       </TooltipProvider>
     );
     expect(view.getByText("Preserved findings")).toBeTruthy();
-    expect(view.getByRole("status").className).not.toContain("text-success");
+    expect(view.getByRole("status").className).not.toContain("text-success-text");
   });
 
   test.each([null, undefined, { type: "json", value: null }].map((result) => ({ result })))(
@@ -169,7 +169,7 @@ describe("AgentReportToolCall", () => {
           />
         </TooltipProvider>
       );
-      expect(view.getByRole("status").className).not.toContain("text-success");
+      expect(view.getByRole("status").className).not.toContain("text-success-text");
       expect(view.getByRole("status").textContent).toBe("Result unavailable");
     }
   );

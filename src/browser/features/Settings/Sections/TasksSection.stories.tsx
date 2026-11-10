@@ -1,7 +1,7 @@
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import type { ComponentType } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, waitFor, within } from "@storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { TasksSection } from "./TasksSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
@@ -27,6 +27,13 @@ export const Tasks: Story = {
       setup={() =>
         setupSettingsStory({
           taskSettings: { maxParallelAgentTasks: 2, maxTaskNestingDepth: 4 },
+          agentResourceLimits: {
+            enabled: true,
+            limits: { cpuCores: 8, memoryGiB: 16 },
+            projects: {},
+            status: { state: "active", cgroup: "/xum/xum-agents" },
+            support: { state: "ready", cgroup: "/xum" },
+          },
           // Reuse this story because the Pixel snapshot budget has no headroom.
           experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
           agentAiDefaults: {
@@ -58,10 +65,17 @@ export const Tasks: Story = {
       await expect(findAutoModelTriggers(canvasElement)).toHaveLength(2);
     });
 
+    await canvas.findByText(/Active: agents share 8 CPU cores and 16 GiB of memory/i);
+    await waitFor(async () => {
+      await expect(canvas.getByLabelText("CPU limit")).toHaveValue(8);
+      await expect(canvas.getByLabelText("Memory limit")).toHaveValue(16);
+    });
+
     await waitFor(() => {
+      // Task settings first, then the CPU and memory limits.
       const inputs = canvas.queryAllByRole("spinbutton");
-      if (inputs.length !== 2) {
-        throw new Error(`Expected 2 task settings inputs, got ${inputs.length}`);
+      if (inputs.length !== 4) {
+        throw new Error(`Expected 4 number inputs, got ${inputs.length}`);
       }
       const maxParallelAgentTasks = (inputs[0] as HTMLInputElement).value;
       const maxTaskNestingDepth = (inputs[1] as HTMLInputElement).value;

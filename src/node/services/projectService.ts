@@ -1,4 +1,5 @@
 import { SecretsStore, type Config, type ProjectConfig, type ProjectsConfig } from "@/node/config";
+import { clearRemoteProjectPluginSnapshots } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { SSH_PROTOCOL_SCHEMES } from "@/constants/git";
 import { spawn } from "child_process";
@@ -62,7 +63,7 @@ import {
   withProjectRegistrationFileLock,
   withProjectRegistrationLock,
 } from "@/node/config/projectRegistrationLock";
-import { isProjectTrusted } from "@/node/utils/projectTrust";
+import { isProjectTrusted, isProjectTrustedIn } from "@/node/utils/projectTrust";
 
 function orderWorkspacesForCascadeRemoval(
   workspaces: ProjectConfig["workspaces"]
@@ -408,6 +409,9 @@ export class ProjectService {
   private workspaceMetadataRefresher?: WorkspaceMetadataRefresher;
   private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">;
   private draftCleaner?: { deleteProjectDrafts(projectPath: string): Promise<string[]> };
+  private unsubscribeProjectTrust?: () => void;
+  /** The effectively trusted project paths at the last config change (watchProjectTrust). */
+  private trustedProjectsKey?: string;
 
   constructor(
     private readonly config: Config,
@@ -960,6 +964,43 @@ export class ProjectService {
   /** A mutation admitted during teardown would be killed half-done by the exit that follows. */
   beginShutdown(): void {
     this.shuttingDown = true;
+    this.unsubscribeProjectTrust?.();
+    this.unsubscribeProjectTrust = undefined;
+  }
+
+  /**
+   * #7621: `xum trust` and other writers of config.json change trust without setTrust, so they
+   * reach this backend only as a config change. Drop the remote plugin snapshots when the set of
+   * effectively trusted projects changes, as setTrust does. Reads only the config snapshot that
+   * every config-change listener shares. The subscription keeps Config's config.json watch open
+   * until beginShutdown. Never throws: a startup step must not fail, and a throw in an own save's
+   * notification would reach that save's caller.
+   */
+  watchProjectTrust(): void {
+    if (this.unsubscribeProjectTrust) return;
+    try {
+      this.trustedProjectsKey = this.readTrustedProjectsKey();
+      this.unsubscribeProjectTrust = this.config.onConfigChanged(() => {
+        try {
+          const key = this.readTrustedProjectsKey();
+          if (key === this.trustedProjectsKey) return;
+          this.trustedProjectsKey = key;
+          clearRemoteProjectPluginSnapshots();
+        } catch (error) {
+          log.warn(`Project trust watch: config change not applied: ${getErrorMessage(error)}`);
+        }
+      });
+    } catch (error) {
+      log.warn(`Project trust watch: not started: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private readTrustedProjectsKey(): string {
+    const projects = this.config.loadConfigOrDefault().projects;
+    const trusted = [...projects.keys()].filter((projectPath) =>
+      isProjectTrustedIn(projects, projectPath)
+    );
+    return JSON.stringify(trusted.sort());
   }
 
   async *cloneWithProgress(
@@ -1227,7 +1268,16 @@ export class ProjectService {
         : undefined;
 
     try {
-      const child = spawn("git", ["clone", "--progress", "--", cloneUrl, cloneWorkPath], {
+      // --no-local: for a source on this machine, git's local-clone shortcut hard-links or copies
+      // the source's `objects/` files one by one. A background repack of that repository (git
+      // starts one after a commit or fetch) removes loose objects mid-copy, so the clone fails
+      // ("failed to copy file to ...", "hardlink different from source", or a checkout that
+      // cannot read an object). The transport reads the source through `git upload-pack`, which
+      // git keeps safe against a concurrent repack. It costs a full pack write instead of hard
+      // links, and leaves a clone that does not depend on the source's object store. Git ignores
+      // the flag for a remote URL.
+      const cloneArgs = ["clone", "--progress", "--no-local", "--", cloneUrl, cloneWorkPath];
+      const child = spawn("git", cloneArgs, {
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...(askpass?.env ?? {}) },
         // Detached children become process-group leaders on Unix so we can
@@ -1628,10 +1678,9 @@ export class ProjectService {
   }
 
   /**
-   * Creation drafts are keyed by the owning project; delete them server-side so a removal from
-   * any client (or none mounted) leaves no draft files behind. Best-effort like the secrets
-   * cleanup: the startup GC removes whatever this misses. Returns the deleted drafts, whose
-   * localStorage keys the removing renderer cleans up (its own list may not have hydrated yet).
+   * Delete the creation drafts whose project field is a removed project, server-side, so a
+   * removal from any client (or none mounted) leaves none behind. Best-effort like the secrets
+   * cleanup: a record this misses stays as an orphan file. Returns the deleted drafts.
    */
   private async deleteCreationDrafts(projectPaths: string[]): Promise<RemovedCreationDraft[]> {
     const removed: RemovedCreationDraft[] = [];
@@ -1802,6 +1851,11 @@ export class ProjectService {
           "user.name=mux",
           "-c",
           "user.email=mux@localhost",
+          // No `git maintenance run --auto --detach` after the commit: a repository with one
+          // empty commit needs none, and a failed create deletes this directory right after
+          // the commit, while that detached git would still be using it.
+          "-c",
+          "maintenance.auto=false",
           "commit",
           "--allow-empty",
           "-m",
@@ -2063,12 +2117,18 @@ export class ProjectService {
         affectedPaths.push(candidatePath);
       }
     }
-    this.mcpServerManager?.applyProjectTrust(
-      affectedPaths.map((candidatePath) => ({
-        projectPath: candidatePath,
-        trusted: isProjectTrusted(this.config, candidatePath),
-      }))
-    );
+    try {
+      this.mcpServerManager?.applyProjectTrust(
+        affectedPaths.map((candidatePath) => ({
+          projectPath: candidatePath,
+          trusted: isProjectTrusted(this.config, candidatePath),
+        }))
+      );
+    } finally {
+      // #6426: snapshots of remote project plugins exist only for trusted projects. After the
+      // trust change is published, even when the MCP update throws; synchronous, never throws.
+      clearRemoteProjectPluginSnapshots();
+    }
   }
 
   async setDisplayName(projectPath: string, displayName: string | null | undefined): Promise<void> {
@@ -2091,6 +2151,18 @@ export class ProjectService {
         throw new Error(`Project not found: ${normalizedPath}`);
       }
       project.color = color ?? undefined;
+      return config;
+    });
+  }
+
+  async setIcon(projectPath: string, icon: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.icon = icon ?? undefined;
       return config;
     });
   }

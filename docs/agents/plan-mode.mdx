@@ -19,13 +19,13 @@ Plan mode lets you review and refine the agent's approach before any code change
 
 ## External Edit Detection
 
-When you edit the plan file externally and send a message, Xum automatically detects the changes and informs the agent with a diff. This uses a timestamp-based polling approach:
+When you edit the plan file externally and send a message, Xum automatically detects the change and tells the agent which file changed. This uses a timestamp-based polling approach:
 
 1. **State Tracking**: When `propose_plan` runs, it records the plan file's content and modification time.
 2. **Change Detection**: Before each LLM query, Xum checks if the file's mtime has changed.
-3. **Diff Injection**: If modified, Xum computes a diff and injects it into the context so the agent sees exactly what changed.
+3. **Change Notice**: If the content changed, Xum adds a short notice that names the file. The notice does not copy the change, because Xum cannot tell who wrote it. The agent reads the file again to see what changed.
 
-This means you can make edits in your preferred editor, return to Xum, send a message, and the agent will incorporate your changes.
+This means you can make edits in your preferred editor, return to Xum, send a message, and the agent will read and incorporate your changes.
 
 ## Plan File Location
 
@@ -85,24 +85,27 @@ Step 4 matters for workspaces that already moved to the new tree (their `remoteP
 
 After these steps, each root has its own tree, and a clear in one leaves the other's plan unchanged. The steps do not undo changes that the two roots made to each other's plans while they shared one ID.
 
-## ask_user_question (Plan Mode Only)
+## ask_user_question
 
-In plan mode, the agent may call `ask_user_question` to ask up to 4 structured multiple-choice questions when it needs clarification before finalizing a plan.
+In Plan and Exec modes, the agent may call `ask_user_question` to ask up to 4 structured multiple-choice questions when it needs clarification (for example, before finalizing a plan or when an implementation choice depends on your preference).
+
+- **Plan Mode** waits for your answers before it continues.
+- **Exec Mode** does not wait. The agent keeps working on its best assumption, and the questions stay open in the chat. When you submit answers, Xum sends them to the agent as a message after its current step, or starts a new turn if the agent has already finished. Typing a normal chat message does not cancel these questions. When several sets of questions are open, they appear as one form in the panel above the chat input, and **Submit answers** sends all the answers in one message. Questions still open when a compaction or **Start Here** removes them from the agent's context close unanswered.
 
 What you’ll see:
 
-- An inline “tool call card” in the chat with a small form (single-select or multi-select).
+- A small form (single-select or multi-select) in the panel above the chat input, and a short card in the chat where the agent asked.
 - An always-available **Other** option for free-form answers.
 
 How to respond:
 
 - **Recommended:** answer in the form and click **Submit answers**.
-- **Optional:** you can also just type a normal chat message. This will **cancel** the pending `ask_user_question` tool call and your message will be sent as a regular chat message.
+- **Optional (Plan Mode):** you can also just type a normal chat message. This will **cancel** the pending `ask_user_question` tool call and your message will be sent as a regular chat message.
 
 Availability:
 
-- `ask_user_question` is only registered for the agent in **Plan Mode**.
-- In Exec Mode, the agent cannot call `ask_user_question`.
+- `ask_user_question` is available to top-level agents in **Plan Mode** and **Exec Mode**.
+- Sub-agents, headless `xum run` sessions, and ACP editor prompts cannot call `ask_user_question`, since they have no way to answer it.
 
 ## UI Features
 

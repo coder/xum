@@ -1,9 +1,10 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "@storybook/test";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { userEvent, within } from "storybook/test";
+import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { BackupSection } from "./BackupSection.js";
 import { SettingsSectionStory } from "./settingsStoryUtils.js";
+import type { BackupPluginRow } from "@/common/orpc/schemas/backup";
 
 const meta: Meta = {
   ...lightweightMeta,
@@ -14,7 +15,7 @@ const meta: Meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-function renderBackupSection() {
+function renderBackupSection(rows: BackupPluginRow[]) {
   return (
     <SettingsSectionStory
       setup={() =>
@@ -57,6 +58,7 @@ function renderBackupSection() {
               },
             ],
             projectBundleSkipped: false,
+            plugins: { rows, skipped: false, warnings: [] },
             pushError: null,
           },
         })
@@ -70,7 +72,7 @@ function renderBackupSection() {
 }
 
 export const Configured: Story = {
-  render: renderBackupSection,
+  render: () => renderBackupSection([]),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByText("Settings backup");
@@ -95,7 +97,7 @@ export const Phone: Story = {
       matrix: { themes: ["dark", "light"], viewports: ["phone"] },
     },
   },
-  render: renderBackupSection,
+  render: () => renderBackupSection([]),
   // The import cards only exist after a preview, so the pinned phone snapshot must open
   // one or it never exercises the narrow card layout and its long repository-controlled
   // strings.
@@ -105,5 +107,76 @@ export const Phone: Story = {
     await userEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText("Projects to reimport");
     await canvas.findByRole("checkbox", { name: /Import project/ });
+  },
+};
+
+const PLUGINS_IN_BACKUP: BackupPluginRow[] = [
+  {
+    name: "pstack",
+    source: {
+      type: "git",
+      url: "https://github.com/cursor/plugins.git",
+      ref: "main",
+      refType: "branch",
+      subpath: "pstack",
+    },
+    lockedSha: "4dd1d05a1b2c3d4e5f60718293a4b5c6d7e8f901",
+    importedComponents: { skills: ["tdd"], mcpServers: [] },
+    status: "missing",
+  },
+  {
+    name: "egm",
+    source: {
+      type: "git",
+      url: "https://github.com/google/elephant-goldfish-model.git",
+      ref: "v0.3.1",
+      refType: "tag",
+    },
+    lockedSha: "113a3af0123456789abcdef0123456789abcdef0",
+    status: "installed",
+  },
+  {
+    // One long unbroken repository-controlled value, which must wrap inside the card.
+    name: "a-plugin-with-an-unusually-long-registry-name-that-must-wrap",
+    source: {
+      type: "git",
+      url: `https://git.example.com/${"very-long-organization-name-".repeat(4)}/repo.git`,
+      ref: "feature/a-long-branch-name-that-keeps-going",
+      refType: "branch",
+    },
+    lockedSha: "0123456789abcdef0123456789abcdef01234567",
+    status: "conflict",
+  },
+  {
+    name: "docs-helper",
+    source: {
+      type: "git",
+      url: "https://github.com/example/docs-helper.git",
+      ref: "main",
+      refType: "branch",
+    },
+    lockedSha: "89abcdef0123456789abcdef0123456789abcdef",
+    status: "folderMissing",
+  },
+];
+
+/**
+ * The plugin card after a preview: a pinned story would add Pixel snapshots (the Storybook budget
+ * sits at its cap), so this one has a play test and no snapshot. The phone width is checked by
+ * hand from the Storybook toolbar viewport (mobile1, 375px).
+ */
+export const PluginsInBackup: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => renderBackupSection(PLUGINS_IN_BACKUP),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("Settings backup");
+    await userEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Plugins in this backup");
+    await canvas.findByText("Not installed");
+    await canvas.findByText("Installed");
+    await canvas.findByText("Name in use");
+    await canvas.findByText("Folder missing");
+    await canvas.findByRole("button", { name: /Review and install \(1\)/ });
   },
 };

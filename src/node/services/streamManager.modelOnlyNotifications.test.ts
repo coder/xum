@@ -11,6 +11,7 @@ import {
 
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 
 const model: LanguageModel = {
   specificationVersion: "v3",
@@ -26,7 +27,9 @@ describe("StreamManager - model-only tool notifications", () => {
   let historyCleanup: () => Promise<void>;
 
   beforeEach(async () => {
-    ({ historyService, cleanup: historyCleanup } = await createTestHistoryService());
+    ({ historyService, cleanup: historyCleanup } = await createTestHistoryService({
+      files: SessionFilesMemory,
+    }));
   });
 
   afterEach(async () => {
@@ -106,6 +109,17 @@ describe("StreamManager - model-only tool notifications", () => {
 
     expect(toolEnd?.result && typeof toolEnd.result === "object").toBe(true);
     expect("__mux_notifications" in (toolEnd!.result as Record<string, unknown>)).toBe(false);
+
+    // The row keeps the notes beside the output (never in it), so the next turn can resend
+    // the bytes this step sent.
+    const history = await historyService.getHistoryFromLatestBoundary("test-workspace");
+    if (!history.success) throw new Error(history.error);
+    const toolPart = history.data.at(-1)?.parts.find((part) => part.type === "dynamic-tool");
+    expect(toolPart).toMatchObject({
+      state: "output-available",
+      modelOnlyNotifications: ["<notification>hello</notification>"],
+    });
+    expect(toolPart && "output" in toolPart ? toolPart.output : undefined).toEqual({ ok: true });
   });
 
   test("persists orphan web_search tool-result when tool-call mapping is missing", async () => {

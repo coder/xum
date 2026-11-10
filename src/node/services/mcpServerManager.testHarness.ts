@@ -26,6 +26,43 @@ export { MCP_STARTUP_TIMEOUT_MS };
 // bun-types (^1.2.23) lags the pinned runtime (bun@1.4.3), which implements this.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
+/**
+ * Real time expireStartupDeadline gives a startup to hang before it fails. A test that awaits the
+ * call directly and keeps the default 5 s limit is marked failed at 5 s, before this bound. The
+ * bound ends what the limit does not: with it disabled, a test that awaited the call inside
+ * `expect(...).rejects` stayed stuck for over 60 s. It is long because a host that stalls the
+ * process for 20 s must not fail a startup that was only paused.
+ */
+const STARTUP_HANG_WAIT_MS = 30_000;
+
+// lib.es2023 lacks Atomics.waitAsync (ES2024); the pinned runtime (bun@1.4.3) has it.
+type AtomicsWaitAsync = (
+  array: Int32Array,
+  index: number,
+  value: number,
+  timeout: number
+) => { async: false; value: string } | { async: true; value: Promise<string> };
+
+/**
+ * A bound in real time while fake timers are on. Fake timers freeze setTimeout, Date,
+ * performance.now and Bun.sleep, but not Atomics.waitAsync, whose timeout the engine owns.
+ */
+function realTimeBound(ms: number): { expired: Promise<void>; cancel: () => void } {
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  const wait = (Atomics as typeof Atomics & { waitAsync: AtomicsWaitAsync }).waitAsync(
+    cell,
+    0,
+    0,
+    ms
+  );
+  assert(wait.async, "realTimeBound: the cell holds 0, so the wait must be pending");
+  return {
+    expired: wait.value.then(() => undefined),
+    // Wake the waiter so no timer outlives the call.
+    cancel: () => void Atomics.notify(cell, 0),
+  };
+}
+
 type MCPClientHandle = Awaited<ReturnType<typeof mcpSdk.createMCPClient>>;
 type FakePrompt = Awaited<ReturnType<MCPClientHandle["prompts"]>>[number];
 
@@ -57,7 +94,16 @@ export interface FakeServerBehavior {
   /** Raw tools/call for plugin hooks (MCPServerManager.callToolForPluginHook). */
   callToolForHook?: MCPClientHandle["callToolForHook"];
   /** OpenAI structured settings client methods. */
-  settings?: Partial<Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">>;
+  settings?: Partial<
+    Pick<
+      MCPClientHandle,
+      | "settingsCapability"
+      | "callSettingsTool"
+      | "settingsToolAction"
+      | "callSettingsActionTool"
+      | "relistTools"
+    >
+  >;
 }
 
 type BehaviorSource =
@@ -80,6 +126,10 @@ export class FakeMcpServers {
   private readonly processes: FakeProcess[] = [];
   private nextNonce = 0;
   private hungConnects = 0;
+  /** Waits for a hung-connection count (expireStartupDeadline), resolved by the hang itself. */
+  private readonly hungWaiters = new Set<{ target: number; resolve: () => void }>();
+  /** Real time expireStartupDeadline waits for the hang; a test of the failure shortens it. */
+  startupHangWaitMs = STARTUP_HANG_WAIT_MS;
   private readonly remoteHeaders = new Map<string, Array<Record<string, string> | undefined>>();
   private clientSpy: ReturnType<typeof spyOn<typeof mcpSdk, "createMCPClient">> | null = null;
 
@@ -139,11 +189,38 @@ export class FakeMcpServers {
     setSystemTime(new Date(startedAt));
     try {
       const pending = operation();
-      // setImmediate is not faked, so real I/O in the startup path keeps flowing.
-      for (let turn = 0; this.hungConnects < target; turn++) {
-        assert(turn < 10_000, "FakeMcpServers.expireStartupDeadline: startup never hung");
-        await new Promise((resolve) => setImmediate(resolve));
+      // Wait for the hang itself, not for a number of event-loop turns: the startup path does real
+      // I/O before it hangs, and a loaded host ran out of turns first. An operation that ends
+      // without hanging fails here with its cause at once. One that is still running after a
+      // bound in real time fails here too. The cause text shows only when the bound ends before
+      // the test's limit: a test that awaits this method directly and keeps the default 5 s limit
+      // is marked "timed out after 5000ms" at 5 s, before the 30 s bound. Shorten
+      // startupHangWaitMs, or raise the limit, to see the cause.
+      const bound = realTimeBound(this.startupHangWaitMs);
+      let outcome: "hung" | "settled" | "bound";
+      try {
+        outcome = await Promise.race([
+          this.untilHung(target).then(() => "hung" as const),
+          pending.then(
+            () => "settled" as const,
+            () => "settled" as const
+          ),
+          bound.expired.then(() => "bound" as const),
+        ]);
+      } finally {
+        bound.cancel();
       }
+      assert(
+        outcome === "hung",
+        `FakeMcpServers.expireStartupDeadline: startup never hung (${
+          outcome === "settled"
+            ? "the operation ended first"
+            : `still running after ${this.startupHangWaitMs} ms`
+        })`
+      );
+      // One more turn, so the other startups in flight finish what their microtasks reach (a
+      // sibling that fails at once must fail before the deadline fires, not time out with it).
+      await new Promise((resolve) => setImmediate(resolve));
       fakeTimers.advanceTimersByTime(MCP_STARTUP_TIMEOUT_MS);
       return await pending;
     } finally {
@@ -151,6 +228,12 @@ export class FakeMcpServers {
       fakeTimers.useRealTimers();
       setSystemTime(new Date(now));
     }
+  }
+
+  /** Resolves once `target` connections have hung since the last reset. */
+  private untilHung(target: number): Promise<void> {
+    if (this.hungConnects >= target) return Promise.resolve();
+    return new Promise((resolve) => this.hungWaiters.add({ target, resolve }));
   }
 
   /** Restore createMCPClient and forget every server; call from afterEach. */
@@ -165,6 +248,8 @@ export class FakeMcpServers {
     this.processesByNonce.clear();
     this.processes.length = 0;
     this.hungConnects = 0;
+    this.hungWaiters.clear();
+    this.startupHangWaitMs = STARTUP_HANG_WAIT_MS;
     this.exec.mockClear();
   }
 
@@ -265,6 +350,11 @@ export class FakeMcpServers {
     await behavior.connect?.();
     if (behavior.hang === true) {
       this.hungConnects += 1;
+      for (const waiter of this.hungWaiters) {
+        if (this.hungConnects < waiter.target) continue;
+        this.hungWaiters.delete(waiter);
+        waiter.resolve();
+      }
       await new Promise<never>(() => undefined);
     }
     const modern = behavior.era === "modern";
@@ -281,6 +371,8 @@ export class FakeMcpServers {
         behavior.callToolForHook ?? (() => Promise.reject(new Error("no hook tool in this fake"))),
       ...behavior.apps,
       settingsCapability: () => undefined,
+      settingsToolAction: () => undefined,
+      relistTools: () => Promise.resolve(),
       ...behavior.settings,
     };
     // Tests supply loosely typed prompt/result fixtures; the manager validates them itself.

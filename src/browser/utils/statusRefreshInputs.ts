@@ -8,8 +8,8 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
  * process per event, even in a hidden window, so stores refresh only when one of these inputs
  * changes for a workspace they actually display.
  *
- * Add a field here when a status refresh (GitStatusStore, PRStatusStore) or the backend
- * `workspace.executeBash` checkout resolution starts reading it.
+ * Add a field here when a status refresh (GitStatusStore, PRStatusStore, RuntimeStatusStore) or
+ * the backend `workspace.executeBash` checkout resolution starts reading it.
  */
 function getStatusRefreshInputs(metadata: FrontendWorkspaceMetadata): unknown[] {
   return [

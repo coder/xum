@@ -157,6 +157,17 @@ describe("ThinkingSelector reasoning modes", () => {
     expect(toggle(container, "CyberModeToggle") != null).toBe(testCase.shown);
   });
 
+  test("a catalogue GPT-5.6 model offers Extra High, Max, and Pro mode", () => {
+    const { container } = renderSelector(<StatefulSelector modelString="openai:gpt-5.6-sol" />);
+    const levels = Array.from(container.querySelectorAll('[role="option"]')).map((option) =>
+      option.getAttribute("aria-label")
+    );
+
+    expect(levels).toContain("Extra High");
+    expect(levels).toContain("Max");
+    expect(toggle(container, "ProModeToggle")).not.toBeNull();
+  });
+
   test("deferred model capabilities offer Pro but not Cyber", () => {
     const { container } = renderSelector(
       <StatefulSelector modelString={CYBER_MODEL} modelCapabilitiesDeferred />

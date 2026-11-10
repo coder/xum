@@ -22,6 +22,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { cn } from "@/common/lib/utils";
+import { ShellOverlayToolbarSpacerContext } from "@/browser/hooks/usePinnedViewCoversWindow";
 import { SelectableDiffRenderer } from "../../Shared/DiffRenderer";
 import { ImmersiveDiffRevealLoadingState } from "./ImmersiveDiffRevealLoadingState";
 import { ImmersiveMinimap } from "./ImmersiveMinimap";
@@ -190,8 +191,10 @@ function getReviewStatusSidebarClasses(status: Review["status"]): {
   if (status === "checked") {
     return {
       accent: "bg-success",
-      badge: "bg-success/20 text-success",
-      icon: "text-success",
+      // Foreground text on the success tint: success text on its own tint was 2.3-3.9:1 in every
+      // theme (#6767). The tint, the accent bar and the icon keep the success color.
+      badge: "bg-success/20 text-foreground",
+      icon: "text-success-text",
     };
   }
 
@@ -205,7 +208,8 @@ function getReviewStatusSidebarClasses(status: Review["status"]): {
 
   return {
     accent: "bg-muted",
-    badge: "bg-muted/25 text-muted",
+    // Foreground text: muted text on its own muted tint was 3.2-4.3:1 in every theme (#6544).
+    badge: "bg-muted/25 text-foreground",
     icon: "text-muted",
   };
 }
@@ -371,6 +375,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     selectedHunkId !== null && (assistedHunkIds?.has(selectedHunkId) ?? false);
   const selectedAssistedLabel = selectedAssistedComment ?? "Flagged by agent for review";
   const isTouchExperience = isTouchImmersive === true;
+  const ToolbarSpacer = React.useContext(ShellOverlayToolbarSpacerContext);
 
   // Flatten file tree into ordered file list
   const fileList = useMemo(() => flattenFileTreeLeaves(fileTree), [fileTree]);
@@ -2089,6 +2094,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     >
       {/* Header */}
       <div className="border-border-light bg-dark flex flex-wrap items-center gap-2 border-b px-3 py-2">
+        <ToolbarSpacer />
         {/* Back button */}
         <button
           onClick={onExit}
@@ -2373,7 +2379,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           <div className="relative min-h-0 min-w-0 flex-1">
             <div
               ref={scrollContainerRef}
-              className="scrollbar-none h-full min-h-0 min-w-0 overflow-y-auto pb-3 [overflow-anchor:none]"
+              className="h-full min-h-0 min-w-0 scrollbar-none overflow-y-auto pb-3 [overflow-anchor:none]"
             >
               {props.isLoading && currentFileHunks.length === 0 ? (
                 <div className="text-muted flex items-center justify-center py-12 text-sm">
@@ -2385,7 +2391,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
                     data-testid="immersive-review-complete"
                     className="flex max-w-md flex-col items-center gap-4 text-center"
                   >
-                    <div className="bg-accent/10 text-accent rounded-full p-3">
+                    <div className="bg-accent/10 text-accent-text rounded-full p-3">
                       <CheckCircle2 aria-hidden="true" className="h-8 w-8" />
                     </div>
                     <div className="space-y-2">
@@ -2496,7 +2502,12 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
               >
                 Notes
               </h2>
-              <span className="bg-muted/20 text-muted rounded px-1.5 py-0.5 font-mono text-[10px]">
+              {/* Foreground text: the muted tint lightens with --color-muted, so muted text on it
+                  fell to 4.23:1 on this dark panel (#6544). */}
+              <span
+                data-testid="immersive-notes-count"
+                className="bg-muted/20 text-foreground rounded px-1.5 py-0.5 font-mono text-[10px]"
+              >
                 {allReviews.length}
               </span>
             </div>

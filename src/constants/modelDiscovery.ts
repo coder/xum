@@ -1,4 +1,3 @@
-import { MUX_GATEWAY_AI_BASE_URL } from "@/common/constants/muxGatewayOAuth";
 import type { ProviderName } from "@/common/constants/providers";
 
 // Discovery is interactive and read-only; bound the entire catalog, not each page.
@@ -25,11 +24,6 @@ export const MODEL_DISCOVERY_BASE_URLS: Partial<Record<ProviderName, string>> = 
   ollama: "http://127.0.0.1:11434/api",
   zai: "https://api.z.ai/api/paas/v4",
   "github-copilot": "https://api.githubcopilot.com",
-  "mux-gateway": MUX_GATEWAY_AI_BASE_URL,
 };
 
 export const COPILOT_MODEL_DISCOVERY_INTENT = "conversation-edits";
-export const GATEWAY_MODEL_DISCOVERY_HEADERS = {
-  "ai-gateway-protocol-version": "0.0.1",
-  "ai-gateway-auth-method": "api-key",
-} as const;

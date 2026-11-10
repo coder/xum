@@ -20,7 +20,6 @@ import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { TutorialProvider } from "@/browser/contexts/TutorialContext";
-import { UILayoutsProvider } from "@/browser/contexts/UILayoutsContext";
 import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import { SplashScreenProvider } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { TerminalRouterProvider } from "@/browser/terminal/TerminalRouterContext";
@@ -29,13 +28,28 @@ import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
-import type { MockSessionUsage } from "@/browser/stories/mocks/orpc";
+import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
-import { blurActiveElement } from "@/browser/stories/storyPlayHelpers";
-import { setupSimpleChatStory, setupStreamingChatStory } from "@/browser/stories/helpers/chatSetup";
+import { blurActiveElement, openSidebarNewTab } from "@/browser/stories/storyPlayHelpers";
+import {
+  createOnChatAdapter,
+  setupSimpleChatStory,
+  setupStreamingChatStory,
+} from "@/browser/stories/helpers/chatSetup";
+import { createStaticChatHandler } from "@/browser/stories/mocks/chatHandlers";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { setHunkFirstSeen } from "@/browser/stories/helpers/reviews";
-import { collapseLeftSidebar, expandRightSidebar } from "@/browser/stories/helpers/uiState";
+import {
+  collapseLeftSidebar,
+  collapseRightSidebar,
+  expandRightSidebar,
+  selectWorkspace,
+} from "@/browser/stories/helpers/uiState";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import { getArtifactKind } from "@/common/utils/artifactKind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
   RIGHT_SIDEBAR_TAB_KEY,
@@ -44,12 +58,13 @@ import {
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ComponentType, CSSProperties, ReactNode } from "react";
 import { useEffect, useRef } from "react";
 import type { TabType } from "@/browser/types/rightSidebar";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { RightSidebar } from "./RightSidebar.js";
+import { writeArtifactSelection } from "./ArtifactsTab/artifactSelection";
 
 const meta: Meta = {
   title: "Features/RightSidebar/RightSidebar",
@@ -151,36 +166,34 @@ function RightSidebarStoryShell(props: { setup: () => APIClient; children: React
           <ProjectProvider>
             <WorkspaceProvider>
               <TerminalRouterProvider>
-                <UILayoutsProvider>
-                  <TooltipProvider delayDuration={200}>
-                    <SettingsProvider>
-                      <AboutDialogProvider>
-                        <ProviderOptionsProvider>
-                          <SplashScreenProvider>
-                            <TutorialProvider>
-                              <CommandRegistryProvider>
-                                <PowerModeProvider>
-                                  <ConfirmDialogProvider>
-                                    <AgentProvider
-                                      workspaceId={workspaceId}
-                                      projectPath={STORY_PROJECT_PATH}
-                                    >
-                                      <ThinkingProvider workspaceId={workspaceId}>
-                                        <BackgroundBashProvider workspaceId={workspaceId}>
-                                          {props.children}
-                                        </BackgroundBashProvider>
-                                      </ThinkingProvider>
-                                    </AgentProvider>
-                                  </ConfirmDialogProvider>
-                                </PowerModeProvider>
-                              </CommandRegistryProvider>
-                            </TutorialProvider>
-                          </SplashScreenProvider>
-                        </ProviderOptionsProvider>
-                      </AboutDialogProvider>
-                    </SettingsProvider>
-                  </TooltipProvider>
-                </UILayoutsProvider>
+                <TooltipProvider delayDuration={200}>
+                  <SettingsProvider>
+                    <AboutDialogProvider>
+                      <ProviderOptionsProvider>
+                        <SplashScreenProvider>
+                          <TutorialProvider>
+                            <CommandRegistryProvider>
+                              <PowerModeProvider>
+                                <ConfirmDialogProvider>
+                                  <AgentProvider
+                                    workspaceId={workspaceId}
+                                    projectPath={STORY_PROJECT_PATH}
+                                  >
+                                    <ThinkingProvider workspaceId={workspaceId}>
+                                      <BackgroundBashProvider workspaceId={workspaceId}>
+                                        {props.children}
+                                      </BackgroundBashProvider>
+                                    </ThinkingProvider>
+                                  </AgentProvider>
+                                </ConfirmDialogProvider>
+                              </PowerModeProvider>
+                            </CommandRegistryProvider>
+                          </TutorialProvider>
+                        </SplashScreenProvider>
+                      </ProviderOptionsProvider>
+                    </AboutDialogProvider>
+                  </SettingsProvider>
+                </TooltipProvider>
               </TerminalRouterProvider>
             </WorkspaceProvider>
           </ProjectProvider>
@@ -204,7 +217,7 @@ function seedSidebarLayout(workspaceId: string, tabs: TabType[], activeTab: TabT
 
 /**
  * The selected tab lies fully inside its strip's scroll viewport (not cut off at an edge or
- * hidden behind "+"). Retries because labels grow after mount (cost badge, counts) and the
+ * hidden behind All tabs). Retries because labels grow after mount (cost badge, counts) and the
  * strip re-scrolls when they do. Stories using it fix the sidebar width themselves, so this
  * holds at any test-runner viewport size.
  */
@@ -301,7 +314,7 @@ export const CostsTab: Story = {
           ],
           sessionUsage: createSessionUsage(0.56),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-costs");
         return client;
       }}
     >
@@ -363,7 +376,7 @@ export const CostsTabWithCacheCreate: Story = {
             version: 1,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-cache-create");
         return client;
       }}
     >
@@ -432,7 +445,7 @@ export const CostsTabMultiModel: Story = {
             version: 1,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-multi-model");
         return client;
       }}
     >
@@ -473,7 +486,7 @@ export const ReviewTab: Story = {
           ],
           sessionUsage: createSessionUsage(0.42),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-review");
         return client;
       }}
     >
@@ -521,7 +534,7 @@ export const StatsTabIdle: Story = {
           ],
           sessionUsage: createSessionUsage(0.25),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-stats-idle");
         return client;
       }}
     >
@@ -565,7 +578,7 @@ export const StatsTabStreaming: Story = {
           historySequence: 2,
           streamText: "I'll create a test suite for you. Let me start by analyzing...",
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-stats-streaming");
         return client;
       }}
     >
@@ -709,7 +722,7 @@ export const ReviewTabSortByLastEdit: Story = {
             numstatOutput: SAMPLE_NUMSTAT_OUTPUT,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-review-sort");
         return client;
       }}
     >
@@ -780,7 +793,7 @@ export const ReviewTabSortByFileOrder: Story = {
             numstatOutput: SAMPLE_NUMSTAT_OUTPUT,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-review-file-order");
         return client;
       }}
     >
@@ -877,7 +890,7 @@ export const DiffPaddingAlignment: Story = {
             numstatOutput: ALIGNMENT_TEST_NUMSTAT,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-diff-alignment");
         return client;
       }}
     >
@@ -954,7 +967,7 @@ export const DiffPaddingAlignmentModification: Story = {
             numstatOutput: MODIFICATION_NUMSTAT,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-diff-modification");
         return client;
       }}
     >
@@ -1067,7 +1080,7 @@ export const ReviewTabReadMore: Story = {
             fileContents: new Map([["src/components/Button.tsx", BUTTON_FILE_CONTENT]]),
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-read-more");
         return client;
       }}
     >
@@ -1133,7 +1146,7 @@ export const ReviewTabWithFileFilter: Story = {
             numstatOutput: SAMPLE_NUMSTAT_OUTPUT,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-review-file-filter");
         return client;
       }}
     >
@@ -1165,6 +1178,31 @@ export const ReviewTabWithFileFilter: Story = {
     });
     await expect(filterIndicator).toBeInTheDocument();
     await expect(filterIndicator).toHaveTextContent("Button.tsx");
+
+    // In the light themes, the warning "-N" counts and "M" letters were 1.54:1 on white, and every
+    // colored text on the selected file row was below WCAG AA, down to 1.16:1. The filter chip
+    // shares the row's tint, and its "✕" was 2.85:1 (#6935).
+    const tree = await canvas.findByTestId("review-file-tree");
+    const selectedName = await within(tree).findByText("Button.tsx");
+    // The selected row is the nearest ancestor that paints a background: the selection tint.
+    let selectedRow = selectedName.parentElement;
+    while (selectedRow && getComputedStyle(selectedRow).backgroundColor === "rgba(0, 0, 0, 0)") {
+      selectedRow = selectedRow.parentElement;
+    }
+    if (!selectedRow || !tree.contains(selectedRow)) throw new Error("No selected-row tint found");
+    const row = selectedRow;
+    // The file-type icon is aria-hidden: the file name next to it carries the same information.
+    const rowTexts = () =>
+      [...row.querySelectorAll<HTMLElement>("*")].filter(
+        (element) => !element.closest("[aria-hidden='true']") && element.childElementCount === 0
+      );
+    const deletionCounts = () => canvas.getAllByText(/^[-−]\d+$|^M$/);
+    await expect(
+      textsBelowAaInThemes(() => [
+        filterIndicator,
+        ...new Set([...rowTexts(), ...deletionCounts()]),
+      ]).join("\n")
+    ).toBe("");
   },
 };
 
@@ -1192,7 +1230,7 @@ export const ReviewTabReadMoreBoundaries: Story = {
             fileContents: new Map([["src/utils/math.ts", SMALL_FILE_CONTENT]]),
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-read-more-boundaries");
         return client;
       }}
     >
@@ -1234,7 +1272,7 @@ export const ReviewTabWithUntrackedFiles: Story = {
             ],
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-untracked");
         return client;
       }}
     >
@@ -1324,7 +1362,7 @@ export const CompactionModelWarning: Story = {
             version: 1,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-compact-warning");
         return client;
       }}
     >
@@ -1433,7 +1471,7 @@ export const OutputTabEmpty: Story = {
           messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
           logEntries: [],
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-output-empty");
         return client;
       }}
     >
@@ -1467,7 +1505,7 @@ export const OutputTabWithLogs: Story = {
           messages: [createUserMessage("msg-1", "Show logs", { historySequence: 1 })],
           logEntries: createOutputLogEntries(),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-output-logs");
         return client;
       }}
     >
@@ -1496,7 +1534,7 @@ export const OutputTabErrorsOnly: Story = {
           messages: [createUserMessage("msg-1", "Check errors", { historySequence: 1 })],
           logEntries: createOutputLogEntries(),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-output-errors");
         return client;
       }}
     >
@@ -1528,7 +1566,7 @@ export const NewTabLauncher: Story = {
         });
         // The keyboard play opens Workflows, not just its launcher row.
         client.workflows.listScripts = () => Promise.resolve([]);
-        expandRightSidebar();
+        expandRightSidebar("ws-new-tab");
         return client;
       }}
     >
@@ -1558,15 +1596,23 @@ export const NewTabLauncher: Story = {
           document.activeElement === tab || panel?.contains(document.activeElement)
         ).toBe(true);
       });
-      await userEvent.click(canvas.getByRole("button", { name: "New tab" }));
+      await openSidebarNewTab(canvasElement);
     }
+    // The strip's "+" hands focus to the launcher, which keeps it.
+    const launcherHasFocus = () =>
+      canvasElement
+        .querySelector('[role="tabpanel"][id$="-panel-new"]')
+        ?.contains(document.activeElement) === true;
+    await waitFor(() => expect(launcherHasFocus()).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(launcherHasFocus()).toBe(true);
   },
 };
 
 /**
  * The New tab launcher at the sidebar's minimum width (300px), next to more open tabs than fit:
  * launcher rows wrap their descriptions instead of overflowing, and the strip stays one row
- * that scrolls sideways (hidden scrollbar, faded edges) with "+" pinned at the end.
+ * that scrolls sideways (hidden scrollbar, faded edges) with All tabs pinned at the end.
  */
 export const NewTabLauncherNarrow: Story = {
   // Match Pixel's named desktop exactly; the global Storybook "desktop" is smaller.
@@ -1625,7 +1671,7 @@ export const NewTabLauncherNarrow: Story = {
           sessionUsage: createSessionUsage(0.12),
           logEntries: [],
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-new-tab-narrow");
         return client;
       }}
     >
@@ -1684,7 +1730,7 @@ export const ManyTabsSingleRow: Story = {
           messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
           sessionUsage: createSessionUsage(0.34),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-many-tabs");
         return client;
       }}
     >
@@ -1694,7 +1740,7 @@ export const ManyTabsSingleRow: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByRole("tab", { name: /^timeline/i, selected: true });
-    await canvas.findByRole("button", { name: "New tab" });
+    await canvas.findByRole("button", { name: "All tabs" });
     // Wait for the cost badge: it widens Stats after mount, pushing the selected tab right.
     await canvas.findByRole("tab", { name: /stats.*\$0\.34/i });
     await expectSelectedTabVisible(canvasElement);
@@ -1709,52 +1755,72 @@ function isHitTarget(element: HTMLElement): boolean {
 }
 
 /**
- * A Windows/Linux titlebar-overlay inset wider than the pane (Linux e2e reported one larger than
- * the whole sidebar) must not squeeze the one-row strip to nothing: tabs stay clickable.
+ * The right sidebar under a Windows/Linux titlebar-overlay inset. The one-row strip must not be
+ * squeezed to nothing, and the selected tab shows whole: capped at the row's width, its label
+ * truncates (#7103). Tabs, "+" and All tabs stay clickable.
  */
-export const TabsReachableUnderWideTitlebarInset: Story = {
-  // Play-only: a regression check, nothing new to look at.
-  parameters: { pixel: PIXEL_DISABLED },
-  render: () => (
-    // On a wrapper, not :root, so the override cannot leak into later stories.
-    <div className="contents" style={{ "--titlebar-right-inset": "2000px" } as CSSProperties}>
-      <RightSidebarStoryShell
-        setup={() => {
-          localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
-          localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
-          seedSidebarLayout("ws-wide-inset", ["costs", "review"], "costs");
-
-          const client = setupSimpleChatStory({
-            workspaceId: "ws-wide-inset",
-            workspaceName: "feature/wide-inset",
-            projectName: "my-app",
-            messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
-          });
-          expandRightSidebar();
-          return client;
-        }}
+function titlebarInsetStory(insetPx: number, sidebarWidthPx: number): Story {
+  const workspaceId = `ws-inset-${insetPx}`;
+  return {
+    // Play-only: a regression check, nothing new to look at.
+    parameters: { pixel: PIXEL_DISABLED },
+    render: () => (
+      // On a wrapper, not :root, so the override cannot leak into later stories.
+      <div
+        className="contents"
+        style={{ "--titlebar-right-inset": `${insetPx}px` } as CSSProperties}
       >
-        <RightSidebarStoryContent workspaceId="ws-wide-inset" />
-      </RightSidebarStoryShell>
-    </div>
-  ),
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    const stats = await canvas.findByRole("tab", { name: /^stats/i, selected: true });
-    const review = await canvas.findByRole("tab", { name: /^review/i });
-    await expectSelectedTabVisible(canvasElement);
-    await waitFor(() => {
-      if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
-    });
-    // Like Playwright: bring the other tab into view, then it must take the click.
-    review.scrollIntoView({ block: "nearest", inline: "nearest" });
-    await waitFor(() => {
-      if (!isHitTarget(review)) throw new Error("unselected tab is not under the pointer");
-    });
-    await userEvent.click(review);
-    await canvas.findByRole("tab", { name: /^review/i, selected: true });
-  },
-};
+        <RightSidebarStoryShell
+          setup={() => {
+            localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
+            localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, String(sidebarWidthPx));
+            seedSidebarLayout(workspaceId, ["costs", "review"], "costs");
+
+            const client = setupSimpleChatStory({
+              workspaceId,
+              workspaceName: "feature/wide-inset",
+              projectName: "my-app",
+              messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
+              // The cost badge makes Stats wider than the row the capped inset leaves.
+              sessionUsage: createSessionUsage(0.34),
+            });
+            expandRightSidebar(workspaceId);
+            return client;
+          }}
+        >
+          <RightSidebarStoryContent workspaceId={workspaceId} />
+        </RightSidebarStoryShell>
+      </div>
+    ),
+    play: async ({ canvasElement }) => {
+      const canvas = within(canvasElement);
+      const stats = await canvas.findByRole("tab", { name: /stats.*\$0\.34/i, selected: true });
+      const review = await canvas.findByRole("tab", { name: /^review/i });
+      await expectSelectedTabVisible(canvasElement);
+      // "+" (New tab) and All tabs must stay clickable too.
+      await waitFor(() => {
+        if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
+        for (const name of ["New tab", "All tabs"]) {
+          if (!isHitTarget(canvas.getByRole("button", { name }))) {
+            throw new Error(`${name} is not under the pointer`);
+          }
+        }
+      });
+      // Like Playwright: bring the other tab into view, then it must take the click.
+      review.scrollIntoView({ block: "nearest", inline: "nearest" });
+      await waitFor(() => {
+        if (!isHitTarget(review)) throw new Error("unselected tab is not under the pointer");
+      });
+      await userEvent.click(review);
+      await canvas.findByRole("tab", { name: /^review/i, selected: true });
+    },
+  };
+}
+
+/** An inset wider than the pane (Linux e2e reported one larger than the whole sidebar). */
+export const TabsReachableUnderWideTitlebarInset = titlebarInsetStory(2000, 400);
+/** The 138 px Windows/Linux fallback inset at the sidebar's 300 px minimum width. */
+export const SelectedTabFitsUnderTitlebarInset = titlebarInsetStory(138, 300);
 
 const OVERVIEW_WORKSPACE_ID = "ws-overview";
 
@@ -1775,7 +1841,6 @@ export const CollapsedOverview: Story = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        // setupSimpleChatStory collapses the right sidebar, which is what this story shows.
         const client = setupSimpleChatStory({
           workspaceId: OVERVIEW_WORKSPACE_ID,
           workspaceName: "feature/settlement-reconciler",
@@ -1815,17 +1880,24 @@ export const CollapsedOverview: Story = {
           ],
         });
         collapseLeftSidebar();
+        // Exercise the app's default: no saved collapsed flag for the workspace.
+        collapseRightSidebar();
         return client;
       }}
     />
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    const card = await canvas.findByRole(
+    const sidebar = await canvas.findByRole(
       "complementary",
       { name: "Workspace insights" },
       { timeout: 15_000 }
     );
+    const card = await waitFor(() => {
+      const element = sidebar.querySelector<HTMLElement>(".right-sidebar-overview-card");
+      if (!element) throw new Error("Overview card not mounted yet");
+      return element;
+    });
     const sideChats = await within(card).findByRole("region", { name: "Side chats" });
     await within(sideChats).findByText("How real-time is the hedger?");
     await waitFor(() =>
@@ -1833,8 +1905,8 @@ export const CollapsedOverview: Story = {
     );
     // The session's cost leads the card.
     await within(card).findByRole("button", { name: /\$7\.99/ });
-    // The header's stand-in shows only where the card cannot.
-    await expect(canvas.queryByRole("button", { name: "Expand right sidebar" })).toBeNull();
+    // The toggle shows beside the card: the card has no expand control of its own.
+    await expect(canvas.getByRole("button", { name: "Expand right sidebar" })).toBeVisible();
 
     // Bounded: the card is a fraction of the workspace's height, and the chat is not narrowed
     // by a collapsed rail: it reaches the workspace's right edge.
@@ -1860,7 +1932,7 @@ export const CollapsedOverview: Story = {
 
 /**
  * Where the transcript column would lose width to the card (a 1000px workspace here), the card
- * stays hidden and the header's expand button stands in for it.
+ * stays hidden; the toggle still expands the sidebar.
  */
 export const CollapsedOverviewYieldsToTranscript: Story = {
   ...CollapsedOverview,
@@ -1877,8 +1949,8 @@ export const CollapsedOverviewYieldsToTranscript: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 });
-    // The header's button can show before the card: WorkspaceShell loads the sidebar lazily
-    // (#6206), so wait for the card to mount. It is hidden, so no role query can find it.
+    // The toggle shows before the card: WorkspaceShell loads the sidebar lazily (#6206), so
+    // wait for the card to mount. It is hidden, so no role query can find it.
     const card = await waitFor(
       () => {
         const element = canvasElement.querySelector<HTMLElement>(".right-sidebar-overview-card");
@@ -1887,9 +1959,492 @@ export const CollapsedOverviewYieldsToTranscript: Story = {
       },
       { timeout: 15_000 }
     );
-    // Hidden by visibility, not display: the layout still shows the sidebar, so its shortcuts
-    // keep expanding it rather than taking the narrow-layout fallbacks.
     await expect(getComputedStyle(card).visibility).toBe("hidden");
-    await expect(getComputedStyle(card).display).not.toBe("none");
+    // The layout still shows the (zero-width) sidebar, so its shortcuts keep expanding it
+    // rather than taking the narrow-layout fallbacks.
+    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
+    await expect(sidebar).not.toBeNull();
+    await expect(getComputedStyle(sidebar!).display).not.toBe("none");
+    // Without its card the sidebar is no landmark: assistive tech would find it empty.
+    await expect(canvas.queryByRole("complementary", { name: "Workspace insights" })).toBeNull();
+  },
+};
+
+/**
+ * Sliding out, the panel stays painted but takes no focus: Tab right after collapsing does not
+ * land on a control that unmounts when the slide ends. The 1000px workspace hides the card, so
+ * nothing else in the sidebar can take that focus.
+ */
+export const CollapsingPanelTakesNoFocus: Story = {
+  ...CollapsedOverviewYieldsToTranscript,
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole(
+      "button",
+      { name: "Expand right sidebar" },
+      { timeout: 15_000 }
+    );
+    toggle.focus();
+    await userEvent.keyboard("{Enter}");
+    const sidebar = await canvas.findByRole("complementary", { name: "Workspace insights" });
+    await waitFor(() => {
+      if (sidebar.querySelector('[role="tablist"]') == null || sidebar.getAnimations().length > 0) {
+        throw new Error("The sidebar is still sliding open");
+      }
+    });
+
+    await userEvent.keyboard("{Enter}");
+    await expect(toggle).toHaveAccessibleName("Expand right sidebar");
+    await userEvent.tab();
+    // Still sliding out after the Tab, so the panel was there to tab into.
+    await expect(sidebar.querySelector('[role="tablist"]')).not.toBeNull();
+    await expect(sidebar.contains(document.activeElement)).toBe(false);
+  },
+};
+
+/** A scratch workspace's side chat with no usage yet: its collapsed sidebar has nothing to show. */
+function setupEmptyOverview(): APIClient {
+  const scratchWorkspace = (id: string, title: string) => {
+    const path = `/home/user/.mux/scratch/${id}`;
+    return {
+      ...createWorkspace({
+        id,
+        name: `scratch-${id}`,
+        projectName: "Scratch",
+        projectPath: path,
+        title,
+        runtimeConfig: { type: "local" },
+      }),
+      kind: "scratch" as const,
+      namedWorkspacePath: path,
+    };
+  };
+  const parent = scratchWorkspace("scratch-parent", "Scratch");
+  const sideChat = {
+    ...scratchWorkspace("scratch-side-chat", "Side question"),
+    sideChatParentWorkspaceId: parent.id,
+  };
+  const workspaces = [parent, sideChat];
+  selectWorkspace(sideChat);
+  collapseLeftSidebar();
+  collapseRightSidebar();
+  return createMockORPCClient({
+    projects: new Map([
+      [
+        SCRATCH_PROJECT_CONFIG_KEY,
+        {
+          projectKind: "system",
+          trusted: true,
+          workspaces: workspaces.map((workspace) => ({
+            kind: "scratch" as const,
+            path: workspace.namedWorkspacePath,
+            id: workspace.id,
+            name: workspace.name,
+            runtimeConfig: { type: "local" as const },
+          })),
+        },
+      ],
+    ]),
+    workspaces,
+    onChat: createOnChatAdapter(
+      new Map([
+        [
+          sideChat.id,
+          createStaticChatHandler([
+            createUserMessage("msg-1", "What does the hedger do?", { historySequence: 1 }),
+            createAssistantMessage("msg-2", "It offsets the open position.", {
+              historySequence: 2,
+            }),
+          ]),
+        ],
+      ])
+    ),
+  });
+}
+
+/**
+ * A collapsed sidebar with nothing to summarize shows no card, so the transcript takes the room
+ * a card would have had, and no empty landmark is left in its place.
+ */
+export const CollapsedEmptyOverviewReservesNothing: Story = {
+  globals: { viewport: { value: "desktop", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={setupEmptyOverview} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 });
+    const card = await waitFor(
+      () => {
+        const element = canvasElement.querySelector<HTMLElement>(".right-sidebar-overview-card");
+        if (!element) throw new Error("Overview card not mounted yet");
+        return element;
+      },
+      { timeout: 15_000 }
+    );
+    await expect(getComputedStyle(card).display).toBe("none");
+    // The 1600px workspace has room for a card, but reserves none for this one.
+    await expect(getPaddingRight(getChatScrollport(canvasElement))).toBe(15);
+    await expect(canvas.queryByRole("complementary", { name: "Workspace insights" })).toBeNull();
+  },
+};
+
+/** The chat scrollport, whose right padding is the room the transcript leaves for the card. */
+function getChatScrollport(canvasElement: HTMLElement): HTMLElement {
+  return canvasElement.querySelector<HTMLElement>(".chat-reserved-inline-end-scrollport")!;
+}
+
+function getPaddingRight(element: HTMLElement): number {
+  return parseFloat(getComputedStyle(element).paddingRight);
+}
+
+/**
+ * A window resize across the card's breakpoint moves the transcript's room for the card at once:
+ * only the sidebar's own slide eases it.
+ */
+export const CollapsedOverviewRoomFollowsResize: Story = {
+  ...CollapsedOverview,
+  decorators: [
+    (Story: ComponentType) => (
+      <div data-testid="shell-frame" style={{ width: 1600, height: "100%" }}>
+        <Story />
+      </div>
+    ),
+  ],
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await waitFor(() =>
+      expect(sidebar.querySelector(".right-sidebar-overview-card")).not.toBeNull()
+    );
+    const scrollport = getChatScrollport(canvasElement);
+    await waitFor(() => expect(getPaddingRight(scrollport)).toBeGreaterThan(100));
+
+    canvas.getByTestId("shell-frame").style.width = "1000px";
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await expect(getPaddingRight(scrollport)).toBe(15);
+  },
+};
+
+interface ToggleFrame {
+  toggle: DOMRect;
+  sidebarWidth: number;
+  card: boolean;
+  panel: boolean;
+  chatPadding: number;
+}
+
+/** Samples the toggle and the sidebar on every animation frame while `act` runs, and after. */
+async function sampleToggleFrames(
+  canvasElement: HTMLElement,
+  act: () => Promise<unknown>
+): Promise<ToggleFrame[]> {
+  const canvas = within(canvasElement);
+  const toggle = canvas.getByTestId("right-sidebar-toggle-bar").querySelector("button")!;
+  const sidebar = canvas.getByRole("complementary", { name: "Workspace insights" });
+  const scrollport = getChatScrollport(canvasElement);
+  const frames: ToggleFrame[] = [];
+  let sampling = true;
+  const sample = () => {
+    frames.push({
+      toggle: toggle.getBoundingClientRect(),
+      sidebarWidth: sidebar.getBoundingClientRect().width,
+      card: sidebar.querySelector(".right-sidebar-overview-card") != null,
+      panel: sidebar.querySelector('[role="tablist"]') != null,
+      chatPadding: getPaddingRight(scrollport),
+    });
+    if (sampling) requestAnimationFrame(sample);
+  };
+  sample();
+  await act();
+  // The slide takes 200ms; sample well past it.
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  sampling = false;
+  return frames;
+}
+
+async function expectSameRect(actual: DOMRect, expected: DOMRect) {
+  for (const key of ["left", "top", "width", "height"] as const) {
+    await expect(Math.abs(actual[key] - expected[key])).toBeLessThanOrEqual(0.1);
+  }
+}
+
+/**
+ * The right sidebar's toggle (like the left one) is one element in both states: it keeps its
+ * size, place and focus while the docked width slides, and the header (collapsed) and the tab
+ * strip (expanded) reserve its room on their own line.
+ */
+export const ToggleStaysPutWhileSliding: Story = {
+  ...CollapsedOverview,
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await waitFor(() =>
+      expect(sidebar.querySelector(".right-sidebar-overview-card")).not.toBeNull()
+    );
+    const toggle = canvas.getByRole("button", { name: "Expand right sidebar" });
+    const header = canvas.getByTestId("workspace-menu-bar");
+    const headerRoom = header.querySelector<HTMLElement>("button.right-sidebar-toggle")!;
+    // Focus first: focus() may scroll the 1600px frame into the test runner's narrower window.
+    toggle.focus();
+    const rest = toggle.getBoundingClientRect();
+    await expectSameRect(headerRoom.getBoundingClientRect(), rest);
+
+    const opening = await sampleToggleFrames(canvasElement, () => userEvent.keyboard("{Enter}"));
+    await expect(toggle).toHaveAccessibleName("Collapse right sidebar");
+    await expect(toggle).toHaveFocus();
+    for (const frame of opening) await expectSameRect(frame.toggle, rest);
+    const openWidth = opening[opening.length - 1].sidebarWidth;
+    await expect(openWidth).toBeGreaterThan(200);
+    await expect(
+      opening.some((frame) => frame.sidebarWidth > 1 && frame.sidebarWidth < openWidth - 1)
+    ).toBe(true);
+    // Expanding drops the card at once; the panel slides in.
+    await expect(opening.some((frame) => frame.card && frame.panel)).toBe(false);
+
+    // The row sits in a wrapper that holds its desktop no-drag region.
+    const strip = canvas.getByRole("tablist", { name: "Sidebar views" }).parentElement!
+      .parentElement!;
+    const stripRoom = strip.querySelector<HTMLElement>('button[aria-hidden="true"]')!;
+    await expectSameRect(stripRoom.getBoundingClientRect(), rest);
+    await expect(strip.getBoundingClientRect().height).toBe(header.getBoundingClientRect().height);
+
+    const closing = await sampleToggleFrames(canvasElement, () => userEvent.keyboard("{Enter}"));
+    await expect(toggle).toHaveAccessibleName("Expand right sidebar");
+    await expect(toggle).toHaveFocus();
+    for (const frame of closing) await expectSameRect(frame.toggle, rest);
+    await expect(closing[closing.length - 1].sidebarWidth).toBe(0);
+    await expect(
+      closing.some((frame) => frame.sidebarWidth > 1 && frame.sidebarWidth < openWidth - 1)
+    ).toBe(true);
+    // The card is revealed under the panel as it slides out.
+    await expect(closing.some((frame) => frame.card && frame.panel)).toBe(true);
+    // The transcript's room for the card eases in with the slide instead of squeezing the
+    // column the moment the sidebar starts collapsing.
+    const reservedPadding = closing[closing.length - 1].chatPadding;
+    await expect(reservedPadding).toBeGreaterThan(100);
+    await expect(
+      closing.some((frame) => frame.chatPadding > 16 && frame.chatPadding < reservedPadding - 1)
+    ).toBe(true);
+    await expect(closing[closing.length - 1].panel).toBe(false);
+  },
+};
+
+/**
+ * Closing the only tab collapses the sidebar, and the panel slides out empty: the New tab that
+ * takes the closed tab's place never paints during the slide (user request). A collapse with the
+ * New tab already open slides out with it (ToggleStaysPutWhileSliding).
+ */
+export const ClosingLastTabSlidesOutEmpty: Story = {
+  ...CollapsedOverview,
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await userEvent.click(canvas.getByRole("button", { name: "Expand right sidebar" }));
+    // The launcher row's name includes its description.
+    await userEvent.click(await within(sidebar).findByRole("button", { name: /^Stats\b/ }));
+    const close = await within(sidebar).findByRole("button", { name: "Close Stats" });
+    await waitFor(() => {
+      if (sidebar.getAnimations().length > 0) throw new Error("The sidebar is still sliding open");
+    });
+
+    const frames = await sampleToggleFrames(canvasElement, () => userEvent.click(close));
+    await expect(canvas.getByRole("button", { name: "Expand right sidebar" })).toBeVisible();
+    const openWidth = frames[0].sidebarWidth;
+    await expect(openWidth).toBeGreaterThan(200);
+    await expect(frames[frames.length - 1].sidebarWidth).toBe(0);
+    const sliding = frames.filter((frame) => frame.sidebarWidth < openWidth - 1);
+    await expect(sliding.some((frame) => frame.sidebarWidth > 1)).toBe(true);
+    await expect(sliding.some((frame) => frame.panel)).toBe(false);
+  },
+};
+
+/**
+ * Dragging the resize handle past the snap point collapses the sidebar, and dragging back
+ * reopens it, at once: the width (and the transcript's room for the card) follows the pointer
+ * instead of sliding behind it.
+ */
+export const DragCollapseSnapsWithoutSliding: Story = {
+  ...CollapsedOverview,
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await waitFor(() =>
+      expect(sidebar.querySelector(".right-sidebar-overview-card")).not.toBeNull()
+    );
+    await userEvent.click(canvas.getByRole("button", { name: "Expand right sidebar" }));
+    // Past the toggle's own slide, and the transcript's easing with it.
+    await waitFor(() => {
+      const sliding =
+        sidebar.querySelector(".right-sidebar-overview-card") != null ||
+        sidebar.getAnimations().length > 0 ||
+        getChatScrollport(canvasElement).getAnimations().length > 0;
+      if (sliding) throw new Error("The sidebar is still sliding open");
+    });
+    const openWidth = sidebar.getBoundingClientRect().width;
+    await expect(openWidth).toBeGreaterThan(200);
+    const handle = sidebar.querySelector<HTMLElement>("[data-sidebar-resize-handle]")!;
+    const start = handle.getBoundingClientRect();
+    const pointer = { pointerId: 7, isPrimary: true, bubbles: true, clientY: start.top + 100 };
+    const nextFrame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+    handle.dispatchEvent(new PointerEvent("pointerdown", { ...pointer, clientX: start.left }));
+    await nextFrame();
+
+    const dragTo = (clientX: number) => async () => {
+      document.dispatchEvent(new PointerEvent("pointermove", { ...pointer, clientX }));
+      await nextFrame();
+    };
+    const closing = await sampleToggleFrames(canvasElement, dragTo(start.left + openWidth + 50));
+    await expect(closing[closing.length - 1].sidebarWidth).toBe(0);
+    await expect(closing[closing.length - 1].panel).toBe(false);
+    const reservedPadding = closing[closing.length - 1].chatPadding;
+    await expect(reservedPadding).toBeGreaterThan(100);
+    for (const frame of closing) {
+      await expect([0, openWidth]).toContain(frame.sidebarWidth);
+      await expect([15, reservedPadding]).toContain(frame.chatPadding);
+    }
+
+    const opening = await sampleToggleFrames(canvasElement, dragTo(start.left));
+    document.dispatchEvent(new PointerEvent("pointerup", { ...pointer, clientX: start.left }));
+    await expect(opening[opening.length - 1].sidebarWidth).toBe(openWidth);
+    for (const frame of opening) await expect([0, openWidth]).toContain(frame.sidebarWidth);
+  },
+};
+
+/**
+ * The shell's toggle bar reserves the full titlebar overlay inset, and the tab strip caps its own
+ * (see TabsReachableUnderWideTitlebarInset), so under a wide inset the bar's box reaches over the
+ * strip. Linux e2e reports 513px: its viewport is wider than the real window. The strip's
+ * controls under the bar must still take clicks.
+ */
+export const StripReachableUnderToggleBar: Story = {
+  ...CollapsedOverview,
+  decorators: [
+    (Story: ComponentType) => (
+      // On a wrapper, not :root, so the override cannot leak into later stories.
+      <div className="contents" style={{ "--titlebar-right-inset": "513px" } as CSSProperties}>
+        <Story />
+      </div>
+    ),
+  ],
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(
+      await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 })
+    );
+    const allTabs = await canvas.findByRole("button", { name: "All tabs" }, { timeout: 15_000 });
+    await waitFor(() => {
+      // Like Playwright: bring it into view (the 1600px frame can be wider than the window),
+      // again on each retry, since it mounts while the panel is still sliding in.
+      allTabs.scrollIntoView({ block: "nearest", inline: "nearest" });
+      if (!isHitTarget(allTabs)) throw new Error("All tabs is not under the pointer");
+    });
+  },
+};
+
+const PINNED_CLOSE_WORKSPACE_ID = "ws-pinned-last-tab-close";
+const PINNED_REPORT: ArtifactReadResult = {
+  status: "ok",
+  path: "report.md",
+  kind: getArtifactKind("report.md"),
+  size: 26,
+  modifiedMs: 1,
+  encoding: "utf8",
+  content: "# Weekly report\n\nAll good.",
+};
+
+/**
+ * Cmd/Ctrl+W on the only tab while it is pinned (Artifacts fullscreen over the workspace shell)
+ * closes the sidebar, and focus still ends on the sidebar toggle. The pinned view holds the
+ * toggle inert until it unmounts with the tab.
+ */
+export const ClosingPinnedLastTabFocusesToggle: Story = {
+  globals: { viewport: { value: "desktop", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupSimpleChatStory({
+          workspaceId: PINNED_CLOSE_WORKSPACE_ID,
+          workspaceName: "feature/pinned-close",
+          experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+          messages: [createUserMessage("msg-1", "Show me the report", { historySequence: 1 })],
+        });
+        client.artifacts = {
+          ...client.artifacts,
+          list: () =>
+            Promise.resolve({
+              success: true as const,
+              data: {
+                available: true,
+                dir: "/scratch/artifacts",
+                entries: [
+                  {
+                    path: PINNED_REPORT.path,
+                    kind: PINNED_REPORT.kind,
+                    size: PINNED_REPORT.size,
+                    modifiedMs: 1,
+                  },
+                ],
+                truncated: false,
+              },
+            }),
+          read: () => Promise.resolve({ success: true as const, data: PINNED_REPORT }),
+        };
+        writeArtifactSelection(PINNED_CLOSE_WORKSPACE_ID, {
+          scope: "artifact",
+          path: PINNED_REPORT.path,
+        });
+        collapseLeftSidebar();
+        seedSidebarLayout(PINNED_CLOSE_WORKSPACE_ID, ["artifacts"]);
+        expandRightSidebar(PINNED_CLOSE_WORKSPACE_ID);
+        return client;
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await userEvent.click(
+      await within(sidebar).findByRole("button", { name: "Fullscreen" }, { timeout: 15_000 })
+    );
+    const pinned = await canvas.findByRole("region", { name: "Artifact report.md" });
+    await waitFor(() => expect(pinned).toHaveFocus());
+
+    await userEvent.keyboard("{Control>}w{/Control}");
+
+    const toggle = await canvas.findByRole("button", { name: "Expand right sidebar" });
+    // A plain throw (not the instrumented expect), so a failure names where focus went.
+    await waitFor(() => {
+      const active = document.activeElement;
+      if (active !== toggle) {
+        throw new Error(`Focus is on <${active?.tagName.toLowerCase() ?? "none"}>, not the toggle`);
+      }
+    });
   },
 };

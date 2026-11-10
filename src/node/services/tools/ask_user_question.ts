@@ -2,29 +2,57 @@ import assert from "node:assert/strict";
 
 import { tool } from "ai";
 
-import type { AskUserQuestionToolResult } from "@/common/types/tools";
-import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
+import type { AskUserQuestionToolArgs, AskUserQuestionToolResult } from "@/common/types/tools";
+import {
+  ASK_USER_QUESTION_ASYNC_SUMMARY,
+  buildAskUserQuestionSummary,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { askUserQuestionManager } from "@/node/services/askUserQuestionManager";
+
+/** Results that do not wait for the user: pre-filled answers, or a non-blocking question. */
+function getImmediateAskUserQuestionResult(
+  args: AskUserQuestionToolArgs,
+  config: ToolConfiguration
+): AskUserQuestionToolResult | null {
+  // Claude Code allows passing pre-filled answers directly. If provided, we can short-circuit
+  // and return immediately without prompting.
+  if (args.answers && Object.keys(args.answers).length > 0) {
+    return {
+      summary: buildAskUserQuestionSummary(args.answers),
+      ui_only: {
+        ask_user_question: {
+          questions: args.questions,
+          answers: args.answers,
+        },
+      },
+    };
+  }
+
+  // Codex-style flow outside plan agents: return at once so the agent keeps working with its
+  // best judgment. The card stays answerable and sends the answers as an ordinary user message
+  // (it steers after the current step, or starts a new turn when idle). Plan agents still
+  // block: their next step is a plan that needs the answers.
+  if (config.planFileOnly !== true) {
+    return {
+      summary: ASK_USER_QUESTION_ASYNC_SUMMARY,
+      ui_only: {
+        ask_user_question: { questions: args.questions, answers: {}, answerDelivery: "message" },
+      },
+    };
+  }
+  return null;
+}
 
 export const createAskUserQuestionTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: TOOL_DEFINITIONS.ask_user_question.description,
     inputSchema: TOOL_DEFINITIONS.ask_user_question.schema,
     execute: async (args, { abortSignal, toolCallId }): Promise<AskUserQuestionToolResult> => {
-      // Claude Code allows passing pre-filled answers directly. If provided, we can short-circuit
-      // and return immediately without prompting.
-      if (args.answers && Object.keys(args.answers).length > 0) {
-        return {
-          summary: buildAskUserQuestionSummary(args.answers),
-          ui_only: {
-            ask_user_question: {
-              questions: args.questions,
-              answers: args.answers,
-            },
-          },
-        };
+      const immediate = getImmediateAskUserQuestionResult(args, config);
+      if (immediate) {
+        return immediate;
       }
 
       assert(config.workspaceId, "ask_user_question requires a workspaceId");

@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Config } from "@/node/config";
 import { diffSeed, snapshotSeed, writeNeutralSeed } from "./neutralSeed";
 
 const parents: string[] = [];
@@ -52,4 +53,21 @@ test("a rewritten or removed seed file fails the run, while new files are only l
     ok: false,
     changed: [path.join("root", "config.json")],
   });
+});
+
+// A load-time migration that the seed lacks makes every seeded run rewrite config.json, and the
+// page-timing guard then stops the run (#6390's taskSettingsDefaultsRaised did, on the VM). This
+// loads the seed with this tree's Config, so it fails for any flag a load sets that the seed does
+// not already have, with no parse of the migration code.
+test("the seed already has every migration flag a config load sets", async () => {
+  const seed = freshSeed();
+  const onDisk = JSON.parse(fs.readFileSync(path.join(seed.root, "config.json"), "utf8")) as {
+    migrations: Record<string, boolean>;
+  };
+  const config = new Config(seed.root);
+  const loaded = config.loadConfigOrDefault().migrations ?? {};
+  const missing = Object.keys(loaded).filter((f) => loaded[f] === true && !onDisk.migrations[f]);
+  // Drain the migration write the load may have queued before afterEach removes the seed.
+  await config.editConfig((c) => c);
+  expect(missing).toEqual([]);
 });

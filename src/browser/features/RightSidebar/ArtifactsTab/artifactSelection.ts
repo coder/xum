@@ -14,35 +14,31 @@ import {
 export type ArtifactSelectionScope = "artifact" | "pinned" | "shelf";
 
 /**
- * The Artifacts tab selection of one workspace: an artifacts-relative path, a checkout-relative
- * path when `pinned`, or a shelf entry; `version` null means "Latest (live)".
+ * The Artifacts tab selection of one workspace: an artifacts-relative path, the stored pin path
+ * (checkout-relative or absolute) when `pinned`, or a shelf entry.
  */
 export interface ArtifactSelection {
   scope: ArtifactSelectionScope;
   path: string | null;
-  version: number | null;
 }
 
 /** Workspace id -> selection; key order is least to most recently written. */
 type ArtifactSelectionMap = Record<string, ArtifactSelection>;
 
-const DEFAULT_SELECTION: ArtifactSelection = { scope: "artifact", path: null, version: null };
+const DEFAULT_SELECTION: ArtifactSelection = { scope: "artifact", path: null };
 const EMPTY_MAP: ArtifactSelectionMap = {};
 
 // One global most-recently-used map instead of three keys per workspace: per-workspace keys
 // multiply by every workspace the user ever opened and overflowed the localStorage budget
-// (persistedStateBudget.test.ts).
+// (persistedStateBudget.test.ts). Values from older builds also carry a `version`, which
+// sanitize drops.
 function sanitize(raw: unknown): ArtifactSelection {
   if (typeof raw !== "object" || raw === null) return DEFAULT_SELECTION;
   const value = raw as Partial<Record<keyof ArtifactSelection, unknown>>;
   const scope =
     value.scope === "pinned" || value.scope === "shelf" ? value.scope : ("artifact" as const);
   const path = typeof value.path === "string" && value.path.length > 0 ? value.path : null;
-  const version =
-    typeof value.version === "number" && Number.isInteger(value.version) && value.version > 0
-      ? value.version
-      : null;
-  return { scope, path, version };
+  return { scope, path };
 }
 
 function selectionFrom(map: unknown, workspaceId: string): ArtifactSelection {

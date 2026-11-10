@@ -4,7 +4,7 @@ import { rankByPaletteQuery } from "@/browser/utils/commandPaletteRanking";
 describe("rankByPaletteQuery", () => {
   const items = [
     { name: "Show Output", section: "Navigation" },
-    { name: "Toggle Layout", section: "Layouts" },
+    { name: "Toggle Layout", section: "Appearance" },
     { name: "Output Panel Settings", section: "Settings" },
   ];
 

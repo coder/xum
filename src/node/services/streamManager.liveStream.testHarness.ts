@@ -130,7 +130,7 @@ export function createLiveStreamHarness(deps: LiveStreamHarnessDeps = {}) {
     deps.runner,
     deps.engineScope,
     deps.toolCallDisplayRegistry,
-    { streamText, tokenTracker: deps.tokenTracker ?? noopTokenTracker }
+    { streamText, tokenTracker: deps.tokenTracker ?? noopTokenTracker, hostClock: deps.hostClock }
   );
   return {
     streamManager,

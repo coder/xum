@@ -1,13 +1,13 @@
 /**
  * Synthetic onChat events for session tape tests: one or more of every event kind the recorder
  * covers, with Dates, undefined usage counts and nested tool payloads. Each event is built
- * through `WorkspaceChatMessageSchema.parse`, so it has the shape the router path delivers.
+ * through `OnChatEventSchema.parse`, so it has the shape the router path delivers.
  * `buildSyntheticSessionTape` turns events into tape text for loader and replay tests.
  * Synthetic only: real tapes hold full chat content and must never become fixtures.
  */
 import { RPCJsonSerializer } from "@orpc/client";
-import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { OnChatEventSchema } from "@/common/orpc/schemas";
+import type { OnChatEvent } from "@/common/orpc/types";
 import {
   SESSION_TAPE_MASKING,
   SESSION_TAPE_VERSION,
@@ -273,8 +273,8 @@ const RAW_EVENTS: unknown[] = [
 ];
 
 /** Synthetic wire events covering history, tool, usage, workflow, snapshot and queue events. */
-export function syntheticChatEvents(): WorkspaceChatMessage[] {
-  return RAW_EVENTS.map((event) => WorkspaceChatMessageSchema.parse(event));
+export function syntheticChatEvents(): OnChatEvent[] {
+  return RAW_EVENTS.map((event) => OnChatEventSchema.parse(event));
 }
 
 /**
@@ -282,7 +282,7 @@ export function syntheticChatEvents(): WorkspaceChatMessage[] {
  * (a batch and a single row), caught-up, then a live turn with reasoning, text and a tool call,
  * and a delete. Events carry `workspaceId` verbatim, like recorded ones.
  */
-export function syntheticReplayTranscript(workspaceId: string): WorkspaceChatMessage[] {
+export function syntheticReplayTranscript(workspaceId: string): OnChatEvent[] {
   const messageId = "msg-assistant-live";
   const raw: unknown[] = [
     {
@@ -390,7 +390,7 @@ export function syntheticReplayTranscript(workspaceId: string): WorkspaceChatMes
     },
     { type: "delete", historySequences: [1] },
   ];
-  return raw.map((event) => WorkspaceChatMessageSchema.parse(event));
+  return raw.map((event) => OnChatEventSchema.parse(event));
 }
 
 export interface SyntheticSessionTapeOptions {
@@ -407,7 +407,7 @@ export interface SyntheticSessionTapeOptions {
  * (RPC JSON keeping undefined-valued properties, same line layout). Synthetic only.
  */
 export function buildSyntheticSessionTape(
-  events: WorkspaceChatMessage[] = syntheticChatEvents(),
+  events: OnChatEvent[] = syntheticChatEvents(),
   options: SyntheticSessionTapeOptions = {}
 ): string {
   const offsetMs = options.offsetMs ?? ((index: number) => index * 10);

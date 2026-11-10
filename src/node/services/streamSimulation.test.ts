@@ -20,7 +20,6 @@ function createSimulationContext(events: CapturedEvent[]): SimulationContext {
     workspaceId: "workspace-1",
     assistantMessageId: "assistant-1",
     canonicalModelString: "openai:gpt-5.5",
-    routedThroughGateway: false,
     historySequence: 1,
     systemMessageTokens: 123,
     effectiveAgentId: "exec",

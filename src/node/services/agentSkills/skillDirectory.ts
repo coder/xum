@@ -1,12 +1,9 @@
 import assert from "@/common/utils/assert";
-import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
-import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
-import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { isPluginPathUsableFrom } from "@/node/services/agentPlugins/pluginPathAvailability";
 import { toPosixPath } from "@/node/utils/paths";
 
 import type { ResolvedAgentSkill } from "./agentSkillsService";
-import { isSkillDynamicDirectiveLine } from "./skillDynamicContext";
 
 /**
  * Where a skill's bundled files live, as seen by `bash` in the workspace.
@@ -27,17 +24,6 @@ const OFF_HOST_REASON =
 
 const OTHER_CHECKOUT_REASON =
   "This skill was read from the project's main checkout, not from this workspace's checkout. Call agent_skill_read for its directory in this workspace.";
-
-/**
- * True when commands run directly on the Xum host. Positive check on purpose:
- * SSH/Docker (RemoteRuntime), devcontainers (exec inside the container) and
- * multi-project wrappers (which can wrap SSH runtimes) all fail it, so a host
- * path is never reported for a runtime Xum cannot prove shares the host
- * filesystem.
- */
-function execsOnHost(runtime: Runtime): boolean {
-  return runtime instanceof LocalBaseRuntime && !(runtime instanceof DevcontainerRuntime);
-}
 
 /**
  * Resolve the skill directory that `bash` on `workspaceRuntime` can use.
@@ -75,7 +61,7 @@ export function resolveSkillDirectory(
   // Host paths are native on Windows (drive letter, backslashes), but bash runs
   // in Git Bash there: give it the POSIX form. toPosixPath is a no-op off Windows; remote paths
   // are already POSIX.
-  const forBash = resolved.sourceRuntime instanceof RemoteRuntime ? (p: string) => p : toPosixPath;
+  const forBash = resolved.sourceRuntime?.location === "remote" ? (p: string) => p : toPosixPath;
   return {
     available: true,
     skillDir: forBash(resolved.skillDir),
@@ -84,17 +70,42 @@ export function resolveSkillDirectory(
 }
 
 /**
- * Prepend the off-host note to a user-invoked (slash/inline) skill snapshot body
- * whose files are on the Xum host while bash runs elsewhere. agent_skill_read reports the
- * same reason as skillDirUnavailable, but a snapshot reaches the model without
- * any tool result, so without this note the model would run a bundled script
- * by a path that does not exist where bash runs. Built-in and other-checkout
- * skills get no note: they are not a host-versus-runtime problem.
+ * A path the snapshot line can show inside a Markdown code span. The path is
+ * attacker-influenced (project and checkout names), and both the model and the
+ * UI's Markdown preview read the line: a backtick would end the code span, a
+ * line break would forge extra lines, and `<`/`>` could fake snapshot tags.
  */
-export function prependSkillDirectoryOffHostNote(body: string, dir: SkillDirectory): string {
+const INLINE_SAFE_PATH_RE = /^[^`<>\p{Cc}\u2028\u2029]+$/u;
+
+const UNSHOWN_PATH_NOTE =
+  "This skill's directory path contains characters Xum does not show here. Call agent_skill_read for its skillDir.";
+
+/** The first snapshot line for a skill whose directory is valid where bash runs. */
+function formatSkillDirectoryLine(dir: Extract<SkillDirectory, { available: true }>): string {
+  const paths = [dir.skillDir, ...(dir.pluginRoot != null ? [dir.pluginRoot] : [])];
+  if (!paths.every((p) => INLINE_SAFE_PATH_RE.test(p))) return UNSHOWN_PATH_NOTE;
+  const pluginRoot = dir.pluginRoot != null ? ` Plugin root: \`${dir.pluginRoot}\`.` : "";
+  return `Skill directory: \`${dir.skillDir}\` (SKILL.md and bundled files are here; valid in bash).${pluginRoot}`;
+}
+
+/**
+ * Prepend the skill-directory line to a skill snapshot body: user-invoked
+ * (slash/inline) snapshots, and snapshots re-injected after compaction from
+ * agent_skill_read results (their skillDir or skillDirUnavailable). A snapshot
+ * reaches the model without any tool result: without the path, models searched
+ * the filesystem for the skill (and read another checkout's copy). Same rule
+ * as agent_skill_read: the path only when bash can use it, the off-host note
+ * when the files are on the Xum host while bash runs elsewhere, and nothing
+ * for built-in and other-checkout skills (agent_skill_read_file and
+ * agent_skill_read cover those).
+ * The line lives in the body, so it is in the snapshot hash and survives
+ * post-compaction re-injection without a new persisted field.
+ */
+export function prependSkillDirectoryNote(body: string, dir: SkillDirectory): string {
   // First, not last: snapshot bodies are cut at MAX_AGENT_SKILL_SNAPSHOT_CHARS,
   // and a trailing note would be lost from a long skill.
-  return !dir.available && dir.reason === OFF_HOST_REASON ? `${OFF_HOST_REASON}\n\n${body}` : body;
+  if (dir.available) return `${formatSkillDirectoryLine(dir)}\n\n${body}`;
+  return dir.reason === OFF_HOST_REASON ? `${OFF_HOST_REASON}\n\n${body}` : body;
 }
 
 /** Why bash on `workspaceRuntime` cannot use the skill's path, or null when it can. */
@@ -113,13 +124,7 @@ function getSkillDirectoryUnavailableReason(
   if (discoveredOutsideWorkspace && resolved.package.scope === "project") {
     return OTHER_CHECKOUT_REASON;
   }
-  // A shared instance proves a shared filesystem only for remote runtimes, which
-  // read and execute on the same machine. A DevcontainerRuntime (or a wrapper
-  // around one) reads the host but executes in the container.
-  const sameRemote =
-    resolved.sourceRuntime === workspaceRuntime && workspaceRuntime instanceof RemoteRuntime;
-  const bothOnHost = execsOnHost(resolved.sourceRuntime) && execsOnHost(workspaceRuntime);
-  return sameRemote || bothOnHost ? null : OFF_HOST_REASON;
+  return isPluginPathUsableFrom(resolved.sourceRuntime, workspaceRuntime) ? null : OFF_HOST_REASON;
 }
 
 /**
@@ -145,25 +150,6 @@ export function substituteSkillDirectoryPlaceholders(body: string, dir: SkillDir
     if (name === "CLAUDE_SKILL_DIR") return dir.skillDir;
     return dir.pluginRoot ?? match;
   });
-}
-
-/**
- * Substitute the placeholders everywhere except whole-line !`command`
- * directives. A directive is shell code: a spliced path containing `$()`,
- * backticks or quotes would be reparsed as shell syntax. Directives get the
- * values as environment variables instead (see skillDirectoryEnv), so the
- * shell expands `"${CLAUDE_SKILL_DIR}"` itself and the path stays one word.
- */
-export function substituteSkillDirectoryPlaceholdersOutsideDirectives(
-  body: string,
-  dir: SkillDirectory
-): string {
-  return body
-    .split("\n")
-    .map((line) =>
-      isSkillDynamicDirectiveLine(line) ? line : substituteSkillDirectoryPlaceholders(line, dir)
-    )
-    .join("\n");
 }
 
 /** Environment for directive commands: the placeholder names with their values. */

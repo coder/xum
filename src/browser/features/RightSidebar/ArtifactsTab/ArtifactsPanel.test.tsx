@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { installDom } from "../../../../../tests/ui/dom";
+import { installDom, stubNarrowViewport } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
@@ -19,13 +19,18 @@ import type {
   ArtifactReadResult,
   ArtifactShelfEntry,
   ArtifactShelfListing,
-  ArtifactVersion,
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
 import {
   ARTIFACTS_SELECTION_KEY,
   ARTIFACTS_SELECTION_MAX_WORKSPACES,
 } from "@/common/constants/storage";
+import { PinnedViewToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
+import {
+  NoToolbarSpacer,
+  PinnedViewToolbarSpacerContext,
+  RightSidebarOverlayContext,
+} from "@/browser/hooks/usePinnedViewCoversWindow";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { openArtifact } from "./openArtifact";
@@ -34,37 +39,14 @@ function entry(path: string, modifiedMs: number, kind: ArtifactEntry["kind"]): A
   return { path, kind, size: 10, modifiedMs };
 }
 
-function version(n: number, label: string | null, path: string): ArtifactVersion {
-  return {
-    version: n,
-    label,
-    source: label == null ? "turn-end" : "publish",
-    createdAtMs: Date.now() - n * 60_000,
-    sha256: `sha-${n}`,
-    size: 10,
-    path,
-  };
-}
-
-/** Test stand-in for the backend's path-derived artifact id. */
-const idFor = (path: string) => `id-${path}`;
-
 function createFakeArtifactsApi(
   listing: ArtifactListing,
   files: Record<string, ArtifactReadResult>,
   extra: {
-    /** Stored versions per artifact path, newest first. */
-    versions?: Record<string, ArtifactVersion[]>;
-    /** listVersions answers only once this settles (default: at once). */
-    versionsGate?: Promise<void>;
-    /** Version contents keyed by `${artifactId}@${version}`. */
-    versionFiles?: Record<string, ArtifactReadResult>;
     pinned?: PinnedArtifactFile[];
     pinnedFiles?: Record<string, ArtifactReadResult>;
     /** Makes `list` fail with this error. */
     listError?: string;
-    /** Makes `listVersions` fail with this error. */
-    listVersionsError?: string;
     /** Shelf listing (M5c); contents keyed by `${scope}:${name}`. */
     shelf?: ArtifactShelfListing;
     shelfFiles?: Record<string, ArtifactReadResult>;
@@ -76,7 +58,6 @@ function createFakeArtifactsApi(
     pinned: extra.pinned ?? [],
     listCalls: 0,
     readCalls: [] as string[],
-    readVersionCalls: [] as string[],
     readPinnedCalls: [] as string[],
     unpinCalls: [] as string[],
     shelf: extra.shelf ?? {
@@ -85,7 +66,7 @@ function createFakeArtifactsApi(
     },
     readShelfCalls: [] as string[],
     unpinShelfCalls: [] as string[],
-    pinToShelfCalls: [] as Array<{ artifactId: string; version: number; scope: string }>,
+    pinToShelfCalls: [] as Array<{ path: string; scope: string }>,
   };
   const found = (file: ArtifactReadResult | undefined, label: string) =>
     Promise.resolve(
@@ -95,26 +76,6 @@ function createFakeArtifactsApi(
     );
   const api: TestApiOverrides<APIClient> = {
     artifacts: {
-      listVersions: async (input: { workspaceId: string; path: string }) => {
-        await extra.versionsGate;
-        if (extra.listVersionsError != null) {
-          return { success: false as const, error: extra.listVersionsError };
-        }
-        return {
-          success: true as const,
-          data: {
-            artifactId: idFor(input.path),
-            path: input.path,
-            pin: null,
-            versions: extra.versions?.[input.path] ?? [],
-          },
-        };
-      },
-      readVersion: (input: { workspaceId: string; artifactId: string; version: number }) => {
-        const key = `${input.artifactId}@${input.version}`;
-        state.readVersionCalls.push(key);
-        return found(extra.versionFiles?.[key], key);
-      },
       listPinned: () =>
         Promise.resolve({
           success: true as const,
@@ -143,21 +104,11 @@ function createFakeArtifactsApi(
         };
         return Promise.resolve({ success: true as const, data: undefined });
       },
-      pinToShelf: (input: {
-        workspaceId: string;
-        artifactId: string;
-        version: number;
-        scope: "project" | "global";
-      }) => {
-        state.pinToShelfCalls.push({
-          artifactId: input.artifactId,
-          version: input.version,
-          scope: input.scope,
-        });
-        return Promise.resolve({ success: true as const, data: { name: input.artifactId } });
+      pinToShelf: (input: { workspaceId: string; path: string; scope: "project" | "global" }) => {
+        state.pinToShelfCalls.push({ path: input.path, scope: input.scope });
+        return Promise.resolve({ success: true as const, data: { name: input.path } });
       },
-      getState: () =>
-        Promise.resolve({ success: true as const, data: { version: 0, state: null } }),
+      getState: () => Promise.resolve({ success: true as const, data: { state: null } }),
       list: () => {
         state.listCalls += 1;
         return Promise.resolve(
@@ -230,6 +181,9 @@ describe("ArtifactsPanel", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    // Most tests cover the narrow-window fullscreen, a modal dialog over the whole window. The
+    // wide-window tests stub a wide viewport and wrap the panel in a workspace shell.
+    stubNarrowViewport(true);
     window.localStorage.clear();
     // Desktop mode (the preload bridge isDesktopMode checks).
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -283,7 +237,7 @@ describe("ArtifactsPanel", () => {
     expect(view.getByText('{"runs":[1,2]}')).toBeTruthy();
   });
 
-  test("JSON keeps its view through fullscreen and a remount, but not into a new version", async () => {
+  test("JSON keeps its view through fullscreen and a remount, but not into a rewritten file", async () => {
     // Own workspace id: the remembered view outlives the panel by design.
     const workspaceId = "ws-json-mode";
     fake = createFakeArtifactsApi(
@@ -306,7 +260,7 @@ describe("ArtifactsPanel", () => {
     const dialog = await first.findByRole("dialog", { name: "Artifact data.json" });
     expect(pressed(dialog, "raw")).toBe("true");
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(first.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(first.queryByRole("dialog") === null).toBe(true));
     expect(pressed(first.container, "raw")).toBe("true");
 
     // Switching sidebar tabs unmounts the panel.
@@ -315,7 +269,7 @@ describe("ArtifactsPanel", () => {
     await second.findByRole("button", { name: "raw" });
     expect(pressed(second.container, "raw")).toBe("true");
 
-    // A rewrite is a new version: its view starts at the default again.
+    // A rewrite is a new read: its view starts at the default again.
     fake.state.listing = {
       available: true,
       dir: "/scratch/artifacts",
@@ -328,7 +282,7 @@ describe("ArtifactsPanel", () => {
     expect(pressed(second.container, "tree")).toBe("true");
   });
 
-  test("JSON tree expansion survives Raw, fullscreen and a remount, but not a new version", async () => {
+  test("JSON tree expansion survives Raw, fullscreen and a remount, but not a rewritten file", async () => {
     const workspaceId = "ws-json-tree";
     fake = createFakeArtifactsApi(
       {
@@ -361,7 +315,7 @@ describe("ArtifactsPanel", () => {
     const dialog = await first.findByRole("dialog", { name: "Artifact tree.json" });
     toggled(dialog);
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(first.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(first.queryByRole("dialog") === null).toBe(true));
     toggled(first.container);
 
     // Switching sidebar tabs unmounts the panel.
@@ -370,7 +324,7 @@ describe("ArtifactsPanel", () => {
     await second.findByRole("button", { name: /^runs:/ });
     toggled(second.container);
 
-    // A rewrite is a new version: its tree starts at the defaults again.
+    // A rewrite is a new read: its tree starts at the defaults again.
     fake.state.listing = {
       available: true,
       dir: "/scratch/artifacts",
@@ -439,7 +393,7 @@ describe("ArtifactsPanel", () => {
     expect(view.getByTestId("artifacts-panel").textContent).toContain(content);
   });
 
-  test("J/K/R do nothing while the picker or the version menu has focus", async () => {
+  test("J/K/R do nothing while the picker or the pin menu has focus", async () => {
     fake = createFakeArtifactsApi(
       {
         available: true,
@@ -452,7 +406,7 @@ describe("ArtifactsPanel", () => {
     const view = renderPanel();
     const panel = view.getByTestId("artifacts-panel");
     expect(await view.findByText("alpha")).toBeTruthy();
-    // Stand-ins for the open Radix listbox and the version menu, whose key events bubble to the
+    // Stand-ins for the open Radix listbox and the pin menu, whose key events bubble to the
     // panel.
     for (const role of ["listbox", "menu"]) {
       const popup = document.createElement("div");
@@ -531,7 +485,7 @@ describe("ArtifactsPanel", () => {
     window.addEventListener("keydown", windowListener);
     fireEvent.keyDown(dialog, { key: "Escape" });
     window.removeEventListener("keydown", windowListener);
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(escapeReachedWindowUnhandled).toBe(false);
     expect(outside.inert).toBe(false);
     expect(view.getByText("alpha")).toBe(viewerNode);
@@ -539,6 +493,101 @@ describe("ArtifactsPanel", () => {
     // Focus returns to the panel, so J/K keep working without another click.
     await waitFor(() => expect(document.activeElement).toBe(panel));
     outside.remove();
+  });
+
+  // A wide window pins fullscreen over the workspace shell only, like immersive review: the left
+  // sidebar beside the shell stays visible and usable, so the panel is a region, not a modal.
+  for (const leftSidebarCollapsed of [false, true]) {
+    test(`wide: fullscreen covers the workspace shell and the left sidebar stays usable (collapsed: ${leftSidebarCollapsed})`, async () => {
+      stubNarrowViewport(false);
+      fake = createFakeArtifactsApi(
+        {
+          available: true,
+          dir: "/scratch/artifacts",
+          entries: [entry("a.txt", 1, "text")],
+          truncated: false,
+        },
+        { "a.txt": textFile("a.txt", "text", "alpha") }
+      );
+      const leftSidebar = document.body.appendChild(document.createElement("button"));
+      const shell = document.body.appendChild(document.createElement("div"));
+      shell.setAttribute("data-workspace-shell", "");
+      const chat = shell.appendChild(document.createElement("button"));
+      // RightSidebar provides the toolbar spacer while the left sidebar is collapsed (the webview
+      // bundles the panel without it).
+      const view = render(
+        <PinnedViewToolbarSpacerContext.Provider
+          value={leftSidebarCollapsed ? PinnedViewToggleBarSpacer : NoToolbarSpacer}
+        >
+          <ArtifactsPanel workspaceId="ws-artifacts" />
+        </PinnedViewToolbarSpacerContext.Provider>,
+        { wrapper: ApiWrapper, container: shell.appendChild(document.createElement("div")) }
+      );
+      const panel = view.getByTestId("artifacts-panel");
+      expect(await view.findByText("alpha")).toBeTruthy();
+
+      fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+      const region = await view.findByRole("region", { name: "Artifact a.txt" });
+      expect(region.getAttribute("aria-modal")).toBeNull();
+      expect([leftSidebar.inert, chat.inert]).toEqual([false, true]);
+      // The collapsed sidebar's toggle bar sits over the toolbar's start: a spacer keeps it clear.
+      expect(region.querySelector(".left-sidebar-toggle-host") != null).toBe(leftSidebarCollapsed);
+
+      fireEvent.keyDown(region, { key: "Escape" });
+      await waitFor(() => expect(view.queryByRole("region") === null).toBe(true));
+      expect(chat.inert).toBe(false);
+      await waitFor(() => expect(document.activeElement).toBe(panel));
+
+      // Escape from a control in the usable left sidebar ends fullscreen too, and is consumed, so
+      // it cannot also reach Escape-to-interrupt (a window listener) behind the panel.
+      fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+      await view.findByRole("region", { name: "Artifact a.txt" });
+      leftSidebar.focus();
+      expect(fireEvent.keyDown(leftSidebar, { key: "Escape" })).toBe(false);
+      await waitFor(() => expect(view.queryByRole("region") === null).toBe(true));
+      expect(chat.inert).toBe(false);
+      leftSidebar.remove();
+      shell.remove();
+    });
+  }
+
+  // A wide window whose workspace shell is too narrow for the docked right sidebar shows it only as
+  // the full-window overlay, which covers the left sidebar and makes it inert: fullscreen inside it
+  // must cover the window too (a workspace-scoped region would claim a usable left sidebar).
+  test("wide window inside the full-window right sidebar overlay: fullscreen covers the window", async () => {
+    stubNarrowViewport(false);
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") }
+    );
+    const leftSidebar = document.body.appendChild(document.createElement("button"));
+    const shell = document.body.appendChild(document.createElement("div"));
+    shell.setAttribute("data-workspace-shell", "");
+    const view = render(
+      <RightSidebarOverlayContext.Provider value={true}>
+        <ArtifactsPanel workspaceId="ws-artifacts" />
+      </RightSidebarOverlayContext.Provider>,
+      { wrapper: ApiWrapper, container: shell.appendChild(document.createElement("div")) }
+    );
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("alpha")).toBeTruthy();
+
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact a.txt" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(leftSidebar.inert).toBe(true);
+    expect(dialog.style.left).toBe("");
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
+    expect(leftSidebar.inert).toBe(false);
+    leftSidebar.remove();
+    shell.remove();
   });
 
   test("autoFocus takes focus from the chat input so J/K and Shift+F work at once", async () => {
@@ -579,7 +628,7 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "F", shiftKey: true });
     expect(await view.findByRole("dialog", { name: "Artifact b.txt" })).toBeTruthy();
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     // Leaving the panel drops the ring.
     act(() => chatInput.focus());
     expect(panel.getAttribute("data-shortcut-focus")).toBeNull();
@@ -678,6 +727,38 @@ describe("ArtifactsPanel", () => {
     }
   });
 
+  test("re-reads an unchanged file that was published as another kind", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "# Title") }
+    );
+    const setIntervalSpy = spyOn(window, "setInterval");
+    try {
+      const view = renderPanel();
+      expect(await view.findByText("# Title")).toBeTruthy();
+      const poll = setIntervalSpy.mock.calls.find((call) => call[1] === 3000)?.[0];
+      if (typeof poll !== "function") throw new Error("Test bug: no 3 s poll registered");
+
+      fake.state.listing = {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "markdown")],
+        truncated: false,
+      };
+      fake.state.files = { "a.txt": textFile("a.txt", "markdown", "# Title") };
+      act(() => poll());
+      expect(await view.findByRole("heading", { name: "Title" })).toBeTruthy();
+      expect(fake.state.readCalls).toEqual(["a.txt", "a.txt"]);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   test("marks artifacts that changed while the tab was open", async () => {
     fake = createFakeArtifactsApi(
       {
@@ -704,7 +785,7 @@ describe("ArtifactsPanel", () => {
     // Opening the changed artifact clears its marker.
     fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
     expect(await view.findByText("beta")).toBeTruthy();
-    await waitFor(() => expect(view.queryByLabelText("1 changed")).toBeNull());
+    await waitFor(() => expect(view.queryByLabelText("1 changed") === null).toBe(true));
   });
 
   test("retries a failed preview on the next refresh", async () => {
@@ -885,158 +966,39 @@ describe("ArtifactsPanel", () => {
     }
   });
 
-  test("version menu switches between stored versions and the live file", async () => {
-    fake = createFakeArtifactsApi(
-      {
-        available: true,
-        dir: "/scratch/artifacts",
-        entries: [entry("report.md", 3, "markdown")],
-        truncated: false,
-      },
-      { "report.md": textFile("report.md", "markdown", "live draft", 3) },
-      {
-        versions: {
-          "report.md": [version(2, "Final numbers", "report.md"), version(1, null, "report.md")],
-        },
-        versionFiles: {
-          [`${idFor("report.md")}@1`]: textFile("report.md", "markdown", "first snapshot"),
-        },
-      }
-    );
-    const view = renderPanel();
-    expect(await view.findByText("live draft")).toBeTruthy();
-
-    fireEvent.click(await view.findByRole("button", { name: "Version: Latest (live)" }));
-    const menu = view.getByRole("menu", { name: "Artifact versions" });
-    // Newest first after "Latest (live)"; unlabeled snapshots get a plain fallback name.
-    const items = Array.from(menu.querySelectorAll('[role="menuitemradio"]')).map(
-      (item) => item.textContent
-    );
-    expect(items[0]).toBe("Latest (live)");
-    expect(items[1]).toContain("v2Final numbers");
-    expect(items[2]).toContain("v1Turn snapshot");
-
-    fireEvent.click(view.getByRole("menuitemradio", { name: /v1/ }));
-    expect(await view.findByText("first snapshot")).toBeTruthy();
-    expect(fake.state.readVersionCalls).toEqual([`${idFor("report.md")}@1`]);
-    expect(view.queryByRole("menu")).toBeNull();
-
-    const liveReads = fake.state.readCalls.length;
-    fireEvent.click(view.getByRole("button", { name: "Version: v1" }));
-    fireEvent.click(view.getByRole("menuitemradio", { name: "Latest (live)" }));
-    expect(await view.findByText("live draft")).toBeTruthy();
-    expect(fake.state.readCalls.length).toBe(liveReads + 1);
-  });
-
-  test("hides the version menu for artifacts without versions", async () => {
-    fake = createFakeArtifactsApi(
-      {
-        available: true,
-        dir: "/scratch/artifacts",
-        entries: [entry("notes.txt", 1, "text")],
-        truncated: false,
-      },
-      { "notes.txt": textFile("notes.txt", "text", "plain notes") }
-    );
-    const view = renderPanel();
-    expect(await view.findByText("plain notes")).toBeTruthy();
-    expect(view.queryByRole("button", { name: /^Version:/ })).toBeNull();
-  });
-
-  test("keeps a stored version viewable after its working file is deleted", async () => {
-    fake = createFakeArtifactsApi(
-      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
-      {},
-      {
-        versions: { "gone.md": [version(1, "Draft", "gone.md")] },
-        versionFiles: { [`${idFor("gone.md")}@1`]: textFile("gone.md", "markdown", "kept bytes") },
-      }
-    );
-    writeArtifactSelection("ws-artifacts", { path: "gone.md", version: 1 });
-    const view = renderPanel();
-    expect(await view.findByText("kept bytes")).toBeTruthy();
-    expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("gone.md");
-  });
-
-  test("a truncated listing does not mark unlisted versioned artifacts as deleted", async () => {
+  test("a deleted artifact leaves the tab: the selection falls back to a listed file", async () => {
     fake = createFakeArtifactsApi(
       {
         available: true,
         dir: "/scratch/artifacts",
         entries: [entry("a.txt", 2, "text")],
-        truncated: true,
-        // b.txt may well exist past the listing cap.
-        versionedPaths: ["b.txt"],
+        truncated: false,
+        publishedPaths: ["gone.md"],
       },
-      { "a.txt": textFile("a.txt", "text", "alpha") },
-      {
-        versions: { "b.txt": [version(1, null, "b.txt")] },
-        versionFiles: { "id-b.txt@1": textFile("b.txt", "text", "beta stored") },
-      }
+      { "a.txt": textFile("a.txt", "text", "alpha") }
     );
+    writeArtifactSelection("ws-artifacts", { path: "gone.md" });
     const view = renderPanel();
     expect(await view.findByText("alpha")).toBeTruthy();
-    act(() => openArtifact({ workspaceId: "ws-artifacts", path: "b.txt" }));
-    // Not offered as a deleted artifact: the selection falls back to a listed one.
-    await waitFor(() =>
-      expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("a.txt")
-    );
-    expect(view.queryByText("beta stored")).toBeNull();
-    expect(fake.state.readVersionCalls).toEqual([]);
+    expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("a.txt");
+    expect(fake.state.readCalls).toEqual(["a.txt"]);
   });
 
-  test("keeps a deleted artifact selected at its latest stored version", async () => {
+  test("with every artifact deleted, the tab shows the empty state", async () => {
     fake = createFakeArtifactsApi(
       {
         available: true,
         dir: "/scratch/artifacts",
         entries: [],
         truncated: false,
-        versionedPaths: ["gone.md"],
+        publishedPaths: ["gone.md"],
       },
-      {},
-      {
-        versions: { "gone.md": [version(2, "Final", "gone.md"), version(1, "Draft", "gone.md")] },
-        versionFiles: {
-          [`${idFor("gone.md")}@2`]: textFile("gone.md", "markdown", "latest kept bytes"),
-        },
-      }
+      {}
     );
-    writeArtifactSelection("ws-artifacts", { path: "gone.md", version: null });
+    writeArtifactSelection("ws-artifacts", { path: "gone.md" });
     const view = renderPanel();
-    expect(await view.findByText("latest kept bytes")).toBeTruthy();
-    expect(fake.state.readVersionCalls).toEqual([`${idFor("gone.md")}@2`]);
-    expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("gone.md");
-  });
-
-  test("shows why a stored version cannot load when listing versions fails", async () => {
-    fake = createFakeArtifactsApi(
-      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
-      {},
-      { listVersionsError: "Version index unreadable" }
-    );
-    writeArtifactSelection("ws-artifacts", { path: "gone.md", version: 1 });
-    const view = renderPanel();
-    expect(await view.findByText("Version index unreadable")).toBeTruthy();
-    expect(view.queryByText("Loading…")).toBeNull();
-  });
-
-  test("shows a stored version while listing the live folder fails", async () => {
-    fake = createFakeArtifactsApi(
-      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
-      {},
-      {
-        listError: "Could not reach this workspace's runtime: offline",
-        versions: { "report.md": [version(1, "Draft", "report.md")] },
-        versionFiles: {
-          [`${idFor("report.md")}@1`]: textFile("report.md", "markdown", "offline bytes"),
-        },
-      }
-    );
-    writeArtifactSelection("ws-artifacts", { path: "report.md", version: 1 });
-    const view = renderPanel();
-    expect(await view.findByText("offline bytes")).toBeTruthy();
-    expect(view.getByText("Could not reach this workspace's runtime: offline")).toBeTruthy();
+    expect(await view.findByText(/No artifacts yet/)).toBeTruthy();
+    expect(fake.state.readCalls).toEqual([]);
   });
 
   test("follows openArtifact while mounted and reads pinned files live", async () => {
@@ -1151,6 +1113,34 @@ describe("ArtifactsPanel", () => {
     expect(await view.findByText("alpha")).toBeTruthy();
   });
 
+  test("pinned files cannot be annotated", async () => {
+    const pinnedFile: PinnedArtifactFile = {
+      path: "README.md",
+      kind: "markdown",
+      size: 5,
+      modifiedMs: 1,
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "alpha") },
+      {
+        pinned: [pinnedFile],
+        pinnedFiles: { "README.md": textFile("README.md", "markdown", "# Readme") },
+      }
+    );
+    const view = renderPanel();
+    expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
+
+    act(() => openArtifact({ workspaceId: "ws-artifacts", path: "README.md", pinned: true }));
+    expect(await view.findByRole("heading", { name: "Readme" })).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Annotate" })).toBeNull();
+  });
+
   test("shows shelf entries read-only and unpins them", async () => {
     const shelfEntry: ArtifactShelfEntry = {
       scope: "global",
@@ -1159,7 +1149,6 @@ describe("ArtifactsPanel", () => {
       title: "style guide",
       kind: "markdown",
       size: 9,
-      version: 2,
       sourceWorkspaceId: "ws-other",
       sourcePath: "style-guide.md",
       pinnedAtMs: 5,
@@ -1182,15 +1171,15 @@ describe("ArtifactsPanel", () => {
     const view = renderPanel();
     expect(await view.findByRole("heading", { name: "Guide" })).toBeTruthy();
     expect(fake.state.readShelfCalls).toEqual(["global:style-guide.md"]);
-    // Shelf copies are fixed: no version menu, an unpin action instead.
-    expect(view.queryByRole("button", { name: /^Version:/ })).toBeNull();
+    // Shelf copies are fixed: no pin menu, an unpin action instead.
+    expect(view.queryByRole("button", { name: "Pin to shelf" })).toBeNull();
 
     fireEvent.click(view.getByRole("button", { name: "Unpin from shelf" }));
     expect(await view.findByText("alpha")).toBeTruthy();
     expect(fake.state.unpinShelfCalls).toEqual(["global:style-guide.md"]);
   });
 
-  test("version menu pins the shown version, or the newest while following the live file", async () => {
+  test("the pin menu copies the shown artifact to the project or global shelf", async () => {
     fake = createFakeArtifactsApi(
       {
         available: true,
@@ -1198,38 +1187,48 @@ describe("ArtifactsPanel", () => {
         entries: [entry("report.md", 3, "markdown")],
         truncated: false,
       },
-      { "report.md": textFile("report.md", "markdown", "live draft", 3) },
-      {
-        versions: {
-          "report.md": [version(2, "Final numbers", "report.md"), version(1, null, "report.md")],
-        },
-        versionFiles: {
-          [`${idFor("report.md")}@1`]: textFile("report.md", "markdown", "first snapshot"),
-        },
-      }
+      { "report.md": textFile("report.md", "markdown", "live draft", 3) }
     );
     const view = renderPanel();
     expect(await view.findByText("live draft")).toBeTruthy();
-    fireEvent.click(await view.findByRole("button", { name: "Version: Latest (live)" }));
+    fireEvent.click(await view.findByRole("button", { name: "Pin to shelf" }));
     fireEvent.click(view.getByRole("menuitem", { name: "Pin to project shelf" }));
     await waitFor(() =>
-      expect(fake?.state.pinToShelfCalls).toEqual([
-        { artifactId: idFor("report.md"), version: 2, scope: "project" },
-      ])
+      expect(fake?.state.pinToShelfCalls).toEqual([{ path: "report.md", scope: "project" }])
     );
+    expect(view.queryByRole("menu")).toBeNull();
 
-    fireEvent.click(view.getByRole("button", { name: "Version: Latest (live)" }));
-    fireEvent.click(view.getByRole("menuitemradio", { name: /v1/ }));
-    expect(await view.findByText("first snapshot")).toBeTruthy();
-    fireEvent.click(view.getByRole("button", { name: "Version: v1" }));
+    fireEvent.click(view.getByRole("button", { name: "Pin to shelf" }));
     fireEvent.click(view.getByRole("menuitem", { name: "Pin to global shelf" }));
     await waitFor(() =>
-      expect(fake?.state.pinToShelfCalls.at(-1)).toEqual({
-        artifactId: idFor("report.md"),
-        version: 1,
-        scope: "global",
-      })
+      expect(fake?.state.pinToShelfCalls.at(-1)).toEqual({ path: "report.md", scope: "global" })
     );
+  });
+
+  test("the pin menu opens on its first entry, arrows move through it, and Escape closes it", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 3, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "live draft", 3) }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("live draft")).toBeTruthy();
+    const trigger = await view.findByRole("button", { name: "Pin to shelf" });
+    fireEvent.click(trigger);
+    const menu = view.getByRole("menu", { name: "Pin to shelf" });
+    const project = within(menu).getByRole("menuitem", { name: "Pin to project shelf" });
+    const global = within(menu).getByRole("menuitem", { name: "Pin to global shelf" });
+    expect(document.activeElement).toBe(project);
+    fireEvent.keyDown(project, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(global);
+    fireEvent.keyDown(global, { key: "Escape" });
+    expect(view.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    expect(fake.state.pinToShelfCalls).toEqual([]);
   });
 
   test("pins and unpins shelf entries from the keyboard", async () => {
@@ -1240,7 +1239,6 @@ describe("ArtifactsPanel", () => {
       title: "report",
       kind: "markdown",
       size: 5,
-      version: 2,
       sourceWorkspaceId: "ws-artifacts",
       sourcePath: "report.md",
       pinnedAtMs: 5,
@@ -1255,7 +1253,6 @@ describe("ArtifactsPanel", () => {
       },
       { "report.md": textFile("report.md", "markdown", "live draft", 3) },
       {
-        versions: { "report.md": [version(2, "Final numbers", "report.md")] },
         shelf: { project: { available: true, entries: [] }, global: [shelfEntry] },
         shelfFiles: { "global:report.md": textFile("report.md", "markdown", "shelf copy") },
       }
@@ -1263,14 +1260,13 @@ describe("ArtifactsPanel", () => {
     const view = renderPanel();
     const panel = view.getByTestId("artifacts-panel");
     expect(await view.findByText("live draft")).toBeTruthy();
-    await view.findByRole("button", { name: "Version: Latest (live)" });
 
     fireEvent.keyDown(panel, { key: "p" });
     fireEvent.keyDown(panel, { key: "P", shiftKey: true });
     await waitFor(() =>
       expect(fake?.state.pinToShelfCalls).toEqual([
-        { artifactId: idFor("report.md"), version: 2, scope: "project" },
-        { artifactId: idFor("report.md"), version: 2, scope: "global" },
+        { path: "report.md", scope: "project" },
+        { path: "report.md", scope: "global" },
       ])
     );
 
@@ -1288,8 +1284,7 @@ describe("ArtifactsPanel", () => {
         entries: [entry("report.md", 1, "markdown")],
         truncated: false,
       },
-      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
-      { versions: { "report.md": [version(2, null, "report.md")] } }
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") }
     );
     const reviewBackend = createFakeReviewStateClient();
     getReviewStateStore().setClient(reviewBackend.client);
@@ -1328,9 +1323,7 @@ describe("ArtifactsPanel", () => {
           filePath: "report.md",
           selectedCode: "grew 12%",
           userNote: "Source?",
-          // The live file is annotated against its newest stored version.
           artifact: {
-            version: 2,
             anchor: {
               kind: "text",
               quote: "grew 12%",
@@ -1355,8 +1348,7 @@ describe("ArtifactsPanel", () => {
         entries: [entry("report.md", 1, "markdown")],
         truncated: false,
       },
-      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
-      { versions: { "report.md": [version(2, null, "report.md")] } }
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") }
     );
     const view = renderPanel("ws-annotate-keyboard");
     const panel = view.getByTestId("artifacts-panel");
@@ -1388,7 +1380,86 @@ describe("ArtifactsPanel", () => {
     expect(popover.textContent).toContain("grew 12%");
   });
 
-  test("the default selection prefers a versioned file over newer other files", async () => {
+  // #5760: the "Shift+Arrow seen" flag outlived the selection gesture. After focus left the viewer
+  // or annotate mode turned off and on, the next bare Shift release opened the comment box.
+  test("annotate mode: a Shift release opens the box only after a Shift+Arrow in the same gesture", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") }
+    );
+    const view = renderPanel("ws-annotate-stale-shift");
+    const panel = view.getByTestId("artifacts-panel");
+    const paragraph = await view.findByText("Revenue grew 12% this quarter.");
+    const viewer = view.getByTestId("artifact-viewer-scroll");
+    fireEvent.keyDown(panel, { key: "c" });
+    const range = document.createRange();
+    range.setStart(paragraph.firstChild!, 8);
+    range.setEnd(paragraph.firstChild!, 16);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    const noBox = () => expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
+
+    // Focus leaves the viewer with Shift still down; Shift is released elsewhere.
+    fireEvent.keyDown(viewer, { key: "ArrowRight", shiftKey: true });
+    fireEvent.blur(viewer);
+    fireEvent.keyUp(document.body, { key: "Shift" });
+    fireEvent.keyUp(viewer, { key: "Shift" });
+    noBox();
+
+    // A Shift+Arrow, then annotate mode off and on, then a new bare Shift press and release.
+    fireEvent.keyDown(viewer, { key: "ArrowRight", shiftKey: true });
+    fireEvent.keyDown(panel, { key: "c" });
+    fireEvent.keyDown(panel, { key: "c" });
+    fireEvent.keyDown(viewer, { key: "Shift", shiftKey: true });
+    fireEvent.keyUp(viewer, { key: "Shift" });
+    noBox();
+
+    // A real keyboard selection still opens the box.
+    fireEvent.keyDown(viewer, { key: "Shift", shiftKey: true });
+    fireEvent.keyDown(viewer, { key: "ArrowRight", shiftKey: true });
+    fireEvent.keyUp(viewer, { key: "Shift" });
+    expect((await view.findByTestId("artifact-annotation-popover")).textContent).toContain(
+      "grew 12%"
+    );
+  });
+
+  // #5760: frame-rendered kinds take pins from the frame bridge, so the viewer around the frame
+  // gets no tab stop of its own in annotate mode.
+  test.each<[string, ArtifactEntry["kind"], string]>([
+    ["page.html", "html", "<p>hi</p>"],
+    ["pic.svg", "svg", '<svg xmlns="http://www.w3.org/2000/svg"><text>hi</text></svg>'],
+  ])("annotate mode: the viewer around a %s frame is not a tab stop", async (path, kind, text) => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry(path, 1, kind)],
+        truncated: false,
+      },
+      { [path]: textFile(path, kind, text) }
+    );
+    // Frame kinds read the theme (renderPanel has no ThemeProvider).
+    const view = render(<ArtifactsPanel workspaceId={`ws-annotate-tabstop-${kind}`} />, {
+      wrapper: (props: { children: ReactNode }) => (
+        <ThemeProvider forcedTheme="dark">
+          <ApiWrapper>{props.children}</ApiWrapper>
+        </ThemeProvider>
+      ),
+    });
+    await view.findByTestId("artifact-frame");
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
+    expect(view.getByRole("button", { name: "Stop annotating" }).getAttribute("aria-pressed")).toBe(
+      "true"
+    );
+    expect(view.getByTestId("artifact-viewer-scroll").hasAttribute("tabindex")).toBe(false);
+  });
+
+  test("the default selection prefers a published file over newer other files", async () => {
     fake = createFakeArtifactsApi(
       {
         available: true,
@@ -1399,30 +1470,13 @@ describe("ArtifactsPanel", () => {
           entry("report.md", 1, "markdown"),
         ],
         truncated: false,
-        versionedPaths: ["report.md"],
+        publishedPaths: ["report.md"],
       },
       { "report.md": textFile("report.md", "markdown", "# Published report") }
     );
     const view = renderPanel();
     expect(await view.findByRole("heading", { name: "Published report" })).toBeTruthy();
     expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("report.md");
-  });
-
-  test("the default selection prefers a deleted published file over other files", async () => {
-    fake = createFakeArtifactsApi(
-      {
-        available: true,
-        dir: "/scratch/artifacts",
-        entries: [entry("img/a.png", 3, "image"), entry("img/b.png", 2, "image")],
-        truncated: false,
-        versionedPaths: ["report.md"],
-      },
-      {}
-    );
-    const view = renderPanel();
-    await waitFor(() =>
-      expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain("report.md")
-    );
   });
 
   test("J/K skip collapsed other files but keep the selected one", async () => {
@@ -1433,7 +1487,6 @@ describe("ArtifactsPanel", () => {
       title: "style guide",
       kind: "markdown",
       size: 9,
-      version: 2,
       sourceWorkspaceId: "ws-other",
       sourcePath: "style-guide.md",
       pinnedAtMs: 5,
@@ -1449,7 +1502,7 @@ describe("ArtifactsPanel", () => {
           entry("report.md", 1, "markdown"),
         ],
         truncated: false,
-        versionedPaths: ["report.md"],
+        publishedPaths: ["report.md"],
       },
       { "report.md": textFile("report.md", "markdown", "# Published report") },
       {
@@ -1463,7 +1516,7 @@ describe("ArtifactsPanel", () => {
     const trigger = () => view.getByRole("combobox", { name: "Artifact" }).textContent;
     await waitFor(() => expect(trigger()).toContain("img/b.png"));
 
-    // The selected other file stays listed after the versioned one; img/a.png is hidden.
+    // The selected other file stays listed after the published one; img/a.png is hidden.
     fireEvent.keyDown(panel, { key: "k" });
     expect(await view.findByRole("heading", { name: "Published report" })).toBeTruthy();
     fireEvent.keyDown(panel, { key: "j" });
@@ -1472,15 +1525,32 @@ describe("ArtifactsPanel", () => {
     expect(trigger()).toContain("style-guide.md");
   });
 
-  test("versions past a truncated listing's cap do not hide the listed files", async () => {
+  test("K skips a lone other file listed before the published one", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("img/a.png", 2, "image"), entry("report.md", 1, "markdown")],
+        truncated: false,
+        publishedPaths: ["report.md"],
+      },
+      { "report.md": textFile("report.md", "markdown", "# Published report") }
+    );
+    const view = renderPanel();
+    expect(await view.findByRole("heading", { name: "Published report" })).toBeTruthy();
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "k" });
+    expect(readArtifactSelection("ws-artifacts").path).toBe("report.md");
+  });
+
+  test("published paths past a truncated listing's cap do not hide the listed files", async () => {
     fake = createFakeArtifactsApi(
       {
         available: true,
         dir: "/scratch/artifacts",
         entries: [entry("a.txt", 2, "text"), entry("c.txt", 1, "text")],
         truncated: true,
-        // b.txt may exist past the cap, so it is no versioned file to group the listed ones under.
-        versionedPaths: ["b.txt"],
+        // b.txt may exist past the cap, so it is no published file to group the listed ones under.
+        publishedPaths: ["b.txt"],
       },
       { "a.txt": textFile("a.txt", "text", "alpha"), "c.txt": textFile("c.txt", "text", "gamma") }
     );
@@ -1491,31 +1561,6 @@ describe("ArtifactsPanel", () => {
     expect(await view.findByText("gamma")).toBeTruthy();
   });
 
-  test("annotate stays off until the live file's version list arrives", async () => {
-    let releaseVersions: (() => void) | undefined;
-    const versionsGate = new Promise<void>((resolve) => {
-      releaseVersions = resolve;
-    });
-    fake = createFakeArtifactsApi(
-      {
-        available: true,
-        dir: "/scratch/artifacts",
-        entries: [entry("report.md", 1, "markdown")],
-        truncated: false,
-      },
-      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
-      { versions: { "report.md": [version(2, null, "report.md")] }, versionsGate }
-    );
-    const view = renderPanel();
-    await view.findByText("Revenue grew 12% this quarter.");
-    // The note would record a version, and which one is not known yet.
-    expect(view.queryByRole("button", { name: "Annotate" })).toBeNull();
-    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "c" });
-    expect(view.queryByRole("button", { name: "Stop annotating" })).toBeNull();
-    releaseVersions?.();
-    expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
-  });
-
   test("Esc leaves annotate mode without reaching Escape-to-interrupt", async () => {
     fake = createFakeArtifactsApi(
       {
@@ -1524,8 +1569,7 @@ describe("ArtifactsPanel", () => {
         entries: [entry("report.md", 1, "markdown")],
         truncated: false,
       },
-      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
-      { versions: { "report.md": [version(2, null, "report.md")] } }
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") }
     );
     const view = renderPanel();
     const panel = view.getByTestId("artifacts-panel");
@@ -1549,6 +1593,35 @@ describe("ArtifactsPanel", () => {
     expect(escapeReachedWindowUnhandled).toBe(true);
   });
 
+  test("a held annotate shortcut toggles annotate mode once", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    await view.findByRole("button", { name: "Annotate" });
+    // Holding the key: one press, then auto-repeated keydowns (#6347).
+    const pressed = () =>
+      view
+        .getByRole("button", { name: /^(Annotate|Stop annotating)$/ })
+        .getAttribute("aria-pressed");
+    fireEvent.keyDown(panel, { key: "c" });
+    expect(pressed()).toBe("true");
+    for (let i = 0; i < 2; i++) {
+      fireEvent.keyDown(panel, { key: "c", repeat: true });
+      expect(pressed()).toBe("true");
+    }
+    // The next press after release toggles again.
+    fireEvent.keyDown(panel, { key: "c" });
+    expect(pressed()).toBe("false");
+  });
+
   test("annotate mode survives a sidebar tab switch and stays per workspace", async () => {
     fake = createFakeArtifactsApi(
       {
@@ -1557,8 +1630,7 @@ describe("ArtifactsPanel", () => {
         entries: [entry("report.md", 1, "markdown")],
         truncated: false,
       },
-      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
-      { versions: { "report.md": [version(2, null, "report.md")] } }
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") }
     );
     const first = renderPanel("ws-annotate-a");
     await first.findByRole("button", { name: "Annotate" });
@@ -1608,7 +1680,7 @@ describe("ArtifactsPanel", () => {
     expect(await within(dialog).findByText("alpha")).toBeTruthy();
 
     fireEvent.keyDown(document.activeElement!, { key: "F", shiftKey: true });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     await waitFor(() => expect(document.activeElement).toBe(panel));
   });
 
@@ -1633,7 +1705,7 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(document.activeElement).toBe(dialog));
 
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(document.activeElement).toBe(button);
     // J/K still reach the panel from the button.
     fireEvent.keyDown(button, { key: "j" });
@@ -1696,7 +1768,10 @@ describe("ArtifactsPanel", () => {
     expect(document.activeElement).toBe(menu);
 
     act(() => menu.remove());
-    await waitFor(() => expect(document.activeElement).toBe(dialog));
+    // Focus comes back on a later tick, so the first poll always fails. Compare with `===`: a
+    // failing `toBe` on happy-dom nodes formats their whole window graph (190 MB, 2-3 s here),
+    // which used most of the test's 5 s timeout in that one early failure.
+    await waitFor(() => expect(document.activeElement === dialog).toBe(true));
   });
 
   // E.g. a phone rotated back to portrait after the full-screen sidebar closed: the sidebar
@@ -1800,8 +1875,7 @@ describe("ArtifactsPanel", () => {
         entries: [entry("data.json", 1, "json")],
         truncated: false,
       },
-      { "data.json": textFile("data.json", "json", '{"runs":[1,2]}') },
-      { versions: { "data.json": [version(2, null, "data.json")] } }
+      { "data.json": textFile("data.json", "json", '{"runs":[1,2]}') }
     );
     const sidebar = renderPanel(workspaceId);
     const dialog = renderPanel(workspaceId);
@@ -1835,8 +1909,7 @@ describe("ArtifactsPanel", () => {
         entries: [entry("report.md", 1, "markdown")],
         truncated: false,
       },
-      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
-      { versions: { "report.md": [version(2, null, "report.md")] } }
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") }
     );
     const view = renderPanel("ws-annotate-picker");
     await view.findByRole("button", { name: "Annotate" });
@@ -1878,8 +1951,7 @@ describe("ArtifactsPanel", () => {
         entries: [entry("report.md", 1, "markdown")],
         truncated: false,
       },
-      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
-      { versions: { "report.md": [version(2, null, "report.md")] } }
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") }
     );
     const view = renderPanel("ws-annotate-escape-layers");
     const panel = view.getByTestId("artifacts-panel");
@@ -1901,14 +1973,16 @@ describe("ArtifactsPanel", () => {
 
     // Keys go to whatever has focus, as a real key press would.
     fireEvent.keyDown(textarea, { key: "Escape" });
-    await waitFor(() => expect(view.queryByTestId("artifact-annotation-popover")).toBeNull());
+    await waitFor(() =>
+      expect(view.queryByTestId("artifact-annotation-popover") === null).toBe(true)
+    );
     expect(document.activeElement).toBe(panel);
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
     expect(view.getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")).toBe(
       "false"
     );
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
   });
 
   // Review: leaving fullscreen from inside the viewer (Escape in an HTML frame arrives over the
@@ -1933,7 +2007,7 @@ describe("ArtifactsPanel", () => {
     act(() => toggle.focus());
 
     fireEvent.keyDown(toggle, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(toggle.isConnected).toBe(true);
     expect(document.activeElement).toBe(panel);
   });
@@ -1948,8 +2022,7 @@ describe("ArtifactsPanel", () => {
         entries: [entry("report.md", 1, "markdown")],
         truncated: false,
       },
-      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
-      { versions: { "report.md": [version(2, null, "report.md")] } }
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") }
     );
     const view = renderPanel("ws-annotate-fullscreen-box");
     const panel = view.getByTestId("artifacts-panel");
@@ -1973,7 +2046,7 @@ describe("ArtifactsPanel", () => {
 
     await pick();
     fireEvent.click(view.getByRole("button", { name: "Exit fullscreen" }));
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
     // Annotate mode itself stays on: only the box, tied to the old layout, goes.
     expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
@@ -1991,8 +2064,7 @@ describe("ArtifactsPanel", () => {
         entries: [entry("report.md", 1, "markdown")],
         truncated: false,
       },
-      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") },
-      { versions: { "report.md": [version(2, null, "report.md")] } }
+      { "report.md": textFile("report.md", "markdown", "Revenue grew 12% this quarter.") }
     );
     const view = renderPanel();
     const panel = view.getByTestId("artifacts-panel");
@@ -2010,6 +2082,6 @@ describe("ArtifactsPanel", () => {
     expect(view.queryByRole("dialog")).not.toBeNull();
 
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
   });
 });

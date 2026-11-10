@@ -14,14 +14,18 @@ import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import type { Config } from "@/node/config";
 
 import type { AgentSession } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createTestStreamManager } from "./agentSession.testHarness";
 import type { CompactionHandler } from "./compactionHandler";
 import { CompactionPendingState } from "./compactionPendingState";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createLoadedSkillSnapshot } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
-import { recordArtifactVersion } from "./artifactVersionStore";
+import { recordArtifactPublish } from "./artifactRecordStore";
+import { upsertSubagentReportArtifact } from "./subagentReportArtifacts";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
+import type { EffectRunner } from "./di/effectRunner";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function createSuccessfulFileEditMessage(id: string, filePath: string, diff: string): MuxMessage {
   return {
@@ -107,12 +111,14 @@ const WORKSPACE_ID = "workspace-post-compaction-test";
 
 async function createSessionForHistory(
   historyService: HistoryService,
-  config: Config
+  config: Config,
+  runner?: EffectRunner
 ): Promise<AgentSession> {
   const { session } = await createAgentSessionHarness({
     workspaceId: WORKSPACE_ID,
     config,
     historyService,
+    ...(runner ? { streamManager: createTestStreamManager(undefined, runner) } : {}),
     aiServiceOverrides: {
       getWorkspaceMetadata: mock(() => Promise.resolve(Err("metadata unavailable"))),
     },
@@ -331,6 +337,37 @@ describe("AgentSession post-compaction attachments", () => {
     }
   });
 
+  test("indexes a report completed before the compaction while the session runs on a TestClock", async () => {
+    // TaskService stamps report completion with Date.now(), so the cutoff must read the wall
+    // clock too (#7282). On the TestClock (months behind wall time) the report would look newer
+    // than the cutoff and drop out of the index, although compaction summarized it away.
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+    const sessionDir = path.join(config.sessionsDir, WORKSPACE_ID);
+    await writePendingPostCompactionState({ sessionDir, diffs: [], loadedSkills: [] });
+    await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
+      workspaceId: WORKSPACE_ID,
+      workspaceSessionDir: sessionDir,
+      childTaskId: "task-before-compaction",
+      parentWorkspaceId: WORKSPACE_ID,
+      ancestorWorkspaceIds: [WORKSPACE_ID],
+      reportMarkdown: "# Report",
+      nowMs: Date.now() - 60_000,
+    });
+    const clock = makeTestEffectRunner();
+    const session = await createSessionForHistory(historyService, config, clock.runner);
+
+    try {
+      const attachments = await getImmediatePostCompactionAttachments(session);
+      const index = attachments.find((attachment) => attachment.type === "completed_reports_index");
+      expect(index?.reports.map((report) => report.id)).toEqual(["task-before-compaction"]);
+    } finally {
+      await session.dispose();
+      await clock.dispose();
+    }
+  });
+
   test("immediately injects persisted loaded skills alongside todo and file attachments", async () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
@@ -492,12 +529,7 @@ describe("AgentSession post-compaction attachments", () => {
     historyCleanup = cleanup;
     const sessionDir = path.join(config.sessionsDir, WORKSPACE_ID);
     await writePendingPostCompactionState({ sessionDir, diffs: [], loadedSkills: [] });
-    await recordArtifactVersion({
-      sessionDir,
-      relPath: "chart.html",
-      bytes: Buffer.from("<p>v1</p>"),
-      label: "chart",
-    });
+    await recordArtifactPublish({ sessionDir, relPath: "chart.html", title: "chart" });
 
     for (const enabled of [true, false]) {
       const { session } = await createAgentSessionHarness({

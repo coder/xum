@@ -1,6 +1,7 @@
-import * as fsPromises from "fs/promises";
 import * as path from "path";
 import type { Stats } from "node:fs";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 /**
  * Local filesystem-only skill file utilities.
@@ -67,7 +68,7 @@ export function resolveSkillFilePath(
 
 async function lstatIfExists(targetPath: string): Promise<Stats | null> {
   try {
-    return await fsPromises.lstat(targetPath);
+    return await nodeHostFiles.promises.lstat(targetPath);
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) {
       return null;
@@ -91,15 +92,33 @@ export function isPathInsideRoot(rootPath: string, targetPath: string): boolean 
  * stays under `containmentRoot`. Returns the canonical path on success; throws on
  * escape.
  */
+/**
+ * True when two host paths name one directory, resolved through links (~/.xum can be a link to
+ * ~/.mux). A path that cannot be resolved compares as written.
+ */
+export async function isSameHostDirectory(
+  a: string,
+  b: string,
+  /** The host filesystem (phase 5: a RuntimeFactory's). Absent: the Node layer. */
+  files: HostFiles = nodeHostFiles
+): Promise<boolean> {
+  const [realA, realB] = await Promise.all(
+    [a, b].map((target) => files.promises.realpath(target).catch(() => path.resolve(target)))
+  );
+  return realA === realB;
+}
+
 export async function ensurePathContained(
   containmentRoot: string,
   candidatePath: string,
-  options?: { allowMissing?: boolean }
+  options?: { allowMissing?: boolean },
+  /** As in isSameHostDirectory. */
+  files: HostFiles = nodeHostFiles
 ): Promise<string> {
-  const containmentRootReal = await fsPromises.realpath(containmentRoot);
+  const containmentRootReal = await files.promises.realpath(containmentRoot);
   const candidateReal = options?.allowMissing
-    ? await resolveRealPathAllowMissing(candidatePath)
-    : await fsPromises.realpath(candidatePath);
+    ? await resolveRealPathAllowMissing(candidatePath, files)
+    : await files.promises.realpath(candidatePath);
 
   if (!isPathInsideRoot(containmentRootReal, candidateReal)) {
     throw new Error("Path resolves outside containment root after symlink resolution.");
@@ -108,13 +127,16 @@ export async function ensurePathContained(
   return candidateReal;
 }
 
-async function resolveRealPathAllowMissing(targetPath: string): Promise<string> {
+async function resolveRealPathAllowMissing(
+  targetPath: string,
+  files: HostFiles = nodeHostFiles
+): Promise<string> {
   const missingSegments: string[] = [];
   let currentPath = targetPath;
 
   while (true) {
     try {
-      const realPath = await fsPromises.realpath(currentPath);
+      const realPath = await files.promises.realpath(currentPath);
       return missingSegments.length === 0 ? realPath : path.join(realPath, ...missingSegments);
     } catch (error) {
       if (!hasErrorCode(error, "ENOENT")) {
@@ -144,12 +166,12 @@ export async function resolveContainedSkillFilePath(
 
   const rootReal = options?.allowMissingLeaf
     ? await resolveRealPathAllowMissing(skillDir)
-    : await fsPromises.realpath(skillDir);
+    : await nodeHostFiles.promises.realpath(skillDir);
   const rootPrefix = rootReal.endsWith(path.sep) ? rootReal : `${rootReal}${path.sep}`;
 
   const targetReal = options?.allowMissingLeaf
     ? await resolveRealPathAllowMissing(requestedPath)
-    : await fsPromises.realpath(requestedPath);
+    : await nodeHostFiles.promises.realpath(requestedPath);
 
   if (targetReal !== rootReal && !targetReal.startsWith(rootPrefix)) {
     throw new Error(

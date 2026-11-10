@@ -6,6 +6,7 @@ import {
   matchesKeybind,
   matchesNewSidebarTabKeybind,
 } from "@/browser/utils/ui/keybinds";
+import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 
 /** Replays one held input. WorkspaceShell queues these while the right sidebar's chunk loads. */
 export type HeldSidebarInput = () => void;
@@ -16,8 +17,7 @@ export type HeldSidebarInput = () => void;
 const SIDEBAR_EVENTS = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
   CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
-  // The header's stand-in for the collapsed overview card: the only expand control while loading.
-  CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
+  CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB,
   CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
   CUSTOM_EVENTS.OPEN_ARTIFACT,
   CUSTOM_EVENTS.OPEN_REVIEW_IMMERSIVE,
@@ -48,23 +48,49 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
     if (isDialogOpen()) return;
     e.preventDefault();
     e.stopImmediatePropagation();
-    const { target, key, code, ctrlKey, shiftKey, altKey, metaKey } = e;
-    const init = { key, code, ctrlKey, shiftKey, altKey, metaKey, bubbles: true, cancelable: true };
+    // The replay keeps `repeat`: a held OPEN_ARTIFACTS_TAB key must not replay as fresh presses,
+    // each of which would flip the sidebar.
+    const { target, key, code, ctrlKey, shiftKey, altKey, metaKey, repeat } = e;
+    const init = {
+      key,
+      code,
+      ctrlKey,
+      shiftKey,
+      altKey,
+      metaKey,
+      repeat,
+      bubbles: true,
+      cancelable: true,
+    };
     held.push(() => {
       const node = target instanceof Node && target.isConnected ? target : window;
       node.dispatchEvent(new window.KeyboardEvent("keydown", init));
     });
   };
-  const holdEvent = (e: Event) => {
-    e.stopImmediatePropagation();
-    const detail: unknown = e instanceof window.CustomEvent ? e.detail : undefined;
-    held.push(() => window.dispatchEvent(new window.CustomEvent(e.type, { detail })));
-  };
+  const holdEvent = holdEventInto(held);
   window.addEventListener("keydown", holdKey, true);
   for (const type of SIDEBAR_EVENTS) window.addEventListener(type, holdEvent, true);
   return () => {
     window.removeEventListener("keydown", holdKey, true);
     for (const type of SIDEBAR_EVENTS) window.removeEventListener(type, holdEvent, true);
+  };
+}
+
+function holdEventInto(held: HeldSidebarInput[]): (e: Event) => void {
+  return (e) => {
+    // While the layout hides the sidebar, RightSidebar ignores these two and WorkspaceMenuBar acts
+    // on them. Chromium may already have run the menu bar's listener (window listeners run in
+    // registration order at the window target), so a replay would act twice (#6208).
+    const menuBarEvent =
+      e.type === CUSTOM_EVENTS.OPEN_ARTIFACT || e.type === CUSTOM_EVENTS.OPEN_MCP_APP_VIEW;
+    if (
+      menuBarEvent &&
+      isWorkspaceRightSidebarHidden(document.querySelector("[data-workspace-shell]"))
+    )
+      return;
+    e.stopImmediatePropagation();
+    const detail: unknown = e instanceof window.CustomEvent ? e.detail : undefined;
+    held.push(() => window.dispatchEvent(new window.CustomEvent(e.type, { detail })));
   };
 }
 

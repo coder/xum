@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ReactNode } from "react";
 import { APIProvider } from "@/browser/contexts/API";
 import { GenericToolCall } from "@/browser/features/Tools/GenericToolCall";
@@ -106,7 +106,7 @@ function renderMcpAppCall() {
   return (
     <APIProvider
       client={createMockORPCClient({
-        experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+        experiments: { [EXPERIMENT_IDS.MCP_APPS]: true },
         mcpApps: {
           views: {
             "call-dice-1": {
@@ -228,7 +228,7 @@ function withView(children: ReactNode) {
   return (
     <APIProvider
       client={createMockORPCClient({
-        experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+        experiments: { [EXPERIMENT_IDS.MCP_APPS]: true },
         mcpApps: {
           views: {
             [APP_TAB_TOOL_CALL_ID]: {

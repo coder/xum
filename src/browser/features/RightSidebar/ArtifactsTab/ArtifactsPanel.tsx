@@ -1,6 +1,10 @@
-import React, { useEffect, useRef, useState } from "react";
-import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
-import { refocusFallenFocus } from "@/browser/utils/ui/refocusFallenFocus";
+import React, { useContext, useEffect, useRef, useState } from "react";
+import {
+  PinnedViewToolbarSpacerContext,
+  usePinnedViewCoversWindow,
+  usePinnedViewEscape,
+} from "@/browser/hooks/usePinnedViewCoversWindow";
+import { pinnedViewClass, pinnedViewRole, pinView } from "@/browser/utils/ui/pinnedView";
 import {
   Download,
   Maximize2,
@@ -22,7 +26,6 @@ import {
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
 import { useReviews } from "@/browser/hooks/useReviews";
-import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
@@ -35,7 +38,6 @@ import type {
   ArtifactEntry,
   ArtifactListing,
   ArtifactReadResult,
-  ArtifactVersionList,
   PinnedArtifactFile,
   PinnedArtifactFiles,
   ArtifactShelfEntry,
@@ -50,13 +52,14 @@ import {
   type ArtifactAnnotationPick,
 } from "./artifactAnnotation";
 import { ArtifactAnnotationPopover } from "./ArtifactAnnotationPopover";
+import { shareArtifactListing, useArtifactsPanelListing } from "./agentInterfaceView";
 import { downloadArtifact } from "./artifactDownload";
-import { ArtifactVersionMenu } from "./ArtifactVersionMenu";
+import { ArtifactPinMenu } from "./ArtifactPinMenu";
 import { useArtifactInteractions } from "./useArtifactInteractions";
+import { useArtifactsRefreshTick } from "./useArtifactsRefreshTick";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { useArtifactAnnotateMode } from "./useArtifactAnnotateMode";
 import {
-  type ArtifactSelection,
   type ArtifactSelectionScope,
   readArtifactSelection,
   useArtifactSelection,
@@ -64,27 +67,12 @@ import {
 } from "./artifactSelection";
 import type { ArtifactFrameKey } from "./SandboxedArtifactFrame";
 
-/** While the tab is visible, re-list this often to catch writes no tool event reports. */
-const ARTIFACTS_POLL_MS = 3000;
-
 interface ReadState {
   /** Identifies what was read (see Selection/readKey), so stale reads are never shown. */
   key: string;
   /** With `error` set too: a re-read of the same key failed, and this is the last good result. */
   result: ArtifactReadResult | null;
   error: string | null;
-}
-
-interface VersionsState {
-  path: string;
-  list: ArtifactVersionList | null;
-  /** Why listVersions failed; shown instead of a stored version that cannot be resolved. */
-  error: string | null;
-  /**
-   * The list is from before a refresh that failed. It still renders stored versions and keeps
-   * the frame's state key, but its newest version may be outdated, so nothing records it.
-   */
-  stale: boolean;
 }
 
 /**
@@ -98,21 +86,10 @@ function keepReadResult(prev: ReadState | null, key: string, error: string): Rea
     : { key, result: null, error };
 }
 
-/** A failed listVersions keeps the list it already had for the path (see keepReadResult). */
-function keepVersionList(prev: VersionsState | null, path: string, error: string): VersionsState {
-  return prev?.path === path && prev.list != null
-    ? { path, list: prev.list, error: null, stale: true }
-    : { path, list: null, error, stale: false };
-}
-
-/**
- * What the toolbar points at. An artifact with a stored version selected stays selectable after
- * its working file is gone (`entry` null), so old versions remain viewable.
- */
 type Selection =
   | { scope: "pinned"; path: string; file: PinnedArtifactFile }
   | { scope: "shelf"; path: string; entry: ArtifactShelfEntry }
-  | { scope: "artifact"; path: string; entry: ArtifactEntry | null; version: number | null };
+  | { scope: "artifact"; path: string; entry: ArtifactEntry };
 
 /** Picker values carry the scope, since a pinned file and an artifact may share a path. */
 function pickerValue(scope: ArtifactSelectionScope, path: string): string {
@@ -133,26 +110,21 @@ function parsePickerValue(value: string): { scope: ArtifactSelectionScope; path:
 const OTHER_FILES_TOGGLE_VALUE = "toggle-other-files";
 
 /**
- * Splits the live files for the picker: files with stored versions (published with the artifact
+ * Splits the live files for the picker: files with a publish record (published with the artifact
  * tool) lead, and the rest go under a collapsed "Other files" group. Agents
  * keep supporting files (for example screenshots that a published HTML artifact references) in
  * the same folder, and a flat newest-first list buried the file they published. Returns null
- * when only one kind exists: the picker then stays a flat list, so a folder with no stored
- * versions yet still shows every file. Both groups keep the listing order (newest first).
- * `versionOnlyPaths` (deleted files whose versions are kept) count as versioned too: they are
- * listed under "Artifacts", so deleting the published file must not bury it under the rest.
+ * when only one kind exists: the picker then stays a flat list, so a folder with nothing
+ * published yet still shows every file. Both groups keep the listing order (newest first).
  */
 function groupArtifactEntries(
   entries: readonly ArtifactEntry[],
-  versionedPaths: readonly string[],
-  versionOnlyPaths: readonly string[]
-): { versioned: ArtifactEntry[]; other: ArtifactEntry[] } | null {
-  const versionedSet = new Set(versionedPaths);
-  const versioned = entries.filter((entry) => versionedSet.has(entry.path));
-  const other = entries.filter((entry) => !versionedSet.has(entry.path));
-  return versioned.length + versionOnlyPaths.length > 0 && other.length > 0
-    ? { versioned, other }
-    : null;
+  publishedPaths: readonly string[]
+): { published: ArtifactEntry[]; other: ArtifactEntry[] } | null {
+  const publishedSet = new Set(publishedPaths);
+  const published = entries.filter((entry) => publishedSet.has(entry.path));
+  const other = entries.filter((entry) => !publishedSet.has(entry.path));
+  return published.length > 0 && other.length > 0 ? { published, other } : null;
 }
 
 /** Shelf selection path: the shelf scope and entry name, so project and global never collide. */
@@ -162,21 +134,16 @@ export function shelfSelectionPath(entry: Pick<ArtifactShelfEntry, "scope" | "na
 
 /**
  * The persisted selection when it still points at something, else the first artifact, else
- * the first pinned file, else the first deleted artifact that still has stored versions, else
- * the first other file, else the first shelf entry. `versionOnlyPaths` are artifacts whose
- * working file is gone but whose versions are kept; with no version selected they show their
- * latest stored version. `otherEntries` are the live files of the collapsed "Other files"
- * group (groupArtifactEntries): they come after every artifact, so a published file stays the
- * default even when it was deleted and only its versions remain.
+ * the first pinned file, else the first other file, else the first shelf entry. `otherEntries`
+ * are the live files of the collapsed "Other files" group (groupArtifactEntries): they come
+ * after every published artifact, so a published file stays the default.
  */
 export function resolveSelection(input: {
   scope: ArtifactSelectionScope;
   path: string | null;
-  version: number | null;
   entries: readonly ArtifactEntry[];
   otherEntries: readonly ArtifactEntry[];
   pinnedFiles: readonly PinnedArtifactFile[];
-  versionOnlyPaths: readonly string[];
   shelfEntries: readonly ArtifactShelfEntry[];
 }): Selection | null {
   if (input.scope === "shelf") {
@@ -189,26 +156,14 @@ export function resolveSelection(input: {
     const entry =
       input.entries.find((e) => e.path === input.path) ??
       input.otherEntries.find((e) => e.path === input.path);
-    if (entry) return { scope: "artifact", path: entry.path, entry, version: input.version };
-    if (
-      input.path != null &&
-      (input.version != null || input.versionOnlyPaths.includes(input.path))
-    ) {
-      return { scope: "artifact", path: input.path, entry: null, version: input.version };
-    }
+    if (entry) return { scope: "artifact", path: entry.path, entry };
   }
   const firstEntry = input.entries[0];
-  if (firstEntry)
-    return { scope: "artifact", path: firstEntry.path, entry: firstEntry, version: null };
+  if (firstEntry) return { scope: "artifact", path: firstEntry.path, entry: firstEntry };
   const firstPinned = input.pinnedFiles[0];
   if (firstPinned) return { scope: "pinned", path: firstPinned.path, file: firstPinned };
-  const firstVersionOnly = input.versionOnlyPaths[0];
-  if (firstVersionOnly != null) {
-    return { scope: "artifact", path: firstVersionOnly, entry: null, version: null };
-  }
   const firstOther = input.otherEntries[0];
-  if (firstOther)
-    return { scope: "artifact", path: firstOther.path, entry: firstOther, version: null };
+  if (firstOther) return { scope: "artifact", path: firstOther.path, entry: firstOther };
   const firstShelf = input.shelfEntries[0];
   if (firstShelf)
     return { scope: "shelf", path: shelfSelectionPath(firstShelf), entry: firstShelf };
@@ -273,6 +228,49 @@ const SELECTION_EXTENDING_KEYS = new Set([
   "PageDown",
 ]);
 
+/** Whether a keyboard selection is in progress after this keydown in the viewer. */
+function selectingAfterKeyDown(selecting: boolean, e: React.KeyboardEvent): boolean {
+  // A held Shift auto-repeats until the arrow press, so only a fresh press resets.
+  if (e.key === "Shift") return e.repeat && selecting;
+  return selecting || (e.shiftKey && SELECTION_EXTENDING_KEYS.has(e.key));
+}
+
+/**
+ * The viewer's keyboard path in annotate mode: Shift+Arrow (etc.) extends a selection, and
+ * releasing Shift opens the comment box for it. The flag lasts one Shift gesture (#5760): a new
+ * Shift press or focus leaving the viewer clears it, so a later bare Shift release cannot open a
+ * box for an old selection. Annotate mode turning off and on needs no reset of its own: the next
+ * gesture starts with a Shift press.
+ */
+function keyboardSelectionHandlers(
+  selectingRef: { current: boolean },
+  openAnnotation: (pick: ArtifactAnnotationPick) => void
+) {
+  return {
+    onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
+      selectingRef.current = selectingAfterKeyDown(selectingRef.current, e);
+    },
+    onKeyUp: (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.key !== "Shift" || !selectingRef.current) return;
+      selectingRef.current = false;
+      const pick = textAnchorFromSelection(e.currentTarget, window.getSelection());
+      if (pick != null) openAnnotation(pick);
+    },
+    // Focus that moves inside the viewer (caret browsing onto a link) keeps the gesture.
+    onBlur: (e: React.FocusEvent<HTMLDivElement>) => {
+      if (!e.currentTarget.contains(e.relatedTarget)) selectingRef.current = false;
+    },
+  };
+}
+
+/**
+ * The annotate shortcut's first press, not its auto-repeat: a held key toggled annotate mode at
+ * the key-repeat rate (#6347). The frame's key bridge ignores repeats the same way.
+ */
+function matchesAnnotateShortcut(e: React.KeyboardEvent): boolean {
+  return !e.repeat && matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE);
+}
+
 /**
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
  * $XUM_SCRATCH_DIR/artifacts, listed newest first with a preview of the selected one.
@@ -286,7 +284,12 @@ export function ArtifactsPanel(props: {
   const { api } = useAPI();
   const [listing, setListing] = useState<ArtifactListing | null>(null);
   const [listError, setListError] = useState<string | null>(null);
-  const [refreshTick, setRefreshTick] = useState(0);
+  // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
+  const listInFlightRef = useRef(false);
+  const [refreshTick, setRefreshTick] = useArtifactsRefreshTick(props.workspaceId, {
+    online: api != null,
+    listInFlightRef,
+  });
   const [reloadTick, setReloadTick] = useState(0);
   const [readState, setReadState] = useState<ReadState | null>(null);
   // Whether the latest preview read failed: the next successful re-list (poll or file event)
@@ -317,30 +320,22 @@ export function ArtifactsPanel(props: {
     setShortcutFocused(document.activeElement === panelRef.current);
     onAutoFocusConsumed?.();
   }, [autoFocus, onAutoFocusConsumed]);
-  // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
-  const listInFlightRef = useRef(false);
   const [pinned, setPinned] = useState<PinnedArtifactFiles | null>(null);
   const [shelf, setShelf] = useState<ArtifactShelfListing | null>(null);
-  const [versionsState, setVersionsState] = useState<VersionsState | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   // The "Other files" picker group (groupArtifactEntries). Not persisted: it starts collapsed.
   const [otherFilesExpanded, setOtherFilesExpanded] = useState(false);
   // openArtifact() (chat cards, file cards, palette) writes the selection before asking for the
   // tab; the listener keeps a mounted panel in sync with those writes.
   // MCP Apps: "Open in Artifacts" on a tool card selects its view through the path.
-  const {
-    path: selectedPath,
-    version: selectedVersion,
-    scope: selectedScope,
-  } = useArtifactSelection(props.workspaceId);
-  const setSelection = (next: Partial<ArtifactSelection>) =>
-    writeArtifactSelection(props.workspaceId, next);
+  const { path: selectedPath, scope: selectedScope } = useArtifactSelection(props.workspaceId);
 
   const select = (next: { scope: ArtifactSelectionScope; path: string | null }) => {
     setActionError(null);
-    setSelection({ scope: next.scope, path: next.path, version: null });
+    writeArtifactSelection(props.workspaceId, next);
   };
 
+  useArtifactsPanelListing(props.workspaceId);
   useEffect(() => {
     if (!api) return;
     const controller = new AbortController();
@@ -358,6 +353,8 @@ export function ArtifactsPanel(props: {
         }
         setListError(null);
         setListing(result.data);
+        // The main pane's Agent interface view takes it instead of listing the folder again.
+        shareArtifactListing(props.workspaceId, result.data);
         if (readFailedRef.current) {
           readFailedRef.current = false;
           setRetryTick((tick) => tick + 1);
@@ -375,7 +372,7 @@ export function ArtifactsPanel(props: {
     };
   }, [api, props.workspaceId, refreshTick]);
 
-  // Pinned checkout files are live: re-list them on the same refresh signal as the artifacts,
+  // Pinned files are live: re-list them on the same refresh signal as the artifacts,
   // and their mtimes drive re-reads like an artifact's.
   useEffect(() => {
     if (!api) return;
@@ -417,39 +414,11 @@ export function ArtifactsPanel(props: {
     return () => controller.abort();
   }, [api, props.workspaceId, refreshTick]);
 
-  // Re-list after the agent's file edits and bash commands, the usual ways it writes files.
-  useEffect(() => {
-    return workspaceStore.subscribeFileModifyingTool((wsId) => {
-      if (wsId === props.workspaceId) setRefreshTick((tick) => tick + 1);
-    }, props.workspaceId);
-  }, [props.workspaceId]);
-
-  // Writes by scripts or other tools emit no event, so poll while the window is visible. Not
-  // while Xum reconnects: each poll re-reads canvas data files, and those reads wait for the
-  // connection (useArtifactAssetReader), so ticks during an outage would only pile them up.
-  const online = api != null;
-  useEffect(() => {
-    if (!online) return;
-    const interval = window.setInterval(() => {
-      if (document.visibilityState === "visible" && !listInFlightRef.current) {
-        setRefreshTick((tick) => tick + 1);
-      }
-    }, ARTIFACTS_POLL_MS);
-    return () => window.clearInterval(interval);
-  }, [online]);
-
   const entries: ArtifactEntry[] = listing?.available === true ? listing.entries : [];
   const pinnedFiles: PinnedArtifactFile[] = pinned?.available === true ? pinned.files : [];
-  // Deleted working files whose versions are kept stay listed and selectable. Only a complete
-  // listing proves a file is gone: past the listing cap it may still exist (as artifact_list
-  // does). An explicitly chosen stored version stays viewable either way.
-  const versionOnlyPaths: string[] =
-    listing?.available === true && !listing.truncated
-      ? (listing.versionedPaths ?? []).filter((path) => !entries.some((e) => e.path === path))
-      : [];
   const entryGroups =
     listing?.available === true
-      ? groupArtifactEntries(entries, listing.versionedPaths ?? [], versionOnlyPaths)
+      ? groupArtifactEntries(entries, listing.publishedPaths ?? [])
       : null;
   // Project entries first, then global (the picker order).
   const shelfEntries: ArtifactShelfEntry[] = [
@@ -467,65 +436,15 @@ export function ArtifactsPanel(props: {
     : resolveSelection({
         scope: selectedScope,
         path: selectedPath,
-        version: selectedVersion,
-        entries: entryGroups?.versioned ?? entries,
+        entries: entryGroups?.published ?? entries,
         otherEntries: entryGroups?.other ?? [],
         pinnedFiles,
-        versionOnlyPaths,
         shelfEntries,
       });
-  const selectedArtifactPath = selected?.scope === "artifact" ? selected.path : null;
-  const selectedVersionForFetch = selected?.scope === "artifact" ? selected.version : null;
 
-  // Versions of the selected artifact, refetched on every refresh: a publish of unchanged bytes
-  // can still change a version's kind, and another backend can publish.
-  useEffect(() => {
-    if (!api || selectedArtifactPath == null) return;
-    const path = selectedArtifactPath;
-    const controller = new AbortController();
-    api.artifacts
-      .listVersions({ workspaceId: props.workspaceId, path }, { signal: controller.signal })
-      .then((result) => {
-        if (controller.signal.aborted) return;
-        if (result.success) {
-          setVersionsState({ path, list: result.data, error: null, stale: false });
-        } else {
-          setVersionsState((prev) => keepVersionList(prev, path, result.error));
-        }
-      })
-      .catch((error: unknown) => {
-        if (isAbortError(error) || controller.signal.aborted) return;
-        setVersionsState((prev) => keepVersionList(prev, path, getErrorMessage(error)));
-      });
-    return () => controller.abort();
-  }, [api, props.workspaceId, selectedArtifactPath, selectedVersionForFetch, refreshTick]);
-
-  const versionList =
-    selected?.scope === "artifact" && versionsState?.path === selected.path
-      ? versionsState.list
-      : null;
-  // The newest stored version, for actions that record a version (Send, annotations, Pin to
-  // Shelf). Null while the list is stale: Send then resolves the version on the server.
-  const latestKnownVersion =
-    selected?.scope === "artifact" && versionsState?.path === selected.path && !versionsState.stale
-      ? (versionList?.versions[0]?.version ?? null)
-      : null;
-  const versionListError =
-    selected?.scope === "artifact" && versionsState?.path === selected.path
-      ? versionsState.error
-      : null;
-  // A deleted working file with no version chosen shows its latest stored version.
-  const versionToRead =
-    selected?.scope === "artifact"
-      ? (selected.version ??
-        (selected.entry == null ? (versionList?.versions[0]?.version ?? null) : null))
-      : null;
-
-  // What to read and how. Stored versions need the artifact id, which listVersions reports.
   let readRequest:
     | { key: string; kind: "live"; path: string; modifiedMs: number }
     | { key: string; kind: "pinned"; path: string }
-    | { key: string; kind: "version"; artifactId: string; version: number }
     | { key: string; kind: "shelf"; scope: ArtifactShelfScope; name: string }
     | null = null;
   if (selected?.scope === "shelf") {
@@ -542,22 +461,11 @@ export function ArtifactsPanel(props: {
       kind: "pinned",
       path: selected.path,
     };
-  } else if (
-    selected?.scope === "artifact" &&
-    (selected.version != null || selected.entry == null)
-  ) {
-    if (versionList != null && versionToRead != null) {
-      readRequest = {
-        key: `version\u0000${versionList.artifactId}\u0000${versionToRead}`,
-        kind: "version",
-        artifactId: versionList.artifactId,
-        version: versionToRead,
-      };
-    }
-  } else if (selected?.scope === "artifact" && selected.entry != null) {
+  } else if (selected?.scope === "artifact") {
     readRequest = {
       // Size too: a same-mtime rewrite (`cp -p`, 1 s mtime resolution) still changes the key.
-      key: `live\u0000${selected.path}\u0000${selected.entry.modifiedMs}\u0000${selected.entry.size}`,
+      // Kind too: a publish with another kind changes how the same bytes are shown.
+      key: `live\u0000${selected.path}\u0000${selected.entry.modifiedMs}\u0000${selected.entry.size}\u0000${selected.entry.kind}`,
       kind: "live",
       path: selected.path,
       modifiedMs: selected.entry.modifiedMs,
@@ -577,15 +485,10 @@ export function ArtifactsPanel(props: {
         ? api.artifacts.read({ workspaceId, path: request.path }, options)
         : request.kind === "pinned"
           ? api.artifacts.readPinned({ workspaceId, path: request.path }, options)
-          : request.kind === "shelf"
-            ? api.artifacts.readShelf(
-                { workspaceId, scope: request.scope, name: request.name },
-                options
-              )
-            : api.artifacts.readVersion(
-                { workspaceId, artifactId: request.artifactId, version: request.version },
-                options
-              );
+          : api.artifacts.readShelf(
+              { workspaceId, scope: request.scope, name: request.name },
+              options
+            );
     read
       .then((result) => {
         if (controller.signal.aborted) return;
@@ -605,19 +508,14 @@ export function ArtifactsPanel(props: {
         setReadState((prev) => keepReadResult(prev, request.key, getErrorMessage(error)));
       });
     return () => controller.abort();
-    // readKey identifies the request (scope, path, mtime or version): re-read when it changes.
+    // readKey identifies the request: re-read when it changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, props.workspaceId, readKey, reloadTick, retryTick]);
 
   // Which annotate flavour the selected artifact supports: text selection on Xum-rendered kinds,
-  // pins inside the sandboxed frame, or none (images, PDFs, pinned files). A live view
-  // also waits for its version list: annotations record the version they were made on, and
-  // before the list arrives that version is unknown.
-  const annotationVersionKnown =
-    selected?.scope === "artifact" &&
-    (selected.version != null || (versionsState?.path === selected.path && !versionsState.stale));
+  // pins inside the sandboxed frame, or none (images, PDFs, pinned files).
   const annotateResult =
-    selected?.scope === "artifact" && annotationVersionKnown && readKey != null
+    selected?.scope === "artifact" && readKey != null
       ? readState?.key === readKey && readState.result?.status === "ok"
         ? readState.result
         : null
@@ -646,26 +544,33 @@ export function ArtifactsPanel(props: {
     setFullscreen(next);
   };
 
-  // Fullscreen is the panel itself pinned over the window, not a portaled dialog: moving the
-  // viewer into a portal remounted it, which rebuilt the document, re-read its relative assets
-  // and reloaded HTML/SVG frames (losing their in-page state) on every enter and exit.
-  // Everything outside the panel goes inert meanwhile, which gives the modal behaviour the
-  // dialog provided: no focus or pointer input behind it, and hidden from assistive tech.
+  // Fullscreen is the panel itself pinned in place, not a portaled dialog: moving the viewer into
+  // a portal remounted it, which rebuilt the document, re-read its relative assets and reloaded
+  // HTML/SVG frames (losing their in-page state) on every enter and exit.
+  // In a wide window it covers the workspace shell, like immersive review, so the left sidebar
+  // stays visible and usable (consistency with immersive review was the ask); the shell's other
+  // content goes inert. In a narrow window the left sidebar is a drawer that would open under the
+  // panel, and inside the full-window right sidebar overlay the left sidebar is covered already,
+  // so then it covers the window, everything else goes inert, and it is a modal dialog.
+  const coversWindow = usePinnedViewCoversWindow();
+  const ToolbarSpacer = useContext(PinnedViewToolbarSpacerContext);
+  // Escape from the usable left sidebar ends a workspace-scoped fullscreen too.
+  usePinnedViewEscape(showFullscreen, coversWindow, () => setFullscreenMode(false));
   useEffect(() => {
     const panel = panelRef.current;
     if (!showFullscreen || panel == null) return;
     // Where focus was when fullscreen opened (the Fullscreen button, or the panel for Shift+F).
     // Closing returns there, as dialogs do (#5694).
     const opener = document.activeElement;
-    const restore = makeOthersInert(panel);
+    // Both also catch focus that falls out with a removed node, as the old dialog's focus scope
+    // did: a poll that swaps the viewer for a rewritten file, or a closing comment box. Focus then
+    // sat on <body>, so J/K and Escape missed the panel (Escape could even reach
+    // Escape-to-interrupt).
+    const unpin = pinView(panel, coversWindow);
     // Focus the panel itself, not the button that opened fullscreen, so J/K, Shift+F and C work
     // at once. Script focus is not :focus-visible in Chrome, so mark the ring by hand.
     panel.focus();
     setShortcutFocused(document.activeElement === panel);
-    // The dialog's focus scope also caught focus that fell out with a removed node: a poll that
-    // swaps the viewer for a new version, or a closing comment box. Focus then sat on <body>, so
-    // J/K and Escape missed the panel (Escape could even reach Escape-to-interrupt). Do the same.
-    const stopRefocus = refocusFallenFocus(panel);
     // A hidden ancestor hides the pinned panel too (the phone sidebar, hidden again after its
     // full-screen view closed on a rotation), which would leave the rest of the app inert
     // behind nothing. Leave fullscreen once the panel has no box.
@@ -678,8 +583,7 @@ export function ArtifactsPanel(props: {
     sizeObserver.observe(panel);
     return () => {
       sizeObserver.disconnect();
-      stopRefocus();
-      restore();
+      unpin();
       // Back to the opener when it is still a control of this panel, else to the panel, so J/K
       // keep working without another click: keys from the panel's controls bubble to it. Not to
       // whatever had focus at close: a control or an HTML frame inside the viewer (Escape in a
@@ -694,23 +598,11 @@ export function ArtifactsPanel(props: {
       // focus on <body>.
       if (document.activeElement !== returnTo) panel.focus();
     };
-  }, [showFullscreen, setAnnotationPick]);
+  }, [showFullscreen, coversWindow, setAnnotationPick]);
 
-  // Picker order: pinned files first, then artifacts, then deleted artifacts with stored
-  // versions. A selected version whose working file is gone keeps its own entry so the picker
-  // can still name it.
-  const deletedPaths = [...versionOnlyPaths];
-  if (
-    selected?.scope === "artifact" &&
-    selected.entry == null &&
-    !deletedPaths.includes(selected.path)
-  ) {
-    deletedPaths.push(selected.path);
-  }
-  // With groups, other files come after the deleted artifacts. While the group is collapsed only
-  // the selected one stays listed: Radix needs the selected item mounted to name it in the
-  // trigger, and the user must see what is selected.
-  const artifactGroupEntries = entryGroups?.versioned ?? entries;
+  // While "Other files" is collapsed only the selected one stays listed: Radix needs the selected
+  // item mounted to name it in the trigger, and the user must see what is selected.
+  const artifactGroupEntries = entryGroups?.published ?? entries;
   const otherFiles = entryGroups?.other ?? [];
   const visibleOtherFiles = otherFilesExpanded
     ? otherFiles
@@ -720,7 +612,6 @@ export function ArtifactsPanel(props: {
   const options: Array<{ scope: ArtifactSelectionScope; path: string }> = [
     ...pinnedFiles.map((file) => ({ scope: "pinned" as const, path: file.path })),
     ...artifactGroupEntries.map((entry) => ({ scope: "artifact" as const, path: entry.path })),
-    ...deletedPaths.map((path) => ({ scope: "artifact" as const, path })),
     ...visibleOtherFiles.map((entry) => ({ scope: "artifact" as const, path: entry.path })),
   ];
   options.push(
@@ -774,19 +665,10 @@ export function ArtifactsPanel(props: {
       .catch((error: unknown) => setActionError(getErrorMessage(error)));
   };
 
-  // User pin from the version menu: copies the shown version (or the newest stored one while
-  // following the live file) to the shelf.
   const pinToShelf = (scope: ArtifactShelfScope) => {
-    if (!api || selected?.scope !== "artifact" || versionList == null) return;
-    const version = selected.version ?? latestKnownVersion;
-    if (version == null) return;
+    if (!api || selected?.scope !== "artifact") return;
     api.artifacts
-      .pinToShelf({
-        workspaceId: props.workspaceId,
-        artifactId: versionList.artifactId,
-        version,
-        scope,
-      })
+      .pinToShelf({ workspaceId: props.workspaceId, path: selected.path, scope })
       .then((result) => {
         setActionError(result.success ? null : result.error);
         if (result.success) setRefreshTick((tick) => tick + 1);
@@ -799,8 +681,6 @@ export function ArtifactsPanel(props: {
     setReloadTick((tick) => tick + 1);
   };
 
-  const annotationVersion =
-    selected?.scope === "artifact" ? (selected.version ?? latestKnownVersion ?? 0) : 0;
   const addAnnotation = (pick: ArtifactAnnotationPick, comment: string) => {
     if (selected?.scope !== "artifact") return;
     reviews.addReview({
@@ -808,7 +688,7 @@ export function ArtifactsPanel(props: {
       lineRange: "",
       selectedCode: pick.anchor.kind === "text" ? pick.anchor.quote : "",
       userNote: comment,
-      artifact: { version: annotationVersion, anchor: pick.anchor },
+      artifact: { anchor: pick.anchor },
     });
     window.getSelection()?.removeAllRanges();
     setAnnotationPick(null);
@@ -832,7 +712,7 @@ export function ArtifactsPanel(props: {
     const inPopup =
       e.target instanceof Element && e.target.closest('[role="listbox"],[role="menu"]') != null;
     // Escape before the picker guard below: the closed picker trigger does not use Escape, so
-    // annotate mode and fullscreen must end from there too. An open list or the version menu
+    // annotate mode and fullscreen must end from there too. An open list or the pin menu
     // keeps Escape to close itself. Escape peels one layer per press: the comment box, then
     // annotate mode, then fullscreen.
     if (matchesKeybind(e, KEYBINDS.CANCEL)) {
@@ -850,7 +730,7 @@ export function ArtifactsPanel(props: {
       return;
     }
     // The picker (open list, or its focused closed trigger, where Radix runs type-ahead) and the
-    // version menu own their keys; J/K/R must not change the selection behind them.
+    // pin menu own their keys; J/K/R must not change the selection behind them.
     if (inPopup || (e.target instanceof Element && e.target.closest('[role="combobox"]') != null)) {
       return;
     }
@@ -884,7 +764,7 @@ export function ArtifactsPanel(props: {
       e.preventDefault();
       keepFocusForShortcuts(e.target);
       unpinShelfSelected();
-    } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE)) {
+    } else if (matchesAnnotateShortcut(e)) {
       e.preventDefault();
       toggleAnnotate();
     }
@@ -917,9 +797,7 @@ export function ArtifactsPanel(props: {
     selected?.scope === "artifact"
       ? {
           path: selected.path,
-          version: selected.version,
-          latestVersion: versionList?.versions[0]?.version ?? null,
-          latestVersionStale: versionsState?.stale === true,
+          readKey,
           reloadTick,
         }
       : null
@@ -939,12 +817,12 @@ export function ArtifactsPanel(props: {
   const viewerBody =
     selected == null && !waitingForPinned ? null : currentRead?.result ? (
       <ArtifactViewer
-        // Remount per file version so renderer state (zoom, JSON mode, frames) starts fresh.
+        // Remount per file read so renderer state (zoom, JSON mode, frames) starts fresh.
         // Reload remounts too: an unchanged file keeps its read key, so without the tick an HTML
         // frame kept its in-page state and Reload looked like it did nothing. Polls do not
         // change reloadTick, so they never reset the viewer.
         key={`${currentRead.key}\u0000${reloadTick}`}
-        // Same version, so the JSON mode survives fullscreen and tab-switch remounts (N7).
+        // Same read, so the JSON mode survives fullscreen and tab-switch remounts (N7).
         viewKey={`${props.workspaceId}\u0000${currentRead.key}`}
         result={currentRead.result}
         workspaceId={props.workspaceId}
@@ -960,14 +838,15 @@ export function ArtifactsPanel(props: {
       />
     ) : currentRead?.error ? (
       <div className="text-danger p-4 text-xs">{currentRead.error}</div>
-    ) : readRequest == null && versionListError != null ? (
-      // A stored version is resolved through listVersions: without it there is nothing to read.
-      <div className="text-danger p-4 text-xs">{versionListError}</div>
     ) : (
       <div className="text-muted p-4 text-xs">Loading…</div>
     );
 
   // Xum-rendered kinds: a text selection inside the viewer opens the comment popover.
+  const keyboardSelection =
+    annotating && annotateSupport === "host"
+      ? keyboardSelectionHandlers(keyboardSelectingRef, openAnnotation)
+      : null;
   const viewerScroll = (
     <div
       data-testid="artifact-viewer-scroll"
@@ -985,25 +864,9 @@ export function ArtifactsPanel(props: {
             }
           : undefined
       }
-      onKeyDown={
-        annotating && annotateSupport === "host"
-          ? (e) => {
-              if (e.shiftKey && SELECTION_EXTENDING_KEYS.has(e.key)) {
-                keyboardSelectingRef.current = true;
-              }
-            }
-          : undefined
-      }
-      onKeyUp={
-        annotating && annotateSupport === "host"
-          ? (e) => {
-              if (e.key !== "Shift" || !keyboardSelectingRef.current) return;
-              keyboardSelectingRef.current = false;
-              const pick = textAnchorFromSelection(e.currentTarget, window.getSelection());
-              if (pick != null) openAnnotation(pick);
-            }
-          : undefined
-      }
+      onKeyDown={keyboardSelection?.onKeyDown}
+      onKeyUp={keyboardSelection?.onKeyUp}
+      onBlur={keyboardSelection?.onBlur}
     >
       {viewerBody}
     </div>
@@ -1024,7 +887,6 @@ export function ArtifactsPanel(props: {
   const toolbarButtonClassName =
     "border-border-light text-muted hover:text-foreground bg-background focus-visible:ring-accent flex h-6 w-6 items-center justify-center rounded border focus-visible:ring-1 disabled:opacity-40";
 
-  const versions = versionList?.versions ?? [];
   const changedDot = (
     <span aria-label="Changed" className="bg-accent h-1.5 w-1.5 shrink-0 rounded-full" />
   );
@@ -1036,24 +898,14 @@ export function ArtifactsPanel(props: {
       </span>
     </SelectItem>
   );
-  const artifactItems = (
-    <>
-      {artifactGroupEntries.map(entryItem)}
-      {deletedPaths.map((path) => (
-        <SelectItem key={path} value={pickerValue("artifact", path)} className="text-xs">
-          <span className="flex min-w-0 items-center gap-2">
-            <span className="min-w-0 truncate">{path}</span>
-            <span className="text-muted shrink-0">deleted</span>
-          </span>
-        </SelectItem>
-      ))}
-    </>
-  );
+  const artifactItems = artifactGroupEntries.map(entryItem);
 
-  // Toolbar layout follows the brainstorm demo: picker | version | fullscreen | reload. Pinned
-  // files have no versions; their slot holds the unpin action instead.
+  // Toolbar layout follows the brainstorm demo: picker | pin | fullscreen | reload. Pinned files
+  // and shelf copies hold their unpin action in the pin slot instead.
   const artbar = (
     <div className="border-border-light bg-sidebar flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
+      {/* In a wide window, fullscreen can sit under the left sidebar's toggle bar. */}
+      {showFullscreen && <ToolbarSpacer />}
       <ArtifactPickerSelect
         value={selected ? pickerValue(selected.scope, selected.path) : ""}
         onToggleOtherFiles={() => setOtherFilesExpanded(!otherFilesExpanded)}
@@ -1086,7 +938,7 @@ export function ArtifactsPanel(props: {
                   ))}
                 </SelectGroup>
               )}
-              {(artifactGroupEntries.length > 0 || deletedPaths.length > 0) && (
+              {artifactGroupEntries.length > 0 && (
                 <SelectGroup>
                   <SelectLabel>Artifacts</SelectLabel>
                   {artifactItems}
@@ -1145,21 +997,15 @@ export function ArtifactsPanel(props: {
         <TooltipIfPresent tooltip="Artifacts changed since you looked">
           <span
             aria-label={`${changedPaths.size} changed`}
-            className="text-accent counter-nums flex shrink-0 items-center gap-1 text-[11px]"
+            className="text-accent-text counter-nums flex shrink-0 items-center gap-1 text-[11px]"
           >
             <span className="bg-accent h-1.5 w-1.5 rounded-full" />
             {changedPaths.size}
           </span>
         </TooltipIfPresent>
       )}
-      {selected?.scope === "artifact" && versions.length > 0 && (
-        <ArtifactVersionMenu
-          versions={versions}
-          selectedVersion={selected.version}
-          onSelect={(version) => {
-            setActionError(null);
-            setSelection({ scope: "artifact", path: selected.path, version });
-          }}
+      {selected?.scope === "artifact" && (
+        <ArtifactPinMenu
           projectShelfAvailable={shelf?.project.available === true}
           onPin={pinToShelf}
         />
@@ -1225,7 +1071,7 @@ export function ArtifactsPanel(props: {
             aria-label={annotating ? "Stop annotating" : "Annotate"}
             aria-pressed={annotating}
             onClick={toggleAnnotate}
-            className={`${toolbarButtonClassName} ${annotating ? "text-accent border-accent" : ""}`}
+            className={`${toolbarButtonClassName} ${annotating ? "text-accent-text border-accent" : ""}`}
           >
             {annotating ? (
               <MessageSquareOff className="h-3.5 w-3.5" />
@@ -1276,10 +1122,6 @@ export function ArtifactsPanel(props: {
     </div>
   );
 
-  // Stored versions live in the host session dir: they stay viewable when listing the live
-  // folder fails (runtime unreachable, container gone).
-  const storedVersionSelected = selected?.scope === "artifact" && selected.version != null;
-
   const annotateHint = annotating ? (
     <div className="text-muted border-border-light border-b px-3 py-1 text-[11px]">
       {annotateSupport === "frame"
@@ -1310,16 +1152,12 @@ export function ArtifactsPanel(props: {
     );
 
   let body: React.ReactNode;
-  if (
-    listError != null &&
-    (listing == null || (selected == null && !waitingForPinned)) &&
-    !storedVersionSelected
-  ) {
+  if (listError != null && (listing == null || (selected == null && !waitingForPinned))) {
     // Only with nothing on screen: a failed re-list (a backend still starting after a reconnect)
     // keeps the last listing, and the error line below sits beside the artifact instead. With
     // nothing selected, "No artifacts yet" would present the failed refresh as an empty folder.
     body = <div className="text-danger p-4 text-xs">{listError}</div>;
-  } else if (listing == null && !storedVersionSelected) {
+  } else if (listing == null) {
     body = <div className="text-muted p-4 text-xs">Loading…</div>;
   } else if (listing != null && selected == null && !waitingForPinned && !listing.available) {
     body = <div className="text-muted p-4 text-xs leading-relaxed">{listing.reason}</div>;
@@ -1366,23 +1204,21 @@ export function ArtifactsPanel(props: {
       ref={panelRef}
       tabIndex={0}
       onKeyDown={handleKeyDown}
-      // Same element and children in both modes, so fullscreen never remounts the viewer.
-      // z-[1500] matches the shared Dialog layer, so portaled menus and tooltips stay above it.
+      // Same element and children in both modes, so fullscreen never remounts the viewer. The
+      // pinned layers are in pinnedViewClass; portaled menus and tooltips stay above them.
       // The ring is an overlay: the sidebar clips anything drawn outside the panel, and an inset
       // ring on the panel itself is hidden under the toolbar's and viewer's backgrounds.
       className={cn(
         "after:ring-accent flex flex-col outline-none after:pointer-events-none after:absolute after:inset-0 after:z-10 after:hidden after:ring-1 after:ring-inset focus-visible:after:block data-[shortcut-focus=true]:after:block",
-        showFullscreen
-          ? "bg-background ios-standalone:top-px fixed inset-0 z-[1500]"
-          : "relative h-full min-h-0"
+        showFullscreen ? pinnedViewClass(coversWindow) : "relative h-full min-h-0"
       )}
       data-shortcut-focus={shortcutFocused || undefined}
       onBlur={(e) => {
         // Only the panel's own blur: focus moving into a toolbar button shows that button's ring.
         if (e.target === e.currentTarget) setShortcutFocused(false);
       }}
-      role={showFullscreen ? "dialog" : undefined}
-      aria-modal={showFullscreen ? true : undefined}
+      // A modal dialog over the window, or a region over the workspace shell.
+      {...(showFullscreen ? pinnedViewRole(coversWindow) : {})}
       aria-label={showFullscreen && selected != null ? `Artifact ${selected.path}` : undefined}
       data-testid="artifacts-panel"
     >

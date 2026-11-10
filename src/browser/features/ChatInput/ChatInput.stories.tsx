@@ -11,8 +11,13 @@ import {
   blurActiveElement,
   waitForChatInputAutofocusDone,
 } from "@/browser/stories/storyPlayHelpers.js";
-import { expect, within, userEvent, waitFor } from "@storybook/test";
+import { expect, within, userEvent, waitFor } from "storybook/test";
+import { wrapAsyncIterator } from "@orpc/shared";
+import type { ProviderConfigInfo } from "@/common/orpc/types";
+import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
+import type { ThemeMode } from "@/browser/contexts/ThemeContext";
+import { textContrasts } from "@/browser/stories/helpers/contrast";
 
 // `max-w-chat` (--container-chat: 48rem) in px, the cap the centered transcript and composer columns share.
 const CENTERED_COLUMN_MAX_WIDTH_PX = 768;
@@ -43,6 +48,53 @@ export const VoiceInputNoApiKey: AppStory = {
           "Shows the voice input button in disabled state when OpenAI API key is not configured. Hover over the mic icon in the chat input to see the user education tooltip.",
       },
     },
+  },
+};
+
+// Set by VoiceInputEnvApiKey's mock client; its play calls it to drop the key mid-story.
+let leaveOnlyCodexOauth: (() => void) | undefined;
+
+/**
+ * Transcription resolves OpenAI keys from env vars and key files too, so those enable the mic.
+ * Codex OAuth alone cannot transcribe, so once only OAuth is left the mic is disabled again even
+ * though the provider still reports isConfigured.
+ */
+export const VoiceInputEnvApiKey: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        let openai: ProviderConfigInfo = {
+          apiKeySet: false,
+          apiKeySource: "env",
+          isEnabled: true,
+          isConfigured: true,
+        };
+        const client = setupSimpleChatStory({ workspaceId: "ws-voice-env-key", messages: [] });
+        const changes = createAsyncMessageQueue<void>();
+        client.providers.getConfig = () => Promise.resolve({ openai });
+        client.providers.onConfigChanged = () =>
+          Promise.resolve(wrapAsyncIterator(changes.iterate(), {}));
+        leaveOnlyCodexOauth = () => {
+          // What providerService.getConfig reports for OpenAI with only Codex OAuth tokens.
+          openai = { apiKeySet: false, codexOauthSet: true, isEnabled: true, isConfigured: true };
+          changes.push();
+        };
+        return client;
+      }}
+    />
+  ),
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const canvas = within(storyRoot);
+    const mic = await canvas.findByRole("button", { name: /^Voice input/ });
+    await waitFor(() => expect(mic).toHaveAccessibleName("Voice input"));
+    await expect(mic).toBeEnabled();
+
+    if (!leaveOnlyCodexOauth) throw new Error("mock client was not set up");
+    leaveOnlyCodexOauth();
+    await waitFor(() => expect(mic).toHaveAccessibleName("Voice input (not configured)"));
+    await expect(mic).toBeDisabled();
   },
 };
 
@@ -385,6 +437,41 @@ export const QueuedFollowUp: AppStory = {
   },
 };
 
+/**
+ * The tinted (`bg-muted/10`) action buttons on queued and held inputs reach WCAG AA (4.5:1).
+ * They used `--color-secondary`, which was 4.49:1 on the light dock (#6453).
+ */
+const queuedButtonContrastStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: QueuedFollowUp.render,
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const buttons = await waitFor(() => {
+      const status = [
+        ...storyRoot.querySelectorAll<HTMLElement>('[data-component="QueuedMessageStatus"]'),
+      ];
+      const sends = [
+        ...storyRoot.querySelectorAll<HTMLElement>('[data-component="HeldInputBanner"]'),
+      ].flatMap((banner) => within(banner).queryAllByRole("button", { name: /^Send/ }));
+      const found = [...status, ...sends];
+      // One queued status button and the three held inputs' Send buttons, at least.
+      if (found.length < 4) throw new Error(`expected 4+ action buttons, found ${found.length}`);
+      return found;
+    });
+    const failing = buttons
+      .flatMap((button) => textContrasts(button))
+      // Shortcut hints are their own `text-muted` chips, not the tinted button's label.
+      .filter((entry) => !entry.element.closest("kbd"))
+      .filter((entry) => entry.ratio < 4.5)
+      .map((entry) => `${entry.ratio.toFixed(2)}:1 "${entry.text}"`);
+    await expect(failing.join("\n")).toBe("");
+  },
+});
+
+export const QueuedButtonsContrastLight = queuedButtonContrastStory("light");
+export const QueuedButtonsContrastDark = queuedButtonContrastStory("dark");
+
 export const FocusedComposer: AppStory = {
   render: () => (
     <AppWithMocks
@@ -550,9 +637,9 @@ export const ThinkingSelectorUltrafast: AppStory = {
     viewport: { value: "mobile1", isRotated: false },
   },
   render: () => (
-    // min() keeps the test-runner's desktop window at the tightest row while Pixel's
-    // phone viewport (narrower than 400px) still sets the real width.
-    <div data-testid="composer-width-wrapper" style={{ width: "min(400px, 100%)", height: 700 }}>
+    // 380px puts the row at its tightest stage both in the test-runner's desktop window and in
+    // Pixel's 390px phone viewport; min() yields to narrower viewports.
+    <div data-testid="composer-width-wrapper" style={{ width: "min(380px, 100%)", height: 700 }}>
       <AppWithMocks
         setup={() => {
           collapseLeftSidebar();
@@ -736,7 +823,7 @@ export const NarrowControlRowCollapse: AppStory = {
       }
     };
 
-    await resizeRowInto(400, 300, 341);
+    await resizeRowInto(380, 300, 341);
     await waitFor(() => {
       if (agentTrigger.innerText.trim() !== "") {
         throw new Error(`Agent pill should be icon-only, showing "${agentTrigger.innerText}"`);
@@ -753,7 +840,7 @@ export const NarrowControlRowCollapse: AppStory = {
       assertNoOverflow("tightest");
     });
 
-    await resizeRowInto(425, 344, 359);
+    await resizeRowInto(405, 344, 359);
     await waitFor(() => {
       if (agentTrigger.innerText.trim() !== "") {
         throw new Error(
@@ -767,7 +854,7 @@ export const NarrowControlRowCollapse: AppStory = {
 
     // Phone-width workspace rows land here. The agent label does not fit alongside the context pill
     // yet, so it must stay hidden rather than clip, and the model name must keep its own room.
-    await resizeRowInto(474, 365, 445);
+    await resizeRowInto(454, 365, 445);
     await waitFor(() => {
       if (agentTrigger.innerText.trim() !== "") {
         throw new Error(
@@ -788,7 +875,7 @@ export const NarrowControlRowCollapse: AppStory = {
       }
     });
 
-    await resizeRowInto(544, 455, 495);
+    await resizeRowInto(524, 455, 495);
     await waitFor(() => {
       if (agentTrigger.innerText.trim() === "") {
         throw new Error("Agent pill should show its label once the row clears 450px");
@@ -804,7 +891,7 @@ export const NarrowControlRowCollapse: AppStory = {
       assertNoOverflow("agent-label-returns");
     });
 
-    await resizeRowInto(640, 505, 1200);
+    await resizeRowInto(620, 505, 1200);
     await waitFor(() => {
       if (!/^\d+%$/.test(contextTrigger.innerText.trim())) {
         throw new Error(
@@ -1012,7 +1099,8 @@ const DOCK_ALIGNMENT_MESSAGES = [
   }),
 ];
 
-// Renders a ChatInputDecoration, so the assertions cover a decoration and not only the composer.
+// Renders a chip in the composer's live line, so the assertions cover the line and not only the
+// composer.
 const DOCK_ALIGNMENT_BACKGROUND_PROCESS = {
   id: "bash_1",
   pid: 4242,
@@ -1053,9 +1141,9 @@ async function assertDockSurfacesMatchTranscript(
     surfaces.push([label, element]);
   };
   addSurface("composer", '[data-component="ChatInputSurface"]');
-  // The background-process decoration can mount after the composer autofocuses.
+  // The background-process chip can mount after the composer autofocuses.
   await waitFor(() =>
-    addSurface("decoration", '[data-component="ChatInputDecorationStack"] button')
+    addSurface("activity line", '[data-component="ChatActivityLine"]:has([data-activity-chip])')
   );
   const wrapped = storyRoot.querySelectorAll<HTMLElement>('[data-component="ChatDockSurface"]');
   if (wrapped.length === 0) throw new Error("No ChatDockSurface-wrapped entry rendered");

@@ -8,8 +8,9 @@ import {
   mcp,
   workspace,
 } from "./api";
+import { OnChatEventSchema } from "./stream";
 import { MCP_ICON_LIMITS } from "../../constants/mcpIcon";
-import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from "../types";
+import type { ProviderConfigInfo, ProvidersConfigMap } from "../types";
 
 /**
  * Schema conformance tests for provider types.
@@ -23,7 +24,7 @@ import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from
  */
 describe("ProviderConfigInfoSchema conformance", () => {
   it("preserves all AWSCredentialStatus fields", () => {
-    const full: AWSCredentialStatus = {
+    const full: ProviderConfigInfo["aws"] = {
       region: "us-east-1",
       profile: "my-sso-profile",
       bearerTokenSet: true,
@@ -87,20 +88,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
     expect(parsed.aws).toEqual(full.aws);
   });
 
-  it("preserves all ProviderConfigInfo fields (with couponCodeSet)", () => {
-    const full: ProviderConfigInfo = {
-      apiKeySet: true,
-      isEnabled: true,
-      isConfigured: true,
-      couponCodeSet: true,
-    };
-
-    const parsed = ProviderConfigInfoSchema.parse(full);
-
-    expect(parsed).toEqual(full);
-    expect(parsed.couponCodeSet).toBe(true);
-  });
-
   it("preserves all ProviderConfigInfo fields (full object with all optional fields)", () => {
     // This is the most comprehensive test - includes ALL possible fields
     const full: ProviderConfigInfo = {
@@ -129,7 +116,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
         accessKeyIdSet: true,
         secretAccessKeySet: true,
       },
-      couponCodeSet: true,
     };
 
     const parsed = ProviderConfigInfoSchema.parse(full);
@@ -156,7 +142,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
     expect(parsed.codexOauthSet).toBe(full.codexOauthSet);
     expect(parsed.codexOauthDefaultAuth).toBe(full.codexOauthDefaultAuth);
     expect(parsed.aws).toEqual(full.aws);
-    expect(parsed.couponCodeSet).toBe(full.couponCodeSet);
   });
 
   it("preserves ProvidersConfigMap with multiple providers", () => {
@@ -188,13 +173,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
           accessKeyIdSet: true,
           secretAccessKeySet: true,
         },
-      },
-      "mux-gateway": {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: false,
-        couponCodeSet: true,
-        models: ["anthropic/claude-sonnet-4-5"],
       },
     };
 
@@ -335,5 +313,26 @@ describe("agentPlugins.setComponents schema", () => {
           .expectedImportedComponents
       ).toEqual(expectedImportedComponents);
     }
+  });
+});
+
+// #5102: only onChat sends `message-batch`, so only its event schema admits one.
+describe("message-batch is onChat-only", () => {
+  const row = {
+    type: "message",
+    id: "m1",
+    role: "user",
+    parts: [],
+    metadata: { historySequence: 1 },
+  };
+  const batch = { type: "message-batch", messages: [row] };
+
+  it("the onChat event schema admits a batch", () => {
+    expect(OnChatEventSchema.safeParse(batch).success).toBe(true);
+  });
+
+  it("getFullReplay's output admits the row but refuses the batch", () => {
+    expect(workspace.getFullReplay.output.safeParse([row]).success).toBe(true);
+    expect(workspace.getFullReplay.output.safeParse([batch]).success).toBe(false);
   });
 });

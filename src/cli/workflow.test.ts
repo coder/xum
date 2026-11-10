@@ -5,6 +5,7 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { nodeVersionWarning } from "./nodeVersion";
 import { parseWorkflowArgs } from "./workflow";
 
 const BUN_EXECUTABLE = process.execPath;
@@ -119,8 +120,14 @@ describe("xum workflow CLI helpers", () => {
       .nothrow()
       .quiet();
 
-    expect(result.exitCode).toBe(0);
     const output = result.stdout.toString() + result.stderr.toString();
+    // #6735: the child once exited 133 (SIGTRAP: a V8 fatal error) in CI. On a failure, show its
+    // exit code with the stderr tail, where V8 prints the reason, so the failure explains itself.
+    const failure =
+      result.exitCode === 0
+        ? ""
+        : `exit ${result.exitCode}\n${result.stderr.toString().slice(-4000)}`;
+    expect(failure).toBe("");
     const scopeClosedAt = output.indexOf("[shutdown] AppFiberScope closed");
     const terminateAllAt = output.indexOf("BackgroundProcessManager.terminateAll() called");
     const runtimeDisposedAt = output.indexOf("[shutdown] AppRuntime disposed");
@@ -179,6 +186,49 @@ describe("xum workflow CLI helpers", () => {
     );
   });
 
+  test("CLI stops the config.json watches when the workflow setup fails", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-setup-failure");
+    const repo = path.join(tmp.path, "repo");
+    const muxRoot = path.join(tmp.path, "mux-root");
+    await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
+    await fs.mkdir(muxRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(repo, "workflows", "echo.js"),
+      `export default function workflow() { return { reportMarkdown: "should not run" }; }
+`,
+      "utf-8"
+    );
+    await trustProject(muxRoot, repo);
+    // The preload fails the setup after the services subscribed to config changes, which
+    // opens the watches, and reports each stop of a watch.
+    const srcDir = path.resolve(import.meta.dir, "..");
+    const preload = path.join(tmp.path, "fail-setup.ts");
+    await fs.writeFile(
+      preload,
+      `import { AgentSession } from ${JSON.stringify(path.join(srcDir, "node/services/agentSession"))};
+import { Config } from ${JSON.stringify(path.join(srcDir, "node/config"))};
+const stop = Config.prototype.stopWatchingConfigFile;
+Config.prototype.stopWatchingConfigFile = function (this: Config) {
+  process.stderr.write("config watches stopped\\n");
+  stop.call(this);
+};
+AgentSession.prototype.ensureMetadata = () => Promise.reject(new Error("setup failed on purpose"));
+`,
+      "utf-8"
+    );
+
+    const result =
+      await Bun.$`${BUN_EXECUTABLE} --preload ${preload} ${WORKFLOW_ENTRY} run ./workflows/echo.js --dir ${repo}`
+        .env({ ...process.env, MUX_ROOT: muxRoot })
+        .nothrow()
+        .quiet();
+
+    const stderr = result.stderr.toString();
+    expect(result.exitCode).not.toBe(0);
+    expect(stderr).toContain("setup failed on purpose");
+    expect(stderr).toContain("config watches stopped");
+  });
+
   // Each model source resolves to a distinct, key-independent failure code, so the
   // reported code identifies which source won: nothing → no-model; an unknown
   // provider → unsupported-provider; an explicit gateway prefix → unsupported-route.
@@ -223,7 +273,7 @@ describe("xum workflow CLI helpers", () => {
     await seedEvaluationDefault(muxRoot, "nope:settings-model");
     expect((await probe()).stdout).toContain("evaluation failed: unsupported/unsupported-provider");
 
-    expect((await probe("--evaluation-model", "mux-gateway:openai:gpt-5")).stdout).toContain(
+    expect((await probe("--evaluation-model", "openrouter:openai/gpt-5")).stdout).toContain(
       "evaluation failed: unsupported/unsupported-route"
     );
 
@@ -231,7 +281,7 @@ describe("xum workflow CLI helpers", () => {
       (
         await probe(
           "--evaluation-model",
-          "mux-gateway:openai:gpt-5",
+          "openrouter:openai/gpt-5",
           "--args-json",
           '{"model":"nope:per-call"}'
         )
@@ -407,7 +457,13 @@ describe("xum workflow CLI helpers", () => {
       stdinProc.exited,
     ]);
     expect(stdinExitCode).toBe(0);
-    expect(stdinStderr).toBe("");
+    // The CLI warns on stderr when the host Node is a release affected by CVE-2026-111497, so the
+    // only stderr this run may print is the warning for the Node this test spawned.
+    const hostNodeVersions = JSON.parse(
+      await Bun.$`node -p ${"JSON.stringify(process.versions)"}`.text()
+    ) as Record<string, string | undefined>;
+    const hostNodeWarning = nodeVersionWarning(hostNodeVersions);
+    expect(stdinStderr).toBe(hostNodeWarning === undefined ? "" : `${hostNodeWarning}\n`);
     const stdinEvent = JSON.parse(stdinStdout.trim()) as unknown;
     expect(stdinEvent).toMatchObject({
       type: "result",

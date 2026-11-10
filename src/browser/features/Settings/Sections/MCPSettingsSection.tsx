@@ -1,6 +1,7 @@
 import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
 import { publishGlobalMcpEnablementChanged } from "@/browser/utils/workspaceMcpMutations";
 import {
+  McpAppViewDomainsLoadError,
   McpAppViewDomainsSection,
   unlistedMcpAppViewDomains,
   useMcpAppViewDomains,
@@ -62,6 +63,8 @@ import {
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu/KebabMenu";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
+import { createOAuthFlowId } from "@/browser/utils/oauth/flowId";
 
 /** Expand/collapse header shared by the editable and read-only tool sections. */
 const ToolsDisclosureButton: React.FC<{
@@ -252,14 +255,6 @@ const PluginToolListSection: React.FC<{ tools: string[]; testedAt: number }> = (
 
 type MCPOAuthLoginStatus = "idle" | "starting" | "waiting" | "completing" | "success" | "error";
 
-interface MCPOAuthAuthStatus {
-  serverUrl?: string;
-  isLoggedIn: boolean;
-  hasRefreshToken: boolean;
-  scope?: string;
-  updatedAtMs?: number;
-}
-
 type MCPOAuthAPI = NonNullable<ReturnType<typeof useAPI>["api"]>["mcpOauth"];
 
 /**
@@ -424,19 +419,25 @@ function useMCPOAuthLogin(input: {
         return;
       }
 
+      // Generated here and stored before the start RPC: the start can stall on discovery, and
+      // Cancel must reach the flow meanwhile (the backend refuses a flow cancelled while it
+      // was starting) (#6565).
+      const startFlowId = createOAuthFlowId();
+      setFlowId(startFlowId);
       setLoginStatus("starting");
 
       const startResult =
         loginFlowMode === "desktop"
-          ? await mcpOauthApi.startDesktopFlow({ serverName, pendingServer })
-          : await mcpOauthApi.startServerFlow({ serverName, pendingServer });
+          ? await mcpOauthApi.startDesktopFlow({ serverName, pendingServer, flowId: startFlowId })
+          : await mcpOauthApi.startServerFlow({ serverName, pendingServer, flowId: startFlowId });
 
       if (attempt !== loginAttemptRef.current) {
+        // A newer attempt replaced this one; Cancel is idempotent if it already ran.
         if (startResult.success) {
           if (loginFlowMode === "desktop") {
-            void mcpOauthApi.cancelDesktopFlow({ flowId: startResult.data.flowId });
+            void mcpOauthApi.cancelDesktopFlow({ flowId: startFlowId });
           } else {
-            void mcpOauthApi.cancelServerFlow({ flowId: startResult.data.flowId });
+            void mcpOauthApi.cancelServerFlow({ flowId: startFlowId });
           }
         }
         return;
@@ -636,12 +637,47 @@ const MCPOAuthRequiredCallout: React.FC<{
   return <MCPOAuthRequiredCalloutView login={login} disabledReason={props.disabledReason} />;
 };
 
+/**
+ * A sign-in prompt after the server refused a tool call with 403 `insufficient_scope` (#6622).
+ * The tokens stay, so tools that need less keep working. The scopes are sanitized names.
+ */
+const InsufficientScopePrompt: React.FC<{ status: MCPOAuthAuthStatus | null }> = (props) => {
+  // The backend reports scopes only while the server is signed in.
+  const scopes = props.status?.insufficientScopes;
+  if (scopes === undefined) return null;
+  const named = scopes.length > 0 ? `: ${scopes.join(" ")}` : "";
+  return (
+    <p role="status" className="text-warning mt-1 text-xs break-words">
+      This server refused a tool call and asks for more permissions{named}. Choose Re-login and
+      grant them on the sign-in page.
+    </p>
+  );
+};
+
+/** Recorded insufficient_scope prompts per credential key: a count that makes each one new. */
+type InsufficientScopeTicks = Readonly<Record<string, number>>;
+
+/**
+ * This row's own count. A prompt for another key leaves it unchanged, so that row does not
+ * read its status again.
+ */
+function ownScopeTickOf(
+  ticks: InsufficientScopeTicks | undefined,
+  status: MCPOAuthAuthStatus | null
+): number | undefined {
+  const key = status?.serverUrl;
+  if (ticks === undefined || key === undefined) return undefined;
+  return ticks[key];
+}
+
 const RemoteMCPOAuthSection: React.FC<{
   serverName: string;
   transport: Exclude<MCPServerTransport, "stdio">;
   url: string;
   oauthRefreshNonce?: number;
-}> = ({ serverName, transport, url, oauthRefreshNonce }) => {
+  /** Recorded insufficient_scope prompts (#6739): this row re-reads on its own key's. */
+  scopeTicks?: InsufficientScopeTicks;
+}> = ({ serverName, transport, url, oauthRefreshNonce, scopeTicks }) => {
   const { api } = useAPI();
   const isDesktop = !!window.api;
 
@@ -675,9 +711,12 @@ const RemoteMCPOAuthSection: React.FC<{
     }
   }, [api, url, serverName]);
 
+  // getAuthStatus returns the credential key as `serverUrl`; a row that has not loaded yet reads
+  // the prompt on its first load.
+  const ownScopeTick = ownScopeTickOf(scopeTicks, authStatus);
   useEffect(() => {
     void refreshAuthStatus();
-  }, [refreshAuthStatus, transport, url, oauthRefreshNonce]);
+  }, [refreshAuthStatus, transport, url, oauthRefreshNonce, ownScopeTick]);
 
   const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = useMCPOAuthLogin({
     isDesktop,
@@ -746,84 +785,87 @@ const RemoteMCPOAuthSection: React.FC<{
   }, [api, cancelLogin, refreshAuthStatus, url]);
 
   return (
-    <div className="mt-1 flex items-center justify-between gap-2">
-      <div className="flex min-w-0 items-center gap-2 text-xs">
-        <span className="text-foreground font-medium">OAuth</span>
-        <span className="text-content-secondary truncate">
-          {authStatusText}
-          {updatedAtText}
-        </span>
+    <div>
+      <div className="mt-1 flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2 text-xs">
+          <span className="text-foreground font-medium">OAuth</span>
+          <span className="text-content-secondary truncate">
+            {authStatusText}
+            {updatedAtText}
+          </span>
 
-        {oauthDebugErrors.length > 0 && (
-          <details className="group inline-block">
-            <summary className="text-content-secondary hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
-              Details
-            </summary>
-            <div className="border-border-medium bg-background-secondary mt-1 space-y-1 rounded-md border px-2 py-1 text-xs">
-              {oauthDebugErrors.map((entry) => (
-                <div key={entry.label} className="text-destructive break-words">
-                  <span className="font-medium">{entry.label}:</span> {entry.message}
-                </div>
-              ))}
-            </div>
-          </details>
-        )}
-      </div>
-
-      {oauthActionsAvailable && (
-        <div className="flex shrink-0 items-center gap-1">
-          {loginInProgress ? (
-            <>
-              <Button variant="outline" size="sm" className="h-7 px-2" disabled>
-                <Loader2 className="h-3 w-3 animate-spin" />
-                {isLoggedIn ? "Re-login" : "Login"}
-              </Button>
-
-              <Button variant="ghost" size="sm" className="h-7 px-2" onClick={cancelLogin}>
-                Cancel
-              </Button>
-            </>
-          ) : isLoggedIn ? (
-            <>
-              {logoutInProgress && <Loader2 className="text-muted h-3 w-3 animate-spin" />}
-              <KebabMenu
-                className="h-7 w-7 px-0 text-xs"
-                items={
-                  [
-                    {
-                      label: reloginMenuLabel,
-                      onClick: () => {
-                        void startLogin();
-                      },
-                      disabled: logoutInProgress,
-                    },
-                    {
-                      label: logoutInProgress ? "Logging out..." : "Logout",
-                      onClick: () => {
-                        void logout();
-                      },
-                      disabled: logoutInProgress,
-                    },
-                  ] satisfies KebabMenuItem[]
-                }
-              />
-            </>
-          ) : (
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 px-2"
-              onClick={() => {
-                void startLogin();
-              }}
-              disabled={logoutInProgress}
-            >
-              <LogIn />
-              {loginButtonLabel}
-            </Button>
+          {oauthDebugErrors.length > 0 && (
+            <details className="group inline-block">
+              <summary className="text-content-secondary hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
+                Details
+              </summary>
+              <div className="border-border-medium bg-background-secondary mt-1 space-y-1 rounded-md border px-2 py-1 text-xs">
+                {oauthDebugErrors.map((entry) => (
+                  <div key={entry.label} className="text-destructive break-words">
+                    <span className="font-medium">{entry.label}:</span> {entry.message}
+                  </div>
+                ))}
+              </div>
+            </details>
           )}
         </div>
-      )}
+
+        {oauthActionsAvailable && (
+          <div className="flex shrink-0 items-center gap-1">
+            {loginInProgress ? (
+              <>
+                <Button variant="outline" size="sm" className="h-7 px-2" disabled>
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  {isLoggedIn ? "Re-login" : "Login"}
+                </Button>
+
+                <Button variant="ghost" size="sm" className="h-7 px-2" onClick={cancelLogin}>
+                  Cancel
+                </Button>
+              </>
+            ) : isLoggedIn ? (
+              <>
+                {logoutInProgress && <Loader2 className="text-muted h-3 w-3 animate-spin" />}
+                <KebabMenu
+                  className="h-7 w-7 px-0 text-xs"
+                  items={
+                    [
+                      {
+                        label: reloginMenuLabel,
+                        onClick: () => {
+                          void startLogin();
+                        },
+                        disabled: logoutInProgress,
+                      },
+                      {
+                        label: logoutInProgress ? "Logging out..." : "Logout",
+                        onClick: () => {
+                          void logout();
+                        },
+                        disabled: logoutInProgress,
+                      },
+                    ] satisfies KebabMenuItem[]
+                  }
+                />
+              </>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2"
+                onClick={() => {
+                  void startLogin();
+                }}
+                disabled={logoutInProgress}
+              >
+                <LogIn />
+                {loginButtonLabel}
+              </Button>
+            )}
+          </div>
+        )}
+      </div>
+      <InsufficientScopePrompt status={authStatus} />
     </div>
   );
 };
@@ -840,8 +882,8 @@ function ToolSearchSetting() {
       description={
         <>
           Defer MCP tool definitions until the model discovers them with{" "}
-          <code className="text-accent">tool_catalog_search</code>. With Anthropic prompt caching,
-          uses Anthropic&apos;s native deferred loading, which keeps the cache intact.
+          <code className="text-accent-text">tool_catalog_search</code>. With Anthropic prompt
+          caching, uses Anthropic&apos;s native deferred loading, which keeps the cache intact.
         </>
       }
       ariaLabel="Toggle MCP tool search"
@@ -851,6 +893,69 @@ function ToolSearchSetting() {
       saveErrorMessage="Failed to update tool search"
     />
   );
+}
+
+/**
+ * Runs onChange with the credential key of each recorded insufficient_scope prompt (#6739). A plain function because
+ * React Compiler cannot lower `for await` inside a component. The caller's cleanup must
+ * `return()` the iterator, so the backend subscription releases its listener.
+ */
+async function forEachInsufficientScope(
+  api: NonNullable<ReturnType<typeof useAPI>["api"]>,
+  signal: AbortSignal,
+  onIterator: (iterator: AsyncIterator<unknown>) => void,
+  onChange: (key: string) => void
+): Promise<void> {
+  try {
+    const subscribed = await api.mcpOauth.onInsufficientScope(undefined, { signal });
+    if (signal.aborted) {
+      void subscribed.return?.();
+      return;
+    }
+    onIterator(subscribed);
+    for await (const key of subscribed) {
+      if (signal.aborted) break;
+      onChange(key);
+    }
+  } catch {
+    // Cancelled through the abort signal on cleanup.
+  }
+}
+
+/** The recorded insufficient_scope prompts, counted per credential key. */
+function useInsufficientScopeTick(api: ReturnType<typeof useAPI>["api"]) {
+  const [ticks, setTicks] = useState<InsufficientScopeTicks>({});
+  useInsufficientScopeTicks(api, (key) =>
+    setTicks((last) => ({ ...last, [key]: (last[key] ?? 0) + 1 }))
+  );
+  return ticks;
+}
+
+/** Calls onTick with the key each time the backend records an insufficient_scope prompt (#6739). */
+function useInsufficientScopeTicks(
+  api: ReturnType<typeof useAPI>["api"],
+  onTick: (key: string) => void
+) {
+  // The subscription calls the latest callback.
+  const onTickRef = useRef(onTick);
+  onTickRef.current = onTick;
+  useEffect(() => {
+    if (!api) return;
+    const abortController = new AbortController();
+    let iterator: AsyncIterator<unknown> | null = null;
+    void forEachInsufficientScope(
+      api,
+      abortController.signal,
+      (subscribed) => {
+        iterator = subscribed;
+      },
+      (key) => onTickRef.current(key)
+    );
+    return () => {
+      abortController.abort();
+      void iterator?.return?.();
+    };
+  }, [api]);
 }
 
 export const MCPSettingsSection: React.FC = () => {
@@ -882,6 +987,10 @@ export const MCPSettingsSection: React.FC = () => {
     Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
   >({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
+  // A refused tool call records a sign-in prompt in the backend only: re-read the mounted rows'
+  // auth status when one does (#6739).
+  // One tick per prompt, carrying its credential key: only that server's row re-reads its status.
+  const scopeTicks = useInsufficientScopeTick(api);
   const viewDomains = useMcpAppViewDomains();
 
   interface EditableServer {
@@ -1309,9 +1418,9 @@ export const MCPSettingsSection: React.FC = () => {
       <div>
         <p className="text-content-secondary mb-4 text-xs">
           Configure global MCP servers. Global config lives in{" "}
-          <code className="text-accent">~/.xum/mcp.jsonc</code>, with optional repo overrides in{" "}
-          <code className="text-accent">./.xum/mcp.jsonc</code> and workspace overrides in{" "}
-          <code className="text-accent">.xum/mcp.local.jsonc</code>.
+          <code className="text-accent-text">~/.xum/mcp.jsonc</code>, with optional repo overrides
+          in <code className="text-accent-text">./.xum/mcp.jsonc</code> and workspace overrides in{" "}
+          <code className="text-accent-text">.xum/mcp.local.jsonc</code>.
         </p>
       </div>
 
@@ -1410,7 +1519,7 @@ export const MCPSettingsSection: React.FC = () => {
                         {cached?.result.success && !isEditing && isEnabled && (
                           <Tooltip>
                             <TooltipTrigger asChild>
-                              <span className="rounded bg-green-500/10 px-1.5 py-0.5 text-xs text-green-500">
+                              <span className="text-success-text rounded bg-green-500/10 px-1.5 py-0.5 text-xs">
                                 {cached.result.tools.length} tools
                               </span>
                             </TooltipTrigger>
@@ -1484,7 +1593,7 @@ export const MCPSettingsSection: React.FC = () => {
                                     editUrlError !== null ||
                                     editHeadersValidation.errors.length > 0
                                   }
-                                  className="h-7 w-7 text-green-500 hover:text-green-400"
+                                  className="text-success-text h-7 w-7"
                                   aria-label="Save"
                                 >
                                   {savingEdit ? (
@@ -1525,7 +1634,7 @@ export const MCPSettingsSection: React.FC = () => {
                                   size="icon"
                                   onClick={() => void handleTest(name)}
                                   disabled={isTesting}
-                                  className="text-muted hover:text-accent h-7 w-7"
+                                  className="text-muted hover:text-accent-text h-7 w-7"
                                   aria-label="Test connection"
                                 >
                                   {isTesting ? (
@@ -1548,7 +1657,7 @@ export const MCPSettingsSection: React.FC = () => {
                                       variant="ghost"
                                       size="icon"
                                       onClick={() => handleStartEdit(name, entry)}
-                                      className="text-muted hover:text-accent h-7 w-7"
+                                      className="text-muted hover:text-accent-text h-7 w-7"
                                       aria-label="Edit server"
                                     >
                                       <Pencil className="h-4 w-4" />
@@ -1588,6 +1697,7 @@ export const MCPSettingsSection: React.FC = () => {
                           transport={remoteEntry.transport}
                           url={remoteEntry.url}
                           oauthRefreshNonce={mcpOauthRefreshNonce}
+                          scopeTicks={scopeTicks}
                         />
                       </div>
                     )}
@@ -1659,10 +1769,12 @@ export const MCPSettingsSection: React.FC = () => {
           showServer
           error={viewDomains.revokeError}
         />
+        <McpAppViewDomainsLoadError error={viewDomains.loadError} onRetry={viewDomains.retry} />
 
         {/* Add server form */}
         <details className="group mt-3">
-          <summary className="text-accent hover:text-accent/80 flex cursor-pointer list-none items-center gap-1 text-sm font-medium">
+          {/* Hover underlines instead of fading: 80% accent text fell below 4.5:1 on the dialog (#5946). */}
+          <summary className="text-accent-text flex cursor-pointer list-none items-center gap-1 text-sm font-medium hover:underline">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" />
             Add server
           </summary>
@@ -1759,7 +1871,7 @@ export const MCPSettingsSection: React.FC = () => {
                 className={cn(
                   "flex items-start gap-2 rounded-md px-3 py-2 text-sm",
                   newTestResult.result.success
-                    ? "bg-green-500/10 text-green-500"
+                    ? "bg-green-500/10 text-success-text"
                     : "bg-destructive/10 text-destructive"
                 )}
               >

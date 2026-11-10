@@ -7,6 +7,8 @@ import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from 
 import type { GoalBoardSnapshot } from "@/common/types/goal";
 import type { MCPSettingValue, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
+import type { AgentResourceLimitsState } from "@/common/orpc/schemas/agentResourceLimits";
+import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
 import type { ExperimentId } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
@@ -17,9 +19,9 @@ import type {
   ArtifactListing,
   ArtifactReadResult,
   ArtifactShelfListing,
-  ArtifactVersion,
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
+import { EMPTY_BACKUP_PLUGIN_REPORT, type BackupPluginReport } from "@/common/orpc/schemas/backup";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { McpAppToolCallResult, McpAppView } from "@/common/orpc/schemas/mcpApps";
 import type { APIClient } from "@/browser/contexts/API";
@@ -39,11 +41,6 @@ import type {
   WorkspaceActivitySnapshot,
 } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/node/config";
-import {
-  DEFAULT_LAYOUT_PRESETS_CONFIG,
-  normalizeLayoutPresetsConfig,
-  type LayoutPresetsConfig,
-} from "@/common/types/uiLayouts";
 import type {
   ModelCatalogSearchInput,
   WorkspaceChatMessage,
@@ -61,11 +58,14 @@ import type { NameGenerationError } from "@/common/types/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/common/types/mcp";
 import type {
+  AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceListing,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
   AgentPluginHooks,
+  AgentPluginPendingSignOuts,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { ChatStats } from "@/common/types/chatStats";
@@ -153,21 +153,41 @@ type MockBackupData<Route extends Exclude<MockBackupRoute, "getSettings">> = Ext
   MockBackupRouteOutput<Route>,
   { success: true }
 >["data"];
+/** A fixture may leave out the plugin report: the mock then reports a backup with no plugin list. */
+type MockBackupFixture<Route extends "preview" | "restore"> = Omit<
+  MockBackupData<Route>,
+  "plugins"
+> & { plugins?: BackupPluginReport };
 type MockBackupSettings = NonNullable<MockBackupRouteOutput<"getSettings">>;
 
 export interface MockORPCClientOptions {
-  /** Layout presets config for Settings → Layouts stories */
-  layoutPresets?: LayoutPresetsConfig;
   /** Agent Plugin installer mock data (Settings → Plugins). */
   agentPlugins?: {
     items?: AgentPluginListItem[];
     updateChecks?: AgentPluginUpdateCheck[];
     /** Returned by agentPlugins.preview; omit to make preview fail. */
     preview?: AgentPluginInstallPreview;
+    /** The error agentPlugins.preview returns when it fails. */
+    previewError?: string;
+    /** Returned by agentPlugins.preview for an "Install as" method; others get `preview`. */
+    previewsByMethod?: Partial<Record<AgentPluginInstallMethod["kind"], AgentPluginInstallPreview>>;
+    /** Returned by agentPlugins.preview without a method: a Claude Code marketplace listing. */
+    marketplace?: AgentPluginMarketplaceListing;
+    /** Returned by agentPlugins.preview for a marketplace entry, by entry name. */
+    previewsByEntry?: Record<string, AgentPluginInstallPreview>;
     /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
     hooks?: Record<string, AgentPluginHooks>;
+    /** Returned by agentPlugins.containerLocation; defaults to `~/.mux/plugins`. */
+    containerLocation?: string;
+    /** Returned by agentPlugins.pendingSignOuts; omit for no record. */
+    pendingSignOuts?: AgentPluginPendingSignOuts;
+    /**
+     * Returned by agentPlugins.previewComponentReview for the named plugin. Confirming clears the
+     * plugin's reviewRequiredCount in `items`, like the backend does.
+     */
+    componentReview?: AgentPluginUpdateReview;
   };
   projects?: Map<string, ProjectConfig>;
   workspaces?: FrontendWorkspaceMetadata[];
@@ -203,6 +223,8 @@ export interface MockORPCClientOptions {
   heartbeatDefaultIntervalMs?: number;
   /** Initial global goal defaults for config.getConfig */
   goalDefaults?: GoalDefaults;
+  /** Agent resource limits and their status (Settings → Agents); off when omitted. */
+  agentResourceLimits?: AgentResourceLimitsState;
   /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
   autoModelRouting?: AutoModelRoutingConfig;
   /**
@@ -223,18 +245,12 @@ export interface MockORPCClientOptions {
   memoryConsolidationStatus?: MemoryConsolidationStatusPayload;
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
-  /**
-   * Artifacts tab: listing for artifacts.list and read results keyed by relative path. The
-   * mock's artifact id is the path, so version contents are keyed by `${path}@${version}`.
-   */
+  /** Artifacts tab: listing for artifacts.list and read results keyed by relative path. */
   artifacts?: {
     listing: ArtifactListing;
     files: Record<string, ArtifactReadResult>;
     /** artifacts.capabilities answer; omitted means unknown (null). */
     agentBrowserAvailable?: boolean | null;
-    /** Stored versions per artifact path, newest first. */
-    versions?: Record<string, ArtifactVersion[]>;
-    versionFiles?: Record<string, ArtifactReadResult>;
     pinned?: PinnedArtifactFile[];
     pinnedFiles?: Record<string, ArtifactReadResult>;
     /** Shelf (M5c) listing and read results keyed by `${scope}:${name}`. */
@@ -242,11 +258,19 @@ export interface MockORPCClientOptions {
     shelfFiles?: Record<string, ArtifactReadResult>;
     /** Persisted window.xum.state per artifact path (artifacts.getState); default null. */
     states?: Record<string, unknown>;
+    /** When set, artifacts.sendInteraction fails with this error (the strip's error state). */
+    sendInteractionError?: string;
+    /** Gets every artifacts.setState call (window.xum.setState reached the host). */
+    onSetState?: (input: { path: string; state: unknown }) => void;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
+  /** When set, mcpApps.listViewDomains fails with this error (Settings' load error). */
+  mcpAppViewDomainsListError?: string;
   mcpApps?: {
     views: Record<string, McpAppView>;
     callTool?: (input: { toolName: string; consented: boolean }) => McpAppToolCallResult;
+    /** When set, every approveViewDomains call fails with this error. */
+    approveViewDomainsError?: string;
   };
   /** Initial updater status for update.onStatus (About dialog stories). */
   updateStatus?: UpdateStatus;
@@ -330,12 +354,43 @@ export interface MockORPCClientOptions {
   mcpSettingsConnected?: Set<string>;
   /** Every mcp.settings.read call's server names, in order (stories assert batching). */
   mcpSettingsReads?: string[][];
+  /** Records the workspace of each settings read (the order of mcpSettingsReads). */
+  mcpSettingsReadWorkspaces?: string[];
   /** Servers whose settings read fails with this message. */
   mcpSettingsReadErrors?: Map<string, string>;
-  /** When set, settings updates wait for this promise (stories hold a save in flight). */
-  mcpSettingsUpdateGate?: { promise: Promise<void> };
+  /**
+   * When set, settings updates wait for this promise (stories hold a save in flight). A list
+   * holds each update on its own gate, in call order.
+   */
+  mcpSettingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
+  /**
+   * Per server: the snapshot the server shows after its next update (the update's values are
+   * merged in). Stories use it for a schema that changes with the values.
+   */
+  mcpSettingsAfterUpdate?: Map<string, MCPSettingsSnapshot>;
   /** When set, the first settings read takes its values, then waits for this promise. */
   mcpSettingsFirstReadGate?: { promise: Promise<void> };
+  /**
+   * Per server: the snapshot its first read returns, instead of `mcpSettings` (a catalog the
+   * server changed after the dialog read it). Runs and opens check `mcpSettings`, like the
+   * backend's refreshed catalog: a tool without `readOnly` there needs `confirmed`.
+   */
+  mcpSettingsStaleFirstRead?: Map<string, MCPSettingsSnapshot>;
+  /**
+   * Records every settings tool action run or app open. A run returns "<tool> finished"; an app
+   * opens the view `settings:<server>:<tool>` (`ui://<server>/<tool>`) of `mcpApps.views`.
+   */
+  mcpSettingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
+  /** When set, the first settings tool run waits for this promise (a run held in flight). */
+  mcpSettingsToolRunGate?: { promise: Promise<void> };
+  /** Per tool name: the setting values a run of it writes on the server (a reset, an import). */
+  mcpSettingsToolRunSets?: Map<string, Record<string, MCPSettingValue>>;
+  /** Tools whose runs report an MCP error (`isError`) after they wrote their values. */
+  mcpSettingsToolRunErrors?: Set<string>;
+  /** Tools whose runs fail (a disconnect after the dispatch) after they wrote their values. */
+  mcpSettingsToolRunFailures?: Set<string>;
+  /** Servers that restart after their first settings read: later reads have a new instanceToken. */
+  mcpSettingsRestartAfterFirstRead?: Set<string>;
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
   mcpTestGate?: { promise: Promise<void> };
   /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
@@ -394,9 +449,9 @@ export interface MockORPCClientOptions {
   };
   backupSettings?: MockBackupSettings | null;
   backupValidation?: MockBackupData<"validate">;
-  backupPreview?: MockBackupData<"preview">;
+  backupPreview?: MockBackupFixture<"preview">;
   backupPush?: MockBackupData<"push">;
-  backupRestore?: MockBackupData<"restore">;
+  backupRestore?: MockBackupFixture<"restore">;
   /** Per-workspace runtime statuses for RuntimeStatusStore stories */
   runtimeStatuses?: Map<string, "running" | "stopped" | "unknown" | "unsupported">;
 }
@@ -422,6 +477,11 @@ interface MockMcpOverrides {
 type MockMcpTestResult =
   | { success: true; tools: string[]; serverInfo?: MCPServerIdentity; icon?: string }
   | { success: false; error: string };
+
+// Backend commit revisions of the mock's view-domain approvals, shared by every mock client: the
+// renderer's approval store outlives a story and keeps the list with the newest revision
+// (mcpAppViewDomainsStore.ts). Not time-based, since .storybook/preview.tsx freezes Date.
+let mockViewDomainsRevision = 0;
 
 /**
  * Creates a mock ORPC client for Storybook.
@@ -478,9 +538,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettings,
     mcpSettingsConnected = new Set<string>(),
     mcpSettingsReads,
+    mcpSettingsReadWorkspaces,
     mcpSettingsReadErrors,
     mcpSettingsUpdateGate,
+    mcpSettingsAfterUpdate,
     mcpSettingsFirstReadGate,
+    mcpSettingsStaleFirstRead,
+    mcpSettingsToolRuns,
+    mcpSettingsToolRunGate,
+    mcpSettingsToolRunSets,
+    mcpSettingsToolRunErrors,
+    mcpSettingsToolRunFailures,
+    mcpSettingsRestartAfterFirstRead,
     mcpTestGate,
     mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
@@ -497,6 +566,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     heartbeatDefaultPrompt: initialHeartbeatDefaultPrompt,
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
+    agentResourceLimits: initialAgentResourceLimits,
     autoModelRouting: initialAutoModelRouting,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
     timelineEvents = [],
@@ -524,7 +594,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderTemplatesResult,
     coderPresetsResult = new Map<string, CoderListPresetsResult>(),
     coderWorkspacesResult,
-    layoutPresets: initialLayoutPresets,
     agentSkills = [],
     invalidAgentSkills = [],
     unavailableAgentSkillSources = [],
@@ -591,6 +660,21 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   let createdWorkspaceCounter = 0;
   let mcpSettingsReadCount = 0;
+  /** Servers read once already: a server in mcpSettingsRestartAfterFirstRead restarts after it. */
+  const readSettingsServers = new Set<string>();
+  const readToken = (serverName: string) => {
+    const restarted =
+      mcpSettingsRestartAfterFirstRead?.has(serverName) === true &&
+      readSettingsServers.has(serverName);
+    readSettingsServers.add(serverName);
+    return restarted ? `mock-instance-2:${serverName}` : mockSettingsToken(serverName);
+  };
+  /** A settings tool action writes its mcpSettingsToolRunSets values on the server. */
+  const applyMockSettingsToolRunSet = (input: { serverName: string; toolName: string }) => {
+    const stored = mcpSettings?.get(input.serverName);
+    const set = mcpSettingsToolRunSets?.get(input.toolName);
+    if (stored !== undefined && set !== undefined) stored.values = { ...stored.values, ...set };
+  };
 
   const agentDefinitions: AgentDefinitionDescriptor[] =
     initialAgentDefinitions ??
@@ -645,8 +729,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   let agentAiDefaults = normalizeAgentAiDefaults(initialAgentAiDefaults ?? {});
 
-  let muxGatewayEnabled: boolean | undefined = undefined;
-  let muxGatewayModels: string[] | undefined = undefined;
   let coderWorkspaceArchiveBehavior = initialCoderWorkspaceArchiveBehavior;
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
@@ -667,6 +749,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let defaultRuntime: RuntimeEnablementId | null = initialDefaultRuntime ?? null;
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
+  let agentResourceLimitsState =
+    initialAgentResourceLimits ?? mockAgentResourceLimitsState(false, {});
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
   let autoModelRouting = normalizeAutoModelRoutingConfig(initialAutoModelRouting);
   let routePriority = [...initialRoutePriority];
@@ -678,6 +762,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     }
   };
   let globalSecretsState: Secret[] = [...globalSecrets];
+  // signOutPluginServers deletes the pending sign-out record, as the backend does.
+  let pluginSignOutsCleared = false;
   const getInjectedGlobalSecretKeys = (projectPath: string): string[] => {
     const normalizedProjectPath = projectPath.trim();
     if (!normalizedProjectPath) {
@@ -733,15 +819,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     empty: false,
     credential: "gh",
   };
-  const backupPreviewResult: MockBackupData<"preview"> = backupPreview ?? {
-    pushChanges: [],
-    restoreChanges: [],
-    localOnlyFiles: [],
-    redactions: [],
-    commandApprovals: [],
-    projectImports: [],
-    projectBundleSkipped: false,
-    pushError: null,
+  const backupPreviewResult: MockBackupData<"preview"> = {
+    plugins: EMPTY_BACKUP_PLUGIN_REPORT,
+    ...(backupPreview ?? {
+      pushChanges: [],
+      restoreChanges: [],
+      localOnlyFiles: [],
+      redactions: [],
+      commandApprovals: [],
+      projectImports: [],
+      projectBundleSkipped: false,
+      pushError: null,
+    }),
   };
   const backupPushResult: MockBackupData<"push"> = backupPush ?? {
     commit: "abc1234",
@@ -749,17 +838,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     credential: backupValidationResult.credential,
     redactions: [],
   };
-  const backupRestoreResult: MockBackupData<"restore"> = backupRestore ?? {
-    commit: "def5678",
-    snapshotPath: "/tmp/mux-backup-snapshot",
-    changedFiles: [],
-    localOnlyFiles: [],
-    projectImportResults: [],
-    projectBundleSkipped: false,
-    unapprovedProjectImports: [],
+  const backupRestoreResult: MockBackupData<"restore"> = {
+    plugins: EMPTY_BACKUP_PLUGIN_REPORT,
+    ...(backupRestore ?? {
+      commit: "def5678",
+      snapshotPath: "/tmp/mux-backup-snapshot",
+      changedFiles: [],
+      localOnlyFiles: [],
+      projectImportResults: [],
+      projectBundleSkipped: false,
+      unapprovedProjectImports: [],
+    }),
   };
-
-  let layoutPresets = initialLayoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
 
   const mockStats: ChatStats = {
     consumers: [],
@@ -869,18 +959,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       restore: (_input: Parameters<APIClient["backup"]["restore"]>[0]) =>
         Promise.resolve({ success: true as const, data: backupRestoreResult }),
     },
-    // Settings → Layouts (layout presets)
-    // Stored in-memory for Storybook only.
-    // Frontend code normalizes the response defensively, but we normalize here too so
-    // stories remain stable even if they mutate the config.
     drafts: createMockDraftsApi(),
-    uiLayouts: {
-      getAll: () => Promise.resolve(layoutPresets),
-      saveAll: (input: { layoutPresets: unknown }) => {
-        layoutPresets = normalizeLayoutPresetsConfig(input.layoutPresets);
-        return Promise.resolve(undefined);
-      },
-    },
     experiments: {
       set: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => {
         experiments = { ...experiments, [input.experimentId]: input.enabled === true };
@@ -893,8 +972,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         Promise.resolve({
           userPreferences,
           taskSettings,
-          muxGatewayEnabled,
-          muxGatewayModels,
           routePriority,
           routeOverrides,
           coderWorkspaceArchiveBehavior,
@@ -992,15 +1069,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             ...(chosen.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
           },
         });
-      },
-      updateMuxGatewayPrefs: (input: {
-        muxGatewayEnabled: boolean;
-        muxGatewayModels: string[];
-      }) => {
-        muxGatewayEnabled = input.muxGatewayEnabled ? undefined : false;
-        muxGatewayModels = input.muxGatewayModels.length > 0 ? input.muxGatewayModels : undefined;
-        notifyConfigChanged();
-        return Promise.resolve(undefined);
       },
       updateRoutePreferences: (input: {
         routePriority: string[];
@@ -1207,16 +1275,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
     },
-    muxGateway: {
-      getAccountStatus: () =>
-        Promise.resolve({
-          success: true,
-          data: {
-            remaining_microdollars: 134_598_127,
-            ai_gateway_concurrent_requests_per_user: 20,
-          },
-        }),
-    },
     analytics: {
       getDelegationSummary: (_input: {
         projectPath?: string | null;
@@ -1313,7 +1371,25 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     },
     agentPlugins: {
       list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
-      containerLocation: () => Promise.resolve("~/.mux/plugins"),
+      containerLocation: () =>
+        Promise.resolve(agentPluginsMock?.containerLocation ?? "~/.mux/plugins"),
+      listForSettings: () =>
+        Promise.resolve({
+          list: { success: true as const, data: agentPluginsMock?.items ?? [] },
+          pendingSignOuts: (pluginSignOutsCleared
+            ? undefined
+            : agentPluginsMock?.pendingSignOuts) ?? { kind: "none" as const },
+        }),
+      pendingSignOuts: () =>
+        Promise.resolve(
+          (pluginSignOutsCleared ? undefined : agentPluginsMock?.pendingSignOuts) ?? {
+            kind: "none" as const,
+          }
+        ),
+      signOutPluginServers: () => {
+        pluginSignOutsCleared = true;
+        return Promise.resolve({ success: true as const });
+      },
       getComponents: () =>
         Promise.resolve({
           success: false,
@@ -1342,15 +1418,46 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           hooks.hooks = hooks.hooks.map((hook) =>
             hook.key === input.key ? { ...hook, review: input.state ?? "new" } : hook
           );
+          // As the backend: the first trust's file review is shown only until a hook is trusted.
+          if (input.state === "trusted") delete hooks.fileReview;
         }
         return Promise.resolve({ success: true as const, data: undefined });
       },
       checkUpdates: () =>
         Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
-      preview: () =>
-        agentPluginsMock?.preview
-          ? Promise.resolve({ success: true, data: agentPluginsMock.preview })
-          : Promise.resolve({ success: false, error: "No preview configured in this story" }),
+      preview: (input: { method?: AgentPluginInstallMethod | null }) => {
+        const method = input.method;
+        if (method == null && agentPluginsMock?.marketplace !== undefined) {
+          return Promise.resolve({
+            success: true as const,
+            data: { kind: "marketplace" as const, marketplace: agentPluginsMock.marketplace },
+          });
+        }
+        const preview =
+          method?.kind === "claude-marketplace"
+            ? agentPluginsMock?.previewsByEntry?.[method.entry]
+            : ((method != null ? agentPluginsMock?.previewsByMethod?.[method.kind] : null) ??
+              agentPluginsMock?.preview);
+        return preview
+          ? Promise.resolve({ success: true as const, data: { kind: "plugin" as const, preview } })
+          : Promise.resolve({
+              success: false as const,
+              error: agentPluginsMock?.previewError ?? "No preview configured in this story",
+            });
+      },
+      // Like the backend's command, from the typed source (the backend normalizes it first).
+      skillsCliCommand: (input: { source: string; skills: string[] }) =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            command: [
+              "cd ~ && npx --yes skills@1.7.4 add",
+              input.source,
+              ...input.skills.map((skill) => `--skill ${skill}`),
+              "--global --agent codex --copy",
+            ].join(" "),
+          },
+        }),
       install: (input: { source: AgentPluginInstallPreview["source"]; expectedSha: string }) =>
         Promise.resolve({
           success: true,
@@ -1369,35 +1476,136 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           : Promise.resolve({ success: false, error: `No update review mock for '${input.name}'` }),
       update: (input: { name: string }) =>
         Promise.resolve({ success: false, error: `No update mock for '${input.name}'` }),
+      previewComponentReview: (input: { name: string }) =>
+        agentPluginsMock?.componentReview?.name === input.name
+          ? Promise.resolve({ success: true, data: agentPluginsMock.componentReview })
+          : Promise.resolve({
+              success: false,
+              error: `No component review mock for '${input.name}'`,
+            }),
+      confirmComponentReview: (input: { name: string; expectedLockedSha: string }) => {
+        const item = agentPluginsMock?.items?.find((entry) => entry.name === input.name);
+        if (item === undefined) {
+          return Promise.resolve({ success: false, error: `No plugin '${input.name}'` });
+        }
+        item.reviewRequiredCount = 0;
+        return Promise.resolve({
+          success: true,
+          data: {
+            entry: {
+              name: item.name,
+              scope: "global" as const,
+              source: item.source ?? {
+                type: "git" as const,
+                url: "",
+                ref: "main",
+                refType: "branch" as const,
+              },
+              lockedSha: input.expectedLockedSha,
+              installedAt: item.installedAt ?? new Date().toISOString(),
+            },
+          },
+        });
+      },
     },
     mcp: {
       settings: {
         // A copy, like IPC: a dialog that keeps an old read must not see later updates.
-        read: async (input: { serverNames: string[]; ifConnected?: boolean }) => {
+        read: async (input: {
+          workspaceId: string;
+          serverNames: string[];
+          ifConnected?: boolean;
+        }) => {
           const first = (mcpSettingsReadCount += 1) === 1;
           mcpSettingsReads?.push(input.serverNames);
+          mcpSettingsReadWorkspaces?.push(input.workspaceId);
           const readOne = (serverName: string) => {
             if (input.ifConnected === true && !mcpSettingsConnected.has(serverName))
               return { success: true, data: { notConnected: true } };
             mcpSettingsConnected.add(serverName);
             const readError = mcpSettingsReadErrors?.get(serverName);
             if (readError !== undefined) return { success: false, error: readError };
-            const snapshot = mcpSettings?.get(serverName);
+            const stale = mcpSettingsStaleFirstRead?.get(serverName);
+            mcpSettingsStaleFirstRead?.delete(serverName);
+            const snapshot = stale ?? mcpSettings?.get(serverName);
             return {
               success: true,
-              data: snapshot === undefined ? null : structuredClone(snapshot),
+              data:
+                snapshot === undefined
+                  ? null
+                  : {
+                      ...structuredClone(snapshot),
+                      instanceToken: readToken(serverName),
+                      readId: `mock-read-${serverName}`,
+                    },
             };
           };
           const result = Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]));
           if (first) await mcpSettingsFirstReadGate?.promise;
           return result;
         },
-        update: async (input: { serverName: string; set: Record<string, MCPSettingValue> }) => {
-          await mcpSettingsUpdateGate?.promise;
-          const snapshot = mcpSettings?.get(input.serverName);
-          if (snapshot === undefined) return { success: false, error: "No settings mock" };
-          snapshot.values = { ...snapshot.values, ...input.set };
-          return { success: true, data: snapshot.values };
+        update: async (input: {
+          serverName: string;
+          set: Record<string, MCPSettingValue>;
+          instanceToken: string;
+        }) => {
+          await (Array.isArray(mcpSettingsUpdateGate)
+            ? mcpSettingsUpdateGate.shift()?.promise
+            : mcpSettingsUpdateGate?.promise);
+          const stored = mcpSettings?.get(input.serverName);
+          if (stored === undefined) return { success: false, error: "No settings mock" };
+          if (input.instanceToken !== mockSettingsToken(input.serverName))
+            return { success: false, error: "The server was replaced. Reopen the dialog." };
+          const after = mcpSettingsAfterUpdate?.get(input.serverName);
+          mcpSettingsAfterUpdate?.delete(input.serverName);
+          const snapshot = after === undefined ? stored : structuredClone(after);
+          snapshot.values = { ...stored.values, ...snapshot.values, ...input.set };
+          mcpSettings?.set(input.serverName, snapshot);
+          return {
+            success: true,
+            data: {
+              ...structuredClone(snapshot),
+              instanceToken: mockSettingsToken(input.serverName),
+              readId: `mock-read-${input.serverName}`,
+            },
+          };
+        },
+        openApp: (input: { serverName: string; toolName: string; confirmed: boolean }) => {
+          const refusal = mockSettingsToolRefusal(mcpSettings, input);
+          if (refusal !== null) return Promise.resolve({ success: false, error: refusal });
+          mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
+          applyMockSettingsToolRunSet(input);
+          // The backend titles the view with the action's display name.
+          const action = mockSettingsToolItem(mcpSettings, input);
+          return Promise.resolve({
+            success: true,
+            data: {
+              viewKey: `settings:${input.serverName}:${input.toolName}`,
+              serverName: input.serverName,
+              // A plugin server's label, as the backend gives one (it differs from the key).
+              serverLabel: `cad-plugin · ${input.serverName}`,
+              toolName: input.toolName,
+              title: action?.action?.title ?? input.toolName,
+              resourceUri: `ui://${input.serverName}/${input.toolName}`,
+            },
+          });
+        },
+        runTool: async (input: { serverName: string; toolName: string; confirmed: boolean }) => {
+          const refusal = mockSettingsToolRefusal(mcpSettings, input);
+          if (refusal !== null) return { success: false, error: refusal };
+          const gated = mcpSettingsToolRuns?.length === 0 ? mcpSettingsToolRunGate : undefined;
+          mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
+          await gated?.promise;
+          applyMockSettingsToolRunSet(input);
+          if (mcpSettingsToolRunFailures?.has(input.toolName) === true)
+            return { success: false, error: `${input.toolName} disconnected` };
+          return {
+            success: true,
+            data: {
+              text: `${input.toolName} finished`,
+              isError: mcpSettingsToolRunErrors?.has(input.toolName) === true,
+            },
+          };
         },
       },
       list: (input?: { projectPath?: string }) => {
@@ -1479,6 +1687,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
     mcpOauth: {
+      onInsufficientScope: async function* (): AsyncGenerator<string> {
+        // Stories record no prompts at runtime.
+      },
       getAuthStatus: (input: { serverUrl: string }) => {
         const status = mcpOauthAuthStatus.get(input.serverUrl);
         return Promise.resolve(
@@ -2134,6 +2345,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       getSessionUsage: (input: { workspaceId: string }) =>
         Promise.resolve(sessionUsage.get(input.workspaceId)),
+      getSubagentUsage: () => Promise.resolve({ children: {} }),
       getSessionUsageBatch: (input: { workspaceIds: string[] }) => {
         const result: Record<string, MockSessionUsage | undefined> = {};
         for (const id of input.workspaceIds) {
@@ -2367,24 +2579,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       capabilities: () =>
         Promise.resolve({ agentBrowserAvailable: artifacts.agentBrowserAvailable ?? null }),
-      listVersions: (input: { workspaceId: string; path: string }) =>
-        Promise.resolve({
-          success: true as const,
-          data: {
-            artifactId: input.path,
-            path: input.path,
-            pin: null,
-            versions: artifacts.versions?.[input.path] ?? [],
-          },
-        }),
-      readVersion: (input: { workspaceId: string; artifactId: string; version: number }) => {
-        const file = artifacts.versionFiles?.[`${input.artifactId}@${input.version}`];
-        return Promise.resolve(
-          file
-            ? { success: true as const, data: file }
-            : { success: false as const, error: `Version not found: v${input.version}` }
-        );
-      },
       listPinned: () =>
         Promise.resolve({
           success: true as const,
@@ -2417,24 +2611,39 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             : { success: false as const, error: `Shelf entry not found: ${input.name}` }
         );
       },
-      pinToShelf: (input: { artifactId: string }) =>
-        Promise.resolve({ success: true as const, data: { name: input.artifactId } }),
+      pinToShelf: (input: { path: string }) =>
+        Promise.resolve({ success: true as const, data: { name: input.path } }),
       unpinShelf: () => Promise.resolve({ success: true as const, data: undefined }),
       getState: (input: { workspaceId: string; path: string }) =>
         Promise.resolve({
           success: true as const,
           data: { state: artifacts.states?.[input.path] ?? null },
         }),
-      setState: () => Promise.resolve({ success: true as const, data: undefined }),
+      setState: (input: { path: string; state: unknown }) => {
+        artifacts.onSetState?.({ path: input.path, state: input.state });
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       sendInteraction: () =>
-        Promise.resolve({ success: true as const, data: { id: "story-interaction" } }),
+        Promise.resolve(
+          artifacts.sendInteractionError != null
+            ? { success: false as const, error: artifacts.sendInteractionError }
+            : { success: true as const, data: { id: "story-interaction" } }
+        ),
     },
     mcpApps: {
       getView: (input: { toolCallId: string }) => {
         const view = mcpApps?.views[input.toolCallId];
         return Promise.resolve(
           view
-            ? { success: true as const, data: view }
+            ? {
+                success: true as const,
+                // Read now, like the backend: newer than every approval published so far.
+                data: {
+                  ...view,
+                  approvedDomainsRevision:
+                    view.approvedDomainsRevision ?? ++mockViewDomainsRevision,
+                },
+              }
             : { success: false as const, error: `No view for ${input.toolCallId}` }
         );
       },
@@ -2445,6 +2654,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         serverName: string;
         origins: string[];
       }) => {
+        if (mcpApps?.approveViewDomainsError != null) {
+          return Promise.resolve({
+            success: false as const,
+            error: mcpApps.approveViewDomainsError,
+          });
+        }
         const view = mcpApps?.views[input.toolCallId];
         const entry = {
           projectPath: view?.approvalProjectPath ?? "",
@@ -2458,13 +2673,22 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         mockViewDomains.set(key, entry);
         return Promise.resolve({
           success: true as const,
-          data: { approvedDomains: entry.origins },
+          data: { approvedDomains: entry.origins, revision: ++mockViewDomainsRevision },
         });
       },
-      listViewDomains: () => Promise.resolve([...mockViewDomains.values()]),
+      setWidgetState: () => Promise.resolve({ success: true as const, data: {} }),
+      listViewDomains: () =>
+        options.mcpAppViewDomainsListError != null
+          ? Promise.reject(new Error(options.mcpAppViewDomainsListError))
+          : Promise.resolve([...mockViewDomains.values()]),
+      readViewDomains: () =>
+        Promise.resolve({
+          revision: ++mockViewDomainsRevision,
+          approvals: [...mockViewDomains.values()],
+        }),
       revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
         mockViewDomains.delete(JSON.stringify([input.projectPath, input.serverName]));
-        return Promise.resolve();
+        return Promise.resolve({ revision: ++mockViewDomainsRevision });
       },
       // Story views are always in the story transcript, so no record lookup finds one.
       getViewRecords: (input: { toolCallIds: string[] }) =>
@@ -2480,6 +2704,45 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             reason: `Unknown tool: ${input.toolName}`,
           },
         }),
+    },
+    agentResourceLimits: {
+      get: () => Promise.resolve(agentResourceLimitsState),
+      set: (limits: AgentResourceLimits) => {
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          agentResourceLimitsState.enabled,
+          limits,
+          agentResourceLimitsState.projects
+        );
+        return Promise.resolve(agentResourceLimitsState);
+      },
+      setEnabled: ({ enabled }: { enabled: boolean }) => {
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          enabled,
+          agentResourceLimitsState.limits,
+          agentResourceLimitsState.projects
+        );
+        return Promise.resolve(agentResourceLimitsState);
+      },
+      setProject: ({
+        projectPath,
+        limits,
+      }: {
+        projectPath: string;
+        limits: AgentResourceLimits;
+      }) => {
+        const projects = { ...agentResourceLimitsState.projects };
+        if (limits.cpuCores === undefined && limits.memoryGiB === undefined) {
+          delete projects[projectPath];
+        } else {
+          projects[projectPath] = { limits };
+        }
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          agentResourceLimitsState.enabled,
+          agentResourceLimitsState.limits,
+          projects
+        );
+        return Promise.resolve(agentResourceLimitsState);
+      },
     },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by
     // the `memoryFiles` option; mutations update the in-memory set so
@@ -2545,4 +2808,56 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
   } as unknown as APIClient;
+}
+
+function mockAgentResourceLimitsState(
+  enabled: boolean,
+  limits: AgentResourceLimits,
+  savedProjects: AgentResourceLimitsState["projects"] = {}
+): AgentResourceLimitsState {
+  const limited =
+    enabled &&
+    (limits.cpuCores !== undefined ||
+      limits.memoryGiB !== undefined ||
+      Object.keys(savedProjects).length > 0);
+  // Like the backend: a project's cgroup shows only while the limits are active.
+  const projects: AgentResourceLimitsState["projects"] = {};
+  for (const [projectPath, project] of Object.entries(savedProjects)) {
+    projects[projectPath] = limited
+      ? { limits: project.limits, cgroup: `/xum/xum-agents/p-${projectPath.length}` }
+      : { limits: project.limits };
+  }
+  return {
+    enabled,
+    limits,
+    projects,
+    status: limited ? { state: "active", cgroup: "/xum/xum-agents" } : { state: "off" },
+    support: { state: "ready", cgroup: "/xum" },
+  };
+}
+
+/** The layout tool item of a settings tool action, in the server's current mock settings. */
+function mockSettingsToolItem(
+  settings: Map<string, MCPSettingsSnapshot> | undefined,
+  input: { serverName: string; toolName: string }
+) {
+  for (const group of settings?.get(input.serverName)?.layout ?? [])
+    for (const item of group.items)
+      if (item.kind === "tool" && item.tool === input.toolName) return item;
+  return undefined;
+}
+
+/** The backend's confirmation rule: a tool that is not read-only runs only when confirmed. */
+function mockSettingsToolRefusal(
+  settings: Map<string, MCPSettingsSnapshot> | undefined,
+  input: { serverName: string; toolName: string; confirmed: boolean }
+): string | null {
+  const action = mockSettingsToolItem(settings, input)?.action;
+  if (action === undefined || action.readOnly || input.confirmed) return null;
+  return `'${action.title}' runs only after a confirmation`;
+}
+
+/** The mock's settings servers never restart: one instance token per server name. */
+function mockSettingsToken(serverName: string): string {
+  return `mock-instance:${serverName}`;
 }

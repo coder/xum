@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useCallback } from "react";
 import { useReasoningMode } from "./useReasoningMode";
 import { useThinkingLevel } from "./useThinkingLevel";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
@@ -20,18 +20,14 @@ import {
   useRuntimeOptionDefaults,
   writeSshOptionDefaults,
 } from "@/browser/utils/runtimeOptionDefaults";
-import {
-  updateUserPreferences,
-  useAppConfig,
-  useUserPreferences,
-} from "@/browser/stores/AppConfigStore";
+import { useAppConfig, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { getCreationDraftStore, useCreationDraft } from "@/browser/stores/CreationDraftStore";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 /**
- * Centralized draft workspace settings for project-level persistence
- * All settings persist across navigation and are restored when returning to the same project
+ * A creation draft's workspace settings: its own choices (CreationDraftStore), else defaults.
  */
 export interface DraftWorkspaceSettings {
   // Model & AI settings (synced with global state)
@@ -164,6 +160,13 @@ const mergeRememberedRuntimeConfig = (
   }
 };
 
+/** The default runtime-type button: Coder is an SSH sub-choice. */
+const resolveDefaultRuntimeChoice = (
+  defaultRuntimeMode: RuntimeMode,
+  coderDefaultFromString: boolean
+): RuntimeChoice =>
+  defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString ? "coder" : defaultRuntimeMode;
+
 const normalizeRuntimeChoice = (value: unknown): RuntimeChoice | null => {
   if (
     value === "coder" ||
@@ -205,10 +208,21 @@ const buildRuntimeFromChoice = (choice: RuntimeChoice): ParsedRuntime => {
  * @param recommendedTrunk - Backend-recommended trunk branch
  * @returns Settings object and setters
  */
+/**
+ * The draft owns its choices; project defaults only fill what it has not chosen (undefined or
+ * null).
+ */
+function useDraftChoices(draftId: string) {
+  const draft = useCreationDraft(draftId).draft;
+  const execution = draft?.execution ?? null;
+  return { model: draft?.ai.model, agentId: execution?.agent?.id, execution };
+}
+
 export function useDraftWorkspaceSettings(
   projectPath: string,
   branches: string[],
-  recommendedTrunk: string | null
+  recommendedTrunk: string | null,
+  draftId: string
 ): {
   settings: DraftWorkspaceSettings;
   /** Restores prior Coder selections when re-entering Coder mode. */
@@ -230,12 +244,13 @@ export function useDraftWorkspaceSettings(
   const globalDefaultAgentId =
     useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId) ??
     WORKSPACE_DEFAULTS.agentId;
-  const projectAgentId = useUserPreferences(
-    (preferences) => preferences.ai?.projectDefaults?.[projectPath]?.agentId
-  );
+  const choices = useDraftChoices(draftId);
+  const execution = choices.execution;
+  // Not the project's stored agent: it is a stale leftover nothing writes anymore, and new chats
+  // follow the Settings default agent, matching the picker (scopedAiDefaults).
   const agentId =
-    typeof projectAgentId === "string" && projectAgentId.trim().length > 0
-      ? coerceAgentId(projectAgentId)
+    typeof choices.agentId === "string" && choices.agentId.trim().length > 0
+      ? coerceAgentId(choices.agentId)
       : coerceAgentId(globalDefaultAgentId);
 
   const defaultModelPref = useAppConfig((config) => config.defaultModel) ?? "";
@@ -243,16 +258,33 @@ export function useDraftWorkspaceSettings(
   // gateway routing choices like "openrouter:openai/gpt-5".
   const defaultModel = normalizeSelectedModel(defaultModelPref).trim() || WORKSPACE_DEFAULTS.model;
 
-  // Project-scoped model preference (persisted per project). If unset, fall back to the global
-  // default model preference.
-  const modelOverride = useUserPreferences(
+  const projectModel = useUserPreferences(
     (preferences) => preferences.ai?.projectDefaults?.[projectPath]?.model
   );
+  // An unset draft model shows its project's default, like the model selector (scopedAiDefaults).
+  const modelOverride = choices.model ?? projectModel;
   const model = normalizeSelectedModel(
     typeof modelOverride === "string" && modelOverride.trim().length > 0
       ? modelOverride.trim()
       : defaultModel
   );
+
+  // A stored trunk that is not (or no longer) a branch falls back to the recommendation
+  // without writing it: only an explicit pick goes into the draft.
+  const projectTrunkBranch = useUserPreferences(
+    (preferences) => preferences.workspaceCreation?.byProject?.[projectPath]?.trunkBranch
+  );
+  const storedTrunkBranch = execution?.trunkBranch ?? projectTrunkBranch;
+  const trunkBranch =
+    branches.length > 0 && (!storedTrunkBranch || !branches.includes(storedTrunkBranch))
+      ? (recommendedTrunk ?? branches[0])
+      : (storedTrunkBranch ?? "");
+  const setTrunkBranch = (branch: string) =>
+    getCreationDraftStore().updateExecution(draftId, { trunkBranch: branch || null });
+
+  type LastRuntimeConfigs = RuntimeOptionDefaults;
+
+  const lastRuntimeConfigs = useRuntimeOptionDefaults(projectPath);
 
   const rawGlobalDefaultRuntime = useAppConfig((config) => config.defaultRuntime);
   const globalDefaultRuntime = normalizeRuntimeChoice(rawGlobalDefaultRuntime);
@@ -267,25 +299,6 @@ export function useDraftWorkspaceSettings(
 
   const parsedDefault = buildRuntimeFromChoice(settingsDefaultRuntime);
   const defaultRuntimeMode: RuntimeMode = parsedDefault?.mode ?? RUNTIME_MODE.WORKTREE;
-
-  // A stored trunk that is not (or no longer) a branch falls back to the recommendation
-  // without writing it: only an explicit pick becomes the project preference.
-  const storedTrunkBranch = useUserPreferences(
-    (preferences) => preferences.workspaceCreation?.byProject?.[projectPath]?.trunkBranch
-  );
-  const trunkBranch =
-    branches.length > 0 && (!storedTrunkBranch || !branches.includes(storedTrunkBranch))
-      ? (recommendedTrunk ?? branches[0])
-      : (storedTrunkBranch ?? "");
-  const setTrunkBranch = (branch: string) => {
-    updateUserPreferences({
-      workspaceCreation: { byProject: { [projectPath]: { trunkBranch: branch || null } } },
-    });
-  };
-
-  type LastRuntimeConfigs = RuntimeOptionDefaults;
-
-  const lastRuntimeConfigs = useRuntimeOptionDefaults(projectPath);
 
   const readRuntimeConfigFlag = (
     configs: LastRuntimeConfigs,
@@ -342,12 +355,6 @@ export function useDraftWorkspaceSettings(
 
   const coderDefaultFromString =
     parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host === CODER_RUNTIME_PLACEHOLDER;
-  // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
-  const defaultRuntimeChoice: RuntimeChoice =
-    defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString
-      ? "coder"
-      : defaultRuntimeMode;
-
   const setLastRuntimeConfig = useCallback(
     // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     (mode: RuntimeMode, field: string, value: string | boolean | object | null) => {
@@ -401,43 +408,10 @@ export function useDraftWorkspaceSettings(
       ? parsedDefault.configPath
       : lastDevcontainerConfigPath;
 
-  // Currently selected runtime for this session. Until the user or a Settings change picks
-  // one it follows the defaults (derived below), so options that load after mount apply.
-  const [runtimePick, setSelectedRuntimeState] = useState<ParsedRuntime | null>(null);
-
-  // Project changes remount ChatInput (key includes projectPath), so this effect only handles
-  // live Settings updates to the default runtime while staying on the same project.
-  const appliedDefaultRuntimeChoiceRef = useRef<RuntimeChoice>(settingsDefaultRuntime);
-  useEffect(() => {
-    if (appliedDefaultRuntimeChoiceRef.current === settingsDefaultRuntime) {
-      return;
-    }
-
-    appliedDefaultRuntimeChoiceRef.current = settingsDefaultRuntime;
-    setSelectedRuntimeState(
-      buildRuntimeForMode(
-        defaultRuntimeMode,
-        { host: defaultSshHost, coder: defaultSshCoder },
-        defaultDockerImage,
-        lastShareCredentials,
-        defaultDevcontainerConfigPath,
-        lastDevcontainerShareCredentials
-      )
-    );
-  }, [
-    settingsDefaultRuntime,
-    defaultRuntimeMode,
-    defaultSshHost,
-    defaultDockerImage,
-    lastShareCredentials,
-    defaultSshCoder,
-    defaultDevcontainerConfigPath,
-    lastDevcontainerShareCredentials,
-  ]);
-
-  // The pure default runtime is built after the hook calls above: built before them, React
-  // Compiler left it uncached, so with no pick `selectedRuntime` and `setSelectedRuntime`
-  // changed on every keystroke and re-rendered CreationControls (#5937).
+  // The default runtime and every input it reads (from parsedDefault on) come after the last
+  // value hook: React Compiler assumes buildRuntimeForMode may mutate its inputs, and a
+  // cache spanning a hook is dropped, so with no pick `selectedRuntime` and
+  // `setSelectedRuntime` changed on every keystroke and re-rendered CreationControls (#5937).
   // useDraftWorkspaceSettings.compiler.test.tsx guards their identity.
   // Uses discriminated union: SSH has host, Docker has image.
   const defaultRuntime = buildRuntimeForMode(
@@ -448,7 +422,8 @@ export function useDraftWorkspaceSettings(
     defaultDevcontainerConfigPath,
     lastDevcontainerShareCredentials
   );
-  const selectedRuntime = runtimePick ?? defaultRuntime;
+  // Until the draft holds a pick it follows the defaults, so options that load after mount apply.
+  const selectedRuntime: ParsedRuntime = execution?.runtime ?? defaultRuntime;
 
   const lastSshHost = lastSsh.host;
   const lastSshCoder = lastSsh.coder;
@@ -466,7 +441,7 @@ export function useDraftWorkspaceSettings(
       devcontainerShareCredentials: lastDevcontainerShareCredentials,
     });
 
-    setSelectedRuntimeState(mergedRuntime);
+    getCreationDraftStore().updateExecution(draftId, { runtime: mergedRuntime });
 
     // Persist host/image/coder so they're remembered when switching modes.
     // Avoid wiping the remembered value when the UI switches modes with an empty field.
@@ -510,7 +485,8 @@ export function useDraftWorkspaceSettings(
       reasoningMode,
       agentId,
       selectedRuntime,
-      defaultRuntimeMode: defaultRuntimeChoice,
+      // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
+      defaultRuntimeMode: resolveDefaultRuntimeChoice(defaultRuntimeMode, coderDefaultFromString),
       trunkBranch,
     },
     coderConfigFallback,

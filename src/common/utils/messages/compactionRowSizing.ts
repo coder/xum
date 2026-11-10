@@ -32,7 +32,7 @@ const always = () => true;
 /**
  * SDK and tool media part types whose payload the provider receives as an attachment, each with
  * the shape that makes it one. A tool "media" item becomes an attachment only with the shape
- * extractToolMediaAsUserMessages checks (isMediaPart): any other record typed "media" reaches
+ * extractToolMediaAsUserMessagesFromModelMessages checks (isMediaPart): any other record typed "media" reaches
  * the provider as tool-result JSON, so its text counts as text.
  */
 const MEDIA_RECORD_SHAPES = new Map<string, (record: Record<string, unknown>) => boolean>([

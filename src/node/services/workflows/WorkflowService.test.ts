@@ -1174,6 +1174,52 @@ export default function workflow({ args }) {
     expect(interruptedRunIds).toEqual(["wfr_parent_interrupt", "wfr_child_interrupt"]);
   });
 
+  // #6826 item 3: a plugin:// run recorded before sourceKind existed is still gated at resume:
+  // storedRunSourceKind infers "plugin" from its path.
+  test("a legacy plugin:// run record without sourceKind still passes the stored-run gate", async () => {
+    using tmp = new DisposableTempDir("workflow-service-legacy-plugin-run");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    await runStore.createRun({
+      id: "wfr_legacy_plugin",
+      workspaceId: "workspace-1",
+      workflow: {
+        name: "demo",
+        description: "Demo",
+        scope: "global",
+        sourcePath: "plugin://demo-plugin/run.js",
+        executable: true,
+      },
+      source: "export default function workflow() { return {}; }\n",
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    const gated: Array<{ scriptPath: string; scope: string }> = [];
+    const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      assertStoredPluginWorkflowReviewed: (stored) => {
+        gated.push({ scriptPath: stored.scriptPath, scope: stored.scope });
+        return Promise.reject(new Error("Plugin 'demo-plugin' is no longer installed"));
+      },
+      runnerId: "runner-a",
+    });
+
+    await expect(
+      service.resumeRun({
+        workspaceId: "workspace-1",
+        runId: "wfr_legacy_plugin",
+        projectTrusted: true,
+      })
+    ).rejects.toThrow("no longer installed");
+    expect(gated).toEqual([{ scriptPath: "plugin://demo-plugin/run.js", scope: "global" }]);
+  });
+
   test("listRuns only loads root runs for the requested workspace", async () => {
     using tmp = new DisposableTempDir("workflow-service-list-runs");
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });

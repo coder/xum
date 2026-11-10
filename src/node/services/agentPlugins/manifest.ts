@@ -25,8 +25,13 @@
 export const AGENT_PLUGIN_SCHEMA_ID_1_0_0 =
   "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
+import * as path from "node:path";
+
 // Name grammar shared with the install registry schema (see the module's doc comment).
-import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
+import {
+  isValidAgentPluginName,
+  isValidMarketplaceEntryName,
+} from "@/common/utils/agentPluginName";
 
 export { isValidAgentPluginName };
 
@@ -57,7 +62,11 @@ export interface AgentPluginSlashCommandContribution {
  * chat commands that have no on-disk convention.
  */
 export interface AgentPluginContributes {
-  skills?: string;
+  /**
+   * One skills root, or several (Codex `skills` may be an array: #6121). A list replaces the
+   * default `skills/`, as in Codex. On a duplicate skill name the earlier root wins.
+   */
+  skills?: string | string[];
   mcp?: string;
   agents?: string;
   workflows?: string;
@@ -65,8 +74,13 @@ export interface AgentPluginContributes {
   slashCommands?: AgentPluginSlashCommandContribution[];
 }
 
-const CONTRIBUTES_PATH_KEYS = ["skills", "mcp", "agents", "workflows", "hooks"] as const;
-const CONTRIBUTES_KEYS = new Set<string>([...CONTRIBUTES_PATH_KEYS, "slashCommands"]);
+const CONTRIBUTES_PATH_KEYS = ["mcp", "agents", "workflows", "hooks"] as const;
+const CONTRIBUTES_KEYS = new Set<string>([...CONTRIBUTES_PATH_KEYS, "skills", "slashCommands"]);
+/**
+ * Skills roots read per plugin. Each root costs a realpath and a directory scan in every
+ * discovery, and a 256 KiB manifest can list thousands of them.
+ */
+export const MAX_SKILLS_ROOTS = 16;
 
 /**
  * A contributes path must stay a plain relative path. Realpath containment is
@@ -142,6 +156,51 @@ function parseSlashCommandContributions(
   return commands;
 }
 
+const SKILLS_PATH_RULE =
+  "'contributes.skills' must be a relative path inside the plugin, or a list of them";
+
+/**
+ * `contributes.skills`: one safe path, or a list that keeps its safe, distinct entries. With none
+ * left the default `skills/` applies.
+ */
+function parseSkillsRoots(
+  raw: unknown,
+  warnings: string[]
+): Pick<AgentPluginContributes, "skills"> {
+  if (raw === undefined) return {};
+  if (typeof raw === "string" && isSafeContributesPath(raw)) return { skills: raw };
+  if (!Array.isArray(raw)) {
+    warnings.push(`${SKILLS_PATH_RULE}; ignoring (using the default location)`);
+    return {};
+  }
+  const roots = parseSkillsRootList(raw, warnings);
+  return roots.length > 0 ? { skills: roots } : {};
+}
+
+/**
+ * Up to MAX_SKILLS_ROOTS distinct safe roots, in declared order. Only kept roots count toward the
+ * cap, so repeated or invalid entries cannot push out a later valid root (Codex
+ * PRRT_kwDOPxxmWM6sPFP6). The scan is pure string checks, so a long list costs no I/O, and one
+ * warning reports every ignored entry.
+ */
+function parseSkillsRootList(raw: unknown[], warnings: string[]): string[] {
+  const roots: string[] = [];
+  let invalid = 0;
+  let index = 0;
+  for (; index < raw.length && roots.length < MAX_SKILLS_ROOTS; index++) {
+    const entry = raw[index];
+    if (typeof entry !== "string" || !isSafeContributesPath(entry)) invalid++;
+    else if (!roots.includes(entry)) roots.push(entry);
+  }
+  if (invalid > 0) warnings.push(`${SKILLS_PATH_RULE}; ignoring invalid entries (${invalid})`);
+  if (index < raw.length) {
+    warnings.push(
+      `'contributes.skills' lists more than ${MAX_SKILLS_ROOTS} roots; reading only the first ${MAX_SKILLS_ROOTS}`
+    );
+  }
+  return roots;
+}
+
 function parseContributes(raw: unknown, warnings: string[]): AgentPluginContributes | undefined {
   if (raw === undefined) {
     return undefined;
@@ -173,6 +232,8 @@ function parseContributes(raw: unknown, warnings: string[]): AgentPluginContribu
     contributes[key] = value;
   }
 
+  Object.assign(contributes, parseSkillsRoots(raw.skills, warnings));
+
   if (raw.slashCommands !== undefined) {
     const commands = parseSlashCommandContributions(raw.slashCommands, warnings);
     if (commands !== undefined) {
@@ -200,6 +261,111 @@ export interface AgentPluginManifest {
   extensions?: Record<string, unknown>;
   /** Mux extension: declarative component contributions (see module docs). */
   contributes?: AgentPluginContributes;
+}
+
+/**
+ * SECURITY AUDIT (downgrade): a build that predates `generatedFrom` reads a generated plugin.json
+ * as an ordinary Agent Plugin and fills in the default component paths: hooks.js, agents/,
+ * workflows/, mcp.json or .mcp.json (`contributes`), and hooks/hooks.json (Codex hooks, which an
+ * `extensions["com.openai"].hooks` list replaces). So the generated manifest names each of them
+ * explicitly: `contributes` paths point into `.git`, which no commit can create (git refuses to
+ * track a `.git` path), so they never resolve, and an empty Codex hooks list turns the default
+ * file off. Those builds then load only the skills roots the manifest lists. Builds before
+ * `contributes` existed (#3872, the experimental flag) read only skills/ and mcp.json.
+ */
+export const INERT_COMPONENT_PATH = ".git/xum-generated-no-component";
+
+/** The `contributes` and `extensions["com.openai"]` members that keep older builds inert. */
+export function inertGeneratedComponents(): {
+  contributes: Record<"hooks" | "agents" | "workflows" | "mcp", string>;
+  openai: { hooks: [] };
+} {
+  return {
+    contributes: {
+      hooks: INERT_COMPONENT_PATH,
+      agents: INERT_COMPONENT_PATH,
+      workflows: INERT_COMPONENT_PATH,
+      mcp: INERT_COMPONENT_PATH,
+    },
+    openai: { hooks: [] },
+  };
+}
+
+/**
+ * `extensions.mux.generatedFrom`: Xum wrote this plugin.json for a repository that had none
+ * (installMethods.ts). Update reads it from the installed tree to regenerate with the same
+ * method. `claude-marketplace` names the marketplace entry, and carries the entry's `commands`
+ * paths (a Claude component without a `contributes` member) and the agent file names that its
+ * `agents` lists (ClaudePluginComponents.agentFiles).
+ */
+export type GeneratedFrom =
+  | { kind: "skills" }
+  | { kind: "claude-marketplace"; entry: string; commands?: string[]; agentFiles?: string[] };
+
+function generatedFromValue(manifest: Pick<AgentPluginManifest, "extensions">): unknown {
+  const mux = manifest.extensions?.mux;
+  return isPlainObject(mux) ? mux.generatedFrom : undefined;
+}
+
+/**
+ * True when the manifest carries the marker in any shape. A repository can write the marker
+ * itself, so discovery uses this only to REMOVE capabilities (see discoverPluginAt).
+ */
+export function hasGeneratedFromMarker(manifest: Pick<AgentPluginManifest, "extensions">): boolean {
+  return generatedFromValue(manifest) !== undefined;
+}
+
+/** `commands` of a claude-marketplace marker: normalized safe paths, at most MAX_SKILLS_ROOTS. */
+function isMarkerCommandList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= MAX_SKILLS_ROOTS &&
+    value.every(
+      (item) =>
+        typeof item === "string" &&
+        isSafeContributesPath(item) &&
+        path.posix.normalize(item) === item
+    )
+  );
+}
+
+/**
+ * The marker when its kind is one this build generates, in exactly the shape Xum writes;
+ * undefined for absent, unknown or malformed ones (discovery reads those as skills-only).
+ */
+export function readGeneratedFrom(
+  manifest: Pick<AgentPluginManifest, "extensions">
+): GeneratedFrom | undefined {
+  const value = generatedFromValue(manifest);
+  if (!isPlainObject(value)) return undefined;
+  if (value.kind === "skills") return { kind: "skills" };
+  if (value.kind !== "claude-marketplace") return undefined;
+  if (typeof value.entry !== "string" || !isValidMarketplaceEntryName(value.entry)) {
+    return undefined;
+  }
+  if (value.commands !== undefined && !isMarkerCommandList(value.commands)) return undefined;
+  if (value.agentFiles !== undefined && !isMarkerAgentFileList(value.agentFiles)) return undefined;
+  return {
+    kind: "claude-marketplace",
+    entry: value.entry,
+    ...(value.commands !== undefined ? { commands: value.commands } : {}),
+    ...(value.agentFiles !== undefined ? { agentFiles: value.agentFiles } : {}),
+  };
+}
+
+/** `agentFiles` of a claude-marketplace marker: `.md` file names without a folder. */
+function isMarkerAgentFileList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        typeof item === "string" &&
+        item.endsWith(".md") &&
+        isSafeContributesPath(item) &&
+        !item.includes("/") &&
+        !item.includes("\\")
+    )
+  );
 }
 
 export type PluginManifestValidation =

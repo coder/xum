@@ -792,7 +792,7 @@ export function GeneralSection() {
             <div className="flex-1">
               <div className="text-foreground text-sm">Flat chat list</div>
               <div className="text-muted text-xs">
-                Show all chats in a single list with project badges instead of project folders.
+                Show all chats in a single list with project avatars instead of project folders.
               </div>
             </div>
             <Switch

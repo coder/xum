@@ -502,7 +502,7 @@ index 0000000..def5678
         expandProjects([README_PROJECT_PATH]);
         selectWorkspace(workspace);
 
-        expandRightSidebar();
+        expandRightSidebar(workspaceId);
         return client;
       }}
     />
@@ -866,6 +866,7 @@ export const GitStatusPopover: AppStory = {
 
 // README: docs/img/plan-mermaid.webp
 export const PlanMermaidWithCosts: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() => {
@@ -883,7 +884,7 @@ export const PlanMermaidWithCosts: AppStory = {
 
         expandProjects([README_PROJECT_PATH]);
         selectWorkspace(workspace);
-        expandRightSidebar();
+        expandRightSidebar(workspaceId);
 
         const sessionUsage = new Map([[workspaceId, createMultiModelSessionUsage(1.84)]]);
 
@@ -992,7 +993,7 @@ export const CostsTabRich: AppStory = {
 
         expandProjects([README_PROJECT_PATH]);
         selectWorkspace(workspace);
-        expandRightSidebar();
+        expandRightSidebar(workspaceId);
 
         return createMockORPCClient({
           projects: groupWorkspacesByProject([workspace]),

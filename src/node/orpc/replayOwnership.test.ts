@@ -3,9 +3,9 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { createAgentSessionHarness } from "../services/agentSession.testHarness";
 import { subscribeWorkspaceChat } from "./routerSubscriptions";
-import type { ORPCContext } from "./context";
+import { orpcContextFromDoubles } from "./orpcContextDoubles.testHarness";
 import { createMuxMessage } from "@/common/types/message";
-import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatMode, OnChatEvent } from "@/common/orpc/types";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import type { TurnCoordinator, OperationId } from "../services/turnCoordinator";
 import { Ok } from "@/common/types/result";
@@ -66,9 +66,9 @@ async function setup(
     workspaceId,
     createMuxMessage("seed", "user", "seed")
   );
-  const context = {
+  const context = orpcContextFromDoubles({
     workspaceService: { getOrCreateSession: () => harness.session },
-  } as unknown as ORPCContext;
+  });
   const clients: Array<{ stop: () => Promise<void> }> = [];
   const subscribe = (mode?: OnChatMode) => {
     const abort = new AbortController();
@@ -77,7 +77,7 @@ async function setup(
     const live = Promise.withResolvers<void>();
     const terminal = Promise.withResolvers<void>();
     const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
-    const events: WorkspaceChatMessage[] = [];
+    const events: OnChatEvent[] = [];
     const done = (async () => {
       for await (const event of subscribeWorkspaceChat(
         context,
@@ -213,7 +213,7 @@ test("overlapping replays preserve an existing client's queue and isolate each r
     await a.caught;
     await Promise.all([a.live, b.live]);
     expect(existing.aggregator.getActiveStreams()[0]?.hasQueuedFollowUp).toBe(true);
-    const windows = (events: WorkspaceChatMessage[]) =>
+    const windows = (events: OnChatEvent[]) =>
       events.filter((event) => event.type === "stream-delta").map((event) => event.delta);
     expect(windows(existing.events)).toEqual(["window-0", "live"]);
     expect(windows(a.events)).toEqual(["window-1", "live"]);
@@ -247,9 +247,15 @@ test("an aborted replay cannot publish its delayed window to another subscriber"
   }
 });
 
-// Bun 1.4.2 and 1.4.3: AsyncLocalStorage.disable() hides the store from synchronous code but not
-// from a continuation that resumes after it. Node and Bun 1.3.12 hide it there too, and the
-// product runs on Node, so the release is asserted only where the runtime implements it.
+// AsyncLocalStorage.disable() hides the store from synchronous code on every runtime. A
+// continuation that was already waiting when disable() ran still sees the store on Bun 1.4.2+
+// and on Node 24+ (AsyncContextFrame, the default there, and Electron 44 runs Node 24). Only
+// Bun 1.3.13 and older and Node 22 hide it from that continuation too. Bun 1.4.2 adopted Node
+// 24's semantics, so no upstream fix will lift this gate (checked 2026-10-15).
+// Removal trigger: the probe stops matching the version rule (BUN_KEEPS_RESUMED_STORE_SINCE), so
+// the tripwire in the test fails. If the pinned Bun then hides the resumed store again, make the
+// release assertion unconditional and delete this probe and the tripwire.
+const BUN_KEEPS_RESUMED_STORE_SINCE = "1.4.2";
 async function disableHidesResumedStore(): Promise<boolean> {
   const storage = new AsyncLocalStorage<object>();
   const gate = Promise.withResolvers<void>();
@@ -276,7 +282,13 @@ test("disposing a held replay releases its async context without affecting a sib
     await h.session.dispose();
     h.gates[0].release.resolve();
     const resumedStore = await resumed.promise;
-    if (await disableHidesResumedStore()) expect(resumedStore).toBeUndefined();
+    const hidesResumedStore = await disableHidesResumedStore();
+    // Tripwire: fails loudly when Bun changes disable() semantics, so the gate gets revisited.
+    expect({ bun: Bun.version, hidesResumedStore }).toEqual({
+      bun: Bun.version,
+      hidesResumedStore: Bun.semver.order(Bun.version, BUN_KEEPS_RESUMED_STORE_SINCE) < 0,
+    });
+    if (hidesResumedStore) expect(resumedStore).toBeUndefined();
     await held.caught;
     expect(held.events.some((event) => event.type === "stream-delta")).toBe(false);
     const surviving = sibling.subscribe();
@@ -389,9 +401,9 @@ test("a constructed session reserves an existing engine before a lazy subscripti
   const h = await setup();
   const send = spyOn(h.session, "sendMessage").mockResolvedValue(Ok(undefined));
   try {
-    const context = {
+    const context = orpcContextFromDoubles({
       workspaceService: { getOrCreateSession: () => h.session },
-    } as unknown as ORPCContext;
+    });
     const subscription = subscribeWorkspaceChat(context, { workspaceId: h.workspaceId });
     expect(h.session.isBusy()).toBe(true);
     h.session.queueMessage("manual before first pull");

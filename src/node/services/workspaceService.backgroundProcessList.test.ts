@@ -6,7 +6,6 @@ import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
 import type { BashMonitorWakeReconciler } from "./bashMonitorWakeReconciler";
 import { saveWorkspaces } from "./taskService.testHarness";
-import { waitForCondition } from "./testDispatchHelpers";
 import {
   createWorkspaceServiceHarness,
   type WorkspaceServiceHarness,
@@ -157,12 +156,16 @@ describe("WorkspaceService.listBackgroundProcesses", () => {
     const first = await harness.service.listBackgroundProcesses(workspaceId);
     expect(first.map((row) => row.id)).toEqual(["gone"]);
     spyOn(reconcilerOf(harness), "snapshot").mockRejectedValue(new Error("EIO"));
-    const notify = spyOn(harness.backgroundProcessManager, "notifyMonitorWakeStateChanged");
+    // Await the nudge itself, not a poll with its own deadline: after a process stall
+    // the poll's timer can fire before the overdue 1 s retry timer and time out.
+    const nudged = Promise.withResolvers<string>();
+    spyOn(harness.backgroundProcessManager, "notifyMonitorWakeStateChanged").mockImplementation(
+      (id: string) => nudged.resolve(id)
+    );
 
     expect(await harness.service.listBackgroundProcesses(workspaceId)).toEqual(first);
     // The listing resolved, so only this nudge makes a subscriber read again.
-    await waitForCondition(() => notify.mock.calls.length > 0, { timeoutMs: 3_000 });
-    expect(notify).toHaveBeenCalledWith(workspaceId);
+    expect(await nudged.promise).toBe(workspaceId);
   });
 
   test("a failed pending-wake read with no earlier good read lists only live processes", async () => {

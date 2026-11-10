@@ -4,7 +4,6 @@ import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { useCompactAndRetry } from "@/browser/hooks/useCompactAndRetry";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { cn } from "@/common/lib/utils";
 import { getModelProvider } from "@/common/utils/ai/models";
 import type { DisplayedMessage } from "@/common/types/message";
@@ -99,39 +98,19 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
   // Terminal refusal: distinct from network/empty-output messaging because retrying
   // the same request will refuse again (no auto-retry is scheduled for this type).
   const isModelRefusalError = message.errorType === "model_refusal";
-  // Gateway quota failures need explicit attribution so users know mux gateway credits,
-  // not a provider quota, are blocking the request.
-  const isMuxGatewayQuotaError =
-    message.errorType === "quota" && message.routedThroughGateway === true;
 
-  const title = isMuxGatewayQuotaError
-    ? "Xum Gateway credits depleted"
-    : isAnthropicOverloaded
-      ? "Service overloaded"
-      : isEmptyOutputError
-        ? "No assistant output"
-        : isMaxOutputTokensError
-          ? "Response truncated"
-          : isModelRefusalError
-            ? "Model refused to respond"
-            : "Stream Error";
+  const title = isAnthropicOverloaded
+    ? "Service overloaded"
+    : isEmptyOutputError
+      ? "No assistant output"
+      : isMaxOutputTokensError
+        ? "Response truncated"
+        : isModelRefusalError
+          ? "Model refused to respond"
+          : "Stream Error";
   const pill = isAnthropicOverloaded ? "overloaded" : message.errorType;
-  const body = isMuxGatewayQuotaError
-    ? "Your Xum Gateway credits have been depleted. Add credits or configure another provider to continue."
-    : message.error;
 
-  const ctaAction = isMuxGatewayQuotaError ? (
-    <Button
-      asChild
-      variant="ghost"
-      size="sm"
-      className="text-error/80 hover:text-error h-6 px-2 text-[10px]"
-    >
-      <a href={MUX_GATEWAY_ORIGIN} target="_blank" rel="noopener noreferrer">
-        Add credits <ExternalLink className="ml-1 h-3 w-3" />
-      </a>
-    </Button>
-  ) : isAnthropicOverloaded ? (
+  const ctaAction = isAnthropicOverloaded ? (
     <Button
       asChild
       variant="ghost"
@@ -167,7 +146,7 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
         </div>
       </div>
       <div className="text-foreground font-mono text-[13px] leading-relaxed break-words whitespace-pre-wrap">
-        {body}
+        {message.error}
       </div>
       {compactionDetails}
       {compactRetryAction ? (

@@ -10,12 +10,15 @@ import {
   type ModelMessage,
   type Tool,
 } from "ai";
+import type { GoogleVertexProviderSettings } from "@ai-sdk/google-vertex";
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
 import { Cause, Effect, Exit, Option } from "effect";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
-import { writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -29,11 +32,13 @@ import { PROVIDER_REGISTRY } from "@/common/constants/providers";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import {
   buildProviderOptions,
+  buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
 import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { MAX_CREDENTIAL_FILE_BYTES } from "@/node/utils/providerRequirements";
 import {
   ProviderModelFactory,
   buildAIProviderRequestHeaders,
@@ -43,7 +48,6 @@ import {
   markCodexOauthRoutedResponse,
   normalizeOpenAICompatibleBaseURL,
   resolveAIProviderHeaderSource,
-  muxGatewayPromptCacheRoute,
   requestEndpoint,
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
@@ -104,7 +108,6 @@ function expectSuccessfulRouteResult(
   expected: {
     effectiveModelString: string;
     routeProvider: SuccessfulResolvedModel["routeProvider"];
-    routedThroughGateway?: boolean;
   }
 ): void {
   expect(result.success).toBe(true);
@@ -113,9 +116,6 @@ function expectSuccessfulRouteResult(
   }
   expect(result.data.effectiveModelString).toBe(expected.effectiveModelString);
   expect(result.data.routeProvider).toBe(expected.routeProvider);
-  if (expected.routedThroughGateway !== undefined) {
-    expect(result.data.routedThroughGateway).toBe(expected.routedThroughGateway);
-  }
 }
 
 async function withTempConfig(
@@ -368,12 +368,12 @@ describe("ProviderModelFactory.createModel", () => {
           apiKey: "sk-test",
           enabled: false,
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
+        openrouter: {
+          apiKey: "or-test",
         },
       });
 
-      await saveRoutePriority(config, ["mux-gateway", "direct"], { muxGatewayEnabled: true });
+      await saveRoutePriority(config, ["openrouter", "direct"]);
 
       const result = await factory.createModel("openai:gpt-5");
       if (!result.success) {
@@ -429,6 +429,53 @@ describe("ProviderModelFactory.createModel", () => {
     }
   });
 
+  // #4231: a gateway such as OpenCode Go names a header that must carry one
+  // stable id per conversation. The header must reach the wire on every
+  // custom provider adapter, with the workspace id as its value.
+  it("sends the configured session header with the workspace id on every adapter", async () => {
+    const seen: Array<string | null> = [];
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        seen.push(req.headers.get("x-opencode-session"));
+        return Response.json({ error: { message: "stop here" } }, { status: 400 });
+      },
+    });
+    try {
+      for (const providerType of CUSTOM_PROVIDER_TYPES) {
+        await withTempConfig(async (config, factory) => {
+          saveLocalVllmConfig(config, {
+            providerType,
+            baseUrl: `${server.url.origin}/v1`,
+            sessionHeader: "x-opencode-session",
+          });
+          const result = await factory.createModelWithPinnedOptions(
+            `local-vllm:${LOCAL_VLLM_MODEL}`,
+            {}
+          );
+          if (!result.success) throw new Error(result.error.type);
+          const before = seen.length;
+          await generateText({
+            model: result.data.model,
+            prompt: "hello",
+            maxRetries: 0,
+            headers: buildRequestHeaders(
+              result.data.optionsModelString,
+              result.data.optionsMuxProviderOptions,
+              "ws-4231",
+              result.data.optionsProvidersConfig,
+              result.data.optionsRouteProvider
+            ),
+          }).catch(() => undefined);
+          expect(seen.slice(before)).toEqual(["ws-4231"]);
+        });
+      }
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   it("keys the wire identity on the custom provider's API format", async () => {
     const expectedWire = {
       "openai-compatible": "local-vllm",
@@ -453,27 +500,6 @@ describe("ProviderModelFactory.createModel", () => {
         }
       });
     }
-  });
-
-  it("keeps a custom provider shadowing mux-gateway off gateway attribution", async () => {
-    await withTempConfig(async (config, factory) => {
-      // The request goes directly to the custom endpoint, so gateway
-      // attribution and quota handling must not engage.
-      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        "mux-gateway": {
-          providerType: "openai-compatible",
-          baseUrl: "http://localhost:8000/v1",
-          models: ["qwen3-coder"],
-        },
-      });
-
-      const result = await factory.resolveAndCreateModel("mux-gateway:qwen3-coder", "off");
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.data.routedThroughGateway).toBe(false);
-        expect(result.data.routeProvider).toBeUndefined();
-      }
-    });
   });
 
   it("merges backend OpenAI store policy for custom openai-responses providers", async () => {
@@ -1271,6 +1297,58 @@ describe("ProviderModelFactory GitHub Copilot", () => {
     }
   );
 
+  it.each([
+    [true, "agent"],
+    [undefined, "user"],
+  ] as const)(
+    "a pinned model with agentInitiated=%p sends Copilot X-Initiator %s",
+    async (agentInitiated, expectedInitiator) => {
+      await withTempConfig(async (_config, factory, _oauth, providersConfigStore) => {
+        // Copilot bills X-Initiator "user" as a premium request; headless summaries and titles
+        // pass agentInitiated so their user-role prompts do not.
+        const initiators: Array<string | null> = [];
+        const recordingFetch = (_input: unknown, init?: RequestInit) => {
+          initiators.push(new Headers(init?.headers).get("X-Initiator"));
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "resp_initiator",
+                created_at: 0,
+                model: "gpt-5.3-codex",
+                output: [
+                  {
+                    type: "message",
+                    id: "msg_1",
+                    role: "assistant",
+                    status: "completed",
+                    content: [{ type: "output_text", text: "ok", annotations: [] }],
+                  },
+                ],
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }),
+              { headers: { "Content-Type": "application/json" } }
+            )
+          );
+        };
+        spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
+          "github-copilot": {
+            apiKey: COPILOT_TOKEN,
+            models: ["gpt-5.3-codex"],
+            fetch: recordingFetch,
+          },
+        } as unknown as ProvidersConfig);
+
+        const created = await factory.createModelWithPinnedOptions("github-copilot:gpt-5.3-codex", {
+          agentInitiated,
+        });
+        if (!created.success) throw new Error(created.error.type);
+        await generateText({ model: created.data.model, prompt: "summarize", maxRetries: 0 });
+
+        expect(initiators).toEqual([expectedInitiator]);
+      });
+    }
+  );
+
   it("returns api_key_not_found before checking a stale Copilot model catalog", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
@@ -1507,6 +1585,223 @@ describe("ProviderModelFactory Meta", () => {
       } finally {
         fetchSpy.mockRestore();
       }
+    });
+  });
+});
+
+describe("ProviderModelFactory Google Vertex AI", () => {
+  unsetEnvForEachTest(
+    "GOOGLE_VERTEX_API_KEY",
+    "GOOGLE_VERTEX_PROJECT",
+    "GOOGLE_VERTEX_LOCATION",
+    "GOOGLE_APPLICATION_CREDENTIALS"
+  );
+
+  const sendOnce = async (
+    factory: ProviderModelFactory,
+    modelString: string
+  ): Promise<CapturedFetchCall[]> => {
+    const options = buildProviderOptions(modelString, "medium");
+    if (!("googleVertex" in options)) throw new Error("Vertex must use the googleVertex namespace");
+    const { calls, fakeFetch } = createCapturingFetch();
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+    try {
+      const result = await factory.createModel(modelString);
+      if (!result.success) throw new Error(result.error.type);
+      await generateText({
+        model: result.data,
+        prompt: "hello",
+        providerOptions: { googleVertex: options.googleVertex },
+        maxRetries: 0,
+      }).catch(() => undefined);
+      return calls;
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  };
+
+  it("sends express mode requests to the Vertex publisher path with the API key", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        "google-vertex": { apiKey: "vertex-key", project: "ignored-project" },
+      });
+
+      const calls = await sendOnce(factory, "google-vertex:gemini-2.5-flash");
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe(
+        "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent"
+      );
+      expect(new Headers(calls[0].init.headers).get("x-goog-api-key")).toBe("vertex-key");
+      // Thinking options must land in the namespace the Vertex model reads.
+      expect(parseSentBody(calls[0])).toMatchObject({
+        generationConfig: { thinkingConfig: { includeThoughts: true } },
+      });
+    });
+  });
+
+  it.each([
+    { name: "the saved key file", source: "config" },
+    { name: "the GOOGLE_APPLICATION_CREDENTIALS key file", source: "env" },
+  ] as const)(
+    "uses ADC with the project, the default global location, and $name",
+    async ({ source }) => {
+      await withTempConfig(async (config, factory, _oauth, store) => {
+        const keyFilename = path.join(config.rootDir, "sa.json");
+        // A real private key, so the up-front key file check must accept it.
+        const { privateKey } = generateKeyPairSync("rsa", {
+          modulusLength: 2048,
+          publicKeyEncoding: { type: "spki", format: "pem" },
+          privateKeyEncoding: { type: "pkcs8", format: "pem" },
+        });
+        await writeFile(
+          keyFilename,
+          JSON.stringify({
+            type: "service_account",
+            client_email: "xum@my-project.iam.gserviceaccount.com",
+            private_key: privateKey,
+          })
+        );
+        if (source === "env") {
+          process.env.GOOGLE_APPLICATION_CREDENTIALS = keyFilename;
+        }
+        store.saveProvidersConfig({
+          "google-vertex": { project: "my-project", ...(source === "config" && { keyFilename }) },
+        });
+        const originalRegistry = PROVIDER_REGISTRY["google-vertex"];
+        let authOptions: GoogleVertexProviderSettings["googleAuthOptions"];
+        PROVIDER_REGISTRY["google-vertex"] = async () => {
+          const module = await originalRegistry();
+          return {
+            ...module,
+            createVertex: (options?: GoogleVertexProviderSettings) => {
+              authOptions = options?.googleAuthOptions;
+              // Stand in for Google's credential lookup so no metadata server is contacted.
+              const authClient = {
+                getAccessToken: () => Promise.resolve({ token: "adc-token" }),
+              } as unknown as NonNullable<
+                GoogleVertexProviderSettings["googleAuthOptions"]
+              >["authClient"];
+              return module.createVertex({
+                ...options,
+                googleAuthOptions: { ...options?.googleAuthOptions, authClient },
+              });
+            },
+          };
+        };
+
+        try {
+          const calls = await sendOnce(factory, "google-vertex:gemini-2.5-flash");
+
+          // The env key file stays with Google's own ADC lookup (see the factory).
+          expect(authOptions).toEqual(source === "config" ? { keyFilename } : undefined);
+          expect(calls).toHaveLength(1);
+          expect(calls[0].url).toBe(
+            "https://aiplatform.googleapis.com/v1beta1/projects/my-project/locations/global/publishers/google/models/gemini-2.5-flash:generateContent"
+          );
+          const headers = new Headers(calls[0].init.headers);
+          expect(headers.get("authorization")).toBe("Bearer adc-token");
+          expect(headers.get("x-goog-api-key")).toBeNull();
+        } finally {
+          PROVIDER_REGISTRY["google-vertex"] = originalRegistry;
+        }
+      });
+    }
+  );
+
+  it.each([
+    { name: "missing", prepare: (_keyFilename: string) => Promise.resolve() },
+    { name: "a directory", prepare: (keyFilename: string) => mkdir(keyFilename) },
+    { name: "not JSON", prepare: (keyFilename: string) => writeFile(keyFilename, "-----BEGIN") },
+    { name: "a JSON array", prepare: (keyFilename: string) => writeFile(keyFilename, "[]") },
+    { name: "JSON null", prepare: (keyFilename: string) => writeFile(keyFilename, "null") },
+    { name: "a JSON string", prepare: (keyFilename: string) => writeFile(keyFilename, '"key"') },
+    {
+      name: "a JSON object with a private_key that is not a key",
+      prepare: (keyFilename: string) =>
+        writeFile(
+          keyFilename,
+          JSON.stringify({
+            client_email: "xum@my-project.iam.gserviceaccount.com",
+            private_key: "not-a-pem",
+          })
+        ),
+    },
+    // A JSON object, so only the size check rejects it.
+    {
+      name: "over the size cap",
+      prepare: (keyFilename: string) =>
+        writeFile(keyFilename, JSON.stringify({ padding: "x".repeat(MAX_CREDENTIAL_FILE_BYTES) })),
+    },
+    // POSIX only: Windows has no mkfifo. Reading a FIFO with no writer blocks forever.
+    ...(process.platform === "win32"
+      ? []
+      : [
+          {
+            name: "a FIFO",
+            prepare: (keyFilename: string) => {
+              execFileSync("mkfifo", [keyFilename]);
+              return Promise.resolve();
+            },
+          },
+        ]),
+  ])(
+    "fails a service account key file that is $name before sending a request",
+    async ({ prepare }) => {
+      await withTempConfig(async (config, factory, _oauth, store) => {
+        const keyFilename = path.join(config.rootDir, "sa.json");
+        await prepare(keyFilename);
+        store.saveProvidersConfig({ "google-vertex": { project: "my-project", keyFilename } });
+
+        // A non-retryable configuration error, not a request-time auth error that
+        // auto-retry repeats and that echoes the path or file contents into the chat.
+        expect(await factory.createModel("google-vertex:gemini-2.5-flash")).toEqual({
+          success: false,
+          error: { type: "api_key_not_found", provider: "google-vertex" },
+        });
+      });
+    }
+  );
+
+  it("fails a missing GOOGLE_APPLICATION_CREDENTIALS key file before sending a request", async () => {
+    await withTempConfig(async (config, factory, _oauth, store) => {
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(config.rootDir, "missing.json");
+      store.saveProvidersConfig({ "google-vertex": { project: "my-project" } });
+
+      expect(await factory.createModel("google-vertex:gemini-2.5-flash")).toEqual({
+        success: false,
+        error: { type: "api_key_not_found", provider: "google-vertex" },
+      });
+    });
+  });
+
+  it("ignores a missing GOOGLE_APPLICATION_CREDENTIALS key file in express mode", async () => {
+    await withTempConfig(async (config, factory, _oauth, store) => {
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(config.rootDir, "missing.json");
+      store.saveProvidersConfig({ "google-vertex": { apiKey: "vertex-key" } });
+
+      const result = await factory.createModel("google-vertex:gemini-2.5-flash");
+
+      expect(result.success).toBe(true);
+    });
+  });
+
+  it("reports a tuned model with an express mode API key as an invalid model", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ "google-vertex": { apiKey: "vertex-key" } });
+
+      const result = await factory.createModel("google-vertex:endpoints/1234567890");
+
+      expect(result).toMatchObject({ success: false, error: { type: "invalid_model_string" } });
+    });
+  });
+
+  it("reports an unconfigured provider without a project or API key", async () => {
+    await withTempConfig(async (_config, factory) => {
+      expect(await factory.createModel("google-vertex:gemini-2.5-flash")).toEqual({
+        success: false,
+        error: { type: "api_key_not_found", provider: "google-vertex" },
+      });
     });
   });
 });
@@ -2179,133 +2474,28 @@ describe("ProviderModelFactory Codex authentication", () => {
     });
   });
 });
-describe("ProviderModelFactory.resolveGatewayModelString (mux gateway)", () => {
-  // Raw file writes (not editConfig/saveProvidersConfig) keep the legacy
-  // muxGateway* config keys exactly as older configs persist them.
-  async function writeMainConfig(config: Config, mainConfig: object): Promise<void> {
-    await writeFile(
-      path.join(config.rootDir, "config.json"),
-      JSON.stringify({ projects: [], ...mainConfig }, null, 2),
-      "utf-8"
-    );
-  }
-
-  async function writeProvidersConfig(config: Config, providersConfig: object): Promise<void> {
-    await writeFile(
-      path.join(config.rootDir, "providers.jsonc"),
-      JSON.stringify(providersConfig, null, 2),
-      "utf-8"
-    );
-  }
-
-  function toGatewayModelString(modelString: string): string {
-    const colonIndex = modelString.indexOf(":");
-    const provider = colonIndex === -1 ? modelString : modelString.slice(0, colonIndex);
-    const modelId = colonIndex === -1 ? "" : modelString.slice(colonIndex + 1);
-    return `mux-gateway:${provider}/${modelId}`;
-  }
-
-  it("routes allowlisted models when gateway is enabled + configured", async () => {
+describe("ProviderModelFactory.resolveGatewayModelString modelKey", () => {
+  it("routes model variants when the base model has a route override", async () => {
     await withTempConfig(async (config, factory) => {
-      await writeMainConfig(config, {
-        muxGatewayEnabled: true,
-        muxGatewayModels: [KNOWN_MODELS.SONNET.id],
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openrouter: { apiKey: "or-test" },
       });
-      await writeProvidersConfig(config, {
-        "mux-gateway": { couponCode: "test-coupon" },
-      });
-
-      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
-
-      expect(resolved).toBe(toGatewayModelString(KNOWN_MODELS.SONNET.id));
-    });
-  });
-
-  it("does not route when the mux-gateway provider is disabled", async () => {
-    await withTempConfig(async (config, factory) => {
-      await writeMainConfig(config, {
-        routePriority: ["mux-gateway", "direct"],
-      });
-      await writeProvidersConfig(config, {
-        anthropic: { apiKey: "sk-ant-test" },
-        "mux-gateway": {
-          couponCode: "test-coupon",
-          enabled: false,
-        },
+      await saveRoutePriority(config, ["direct"], {
+        routeOverrides: { "xai:grok-4-1-fast": "openrouter" },
       });
 
-      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+      const resolved = factory.resolveGatewayModelString(
+        "xai:grok-4-1-fast-reasoning",
+        "xai:grok-4-1-fast"
+      );
 
-      expect(resolved).toBe(KNOWN_MODELS.SONNET.id);
-    });
-  });
-
-  it("does not route when gateway is not configured", async () => {
-    await withTempConfig(async (config, factory) => {
-      await writeMainConfig(config, {
-        muxGatewayEnabled: true,
-        muxGatewayModels: [KNOWN_MODELS.SONNET.id],
-      });
-
-      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
-
-      expect(resolved).toBe(KNOWN_MODELS.SONNET.id);
-    });
-  });
-
-  it("does not route unsupported providers even when allowlisted", async () => {
-    await withTempConfig(async (config, factory) => {
-      const modelString = "openrouter:some-model";
-      await writeMainConfig(config, {
-        muxGatewayEnabled: true,
-        muxGatewayModels: [modelString],
-      });
-      await writeProvidersConfig(config, {
-        "mux-gateway": { couponCode: "test-coupon" },
-      });
-
-      const resolved = factory.resolveGatewayModelString(modelString);
-
-      expect(resolved).toBe(modelString);
-    });
-  });
-
-  it("routes model variants when the base model is allowlisted via modelKey", async () => {
-    await withTempConfig(async (config, factory) => {
-      const variant = "xai:grok-4-1-fast-reasoning";
-      await writeMainConfig(config, {
-        muxGatewayEnabled: true,
-        muxGatewayModels: ["xai:grok-4-1-fast"],
-      });
-      await writeProvidersConfig(config, {
-        "mux-gateway": { couponCode: "test-coupon" },
-      });
-
-      const resolved = factory.resolveGatewayModelString(variant, "xai:grok-4-1-fast");
-
-      expect(resolved).toBe(toGatewayModelString(variant));
-    });
-  });
-
-  it("honors explicit mux-gateway prefixes from legacy clients", async () => {
-    await withTempConfig(async (config, factory) => {
-      await writeMainConfig(config, {
-        muxGatewayEnabled: true,
-        muxGatewayModels: [],
-      });
-      await writeProvidersConfig(config, {
-        "mux-gateway": { couponCode: "test-coupon" },
-      });
-
-      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.GPT.id, undefined, true);
-
-      expect(resolved).toBe(toGatewayModelString(KNOWN_MODELS.GPT.id));
+      expect(resolved).toBe("openrouter:xai/grok-4-1-fast-reasoning");
     });
   });
 });
 
 describe("ProviderModelFactory routing", () => {
-  it("honors non-mux gateway routes end-to-end", async () => {
+  it("honors gateway routes end-to-end", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
@@ -2329,7 +2519,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openrouter:openai/gpt-5",
         routeProvider: "openrouter",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2352,7 +2541,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openai:gpt-5.5",
         routeProvider: "openai",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2372,7 +2560,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openrouter:openai/gpt-5",
         routeProvider: "openrouter",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2436,25 +2623,24 @@ describe("ProviderModelFactory routing", () => {
   it("skips disabled gateway providers even when credentials exist", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        openai: {
-          apiKey: "sk-test",
+        anthropic: {
+          apiKey: "sk-ant-test",
           enabled: false,
         },
         openrouter: {
           apiKey: "or-test",
           enabled: false,
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
-        },
+        bedrock: { region: "us-east-1" },
       });
 
-      await saveRoutePriority(config, ["openrouter", "mux-gateway", "direct"], {
-        muxGatewayEnabled: true,
-      });
+      await saveRoutePriority(config, ["openrouter", "bedrock", "direct"]);
 
-      const resolved = factory.resolveGatewayModelString("openai:gpt-5", "openai:gpt-5");
-      expect(resolved).toBe("mux-gateway:openai/gpt-5");
+      const resolved = factory.resolveGatewayModelString(
+        "anthropic:claude-sonnet-4-5",
+        "anthropic:claude-sonnet-4-5"
+      );
+      expect(resolved).toBe("bedrock:anthropic.claude-sonnet-4-5");
     });
   });
 
@@ -2465,12 +2651,12 @@ describe("ProviderModelFactory routing", () => {
           providerType: "openai-compatible",
           baseUrl: "http://localhost:8000/v1",
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
+        openrouter: {
+          apiKey: "or-test",
         },
       });
 
-      await saveRoutePriority(config, ["mux-gateway", "direct"], { muxGatewayEnabled: true });
+      await saveRoutePriority(config, ["openrouter", "direct"]);
 
       const resolved = factory.resolveGatewayModelString("openai:gpt-5", "openai:gpt-5");
       expect(resolved).toBe("openai:gpt-5");
@@ -2536,7 +2722,6 @@ describe("ProviderModelFactory routing", () => {
       if (result.success) {
         expect(result.data.effectiveModelString).toBe("coder:google/gemini-2.5-pro");
         expect(result.data.canonicalModelString).toBe("coder:google/gemini-2.5-pro");
-        expect(result.data.routedThroughGateway).toBe(false);
         expect((result.data.model as { modelId?: unknown }).modelId).toBe("google/gemini-2.5-pro");
       }
     });
@@ -2554,7 +2739,7 @@ describe("ProviderModelFactory routing", () => {
         },
       });
 
-      await saveRoutePriority(config, ["mux-gateway", "openrouter", "direct"]);
+      await saveRoutePriority(config, ["github-copilot", "openrouter", "direct"]);
 
       const resolved = factory.resolveGatewayModelString("openai:gpt-5", "openai:gpt-5");
       expect(resolved).toBe("openrouter:openai/gpt-5");
@@ -2574,12 +2759,13 @@ describe("ProviderModelFactory routing", () => {
         openrouter: {
           apiKey: "or-test",
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: ["gpt-5"],
         },
       });
 
-      await saveRoutePriority(config, ["mux-gateway", "direct"], { muxGatewayEnabled: true });
+      await saveRoutePriority(config, ["github-copilot", "direct"]);
 
       const resolved = factory.resolveGatewayModelString(
         "openrouter:openai/gpt-5",
@@ -2592,7 +2778,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openrouter:openai/gpt-5",
         routeProvider: "openrouter",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2600,64 +2785,33 @@ describe("ProviderModelFactory routing", () => {
   it("falls back from explicit OpenRouter model strings when OpenRouter is unavailable", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        openai: {
-          apiKey: "sk-test",
+        anthropic: {
+          apiKey: "sk-ant-test",
           enabled: false,
         },
         openrouter: {
           apiKey: "or-test",
           enabled: false,
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
-        },
+        bedrock: { region: "us-east-1" },
       });
 
-      await saveRoutePriority(config, ["openrouter", "mux-gateway", "direct"], {
-        muxGatewayEnabled: true,
-      });
+      await saveRoutePriority(config, ["openrouter", "bedrock", "direct"]);
 
       const resolved = factory.resolveGatewayModelString(
-        "openrouter:openai/gpt-5",
-        "openai:gpt-5",
+        "openrouter:anthropic/claude-sonnet-4-5",
+        "anthropic:claude-sonnet-4-5",
         "openrouter"
       );
-      expect(resolved).toBe("mux-gateway:openai/gpt-5");
-
-      const result = await factory.resolveAndCreateModel("openrouter:openai/gpt-5", "off");
-      expectSuccessfulRouteResult(result, {
-        effectiveModelString: "mux-gateway:openai/gpt-5",
-        routeProvider: "mux-gateway",
-        routedThroughGateway: true,
-      });
-    });
-  });
-
-  it("honors explicit mux-gateway prefixes for compatibility", async () => {
-    await withTempConfig(async (config, factory) => {
-      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        "mux-gateway": {
-          couponCode: "test-coupon",
-        },
-      });
-
-      await saveRoutePriority(config, ["direct"], { muxGatewayEnabled: true });
-
-      const resolved = factory.resolveGatewayModelString(
-        "mux-gateway:anthropic/claude-sonnet-4-6",
-        KNOWN_MODELS.SONNET.id,
-        "mux-gateway"
-      );
-      expect(resolved).toBe("mux-gateway:anthropic/claude-sonnet-4-6");
+      expect(resolved).toBe("bedrock:anthropic.claude-sonnet-4-5");
 
       const result = await factory.resolveAndCreateModel(
-        "mux-gateway:anthropic/claude-sonnet-4-6",
+        "openrouter:anthropic/claude-sonnet-4-5",
         "off"
       );
       expectSuccessfulRouteResult(result, {
-        effectiveModelString: "mux-gateway:anthropic/claude-sonnet-4-6",
-        routeProvider: "mux-gateway",
-        routedThroughGateway: true,
+        effectiveModelString: "bedrock:anthropic.claude-sonnet-4-5",
+        routeProvider: "bedrock",
       });
     });
   });
@@ -2692,7 +2846,6 @@ describe("ProviderModelFactory routing", () => {
         expectSuccessfulRouteResult(result, {
           effectiveModelString: "openai:gpt-6-luna",
           routeProvider: "openai",
-          routedThroughGateway: false,
         });
       });
     } finally {
@@ -2711,14 +2864,9 @@ describe("ProviderModelFactory routing", () => {
         openrouter: {
           apiKey: "or-test",
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
-        },
       });
 
-      await saveRoutePriority(config, ["direct", "mux-gateway", "openrouter"], {
-        muxGatewayEnabled: true,
-      });
+      await saveRoutePriority(config, ["direct", "openrouter"]);
 
       const result = await factory.resolveAndCreateModel("openai:gpt-5", "off");
       expect(result.success).toBe(true);
@@ -2729,7 +2877,6 @@ describe("ProviderModelFactory routing", () => {
       expect(result.data.effectiveModelString).toBe("openai:gpt-5");
       expect(result.data.canonicalModelString).toBe("openai:gpt-5");
       expect(result.data.routeProvider).toBe("openai");
-      expect(result.data.routedThroughGateway).toBe(false);
     });
   });
 });
@@ -2892,7 +3039,8 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
   unsetEnvForEachTest("ANTHROPIC_BASE_URL");
   const sendOnce = async (
     anthropicConfig: Record<string, unknown>,
-    modelString: string
+    modelString: string,
+    chatServiceTier?: ServiceTier
   ): Promise<CapturedFetchCall> => {
     let captured: CapturedFetchCall | undefined;
     await withTempConfig(async (_config, factory, _oauth, store) => {
@@ -2900,7 +3048,10 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
       const { calls, fakeFetch } = createCapturingFetch();
       const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
       try {
-        const result = await factory.createModel(modelString);
+        const result = await factory.createModel(
+          modelString,
+          chatServiceTier != null ? { openai: { serviceTier: chatServiceTier } } : undefined
+        );
         if (!result.success) throw new Error(result.error.type);
         await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
           () => undefined
@@ -2936,6 +3087,106 @@ describe("ProviderModelFactory Anthropic Fast mode", () => {
     const call = await sendOnce(anthropicConfig, modelString);
     expect(parseSentBody(call)).not.toHaveProperty("speed");
     expect(betaHeader(call)).not.toContain("fast-mode-2026-02-01");
+  });
+
+  // Speed is the chat's choice, like reasoning: it follows the chat across models.
+  it("lets the chat's speed pick override the provider preference", async () => {
+    const fast = await sendOnce({}, "anthropic:claude-opus-5-5", "priority");
+    expect(parseSentBody(fast)).toMatchObject({ speed: "fast" });
+    expect(betaHeader(fast)).toContain("fast-mode-2026-02-01");
+
+    const standard = await sendOnce({ speed: "fast" }, "anthropic:claude-opus-5-5", "default");
+    expect(parseSentBody(standard)).not.toHaveProperty("speed");
+
+    const unsupported = await sendOnce({}, "anthropic:claude-opus-4-7", "priority");
+    expect(parseSentBody(unsupported)).not.toHaveProperty("speed");
+  });
+
+  it("applies a mid-turn chat speed change to the next call", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ anthropic: { apiKey: "test-key" } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      const chat: { serviceTier?: ServiceTier } = {};
+      try {
+        const result = await factory.createModel("anthropic:claude-opus-5-5", undefined, {
+          getServiceTierOverride: () => chat.serviceTier,
+        });
+        if (!result.success) throw new Error(result.error.type);
+        const send = () =>
+          generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+        await send();
+        chat.serviceTier = "priority";
+        await send();
+        chat.serviceTier = "default";
+        await send();
+        expect(calls.map((call) => parseSentBody(call).speed)).toEqual([
+          undefined,
+          "fast",
+          undefined,
+        ]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+});
+
+describe("ProviderModelFactory xAI chat speed", () => {
+  const sentTiers = async (
+    xaiConfig: Record<string, unknown>,
+    modelString: string,
+    tiers: Array<ServiceTier | undefined>,
+    requestTier?: "default" | "priority"
+  ): Promise<unknown[]> => {
+    let sent: unknown[] = [];
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ xai: { apiKey: "test-key", ...xaiConfig } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      const chat: { serviceTier?: ServiceTier } = { serviceTier: tiers[0] };
+      try {
+        const result = await factory.createModel(
+          modelString,
+          requestTier != null ? { xai: { serviceTier: requestTier } } : undefined,
+          { getServiceTierOverride: () => chat.serviceTier }
+        );
+        if (!result.success) throw new Error(result.error.type);
+        for (const tier of tiers) {
+          chat.serviceTier = tier;
+          await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+        }
+        sent = calls.map((call) => parseSentBody(call).service_tier);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    return sent;
+  };
+
+  it("follows the chat's pick per request over the provider tier", async () => {
+    expect(
+      await sentTiers({ serviceTier: "priority" }, "xai:grok-4.7", [
+        undefined,
+        "default",
+        "priority",
+        "ultrafast",
+      ])
+    ).toEqual(["priority", "default", "priority", "default"]);
+  });
+
+  it("keeps an explicit xAI request tier over live chat changes", async () => {
+    expect(
+      await sentTiers({}, "xai:grok-4.7", ["priority", "default", "priority"], "default")
+    ).toEqual(["default", "default", "default"]);
+  });
+
+  it("keeps non-frontier Grok on the provider tier", async () => {
+    expect(await sentTiers({}, "xai:grok-code-fast-1", ["priority"])).toEqual([undefined]);
   });
 });
 
@@ -3086,6 +3337,97 @@ describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
   });
 });
 
+describe("wrapFetchWithAnthropicCacheControl — one TTL per request", () => {
+  /** Every marker's ttl in wire order (tools, system, messages): Anthropic's ordering rule. */
+  const markerTtls = (body: unknown): Array<string | undefined> => {
+    const ttls: Array<string | undefined> = [];
+    const walk = (value: unknown): void => {
+      if (Array.isArray(value)) return value.forEach(walk);
+      if (value == null || typeof value !== "object") return;
+      for (const [key, child] of Object.entries(value)) {
+        if (key === "cache_control" || key === "cacheControl") {
+          ttls.push((child as { ttl?: string }).ttl);
+        } else {
+          walk(child);
+        }
+      }
+    };
+    const { tools, system, messages, prompt } = body as Record<string, unknown>;
+    walk([tools, system, messages, prompt]);
+    return ttls;
+  };
+  // Markers of mixed TTLs, as a per-model extra or a continuous-compaction prefix can leave them.
+  const mixedMessagesBody = {
+    tools: [{ name: "bash", cache_control: { type: "ephemeral", ttl: "5m" } }],
+    system: [{ type: "text", text: "sys", cache_control: { type: "ephemeral", ttl: "5m" } }],
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "t1",
+            content: [{ type: "text", text: "out", cache_control: { type: "ephemeral" } }],
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral", ttl: "1h" } }],
+      },
+    ],
+  };
+  const mixedPromptBody = {
+    prompt: [
+      {
+        role: "system",
+        content: "sys",
+        providerOptions: { anthropic: { cacheControl: { type: "ephemeral", ttl: "5m" } } },
+      },
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+    ],
+  };
+  const send = (wrapped: typeof fetch, body: unknown) =>
+    wrapped("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+
+  it("puts the TTL on every marker of both wire forms", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, () => "1h");
+
+    await send(wrapped, mixedMessagesBody);
+    await send(wrapped, mixedPromptBody);
+
+    expect(markerTtls(parseSentBody(calls[0]))).toEqual(["1h", "1h", "1h", "1h"]);
+    // The prompt form's last message gets both the message-level and the part-level marker.
+    expect(markerTtls(parseSentBody(calls[1]))).toEqual(["1h", "1h", "1h"]);
+  });
+
+  it("samples the TTL getter at each request", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    let ttl: "5m" | "1h" = "1h";
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, () => ttl);
+
+    await send(wrapped, mixedMessagesBody);
+    ttl = "5m";
+    await send(wrapped, mixedMessagesBody);
+
+    expect(markerTtls(parseSentBody(calls[0]))).toEqual(["1h", "1h", "1h", "1h"]);
+    expect(markerTtls(parseSentBody(calls[1]))).toEqual(["5m", "5m", "5m", "5m"]);
+  });
+
+  it("leaves existing marker TTLs alone without a TTL", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, () => undefined);
+
+    await send(wrapped, mixedMessagesBody);
+
+    expect(markerTtls(parseSentBody(calls[0]))).toEqual(["5m", "5m", undefined, "1h"]);
+  });
+});
+
 describe("wrapFetchWithAnthropicCacheControl — deferred tools (#5262)", () => {
   it("marks the last non-deferred tool and never leaves cache_control on a deferred one", async () => {
     const { calls, fakeFetch } = createCapturingFetch();
@@ -3227,7 +3569,6 @@ describe("ProviderModelFactory Coder", () => {
     "coder:chat-proxy/team-astra",
     "coder:chat-proxy/gpt-6-astra",
     "openrouter:openai/gpt-6-astra",
-    "mux-gateway:openai/gpt-6-astra",
     "github-copilot:gpt-6-astra",
     "github-copilot:gpt-5.4",
     "openai:gpt-6-astra",
@@ -3236,7 +3577,6 @@ describe("ProviderModelFactory Coder", () => {
     "openai:team-astra",
     "responses-proxy:team-astra",
     "openrouter:openai/team-astra",
-    "mux-gateway:openai/team-astra",
     "responses-proxy:gpt-6-astra",
   ])("pins Fast tiers and isolates live per-chat speed changes through %s", async (modelString) => {
     await withTempConfig(async (config, factory, oauth, store) => {
@@ -3258,7 +3598,6 @@ describe("ProviderModelFactory Coder", () => {
           models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
         },
         openrouter: { apiKey: "test-key" },
-        "mux-gateway": { couponCode: "test-token" },
         "github-copilot": { apiKey: COPILOT_TOKEN, baseUrl: "https://copilot.example.com/v1" },
         "responses-proxy": {
           providerType: "openai-responses",
@@ -3374,13 +3713,7 @@ describe("ProviderModelFactory Coder", () => {
                 expect(new Headers(calls[before].init.headers).get("authorization")).toBeNull();
                 expect(calls[before].url).toBe("https://proxy.example.com/v1/responses");
               }
-              if (modelString.startsWith("mux-gateway:")) {
-                expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
-                  expected
-                );
-              } else {
-                expect(body.service_tier).toBe(expected);
-              }
+              expect(body.service_tier).toBe(expected);
             }
           }
         }
@@ -3472,13 +3805,7 @@ describe("ProviderModelFactory Coder", () => {
                 expect(new Headers(call.init.headers).get("authorization")).toBe(
                   new Headers(originalCall.init.headers).get("authorization")
                 );
-                if (modelString.startsWith("mux-gateway:")) {
-                  expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
-                    expected
-                  );
-                } else {
-                  expect(body.service_tier).toBe(expected);
-                }
+                expect(body.service_tier).toBe(expected);
               }
             }
           }
@@ -3881,7 +4208,7 @@ describe("ProviderModelFactory Coder", () => {
     {
       available: true,
       excluded: false,
-      fallback: "mux-gateway",
+      fallback: "openrouter",
       wire: "chatCompletions",
       alias: true,
       pro: true,
@@ -3889,7 +4216,7 @@ describe("ProviderModelFactory Coder", () => {
     {
       available: false,
       excluded: false,
-      fallback: "mux-gateway",
+      fallback: "openrouter",
       wire: "responses",
       alias: false,
       pro: false,
@@ -3897,7 +4224,7 @@ describe("ProviderModelFactory Coder", () => {
     {
       available: true,
       excluded: true,
-      fallback: "mux-gateway",
+      fallback: "openrouter",
       wire: "responses",
       alias: false,
       pro: false,
@@ -3941,10 +4268,10 @@ describe("ProviderModelFactory Coder", () => {
       store.saveProvidersConfig({
         ...store.loadProvidersConfig(),
         openai: { apiKey: "test-key", wireFormat: testCase.wire },
-        "mux-gateway": { couponCode: "test" },
+        openrouter: { apiKey: "test-key" },
       });
       oauth.coderOauthService = stubCoderOauthService();
-      await saveRoutePriority(config, [testCase.fallback], { muxGatewayEnabled: true });
+      await saveRoutePriority(config, [testCase.fallback]);
       const result = await factory.createModelWithPinnedOptions(`coder:prod-openai/${modelId}`, {
         thinkingLevel: "high",
         agentInitiated: true,
@@ -3957,7 +4284,7 @@ describe("ProviderModelFactory Coder", () => {
           ? "coder"
           : testCase.fallback === "direct"
             ? "openai"
-            : "mux-gateway"
+            : "openrouter"
       );
       expect(result.data.metadataModel).toBe("openai:gpt-6-astra");
       const options = buildProviderOptions(
@@ -3973,8 +4300,9 @@ describe("ProviderModelFactory Coder", () => {
         undefined,
         "pro"
       );
-      if (!("openai" in options)) throw new Error("Expected OpenAI request options");
-      expect(options.openai.reasoningMode).toBe(testCase.pro ? "pro" : undefined);
+      // A non-passthrough fallback (OpenRouter) builds its own options namespace.
+      const reasoningMode = "openai" in options ? options.openai.reasoningMode : undefined;
+      expect(reasoningMode).toBe(testCase.pro ? "pro" : undefined);
     });
   });
 
@@ -4020,22 +4348,21 @@ describe("ProviderModelFactory Coder", () => {
         store.saveProvidersConfig({
           ...store.loadProvidersConfig(),
           openai: { apiKey: "test-key" },
-          "mux-gateway": { couponCode: "test" },
         });
-        await saveRoutePriority(config, ["direct"], { muxGatewayEnabled: true });
+        await saveRoutePriority(config, ["direct"]);
         oauth.coderOauthService = stubCoderOauthService();
         const resolve = factory.resolveAndCreateModel.bind(factory);
         spyOn(factory, "resolveAndCreateModel").mockImplementation(async (...args) => {
           const created = await resolve(...args);
           store.saveProvidersConfig({
             openai: { apiKey: "test-key" },
-            "mux-gateway": { couponCode: "test" },
+            openrouter: { apiKey: "or-test" },
             coder: {
               discoveredProviders: [{ name: "prod-openai", type: "anthropic" }],
               models: [],
             },
           });
-          await saveRoutePriority(config, ["mux-gateway"]);
+          await saveRoutePriority(config, ["openrouter"]);
           return created;
         });
         const result = await factory.createModelWithPinnedOptions(modelString, {
@@ -5612,8 +5939,8 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
   it("rejects explicit gateway prefixes instead of rewriting them to a direct route", async () => {
     await withEvaluationFixture({ openai: { apiKey: "sk-test" } }, async (_c, factory) => {
       expect(
-        expectRejected(await factory.createEvaluationModel("mux-gateway:openai/gpt-5"))
-      ).toEqual({ reason: "unsupported-route", routeKind: "gateway", providerName: "mux-gateway" });
+        expectRejected(await factory.createEvaluationModel("openrouter:openai/gpt-5"))
+      ).toEqual({ reason: "unsupported-route", routeKind: "gateway", providerName: "openrouter" });
       expect(
         expectRejected(await factory.createEvaluationModel("coder:anthropic/claude-haiku-4-5"))
       ).toMatchObject({ reason: "unsupported-route", providerName: "coder" });
@@ -5803,6 +6130,77 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
   });
 });
 
+// #5372: ollama-ai-provider-v2 4.x is the release whose peer range accepts ai 7. Generation and
+// streaming must still decode Ollama's /api/chat replies through the factory's model.
+describe("ProviderModelFactory Ollama generate and stream", () => {
+  const chatReply = (content: string, done: boolean) => ({
+    model: "qwen3:8b",
+    created_at: "2026-10-20T00:00:00Z",
+    message: { role: "assistant", content },
+    done,
+    ...(done ? { done_reason: "stop", prompt_eval_count: 7, eval_count: 3 } : {}),
+  });
+  const withOllama = async (
+    reply: (body: Record<string, unknown>) => Response,
+    run: (model: LanguageModel) => Promise<void>
+  ) => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ ollama: { baseUrl: "http://127.0.0.1:11434/api" } });
+      const urls: string[] = [];
+      const fakeFetch = Object.assign((input: RequestInfo | URL, init?: RequestInit) => {
+        urls.push(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+        );
+        return Promise.resolve(reply(JSON.parse(init?.body as string) as Record<string, unknown>));
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("ollama:qwen3:8b");
+        if (!result.success) throw new Error(result.error.type);
+        await run(result.data);
+        expect(urls).toEqual(["http://127.0.0.1:11434/api/chat"]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  };
+
+  it("generates text with token usage", async () => {
+    await withOllama(
+      (body) => {
+        expect(body.stream).toBe(false);
+        return Response.json(chatReply("Hello from Ollama", true));
+      },
+      async (model) => {
+        const result = await generateText({ model, prompt: "hi", maxRetries: 0 });
+        expect(result.text).toBe("Hello from Ollama");
+        expect(result.finishReason).toBe("stop");
+        expect(result.usage).toMatchObject({ inputTokens: 7, outputTokens: 3 });
+      }
+    );
+  });
+
+  it("streams text deltas from newline-delimited chunks", async () => {
+    await withOllama(
+      (body) => {
+        expect(body.stream).toBe(true);
+        const lines = [chatReply("Hel", false), chatReply("lo", false), chatReply("", true)];
+        return new Response(lines.map((line) => JSON.stringify(line) + "\n").join(""), {
+          headers: { "content-type": "application/x-ndjson" },
+        });
+      },
+      async (model) => {
+        const result = streamText({ model, prompt: "hi", maxRetries: 0 });
+        const deltas: string[] = [];
+        for await (const delta of result.textStream) deltas.push(delta);
+        expect(deltas.join("")).toBe("Hello");
+        expect(await result.finishReason).toBe("stop");
+        expect(await result.usage).toMatchObject({ inputTokens: 7, outputTokens: 3 });
+      }
+    );
+  });
+});
+
 describe("ProviderModelFactory Ollama tool schemas", () => {
   // Ollama servers before v0.6.6 parse a tool schema `type` only as a string, so one `type`
   // array fails the whole tool request. zod >= 4.5 emits nullable fields as type arrays, and
@@ -5872,6 +6270,27 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
           allOf: [{ anyOf: [{ type: "string" }, { type: "null" }] }],
         },
       },
+    });
+  });
+
+  // #6083: a draft-07 `dependencies` entry is a schema when it is an object and a list of
+  // property names when it is an array. Only the schema needs the rewrite.
+  it("rewrites type arrays in draft-07 schema dependencies and keeps property lists", async () => {
+    const sent = await sendTools({
+      mcp_tool: rawTool({
+        type: "object",
+        properties: { a: { type: "string" }, b: { type: "string" } },
+        dependencies: {
+          a: { properties: { c: { type: ["string", "null"] } } },
+          b: ["a"],
+        },
+      }),
+    });
+
+    expect(typeArrayPaths(sent.mcp_tool)).toEqual([]);
+    expect((sent.mcp_tool as { dependencies: unknown }).dependencies).toEqual({
+      a: { properties: { c: { anyOf: [{ type: "string" }, { type: "null" }] } } },
+      b: ["a"],
     });
   });
 
@@ -5948,6 +6367,38 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
   });
 });
 
+describe("ProviderModelFactory tool schema compaction", () => {
+  unsetEnvForEachTest("ANTHROPIC_BASE_URL");
+
+  it("sends Anthropic built-in tool schemas without $schema or optional nulls", async () => {
+    let sent: Array<{ name: string; input_schema: Record<string, unknown> }> = [];
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ anthropic: { apiKey: "test-key" } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("anthropic:claude-opus-5-5");
+        if (!result.success) throw new Error(result.error.type);
+        const tools = { task_await: tool({ inputSchema: TOOL_DEFINITIONS.task_await.schema }) };
+        // The fake response is not a valid message, so only the request matters.
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+        await expect(
+          generateText({ model: result.data, prompt: "hello", tools, maxRetries: 0 })
+        ).rejects.toThrow();
+        expect(calls).toHaveLength(1);
+        sent = parseSentBody(calls[0]).tools as typeof sent;
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+
+    expect(sent.map((entry) => entry.name)).toEqual(["task_await"]);
+    const schema = sent[0].input_schema;
+    expect(schema).not.toHaveProperty("$schema");
+    expect(JSON.stringify(schema)).not.toContain('"null"');
+  });
+});
+
 describe("ProviderModelFactory prompt-cache prefix observation", () => {
   const recorded: TimelineEventDraft[] = [];
   const recorder = {
@@ -5973,56 +6424,6 @@ describe("ProviderModelFactory prompt-cache prefix observation", () => {
   async function send(model: LanguageModel, messages: ModelMessage[]) {
     await generateText({ model, messages, maxRetries: 0 }).catch(() => undefined);
   }
-
-  it("observes mux-gateway requests after file-part normalization", async () => {
-    await withTempConfig(async (_config, factory) => {
-      const sent: Array<Record<string, unknown>> = [];
-      const providersConfig = {
-        "mux-gateway": { couponCode: "test-coupon", fetch: capturingFetch(sent) },
-      } as unknown as ProvidersConfig;
-      const messages = (image: string) => [
-        {
-          role: "user" as const,
-          content: [
-            { type: "text" as const, text: "What is in this image?" },
-            { type: "file" as const, mediaType: "image/png", data: image },
-          ],
-        },
-      ];
-      for (const image of ["AAAA", "BBBB"]) {
-        const scope = factory.createPromptCacheTurnScope("ws-gateway", recorder);
-        const result = await factory.createModel(
-          "mux-gateway:anthropic/claude-sonnet-4-5",
-          {},
-          {
-            promptCacheScope: scope,
-            providersConfig,
-          }
-        );
-        if (!result.success) throw new Error("expected a gateway model");
-        await send(result.data, messages(image));
-      }
-
-      // The changed image breaks the prefix, and the event describes the part as the gateway
-      // received it (the v3 data-URL string), not the SDK's v4 tagged object.
-      const sentFile = (sent[1].prompt as Array<{ content: Array<Record<string, unknown>> }>)
-        .flatMap((message) => message.content)
-        .find((part) => part.type === "file");
-      expect(sentFile?.data).toBe("data:image/png;base64,BBBB");
-      const { cache_control: _marker, ...unmarkedFile } = sentFile ?? {};
-      expect(recorded).toMatchObject([
-        {
-          kind: "cache.prefix_break",
-          data: {
-            promptCacheBreak: {
-              section: "messages",
-              next: { type: "file", length: JSON.stringify(unmarkedFile).length },
-            },
-          },
-        },
-      ]);
-    });
-  });
 
   it("does not compare requests sent to another Anthropic base URL", async () => {
     await withTempConfig(async (_config, factory) => {
@@ -6081,44 +6482,6 @@ describe("ProviderModelFactory prompt-cache prefix observation", () => {
       expect(recorded).toHaveLength(1);
       expect(JSON.stringify(recorded)).not.toContain("secret");
     });
-  });
-
-  it("keys mux-gateway baselines by account: another sign-in is another baseline", async () => {
-    await withTempConfig(async (_config, factory) => {
-      const sent: Array<Record<string, unknown>> = [];
-      const sendAs = async (couponCode: string, text: string) => {
-        const scope = factory.createPromptCacheTurnScope("ws-gateway-account", recorder);
-        const result = await factory.createModel(
-          "mux-gateway:anthropic/claude-sonnet-4-5",
-          {},
-          {
-            promptCacheScope: scope,
-            providersConfig: {
-              "mux-gateway": { couponCode, fetch: capturingFetch(sent) },
-            } as unknown as ProvidersConfig,
-          }
-        );
-        if (!result.success) throw new Error("expected a gateway model");
-        await send(result.data, [{ role: "user", content: text }]);
-      };
-      // Same base URL, another account: its first request is a new baseline.
-      await sendAs("account-a-secret", "first");
-      await sendAs("account-b-secret", "second");
-      expect(sent).toHaveLength(2);
-      expect(recorded).toEqual([]);
-      // The same account is the same cache, so a rewritten prompt is reported.
-      await sendAs("account-b-secret", "third");
-      expect(recorded).toHaveLength(1);
-      expect(JSON.stringify(recorded)).not.toContain("secret");
-    });
-  });
-
-  it("the mux-gateway route holds a stable hash of the account, not its credential", () => {
-    const accountA = muxGatewayPromptCacheRoute("account-a-secret");
-    expect(accountA).toMatch(/^mux-gateway:[0-9a-f]{16}$/);
-    expect(accountA).toBe(muxGatewayPromptCacheRoute("account-a-secret"));
-    expect(accountA).not.toBe(muxGatewayPromptCacheRoute("account-b-secret"));
-    expect(accountA).not.toContain("secret");
   });
 
   it("requestEndpoint keeps no query text, only a stable hash of it", () => {

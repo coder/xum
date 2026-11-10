@@ -13,6 +13,11 @@ import type { CachedMCPTestResult, MCPTestResult } from "@/common/types/mcp";
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 const SERVER = "notion-work";
+// A closed local port: starting the server (the modal's settings warm-up does) fails at once.
+// A real remote URL made that start an internet request that could outlast a waitFor (#7071).
+// HTTPS, because the identity popover shows only an HTTPS origin.
+const SERVER_ORIGIN = "https://127.0.0.1:9";
+const SERVER_URL = `${SERVER_ORIGIN}/mcp`;
 const INFO_BUTTON = `Server information: ${SERVER}`;
 // Actual one-pixel PNG: the host-decoded icon shape the renderer accepts.
 const PNG =
@@ -93,7 +98,7 @@ describeIntegration("MCP settings server identity", () => {
         const added = await env.orpc.mcp.add({
           name: SERVER,
           transport: "http",
-          url: "https://mcp.notion.com/mcp",
+          url: SERVER_URL,
         });
         if (!added.success) throw new Error(added.error);
       },
@@ -136,7 +141,7 @@ describeIntegration("MCP settings server identity", () => {
     expect(within(popover).getByText("Notion MCP")).toBeTruthy();
     expect(within(popover).getByText("v1.2.0")).toBeTruthy();
     expect(within(popover).getByText(SERVER, { exact: true })).toBeTruthy();
-    expect(within(popover).getByText("http · https://mcp.notion.com")).toBeTruthy();
+    expect(within(popover).getByText(`http · ${SERVER_ORIGIN}`)).toBeTruthy();
     expect(
       within(popover)
         .getByRole("link", { name: /Website/ })
@@ -186,11 +191,11 @@ describeIntegration("MCP settings server identity", () => {
     await testConnection(canvas, SERVER);
     await expectBadge(canvas, SERVER, true);
     fireEvent.click(within(serverRow(canvas, SERVER)).getByRole("button", { name: "Edit server" }));
-    const input = within(serverRow(canvas, SERVER)).getByDisplayValue("https://mcp.notion.com/mcp");
-    fireEvent.change(input, { target: { value: "https://mcp.notion.com/v2/mcp" } });
+    const input = within(serverRow(canvas, SERVER)).getByDisplayValue(SERVER_URL);
+    fireEvent.change(input, { target: { value: `${SERVER_ORIGIN}/v2/mcp` } });
     fireEvent.click(within(serverRow(canvas, SERVER)).getByRole("button", { name: "Save" }));
     await waitFor(() => {
-      if (!within(serverRow(canvas, SERVER)).queryByText("https://mcp.notion.com/v2/mcp"))
+      if (!within(serverRow(canvas, SERVER)).queryByText(`${SERVER_ORIGIN}/v2/mcp`))
         throw new Error("Edit not saved yet");
     });
     await expectBadge(canvas, SERVER, false);
@@ -237,11 +242,18 @@ describeIntegration("MCP settings server identity", () => {
         within(row()).getByRole<HTMLButtonElement>("button", {
           name: surface === "Settings" ? "Test connection" : /^(Fetch|Refresh) Tools$/,
         });
+      // The modal's Fetch Tools also reads the server's settings over real IPC before the
+      // button returns, so allow the same 10 s as openMcpSettings, not the 1 s default (#7071).
       const expectBranding = async (present: boolean) => {
-        await waitFor(() => {
-          if (testButton().disabled) throw new Error("Test is still running");
-          expect(within(row()).queryByRole("button", { name: INFO_BUTTON }) !== null).toBe(present);
-        });
+        await waitFor(
+          () => {
+            if (testButton().disabled) throw new Error("Test is still running");
+            expect(within(row()).queryByRole("button", { name: INFO_BUTTON }) !== null).toBe(
+              present
+            );
+          },
+          { timeout: 10_000 }
+        );
       };
 
       for (const outcome of ["unbranded", "failure", "rejection"] as const) {

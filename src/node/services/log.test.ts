@@ -13,7 +13,14 @@ import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { __resetFileSinkForTests, clearLogFiles, closeLogFile, log } from "./log";
+import {
+  __closeFileSinkForTests,
+  __resetFileSinkForTests,
+  clearLogFiles,
+  closeLogFile,
+  log,
+} from "./log";
+import { subscribeLogFeed, type LogEntry } from "./logBuffer";
 
 describe("log file sink state machine", () => {
   let tempMuxRoot: string;
@@ -102,6 +109,50 @@ describe("log file sink state machine", () => {
     expect(createWriteStreamSpy).toHaveBeenCalledTimes(2);
   });
 
+  test("__closeFileSinkForTests resolves only after the descriptor is closed and keeps the sink closed", async () => {
+    const originalCreateWriteStream = fs.createWriteStream;
+    const createdStreams: fs.WriteStream[] = [];
+    const createWriteStreamSpy = spyOn(fs, "createWriteStream").mockImplementation((...args) => {
+      const stream = originalCreateWriteStream(...args);
+      createdStreams.push(stream);
+      return stream;
+    });
+
+    log.info("line before the sink is closed");
+    const stream = createdStreams[0];
+    if (!stream) {
+      throw new Error("expected a log stream");
+    }
+    expect(stream.closed).toBe(false);
+
+    await __closeFileSinkForTests();
+    expect(stream.closed).toBe(true);
+
+    // A line that arrives while the caller deletes the log folder must not reopen the sink.
+    log.info("line after the sink is closed");
+    expect(createWriteStreamSpy).toHaveBeenCalledTimes(1);
+
+    // With no sink open there is nothing to wait for.
+    await __closeFileSinkForTests();
+
+    __resetFileSinkForTests();
+    log.info("line after the sink is reset");
+    expect(createWriteStreamSpy).toHaveBeenCalledTimes(2);
+  });
+
+  test("__closeFileSinkForTests also waits for a clear that is in flight", async () => {
+    log.info("line before the clear");
+    let cleared = false;
+    // clearLogFiles takes the stream out of the open state at once and finishes in the sink queue.
+    const clearing = clearLogFiles().then(() => {
+      cleared = true;
+    });
+
+    await __closeFileSinkForTests();
+    expect(cleared).toBe(true);
+    await clearing;
+  });
+
   test("clearLogFiles rejects when truncate fails", async () => {
     const openSyncSpy = spyOn(fs, "openSync").mockImplementation(() => {
       throw new Error("truncate failed");
@@ -143,6 +194,31 @@ describe("log file sink state machine", () => {
 
     log.info("line after close should be dropped");
     expect(createWriteStreamSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("a log line names its caller without running the global stack formatter", () => {
+    // Stands in for source-map-support's hook, which maps (and parses source maps for) every
+    // frame of every formatted stack (#6556).
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- restored as is in finally
+    const previous = Error.prepareStackTrace;
+    let formattedStacks = 0;
+    Error.prepareStackTrace = (error, callSites): unknown => {
+      formattedStacks++;
+      return previous ? (previous(error, callSites) as unknown) : String(error);
+    };
+    const entries: LogEntry[] = [];
+    const feed = subscribeLogFeed((event) => {
+      if (event.type === "append") entries.push(event.entry);
+    });
+    try {
+      log.info("caller location probe");
+    } finally {
+      feed.unsubscribe();
+      Error.prepareStackTrace = previous;
+    }
+    expect(formattedStacks).toBe(0);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].location).toMatch(/^src\/node\/services\/log\.test\.ts:\d+$/);
   });
 
   test("closeLogFile transitions sink to closed and blocks reopen attempts", () => {

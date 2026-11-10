@@ -44,7 +44,7 @@
 import * as path from "node:path";
 import { ORPCError } from "@orpc/server";
 import { resolveXumEnvironmentValue } from "@/common/compat/xumEnv";
-import type { OnChatMode, WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatEvent, OnChatMode } from "@/common/orpc/types";
 import {
   isSessionTapeReplayConfigured,
   isSessionTapeReplayEgressBlocked,
@@ -130,7 +130,7 @@ export interface SessionTapeReplay {
    * abort. Rejects with an ORPCError carrying `SESSION_TAPE_REPLAY_REFUSAL_DATA` (message shown
    * by the client) when the replay cannot be served.
    */
-  play(push: (event: WorkspaceChatMessage) => void, signal?: AbortSignal): Promise<void>;
+  play(push: (event: OnChatEvent) => void, signal?: AbortSignal): Promise<void>;
 }
 
 function waitForAbort(signal: AbortSignal | undefined): Promise<void> {

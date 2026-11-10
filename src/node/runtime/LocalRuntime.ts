@@ -31,6 +31,12 @@ export class LocalRuntime extends LocalBaseRuntime {
     this.projectPath = projectPath;
   }
 
+  // Callers also build LocalRuntime for a worktree path (skill loaders); that path matches no
+  // project, so those commands get the shared limit.
+  protected override agentCgroupProjectPath(): string {
+    return this.projectPath;
+  }
+
   /**
    * For LocalRuntime, the workspace path is always the project path itself.
    * The workspaceName parameter is ignored since there's only one workspace per project.

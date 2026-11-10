@@ -56,7 +56,7 @@ export function SecuritySection() {
                 className="border-border-medium flex items-center gap-3 rounded-md border px-3 py-2"
               >
                 {trusted ? (
-                  <ShieldCheck className="text-success size-4 shrink-0" />
+                  <ShieldCheck className="text-success-text size-4 shrink-0" />
                 ) : (
                   <ShieldOff className="text-muted size-4 shrink-0" />
                 )}

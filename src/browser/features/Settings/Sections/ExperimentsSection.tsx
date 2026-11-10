@@ -27,20 +27,31 @@ import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { ArtifactsExperimentConfig } from "./ArtifactsExperimentConfig";
 import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
+import { MemoryDreamCostCeilingSetting } from "./MemoryDreamCostCeilingSetting";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
 
 // Sub-experiments of Agent Memory: hidden from the flat list and rendered in a
 // nested panel under the parent toggle, since they are no-ops while memory is off.
-const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
-  EXPERIMENT_IDS.MEMORY_HOT_SET,
-  EXPERIMENT_IDS.MEMORY_INTUITION,
-  EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
-];
+const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.MEMORY_CONSOLIDATION];
 
 // Sub-experiments of Programmatic Tool Calling: same nesting treatment — RLM
 // mode is a no-op while PTC is off (code_execution is never assembled).
 const PTC_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.RLM];
+
+// Sub-experiments of Artifacts: the Agent interface view shows an artifact, so it is a no-op
+// while Artifacts is off.
+const ARTIFACTS_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
+  EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+  EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT,
+];
+
+// Every sub-experiment: hidden from the flat list, since each renders under its parent row.
+const NESTED_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
+  ...MEMORY_SUB_EXPERIMENT_IDS,
+  ...PTC_SUB_EXPERIMENT_IDS,
+  ...ARTIFACTS_SUB_EXPERIMENT_IDS,
+];
 
 interface ExperimentRowProps {
   experimentId: ExperimentId;
@@ -695,6 +706,15 @@ function ExperimentSettingsPanel(props: ExperimentSettingsPanelProps) {
   return <div className="bg-background-secondary px-4 py-3">{props.children}</div>;
 }
 
+/** Status page agent does nothing without Agent interface view, so it shows only under it. */
+function visibleArtifactsSubExperimentIds(agentInterfaceEnabled: boolean): readonly ExperimentId[] {
+  return agentInterfaceEnabled
+    ? ARTIFACTS_SUB_EXPERIMENT_IDS
+    : ARTIFACTS_SUB_EXPERIMENT_IDS.filter(
+        (id) => id !== EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT
+      );
+}
+
 // Renders a parent experiment's sub-experiment toggles as a nested list.
 // Extracted so the nested-config call sites mirror their siblings
 // (AutoModelRoutingExperimentConfig) instead of inlining the map in the
@@ -722,17 +742,18 @@ export function ExperimentsSection() {
   const { api } = useAPI();
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const memoryConsolidationEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const artifactsSubExperimentIds = visibleArtifactsSubExperimentIds(
+    useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE)
+  );
   // Only show user-overridable experiments (non-overridable ones are hidden since users can't
   // change them). Sub-experiments render nested under their parent row instead.
   const experiments = useMemo(
     () =>
       allExperiments.filter(
-        (exp) =>
-          exp.showInSettings !== false &&
-          !MEMORY_SUB_EXPERIMENT_IDS.includes(exp.id) &&
-          !PTC_SUB_EXPERIMENT_IDS.includes(exp.id)
+        (exp) => exp.showInSettings !== false && !NESTED_SUB_EXPERIMENT_IDS.includes(exp.id)
       ),
     [allExperiments]
   );
@@ -784,6 +805,7 @@ export function ExperimentsSection() {
               {exp.id === EXPERIMENT_IDS.MEMORY && memoryEnabled && (
                 <ExperimentSettingsPanel>
                   <SubExperimentRows experimentIds={MEMORY_SUB_EXPERIMENT_IDS} />
+                  {memoryConsolidationEnabled && <MemoryDreamCostCeilingSetting />}
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING && ptcEnabled && (
@@ -792,7 +814,12 @@ export function ExperimentsSection() {
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.ARTIFACTS && artifactsEnabled && (
-                <ArtifactsExperimentConfig />
+                <>
+                  <ArtifactsExperimentConfig />
+                  <ExperimentSettingsPanel>
+                    <SubExperimentRows experimentIds={artifactsSubExperimentIds} />
+                  </ExperimentSettingsPanel>
+                </>
               )}
               {exp.id === EXPERIMENT_IDS.PORTABLE_DESKTOP && <PortableDesktopExperimentWarning />}
               {exp.id === EXPERIMENT_IDS.CONFIGURABLE_BIND_URL && <ConfigurableBindUrlControls />}

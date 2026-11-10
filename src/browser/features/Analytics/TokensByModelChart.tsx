@@ -8,6 +8,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { renderLegendLabel } from "./chartLegend";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import type { TokensByModelItem } from "@/browser/hooks/useAnalytics";
 import {
@@ -153,7 +154,7 @@ export function TokensByModelChart(props: TokensByModelChartProps) {
                 cursor={{ fill: "var(--color-hover)" }}
                 content={(tooltipProps) => <TokensByModelTooltipContent {...tooltipProps} />}
               />
-              <Legend wrapperStyle={{ fontSize: "11px" }} />
+              <Legend wrapperStyle={{ fontSize: "11px" }} formatter={renderLegendLabel} />
               <Bar
                 dataKey="inputTokens"
                 stackId="tokens"

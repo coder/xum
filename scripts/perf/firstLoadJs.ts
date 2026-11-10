@@ -12,18 +12,21 @@
  */
 import * as fs from "fs";
 import * as path from "path";
+import { FIRST_RUN_MODULES_ID } from "@/node/orpc/firstRunView";
 
 // Source-map path substrings never allowed on the first load. Later T3 PRs add the module
 // they make lazy (e.g. `node_modules/lottie-web/`) so it cannot come back.
 export const FIRST_LOAD_FORBIDDEN_SOURCES: readonly string[] = [
   "node_modules/lottie-web/",
   "node_modules/ghostty-web/",
-  "node_modules/mermaid/",
+  "node_modules/pele/",
   "features/Settings/Sections/ProvidersSection",
   "node_modules/@shikijs/langs/",
   "node_modules/recharts/",
   "features/desktop/DesktopPanel",
   "src/common/orpc/schemas/api.ts",
+  "components/CommandPalette/CommandPalette.tsx",
+  "node_modules/cmdk/",
 ];
 
 function fail(message: string): never {
@@ -50,7 +53,7 @@ const ATTRIBUTE = /([^\s="'<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?
  * which this tool counts like the tags it replaces. PR 4b writes that block, and must keep this
  * id and shape.
  */
-export const FIRST_RUN_MODULES_ID = "xum-pre-modules";
+export { FIRST_RUN_MODULES_ID };
 
 function parseAttributes(rest: string): Map<string, string> {
   const attrs = new Map<string, string>();
@@ -111,7 +114,7 @@ function htmlRoots(distDir: string): string[] {
 }
 
 /** Follows static imports only: dynamic `import()` and `__vite__mapDeps` strings are not first load. */
-function firstLoadFiles(distDir: string): Map<string, string> {
+export function firstLoadFiles(distDir: string): Map<string, string> {
   const transpiler = new Bun.Transpiler({ loader: "js" });
   const code = new Map<string, string>();
   const queue = htmlRoots(distDir);

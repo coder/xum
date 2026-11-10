@@ -119,10 +119,9 @@ const actualWorkspaceStore = { ...RealWorkspaceStoreModule };
 // The overlay also changes the store identity, so it must stay local to this suite.
 restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...actualWorkspaceStore }]]);
 
-// Overlay (not replace) the raw store: bun evaluates every test file before running tests
-// and static import bindings freeze at eval time, so this file-scope mock is what any
-// later-evaluated file in the same bun process gets forever. A bare fake missing store
-// methods breaks those files' cleanup and cascades.
+// Overlay (not replace) the raw store: this file-scope mock stays in place for the whole
+// file, and for every later test file if the restore does not run. A bare fake missing
+// store methods breaks those files' cleanup and cascades.
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...actualWorkspaceStore,
   useWorkspaceState: () => currentWorkspaceState,
@@ -134,9 +133,8 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
 
 // No usePersistedState module mock: the real hook returns [false, setter] for the unset
 // vim key in a fresh happy-dom localStorage (what the old fake hardcoded), and a partial
-// module replacement here leaks process-wide (bun evaluates every test file before running
-// tests), turning later-evaluated suites' persistence into no-ops (seen as GeneralSection
-// CI failures).
+// module replacement here leaks process-wide (a module mock outlives its test file),
+// turning later suites' persistence into no-ops (seen as GeneralSection CI failures).
 
 import { RetryBarrier } from "./RetryBarrier";
 

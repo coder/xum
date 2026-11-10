@@ -8,7 +8,7 @@ import { ThinkingLevelSchema } from "../../types/thinking";
 import { isValidModelFormat } from "@/common/utils/ai/models";
 import { AgentIdSchema } from "./agentDefinition";
 import { StreamErrorTypeSchema } from "./errors";
-import { AgentSkillScopeSchema, SkillNameSchema } from "./agentSkill";
+import { AgentSkillScopeSchema, SkillLookupNameSchema } from "./agentSkill";
 import { WorkflowRunIdSchema, WorkflowRunRecordSchema } from "./workflow";
 
 export const FilePartSchema = z.object({
@@ -97,6 +97,10 @@ export const DynamicToolPartPendingSchema = MuxToolPartBase.extend({
 const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
   state: z.literal("output-available"),
   output: z.unknown(),
+  // Model-only notes the in-turn result carried (`__mux_notifications`), kept out of `output`
+  // so the transcript never shows them. The request build attaches them again: see
+  // readModelOnlyToolNotifications.
+  modelOnlyNotifications: z.array(z.string()).optional().catch(undefined),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
 const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
@@ -232,7 +236,6 @@ export const MuxMessageSchema = z.object({
       model: z.string().optional(),
       metadataModel: z.string().optional(),
       thinkingLevel: ThinkingLevelSchema.optional(),
-      routedThroughGateway: z.boolean().optional(),
       routeProvider: z.string().optional(), // Preserve replayed/non-stream route attribution.
       // Self-healing read path (like agentId/compactionEpoch): the badge is purely
       // decorative, so a shape-corrupt persisted record must degrade to "no badge"
@@ -249,6 +252,24 @@ export const MuxMessageSchema = z.object({
       // A corrupt point degrades to the strip-all receipt, which is always valid.
       anthropicThinkingReplayFromStep: z
         .union([z.number().int().nonnegative(), z.literal("end")])
+        .optional()
+        .catch(undefined),
+      // Volatile system-tail record (MuxMetadata.volatileSystemTail); corrupt degrades to none.
+      volatileSystemTail: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
+      // Same shape for the custom-instructions block, the skill index and the tool instructions.
+      customInstructions: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
+      skillIndex: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
+      toolInstructions: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
         .optional()
         .catch(undefined),
       usage: z.any().optional(),
@@ -295,7 +316,9 @@ export const MuxMessageSchema = z.object({
       // Ignore malformed snapshot metadata so one row cannot fail the whole history parse.
       agentSkillSnapshot: z
         .object({
-          skillName: SkillNameSchema,
+          // A lookup name: `<plugin>:<skill>` for a qualified invocation. Older
+          // builds drop only this metadata (.catch below), not the row.
+          skillName: SkillLookupNameSchema,
           scope: AgentSkillScopeSchema,
           sha256: z.string(),
           frontmatterYaml: z.string().optional(),

@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect } from "@storybook/test";
+import { expect } from "storybook/test";
 
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 

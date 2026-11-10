@@ -1,6 +1,6 @@
 import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { ProvidersSection } from "./ProvidersSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 
@@ -61,6 +61,70 @@ export const ProvidersConfigured: Story = {
     const canvas = within(canvasElement);
 
     await canvas.findAllByTitle(/^Configured$/i, {}, { timeout: 5000 });
+  },
+};
+
+function localStoryProvider(baseUrl: string, model: string, displayName?: string) {
+  return {
+    apiKeySet: false,
+    isEnabled: true,
+    isConfigured: true,
+    isCustom: true,
+    providerType: "openai-compatible" as const,
+    baseUrl,
+    displayName,
+    models: [model],
+  };
+}
+
+export const LocalProviderIcons: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            omlx: localStoryProvider("http://127.0.0.1:8000/v1", "qwen3-8b"),
+            // Only the base URL's port names this runtime, so the icon must come from the config.
+            "gpu-box": localStoryProvider("http://gpu-box:11434/v1", "llama3.2"),
+            "lm-studio": localStoryProvider("http://localhost:1234/v1", "gemma-3-12b"),
+            "llama-cpp": localStoryProvider("http://127.0.0.1:8080/v1", "phi-4"),
+            "local-vllm": localStoryProvider(
+              "http://localhost:8001/v1",
+              "mistral-small",
+              "Local vLLM"
+            ),
+            "mac-studio": localStoryProvider("http://192.168.1.20:8000/v1", "qwen3-32b"),
+            proxy: localStoryProvider("https://proxy.example.com/v1", "gpt-proxy"),
+          },
+        })
+      }
+    >
+      <ProvidersSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    const expectedIcons: Array<[RegExp, string]> = [
+      [/omlx/i, "oMLX"],
+      [/gpu-box/i, "Ollama"],
+      [/lm-studio/i, "LM Studio"],
+      [/llama-cpp/i, "llama.cpp"],
+      [/Local vLLM/, "vLLM"],
+    ];
+    for (const [providerName, iconTitle] of expectedIcons) {
+      const header = await canvas.findByRole("button", { name: providerName }, { timeout: 5000 });
+      await within(header).findByTitle(iconTitle);
+    }
+
+    const expectedFallbacks: Array<[RegExp, string]> = [
+      [/mac-studio/i, ".lucide-cpu"],
+      [/proxy/i, ".lucide-server"],
+    ];
+    for (const [providerName, iconSelector] of expectedFallbacks) {
+      const header = await canvas.findByRole("button", { name: providerName });
+      await expect(header.querySelector(iconSelector)).not.toBeNull();
+    }
   },
 };
 

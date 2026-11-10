@@ -36,6 +36,12 @@ export const WORKFLOW_TONE_VAR: Record<WorkflowTone, string> = {
   destructive: "var(--color-danger)",
 };
 
+/** Tone → CSS color for text. Light-theme success green is below WCAG AA as text (#6882). */
+export const WORKFLOW_TONE_TEXT_VAR: Record<WorkflowTone, string> = {
+  ...WORKFLOW_TONE_VAR,
+  success: "var(--color-success-text)",
+};
+
 export function getWorkflowStepTone(status: WorkflowStepDisplayStatus): WorkflowTone {
   switch (status) {
     case "running":

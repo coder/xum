@@ -379,9 +379,9 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
     }
   }
 
-  // Event costs are computed at ingest time; when the bundled pricing tables
-  // change (app upgrade), rows priced under the old tables — typically $0 for
-  // then-unknown models — must be repriced via a full rebuild.
+  // Event costs are computed at ingest time, so when the bundled pricing tables
+  // or rules change (app upgrade), rows priced under the old ones (typically $0
+  // for then-unknown models) must be repriced via a full rebuild.
   const storedPricingFingerprint = await readStoredPricingFingerprint(getConn());
   const pricingFingerprintChanged = storedPricingFingerprint !== getCurrentPricingFingerprint();
 

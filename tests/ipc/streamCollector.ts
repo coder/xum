@@ -14,7 +14,8 @@
  *   const events = collector.getEvents();
  */
 
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { OnChatEvent, WorkspaceChatMessage } from "@/common/orpc/types";
+import { singleChatEvent } from "@/common/orpc/singleChatEvent";
 import type { OrpcTestClient } from "./orpcTestClient";
 
 /** Event with arrival timestamp for timing analysis in tests */
@@ -33,7 +34,7 @@ export class StreamCollector {
   private events: WorkspaceChatMessage[] = [];
   private timestampedEvents: TimestampedEvent[] = [];
   private abortController: AbortController;
-  private iterator: AsyncIterableIterator<WorkspaceChatMessage> | null = null;
+  private iterator: AsyncIterableIterator<OnChatEvent> | null = null;
   private iteratorPromise: Promise<void> | null = null;
   private started = false;
   private stopped = false;
@@ -154,8 +155,10 @@ export class StreamCollector {
       );
       this.iterator = iterator;
 
-      for await (const message of iterator) {
+      for await (const received of iterator) {
         if (this.stopped) break;
+        // The collector does not pass batchReplay, so every event is a single one.
+        const message = singleChatEvent(received);
 
         // Check for "caught-up" event which signals subscription is established
         // and history replay is complete. Only then is it safe to send messages.

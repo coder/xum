@@ -5,9 +5,10 @@
  * Chrome at 390, 744, 1200 and 1900 px, in the light and the dark system theme. Each run holds the
  * app's main chunk, so the static view (#xum-pre) stays alone on screen, measures it, releases the
  * chunk and measures the live wizard's first frame after the handoff.
- * Rule: the static "OSS contributors..." paragraph is within 2 px of the live one in x, y, width and
- * height, and the static phase has exactly one <main>. It saves a full-page screenshot of the static
- * phase and of the live first frame per run, for PR 4b's shell check (owner decision 10-14).
+ * Rule: the static "Xum is provider-agnostic..." paragraph is within 2 px of the live one in x, y,
+ * width and height, and the static phase has exactly one <main>. Shell check (PR 4b's precondition,
+ * owner decision 10-14): outside the dialog box and a 4 px margin, no pixel of the static phase's
+ * screenshot differs from the live first frame's by more than 16 in a color channel.
  * Until PR 4b serves the view, the served "/" has no #xum-pre: the tool then inserts #6444's
  * FIRST_RUN_VIEW_HTML before </body> of the served "/" by hand (Playwright route), as a test page.
  * Exit: 0 every run passes, 1 a run fails the rule, 2 bad input, 3 an invalid run.
@@ -21,8 +22,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { chromium, type Browser, type Page } from "playwright";
+import sharp from "sharp";
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
 import { FIRST_RUN_VIEW_HTML } from "@/node/orpc/firstRunView";
+import { newServerToken, serverTokenEnv, withServerToken } from "./serverToken";
 
 export interface Box {
   x: number;
@@ -48,6 +51,49 @@ export function parityFailures(staticBox: Box, liveBox: Box, staticMains: number
   return failures;
 }
 
+export interface RawImage {
+  data: Uint8Array;
+  width: number;
+  height: number;
+  channels: number;
+}
+
+/** The shell check: pixels outside the dialog (CSS px box, 4 px margin) off by more than 16. */
+export function shellDiff(a: RawImage, b: RawImage, dialog: Box, scale: number) {
+  if (a.width !== b.width || a.height !== b.height || a.channels !== b.channels) {
+    throw new Error("the static and live screenshots differ in size");
+  }
+  const [left, top] = [(dialog.x - 4) * scale, (dialog.y - 4) * scale];
+  const [right, bottom] = [left + (dialog.width + 8) * scale, top + (dialog.height + 8) * scale];
+  let pixels = 0;
+  const hit = { x0: Infinity, y0: Infinity, x1: -1, y1: -1 };
+  for (let y = 0; y < a.height; y++) {
+    for (let x = 0; x < a.width; x++) {
+      if (x >= left && x < right && y >= top && y < bottom) continue;
+      const i = (y * a.width + x) * a.channels;
+      const off = Math.max(...[0, 1, 2].map((c) => Math.abs(a.data[i + c] - b.data[i + c])));
+      if (off <= 16) continue;
+      pixels++;
+      Object.assign(hit, {
+        x0: Math.min(hit.x0, x),
+        y0: Math.min(hit.y0, y),
+        x1: Math.max(hit.x1, x),
+        y1: Math.max(hit.y1, y),
+      });
+    }
+  }
+  const [x, y, width, height] = [hit.x0, hit.y0, hit.x1 + 1 - hit.x0, hit.y1 + 1 - hit.y0];
+  const bbox = pixels
+    ? { x: x / scale, y: y / scale, width: width / scale, height: height / scale }
+    : null;
+  return { pixels, bbox };
+}
+
+const raw = async (png: Buffer): Promise<RawImage> => {
+  const { data, info } = await sharp(png).raw().toBuffer({ resolveWithObject: true });
+  return { data, width: info.width, height: info.height, channels: info.channels };
+};
+
 const WIDTHS = [
   { width: 390, height: 844, phone: true },
   { width: 744, height: 1133, phone: true },
@@ -55,7 +101,7 @@ const WIDTHS = [
   { width: 1900, height: 1000, phone: false },
 ];
 const THEMES = ["light", "dark"] as const;
-const TEXT = "OSS contributors with GitHub accounts";
+const TEXT = "Xum is provider-agnostic";
 
 async function startServer(tree: string, root: string, logFile: string) {
   const probePort = net.createServer().listen(0, "127.0.0.1");
@@ -63,8 +109,15 @@ async function startServer(tree: string, root: string, logFile: string) {
   const { port } = probePort.address() as net.AddressInfo;
   probePort.close();
   const log = fs.openSync(logFile, "w");
-  const env = { PATH: process.env.PATH, HOME: root, XUM_ROOT: root, XUM_DISABLE_TELEMETRY: "1" };
-  const args = `dist/cli/index.js server --no-auth --host 127.0.0.1 --port ${port}`.split(" ");
+  const token = newServerToken();
+  const env = {
+    PATH: process.env.PATH,
+    HOME: root,
+    XUM_ROOT: root,
+    XUM_DISABLE_TELEMETRY: "1",
+    ...serverTokenEnv(token),
+  };
+  const args = `dist/cli/index.js server --host 127.0.0.1 --port ${port}`.split(" ");
   const server = spawn("node", args, {
     cwd: tree,
     env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null" },
@@ -88,20 +141,20 @@ async function startServer(tree: string, root: string, logFile: string) {
     await stop();
     throw new Error(`the server did not start, see ${logFile}`);
   }
-  return { origin, stop };
+  return { origin, token, stop };
 }
 
-/** The target paragraph's box, in the static view or outside it; null while there is none. */
-function paragraphBox(page: Page, inStatic: boolean) {
+/** The box of the first `selector` match starting with `text`, in the static view or outside it. */
+function boxOf(page: Page, inStatic: boolean, selector = "p", text = TEXT) {
   return page.evaluate(
-    ([id, text, wantStatic]) => {
-      const p = [...document.querySelectorAll("p")].find(
-        (e) => e.textContent?.startsWith(text) && !!e.closest(`#${id}`) === wantStatic
+    ([id, sel, prefix, wantStatic]) => {
+      const p = [...document.querySelectorAll(sel)].find(
+        (e) => e.textContent?.startsWith(prefix) && !!e.closest(`#${id}`) === wantStatic
       );
       const r = p?.getBoundingClientRect();
       return r && r.width > 0 ? { x: r.x, y: r.y, width: r.width, height: r.height } : null;
     },
-    [FIRST_RUN_VIEW_ID, TEXT, inStatic] as const
+    [FIRST_RUN_VIEW_ID, selector, text, inStatic] as const
   );
 }
 
@@ -126,7 +179,7 @@ async function main(): Promise<number> {
   let injected = false;
   try {
     server = await startServer(path.resolve(a.tree), root, path.join(out, "server.log"));
-    const { origin } = server;
+    const { origin, token } = server;
     // A route-fulfilled document has no local address space, so Local Network Access would block the
     // app's WebSocket to 127.0.0.1. pageTiming.ts navigates without fulfill and needs no such flag.
     browser = await chromium.launch({
@@ -145,20 +198,24 @@ async function main(): Promise<number> {
         const page = await context.newPage();
         let release!: () => void;
         const held = new Promise<void>((resolve) => (release = resolve));
-        await page.route(`${origin}/`, async (route) => {
-          const response = await route.fetch();
-          const html = await response.text();
-          injected ||= !html.includes(`id="${FIRST_RUN_VIEW_ID}"`);
-          const body = html.includes(`id="${FIRST_RUN_VIEW_ID}"`)
-            ? html
-            : withFirstRunView(html, FIRST_RUN_VIEW_HTML);
-          await route.fulfill({ status: response.status(), contentType: "text/html", body });
-        });
+        // The page loads with `?token=`, so match the path, not the whole URL.
+        await page.route(
+          (url) => url.origin === origin && url.pathname === "/",
+          async (route) => {
+            const response = await route.fetch();
+            const html = await response.text();
+            injected ||= !html.includes(`id="${FIRST_RUN_VIEW_ID}"`);
+            const body = html.includes(`id="${FIRST_RUN_VIEW_ID}"`)
+              ? html
+              : withFirstRunView(html, FIRST_RUN_VIEW_HTML);
+            await route.fulfill({ status: response.status(), contentType: "text/html", body });
+          }
+        );
         await page.route(/\/main-[^/]+\.js$/, async (route) => {
           await held;
           await route.continue();
         });
-        await page.goto(`${origin}/`, { waitUntil: "commit" });
+        await page.goto(withServerToken(`${origin}/`, token), { waitUntil: "commit" });
         // Measure the painted static view: stylesheets applied (a stylesheet that never loads is an
         // invalid run after 60 s), then the fonts that layout asked for.
         const sheets = "link[rel=stylesheet]";
@@ -175,10 +232,14 @@ async function main(): Promise<number> {
           for (let i = 0; i < 2; i++)
             await new Promise((resolve) => requestAnimationFrame(resolve));
         });
-        const staticBox = await paragraphBox(page, true);
+        const staticBox = await boxOf(page, true);
+        const staticDialog = await boxOf(page, true, "[role=dialog]", "");
         if (!staticBox) throw new Error(`${name}: the static view shows no target paragraph`);
         const staticMains = await page.evaluate(() => document.querySelectorAll("main").length);
-        await page.screenshot({ path: path.join(out, `static-${name}.png`), fullPage: true });
+        const staticShot = await page.screenshot({
+          path: path.join(out, `static-${name}.png`),
+          fullPage: true,
+        });
         release();
         const handle = await page.waitForFunction(
           ([id, text]) => {
@@ -193,9 +254,33 @@ async function main(): Promise<number> {
           { polling: "raf", timeout: 120_000 }
         );
         const liveBox = (await handle.jsonValue())!;
-        await page.screenshot({ path: path.join(out, `live-${name}.png`), fullPage: true });
+        const liveShot = await page.screenshot({
+          path: path.join(out, `live-${name}.png`),
+          fullPage: true,
+        });
+        const liveDialog = await boxOf(page, false, "[role=dialog]", "");
+        if (!staticDialog || !liveDialog) throw new Error(`${name}: a phase shows no dialog`);
+        const [x, y] = [
+          Math.min(staticDialog.x, liveDialog.x),
+          Math.min(staticDialog.y, liveDialog.y),
+        ];
+        const dialog = {
+          x,
+          y,
+          width: Math.max(staticDialog.x + staticDialog.width, liveDialog.x + liveDialog.width) - x,
+          height:
+            Math.max(staticDialog.y + staticDialog.height, liveDialog.y + liveDialog.height) - y,
+        };
+        const [a, b] = [await raw(staticShot), await raw(liveShot)];
+        const shell = shellDiff(a, b, dialog, a.width / size.width);
         const failures = parityFailures(staticBox, liveBox, staticMains);
-        results.push({ name, staticBox, liveBox, staticMains, failures });
+        if (shell.pixels > 0) {
+          const at = Object.values(shell.bbox!).map((v) => Math.round(v));
+          failures.push(
+            `shell: ${shell.pixels} pixels off by more than 16 at x,y,w,h ${at.join(",")}`
+          );
+        }
+        results.push({ name, staticBox, liveBox, staticMains, dialog, shell, failures });
         console.log(`${name}: ${failures.length ? failures.join(", ") : "pass"}`);
         await context.close();
       }

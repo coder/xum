@@ -1,0 +1,306 @@
+/**
+ * Cursor-format plugin hooks (`hooks/hooks.json`, or the `.cursor-plugin/plugin.json` `hooks`
+ * value).
+ *
+ * Source: https://cursor.com/docs/hooks.md. Shape:
+ * `{ version: 1, hooks: { <event>: [{ command, type?, matcher?, timeout?, loop_limit?, failClosed? }] } }`.
+ *
+ * - Trust (D1): the hash covers the event, the matcher and the entry exactly as declared, unknown
+ *   fields included, and `declared` carries that canonical entry so the review shows all of it.
+ *
+ * Discovery calls the loader with its own PluginFs, so this module imports discovery for types only.
+ */
+import * as path from "node:path";
+import type { PluginHookStatus } from "@/common/orpc/schemas/agentPlugins";
+import { getErrorMessage } from "@/common/utils/errors";
+import {
+  MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN,
+  cursorHookNotAppliedReason,
+} from "@/constants/pluginHooks";
+import type { PluginHookDefinition, PluginHooksLoadResult } from "./codexHooks";
+import type { AgentPluginNotApplied, PluginFs } from "./discovery";
+import {
+  HookWarnings,
+  MAX_HOOK_WARNINGS,
+  MAX_HOOKS_FILE_BYTES,
+  MAX_PLUGIN_HOOKS,
+  canonicalJson,
+  hashHookDefinition,
+} from "./hookDefinition";
+import { isPlainObject } from "./manifest";
+
+const INLINE_HOOKS_SOURCE = "plugin.json#hooks";
+
+export interface CursorHooksLoadResult extends PluginHooksLoadResult {
+  notApplied: AgentPluginNotApplied[];
+}
+
+export type CursorHooksSource = string | Record<string, unknown> | undefined;
+
+/**
+ * Read and parse a Cursor package's hooks. A path is read only inside the plugin folder, through
+ * `fs` (discovery's PluginFs): a path that leaves it, also through a symlink, gives no hooks and a
+ * warning. A missing file gives no hooks.
+ */
+export async function loadPluginCursorHooks(args: {
+  rootPath: string;
+  source: CursorHooksSource;
+  fs: Pick<PluginFs, "ensureContained" | "readFileCapped">;
+}): Promise<CursorHooksLoadResult> {
+  const warnings = new HookWarnings();
+  const document =
+    typeof args.source === "string"
+      ? await readHooksDocument(args.rootPath, args.source, args.fs, warnings)
+      : args.source;
+  const label = typeof args.source === "string" ? path.normalize(args.source) : INLINE_HOOKS_SOURCE;
+  const dropped: AgentPluginNotApplied[] = [];
+  const hooks: PluginHookDefinition[] =
+    document === undefined ? [] : parseCursorHooksDocument(document, label, { warnings, dropped });
+  const list = warnings.list();
+  if (hooks.length > MAX_PLUGIN_HOOKS) {
+    list.push(`More than ${MAX_PLUGIN_HOOKS} hooks; ignoring the rest`);
+    hooks.length = MAX_PLUGIN_HOOKS;
+  }
+  const notApplied = hooks.flatMap((hook): AgentPluginNotApplied[] => {
+    const reason = cursorHookNotAppliedReason(hook);
+    return reason === undefined ? [] : [{ part: "hook", name: hookName(hook), reason }];
+  });
+  return { hooks, warnings: list, notApplied: [...notApplied, ...dropped] };
+}
+
+function hookName(hook: Pick<PluginHookDefinition, "key" | "source">): string {
+  return hook.key.slice(`cursor:${hook.source}#`.length);
+}
+
+async function readHooksDocument(
+  rootPath: string,
+  relativePath: string,
+  fs: Pick<PluginFs, "ensureContained" | "readFileCapped">,
+  warnings: HookWarnings
+): Promise<unknown> {
+  // A key is `cursor:<source>#<event>[<index>]`, and the inline source holds a `#`: a file path
+  // with one could take the inline source's keys (the rule of codexHooks.ts).
+  if (relativePath.includes("#")) {
+    warnings.push(`${relativePath}: a hooks file path must not contain '#'; ignoring it`);
+    return undefined;
+  }
+  let canonical: string;
+  try {
+    canonical = await fs.ensureContained(rootPath, path.join(rootPath, relativePath));
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return undefined;
+    warnings.push(`${relativePath} cannot be read; ignoring it: ${getErrorMessage(error)}`);
+    return undefined;
+  }
+  let content: string;
+  try {
+    ({ content } = await fs.readFileCapped({
+      filePath: canonical,
+      pluginRoot: rootPath,
+      maxBytes: MAX_HOOKS_FILE_BYTES,
+      label: relativePath,
+    }));
+  } catch (error) {
+    warnings.push(`${relativePath} cannot be read; ignoring it: ${getErrorMessage(error)}`);
+    return undefined;
+  }
+  try {
+    return JSON.parse(content) as unknown;
+  } catch (error) {
+    warnings.push(`${relativePath} is not valid JSON; ignoring it: ${getErrorMessage(error)}`);
+    return undefined;
+  }
+}
+
+function errorCode(error: unknown): unknown {
+  return typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+}
+
+function hooksMapOf(
+  document: unknown,
+  source: string,
+  warnings: HookWarnings
+): Record<string, unknown> | undefined {
+  if (!isPlainObject(document) || !isPlainObject(document.hooks)) {
+    warnings.push(`${source}: expected { "version": 1, "hooks": { <event>: [...] } }; ignoring it`);
+    return undefined;
+  }
+  if (document.version !== undefined && document.version !== 1) {
+    warnings.push(`${source}: only hooks.json version 1 is supported; ignoring it`);
+    return undefined;
+  }
+  return document.hooks;
+}
+
+/**
+ * What a parse reports besides its hooks. A dropped hook gets a warning and a `notApplied` row, so
+ * the plugin's "not applied" list names it too (CUJ 5). The rows are bounded like the warnings: a
+ * 256 KiB file can hold thousands of bad entries.
+ */
+interface ParseReport {
+  warnings: HookWarnings;
+  dropped: AgentPluginNotApplied[];
+}
+
+function reportDropped(report: ParseReport, name: string, reason: string): void {
+  if (report.dropped.length < MAX_HOOK_WARNINGS)
+    report.dropped.push({ part: "hook", name, reason });
+}
+
+/** Up to MAX_PLUGIN_HOOKS + 1 hooks, so the caller can tell that the file holds more. */
+function parseCursorHooksDocument(
+  document: unknown,
+  source: string,
+  report: ParseReport
+): PluginHookDefinition[] {
+  const { warnings } = report;
+  const hooks: PluginHookDefinition[] = [];
+  for (const [event, entries] of Object.entries(hooksMapOf(document, source, warnings) ?? {})) {
+    if (!Array.isArray(entries)) {
+      warnings.push(`${source}: '${event}' must be an array of hooks; ignoring it`);
+      reportDropped(report, event, "must be an array of hooks");
+      continue;
+    }
+    for (const [index, raw] of (entries as unknown[]).entries()) {
+      if (hooks.length > MAX_PLUGIN_HOOKS) return hooks;
+      const hook = parseEntry(raw, { source, event, index }, report);
+      if (hook !== undefined) hooks.push(hook);
+    }
+  }
+  return hooks;
+}
+
+interface EntryPlace {
+  source: string;
+  event: string;
+  index: number;
+}
+
+function parseEntry(
+  raw: unknown,
+  where: EntryPlace,
+  report: ParseReport
+): PluginHookDefinition | undefined {
+  const label = `${where.source}: hook ${where.event}[${where.index}]`;
+  const parsed = readEntry(raw, where, label, report.warnings);
+  if (typeof parsed === "string") {
+    report.warnings.push(`${label}: ${parsed}; ignoring this hook`);
+    // The name of a kept hook (hookName); the display marks its controls (shownNotApplied).
+    reportDropped(report, `${where.event}[${where.index}]`, parsed);
+    return undefined;
+  }
+  return withStatus(parsed);
+}
+
+function readEntry(
+  raw: unknown,
+  where: EntryPlace,
+  label: string,
+  warnings: HookWarnings
+): Omit<PluginHookDefinition, "status"> | string {
+  const shape = readEntryShape(raw);
+  if (typeof shape === "string") return shape;
+  const { type, matcher, raw: entry } = shape;
+  let hash: string;
+  let declared: string;
+  try {
+    hash = hashHookDefinition(where.event, matcher, entry);
+    declared = canonicalJson(entry);
+  } catch (error) {
+    return getErrorMessage(error);
+  }
+  const handler =
+    type === "prompt"
+      ? ({ type: "cursor-prompt", declared } as const)
+      : commandHandler(entry, declared, label, warnings);
+  if (typeof handler === "string") return handler;
+  return {
+    key: `cursor:${where.source}#${where.event}[${where.index}]`,
+    hash,
+    event: where.event,
+    ...(matcher !== undefined ? { matcher } : {}),
+    handler,
+    source: where.source,
+  };
+}
+
+function readEntryShape(
+  raw: unknown
+): { raw: Record<string, unknown>; type: "command" | "prompt"; matcher?: string } | string {
+  if (!isPlainObject(raw)) return "an entry must be an object";
+  const type = raw.type ?? "command";
+  if (type !== "command" && type !== "prompt") return "type must be command or prompt";
+  if (raw.matcher == null) return { raw, type };
+  if (typeof raw.matcher !== "string") return "matcher must be a string";
+  return { raw, type, matcher: raw.matcher };
+}
+
+function commandHandler(
+  raw: Record<string, unknown>,
+  declared: string,
+  label: string,
+  warnings: HookWarnings
+): Extract<PluginHookDefinition["handler"], { type: "cursor-command" }> | string {
+  if (typeof raw.command !== "string" || raw.command.trim().length === 0) {
+    return "an entry needs a command string";
+  }
+  const loopLimit = readLoopLimit(raw);
+  if (loopLimit === "invalid") return "loop_limit must be a whole number or null";
+  return {
+    type: "cursor-command",
+    command: raw.command,
+    ...readTimeout(raw, label, warnings),
+    ...(loopLimit !== undefined ? { loopLimit } : {}),
+    ...readFailClosed(raw, label, warnings),
+    declared,
+  };
+}
+
+function withStatus(hook: Omit<PluginHookDefinition, "status">): PluginHookDefinition {
+  const reason = cursorHookNotAppliedReason(hook);
+  const status: PluginHookStatus =
+    reason === undefined
+      ? "runnable"
+      : hook.handler.type === "cursor-prompt"
+        ? "unsupported-handler"
+        : "ignored-event";
+  return { ...hook, status };
+}
+
+/**
+ * The hook's own continuation limit: a whole number from 0 (never continues) up to the per-user-turn
+ * ceiling (a larger one runs as the ceiling; `declared` keeps it), null for none, undefined for the
+ * shared default.
+ */
+function readLoopLimit(raw: Record<string, unknown>): number | null | undefined | "invalid" {
+  if (!Object.hasOwn(raw, "loop_limit")) return undefined;
+  const value = raw.loop_limit;
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) return "invalid";
+  return Math.min(value, MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN);
+}
+
+function readTimeout(
+  raw: Record<string, unknown>,
+  where: string,
+  warnings: HookWarnings
+): { timeoutSeconds?: number } {
+  const value = raw.timeout;
+  if (value == null) return {};
+  if (typeof value === "number" && value > 0) return { timeoutSeconds: value };
+  warnings.push(`${where}: timeout must be a positive number; using the default`);
+  return {};
+}
+
+/** Parsed and hashed only: no mapped event is a permission hook, so it changes nothing (5.5). */
+function readFailClosed(
+  raw: Record<string, unknown>,
+  where: string,
+  warnings: HookWarnings
+): { failClosed?: boolean } {
+  const value = raw.failClosed;
+  if (value === undefined) return {};
+  if (typeof value === "boolean") return { failClosed: value };
+  warnings.push(`${where}: failClosed must be true or false; ignoring the field`);
+  return {};
+}

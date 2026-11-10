@@ -1,4 +1,4 @@
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { createMuxMessage } from "@/common/types/message";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -324,16 +324,6 @@ export const ExperimentSettings: AppStory = {
     />
   ),
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await waitFor(() =>
-      expect(
-        canvas.queryByTestId("settings-button") ??
-          canvas.queryByRole("button", { name: "Open sidebar menu" })
-      ).not.toBeNull()
-    );
-    if (!canvas.queryByTestId("settings-button")) {
-      await userEvent.click(canvas.getByRole("button", { name: "Open sidebar menu" }));
-    }
     const settings = within(await openSettingsDialog(canvasElement));
     const strategy = await settings.findByRole("combobox", { name: "Compaction strategy" });
     strategy.scrollIntoView({ block: "center" });

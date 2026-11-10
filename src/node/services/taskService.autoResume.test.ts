@@ -6,7 +6,11 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
-import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
+import {
+  BACKGROUND_WORK_WAKE_OPENINGS,
+  LEGACY_TODO_TURN_END_NUDGES,
+} from "@/common/utils/machineTurnPrompts";
+import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import {
   buildWorkflowRunCardMessage,
@@ -1758,6 +1762,100 @@ describe("TaskService", () => {
     expect(serializedParentHistory).toContain("structuredOutput");
     expect(serializedParentHistory).toContain("claims");
     expect(serializedParentHistory).not.toContain("Background sub-agent task(s) have completed");
+  });
+
+  // F49: TODO-nudge rows saved before #7027 carry the nudge's todo-only rule, and each wake copied
+  // it forward (a second nudge doubled it), so every later wake ran with task_await and
+  // session_history disabled. The rule goes only when the chain proves a nudge added it: a caller
+  // who set the same rule on purpose keeps it, because dropping it would enable every tool.
+  const legacyRule = { regex_match: "(?!todo_write$).*", action: "disable" } as const;
+  const bashRule = { regex_match: "bash", action: "disable" } as const;
+  const legacyNudgeText = LEGACY_TODO_TURN_END_NUDGES[0];
+  const userRow = (
+    id: string,
+    text: string,
+    toolPolicy: ToolPolicy | undefined,
+    synthetic = true
+  ) =>
+    createMuxMessage(id, "user", text, {
+      timestamp: Date.now(),
+      ...(synthetic ? { synthetic: true, uiVisible: true } : {}),
+      ...(toolPolicy != null ? { toolPolicy } : {}),
+    });
+  const legacyChain = (own: ToolPolicy) => [
+    userRow("manual", "Do the work", own.length > 0 ? own : undefined, false),
+    userRow("nudge-1", legacyNudgeText, [...own, legacyRule]),
+    userRow("wake-1", "Background sub-agent task(s) have completed.", [...own, legacyRule]),
+    userRow("nudge-2", legacyNudgeText, [...own, legacyRule, legacyRule]),
+  ];
+  test.each([
+    ["heals a legacy nudge chain", legacyChain([]), undefined],
+    ["heals a legacy nudge chain and keeps the caller rule", legacyChain([bashRule]), [bashRule]],
+    [
+      "keeps the same rule a manual turn set",
+      [userRow("manual", "Only todos", [legacyRule], false)],
+      [legacyRule],
+    ],
+    [
+      "keeps the same rule a spawn set",
+      [userRow("spawn", "Explore the repo", [legacyRule])],
+      [legacyRule],
+    ],
+    [
+      "keeps a caller rule the nudge doubled",
+      [
+        userRow("manual", "Only todos", [legacyRule], false),
+        userRow("nudge", legacyNudgeText, [legacyRule, legacyRule]),
+      ],
+      [legacyRule],
+    ],
+  ] as const)("terminal wake %s", async (_name, rows, expected) => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-legacy-todo-policy";
+    const childTaskId = "task-legacy-todo-policy";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        {
+          path: path.join(projectPath, "child-task"),
+          id: childTaskId,
+          name: "agent_explore_child",
+          parentWorkspaceId,
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          taskThinkingLevel: "medium",
+        },
+      ],
+      testTaskSettings()
+    );
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService, resumeStream } = createWorkspaceServiceMocks();
+    const { historyService, taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+    for (const message of rows) {
+      expect((await historyService.appendToHistory(parentWorkspaceId, message)).success).toBe(true);
+    }
+
+    await streamEnd(taskService, {
+      type: "stream-end",
+      workspaceId: childTaskId,
+      messageId: "assistant-child-output",
+      metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+      parts: [{ type: "text", text: "Hello from child" }],
+    });
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(resumeStream).toHaveBeenCalledTimes(1);
+    const wakeOptions = resumeStream.mock.calls[0][1] as { toolPolicy?: unknown };
+    expect(wakeOptions.toolPolicy).toEqual(expected);
   });
 
   test("terminal report cuts a busy parent's turn with one coalesced tool-end wake", async () => {

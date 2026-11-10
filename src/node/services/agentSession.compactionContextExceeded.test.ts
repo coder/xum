@@ -22,6 +22,7 @@ import {
   createStartedTurnHandle,
 } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 
 const FAILED_MESSAGE_ID = "assistant-compaction-ctx-exceeded";
 const FAILED_RETRY_MESSAGE_ID = "assistant-compaction-retry-ctx-exceeded";
@@ -47,7 +48,9 @@ describe("AgentSession: compaction request over the context window", () => {
     } = {}
   ) {
     const workspaceId = `ws-compaction-overflow-${model.replace(/\W/g, "-")}`;
-    const { historyService, config, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService({
+      files: SessionFilesMemory,
+    });
     historyCleanup = cleanup;
     await historyService.appendToHistory(workspaceId, {
       id: "compaction-request-1",

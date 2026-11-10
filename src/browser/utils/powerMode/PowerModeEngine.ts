@@ -15,6 +15,9 @@ interface BurstOptions {
   kind?: PowerModeBurstKind;
 }
 
+// Particle cap (reference: 500 max).
+const MAX_PARTICLES = 500;
+
 export class PowerModeEngine {
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
@@ -38,8 +41,7 @@ export class PowerModeEngine {
 
   private resizeListenerActive = false;
 
-  // Particle cap (reference: 500 max) and spawn throttle (reference: 25ms).
-  private static readonly MAX_PARTICLES = 500;
+  // Spawn throttle (reference: 25ms).
   private lastBurstTimeMs = 0;
 
   // Golden-ratio hue walk for well-distributed bright colors (reference "bright random" mode).
@@ -89,7 +91,7 @@ export class PowerModeEngine {
 
     // Enforce particle cap (reference: 500 max). Evict oldest in one bulk
     // splice instead of per-particle shift() which is O(n) each.
-    const overflow = this.particles.length + count - PowerModeEngine.MAX_PARTICLES;
+    const overflow = this.particles.length + count - MAX_PARTICLES;
     if (overflow > 0) {
       this.particles.splice(0, overflow);
     }

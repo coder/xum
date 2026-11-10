@@ -44,6 +44,7 @@ import type {
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import { modelStringStartsWithProvider } from "@/common/utils/providers/modelString";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
+import { sessionHeaderNameError } from "@/common/utils/providers/sessionHeader";
 import {
   baseUrlQueryFragmentError,
   getCustomProviderIds,
@@ -67,6 +68,7 @@ import {
   isProviderAutoRouteEligible,
   resolveProviderCredentials,
   resolveCustomProviderCredentials,
+  resolveGoogleVertexEnvSettings,
 } from "@/node/utils/providerRequirements";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import {
@@ -95,6 +97,9 @@ function buildCustomProviderConfigInfo(config: BaseProviderConfig): ProviderConf
     apiKeyFile,
     apiKeySource: apiKeySet ? "config" : apiKeyFile ? "file" : "keyless",
     baseUrl,
+    // providers.jsonc loads without schema validation; a non-string would
+    // throw in the request path (see sessionHeader.ts).
+    sessionHeader: typeof config.sessionHeader === "string" ? config.sessionHeader : undefined,
     models,
     displayName: config.displayName,
     providerType: config.providerType ?? "openai-compatible",
@@ -104,7 +109,51 @@ function buildCustomProviderConfigInfo(config: BaseProviderConfig): ProviderConf
   };
 }
 
+function nonBlankString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
+/**
+ * Vertex settings for the UI: the service-account key file path is reported only
+ * as set/unset. Blank saved values count as unset (runtime ignores them too), and
+ * env-sourced values are reported separately so Settings can show where they come from.
+ */
+function googleVertexCredentialStatus(
+  config: { project?: unknown; location?: unknown; keyFilename?: unknown },
+  env: Record<string, string | undefined>
+): NonNullable<ProviderConfigInfo["googleVertex"]> {
+  const project = nonBlankString(config.project);
+  const location = nonBlankString(config.location);
+  const keyFilenameSet = nonBlankString(config.keyFilename) != null;
+  const envSettings = resolveGoogleVertexEnvSettings(env);
+  return {
+    project,
+    location,
+    envProject: project == null ? envSettings.project : undefined,
+    envLocation: location == null ? envSettings.location : undefined,
+    keyFilenameSet,
+    envKeyFilenameSet: !keyFilenameSet && envSettings.keyFilename != null,
+  };
+}
+
 const DENIED_KEY_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
+
+/** Value-only guards that run before the lock. "" always passes: it clears the key. */
+function configEditValueError(keyPath: string[], value: string | boolean): string | null {
+  if (keyPath.length !== 1 || value === "") return null;
+  const key = keyPath[0];
+  // No SDK adapter survives a query/fragment in its base URL (endpoint paths
+  // are raw-appended). `baseURL` is the legacy SDK-style alias.
+  if (key === "baseUrl" || key === "baseURL") {
+    return typeof value === "string" ? baseUrlQueryFragmentError(value) : null;
+  }
+  if (key === "sessionHeader") {
+    return typeof value === "string"
+      ? sessionHeaderNameError(value)
+      : "Session header must be a header name.";
+  }
+  return null;
+}
 
 type CustomProviderMutationResult<T> = Result<T, CustomProviderMutationError>;
 
@@ -224,7 +273,7 @@ export class ProviderService {
   /**
    * Notify subscribers that provider-relevant config has changed.
    * Called internally on provider config edits, and externally when
-   * main config changes affect provider availability (e.g. muxGatewayEnabled).
+   * other config changes affect provider availability.
    */
   notifyConfigChanged(): void {
     this.lastWarnedShadowedCustomProviderIds = null;
@@ -330,7 +379,6 @@ export class ProviderService {
     // Request builders can project their creation-time snapshot without racing
     // a second disk read that changes instance types or scoped model aliases.
     const providersConfig = snapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
-    const mainConfig = this.config.loadConfigOrDefault();
     const result: ProvidersConfigMap = {};
     const shadowedCustomProviderIds = this.detectAndLogShadowedProviders(providersConfig);
 
@@ -361,6 +409,10 @@ export class ProviderService {
         bearerToken?: string;
         accessKeyId?: string;
         secretAccessKey?: string;
+        /** Google Vertex AI-only: GCP project, location, and service-account key file. */
+        project?: string;
+        location?: string;
+        keyFilename?: string;
         /** Persisted provider toggle: only `false` is stored; missing means enabled. */
         enabled?: unknown;
         /** OpenAI-only: stored Codex OAuth tokens (never sent to frontend). */
@@ -386,10 +438,7 @@ export class ProviderService {
 
       const codexOauthSet =
         provider === "openai" && parseCodexOauthAuth(config.codexOauth) !== null;
-      let isEnabled = !isProviderDisabledInConfig(config);
-      if (provider === "mux-gateway" && mainConfig.muxGatewayEnabled === false) {
-        isEnabled = false;
-      }
+      const isEnabled = !isProviderDisabledInConfig(config);
 
       const explicitBaseUrl = resolveConfigBaseUrl(config);
 
@@ -493,6 +542,10 @@ export class ProviderService {
         };
       }
 
+      if (provider === "google-vertex") {
+        providerInfo.googleVertex = googleVertexCredentialStatus(config, process.env);
+      }
+
       // Coder-specific fields: deployment URL + OAuth connection status.
       // "Connected" only when the stored tokens were minted by the deployment
       // actually used for routing (tokens are issuer-bound; see
@@ -549,24 +602,10 @@ export class ProviderService {
         }
       }
 
-      // Xum Gateway-specific fields (check couponCode first, fallback to legacy voucher).
-      // Gateway stores enabled/models in the global config (~/.xum/config.json), not
-      // in providers.jsonc, so override the generic isEnabled with the gateway-specific value.
-      if (provider === "mux-gateway") {
-        const muxConfig = config as { couponCode?: string; voucher?: string };
-        providerInfo.couponCodeSet = !!(muxConfig.couponCode ?? muxConfig.voucher);
-        const globalConfig = this.config.loadConfigOrDefault();
-        providerInfo.isEnabled = globalConfig.muxGatewayEnabled !== false;
-        providerInfo.gatewayModels = globalConfig.muxGatewayModels ?? [];
-      }
-
       // Compute isConfigured using shared utility (checks config + env vars).
       // Disabled providers intentionally surface as not configured in the UI.
-      // Use providerInfo.isEnabled (not the local `isEnabled`) because gateway
-      // overrides it from global config — using the providers.jsonc value would
-      // make a disabled gateway appear configured.
       const configCheck = checkProviderConfigured(provider, config);
-      providerInfo.isConfigured = providerInfo.isEnabled && configCheck.isConfigured;
+      providerInfo.isConfigured = isEnabled && configCheck.isConfigured;
       providerInfo.apiKeySource = configCheck.apiKeySource;
       if (configCheck.baseUrlSource && configCheck.baseUrlResolved) {
         providerInfo.baseUrlSource = configCheck.baseUrlSource;
@@ -612,13 +651,7 @@ export class ProviderService {
       // Legacy shadowed built-ins remain unavailable, never inheriting official environment keys.
       if (custom ? !validateCustomProviderId(provider).ok : !defaultBaseUrl)
         return { status: "unsupported" };
-      if (
-        isProviderDisabledInConfig(config) ||
-        // Gateway enablement lives in config.json (see getConfig), not providers.jsonc.
-        (provider === "mux-gateway" &&
-          this.config.loadConfigOrDefault().muxGatewayEnabled === false)
-      )
-        return { status: "not-configured" };
+      if (isProviderDisabledInConfig(config)) return { status: "not-configured" };
       let apiKey: string | undefined, baseUrl: string | undefined, organization: string | undefined;
       if (custom) {
         const credentials = resolveCustomProviderCredentials(provider, config);
@@ -633,7 +666,7 @@ export class ProviderService {
         const credentials = resolveProviderCredentials(provider, config);
         // Use this provider's resolved credentials, never a Codex OAuth or ambient SDK token.
         if (!credentials.isConfigured) return { status: "not-configured" };
-        apiKey = provider === "mux-gateway" ? credentials.couponCode : credentials.apiKey;
+        apiKey = credentials.apiKey;
         baseUrl = credentials.baseUrl ?? resolveConfigBaseUrl(config) ?? defaultBaseUrl;
         organization = credentials.organization;
       }
@@ -642,19 +675,17 @@ export class ProviderService {
         ? custom === "anthropic-messages"
           ? "anthropic"
           : "openai"
-        : provider === "mux-gateway"
-          ? "gateway"
-          : provider === "anthropic" ||
-              provider === "google" ||
-              provider === "ollama" ||
-              provider === "openrouter"
-            ? provider
-            : "openai";
+        : provider === "anthropic" ||
+            provider === "google" ||
+            provider === "ollama" ||
+            provider === "openrouter"
+          ? provider
+          : "openai";
       return Object.freeze({
         provider,
         providerType: custom,
         format,
-        conditional: Boolean(custom) || provider === "zai" || provider === "mux-gateway",
+        conditional: Boolean(custom) || provider === "zai",
         baseUrl,
         apiKey,
         organization,
@@ -1156,13 +1187,7 @@ export class ProviderService {
             const insertIndex = directIndex === -1 ? priority.length : directIndex;
             const nextPriority = [...priority];
             nextPriority.splice(insertIndex, 0, providerName);
-            return (c) => ({
-              ...c,
-              routePriority: nextPriority,
-              // Clear legacy disable — routePriority presence is now the authoritative
-              // routing signal, so a stale muxGatewayEnabled: false must not veto it.
-              ...(providerName === "mux-gateway" ? { muxGatewayEnabled: undefined } : {}),
-            });
+            return (c) => ({ ...c, routePriority: nextPriority });
           } else if (!isAutoRouteEligible && priority.includes(providerName)) {
             // Only remove a gateway from routePriority when it is truly deconfigured
             // or explicitly disabled. Configured-but-not-auto-eligible providers
@@ -1484,16 +1509,10 @@ export class ProviderService {
         return { success: false as const, error: `Invalid custom provider type: ${String(value)}` };
       }
 
-      // Value-only guard shared by every provider: no SDK adapter survives a
-      // query/fragment in its base URL (endpoint paths are raw-appended).
-      // Empty string falls through: it clears the key.
-      const isBaseUrlEdit =
-        keyPath.length === 1 && (keyPath[0] === "baseUrl" || keyPath[0] === "baseURL");
-      if (isBaseUrlEdit && typeof value === "string" && value !== "") {
-        const queryFragmentError = baseUrlQueryFragmentError(value);
-        if (queryFragmentError != null) {
-          return { success: false as const, error: queryFragmentError };
-        }
+      // Value-only guards shared by every provider (base URL, session header).
+      const valueError = configEditValueError(keyPath, value);
+      if (valueError != null) {
+        return { success: false as const, error: valueError };
       }
 
       // Read-modify-write under the cross-process lock (see setConfigValue).
@@ -1520,14 +1539,6 @@ export class ProviderService {
             return `Invalid custom provider id for ${String(value)}: ${validation.reason}`;
           }
         }
-
-        // Track if this is first time setting couponCode for mux-gateway
-        const isFirstMuxGatewayCoupon =
-          provider === "mux-gateway" &&
-          keyPath.length === 1 &&
-          keyPath[0] === "couponCode" &&
-          value !== "" &&
-          !providersConfig[provider]?.couponCode;
 
         // Ensure provider exists
         if (!providersConfig[provider]) {
@@ -1566,19 +1577,6 @@ export class ProviderService {
             delete current[lastKey];
           } else {
             current[lastKey] = value;
-          }
-        }
-
-        // Add default models when setting up mux-gateway for the first time
-        if (isFirstMuxGatewayCoupon) {
-          const providerConfig = providersConfig[provider] as Record<string, unknown>;
-          const existingModels = normalizeProviderModelEntries(providerConfig.models);
-          if (existingModels.length === 0) {
-            providerConfig.models = [
-              "anthropic/claude-sonnet-5-5",
-              "anthropic/claude-opus-5-5",
-              "openai/gpt-6.1-sol",
-            ];
           }
         }
 

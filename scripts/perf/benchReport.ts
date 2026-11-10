@@ -123,6 +123,12 @@ export async function runAndReport(meta: BenchMeta): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  if (benchmarks.length === 0) {
+    // An empty result would read as a clean run that measured nothing (#5648).
+    console.error(`${meta.bench} registered no benchmarks, no JSON written`);
+    process.exitCode = 1;
+    return;
+  }
   fs.mkdirSync(path.dirname(jsonPath), { recursive: true });
   fs.writeFileSync(jsonPath, `${JSON.stringify(json, null, 2)}\n`);
   console.log(`loadavg end ${formatLoadavg(loadavgEnd)} | JSON: ${jsonPath}`);

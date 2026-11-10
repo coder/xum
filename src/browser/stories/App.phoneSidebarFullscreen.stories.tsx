@@ -8,7 +8,7 @@
  * is the Pixel capture of the open view at the phone viewport.
  */
 import { wrapAsyncIterator } from "@orpc/shared";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { ComponentType } from "react";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -16,7 +16,7 @@ import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
 import type { WorkflowRunRecord, WorkflowRunStreamEvent } from "@/common/types/workflow";
@@ -25,7 +25,7 @@ import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
-import { waitForChatInputAutofocusDone } from "./storyPlayHelpers.js";
+import { openSidebarNewTab, waitForChatInputAutofocusDone } from "./storyPlayHelpers.js";
 
 export default {
   ...appMeta,
@@ -84,8 +84,8 @@ function setup(layout: RightSidebarLayoutState = LAYOUT, workspaceId = WORKSPACE
     ],
   });
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
-  // Collapsed on a wide layout earlier: opening the full-screen view expands it.
-  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+  // Start without a preference: the default is collapsed, but the phone view must still open.
+  updatePersistedState(getRightSidebarCollapsedKey(workspaceId), null);
   updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
   // The Browser tool polls for sessions; this story has none.
   client.browser = {
@@ -149,11 +149,15 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       "true"
     );
     await within(sidebar).findByText(RUN_NAME);
-    // Everything behind the view is inert, not just the chat: the left sidebar and the footer
-    // sit outside the chat pane.
+    // The view closes from its header: the right sidebar toggle stays hidden.
+    await expect(canvas.queryByRole("button", { name: "Collapse right sidebar" })).toBeNull();
+    // Everything behind the view is inert, not just the chat: the left sidebar, its toggle bar
+    // and the footer sit outside the chat pane.
     await expect(chatPane.closest("[inert]")).not.toBeNull();
-    const expandLeftSidebar = canvas.getByRole("button", { name: "Expand sidebar", hidden: true });
-    await expect(expandLeftSidebar.closest("[inert]")).not.toBeNull();
+    const leftSidebar = canvasElement.querySelector("[data-testid='left-sidebar']");
+    await expect(leftSidebar?.closest("[inert]")).not.toBeNull();
+    const toggleBar = canvasElement.querySelector("[data-testid='left-sidebar-toggle-bar']");
+    await expect(toggleBar?.closest("[inert]")).not.toBeNull();
     // Focus moves into the view and stays there. The closing menu returns focus to the More
     // button on a timer, which must not win: the inert chat pane cannot take focus. Check again
     // after that timer had its turn.
@@ -162,7 +166,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await expect(sidebar.contains(document.activeElement)).toBe(true);
 
     // Its New tab launcher opens the tools that have no tab yet, Browser among them.
-    await userEvent.click(within(sidebar).getByRole("button", { name: "New tab" }));
+    await openSidebarNewTab(sidebar);
     await userEvent.click(await within(sidebar).findByRole("button", { name: /^Browser/ }));
     await expect(within(sidebar).getByRole("tab", { name: /Browser/ })).toHaveAttribute(
       "aria-selected",
@@ -176,9 +180,10 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await waitFor(() => expect(sidebar).not.toBeVisible());
     await waitFor(() => expect(moreButton).toHaveFocus());
     await expect(chatPane.closest("[inert]")).toBeNull();
-    await expect(expandLeftSidebar.closest("[inert]")).toBeNull();
+    await expect(leftSidebar?.closest("[inert]")).toBeNull();
+    await expect(toggleBar?.closest("[inert]")).toBeNull();
     // Opening the view expanded the sidebar (it was collapsed), so its panels stay mounted.
-    await expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+    await expect(readPersistedState(getRightSidebarCollapsedKey(WORKSPACE_ID), true)).toBe(false);
 
     // Reopening shows the tab used last, the same panel instance, not a remounted copy.
     await openSidebarFromMenu(canvasElement);
@@ -249,6 +254,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       await waitFor(() => expect(sidebar).not.toHaveClass("right-sidebar-fullscreen"));
       await expect(sidebar).toBeVisible();
       await expect(within(sidebar).queryByRole("button", { name: "Close sidebar" })).toBeNull();
+      await expect(canvas.getByRole("button", { name: "Collapse right sidebar" })).toBeVisible();
     }
   },
 };
@@ -293,6 +299,31 @@ export const SplitLayoutKeepsFocusedPane: AppStory = {
     );
     const newTab = await within(sidebar).findByRole("tab", { name: /New tab/ });
     await expect(newTab.closest('[role="tablist"]')?.contains(workflowsTab) ?? false).toBe(true);
+  },
+};
+
+/**
+ * Closing the view's only tab closes the view, as it closes the docked sidebar (user request),
+ * instead of showing the New tab in its place. The next open shows the New tab launcher.
+ */
+export const ClosingLastTabClosesView: AppStory = {
+  decorators: [PhoneFrameDecorator],
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => setup(LAYOUT, "ws-phone-sidebar-last-tab")} />,
+  play: async ({ canvasElement }) => {
+    await waitForChatInputAutofocusDone(canvasElement);
+    const sidebar = await findRightSidebar(canvasElement);
+    const moreButton = within(canvasElement).getByTestId("workspace-more-actions");
+    await openSidebarFromMenu(canvasElement);
+    await waitFor(() => expect(sidebar).toBeVisible());
+
+    await userEvent.click(within(sidebar).getByRole("button", { name: "Close Workflows" }));
+    await waitFor(() => expect(sidebar).not.toBeVisible());
+    await waitFor(() => expect(moreButton).toHaveFocus());
+
+    await openSidebarFromMenu(canvasElement);
+    await waitFor(() => expect(sidebar).toBeVisible());
+    await expect(await within(sidebar).findByText("Open a tool")).toBeVisible();
   },
 };
 

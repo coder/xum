@@ -10,6 +10,7 @@ import type { RouterClient } from "@orpc/server";
 import { z } from "zod";
 import type { AppRouter } from "../../../src/node/orpc/router";
 import { isWorkspaceArchived } from "../../../src/common/utils/archive";
+import { newServerToken, serverTokenEnv } from "../serverToken";
 import {
   benchArgs,
   copyFixture,
@@ -77,13 +78,14 @@ async function runOnce(root: string, label: string, repetition: number, launch: 
   const workspaceId = workspace.id;
   const port = await freePort();
   const origin = "http://127.0.0.1:" + port;
+  const token = newServerToken();
   const start = performance.now();
   const child = spawn(
     "node",
-    ["dist/cli/index.js", "server", "--host", "127.0.0.1", "--port", String(port), "--no-auth"],
+    ["dist/cli/index.js", "server", "--host", "127.0.0.1", "--port", String(port)],
     {
       cwd: repoRoot,
-      env: isolatedEnv(root),
+      env: { ...isolatedEnv(root), ...serverTokenEnv(token) },
       stdio: ["ignore", "pipe", "pipe"],
     }
   );
@@ -156,6 +158,7 @@ async function runOnce(root: string, label: string, repetition: number, launch: 
       new RPCLink({
         origin,
         url: "/orpc",
+        headers: { Authorization: `Bearer ${token}` },
         fetch: (request, init) => fetch(request, { ...init, signal: AbortSignal.timeout(120_000) }),
       })
     );

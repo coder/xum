@@ -152,7 +152,7 @@ describe("AppFiberScope", () => {
   });
 
   it("a fiber forked with startImmediately into an already-closed scope still runs its onInterrupt finalizer", async () => {
-    // Pins the rc.112 forkIn semantics the supervisor relies on for streams
+    // Pins the effect forkIn semantics the supervisor relies on for streams
     // that start mid-shutdown: the body runs synchronously up to its first
     // async boundary, the closed scope interrupts it right there, and the
     // interruption unwinds through onInterrupt — so such a stream is aborted

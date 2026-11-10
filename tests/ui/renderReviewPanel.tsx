@@ -85,6 +85,10 @@ export function renderApp(props: RenderReviewPanelParams): RenderedApp {
     async selectTab(tab: "costs" | "review" | "terminal"): Promise<void> {
       await waitFor(
         () => {
+          // Selecting a tool is an explicit open action even when chats start collapsed.
+          result.container
+            .querySelector<HTMLElement>('button[aria-label="Expand right sidebar"]')
+            ?.click();
           // Find tab button by role and name
           const tabButton = result.container.querySelector<HTMLElement>(
             `[role="tab"][aria-controls*="${tab}"]`
@@ -93,8 +97,9 @@ export function renderApp(props: RenderReviewPanelParams): RenderedApp {
             tabButton.click();
             return;
           }
-          // The strip holds only opened tabs: open the tool from a New tab's launcher, adding
-          // a New tab with "+" first when none is showing. The retry then selects the tab.
+          // The strip holds only opened tabs: open the tool from a New tab's launcher, opening
+          // a New tab with the strip's "+" button first when none is showing. The retry then
+          // selects the tab.
           const launcherRow = Array.from(
             result.container.querySelectorAll<HTMLElement>(
               '[role="tabpanel"][id*="-panel-new"] button'

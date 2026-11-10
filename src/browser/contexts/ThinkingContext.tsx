@@ -23,6 +23,7 @@ import { useOptionalAgent } from "@/browser/contexts/AgentContext";
 import { KEYBINDS, matchesKeybind, paneHandlesKeyEvent } from "@/browser/utils/ui/keybinds";
 import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 
@@ -41,6 +42,7 @@ const ThinkingContext = createContext<ThinkingContextType | undefined>(undefined
 interface ThinkingProviderProps {
   workspaceId?: string; // Workspace-scoped storage (highest priority)
   projectPath?: string; // Project-scoped storage (fallback if no workspaceId)
+  scopeId?: string; // Overrides both (a creation draft's scope)
   children: ReactNode;
 }
 
@@ -55,14 +57,14 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   const { config: providersConfig } = useProvidersConfig();
   const workspaceId = props.workspaceId;
   const defaultModel = useDefaultModel();
-  const scopeId = getScopeId(workspaceId, props.projectPath);
+  const scopeId = props.scopeId ?? getScopeId(workspaceId, props.projectPath);
   // Hooks run unconditionally; a workspace mount reads the resolver instead of scope defaults.
   const defaultsScopeId = workspaceId != null ? GLOBAL_SCOPE_ID : scopeId;
   const agentContext = useOptionalAgent();
   const selection = useWorkspaceAiSelection(
     scopeId,
     agentContext?.agentId,
-    agentContext && new Map(agentContext.agents.map((agent) => [agent.id, agent.base]))
+    agentContext && getAgentAiSettingsBases(agentContext.agents)
   );
   const scopedModel = useScopedAiDefault(defaultsScopeId, "model");
   const scopedThinkingLevel = useScopedAiDefault(defaultsScopeId, "thinkingLevel");

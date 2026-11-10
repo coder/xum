@@ -5,13 +5,17 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import * as ReactDndModule from "react-dnd";
 import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
-import * as ReactColorfulModule from "react-colorful";
+import * as LazyHexColorPickerModule from "@/browser/components/LazyHexColorPicker/LazyHexColorPicker";
 import { installDom } from "../../../../tests/ui/dom";
 import { EXPANDED_PROJECTS_KEY } from "@/common/constants/storage";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
-import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
+import {
+  SCRATCH_PROJECT_CONFIG_KEY,
+  SCRATCH_PROJECT_NAME,
+  SCRATCH_SIDEBAR_SECTION_ID,
+} from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type {
@@ -33,7 +37,6 @@ import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as PopoverErrorHookModule from "@/browser/hooks/usePopoverError";
 import * as TooltipModule from "../Tooltip/Tooltip";
-import * as SidebarCollapseButtonModule from "../SidebarCollapseButton/SidebarCollapseButton";
 import * as ConfirmationModalModule from "../ConfirmationModal/ConfirmationModal";
 import * as ProjectDeleteConfirmationModalModule from "../ProjectDeleteConfirmationModal/ProjectDeleteConfirmationModal";
 import * as PopoverErrorModule from "../PopoverError/PopoverError";
@@ -47,6 +50,7 @@ import type * as WorkspaceStatusIndicatorModuleExports from "../WorkspaceStatusI
 import * as RealPositionedMenuModule from "@/browser/components/PositionedMenu/PositionedMenu";
 import * as RealContextMenuPositionModule from "@/browser/hooks/useContextMenuPosition";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const agentItemTestId = (workspaceId: string) => `agent-item-${workspaceId}`;
 const toggleButtonLabel = (workspaceId: string) => `toggle-completed-${workspaceId}`;
@@ -162,6 +166,8 @@ interface MockAgentListItemProps {
   depth?: number;
   rowRenderMeta?: AgentRowRenderMeta;
   projectBadgeName?: string;
+  projectBadgeColor?: string;
+  projectBadgeIcon?: string;
   delegatedActivity?: { activeCount: number; queuedCount: number };
   hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
   getWorkflowRunName?: (runId: string) => string | undefined;
@@ -172,7 +178,7 @@ interface MockAgentListItemProps {
   onCancelCreation?: (workspaceId: string) => Promise<void>;
 }
 
-type HexColorPickerProps = ComponentProps<typeof ReactColorfulModule.HexColorPicker>;
+type HexColorPickerProps = ComponentProps<typeof LazyHexColorPickerModule.LazyHexColorPicker>;
 
 let renderRealAgentListItems = false;
 let latestArchiveWorkspaceHandler:
@@ -306,6 +312,7 @@ function createProjectContextValue(
     updateSecrets: () => Promise.resolve(),
     updateDisplayName: () => resolveVoidResult(),
     updateColor: () => resolveVoidResult(),
+    updateIcon: () => resolveVoidResult(),
     updateCustomInstructions: () => resolveVoidResult(),
     updateCodeWorkspaceSyncPath: () => resolveVoidResult(),
     assignWorkspaceToSubProject: () => resolveVoidResult(),
@@ -346,7 +353,10 @@ function installProjectSidebarTestDoubles() {
     AgentListItem: (props: MockAgentListItemProps) => {
       if (props.draft) {
         return (
-          <div data-testid={`draft-item-${props.draft.draftId}`}>
+          <div
+            data-testid={`draft-item-${props.draft.draftId}`}
+            data-project-badge-icon={props.projectBadgeIcon}
+          >
             {props.draft.title ?? "Draft"}
             {props.projectBadgeName != null && <span>{props.projectBadgeName}</span>}
           </div>
@@ -382,6 +392,8 @@ function installProjectSidebarTestDoubles() {
           data-shared-below={String(props.rowRenderMeta?.sharedTrunkActiveBelowRow ?? false)}
           data-row-kind={props.rowRenderMeta?.rowKind ?? "unknown"}
           data-connector-layout={props.subAgentConnectorLayout ?? "default"}
+          data-project-badge-color={props.projectBadgeColor}
+          data-project-badge-icon={props.projectBadgeIcon}
           data-completed-expanded={String(props.completedChildrenExpanded ?? false)}
           data-delegated-active={String(props.delegatedActivity?.activeCount ?? 0)}
           data-delegated-queued={String(props.delegatedActivity?.queuedCount ?? 0)}
@@ -503,7 +515,11 @@ function installProjectSidebarTestDoubles() {
     currentOffset: null,
   })) as unknown as typeof ReactDndModule.useDragLayer);
   spyOn(ReactDndHtml5BackendModule, "getEmptyImage").mockImplementation(() => new Image());
-  spyOn(ReactColorfulModule, "HexColorPicker").mockImplementation(((props: HexColorPickerProps) => (
+  // Mock the lazy wrapper, not react-colorful: React.lazy keeps the first export it resolves for
+  // the whole process, so a per-test spy on react-colorful only reaches the first test (#6982).
+  spyOn(LazyHexColorPickerModule, "LazyHexColorPicker").mockImplementation(((
+    props: HexColorPickerProps
+  ) => (
     <button
       type="button"
       data-testid="hex-color-picker"
@@ -513,7 +529,7 @@ function installProjectSidebarTestDoubles() {
     >
       mock color picker
     </button>
-  )) as typeof ReactColorfulModule.HexColorPicker);
+  )) as typeof LazyHexColorPickerModule.LazyHexColorPicker);
 
   spyOn(DesktopTitlebarModule, "isDesktopMode").mockImplementation(() => false);
   spyOn(ThemeContextModule, "useTheme").mockImplementation(() => ({
@@ -649,9 +665,6 @@ function installProjectSidebarTestDoubles() {
   spyOn(TooltipModule, "TooltipContent").mockImplementation(
     (() => null) as unknown as typeof TooltipModule.TooltipContent
   );
-  spyOn(SidebarCollapseButtonModule, "SidebarCollapseButton").mockImplementation((() => (
-    <button type="button">toggle sidebar</button>
-  )) as unknown as typeof SidebarCollapseButtonModule.SidebarCollapseButton);
   spyOn(ConfirmationModalModule, "ConfirmationModal").mockImplementation(((props: {
     isOpen: boolean;
     title: string;
@@ -961,9 +974,7 @@ describe("ProjectSidebar title keys", () => {
     const regenerateTitle = mock((_input: { workspaceId: string }) =>
       Promise.resolve({ success: true as const, data: { title: "Generated" } })
     );
-    const api = { workspace: { regenerateTitle } } as unknown as NonNullable<
-      ReturnType<typeof APIModule.useAPI>["api"]
-    >;
+    const api = createTestApiClient({ workspace: { regenerateTitle } });
     spyOn(APIModule, "useAPI").mockImplementation(() => ({
       api,
       status: "connected",
@@ -1139,6 +1150,49 @@ describe("ProjectSidebar flat chat list", () => {
     });
   });
 
+  // The collapsed sidebar's toggle bar New chat and Ctrl+N share one path; on a draft page nothing is
+  // selected, so both open another draft in the page's project.
+  describe("New chat without a selected chat", () => {
+    function renderOnDraftPage() {
+      const createWorkspaceDraft = mock(() => undefined);
+      mockWorkspaceActions({
+        createWorkspaceDraft,
+        pendingNewWorkspaceProject: "/projects/demo-project",
+        pendingNewWorkspaceSubProjectPath: "/projects/demo-project/features",
+        pendingNewWorkspaceDraftId: "draft-1",
+      });
+      render(
+        <ProjectSidebar
+          collapsed
+          onToggleCollapsed={() => undefined}
+          sortedWorkspacesByProject={new Map()}
+          workspaceRecency={{}}
+        />
+      );
+      return createWorkspaceDraft;
+    }
+
+    test("Ctrl+N opens a draft in the draft page's project", () => {
+      const createWorkspaceDraft = renderOnDraftPage();
+      fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(
+        "/projects/demo-project",
+        "/projects/demo-project/features"
+      );
+    });
+
+    test("the toggle bar's New chat request opens a draft in the draft page's project", () => {
+      const createWorkspaceDraft = renderOnDraftPage();
+      act(() => {
+        window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.NEW_CHAT_REQUESTED));
+      });
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(
+        "/projects/demo-project",
+        "/projects/demo-project/features"
+      );
+    });
+  });
+
   test("filters multi-project rows out of the flat list while the experiment is disabled", () => {
     spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
     const single = {
@@ -1181,23 +1235,16 @@ describe("ProjectSidebar flat chat list", () => {
           pendingNewWorkspaceProject: null,
           pendingNewWorkspaceDraftId: null,
           workspaceDraftsByProject: {
-            _multi: [{ draftId: "draft-multi", createdAt: Date.now() }],
-            "/projects/demo-project": [{ draftId: "draft-single", createdAt: Date.now() }],
+            _multi: [{ draftId: "draft-multi", createdAt: Date.now(), manualName: "" }],
+            "/projects/demo-project": [
+              { draftId: "draft-single", createdAt: Date.now(), manualName: "" },
+            ],
           },
           workspaceDraftPromotionsByProject: {},
           createWorkspaceDraft: () => undefined,
           openWorkspaceDraft: () => undefined,
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-    // Give both drafts persisted content so their rows would render.
-    getDraftStore().setText(
-      { kind: "creation", projectPath: "_multi", draftId: "draft-multi" },
-      "Multi draft"
-    );
-    getDraftStore().setText(
-      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-single" },
-      "Single draft"
     );
     setSidebarPreferences({ sidebarFlatMode: true });
 
@@ -1236,17 +1283,13 @@ describe("ProjectSidebar flat chat list", () => {
           pendingNewWorkspaceProject: null,
           pendingNewWorkspaceDraftId: null,
           workspaceDraftsByProject: {
-            _multi: [{ draftId: "draft-multi-badge", createdAt: Date.now() }],
+            _multi: [{ draftId: "draft-multi-badge", createdAt: Date.now(), manualName: "" }],
           },
           workspaceDraftPromotionsByProject: {},
           createWorkspaceDraft: () => undefined,
           openWorkspaceDraft: () => undefined,
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-    getDraftStore().setText(
-      { kind: "creation", projectPath: "_multi", draftId: "draft-multi-badge" },
-      "Multi draft"
     );
     setSidebarPreferences({ sidebarFlatMode: true });
 
@@ -1331,6 +1374,7 @@ describe("ProjectSidebar flat chat list", () => {
               {
                 draftId: "draft-in-section",
                 createdAt: Date.now(),
+                manualName: "",
                 subProjectPath: "/projects/demo-project/features",
               },
             ],
@@ -1440,6 +1484,131 @@ describe("ProjectSidebar flat chat list", () => {
     ).toBeTruthy();
   });
 
+  test("tells uncolored projects apart by avatar color, and gives scratch chats an avatar identity", () => {
+    const parentChat = { ...createWorkspace("parent-chat"), projects: singleProjectRefs };
+    const subChat = {
+      ...createWorkspace("sub-chat", { subProjectPath: "/projects/demo-project/features" }),
+      projects: singleProjectRefs,
+    };
+    const otherChat = {
+      ...createWorkspace("other-chat"),
+      projects: undefined,
+      projectPath: "/projects/other",
+      projectName: "other",
+    };
+    const scratchPath = "/home/user/.xum/scratch/scratch-chat";
+    const scratchChat: FrontendWorkspaceMetadata = {
+      kind: "scratch",
+      id: "scratch-chat",
+      name: "scratch-scratch-chat",
+      title: "Explore an idea",
+      projectName: "Scratch",
+      projectPath: scratchPath,
+      namedWorkspacePath: scratchPath,
+      runtimeConfig: { type: "local" },
+    };
+    // No project has a configured color.
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { displayName: "Demo", workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+        ["/projects/other", { displayName: "Other", workspaces: [] }],
+      ]),
+    });
+
+    const now = Date.now();
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([
+            ["/projects/demo-project", [parentChat, subChat]],
+            ["/projects/other", [otherChat]],
+            [SCRATCH_PROJECT_CONFIG_KEY, [scratchChat]],
+          ])
+        }
+        workspaceRecency={{
+          "parent-chat": now,
+          "sub-chat": now,
+          "other-chat": now,
+          "scratch-chat": now,
+        }}
+      />
+    );
+
+    const avatarColor = (workspaceId: string) =>
+      view.getByTestId(agentItemTestId(workspaceId)).dataset.projectBadgeColor;
+    // Different projects get different colors without the user picking any.
+    expect(avatarColor("other-chat")).not.toBe(avatarColor("parent-chat"));
+    // The sub-project avatar shows the parent's letter, so it keeps the parent's color too.
+    expect(avatarColor("sub-chat")).toBe(avatarColor("parent-chat"));
+    // Scratch chats have no project but still get an avatar identity.
+    expect(
+      within(view.getByTestId(agentItemTestId("scratch-chat"))).getByText(SCRATCH_PROJECT_NAME)
+    ).toBeTruthy();
+  });
+
+  test("flat rows and drafts carry their project's icon, and sub-project rows inherit the parent's", () => {
+    const parentChat = { ...createWorkspace("parent-chat"), projects: singleProjectRefs };
+    const subChat = {
+      ...createWorkspace("sub-chat", { subProjectPath: "/projects/demo-project/features" }),
+      projects: singleProjectRefs,
+    };
+    const otherChat = {
+      ...createWorkspace("other-chat"),
+      projects: undefined,
+      projectPath: "/projects/other",
+      projectName: "other",
+    };
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "icon-draft", createdAt: Date.now(), manualName: "" }],
+    });
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { displayName: "Demo", icon: "rocket", workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+        ["/projects/other", { displayName: "Other", workspaces: [] }],
+      ]),
+    });
+
+    const now = Date.now();
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([
+            ["/projects/demo-project", [parentChat, subChat]],
+            ["/projects/other", [otherChat]],
+          ])
+        }
+        workspaceRecency={{ "parent-chat": now, "sub-chat": now, "other-chat": now }}
+      />
+    );
+
+    const avatarIcon = (workspaceId: string) =>
+      view.getByTestId(agentItemTestId(workspaceId)).dataset.projectBadgeIcon;
+    expect(avatarIcon("parent-chat")).toBe("rocket");
+    expect(avatarIcon("sub-chat")).toBe("rocket");
+    expect(avatarIcon("other-chat")).toBeUndefined();
+    expect(view.getByTestId("draft-item-icon-draft").dataset.projectBadgeIcon).toBe("rocket");
+  });
+
   test("coalesces best-of children into a task group in the flat list", () => {
     const parentWorkspace = {
       ...createWorkspace("parent", { title: "Parent workspace" }),
@@ -1483,16 +1652,9 @@ describe("ProjectSidebar flat chat list", () => {
     expect(view.getByTestId(agentItemTestId("parent"))).toBeTruthy();
   });
 
-  test("keeps the pinned block above drafts in the flat list", () => {
-    const pinned = {
-      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
-      projects: singleProjectRefs,
-      pinnedAt: "2026-01-01T00:00:00.000Z",
-    };
-    const regular = {
-      ...createWorkspace("regular-chat", { title: "Regular chat" }),
-      projects: singleProjectRefs,
-    };
+  const mockDraftActions = (
+    workspaceDraftsByProject: Record<string, Array<Record<string, unknown>>>
+  ) =>
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
@@ -1507,21 +1669,36 @@ describe("ProjectSidebar flat chat list", () => {
           refreshWorkspaceMetadata: () => Promise.resolve(),
           pendingNewWorkspaceProject: null,
           pendingNewWorkspaceDraftId: null,
-          workspaceDraftsByProject: {
-            "/projects/demo-project": [{ draftId: "draft-order", createdAt: Date.now() }],
-          },
+          workspaceDraftsByProject,
           workspaceDraftPromotionsByProject: {},
           createWorkspaceDraft: () => undefined,
           openWorkspaceDraft: () => undefined,
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
-    // Non-empty drafts render as rows; empty ones stay hidden.
-    getDraftStore().setText(
-      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-order" },
-      "Draft prompt"
-    );
-    setSidebarPreferences({ sidebarFlatMode: true });
+  const renderedRowIds = (container: HTMLElement) =>
+    Array.from(
+      container.querySelectorAll('[data-testid^="agent-item-"], [data-testid^="draft-item-"]')
+    ).map((row) => row.getAttribute("data-testid"));
+
+  // Drafts lead the list in both sidebar modes, above pinned chats.
+  test.each([
+    { mode: "flat list", sidebarFlatMode: true },
+    { mode: "project view", sidebarFlatMode: false },
+  ])("renders drafts above the pinned block in the $mode", ({ sidebarFlatMode }) => {
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const regular = {
+      ...createWorkspace("regular-chat", { title: "Regular chat" }),
+      projects: singleProjectRefs,
+    };
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "draft-order", createdAt: Date.now(), manualName: "" }],
+    });
+    setSidebarPreferences({ sidebarFlatMode });
 
     const view = render(
       <ProjectSidebar
@@ -1532,15 +1709,184 @@ describe("ProjectSidebar flat chat list", () => {
       />
     );
 
-    // Pinned chats keep the top of the flat list: a new draft slots in
-    // between the pinned block and the unpinned chats, never above pins.
-    const rows = Array.from(
-      view.container.querySelectorAll('[data-testid^="agent-item-"], [data-testid^="draft-item-"]')
-    ).map((row) => row.getAttribute("data-testid"));
-    expect(rows).toEqual([
-      agentItemTestId("pinned-chat"),
+    expect(renderedRowIds(view.container)).toEqual([
       "draft-item-draft-order",
+      agentItemTestId("pinned-chat"),
       agentItemTestId("regular-chat"),
+    ]);
+  });
+
+  test("labels the Pinned and Recent sections below the drafts and moves a chat between them on pin", () => {
+    const newer = {
+      ...createWorkspace("newer-chat", { title: "Newer chat" }),
+      projects: singleProjectRefs,
+    };
+    const older = {
+      ...createWorkspace("older-chat", { title: "Older chat" }),
+      projects: singleProjectRefs,
+    };
+    const now = Date.now();
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "draft-labels", createdAt: now, manualName: "" }],
+    });
+    const renderFlatList = (workspaces: FrontendWorkspaceMetadata[]) => (
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", workspaces]])}
+        workspaceRecency={{ "newer-chat": now, "older-chat": now - 60_000 }}
+      />
+    );
+    // Section labels and rows in document order.
+    const listOrder = () => {
+      const nodes = [
+        ...view.container.querySelectorAll<HTMLElement>(
+          '[data-testid^="agent-item-"], [data-testid^="draft-item-"]'
+        ),
+        ...view.queryAllByText(/^(Pinned|Recent)$/),
+      ];
+      nodes.sort((a, b) =>
+        a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+      );
+      return nodes.map((node) => node.getAttribute("data-testid") ?? node.textContent);
+    };
+
+    const view = render(renderFlatList([newer, older]));
+    // No pinned chat, no Pinned section. Drafts lead without a label.
+    const unpinnedOrder = [
+      "draft-item-draft-labels",
+      "Recent",
+      agentItemTestId("newer-chat"),
+      agentItemTestId("older-chat"),
+    ];
+    expect(listOrder()).toEqual(unpinnedOrder);
+
+    // Pinning (the optimistic pinnedAt) moves the chat into Pinned at once.
+    view.rerender(renderFlatList([newer, { ...older, pinnedAt: "2026-01-01T00:00:00.000Z" }]));
+    expect(listOrder()).toEqual([
+      "draft-item-draft-labels",
+      "Pinned",
+      agentItemTestId("older-chat"),
+      "Recent",
+      agentItemTestId("newer-chat"),
+    ]);
+
+    // Unpinning returns it to its recency position in Recent.
+    view.rerender(renderFlatList([newer, older]));
+    expect(listOrder()).toEqual(unpinnedOrder);
+  });
+
+  test("collapses each section from its heading and keeps it collapsed after a remount", () => {
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const regular = {
+      ...createWorkspace("regular-chat", { title: "Regular chat" }),
+      projects: singleProjectRefs,
+    };
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "draft-kept", createdAt: Date.now(), manualName: "" }],
+    });
+    const renderFlatList = () =>
+      render(
+        <ProjectSidebar
+          collapsed={false}
+          onToggleCollapsed={() => undefined}
+          sortedWorkspacesByProject={new Map([["/projects/demo-project", [pinned, regular]]])}
+          workspaceRecency={{ "pinned-chat": Date.now(), "regular-chat": Date.now() }}
+        />
+      );
+    let view = renderFlatList();
+    // The project management row stands for the Projects section's rows.
+    const visibleRows = () => [
+      ...renderedRowIds(view.container),
+      ...(view.queryByRole("button", { name: "Create workspace in demo-project" })
+        ? ["project-row"]
+        : []),
+    ];
+    const toggleSection = (name: string) => fireEvent.click(view.getByRole("button", { name }));
+
+    toggleSection("Pinned");
+    expect(view.getByRole("button", { name: "Pinned" }).getAttribute("aria-expanded")).toBe(
+      "false"
+    );
+    expect(visibleRows()).toEqual([
+      "draft-item-draft-kept",
+      agentItemTestId("regular-chat"),
+      "project-row",
+    ]);
+    toggleSection("Recent");
+    toggleSection("Projects");
+    // Drafts belong to no section.
+    expect(visibleRows()).toEqual(["draft-item-draft-kept"]);
+
+    view.unmount();
+    view = renderFlatList();
+    expect(visibleRows()).toEqual(["draft-item-draft-kept"]);
+
+    toggleSection("Pinned");
+    toggleSection("Recent");
+    toggleSection("Projects");
+    expect(visibleRows()).toEqual([
+      "draft-item-draft-kept",
+      agentItemTestId("pinned-chat"),
+      agentItemTestId("regular-chat"),
+      "project-row",
+    ]);
+  });
+
+  test("renders drafts first in the unsectioned zone and in their sub-project in the project view", () => {
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { workspaces: [] }],
+        [
+          "section-1",
+          {
+            displayName: "Section 1",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+      ]),
+    });
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const sectionChat = {
+      ...createWorkspace("section-chat", { title: "Section chat", subProjectPath: "section-1" }),
+      projects: singleProjectRefs,
+    };
+    mockDraftActions({
+      "/projects/demo-project": [
+        { draftId: "draft-unsectioned", createdAt: Date.now(), manualName: "" },
+        {
+          draftId: "draft-in-section",
+          createdAt: Date.now(),
+          manualName: "",
+          subProjectPath: "section-1",
+        },
+      ],
+    });
+    setSidebarPreferences({ sidebarFlatMode: false });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [pinned, sectionChat]]])}
+        workspaceRecency={{ "pinned-chat": Date.now(), "section-chat": Date.now() }}
+      />
+    );
+
+    expect(renderedRowIds(view.container)).toEqual([
+      "draft-item-draft-unsectioned",
+      agentItemTestId("pinned-chat"),
+      "draft-item-draft-in-section",
+      agentItemTestId("section-chat"),
     ]);
   });
 
@@ -1573,11 +1919,6 @@ describe("ProjectSidebar flat chat list", () => {
           openWorkspaceDraft: () => undefined,
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-    // Give the draft persisted content so the draft row would render pre-substitution.
-    getDraftStore().setText(
-      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-promoted" },
-      "Draft prompt"
     );
 
     const view = render(
@@ -2126,6 +2467,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       updateSecrets: () => Promise.resolve(),
       updateDisplayName: () => resolveVoidResult(),
       updateColor: () => resolveVoidResult(),
+      updateIcon: () => resolveVoidResult(),
       updateCustomInstructions: () => resolveVoidResult(),
       updateCodeWorkspaceSyncPath: () => resolveVoidResult(),
       assignWorkspaceToSubProject: () => resolveVoidResult(),
@@ -2720,6 +3062,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       updateSecrets: () => Promise.resolve(),
       updateDisplayName: () => resolveVoidResult(),
       updateColor: () => resolveVoidResult(),
+      updateIcon: () => resolveVoidResult(),
       updateCustomInstructions: () => resolveVoidResult(),
       updateCodeWorkspaceSyncPath: () => resolveVoidResult(),
       assignWorkspaceToSubProject: () => resolveVoidResult(),
@@ -2864,12 +3207,12 @@ describe("ProjectSidebar archive errors", () => {
       ): Promise<ArchiveWorkspaceActionResult> =>
         Promise.resolve({ success: false as const, error: "snapshot failed" })
     );
-    const apiWithArchivePreflight = {
+    const apiWithArchivePreflight = createTestApiClient({
       workspace: {
         preflightArchive: () =>
-          Promise.resolve({ success: true, data: { kind: "ready" as const } }),
+          Promise.resolve({ success: true as const, data: { kind: "ready" as const } }),
       },
-    } as unknown as NonNullable<ReturnType<typeof APIModule.useAPI>["api"]>;
+    });
     spyOn(APIModule, "useAPI").mockImplementation(() => ({
       api: apiWithArchivePreflight,
       status: "connected",
@@ -2988,6 +3331,7 @@ describe("ProjectSidebar project actions menu", () => {
       "Manage secrets",
       "Instructions",
       "Change color",
+      "Change icon",
       "Delete...",
     ]);
   });
@@ -3110,6 +3454,72 @@ describe("ProjectSidebar project actions menu", () => {
     expect(view.queryByTestId("project-delete-confirmation-modal")).toBeNull();
   });
 
+  test("the icon panel sets a project icon and clears it back to the initial", async () => {
+    const updateIcon = mock((_projectPath: string, _icon: string | null) => resolveVoidResult());
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([[demoProjectPath, { workspaces: [] }]]),
+      updateIcon,
+    });
+
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Change icon" }));
+    // Without a stored icon the initial is the current choice.
+    expect(
+      view.getByRole("button", { name: "Use project initial" }).getAttribute("aria-pressed")
+    ).toBe("true");
+    fireEvent.click(view.getByRole("button", { name: "Set project icon to Rocket" }));
+
+    await waitFor(() => {
+      expect(updateIcon.mock.calls).toEqual([[demoProjectPath, "rocket"]]);
+    });
+    // Like a color swatch, a pick closes the panel but keeps the menu open.
+    expect(view.queryByRole("group", { name: "Project icon" })).toBeNull();
+    expect(view.getByTestId("project-actions-menu")).toBeTruthy();
+
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([[demoProjectPath, { workspaces: [], icon: "rocket" }]]),
+      updateIcon,
+    });
+    view.rerender(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map()}
+        workspaceRecency={{}}
+      />
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Change icon" }));
+    expect(
+      view.getByRole("button", { name: "Set project icon to Rocket" }).getAttribute("aria-pressed")
+    ).toBe("true");
+    fireEvent.click(view.getByRole("button", { name: "Use project initial" }));
+
+    await waitFor(() => {
+      expect(updateIcon.mock.calls).toEqual([
+        [demoProjectPath, "rocket"],
+        [demoProjectPath, null],
+      ]);
+    });
+  });
+
+  test("the icon and color panels replace each other", () => {
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Change color" }));
+    expect(view.getByRole("button", { name: "Set project color to Blue" })).toBeTruthy();
+
+    fireEvent.click(view.getByRole("button", { name: "Change icon" }));
+    expect(view.getByRole("group", { name: "Project icon" })).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Set project color to Blue" })).toBeNull();
+
+    fireEvent.click(view.getByRole("button", { name: "Change color" }));
+    expect(view.queryByRole("group", { name: "Project icon" })).toBeNull();
+  });
+
   test("reopening the color picker does not apply stale pending color", async () => {
     const updateColor = mock((_projectPath: string, _color: string | null) => resolveVoidResult());
     projectContextValue = createProjectContextValue({
@@ -3179,7 +3589,8 @@ describe("ProjectSidebar project actions menu", () => {
     const initialInput = view.container.querySelector<HTMLInputElement>('input[type="text"]');
     expect(initialInput?.value).toBe("#6b7280");
 
-    fireEvent.click(view.getByTestId("hex-color-picker"));
+    // The picker may load after the popover opens (#6982), so wait for it.
+    fireEvent.click(await view.findByTestId("hex-color-picker"));
 
     await waitFor(() => {
       const input = view.container.querySelector<HTMLInputElement>('input[type="text"]');
@@ -3302,6 +3713,31 @@ describe("ProjectSidebar project actions menu", () => {
     expect(sectionProps?.hasAttention).toBe(true);
   });
 
+  test("collapses a sub-project on its first toggle", () => {
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        [demoProjectPath, { workspaces: [] }],
+        [
+          "section-1",
+          { displayName: "Section 1", parentProjectPath: demoProjectPath, workspaces: [] },
+        ],
+      ]),
+    });
+    renderSidebar();
+    const latestSectionProps = () =>
+      (
+        SectionHeaderModule.SectionHeader as unknown as {
+          mock: { calls: Array<[Parameters<typeof SectionHeaderModule.SectionHeader>[0]]> };
+        }
+      ).mock.calls
+        .map(([props]) => props)
+        .findLast((props) => props.section.id === "section-1");
+
+    expect(latestSectionProps()?.isExpanded).toBe(true);
+    act(() => latestSectionProps()?.onToggleExpand?.());
+    expect(latestSectionProps()?.isExpanded).toBe(false);
+  });
+
   test("supports inline project name editing with Enter, Escape, and empty-to-null commit", async () => {
     const updateDisplayName = mock(() => resolveVoidResult());
     projectContextValue = createProjectContextValue({
@@ -3357,88 +3793,5 @@ describe("ProjectSidebar project actions menu", () => {
 
     expect(view.getByText("Custom Label")).toBeTruthy();
     expect(view.getByText("fallback-project")).toBeTruthy();
-  });
-
-  test("keeps empty placeholder visible when only hidden empty drafts exist", () => {
-    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
-      () =>
-        ({
-          archivingWorkspaceIds: new Set<string>(),
-          selectedWorkspace: null,
-          setSelectedWorkspace: () => undefined,
-          preflightArchiveWorkspace: () =>
-            Promise.resolve({ success: true, data: { kind: "ready" as const } }),
-          archiveWorkspace: archiveWorkspaceActionMock,
-          removeWorkspace: () => Promise.resolve({ success: true }),
-          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
-          refreshWorkspaceMetadata: () => Promise.resolve(),
-          pendingNewWorkspaceProject: null,
-          pendingNewWorkspaceDraftId: null,
-          workspaceDraftsByProject: {
-            [demoProjectPath]: [
-              {
-                draftId: "draft-hidden-empty",
-                subProjectPath: null,
-                createdAt: Date.now(),
-              },
-            ],
-          },
-          workspaceDraftPromotionsByProject: {},
-          createWorkspaceDraft: () => undefined,
-          openWorkspaceDraft: () => undefined,
-          deleteWorkspaceDraft: () => undefined,
-        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-
-    const view = renderSidebar();
-
-    expect(view.getByText("Empty")).toBeTruthy();
-  });
-
-  test("hides empty placeholder immediately when a hidden draft becomes visible", async () => {
-    const draftId = "draft-hidden-empty";
-    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
-      () =>
-        ({
-          archivingWorkspaceIds: new Set<string>(),
-          selectedWorkspace: null,
-          setSelectedWorkspace: () => undefined,
-          preflightArchiveWorkspace: () =>
-            Promise.resolve({ success: true, data: { kind: "ready" as const } }),
-          archiveWorkspace: archiveWorkspaceActionMock,
-          removeWorkspace: () => Promise.resolve({ success: true }),
-          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
-          refreshWorkspaceMetadata: () => Promise.resolve(),
-          pendingNewWorkspaceProject: null,
-          pendingNewWorkspaceDraftId: null,
-          workspaceDraftsByProject: {
-            [demoProjectPath]: [
-              {
-                draftId,
-                subProjectPath: null,
-                createdAt: Date.now(),
-              },
-            ],
-          },
-          workspaceDraftPromotionsByProject: {},
-          createWorkspaceDraft: () => undefined,
-          openWorkspaceDraft: () => undefined,
-          deleteWorkspaceDraft: () => undefined,
-        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-
-    const view = renderSidebar();
-    expect(view.getByText("Empty")).toBeTruthy();
-
-    act(() => {
-      getDraftStore().setText(
-        { kind: "creation", projectPath: demoProjectPath, draftId },
-        "Visible draft prompt"
-      );
-    });
-
-    await waitFor(() => {
-      expect(view.queryByText("Empty")).toBeNull();
-    });
   });
 });

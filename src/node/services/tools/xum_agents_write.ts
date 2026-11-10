@@ -1,4 +1,3 @@
-import * as fsPromises from "fs/promises";
 import { tool } from "ai";
 
 import {
@@ -6,6 +5,7 @@ import {
   type XumAgentsWriteToolArgs,
   type XumAgentsWriteToolResult,
 } from "@/common/types/tools";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -72,7 +72,7 @@ export const createXumAgentsWriteTool: ToolFactory = (config: ToolConfiguration)
         // Project roots are user-managed; recreating a stale one would silently
         // mutate an unintended location.
         if (ctx.kind === "global-local") {
-          await fsPromises.mkdir(agentsRoot, { recursive: true });
+          await nodeHostFiles.promises.mkdir(agentsRoot, { recursive: true });
         }
 
         const resolved = await resolveAgentsPathWithinRoot(agentsRoot);
@@ -84,13 +84,13 @@ export const createXumAgentsWriteTool: ToolFactory = (config: ToolConfiguration)
         let originalContent = "";
         let writePath: string;
         if (resolved.kind === "existing") {
-          originalContent = await fsPromises.readFile(resolved.realPath, "utf-8");
+          originalContent = await nodeHostFiles.promises.readFile(resolved.realPath, "utf-8");
           writePath = resolved.realPath;
         } else {
           writePath = resolved.writePath;
         }
 
-        await fsPromises.writeFile(writePath, args.newContent, "utf-8");
+        await nodeHostFiles.promises.writeFile(writePath, args.newContent, "utf-8");
 
         const diff = generateDiff(writePath, originalContent, args.newContent);
 

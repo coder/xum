@@ -35,6 +35,8 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": resolve(__dirname, "../../src"),
+      // Node-only SDK; see the stub for why browser bundles never load it.
+      "@ai-sdk/google-vertex": resolve(__dirname, "../../src/common/mocks/googleVertexStub.ts"),
     },
   },
 });

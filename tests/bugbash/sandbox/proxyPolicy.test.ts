@@ -298,6 +298,57 @@ test("ledger: settle counts the usage cost, and unreadable usage keeps the reser
   });
 });
 
+const haikuCost = (input: number, cacheWrite: number, cacheRead: number, output: number) =>
+  usageCost("claude-haiku-5-5", {
+    input_tokens: input,
+    cache_creation_input_tokens: cacheWrite,
+    cache_read_input_tokens: cacheRead,
+    output_tokens: output,
+  });
+
+test("a Haiku call settles at the low tier up to 100,000 prompt tokens, else at the high tier", () => {
+  // Low tier: $0.10 / $0.50 per million, a cache write 2x input, a cache read $0.01.
+  expect(haikuCost(1000, 0, 0, 50)).toBe(1000 * 100 + 50 * 500);
+  expect(haikuCost(100_000, 0, 0, 50)).toBe(100_000 * 100 + 50 * 500);
+  // High tier, one token above: $0.50 / $2.50, a cache read $0.05.
+  expect(haikuCost(100_001, 0, 0, 50)).toBe(100_001 * 500 + 50 * 2500);
+  // Cache writes and cache reads count toward the prompt length.
+  expect(haikuCost(1000, 1000, 98_000, 50)).toBe(1000 * 100 + 1000 * 200 + 98_000 * 10 + 50 * 500);
+  expect(haikuCost(1000, 1000, 98_001, 50)).toBe(
+    1000 * 500 + 1000 * 1000 + 98_001 * 50 + 50 * 2500
+  );
+});
+
+test("a Haiku call's bound is never below its settled cost, on either side of the tier", () => {
+  for (const chars of [1000, 99_000, 100_000, 150_000]) {
+    const result = check({
+      ...content({ type: "text", text: "x".repeat(chars) }),
+      model: "claude-haiku-5-5",
+      max_tokens: MAX_OUTPUT_TOKENS,
+    });
+    if (!result.ok) throw new Error(result.reason);
+    // A token holds at least one byte, so the body bytes are the most prompt tokens it can hold.
+    const prompt = Buffer.byteLength(result.body);
+    for (const [input, cacheWrite, cacheRead] of [
+      [prompt, 0, 0],
+      [0, prompt, 0],
+      [0, 0, prompt],
+      [1, prompt - 1, 0],
+    ]) {
+      const ledger = new Ledger(1);
+      const id = ledger.reserve("claude-haiku-5-5", result.maxCostNanoUsd)!;
+      ledger.settle(id, {
+        input_tokens: input,
+        cache_creation_input_tokens: cacheWrite,
+        cache_read_input_tokens: cacheRead,
+        output_tokens: MAX_OUTPUT_TOKENS,
+      });
+      expect(ledger.totals().boundExceeded).toBe(0);
+      expect(ledger.totals().spentNanoUsd).toBeGreaterThan(0);
+    }
+  }
+});
+
 test("ledger: concurrent reservations never exceed the cap", async () => {
   const ledger = new Ledger(1);
   const reserve = async () => (

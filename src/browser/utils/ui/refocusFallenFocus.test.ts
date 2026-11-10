@@ -140,3 +140,32 @@ test("the undo stops watching", () => {
   expect(document.activeElement).toBe(document.body);
   expect(observers.size).toBe(0);
 });
+
+// Wide-window fullscreen covers only the workspace shell: a click into the left sidebar must keep
+// its focus there, while focus that falls out of the panel itself still returns (pinOverWorkspace).
+test("with a scope, focus the user put outside the scope stays there", () => {
+  const shell = document.createElement("div");
+  const sidebarButton = document.createElement("button");
+  const { panel, first } = buildPanel();
+  shell.append(panel);
+  document.body.append(sidebarButton, shell);
+  const stop = refocusFallenFocus(panel, shell);
+
+  sidebarButton.focus();
+  sidebarButton.blur();
+  deliverMutation();
+  expect(document.activeElement).toBe(document.body);
+
+  // Back in the panel: a removed control returns focus to the panel again.
+  first.focus();
+  first.remove();
+  deliverMutation();
+  expect(document.activeElement).toBe(panel);
+
+  // A removed outside node (a closed portaled menu) no longer holds focus for the user.
+  sidebarButton.focus();
+  sidebarButton.remove();
+  deliverMutation();
+  expect(document.activeElement).toBe(panel);
+  stop();
+});

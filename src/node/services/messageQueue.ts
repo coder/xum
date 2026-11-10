@@ -289,6 +289,40 @@ function compactionFollowUpOf(entry: QueueEntry) {
 }
 
 /**
+ * Preserve the first muxMetadata per entry (see the MessageQueue docblock for the rationale). A
+ * later add's reviews still go to `batchedReviews`, so a restore gives them back (a hook blocking
+ * the batch, Codex PRRT_kwDOPxxmWM6rZqyS).
+ */
+function recordAddMetadata(entry: QueueEntry, muxMetadata: unknown): void {
+  if (muxMetadata === undefined) return;
+  if (entry.muxMetadata === undefined) {
+    entry.muxMetadata = muxMetadata;
+    return;
+  }
+  const reviews = hasReviews(muxMetadata) ? (muxMetadata.reviews ?? []) : [];
+  if (reviews.length > 0) entry.batchedReviews = [...(entry.batchedReviews ?? []), ...reviews];
+}
+
+/**
+ * The entry's metadata with the batched adds' reviews added, for a dispatch or a held re-send: the
+ * transcript row shows review blocks from `muxMetadata.reviews` (Codex PRRT_kwDOPxxmWM6s3RUw). A /compact's
+ * metadata keeps its shape: its restore returns the reviews instead.
+ */
+function metadataWithBatchedReviews(entry: QueueEntry): unknown {
+  const batched = entry.batchedReviews ?? [];
+  const meta = entry.muxMetadata;
+  if (
+    batched.length === 0 ||
+    isCompactionMetadata(meta) ||
+    typeof meta !== "object" ||
+    meta === null
+  )
+    return meta;
+  const own = hasReviews(meta) ? (meta.reviews ?? []) : [];
+  return { ...meta, reviews: [...own, ...batched] };
+}
+
+/**
  * One dispatchable unit in the queue. Plain follow-up messages batch into a single
  * entry (joined text, accumulated file parts); "special" sends (compaction requests,
  * agent-skill invocations, workspace-turn follow-ups, callback-carrying internal
@@ -315,6 +349,8 @@ interface QueueEntry {
   sendIdentities: Array<SendIdentity & { dedupeKey?: string }>;
   /** First muxMetadata added to this entry (never overwritten by later batched adds). */
   muxMetadata?: unknown;
+  /** Reviews of later adds, whose metadata the entry did not adopt (see muxMetadata). */
+  batchedReviews?: ReviewNoteData[];
   latestOptions?: SendMessageOptions;
   fileParts: FilePart[];
   /** Dedupe keys registered by addOnce for adds that landed in this entry. */
@@ -370,6 +406,17 @@ interface QueueEntry {
   skipPromptHooks?: boolean;
   /** Task-attempt obligation owned by this entry until dispatch or removal (sealed). */
   turnAdmission?: TurnAdmissionToken;
+}
+
+/** Stale/withdrawn entries drain as no-ops or held input; they must not cut tools or background Bash. */
+function isEntryDispatchable(entry: QueueEntry): boolean {
+  return (
+    entry.cancelSignal?.aborted !== true &&
+    entry.admissionStale?.() !== true &&
+    entry.turnAdmission?.admissionStale() !== true &&
+    // dequeueNext folds each add's compaction staleness into the dispatched send's.
+    !entry.acceptanceOrigins.some((add) => add.compactionAdmissionStale?.() === true)
+  );
 }
 
 /**
@@ -460,12 +507,12 @@ export class MessageQueue {
     return entries.some((entry) => entry.dispatchMode === "tool-end") ? "tool-end" : "turn-end";
   }
 
-  /**
-   * The first entry whose cancel signal has not fired. Aborted entries still drain FIFO (as no-ops that fire
-   * onCanceled), but they are not pending work or continuations of a turn.
-   */
   private nextDispatchableEntry(): QueueEntry | undefined {
-    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true);
+    return this.entries.find(isEntryDispatchable);
+  }
+
+  hasDispatchableEntries(): boolean {
+    return this.entries.some(isEntryDispatchable);
   }
 
   getNextDispatchableMode(): QueueDispatchMode | undefined {
@@ -473,43 +520,22 @@ export class MessageQueue {
   }
 
   /**
-   * Whether every pending queued entry continues the exact workspace turn correlation.
-   *
-   * The caller uses this for a new continuation that has not entered the queue.
-   * An unrelated pending entry anywhere ahead of it supersedes the correlation.
+   * Only eligible predecessors can supersede a new continuation. A promoted tool-end report
+   * overtakes hidden turn-end entries; counting those would strip its correlation and settle
+   * the delegated turn it is meant to continue. Retained manual input still belongs to the queue,
+   * but refusal without streaming does not start an unrelated turn.
    */
   hasAllWorkspaceTurnContinuations(
     taskHandleId: string,
     ownerWorkspaceId: string,
-    turnId: string
+    turnId: string,
+    options?: { promoteAheadOfHiddenTurnEnd?: boolean }
   ): boolean {
-    return this.entries.every((entry) => {
-      if (entry.cancelSignal?.aborted === true) return true;
-      const metadata = entry.muxMetadata;
-      return (
-        isWorkspaceTurnMetadata(metadata) &&
-        metadata.taskHandleId === taskHandleId &&
-        metadata.ownerWorkspaceId === ownerWorkspaceId &&
-        metadata.turnId === turnId
-      );
-    });
-  }
-
-  /**
-   * hasAllWorkspaceTurnContinuations for a tool-end entry about to be enqueued with
-   * promoteAheadOfHiddenTurnEnd: the hidden turn-end entries it will overtake are not its
-   * predecessors, so only the entries that stay ahead of it must share the correlation
-   * (vacuously true when none do). Without this, WorkspaceService would strip the promoted
-   * entry's correlation for an entry it never dispatches behind, and its tool-end cut would
-   * then supersede the delegated turn it was meant to continue.
-   */
-  hasAllWorkspaceTurnContinuationsAheadOfPromotedToolEnd(
-    taskHandleId: string,
-    ownerWorkspaceId: string,
-    turnId: string
-  ): boolean {
-    return this.entries.slice(0, this.promotedToolEndInsertIndex()).every((entry) => {
-      if (entry.cancelSignal?.aborted === true) return true;
+    const predecessors = options?.promoteAheadOfHiddenTurnEnd
+      ? this.entries.slice(0, this.promotedToolEndInsertIndex())
+      : this.entries;
+    return predecessors.every((entry) => {
+      if (!isEntryDispatchable(entry)) return true;
       const metadata = entry.muxMetadata;
       return (
         isWorkspaceTurnMetadata(metadata) &&
@@ -522,13 +548,13 @@ export class MessageQueue {
 
   /**
    * Whether a tool-end add flagged promoteAheadOfHiddenTurnEnd would become the next dispatchable
-   * entry (and so cut the active stream): every entry it stays behind is hidden and withdrawn
-   * (aborted entries drain as no-ops and cut nothing, see nextDispatchableEntry).
+   * entry (and so cut the active stream): every entry it stays behind is hidden and ineligible
+   * under the same cancellation/admission checks as dispatch. User-authored entries are never passed.
    */
   promotedToolEndWouldLead(): boolean {
     return this.entries
       .slice(0, this.promotedToolEndInsertIndex())
-      .every((entry) => !entry.userAuthored && entry.cancelSignal?.aborted === true);
+      .every((entry) => !entry.userAuthored && !isEntryDispatchable(entry));
   }
 
   /**
@@ -548,7 +574,7 @@ export class MessageQueue {
     }
     const firstBlocking = this.entries.findIndex(
       (entry, index) =>
-        index >= floor && entry.dispatchMode === "turn-end" && entry.cancelSignal?.aborted !== true
+        index >= floor && entry.dispatchMode === "turn-end" && isEntryDispatchable(entry)
     );
     return firstBlocking === -1 ? this.entries.length : firstBlocking;
   }
@@ -637,7 +663,7 @@ export class MessageQueue {
     for (const entry of this.entries) {
       // Withdrawn entries drain as no-ops: neither predecessors nor correlation holders, as in
       // hasAllWorkspaceTurnContinuations.
-      if (entry.cancelSignal?.aborted === true) continue;
+      if (!isEntryDispatchable(entry)) continue;
       const metadata = isWorkspaceTurnMetadata(entry.muxMetadata) ? entry.muxMetadata : undefined;
       const matchesPriorCorrelation =
         metadata != null &&
@@ -906,10 +932,7 @@ export class MessageQueue {
       // authoredText describes this add only: it must not ride along as the entry's options.
       const { fileParts, authoredText, ...restOptions } = options;
 
-      // Preserve first muxMetadata per entry (see class docblock for rationale)
-      if (options.muxMetadata !== undefined && entry.muxMetadata === undefined) {
-        entry.muxMetadata = options.muxMetadata;
-      }
+      recordAddMetadata(entry, options.muxMetadata);
       entry.latestOptions = restOptions;
 
       if (fileParts && fileParts.length > 0) {
@@ -1056,6 +1079,7 @@ export class MessageQueue {
     const reviews = entries.flatMap((entry) => [
       ...(compactionFollowUpOf(entry)?.reviews ?? []),
       ...(hasReviews(entry.muxMetadata) ? (entry.muxMetadata.reviews ?? []) : []),
+      ...(entry.batchedReviews ?? []),
     ]);
     return reviews.length > 0 ? reviews : undefined;
   }
@@ -1410,7 +1434,7 @@ export class MessageQueue {
       message: entry.messages.join("\n"),
       options: {
         ...options,
-        muxMetadata: entry.muxMetadata,
+        muxMetadata: metadataWithBatchedReviews(entry),
         ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
         // Kept so a re-send that is queued and refused again is held with the same display text.
         ...(authoredText !== entry.messages.join("\n") ? { authoredText } : {}),
@@ -1463,8 +1487,10 @@ export class MessageQueue {
           }
           return {
             ...restOptions,
-            // First metadata takes precedence (preserves compaction + agent-skill invocations)
-            muxMetadata: entry.muxMetadata,
+            // First metadata takes precedence (preserves compaction + agent-skill invocations).
+            // Later adds' reviews join it: the transcript draws review cards from it (Codex
+            // PRRT_kwDOPxxmWM6s3-n2).
+            muxMetadata: metadataWithBatchedReviews(entry),
             fileParts: entry.fileParts.length > 0 ? entry.fileParts : undefined,
           };
         })()

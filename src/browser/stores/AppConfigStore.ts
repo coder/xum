@@ -369,7 +369,10 @@ export function getAppConfigStore(): AppConfigStore {
 /** `select` must return a slice of the snapshot, not a new object, or the hook re-renders forever. */
 export function useAppConfig<T>(select: (config: AppConfigSnapshot) => T): T {
   const store = getAppConfigStore();
-  return useSyncExternalStore(store.subscribe, () => select(store.getSnapshot() ?? EMPTY_SNAPSHOT));
+  const getSnapshot = () => select(store.getSnapshot() ?? EMPTY_SNAPSHOT);
+  // The server renders the live markdown components for the static workspace view, so this
+  // hook needs a server snapshot (React throws without one). It is the client snapshot.
+  return useSyncExternalStore(store.subscribe, getSnapshot, getSnapshot);
 }
 
 export function useAgentAiDefaults(): AgentAiDefaults {

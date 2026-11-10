@@ -1,4 +1,7 @@
-export const BASH_DEFAULT_TIMEOUT_SECS = 3;
+// Kill deadline for a bash call whose `timeout_secs` is absent. 60 is both the mode and the median
+// of the values models pass when they pass one. Background processes ignore it (they live until
+// stopped), so only a foreground command can be cut short, and its error says to raise the value.
+export const BASH_DEFAULT_TIMEOUT_SECS = 60;
 
 // tmpfile policy limits (AI agent - conservative for LLM context)
 export const BASH_HARD_MAX_LINES = 300;
@@ -74,3 +77,7 @@ export const MCP_PROMPT_MAX_ARGUMENTS = 64;
 // Per-skill description cap in the agent_skill_read index: skill frontmatter allows long
 // descriptions, and every workspace pays the index before its first message.
 export const AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS = 280;
+
+// Max sibling mappings in the note Xum puts on a plugin skill whose sibling skills
+// other skills shadow (pluginSiblingNote.ts). Bounds the note for large plugins.
+export const PLUGIN_SIBLING_NOTE_MAX_SKILLS = 30;

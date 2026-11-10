@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { UpdateStatus } from "@/common/orpc/types";
 import { APIProvider } from "@/browser/contexts/API";
 import { AboutDialogProvider, useAboutDialog } from "@/browser/contexts/AboutDialogContext";

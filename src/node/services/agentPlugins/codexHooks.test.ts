@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import assert from "@/common/utils/assert";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -106,6 +107,106 @@ describe("loadPluginCodexHooks", () => {
     expect(hooks[2]?.handler).toMatchObject({ input: {}, timeoutSeconds: 30 });
   });
 
+  test("a Claude package lists every hook as never running, on every Claude event", async () => {
+    using tmp = new DisposableTempDir("claude-hooks");
+    await writePlugin(tmp.path, {
+      ".claude-plugin/plugin.json": { name: "guard", hooks: "./config/extra.json" },
+      "hooks/hooks.json": {
+        hooks: {
+          // Runnable in a Codex package: a Claude package never runs it.
+          PreToolUse: [{ matcher: "Bash", hooks: [scan, { type: "command", command: "x.sh" }] }],
+          Notification: [{ hooks: [{ type: "prompt", prompt: "p" }] }],
+          SessionEnd: [{ hooks: [{ type: "command", command: "y.sh" }] }],
+        },
+      },
+      "config/extra.json": { hooks: { PreCompact: [{ hooks: [{ type: "agent" }] }] } },
+    });
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    assert(plugin, "the Claude package is discovered");
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(warnings).toEqual([]);
+    expect(
+      hooks.map(({ event, status, handler, source }) => [event, status, handler.type, source])
+    ).toEqual([
+      ["PreToolUse", "claude-plugin", "mcp_tool", path.join("hooks", "hooks.json")],
+      ["PreToolUse", "claude-plugin", "command", path.join("hooks", "hooks.json")],
+      ["Notification", "claude-plugin", "prompt", path.join("hooks", "hooks.json")],
+      ["SessionEnd", "claude-plugin", "command", path.join("hooks", "hooks.json")],
+      ["PreCompact", "claude-plugin", "agent", path.join("config", "extra.json")],
+    ]);
+  });
+
+  test("a Claude matcherless event ignores its matcher, so the hook stays listed", async () => {
+    using tmp = new DisposableTempDir("claude-hook-matcherless");
+    const hook = { hooks: [{ type: "command", command: "x.sh" }] };
+    await writePlugin(tmp.path, {
+      ".claude-plugin/plugin.json": { name: "guard" },
+      "hooks/hooks.json": {
+        hooks: {
+          // Claude Code silently ignores a matcher on these events, even an invalid one.
+          TaskCompleted: [{ matcher: "[", ...hook }],
+          PostToolBatch: [{ matcher: "[", ...hook }],
+          // A matcher event still refuses an invalid regex.
+          PreToolUse: [{ matcher: "[", ...hook }],
+        },
+      },
+    });
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    assert(plugin, "the Claude package is discovered");
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((h) => [h.event, h.status])).toEqual([
+      ["TaskCompleted", "claude-plugin"],
+      ["PostToolBatch", "claude-plugin"],
+    ]);
+    expect(warnings.join("\n")).toContain("a 'PreToolUse' matcher is not a valid regex");
+  });
+
+  test("a Claude exec-form hook shows its args in the summary; bad args drop the hook", async () => {
+    using tmp = new DisposableTempDir("claude-hook-args");
+    await writePlugin(tmp.path, {
+      ".claude-plugin/plugin.json": { name: "guard" },
+      "hooks/hooks.json": {
+        hooks: {
+          SessionEnd: [
+            {
+              hooks: [
+                { type: "command", command: "node", args: ["scripts/delete.js", "--all", "a b"] },
+                { type: "command", command: "node", args: "--all" },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    assert(plugin, "the Claude package is discovered");
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.handler)).toEqual([
+      { type: "command", summary: 'node scripts/delete.js --all "a b"' },
+    ]);
+    expect(warnings.join("\n")).toContain("('args')");
+  });
+
+  test("a Codex package still warns on a Claude-only event", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-claude-event");
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": { hooks: { Notification: [{ hooks: [scan] }] } },
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks).toEqual([]);
+    expect(warnings).toEqual([
+      `${path.join("hooks", "hooks.json")}: unknown hook event 'Notification'; ignoring it`,
+    ]);
+  });
+
   test("a non-finite timeout drops only that handler", async () => {
     using tmp = new DisposableTempDir("codex-hooks-timeout");
     const plugin = await writePlugin(tmp.path, {
@@ -174,6 +275,17 @@ describe("loadPluginCodexHooks", () => {
 
     // Only the inline entry's key remains: the file path would have produced the same one.
     expect(hooks.map((hook) => hook.source)).toEqual(["plugin.json#hooks[1]"]);
+  });
+
+  test("an inline entry keeps its declared index after an invalid entry is dropped", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-inline-index");
+    const document = { hooks: { Stop: [{ hooks: [scan] }] } };
+    // hooks[0] is not a relative path, so discovery drops it.
+    const plugin = await writePlugin(tmp.path, {}, { "com.openai": { hooks: [1, document] } });
+
+    const { hooks } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.key)).toEqual(["plugin.json#hooks[1]#Stop[0][0]"]);
   });
 
   test("a com.openai pointer replaces the default file instead of adding to it", async () => {
@@ -367,7 +479,7 @@ describe("loadPluginCodexHooks", () => {
 
   test("a Rust matcher that JavaScript would read differently drops its group", async () => {
     using tmp = new DisposableTempDir("codex-hooks-rust-only");
-    const refused = ["\\A(?:Bash|Edit)\\z", "^[[:alpha:]]+$", "^\\pL+$", "^[a-z&&[^x]]$"];
+    const refused = ["^\\pL+$", "^[[:alpha:]]+$", "^[a-z&&[^x]]$"];
     const plugin = await writePlugin(tmp.path, {
       "hooks/hooks.json": {
         hooks: {
@@ -384,7 +496,7 @@ describe("loadPluginCodexHooks", () => {
 
     expect(hooks.map((hook) => hook.matcher)).toEqual(["^mcp\\.\\x5f[a-z-]+$"]);
     expect(warnings).toHaveLength(refused.length);
-    expect(warnings[0]).toMatch(/not a valid regex \('\\A' means something else in JavaScript\)/);
+    expect(warnings[0]).toMatch(/not a valid regex \('\\p' means something else in JavaScript\)/);
     expect(warnings[1]).toMatch(/'\[' in a character class/);
   });
 
@@ -395,7 +507,7 @@ describe("loadPluginCodexHooks", () => {
       "hooks/hooks.json": {
         hooks: {
           PreToolUse: [
-            { matcher: "\\A(?:Bash|Edit)\\z", hooks: [scan] },
+            { matcher: "\\pL(?:Bash|Edit)", hooks: [scan] },
             { matcher: "^Bash$", hooks: [{ ...scan, tool: "bad_timeout", timeout: "ten" }] },
             { matcher: "^Bash$", hooks: [{ type: "mcp_tool", server: " ", tool: "blank_server" }] },
           ],
@@ -406,7 +518,7 @@ describe("loadPluginCodexHooks", () => {
     const { warnings } = await loadPluginCodexHooks(plugin);
 
     expect(warnings).toHaveLength(3);
-    expect(warnings[0]).toContain('ignoring its group "\\\\A(?:Bash|Edit)\\\\z"');
+    expect(warnings[0]).toContain('ignoring its group "\\\\pL(?:Bash|Edit)"');
     expect(warnings[1]).toContain(`('timeout' of tool "bad_timeout")`);
     expect(warnings[2]).toContain(`('server' of tool "blank_server")`);
   });
@@ -424,6 +536,36 @@ describe("loadPluginCodexHooks", () => {
       "Edit",
     ]);
     expect(matching("^mcp__.*", ["mcp__s__t", "x_mcp__"])).toEqual(["mcp__s__t"]);
+    // Rust-only syntax Xum translates (Codex PRRT_kwDOPxxmWM6rN8BF): `(?P<name>...)` groups and
+    // the `\A`/`\z` text anchors, which ignore the m flag as in Rust.
+    expect(matching("^(?P<tool>Bash|Edit)$", ["Bash", "Edit", "BashOutput"])).toEqual([
+      "Bash",
+      "Edit",
+    ]);
+    expect(matching("(?m)\\A(?:Bash|Edit)\\z", ["Bash", "Edit", "x\nBash", "Bash\nx"])).toEqual([
+      "Bash",
+      "Edit",
+    ]);
+    // Rust lets an anchor take a quantifier (Codex PRRT_kwDOPxxmWM6s35hr).
+    expect(matching("\\A+Bash\\z{1}", ["Bash", "xBash"])).toEqual(["Bash"]);
+    // A group name only one dialect accepts is refused (Codex PRRT_kwDOPxxmWM6s35ho).
+    for (const name of ["$", "a.b", "1a"]) {
+      expect(() => compileHookMatcher(`(?P<${name}>Bash)`)).toThrow(SyntaxError);
+    }
+    // Unicode names both accept pass (Codex PRRT_kwDOPxxmWM6s4Py1), a name used twice does not,
+    // also across alternatives and in `(?<name>` form (Codex PRRT_kwDOPxxmWM6s4Py9).
+    expect(matching("^(?P<é>Bash)$|^(?P<名>Edit)$", ["Bash", "Edit"])).toEqual(["Bash", "Edit"]);
+    for (const pattern of ["(?P<tool>Bash)|(?P<tool>Edit)", "(?P<tool>Bash)|(?<tool>Edit)"]) {
+      expect(() => compileHookMatcher(pattern)).toThrow(SyntaxError);
+    }
+    // A combining mark Rust counts as alphabetic (U+0345) passes (Codex PRRT_kwDOPxxmWM6s4vbi).
+    expect(matching("^(?P<a\u0345>Bash)$", ["Bash"])).toEqual(["Bash"]);
+    // Many unclosed openers are refused in linear time (Codex PRRT_kwDOPxxmWM6s4vbk).
+    const started = performance.now();
+    expect(() => compileHookMatcher("(?<".repeat(80_000))).toThrow(SyntaxError);
+    expect(performance.now() - started).toBeLessThan(500);
+    // An escaped backslash before `A` is a literal backslash and `A`, not an anchor.
+    expect(matching("^a\\\\A$", ["a\\A", "a"])).toEqual(["a\\A"]);
   });
 
   test("mcp_tool fields follow Codex: blank targets are dropped, a timeout below 1s becomes 1s", async () => {
@@ -445,6 +587,57 @@ describe("loadPluginCodexHooks", () => {
     ]);
     expect(warnings).toHaveLength(4);
     for (const warning of warnings) expect(warning).toMatch(/missing or invalid fields/);
+  });
+
+  test("null matcher and null timeout mean omitted, as Codex's Option fields read them", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-null-fields");
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": {
+        hooks: {
+          PreToolUse: [{ matcher: null, hooks: [{ ...scan, timeout: null }] }, { hooks: [scan] }],
+        },
+      },
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(warnings).toEqual([]);
+    expect(hooks.map((hook) => [hook.matcher, hook.handler])).toEqual([
+      [undefined, { type: "mcp_tool", server: "scanner", tool: "scan", input: scan.input }],
+      [undefined, { type: "mcp_tool", server: "scanner", tool: "scan", input: scan.input }],
+    ]);
+  });
+
+  test("a fractional timeout drops its handler: Codex reads timeout as whole seconds", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-fraction");
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": {
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                { ...scan, timeout: 1.5 },
+                { ...scan, timeout: 2 },
+                // Every u64 value parses in Codex, also above 2^53 and u64::MAX itself (which
+                // JSON.parse rounds to 2^64); a larger value does not.
+                { ...scan, timeout: 1e19 },
+                { ...scan, timeout: 2 ** 64 },
+                { ...scan, timeout: 2 ** 65 },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.key)).toEqual([
+      "hooks/hooks.json#Stop[0][1]",
+      "hooks/hooks.json#Stop[0][2]",
+      "hooks/hooks.json#Stop[0][3]",
+    ]);
+    expect(warnings).toHaveLength(2);
   });
 
   test("a handler whose input holds a non-finite number is dropped with a warning", async () => {

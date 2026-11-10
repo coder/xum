@@ -1,6 +1,7 @@
-import { waitFor, within } from "@storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { DevToolsStep } from "@/common/types/devtools";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { PIXEL_DISABLED, StoryUiShell } from "@/browser/stories/meta";
 import { DevToolsStepCard } from "./DevToolsStepCard";
 
@@ -142,6 +143,10 @@ export const NarrowExpanded: Story = {
     canvas.getByRole("button", { name: /12 policy rules/ }).click();
     await waitFor(() => canvas.getByText(LONG_POLICY_REGEX));
     assertNoDebugCardOverflow(container);
+
+    // The green role and policy chips are success text on a green tint (#6882).
+    const greenChips = [...canvas.getAllByText("assistant"), ...canvas.getAllByText("enable")];
+    await expect(textsBelowAaInThemes(() => greenChips).join("\n")).toBe("");
   },
 };
 

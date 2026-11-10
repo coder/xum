@@ -23,17 +23,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { TaskAttemptOutcome } from "@/common/types/tasks";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { Config } from "@/node/config";
-import { SecretsStore } from "@/node/config";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { TaskService } from "@/node/services/taskService";
-import {
-  createAIServiceMocks,
-  createMockInitStateManager,
-  createWorkspaceServiceMocks,
-} from "@/node/services/taskService.testHarness";
-import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import { createTaskServiceStack } from "@/node/services/taskService.testHarness";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
-import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { WorkflowRunStore } from "./WorkflowRunStore";
 import { createDeferred, pauseNextOwnerCheckedWrite } from "./workflowRunStore.testHarness";
 import {
@@ -212,34 +204,7 @@ function createOtherProcessTaskService(
   config: Config,
   historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"]
 ) {
-  const aiService = createAIServiceMocks(config).aiService;
-  const workspaceService = createWorkspaceServiceMocks().workspaceService;
-  const initStateManager = createMockInitStateManager();
-  const terminalAttentionStore = new TerminalAttentionStore(config);
-  const taskService = new TaskService(
-    config,
-    historyService,
-    aiService,
-    workspaceService,
-    initStateManager,
-    undefined,
-    undefined,
-    new SecretsStore(config.rootDir),
-    terminalAttentionStore
-  );
-  taskService.setWorkspaceTurnManager(
-    new WorkspaceTurnManager(
-      config,
-      historyService,
-      aiService,
-      workspaceService,
-      initStateManager,
-      taskService,
-      terminalAttentionStore,
-      aiService as unknown as ConstructorParameters<typeof WorkspaceTurnManager>[7]
-    )
-  );
-  return taskService;
+  return createTaskServiceStack(config, { historyService }).taskService;
 }
 
 function startedTaskIdForStep(run: WorkflowRunRecord): string | undefined {

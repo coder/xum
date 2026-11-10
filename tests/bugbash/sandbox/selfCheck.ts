@@ -113,8 +113,9 @@ check(
   "write attempt"
 );
 
-// Network. The probes run in node (the app and e2e run in node): Bun 1.3.12 reports a missing
-// route as ECONNREFUSED, which would hide the difference (measured in this image).
+// Network. The probes run in node (the app and e2e run in node): Bun 1.3.12 reported a missing
+// route as ECONNREFUSED, which would hide the difference (measured in this image, not re-measured
+// on Bun 1.4.3).
 const devices = fs.readdirSync("/sys/class/net");
 check("loopback only", devices.join() === "lo", devices.join());
 const routes = read("/proc/net/route").trim().split("\n").slice(1);

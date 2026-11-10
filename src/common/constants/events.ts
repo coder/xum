@@ -79,12 +79,6 @@ export const CUSTOM_EVENTS = {
   SKILLS_REFRESH_REQUESTED: "mux:skillsRefreshRequested",
 
   /**
-   * Event emitted when the mux gateway session expires.
-   * No detail
-   */
-  MUX_GATEWAY_SESSION_EXPIRED: "mux:muxGatewaySessionExpired",
-
-  /**
    * Event to switch to a different workspace after fork
    * Detail: { workspaceId: string, projectPath: string, projectName: string, workspacePath: string, branch: string }
    */
@@ -150,11 +144,18 @@ export const CUSTOM_EVENTS = {
   OPEN_NEW_SIDEBAR_TAB: "mux:openNewSidebarTab",
 
   /**
-   * Expand the collapsed right sidebar on its focused tab, the same path as the overview card's
-   * Expand button. Sent by the header's stand-in for the card where the card would cover the
-   * transcript. Detail: { workspaceId: string }
+   * Move keyboard focus to a right-sidebar tab that the command palette just showed (its
+   * "Split Horizontally/Vertically" and "Add Tool…" change the stored layout, then send this).
+   * Detail: { workspaceId: string, tabsetId: string, tab: string }
    */
-  EXPAND_RIGHT_SIDEBAR: "mux:expandRightSidebar",
+  FOCUS_SIDEBAR_TAB: "mux:focusSidebarTab",
+
+  /**
+   * Start a new chat the way the left sidebar's "New chat" button does. Sent by the app shell's
+   * toggle bar while the sidebar is collapsed; ProjectSidebar stays mounted and owns
+   * the draft logic. No payload.
+   */
+  NEW_CHAT_REQUESTED: "mux:newChatRequested",
 
   /**
    * Open a /side chat as a right-sidebar tab of its parent workspace. Dispatched cancelable: the
@@ -164,14 +165,14 @@ export const CUSTOM_EVENTS = {
   OPEN_SIDE_CHAT_TAB: "mux:openSideChatTab",
 
   /**
-   * Open an MCP Apps view in its app tab (artifacts experiment): uncollapse the right sidebar
+   * Open an MCP Apps view in its app tab (mcp-apps experiment): uncollapse the right sidebar
    * and open or focus the view's tab, or open the view's sheet on small viewports.
    */
   OPEN_MCP_APP_VIEW: "mux:openMcpAppView",
 
   /**
    * Open the Artifacts tab on one artifact (Artifacts M4). Senders persist the selection first.
-   * Detail: { workspaceId: string, path: string, versionId?: number }
+   * Detail: { workspaceId: string, path: string, pinned?: boolean }
    */
   OPEN_ARTIFACT: "mux:openArtifact",
 
@@ -236,11 +237,11 @@ export interface CustomEventPayloads {
     handled: boolean;
   };
   [CUSTOM_EVENTS.OPEN_AGENT_PICKER]: never; // No payload
+  [CUSTOM_EVENTS.NEW_CHAT_REQUESTED]: never; // No payload
   [CUSTOM_EVENTS.CLOSE_AGENT_PICKER]: never; // No payload
   [CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED]: never; // No payload
   [CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED]: never; // No payload
   [CUSTOM_EVENTS.OPEN_MODEL_SELECTOR]: never; // No payload
-  [CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED]: never; // No payload
   [CUSTOM_EVENTS.WORKSPACE_FORK_SWITCH]: {
     workspaceId: string;
     projectPath: string;
@@ -285,8 +286,12 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
     workspaceId: string;
   };
-  [CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR]: {
+  [CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB]: {
     workspaceId: string;
+    /** The pane that shows the tab. */
+    tabsetId: string;
+    /** A TabType (a browser type); the sidebar ignores anything else. */
+    tab: string;
   };
   [CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB]: {
     /** The main chat whose right sidebar shows the tab. */
@@ -304,10 +309,8 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.OPEN_ARTIFACT]: {
     workspaceId: string;
-    /** Artifacts-relative path, or a checkout-relative path when `pinned`. */
+    /** Artifacts-relative path, or the stored pin path (checkout-relative or absolute) when `pinned`. */
     path: string;
-    /** Version number to show; absent means "Latest (live)". */
-    versionId?: number;
     /** True for pinned workspace files (Concept C). */
     pinned?: boolean;
   };

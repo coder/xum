@@ -15,6 +15,13 @@
 
 @source "../node_modules/streamdown/dist/index.js";
 
+/* src/common/staticWorkspaceView holds captured markup: the static view's class allow-list and
+   the generated phone skeleton. Those files spell out Streamdown's own utility classes as strings,
+   and scanning them made Tailwind generate utilities the transcript never had (#6836), such as
+   bg-muted/80 on table headers and list-inside on lists. They mirror classes rather than use
+   them, so leave them out of the scan. */
+@source not "../../common/staticWorkspaceView";
+
 /* Geist Font Declarations */
 @font-face {
   font-family: "Geist";
@@ -50,6 +57,14 @@
   font-weight: 100 900;
   font-style: normal;
   font-display: swap;
+  /* The vertical metrics of geist 1.5.1's Geist Mono. geist 1.8.1 raised them from 955/245 to
+     1005/295 units (a 1.3 em text box, was 1.2 em; the baseline stays where it was). The phone
+     static workspace view paints code before this font loads (no preload, see staticAssets.ts), so
+     the live code line's taller box was a new, later LCP entry: seeded phone Lighthouse 93 -> 70
+     (#7637). Keep the live box no larger than the static copy's. */
+  ascent-override: 95.5%;
+  descent-override: 24.5%;
+  line-gap-override: 0%;
 }
 
 @import "./theme-dark.css";
@@ -246,10 +261,21 @@
   --color-accent-dark: hsl(207 90% 38%);
   --color-accent-darker: hsl(204 92% 30%);
   --color-accent-light: hsl(198 100% 70%);
+  /* The accent's hue and saturation, darker: WCAG AA (4.5:1) on every light surface, down to the
+     selected-row tint #c8dff3 (4.64:1), where the accent itself was 3.46:1 (#6449).
+     --color-accent stays the button fill and focus ring. */
+  --color-accent-text: hsl(207 90% 35%);
   --color-accent-foreground: hsl(0 0% 100%); /* preserve contrast on blue buttons in light mode */
 
   --color-success: hsl(122 39% 45%);
   --color-success-light: hsl(123 46% 60%);
+  /* The success hue, darker: WCAG AA (4.5:1) on every light surface and success tint, down to
+     4.52:1. The success color itself was 2.29-3.1:1 as text (#6882). --color-success stays the
+     fill, border and tint color. */
+  --color-success-text: hsl(122 39% 30%);
+  /* Text-only variant of --color-success-light (diff "+N" counts). The light success-light was
+     2.08:1 on white, so light themes use the success text color (#6885). */
+  --color-success-light-text: var(--color-success-text);
   --color-on-success: hsl(0 0% 100%);
 
   --color-danger: hsl(4 78% 52%);
@@ -259,6 +285,10 @@
 
   --color-warning: hsl(45 100% 50%);
   --color-warning-light: hsl(38 100% 70%);
+  /* Text-only variant of --color-warning-light (diff "-N" counts, "M" status letters). The light
+     warning-light was 1.54:1 on white; this one reaches WCAG AA down to the selected-row tint,
+     4.86:1 (#6935). */
+  --color-warning-light-text: hsl(38 100% 26%);
   --color-warning-text: var(--color-review-warning);
 
   --color-code-type: hsl(200 84% 28%);
@@ -281,7 +311,8 @@
   --color-selection: hsl(204 100% 45% / 0.3);
   --color-vim-status: hsl(210 18% 32% / 0.6);
   --color-code-keyword-overlay-light: hsl(210 88% 28% / 0.16);
-  --color-code-keyword-overlay: hsl(210 88% 28% / 0.32);
+  /* Selected review file row. At 0.32 the row's colored texts could not reach WCAG AA on it (#6935). */
+  --color-code-keyword-overlay: hsl(210 88% 28% / 0.16);
 
   --color-info-light: hsl(5 90% 70%);
   --color-info-yellow: hsl(38 100% 60%);
@@ -309,6 +340,17 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
   /* Theme override hook: redeclare tokens inside this block to swap palettes */
+}
+
+/* Light values of the Coder link and highlight tokens in theme-dark.css. The Flexoki themes set their own. */
+:root[data-theme="light"] {
+  --color-content-link: hsl(221 83% 53%);
+  --color-highlight-purple: hsl(271 61% 35%);
+  --color-highlight-sky: hsl(195 61% 22%);
+  --color-highlight-orange: hsl(30 100% 32%);
+  --color-highlight-magenta: hsl(295 68% 40%);
+  --color-highlight-green: hsl(143 64% 24%);
+  --color-highlight-red: hsl(0 74% 42%);
 }
 
 /* Flexoki themes (https://stephango.com/flexoki) */
@@ -501,10 +543,16 @@
   --color-accent-dark: color-mix(in srgb, var(--color-accent), black 14%);
   --color-accent-darker: color-mix(in srgb, var(--color-accent), black 24%);
   --color-accent-light: color-mix(in srgb, var(--color-accent), white 42%);
+  /* Flexoki blue-600 already reaches WCAG AA on every flexoki-light surface (#5946, #6449). */
+  --color-accent-text: var(--color-accent);
   --color-accent-foreground: #fffcf0; /* high-contrast text on accent buttons */
 
   --color-success: #66800b;
   --color-success-light: color-mix(in srgb, var(--color-success), white 35%);
+  /* Darker green: WCAG AA (4.5:1) on every flexoki-light surface and success tint, down to
+     4.69:1, where #66800b was 3.02:1 (#6882). */
+  --color-success-text: #4d6008;
+  --color-success-light-text: var(--color-success-text);
   --color-on-success: #fffcf0;
 
   --color-danger: #af3029;
@@ -514,6 +562,9 @@
 
   --color-warning: #ad8301;
   --color-warning-light: color-mix(in srgb, var(--color-warning), white 35%);
+  /* Darker warning for text: WCAG AA down to the selected-row tint, 4.80:1, where warning-light
+     was 1.27:1 (#6935). */
+  --color-warning-light-text: color-mix(in srgb, var(--color-warning), black 30%);
 
   --color-code-type: #24837b;
   --color-code-keyword: #205ea6;
@@ -538,7 +589,7 @@
   --color-selection: hsl(from var(--color-accent) h s l / 0.25);
   --color-vim-status: hsl(from var(--color-foreground) h s l / 0.35);
   --color-code-keyword-overlay-light: hsl(from var(--color-code-keyword) h s l / 0.16);
-  --color-code-keyword-overlay: hsl(from var(--color-code-keyword) h s l / 0.32);
+  --color-code-keyword-overlay: hsl(from var(--color-code-keyword) h s l / 0.16); /* #6935 */
 
   --color-info: #24837b;
   --color-info-light: color-mix(in srgb, var(--color-info), white 35%);
@@ -561,6 +612,15 @@
   --color-init-output-bg: #e6e4d9;
   --color-init-output-text: #6f6e69;
   --color-init-output-error-text: var(--color-danger);
+
+  /* Link and highlight tokens (Mermaid accent and series colors), Flexoki 600 */
+  --color-content-link: #205ea6; /* Flexoki blue-600 */
+  --color-highlight-purple: #5e409d;
+  --color-highlight-sky: #24837b; /* Flexoki cyan-600 */
+  --color-highlight-orange: #bc5215;
+  --color-highlight-magenta: #a02f6f;
+  --color-highlight-green: #66800b;
+  --color-highlight-red: #af3029;
 }
 
 :root[data-theme="flexoki-dark"] {
@@ -707,7 +767,9 @@
   --color-input-border: #4385be;
   --color-input-border-focus: color-mix(in srgb, var(--color-input-border), white 22%);
 
-  --color-muted: #878580;
+  /* Flexoki base-400, the same as --color-secondary: WCAG AA on every flexoki-dark surface, down to
+     #343331 (4.65:1). base-500 #878580 was 4.04:1 on hover (#6544). */
+  --color-muted: #9f9d96;
   --color-muted-light: #cecdc3;
   --color-muted-dark: #575653;
   --color-placeholder: #575653;
@@ -747,6 +809,9 @@
   --color-accent-button-hover: color-mix(in srgb, var(--color-accent), white 12%);
   --color-accent-darker: color-mix(in srgb, var(--color-accent), black 28%);
   --color-accent-light: color-mix(in srgb, var(--color-accent), white 22%);
+  /* Flexoki blue-300: WCAG AA (4.5:1) on every flexoki-dark surface, down to hover #282726
+     (5.27:1); blue-400 was 3.79:1 there (#5946). */
+  --color-accent-text: #66a0c8;
   --color-accent-foreground: #100f0f; /* maintain WCAG contrast against lighter Flexoki dark accent */
 
   --color-success: #879a39;
@@ -802,6 +867,15 @@
   --color-init-output-bg: #1c1b1a;
   --color-init-output-text: #cecdc3;
   --color-init-output-error-text: var(--color-danger);
+
+  /* Link and highlight tokens (Mermaid accent and series colors), Flexoki 400 */
+  --color-content-link: #4385be; /* Flexoki blue-400 */
+  --color-highlight-purple: #8b7ec8;
+  --color-highlight-sky: #3aa99f; /* Flexoki cyan-400 */
+  --color-highlight-orange: #da702c;
+  --color-highlight-magenta: #ce5d97;
+  --color-highlight-green: #879a39;
+  --color-highlight-red: #d14d41;
 }
 h1,
 h2,
@@ -844,8 +918,10 @@ body,
   background-color: var(--color-surface-primary);
 }
 
-/* iOS 26 standalone colors the status bar from an opaque, near-full-width fixed element at the
-   top edge (element lives in index.html); keep it at least 1px tall when there is no inset. */
+/* iOS 26+ standalone colors the status bar from the fixed box 4px below the top edge's midpoint
+   when it spans at least 90% of the viewport and is over 10px tall (WebKit fixedContainerEdges).
+   Without one, iPadOS blurs about 40pt of the app below the status bar. The element lives in
+   index.html so it exists from the first frame: iPadOS can keep the blur after a frame without it. */
 .ios-status-bar-band {
   display: none;
 }
@@ -858,10 +934,12 @@ body,
       top: 0;
       left: 0;
       right: 0;
-      height: max(1px, env(safe-area-inset-top, 0px));
+      height: 12px;
       background-color: var(--color-sidebar);
-      /* Above the off-canvas drawer (z-index 1000). */
-      z-index: 1001;
+      /* WebKit reads the color from the style, and with no text this clip paints nothing. */
+      background-clip: text;
+      /* Topmost, so no menu or overlay covers the sampled point. */
+      z-index: 2147483647;
       pointer-events: none;
     }
   }
@@ -870,6 +948,13 @@ body,
 /* iPadOS reports pointer: coarse even with a trackpad attached, so selection suppression
    must not be limited to phone widths. */
 @media (pointer: coarse) {
+  /* iOS ignores the viewport's zoom limits for gestures, so without this its double-tap-to-zoom
+     recognizer stays armed on tablets and holds or drops taps on the blank part of a control
+     (Settings nav rows on an iPad needed several taps right of the label). Pinch zoom stays. */
+  html {
+    touch-action: manipulation;
+  }
+
   body {
     -webkit-user-select: none;
     user-select: none;
@@ -888,7 +973,6 @@ body,
 @media (max-width: 768px) and (pointer: coarse) {
   html {
     -webkit-text-size-adjust: 100%;
-    touch-action: manipulation;
   }
 
   body {
@@ -901,8 +985,11 @@ body,
 
   button,
   a,
-  [role="button"] {
-    /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule. */
+  [role="button"],
+  .mobile-touch-target {
+    /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule.
+       .mobile-touch-target: an inert placeholder that holds a button's slot while it loads gets
+       the button's size, or the header icons after it jump when the button arrives (#6841). */
     min-height: 44px;
     min-width: 44px;
   }
@@ -965,10 +1052,10 @@ body,
     display: inline-flex !important;
   }
 
-  /* The collapsed-left-sidebar header inset reserves room for the desktop reopen affordance; at
-     phone widths this button is that affordance, so fall back to the header's ordinary gutter. */
-  .mobile-sticky-header:has(.mobile-menu-btn) {
-    padding-left: 0.5rem !important;
+  /* The app shell's fixed left sidebar toggle bar and its header spacers take the header's
+     ordinary phone gutter. */
+  .left-sidebar-toggle-host {
+    padding-left: max(var(--titlebar-left-inset, 0px), 0.5rem) !important;
   }
 
   .mobile-overlay {
@@ -1031,7 +1118,7 @@ body,
     max-width: none !important;
     z-index: 1100 !important;
     border-left: 0 !important;
-    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    padding: env(safe-area-inset-top, 0px) var(--safe-area-right)
       env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
   }
 
@@ -1043,15 +1130,69 @@ body,
 /* Touch targets widen this button to 44px (see the coarse-pointer block above), so centering
    would drift the icon to 22px; anchor the box to the header edge to keep it on the 12px gutter.
    Fine pointers keep the 24px box, where this inset would push the icon out of the box and paint
-   the hover pill against the window edge. */
+   the hover pill against the window edge. The toggle bar and its spacers match the page header's
+   44px touch height, so the bar lines up with the header under it. */
 @media (max-width: 768px) and (pointer: coarse) {
   .mobile-menu-btn {
     justify-content: flex-start !important;
     padding-left: 12px !important;
   }
 
-  .mobile-sticky-header:has(.mobile-menu-btn) {
-    padding-left: 0 !important;
+  .left-sidebar-toggle-host {
+    padding-left: var(--titlebar-left-inset, 0px) !important;
+    min-height: 44px;
+  }
+}
+
+/* The OS draws only in a band at the top of that column (measured on a folded Duo, 2.95 px per pt:
+   glyphs at x 398..437, y 87..151 of 466x678) and takes the touches there. Padding the shell by the
+   whole column gives up a fifth of the width for the whole page, so in narrow portrait the shell
+   keeps no right padding, the fixed header keeps its controls left of the column, and the band
+   below the header is painted over. Content below the band uses the full width.
+   Where no side column exists this changes nothing: iPhone and iPad portrait have none, and
+   landscape and wide layouts keep the shell padding, because there a side inset is a full-height
+   notch. .storybook/test-runner.ts asserts the band geometry. */
+@media (orientation: portrait) and (max-width: 768px) {
+  /* The shell's `pr-[env(safe-area-inset-right)]` utility still carries the other layouts;
+     !important is how the narrow-layout rules around here win over utilities. */
+  .mobile-layout {
+    padding-right: 0 !important;
+  }
+
+  /* The header's background spans the display; its controls stop at the column. Its own right
+     padding is px-2. */
+  .mobile-sticky-header {
+    right: 0 !important;
+    padding-right: calc(0.5rem + var(--safe-area-right)) !important;
+  }
+
+  /* On the body, the one element, rather than on the shell: `mobile-layout` is on three nested
+     elements, the reserve is fixed to the viewport edge anyway, and a pseudo-element adds no node to
+     the tree the phone skeleton pins (`make check-phone-chrome`). It paints the shell's own
+     background, which is what the band sits on. */
+  body::after {
+    content: "";
+    position: fixed;
+    /* From the top: the fixed header (z-50) covers its own part. */
+    top: 0;
+    /* IOS_STATUS_BAND_HEIGHT_PX: iosCoverColumn.ts takes no touches in the band. */
+    height: 172px;
+    right: 0;
+    /* Zero wherever there is no side column, so nothing paints. */
+    width: var(--safe-area-right);
+    background-color: var(--color-surface-primary);
+    /* Text that scrolls under the band fades out instead of being cut mid-letter. Both fades stay
+       clear of the glyphs, which start 16px into the column and end 20px above the band's bottom. */
+    -webkit-mask-image:
+      linear-gradient(to right, transparent, #000 16px), linear-gradient(to top, transparent, #000 16px);
+    -webkit-mask-composite: source-in;
+    mask-image:
+      linear-gradient(to right, transparent, #000 16px), linear-gradient(to top, transparent, #000 16px);
+    mask-composite: intersect;
+    /* The OS draws over this band and takes no touches there, so the reserve takes none either. */
+    pointer-events: none;
+    /* Above the page's own content, below the fixed phone header (z-50) and every overlay (1100+). */
+    z-index: 40;
   }
 }
 
@@ -1071,7 +1212,7 @@ body,
     max-width: none !important;
     z-index: 1100 !important;
     border-left: 0 !important;
-    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    padding: env(safe-area-inset-top, 0px) var(--safe-area-right)
       env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
   }
 
@@ -1087,9 +1228,13 @@ body,
 }
 
 /* -----------------------------------------------------------------------------
- * Collapsed right sidebar: overview card vs. header stand-in
+ * Right sidebar toggle and the collapsed sidebar's overview card
  *
- * The collapsed right sidebar is a card floating in the chat's top-right corner (RightSidebar).
+ * The toggle (RightSidebarToggle, mounted by WorkspaceShell) and the header spacer that reserves
+ * its room show wherever the docked sidebar can show, in both states: the narrow layouts hide the
+ * sidebar itself (the workspace menu opens it there).
+ *
+ * The collapsed right sidebar shows a card floating in the chat's top-right corner (RightSidebar).
  * It never covers the transcript: where it shows, the chat reserves its width
  * (--chat-reserved-inline-end, read by ChatPane's scrollport), so the transcript column, and
  * the composer under it, center in the space left of the card, as far from the card as from the
@@ -1100,12 +1245,6 @@ body,
  *
  * Container queries take no var(), so that sum is spelled out below; keep it in step with the
  * tokens. A full-width transcript has no column to make room beside, so it never shows the card.
- * Everywhere else the header's expand button (WorkspaceMenuBar) stands in for it, except in the
- * narrow layouts, which hide the sidebar itself (the workspace menu opens it there).
- *
- * visibility, not display: the card's display tells shortcuts whether the layout hides the sidebar
- * (isRightSidebarResponsivelyHidden), and a collapsed sidebar is not hidden by the layout: its
- * shortcuts still expand it.
  * --------------------------------------------------------------------------- */
 
 [data-workspace-shell] {
@@ -1119,42 +1258,70 @@ body,
   visibility: hidden;
 }
 
-.right-sidebar-overview-expand {
+/* A workspace with nothing to summarize shows no empty card. */
+.right-sidebar-overview-card:has(> :empty) {
+  display: none;
+}
+
+/* The closed sidebar (RightSidebar marks it) is a 0px box around the card, so it shows only with
+   the card (below): elsewhere assistive tech would find an empty "Workspace insights" landmark.
+   The full-screen view keeps its header and its close button. */
+.mobile-hide-right-sidebar[data-right-sidebar-phase="closed"]:not(.right-sidebar-fullscreen) {
+  visibility: hidden;
+}
+
+.right-sidebar-toggle {
   display: none;
 }
 
 @media (min-width: 769px) {
   @container workspace-shell (width > 684px) {
-    .right-sidebar-overview-expand {
-      display: inline-flex;
+    .right-sidebar-toggle {
+      display: flex;
     }
   }
 }
 
-/* At any width: a sidebar whose chunk failed to load shows docked with its Reload button and never
-   listens for the stand-in's event, so the stand-in would do nothing. */
-[data-workspace-shell]:has(> [data-right-sidebar-load-failed]) .right-sidebar-overview-expand {
+/* At any width: a sidebar whose chunk failed to load shows docked with its Reload button, and
+   there is no sidebar to toggle. */
+[data-workspace-shell]:has(> [data-right-sidebar-load-failed]) .right-sidebar-toggle {
   display: none;
 }
 
 @container workspace-shell (width >= 66.625rem) {
-  [data-workspace-shell]:not([data-transcript-full-width]) > .right-sidebar-overview-card {
+  [data-workspace-shell]:not([data-transcript-full-width])
+    > .mobile-hide-right-sidebar
+    > .right-sidebar-overview-card,
+  [data-workspace-shell]:not([data-transcript-full-width])
+    > .mobile-hide-right-sidebar[data-right-sidebar-phase="closed"]:not(
+      :has(> .right-sidebar-overview-card > :empty)
+    ) {
     visibility: visible;
   }
 
-  [data-workspace-shell]:not([data-transcript-full-width]) .right-sidebar-overview-expand {
-    display: none;
-  }
-
   /* Keyed on the collapsed state (WorkspaceShell), not on the card element, which mounts only
-     once the lazy sidebar chunk loads: the transcript must not shift when it does. A chunk that
-     failed to load shows docked instead, with no card, so nothing is reserved then. */
+     once the lazy sidebar chunk loads: the transcript must not shift when it does. Nothing is
+     reserved where no card shows: a chunk that failed to load shows docked instead, and a card
+     with nothing to summarize is hidden (above), so the transcript widens once that card mounts.
+     Not on the sidebar itself: a side chat's transcript in its sliding panel must not inherit it. */
   [data-workspace-shell][data-right-sidebar-collapsed]:not([data-transcript-full-width]):not(
-      :has(> [data-right-sidebar-load-failed])
+      :has(
+        > [data-right-sidebar-load-failed],
+        > .mobile-hide-right-sidebar > .right-sidebar-overview-card > :empty
+      )
     )
-    > :not(.right-sidebar-overview-card) {
+    > :not(.mobile-hide-right-sidebar) {
     --chat-reserved-inline-end: calc(var(--overview-card-width) + var(--overview-card-inset));
   }
+}
+
+/* The room eases only with the sidebar's width slide (RightSidebar marks the sidebar then), so
+   the transcript column does not squeeze the moment the sidebar starts collapsing. A window
+   resize across the breakpoint, or a drag that snaps the sidebar closed, moves it at once. */
+[data-workspace-shell]:has(> [data-right-sidebar-animating]) .chat-reserved-inline-end-scrollport {
+  transition-property: padding-right;
+  transition-duration: 200ms;
+  transition-timing-function: var(--default-transition-timing-function);
 }
 
 /*
@@ -1281,7 +1448,8 @@ input[type="checkbox"] {
 /* Tutorial highlight effect */
 .tutorial-highlight {
   position: relative;
-  z-index: 9997;
+  /* Under the tutorial backdrop and every dialog layer (see TutorialTooltip). */
+  z-index: 1497;
   border-radius: 6px;
   box-shadow: 0 0 0 2px var(--color-accent);
   animation: tutorial-pulse 1.5s ease-in-out infinite;
@@ -1415,16 +1583,13 @@ html[data-renderer-inactive] *::after {
 }
 /* Desktop titlebar drag regions (Electron only)
  * -webkit-app-region: drag marks areas that can be used to drag the window
- * -webkit-app-region: no-drag marks interactive elements inside drag regions
+ * -webkit-app-region: no-drag marks interactive elements inside drag regions (the
+ * .titlebar-no-drag rule lives in transcript-content.css, shared with the VS Code webview)
  * These styles only apply in Electron; in browser mode they have no effect */
 .titlebar-drag {
   -webkit-app-region: drag;
   /* Prevent text selection while dragging */
   user-select: none;
-}
-
-.titlebar-no-drag {
-  -webkit-app-region: no-drag;
 }
 
 /* Titlebar-safe inset classes — consume the CSS custom properties set by

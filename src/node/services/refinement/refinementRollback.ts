@@ -41,7 +41,10 @@ import {
 } from "@/common/types/refinement";
 import { getErrorMessage } from "@/common/utils/errors";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import type { ProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import type { BlobQuotaEntry } from "@/node/utils/journal/blobReclamation";
 import { log } from "@/node/services/log";
@@ -57,10 +60,16 @@ import { SESSION_MEMORY_DIR_NAME } from "@/common/constants/memory";
 
 export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
 
-/** All refinement rows in the session journal (byId-deduped, seq order). */
-export async function listRefinements(sessionDir: string): Promise<RefinementEvent[]> {
+/**
+ * All refinement rows in the session journal (byId-deduped, seq order). `layers`: the session's
+ * file and lock layers (RefineService passes its history's). Absent: the Node layers.
+ */
+export async function listRefinements(
+  sessionDir: string,
+  layers?: { files: SessionFiles; locks: SessionLocks }
+): Promise<RefinementEvent[]> {
   assert(sessionDir.length > 0, "listRefinements requires a session dir");
-  const events = await sharedDurableEventJournal(sessionDir).read();
+  const events = await sharedDurableEventJournal(sessionDir, layers).read();
   return events.filter((event): event is RefinementEvent => event.kind === "refinement");
 }
 
@@ -74,6 +83,8 @@ export interface RollbackRefinementOptions {
   evidence: { toolName: string; toolCallId?: string; actor?: string };
   /** Caller-supplied justification, recorded in the rollback row's action. */
   reason?: string;
+  /** The rollback and target locks (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
   /**
    * Test seam: runs after filesystem mutation, immediately before the
    * commit-point ownership re-check — the only way to deterministically
@@ -181,7 +192,10 @@ export interface RollbackFileLock extends AsyncDisposable {
   assertStillOwned(): Promise<void>;
 }
 
-export async function acquireRollbackFileLock(sessionDir: string): Promise<RollbackFileLock> {
+export async function acquireRollbackFileLock(
+  sessionDir: string,
+  locks: SessionLocks = nodeSessionLocks
+): Promise<RollbackFileLock> {
   const lockPath = path.join(path.resolve(sessionDir), ROLLBACK_LOCKFILE);
   // A session dir may not exist yet (e.g. unknown-id refusals before any row
   // was journaled); the claim must still succeed so the ordinary "No
@@ -189,7 +203,7 @@ export async function acquireRollbackFileLock(sessionDir: string): Promise<Rollb
   await fsPromises.mkdir(path.resolve(sessionDir), { recursive: true });
   let fileLock: ProcessFileLock;
   try {
-    fileLock = await acquireProcessFileLock({
+    fileLock = await locks.acquireProcessFileLock({
       lockPath,
       timeoutMs: ROLLBACK_LOCK_TIMEOUT_MS,
       label: "rollback lock",
@@ -734,7 +748,7 @@ export async function rollbackRefinement(
     // cheaply; the lockfile serializes the debug CLI (a separate Bun process)
     // against the backend.
     await using _lock = await sessionLock(opts.sessionDir).acquire();
-    await using fileLock = await acquireRollbackFileLock(opts.sessionDir);
+    await using fileLock = await acquireRollbackFileLock(opts.sessionDir, opts.locks);
     const journal = sharedDurableEventJournal(opts.sessionDir);
     const rows = await listRefinements(opts.sessionDir);
 
@@ -838,7 +852,9 @@ export async function rollbackRefinement(
     // non-standard layout (null) degrades to in-process-only locking — see
     // targetMutationLocks.ts.
     const targetLockRoot = inferMemoryLayout(opts.sessionDir)?.muxRoot ?? null;
-    const applied = await withTargetMutationLocks(targetLockRoot, lockKeys, async () => {
+    const withTargetLocks = <T>(fn: () => Promise<T>) =>
+      withTargetMutationLocks(targetLockRoot, lockKeys, fn, opts.locks);
+    const applied = await withTargetLocks(async () => {
       // Re-verify INSIDE the lock, immediately before mutating: a writer that
       // won the lock first has already landed, and its change must surface as
       // divergence rather than be overwritten. `rows` is intentionally the

@@ -1,5 +1,5 @@
 /**
- * MCP Apps route operations (artifacts experiment): open a view (resources/read + host-only
+ * MCP Apps route operations (mcp-apps experiment): open a view (resources/read + host-only
  * tool result), proxy tools/call and resources/read issued by a view to its own server, and
  * store a view's ui/update-model-context.
  */
@@ -12,6 +12,7 @@ import type {
   McpAppEntrypoint,
   McpAppOpenEntrypointRequestSchema,
   McpAppModelContextRequestSchema,
+  McpAppWidgetStateRequestSchema,
   McpAppResourceReadRequestSchema,
   McpAppToolCallRequestSchema,
   McpAppToolCallResult,
@@ -21,6 +22,7 @@ import type {
   McpAppViewRecordsRequestSchema,
   McpAppViewRequestSchema,
 } from "@/common/orpc/schemas/mcpApps";
+import type { ProjectsConfig } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getOwn } from "@/common/utils/getOwn";
@@ -28,7 +30,7 @@ import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { isSystemProjectEntry } from "@/common/utils/systemProjects";
 import type { ORPCContext } from "@/node/orpc/context";
 import { buildMcpToolName } from "@/common/utils/tools/mcpToolName";
-import type { McpAppResultRecord } from "./mcpAppResultStore";
+import { mcpAppWidgetStateBindingOf, type McpAppResultRecord } from "./mcpAppResultStore";
 import { displayConnectionKey } from "./mcpServerIdentity";
 
 export type McpAppsContext = Pick<
@@ -49,7 +51,19 @@ export type McpAppsContext = Pick<
  * workspaces. Its MCP config is resolved against its first project (attributionProjectPath), so
  * a server defined by that project's repo config or a project plugin belongs to that project.
  * A global server there has no single owner project: no approval applies and approving fails.
+ * A task of a multi-project workspace counts too (isMultiProjectRow), though it is not stored
+ * under `_multi` (#6181).
  */
+/**
+ * Whether a workspace row is multi-project: stored under `_multi`, or a task of a multi-project
+ * workspace, stored under its first project but keeping the parent's project list (Task.createMany).
+ */
+function isMultiProjectRow(workspace: { projectPath: string; projects?: unknown[] }): boolean {
+  return (
+    workspace.projectPath === MULTI_PROJECT_CONFIG_KEY || (workspace.projects?.length ?? 0) > 1
+  );
+}
+
 async function approvalProjectPathOf(
   context: McpAppsContext,
   workspaceId: string,
@@ -57,7 +71,7 @@ async function approvalProjectPathOf(
 ): Promise<string | null> {
   const workspace = context.config.findWorkspace(workspaceId);
   if (workspace == null) return null;
-  const multi = workspace.projectPath === MULTI_PROJECT_CONFIG_KEY;
+  const multi = isMultiProjectRow(workspace);
   const owner = multi ? workspace.attributionProjectPath : workspace.projectPath;
   const project =
     owner == null ? undefined : context.config.loadConfigOrDefault().projects.get(owner);
@@ -71,6 +85,59 @@ async function approvalProjectPathOf(
     server?.configLayer === "project" ||
     (server?.configLayer === undefined && server?.plugin?.sourceScope === "project");
   return fromProject ? owner : null;
+}
+
+/**
+ * Commit order of view-domain approval lists (#6181). Every list this backend returns (getView,
+ * approve, revoke) carries a revision, and the renderer keeps the list with the newest one
+ * (mcpAppViewDomainsStore.ts), so it follows the order of config commits, not of requests.
+ *
+ * An approve or revoke takes the next revision inside its config edit: edits run one at a time
+ * (Config.editConfig), so revisions follow commit order. Once the write landed, the revision
+ * counts as committed. A read takes the committed revision before it reads the config, so the
+ * list it reads is at least that new.
+ *
+ * Edits by another process take no revision. The live follow (readMcpAppViewDomains) reaches
+ * them: the renderer re-reads after each config change, and each such read takes a new
+ * revision of its own.
+ *
+ * Process memory only. The counter starts at the boot time in microseconds, so revisions after a
+ * backend restart stay above those a renderer still holds from before it (unless the clock went
+ * back).
+ */
+let assignedViewDomainsRevision = Date.now() * 1000;
+let committedViewDomainsRevision = assignedViewDomainsRevision;
+
+/** Approval-list edits of this backend that have not committed yet, and who waits for none. */
+let viewDomainsEditsInFlight = 0;
+let viewDomainsEditsDrained: Array<() => void> = [];
+
+/** Runs one approval-list edit and returns the revision of its commit. */
+async function editViewDomains(
+  context: McpAppsContext,
+  edit: (config: ProjectsConfig) => ProjectsConfig
+): Promise<number> {
+  let revision = 0;
+  viewDomainsEditsInFlight++;
+  try {
+    await context.config.editConfig((config) => {
+      revision = ++assignedViewDomainsRevision;
+      return edit(config);
+    });
+    committedViewDomainsRevision = Math.max(committedViewDomainsRevision, revision);
+  } finally {
+    endViewDomainsEdit();
+  }
+  return revision;
+}
+
+/** One edit left the flight: when it was the last, wake the reads that wait for none. */
+function endViewDomainsEdit(): void {
+  viewDomainsEditsInFlight--;
+  if (viewDomainsEditsInFlight > 0) return;
+  const waiters = viewDomainsEditsDrained;
+  viewDomainsEditsDrained = [];
+  for (const resolve of waiters) resolve();
 }
 
 /** Origins the user allowed `serverName`'s views to reach in `projectPath`. */
@@ -88,9 +155,33 @@ function approvedDomainsIn(
 export const MCP_APP_TOOL_RESULT_MAX_BYTES = 2 * 1024 * 1024;
 
 function assertMcpAppsEnabled(context: McpAppsContext): void {
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)) {
+  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)) {
     throw new ORPCError("BAD_REQUEST", { message: "MCP Apps views are disabled" });
   }
+}
+
+/** What a view gets from its result record; without one it opens with tool input only. */
+function viewFieldsOfRecord(record: McpAppResultRecord | null) {
+  if (record === null) {
+    return {
+      resultAvailable: false,
+      result: null,
+      widgetState: null,
+      widgetStateBinding: null,
+      invocation: null,
+    };
+  }
+  return {
+    resultAvailable: record.result !== null,
+    result: record.result,
+    widgetState: record.widgetState ?? null,
+    widgetStateBinding: mcpAppWidgetStateBindingOf(record),
+    invocation: {
+      serverName: record.serverName,
+      toolName: record.toolName,
+      arguments: record.arguments,
+    },
+  };
 }
 
 export async function getMcpAppView(
@@ -137,7 +228,6 @@ export async function getMcpAppView(
       input.resourceUri,
       signal !== undefined ? { signal } : undefined
     );
-    const result = record?.result ?? null;
     const boundServerName = record?.serverName ?? input.serverName;
     const approvalProjectPath = await approvalProjectPathOf(
       context,
@@ -148,18 +238,11 @@ export async function getMcpAppView(
       success: true,
       data: {
         ...resource,
-        resultAvailable: result !== null,
-        result,
+        ...viewFieldsOfRecord(record),
+        // Taken before the read below: the list read is at least this new.
+        approvedDomainsRevision: committedViewDomainsRevision,
         approvedDomains: approvedDomainsIn(context, approvalProjectPath, boundServerName),
         approvalProjectPath,
-        invocation:
-          record !== null
-            ? {
-                serverName: record.serverName,
-                toolName: record.toolName,
-                arguments: record.arguments,
-              }
-            : null,
       },
     };
   } catch (error) {
@@ -204,6 +287,8 @@ function viewOfRecord(record: McpAppResultRecord): NonNullable<McpAppViewRecord>
     toolName: modelFacing?.toolName ?? record.toolName,
     resourceUri: record.resourceUri,
     arguments: record.arguments,
+    entrypoint: record.entrypoint,
+    outcome: record.outcome,
   };
 }
 
@@ -235,8 +320,8 @@ export async function callMcpAppTool(
 }
 
 /**
- * Entry points of the workspace's enabled servers. Starts them first, the way prompt
- * discovery does, so a server just enabled (or a cold backend) is listed.
+ * Entry points of the workspace's enabled servers. Starts them first (without prompt
+ * discovery), so a server just enabled (or a cold backend) is listed.
  */
 export async function listMcpAppEntrypoints(
   context: McpAppsContext,
@@ -331,6 +416,39 @@ export async function updateMcpAppModelContext(
 }
 
 /**
+ * window.openai.setWidgetState of a view. Like updateMcpAppModelContext, the view's result record
+ * binds the server, and the store refuses a write whose binding is not the current record's.
+ */
+export async function setMcpAppWidgetState(
+  context: McpAppsContext,
+  input: z.infer<typeof McpAppWidgetStateRequestSchema>
+): Promise<Result<Record<string, never>, string>> {
+  assertMcpAppsEnabled(context);
+  const record = await context.mcpServerManager.getMcpAppResult(
+    input.workspaceId,
+    input.toolCallId
+  );
+  if (
+    record === null ||
+    (input.serverName !== record.serverName &&
+      input.serverName !== displayConnectionKey(record.serverName))
+  ) {
+    return { success: false, error: "This view cannot store widget state" };
+  }
+  try {
+    await context.mcpServerManager.setMcpAppWidgetState(
+      input.workspaceId,
+      input.toolCallId,
+      input.binding,
+      input.state
+    );
+    return { success: true, data: {} };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+/**
  * Allow the server of a view to reach `origins` from its views in every workspace of the
  * project. Like updateMcpAppModelContext, the view's result record binds the server: a view
  * without one, or a request naming another server, is refused. Only bare https origins are
@@ -339,7 +457,7 @@ export async function updateMcpAppModelContext(
 export async function approveMcpAppViewDomains(
   context: McpAppsContext,
   input: z.infer<typeof McpAppApproveDomainsRequestSchema>
-): Promise<Result<{ approvedDomains: string[] }, string>> {
+): Promise<Result<{ approvedDomains: string[]; revision: number }, string>> {
   assertMcpAppsEnabled(context);
   const record = await context.mcpServerManager.getMcpAppResult(
     input.workspaceId,
@@ -365,7 +483,7 @@ export async function approveMcpAppViewDomains(
   }
   let approvedDomains: string[] = [];
   let full = false;
-  await context.config.editConfig((config) => {
+  const revision = await editViewDomains(context, (config) => {
     const project = config.projects.get(projectPath);
     if (!project) throw new Error(`Project not found: ${projectPath}`);
     const domains = project.mcpAppViewDomains;
@@ -389,7 +507,7 @@ export async function approveMcpAppViewDomains(
       error: `A server can be allowed at most ${MCP_APP_VIEW_DOMAINS_MAX} domains in a project`,
     };
   }
-  return { success: true, data: { approvedDomains } };
+  return { success: true, data: { approvedDomains, revision } };
 }
 
 /** Every project's approvals, for Settings → MCP (one call, not one per server). */
@@ -403,15 +521,33 @@ export function listMcpAppViewDomains(context: McpAppsContext): McpAppViewDomain
   );
 }
 
+/**
+ * Every project's approvals with a new revision of their own (the live follow, #6181). The read
+ * waits until no edit of this backend is in flight: an edit that took its revision but has not
+ * committed could otherwise be read as missing, and this newer read would then outrank its
+ * result. The revision, the commit mark and the read then happen in one synchronous step.
+ */
+export async function readMcpAppViewDomains(
+  context: McpAppsContext
+): Promise<{ revision: number; approvals: McpAppViewDomains[] }> {
+  while (viewDomainsEditsInFlight > 0) {
+    await new Promise<void>((resolve) => viewDomainsEditsDrained.push(resolve));
+  }
+  const revision = ++assignedViewDomainsRevision;
+  committedViewDomainsRevision = Math.max(committedViewDomainsRevision, revision);
+  return { revision, approvals: listMcpAppViewDomains(context) };
+}
+
 export async function revokeMcpAppViewDomains(
   context: McpAppsContext,
   input: { projectPath: string; serverName: string }
-): Promise<void> {
-  await context.config.editConfig((config) => {
+): Promise<{ revision: number }> {
+  const revision = await editViewDomains(context, (config) => {
     const project = config.projects.get(input.projectPath);
     if (project?.mcpAppViewDomains?.[input.serverName] === undefined) return config;
     const { [input.serverName]: _revoked, ...rest } = project.mcpAppViewDomains;
     project.mcpAppViewDomains = Object.keys(rest).length > 0 ? rest : undefined;
     return config;
   });
+  return { revision };
 }

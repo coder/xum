@@ -1,5 +1,8 @@
 import {
   DraftAttachmentSchema,
+  type CreationDraft,
+  type CreationDraftSummary,
+  type CreationDraftUpdateOutput,
   type Draft,
   type DraftAttachment,
   type DraftAttachmentMetadata,
@@ -10,11 +13,27 @@ import {
 import { joinDraftText } from "@/common/utils/composerDraftText";
 import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 
-/** Stable map key for a draft scope (creation keys are unambiguous for any project path). */
+/** Stable map key for a draft scope. */
 export function draftScopeKey(scope: DraftScope): string {
-  return scope.kind === "workspace"
-    ? `workspace:${scope.workspaceId}`
-    : `creation:${JSON.stringify([scope.projectPath, scope.draftId])}`;
+  return `workspace:${scope.workspaceId}`;
+}
+
+/** A creation draft's sidebar row (also computed locally, so a local edit updates it at once). */
+/** A stored record without its content fields (CREATION_DRAFT_CONTENT_FIELDS): a save's reply. */
+export function creationDraftMetadata(draft: CreationDraft): CreationDraftUpdateOutput["record"] {
+  const { text: _text, attachments: _attachments, ...metadata } = draft;
+  return metadata;
+}
+
+export function summarizeCreationDraft(draft: CreationDraft): CreationDraftSummary {
+  return {
+    draftId: draft.id,
+    projectPath: draft.projectPath,
+    subProjectPath: draft.subProjectPath,
+    createdAt: draft.createdAt,
+    manualName: draft.manualName,
+    preview: draft.text.slice(0, 1000).trim().replace(/\s+/g, " ").slice(0, 200),
+  };
 }
 
 /** A new creation draft id (matches DRAFT_ID_PATTERN: it becomes a backend file name). */
@@ -44,11 +63,6 @@ export function createSendId(): string {
 
 export function createEmptyDraft(): Draft {
   return { text: "", attachments: [] };
-}
-
-/** An empty draft has no file on the backend: writing one deletes it. */
-export function isDraftEmpty(draft: Draft): boolean {
-  return draft.text.length === 0 && draft.attachments.length === 0;
 }
 
 const UTF8_CHUNK_UNITS = 64 * 1024;
@@ -181,7 +195,9 @@ export function sanitizeDraft(raw: unknown): { draft: Draft; droppedEntries: num
 }
 
 /** Forks do not share worktree files, so staged attachments (worktree paths) are dropped. */
-export function stripStagedDraftAttachments(attachments: DraftAttachment[]): DraftAttachment[] {
+export function stripStagedDraftAttachments(
+  attachments: DraftAttachment[]
+): Array<Exclude<DraftAttachment, { kind: "staged" }>> {
   return attachments.filter((attachment) => attachment.kind !== "staged");
 }
 

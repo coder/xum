@@ -17,12 +17,15 @@ import { useWorkspaceStoreRaw, type WorkspaceSidebarState } from "@/browser/stor
 import { isActiveWorkflowRunStatus } from "@/common/types/workflow";
 import type { WorkflowRunLivenessEntry } from "@/common/orpc/schemas/api";
 import { shortenWorkflowRunId } from "@/browser/components/ProjectSidebar/sidebarTaskGroups";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouter } from "@/browser/contexts/RouterContext";
-import { ChatInputDecoration } from "@/browser/components/ChatPane/ChatInputDecoration";
-import { getSubAgentTasksExpandedKey } from "@/common/constants/storage";
+import {
+  ActivityChipLiveDot,
+  ChatInputDecoration,
+} from "@/browser/components/ChatPane/ChatInputDecoration";
+import { useChatActivityPanel } from "@/browser/components/ChatPane/chatActivityPanels";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   isWorkspaceDelegatedActivityActive,
   isWorkspaceSidebarStateWorking,
@@ -310,7 +313,7 @@ interface SubAgentStatusPresentation {
 const COMPLETED_PRESENTATION: SubAgentStatusPresentation = {
   label: "Completed",
   icon: CheckCircle2,
-  iconClassName: "text-success",
+  iconClassName: "text-success-text",
 };
 const INACTIVE_PRESENTATION: SubAgentStatusPresentation = {
   label: "Inactive",
@@ -336,7 +339,7 @@ function getTaskStatusPresentation(workspace: SubAgentTaskWorkspace): SubAgentSt
         return {
           label: "Running",
           icon: LoaderCircle,
-          iconClassName: "text-success animate-spin",
+          iconClassName: "text-success-text animate-spin",
         };
       case "completed":
         return COMPLETED_PRESENTATION;
@@ -352,7 +355,11 @@ function getTaskStatusPresentation(workspace: SubAgentTaskWorkspace): SubAgentSt
     case "starting":
       return { label: "Starting", icon: LoaderCircle, iconClassName: "text-warning animate-spin" };
     case "running":
-      return { label: "Running", icon: LoaderCircle, iconClassName: "text-success animate-spin" };
+      return {
+        label: "Running",
+        icon: LoaderCircle,
+        iconClassName: "text-success-text animate-spin",
+      };
     case "awaiting_report":
       return { label: "Finishing", icon: LoaderCircle, iconClassName: "text-warning animate-spin" };
     case "reported":
@@ -477,10 +484,7 @@ export function reconcileNestedRunLiveness(input: {
 export function SubAgentTasksDecoration(props: { workspaceId: string }) {
   const { workspaceMetadata } = useWorkspaceMetadata();
   const { navigateToWorkspace } = useRouter();
-  const [expanded, setExpanded] = usePersistedState(
-    getSubAgentTasksExpandedKey(props.workspaceId),
-    false
-  );
+  const [expanded, setExpanded] = useChatActivityPanel("sub-agents");
   const workspaceStore = useWorkspaceStoreRaw();
   const { api } = useAPI();
   const observedWorkflowRunsRef = useRef<Map<string, ObservedWorkflowRunInfo>>(new Map());
@@ -710,6 +714,63 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
   );
 }
 
+/** What the live line's sub-agents chip shows, and its accessible name. */
+export function describeSubAgentsChip(input: {
+  subAgents: readonly DescendantSubAgent[];
+  workflowGroups: readonly WorkflowAgentGroup[];
+  activity: ReadonlyMap<string, DescendantActivityHints>;
+  activeCount: number;
+  workflowSummary: string | null;
+}): { count: number; active: boolean; label: string } {
+  const subAgentCount = input.subAgents.length;
+  const parts: string[] = [];
+  if (subAgentCount > 0) {
+    const active = input.activeCount > 0 ? `, ${input.activeCount} active` : "";
+    parts.push(`${subAgentCount} sub-agent${subAgentCount === 1 ? "" : "s"}${active}`);
+  }
+  if (input.workflowSummary !== null) parts.push(input.workflowSummary);
+  const isWorkerActive = ({ workspace }: DescendantSubAgent) =>
+    isSubAgentActive(workspace, input.activity.get(workspace.id));
+  return {
+    count: subAgentCount > 0 ? subAgentCount : input.workflowGroups.length,
+    // Still running: a sub-agent, a workflow worker, or a run between steps (no workers yet).
+    active:
+      input.activeCount > 0 ||
+      input.workflowGroups.some(
+        (group) => group.workers.length === 0 || group.workers.some(isWorkerActive)
+      ),
+    label: parts.join(", "),
+  };
+}
+
+/** The panel heading's detail: how many sub-agents work right now, then any workflow runs. */
+function formatSubAgentsPanelMeta(
+  subAgentCount: number,
+  activeCount: number,
+  workflowSummary: string | null
+): string {
+  const parts: string[] = [];
+  if (subAgentCount > 0) {
+    parts.push(activeCount > 0 ? `${activeCount} active` : "inactive");
+  }
+  if (workflowSummary !== null) parts.push(workflowSummary);
+  return parts.join(" · ");
+}
+
+/** The tray's icon, panel title and sheet tab name: it names sub-agents when it lists any. */
+const SUB_AGENTS_NAMES = { icon: Bot, panelTitle: "Sub-agents", tab: "Agents" };
+const WORKFLOWS_NAMES = { icon: Workflow, panelTitle: "Workflows", tab: "Workflows" };
+
+function SubAgentsChip(props: { icon: typeof Bot; count: number; active: boolean }) {
+  return (
+    <>
+      <props.icon className="size-3.5 shrink-0" />
+      <span className="counter-nums">{props.count}</span>
+      {props.active && <ActivityChipLiveDot />}
+    </>
+  );
+}
+
 /**
  * The tray itself, driven by props so hosts without WorkspaceContext/WorkspaceStore (the VS Code
  * webview, #5109) can feed it. SubAgentTasksDecoration is the desktop container.
@@ -729,7 +790,19 @@ export function SubAgentTasksContent(props: {
   const activeCount = props.subAgents.filter(({ workspace }) =>
     isSubAgentActive(workspace, props.descendantActivity.get(workspace.id))
   ).length;
-  const SummaryIcon = props.subAgents.length === 0 ? Workflow : Bot;
+  const names = props.subAgents.length > 0 ? SUB_AGENTS_NAMES : WORKFLOWS_NAMES;
+  const SummaryIcon = names.icon;
+  const workflowSummary =
+    props.workflowGroups.length > 0
+      ? formatWorkflowSummary(props.workflowGroups, props.descendantActivity)
+      : null;
+  const chip = describeSubAgentsChip({
+    subAgents: props.subAgents,
+    workflowGroups: props.workflowGroups,
+    activity: props.descendantActivity,
+    activeCount,
+    workflowSummary,
+  });
 
   return (
     <ChatInputDecoration
@@ -737,6 +810,19 @@ export function SubAgentTasksContent(props: {
       onToggle={props.onToggle}
       dataComponent="SubAgentTasksDecoration"
       contentClassName="max-h-52 space-y-1 overflow-y-auto py-2"
+      activityId="sub-agents"
+      chipLabel={chip.label}
+      chip={<SubAgentsChip icon={SummaryIcon} count={chip.count} active={chip.active} />}
+      panelTitle={names.panelTitle}
+      panelKeybind={KEYBINDS.OPEN_SUB_AGENTS_PANEL}
+      panelMeta={formatSubAgentsPanelMeta(props.subAgents.length, activeCount, workflowSummary)}
+      tab={
+        <>
+          <SummaryIcon className="size-4 shrink-0" />
+          <span>{names.tab}</span>
+          <span className="counter-nums text-muted">{chip.count}</span>
+        </>
+      }
       summary={
         <>
           <SummaryIcon className="text-muted group-hover:text-secondary size-3.5 shrink-0 transition-colors" />
@@ -749,8 +835,7 @@ export function SubAgentTasksContent(props: {
               </>
             )}
             {props.subAgents.length > 0 && props.workflowGroups.length > 0 && " · "}
-            {props.workflowGroups.length > 0 &&
-              formatWorkflowSummary(props.workflowGroups, props.descendantActivity)}
+            {workflowSummary}
           </span>
         </>
       }

@@ -229,7 +229,7 @@ export function AnalyticsQueryToolCall(props: AnalyticsQueryToolCallProps): JSX.
               <div className="mb-2 flex flex-wrap items-center gap-2">
                 {saveState.status === "saved" ? (
                   <>
-                    <span className="text-success text-[10px]" role="status">
+                    <span className="text-success-text text-[10px]" role="status">
                       Added to analytics dashboard.
                     </span>
                     <HeaderButton

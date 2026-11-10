@@ -368,7 +368,7 @@ describe("ModelsSection catalogue suggestions", () => {
     const option = await ui.view.findByRole("option", { name: /claude-fable-5$/ });
     expect(option.textContent).toContain("Anthropic");
     // The built-in successor is already selectable, so it is not offered.
-    expect(ui.view.queryByRole("option", { name: /claude-fable-5-1/ })).toBeNull();
+    expect(ui.view.queryByRole("option", { name: /claude-fable-5-2/ })).toBeNull();
     fireEvent.click(option);
     expect(ui.save.mock.calls[0][0]).toEqual({ provider: "anthropic", models: ["claude-fable-5"] });
     expect(ui.view.getByRole("combobox", { name: "Provider" }).textContent).toContain("Anthropic");
@@ -583,7 +583,8 @@ describe("ModelsSection manual model IDs", () => {
   );
 
   // A selected "provider:id" longer than the per-workspace model key would not survive a restart.
-  // Typing over a hundred characters takes several seconds, hence the longer timeout.
+  // Typing over a hundred characters takes several seconds (11 s at a load average of 31, over
+  // 15 s when more test runs share the host), hence the longer timeout.
   test("rejects an ID too long to persist as the selected model, accepts one at the limit", async () => {
     const ui = await setup();
     const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;
@@ -598,7 +599,7 @@ describe("ModelsSection manual model IDs", () => {
       provider: "anthropic",
       models: ["m".repeat(maxIdChars)],
     });
-  }, 15_000);
+  }, 60_000);
 
   test("editing a model rejects an ID too long to persist, accepts one at the limit", async () => {
     const maxIdChars = MODEL_KEY_MAX_CHARS - JSON.stringify("anthropic:").length;

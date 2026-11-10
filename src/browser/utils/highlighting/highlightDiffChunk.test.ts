@@ -1,7 +1,7 @@
 import {
-  highlightDiffChunk,
   highlightDiffChunks,
   isWithinDiffHighlightSyncBudget,
+  type HighlightedChunk,
 } from "./highlightDiffChunk";
 import type { DiffChunk } from "./diffChunking";
 
@@ -11,7 +11,14 @@ import type { DiffChunk } from "./diffChunking";
  * WASM loads on first test (~100ms), then cached for subsequent tests
  */
 
-describe("highlightDiffChunk", () => {
+// One chunk through the batch API that DiffRenderer calls.
+async function highlightDiffChunk(chunk: DiffChunk, language: string): Promise<HighlightedChunk> {
+  const highlighted = await highlightDiffChunks([chunk], language);
+  expect(highlighted).toHaveLength(1);
+  return highlighted[0];
+}
+
+describe("highlightDiffChunks", () => {
   const mockChunk: DiffChunk = {
     type: "add",
     lines: ["const x = 1;", "const y = 2;"],
@@ -316,8 +323,9 @@ describe("highlightDiffChunk", () => {
 
       expect(result.lines).toHaveLength(1);
       expect(result.lines[0].html).toContain("<span");
-      // Shiki HTML-encodes special chars: && becomes &#x26;&#x26;
-      expect(result.lines[0].html).toContain("&#x26;&#x26;");
+      // Special chars are HTML-encoded (Shiki writes &#x26;, Highlights output &amp;): no raw &&.
+      expect(result.lines[0].html).not.toContain("&&");
+      expect(result.lines[0].html).toMatch(/(&amp;|&#x26;){2}/);
     });
 
     it("should handle complex nested structures", async () => {

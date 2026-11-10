@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
 import {
   getThinkingPolicyForModel,
   enforceThinkingPolicy,
@@ -14,6 +14,7 @@ import {
   getAvailableThinkingLevels,
   isXaiGrokFastVariantSwap,
   resolveBetweenToolsThinkingLevel,
+  hasExplicitThinkingPolicy,
 } from "./policy";
 
 describe("Muse Wonder thinking policy", () => {
@@ -38,7 +39,7 @@ describe("getThinkingPolicyForModel", () => {
   test.each(["gpt-6-luna"])("preserves off and native max for %s", (model) => {
     for (const id of [
       `openai:${model}`,
-      `mux-gateway:openai/${model}`,
+      `coder:openai/${model}`,
       `openrouter:openai/${model}-2026-09-22`,
     ]) {
       expect(getThinkingPolicyForModel(id)).toEqual([
@@ -55,12 +56,51 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy(`openai:${model}-mini`, "max")).toBe("high");
   });
 
+  // Catalogue GPT-5.6 models are not built in, but OpenAI serves none through
+  // native max on the whole family, so they get the explicit 6-level policy (and
+  // with it the Settings → Models floor selector and default medium floor).
+  test("gives catalogue GPT-5.6 models off through native max and a default floor", () => {
+    const sixLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
+    for (const id of [
+      "openai:gpt-5.6",
+      "openai:gpt-5.6-sol",
+      "openai:gpt-5.6-terra",
+      "openai:gpt-5.6-luna",
+    ]) {
+      expect(getThinkingPolicyForModel(id)).toEqual(sixLevels);
+      expect(hasExplicitThinkingPolicy(id)).toBe(true);
+      expect(getDefaultMinimumThinkingLevel(id)).toBe("medium");
+      expect(enforceThinkingPolicy(id, "xhigh")).toBe("xhigh");
+      expect(enforceThinkingPolicy(id, "max")).toBe("max");
+    }
+    for (const id of ["openai:gpt-5.6-cyber", "openai:gpt-5.5"]) {
+      expect(getThinkingPolicyForModel(id)).toEqual(["off", "low", "medium", "high"]);
+      expect(hasExplicitThinkingPolicy(id)).toBe(false);
+      expect(enforceThinkingPolicy(id, "max")).toBe("high");
+    }
+  });
+
+  // A duplicate label lists two identical floors or menu entries, and the policy matches
+  // these ids by name under any prefix.
+  test.each([
+    "openai:gpt-5.6-sol",
+    "gpt-5.6-sol",
+    "azure:gpt-5.6-sol",
+    "github-copilot:gpt-6-luna",
+    "openrouter:openai/gpt-6-astra",
+  ])("labels each level of %s's native-max ladder distinctly", (id) => {
+    const ladder = getThinkingPolicyForModel(id);
+    expect(ladder).toContain("max");
+    const labels = ladder.map((level) => getThinkingOptionLabel(level, id));
+    expect(new Set(labels).size).toBe(ladder.length);
+  });
+
   // GPT-6 Astra keeps native max but rejects effort "none" (HTTP 400), so "off"
   // is not offered. Named variants and other GPT-6 ids stay outside the rule.
   test("returns 5 levels (no off) including max for gpt-6-astra (direct, gateway, dated)", () => {
     const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
     expect(getThinkingPolicyForModel("openai:gpt-6-astra")).toEqual(fiveLevels);
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-6-astra")).toEqual(fiveLevels);
+    expect(getThinkingPolicyForModel("coder:openai/gpt-6-astra")).toEqual(fiveLevels);
     expect(getThinkingPolicyForModel("openrouter:openai/gpt-6-astra-2026-09-30")).toEqual(
       fiveLevels
     );
@@ -70,7 +110,7 @@ describe("getThinkingPolicyForModel", () => {
 
   test("gpt-6.1-sol follows Astra: 5 levels (no off), off and unset clamp to low", () => {
     const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
-    for (const id of ["openai:gpt-6.1-sol", "mux-gateway:openai/gpt-6.1-sol"]) {
+    for (const id of ["openai:gpt-6.1-sol", "coder:openai/gpt-6.1-sol"]) {
       expect(getThinkingPolicyForModel(id)).toEqual(fiveLevels);
       expect(enforceThinkingPolicy(id, "off")).toBe("low");
       expect(resolveEffectiveThinkingLevel(id, undefined)).toBe("low");
@@ -88,7 +128,7 @@ describe("getThinkingPolicyForModel", () => {
   test("gpt-6-astra clamps unset/off to low (forced thinking, like Mythos/GLM/3.8 Flash)", () => {
     expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", undefined)).toBe("low");
     expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "off")).toBe("low");
-    expect(resolveEffectiveThinkingLevel("mux-gateway:openai/gpt-6-astra", null)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("coder:openai/gpt-6-astra", null)).toBe("low");
     expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "max")).toBe("max");
     // Luna keeps a real "off" (wire effort "none"); the clamp is Astra/6.1 Sol-specific.
     expect(resolveEffectiveThinkingLevel("openai:gpt-6-luna", undefined)).toBe("off");
@@ -170,7 +210,7 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
     ]);
     // Behind gateway
-    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-opus-4-6")).toEqual([
+    expect(getThinkingPolicyForModel("coder:anthropic/claude-opus-4-6")).toEqual([
       "off",
       "low",
       "medium",
@@ -272,6 +312,9 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
+    for (const model of ["anthropic:claude-fable-5-2", "anthropic:claude-mythos-5-2"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    }
   });
 
   test("clamps 'off' up to 'low' for Mythos-class models", () => {
@@ -280,6 +323,8 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("anthropic:claude-fable-5-1", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5-1", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-fable-5-2", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-mythos-5-2", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-opus-5-5", "off")).toBe("low");
   });
 
@@ -301,10 +346,15 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
   });
 
-  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash but not older Flash", () => {
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash and Argon but not older Flash", () => {
     // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
     // request envelope and debug snapshots agree with what the Google adapter sends.
-    for (const model of ["google:gemini-3.8-flash", "mux-gateway:google/gemini-3.8-flash"]) {
+    // Argon has no "off" either; unclamped, it would run at its medium default.
+    for (const model of [
+      "google:gemini-3.8-flash",
+      "openrouter:google/gemini-3.8-flash",
+      "google:gemini-4-argon",
+    ]) {
       expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
       expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
       expect(resolveEffectiveThinkingLevel(model, "high")).toBe("high");
@@ -386,7 +436,7 @@ describe("getThinkingPolicyForModel", () => {
       "max",
     ]);
     // Behind gateway
-    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-sonnet-5")).toEqual([
+    expect(getThinkingPolicyForModel("coder:anthropic/claude-sonnet-5")).toEqual([
       "off",
       "low",
       "medium",
@@ -401,7 +451,7 @@ describe("getThinkingPolicyForModel", () => {
     for (const model of [
       "anthropic:claude-sonnet-5-5",
       "anthropic:claude-sonnet-5-5-20261001",
-      "mux-gateway:anthropic/claude-sonnet-5-5",
+      "coder:anthropic/claude-sonnet-5-5",
       "bedrock:anthropic.claude-sonnet-5-5",
     ]) {
       expect({ model, policy: getThinkingPolicyForModel(model) }).toEqual({
@@ -421,7 +471,7 @@ describe("getThinkingPolicyForModel", () => {
     const allLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
     for (const model of [
       "anthropic:claude-haiku-5-5",
-      "mux-gateway:anthropic/claude-haiku-5-5",
+      "coder:anthropic/claude-haiku-5-5",
       "bedrock:anthropic.claude-haiku-5-5",
     ]) {
       expect({ model, policy: getThinkingPolicyForModel(model) }).toEqual({
@@ -442,7 +492,7 @@ describe("getThinkingPolicyForModel", () => {
     };
     for (const [model, config] of [
       ["anthropic:claude-haiku-5-5", null],
-      ["mux-gateway:anthropic/claude-haiku-5-5", null],
+      ["coder:anthropic/claude-haiku-5-5", null],
       ["bedrock:anthropic.claude-haiku-5-5", null],
       ["anthropic:team-haiku", mapped],
     ] as const) {
@@ -479,7 +529,7 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
     ]);
     // Behind gateway
-    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-sonnet-4-6")).toEqual([
+    expect(getThinkingPolicyForModel("coder:anthropic/claude-sonnet-4-6")).toEqual([
       "off",
       "low",
       "medium",
@@ -492,14 +542,16 @@ describe("getThinkingPolicyForModel", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.1-pro-preview")).toEqual(["low", "high"]);
   });
 
+  test("returns low/medium/high (no off) for Gemini 4 Argon, unlike the Gemini 3 Pro set", () => {
+    for (const model of ["google:gemini-4-argon", "openrouter:google/gemini-4-argon"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "medium")).toBe("medium");
+    }
+  });
+
   test("returns off/low/medium/high for stable Gemini 3.5 Flash", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.5-flash")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-    ]);
-    expect(getThinkingPolicyForModel("mux-gateway:google/gemini-3.5-flash")).toEqual([
       "off",
       "low",
       "medium",
@@ -520,7 +572,7 @@ describe("getThinkingPolicyForModel", () => {
   test("returns off/low/medium/high for stable Gemini 3.6 Flash", () => {
     for (const model of [
       "google:gemini-3.6-flash",
-      "mux-gateway:google/gemini-3.6-flash",
+      "openrouter:google/gemini-3.6-flash",
       "google:gemini-3.6-flash-001",
     ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
@@ -530,7 +582,7 @@ describe("getThinkingPolicyForModel", () => {
   test("returns off/low/medium/high for stable Gemini 3.7 Flash", () => {
     for (const model of [
       "google:gemini-3.7-flash",
-      "mux-gateway:google/gemini-3.7-flash",
+      "openrouter:google/gemini-3.7-flash",
       "google:gemini-3.7-flash-001",
     ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
@@ -540,7 +592,6 @@ describe("getThinkingPolicyForModel", () => {
   test("returns low/medium/high (no off) for Gemini 3.8 Flash, which rejects minimal", () => {
     for (const model of [
       "google:gemini-3.8-flash",
-      "mux-gateway:google/gemini-3.8-flash",
       "openrouter:google/gemini-3.8-flash",
       "google:gemini-3.8-flash-001",
     ]) {

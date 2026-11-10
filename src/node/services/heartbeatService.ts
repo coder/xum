@@ -55,6 +55,19 @@ export function advanceAnchoredDeadline(firedAt: number, intervalMs: number, now
   return firedAt + (intervalsElapsed + 1) * intervalMs;
 }
 
+/**
+ * The no-firing fallback deadline, never before one interval after the last schedule edit.
+ * A global default change stamps scheduleUpdatedAt without touching activity recency (a
+ * per-workspace edit persists both), so recency alone could fire at once (#5741).
+ */
+function boundByEditAnchor(
+  recencyDeadline: number,
+  editAnchor: number | undefined,
+  intervalMs: number
+): number {
+  return editAnchor == null ? recencyDeadline : Math.max(recencyDeadline, editAnchor + intervalMs);
+}
+
 export class HeartbeatService {
   private readonly config: Config;
   private readonly extensionMetadata: ExtensionMetadataService;
@@ -387,8 +400,9 @@ export class HeartbeatService {
    * (scheduleUpdatedAt) loses to the edit: the live path re-anchored the fixed cadence at
    * the edit, so an idle-era or old-interval firing must not pull the restart deadline
    * earlier. Workspaces with no recorded firing (never fired, or the record was compacted
-   * away) fall back to the activity-recency approximation used by idle triggers, which is
-   * never earlier than the edit anchor because setHeartbeatSettings persists that recency.
+   * away) fall back to the activity-recency approximation used by idle triggers, bounded by
+   * the edit anchor: setHeartbeatSettings persists that recency, but a global default change
+   * only stamps scheduleUpdatedAt.
    */
   private async deriveInitialIntervalNextEligibleAt(
     now: number,
@@ -449,7 +463,13 @@ export class HeartbeatService {
       });
     }
 
-    return this.deriveInitialNextEligibleAt(now, workspaceId, trackingIntervalMs, activity);
+    const recencyDeadline = this.deriveInitialNextEligibleAt(
+      now,
+      workspaceId,
+      trackingIntervalMs,
+      activity
+    );
+    return boundByEditAnchor(recencyDeadline, editAnchor, trackingIntervalMs);
   }
 
   private deriveInitialNextEligibleAt(
@@ -828,6 +848,24 @@ export class HeartbeatService {
     return (
       this.findWorkspaceConfigEntry(workspaceId, config)?.heartbeat?.scheduleUpdatedAt ?? undefined
     );
+  }
+
+  /**
+   * Milliseconds until the workspace's next heartbeat slot opens, for the sidebar's "Next in"
+   * label. A duration, not the deadline: a remote renderer's clock can differ from this host's,
+   * so it counts down from its own read time. Null while the scheduler does not track the
+   * workspace: heartbeats off, a sub-agent or archived workspace, or the first minute after
+   * startup. Zero or less means the slot is due: it waits for the next tick or the queue, or it
+   * is running. An idle trigger's deadline moves with each new activity, and any slot can still
+   * be skipped when it fires (see checkEligibility).
+   */
+  getMsUntilNextHeartbeat(workspaceId: string, now: number = Date.now()): number | null {
+    assert(
+      workspaceId.trim().length > 0,
+      "HeartbeatService.getMsUntilNextHeartbeat requires a workspaceId"
+    );
+    const deadline = this.nextEligibleAtByWorkspaceId.get(workspaceId);
+    return deadline == null ? null : deadline - now;
   }
 
   async checkEligibility(workspaceId: string, now: number): Promise<HeartbeatEligibilityResult> {

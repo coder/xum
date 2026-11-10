@@ -1,13 +1,26 @@
 import type { CSSProperties, ReactNode } from "react";
 import React, { useContext, useEffect, useId, useRef, useState } from "react";
-import mermaid from "mermaid";
+import katex from "katex";
+import { render as renderPele, type MathMarkup, type RenderOptions } from "pele";
+import assert from "@/common/utils/assert";
 import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { DESKTOP_TITLEBAR_HEIGHT_PX, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
+import { MERMAID_ERROR_ATTRIBUTE, MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
 import {
+  diagramPixelSize,
+  NARROW_DIAGRAM_WIDTH,
+  type DiagramFrame,
+  type RenderedDiagram,
+} from "./mermaidDiagramBox";
+import {
+  MERMAID_BUTTON_HEIGHT,
+  MERMAID_BUTTON_INSET,
   MERMAID_CONTAINER_STYLE,
   MERMAID_FRAME_STYLE,
   MERMAID_PENDING_STYLE,
@@ -19,183 +32,686 @@ const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 3;
 const ZOOM_STEP = 0.1;
 
-mermaid.initialize({
-  startOnLoad: false,
-  theme: "dark",
-  layout: "elk",
-  // Security hardening: Mermaid content is untrusted (comes from markdown),
-  // so keep Mermaid's strict sanitization and disallow scriptable links.
-  securityLevel: "strict",
-  fontFamily: "var(--font-monospace)",
-  darkMode: true,
-  elk: {
-    nodePlacementStrategy: "LINEAR_SEGMENTS",
-    mergeEdges: true,
-  },
-  wrap: true,
-  markdownAutoWrap: true,
-  flowchart: {
-    nodeSpacing: 60,
-    curve: "linear",
-    defaultRenderer: "elk",
-  },
-});
+const SVG_NS = "http://www.w3.org/2000/svg";
+const XHTML_NS = "http://www.w3.org/1999/xhtml";
+const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
 
-function decodeNumericCodePoint(codePoint: number): string {
-  if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
-    // Treat invalid numeric entities as empty content to avoid parser crashes
-    // and collapse obfuscated scheme separators.
-    return "";
+/** What Pele emits in one namespace. Names are lowercase, like the HTML parser makes them. */
+interface PeleNamespace {
+  elements: ReadonlySet<string>;
+  /** HTML integration points: the HTML parser would build their element children as HTML. */
+  textOnlyElements: ReadonlySet<string>;
+  /** Their values must pass isPeleCss. Most are presentation attributes, which are CSS. */
+  cssAttributes: ReadonlySet<string>;
+  /** Ids and id lists. Each id must start with the diagram's idPrefix. */
+  idAttributes: ReadonlySet<string>;
+  /** Names and label text, which the browser never reads as CSS. */
+  textAttributes: ReadonlySet<string>;
+}
+
+/**
+ * Everything Pele 1.9 emits with peleRenderOptions. The sanitizer removes every other element and
+ * attribute, every value that fails isPeleCss, and every id outside the diagram's idPrefix. A
+ * blocklist leaks: <set> can write a javascript: href, the HTML parser ends the <svg> at an
+ * SVG-namespace <p>, and fill, mask or marker-end can load a url(). Mermaid.sanitization.test.ts
+ * fails when the sanitizer removes anything from a sample of every diagram type, so run it after
+ * a Pele or KaTeX upgrade.
+ */
+const PELE_OUTPUT = new Map<string | null, PeleNamespace>([
+  [
+    SVG_NS,
+    {
+      // Pele also emits <a> and <image>, but only with the links and images that
+      // peleRenderOptions turns off.
+      elements: new Set([
+        "circle",
+        "defs",
+        "desc",
+        "ellipse",
+        "g",
+        "lineargradient",
+        "path",
+        "polygon",
+        "rect",
+        "stop",
+        "svg",
+        "text",
+        "title",
+        "tspan",
+      ]),
+      textOnlyElements: new Set(["desc", "title"]),
+      cssAttributes: new Set([
+        "baseline-shift",
+        "cx",
+        "cy",
+        "d",
+        "fill",
+        "fill-opacity",
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "gradientunits",
+        "height",
+        "offset",
+        "opacity",
+        "overflow",
+        "points",
+        "r",
+        "rx",
+        "ry",
+        "stop-color",
+        "stroke",
+        "stroke-dasharray",
+        "stroke-linecap",
+        "stroke-linejoin",
+        "stroke-width",
+        "style",
+        "text-anchor",
+        "text-decoration",
+        "transform",
+        "viewbox",
+        "width",
+        "x",
+        "x1",
+        "x2",
+        "y",
+      ]),
+      // An id outside the diagram's idPrefix could shadow an app global such as window.api, or
+      // an element the app looks up with getElementById, or another diagram's gradient.
+      idAttributes: new Set(["aria-describedby", "aria-labelledby", "id"]),
+      // data-id holds label text such as "feat(api): add".
+      textAttributes: new Set([
+        "aria-roledescription",
+        "class",
+        "data-icon",
+        "data-id",
+        "role",
+        "xml:space",
+        "xmlns",
+      ]),
+    },
+  ],
+  // The <div> that Pele wraps around each math label.
+  [
+    XHTML_NS,
+    {
+      elements: new Set(["div"]),
+      textOnlyElements: new Set(),
+      cssAttributes: new Set(["style"]),
+      idAttributes: new Set(),
+      textAttributes: new Set(["xmlns"]),
+    },
+  ],
+  [
+    MATHML_NS,
+    {
+      // KaTeX's MathML output (MathNodeType in katex/src/mathMLTree.ts), minus mglyph, which
+      // loads an image. The name matters, not only the namespace: inside <mtext> the HTML parser
+      // that inserts the SVG builds HTML elements, so a MathML-namespace <img> there becomes a
+      // real image.
+      elements: new Set([
+        "math",
+        "semantics",
+        "annotation",
+        "mrow",
+        "mi",
+        "mn",
+        "mo",
+        "mtext",
+        "mspace",
+        "msup",
+        "msub",
+        "msubsup",
+        "mfrac",
+        "mroot",
+        "msqrt",
+        "mover",
+        "munder",
+        "munderover",
+        "mtable",
+        "mtr",
+        "mtd",
+        "mlabeledtr",
+        "menclose",
+        "mstyle",
+        "mpadded",
+        "mphantom",
+      ]),
+      textOnlyElements: new Set(),
+      // What KaTeX's MathML builders set (setAttribute in katex/src), minus href, which
+      // `trust: false` turns off.
+      cssAttributes: new Set([
+        "accent",
+        "accentunder",
+        "columnalign",
+        "columnlines",
+        "columnspacing",
+        "depth",
+        "display",
+        "displaystyle",
+        "encoding",
+        "fence",
+        "height",
+        "largeop",
+        "linebreak",
+        "linethickness",
+        "lspace",
+        "mathbackground",
+        "mathcolor",
+        "mathsize",
+        "mathvariant",
+        "maxsize",
+        "minsize",
+        "notation",
+        "rowlines",
+        "rowspacing",
+        "rspace",
+        "scriptlevel",
+        "separator",
+        "stretchy",
+        "style",
+        "voffset",
+        "width",
+      ]),
+      idAttributes: new Set(),
+      // A numbered environment gives its mtd cells a class.
+      textAttributes: new Set(["class", "xmlns"]),
+    },
+  ],
+]);
+
+function peleNamespace(namespace: string | null): PeleNamespace {
+  const rules = PELE_OUTPUT.get(namespace);
+  assert(rules, `Pele emits no element in namespace ${String(namespace)}`);
+  return rules;
+}
+
+/**
+ * Lowercases A-Z only, like the HTML parser. String.toLowerCase maps the Kelvin sign U+212A to k,
+ * so a name that the browser does not read as stroke would match stroke.
+ */
+function asciiLowerCase(name: string): string {
+  return name.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
+// The CSS functions in Pele's output, plus the color and math functions that chart styles can
+// use and that load nothing. Pele passes almost any function into style and classDef, so this
+// list is the check: element(), paint(), attr(), cross-fade() and gradients stay out.
+const PELE_CSS_FUNCTIONS = new Set([
+  "calc",
+  "clamp",
+  "color",
+  "color-mix",
+  "contrast-color",
+  "device-cmyk",
+  "hsl",
+  "hsla",
+  "hwb",
+  "lab",
+  "lch",
+  "light-dark",
+  "max",
+  "min",
+  "oklab",
+  "oklch",
+  "rgb",
+  "rgba",
+  "rotate",
+  "translate",
+  "var",
+]);
+
+/**
+ * The custom properties Pele declares, all in the style of the root <svg>, each as one theme
+ * variable such as `--_bg:var(--pele-bg,#fff)`. Chromium nests each var() when it computes styles
+ * after insert, in time that doubles with each level, so a chain of custom properties freezes it
+ * while each declaration nests only 2 deep. Pele drops custom properties from chart styles.
+ */
+const PELE_CUSTOM_PROPERTIES: ReadonlySet<string> = new Set([
+  "--_a",
+  "--_b",
+  "--_bg",
+  "--_c",
+  "--_fg",
+  "--_fm",
+  "--_hw",
+  "--_l",
+  "--_m",
+  "--_r",
+  "--_s",
+  "--_tw",
+  "--_w",
+]);
+const NO_CUSTOM_PROPERTIES: ReadonlySet<string> = new Set();
+
+// One theme variable with a fallback of names, numbers, colors and closed strings: the value reads
+// no other custom property, and without a block or an open string it ends at the next ;.
+const PELE_CUSTOM_PROPERTY =
+  /^[ \t\n\r]*(--[\w-]*)[ \t\n\r]*:[ \t\n\r]*var\(--pele-[\w-]+,(?:[^;()[\]{}"']|"[^"\n\r]*")*\)[ \t\n\r]*$/;
+// Chromium starts a declaration at the start of a style and after a ;, { or }.
+const CUSTOM_PROPERTY_START = /(?:^|[;{}])(?=[ \t\n\r]*--)/g;
+
+/** Every custom property that style declares is one of customProperties, as Pele writes it. */
+function declaresOnly(style: string, customProperties: ReadonlySet<string>): boolean {
+  for (const { 0: delimiter, index } of style.matchAll(CUSTOM_PROPERTY_START)) {
+    const start = index + delimiter.length;
+    const end = style.indexOf(";", start);
+    const name = PELE_CUSTOM_PROPERTY.exec(style.slice(start, end === -1 ? undefined : end))?.[1];
+    if (name === undefined || !customProperties.has(name)) return false;
   }
+  return true;
+}
 
-  try {
-    return String.fromCodePoint(codePoint);
-  } catch {
-    return "";
+/** Pele derives every id from idPrefix, such as `${idPrefix}-title` for an accTitle. */
+function isDiagramId(id: string, idPrefix: string): boolean {
+  return id.startsWith(`${idPrefix}-`);
+}
+
+/**
+ * A CSS value that loads nothing: only printable ASCII, tab, LF and CR, no escape, comment,
+ * at-rule or IE expression, and only PELE_CSS_FUNCTIONS. With an idPrefix, url(#id) may also
+ * point at an element of the same diagram, as Pele's fill attribute does. A style attribute gets
+ * no idPrefix: there Chromium fetches the page itself for url(#id) in background-image, cursor or
+ * border-image-source.
+ */
+function isPeleCss(value: string, idPrefix: string | null): boolean {
+  // Pele writes only ASCII in CSS. Past it, the regexes below read CSS unlike the browser: \s
+  // matches &#160;, but Chromium reads url(&#160;#id) as a relative URL and requests it.
+  if (/[^\t\n\r\x20-\x7e]/.test(value)) return false;
+  // CSS whitespace is space, tab, LF, CR and FF, not \s.
+  const rest = value.replace(
+    /(?<![\w-])url\([ \t\n\r\f]*(["']?)#([\w-]+)\1[ \t\n\r\f]*\)/gi,
+    (url, _quote, id: string) => (idPrefix !== null && isDiagramId(id, idPrefix) ? "" : url)
+  );
+  return !/\\|\/\*|@|expression/i.test(rest) && usesOnlyPeleFunctions(rest);
+}
+
+/** Every ( in css follows the name of one of PELE_CSS_FUNCTIONS. */
+function usesOnlyPeleFunctions(css: string): boolean {
+  // Names and single characters other than CSS whitespace, so each character is matched once. A
+  // scan that restarts at every character of a run takes seconds on a 50,000-character chart, on
+  // the renderer thread. Skipping whitespace allows SVG's transform syntax, as in rotate (3).
+  const tokens = css.match(/[\w-]+|[^ \t\n\r\f]/g) ?? [];
+  return tokens.every(
+    (token, index) =>
+      token !== "(" || PELE_CSS_FUNCTIONS.has(asciiLowerCase(tokens[index - 1] ?? ""))
+  );
+}
+
+/** An id, or an id list such as aria-labelledby, kept only when every id is the diagram's own. */
+function keptIdValue(name: string, value: string, idPrefix: string): string | null {
+  // The browser splits an id list at ASCII whitespace, including the tab that &#9; writes, and
+  // skips empty ids. \S+ also splits at other whitespace, such as &#160;, so it is stricter.
+  const ids = value.match(/\S+/g);
+  // An id holds one value, so whitespace there is not a separator but part of the id.
+  if (name === "id" && ids?.[0] !== value) return null;
+  return ids?.every((id) => isDiagramId(id, idPrefix)) ? value : null;
+}
+
+/**
+ * The value to keep for an attribute, or null to remove the attribute. A style may declare only
+ * customProperties.
+ */
+function keptAttributeValue(
+  rules: PeleNamespace,
+  name: string,
+  value: string,
+  idPrefix: string,
+  customProperties: ReadonlySet<string>
+): string | null {
+  if (rules.textAttributes.has(name)) return value;
+  if (rules.idAttributes.has(name)) return keptIdValue(name, value, idPrefix);
+  if (!rules.cssAttributes.has(name)) return null;
+  // A style is kept or removed whole, never split into declarations: a splitter that tokenizes
+  // quotes, escapes or comments unlike the browser turns an inert string into live declarations.
+  // Pele writes no style that fails, so its diagrams lose nothing.
+  const isKept =
+    name === "style"
+      ? isPeleCss(value, null) && declaresOnly(value, customProperties)
+      : isPeleCss(value, idPrefix);
+  return isKept ? value : null;
+}
+
+/** Applies PELE_OUTPUT to the attributes of an element that removeUnknownElements kept. */
+function sanitizeAttributes(
+  element: Element,
+  idPrefix: string,
+  customProperties: ReadonlySet<string>
+): void {
+  const rules = peleNamespace(element.namespaceURI);
+  for (const attribute of Array.from(element.attributes)) {
+    // Lowercase like the HTML parser, which turns an XML FILL attribute into fill.
+    const name = asciiLowerCase(attribute.name);
+    const value = keptAttributeValue(rules, name, attribute.value, idPrefix, customProperties);
+    if (value === null) element.removeAttributeNode(attribute);
+    else attribute.value = value;
   }
 }
 
-function decodeEntity(entityBody: string): string | null {
-  if (entityBody.startsWith("#x") || entityBody.startsWith("#X")) {
-    const parsed = Number.parseInt(entityBody.slice(2), 16);
-    return Number.isNaN(parsed) ? "" : decodeNumericCodePoint(parsed);
-  }
-
-  if (entityBody.startsWith("#")) {
-    const parsed = Number.parseInt(entityBody.slice(1), 10);
-    return Number.isNaN(parsed) ? "" : decodeNumericCodePoint(parsed);
-  }
-
-  const named: Record<string, string> = {
-    tab: "\t",
-    newline: "\n",
-    colon: ":",
-    nbsp: " ",
-  };
-
-  return named[entityBody.toLowerCase()] ?? null;
+/** A <math> tree that holds only the elements KaTeX emits. */
+function isKatexMathml(math: Element | null): boolean {
+  // mutation-equivalent: isPeleMathLabel passes a div's only child, so math is never null
+  if (math === null || asciiLowerCase(math.localName) !== "math") return false;
+  const { elements } = peleNamespace(MATHML_NS);
+  // Lowercase like the HTML parser does with MathML tag names.
+  return [math, ...Array.from(math.querySelectorAll("*"))].every(
+    (element) =>
+      element.namespaceURI === MATHML_NS &&
+      element.prefix === null &&
+      elements.has(asciiLowerCase(element.localName))
+  );
 }
 
-function canonicalizeUrlForSchemeCheck(value: string): string {
-  // Normalize encoded and obfuscated schemes before comparison so payloads like
-  // java&#10;script:, java%0Ascript:, or java\nscript: reduce to javascript:.
-  let normalized = value.toLowerCase();
-
-  normalized = normalized.replace(/&([^;\s]+);?/g, (fullMatch, entityBody: string) => {
-    return decodeEntity(entityBody) ?? fullMatch;
-  });
-
-  normalized = normalized.replace(/%([0-9a-f]{2})/gi, (fullMatch, hex: string) => {
-    const parsed = Number.parseInt(hex, 16);
-    return Number.isNaN(parsed) ? fullMatch : String.fromCodePoint(parsed);
-  });
-
-  let canonical = "";
-  for (const char of normalized) {
-    const charCode = char.charCodeAt(0);
-    const isAsciiControl = charCode <= 0x1f || charCode === 0x7f;
-    if (isAsciiControl || /\s/.test(char)) {
-      continue;
-    }
-
-    canonical += char;
-  }
-
-  return canonical;
+/** Pele wraps the MathML that renderMathLabel returns in exactly this shape. */
+function isPeleMathLabel(foreignObject: Element): boolean {
+  const div = foreignObject.firstElementChild;
+  return (
+    foreignObject.getAttribute("class") === "pele-math" &&
+    foreignObject.childElementCount === 1 &&
+    // mutation-equivalent: the check above leaves foreignObject one child, so div is never null
+    div?.namespaceURI === XHTML_NS &&
+    div.prefix === null &&
+    peleNamespace(XHTML_NS).elements.has(div.localName) &&
+    div.childElementCount === 1 &&
+    Array.from(div.attributes, (attribute) => attribute.name).join() === "xmlns,style" &&
+    isKatexMathml(div.firstElementChild)
+  );
 }
 
-export function sanitizeMermaidSvg(svg: string): string | null {
-  // Validate the SVG structure strictly so genuinely malformed input still
-  // fails closed. The complication: Mermaid embeds HTML labels inside
-  // <foreignObject> (wrap/markdownAutoWrap), and that HTML legitimately uses
-  // void elements like bare <br>. Strict image/svg+xml DOMParser rejects such
-  // SVG with a parsererror, which used to make every wrapped-label diagram
-  // surface as "Mermaid returned invalid SVG output".
-  //
-  // Approach:
-  //   1. Try strict XML parsing on the original. If it succeeds, the input is
-  //      well-formed SVG; we're done.
-  //   2. Otherwise, replace each <foreignObject>...</foreignObject> subtree
-  //      with a self-closed placeholder and re-parse strictly. If that
-  //      succeeds, the *only* XML invalidity lives inside foreignObject HTML
-  //      (the known idiom we want to tolerate); we then materialize the
-  //      original via the HTML parser, which handles SVG-plus-embedded-HTML
-  //      the same way the browser does when innerHTML'd at the render sink.
-  //   3. If stripping foreignObject doesn't make the outer structure parse,
-  //      the malformed input is outside the wrapped-label case — reject it.
-  //
-  // This keeps the original "reject malformed SVG" contract intact while
-  // accepting Mermaid's legitimate output.
-  const parser = new DOMParser();
-  const xmlDoc = parser.parseFromString(svg, "image/svg+xml");
-  const xmlHasError = xmlDoc.querySelector("parsererror") !== null;
-
-  let svgRoot: Element | null;
-  if (!xmlHasError) {
-    svgRoot =
-      xmlDoc.documentElement.tagName.toLowerCase() === "svg" ? xmlDoc.documentElement : null;
-  } else {
-    // Strip foreignObject subtrees and validate the outer structure strictly.
-    // Non-greedy match; Mermaid does not nest foreignObject, and over-stripping
-    // would only cause us to reject more aggressively (acceptable for a
-    // validation step).
-    const strippedForValidation = svg.replace(
-      /<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi,
-      "<foreignObject/>"
-    );
-    if (strippedForValidation === svg) {
-      // No foreignObject in the input, so the XML error isn't the known idiom.
-      return null;
+/**
+ * Removes every SVG element that Pele does not emit and the element children of its text-only
+ * elements, keeping only Pele's math labels as foreignObject. Pele writes no namespace prefix,
+ * and the HTML parser knows no s:foreignobject, so a serializer that kept the prefix would let
+ * a label's div leave the <svg>.
+ */
+function removeUnknownElements(parent: Element): void {
+  const svg = peleNamespace(SVG_NS);
+  for (const child of Array.from(parent.children)) {
+    const svgName =
+      child.namespaceURI === SVG_NS && child.prefix === null ? asciiLowerCase(child.localName) : "";
+    if (svgName === "foreignobject" && isPeleMathLabel(child)) continue;
+    if (!svg.elements.has(svgName)) {
+      child.remove();
+    } else if (svg.textOnlyElements.has(svgName)) {
+      for (const element of Array.from(child.children)) element.remove();
+    } else {
+      removeUnknownElements(child);
     }
-    const revalidated = parser.parseFromString(strippedForValidation, "image/svg+xml");
-    if (revalidated.querySelector("parsererror") !== null) {
-      // Outer structure is still malformed — fail closed.
-      return null;
-    }
-    if (revalidated.documentElement.tagName.toLowerCase() !== "svg") {
-      return null;
-    }
-    // Outer SVG is well-formed XML; only foreignObject HTML was problematic.
-    // Materialize the original tree via the HTML parser so embedded labels
-    // survive intact.
-    const htmlDoc = parser.parseFromString(svg, "text/html");
-    svgRoot = htmlDoc.querySelector("svg");
   }
+}
 
-  if (!svgRoot) {
+/** Names that the browser never parses as CSS, so their values may hold any label text. */
+const NON_CSS_ATTRIBUTES = new Set(
+  [...PELE_OUTPUT.values()].flatMap((rules) => [...rules.textAttributes, ...rules.idAttributes])
+);
+
+function isNonCssAttribute(name: string): boolean {
+  return NON_CSS_ATTRIBUTES.has(name) || /^(?:aria-|data-|xmlns:)/.test(name);
+}
+
+const XML_REFERENCE = /&(?:#x([\dA-Fa-f]+)|#(\d+)|(quot|apos|amp|lt|gt));/g;
+const XML_ENTITIES: Record<string, string> = { quot: '"', apos: "'", amp: "&", lt: "<", gt: ">" };
+
+/**
+ * An attribute value as the XML parser decodes it, with each non-ASCII character as U+0080. CSS
+ * reads every non-ASCII character alike: as part of a name.
+ */
+function decodeXmlAttribute(value: string): string {
+  // The XML parser turns a literal tab, LF or CR into a space, but not one written as a reference.
+  return value
+    .replace(/[\t\n\r]/g, " ")
+    .replace(XML_REFERENCE, (_reference, hex?: string, decimal?: string, name?: string) => {
+      if (name !== undefined) return XML_ENTITIES[name];
+      const code = hex === undefined ? Number(decimal) : parseInt(hex, 16);
+      // mutation-equivalent: String.fromCharCode(0x80) is U+0080 too
+      return code < 0x80 ? String.fromCharCode(code) : "\u0080";
+    });
+}
+
+// The CSS tokens that can open or close a block: a backslash, a block character, and the strings,
+// comments and unquoted url() whose (, ), [, ], { and } open and close nothing. A string ends at
+// its quote, a newline or a backslash. An unquoted url( ends at its ) or a backslash, and a name
+// character, # or @ before it makes it part of an earlier token, so the ( opens a block.
+const CSS_BLOCK_TOKEN =
+  /\\|"[^"\\\n\r\f]*"?|'[^'\\\n\r\f]*'?|\/\*[\s\S]*?(?:\*\/|$)|(?<![\w#@\u0080-\uffff-])url\((?![ \t\n\r\f]*["'])[^)\\]*\)?|[()[\]{}]/gi;
+const CSS_BLOCK_CLOSERS: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
+
+/**
+ * How deep (, [ and { nest in css, never less than Chromium's CSS tokenizer reads it: a block
+ * closes only at its own closer. Past a backslash every opener counts and no closer does. Pele
+ * writes no escape in CSS, and isPeleCss removes one.
+ */
+function cssNestingDepth(css: string): number {
+  const closers: string[] = [];
+  // mutation-equivalent: the limit is above 1, so a floor of 0 or 1 decides nothing
+  let deepest = 0;
+  for (const { 0: token, index } of css.matchAll(CSS_BLOCK_TOKEN)) {
+    if (token === "\\") {
+      // mutation-equivalent: || reads the same length, because match returns null for no match
+      const openers = css.slice(index).match(/[([{]/g)?.length ?? 0;
+      return Math.max(deepest, closers.length + openers);
+    }
+    const closer = CSS_BLOCK_CLOSERS[token];
+    if (closer !== undefined) deepest = Math.max(deepest, closers.push(closer));
+    else if (token === closers.at(-1)) closers.pop();
+  }
+  return deepest;
+}
+
+// XML whitespace is space, tab, LF and CR. A < cannot be in a name or value, so it starts the next
+// tag.
+const XML_TAG_NAME = /<[^ \t\n\r/<>]*/y;
+const XML_ATTRIBUTE = /[ \t\n\r]+([^ \t\n\r=/<>]+)[ \t\n\r]*=[ \t\n\r]*(?:"([^"<]*)"|'([^'<]*)')/y;
+
+/**
+ * The deepest nesting in an attribute value of svg that the browser may parse as CSS, read from
+ * the markup in one pass. svg has no comment, CDATA, processing instruction or DOCTYPE, so each <
+ * starts a tag. The XML parser stops at the first error, so the scan of a tag may stop there too.
+ */
+function attributeNestingDepth(svg: string): number {
+  // mutation-equivalent: the limit is above 1, so a floor of 0 or 1 decides nothing
+  let deepest = 0;
+  for (let tag = svg.indexOf("<"); tag !== -1; ) {
+    XML_TAG_NAME.lastIndex = tag;
+    XML_TAG_NAME.exec(svg);
+    XML_ATTRIBUTE.lastIndex = XML_TAG_NAME.lastIndex;
+    let end = XML_ATTRIBUTE.lastIndex;
+    for (let attribute = XML_ATTRIBUTE.exec(svg); attribute; attribute = XML_ATTRIBUTE.exec(svg)) {
+      end = XML_ATTRIBUTE.lastIndex;
+      if (isNonCssAttribute(attribute[1])) continue;
+      const value = decodeXmlAttribute(attribute[2] ?? attribute[3]);
+      deepest = Math.max(deepest, cssNestingDepth(value));
+    }
+    tag = svg.indexOf("<", end);
+  }
+  return deepest;
+}
+
+/** Sanitizes the SVG that Pele rendered with idPrefix. Null when it is not well-formed SVG. */
+export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null {
+  assert(/^[\w-]+$/.test(idPrefix), "idPrefix is a plain id, as Mermaid builds it");
+  // Pele writes no comment, CDATA, processing instruction or DOCTYPE. A quote in one would hide
+  // the markup after it from attributeNestingDepth, and a DOCTYPE entity can expand to CSS. The
+  // HTML parser that inserts the output ends `<!-->` and `<?x >` at their first `>`, so markup
+  // that the XML parser read as their data would become live elements.
+  if (/<[!?]/.test(svg)) return null;
+  // DOMParser parses the text of a <style> too, and the scan below reads only attributes. Pele
+  // writes no <style>, so this refuses one in any namespace or case. The name ends at XML
+  // whitespace, not \s: a prefix such as x\u1680 is one XML name.
+  if (/<(?:[^ \t\n\r/<>]*:)?style[ \t\n\r/>]/i.test(svg)) return null;
+  // Chromium parses each style while DOMParser builds the tree, in time that doubles with each
+  // color-mix() nested around an invalid value, so this check must run first. Pele passes such
+  // values from a chart unchanged.
+  if (attributeNestingDepth(svg) > MERMAID_MAX_ATTRIBUTE_NESTING) return null;
+  // Pele emits well-formed SVG, so anything that fails a strict parse is not its output:
+  // fail closed.
+  const xmlDoc = new DOMParser().parseFromString(svg, "image/svg+xml");
+  if (xmlDoc.querySelector("parsererror") !== null) {
+    return null;
+  }
+  const svgRoot = xmlDoc.documentElement;
+  if (svgRoot.namespaceURI !== SVG_NS || asciiLowerCase(svgRoot.tagName) !== "svg") {
     return null;
   }
 
-  // Defense in depth: remove active content containers and sanitize remaining attributes.
-  // NOTE: Keep <foreignObject> because Mermaid uses it for wrapped node labels.
-  svgRoot.querySelectorAll("script,iframe,object,embed").forEach((node) => {
-    node.remove();
-  });
-
-  const urlAttributes = new Set(["href", "xlink:href", "src", "action", "formaction"]);
-  const blockedSchemes = ["javascript:", "vbscript:", "data:text/html"];
-
-  const elementsToScan: Element[] = [svgRoot, ...Array.from(svgRoot.querySelectorAll("*"))];
-  elementsToScan.forEach((element) => {
-    for (const attribute of Array.from(element.attributes)) {
-      const attributeName = attribute.name.toLowerCase();
-      const canonicalUrlValue = canonicalizeUrlForSchemeCheck(attribute.value.trim());
-
-      if (attributeName.startsWith("on")) {
-        element.removeAttribute(attribute.name);
-        continue;
-      }
-
-      if (
-        urlAttributes.has(attributeName) &&
-        blockedSchemes.some((scheme) => canonicalUrlValue.startsWith(scheme))
-      ) {
-        element.removeAttribute(attribute.name);
-      }
-    }
-  });
+  // Defense in depth: keep only the elements, text and attribute values Pele emits.
+  removeUnknownElements(svgRoot);
+  sanitizeAttributes(svgRoot, idPrefix, PELE_CUSTOM_PROPERTIES);
+  for (const element of Array.from(svgRoot.querySelectorAll("*"))) {
+    sanitizeAttributes(element, idPrefix, NO_CUSTOM_PROPERTIES);
+  }
 
   return svgRoot.outerHTML;
+}
+
+/** Typesets a `$$...$$` label as MathML. Null makes Pele show the TeX source. */
+function renderMathLabel(tex: string, size: number): MathMarkup | null {
+  let markup: string;
+  try {
+    markup = katex.renderToString(tex, { displayMode: true, output: "mathml", throwOnError: true });
+  } catch {
+    return null;
+  }
+
+  const probe = document.createElement("div");
+  probe.style.cssText =
+    "position:absolute;left:-9999px;visibility:hidden;display:inline-block;white-space:nowrap";
+  probe.style.fontSize = `${size}px`;
+  // SECURITY AUDIT: tex is untrusted chart text. KaTeX escapes it, and its default
+  // `trust: false` rejects \href, \url, \includegraphics and \html*. sanitizeMermaidSvg()
+  // still checks the markup Pele embeds.
+  probe.innerHTML = markup;
+  document.body.append(probe);
+  try {
+    const math = probe.querySelector("math");
+    assert(math, "KaTeX MathML output has a <math> element");
+    const { width, height } = math.getBoundingClientRect();
+    // Not outerHTML: sanitizeMermaidSvg() parses the SVG as strict XML, which has no HTML
+    // named entities.
+    return { html: new XMLSerializer().serializeToString(math), width, height };
+  } finally {
+    probe.remove();
+  }
+}
+
+const DIAGRAM_FONT_SIZE = 14;
+
+/**
+ * Xum's Pele options. Mermaid.sanitization.test.ts renders with them, so every option that
+ * changes Pele's output belongs here.
+ */
+export function peleRenderOptions(
+  diagram: Pick<RenderOptions, "idPrefix" | "maxWidth" | "fontFamily" | "fontFamilyMono">
+): RenderOptions {
+  return {
+    ...diagram,
+    fontSize: DIAGRAM_FONT_SIZE,
+    directionBreakpoint: NARROW_DIAGRAM_WIDTH,
+    // The responsive style (max-width:100%, height:auto) would beat the explicit pixel size that
+    // mermaidDiagramBox.ts computes, and hand the box back to each engine's intrinsic sizing.
+    responsive: false,
+    // Diagram text is untrusted model output: no clickable links, and no images,
+    // which would fetch from the network as soon as the SVG is inserted.
+    links: false,
+    images: false,
+    math: renderMathLabel,
+  };
+}
+
+/** Renders untrusted chart text to sanitized SVG markup. Throws Pele's parse errors. */
+async function renderMermaidSvg(
+  chart: string,
+  idPrefix: string,
+  maxWidth: number | undefined
+): Promise<Pick<RenderedDiagram, "svg" | "width" | "height">> {
+  const rootStyle = window.getComputedStyle(document.documentElement);
+  // Measure with the same fonts the .mermaid-container CSS draws with.
+  const fontFamily = rootStyle.getPropertyValue("--font-primary").trim() || undefined;
+  const fontFamilyMono = rootStyle.getPropertyValue("--font-monospace").trim() || undefined;
+
+  // Pele measures labels with canvas when it renders, so the fonts must be loaded first
+  // or boxes are sized for the fallback font. fonts.ready does not start loading a face
+  // that nothing on the page uses yet, so request each family. A failed load falls back
+  // to measuring whatever font is there. happy-dom has no document.fonts.
+  if ("fonts" in document) {
+    const families = [fontFamily, fontFamilyMono].filter((family) => family !== undefined);
+    await Promise.allSettled(
+      families.map((family) => document.fonts.load(`${DIAGRAM_FONT_SIZE}px ${family}`))
+    );
+    await document.fonts.ready;
+  }
+
+  const { svg, width, height } = renderPele(
+    chart,
+    peleRenderOptions({ idPrefix, maxWidth, fontFamily, fontFamilyMono })
+  );
+  assert(
+    Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0,
+    "Diagram renderer returned an invalid size"
+  );
+
+  const sanitizedSvg = sanitizeMermaidSvg(svg, idPrefix);
+  if (!sanitizedSvg) {
+    throw new Error("Diagram renderer returned invalid SVG output");
+  }
+  return { svg: sanitizedSvg, width, height };
+}
+
+/** The stylesheet sizes the <svg> from these two variables (transcript-content.css). */
+function diagramBoxStyle(diagram: RenderedDiagram | null, frame: DiagramFrame): CSSProperties {
+  if (!diagram) return {};
+  const box = diagramPixelSize(diagram, frame);
+  return {
+    ["--diagram-width" as string]: `${box.width}px`,
+    ["--diagram-height" as string]: `${box.height}px`,
+  };
+}
+
+/**
+ * Renders chart at the width of the element that containerRef points to, so each frame
+ * (inline and the expand dialog) lays the diagram out for its own width. A chart that
+ * fails to render keeps the last valid diagram on screen.
+ */
+function useDiagramSvg(chart: string, idPrefix: string) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  // Zero width (hidden, or not laid out yet) means unknown: render the natural layout.
+  const containerSize = useResizeObserver(containerRef);
+  // mutation-equivalent: the width is a number when measured, so ?? and || both give 0 otherwise
+  const containerWidth = containerSize?.width ?? 0;
+  // mutation-equivalent: the height is a number when measured, and until then nothing is drawn,
+  // so neither the fallback value nor ?? against || reaches a box
+  const containerHeight = containerSize?.height ?? 0;
+  const maxWidth = containerWidth > 0 ? containerWidth : undefined;
+  // Keep the source and SVG together while a newer chart is pending or invalid.
+  const [rendered, setRendered] = useState<RenderedDiagram | null>(null);
+  const [error, setError] = useState<{ chart: string; message: string } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const renderDiagram = async () => {
+      try {
+        const laidOut = await renderMermaidSvg(chart, idPrefix, maxWidth);
+        if (cancelled) return;
+
+        setRendered({ ...laidOut, chart });
+        setError(null);
+      } catch (err) {
+        if (cancelled) return;
+        const message = err instanceof Error ? err.message : "Failed to render diagram";
+        setError({ chart, message });
+      }
+    };
+
+    void renderDiagram();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [chart, idPrefix, maxWidth]);
+
+  return { containerRef, containerWidth, containerHeight, rendered, error };
 }
 
 function normalizeDiagramZoom(value: number): number {
@@ -208,16 +724,32 @@ function normalizeDiagramZoom(value: number): number {
 
 // Common button styles
 const getButtonStyle = (disabled = false): CSSProperties => ({
-  background: disabled ? "rgba(255, 255, 255, 0.05)" : "rgba(255, 255, 255, 0.1)",
-  border: "1px solid rgba(255, 255, 255, 0.2)",
+  // Theme tokens, not fixed white, so the buttons stay visible in the light themes (#7821).
+  background: "var(--color-background)",
+  border: "1px solid var(--color-border-subtle)",
   color: disabled ? "var(--color-text-secondary)" : "var(--color-text)",
-  padding: "6px 10px",
+  height: `${MERMAID_BUTTON_HEIGHT}px`,
+  padding: "0 10px",
   cursor: disabled ? "not-allowed" : "pointer",
   borderRadius: "4px",
   fontSize: "16px",
   lineHeight: 1,
   opacity: disabled ? 0.5 : 1,
 });
+
+const CLOSE_BUTTON_INSET_PX = 8;
+
+// The expand dialog is DIALOG_PERCENT of the space inside an overlay that keeps at least
+// DIALOG_OVERLAY_PADDING_PX from every edge of the layout viewport, and further from an edge the
+// device covers (notch, home indicator, a side inset). The drawing sits inside DIALOG_PADDING_PX.
+const DIALOG_OVERLAY_PADDING_PX = 40;
+const DIALOG_PERCENT = 90;
+const DIALOG_PADDING_PX = 24;
+
+// The right side reads --safe-area-right, which also covers the Duo cover display's status column
+// on iOS 27.2 (see globals.css).
+const overlayInset = (side: "top" | "right" | "bottom" | "left") =>
+  `max(${DIALOG_OVERLAY_PADDING_PX}px, ${side === "right" ? "var(--safe-area-right)" : `env(safe-area-inset-${side}, 0px)`})`;
 
 // Modal component for fullscreen diagram view
 const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
@@ -236,6 +768,8 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
     return () => window.removeEventListener("keydown", handleEscape, { capture: true });
   }, [onClose]);
 
+  const desktop = isDesktopMode();
+
   return (
     <div
       style={{
@@ -249,39 +783,89 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        padding: "40px",
+        paddingTop: overlayInset("top"),
+        paddingRight: overlayInset("right"),
+        paddingBottom: overlayInset("bottom"),
+        paddingLeft: overlayInset("left"),
       }}
       onClick={onClose}
     >
+      {/* A definite size, so the drawing is fitted to the room this box has and never the other
+          way round: a phone cannot scroll an empty dialog, and a tall diagram cannot grow it. */}
       <div
         style={{
           position: "relative",
-          maxWidth: "90%",
-          maxHeight: "90%",
-          overflow: "auto",
+          width: `${DIALOG_PERCENT}%`,
+          height: `${DIALOG_PERCENT}%`,
         }}
         onClick={(e) => e.stopPropagation()}
       >
         {children}
-        <button
-          onClick={onClose}
-          style={{
-            position: "absolute",
-            top: "16px",
-            right: "16px",
-            background: "rgba(255, 255, 255, 0.1)",
-            border: "1px solid rgba(255, 255, 255, 0.2)",
-            color: "var(--color-text)",
-            padding: "8px 16px",
-            cursor: "pointer",
-            borderRadius: "4px",
-            fontSize: "14px",
-            fontFamily: "var(--font-primary)",
-          }}
-        >
-          Close
-        </button>
       </div>
+      {/* Outside the dialog's box, so it never covers the drawing the dialog fits to its room.
+          The desktop title bar holds the native window controls and moves the window, so the
+          button starts below it. */}
+      <button
+        className={desktop ? "titlebar-no-drag" : undefined}
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+        style={{
+          position: "absolute",
+          top: `calc(${CLOSE_BUTTON_INSET_PX + (desktop ? DESKTOP_TITLEBAR_HEIGHT_PX : 0)}px + env(safe-area-inset-top, 0px))`,
+          right: `calc(${CLOSE_BUTTON_INSET_PX}px + var(--safe-area-right))`,
+          background: "var(--color-background)",
+          border: "1px solid var(--color-border-subtle)",
+          color: "var(--color-text)",
+          padding: "8px 16px",
+          cursor: "pointer",
+          borderRadius: "4px",
+          fontSize: "14px",
+          fontFamily: "var(--font-primary)",
+        }}
+      >
+        Close
+      </button>
+    </div>
+  );
+};
+
+/**
+ * The expand dialog renders its own copy of an already valid chart, at the dialog's size. The
+ * drawing's room is the measured content box of the padding-free container inside the padded
+ * frame, so it is exactly what the dialog leaves, whatever the overlay does around it.
+ */
+const DialogDiagram: React.FC<{ chart: string; idPrefix: string }> = (props) => {
+  const { containerRef, containerWidth, containerHeight, rendered } = useDiagramSvg(
+    props.chart,
+    props.idPrefix
+  );
+  return (
+    <div
+      style={{
+        boxSizing: "border-box",
+        width: "100%",
+        height: "100%",
+        padding: `${DIALOG_PADDING_PX}px`,
+        background: "var(--color-code-bg)",
+        borderRadius: "8px",
+      }}
+    >
+      <div
+        ref={containerRef}
+        className="mermaid-container mermaid-modal"
+        style={{
+          width: "100%",
+          height: "100%",
+          ...diagramBoxStyle(rendered, {
+            kind: "dialog",
+            room: { width: containerWidth, height: containerHeight },
+          }),
+        }}
+        // SECURITY AUDIT: rendered.svg only holds sanitizeMermaidSvg() output.
+        dangerouslySetInnerHTML={{ __html: rendered?.svg ?? "" }}
+      />
     </div>
   );
 };
@@ -289,21 +873,23 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
 // Mermaid diagram component
 export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   const { isStreaming } = useContext(StreamingContext);
-  const modalContainerRef = useRef<HTMLDivElement>(null);
-  const [error, setError] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  // Keep the source and SVG together while a newer chart is pending or invalid.
-  const [renderedDiagram, setRenderedDiagram] = useState<{ svg: string; chart: string } | null>(
-    null
-  );
-  const svg = renderedDiagram?.svg ?? "";
-  const stableId = useId();
+  // Each diagram needs its own prefix: inline SVG ids (markers, clip paths) share the document.
+  const idPrefix = `mermaid-${useId().replace(/[^A-Za-z0-9_-]/g, "")}`;
 
   // Debounce chart changes to avoid flickering during streaming
   const [debouncedChart, setDebouncedChart] = useState(chart);
+  const {
+    containerRef,
+    containerWidth,
+    rendered: renderedDiagram,
+    error: renderError,
+  } = useDiagramSvg(debouncedChart, idPrefix);
+  const svg = renderedDiagram?.svg ?? "";
+  // An error belongs to the chart that failed, so a newer chart hides it at once instead of
+  // flashing it at the end of a stream.
+  const error = renderError?.chart === chart ? renderError.message : null;
   useEffect(() => {
-    // Clear stale errors when chart changes - avoids error flash at end of stream
-    setError(null);
     const timer = setTimeout(() => setDebouncedChart(chart), 350);
     return () => clearTimeout(timer);
   }, [chart]);
@@ -313,8 +899,8 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
     DEFAULT_ZOOM,
     { listener: true }
   );
-  // The +/- controls are shown as zoom affordances, so scale the rendered SVG
-  // itself; changing only max-height is a no-op for diagrams already below the cap.
+  // The +/- controls scale the diagram's explicit pixel size, so the box, the scrollable area
+  // and the frame all grow with it.
   const diagramZoom = normalizeDiagramZoom(storedDiagramZoom);
   const atMinZoom = diagramZoom <= MIN_ZOOM;
   const atMaxZoom = diagramZoom >= MAX_ZOOM;
@@ -331,56 +917,10 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
     }
   };
 
-  useEffect(() => {
-    // Use stable ID to avoid ELK layout recalculating from scratch each render
-    const id = `mermaid-${stableId.replace(/:/g, "")}`;
-    let cancelled = false;
-
-    const renderDiagram = async () => {
-      try {
-        // Parse first to validate syntax without rendering
-        await mermaid.parse(debouncedChart);
-
-        // If parse succeeds, render the diagram
-        const { svg: renderedSvg } = await mermaid.render(id, debouncedChart);
-        if (cancelled) return;
-
-        const sanitizedSvg = sanitizeMermaidSvg(renderedSvg);
-        if (!sanitizedSvg) {
-          throw new Error("Mermaid returned invalid SVG output");
-        }
-
-        setRenderedDiagram({ svg: sanitizedSvg, chart: debouncedChart });
-        setError(null);
-      } catch (err) {
-        if (cancelled) return;
-
-        // Don't remove elements by ID - with stable IDs, we'd remove the last valid render
-        // Mermaid error artifacts are cleaned up by subsequent successful renders
-
-        setError(err instanceof Error ? err.message : "Failed to render diagram");
-        // Don't clear SVG - keep showing last valid render during errors
-      }
-    };
-
-    void renderDiagram();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [debouncedChart, stableId]);
-
-  // Update modal container when opened
-  useEffect(() => {
-    if (isModalOpen && modalContainerRef.current && svg) {
-      // SECURITY AUDIT: svg state only stores sanitizeMermaidSvg() output.
-      modalContainerRef.current.innerHTML = svg;
-    }
-  }, [isModalOpen, svg]);
-
   if (error && !isStreaming) {
     return (
       <pre
+        {...{ [MERMAID_ERROR_ATTRIBUTE]: "" }}
         style={{
           color: "var(--color-syntax-error)",
           background: "hsl(from var(--color-syntax-error) h s l / 0.1)",
@@ -404,8 +944,8 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
         <div
           style={{
             position: "absolute",
-            top: "8px",
-            right: "8px",
+            top: `${MERMAID_BUTTON_INSET}px`,
+            right: `${MERMAID_BUTTON_INSET}px`,
             display: "flex",
             gap: "4px",
           }}
@@ -429,13 +969,18 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
         <div
           className="mermaid-container"
           ref={(element) => {
+            containerRef.current = element;
             if (!element) return;
             if (renderedDiagram) transcriptMermaidSources.set(element, renderedDiagram.chart);
             else transcriptMermaidSources.delete(element);
           }}
           style={{
             ...MERMAID_CONTAINER_STYLE,
-            ["--diagram-zoom" as string]: `${diagramZoom}`,
+            ...diagramBoxStyle(renderedDiagram, {
+              kind: "inline",
+              containerWidth,
+              userZoom: diagramZoom,
+            }),
             ...(showPendingPlaceholder ? MERMAID_PENDING_STYLE : {}),
           }}
           // SECURITY AUDIT: displaySvg is produced by sanitizeMermaidSvg(), which strips
@@ -446,19 +991,9 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           {showPendingPlaceholder ? MERMAID_PENDING_TEXT : null}
         </div>
       </div>
-      {isModalOpen && (
+      {isModalOpen && renderedDiagram && (
         <DiagramModal onClose={() => setIsModalOpen(false)}>
-          <div
-            ref={modalContainerRef}
-            className="mermaid-container mermaid-modal"
-            style={{
-              background: "var(--color-code-bg)",
-              padding: "24px",
-              borderRadius: "8px",
-              minWidth: "80vw",
-              minHeight: "60vh",
-            }}
-          />
+          <DialogDiagram chart={renderedDiagram.chart} idPrefix={`${idPrefix}-modal`} />
         </DiagramModal>
       )}
     </>

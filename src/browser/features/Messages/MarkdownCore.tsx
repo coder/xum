@@ -1,15 +1,15 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
 import type { Element, ElementContent, Root, RootContent, Text } from "hast";
 import type { Pluggable, Plugin } from "unified";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import remarkBreaks from "remark-breaks";
-import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { harden } from "rehype-harden";
-import "katex/dist/katex.min.css";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
+import { MATH_CLASS_NAMES, SHIKI_THEME, useKatexPlugins, withKatex } from "./mathRendering";
 import { normalizeMarkdown } from "./MarkdownStyles";
 import { repairIncompleteMarkdownTail } from "./repairIncompleteMarkdownTail";
 import { markdownComponents } from "./MarkdownComponents";
@@ -98,7 +98,7 @@ const sanitizeSchema = {
     ...defaultSchema.attributes,
     // SECURITY AUDIT: Raw CSS can conceal copied text. Only semantic Markdown classes are allowed.
     // KaTeX adds its trusted classes and styles after sanitization.
-    code: [["className", /^language-./, "math-inline", "math-display"]],
+    code: [["className", /^language-./, ...MATH_CLASS_NAMES]],
   },
 };
 
@@ -258,13 +258,12 @@ const FILE_PREVIEW_HARDEN_OPTIONS: HardenOptions = {
   allowDataImages: true,
 };
 
-// Everything after raw HTML parsing, shared by the lists below.
+// Everything after raw HTML parsing, shared by the lists below. withKatex appends KaTeX.
 function rehypePluginsAfterRawHtml(hardenOptions: HardenOptions): Pluggable[] {
   return [
     [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
     rehypeFootnoteLinks,
     [harden, hardenOptions], // Additional URL filtering for links and images
-    [rehypeKatex, { errorColor: "var(--color-muted-foreground)" }], // Render math
   ];
 }
 
@@ -309,6 +308,23 @@ function selectRehypePlugins(renderRawHtml: boolean, filePreview: boolean): Plug
   return renderRawHtml ? REHYPE_PLUGINS : REHYPE_PLUGINS_RAW_HTML_AS_TEXT;
 }
 
+// Matches every input that renders as math: `$$` (remark-math, with single-dollar math off), a
+// fence with the info string `math` (rehype-katex renders language-math code), and raw HTML code
+// with a math class (sanitizeSchema allows these), including a class rehype-raw decodes from a
+// character reference. A false positive costs one chunk load; a false negative shows TeX source,
+// so the pattern errs wide. The bounded class scan keeps the test linear.
+const MATH_HINT = new RegExp(
+  String.raw`\$\$|[\`~]{3}[ \t]*math|class\s*=[^>&]{0,200}&|` + MATH_CLASS_NAMES.join("|"),
+  "i"
+);
+
+export function markdownMayContainMath(markdown: string): boolean {
+  return MATH_HINT.test(markdown);
+}
+
+// Evaluating this chunk publishes the KaTeX plugins (see mathRendering); it renders nothing.
+const KatexLoader = React.lazy(() => import("./katexRehypePlugin"));
+
 /**
  * Core markdown rendering component that handles all markdown processing.
  * This is the single source of truth for markdown configuration.
@@ -334,12 +350,20 @@ export const MarkdownCore = React.memo<MarkdownCoreProps>(
       return parseIncompleteMarkdown ? repairIncompleteMarkdownTail(normalized) : normalized;
     }, [content, parseIncompleteMarkdown]);
 
+    // Once a row has math it keeps the KaTeX plugin, so a streaming row never flips back to the
+    // plain render (and never scans again). Setting state during render is React's pattern here.
+    const [hasMath, setHasMath] = useState(false);
+    if (!hasMath && markdownMayContainMath(normalizedContent)) setHasMath(true);
+    const katex = useKatexPlugins(hasMath);
+    const rehypePlugins = selectRehypePlugins(renderRawHtml, filePreview);
+
     return (
       <>
         <Streamdown
           components={markdownComponents}
           remarkPlugins={preserveLineBreaks ? REMARK_PLUGINS_WITH_BREAKS : REMARK_PLUGINS}
-          rehypePlugins={selectRehypePlugins(renderRawHtml, filePreview)}
+          rehypePlugins={katex ? withKatex(rehypePlugins, katex.plugins) : rehypePlugins}
+          shikiTheme={katex?.shikiTheme ?? SHIKI_THEME}
           // The text is already repaired above. In streamdown 2.0 this prop only gates its
           // whole-text remend call (MarkdownCore.test.tsx fails if an upgrade changes that).
           parseIncompleteMarkdown={false}
@@ -351,6 +375,12 @@ export const MarkdownCore = React.memo<MarkdownCoreProps>(
         >
           {normalizedContent}
         </Streamdown>
+        {hasMath && (
+          // Until the chunk loads the row keeps its plain render. If it fails, Reload shows below.
+          <LazyFeature name="Math rendering">
+            <KatexLoader />
+          </LazyFeature>
+        )}
         {children}
       </>
     );

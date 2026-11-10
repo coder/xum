@@ -1,12 +1,15 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import assert from "@/common/utils/assert";
 import { installBrowserLogCapture } from "@/browser/utils/browserLog";
 import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/windowOpenLocalhostProxy";
 import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimations";
 import {
   installIosFocusZoomGuard,
+  installIphoneDuoStatusBarStyle,
   installViewportHeightSync,
 } from "@/browser/utils/viewportHeight";
+import { installIosCoverColumn } from "@/browser/utils/iosCoverColumn";
 import { removeDroppedCacheKeys } from "@/browser/utils/legacyLocalStorageCleanup";
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 import { initTelemetry } from "@/common/telemetry";
@@ -15,6 +18,10 @@ import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { initTitlebarInsets } from "@/browser/hooks/useDesktopTitlebar";
 import { resolveBrowserAssetUrl } from "@/browser/utils/frontendBasePath";
 import { removeFirstRunView } from "@/browser/features/SplashScreens/SplashScreenProvider";
+import {
+  markAppStarted,
+  removeWorkspaceView,
+} from "@/browser/features/StaticWorkspaceView/removeWorkspaceView";
 
 // Initialize telemetry on app startup
 try {
@@ -39,9 +46,22 @@ installWindowOpenLocalhostProxyNormalization();
 installViewportHeightSync();
 
 try {
+  installIosCoverColumn();
+} catch (error) {
+  // Taking back the cover display's status column is cosmetic and must never block startup.
+  console.error("iOS cover column: could not take back the status column", error);
+}
+
+try {
   installIosFocusZoomGuard();
 } catch {
   // Stopping iOS focus zoom is cosmetic and must never block renderer startup.
+}
+
+try {
+  installIphoneDuoStatusBarStyle();
+} catch {
+  // A web clip status-bar style must never block renderer startup.
 }
 
 initTelemetry();
@@ -57,14 +77,16 @@ initTitlebarInsets();
 // Global error handlers for renderer process
 // These catch errors that escape the ErrorBoundary
 window.addEventListener("error", (event) => {
-  console.error("Uncaught error in renderer:", event.error);
+  // ErrorEvent.error is typed `any`: anything can be thrown.
+  const error: unknown = event.error;
+  console.error("Uncaught error in renderer:", error);
   console.error("Error details:", {
     message: event.message,
     filename: event.filename,
     lineno: event.lineno,
     colno: event.colno,
-    error: event.error,
-    stack: event.error?.stack,
+    error,
+    stack: error instanceof Error ? error.stack : undefined,
   });
 });
 
@@ -93,6 +115,7 @@ export class FirstRunViewErrorBoundary extends React.Component<
 
   componentDidCatch(error: Error) {
     removeFirstRunView();
+    removeWorkspaceView();
     window.reportError(error);
   }
 
@@ -101,7 +124,10 @@ export class FirstRunViewErrorBoundary extends React.Component<
   }
 }
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
+markAppStarted();
+const rootElement = document.getElementById("root");
+assert(rootElement, "index.html must contain the #root element");
+ReactDOM.createRoot(rootElement).render(
   <React.StrictMode>
     <FirstRunViewErrorBoundary>
       <AppLoader />

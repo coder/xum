@@ -11,8 +11,73 @@ import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/fetch";
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "../../../src/node/orpc/router";
+import { TODO_TURN_END_NUDGE } from "../../../src/common/utils/machineTurnPrompts";
+import type { ToolPolicy } from "../../../src/common/utils/tools/toolPolicy";
 
 export const WORKSPACE_TITLE = "Bug bash playground";
+
+function appClient(app: { baseUrl: string | undefined }): RouterClient<AppRouter> {
+  if (app.baseUrl === undefined) throw new Error("The bug-bash target declares no app URL");
+  return createORPCClient(new RPCLink({ origin: new URL(app.baseUrl).origin, url: "/orpc" }));
+}
+
+export interface TodoNudgeToolPolicy {
+  toolPolicy: ToolPolicy | null;
+  retryToolPolicy: ToolPolicy | null;
+}
+
+/**
+ * The tool policies that Xum sent each turn-end TODO nudge with, oldest first: the row's own
+ * `toolPolicy` and the one kept for a restart retry (null when the row has none). Read from the
+ * server's history, not the page: the transcript does not show a row's tool policy.
+ */
+export async function todoNudgeToolPolicies(app: {
+  baseUrl: string | undefined;
+}): Promise<TodoNudgeToolPolicy[]> {
+  const client = appClient(app);
+  const playground = (await client.workspace.list()).filter(
+    (workspace) => workspace.title === WORKSPACE_TITLE
+  );
+  if (playground.length !== 1) {
+    throw new Error(`expected one '${WORKSPACE_TITLE}' workspace, found ${playground.length}`);
+  }
+  const replay = await client.workspace.getFullReplay({ workspaceId: playground[0].id });
+  // getFullReplay sends single rows only: `message-batch` is onChat-only (#5102).
+  return replay.flatMap((row) => {
+    if (row.type !== "message" || row.role !== "user") return [];
+    const text = row.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
+    if (text.trim() !== TODO_TURN_END_NUDGE.trim()) return [];
+    // The wire schema leaves both untyped.
+    const toolPolicy = row.metadata?.toolPolicy as ToolPolicy | undefined;
+    const retry = row.metadata?.retrySendOptions as { toolPolicy?: ToolPolicy } | undefined;
+    return [{ toolPolicy: toolPolicy ?? null, retryToolPolicy: retry?.toolPolicy ?? null }];
+  });
+}
+
+/**
+ * Turns heartbeats on or off for the seeded workspace (on, the overview card shows its Heartbeat
+ * row). Every test of a target shares the one seeded workspace, so a test that turns them on must
+ * turn them off again, or later tests inherit the row and an unsolicited heartbeat turn.
+ */
+export async function setPlaygroundHeartbeat(
+  app: { baseUrl: string | undefined },
+  enabled: boolean,
+  intervalMs: number
+): Promise<void> {
+  const client = appClient(app);
+  const playground = (await client.workspace.list()).filter(
+    (workspace) => workspace.title === WORKSPACE_TITLE
+  );
+  if (playground.length !== 1) {
+    throw new Error(`expected one '${WORKSPACE_TITLE}' workspace, found ${playground.length}`);
+  }
+  const result = await client.workspace.heartbeat.set({
+    workspaceId: playground[0].id,
+    enabled,
+    intervalMs,
+  });
+  if (!result.success) throw new Error(`heartbeat.set failed: ${result.error}`);
+}
 
 /**
  * Switches tutorials off on the server before the page loads (one would show over the
@@ -29,8 +94,23 @@ export async function disableTutorials(app: { baseUrl: string | undefined }): Pr
 }
 
 /**
+ * Clears the saved tutorial state (the opt-out and every finished tutorial) before the page loads,
+ * so the creation tutorial shows again. A merge patch with null deletes the key (RFC 7386).
+ */
+export async function resetTutorials(app: { baseUrl: string | undefined }): Promise<void> {
+  await appClient(app).config.updateUserPreferences({
+    patches: [{ ui: { tutorialState: null } }],
+  });
+}
+
+/**
  * Sends a chat message with the Send button and waits until the composer has taken it. Pressing
  * Enter right after `fill` can arrive before the composer is ready (seen on the phone target).
+ *
+ * Stories send setup messages with this, not `agent.act`: e2e records the composer's placeholder
+ * as part of the target, and the placeholder tip rotates on a wall-clock timer (placeholderTips.ts).
+ * So an agent step that typed here replayed only until the next tip, and missed
+ * (`target-not-found`) in almost every CI run.
  */
 export async function sendMessage(screen: Screen, text: string): Promise<void> {
   const composer = screen.getByRole("textbox", "Message");
@@ -269,4 +349,19 @@ export async function expectNotifyOnAllResponses(
   await waitForLayerEscapeReady(browser);
   await browser.keyboard.press("Escape");
   await expect(setting).toBeHidden();
+}
+
+/**
+ * The absolute path of the seeded plugin source `name` (tests/bugbash/pluginInstallFixtures.ts).
+ * Every source sits next to the seeded hook-review-demo plugin, whose install records its path.
+ */
+export async function pluginSourcePath(
+  app: { baseUrl: string | undefined },
+  name: string
+): Promise<string> {
+  const listed = await appClient(app).agentPlugins.list();
+  if (!listed.success) throw new Error(`agentPlugins.list failed: ${listed.error}`);
+  const demo = listed.data.find((item) => item.name === "hook-review-demo")?.source?.url;
+  if (demo === undefined) throw new Error("the seeded hook-review-demo plugin has no source");
+  return `${demo.slice(0, demo.lastIndexOf("/"))}/${name}`;
 }

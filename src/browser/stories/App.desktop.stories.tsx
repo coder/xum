@@ -1,4 +1,4 @@
-import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 import type { APIClient } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -67,9 +67,9 @@ function setupDesktopStory(phone = false): APIClient {
   updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, 320);
   for (const workspaceId of [CALLER_ID, isolatedWorkspace.id]) {
     updatePersistedState(getRightSidebarLayoutKey(workspaceId), undefined);
+    expandRightSidebar(workspaceId);
   }
   expandProjects([isolatedWorkspace.projectPath]);
-  expandRightSidebar();
   return client;
 }
 

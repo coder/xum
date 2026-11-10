@@ -1,4 +1,4 @@
-import { fireEvent, userEvent, waitFor } from "@storybook/test";
+import { fireEvent, userEvent, waitFor } from "storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import {
@@ -7,6 +7,8 @@ import {
   expandProjects,
 } from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { setWorkspaceDrafts } from "@/browser/stories/helpers/drafts";
+import { openLeftSidebar, waitForChatInputAutofocusDone } from "@/browser/stories/storyPlayHelpers";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
@@ -41,6 +43,9 @@ export const ProjectRemovalDisabled: AppStory = {
     />
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    // The composer focuses itself on load. Focus leaving the open menu closes it, so a menu
+    // opened before that would close before the click below lands on it.
+    await waitForChatInputAutofocusDone(canvasElement);
     const projectOptionsButton = await waitFor(() => {
       const button = canvasElement.querySelector<HTMLButtonElement>(
         'button[aria-label="Project options for my-app"]'
@@ -307,7 +312,7 @@ export const WorkflowRunGroups: AppStory = {
 
 export const FlatChatList: AppStory = {
   // The flat list replaces the whole sidebar layout, so validate the compact
-  // badge/truncation behavior at the phone width alongside the laptop capture.
+  // avatar/truncation behavior at the phone width alongside the laptop capture.
   globals: {
     viewport: { value: "mobile2", isRotated: false },
   },
@@ -317,8 +322,9 @@ export const FlatChatList: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        // Keep the sidebar visible at the phone width: no selected workspace
-        // (mobile shows the chat over the sidebar) and the sidebar expanded.
+        // Keep the sidebar visible: no selected workspace (mobile shows the chat
+        // over the sidebar) and the wide sidebar expanded; the play opens the
+        // phone drawer.
         clearWorkspaceSelection();
         collapseRightSidebar();
         updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
@@ -361,6 +367,10 @@ export const FlatChatList: AppStory = {
         const betaConfig = projects.get(betaPath);
         if (alphaConfig) projects.set(alphaPath, { ...alphaConfig, color: "Blue" });
         if (betaConfig) projects.set(betaPath, { ...betaConfig, color: "Green" });
+        // A draft row shows its project's avatar with the draft cues.
+        setWorkspaceDrafts(betaPath, [
+          { draftId: "flat-draft", workspaceName: "beta-draft", prompt: "Refactor the cache" },
+        ]);
         return createMockORPCClient({
           projects,
           workspaces,
@@ -369,13 +379,14 @@ export const FlatChatList: AppStory = {
       }}
     />
   ),
-  // Contract: the flat list (badges) and the project management headers are
+  // Contract: the flat list (avatars) and the project management headers are
   // actually on screen, so a viewport variant cannot silently snapshot the
   // wrong UI (e.g. the sidebar hidden behind a selected chat on mobile).
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    await openLeftSidebar(canvasElement);
     await waitFor(() => {
-      if (!canvasElement.querySelector('[data-testid="workspace-project-badge-alpha-pinned"]')) {
-        throw new Error("Expected a project badge on a flat-list chat row");
+      if (!canvasElement.querySelector('[data-testid="workspace-project-avatar-alpha-pinned"]')) {
+        throw new Error("Expected a project avatar on a flat-list chat row");
       }
       if (
         !canvasElement.querySelector(

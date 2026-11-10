@@ -2,7 +2,9 @@
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import { describe, expect, mock, test } from "bun:test";
-import { asSchema, type Tool } from "ai";
+import { asSchema, generateText, type Tool } from "ai";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { createVertex } from "@ai-sdk/google-vertex";
 import { z } from "zod";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -21,6 +23,7 @@ import {
   type ToolConfiguration,
   type WorkspaceHeartbeatToolService,
 } from "./tools";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 const DESKTOP_TOOL_NAMES = [
   "desktop_screenshot",
   "desktop_move_mouse",
@@ -82,6 +85,8 @@ describe("supportsAnthropicNativeWebFetch", () => {
     // Two-segment IDs at/after the 4.6 cutoff.
     ["claude-fable-5-1", true],
     ["claude-mythos-5-1", true],
+    ["claude-fable-5-2", true],
+    ["claude-mythos-5-2", true],
     ["claude-opus-5-5", true],
     ["claude-sonnet-5-5", true],
     ["claude-haiku-5-5", true],
@@ -139,6 +144,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime: new LocalRuntime(process.cwd()),
         runtimeTempDir: "/tmp",
@@ -160,6 +166,7 @@ describe("getToolsForModel", () => {
     const toolsWithoutReport = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -173,6 +180,7 @@ describe("getToolsForModel", () => {
     const toolsWithReport = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -193,6 +201,7 @@ describe("getToolsForModel", () => {
     const toolsWithout = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -207,6 +216,7 @@ describe("getToolsForModel", () => {
     const toolsWith = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -227,6 +237,7 @@ describe("getToolsForModel", () => {
     const toolsWithoutHeartbeat = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -249,6 +260,7 @@ describe("getToolsForModel", () => {
     const toolsWithHeartbeat = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -261,6 +273,7 @@ describe("getToolsForModel", () => {
     const childToolsWithHeartbeat = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -295,6 +308,7 @@ describe("getToolsForModel", () => {
       const tools = await getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime,
           runtimeTempDir: "/tmp",
@@ -320,7 +334,13 @@ describe("getToolsForModel", () => {
 
     const withoutGoalService = await getToolsForModel(
       "noop:model",
-      { cwd: process.cwd(), runtime, runtimeTempDir: "/tmp", workspaceId: "ws-1" },
+      {
+        sessionLocks: nodeSessionLocks,
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+      },
       "ws-1",
       initStateManager
     );
@@ -336,6 +356,7 @@ describe("getToolsForModel", () => {
       getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime,
           runtimeTempDir: "/tmp",
@@ -382,6 +403,7 @@ describe("getToolsForModel", () => {
     const topLevelTools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -397,6 +419,7 @@ describe("getToolsForModel", () => {
     const subAgentTools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -409,6 +432,31 @@ describe("getToolsForModel", () => {
     expect(subAgentTools.review_pane_get).toBeUndefined();
   });
 
+  test("withholds repository tools from scratch chats", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const build = (scratchWorkspace: boolean) =>
+      getToolsForModel(
+        "noop:model",
+        {
+          sessionLocks: nodeSessionLocks,
+          cwd: process.cwd(),
+          runtime,
+          runtimeTempDir: "/tmp",
+          scratchWorkspace,
+        },
+        "ws-1",
+        createInitStateManager()
+      );
+    const repositoryTools = ["review_pane_update", "review_pane_get", "task_apply_git_patch"];
+
+    const project = Object.keys(await build(false));
+    const scratch = Object.keys(await build(true));
+
+    expect(repositoryTools.filter((name) => !project.includes(name))).toEqual([]);
+    expect(scratch.filter((name) => repositoryTools.includes(name))).toEqual([]);
+    expect(scratch).toContain("task");
+  });
+
   test("only includes workflow tools when the workflow service is available", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
@@ -416,6 +464,7 @@ describe("getToolsForModel", () => {
     const withoutService = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -430,6 +479,7 @@ describe("getToolsForModel", () => {
     const withService = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -461,6 +511,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -487,6 +538,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -508,6 +560,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -530,6 +583,7 @@ describe("getToolsForModel", () => {
       getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime,
           runtimeTempDir: "/tmp",
@@ -564,65 +618,72 @@ describe("getToolsForModel", () => {
     expect((await run(streamTool, "screenshot")).error).toMatch(/turned off by the user/);
   });
 
-  test("adds native Google Search and URL Context only for Gemini 3 models", async () => {
-    const runtime = new LocalRuntime(process.cwd());
-    const initStateManager = createInitStateManager();
-
-    const gemini25Tools = await getToolsForModel(
-      "google:gemini-2.5-pro",
+  // Gemini's built-in googleSearch tool (which needs includeServerSideToolInvocations) broke
+  // its implicit caching, so Gemini requests carry function tools only.
+  test.each([
+    { provider: "google", modelId: "gemini-4-argon" },
+    { provider: "google", modelId: "gemini-3.8-flash" },
+    { provider: "google-vertex", modelId: "gemini-4-argon" },
+    { provider: "google-vertex", modelId: "gemini-3.8-flash" },
+  ])("sends $provider:$modelId only function tools", async ({ provider, modelId }) => {
+    const tools = await getToolsForModel(
+      `${provider}:${modelId}`,
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
-        runtime,
+        runtime: new LocalRuntime(process.cwd()),
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
       },
       "ws-1",
-      initStateManager
-    );
-    expect(gemini25Tools.google_search).toBeUndefined();
-    expect(gemini25Tools.url_context).toBeUndefined();
-
-    const gemini4Tools = await getToolsForModel(
-      "google:gemini-4-pro",
+      createInitStateManager(),
+      undefined,
       {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
+        github_list_issues: {
+          description: "List issues",
+          inputSchema: z.object({}),
+          execute: mock(() => Promise.resolve({})),
+        },
+      }
     );
-    expect(gemini4Tools.google_search).toBeUndefined();
-    expect(gemini4Tools.url_context).toBeUndefined();
+    const providerTools = Object.entries(tools).filter(([, tool]) => tool.type === "provider");
+    expect(providerTools.map(([name]) => name)).toEqual([]);
 
-    const gemini35Tools = await getToolsForModel(
-      "google:gemini-3.5-flash",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
-    );
-    const namespacedGemini35Tools = await getToolsForModel(
-      "google:models/gemini-3.5-flash",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
-    );
-    expect(namespacedGemini35Tools.google_search).toBeDefined();
-    expect(namespacedGemini35Tools.url_context).toBeDefined();
+    interface GeminiRequestBody {
+      tools?: Array<{ functionDeclarations?: Array<{ name: string }> }>;
+      toolConfig?: { includeServerSideToolInvocations?: boolean };
+    }
+    let body: GeminiRequestBody = {};
+    const fakeFetchImpl = (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (typeof init?.body !== "string") {
+        throw new Error("Expected a JSON string request body");
+      }
+      body = JSON.parse(init.body) as GeminiRequestBody;
+      const reply = {
+        candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+      };
+      return Promise.resolve(Response.json(reply));
+    };
+    // Keep Bun's fetch extensions (preconnect) that `typeof fetch` expects.
+    const fakeFetch = Object.assign(fakeFetchImpl, fetch) as typeof fetch;
+    const model =
+      provider === "google"
+        ? createGoogleGenerativeAI({ apiKey: "test-key", fetch: fakeFetch })(modelId)
+        : createVertex({ apiKey: "test-key", fetch: fakeFetch })(modelId);
 
-    expect(gemini35Tools.google_search).toBeDefined();
-    expect(gemini35Tools.url_context).toBeDefined();
+    await generateText({ model, prompt: "hello", tools, maxRetries: 0 });
+
+    const sentTools = body.tools ?? [];
+    expect(sentTools.flatMap((entry) => Object.keys(entry))).toEqual(["functionDeclarations"]);
+    expect(body.toolConfig?.includeServerSideToolInvocations).toBeUndefined();
+    // Every tool Xum built reaches Gemini as a function, MCP tools and the client web_fetch included.
+    const declaredNames = sentTools
+      .flatMap((entry) => entry.functionDeclarations ?? [])
+      .map((declaration) => declaration.name);
+    expect(declaredNames.sort()).toEqual(Object.keys(tools).sort());
+    for (const name of ["bash", "file_read", "web_fetch", "github_list_issues"]) {
+      expect(declaredNames).toContain(name);
+    }
   });
 
   test("adds xAI native web and X search tools for Grok 4.5", async () => {
@@ -632,6 +693,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -670,6 +732,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -697,6 +760,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -720,6 +784,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5-latest",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -740,6 +805,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:team-grok",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -761,6 +827,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -805,6 +872,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -838,6 +906,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -885,6 +954,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -906,6 +976,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -936,6 +1007,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime: new LocalRuntime(process.cwd()),
         runtimeTempDir: "/tmp",
@@ -977,6 +1049,7 @@ describe("getToolsForModel", () => {
       getToolsForModel(
         model,
         {
+          sessionLocks: nodeSessionLocks,
           cwd: dir,
           runtime: new LocalRuntime(dir),
           runtimeTempDir: dir,
@@ -995,10 +1068,14 @@ describe("getToolsForModel", () => {
       )) as FetchResult;
     }
 
-    test("a blocking tool_pre hook denies Claude 4.6+ fetches", async () => {
+    test("a blocking tool_pre hook denies Claude 4.6+ and Gemini fetches", async () => {
       await withProject(async (dir) => {
         await writePreHook(dir, 'echo "egress blocked" >&2\nexit 1');
-        for (const model of ["anthropic:claude-sonnet-5-5", "anthropic:claude-haiku-5-5"]) {
+        for (const model of [
+          "anthropic:claude-sonnet-5-5",
+          "anthropic:claude-haiku-5-5",
+          "google:gemini-4-argon",
+        ]) {
           const result = await fetchWith((await toolsFor(model, dir, true)).web_fetch);
           expect({ model, error: result.error }).toEqual({ model, error: "egress blocked" });
         }
@@ -1023,12 +1100,25 @@ describe("getToolsForModel", () => {
       });
     });
 
-    test("trusted projects drop Google URL Context but keep native search", async () => {
+    test("a route that cannot run native fetch gets the client web_fetch (#2922)", async () => {
       await withProject(async (dir) => {
-        const tools = await toolsFor("google:gemini-3.5-flash", dir, true);
-        expect(tools.url_context).toBeUndefined();
-        expect(tools.google_search).toBeDefined();
-        expect(tools.web_fetch?.execute).toBeDefined();
+        const tools = await getToolsForModel(
+          "anthropic:claude-opus-4-6",
+          {
+            sessionLocks: nodeSessionLocks,
+            cwd: dir,
+            runtime: new LocalRuntime(dir),
+            runtimeTempDir: dir,
+            workspaceId: "ws-1",
+            trusted: false,
+            anthropicNativeWebFetchEnabled: false,
+          },
+          "ws-1",
+          createInitStateManager()
+        );
+        // Xum's own fetch tool runs locally; native web search stays (proxies accept it).
+        expect((await fetchWith(tools.web_fetch)).error).toContain("Blocked URL");
+        expect(tools.web_search).toMatchObject({ type: "provider" });
       });
     });
 
@@ -1042,7 +1132,6 @@ describe("getToolsForModel", () => {
             id: "anthropic.web_fetch_20250910",
           });
         }
-        expect((await toolsFor("google:gemini-3.5-flash", dir, false)).url_context).toBeDefined();
       });
     });
   });

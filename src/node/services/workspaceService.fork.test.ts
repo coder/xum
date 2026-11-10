@@ -1,5 +1,10 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
-import { generateForkBranchName, generateForkTitle } from "./workspaceService";
+import * as humanIdModule from "human-id";
+import {
+  generateAutoWorkspaceName,
+  generateForkBranchName,
+  generateForkTitle,
+} from "./workspaceService";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
@@ -1200,6 +1205,24 @@ describe("WorkspaceService fork", () => {
   });
 });
 
+describe("generateAutoWorkspaceName", () => {
+  test("returns a lowercase hyphenated name outside the existing set", () => {
+    const name = generateAutoWorkspaceName(new Set(["workspace-1"]));
+    expect(name).toMatch(/^[a-z]+(-[a-z]+)+$/);
+  });
+
+  test("numbers the last draw when every draw collides", () => {
+    const humanIdSpy = spyOn(humanIdModule, "humanId").mockReturnValue("calm-otters-sing");
+    try {
+      expect(generateAutoWorkspaceName(new Set(["calm-otters-sing", "calm-otters-sing-1"]))).toBe(
+        "calm-otters-sing-2"
+      );
+    } finally {
+      humanIdSpy.mockRestore();
+    }
+  });
+});
+
 // --- Pure helper tests (no mocks needed) ---
 
 describe("generateForkBranchName", () => {
@@ -1386,6 +1409,7 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
       // Failure injection: the usage reset (the LAST failure-prone setup
       // step) rejects, driving the fork into its rollback path.
       const sessionUsageService = {
+        onUsageChanged: () => undefined,
         resetSessionUsage: mock(() => Promise.reject(new Error("usage reset failed"))),
         recordHeadlessUsage: mock(() => Promise.resolve(undefined)),
       } as unknown as SessionUsageService;

@@ -20,11 +20,13 @@ export const MAX_DRAFT_JSON_BYTES = 40 * 1024 * 1024;
 export const DRAFT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
- * Draft id of a project's default creation composer (the project page opened without a draft
- * id). Generated draft ids are UUIDs, so this fixed id never collides with a listed draft, and the
- * backend never lists it.
+ * Draft id older builds gave a project's default creation composer. Only code reading their
+ * drafts or storage keys uses it: creation drafts no longer have a reserved id.
  */
 export const DEFAULT_CREATION_DRAFT_ID = "default";
+
+/** Longest stored manual workspace name (valid names are far shorter; only invalid ones are cut). */
+export const CREATION_DRAFT_NAME_MAX_CHARS = 1024;
 
 /**
  * Longest the app waits for the drafts subscription's first snapshot (and the legacy import)

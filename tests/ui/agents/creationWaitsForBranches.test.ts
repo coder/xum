@@ -16,13 +16,13 @@ import {
 } from "../../ipc/sendMessageTestHelpers";
 
 import { renderApp } from "../renderReviewPanel";
-import { addProjectViaUI, cleanupView, setupTestDom, waitForLatestDraftId } from "../helpers";
+import { addProjectViaUI, cleanupView, setupTestDom, waitForOpenDraftId } from "../helpers";
 import { ChatHarness } from "../harness";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getAgentsInitNudgeKey, getDraftScopeId } from "@/common/constants/storage";
 import { BRANCH_LIST_TIMEOUT_MS } from "@/browser/features/ChatInput/branchListLoad";
-import type { DraftScope } from "@/common/orpc/schemas/drafts";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -173,11 +173,13 @@ async function openCreationViewWithHeldBranches(options?: {
   const held = holdBranchList(env);
   await openCreationViewWhileBranchesLoad(view, projectPath);
   await waitFor(() => expect(held.spy).toHaveBeenCalled(), { timeout: 10_000 });
-  const draftId = await waitForLatestDraftId(projectPath);
-  const scope: DraftScope = { kind: "creation", projectPath, draftId };
-  const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), scope);
+  const draftId = await waitForOpenDraftId();
+  const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
+    kind: "creation",
+    draftId,
+  });
   const create = jest.spyOn(env.services.workspaceService, "create");
-  return { env, view, cleanupDom, chat, held, create };
+  return { env, view, cleanupDom, chat, held, create, draftId };
 }
 
 describeIntegration("creation composer while the branch list loads (#6033)", () => {
@@ -265,9 +267,11 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
     try {
       await openCreationViewWhileBranchesLoad(view, projectPath);
       await waitFor(() => expect(reject).toHaveBeenCalled(), { timeout: 10_000 });
-      const draftId = await waitForLatestDraftId(projectPath);
-      const scope: DraftScope = { kind: "creation", projectPath, draftId };
-      const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), scope);
+      const draftId = await waitForOpenDraftId();
+      const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
+        kind: "creation",
+        draftId,
+      });
       await chat.typeWithoutSending("hello after a failed branch list");
 
       await waitFor(() => expect(view.container.textContent ?? "").toContain(BRANCH_LIST_FAILED), {
@@ -314,10 +318,15 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
     BRANCH_LIST_TIMEOUT_MS + 60_000
   );
 
-  test("Run /init clicked after the branches load sends /init at once", async () => {
-    const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
-      showAgentsInitBanner: true,
-    });
+  test("Run /init clicked after the branches load sends /init at once, in Exec", async () => {
+    const { env, view, cleanupDom, held, create, draftId } = await openCreationViewWithHeldBranches(
+      {
+        showAgentsInitBanner: true,
+      }
+    );
+    // The draft owns its agent, so Run /init must switch the draft itself to Exec.
+    getCreationDraftStore().updateExecution(draftId, { agent: { id: "plan", scope: "built-in" } });
+    const send = jest.spyOn(env.services.workspaceService, "sendMessage");
     try {
       held.release();
       await waitFor(
@@ -329,12 +338,18 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
         },
         { timeout: 10_000 }
       );
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 10_000,
+      });
       fireEvent.click(await runInitButton(view.container));
       await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
+      await waitFor(() => expect(send).toHaveBeenCalled(), { timeout: 30_000 });
+      expect(send.mock.calls[0]?.[2].agentId).toBe("exec");
     } finally {
       held.release();
       held.spy.mockRestore();
       create.mockRestore();
+      send.mockRestore();
       await cleanupView(view, cleanupDom);
     }
   }, 90_000);
@@ -379,6 +394,101 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       await waitFor(() => expect(create).toHaveBeenCalled(), { timeout: 30_000 });
       expect(held.spy.mock.results.length).toBeGreaterThan(0);
     } finally {
+      held.release();
+      held.spy.mockRestore();
+      create.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  // #6423: "Run /init" sends through the creation composer once, so it stays off whenever that
+  // composer's Send is off, not only while the branch list loads.
+  test("Run /init is off while the Coder presets load", async () => {
+    const env = getSharedEnv();
+    const coder = env.services.coderService;
+    let releasePresets: () => void = () => undefined;
+    const presetsHeld = new Promise<void>((resolve) => {
+      releasePresets = resolve;
+    });
+    const spies = [
+      jest
+        .spyOn(coder, "getCoderInfo")
+        .mockResolvedValue({ state: "available", version: "2.30.0" }),
+      jest.spyOn(coder, "listTemplates").mockResolvedValue({
+        ok: true,
+        templates: [{ name: "dev", displayName: "Dev", organizationName: "default" }],
+      }),
+      jest.spyOn(coder, "listWorkspaces").mockResolvedValue({ ok: true, workspaces: [] }),
+    ];
+    const presets = jest.spyOn(coder, "listPresets").mockImplementation(async () => {
+      await presetsHeld;
+      return { ok: true, presets: [] };
+    });
+    const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
+      showAgentsInitBanner: true,
+    });
+    try {
+      held.release();
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      await selectRuntime(view.container, "Coder");
+      await waitFor(() => expect(presets).toHaveBeenCalled(), { timeout: 10_000 });
+      // The composer reports from an effect, and the page renders the banner after it.
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(true), {
+        timeout: 5_000,
+      });
+
+      releasePresets();
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      expect(create).not.toHaveBeenCalled();
+    } finally {
+      releasePresets();
+      for (const spy of [...spies, presets]) spy.mockRestore();
+      held.release();
+      held.spy.mockRestore();
+      create.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("Run /init is off while a send is in flight", async () => {
+    const env = getSharedEnv();
+    const opened = await openCreationViewWithHeldBranches({ showAgentsInitBanner: true });
+    const { view, cleanupDom, chat, held } = opened;
+    // Replace the helper's call-through spy with one that holds the creation send.
+    opened.create.mockRestore();
+    const workspaceService = env.services.workspaceService;
+    const realCreate = workspaceService.create.bind(workspaceService);
+    let releaseCreate: () => void = () => undefined;
+    const createHeld = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const create = jest
+      .spyOn(workspaceService, "create")
+      .mockImplementation(async (...args: Parameters<typeof workspaceService.create>) => {
+        await createHeld;
+        return realCreate(...args);
+      });
+    try {
+      held.release();
+      await chat.typeWithoutSending("hello while Run /init waits");
+      await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      // Run /init turns on one commit after Send: the composer reports it from an effect (#6458, #7519).
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 5_000,
+      });
+      fireEvent.click(sendButton(view.container));
+      await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(true), {
+        timeout: 5_000,
+      });
+    } finally {
+      releaseCreate();
       held.release();
       held.spy.mockRestore();
       create.mockRestore();

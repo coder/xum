@@ -1,15 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { Menu } from "lucide-react";
-import { getArchivedWorkspacesExpandedKey } from "@/common/constants/storage";
+import {
+  getArchivedWorkspacesExpandedKey,
+  getCreationDraftScopeId,
+} from "@/common/constants/storage";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { CREATION_COLUMN_MAX_WIDTH_CLASS } from "@/constants/layout";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { LeftSidebarToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
+import { CreationDraftGate } from "@/browser/features/ChatInput/CreationDraftGate";
 import { ChatInput } from "@/browser/features/ChatInput";
 import type { ChatInputAPI, WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
 import { hasConfiguredProvider, useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -17,12 +21,11 @@ import { ConfigureProvidersPrompt } from "@/browser/components/ConfigureProvider
 import { ConfiguredProvidersBar } from "@/browser/components/ConfiguredProvidersBar/ConfiguredProvidersBar";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { ArchivedWorkspaces } from "@/browser/components/ArchivedWorkspaces/ArchivedWorkspaces";
-import { Button } from "@/browser/components/Button/Button";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
+import { autoFocusUnlessPhone } from "@/browser/utils/env";
 
 interface ScratchPageProps {
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   pendingDraftId?: string | null;
   onWorkspaceCreated: (
     metadata: FrontendWorkspaceMetadata,
@@ -70,37 +73,31 @@ export function ScratchPage(props: ScratchPageProps) {
     };
   }, [api, archivedExpanded]);
 
+  const creationScopeId = props.pendingDraftId
+    ? getCreationDraftScopeId(props.pendingDraftId)
+    : undefined;
+
   function handleChatReady(api: ChatInputAPI) {
     if (didAutoFocusRef.current) return;
     didAutoFocusRef.current = true;
-    api.focus();
+    autoFocusUnlessPhone(() => api.focus());
   }
 
   return (
-    <AgentProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY}>
-      <ThinkingProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY}>
+    <AgentProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY} scopeId={creationScopeId}>
+      <ThinkingProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY} scopeId={creationScopeId}>
         {/* No workspace is open, so this page is the one `main` landmark (#5969). */}
         <main className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
           <div
             className={cn(
-              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
-              isDesktopMode() ? "h-10 titlebar-drag" : "h-8"
+              // Same height as the app shell's fixed sidebar toggle bar, which sits over this header
+              // while the sidebar is collapsed.
+              "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2",
+              props.leftSidebarCollapsed && "pl-0",
+              isDesktopMode() ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
             )}
           >
-            {props.leftSidebarCollapsed && (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={props.onToggleLeftSidebarCollapsed}
-                aria-label="Open sidebar menu"
-                className={cn(
-                  "hidden mobile-menu-btn h-6 w-6 shrink-0 text-muted hover:text-foreground",
-                  isDesktopMode() && "titlebar-no-drag"
-                )}
-              >
-                <Menu className="h-4 w-4" />
-              </Button>
-            )}
+            {props.leftSidebarCollapsed && <LeftSidebarToggleBarSpacer showNewChat />}
           </div>
           {/* mobile-header-spacer keeps content below the fixed mobile header on touch devices. */}
           <div className="mobile-header-spacer min-h-0 flex-1 overflow-y-auto">
@@ -110,16 +107,22 @@ export function ScratchPage(props: ScratchPageProps) {
                   <ConfigureProvidersPrompt />
                 ) : (
                   <>
-                    <ChatInput
-                      key={`${SCRATCH_PROJECT_CONFIG_KEY}:${props.pendingDraftId ?? "__pending__"}`}
-                      variant="creation"
-                      kind="scratch"
+                    <CreationDraftGate
+                      draftId={props.pendingDraftId}
                       projectPath={SCRATCH_PROJECT_CONFIG_KEY}
-                      projectName={SCRATCH_PROJECT_NAME}
-                      pendingDraftId={props.pendingDraftId}
-                      onReady={handleChatReady}
-                      onWorkspaceCreated={props.onWorkspaceCreated}
-                    />
+                      subProjectPath={null}
+                    >
+                      <ChatInput
+                        key={props.pendingDraftId ?? "__pending__"}
+                        variant="creation"
+                        kind="scratch"
+                        projectPath={SCRATCH_PROJECT_CONFIG_KEY}
+                        projectName={SCRATCH_PROJECT_NAME}
+                        pendingDraftId={props.pendingDraftId}
+                        onReady={handleChatReady}
+                        onWorkspaceCreated={props.onWorkspaceCreated}
+                      />
+                    </CreationDraftGate>
                     {providersLoading ? (
                       <div className="flex items-center justify-center gap-2 py-1.5">
                         <Skeleton className="h-7 w-32" />

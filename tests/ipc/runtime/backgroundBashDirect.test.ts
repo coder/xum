@@ -30,6 +30,7 @@ import { LocalRuntime } from "../../../src/node/runtime/LocalRuntime";
 import { BackgroundProcessManager } from "../../../src/node/services/backgroundProcessManager";
 import { createBashTool } from "../../../src/node/services/tools/bash";
 import { createBashOutputTool } from "../../../src/node/services/tools/bash_output";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 // Access private fields from ServiceContainer for direct testing
 interface ServiceContainerPrivates {
@@ -165,6 +166,7 @@ describe("Background Bash Direct Integration", () => {
     const marker = `MULTI_MSG_${Date.now()}`;
 
     const toolConfig = {
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime,
       secrets: {},
@@ -493,6 +495,7 @@ describe("Foreground to Background Migration", () => {
     const outputCollector = createBashOutputCollector(toolCallId);
 
     const toolConfig = {
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime,
       secrets: {},
@@ -586,6 +589,7 @@ describe("Foreground to Background Migration", () => {
     const outputCollector = createBashOutputCollector(toolCallId);
 
     const toolConfig = {
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime,
       secrets: {},
@@ -647,6 +651,7 @@ describe("Foreground to Background Migration", () => {
     const runtime = new LocalRuntime(workspacePath);
 
     const toolConfig = {
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime,
       secrets: {},
@@ -733,6 +738,7 @@ describe("Foreground to Background Migration", () => {
     const outputCollector = createBashOutputCollector(toolCallId);
 
     const toolConfig = {
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime,
       secrets: {},

@@ -6,7 +6,7 @@ import { Err, Ok } from "@/common/types/result";
 import type { FileLeaseManager, ProvidersConfig, ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
-import type { ProviderModelEntry } from "@/common/config/schemas/providerModelEntry";
+import type { ProviderModelEntry } from "@/common/orpc/types";
 import type { CoderOauthAuth } from "@/node/utils/coderOauthAuth";
 import { CODER_GATEWAY_DEFAULT_PROVIDER_NAMES } from "@/common/constants/coderOAuth";
 import { CoderOauthService } from "./coderOauthService";
@@ -3416,6 +3416,69 @@ describe("CoderOauthService", () => {
       expect((deps.providersConfig.coder as Record<string, unknown>).discoveredModels).toEqual([]);
     });
 
+    // #5762: dispose() stops a committed login's discovery. Before, its retries outlived the
+    // service and reached whichever fetch mock the next test installed (#5758).
+    it("stops a committed login's provider discovery on dispose", async () => {
+      deps.providersConfig = { coder: { deploymentUrl: DEPLOYMENT_URL } };
+      let listingRequests = 0;
+      let listingSignal: AbortSignal | undefined;
+      let firstListing!: () => void;
+      const listingStarted = new Promise<void>((resolve) => (firstListing = resolve));
+      mockFetch(async (input, init) => {
+        const url = fetchUrl(input);
+        if (url.startsWith("http://127.0.0.1")) {
+          return originalFetch(input, init);
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/buildinfo`) {
+          return jsonResponse({ version: "v2.99.0" });
+        }
+        if (url === `${DEPLOYMENT_URL}/.well-known/oauth-authorization-server`) {
+          return discoveryResponse();
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/register`) {
+          return jsonResponse({ client_id: "client_new", client_secret: "secret_new" });
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/tokens`) {
+          return jsonResponse({
+            access_token: "at_dispose",
+            refresh_token: "rt_dispose",
+            expires_in: 86400,
+            token_type: "Bearer",
+          });
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          if (new Headers(init?.headers).get("authorization") !== "Bearer at_dispose") {
+            return new Response("forbidden", { status: 403 });
+          }
+          listingRequests++;
+          listingSignal = init?.signal ?? undefined;
+          firstListing();
+          // Hang until the request is aborted, like a stalled deployment.
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          });
+        }
+        return new Response(`unexpected url: ${url}`, { status: 500 });
+      });
+
+      const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+      const { flowId, authorizeUrl } = startResult.data;
+      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
+      const callbackUrl = new URL(new URL(authorizeUrl).searchParams.get("redirect_uri")!);
+      callbackUrl.searchParams.set("code", "auth_code_dispose");
+      callbackUrl.searchParams.set("state", flowId);
+      await originalFetch(callbackUrl);
+      expect((await waitPromise).success).toBe(true);
+
+      await listingStarted;
+      await service.dispose();
+      // dispose() waits for the interrupted discovery, which aborted its request.
+      expect(listingSignal?.aborted).toBe(true);
+      expect(listingRequests).toBe(1);
+    });
+
     /** Re-login fetch mock whose post-login discovery lists exactly one anthropic model. */
     function mockReLoginFetch(): void {
       mockFetch(async (input, init) => {
@@ -4098,6 +4161,34 @@ describe("CoderOauthService", () => {
       expect(result.success).toBe(false);
       if (!result.success) {
         expect(result.error).toContain("Login with Coder");
+      }
+    });
+
+    // #5659: the error names each provider whose model list keeps failing, with its status, so a
+    // user can tell a deployment problem from a Xum problem.
+    it("names the failing provider and its status when one model list keeps failing", async () => {
+      deps.providersConfig = {
+        coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
+      };
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(aiProvidersResponse());
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(new Response("bad gateway", { status: 502 }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "gpt-5" }] }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      const result = await service.refreshModels();
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toContain("anthropic (HTTP 502)");
+        expect(result.error).not.toContain("openai");
       }
     });
 

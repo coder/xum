@@ -11,7 +11,7 @@ test(
     await disableTutorials(app);
     // The app opens on the project's default creation form.
     await app.open();
-    const name = screen.getByRole("textbox", "workspace-name");
+    const name = screen.getByRole("textbox", "Workspace name");
     await expect(name).toBeVisible({ timeout: 15_000 });
 
     // Focusing the field turns auto-naming off, so the typed name is the one submitted.

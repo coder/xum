@@ -1,4 +1,4 @@
-import { expect, userEvent, within } from "@storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";

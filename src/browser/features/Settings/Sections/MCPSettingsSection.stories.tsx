@@ -7,13 +7,14 @@ import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
 import { useEffect, useRef } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
@@ -60,6 +61,7 @@ interface MCPSectionStoryOptions {
   secrets?: Secret[];
   preCacheTools?: boolean;
   experiments?: Partial<Record<ExperimentId, boolean>>;
+  mcpAppViewDomainsListError?: string;
 }
 
 function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): APIClient {
@@ -99,6 +101,7 @@ function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): API
     mcpTestResults,
     mcpOauthAuthStatus: options.mcpOauthAuthStatus,
     experiments: options.experiments,
+    mcpAppViewDomainsListError: options.mcpAppViewDomainsListError,
   });
 }
 
@@ -548,6 +551,59 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
   },
 };
 
+/**
+ * #6622: the server refused a tool call with 403 insufficient_scope. The tokens stay, and the row
+ * names the scopes and the next step. Phone width: long scope URLs wrap. Out of Pixel snapshots
+ * (snapshot budget); the play checks it.
+ */
+export const ProjectSettingsOAuthInsufficientScope: Story = {
+  decorators: withDesktopWindowApi,
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() =>
+        setupMCPSettingsSectionStory({
+          servers: {
+            "remote-oauth": {
+              transport: "http",
+              url: "https://example.com/mcp",
+              disabled: false,
+            },
+          },
+          mcpOauthAuthStatus: new Map<string, MCPOAuthAuthStatus>([
+            [
+              "https://example.com/mcp",
+              {
+                serverUrl: "https://example.com/mcp",
+                isLoggedIn: true,
+                hasRefreshToken: true,
+                updatedAtMs: Date.now() - 60_000,
+                insufficientScopes: ["https://www.googleapis.com/auth/drive.file", "files.write"],
+              },
+            ],
+          ]),
+        })
+      }
+    >
+      <div style={{ width: 375 }}>
+        <MCPSettingsSection />
+      </div>
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const body = within(canvasElement.ownerDocument.body);
+    await body.findByText(/Logged in/i);
+    const scopes = "https://www.googleapis.com/auth/drive.file files.write";
+    // By role, not by copy: the prompt is the status line that names the scopes.
+    const prompt = (await body.findAllByRole("status")).find((el) =>
+      el.textContent?.includes(scopes)
+    );
+    if (!prompt) throw new Error("The sign-in prompt must name the requested scopes");
+    await expect(prompt.textContent).toContain(scopes);
+    await expect(prompt.scrollWidth).toBeLessThanOrEqual(prompt.clientWidth + 1);
+  },
+};
+
 function setupDesignStory(
   enabled = true,
   reuseEnabled = false,
@@ -689,6 +745,32 @@ export const ClaudeDesignPhone: Story = {
     const card = within(context.canvasElement).getByRole("region", { name: "Claude Design" });
     await expect(card.getBoundingClientRect().width).toBeLessThanOrEqual(375);
     await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
+  },
+};
+
+// A failed load of the MCP App view-domain approvals shows its error with a Retry instead of an
+// empty list (#6181). Phone width: the error wraps and Retry stays on screen.
+export const ViewDomainsLoadErrorPhone: Story = {
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  // The test-runner ignores viewport globals; the wrapper enforces the width there too.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%" }}>
+      <MCPSettingsSectionStoryShell
+        setup={() =>
+          setupMCPSettingsSectionStory({ mcpAppViewDomainsListError: "The backend is busy" })
+        }
+      >
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const error = await canvas.findByText(/Could not load allowed view domains: The backend/);
+    const row = error.parentElement!;
+    await expect(within(row).getByRole("button", { name: "Retry" })).toBeVisible();
+    await expect(row.getBoundingClientRect().right).toBeLessThanOrEqual(375);
   },
 };
 

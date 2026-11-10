@@ -38,19 +38,7 @@ export function isProviderModelAccessibleFromAuthoritativeCatalog(
     if (!Array.isArray(discoveredModels)) {
       return true;
     }
-    if (discoveredModels.includes(modelId)) {
-      return true;
-    }
-    // Google catalogs list `models/<id>` while native selections and the
-    // gateway use the bare id; without this a loaded catalog would reject
-    // every mapped Gemini route.
-    const separatorIndex = modelId.indexOf("/");
-    if (
-      separatorIndex > 0 &&
-      discoveredModels.includes(
-        `${modelId.slice(0, separatorIndex)}/models/${modelId.slice(separatorIndex + 1)}`
-      )
-    ) {
+    if (coderCatalogListsModel(discoveredModels, modelId)) {
       return true;
     }
     // providers.jsonc is hand-editable JSON: a non-array `models` must not throw here.
@@ -203,5 +191,48 @@ export function resolveCoderRouteGatewayModelId(
     providersConfig?.coder,
     canonical.slice(0, colonIndex),
     canonical.slice(colonIndex + 1)
+  );
+}
+
+/**
+ * Whether a loaded Coder catalog lists the model: its exact id, a dated snapshot of it, or the
+ * Google `models/` form. Removals are checked by the caller, exactly.
+ */
+function coderCatalogListsModel(discoveredModels: string[], modelId: string): boolean {
+  if (discoveredModels.includes(modelId)) {
+    return true;
+  }
+  if (claudeSnapshotListed(discoveredModels, modelId)) {
+    return true;
+  }
+  // Google catalogs list `models/<id>` while native selections and the
+  // gateway use the bare id; without this a loaded catalog would reject
+  // every mapped Gemini route.
+  const separatorIndex = modelId.indexOf("/");
+  if (
+    separatorIndex > 0 &&
+    discoveredModels.includes(
+      `${modelId.slice(0, separatorIndex)}/models/${modelId.slice(separatorIndex + 1)}`
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Anthropic-type gateways list only dated Claude snapshots (`claude-haiku-4-5-20251001`) while
+ * built-in models send the undated id (#5660), which Anthropic serves as an alias. So a dated
+ * Claude entry satisfies its undated id. Other model families get no such alias: an
+ * OpenAI-compatible upstream need not serve an undated id it never listed. Tombstones stay exact,
+ * as for the Gemini alias: only the undated id's own removal (checked by the caller) hides it.
+ */
+function claudeSnapshotListed(discoveredModels: string[], modelId: string): boolean {
+  if (!modelId.slice(modelId.indexOf("/") + 1).startsWith("claude-")) return false;
+  return discoveredModels.some(
+    (id) =>
+      id.length === modelId.length + 9 &&
+      id.startsWith(`${modelId}-`) &&
+      /^\d{8}$/.test(id.slice(modelId.length + 1))
   );
 }

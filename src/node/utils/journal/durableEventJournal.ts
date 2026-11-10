@@ -14,7 +14,6 @@
 
 import assert from "node:assert";
 import crypto from "node:crypto";
-import * as fs from "fs/promises";
 import * as path from "path";
 import {
   DurableEventSchema,
@@ -24,7 +23,11 @@ import {
   type DurableEventDraft,
 } from "@/common/types/durableEvent";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import type { ProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { Journal } from "./journal";
 import { BlobStore } from "./blobStore";
 
@@ -52,16 +55,58 @@ const BLOB_LOCK_TIMEOUT_MS = 10_000;
  * blob-mention index are per-instance). Entries are tiny and live for the
  * process.
  */
-const sharedJournals = new Map<string, DurableEventJournal>();
+// One registry per pair of file and lock layers: the Node layers in production, so every writer of
+// a session dir shares one journal. A test graph on memory layers (5b PR 9) gets its own journal
+// on its own volume, and never the Node journal of the same path.
+const sharedJournals = new WeakMap<
+  SessionFiles,
+  WeakMap<SessionLocks, Map<string, DurableEventJournal>>
+>();
 
-export function sharedDurableEventJournal(sessionDir: string): DurableEventJournal {
+export function sharedDurableEventJournal(
+  sessionDir: string,
+  /** The session's file and lock layers (phase 5). Absent: the Node layers. */
+  layers: { files: SessionFiles; locks: SessionLocks } = {
+    files: nodeSessionFiles,
+    locks: nodeSessionLocks,
+  }
+): DurableEventJournal {
+  let byLocks = sharedJournals.get(layers.files);
+  if (!byLocks) {
+    byLocks = new WeakMap();
+    sharedJournals.set(layers.files, byLocks);
+  }
+  let byDir = byLocks.get(layers.locks);
+  if (!byDir) {
+    byDir = new Map();
+    byLocks.set(layers.locks, byDir);
+  }
   const key = path.resolve(sessionDir);
-  let journal = sharedJournals.get(key);
+  let journal = byDir.get(key);
   if (!journal) {
-    journal = new DurableEventJournal(sessionDir);
-    sharedJournals.set(key, journal);
+    journal = new DurableEventJournal(sessionDir, layers.locks, layers.files);
+    byDir.set(key, journal);
   }
   return journal;
+}
+
+/**
+ * Per-call write options. createSessionDir (default true) false: the write
+ * never creates the session directory, and a missing one fails it with
+ * ENOENT. Writers that can finish after workspace removal (a tool call the
+ * aborted turn left running, #7474) pass false, so a late row is dropped
+ * instead of recreating the deleted directory. Per call, not per instance:
+ * every writer of a session dir shares one journal (sharedDurableEventJournal).
+ */
+export interface DurableEventWriteOptions {
+  createSessionDir?: boolean;
+}
+
+/** The lower layers' (lock, Journal, BlobStore) parent is the session dir. */
+function createParentDirOption(options: DurableEventWriteOptions | undefined): {
+  createParentDir?: boolean;
+} {
+  return options?.createSessionDir === false ? { createParentDir: false } : {};
 }
 
 /**
@@ -141,11 +186,24 @@ export class DurableEventJournal {
    */
   private mentionEpoch = 0;
 
-  constructor(sessionDir: string) {
+  /**
+   * `locks` takes the blob lock and the journal's append lock (phase 4: SessionLocks). Callers with
+   * a history service pass its locks. The process-wide registry (sharedDurableEventJournal) passes
+   * the layers it was given, and replayVerifySession has none, so it keeps the Node default.
+   * `files` holds the journal and its blobs (phase 5: SessionFiles), with the same callers and
+   * defaults as `locks`.
+   */
+  constructor(
+    sessionDir: string,
+    private readonly locks: SessionLocks = nodeSessionLocks,
+    private readonly files: SessionFiles = nodeSessionFiles
+  ) {
     this.journalFilePath = path.join(sessionDir, DURABLE_EVENTS_FILE_NAME);
     this.blobLockPath = path.join(sessionDir, BLOB_LOCK_FILE_NAME);
     this.journal = new Journal<DurableEvent>({
       filePath: this.journalFilePath,
+      locks,
+      files,
       schema: DurableEventSchema,
       getSeq: (row) => row.seq,
       getId: (row) => row.id,
@@ -165,11 +223,14 @@ export class DurableEventJournal {
         }
       },
     });
-    this.blobs = new BlobStore(path.join(sessionDir, BLOBS_DIR_NAME));
+    this.blobs = new BlobStore(path.join(sessionDir, BLOBS_DIR_NAME), files);
   }
 
   /** Append a draft; the journal assigns v/seq/ts (and id unless provided). */
-  async append(draft: DurableEventDraft): Promise<DurableEvent> {
+  async append(
+    draft: DurableEventDraft,
+    options?: DurableEventWriteOptions
+  ): Promise<DurableEvent> {
     return await this.journal.append((seq) => {
       const built = {
         ...draft,
@@ -181,7 +242,7 @@ export class DurableEventJournal {
       // The spread of a distributive draft union does not re-narrow to the
       // discriminated union; the journal schema-validates the row on append.
       return built as DurableEvent;
-    });
+    }, createParentDirOption(options));
   }
 
   /** Read all events (self-healed: malformed/duplicate rows dropped, seq order). */
@@ -208,12 +269,13 @@ export class DurableEventJournal {
    * Lock order is blob → append (fn's appends take the append lock);
    * nothing acquires them in the opposite order, so no deadlock.
    */
-  async withBlobLock<T>(fn: () => Promise<T>): Promise<T> {
+  async withBlobLock<T>(fn: () => Promise<T>, options?: DurableEventWriteOptions): Promise<T> {
     await using _mutex = await this.blobLock.acquire();
-    await using fileLock = await acquireProcessFileLock({
+    await using fileLock = await this.locks.acquireProcessFileLock({
       lockPath: this.blobLockPath,
       timeoutMs: BLOB_LOCK_TIMEOUT_MS,
       label: "blob lock",
+      ...createParentDirOption(options),
     });
     this.activeBlobFileLock = fileLock;
     try {
@@ -264,18 +326,19 @@ export class DurableEventJournal {
   async publishWithBlob(
     content: string | Uint8Array,
     buildDraft: (ref: BlobRef, size: number) => DurableEventDraft,
-    options?: { precondition?: () => Promise<void> }
+    options?: { precondition?: () => Promise<void> } & DurableEventWriteOptions
   ): Promise<{ event: DurableEvent; ref: BlobRef; size: number }> {
+    const writeOptions = createParentDirOption(options);
     return await this.withBlobLock(async () => {
       await options?.precondition?.();
-      const { ref, size, created } = await this.blobs.put(content);
+      const { ref, size, created } = await this.blobs.put(content, writeOptions);
       try {
         // Ownership re-check between put and append (round 11 defense in
         // depth): if this holder was wrongfully displaced, a reclaimer may
         // have deleted the just-put blob — appending would then create a row
         // permanently referencing a missing payload. Abort instead.
         await this.assertBlobLockOwned();
-        const event = await this.append(buildDraft(ref, size));
+        const event = await this.append(buildDraft(ref, size), options);
         return { event, ref, size };
       } catch (error) {
         // A blob whose row never landed would leak forever: reclamation
@@ -298,7 +361,7 @@ export class DurableEventJournal {
         }
         throw error;
       }
-    });
+    }, options);
   }
 
   /**
@@ -348,7 +411,7 @@ export class DurableEventJournal {
   /** Journal file size in bytes; 0 when the file does not exist yet. */
   private async journalFileSize(): Promise<number> {
     try {
-      return (await fs.stat(this.journalFilePath)).size;
+      return (await this.files.promises.stat(this.journalFilePath)).size;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return 0;

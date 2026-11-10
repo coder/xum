@@ -2,14 +2,18 @@ import React from "react";
 
 import { cn } from "@/common/lib/utils";
 import { getArchivedWorkspacesExpandedKey } from "@/common/constants/storage";
-import { isWorktreeRuntime } from "@/common/types/runtime";
 import type {
   FrontendWorkspaceMetadata,
   WorkspaceRemovalDescendant,
 } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
-import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
+import { confirmAndRemoveWorkspace } from "@/browser/utils/confirmAndRemoveWorkspace";
+import {
+  useOptionalWorkspaceMetadata,
+  useWorkspaceContext,
+} from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
@@ -38,6 +42,14 @@ import {
 } from "@/common/utils/tokens/usageAggregator";
 import { useOptimisticBatchLRU } from "@/browser/hooks/useOptimisticBatchLRU";
 import { sessionCostCache } from "@/browser/utils/sessionCostCache";
+import {
+  expandHistorySelection,
+  getCheckoutOwnerIds,
+  getHistoryRowCost,
+  keepListedSelection,
+  partitionArchivedHistoryRows,
+  sumKnownCosts,
+} from "./archivedHistoryRows";
 
 type SessionUsageFile = z.infer<typeof SessionUsageFileSchema>;
 
@@ -59,15 +71,6 @@ interface BulkOperationState {
   errors: string[];
   /** What forced removals left behind (#5143); kept in the dialog so Done does not clear it. */
   warnings?: string[];
-}
-
-function canDeleteManagedWorktree(workspace: FrontendWorkspaceMetadata): boolean {
-  return (
-    isWorktreeRuntime(workspace.runtimeConfig) &&
-    workspace.transcriptOnly !== true &&
-    // isolation:none tasks reuse an ancestor checkout, so they do not own local worktree state.
-    workspace.taskIsolation !== "none"
-  );
 }
 
 /** Group workspaces by time period for timeline display */
@@ -333,6 +336,13 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const archivedRegionId = React.useId();
 
   const { unarchiveWorkspace, removeWorkspace, setSelectedWorkspace } = useWorkspaceContext();
+  const { confirm: confirmDialog } = useConfirmDialog();
+  // Sub-agents swept into the archive with their parent fold into its row (see the helper).
+  // Live (unarchived) metadata only tells which parents are still active.
+  const { rows: historyRows, foldedByRowId } = partitionArchivedHistoryRows(
+    workspaces,
+    useOptionalWorkspaceMetadata()?.workspaceMetadata
+  );
   const { api } = useAPI();
   const liveApi = useLiveAPI();
   const [searchQuery, setSearchQuery] = React.useState("");
@@ -352,7 +362,9 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const removeWarning = usePopoverError(null);
 
   // Bulk selection state
-  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  const [rawSelectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  // Act only on listed rows: a selected row can fold away when another window archives its parent.
+  const selectedIds = keepListedSelection(rawSelectedIds, historyRows);
   const [lastClickedId, setLastClickedId] = React.useState<string | null>(null);
   const [bulkOperation, setBulkOperation] = React.useState<BulkOperationState | null>(null);
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = React.useState(false);
@@ -400,44 +412,30 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   });
   const costsLoading = costsStatus === "idle" || costsStatus === "loading";
 
+  const getRowCost = (workspaceId: string) =>
+    getHistoryRowCost(workspaceId, foldedByRowId, costsByWorkspace);
+
   // Filter workspaces by search query (frontend-only)
   const filteredWorkspaces = searchQuery.trim()
-    ? workspaces.filter((ws) => {
+    ? historyRows.filter((ws) => {
         const query = searchQuery.toLowerCase();
         const title = (ws.title ?? ws.name).toLowerCase();
         const name = ws.name.toLowerCase();
         return title.includes(query) || name.includes(query);
       })
-    : workspaces;
+    : historyRows;
 
   const groupedWorkspaces = groupByTimePeriod(filteredWorkspaces);
   const flatWorkspaces = flattenGrouped(groupedWorkspaces);
 
   // Calculate total cost and per-period costs from cached/fetched values
-  let totalCost: number | undefined;
-  for (const ws of workspaces) {
-    const cost = costsByWorkspace[ws.id];
-    if (cost !== undefined) {
-      totalCost = (totalCost ?? 0) + cost;
-    }
-  }
-
-  const periodCosts = React.useMemo(() => {
-    const costs = new Map<string, number | undefined>();
-    for (const [period, periodWorkspaces] of groupedWorkspaces) {
-      let sum = 0;
-      let hasCost = false;
-      for (const ws of periodWorkspaces) {
-        const cost = costsByWorkspace[ws.id];
-        if (cost !== undefined) {
-          sum += cost;
-          hasCost = true;
-        }
-      }
-      costs.set(period, hasCost ? sum : undefined);
-    }
-    return costs;
-  }, [groupedWorkspaces, costsByWorkspace]);
+  const totalCost = sumKnownCosts(historyRows.map((ws) => getRowCost(ws.id)));
+  const periodCosts = new Map(
+    Array.from(groupedWorkspaces, ([period, periodWorkspaces]) => [
+      period,
+      sumKnownCosts(periodWorkspaces.map((ws) => getRowCost(ws.id))),
+    ])
+  );
 
   // Handle checkbox click with shift-click range selection
   const handleCheckboxClick = (workspaceId: string, event: React.MouseEvent) => {
@@ -538,10 +536,13 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     onWorkspacesChanged?.();
   };
 
+  // Deleting a row deletes the sub-agents folded into it.
+  const bulkDeleteIds = expandHistorySelection(selectedIds, foldedByRowId);
+
   // Bulk delete (always force: true) - requires confirmation
   const handleBulkDelete = async () => {
     setBulkDeleteConfirm(false);
-    const idsToDelete = sortWorkspaceIdsDeepestFirst(Array.from(selectedIds), workspaces);
+    const idsToDelete = sortWorkspaceIdsDeepestFirst(bulkDeleteIds, workspaces);
     setBulkOperation({
       type: "delete",
       total: idsToDelete.length,
@@ -556,7 +557,12 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       setBulkOperation((prev) => (prev ? { ...prev, current: ws?.title ?? ws?.name ?? id } : prev));
 
       try {
-        const result = await removeWorkspace(id, { force: true });
+        const result = await confirmAndRemoveWorkspace({
+          removeWorkspace,
+          confirm: confirmDialog,
+          workspaceId: id,
+          options: { force: true },
+        });
         if (result.success && result.warnings?.length) {
           const line = `${ws?.name ?? id}: ${formatWorkspaceRemoveWarnings(result.warnings)}`;
           setBulkOperation((prev) =>
@@ -626,15 +632,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     }
   };
 
-  const handleBulkDeleteWorktree = async () => {
+  const handleBulkDeleteWorktree = async (idsToDeleteWorktree: string[]) => {
     if (!liveApi) {
       return;
     }
 
-    const idsToDeleteWorktree = Array.from(selectedIds).filter((id) => {
-      const workspace = workspaces.find((candidate) => candidate.id === id);
-      return workspace ? canDeleteManagedWorktree(workspace) : false;
-    });
     if (idsToDeleteWorktree.length === 0) {
       return;
     }
@@ -740,47 +742,45 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const handleDelete = async (workspaceId: string, options?: { bypassForceConfirm?: boolean }) => {
     setProcessingIds((prev) => new Set(prev).add(workspaceId));
     try {
-      const result = await removeWorkspace(workspaceId);
-      if (result.success) {
-        onWorkspacesChanged?.();
-        return;
+      let result = await confirmAndRemoveWorkspace({
+        removeWorkspace,
+        confirm: confirmDialog,
+        workspaceId,
+      });
+      const initialError = result.error;
+
+      // Shift skips the force dialog, not the unknown-process acknowledgment.
+      // Do not retry after a cancelled acknowledgment or a changed process state.
+      // Shift still acknowledges the descendant scope that the backend reports.
+      if (!result.success && options?.bypassForceConfirm && !result.backgroundProcesses?.length) {
+        result = await confirmAndRemoveWorkspace({
+          removeWorkspace,
+          confirm: confirmDialog,
+          workspaceId,
+          options: {
+            force: true,
+            ...(result.descendants?.length
+              ? {
+                  acknowledgedDescendantIds: result.descendants.map(
+                    (descendant) => descendant.workspaceId
+                  ),
+                }
+              : {}),
+          },
+        });
       }
 
-      // Shift-click: skip every confirmation, auto-force immediately. Shift stands in for the
-      // descendant acknowledgment the modal would otherwise collect, so pass the scope the
-      // backend just reported. The backend still rejects the retry if any descendant is active
-      // or the scope changed, and that failure falls through to the modal below.
-      if (options?.bypassForceConfirm) {
-        const forced = await removeWorkspace(workspaceId, {
-          force: true,
-          ...(result.descendants?.length
-            ? {
-                acknowledgedDescendantIds: result.descendants.map(
-                  (descendant) => descendant.workspaceId
-                ),
-              }
-            : {}),
-        });
-        if (forced.success) {
-          if (forced.warnings?.length) {
-            removeWarning.showError(workspaceId, formatWorkspaceRemoveWarnings(forced.warnings));
-          }
-          onWorkspacesChanged?.();
-          return;
+      if (result.success) {
+        if (result.warnings?.length) {
+          removeWarning.showError(workspaceId, formatWorkspaceRemoveWarnings(result.warnings));
         }
-
-        // Force delete also failed — fall through to show modal with the error.
-        setForceDeleteModal({
-          workspaceId,
-          error: forced.error ?? result.error ?? "Failed to remove workspace",
-          descendants: forced.descendants,
-        });
+        onWorkspacesChanged?.();
         return;
       }
 
       setForceDeleteModal({
         workspaceId,
-        error: result.error ?? "Failed to remove workspace",
+        error: result.error ?? initialError ?? "Failed to remove workspace",
         descendants: result.descendants,
       });
     } finally {
@@ -793,9 +793,15 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   };
 
   const hasSelection = selectedIds.size > 0;
-  const hasBulkDeleteWorktreeSelection = workspaces.some(
-    (workspace) => selectedIds.has(workspace.id) && canDeleteManagedWorktree(workspace)
-  );
+  // Folded sub-agents keep their own checkouts (archive keeps worktrees by default), so removing a
+  // row's checkout covers theirs too.
+  const bulkCheckoutIds = getCheckoutOwnerIds(bulkDeleteIds, workspaces);
+  const hasBulkDeleteWorktreeSelection = bulkCheckoutIds.length > 0;
+  // A row alone keeps the inline flow; with folded checkouts it uses the progress dialog.
+  const handleRowDeleteWorktree = (rowId: string, checkoutIds: string[], anchorEl: HTMLElement) =>
+    checkoutIds.length === 1 && checkoutIds[0] === rowId
+      ? handleDeleteWorktree(rowId, anchorEl)
+      : handleBulkDeleteWorktree(checkoutIds);
   const allFilteredSelected =
     filteredWorkspaces.length > 0 && filteredWorkspaces.every((w) => selectedIds.has(w.id));
 
@@ -811,9 +817,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
           descendants={forceDeleteModal.descendants}
           onClose={() => setForceDeleteModal(null)}
           onForceDelete={async (workspaceId, acknowledgedDescendantIds) => {
-            const result = await removeWorkspace(workspaceId, {
-              force: true,
-              acknowledgedDescendantIds,
+            const result = await confirmAndRemoveWorkspace({
+              removeWorkspace,
+              confirm: confirmDialog,
+              workspaceId,
+              options: { force: true, acknowledgedDescendantIds },
             });
             if (result.success) {
               // The dialog showed the non-forced error; the forced retry can leave more behind.
@@ -868,7 +876,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
           <ArchiveIcon className="text-muted h-4 w-4" />
           <span className="text-foreground font-medium">
             Archived Workspaces
-            {isExpanded && loadedWorkspaces !== undefined && ` (${loadedWorkspaces.length})`}
+            {isExpanded && loadedWorkspaces !== undefined && ` (${historyRows.length})`}
           </span>
           {isExpanded && <CostBadge cost={totalCost} loading={costsLoading} size="lg" />}
           <span className="flex-1" />
@@ -884,7 +892,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                     onClick={() => void handleBulkDelete()}
                     className="rounded bg-red-600 px-2 py-0.5 text-xs text-white hover:bg-red-700"
                   >
-                    Yes, delete {selectedIds.size}
+                    Yes, delete {bulkDeleteIds.length}
                   </button>
                   <button
                     onClick={() => setBulkDeleteConfirm(false)}
@@ -911,7 +919,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <button
-                          onClick={() => void handleBulkDeleteWorktree()}
+                          onClick={() => void handleBulkDeleteWorktree(bulkCheckoutIds)}
                           className="text-muted rounded p-1 transition-colors hover:bg-white/10 hover:text-orange-300"
                           aria-label="Remove local checkouts for selected"
                         >
@@ -961,7 +969,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
             )}
 
             {/* Search input with select all */}
-            {workspaces.length > 1 && (
+            {historyRows.length > 1 && (
               <div className="border-border flex items-center gap-2 border-b px-4 py-2">
                 <input
                   type="checkbox"
@@ -970,7 +978,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                   className="h-4 w-4 rounded border-gray-600 bg-transparent"
                   aria-label="Select all"
                 />
-                {workspaces.length > 3 && (
+                {historyRows.length > 3 && (
                   <div className="relative flex-1">
                     <Search className="text-muted pointer-events-none absolute top-1/2 left-2 h-4 w-4 -translate-y-1/2" />
                     <input
@@ -1014,7 +1022,10 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                             ? workspace.name
                             : undefined;
                         const displayTitle = workspace.title ?? workspace.name;
-                        const canDeleteWorktree = canDeleteManagedWorktree(workspace);
+                        const rowCheckoutIds = getCheckoutOwnerIds(
+                          expandHistorySelection([workspace.id], foldedByRowId),
+                          workspaces
+                        );
                         const isDeletingWorktree = deleteWorktreeIds.has(workspace.id);
 
                         return (
@@ -1056,7 +1067,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                                   </span>
                                 )}
                                 <CostBadge
-                                  cost={costsByWorkspace[workspace.id]}
+                                  cost={getRowCost(workspace.id)}
                                   loading={costsLoading}
                                   size="sm"
                                 />
@@ -1078,12 +1089,16 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
                                 </TooltipTrigger>
                                 <TooltipContent>Restore to sidebar</TooltipContent>
                               </Tooltip>
-                              {canDeleteWorktree && (
+                              {rowCheckoutIds.length > 0 && (
                                 <Tooltip>
                                   <TooltipTrigger asChild>
                                     <button
                                       onClick={(event) =>
-                                        void handleDeleteWorktree(workspace.id, event.currentTarget)
+                                        void handleRowDeleteWorktree(
+                                          workspace.id,
+                                          rowCheckoutIds,
+                                          event.currentTarget
+                                        )
                                       }
                                       disabled={isProcessing}
                                       className="text-muted rounded p-1.5 transition-colors hover:bg-white/10 hover:text-orange-300 disabled:opacity-50"

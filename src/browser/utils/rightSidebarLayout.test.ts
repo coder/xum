@@ -12,6 +12,7 @@ import {
   getTabRevealedByClose,
   collectAllTabsWithTabset,
   dockTabToEdge,
+  findTopRightTabsetId,
   getDefaultRightSidebarLayoutState,
   moveTabToTabset,
   openToolFromNewTab,
@@ -19,7 +20,6 @@ import {
   removeTabEverywhere,
   reorderTabInTabset,
   selectOrAddTab,
-  selectTabInFocusedTabset,
   splitFocusedTabset,
   type RightSidebarLayoutNode,
   type RightSidebarLayoutState,
@@ -95,8 +95,8 @@ test("removing the last tab leaves the New tab", () => {
   expect(rootTabset(next)).toMatchObject({ tabs: ["new"], activeTab: "new" });
 });
 
-test("selectTabInFocusedTabset adds missing tool and makes it active", () => {
-  const s = selectTabInFocusedTabset(single(["costs"]), "terminal");
+test("addTabToFocusedTabset adds a missing tab and makes it active by default", () => {
+  const s = addTabToFocusedTabset(single(["costs"]), "terminal");
   expect(rootTabset(s)).toMatchObject({
     tabs: ["costs", "terminal"],
     activeTab: "terminal",
@@ -256,6 +256,28 @@ test("splitting a multi-tab pane moves the active tab into the new pane", () => 
   );
   expect(left.tabs).toEqual(["costs"]);
   expect(right.tabs).toEqual(["review"]);
+});
+
+test("the top-right pane is a stack's top pane and a row's right pane", () => {
+  expect(findTopRightTabsetId(tabset("only", ["costs"]))).toBe("only");
+  // A row of two panes whose right side is a stack of two.
+  const root: RightSidebarLayoutNode = {
+    type: "split",
+    id: "row",
+    direction: "vertical",
+    sizes: [50, 50],
+    children: [
+      tabset("left", ["costs"]),
+      {
+        type: "split",
+        id: "stack",
+        direction: "horizontal",
+        sizes: [50, 50],
+        children: [tabset("top-right", ["review"]), tabset("bottom-right", ["output"])],
+      },
+    ],
+  };
+  expect(findTopRightTabsetId(root)).toBe("top-right");
 });
 
 test("moveTabToTabset moves tab between tabsets", () => {

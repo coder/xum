@@ -103,6 +103,10 @@ artifacts/
 tests/e2e/tmp/
 # e2e bug-bash output (reports, videos, unredacted app logs)
 tests/bugbash/.e2e/
+tests/stories/.e2e/
+# The story replay-cache seed (tests/bugbash/sandbox/cacheSeed.ts): ignored, so no `git add -A`
+# commits recorded cache entries.
+tests/stories/.e2e-cache-seed/
 
 # Test temporary directories
 src/test-temp-*/
@@ -114,6 +118,8 @@ runs/
 __pycache__
 # ruff format (fmt.mk) drops its cache at the repo root
 .ruff_cache/
+# uv run installs pyproject.toml's dependency groups here
+/.venv/
 
 tmpfork
 .mux-agent-cli
@@ -135,6 +141,7 @@ docs/theme/pagetoc.css
 *.generated.ts
 !src/node/services/workflows/builtInWorkflowActionContent.generated.ts
 !src/node/services/workflows/workflowRuntimeSources.generated.ts
+!src/common/staticWorkspaceView/phoneChrome.generated.ts
 docs/theme/pagetoc.js
 .xum/mcp.jsonc
 .mux/mcp.jsonc
@@ -157,3 +164,6 @@ ds-bundle/
 
 # CRAP score snapshots (make crap)
 .metrics/
+
+# Written from bun.lock at pack time (scripts/generate-npm-shrinkwrap.ts)
+/npm-shrinkwrap.json

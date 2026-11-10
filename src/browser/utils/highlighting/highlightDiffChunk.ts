@@ -1,5 +1,5 @@
 import { highlightCode, isHighlightStartFailure } from "./highlightWorkerClient";
-import { isLightThemeMode } from "./shiki-shared";
+import { escapeHtml, isLightThemeMode } from "./shiki-shared";
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import type { DiffChunk } from "./diffChunking";
 
@@ -50,19 +50,6 @@ export interface HighlightedChunk {
   type: DiffChunk["type"];
   lines: HighlightedLine[];
   usedFallback: boolean; // True if highlighting failed
-}
-
-/**
- * Highlight a chunk of code using Shiki.
- * Falls back to plain text on error, except a worker start timeout, which rejects.
- */
-export async function highlightDiffChunk(
-  chunk: DiffChunk,
-  language: string,
-  themeMode: ThemeMode = "dark"
-): Promise<HighlightedChunk> {
-  const [highlighted] = await highlightDiffChunks([chunk], language, themeMode);
-  return highlighted ?? createFallbackChunk(chunk);
 }
 
 interface DiffLineRef {
@@ -307,16 +294,4 @@ function extractLinesFromHtml(html: string): string[] {
       return chunk.substring(contentStart, closeIndex);
     })
     .filter((line) => line !== null); // Remove malformed lines
-}
-
-/**
- * Escape HTML entities for plain text fallback
- */
-export function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
 }

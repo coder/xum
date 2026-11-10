@@ -104,6 +104,8 @@ function createService(overrides: Partial<PerfReportServiceOptions> = {}) {
     captures: { listCaptures: () => Promise.resolve({ captures }) },
     isExperimentEnabled: (id) => id === EXPERIMENT_IDS.PERF_FLIGHT_RECORDER && experimentOn,
     createId: () => `20261003T000000000Z-${++nextId}`,
+    // Tests run from src/, but a checkout path could hold a "dist" folder.
+    appRoot: null,
     ...overrides,
   });
 }
@@ -132,6 +134,55 @@ async function listFiles(dir: string): Promise<string[]> {
 
 async function readJson(file: string): Promise<unknown> {
   return JSON.parse(await fs.readFile(file, "utf8"));
+}
+
+/** A snapshot with one long animation frame that ran `scripts`: [sourceURL, invoker, type]. */
+function loafSnapshot(scripts: Array<[string, string, string]>): FlightRecorderSnapshot {
+  const base = { sourceFunctionName: "f", sourceCharPosition: 0, durationMs: 60 };
+  const toScript = ([sourceURL, invoker, invokerType]: string[]) => ({
+    ...base,
+    forcedStyleAndLayoutDurationMs: 0,
+    sourceURL,
+    invoker,
+    invokerType,
+  });
+  const frame = { rendererId: "r1", startMs: 1000, durationMs: 120, renderStartMs: 0 };
+  const loaf = { ...frame, blockingDurationMs: 70, styleAndLayoutStartMs: 0 };
+  const renderer = { events: [], droppedLoaf: 0, droppedEvents: 0 };
+  return snapshot({
+    renderer: { ...renderer, loaf: [{ ...loaf, scripts: scripts.map(toScript) }] },
+  });
+}
+
+/** Reports a profile naming `urls` and `recorded`; returns the copied URLs and LoAF scripts. */
+async function reportUrls(
+  urls: string[],
+  recorded: FlightRecorderSnapshot,
+  overrides: Partial<PerfReportServiceOptions> = {}
+) {
+  await writeProfile(
+    "c-urls",
+    JSON.stringify({ nodes: urls.map((url) => ({ callFrame: { url } })) })
+  );
+  captures.unshift(captureMetadata("c-urls", 2000));
+  const report = await createService({
+    recorder: {
+      getSnapshot: () => recorded,
+      getStatus: () => ({ enabled: true, state: "collecting" }),
+    },
+    ...overrides,
+  }).createReport();
+  const copy = (await readJson(path.join(report.dir, "captures/c-urls.cpuprofile"))) as {
+    nodes: Array<{ callFrame: { url: string } }>;
+  };
+  const written = (await readJson(
+    path.join(report.dir, "snapshot.json")
+  )) as FlightRecorderSnapshot;
+  return {
+    dir: report.dir,
+    urls: copy.nodes.map((node) => node.callFrame.url),
+    scripts: written.renderer.loaf[0]?.scripts.map((script) => [script.sourceURL, script.invoker]),
+  };
 }
 
 describe("PerfReportService", () => {
@@ -343,16 +394,15 @@ describe("PerfReportService", () => {
       expect(content).not.toContain(JSON.stringify(userHome).slice(1, -1));
       expect(content).not.toContain(pathToFileURL(userHome).pathname);
     }
-    // Everything but the home directory survives, and the copy is still valid JSON.
+    // The copy is still valid JSON, and the script URL keeps its file name only.
     const profileCopy = (await readJson(path.join(report.dir, "captures/c-ok.cpuprofile"))) as {
       nodes: Array<{ callFrame: { url: string } }>;
     };
-    expect(profileCopy.nodes[0]?.callFrame.url).toEndWith("/src/xum/dist/main.js");
-    expect(profileCopy.nodes[0]?.callFrame.url).toContain("~");
+    expect(profileCopy.nodes[0]?.callFrame.url).toBe("file://~/<dir>/main.js");
     const written = (await readJson(
       path.join(report.dir, "snapshot.json")
     )) as FlightRecorderSnapshot;
-    expect(written.renderer.loaf[0]?.scripts[0]?.sourceURL).toBe("file://~/src/xum/dist/main.js");
+    expect(written.renderer.loaf[0]?.scripts[0]?.sourceURL).toBe("file://~/<dir>/main.js");
   });
 
   test("writes only the home directory itself as ~, not folders that share its prefix", async () => {
@@ -420,6 +470,75 @@ describe("PerfReportService", () => {
     // The prefix is copied unchanged: the url value's opening quote sits at MiB - 2.
     expect(copyText.indexOf('"url":"') + '"url":'.length).toBe(MiB - 2);
     expect(copyText).not.toContain(SECRET_QUERY);
+  });
+
+  test("leaves script paths outside the home folder as they are", async () => {
+    // Only paths below the home folder can name the user's folders; rewriting others would
+    // cost attribution for nothing. An app installed outside the home folder keeps its paths.
+    const outside = ["file:///opt/xum/dist/a.js", "/opt/xum/node_modules/zod/b.js", "node:fs"];
+    const label = `click at ${outside[0]}:1:2`;
+    const out = await reportUrls(
+      outside,
+      loafSnapshot([
+        [outside[0], outside[0], "classic-script"],
+        [outside[1], label, "event-listener"],
+      ]),
+      { appRoot: "/opt/xum" }
+    );
+    expect(out.urls).toEqual(outside);
+    expect(out.scripts).toEqual([
+      [outside[0], outside[0]],
+      [outside[1], label],
+    ]);
+  });
+
+  test("names no folder below the home folder in script paths", async () => {
+    // Project, checkout and branch names are folder names; a shared bundle must not show
+    // them (#7125). The app root is a dev checkout named after its branch.
+    const userHome = os.homedir();
+    const secret = "secret-dir-3b7e";
+    const appRoot = path.join(userHome, ".xum", "src", "xum", secret);
+    const nodeModule = path.join(userHome, secret, "node_modules", "zod", "v4", "a.js");
+    const cases: Array<[string, string]> = [
+      [pathToFileURL(path.join(appRoot, "dist", "app-1a.js")).href, "file://<xum>/dist/app-1a.js"],
+      [path.join(appRoot, "dist", "node", "x.js"), "<xum>/dist/node/x.js"],
+      [pathToFileURL(nodeModule).href, "file://~/<dir>/node_modules/zod/v4/a.js"],
+      [pathToFileURL(path.join(userHome, `${secret} 2`, "p.js")).href, "file://~/<dir>/p.js"],
+      [path.join(userHome, secret, "tool.js"), "~/<dir>/tool.js"],
+    ];
+    // A failed capture's reason quotes the error, which can name a path.
+    const failed = captureMetadata("c-failed", 1000, false);
+    captures = [{ ...failed, skippedReason: `failed: open ${path.join(userHome, "x")}` }];
+    const out = await reportUrls(
+      cases.map(([url]) => url),
+      loafSnapshot([[cases[0][0], `click at ${cases[2][0]}:1:2`, "event-listener"]]),
+      { appRoot }
+    );
+    expect(out.urls).toEqual(cases.map(([, expected]) => expected));
+    expect(out.scripts).toEqual([[cases[0][1], `click at ${cases[2][1]}:1:2`]]);
+    for (const file of await listFiles(out.dir)) {
+      const content = await fs.readFile(file, "utf8");
+      expect(content).not.toContain(JSON.stringify(userHome).slice(1, -1));
+      expect(content).not.toContain(secret);
+    }
+  });
+
+  test("skips a profile whose size no longer matches its metadata", async () => {
+    await writeProfile("c-grown", '{"nodes":[],"samples":[1,2,3]}');
+    await writeProfile("c-intact", "{}");
+    captures = [
+      { ...captureMetadata("c-grown", 2000), profileBytes: 2 },
+      { ...captureMetadata("c-intact", 1000), profileBytes: 2 },
+    ];
+    const report = await createService().createReport();
+
+    const manifest = (await readJson(path.join(report.dir, "captures/manifest.json"))) as {
+      included: Array<{ id: string }>;
+      skipped: Array<{ id: string; reason: string }>;
+    };
+    expect(manifest.included.map((capture) => capture.id)).toEqual(["c-intact"]);
+    expect(manifest.skipped).toMatchObject([{ id: "c-grown", reason: "size-mismatch" }]);
+    await expect(fs.stat(path.join(report.dir, "captures/c-grown.cpuprofile"))).rejects.toThrow();
   });
 
   test("copies long numeric runs but skips a profile it cannot cut safely", async () => {

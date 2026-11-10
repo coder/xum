@@ -63,7 +63,7 @@ describe("UserPreferencesSchema", () => {
           projectDefaults: {
             "/repo": {
               agentId: " Exec ",
-              model: "mux-gateway:openai",
+              model: "openai:",
               thinkingLevel: "xhigh",
             },
           },
@@ -105,7 +105,7 @@ describe("UserPreferencesSchema", () => {
         ai: {
           globalDefaults: { agentId: " Plan ", thinkingLevel: "med" },
           projectDefaults: {
-            "/a": { agentId: "exec", model: "mux-gateway:openai" },
+            "/a": { agentId: "exec", model: "openai:" },
             "/b": { model: " openai:gpt-4.1 ", thinkingLevel: "med" },
           },
         },
@@ -131,6 +131,26 @@ describe("UserPreferencesSchema", () => {
       workspaceCreation: { byProject: { "/a": { trunkBranch: "main" } } },
       review: { defaultBaseByProject: { "/a": "origin/main" } },
     });
+  });
+
+  test("keeps a valid dream cost ceiling and reads an invalid one as no ceiling", () => {
+    expect(normalizeUserPreferences({ memory: { dreamCostCeilingUsd: 2.5 } })).toEqual({
+      memory: { dreamCostCeilingUsd: 2.5 },
+    });
+    expect(normalizeUserPreferences({ memory: { dreamCostCeilingUsd: 100_000 } })).toEqual({
+      memory: { dreamCostCeilingUsd: 100_000 },
+    });
+    // A hand-edited value below the smallest ceiling (or not a number) must not stop every
+    // run, and must not take other preferences down with it.
+    // Nor may one past the largest ceiling: `String()` would show a huge one in exponent notation.
+    for (const stored of [0, -1, 0.001, 100_000.01, 1e21, "5", null]) {
+      expect(
+        normalizeUserPreferences({
+          memory: { dreamCostCeilingUsd: stored },
+          appearance: { vimEnabled: true },
+        })
+      ).toEqual({ appearance: { vimEnabled: true } });
+    }
   });
 
   test("prunes empty nested preference groups", () => {

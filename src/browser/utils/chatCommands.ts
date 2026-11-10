@@ -18,11 +18,15 @@ import type {
 } from "@/common/orpc/types";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import {
+  type AgentSkillReference,
+  type MCPPromptReference,
   type MuxMessageMetadata,
   type CompactionRequestData,
   type CompactionFollowUpRequest,
   type CompactionFollowUpInput,
   pickPreservedSendOptions,
+  withAgentSkillRefs,
+  withMcpPromptRefs,
 } from "@/common/types/message";
 import type { GoalRecordV1, GoalSetError, GoalStatus } from "@/common/types/goal";
 import type { ReviewNoteData } from "@/common/types/review";
@@ -117,10 +121,8 @@ import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { DEFAULT_ROUTE_PRIORITY, resolveRoute } from "@/common/routing";
 import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
 import {
-  applyFastModeToggle,
   getFastModeProvider,
-  isFastModeActive,
-  isUltrafastModeActive,
+  resolveChatServiceTier,
   setWorkspaceServiceTier,
   toggleServiceTier,
   ultrafastModeAvailable,
@@ -245,8 +247,22 @@ export type CommandResult =
       backgroundTask?: () => Promise<CommandAction[]>;
     };
 
+/** `$skill` and MCP prompt references the composer resolved from the typed input. */
+export interface SlashCommandInlineRefs {
+  agentSkillRefs: AgentSkillReference[];
+  mcpPromptRefs: MCPPromptReference[];
+}
+
+/** For command runs without typed text to reference (/clear confirmation, creation /goal). */
+export const NO_INLINE_REFS: SlashCommandInlineRefs = { agentSkillRefs: [], mcpPromptRefs: [] };
+
 export interface SlashCommandEnv {
   api: RouterClient<AppRouter> | null;
+  /**
+   * Required so that every command that sends the typed text later or elsewhere (/compact
+   * follow-up, /new, /fork) gets the references; without them the model sees a bare `$skill`.
+   */
+  inlineRefs: SlashCommandInlineRefs;
   /** Composer's AI scope, which may be the owning project rather than a sub-project path. */
   aiScopeId?: string;
   workspaceId?: string;
@@ -273,6 +289,16 @@ export interface SlashCommandEnv {
 interface WorkspaceCommandEnv extends SlashCommandEnv {
   api: RouterClient<AppRouter>;
   workspaceId: string;
+}
+
+function inlineRefsMetadata(refs: SlashCommandInlineRefs): MuxMessageMetadata | undefined {
+  return withMcpPromptRefs(withAgentSkillRefs(undefined, refs.agentSkillRefs), refs.mcpPromptRefs);
+}
+
+/** Send options for a command's start message, carrying the references typed with it. */
+function startMessageSendOptions(env: SlashCommandEnv): SendMessageOptions {
+  const muxMetadata = inlineRefsMetadata(env.inlineRefs);
+  return muxMetadata ? { ...env.sendMessageOptions, muxMetadata } : env.sendMessageOptions;
 }
 
 function complete(
@@ -836,40 +862,26 @@ export async function processSlashCommand(
           );
         }
         const targetTier = parsed.mode === "fast" ? "priority" : "ultrafast";
-        let enabled: boolean;
-        if (provider === "openai") {
-          if (!scopeId) throw new Error("Workspace ID required");
-          // Async capability loading must not apply an old command to a newly selected agent.
-          if (
-            (env.variant === "workspace" && env.isCurrent?.() === false) ||
-            getWorkspaceAgentId(scopeId) !== selectedAgent ||
-            getWorkspaceAiSelection(scopeId).model !== selectedModel
-          ) {
-            return complete("restore-if-empty");
-          }
-          // Share the picker/shortcut's pending choice and next-step nudge, not a
-          // provider-wide write. Read after awaits so an intervening pick is respected.
-          const currentTier =
-            getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier;
-          const tier = toggleServiceTier(currentTier, targetTier);
-          setWorkspaceServiceTier(client, scopeId, tier);
-          enabled = tier === targetTier;
-        } else {
-          const patch = await applyFastModeToggle(
-            client.providers,
-            provider,
-            providersConfig[provider],
-            targetTier
-          );
-          if (!patch) throw new Error(`Failed to toggle ${label} mode`);
-          store.updateOptimistically(provider, patch);
-          if (store.getConfig() == null) await store.refresh();
-          const updatedConfig = { ...providersConfig[provider], ...patch };
-          enabled =
-            parsed.mode === "fast"
-              ? isFastModeActive(provider, updatedConfig)
-              : isUltrafastModeActive(updatedConfig);
+        if (!scopeId) throw new Error("Workspace ID required");
+        // Async capability loading must not apply an old command to a newly selected agent.
+        if (
+          (env.variant === "workspace" && env.isCurrent?.() === false) ||
+          getWorkspaceAgentId(scopeId) !== selectedAgent ||
+          getWorkspaceAiSelection(scopeId).model !== selectedModel
+        ) {
+          return complete("restore-if-empty");
         }
+        // Speed belongs to the chat for every provider, like its reasoning level: share the
+        // picker/shortcut's pending choice and next-step nudge, not a provider-wide write.
+        // Read after awaits so an intervening pick is respected.
+        const currentTier = resolveChatServiceTier(
+          provider,
+          getWorkspaceAiSelection(scopeId).serviceTier,
+          providersConfig
+        );
+        const tier = toggleServiceTier(currentTier, targetTier);
+        setWorkspaceServiceTier(client, scopeId, tier);
+        const enabled = tier === targetTier;
         return complete("consume", [
           showToast({
             id: Date.now().toString(),
@@ -1457,7 +1469,7 @@ function handleForkCommand(
         client: env.api,
         sourceWorkspaceId: env.workspaceId,
         startMessage: parsed.startMessage,
-        sendMessageOptions: env.sendMessageOptions,
+        sendMessageOptions: startMessageSendOptions(env),
       });
       if (!result.success) {
         const message = result.error ?? "Failed to fork workspace";
@@ -1578,7 +1590,7 @@ export interface CreateWorkspaceOptions {
   projectPath: string;
   /**
    * Workspace branch name. When omitted, the backend auto-generates one
-   * (e.g., "workspace-1", "workspace-2") so /new can mirror /fork's
+   * (e.g., "calm-otters-sing") so /new can mirror /fork's
    * seamless creation flow.
    */
   workspaceName?: string;
@@ -1865,7 +1877,7 @@ function handleNewCommand(
         client: env.api,
         projectPath: workspaceInfo.projectPath,
         startMessage,
-        sendMessageOptions: env.sendMessageOptions,
+        sendMessageOptions: startMessageSendOptions(env),
         pendingAutoTitle: Boolean(startMessage),
       });
       if (!result.success) {
@@ -1934,6 +1946,10 @@ function handleCompactCommand(
             text: appendStagedAttachmentNotice(parsed.continueMessage ?? "", stagedAttachments),
             fileParts: env.fileParts,
             reviews: env.reviews,
+            // The references ride the follow-up, not the compaction request: a /compact turn
+            // persists its own skill snapshots, which would land before the boundary and be
+            // summarized away.
+            muxMetadata: inlineRefsMetadata(env.inlineRefs),
           }
         : undefined;
       const result = await executeCompaction({

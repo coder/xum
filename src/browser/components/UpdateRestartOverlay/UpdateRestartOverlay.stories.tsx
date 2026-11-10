@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, within } from "@storybook/test";
+import { expect, within } from "storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
 import { lightweightMeta } from "@/browser/stories/meta";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";

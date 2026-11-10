@@ -5,7 +5,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * Handler convention (Effect migration, phases 1-4): new unary procedures
  * should ride `handlerGen` from `@orpc/experimental-effect` and yield a
  * wire-shaped Effect exposed by the backing service (see `memory.*`,
- * `providers.*` mutations, and `muxGateway*` for the house pattern). Plain
+ * `providers.*` mutations, and `codexOauth.*` for the house pattern). Plain
  * async handlers remain appropriate only when:
  * - the backing service is still Promise-based (convert the service surface
  *   first; do not wrap Promises in Effect at the router),
@@ -16,7 +16,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * handlerGen makes handlers interruptible on client abort: before converting
  * a mutation, audit its abort-atomicity and keep multi-step writes
  * uninterruptible in the service pipeline (see asAtomicMutation in
- * providerService.ts and startDesktopFlowEffect in muxGatewayOauthService.ts).
+ * providerService.ts and startDesktopFlowEffect in codexOauthService.ts).
  */
 import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
@@ -28,9 +28,11 @@ import {
   getWorkspaceMcpOverrides,
   getWorkspacePluginComposition,
   listWorkspaceMcpPrompts,
+  warmWorkspaceMcpServers,
   listWorkspacePluginSlashCommands,
   setWorkspaceMcpOverrides,
 } from "@/node/services/agentPlugins/workspacePluginOperations";
+import { skillsCliCommandResult } from "@/node/services/agentPlugins/skillsCli";
 import { handlerGen } from "@orpc/experimental-effect";
 import { Effect } from "effect";
 import {
@@ -57,15 +59,13 @@ import {
   getMcpAppView,
   getMcpAppViewRecords,
   readMcpAppServerResource,
+  setMcpAppWidgetState,
   updateMcpAppModelContext,
   approveMcpAppViewDomains,
   listMcpAppViewDomains,
+  readMcpAppViewDomains,
   revokeMcpAppViewDomains,
 } from "@/node/services/mcpAppsOperations";
-import {
-  listArtifactVersions,
-  readArtifactVersion,
-} from "@/node/services/artifactVersionsOperations";
 import {
   listPinnedFiles,
   pinFile,
@@ -123,9 +123,7 @@ import {
 import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
-import { AutoModelRouterTag } from "@/node/services/di/tags";
-
-import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
+import { AutoModelRouterTag, Heartbeat } from "@/node/services/di/tags";
 
 import {
   createAuthMiddleware,
@@ -139,6 +137,7 @@ import { clearLogsForApi, getLogFilePath } from "@/node/services/log";
 import {
   attachTerminal,
   subscribeConfigChanges,
+  subscribeMcpAppEntrypointChanges,
   subscribeDevTools,
   subscribeReviewState,
   subscribeDrafts,
@@ -148,6 +147,7 @@ import {
   subscribeMetadata,
   subscribeOpenSettings,
   subscribeDesignExperiment,
+  subscribeMcpInsufficientScope,
   subscribePerfFlightRecorderStatus,
   subscribeComputerUseStatus,
   subscribeProviderConfig,
@@ -163,7 +163,6 @@ import {
 } from "./routerSubscriptions";
 
 import { checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
-import { DEFAULT_LAYOUT_PRESETS_CONFIG } from "@/common/types/uiLayouts";
 
 import { getAgentSkill, listAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import {
@@ -189,12 +188,15 @@ import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
 import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import type { SendAcceptance } from "@/node/services/draftService";
+import { CreationDraftRejectedError } from "@/node/services/creationDraftService";
 import {
   boundMCPSettingsError,
+  mcpSettingsSnapshotForIpc,
   MCP_SETTINGS_READ_TIMEOUT_MS,
-  type MCPSettingsSnapshot,
+  type MCPSettingsReadSnapshot,
 } from "@/common/utils/mcpSettings";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
+import { readWorkspaceViewTail } from "@/node/services/workspaceViewTail";
 
 /**
  * Transports mask plain errors as "Internal Server Error". The draft size refusal must reach the
@@ -205,6 +207,14 @@ function rethrowDraftTooLarge(error: unknown): never {
     throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
   }
   throw error;
+}
+
+/** A refused creation draft save needs corrected choices or a reload, never a retry. */
+function rethrowCreationDraftRefusal(error: unknown): never {
+  if (error instanceof CreationDraftRejectedError) {
+    throw new ORPCError("BAD_REQUEST", { message: error.message });
+  }
+  return rethrowDraftTooLarge(error);
 }
 
 /**
@@ -238,8 +248,11 @@ async function runMcpSettingsRoute<T>(
 }
 
 type McpSettingsReadResult =
-  | { success: true; data: MCPSettingsSnapshot | { notConnected: true } | null }
+  | { success: true; data: MCPSettingsReadSnapshot | { notConnected: true } | null }
   | { success: false; error: string };
+
+const forIpc = (snapshot: MCPSettingsReadSnapshot | null) =>
+  snapshot === null ? null : mcpSettingsSnapshotForIpc(snapshot);
 
 /**
  * `mcp.settings.read` for several servers in one call (concurrently). With `ifConnected`, a
@@ -255,11 +268,17 @@ async function readMcpSettingsRoute(
 ): Promise<Record<string, McpSettingsReadResult>> {
   const manager = context.mcpServerManager;
   // Per server: a hung server times out with its own error and does not hold back the others.
-  const timeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
+  const readTimeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
   const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
+    // A dialog reopened during a save must not show the values from before the save. The read
+    // gets the time the wait left, so the two share one deadline.
+    const timeoutMs = await manager.settingsSavesSettled(input.workspaceId, serverName, {
+      signal,
+      timeoutMs: readTimeoutMs,
+    });
     if (input.ifConnected !== true)
-      return runMcpSettingsRoute(context, input.workspaceId, signal, () =>
-        manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs })
+      return runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
+        forIpc(await manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs }))
       );
     if (!manager.isWorkspaceServerConnected(input.workspaceId, serverName))
       return { success: true, data: { notConnected: true } };
@@ -269,7 +288,7 @@ async function readMcpSettingsRoute(
         timeoutMs,
         noStart: true,
       });
-      return { success: true, data };
+      return { success: true, data: forIpc(data) };
     } catch (error) {
       return { success: false, error: boundMCPSettingsError(getErrorMessage(error)) };
     }
@@ -360,7 +379,7 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) => context.tokenizerService.calculateWorkspaceStats(input)),
     },
     // Config-backed procedures ride handlerGen. Interruption posture (also applies to
-    // the `config` and `uiLayouts` namespaces below): reads are single Effect.sync
+    // the `config` namespace below): reads are single Effect.sync
     // steps (interruption is a don't-care); mutations wrap the whole pre-Effect
     // handler body in one atomicPromise thunk, so a client abort never interrupts the
     // in-flight Semaphore(1)-serialized config edit, multi-step bodies (mutate + notify)
@@ -464,18 +483,6 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () =>
               context.config.updateAgentAiDefaults(input.agentAiDefaults)
             );
-          })
-        ),
-
-      updateMuxGatewayPrefs: t
-        .input(schemas.config.updateMuxGatewayPrefs.input)
-        .output(schemas.config.updateMuxGatewayPrefs.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            yield* atomicPromise(async () => {
-              await context.config.updateMuxGatewayPrefs(input);
-              context.providerService.notifyConfigChanged();
-            });
           })
         ),
       updateRoutePreferences: t
@@ -816,43 +823,36 @@ export const router = (authToken?: string) => {
         .input(schemas.drafts.resolveSends.input)
         .output(schemas.drafts.resolveSends.output)
         .handler(({ context, input }) => resolveDraftSends(context, input)),
-      getList: t
-        .input(schemas.drafts.getList.input)
-        .output(schemas.drafts.getList.output)
-        .handler(({ context }) => context.draftService.getList({ strict: true })),
-      putListEntry: t
-        .input(schemas.drafts.putListEntry.input)
-        .output(schemas.drafts.putListEntry.output)
-        .handler(({ context, input }) => context.draftService.putListEntry(input)),
-      importLegacyList: t
-        .input(schemas.drafts.importLegacyList.input)
-        .output(schemas.drafts.importLegacyList.output)
-        .handler(({ context, input }) => context.draftService.importLegacyList(input.entries)),
+      listCreation: t
+        .input(schemas.drafts.listCreation.input)
+        .output(schemas.drafts.listCreation.output)
+        .handler(({ context }) => context.draftService.creation.list()),
+      getCreation: t
+        .input(schemas.drafts.getCreation.input)
+        .output(schemas.drafts.getCreation.output)
+        .handler(({ context, input }) => context.draftService.creation.get(input.scope.draftId)),
+      updateCreation: t
+        .input(schemas.drafts.updateCreation.input)
+        .output(schemas.drafts.updateCreation.output)
+        .handler(({ context, input }) =>
+          context.draftService.creation.update(input).catch(rethrowCreationDraftRefusal)
+        ),
+      deleteCreation: t
+        .input(schemas.drafts.deleteCreation.input)
+        .output(schemas.drafts.deleteCreation.output)
+        .handler(({ context, input }) =>
+          context.draftService.creation.delete(input.scope.draftId, input.ifStored)
+        ),
+      importLegacyCreation: t
+        .input(schemas.drafts.importLegacyCreation.input)
+        .output(schemas.drafts.importLegacyCreation.output)
+        .handler(({ context, input }) =>
+          context.draftService.creation.importLegacy(input).catch(rethrowCreationDraftRefusal)
+        ),
       subscribe: t
         .input(schemas.drafts.subscribe.input)
         .output(schemas.drafts.subscribe.output)
         .handler(({ context, signal }) => subscribeDrafts(context, signal)),
-    },
-    uiLayouts: {
-      getAll: t
-        .input(schemas.uiLayouts.getAll.input)
-        .output(schemas.uiLayouts.getAll.output)
-        .handler(
-          handlerGen(function* ({ context }) {
-            return yield* Effect.sync(() => {
-              const config = context.config.loadConfigOrDefault();
-              return config.layoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
-            });
-          })
-        ),
-      saveAll: t
-        .input(schemas.uiLayouts.saveAll.input)
-        .output(schemas.uiLayouts.saveAll.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            yield* atomicPromise(async () => context.config.saveLayoutPresets(input.layoutPresets));
-          })
-        ),
     },
     agents: {
       list: t
@@ -997,52 +997,13 @@ export const router = (authToken?: string) => {
         .output(schemas.providers.onConfigChanged.output)
         .handler(({ context, signal }) => subscribeProviderConfig(context, signal)),
     },
-    muxGateway: {
-      getAccountStatus: t
-        .input(schemas.muxGateway.getAccountStatus.input)
-        .output(schemas.muxGateway.getAccountStatus.output)
-        .handler(
-          handlerGen(function* ({ context }) {
-            return yield* context.muxGatewayOauthService.getAccountStatusEffect();
-          })
-        ),
-    },
-
-    // OAuth procedures (gateway/copilot/codex) run Effect generators
+    // OAuth procedures (copilot/codex) run Effect generators
     // via handlerGen; the wire contracts are unchanged. Flow-starting
     // mutations are uninterruptible in the services (see the respective
     // startDesktopFlowEffect/startDeviceFlowEffect), so a client abort cannot
     // leak a loopback server or strand a flow record; waits are interruptible
     // (abandoning a wait leaves the flow's own lifecycle intact) and cancels
     // run guaranteed-finalizer cleanup.
-    muxGatewayOauth: {
-      startDesktopFlow: t
-        .input(schemas.muxGatewayOauth.startDesktopFlow.input)
-        .output(schemas.muxGatewayOauth.startDesktopFlow.output)
-        .handler(
-          handlerGen(function* ({ context }) {
-            return yield* context.muxGatewayOauthService.startDesktopFlowEffect();
-          })
-        ),
-      waitForDesktopFlow: t
-        .input(schemas.muxGatewayOauth.waitForDesktopFlow.input)
-        .output(schemas.muxGatewayOauth.waitForDesktopFlow.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            return yield* context.muxGatewayOauthService.waitForDesktopFlowEffect(input.flowId, {
-              timeoutMs: input.timeoutMs,
-            });
-          })
-        ),
-      cancelDesktopFlow: t
-        .input(schemas.muxGatewayOauth.cancelDesktopFlow.input)
-        .output(schemas.muxGatewayOauth.cancelDesktopFlow.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            yield* context.muxGatewayOauthService.cancelDesktopFlowEffect(input.flowId);
-          })
-        ),
-    },
     copilotOauth: {
       startDeviceFlow: t
         .input(schemas.copilotOauth.startDeviceFlow.input)
@@ -1229,7 +1190,11 @@ export const router = (authToken?: string) => {
         .input(schemas.general.recordEditorOpen.input)
         .output(schemas.general.recordEditorOpen.output)
         .handler(async ({ context, input }) =>
-          context.workspaceService.recordExternalEditorOpen(input.workspaceId, input.launchToken)
+          context.workspaceService.recordExternalEditorOpen(
+            input.workspaceId,
+            input.launchToken,
+            input.remotePath
+          )
         ),
       rollbackEditorOpen: t
         .input(schemas.general.rollbackEditorOpen.input)
@@ -1302,22 +1267,45 @@ export const router = (authToken?: string) => {
           .input(schemas.mcp.settings.update.input)
           .output(schemas.mcp.settings.update.output)
           .handler(({ context, input, signal }) =>
-            // Validate against a fresh read: the renderer's schema can be stale.
-            runMcpSettingsRoute(context, input.workspaceId, signal, async () => {
-              const snapshot = await context.mcpServerManager.readSettings(
+            runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
+              mcpSettingsSnapshotForIpc(
+                await context.mcpServerManager.saveSettings(
+                  input.workspaceId,
+                  input.serverName,
+                  input.set,
+                  input.instanceToken,
+                  { signal }
+                )
+              )
+            )
+          ),
+        runTool: t
+          .input(schemas.mcp.settings.runTool.input)
+          .output(schemas.mcp.settings.runTool.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+              context.mcpServerManager.runSettingsTool(
                 input.workspaceId,
                 input.serverName,
-                { signal }
-              );
-              if (snapshot === null)
-                throw new Error(`MCP server '${input.serverName}' has no settings`);
-              return context.mcpServerManager.updateSettings(
+                input.toolName,
+                { instanceToken: input.instanceToken, readId: input.readId },
+                { confirmed: input.confirmed, signal }
+              )
+            )
+          ),
+        openApp: t
+          .input(schemas.mcp.settings.openApp.input)
+          .output(schemas.mcp.settings.openApp.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+              context.mcpServerManager.openSettingsApp(
                 input.workspaceId,
                 input.serverName,
-                input.set,
-                snapshot
-              );
-            })
+                input.toolName,
+                { instanceToken: input.instanceToken, readId: input.readId },
+                { confirmed: input.confirmed, signal }
+              )
+            )
           ),
       },
       designStatus: t
@@ -1384,6 +1372,10 @@ export const router = (authToken?: string) => {
             subpath: input.subpath ?? undefined,
           })
         ),
+      skillsCliCommand: t
+        .input(schemas.agentPlugins.skillsCliCommand.input)
+        .output(schemas.agentPlugins.skillsCliCommand.output)
+        .handler(({ input }) => skillsCliCommandResult(input)),
       install: t
         .input(schemas.agentPlugins.install.input)
         .output(schemas.agentPlugins.install.output)
@@ -1414,6 +1406,18 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.agentPluginInstallService.setComponentsResult(input)
         ),
+      listForSettings: t
+        .input(schemas.agentPlugins.listForSettings.input)
+        .output(schemas.agentPlugins.listForSettings.output)
+        .handler(({ context }) => context.agentPluginInstallService.listForSettings()),
+      pendingSignOuts: t
+        .input(schemas.agentPlugins.pendingSignOuts.input)
+        .output(schemas.agentPlugins.pendingSignOuts.output)
+        .handler(({ context }) => context.agentPluginInstallService.pendingSignOutStatus()),
+      signOutPluginServers: t
+        .input(schemas.agentPlugins.signOutPluginServers.input)
+        .output(schemas.agentPlugins.signOutPluginServers.output)
+        .handler(({ context }) => context.agentPluginInstallService.signOutPluginServersResult()),
       containerLocation: t
         .input(schemas.agentPlugins.containerLocation.input)
         .output(schemas.agentPlugins.containerLocation.output)
@@ -1441,8 +1445,24 @@ export const router = (authToken?: string) => {
             consent: input.consent ?? undefined,
           })
         ),
+      previewComponentReview: t
+        .input(schemas.agentPlugins.previewComponentReview.input)
+        .output(schemas.agentPlugins.previewComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.previewComponentReviewResult(input)
+        ),
+      confirmComponentReview: t
+        .input(schemas.agentPlugins.confirmComponentReview.input)
+        .output(schemas.agentPlugins.confirmComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.confirmComponentReviewResult(input)
+        ),
     },
     mcpOauth: {
+      onInsufficientScope: t
+        .input(schemas.mcpOauth.onInsufficientScope.input)
+        .output(schemas.mcpOauth.onInsufficientScope.output)
+        .handler(({ context, signal }) => subscribeMcpInsufficientScope(context, signal)),
       startDesktopFlow: t
         .input(schemas.mcpOauth.startDesktopFlow.input)
         .output(schemas.mcpOauth.startDesktopFlow.output)
@@ -1554,6 +1574,12 @@ export const router = (authToken?: string) => {
         .output(schemas.projects.setColor.output)
         .handler(({ context, input }) =>
           context.projectService.setColor(input.projectPath, input.color)
+        ),
+      setIcon: t
+        .input(schemas.projects.setIcon.input)
+        .output(schemas.projects.setIcon.output)
+        .handler(({ context, input }) =>
+          context.projectService.setIcon(input.projectPath, input.icon)
         ),
       setCustomInstructions: t
         .input(schemas.projects.setCustomInstructions.input)
@@ -1700,16 +1726,7 @@ export const router = (authToken?: string) => {
       generate: t
         .input(schemas.nameGeneration.generate.input)
         .output(schemas.nameGeneration.generate.output)
-        .handler(async ({ context, input }) => {
-          // Pre-creation naming has no workspace yet: the configured naming
-          // agent (model + thinking) still leads; the caller's models only fill
-          // in after the built-in fallbacks.
-          const candidates = await context.workspaceService.getWorkspaceNamingCandidates(
-            undefined,
-            input.candidates
-          );
-          return generateWorkspaceIdentity(input.message, candidates, context.aiService);
-        }),
+        .handler(({ context, input }) => context.workspaceService.generateDraftIdentity(input)),
     },
     coder: {
       getInfo: t
@@ -1744,14 +1761,6 @@ export const router = (authToken?: string) => {
         .input(schemas.artifacts.capabilities.input)
         .output(schemas.artifacts.capabilities.output)
         .handler(({ context, input }) => getArtifactsCapabilities(context, input)),
-      listVersions: t
-        .input(schemas.artifacts.listVersions.input)
-        .output(schemas.artifacts.listVersions.output)
-        .handler(({ context, input }) => listArtifactVersions(context, input)),
-      readVersion: t
-        .input(schemas.artifacts.readVersion.input)
-        .output(schemas.artifacts.readVersion.output)
-        .handler(({ context, input }) => readArtifactVersion(context, input)),
       listPinned: t
         .input(schemas.artifacts.listPinned.input)
         .output(schemas.artifacts.listPinned.output)
@@ -1822,6 +1831,10 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.updateModelContext.input)
         .output(schemas.mcpApps.updateModelContext.output)
         .handler(({ context, input }) => updateMcpAppModelContext(context, input)),
+      setWidgetState: t
+        .input(schemas.mcpApps.setWidgetState.input)
+        .output(schemas.mcpApps.setWidgetState.output)
+        .handler(({ context, input }) => setMcpAppWidgetState(context, input)),
       approveViewDomains: t
         .input(schemas.mcpApps.approveViewDomains.input)
         .output(schemas.mcpApps.approveViewDomains.output)
@@ -1830,6 +1843,10 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.listViewDomains.input)
         .output(schemas.mcpApps.listViewDomains.output)
         .handler(({ context }) => listMcpAppViewDomains(context)),
+      readViewDomains: t
+        .input(schemas.mcpApps.readViewDomains.input)
+        .output(schemas.mcpApps.readViewDomains.output)
+        .handler(({ context }) => readMcpAppViewDomains(context)),
       revokeViewDomains: t
         .input(schemas.mcpApps.revokeViewDomains.input)
         .output(schemas.mcpApps.revokeViewDomains.output)
@@ -1839,15 +1856,21 @@ export const router = (authToken?: string) => {
         .output(schemas.mcpApps.listEntrypoints.output)
         .handler(({ context, input, signal }) =>
           listMcpAppEntrypoints(context, input.workspaceId, signal, (workspaceId, warmSignal) =>
-            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+            warmWorkspaceMcpServers(context, workspaceId, warmSignal)
           )
+        ),
+      onEntrypointsChanged: t
+        .input(schemas.mcpApps.onEntrypointsChanged.input)
+        .output(schemas.mcpApps.onEntrypointsChanged.output)
+        .handler(({ context, input, signal }) =>
+          subscribeMcpAppEntrypointChanges(context, input.workspaceId, signal)
         ),
       openEntrypoint: t
         .input(schemas.mcpApps.openEntrypoint.input)
         .output(schemas.mcpApps.openEntrypoint.output)
         .handler(({ context, input, signal }) =>
           openMcpAppEntrypoint(context, input, signal, (workspaceId, warmSignal) =>
-            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+            warmWorkspaceMcpServers(context, workspaceId, warmSignal)
           )
         ),
     },
@@ -2004,6 +2027,15 @@ export const router = (authToken?: string) => {
           .input(schemas.workspace.heartbeat.set.input)
           .output(schemas.workspace.heartbeat.set.output)
           .handler(({ context, input }) => setWorkspaceHeartbeat(context, input)),
+        next: t
+          .input(schemas.workspace.heartbeat.next.input)
+          .output(schemas.workspace.heartbeat.next.output)
+          .handler(
+            handlerGen(function* (_options, input) {
+              const heartbeat = yield* Heartbeat;
+              return heartbeat.getMsUntilNextHeartbeat(input.workspaceId);
+            })
+          ),
       },
       goalDefaults: {
         // Per-workspace override of the global `goalDefaults` block.
@@ -2109,7 +2141,7 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.preflightArchive.input)
         .output(schemas.workspace.preflightArchive.output)
         .handler(async ({ context, input }) =>
-          context.workspaceService.preflightArchive(input.workspaceId)
+          context.workspaceService.preflightArchiveWithSubagents(input.workspaceId)
         ),
       archive: t
         .input(schemas.workspace.archive.input)
@@ -2117,7 +2149,8 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.archive(
             input.workspaceId,
-            input.acknowledgedUntrackedPaths ?? undefined
+            input.acknowledgedUntrackedPaths ?? undefined,
+            { acknowledgedSubagentUntrackedPaths: input.acknowledgedSubagentUntrackedPaths }
           )
         ),
       unarchive: t
@@ -2205,6 +2238,12 @@ export const router = (authToken?: string) => {
         .output(schemas.workspace.setUnrelatedWorkspaceConsent.output)
         .handler(({ context, input }) =>
           context.workspaceService.setUnrelatedWorkspaceConsent(input.workspaceId, input.enabled)
+        ),
+      setMessagingTag: t
+        .input(schemas.workspace.setMessagingTag.input)
+        .output(schemas.workspace.setMessagingTag.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.setMessagingTag(input.workspaceId, input.tag)
         ),
       setAgentMessageDispatchMode: t
         .input(schemas.workspace.setAgentMessageDispatchMode.input)
@@ -2400,6 +2439,11 @@ export const router = (authToken?: string) => {
               windowed: input.windowed === true,
             })
           ),
+        // The static first view's read: bounded and cheap, no replay (see workspaceViewTail.ts).
+        tail: t
+          .input(schemas.workspace.history.tail.input)
+          .output(schemas.workspace.history.tail.output)
+          .handler(({ context, input }) => readWorkspaceViewTail(context, input.workspaceId)),
         lastUserPrompt: t
           .input(schemas.workspace.history.lastUserPrompt.input)
           .output(schemas.workspace.history.lastUserPrompt.output)
@@ -2518,6 +2562,12 @@ export const router = (authToken?: string) => {
         .output(schemas.workspace.getSessionUsage.output)
         .handler(async ({ context, input }) =>
           context.sessionUsageService.getSessionUsage(input.workspaceId)
+        ),
+      getSubagentUsage: t
+        .input(schemas.workspace.getSubagentUsage.input)
+        .output(schemas.workspace.getSubagentUsage.output)
+        .handler(async ({ context, input }) =>
+          context.sessionUsageService.getOpenSubagentUsage(input.workspaceId)
         ),
       getSessionUsageBatch: t
         .input(schemas.workspace.getSessionUsageBatch.input)
@@ -2891,6 +2941,26 @@ export const router = (authToken?: string) => {
         .input(schemas.perf.pushRendererFlightRecorderBatch.input)
         .output(schemas.perf.pushRendererFlightRecorderBatch.output)
         .handler(({ context, input }) => context.perfFlightRecorder.ingestRendererBatch(input)),
+    },
+    agentResourceLimits: {
+      get: t
+        .input(schemas.agentResourceLimits.get.input)
+        .output(schemas.agentResourceLimits.get.output)
+        .handler(({ context }) => context.agentResourceLimits.get()),
+      set: t
+        .input(schemas.agentResourceLimits.set.input)
+        .output(schemas.agentResourceLimits.set.output)
+        .handler(({ context, input }) => context.agentResourceLimits.set(input)),
+      setProject: t
+        .input(schemas.agentResourceLimits.setProject.input)
+        .output(schemas.agentResourceLimits.setProject.output)
+        .handler(({ context, input }) =>
+          context.agentResourceLimits.setProject(input.projectPath, input.limits)
+        ),
+      setEnabled: t
+        .input(schemas.agentResourceLimits.setEnabled.input)
+        .output(schemas.agentResourceLimits.setEnabled.output)
+        .handler(({ context, input }) => context.agentResourceLimits.setEnabled(input.enabled)),
     },
     perfCaptures: {
       list: t

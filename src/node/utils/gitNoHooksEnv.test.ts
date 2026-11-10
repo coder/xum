@@ -101,6 +101,8 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(env.OPENAI_API_KEY).toBe("");
     expect(env.AWS_SECRET_ACCESS_KEY).toBe("");
     expect(env.AWS_BEARER_TOKEN_BEDROCK).toBe("");
+    // Google ADC service account key file path (Vertex AI).
+    expect(env.GOOGLE_APPLICATION_CREDENTIALS).toBe("");
     expect(env.XUM_RUN_SESSION_ROOT).toBe("");
     expect(env.MUX_RUN_SESSION_ROOT).toBe("");
   });

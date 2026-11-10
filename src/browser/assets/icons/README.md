@@ -11,7 +11,13 @@ This directory contains SVG icons for AI providers displayed in the UI.
 | `google.svg`    | Google (Gemini) | [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Google_Gemini_icon_2025.svg) |
 | `xai.svg`       | xAI             | [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:XAI_Logo.svg)                |
 | `aws.svg`       | Amazon Bedrock  | [AWS Architecture Icons](https://aws.amazon.com/architecture/icons/)                     |
-| `xum.svg`       | Xum Gateway     | Internal                                                                                 |
+| `omlx.svg`      | oMLX            | [jundot/omlx](https://github.com/jundot/omlx) menu bar glyph (Apache-2.0)                |
+| `lmstudio.svg`  | LM Studio       | [Lobe Icons](https://github.com/lobehub/lobe-icons) (MIT)                                |
+| `vllm.svg`      | vLLM            | [Lobe Icons](https://github.com/lobehub/lobe-icons) (MIT)                                |
+| `llamacpp.svg`  | llama.cpp       | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) media icon, one color (MIT)  |
+
+Local runtimes have no provider key: `ProviderIcon` matches a custom provider to one by its id,
+display name and base URL.
 
 ## Adding a new icon
 
@@ -19,12 +25,12 @@ This directory contains SVG icons for AI providers displayed in the UI.
 2. **Optimize the SVG** - remove unnecessary metadata, comments, and attributes
 3. **Ensure single color** - icons should use `fill="currentColor"` or a class like `.st0` that can be styled via CSS
 4. **Name the file** `{provider}.svg` matching the provider key in `src/common/constants/providers.ts`
-5. **Register in ProviderIcon** - add to `PROVIDER_ICONS` map in `src/browser/components/ProviderIcon.tsx`:
+5. **Register in ProviderIcon** - add to `PROVIDER_ICONS` map in `src/browser/components/ProviderIcon/ProviderIcon.tsx`:
 
 ```tsx
 import NewProviderIcon from "@/browser/assets/icons/newprovider.svg?react";
 
-const PROVIDER_ICONS: Partial<Record<ProviderName | "mux-gateway", React.FC>> = {
+const PROVIDER_ICONS: Partial<Record<ProviderName, React.FC>> = {
   // ...existing icons
   newprovider: NewProviderIcon,
 };

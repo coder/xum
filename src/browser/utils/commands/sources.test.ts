@@ -28,7 +28,20 @@ import {
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { MCP_APP_ENTRYPOINT_NOT_CONNECTED } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { CommandIds } from "@/browser/utils/commandIds";
+import { QuotaLimitedStorage } from "../../../../tests/ui/quotaLimitedStorage";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
+import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
+
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getRightSidebarCollapsedKey, getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { focusInstructionsTab } from "@/browser/utils/instructionsTabFocus";
+import { readRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
+import {
+  getDefaultRightSidebarLayoutState,
+  getFocusedActiveTab,
+  selectOrAddTab,
+} from "@/browser/utils/rightSidebarLayout";
 
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const userProjects = new Map<string, ProjectConfig>();
@@ -379,6 +392,27 @@ test("reset context and history truncation refuse while the transcript is not ca
   );
 });
 
+// #6627: the palette runs actions without a catch, so a lost connection must still show an
+// error instead of closing the palette with no word on the sign-out.
+test("plugin sign-out command reports a transport failure", async () => {
+  await withTestWindow(async () => {
+    const api = createMockORPCClient({});
+    api.agentPlugins.pendingSignOuts = () =>
+      Promise.resolve({ kind: "pending", servers: ["https://x/mcp"] });
+    api.agentPlugins.signOutPluginServers = () => Promise.reject(new Error("connection lost"));
+    const events = collectCommandEvents();
+    try {
+      const action = getActions({ api, onOpenSettings: mock() }).find(
+        (a) => a.id === CommandIds.pluginsSignOutServers()
+      );
+      await action!.run();
+      expect(events.receivedToasts).toEqual([{ type: "error", message: "connection lost" }]);
+    } finally {
+      events.dispose();
+    }
+  });
+});
+
 test("reset context command dispatches composer and toast outcomes", async () => {
   await withTestWindow(async () => {
     const cases = [
@@ -442,6 +476,32 @@ test("buildCoreSources includes create/switch workspace actions", () => {
   expect(titles.includes("Right Sidebar: Focus Terminal")).toBe(true);
   expect(titles.includes("New Terminal Window")).toBe(true);
   expect(titles.includes("Open Terminal Window for Workspace…")).toBe(true);
+});
+
+// #6856: on a Windows server, paths use "\\". The titles name the last segment, not the path.
+test("project and workspace commands name Windows server paths by their last segment", async () => {
+  const projectPath = "C:\\Users\\u\\repo";
+  const namedWorkspacePath = "C:\\Users\\u\\.xum\\src\\repo\\feat-x";
+  const userProjects = new Map<string, ProjectConfig>([
+    [projectPath, { workspaces: [{ path: namedWorkspacePath }] }],
+  ]);
+  const confirmTitles: string[] = [];
+  const actions = getActions({
+    userProjects,
+    selectedWorkspace: { projectPath, projectName: "repo", namedWorkspacePath, workspaceId: "w1" },
+    confirmDialog: (options: ConfirmDialogOptions) => {
+      confirmTitles.push(options.title);
+      return Promise.resolve(false);
+    },
+  });
+  expect(actions.find((a) => a.id === CommandIds.projectRemove(projectPath))?.title).toBe(
+    "Remove Project repo…"
+  );
+  expect(actions.find((a) => a.id === CommandIds.workspaceRemove())?.subtitle).toBe("repo/feat-x");
+  await actions
+    .find((a) => a.id === CommandIds.workspaceArchiveMergedInProject())
+    ?.prompt?.onSubmit({ projectPath });
+  expect(confirmTitles).toEqual(["Archive merged workspaces in repo?"]);
 });
 
 test("appearance commands offer auto when a manual theme is selected", () => {
@@ -1844,7 +1904,7 @@ test("toggle hide sub-agents command flips the persisted sidebar setting", () =>
   }
 });
 
-test.each(["coder", "mux-gateway", "direct"])(
+test.each(["coder", "openrouter", "direct"])(
   "Pro palette uses the effective %s route instead of stale settings routing",
   async (route) =>
     withTestWindow(() => {
@@ -1868,7 +1928,7 @@ test.each(["coder", "mux-gateway", "direct"])(
         getEffectiveRouteForModel: resolveEffectiveRoute,
       });
       expect(actions.some((action) => action.id === "thinking:toggle-pro-reasoning")).toBe(
-        route !== "mux-gateway"
+        route !== "openrouter"
       );
       expect(resolveEffectiveRoute).toHaveBeenCalled();
     })
@@ -2126,6 +2186,16 @@ describe("Focus Background Processes palette action (#5197)", () => {
       }
     });
   });
+});
+
+test("the status page / chat switch needs the Agent interface view and hides without a status page", () => {
+  const find = (agentInterfaceViewEnabled: boolean) =>
+    getActions({ agentInterfaceViewEnabled }).find(
+      (action) => action.id === "nav:toggle-agent-interface-view"
+    );
+  expect(find(false)).toBeUndefined();
+  // No status page has been listed for the workspace, so there is nothing to switch to.
+  expect(find(true)?.visible?.()).toBe(false);
 });
 
 test("artifact palette commands follow the experiment and pin the typed path", async () => {
@@ -2397,8 +2467,166 @@ describe("Right Sidebar: New Tab palette action", () => {
   });
 });
 
+describe("explicit sidebar navigation from a collapsed chat", () => {
+  test.each([null, true])("Instructions opens with collapse preference %s", async (collapsed) => {
+    await withTestWindow(() => {
+      updatePersistedState(getRightSidebarCollapsedKey("w1"), collapsed);
+      focusInstructionsTab("w1");
+      expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
+      expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe("instructions");
+    });
+  });
+
+  // The sidebar moves focus there (tests/ui/layout/rightSidebar.test.ts).
+  test("Add Tool and the splits ask the sidebar to focus the tab they showed", async () => {
+    await withTestWindow(async () => {
+      const requests: unknown[] = [];
+      const record = (event: Event) => requests.push((event as CustomEvent).detail);
+      window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      try {
+        const actions = getActions();
+        const find = (id: string) => actions.find((entry) => entry.id === id)!;
+        await find(CommandIds.navRightSidebarSplitVertical()).run();
+        // The split's new pane holds a New tab, which Add Tool then replaces with the tool.
+        const newPane = readRightSidebarLayout("w1").focusedTabsetId;
+        await find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool: "review" });
+        expect(requests).toEqual([
+          { workspaceId: "w1", tabsetId: newPane, tab: "new" },
+          { workspaceId: "w1", tabsetId: newPane, tab: "review" },
+        ]);
+      } finally {
+        window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      }
+    });
+  });
+
+  // A refused layout write (localStorage full, or setItem throwing) changes nothing on screen, so
+  // a focus request would move focus to the tab the focused pane showed before. A request that
+  // the old layout already shows still gets focus.
+  test("a refused layout write sends a focus request only when the screen already shows it", async () => {
+    await withTestWindow(async () => {
+      const layoutKey = getRightSidebarLayoutKey("w1");
+      // Every layout write throws, like setItem when storage is blocked (SecurityError).
+      class LayoutRefusingStorage extends QuotaLimitedStorage {
+        override setItem(key: string, value: string): void {
+          if (key === layoutKey)
+            throw new DOMException("The operation is insecure.", "SecurityError");
+          super.setItem(key, value);
+        }
+      }
+      const storage = new LayoutRefusingStorage(Number.POSITIVE_INFINITY);
+      // A terminal session to focus, behind the Stats tab.
+      const before = selectOrAddTab(
+        getDefaultRightSidebarLayoutState("terminal:session-1"),
+        "costs"
+      );
+      storage.seed(layoutKey, JSON.stringify(before));
+      Object.defineProperty(window, "localStorage", { configurable: true, value: storage });
+
+      const requests: unknown[] = [];
+      const record = (event: Event) => requests.push((event as CustomEvent).detail);
+      window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const actions = getActions();
+        const find = (id: string) => actions.find((entry) => entry.id === id)!;
+        const addTool = (tool: string) =>
+          find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool });
+        await find(CommandIds.navRightSidebarSplitVertical()).run();
+        await addTool("review");
+        await find(CommandIds.navRightSidebarFocusTerminal()).run();
+        // Nothing was stored, and none of these three would have shown its target.
+        expect(readRightSidebarLayout("w1")).toEqual(before);
+        expect(requests).toEqual([]);
+
+        // Stats is already the focused pane's tab: the request still gets focus there.
+        await addTool("costs");
+        expect(requests).toEqual([
+          { workspaceId: "w1", tabsetId: before.focusedTabsetId, tab: "costs" },
+        ]);
+      } finally {
+        consoleError.mockRestore();
+        window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      }
+    });
+  });
+
+  test.each([null, true])("Add Tool opens with collapse preference %s", async (collapsed) => {
+    await withTestWindow(async () => {
+      updatePersistedState(getRightSidebarCollapsedKey("w1"), collapsed);
+      const action = getActions().find((entry) => entry.id === CommandIds.navRightSidebarAddTool());
+      await action!.prompt!.onSubmit({ tool: "review" });
+      expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
+      const layout = readRightSidebarLayout("w1");
+      expect(layout.root).toMatchObject({ tabs: ["review"], activeTab: "review" });
+    });
+  });
+
+  test.each(["horizontal", "vertical"] as const)(
+    "splitting %s reveals the panes",
+    async (direction) => {
+      await withTestWindow(async () => {
+        const id =
+          direction === "horizontal"
+            ? CommandIds.navRightSidebarSplitHorizontal()
+            : CommandIds.navRightSidebarSplitVertical();
+        await getActions()
+          .find((entry) => entry.id === id)!
+          .run();
+        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
+        expect(readRightSidebarLayout("w1").root).toMatchObject({ type: "split", direction });
+      });
+    }
+  );
+
+  test.each(["focus", "add"])(
+    "%s terminal reveals an existing session, but does not create one",
+    async (actionType) => {
+      await withTestWindow(async () => {
+        const actions = getActions();
+        const run = async () => {
+          if (actionType === "focus") {
+            await actions
+              .find((entry) => entry.id === CommandIds.navRightSidebarFocusTerminal())!
+              .run();
+          } else {
+            await actions
+              .find((entry) => entry.id === CommandIds.navRightSidebarAddTool())!
+              .prompt!.onSubmit({ tool: "terminal" });
+          }
+        };
+        const focusRequests: unknown[] = [];
+        const record = (event: Event) => focusRequests.push((event as CustomEvent).detail);
+        window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+        try {
+          await run();
+          // With no session there is nothing to focus: leave the new chat collapsed.
+          expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(true);
+          expect(focusRequests).toEqual([]);
+          const layout = selectOrAddTab(
+            getDefaultRightSidebarLayoutState("terminal:session-1"),
+            "costs"
+          );
+          updatePersistedState(getRightSidebarLayoutKey("w1"), layout);
+          await run();
+          expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
+          expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe(
+            "terminal:session-1"
+          );
+          // The sidebar hands the terminal the keyboard.
+          expect(focusRequests).toEqual([
+            { workspaceId: "w1", tabsetId: layout.focusedTabsetId, tab: "terminal:session-1" },
+          ]);
+        } finally {
+          window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+        }
+      });
+    }
+  );
+});
+
 describe("Right Sidebar: Add Tool palette action (#5767)", () => {
-  test("Stats also asks for the Stats dialog; other tools do not", async () => {
+  test("Stats also asks to show the Stats tab full-screen; other tools do not", async () => {
     await withTestWindow(async () => {
       const action = getActions().find(
         (candidate) => candidate.id === CommandIds.navRightSidebarAddTool()
@@ -2436,7 +2664,7 @@ test("app view entries tell several calls of one tool apart", () => {
     },
   });
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     selectedWorkspaceState: {
       messages: [call("a", { count: 2 }), call("b", { count: 4 }), call("c", { count: 4 })],
     } as unknown as WorkspaceState,
@@ -2448,10 +2676,56 @@ test("app view entries tell several calls of one tool apart", () => {
   expect(new Set(subtitles).size).toBe(3);
 });
 
+// The keyboard path to Reload: only a view with an open tab has one, and it focuses that tab.
+test("an app view with an open tab gets a Reload command that focuses its tab", () => {
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+  const originalCustomEvent = globalThis.CustomEvent;
+  // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+  globalThis.CustomEvent = testWindow.CustomEvent as unknown as typeof CustomEvent;
+  try {
+    const call = (toolCallId: string) => ({
+      type: "tool",
+      toolCallId,
+      toolName: "dice_show_dice_board",
+      args: {},
+      status: "completed",
+      mcpServer: {
+        connection: { key: "dice", transport: "stdio" },
+        identity: { name: "dice", version: "1.0.0" },
+        source: "connection",
+        app: { resourceUri: "ui://dice/board.html" },
+      },
+    });
+    updateRightSidebarLayout("w1", (state) => withAppViewTab(state, "open"));
+    const actions = getActions({
+      mcpAppsEnabled: true,
+      selectedWorkspaceState: {
+        messages: [call("open"), call("closed")],
+      } as unknown as WorkspaceState,
+    });
+    expect(actions.some((a) => a.id === CommandIds.navReloadAppView("closed"))).toBe(false);
+    const reload = actions.find((a) => a.id === CommandIds.navReloadAppView("open"));
+    const focused: unknown[] = [];
+    testWindow.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, (event) =>
+      focused.push((event as unknown as CustomEvent).detail)
+    );
+    void reload?.run();
+    expect(focused).toEqual([{ workspaceId: "w1", toolCallId: "open" }]);
+  } finally {
+    globalThis.CustomEvent = originalCustomEvent;
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  }
+});
+
 test("a plugin view's palette entry shows its server part and keeps the full key searchable", () => {
   const key = "plugin:0123456789abcdef:tray";
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     selectedWorkspaceState: {
       messages: [
         {
@@ -2490,7 +2764,7 @@ test("two plugin installs with one server name keep their instance markers apart
     },
   });
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     selectedWorkspaceState: {
       messages: [
         call("i1", "plugin:0123456789abcdef:tray"),
@@ -2520,7 +2794,7 @@ test("an MCP App entry point's palette entry shows its server label and opens it
   };
   const opened: unknown[] = [];
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     mcpAppEntrypoints: [entrypoint],
     api: createTestApiClient({
       mcpApps: {
@@ -2541,7 +2815,10 @@ test("an MCP App entry point's palette entry shows its server label and opens it
   // Opening dispatches OPEN_MCP_APP_VIEW on window (the "Open in tab" path).
   const testWindow = new GlobalWindow();
   const originalWindow = globalThis.window;
+  const originalCustomEvent = globalThis.CustomEvent;
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+  globalThis.CustomEvent = testWindow.CustomEvent as unknown as typeof CustomEvent;
   const shown: unknown[] = [];
   testWindow.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, (event) =>
     shown.push((event as unknown as CustomEvent<{ toolCallId: string }>).detail.toolCallId)
@@ -2549,6 +2826,7 @@ test("an MCP App entry point's palette entry shows its server label and opens it
   try {
     await entry?.run();
   } finally {
+    globalThis.CustomEvent = originalCustomEvent;
     globalThis.window = originalWindow;
     testWindow.close();
   }
@@ -2569,7 +2847,7 @@ test("a failed entry point open from the palette shows its error in a toast", as
     viewKey: "entrypoint:cad:cad.tray:global",
   };
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     mcpAppEntrypoints: [entrypoint],
     api: createTestApiClient({
       mcpApps: {
@@ -2603,7 +2881,7 @@ test("an entry point picked from the palette while disconnected says so in a toa
     viewKey: "entrypoint:cad:cad.tray:global",
   };
   const actions = getActions({
-    artifactsEnabled: true,
+    mcpAppsEnabled: true,
     mcpAppEntrypoints: [entrypoint],
     api: null,
   });
@@ -2621,6 +2899,36 @@ test("an entry point picked from the palette while disconnected says so in a toa
   });
 });
 
+// An open entry point's tab only gets focus from Open while its record is current, so a failed
+// load needs Reload from the keyboard too.
+test("an entry point with an open tab gets a Reload command that focuses its tab", async () => {
+  const entrypoint = (toolName: string) => ({
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName,
+    title: toolName,
+    resourceUri: "ui://cad/view",
+    type: "global" as const,
+    viewKey: `entrypoint:cad:${toolName}:global`,
+  });
+  const [open, closed] = [entrypoint("cad.open"), entrypoint("cad.closed")];
+  await withTestWindow(() => {
+    updateRightSidebarLayout("w1", (state) => withAppViewTab(state, open.viewKey));
+    const actions = getActions({ mcpAppsEnabled: true, mcpAppEntrypoints: [open, closed] });
+    expect(actions.some((a) => a.id === CommandIds.navReloadAppView(closed.viewKey))).toBe(false);
+    const reload = actions.find((a) => a.id === CommandIds.navReloadAppView(open.viewKey));
+    const focused: unknown[] = [];
+    const onFocus = (event: Event) => focused.push((event as CustomEvent).detail);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
+    try {
+      void reload?.run();
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
+    }
+    expect(focused).toEqual([{ workspaceId: "w1", toolCallId: open.viewKey }]);
+  });
+});
+
 test("a tool's global and thread entry points get palette commands that read differently", () => {
   const entrypoint = (type: "global" | "thread") => ({
     serverName: "cad",
@@ -2632,10 +2940,101 @@ test("a tool's global and thread entry points get palette commands that read dif
     viewKey: `entrypoint:cad:cad.board:${type}`,
   });
   const entrypoints = [entrypoint("global"), entrypoint("thread")];
-  const actions = getActions({ artifactsEnabled: true, mcpAppEntrypoints: entrypoints });
+  const actions = getActions({ mcpAppsEnabled: true, mcpAppEntrypoints: entrypoints });
   const shown = entrypoints.map((e) => {
     const action = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(e.viewKey));
     return [action?.title, action?.subtitle].join(" ");
   });
   expect(shown[0]).not.toBe(shown[1]);
+});
+
+test("entry point commands follow the MCP Apps experiment, not Artifacts (#6760)", () => {
+  const entrypoint = {
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.board",
+    title: "Board",
+    resourceUri: "ui://cad/board",
+    type: "global" as const,
+    viewKey: "entrypoint:cad:cad.board:global",
+  };
+  const has = (flags: { artifactsEnabled: boolean; mcpAppsEnabled: boolean }) =>
+    getActions({ ...flags, mcpAppEntrypoints: [entrypoint] }).some(
+      (a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey)
+    );
+  expect(has({ artifactsEnabled: true, mcpAppsEnabled: false })).toBe(false);
+  expect(has({ artifactsEnabled: false, mcpAppsEnabled: true })).toBe(true);
+});
+
+describe("Revoke MCP App View Domains…", () => {
+  const stored = [
+    { projectPath: "/repo/a", serverName: "charts", origins: ["https://api.example.com"] },
+  ];
+  // Shown whatever the experiments: Settings lists stored approvals either way.
+  const revokeAction = (api: APIClient, artifactsEnabled = false) =>
+    getActions({ api, artifactsEnabled }).find(
+      (action) => action.id === CommandIds.mcpAppsRevokeViewDomains()
+    );
+
+  test("lists the stored approvals and revokes the picked one", async () => {
+    const revoked: unknown[] = [];
+    const api = createTestApiClient({
+      mcpApps: {
+        listViewDomains: () => Promise.resolve(stored),
+        revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
+          revoked.push(input);
+          return Promise.resolve({ revision: 1 });
+        },
+      },
+    });
+    expect(revokeAction(api, true)?.title).toBe("Revoke MCP App View Domains…");
+    const action = revokeAction(api);
+    const field = action?.prompt?.fields[0];
+    if (field?.type !== "select" || !action?.prompt) throw new Error("Expected an approval picker");
+    const options = await field.getOptions({});
+    expect(options).toHaveLength(1);
+    expect(options[0].label).toContain("charts");
+    expect(options[0].label).toContain("api.example.com");
+    await withTestWindow(async () => {
+      const events = collectCommandEvents();
+      try {
+        await action.prompt!.onSubmit({ approval: options[0].id });
+        expect(events.receivedToasts.map((toast) => toast.type)).toEqual(["success"]);
+      } finally {
+        events.dispose();
+      }
+    });
+    expect(revoked).toEqual([{ projectPath: "/repo/a", serverName: "charts" }]);
+  });
+
+  test("a failed list rejects for the palette, and a failed revoke shows a toast", async () => {
+    const api = createTestApiClient({
+      mcpApps: {
+        listViewDomains: () => Promise.reject(new Error("backend busy")),
+        revokeViewDomains: () => Promise.reject(new Error("config write failed")),
+      },
+    });
+    const action = revokeAction(api);
+    const field = action?.prompt?.fields[0];
+    if (field?.type !== "select" || !action?.prompt) throw new Error("Expected an approval picker");
+    await withTestWindow(async () => {
+      const events = collectCommandEvents();
+      try {
+        // The open palette shows a rejected list (CommandPalette): a toast would sit under it.
+        let listError: unknown;
+        try {
+          await field.getOptions({});
+        } catch (error) {
+          listError = error;
+        }
+        expect(String(listError)).toContain("backend busy");
+        await action.prompt!.onSubmit({ approval: JSON.stringify(["/repo/a", "charts"]) });
+        const messages = events.receivedToasts.map((toast) => toast.message);
+        expect(messages).toHaveLength(1);
+        expect(messages[0]).toContain("config write failed");
+      } finally {
+        events.dispose();
+      }
+    });
+  });
 });

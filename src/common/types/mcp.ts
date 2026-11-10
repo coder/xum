@@ -1,9 +1,13 @@
 import type { z } from "zod";
 import type {
+  MCPConfigProblemSchema,
   MCPConnectionRefSchema,
   MCPServerIdentitySchema,
   MCPToolCallDisplaySchema,
 } from "@/common/orpc/schemas/mcp";
+
+/** A part of mcp.jsonc that Xum skipped (MCPConfigProblemSchema). */
+export type MCPConfigProblem = z.infer<typeof MCPConfigProblemSchema>;
 
 /** Supported MCP server transports. */
 export type MCPServerTransport = "stdio" | "http" | "sse" | "auto";
@@ -39,6 +43,11 @@ export interface MCPServerPluginProvenance {
   sourceLocation: string;
   /** Canonical managed owner; retained even if its registry row later disappears. */
   componentPolicy?: { registryPath: string; name: string };
+  /**
+   * Consent fingerprint of this exact server definition (componentConsent.ts, #6498), set where the
+   * plugin's config is loaded. A managed server starts only when the user reviewed this value.
+   */
+  consentFingerprint?: string;
 }
 
 export interface MCPServerBaseInfo {
@@ -71,6 +80,11 @@ export interface MCPStdioServerInfo extends MCPServerBaseInfo {
   args?: string[];
   /** Extra environment variables injected into the server process. */
   env?: Record<string, string>;
+  /**
+   * Host variable names whose values launch copies into the server env (Codex
+   * `.mcp.json` `env_vars`). Unset names are skipped, and `env` wins on a clash.
+   */
+  forwardEnv?: string[];
   /** Working directory; defaults to the workspace path when unset. */
   cwd?: string;
 }

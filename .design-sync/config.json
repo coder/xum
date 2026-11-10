@@ -52,6 +52,12 @@
     "GoogleSearch": null,
     "AnalyticsDashboard": null,
     "ProjectSidebar": null,
+    "MemorySection": null,
+    "SessionHistory": null,
+    "ArtifactsPanel": null,
+    "NewTabLauncher": null,
+    "Stabletabcontrols": null,
+    "ScratchPage": null,
     "LeftSidebar": null,
     "WorkspaceMenuBar": null,
     "AgentListItem": null,
@@ -62,7 +68,6 @@
     "TasksSection": null,
     "CreationControls": null,
     "ArchivedWorkspaces": null,
-    "LayoutsSection": null,
     "AgentModePicker": null,
     "WorkspaceHeartbeatModal": null,
     "ExperimentsSection": null,
@@ -72,14 +77,22 @@
     "ModelSelector": null,
     "MultiProjectGitStatusIndicator": null,
     "WorkspaceMCPModal": null,
+    "AgentSkillList": null,
+    "ToolSearch": null,
+    "Artifact": "ArtifactToolCall",
     "CoderControls": "CoderWorkspaceForm",
     "Compaction": "CompactingMessageContent",
     "ContextUsageIndicator": "ContextUsageIndicatorButton",
+    "DelegatedCreationInterruptedBanner": "DelegatedCreationInterruptedNotice",
     "Goal": "GetGoalToolCall",
     "Heartbeat": "HeartbeatToolCall",
     "HookOutput": "HookOutputDisplay",
     "Init": "InitMessage",
+    "LegacyPlanImportBanner": "LegacyPlanImportNotice",
+    "Serverupdates": "AboutDialog",
     "Streaming": "StreamingBarrierView",
+    "TimelineEvent": "TimelineEventToolCall",
+    "TimelinePanel": "TimelinePanelView",
     "Todo": "TodoToolCall",
     "WorkspaceLifecycle": "WorkspaceLifecycleToolCall"
   },
@@ -134,11 +147,6 @@
     "HookOutputDisplay": {
       "skip": [
         "app-chat-tools-hookoutput--tool-hooks-output-expanded"
-      ]
-    },
-    "MemorySection": {
-      "skip": [
-        "settings-sections-memorysection--empty"
       ]
     },
     "PRLinkBadge": {
@@ -249,6 +257,125 @@
     "Popover": {
       "cardMode": "single",
       "primaryStory": "Default",
+      "skip": []
+    },
+    "AboutDialog": {
+      "cardMode": "single",
+      "primaryStory": "BlockedPhone",
+      "viewport": "375x667",
+      "skip": [
+        "features-about-server-updates--restarting-closes-dialog"
+      ]
+    },
+    "ActiveGoalsWarningToast": {
+      "cardMode": "single",
+      "primaryStory": "AboveThreshold",
+      "skip": []
+    },
+    "ArtifactToolCall": {
+      "cardMode": "column",
+      "skip": []
+    },
+    "BackupSection": {
+      "cardMode": "column",
+      "skip": []
+    },
+    "BranchSelector": {
+      "skip": []
+    },
+    "ChatInputToast": {
+      "cardMode": "column",
+      "skip": []
+    },
+    "DelegatedCreationInterruptedNotice": {
+      "cardMode": "column",
+      "skip": [
+        "app-chat-components-delegatedcreationinterruptedbanner--contrast-dark",
+        "app-chat-components-delegatedcreationinterruptedbanner--contrast-flexoki-dark",
+        "app-chat-components-delegatedcreationinterruptedbanner--contrast-flexoki-light",
+        "app-chat-components-delegatedcreationinterruptedbanner--contrast-light"
+      ]
+    },
+    "ForceDeleteModal": {
+      "cardMode": "single",
+      "primaryStory": "Phone",
+      "viewport": "390x844",
+      "skip": [
+        "components-forcedeletemodal--rejected-retry-remains-visible",
+        "components-forcedeletemodal--retry-becomes-blocked",
+        "components-forcedeletemodal--retry-refreshes-scope"
+      ]
+    },
+    "InstructionsSection": {
+      "cardMode": "column",
+      "skip": [
+        "settings-sections-instructionssection--dirty-draft-enables-save"
+      ]
+    },
+    "LegacyPlanImportNotice": {
+      "cardMode": "column",
+      "skip": [
+        "app-chat-components-legacyplanimportbanner--contrast-dark",
+        "app-chat-components-legacyplanimportbanner--contrast-flexoki-dark",
+        "app-chat-components-legacyplanimportbanner--contrast-flexoki-light",
+        "app-chat-components-legacyplanimportbanner--contrast-light",
+        "app-chat-components-legacyplanimportbanner--nothing-to-import"
+      ]
+    },
+    "PRStackBadge": {
+      "cardMode": "single",
+      "primaryStory": "PhoneWidth",
+      "viewport": "375x667",
+      "skip": []
+    },
+    "PluginsSettingsSection": {
+      "cardMode": "column",
+      "skip": [
+        "features-settings-sections-pluginssettingssection--add-plugin-cursor-marketplace",
+        "features-settings-sections-pluginssettingssection--add-plugin-cursor-marketplace-phone-viewport",
+        "features-settings-sections-pluginssettingssection--add-plugin-cursor-review",
+        "features-settings-sections-pluginssettingssection--add-plugin-cursor-review-phone-viewport",
+        "features-settings-sections-pluginssettingssection--component-review-intent-not-replayed-on-reconnect",
+        "features-settings-sections-pluginssettingssection--component-review-intent-waits-for-live-connection",
+        "features-settings-sections-pluginssettingssection--cursor-hooks-review",
+        "features-settings-sections-pluginssettingssection--cursor-hooks-review-phone-viewport",
+        "features-settings-sections-pluginssettingssection--themed-logo-light"
+      ]
+    },
+    "PromptCacheHealth": {
+      "cardMode": "column",
+      "skip": []
+    },
+    "SkillIndicator": {
+      "cardMode": "single",
+      "primaryStory": "UnavailableProjectSourcesPhone",
+      "viewport": "390x844",
+      "skip": []
+    },
+    "StreamErrorMessage": {
+      "cardMode": "column",
+      "skip": []
+    },
+    "TerminalBadgeOverlay": {
+      "cardMode": "single",
+      "primaryStory": "TopRightDefault",
+      "skip": []
+    },
+    "TimelineEventToolCall": {
+      "cardMode": "column",
+      "skip": []
+    },
+    "TimelinePanelView": {
+      "cardMode": "column",
+      "skip": []
+    },
+    "UpdateRestartOverlay": {
+      "cardMode": "single",
+      "primaryStory": "RestartingPhone",
+      "viewport": "375x667"
+    },
+    "WorkflowPhaseFlow": {
+      "cardMode": "column",
       "skip": []
     }
   },

@@ -336,7 +336,7 @@ export const FileEditToolCall: React.FC<FileEditToolCallProps> = ({
                       </div>
                       <button
                         type="button"
-                        className="text-accent hover:text-accent-light mt-1 text-left text-[11px] underline underline-offset-2"
+                        className="text-accent-text hover:text-accent-light mt-1 text-left text-[11px] underline underline-offset-2"
                         onClick={() => setShowFullDiff(true)}
                       >
                         Render full parsed diff

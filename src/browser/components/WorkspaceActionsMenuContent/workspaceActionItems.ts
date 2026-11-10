@@ -57,10 +57,14 @@ interface TopBarActionsState extends CommonActionsState {
 
 export type WorkspaceActionsState = SidebarActionsState | TopBarActionsState;
 
+/** An item, or `false` when its condition hides it. */
+type ActionSlot = WorkspaceActionId | false;
+
 /**
  * The one decision of which items each menu shows, in the approved group order: Title,
- * Settings, View (top bar only), Sidebar row, Lifecycle. Empty groups are dropped, so the menu draws a
- * separator only between groups that show.
+ * Settings, View (top bar only), Sidebar row, Lifecycle. The sidebar row menu leads with Pin in a
+ * group of its own: flat sidebar rows have no inline pin icon, so pinning lives first in the menu.
+ * Empty groups are dropped, so the menu draws a separator only between groups that show.
  */
 export function getWorkspaceActionGroups(state: WorkspaceActionsState): WorkspaceActionId[][] {
   // Heartbeats never fire for sub-agent workspaces.
@@ -68,31 +72,43 @@ export function getWorkspaceActionGroups(state: WorkspaceActionsState): Workspac
   // Scratch chats have no repo: the backend rejects forking them and RightSidebar ignores
   // review events for them.
   const hasRepository = hasWorkspaceRepository(state.workspace);
-  const topBar = state.surface === "topbar" ? state : null;
-  const sidebar = state.surface === "sidebar" ? state : null;
-  const groups: Array<Array<WorkspaceActionId | false>> = [
+  const pin = state.workspace != null && isWorkspacePinnable(state.workspace) && "togglePinned";
+  const title: ActionSlot[] = [
     // The top bar edits the title in the header itself, so it works with the row hidden (#6328).
-    ["editTitle", "generateTitle"],
-    ["configureMcp", !isSubAgent && "configureHeartbeat", "configureMessaging"],
-    topBar
-      ? [
-          hasRepository && !topBar.isTouchMobileScreen && "immersiveReview",
-          hasRepository && topBar.isTouchMobileScreen && "touchFullscreenReview",
-          topBar.isRightSidebarHidden && "openSidebar",
-          topBar.isPhoneHeader && "openTerminal",
-        ]
-      : [],
-    [
-      state.workspace != null && isWorkspacePinnable(state.workspace) && "togglePinned",
-      sidebar?.canMarkUnread === true && "markUnread",
-      sidebar?.canToggleSubAgents === true && "toggleSubAgents",
-    ],
-    [
-      hasRepository && "fork",
-      state.isRuntimeRunning && "stopRuntime",
-      !state.showsSubAgent && "archive",
-    ],
+    "editTitle",
+    "generateTitle",
   ];
+  const settings: ActionSlot[] = [
+    "configureMcp",
+    !isSubAgent && "configureHeartbeat",
+    "configureMessaging",
+  ];
+  const lifecycle: ActionSlot[] = [
+    hasRepository && "fork",
+    state.isRuntimeRunning && "stopRuntime",
+    !state.showsSubAgent && "archive",
+  ];
+  const groups: ActionSlot[][] =
+    state.surface === "topbar"
+      ? [
+          title,
+          settings,
+          [
+            hasRepository && !state.isTouchMobileScreen && "immersiveReview",
+            hasRepository && state.isTouchMobileScreen && "touchFullscreenReview",
+            state.isRightSidebarHidden && "openSidebar",
+            state.isPhoneHeader && "openTerminal",
+          ],
+          [pin],
+          lifecycle,
+        ]
+      : [
+          [pin],
+          title,
+          settings,
+          [state.canMarkUnread && "markUnread", state.canToggleSubAgents && "toggleSubAgents"],
+          lifecycle,
+        ];
   return groups
     .map((group) => group.filter((id): id is WorkspaceActionId => id !== false))
     .filter((group) => group.length > 0);

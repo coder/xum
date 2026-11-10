@@ -657,7 +657,7 @@ describe("computeBashOutputGroupInfo", () => {
     expect(groupInfo?.processId).toBe("my-special-process");
   });
 
-  it("includes firstIndex for all positions in group", () => {
+  it("keys every position of a group by the first message's id", () => {
     const messages: DisplayedMessage[] = [
       createBashOutputMessage("1", "proc", 1),
       createBashOutputMessage("2", "proc", 2),
@@ -665,11 +665,43 @@ describe("computeBashOutputGroupInfo", () => {
       createBashOutputMessage("4", "proc", 4),
     ];
 
-    // All positions should report firstIndex as 0
-    expect(computeBashOutputGroupInfo(messages, 0)?.firstIndex).toBe(0); // first
-    expect(computeBashOutputGroupInfo(messages, 1)?.firstIndex).toBe(0); // middle
-    expect(computeBashOutputGroupInfo(messages, 2)?.firstIndex).toBe(0); // middle
-    expect(computeBashOutputGroupInfo(messages, 3)?.firstIndex).toBe(0); // last
+    for (let index = 0; index < messages.length; index++) {
+      expect(computeBashOutputGroupInfo(messages, index)?.groupKey).toBe("1");
+    }
+  });
+
+  // Rows are memoized on prop identity: older rows loaded above a group must not hand its
+  // rows new (equal) info objects, or every mounted group row re-renders per page (#4961 F20).
+  it("returns the same info objects when older rows are prepended", () => {
+    const group = [
+      createBashOutputMessage("3", "proc", 3),
+      createBashOutputMessage("4", "proc", 4),
+      createBashOutputMessage("5", "proc", 5),
+    ];
+    const before = computeBashOutputGroupInfos(group);
+    const older: DisplayedMessage[] = [
+      { type: "user", id: "u0", historyId: "hu0", content: "older", historySequence: 1 },
+    ];
+    const after = computeBashOutputGroupInfos([...older, ...group]);
+
+    expect(after[0]).toBeUndefined();
+    for (let index = 0; index < group.length; index++) {
+      expect(after[index + 1]).toBe(before[index]);
+    }
+  });
+
+  it("returns new info objects when the group itself changes", () => {
+    const group = [
+      createBashOutputMessage("3", "proc", 3),
+      createBashOutputMessage("4", "proc", 4),
+      createBashOutputMessage("5", "proc", 5),
+    ];
+    const before = computeBashOutputGroupInfos(group);
+    const after = computeBashOutputGroupInfos([...group, createBashOutputMessage("6", "proc", 6)]);
+
+    expect(after[0]).not.toBe(before[0]);
+    expect(after[0]).toMatchObject({ position: "first", totalCount: 4, collapsedCount: 2 });
+    expect(after[2]).toMatchObject({ position: "middle" });
   });
 
   it("precomputes per-index group info in one pass", () => {

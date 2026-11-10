@@ -43,12 +43,12 @@ module.exports = {
   },
   // Storybook UI tests and the DOM-harness isolation guards use bun:test and
   // are run via `bun test`, so Jest must skip them.
-  // tests/bugbash/ unit tests run under bun (test-unit-ci.sh tooling roots).
+  // tests/bugbash/ and tests/stories/ unit tests run under bun (test-unit-ci.sh tooling roots).
   testPathIgnorePatterns: [
     "<rootDir>/tests/ui/storybook/",
     "<rootDir>/tests/ui/domIsolation\\.test\\.ts",
-    "<rootDir>/tests/bunEachTableGc\\.test\\.ts",
     "<rootDir>/tests/bugbash/",
+    "<rootDir>/tests/stories/",
   ],
   // Avoid haste module collision with vscode extension
   modulePathIgnorePatterns: ["<rootDir>/vscode/"],

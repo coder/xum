@@ -38,8 +38,8 @@ const MarkdownCoreStub = React.memo(function MarkdownCoreStub(props: {
   );
 });
 
-// Keep module mocks inside test hooks: Bun loads test files before afterAll runs, so
-// file-scope mock.module() calls can pollute unrelated files during collection.
+// Keep module mocks inside test hooks, installed and restored around each test: a
+// module mock outlives its test file, so a stub left in place leaks into later files.
 async function installTypewriterMarkdownModuleMocks() {
   await mock.module("./MarkdownCore", () => ({
     MarkdownCore: MarkdownCoreStub,

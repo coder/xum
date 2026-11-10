@@ -159,6 +159,9 @@ describeIntegration("GitStatus (UI + ORPC)", () => {
           });
           expect(bashRes.success).toBe(true);
           if (!bashRes.success) return;
+          // The RPC succeeds even when the script fails: check the commit itself, so a failed
+          // commit reports its own error instead of a wrong ahead count 30 s later (#7626).
+          expect(bashRes.data.success ? "" : bashRes.data.error).toBe("");
         }
 
         // Directly invalidate git status instead of simulating window focus.

@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { execFileSync } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
 import * as path from "path";
@@ -70,6 +72,20 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
   let b: Backend;
   const checkouts = new Map<string, string>();
   const leases: WorkspaceUseLease[] = [];
+  const processRecords: string[] = [];
+
+  async function createProcessRecord(workspaceId: string, running = false): Promise<string> {
+    const recordPath = path.join(localBgWorkspaceDir(workspaceId), `recovery-${randomUUID()}`);
+    processRecords.push(recordPath);
+    await fsPromises.mkdir(recordPath, { recursive: true });
+    if (running) {
+      await fsPromises.writeFile(
+        path.join(recordPath, "meta.json"),
+        JSON.stringify({ pid: process.pid, status: "running" })
+      );
+    }
+    return recordPath;
+  }
 
   beforeEach(async () => {
     const fixture = await createTestHistoryService();
@@ -109,6 +125,9 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
 
   afterEach(async () => {
     for (const lease of leases.splice(0)) await lease.release();
+    for (const recordPath of processRecords.splice(0)) {
+      await fsPromises.rm(recordPath, { recursive: true, force: true });
+    }
     checkouts.clear();
     mock.restore();
     await cleanupFixture();
@@ -131,6 +150,42 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
       expect(findWorkspaceInConfig(a.config, id)).toBeDefined();
       expect(await exists(checkouts.get(id)!)).toBe(true);
       expect(findWorkspaceInConfig(a.config, id)?.pendingRemoval).toBeUndefined();
+    }
+  });
+
+  test("an unknown parent record does not hide a running descendant process", async () => {
+    const unknown = await createProcessRecord(rootId);
+    const running = await createProcessRecord(childId, true);
+    const result = await removeRootWithTree();
+
+    expect(result.success).toBe(false);
+    expect(result.backgroundProcesses?.find((record) => record.recordPath === unknown)?.state).toBe(
+      "unknown"
+    );
+    expect(result.backgroundProcesses?.find((record) => record.recordPath === running)?.state).toBe(
+      "running"
+    );
+    for (const id of allIds) {
+      expect(await exists(checkouts.get(id)!)).toBe(true);
+      expect(findWorkspaceInConfig(a.config, id)?.pendingRemoval).toBeUndefined();
+    }
+  });
+
+  test("exact unknown-record confirmation removes the complete acknowledged tree", async () => {
+    const records = await Promise.all(allIds.map((id) => createProcessRecord(id)));
+    const refused = await removeRootWithTree();
+    expect(refused.success).toBe(false);
+    expect(refused.backgroundProcesses).toHaveLength(allIds.length);
+    for (const id of allIds) expect(await exists(checkouts.get(id)!)).toBe(true);
+
+    const result = await a.workspaceService.remove(rootId, true, {
+      acknowledgedDescendantIds: [grandchildId, childId],
+      acknowledgedUnknownProcessRecords: records,
+    });
+    expect(result.success).toBe(true);
+    for (const id of allIds) {
+      expect(findWorkspaceInConfig(b.config, id)).toBeUndefined();
+      expect(await exists(checkouts.get(id)!)).toBe(false);
     }
   });
 
@@ -172,8 +227,9 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
   // #5028: the mark a task gets when the write ending it rejects (#4747) is in-memory only and
   // has no reader once the row is gone. White-box: the leak is its only observable effect.
   test("removing tasks drops their unpersisted-end marks", async () => {
-    const marks = (a.taskService as unknown as { unpersistedLaunchFailureTaskIds: Set<string> })
-      .unpersistedLaunchFailureTaskIds;
+    const marks = (
+      a.taskService as unknown as { waiters: { unpersistedLaunchFailureTaskIds: Set<string> } }
+    ).waiters.unpersistedLaunchFailureTaskIds;
     marks.add(childId);
     marks.add(grandchildId);
 
@@ -190,8 +246,9 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
     const userStopEpochs = (
       a.taskService as unknown as { workspaceUserStopEpochs: Map<string, number> }
     ).workspaceUserStopEpochs;
-    const stopEpochs = (a.taskService as unknown as { workspaceStopEpochs: Map<string, number> })
-      .workspaceStopEpochs;
+    const stopEpochs = (
+      a.taskService as unknown as { taskStopLatch: { workspaceStopEpochs: Map<string, number> } }
+    ).taskStopLatch.workspaceStopEpochs;
     expect([...userStopEpochs.keys()].sort()).toEqual([...allIds].sort());
     expect([...stopEpochs.keys()].sort()).toEqual([...allIds].sort());
 

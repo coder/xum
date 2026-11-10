@@ -413,7 +413,11 @@ export function GoalTab(props: GoalTabProps) {
         ? "border-warning/40 bg-warning-overlay"
         : "border-border-light bg-surface-secondary";
   const headerLabelClass =
-    activeMode === "running" ? "text-success" : isStalledActive ? "text-warning" : "text-muted";
+    activeMode === "running"
+      ? "text-success-text"
+      : isStalledActive
+        ? "text-warning"
+        : "text-muted";
 
   return (
     <section className="flex h-full flex-col gap-4 overflow-y-auto p-4" aria-label="Workspace goal">
@@ -635,7 +639,7 @@ export function GoalTab(props: GoalTabProps) {
           {canResume && lifecycle !== "complete" && (
             <button
               type="button"
-              className="border-success/40 bg-success/10 text-success hover:bg-success/20 inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm"
+              className="border-success/40 bg-success/10 text-success-text hover:bg-success/20 inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm"
               aria-label="Resume goal"
               onClick={() => void setStatus("active")}
             >

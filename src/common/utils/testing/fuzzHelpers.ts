@@ -53,7 +53,6 @@ const STRING_FRAGMENTS: readonly string[] = [
   "openai",
   "google",
   "coder",
-  "mux-gateway",
   "openrouter",
   "bedrock",
   "github-copilot",

@@ -8,7 +8,10 @@ import {
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { removeTabEverywhere } from "@/browser/utils/rightSidebarLayout";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { isMcpAppViewHosted } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import {
+  isMcpAppViewHosted,
+  setMcpAppViewFullscreenOnly,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import { installDom } from "../../../../tests/ui/dom";
 import { APIContext, APIProvider } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
@@ -99,7 +102,7 @@ describe("GenericToolCall MCP Apps view", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     getViewCalls = 0;
-    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+    setTestExperiment(EXPERIMENT_IDS.MCP_APPS, true);
   });
   afterEach(() => {
     resetTestExperiments();
@@ -112,7 +115,11 @@ describe("GenericToolCall MCP Apps view", () => {
     app: { resourceUri: "ui://dice/board.html" },
   };
 
-  function renderAppCall(status: ToolStatus, mcpServer: MCPToolCallDisplay = appSnapshot) {
+  function renderAppCall(
+    status: ToolStatus,
+    mcpServer: MCPToolCallDisplay = appSnapshot,
+    workspaceId = "ws-app-card"
+  ) {
     const client = createTestApiClient({
       mcpApps: {
         getView: () => {
@@ -140,7 +147,7 @@ describe("GenericToolCall MCP Apps view", () => {
             result={{ content: [{ type: "text", text: "Rolled 4d6" }] }}
             status={status}
             mcpServer={mcpServer}
-            workspaceId="ws-app-card"
+            workspaceId={workspaceId}
             toolCallId="call-1"
           />
         </APIProvider>
@@ -170,8 +177,10 @@ describe("GenericToolCall MCP Apps view", () => {
     const view = renderAppCall("completed");
     await view.findByTestId("mcp-app-frame");
     // "Open in tab" adds the tab; the card drops its frame and offers the tab.
-    act(() => updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1")));
-    await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
+    act(() => {
+      updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1"));
+    });
+    await waitFor(() => expect(view.queryByTestId("mcp-app-frame") === null).toBe(true));
     const goTo = view.getByRole("button", { name: "Go to tab" });
     const opened: string[] = [];
     const onOpen = (e: Event) =>
@@ -181,13 +190,32 @@ describe("GenericToolCall MCP Apps view", () => {
     window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
     expect(opened).toEqual(["call-1"]);
     // Closing the tab brings the view back, mounted again (a new resource read).
-    act(() =>
+    act(() => {
       updateRightSidebarLayout("ws-app-card", (s) =>
         removeTabEverywhere(s, appViewTabFor("call-1"))
-      )
-    );
+      );
+    });
     await view.findByTestId("mcp-app-frame");
     expect(getViewCalls).toBe(2);
+  });
+
+  // Found when the view first initialized in its card and moved to its tab (McpAppFrame).
+  test("a fullscreen-only view's card keeps the placeholder after its tab closes", async () => {
+    const workspaceId = "ws-app-card-fullscreen-only";
+    const view = renderAppCall("completed", appSnapshot, workspaceId);
+    await view.findByTestId("mcp-app-frame");
+    act(() => {
+      setMcpAppViewFullscreenOnly(workspaceId, "call-1", true);
+      updateRightSidebarLayout(workspaceId, (s) => withAppViewTab(s, "call-1"));
+    });
+    await waitFor(() => expect(view.queryByTestId("mcp-app-frame") === null).toBe(true));
+    act(() => {
+      updateRightSidebarLayout(workspaceId, (s) => removeTabEverywhere(s, appViewTabFor("call-1")));
+    });
+    // No frame comes back, which would move the view to a tab again.
+    expect(view.getByRole("button", { name: "Go to tab" })).toBeTruthy();
+    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+    expect(getViewCalls).toBe(1);
   });
 
   test("an expanded card is an inline target for its view, also while the tab has it", async () => {
@@ -195,8 +223,10 @@ describe("GenericToolCall MCP Apps view", () => {
     const view = renderAppCall("completed");
     await view.findByTestId("mcp-app-frame");
     expect(isCard()).toBe(true);
-    act(() => updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1")));
-    await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
+    act(() => {
+      updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1"));
+    });
+    await waitFor(() => expect(view.queryByTestId("mcp-app-frame") === null).toBe(true));
     expect(isCard()).toBe(true);
     // Collapsed, the card mounts no view: inline from the tab must not close it.
     fireEvent.click(view.getByText("dice_show_dice_board"));
@@ -270,8 +300,10 @@ describe("GenericToolCall MCP Apps view", () => {
     expect(view.queryByTestId("mcp-app-frame")).toBeNull();
   });
 
-  test("with the experiment off, an app call renders like any other call", () => {
-    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, false);
+  test("with MCP Apps off, an app call renders like any other call, even with Artifacts on", () => {
+    // #6760: MCP Apps have their own experiment; Artifacts alone no longer shows views.
+    setTestExperiment(EXPERIMENT_IDS.MCP_APPS, false);
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const view = renderAppCall("completed");
     expect(view.getByText("Arguments")).toBeTruthy();
     expect(view.queryByTestId("mcp-app-frame")).toBeNull();

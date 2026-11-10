@@ -139,6 +139,18 @@ describe("useWorkspaceActionKeybinds", () => {
     overlay.remove();
   });
 
+  // #6434: the palette is no modal, and a click on it outside its input focuses its root.
+  test("does nothing while focus is in the command palette", () => {
+    const { onForkWorkspace } = renderKeybinds(repoWorkspace);
+    const palette = document.createElement("div");
+    palette.setAttribute("cmdk-root", "");
+    palette.tabIndex = -1;
+    document.body.appendChild(palette);
+    expect(press("B", palette).defaultPrevented).toBe(false);
+    expect(onForkWorkspace).not.toHaveBeenCalled();
+    palette.remove();
+  });
+
   // Perf owner on #6398: ProjectSidebar passes new callbacks on every render.
   test("keeps one listener across renders and calls the latest callbacks", () => {
     const addSpy = spyOn(window, "addEventListener");

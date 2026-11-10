@@ -87,7 +87,8 @@ function pinnedOptionsFor(
   modelString: string,
   model: LanguageModel,
   _opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean },
-  muxProviderOptions: MuxProviderOptions = {}
+  muxProviderOptions: MuxProviderOptions = {},
+  optionsRouteProvider?: "bedrock" | "openrouter"
 ) {
   return Ok({
     model,
@@ -97,6 +98,7 @@ function pinnedOptionsFor(
     optionsModelString: modelString,
     optionsProvidersConfig: {},
     optionsMuxProviderOptions: muxProviderOptions,
+    ...(optionsRouteProvider && { optionsRouteProvider }),
   });
 }
 
@@ -159,6 +161,23 @@ describe("generateWorkspaceIdentity candidate settings", () => {
     expect(streamTextSpy.mock.calls[0]?.[0].providerOptions).toMatchObject({
       google: { thinkingConfig: { thinkingLevel: "medium" } },
     });
+  });
+
+  test("the request carries the caller's abort signal", async () => {
+    // Creation naming stops a timed-out or orphaned request through this signal.
+    const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+    const controller = new AbortController();
+
+    await generateWorkspaceIdentity(
+      "Add setting",
+      [{ model: "anthropic:claude-haiku-4-5" }],
+      createTitleAIService(createTitleModel()),
+      undefined,
+      undefined,
+      controller.signal
+    );
+
+    expect(streamTextSpy.mock.calls[0]?.[0].abortSignal).toBe(controller.signal);
   });
 
   test("clamps the configured thinking level to the model's policy", async () => {
@@ -459,6 +478,29 @@ describe("generateWorkspaceIdentity candidate settings", () => {
     }
   );
 
+  // #5954: Bedrock and OpenRouter spell "thinking off" in their own namespaces.
+  test.each([{ route: "bedrock" as const }, { route: "openrouter" as const }])(
+    "forces propose_name when the $route route serializes thinking off",
+    async ({ route }) => {
+      const model = "anthropic:claude-haiku-5-5";
+      const aiService = titleAIService((modelString) =>
+        Promise.resolve(
+          pinnedOptionsFor(modelString, createTitleModel(modelString), undefined, {}, route)
+        )
+      );
+      const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+
+      const result = await generateWorkspaceIdentity(
+        "Add setting",
+        [{ model, thinkingLevel: "off" }],
+        aiService
+      );
+
+      expect(result.success).toBe(true);
+      expect(streamTextSpy.mock.calls[0]?.[0].toolChoice).toEqual(forcedProposeName);
+    }
+  );
+
   test("skips a candidate whose model cannot be created and reports the last failure", async () => {
     const createModelWithPinnedOptions = mock((modelString: string) =>
       Promise.resolve(
@@ -487,6 +529,43 @@ describe("generateWorkspaceIdentity candidate settings", () => {
         type: "unknown",
         raw: "Model did not call propose_name tool",
       });
+    }
+    expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
+  });
+
+  test.each([
+    {
+      label: "a failed request over a later candidate skipped for missing credentials",
+      skippedProviders: ["openai"],
+      expected: { type: "service_unavailable", raw: "naming model unavailable" },
+    },
+    {
+      label: "the last skip when every candidate is skipped for missing credentials",
+      skippedProviders: ["anthropic", "openai"],
+      expected: { type: "authentication", authKind: "api_key_missing", provider: "openai" },
+    },
+  ])("reports $label", async (c) => {
+    const createModelWithPinnedOptions = mock((modelString: string) => {
+      const provider = modelString.split(":")[0] ?? modelString;
+      return Promise.resolve(
+        c.skippedProviders.some((skipped) => skipped === provider)
+          ? Err({ type: "api_key_not_found" as const, provider })
+          : pinnedOptionsFor(modelString, createTitleModel(modelString))
+      );
+    });
+    spyOn(aiSdk, "streamText").mockImplementation((() => {
+      throw createApiCallError(500, "naming model unavailable");
+    }) as unknown as typeof aiSdk.streamText);
+
+    const result = await generateWorkspaceIdentity(
+      "Add setting",
+      [{ model: "anthropic:claude-haiku-4-5" }, { model: "openai:gpt-5.6-luna" }],
+      titleAIService(createModelWithPinnedOptions)
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toEqual(c.expected);
     }
     expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
   });

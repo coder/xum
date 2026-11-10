@@ -16,9 +16,8 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { APIClient } from "@/browser/contexts/API";
 
-import { installDom } from "../dom";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
-import { cleanupView, setupWorkspaceView } from "../helpers";
+import { cleanupView, setupTestDom, setupWorkspaceView } from "../helpers";
 import { ChatHarness } from "./chatHarness";
 
 async function waitForWorkspaceChatToRender(container: HTMLElement): Promise<void> {
@@ -93,7 +92,11 @@ export async function createAppHarness(options?: {
     workspaceId = createResult.metadata.id;
     metadata = createResult.metadata;
 
-    cleanupDom = installDom();
+    // setupTestDom turns the first-run tutorial off: its bubble takes focus ~300 ms after the
+    // workspace header mounts (#7109), so a test that focused a composer in that window lost focus
+    // to it (#7120). No app-harness test covers tutorials; one that does can set the flag in its
+    // beforeRender hook. Cleanup restores the flag.
+    cleanupDom = setupTestDom();
     options?.beforeRender?.(workspaceId);
     view = renderApp({ apiClient: options?.wrapApiClient?.(env.orpc) ?? env.orpc, metadata });
 

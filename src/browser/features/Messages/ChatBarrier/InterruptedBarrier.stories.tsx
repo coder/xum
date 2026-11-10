@@ -1,4 +1,4 @@
-import { expect, waitFor, within } from "@storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { PIXEL_DISABLED, PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";

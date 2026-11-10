@@ -586,6 +586,38 @@ export async function prepareExtractedToolAttachmentForProvider(
     };
   }
 }
+/**
+ * Replay-only self-healing for MCP media that no provider accepts. mcpToModelOutput turns every
+ * `media` item into a file part, so audio, blobs or SVG in a persisted MCP result would fail
+ * every later request. The extraction these results used to go through replaced such items
+ * with bounded text (unsupported types) or inline SVG text; this keeps that on replay. Images
+ * of supported types stay unchanged, so their bytes match the in-turn step. Returns the same
+ * object when nothing changes.
+ */
+export function replaceProviderUnreadyMcpMedia(output: unknown): unknown {
+  if (!isContentContainer(output)) return output;
+  let changed = false;
+  const value = output.value.map((item) => {
+    if (!isMediaPart(item)) return item;
+    if (!isSupportedAttachmentMediaType(item.mediaType)) {
+      changed = true;
+      return buildUnsupportedMediaPlaceholder(item);
+    }
+    if (normalizeAttachmentMediaType(item.mediaType) !== SVG_MEDIA_TYPE) return item;
+    changed = true;
+    return { type: "text" as const, text: inlineSvgTextOrNote(item) };
+  });
+  return changed ? { ...output, value } : output;
+}
+
+function inlineSvgTextOrNote(item: AISDKMediaPart): string {
+  try {
+    return createInlineSvgAttachmentText({ data: item.data, mediaType: SVG_MEDIA_TYPE });
+  } catch (error) {
+    return `[SVG attachment omitted from provider request: ${error instanceof Error ? error.message : "Failed to inline SVG attachment."}]`;
+  }
+}
+
 export function createToolAttachmentSummaryText(count: number): string {
   return `[Attached ${count} attachment(s) from tool output]`;
 }
@@ -823,15 +855,6 @@ function isAttachmentPlaceholderPart(value: unknown): boolean {
     typeof part.text === "string" &&
     part.text.startsWith(ATTACHMENT_PLACEHOLDER_PREFIX)
   );
-}
-
-export function createDataUrlForExtractedAttachment(attachment: ExtractedToolAttachment): string {
-  if (attachment.mediaType === SVG_MEDIA_TYPE) {
-    const svgText = Buffer.from(attachment.data, "base64").toString("utf8");
-    return `data:${SVG_MEDIA_TYPE},${encodeURIComponent(svgText)}`;
-  }
-
-  return `data:${attachment.mediaType};base64,${attachment.data}`;
 }
 
 function createInlineSvgAttachmentText(attachment: ExtractedToolAttachment): string {
