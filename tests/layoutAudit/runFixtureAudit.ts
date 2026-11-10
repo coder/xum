@@ -85,17 +85,22 @@ function formatRow(row: Row): string {
   ].join("  ");
 }
 
-/** Mismatches between a row and its expectation: a settled pass, the width asked for, the rules. */
+const describeFinding = (finding: { rule: string; selector: string }) =>
+  `${finding.rule} ${finding.selector}`;
+
+/** Mismatches between a row and its expectation: a settled pass, the width, the findings. */
 function mismatches(row: Row): string[] {
-  const expected = FIXTURE_EXPECTATIONS[row.fixture]?.[row.width];
-  const found = row.pass.findings.map((finding) => finding.rule).sort();
+  const expected = FIXTURE_EXPECTATIONS[row.fixture]?.[row.width] ?? [];
+  const found = row.pass.findings.map(describeFinding).sort();
   const problems: string[] = [];
   if (!row.pass.complete) problems.push("the pass is not complete");
   if (row.pass.viewportWidth !== row.width) {
     problems.push(`the page reported width ${row.pass.viewportWidth}`);
   }
-  if (!expected || JSON.stringify(found) !== JSON.stringify([...expected].sort())) {
-    problems.push(`rules [${found.join(", ")}], expected [${(expected ?? []).join(", ")}]`);
+  if (JSON.stringify(found) !== JSON.stringify(expected.map(describeFinding).sort())) {
+    problems.push(
+      `findings [${found.join(" | ")}], expected [${expected.map(describeFinding).sort().join(" | ")}]`
+    );
   }
   return problems;
 }
