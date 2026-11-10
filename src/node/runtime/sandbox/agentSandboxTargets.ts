@@ -653,12 +653,13 @@ function statIfExists(target: string): fs.Stats | undefined {
   }
 }
 
+/** The folders in `folder`, also those that a link in it names: git follows one (Codex review). */
 function childDirs(folder: string): string[] {
   try {
     return fs
-      .readdirSync(folder, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(folder, entry.name));
+      .readdirSync(folder)
+      .map((name) => path.join(folder, name))
+      .filter((entry) => statIfExists(entry)?.isDirectory() === true);
   } catch {
     return [];
   }

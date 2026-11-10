@@ -1,6 +1,10 @@
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
-import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
+import {
+  SandboxManager,
+  type FilesystemPathEntry,
+  type SandboxRuntimeConfig,
+} from "@anthropic-ai/sandbox-runtime";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import {
@@ -110,13 +114,19 @@ export async function resetAgentSandboxRuntime(): Promise<void> {
   await reset;
 }
 
-/** The srt config that turns `policy` into one command's Seatbelt profile. */
+/**
+ * The srt config that turns `policy` into one command's Seatbelt profile. Its allows are real
+ * paths, which srt would read as globs where a name holds `*`, `?`, `[` or `]`: a workspace
+ * `project*` would open `project-secrets` (Codex review). Its denies keep their globs, and srt
+ * also denies a deny's own name.
+ */
 function srtConfigForPolicy(policy: AgentSandboxPolicy): Partial<SandboxRuntimeConfig> {
+  const literal = (entry: string): FilesystemPathEntry => ({ path: entry, literal: true });
   return {
     filesystem: {
       denyRead: policy.denyRead,
-      allowRead: policy.allowRead,
-      allowWrite: [...policy.writeRoots, ...policy.gitCommonDirs],
+      allowRead: policy.allowRead.map(literal),
+      allowWrite: [...policy.writeRoots, ...policy.gitCommonDirs].map(literal),
       denyWrite: policy.denyWrite,
     },
     network: {

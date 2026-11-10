@@ -1525,12 +1525,14 @@ async function applyProjectPatch(params: {
         // `git worktree remove` and `prune` run no hooks. Once the dry-run worktree exists, the
         // sandbox keeps its metadata in the main .git read-only, so a sandboxed cleanup failed and
         // left the worktree behind after every dry run (Codex review); like `git worktree add` for
-        // a workspace, Xum's own cleanup runs outside the sandbox.
+        // a workspace, Xum's own cleanup runs outside the sandbox. It needs nothing from the
+        // user's PATH, where a sandboxed command can plant a git (an activated .venv/bin), so it
+        // takes git from the system folders.
         try {
           const removeResult = await execBuffered(
             params.runtime,
             `${gitPrefix}git worktree remove --force ${shellQuote(dryRunWorktreePath)}`,
-            { cwd: params.repoCwd, timeout: 60, sandbox: "off" }
+            { cwd: params.repoCwd, timeout: 60, sandbox: "internal" }
           );
           if (removeResult.exitCode !== 0) {
             log.debug("task_apply_git_patch: dry-run git worktree remove failed", {
@@ -1557,7 +1559,7 @@ async function applyProjectPatch(params: {
           const pruneResult = await execBuffered(params.runtime, `${gitPrefix}git worktree prune`, {
             cwd: params.repoCwd,
             timeout: 60,
-            sandbox: "off",
+            sandbox: "internal",
           });
           if (pruneResult.exitCode !== 0) {
             log.debug("task_apply_git_patch: dry-run git worktree prune failed", {

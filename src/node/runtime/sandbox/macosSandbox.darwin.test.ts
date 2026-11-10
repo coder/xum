@@ -164,6 +164,31 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(await exists(path.join(outside, "escaped.txt"))).toBe(false);
     });
 
+    it("opens a workspace whose name holds glob characters as that folder only", async () => {
+      const workspace = path.join(root, "ws*[x]");
+      // srt reads such a name as a glob, which matches these files beside it.
+      const secret = path.join(root, "ws-secret-x");
+      const escaped = path.join(root, "ws-escaped-x");
+      await fs.mkdir(workspace);
+      await fs.writeFile(secret, "secret");
+
+      const result = await runSandboxed(
+        explicitPolicy(workspace, { denyRead: [root] }),
+        workspace,
+        [
+          "echo in > inside.txt",
+          `echo out > '${escaped}' || echo WRITE_DENIED`,
+          `cat '${secret}' || echo READ_DENIED`,
+        ].join("; ")
+      );
+
+      expect(result.stdout).toContain("WRITE_DENIED");
+      expect(result.stdout).toContain("READ_DENIED");
+      expect(result.stdout).not.toContain("secret");
+      expect(await fs.readFile(path.join(workspace, "inside.txt"), "utf8")).toBe("in\n");
+      expect(await exists(escaped)).toBe(false);
+    });
+
     it("closes a denied root, reopens a carve-out and closes a nested deny again", async () => {
       const workspace = path.join(root, "ws");
       const home = path.join(root, "home");

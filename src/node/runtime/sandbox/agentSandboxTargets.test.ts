@@ -639,6 +639,21 @@ describe("buildAgentSandboxPolicy", () => {
     expect(agentSandboxPolicyAllows(policy, path.join(repo, "deep.inc"), "write")).toBe(false);
   });
 
+  test("keeps a submodule git folder that a link in .git/modules names read-only", async () => {
+    const linked = path.join(repo, "vendor-git");
+    await fs.mkdir(path.join(linked, "hooks"), { recursive: true });
+    await fs.writeFile(path.join(linked, "HEAD"), "ref: refs/heads/main\n");
+    await fs.mkdir(path.join(commonDir, "modules"));
+    await fs.symlink(linked, path.join(commonDir, "modules", "vendor"));
+
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+    for (const name of ["hooks/post-checkout", "config"]) {
+      expect(agentSandboxPolicyAllows(policy, path.join(linked, name), "write")).toBe(false);
+    }
+    expect(agentSandboxPolicyAllows(policy, path.join(repo, "notes.md"), "write")).toBe(true);
+  });
+
   test("fails closed on a git include path that it cannot read as git does", () => {
     git(repo, "config", "include.path", '../"git config"');
 

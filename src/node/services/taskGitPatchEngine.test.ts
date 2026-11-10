@@ -975,6 +975,17 @@ describe("task git patch engine", () => {
         ],
       });
       const runtimeTempDir = path.join(realRoot, "runtime-tmp-sandboxed-dry-run");
+      // A sandboxed command can plant a git in a PATH folder that it writes (an activated .venv/bin).
+      const plantedBin = path.join(realRoot, "planted-bin");
+      const plantedLog = path.join(realRoot, "planted-git.log");
+      await fsPromises.mkdir(plantedBin);
+      await fsPromises.writeFile(
+        path.join(plantedBin, "git"),
+        `#!/bin/sh\necho "$*" >> '${plantedLog}'\nexec /usr/bin/git "$@"\n`,
+        { mode: 0o755 }
+      );
+      const inheritedPath = process.env.PATH;
+      process.env.PATH = `${plantedBin}:${inheritedPath ?? ""}`;
 
       setAgentSandboxTargets({
         fallback: {
@@ -1002,7 +1013,12 @@ describe("task git patch engine", () => {
         expect(dryRun.success).toBe(true);
       } finally {
         setAgentSandboxTargets(null);
+        process.env.PATH = inheritedPath;
       }
+      // The sandboxed git calls ran it, Xum's cleanup outside the sandbox did not.
+      const plantedCalls = await fsPromises.readFile(plantedLog, "utf-8");
+      expect(plantedCalls).toContain("am --abort");
+      expect(plantedCalls).not.toMatch(/^worktree (remove|prune)/m);
 
       const worktrees = execSync("git worktree list --porcelain", {
         cwd: targetRepo,
