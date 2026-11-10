@@ -5607,6 +5607,56 @@ describe("Config", () => {
       });
     });
 
+    it("still seeds the direct default when the user chain uses a Coder-scoped Fable key", () => {
+      // Coder keys stay gateway-scoped (sanitizeFallbackModelString). Runtime
+      // lookup is raw-first, so this chain serves only the Coder selection and
+      // a direct FABLE selection still needs its own default chain.
+      const coderKey = `coder:anthropic/${KNOWN_MODELS.FABLE.providerModelId}`;
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
+          modelFallbacks: { [coderKey]: { models: ["openai:gpt-5.5"] } },
+        })
+      );
+
+      expect(config.loadConfigOrDefault().modelFallbacks).toEqual({
+        [coderKey]: { models: ["openai:gpt-5.5"] },
+        [FABLE]: { models: [OPUS] },
+      });
+    });
+
+    it("does not activate a fallback through a Coder-scoped tombstone", () => {
+      // Read-time sanitizing drops this empty, disabled entry, and a default-typed
+      // Coder selection then resolves through the direct key. Seeding the direct
+      // default here would turn on a fallback the user disabled.
+      const coderKey = `coder:anthropic/${KNOWN_MODELS.FABLE.providerModelId}`;
+      const tombstone = { enabled: false, models: [] };
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
+          modelFallbacks: { [coderKey]: tombstone },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.modelFallbacks?.[FABLE]).toBeUndefined();
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
+      const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
+        modelFallbacks?: unknown;
+      };
+      expect(raw.modelFallbacks).toEqual({ [coderKey]: tombstone });
+    });
+
     it("respects a hand-edited tombstone whose chain sanitizes away", () => {
       fs.writeFileSync(
         configFilePath(),
