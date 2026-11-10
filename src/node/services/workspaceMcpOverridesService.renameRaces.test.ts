@@ -378,6 +378,7 @@ describe("plugin sweep: a rename that puts a workspace back where it was", () =>
     const a = w.workspacePath;
     const b = path.join(path.dirname(a), "rolling");
     let release: (() => Promise<void>) | undefined;
+    let rollback: Promise<void> | undefined;
     const { failures } = await sweepWithPhases(
       service,
       [w.workspaceId, other.workspaceId],
@@ -388,18 +389,18 @@ describe("plugin sweep: a rename that puts a workspace back where it was", () =>
         await fs.rename(a, b);
         await fs.mkdir(a); // third actor
       },
-      async () => {
-        // Not awaited: the rollback lands 1 s later, while the sweep waits for the workspace's lock.
-        setTimeout(() => {
-          void (async () => {
-            await fs.rename(b, a);
-            await release?.();
-          })();
-        }, 1000);
+      () => {
+        // Not awaited here: the rollback lands 1 s later, while the sweep waits for the
+        // workspace's lock.
+        rollback = new Promise<void>((resolve) => setTimeout(resolve, 1000)).then(async () => {
+          await fs.rename(b, a);
+          await release?.();
+        });
+        return Promise.resolve();
       }
     );
     // Let the delayed rollback land if the sweep returned before it.
-    await new Promise((r) => setTimeout(r, 1500));
+    await rollback;
     const failed = failures.map((f) => f.workspaceId);
     const keyAtA = await holdsKey(a);
     const violation = !failed.includes(w.workspaceId) && keyAtA;
