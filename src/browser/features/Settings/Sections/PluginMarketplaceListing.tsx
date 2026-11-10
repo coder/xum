@@ -266,12 +266,13 @@ const PreviewButton: React.FC<{
     size="sm"
     // An entry name has no length limit and may have no break point: the label wraps at its
     // spaces and hyphens, and inside a word only when the word is longer than a line, so the
-    // action row never grows past a phone screen.
-    className="h-auto min-h-8 max-w-full py-1 text-left break-words whitespace-normal"
+    // action row never grows past a phone screen. The label is its own min-w-0 flex item: the
+    // button lays out as a flex row, and break-words alone would not let a long word shrink.
+    className="h-auto min-h-8 max-w-full py-1 text-left whitespace-normal"
     onClick={props.onClick}
     disabled={props.disabled}
   >
     {props.fetching && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-    {props.fetching ? "Fetching…" : props.label}
+    <span className="min-w-0 break-words">{props.fetching ? "Fetching…" : props.label}</span>
   </Button>
 );
