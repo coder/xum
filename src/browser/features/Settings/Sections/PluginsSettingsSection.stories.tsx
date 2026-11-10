@@ -7,6 +7,7 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
+import { renderedLineTops, textLineTops } from "@/browser/stories/helpers/renderedLines";
 import { PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import type {
@@ -215,28 +216,6 @@ function pluginCardOf(element: HTMLElement): HTMLElement {
   return card;
 }
 
-/**
- * The line tops that the text of `range` covers. An inline-block's own client rects hold one box
- * for all its lines, so measure a range over its text.
- */
-function renderedLineTops(range: Range): Set<number> {
-  return new Set(Array.from(range.getClientRects()).map((rect) => Math.round(rect.top)));
-}
-
-/** The line tops that the first `text` inside `element` covers. */
-function textLineTops(element: HTMLElement, text: string): Set<number> {
-  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-  for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
-    const start = (node.textContent ?? "").indexOf(text);
-    if (start === -1) continue;
-    const range = document.createRange();
-    range.setStart(node, start);
-    range.setEnd(node, start + text.length);
-    return renderedLineTops(range);
-  }
-  throw new Error(`${text} is not inside the element`);
-}
-
 /** The plain words of `element` (letters and a trailing punctuation mark) that span two lines. */
 function splitProseWords(element: HTMLElement): string[] {
   const split: string[] = [];
@@ -378,12 +357,10 @@ export const InstalledPhoneViewport: Story = {
     await canvas.findByRole("button", { name: /Update/ });
     await expectInterfaceAsText(canvasElement);
     // Max-length separator-free names must wrap instead of overflowing the
-    // card's right edge at phone width.
+    // card's right edge at phone width: checked in the sweep below, down to 320 px.
     const maxRow = await canvas.findByText(MAX_LENGTH_NAME);
     const card = maxRow.closest("div[class*='rounded-md']");
-    if (card instanceof HTMLElement && card.scrollWidth > card.clientWidth + 1) {
-      throw new Error("Max-length plugin row overflows its card at phone width");
-    }
+    if (!(card instanceof HTMLElement)) throw new Error("Max-length plugin card not found");
     const capability = await canvas.findByText(MAX_LENGTH_CAPABILITY);
     const capabilityCard = capability.closest("div[class*='rounded-md']");
     if (
@@ -424,6 +401,9 @@ export const InstalledPhoneViewport: Story = {
     });
     for (let width = 320; width <= 390; width += 5) {
       wrapper.style.width = `${width}px`;
+      if (card.scrollWidth > card.clientWidth + 1) {
+        throw new Error(`Max-length plugin row overflows its card at ${width}px`);
+      }
       for (const path of paths) {
         const range = document.createRange();
         range.selectNodeContents(path);
@@ -1866,6 +1846,62 @@ export const AddPluginMarketplacePhoneViewport: Story = {
     if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
     if (card.scrollWidth > card.clientWidth + 1) {
       throw new Error("The marketplace list overflows the card at phone width");
+    }
+  },
+};
+
+/** An entry name with hyphens that is longer than a phone line: its Preview label wraps at them. */
+const HYPHENATED_ENTRY_NAME = "design-readiness-orchestrator-with-weekly-status-reports";
+const HYPHENATED_NAME_LISTING: AgentPluginMarketplaceListing = {
+  ...MARKETPLACE_LISTING,
+  entries: [
+    { ...MARKETPLACE_LISTING.entries[0], name: HYPHENATED_ENTRY_NAME },
+    ...MARKETPLACE_LISTING.entries.slice(1),
+  ],
+};
+
+/**
+ * The "Preview <entry name>" action of a long entry name at phone width: the label wraps at its
+ * spaces and hyphens, so no part of the name is cut in two, and the button stays inside the card
+ * down to 320 px. Play-only: the marketplace story above snapshots the same panel (Pixel budget).
+ */
+export const AddPluginMarketplaceLongNamePhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: PIXEL_DISABLED,
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={marketplaceOptions(HYPHENATED_NAME_LISTING)}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openMarketplace(canvasElement);
+    const preview = await canvas.findByRole("button", { name: `Preview ${HYPHENATED_ENTRY_NAME}` });
+    const group = canvas.getByRole("group", { name: "Pick one plugin to install" });
+    const card = group.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (let width = 320; width <= 390; width += 5) {
+      wrapper.style.width = `${width}px`;
+      if (card.scrollWidth > card.clientWidth + 1) {
+        throw new Error(`The marketplace list overflows the card at ${width}px`);
+      }
+      if (preview.getBoundingClientRect().right > card.getBoundingClientRect().right + 1) {
+        throw new Error(`The Preview button sticks out of the card at ${width}px`);
+      }
+      for (const part of ["Preview", ...HYPHENATED_ENTRY_NAME.split("-")]) {
+        if (textLineTops(preview, part).size !== 1) {
+          throw new Error(`${part} of the Preview button is split across lines at ${width}px`);
+        }
+      }
     }
   },
 };
