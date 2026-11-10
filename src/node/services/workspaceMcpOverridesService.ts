@@ -11,7 +11,7 @@ import assert from "@/common/utils/assert";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { Config, ProjectsConfig } from "@/node/config";
+import { CONFIG_UNCHANGED, type Config, type ProjectsConfig } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
@@ -1562,10 +1562,16 @@ export class WorkspaceMcpOverridesService {
   ): Promise<void> {
     const expected =
       options?.onlyIfEquals === undefined ? undefined : JSON.stringify(options.onlyIfEquals);
-    await this.config.editConfig((config) => {
+    // Every save calls this. An edit that changes nothing still rewrote the whole config.json
+    // (at 7,550 workspaces each save re-serialized the registry), so the transform reports
+    // CONFIG_UNCHANGED when there is no value to clear. It decides under the edit's lock: a
+    // check read before the lock skipped the clear of a value that another process (a
+    // downgraded Xum) committed under that lock.
+    await this.config.editConfigIfChanged((config) => {
       for (const [_projectPath, projectConfig] of config.projects) {
         const workspace = projectConfig.workspaces.find((w) => w.id === workspaceId);
         if (workspace) {
+          if (workspace.mcp === undefined) return CONFIG_UNCHANGED;
           if (expected !== undefined && JSON.stringify(workspace.mcp) !== expected) {
             log.debug(
               "[MCP] Legacy workspace MCP overrides changed since they were read; not clearing",
@@ -1573,13 +1579,13 @@ export class WorkspaceMcpOverridesService {
                 workspaceId,
               }
             );
-            return config;
+            return CONFIG_UNCHANGED;
           }
           delete workspace.mcp;
           return config;
         }
       }
-      return config;
+      return CONFIG_UNCHANGED;
     });
   }
 

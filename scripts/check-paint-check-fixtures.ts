@@ -42,6 +42,7 @@ export const FIXTURES: ReadonlyMap<string, string | null> = new Map([
   ["DiagramClippedAway", VIEWPORT_CHECK_MESSAGE],
   ["DiagramBelowTheFoldInHiddenParent", VIEWPORT_CHECK_MESSAGE],
   ["DiagramPaintsOutsideItsBox", "paint only inside its box"],
+  ["DiagramBelowTheFoldSeenWhenScrolled", null],
   ["DiagramMountsWhenTheRunnerWaits", null],
 ]);
 

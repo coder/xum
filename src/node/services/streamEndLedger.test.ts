@@ -5,6 +5,7 @@ import type { ProjectsConfig } from "@/node/config";
 import { StreamEndLedger, type StreamEndLedgerDeps } from "@/node/services/streamEndLedger";
 import type {
   AdmittedSend,
+  InheritedReport,
   OwnedTaskAttempt,
   StreamEndTaskOrigin,
 } from "@/node/services/taskService";
@@ -18,8 +19,12 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 const TASK = "task-a";
 const ATTEMPT = "att_00000000000000a1";
 const OTHER = "att_00000000000000b2";
+const PREDECESSOR_REPORTED_AT = "2026-10-01T00:00:00.000Z";
 
-function attempt(attemptId: string = ATTEMPT, inheritedReport = false): OwnedTaskAttempt {
+function attempt(
+  attemptId: string = ATTEMPT,
+  inheritedReport: InheritedReport | null = null
+): OwnedTaskAttempt {
   return { attemptId, receiptEligible: true, inheritedReport } as unknown as OwnedTaskAttempt;
 }
 
@@ -270,14 +275,66 @@ describe("StreamEndLedger decisions", () => {
 
   test("an attempt that began on a reported row (reactivated) inherits the report and continues", () => {
     const t = harness();
-    t.state.config = configWithRow({ taskStatus: "reported", taskAttemptId: ATTEMPT });
-    const owned = attempt(ATTEMPT, true);
+    t.state.config = configWithRow({
+      taskStatus: "reported",
+      reportedAt: PREDECESSOR_REPORTED_AT,
+      taskAttemptId: ATTEMPT,
+    });
+    const owned = attempt(ATTEMPT, { taskStatus: "reported" });
     const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
     expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
     expect(decision?.outcome).toBe("nonreport");
-    // Its next reawaken may still prove a no-report receipt.
+    // The attempt continues: a later no-report end may still prove it never reported.
     expect(owned.receiptEligible).toBe(true);
   });
+
+  // A report writes `reported`, and finalizeAgentTaskReport ends early on a row that reads it, so
+  // a reported row's report is never replaced. Only an interrupted row's report can be.
+  test.each([
+    {
+      name: "a reported row that another writer's report time changed",
+      inherited: "reported",
+      row: { taskStatus: "reported", reportedAt: "2026-10-01T00:00:09.000Z" },
+    },
+    {
+      name: "a reported row that a failure turned interrupted",
+      inherited: "reported",
+      row: { taskStatus: "interrupted", reportedAt: PREDECESSOR_REPORTED_AT },
+    },
+    {
+      name: "an interrupted row that still carries its report",
+      inherited: "interrupted",
+      row: { taskStatus: "interrupted", reportedAt: PREDECESSOR_REPORTED_AT },
+    },
+  ] as const)("an inherited report that the row still carries ($name) continues", (c) => {
+    const t = harness();
+    t.state.config = configWithRow({ ...c.row, taskAttemptId: ATTEMPT });
+    const owned = attempt(ATTEMPT, { taskStatus: c.inherited });
+    const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
+    expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+    expect(decision?.outcome).toBe("nonreport");
+    expect(owned.receiptEligible).toBe(true);
+  });
+
+  test.each([
+    { name: "the same millisecond", reportedAt: PREDECESSOR_REPORTED_AT },
+    { name: "a later time", reportedAt: "2026-10-01T00:00:09.000Z" },
+  ])(
+    "an inherited report of an interrupted row that the row has since replaced ($name) turns the decision indeterminate",
+    (c) => {
+      const t = harness();
+      t.state.config = configWithRow({
+        taskStatus: "reported",
+        reportedAt: c.reportedAt,
+        taskAttemptId: ATTEMPT,
+      });
+      const owned = attempt(ATTEMPT, { taskStatus: "interrupted" });
+      const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
+      expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+      expect(decision?.outcome).toBe("indeterminate");
+      expect(owned.receiptEligible).toBe(false);
+    }
+  );
 
   test("an unowned stream whose row reads reported is refused, never assumed to continue", () => {
     const t = harness();

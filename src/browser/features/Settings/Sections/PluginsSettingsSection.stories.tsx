@@ -215,6 +215,30 @@ function pluginCardOf(element: HTMLElement): HTMLElement {
   return card;
 }
 
+/**
+ * The line tops that the text of `range` covers. An inline-block's own client rects hold one box
+ * for all its lines, so measure a range over its text.
+ */
+function renderedLineTops(range: Range): Set<number> {
+  return new Set(Array.from(range.getClientRects()).map((rect) => Math.round(rect.top)));
+}
+
+/** The plain words of `element` (letters and a trailing punctuation mark) that span two lines. */
+function splitProseWords(element: HTMLElement): string[] {
+  const split: string[] = [];
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+    for (const match of (node.textContent ?? "").matchAll(/\S+/g)) {
+      if (!/^[A-Za-z]+[.,:;]?$/.test(match[0])) continue;
+      const range = document.createRange();
+      range.setStart(node, match.index);
+      range.setEnd(node, match.index + match[0].length);
+      if (renderedLineTops(range).size > 1) split.push(match[0]);
+    }
+  }
+  return split;
+}
+
 const PluginsSectionStoryShell: FC<{ options: MockORPCClientOptions; children: ReactNode }> = (
   props
 ) => {
@@ -359,6 +383,18 @@ export const InstalledPhoneViewport: Story = {
     const name = within(pluginCardOf(manage)).getByText("grill");
     if (Math.abs(manage.getBoundingClientRect().left - name.getBoundingClientRect().left) > 1) {
       throw new Error("Wrapped plugin actions are not flush with the card text");
+    }
+    // The skill and MCP counts are prose: they wrap at spaces, never inside a word. A word only
+    // splits when the screen's edge falls inside it, and the counts of this fixture fit a 320 px
+    // line, so sweep widths from below that up to 390 px, the width that the Pixel snapshot shows.
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (let width = 200; width <= 390; width += 5) {
+      wrapper.style.width = `${width}px`;
+      for (const counts of canvas.getAllByText(/skills imported/)) {
+        const split = splitProseWords(counts);
+        if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}px`);
+      }
     }
   },
 };
@@ -811,6 +847,18 @@ export const HooksReviewPhoneViewport: Story = {
     const panel = (await canvas.findByText(/A hook runs only after you trust it/)).parentElement;
     if (panel instanceof HTMLElement && panel.scrollWidth > panel.clientWidth + 1) {
       throw new Error("Hook review panel overflows at phone width");
+    }
+    // The handler lines wrap at words, never inside one, down to a 320 px screen.
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (const width of ["390px", "320px"]) {
+      wrapper.style.width = width;
+      await waitFor(() => {
+        for (const line of canvas.getAllByText(/^MCP tool grill/)) {
+          const split = splitProseWords(line);
+          if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}`);
+        }
+      });
     }
   },
 };
@@ -2047,6 +2095,125 @@ export const AddPluginCursorReviewPhoneViewport: Story = {
     if (!(card instanceof HTMLElement)) throw new Error("Consent preview card not found");
     if (card.scrollWidth > card.clientWidth + 1) {
       throw new Error("The not-applied list overflows the card at phone width");
+    }
+  },
+};
+
+const COMPONENT_FILES = {
+  agents: [
+    "bootstrap_orchestrator.md",
+    "codebase_details.md",
+    "comprehension.md",
+    "design_critic.md",
+    "implementation_readiness.md",
+    "design-review-orchestrator.md",
+  ],
+  workflows: ["weekly-release-notes.js", "implementation-readiness-report.js", "triage.js"],
+};
+
+/** A separator-free name longer than a phone line: it can only wrap inside its own box. */
+const LONG_FILE_NAME = "implementation_readiness_design_review_orchestrator_agent_v2.md";
+
+/** A configured plugins folder with one segment longer than a phone line. */
+const LONG_PLUGINS_DIRECTORY = `~/.mux/plugins/${"d".repeat(100)}`;
+
+/** A plugin whose agents and workflows have long file names, some with hyphens (break points). */
+const COMPONENT_FILES_PREVIEW: AgentPluginInstallPreview = {
+  ...CLAUDE_REPO_PREVIEW,
+  method: { kind: "agent-plugin" },
+  methods: [{ kind: "agent-plugin" }],
+  skillsCliSkills: [],
+  manifest: { name: "review-kit", version: "1.4.0" },
+  mcpServers: [],
+  agents: [...COMPONENT_FILES.agents, LONG_FILE_NAME],
+  workflows: COMPONENT_FILES.workflows,
+  codexHooks: [
+    {
+      key: "hooks/hooks.json#PreToolUse[0][0]",
+      hash: "4".repeat(64),
+      event: "PreToolUse",
+      handler: { type: "command", summary: "node ${CLAUDE_PLUGIN_ROOT}/hooks/check.js" },
+      status: "claude-plugin",
+      source: "hooks/hooks.json",
+    },
+  ],
+  reviewedComponents: [
+    { kind: "agents", name: "implementation_readiness_review.md", detail: "Reviews readiness." },
+    { kind: "workflows", name: "implementation-readiness-report.js", detail: "Writes a report." },
+    { kind: "agents", name: LONG_FILE_NAME, detail: "Orchestrates the review." },
+  ],
+};
+
+/**
+ * File names of agents, workflows and reviewed components, the words of the hook list and the
+ * plugins folder at phone width: each name moves to the next line whole instead of splitting at
+ * the card's edge, a name longer than a line wraps inside its own box, and nothing sticks out of
+ * the screen, down to 320 px. Play-only: the other phone stories of this file snapshot the same
+ * panel (Pixel budget).
+ */
+export const AddPluginFileNamesPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: PIXEL_DISABLED,
+  },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: {
+          items: [],
+          preview: COMPONENT_FILES_PREVIEW,
+          containerLocation: LONG_PLUGINS_DIRECTORY,
+        },
+      }}
+    >
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
+    await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), "acme/review-kit");
+    await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
+    await canvas.findByText("Agents (7)");
+    const directory = await canvas.findByText(LONG_PLUGINS_DIRECTORY);
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    const names = [
+      ...COMPONENT_FILES.agents,
+      ...COMPONENT_FILES.workflows,
+      "implementation_readiness_review.md",
+    ];
+    for (const width of ["390px", "320px"]) {
+      wrapper.style.width = width;
+      await waitFor(() => {
+        for (const name of names) {
+          for (const element of canvas.getAllByText(name)) {
+            const range = document.createRange();
+            range.selectNodeContents(element);
+            if (renderedLineTops(range).size !== 1) {
+              throw new Error(`${name} is split across lines at ${width}`);
+            }
+          }
+        }
+        const hook = canvas
+          .getAllByRole("listitem")
+          .find((item) => item.textContent?.startsWith("PreToolUse"));
+        if (hook === undefined) throw new Error("The hook list item is missing");
+        const split = splitProseWords(hook);
+        if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}`);
+        if (wrapper.scrollWidth > wrapper.clientWidth + 1) {
+          throw new Error(`The plugins section is wider than the screen at ${width}`);
+        }
+        if (directory.getBoundingClientRect().right > wrapper.getBoundingClientRect().right + 1) {
+          throw new Error(`The plugins folder sticks out of the screen at ${width}`);
+        }
+      });
     }
   },
 };

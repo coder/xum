@@ -889,35 +889,41 @@ describe("bridge document channel", () => {
     ]);
   });
 
-  // document.open() erases the window's listeners (WebKit and Chromium): the bridge adds its
-  // pagehide listener again, so a later navigation still closes the frame at once.
-  test("pagehide sends leave, also after document.open() erased the window's listeners", () => {
-    const { win, listeners, fire } = pageWindow();
-    class PageDocument {
-      // document.open() erases the window's listeners, as in WebKit and Chromium.
-      open() {
+  // document.open() erases the window's listeners (WebKit and Chromium), and document.write()
+  // or writeln() after load opens the document again: the bridge adds its pagehide listener
+  // again after each, so a later navigation still closes the frame at once.
+  test.each(["open", "write", "writeln"] as const)(
+    "pagehide sends leave, also after document.%s() erased the window's listeners",
+    (method) => {
+      const { win, listeners, fire } = pageWindow();
+      const erase = () => {
         listeners.length = 0;
+      };
+      class PageDocument {
+        open() {
+          erase();
+        }
+        write() {
+          erase();
+        }
+        writeln() {
+          erase();
+        }
       }
-      write() {
-        // Only open() matters here.
-      }
-      writeln() {
-        // Only open() matters here.
-      }
+      const bridge = runFrameScript(bridgeScript("dark"), {
+        window: win,
+        document: page(),
+        CustomEvent: FakeCustomEvent,
+        Document: PageDocument,
+      });
+      const leave = { xumFrameDocument: 1, type: "leave" };
+      fire("pagehide");
+      expect(bridge.posted).toEqual([leave]);
+      PageDocument.prototype[method].call(new PageDocument());
+      fire("pagehide");
+      expect(bridge.posted).toEqual([leave, leave]);
     }
-    const bridge = runFrameScript(bridgeScript("dark"), {
-      window: win,
-      document: page(),
-      CustomEvent: FakeCustomEvent,
-      Document: PageDocument,
-    });
-    const leave = { xumFrameDocument: 1, type: "leave" };
-    fire("pagehide");
-    expect(bridge.posted).toEqual([leave]);
-    PageDocument.prototype.open.call(new PageDocument());
-    fire("pagehide");
-    expect(bridge.posted).toEqual([leave, leave]);
-  });
+  );
 });
 
 describe("bridge script WebRTC removal", () => {

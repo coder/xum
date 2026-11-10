@@ -7,13 +7,13 @@
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally:
 // bun test ./scripts/ci/downloadTreeSitterGrammars.test.ts
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { runScript, type RunResult } from "./runScript";
+import { SPAWNING_TEST_TIMEOUT_MS, runScript, type RunResult } from "./runScript";
 
 const SCRIPT_DIR = import.meta.dir;
 const PLATFORM = "linux-x86_64";
@@ -77,6 +77,8 @@ elif mode == "main":
 elif mode == "pins":
     print(json.dumps({"release": m.RELEASE, "pins": m.PINS.__dict__}))
 `;
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");

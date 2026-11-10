@@ -242,7 +242,7 @@ Xum reports a directory only when the path is valid where `bash` runs. Otherwise
 | Plugin skills                                      | Path                          | Global plugins: no path. Project plugins: path (on the remote) | No path                 |
 | Built-in skills (bundled in the app, no directory) | No path                       | No path                                                        | No path                 |
 
-A multi-project workspace gets a path only when every one of its projects is a local or worktree workspace, and then follows the first column. With an SSH, Docker or devcontainer project, it gets none.
+A multi-project workspace gets a path only when every one of its projects is a local or worktree workspace, and then follows the "Local and worktree workspaces" column. With an SSH, Docker or devcontainer project, it gets none.
 
 When you invoke a project skill in the first message of a new worktree workspace, Xum reads the skill from the project's main checkout, because the new worktree can lack it. That copy is not the worktree's, so the placeholders stay literal. If the worktree has the skill, the agent gets its path from `agent_skill_read`.
 
