@@ -28,6 +28,7 @@ import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { ArtifactsExperimentConfig } from "./ArtifactsExperimentConfig";
 import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
 import { MemoryDreamCostCeilingSetting } from "./MemoryDreamCostCeilingSetting";
+import { MemoryDreamEditLimitSetting } from "./MemoryDreamEditLimitSetting";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
 
@@ -805,7 +806,12 @@ export function ExperimentsSection() {
               {exp.id === EXPERIMENT_IDS.MEMORY && memoryEnabled && (
                 <ExperimentSettingsPanel>
                   <SubExperimentRows experimentIds={MEMORY_SUB_EXPERIMENT_IDS} />
-                  {memoryConsolidationEnabled && <MemoryDreamCostCeilingSetting />}
+                  {memoryConsolidationEnabled && (
+                    <>
+                      <MemoryDreamCostCeilingSetting />
+                      <MemoryDreamEditLimitSetting />
+                    </>
+                  )}
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING && ptcEnabled && (
