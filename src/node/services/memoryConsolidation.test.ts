@@ -1983,7 +1983,7 @@ describe("runMemoryConsolidation", () => {
 
     // Memory contents are untrusted model input: unlimited runs at the safety cap, so one run's
     // accepted writes, and its journal rows, stay bounded (organizerEditBudget's tests refuse the
-    // edit after the cap; 256 parallel creates here would only slow the suite down).
+    // edit after the cap; a cap's worth of parallel creates here would only slow the suite down).
     it("states the safety cap as the budget of an unlimited run", async () => {
       using fixture = await createFixture();
       const scripted = creatingModel(MEMORY_CONSOLIDATION_OP_BUDGET + 4);

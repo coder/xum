@@ -165,7 +165,7 @@ describe("UserPreferencesSchema", () => {
     // cap: dropping it would run at the default 8, far under what the user asked for.
     for (const stored of [
       MEMORY_DREAM_EDIT_LIMIT_MAX + 1,
-      1000,
+      50_000,
       Number.MAX_SAFE_INTEGER,
       2 ** 60,
     ]) {
