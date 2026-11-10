@@ -911,9 +911,11 @@ export interface InheritedReport {
    * The row's status then. Only a row that read `interrupted` can be reported again: a report
    * writes `reported`, finalizeAgentTaskReport ends early on a row that reads it, and an adopted
    * artifact needs a row without a completed report. So a `reported` row's report is never
-   * replaced, and an `interrupted` row's is replaced exactly when the row reads `reported`. Known
-   * limit: a failure can turn a `reported` row `interrupted` (it keeps its report time), and
-   * another backend's report of the attempt then goes unseen, as the row reads `reported` again.
+   * replaced, and an `interrupted` row's is replaced exactly when the row reads `reported`. The
+   * status cannot tell the report of a `reported` row that a failure turned `interrupted` (it keeps
+   * its report time) and another backend's report turned back: the row's `taskReportAttemptId`
+   * names the attempt that wrote its report, and StreamEndLedger.rowReportsAttempt counts a report
+   * that names the attempt too.
    */
   readonly taskStatus: "reported" | "interrupted";
 }
@@ -22989,6 +22991,9 @@ export class TaskService implements AgentTaskIntegration {
         reportedAttemptId = ws.taskAttemptId;
         ws.taskStatus = "reported";
         ws.reportedAt = getIsoNow();
+        // Whose report the row carries: the ledger counts it as this attempt's own even after a
+        // failure turned the row interrupted and another report turned it back (see InheritedReport).
+        if (ws.taskAttemptId != null) ws.taskReportAttemptId = ws.taskAttemptId;
         markChildGoalPauseOwed(ws);
         // Successful completion resets the persisted recovery circuit breaker.
         delete ws.taskRecoveryAttempts;
@@ -23282,6 +23287,8 @@ export class TaskService implements AgentTaskIntegration {
         }
         workspace.taskStatus = "reported";
         workspace.reportedAt = getIsoNow();
+        if (workspace.taskAttemptId != null)
+          workspace.taskReportAttemptId = workspace.taskAttemptId;
         markChildGoalPauseOwed(workspace);
         delete workspace.taskRecoveryAttempts;
       },

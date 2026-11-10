@@ -47,6 +47,8 @@ import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks"
  */
 const rootId = "root-hold";
 const model = "openai:gpt-5.2";
+/** The attempt createStack seeds the child row with. */
+const PREDECESSOR_ATTEMPT = "att_00000000000000a4";
 
 interface Internals {
   attemptLedger: {
@@ -60,6 +62,13 @@ interface Internals {
   };
   taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+  finalizeAgentTaskReport: (
+    childWorkspaceId: string,
+    childEntry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    reportArgs: { reportMarkdown: string },
+    reportedAttempt: undefined,
+    reportedAttemptId: string | undefined
+  ) => Promise<{ finalized: boolean; reason?: string }>;
   editWorkspaceEntry: (
     workspaceId: string,
     updater: (workspace: WorkspaceConfigEntry) => void,
@@ -1232,6 +1241,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     const stack = await createStack(childId, {
       taskStatus: "reported",
       reportedAt: REPORTED_AT,
+      // A report written by a build that records whose it is: it names the predecessor attempt.
+      taskReportAttemptId: PREDECESSOR_ATTEMPT,
     });
     const { workspaceService, completions, sendOptions } = stack;
     try {
@@ -1339,6 +1350,134 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       // The inherited report says nothing about this attempt: its follow-up runs.
       expect(completions).toHaveLength(2);
       expect(stack.heldTexts()).toEqual([]);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  // The status cannot tell an attempt's own report from an inherited one once a failure has turned
+  // the reported row interrupted (it keeps its report time): the row's report binding does. The
+  // stream end's handler waits on the workspace event lock while the row changes, so the decision
+  // reads the final row. The failure is a raw row edit: failAgentTaskTerminally on the owning
+  // backend would also close the attempt's admission, a different refusal. The report is another
+  // backend's: a second TaskService on the same config.
+  async function endStreamWhileRowChanges(
+    childId: string,
+    row: Partial<WorkspaceConfigEntry>,
+    steps: ReadonlyArray<"failure" | "foreign report">
+  ) {
+    const stack = await createStack(childId, row);
+    const { config, svc, taskService, workspaceService, completions, sendOptions } = stack;
+    const foreign = internals(
+      createTaskServiceStack(config, { historyService: fixture.historyService }).taskService
+    );
+    const onCanceled = mock((_reason: string) => undefined);
+    const parked = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let parkedLock: Promise<void> | undefined;
+    try {
+      expect(
+        await taskService.sendMessageToDescendantAgentTask(rootId, childId, "work", "turn-end")
+      ).toMatchObject(Ok({ delivery: "reactivated" }));
+      await until(() => completions.length === 1, "the continuation stream");
+      expect(
+        await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+      ).toEqual(Ok(undefined));
+      parkedLock = svc.workspaceEventLocks.withLock(childId, async () => {
+        parked.resolve();
+        await release.promise;
+      });
+      await parked.promise;
+      stack.endStream(0, {}, true);
+      for (const step of steps) {
+        if (step === "failure") {
+          await editChildRow(config, childId, (workspace) => {
+            workspace.taskStatus = "interrupted";
+          });
+          continue;
+        }
+        const workspace = entryOf(config, childId)!;
+        expect(
+          await foreign.finalizeAgentTaskReport(
+            childId,
+            { projectPath: workspace.path, workspace },
+            { reportMarkdown: "done by another backend" },
+            undefined,
+            workspace.taskAttemptId
+          )
+        ).toMatchObject({ finalized: true });
+      }
+      release.resolve();
+      await parkedLock;
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "the follow-up dispatched or held"
+      );
+      await yieldMacrotasks(10);
+      return { stack, onCanceled };
+    } catch (error) {
+      release.resolve();
+      await parkedLock;
+      await stack.cleanup();
+      throw error;
+    }
+  }
+
+  test.each([
+    {
+      name: "a failure turned a reactivated reported row interrupted and another backend then reported",
+      row: {
+        taskStatus: "reported",
+        reportedAt: REPORTED_AT,
+        taskReportAttemptId: PREDECESSOR_ATTEMPT,
+      },
+      steps: ["failure", "foreign report"],
+    },
+    {
+      name: "another backend reported a reactivated interrupted row and a failure then turned it interrupted again",
+      row: { taskStatus: "interrupted", reportedAt: REPORTED_AT },
+      steps: ["foreign report", "failure"],
+    },
+  ] as const)(
+    "a report that names the fresh attempt refuses the held follow-up as indeterminate: $name",
+    async (c) => {
+      const childId = "holdbinding001";
+      const { stack, onCanceled } = await endStreamWhileRowChanges(childId, c.row, c.steps);
+      try {
+        const row = entryOf(stack.config, childId);
+        expect(row?.taskReportAttemptId).toBe(row?.taskAttemptId);
+        expect(row?.taskAttemptId).not.toBe(PREDECESSOR_ATTEMPT);
+        // Never a new turn of the attempt that another backend reported.
+        expect(stack.completions).toHaveLength(1);
+        expect(stack.heldTexts()).toEqual(["follow-up text"]);
+        expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
+        expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+      } finally {
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
+
+  test("a superseded report writes no report binding", async () => {
+    const childId = "holdbinding002";
+    const stack = await createStack(childId, { taskStatus: "running" });
+    const foreign = internals(
+      createTaskServiceStack(stack.config, { historyService: fixture.historyService }).taskService
+    );
+    try {
+      const workspace = entryOf(stack.config, childId)!;
+      expect(
+        await foreign.finalizeAgentTaskReport(
+          childId,
+          { projectPath: workspace.path, workspace },
+          { reportMarkdown: "late report" },
+          undefined,
+          "att_00000000000000b9"
+        )
+      ).toMatchObject({ finalized: false, reason: "superseded_attempt" });
+      expect(entryOf(stack.config, childId)).toMatchObject({ taskStatus: "running" });
+      expect(entryOf(stack.config, childId)?.taskReportAttemptId).toBeUndefined();
     } finally {
       await stack.cleanup();
     }

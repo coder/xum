@@ -367,8 +367,11 @@ export class StreamEndLedger {
 
   /**
    * The task's row reads a completed report bound to `attemptId`, other than `inherited` (the one
-   * the row carried when the attempt began). Only an inherited report of an `interrupted` row can
-   * be replaced, and the replacing report writes `reported` (see InheritedReport).
+   * the row carried when the attempt began). Two things count as this attempt's own: a report that
+   * replaced an inherited `interrupted` row's (it writes `reported`, see InheritedReport), and a
+   * report whose `taskReportAttemptId` names the attempt. The second adds to the first and never
+   * removes from it, so a binding can only add a refusal: it cannot reopen a case the status rule
+   * refuses, and a stale or foreign binding changes nothing.
    */
   private rowReportsAttempt(
     taskId: string,
@@ -382,7 +385,8 @@ export class StreamEndLedger {
     if (workspace?.taskAttemptId !== attemptId || !hasCompletedAgentReport(workspace)) return false;
     return (
       inherited == null ||
-      (inherited.taskStatus === "interrupted" && workspace.taskStatus === "reported")
+      (inherited.taskStatus === "interrupted" && workspace.taskStatus === "reported") ||
+      workspace.taskReportAttemptId === attemptId
     );
   }
 

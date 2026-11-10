@@ -915,6 +915,10 @@ function normalizePersistedWorkspace(
   const hasLegacyTaskExperiments = Object.hasOwn(persisted, "taskExperiments");
   const hasMalformedTaskAttemptId =
     persisted.taskAttemptId !== undefined && !isTaskAttemptId(persisted.taskAttemptId);
+  // A malformed report binding (hand edit, corruption) reads as absent: the stream-end decision
+  // then applies the status rule alone, as it does for every row reported before the field existed.
+  const hasMalformedReportAttemptId =
+    persisted.taskReportAttemptId !== undefined && !isTaskAttemptId(persisted.taskReportAttemptId);
   // A malformed removal marker (hand edit, corruption) is dropped rather than kept: every task
   // admission refuses while one is set, and the removal could not judge its owner, so the
   // workspace could neither be used nor removed.
@@ -953,6 +957,7 @@ function normalizePersistedWorkspace(
     !hasBestOf &&
     !hasLegacyTaskExperiments &&
     !hasMalformedTaskAttemptId &&
+    !hasMalformedReportAttemptId &&
     !hasMalformedPendingRemoval &&
     !hasMalformedPendingArchive &&
     !hasMalformedConsentPending &&
@@ -969,6 +974,7 @@ function normalizePersistedWorkspace(
   if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
   if (hasMalformedPendingArchive) delete nextWorkspace.pendingArchive;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
+  if (hasMalformedReportAttemptId) delete nextWorkspace.taskReportAttemptId;
   if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
   if (hasMalformedRemotePlanMigrated) nextWorkspace.remotePlanMigrated = true;
   if (hasMalformedDelegatedCreation) delete nextWorkspace.delegatedCreation;
@@ -5714,6 +5720,8 @@ export class Config {
           taskPromptSendId: existing.taskPromptSendId,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
+          // Written only by a report (with reportedAt): a metadata round trip never drops it.
+          taskReportAttemptId: existing.taskReportAttemptId,
           taskReservationTombstones: existing.taskReservationTombstones,
           pendingRemoval: existing.pendingRemoval,
           pendingArchive: existing.pendingArchive,

@@ -2650,6 +2650,48 @@ describe("Config", () => {
     });
   });
 
+  describe("report attempt binding", () => {
+    it("keeps a well-formed binding and drops malformed ones while loading", () => {
+      const rows = [
+        ["ws-ok", "att_00000000000000a1"],
+        ["ws-str", "not-an-attempt-id"],
+        ["ws-empty", ""],
+        ["ws-num", 7],
+        ["ws-obj", { attemptId: "att_00000000000000a1" }],
+      ] as const;
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: rows.map(([id, taskReportAttemptId]) => ({
+                  path: `/repo/${id}`,
+                  id,
+                  name: id,
+                  taskReportAttemptId,
+                })),
+              },
+            ],
+          ],
+        })
+      );
+
+      const kept = (config.loadConfigOrDefault().projects.get("/repo")?.workspaces ?? []).map(
+        (workspace) => [workspace.id, workspace.taskReportAttemptId]
+      );
+
+      expect(kept).toEqual([
+        ["ws-ok", "att_00000000000000a1"],
+        ["ws-str", undefined],
+        ["ws-empty", undefined],
+        ["ws-num", undefined],
+        ["ws-obj", undefined],
+      ]);
+    });
+  });
+
   describe("birth stamp of a root created without delegation (#5569)", () => {
     const row = (id: string, extra: Record<string, unknown>) => ({
       path: `/repo/${id}`,
@@ -6654,6 +6696,38 @@ describe("Config", () => {
       const [metadata] = await reloaded.getAllWorkspaceMetadata();
       await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
       expect(row()).toMatchObject({ title: "Renamed", taskTerminalFailure: marker });
+    });
+
+    it("keeps a task's report attempt binding through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      const attemptId = "att_00000000000000a1";
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "child",
+              name: "child",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              parentWorkspaceId: "owner",
+              taskStatus: "reported",
+              reportedAt: "2026-10-01T00:00:00.000Z",
+              taskAttemptId: attemptId,
+              taskReportAttemptId: attemptId,
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      expect(row()?.taskReportAttemptId).toBe(attemptId);
+      // Server-owned like the attempt identity: absent from metadata, kept by a metadata write.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({ title: "Renamed", taskReportAttemptId: attemptId });
     });
 
     it("keeps the messaging-tag revocation generation through reload and a metadata write", async () => {
