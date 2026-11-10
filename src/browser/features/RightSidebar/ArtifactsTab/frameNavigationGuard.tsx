@@ -27,10 +27,11 @@ type FrameLifecycle =
  * document can answer it: a page the frame navigated to gets a fresh realm without the port.
  * No answer to the latest check within FRAME_DOCUMENT_CHECK_DEADLINE_MS of the first unanswered
  * one closes the frame, so neither an old answer nor a page that keeps reloading itself keeps it
- * open. A deadline timer that fires late (the app's own thread was blocked, so the document
- * could not answer either) gives the check one more deadline, never past
- * FRAME_DOCUMENT_CHECK_CAP_MS after its first unanswered check (frameDocumentChannel.ts). The
- * document's `pagehide` leave closes it at once (a fast path its own code can block).
+ * open. A deadline whose window saw the app's own thread blocked (a timer of the channel fired
+ * late, so the document may not have been able to answer either) gives the check one more
+ * deadline, never past FRAME_DOCUMENT_CHECK_CAP_MS after its first unanswered check
+ * (frameDocumentChannel.ts). The document's `pagehide` leave closes it at once (a fast path its
+ * own code can block).
  * Before the bind, the second load closes the frame. All bridge traffic, both ways, goes over the
  * bound port only (frameDocumentChannel.ts).
  *
@@ -44,8 +45,8 @@ type FrameLifecycle =
  *    a destination page; the first script posts it before any artifact or view script runs.
  * 5. An MCP App view holds its own port, so it can break its own channel (close it, answer
  *    nothing). Its next load then closes its frame; it cannot keep a destination page open.
- * 6. A destination page that keeps the shared thread busy (WebKit, in-process Chromium) makes
- *    each deadline late, so it stays shown (without the bridge) until the cap passes and its
+ * 6. A destination page that keeps the shared thread busy (WebKit, in-process Chromium) blocks
+ *    each deadline's window, so it stays shown (without the bridge) until the cap passes and its
  *    current block ends.
  */
 export function useFrameNavigationGuard(documentKey: string | null) {

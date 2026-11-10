@@ -260,6 +260,8 @@ describe("ServiceContainer", () => {
       startTime: Date.parse(armed.createdAt),
       shownThroughOffset: 0,
       terminalStatusShownToAgent: false,
+      outputBytesRead: 0,
+      incompleteLineBuffer: "",
       status: "running",
       isForeground: false,
       monitor,
