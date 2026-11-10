@@ -128,12 +128,15 @@ export function hidesSecretBehindEscapes(text: string): boolean {
 }
 
 /**
- * True when `text` carries a secret that the publish-time scan of the JSON text it is written as
- * would not find. JSON writes a control character as an escape: `"\nghp_..."` has no word boundary
- * before the token, so the scan passes it while a reader of the decoded string sees the token. The
- * same goes for a percent escape (`hidesSecretBehindEscapes`). A token that the scan finds in the
- * written text is not hidden: the scan holds that file for the user's review, the flow a push uses
- * for any file that looks like a secret.
+ * True when `text` carries a secret that the raw-text check of the publish-time scan would not find
+ * in the JSON text it is written as. JSON writes a control character as an escape: `"\nghp_..."` has
+ * no word boundary before the token, so that check passes it while a reader of the decoded string
+ * sees the token. The same goes for a percent escape (`hidesSecretBehindEscapes`). The scan also
+ * checks each decoded JSON string of a `.json` file (`jsonStringsMatchSecretPattern`), which holds
+ * the file for the first kind of escape and not for the second. The first kind still counts here:
+ * a plugin row is left out of the list, so a push does not stop for review over a name the
+ * installer took. A token that the raw-text check finds is not hidden: the scan holds that file
+ * for the user's review, the flow a push uses for any file that looks like a secret.
  */
 function stringHidesSecret(text: string): boolean {
   if (matchesSecretPattern(JSON.stringify(text))) return false;
@@ -142,8 +145,8 @@ function stringHidesSecret(text: string): boolean {
 
 /**
  * True when a string of a JSON value, a value or an object key at any depth, hides a secret from
- * the publish-time scan of the JSON text (`stringHidesSecret`). Checking the strings themselves
- * leaves nothing for a JSON escape to hide behind.
+ * the raw-text check of the publish-time scan of the JSON text (`stringHidesSecret`). Checking the
+ * strings themselves leaves nothing for a JSON escape to hide behind.
  */
 export function jsonValueHidesSecret(value: unknown): boolean {
   if (typeof value === "string") return stringHidesSecret(value);

@@ -5861,30 +5861,36 @@ describe("jsonValueHidesSecret", () => {
     );
 
   // JSON writes each of these first characters as an escape, so the token has no word boundary in
-  // the text the publish-time scan reads. The strings themselves have one.
+  // the text the raw check reads. The strings themselves have one, and the scan reads them too: it
+  // holds the file for review as well. The row check still finds the token, so a plugin row that
+  // carries one is left out of the list and no push has to stop over it.
   it.each([
     ["a newline", "\n"],
     ["a tab", "\t"],
     ["a carriage return", "\r"],
     ["a control character written as \\u00XX", "\u0001"],
     ["a lone surrogate", "\ud800"],
-  ])("finds a token after %s that the scan of the JSON text passes", (_label, prefix) => {
+  ])("finds a token after %s that only a decoded string shows", (_label, prefix) => {
     const value = { importedComponents: { skills: [], mcpServers: [`${prefix}${token}`] } };
 
-    expect(publishScan(value)).toEqual([]);
     expect(jsonValueHidesSecret(value)).toBe(true);
+    expect(publishScan(value)).toEqual(["agent-plugins/manifest.json"]);
   });
 
   it("finds a token in an object key, at any depth", () => {
     const value = { a: [{ b: { [`\n${token}`]: 1 } }] };
 
-    expect(publishScan(value)).toEqual([]);
     expect(jsonValueHidesSecret(value)).toBe(true);
+    expect(publishScan(value)).toEqual(["agent-plugins/manifest.json"]);
   });
 
-  it("finds a token that a percent escape hides, in a value or a key", () => {
-    expect(jsonValueHidesSecret({ url: `https://h/%20${token}/r.git` })).toBe(true);
-    expect(jsonValueHidesSecret({ [`%20${token}`]: "x" })).toBe(true);
+  it("finds a token that a percent escape hides, in a value or a key, which the scan does not read", () => {
+    const hidden = [{ url: `https://h/%20${token}/r.git` }, { [`%20${token}`]: "x" }];
+
+    for (const value of hidden) {
+      expect(jsonValueHidesSecret(value)).toBe(true);
+      expect(publishScan(value)).toEqual([]);
+    }
   });
 
   it("leaves a token that the scan of the JSON text finds to the scan, which holds the file for review", () => {
