@@ -11,6 +11,7 @@ import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
   MEMORY_DREAM_EDIT_LIMIT_MAX,
+  MEMORY_CONSOLIDATION_NOTE_MAX_CHARS,
   MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
@@ -637,6 +638,50 @@ describe("consolidation memory tool rails", () => {
         expect(op.note?.length).toBeLessThan(MEMORY_CONSOLIDATION_PATH_MAX_CHARS);
       }
       expect(fixture.getMutationCount()).toBe(0);
+    });
+
+    it("journals a failed edit's long error cut to the note cap, and returns it whole", async () => {
+      using fixture = await createFixture();
+      // A full-size file in which old_str starts every line: the error lists every line number.
+      // (Few matches per line: findMatchingLines re-reads the file once per match.)
+      const line = `x${"-".repeat(126)}\n`;
+      const lines = MEMORY_MAX_FILE_BYTES / line.length;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "big.md"), line.repeat(lines));
+
+      const result = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/big.md",
+        old_str: "x",
+        new_str: "y",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      // The model still gets every line number to pick a unique old_str from.
+      expect(result.error).toContain(`matches ${lines} locations`);
+      expect(result.error).toContain(`, ${lines})`);
+      const note = fixture.journal[0]?.note ?? "";
+      expect(fixture.journal[0]?.applied).toBe(false);
+      expect(note).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      expect(result.error.startsWith(note.slice(0, MEMORY_CONSOLIDATION_NOTE_MAX_CHARS / 2))).toBe(
+        true
+      );
+      expect(note).not.toContain(`, ${lines})`);
+    });
+
+    it("journals a failed edit's error whole when it fits the note cap", async () => {
+      using fixture = await createFixture();
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "small.md"), "x\nx\n");
+
+      const result = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/small.md",
+        old_str: "x",
+        new_str: "y",
+      });
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(fixture.journal[0]?.note).toBe(result.error);
     });
 
     it("accepts a path of exactly the cap", async () => {

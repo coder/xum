@@ -24,7 +24,8 @@
  * Every mutating command is journaled ({command, path, applied, rejected})
  * for the audit trail that feeds the Memory tab's "last consolidated" line.
  * Refused commands spend no budget, so their rows are capped
- * (MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES) and so is a path's length.
+ * (MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES), and so are a path's length and a
+ * row's note (MEMORY_CONSOLIDATION_NOTE_MAX_CHARS).
  * Global-scope writes are intentionally permitted (merging into global files
  * is core consolidation work); they remain auditable in the journal via the
  * /memories/global/ path prefix.
@@ -49,6 +50,7 @@ import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
   MEMORY_DREAM_EDIT_LIMIT_MAX,
+  MEMORY_CONSOLIDATION_NOTE_MAX_CHARS,
   MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   type MemoryScope,
 } from "@/common/constants/memory";
@@ -103,6 +105,8 @@ const DEFAULT_WRITABLE_SCOPES: readonly WritableMemoryScope[] = ["workspace", "g
 const LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
 const MUTATING_COMMANDS = MemoryConsolidationOpSchema.shape.command.options;
 const JOURNAL_FULL_NOTE = "The journal is full; later refusals of this run are not recorded.";
+/** Ends a journal note cut to its length cap (see clipJournalNote). */
+const JOURNAL_NOTE_CUT_MARKER = " [note cut]";
 
 interface MutationTarget {
   command: MemoryConsolidationOp["command"];
@@ -439,12 +443,27 @@ function refusalRow(
   return {
     ...persistedTarget(rails, target),
     applied: false,
-    note: persistedText(rails, note),
+    note: persistedNote(rails, note),
   };
 }
 
 function persistedText(rails: Pick<MutationRails, "rejectSecretLike">, text: string): string {
   return rails.rejectSecretLike === true ? redactSecretLike(text) : text;
+}
+
+/**
+ * A note cut to `max` characters, the marker included. Each row's note is bounded so the journal
+ * is: its rows are bounded in number and their paths in length, but a failed command's error is
+ * not (MEMORY_CONSOLIDATION_NOTE_MAX_CHARS).
+ */
+function clipJournalNote(note: string, max = MEMORY_CONSOLIDATION_NOTE_MAX_CHARS): string {
+  if (note.length <= max) return note;
+  return `${note.slice(0, max - JOURNAL_NOTE_CUT_MARKER.length)}${JOURNAL_NOTE_CUT_MARKER}`;
+}
+
+/** A note as a row stores it: redacted first (a cut could split a credential), then cut. */
+function persistedNote(rails: Pick<MutationRails, "rejectSecretLike">, note: string): string {
+  return clipJournalNote(persistedText(rails, note));
 }
 
 /**
@@ -489,7 +508,9 @@ function journalRefusal(journal: MemoryConsolidationOp[], row: RefusalRow): void
     return;
   }
   fullJournals.add(journal);
-  journal.push({ ...row, note: `${row.note} ${JOURNAL_FULL_NOTE}` });
+  // Cut so that the full note itself always fits under the note cap.
+  const roomForNote = MEMORY_CONSOLIDATION_NOTE_MAX_CHARS - JOURNAL_FULL_NOTE.length - 1;
+  journal.push({ ...row, note: `${clipJournalNote(row.note, roomForNote)} ${JOURNAL_FULL_NOTE}` });
 }
 
 /**
@@ -625,7 +646,7 @@ export function createConsolidationMemoryTool(args: {
           rejectSecretLike: args.rejectSecretLike,
         });
         if (invalid !== null) {
-          journal.push({ ...target, applied: false, note: invalid });
+          journal.push({ ...target, applied: false, note: clipJournalNote(invalid) });
           return { success: false, error: invalid };
         }
         journal.push({ ...target, applied: false, note: "dry-run" });
@@ -643,7 +664,7 @@ export function createConsolidationMemoryTool(args: {
       journal.push({
         ...persistedTarget(rails, target),
         applied: result.success,
-        note: result.success ? undefined : persistedText(rails, result.error),
+        note: result.success ? undefined : persistedNote(rails, result.error),
       });
       return result;
     },
