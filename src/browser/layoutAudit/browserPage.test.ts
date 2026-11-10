@@ -204,6 +204,27 @@ describe("createBrowserSettleSignals", () => {
     await signals.fontsReady();
   });
 
+  test("fonts: waits for the font set to be ready", async () => {
+    using fake = createFakeBrowserWindow();
+    let fontsLoaded: () => void = noop;
+    const ready = new Promise<void>((resolve) => {
+      fontsLoaded = resolve;
+    });
+    Object.defineProperty(fake.win.document, "fonts", { value: { ready }, configurable: true });
+    let resolved = false;
+    const waiting = createBrowserSettleSignals(fake.win)
+      .fontsReady()
+      .then(() => {
+        resolved = true;
+      });
+    // A promise that resolves at once would have run its continuation within these ticks.
+    for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    expect(resolved).toBe(false);
+    fontsLoaded();
+    await waiting;
+    expect(resolved).toBe(true);
+  });
+
   test("frames: waits for as many animation frames as asked", async () => {
     using fake = createFakeBrowserWindow();
     let frames = 0;
