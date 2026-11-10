@@ -455,20 +455,49 @@ interface WorkflowJob {
   steps?: WorkflowStep[];
 }
 
+// The runner labels of a job: `runs-on` is a label, a list of labels, or `{ group, labels }`.
+function runnerLabels(runsOn: unknown): string[] {
+  if (typeof runsOn === "string") return [runsOn];
+  if (Array.isArray(runsOn)) return runsOn.flatMap(runnerLabels);
+  if (typeof runsOn === "object" && runsOn !== null && "labels" in runsOn) {
+    return runnerLabels(runsOn.labels);
+  }
+  return [];
+}
+
+// Whether the arguments of one electron-builder call build the Linux AppImage. `--linux` or `-l`
+// (alone or in a cluster such as `-wl`) does. Without a platform option electron-builder builds
+// for the host, so the call builds it on a runner that may be Linux, unless it is another
+// command (`install-app-deps`) or builds no package (`--dir`, `--help`).
+function electronBuilderBuildsAppImage(args: string, mayRunOnLinux: boolean): boolean {
+  if (/(?:^|\s)(?:--linux|-[mwl]*l[mwl]*)(?=\s|$)/.test(args)) return true;
+  const otherPlatform = /(?:^|\s)(?:--mac|--win|-[mwl]+)(?=\s|$)/.test(args);
+  const buildsNothing =
+    /^\s*(?:install-app-deps|node-gyp-rebuild|create-self-signed-cert|start)\b/.test(args) ||
+    /(?:^|\s)(?:--dir|--help|-h|--version)(?=\s|$)/.test(args);
+  return mayRunOnLinux && !otherPlatform && !buildsNothing;
+}
+
 // Whether a job builds the Linux AppImage. A command split over lines with a trailing backslash
-// reads as one. electron-builder builds it for `--linux`, directly or through `make dist-linux` or
-// `bun run dist:linux`, and the unqualified `make dist` (or `bun run dist`) builds for the runner's
-// own OS. `runs-on` is often an expression, so only a literal macOS or Windows runner rules a job out.
+// reads as one, and a comment line is not a command. electron-builder builds it as above, directly
+// or through `make dist-linux` or `bun run dist:linux`, and the unqualified `make dist` (or
+// `bun run dist`) builds for the runner's own OS. `runs-on` is often an expression, so only a
+// runner label that names macOS or Windows rules a job out.
 function buildsAppImage(job: WorkflowJob): boolean {
-  const runsOn =
-    typeof job["runs-on"] === "string" ? job["runs-on"] : JSON.stringify(job["runs-on"]);
-  const mayRunOnLinux = !/^(macos|windows)-[\w.-]+$/.test(runsOn);
+  const mayRunOnLinux = !runnerLabels(job["runs-on"]).some((label) =>
+    /^(?:macos|windows)\b/i.test(label)
+  );
   return (job.steps ?? []).some((step) => {
-    const run = (step.run ?? "").replace(/\\\r?\n\s*/g, " ");
-    return (
-      /electron-builder\b.*--linux|make dist-linux|run dist:linux/.test(run) ||
-      (mayRunOnLinux && /(?:make|run) dist(?![-:\w])/.test(run))
-    );
+    const lines = (step.run ?? "")
+      .replace(/\\\r?\n\s*/g, " ")
+      .split("\n")
+      .filter((line) => !/^\s*#/.test(line));
+    return lines.some((line) => {
+      if (/make dist-linux|run dist:linux/.test(line)) return true;
+      if (mayRunOnLinux && /(?:make|run) dist(?![-:\w])/.test(line)) return true;
+      const args = /electron-builder(?=\s|$)(.*)/.exec(line)?.[1];
+      return args !== undefined && electronBuilderBuildsAppImage(args, mayRunOnLinux);
+    });
   });
 }
 
@@ -476,7 +505,7 @@ function buildsAppImage(job: WorkflowJob): boolean {
 // and download the tool with no retry. Each row is one form that the detector must find or leave.
 describe("the AppImage job detector", () => {
   const linux = "ubuntu-latest";
-  test.each([
+  test.each<[string, unknown, string, boolean]>([
     ["electron-builder --linux", linux, "bun x electron-builder --linux --publish always", true],
     [
       "electron-builder over several lines",
@@ -503,6 +532,43 @@ describe("the AppImage job detector", () => {
       linux,
       "bun x electron-builder --mac\necho --linux",
       false,
+    ],
+    ["electron-builder -l", linux, "bun x electron-builder -l --publish never", true],
+    ["electron-builder -wl", linux, "bun x electron-builder -wl --publish never", true],
+    [
+      "electron-builder with no platform option",
+      linux,
+      "bun x electron-builder --publish never",
+      true,
+    ],
+    [
+      "electron-builder with no platform option on macOS",
+      "macos-15",
+      "bun x electron-builder",
+      false,
+    ],
+    ["electron-builder -m", linux, "bun x electron-builder -m --publish never", false],
+    ["electron-builder install-app-deps", linux, "bun x electron-builder install-app-deps", false],
+    ["electron-builder --dir", linux, "bun x electron-builder --dir", false],
+    ["a file named electron-builder.yml", linux, "cat electron-builder.yml", false],
+    ["a comment about electron-builder", linux, "# electron-builder unpacks the zip\ntrue", false],
+    [
+      "a plain make dist on a self-hosted macOS runner",
+      ["self-hosted", "macOS", "ARM64"],
+      "make dist",
+      false,
+    ],
+    [
+      "a plain make dist on a runner group with macOS labels",
+      { group: "g", labels: ["macOS"] },
+      "make dist",
+      false,
+    ],
+    [
+      "a plain make dist on a self-hosted Linux runner",
+      ["self-hosted", "linux"],
+      "make dist",
+      true,
     ],
   ])("%s", (_name, runsOn, run, builds) => {
     expect(buildsAppImage({ "runs-on": runsOn, steps: [{ run }] })).toBe(builds);
