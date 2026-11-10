@@ -1,4 +1,5 @@
 import { Window } from "happy-dom";
+import type { BrowserWindow } from "./browserPage";
 import type { Box, LayoutPage, LayoutStyle, PageMetrics, SettleSignals } from "./layoutPage";
 
 /**
@@ -178,6 +179,30 @@ export function createFakeLayoutPage(
       if (!el) throw new Error(`no element #${id}`);
       return el;
     },
+    [Symbol.dispose]() {
+      window.close();
+    },
+  };
+}
+
+export interface FakeBrowserWindow {
+  readonly win: BrowserWindow;
+  [Symbol.dispose](): void;
+}
+
+/**
+ * A happy-dom window typed as the browser window that browserPage.ts reads. happy-dom has no
+ * layout, so tests stub the individual browser APIs under test (getAnimations, ResizeObserver,
+ * createRange) on the returned window.
+ */
+export function createFakeBrowserWindow(
+  options: { width?: number; height?: number; bodyHtml?: string } = {},
+): FakeBrowserWindow {
+  const window = new Window({ width: options.width ?? 390, height: options.height ?? 844 });
+  window.document.body.innerHTML = options.bodyHtml ?? "";
+  return {
+    // happy-dom's Window is not structurally the DOM lib's Window & typeof globalThis.
+    win: window as unknown as BrowserWindow,
     [Symbol.dispose]() {
       window.close();
     },

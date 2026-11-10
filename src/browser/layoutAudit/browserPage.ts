@@ -41,8 +41,9 @@ function animationTarget(win: BrowserWindow, animation: Animation): Element | nu
   return owner instanceof win.Element ? owner : null;
 }
 
-// Upstream also matched playState "pending", which browsers stopped reporting (a play that is
-// still waiting to start reads "running").
+// Upstream also matched playState "pending", which browsers no longer report: in Chromium 153 an
+// animation still waiting to start reads "running" (with `pending` true) and one waiting to pause
+// reads "paused", so "running" covers every case upstream's "pending" once did.
 function runningAnimations(win: BrowserWindow): Animation[] {
   if (typeof win.document.getAnimations !== "function") return [];
   return win.document.getAnimations().filter((animation) => animation.playState === "running");
