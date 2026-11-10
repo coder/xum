@@ -2027,6 +2027,7 @@ describe("runMemoryConsolidation", () => {
       );
     });
 
+    // Up to 96 model steps: slow on a loaded host, so a longer timeout than the default 5 s.
     it("takes 4 steps for each edit of a raised limit", async () => {
       using fixture = await createFixture();
       const scripted = listingModel();
@@ -2034,7 +2035,7 @@ describe("runMemoryConsolidation", () => {
       await run(fixture, scripted.model, { editLimit: 24 });
 
       expect(scripted.calls).toHaveLength(96);
-    });
+    }, 30_000);
 
     it("never takes fewer steps than the default limit allows", async () => {
       using fixture = await createFixture();
@@ -2054,7 +2055,7 @@ describe("runMemoryConsolidation", () => {
 
       expect(scripted.calls).toHaveLength(40);
       expect(result.note).toBe("stopped at the cost ceiling after $20.00");
-    });
+    }, 30_000);
   });
 
   it("reports a pass cut short by its timeout as a stream error, not a clean run", async () => {
