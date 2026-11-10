@@ -57,6 +57,14 @@ function goal(overrides: Partial<GoalRecordV1> = {}): GoalRecordV1 {
   };
 }
 
+/** The raw reply of the review-threads GraphQL query; `flags` are the isResolved values, one per thread. */
+function threadsReply(totalCount: unknown, flags: readonly unknown[]): string {
+  const nodes = flags.map((isResolved) => ({ isResolved }));
+  return JSON.stringify({
+    data: { repository: { pullRequest: { reviewThreads: { totalCount, nodes } } } },
+  });
+}
+
 /** gh stand-in: answers by which command the script runs. */
 function ghRunner(answers: { view: string | null; threads?: string | null }): GoalBoardBashRunner {
   return (_workspaceId, script) =>
@@ -159,10 +167,10 @@ describe("fetchGoalBoardPrSection", () => {
   });
 
   test("a thread counts as resolved only when its flag is the boolean true", async () => {
-    // GitHub's isResolved is a Boolean!. A value of another type must not read as resolved: jq's `not` made
-    // the string "false" and the number 0 resolved.
+    // GitHub's isResolved is a Boolean!. A value of another type must not read as resolved: a jq `not`
+    // made the string "false" and the number 0 resolved.
     const resolved = [true, true, false, "false", 0, null, {}, "true", 1];
-    const threads = JSON.stringify({ total: resolved.length, resolved });
+    const threads = threadsReply(resolved.length, resolved);
     expect(
       await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads }))
     ).toMatchObject({ status: { unresolvedThreads: { count: 7, atLeast: false } } });
@@ -177,20 +185,43 @@ describe("fetchGoalBoardPrSection", () => {
     await fetchGoalBoardPrSection(WORKSPACE_ID, runner);
     const query = scripts.filter((script) => script.includes("gh api graphql"));
     expect(query).toHaveLength(1);
-    expect(query[0]).toMatch(/-F owner=\W*acme\W* -F name=\W*widgets\W* -F number=42 /);
+    expect(query[0]).toMatch(/-F owner=\W*acme\W* -F name=\W*widgets\W* -F number=42$/);
   });
 
-  test("a thread reply without the flags leaves the thread count unavailable", async () => {
-    // The shape of an older query (a count computed by jq) is not a list of flags.
+  test("a thread reply that is no list of threads leaves the thread count unavailable", async () => {
+    const reply = (reviewThreads: unknown) =>
+      JSON.stringify({ data: { repository: { pullRequest: { reviewThreads } } } });
     for (const threads of [
+      // The shape of an older query (a count computed by jq).
       JSON.stringify({ total: 3, seen: 3, unresolved: 3 }),
-      JSON.stringify({ total: 3, resolved: "true" }),
-      JSON.stringify({ resolved: [true] }),
+      // A GraphQL error carries no data.
+      JSON.stringify({ errors: [{ message: "Could not resolve to a PullRequest" }] }),
+      JSON.stringify({ data: null }),
+      reply(null),
+      reply({ nodes: [{ isResolved: true }] }),
+      reply({ totalCount: "3", nodes: [{ isResolved: true }] }),
+      reply({ totalCount: 3, nodes: "true" }),
+      reply({ totalCount: 3 }),
     ]) {
       expect(
         await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads }))
       ).toMatchObject({ kind: "pr", status: { unresolvedThreads: null } });
     }
+  });
+
+  test("a thread entry that is no object counts as unresolved", async () => {
+    const reply = JSON.stringify({
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: { totalCount: 3, nodes: [{ isResolved: true }, null, "x"] },
+          },
+        },
+      },
+    });
+    expect(
+      await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads: reply }))
+    ).toMatchObject({ status: { unresolvedThreads: { count: 2, atLeast: false } } });
   });
 
   test("no PR omits the section", async () => {
@@ -202,7 +233,7 @@ describe("fetchGoalBoardPrSection", () => {
 
   test("reports checks and unresolved threads; a failed thread query keeps the checks", async () => {
     const flags = [...Array.from({ length: 97 }, () => true), false, false, false];
-    const threads = "banner\n" + JSON.stringify({ total: 120, resolved: flags });
+    const threads = "banner\n" + threadsReply(120, flags);
     expect(
       await fetchGoalBoardPrSection(WORKSPACE_ID, ghRunner({ view: PR_VIEW, threads }))
     ).toEqual({

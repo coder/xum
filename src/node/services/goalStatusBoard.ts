@@ -286,6 +286,16 @@ export function summarizeChecks(raw: unknown): GoalBoardPrStatus["checks"] {
   return checks;
 }
 
+/** Follows `keys` through unknown JSON; anything that is no object on the way ends in undefined. */
+function dig(value: unknown, ...keys: string[]): unknown {
+  let current = value;
+  for (const key of keys) {
+    if (typeof current !== "object" || current === null) return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current;
+}
+
 function parseJsonObject(output: string): Record<string, unknown> | null {
   // Login shells can print banners first: parse from the first line that starts an object.
   const start = output.search(/^\{/m);
@@ -318,17 +328,19 @@ export async function fetchGoalBoardPrSection(
   if (repo) {
     const script =
       `gh api graphql -f query=${shescape.quote(REVIEW_THREADS_QUERY)}` +
-      ` -F owner=${shescape.quote(repo[1])} -F name=${shescape.quote(repo[2])} -F number=${number}` +
-      ` --jq '.data.repository.pullRequest.reviewThreads | {total: .totalCount, resolved: [.nodes[] | .isResolved]}'`;
+      ` -F owner=${shescape.quote(repo[1])} -F name=${shescape.quote(repo[2])} -F number=${number}`;
     const threads = await runBash(workspaceId, script, GOAL_BOARD_GH_TIMEOUT_SECONDS);
-    const counts = threads == null ? null : parseJsonObject(threads);
-    const flags = counts?.resolved;
-    if (counts != null && typeof counts.total === "number" && Array.isArray(flags)) {
-      // jq hands over the raw flags and the count happens here: GitHub's isResolved is a Boolean!, and a
-      // jq `not` would read the string "false" or the number 0 as resolved. Only `true` is resolved.
-      const unresolved = flags.filter((flag) => flag !== true).length;
+    // The raw GraphQL reply is read here, not through `gh --jq`: GitHub's isResolved is a Boolean!, and a
+    // jq `not` would read the string "false" or the number 0 as resolved.
+    const reply = threads == null ? null : parseJsonObject(threads);
+    const connection = dig(reply, "data", "repository", "pullRequest", "reviewThreads");
+    const total = dig(connection, "totalCount");
+    const nodes = dig(connection, "nodes");
+    if (typeof total === "number" && Array.isArray(nodes)) {
+      // Only `true` is resolved: a flag that is missing, null or of another type counts as unresolved.
+      const unresolved = nodes.filter((node) => dig(node, "isResolved") !== true).length;
       // Only the first 100 threads are fetched; more than that makes the count a lower bound.
-      unresolvedThreads = { count: unresolved, atLeast: counts.total > flags.length };
+      unresolvedThreads = { count: unresolved, atLeast: total > nodes.length };
     }
   }
   return {
