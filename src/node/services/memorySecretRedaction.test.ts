@@ -284,8 +284,8 @@ describe("redactSecretLike", () => {
   });
 
   // A session cookie is a bearer credential with no keyword and no token shape of its own. The
-  // value of a `Cookie` / `Set-Cookie` header goes to the end of its line (a raw break, or the
-  // escape of one in JSON text) or to the quote that ends it; the header name stays readable.
+  // value of a `Cookie` / `Set-Cookie` header goes to the end of its frame (a raw line, a quoted
+  // string, a JSON string at some depth), never to a quote or bracket of its own; the name stays.
   describe("a cookie header", () => {
     const SESSION = "s%3AopaqueSessionValue.Zm9vYmFy";
     const jsonOf = (value: unknown): string => JSON.stringify(value);
@@ -369,13 +369,20 @@ describe("redactSecretLike", () => {
       ],
       [
         "a header after an escaped line break and an indent",
-        String.raw`GET /\r\n  Cookie: sid=${SESSION}\r\nAccept: */*`,
-        String.raw`GET /\r\n  Cookie: [redacted]\r\nAccept: */*`,
+        String.raw`"GET /\r\n  Cookie: sid=${SESSION}\r\nAccept: */*"`,
+        String.raw`"GET /\r\n  Cookie: [redacted]\r\nAccept: */*"`,
       ],
       [
+        // No string's quote is in view, so where the value ends is unknown: the raw line goes.
+        "a header after an escaped line break outside any string",
+        String.raw`GET /\r\n  Cookie: sid=${SESSION}\r\nAccept: */*`,
+        String.raw`GET /\r\n  Cookie: [redacted]`,
+      ],
+      [
+        // An unquoted key is no quoted key, so its value runs to the end of the raw line.
         "a key of an object that a tool printed unquoted",
         `{ host: 'example.com', cookie: 'sid=${SESSION}', accept: '*/*' }`,
-        "{ host: 'example.com', cookie: '[redacted]', accept: '*/*' }",
+        "{ host: 'example.com', cookie: [redacted]",
       ],
       [
         "an unquoted -H argument",
@@ -429,16 +436,24 @@ describe("redactSecretLike", () => {
         `Host: x; Cookie: a=${SESSION}`,
         "Host: x; Cookie: [redacted]",
       ],
+      // The frame is read only from right before the name, so the rest of this line goes too.
+      [
+        "several headers in a quoted argument",
+        `curl -H "Host: x; Cookie: a=${SESSION}" url`,
+        'curl -H "Host: x; Cookie: [redacted]',
+      ],
+      // The list only tells where the line's end may begin: the value runs to the end of the line.
       [
         "Go's map print",
         `map[Accept:[*/*] Cookie:[a=${SESSION}]]`,
-        "map[Accept:[*/*] Cookie:[redacted]]",
+        "map[Accept:[*/*] Cookie:[redacted]",
       ],
       [
         "Go's map print with a quoted value in the list",
         `map[Set-Cookie:[theme="dark"; Path=/ sid=${SESSION}]]`,
-        "map[Set-Cookie:[redacted]]",
+        "map[Set-Cookie:[redacted]",
       ],
+      ["Go's map print closed after the marker", "map[Cookie:[redacted]]", "map[Cookie:[redacted]"],
       ["a sentence", `The cookie: a=${SESSION}`, "The cookie: [redacted]"],
       ["terminal color codes", `Cookie: \x1b[31msid=${SESSION}\x1b[0m`, "Cookie: [redacted]"],
       [
@@ -459,6 +474,481 @@ describe("redactSecretLike", () => {
       expect(redactSecretLike(redacted)).toBe(redacted);
     });
 
+    // Each of these ends a value at something inside it (a quote, a `]`, a marker, a color code
+    // around the name) under a content-based rule, and leaves the rest of the value readable.
+    it.each([
+      [
+        "a `]` inside a list item",
+        jsonOf({ "set-cookie": ["a=foo]bar", `sid=${SESSION}`] }),
+        // The regex pass ends the list at that `]`; what follows reads as more value.
+        '{"set-cookie":[redacted]',
+      ],
+      ["a quoted pair", `Cookie: sid="${SESSION}"\nHost: h`, "Cookie: [redacted]\nHost: h"],
+      [
+        "a quoted pair in JSON text",
+        jsonOf({ o: `Cookie: sid="${SESSION}"` }),
+        '{"o":"Cookie: [redacted]"}',
+      ],
+      [
+        "a single-quoted pair in JSON text",
+        jsonOf({ o: `Cookie: sid='${SESSION}'` }),
+        '{"o":"Cookie: [redacted]"}',
+      ],
+      ["a pair after the marker", `Cookie: [redacted]; sid=${SESSION}`, "Cookie: [redacted]"],
+      ["a pair after a list", `Cookie: [x]; sid=${SESSION}`, "Cookie: [redacted]"],
+      ["a pair after an empty list", `Cookie: [] sid=${SESSION}`, "Cookie: [redacted]"],
+      [
+        "a pair after a quoted key's value",
+        `"cookie": "a"; sid=${SESSION}`,
+        '"cookie": [redacted]',
+      ],
+      [
+        "a pair after escaped quotes in a quoted argument",
+        `curl -H "Cookie: a=\\"x\\"; sid=${SESSION}" url`,
+        'curl -H "Cookie: [redacted]" url',
+      ],
+      // `C` and `S` end a color code too: the name still starts there.
+      ["a name that ends a color code", `\x1b[Cookie: sid=${SESSION}`, "\x1b[Cookie: [redacted]"],
+      [
+        "a Set-Cookie that ends a color code",
+        `\x1b[Set-Cookie: sid=${SESSION}`,
+        "\x1b[Set-Cookie: [redacted]",
+      ],
+      // A quote behind a word closes a string: the header after it sits in raw text.
+      [
+        "a quoted token before the header",
+        `msg="req" Cookie: sid="${SESSION}"`,
+        'msg="req" Cookie: [redacted]',
+      ],
+      [
+        "escaped quotes before the header in JSON text",
+        jsonOf({ o: `say "hi" Cookie: sid="${SESSION}"` }),
+        String.raw`{"o":"say \"hi\" Cookie: [redacted]`,
+      ],
+      // A quote before `S` or before a cookie character is the value's own, not the string's close.
+      [
+        "Python's bytes repr",
+        `b'GET /\\r\\nSet-Cookie: sid="${SESSION}"\\r\\n'`,
+        `b'GET /\\r\\nSet-Cookie: [redacted]\\r\\n'`,
+      ],
+      [
+        "a quoted pair in a quoted argument",
+        `curl -H "Cookie: sid="${SESSION}"" url`,
+        'curl -H "Cookie: [redacted]" url',
+      ],
+      ["a single-quoted escaped key", `\\'cookie\\': sid="${SESSION}"`, "\\'cookie\\': [redacted]"],
+      [
+        "a name after an escaped tab",
+        jsonOf({ o: `a\tCookie: sid=${SESSION}` }),
+        String.raw`{"o":"a\tCookie: [redacted]"}`,
+      ],
+      [
+        "an apostrophe in a list that is not an item's quote",
+        `Set-Cookie: [it's x] ${SESSION}\nmore\nlines`,
+        "Set-Cookie: [redacted]\nmore\nlines",
+      ],
+      // A quote at a value's start opens it, even where it could close the frame around it.
+      [
+        "a quoted value after a single-quoted argument's colon",
+        `echo 'Cookie: ' sid=${SESSION}'`,
+        "echo 'Cookie: [redacted]",
+      ],
+      ["a single-quoted value at the start", `'Cookie: ' sid=${SESSION}`, "'Cookie: [redacted]"],
+      ["a quoted value in an assignment", `x="Cookie: " sid=${SESSION}"`, 'x="Cookie: [redacted]'],
+      ["a quoted value before a comma", `"Cookie: ",${SESSION}"`, '"Cookie: [redacted]'],
+      // The fail-closed cost: an empty header in a quoted argument loses the rest of its line.
+      [
+        "an empty header in a quoted argument",
+        `curl -H "Cookie: " https://example.com/${SESSION}`,
+        'curl -H "Cookie: [redacted]',
+      ],
+    ])("redacts the whole value with %s", (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toBe(expected);
+      expect(redacted).not.toContain(SESSION);
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
+    // Where the frame ends decides what stays readable after the value.
+    it.each([
+      [
+        "a string closed before an escaped line break",
+        jsonOf(JSON.stringify({ h: `Cookie: ${SESSION}` }, null, 2)),
+        String.raw`"{\n  \"h\": \"Cookie: [redacted]\"\n}"`,
+      ],
+      [
+        "a string that opens the text",
+        `"Cookie: sid=${SESSION}" keep`,
+        '"Cookie: [redacted]" keep',
+      ],
+      ["a string after a space", ` "Cookie: sid=${SESSION}" keep`, ' "Cookie: [redacted]" keep'],
+      // Up to 16 line markers between a string's quote and the name keep the string as the frame.
+      [
+        "a string with 16 blanks before the name",
+        `"${" ".repeat(16)}Cookie: sid=${SESSION}" keep`,
+        `"${" ".repeat(16)}Cookie: [redacted]" keep`,
+      ],
+      [
+        "a string with 17 blanks before the name",
+        `"${" ".repeat(17)}Cookie: sid=${SESSION}" keep`,
+        `"${" ".repeat(17)}Cookie: [redacted]`,
+      ],
+      [
+        "a string with a comma before the name",
+        `"\x1b[0m,Cookie: sid=${SESSION}" keep`,
+        '"\x1b[0m,Cookie: [redacted]',
+      ],
+      [
+        "a string with a bare escape before the name",
+        `"\x1b Cookie: a" sid=${SESSION}`,
+        '"\x1b Cookie: [redacted]',
+      ],
+      // The other quote inside a string is content: `'a'` leaves the JSON string open.
+      [
+        "a JSON string with single quotes before an escaped line break",
+        jsonOf({ o: `'a'\nCookie: sid=${SESSION}`, p: "keep" }),
+        String.raw`{"o":"'a'\nCookie: [redacted]","p":"keep"}`,
+      ],
+      [
+        "an escaped backslash before an escaped line break",
+        jsonOf({ o: `a\\\nCookie: sid=${SESSION}`, p: "keep" }),
+        String.raw`{"o":"a\\\nCookie: [redacted]","p":"keep"}`,
+      ],
+      [
+        "a quoted key's bare value in a JSON string",
+        jsonOf({ p: `{"cookie": sid=${SESSION}, "a": 1}`, q: "keep" }),
+        String.raw`{"p":"{\"cookie\": [redacted]","q":"keep"}`,
+      ],
+      [
+        "a quoted key's bare value two strings deep",
+        jsonOf({ o: jsonOf({ p: `{"cookie": sid=${SESSION}, "a": 1}`, q: "keep" }) }),
+        String.raw`{"o":"{\"p\":\"{\\\"cookie\\\": [redacted]\",\"q\":\"keep\"}"}`,
+      ],
+      ["a pair after a quoted key's list", `"cookie": [a] sid=${SESSION}`, '"cookie": [redacted]'],
+      [
+        "an escaped bracket in a list",
+        `Set-Cookie: [a\\[b] sid=${SESSION}\nHost: h`,
+        "Set-Cookie: [redacted]\nHost: h",
+      ],
+      // A raw line break ends an unclosed item, not the list.
+      [
+        "an item cut by a line break",
+        `Set-Cookie: ["${SESSION}\\\nb]\nHost: h`,
+        "Set-Cookie: [redacted]\nHost: h",
+      ],
+      [
+        "an item after an item cut by a line break",
+        `Set-Cookie: ["${SESSION}\\\n"x[y"]\nHost: h`,
+        "Set-Cookie: [redacted]\nHost: h",
+      ],
+      [
+        "backslashes before a raw line break",
+        `Cookie: sid=${SESSION}\\\\\nHost: h`,
+        "Cookie: [redacted]\nHost: h",
+      ],
+    ])("ends the value at its frame in %s", (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toBe(expected);
+      expect(redacted).not.toContain(SESSION);
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
+    // The regex pass runs first and its marker can hide the structure after it, so these rows put
+    // more blanks before the colon than the regex reads: only the reader sees the header.
+    const GAP = " ".repeat(49);
+    it.each([
+      [
+        "a nested list",
+        `{"set-cookie"${GAP}:[["a"],"${SESSION}"]}`,
+        `{"set-cookie"${GAP}:[redacted]}`,
+      ],
+      [
+        "an escaped line break two strings deep",
+        jsonOf({ out: jsonOf({ h: `Cookie${GAP}: sid=${SESSION}\nHost: h` }) }),
+        String.raw`{"out":"{\"h\":\"Cookie${GAP}: [redacted]\\nHost: h\"}"}`,
+      ],
+      [
+        "an unclosed list in a string at depth one",
+        String.raw`{"o":"{\"h\":\"Set-Cookie${GAP}: [a, ${SESSION}\"}"}`,
+        String.raw`{"o":"{\"h\":\"Set-Cookie${GAP}: [redacted]\"}"}`,
+      ],
+      [
+        "a quoted key's list of escaped items with a `]` in one",
+        jsonOf({ o: `{"set-cookie"${GAP}:["a]b","sid=${SESSION}"]}` }),
+        String.raw`{"o":"{\"set-cookie\"${GAP}:[redacted]}"}`,
+      ],
+      // An item's quote before a blank opens it: read as its close, ` a]` would end the list.
+      [
+        "a list item that opens with a blank",
+        `{"cookie"${GAP}:[" a]b","${SESSION}"],"host":"h"}`,
+        `{"cookie"${GAP}:[redacted],"host":"h"}`,
+      ],
+      [
+        "an escaped list item that opens with a blank",
+        jsonOf({ o: `{"cookie"${GAP}:[" a]b","${SESSION}"],"host":"h"}` }),
+        String.raw`{"o":"{\"cookie\"${GAP}:[redacted],\"host\":\"h\"}"}`,
+      ],
+      [
+        "backslashes before a raw line break",
+        `Cookie${GAP}: sid=${SESSION}\\\\\nHost: h`,
+        `Cookie${GAP}: [redacted]\nHost: h`,
+      ],
+      [
+        "an escaped bracket in a list",
+        `Set-Cookie${GAP}: [a\\[b] sid=${SESSION}\nHost: h`,
+        `Set-Cookie${GAP}: [redacted]\nHost: h`,
+      ],
+      [
+        "an item cut by a line break",
+        `Set-Cookie${GAP}: ["${SESSION}\\\nb]\nHost: h`,
+        `Set-Cookie${GAP}: [redacted]\nHost: h`,
+      ],
+      [
+        "an item after an item cut by a line break",
+        `Set-Cookie${GAP}: ["${SESSION}\\\n"x[y"]\nHost: h`,
+        `Set-Cookie${GAP}: [redacted]\nHost: h`,
+      ],
+      [
+        "an apostrophe in a list that is not an item's quote",
+        `Set-Cookie${GAP}: [it's x] ${SESSION}\nmore\nlines`,
+        `Set-Cookie${GAP}: [redacted]\nmore\nlines`,
+      ],
+      [
+        "a key quoted behind 31 backslashes",
+        `${"\\".repeat(31)}"cookie${"\\".repeat(31)}"${GAP}: sid=${SESSION}`,
+        `${"\\".repeat(31)}"cookie${"\\".repeat(31)}"${GAP}: [redacted]`,
+      ],
+      // A new marker takes the value's quotes with it: kept, they would not read back the same.
+      ["a quoted key's quoted value", `"cookie"${GAP}:"${SESSION}"`, `"cookie"${GAP}:[redacted]`],
+      // An even run before a quote escapes backslashes, not the quote: the value closes there and
+      // the next field stays.
+      [
+        "a quoted value that ends in escaped backslashes",
+        jsonOf(`"cookie"${GAP}:'${SESSION}\\\\',"safe":"SAFE"}`),
+        String.raw`"\"cookie\"${GAP}:[redacted],\"safe\":\"SAFE\"}"`,
+      ],
+    ])("reads %s where only the reader sees the header", (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toBe(expected);
+      expect(redacted).not.toContain(SESSION);
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
+    // Each row tells one of the reader's rules apart from a near miss: where a frame closes, what
+    // ends a quoted key's value, and what the reader remembers between headers.
+    it.each([
+      // A leading quote opens the value before the frame test: as the frame's close it would end it.
+      ["a quote that opens a value", `'Cookie${GAP}: ' sid=SEKRIT'`, `'Cookie${GAP}: [redacted]`],
+      // A new marker drops the value's quotes; kept, `"[redacted] "` would read back as less.
+      ["a quoted key's value that a blank closes", `cookie":""r "`, `cookie":[redacted]`],
+      ["a quoted key's list before a `)`", `"cookie":[])tail`, `"cookie":[redacted])tail`],
+      ["a close quote before a backtick", "'Cookie: a'`tail", "'Cookie: [redacted]'`tail"],
+      ["a close quote before an escaped tab", "'Cookie: a'\\ttail", "'Cookie: [redacted]'\\ttail"],
+      ["a close quote at the end of the text", "'Cookie:a=b'", "'Cookie:[redacted]'"],
+      [
+        "a quote that opens a tuple item",
+        `{"msg": "('Set-Cookie: a', 'keep=1')"}`,
+        `{"msg": "('Set-Cookie: [redacted]', 'keep=1')"}`,
+      ],
+      // After a marker, the quote that follows it closes nothing new: `]` opens no string.
+      [
+        "a quote after a marker",
+        '"Cookie:\'"{"`cOOkie:x"',
+        '"Cookie:[redacted]"`cOOkie:[redacted]',
+      ],
+      // Five backslashes are no JSON depth, so the key's frame is raw and `\\"` does not close it.
+      [
+        "a key behind a run that is no depth",
+        `"cookie${"\\".repeat(5)}"${GAP}: sid=SEKRIT\\\\" tail`,
+        `"cookie${"\\".repeat(5)}"${GAP}: [redacted]`,
+      ],
+      [
+        "a key quoted behind 63 backslashes",
+        `${"\\".repeat(63)}"cookie${"\\".repeat(63)}"${GAP}: sid=SEKRIT`,
+        `${"\\".repeat(63)}"cookie${"\\".repeat(63)}"${GAP}: [redacted]`,
+      ],
+      [
+        "an escaped bracket at a value's start",
+        `Cookie${GAP}: \\[a] sid=SEKRIT\nHost: h`,
+        `Cookie${GAP}: [redacted]\nHost: h`,
+      ],
+      // A header's end clears the frame read before it: `)` keeps a hint, not the key's quote.
+      [
+        "a header after a quoted key's value and a `)`",
+        `x 'cookie'${GAP}: 'a') Cookie: SEKRIT' keep`,
+        `x 'cookie'${GAP}: [redacted]) Cookie: [redacted]`,
+      ],
+      // The key's own quotes close the string they open, so no string is open at the escaped tab.
+      [
+        "a quoted key before an escaped tab",
+        `"cookie"\\tCookie:\\nsid=SEKRIT`,
+        `"cookie"\\tCookie:[redacted]`,
+      ],
+      ["a tab after the colon", "Cookie:\ta'b", "Cookie:\t[redacted]"],
+      // Blanks before the `,` after a quoted key's value still end it there.
+      [
+        "a quoted key's value before a blank and a comma",
+        `{"cookie": "a" , "host": "h"}`,
+        `{"cookie": "[redacted]" , "host": "h"}`,
+      ],
+      // A quote right after `[` opens an item: read as content, its `]` would end the list early.
+      [
+        "an item quote right after a nested list's bracket",
+        `{"set-cookie"${GAP}: [["a]b"], "SEKRIT"], "host": "h"}`,
+        `{"set-cookie"${GAP}: [redacted], "host": "h"}`,
+      ],
+      // An escaped comma starts no item, so the quote after it is content and its `]` ends the list.
+      [
+        "a quote after an escaped comma in a list",
+        `{"set-cookie"${GAP}:[a\\,"x]y","SEKRIT"]}`,
+        `{"set-cookie"${GAP}:[redacted]`,
+      ],
+      // A curl trace or a Markdown list between a string's quote and the name keeps the string.
+      ["a trace marker inside a string", `"> Cookie: a" keep`, `"> Cookie: [redacted]" keep`],
+      [
+        "list and emphasis markers inside a string",
+        `"1. **Cookie: a" keep`,
+        `"1. **Cookie: [redacted]" keep`,
+      ],
+      // Markers count from the string's quote: blanks before the quote do not use them up.
+      [
+        "an indented string with blanks before the name",
+        `${" ".repeat(16)}"  Cookie: a" keep`,
+        `${" ".repeat(16)}"  Cookie: [redacted]" keep`,
+      ],
+      [
+        "a trace's `<` inside a string",
+        `"< Set-Cookie: a" keep`,
+        `"< Set-Cookie: [redacted]" keep`,
+      ],
+      ["a list dash inside a string", `"- Cookie: a" keep`, `"- Cookie: [redacted]" keep`],
+      ["a code span inside a string", '"`Cookie: a`" keep', '"`Cookie: [redacted]" keep'],
+      // Any other escape before the name ends the string's hint: the value runs to the raw end.
+      [
+        "an escaped letter before the name",
+        String.raw`"\Cookie: a" keep`,
+        String.raw`"\Cookie: [redacted]`,
+      ],
+      // An escaped backslash before the close quote leaves the quote unescaped: it closes the string.
+      [
+        "a value that ends in an escaped backslash",
+        jsonOf({ o: `Cookie${GAP}: a\\`, p: "keep" }),
+        `{"o":"Cookie${GAP}: [redacted]","p":"keep"}`,
+      ],
+      // An escape after a close quote that is no line break or tab is inside the value.
+      [
+        "a quote before another escape",
+        String.raw`echo 'Cookie${GAP}: a'\x sid=SEKRIT`,
+        `echo 'Cookie${GAP}: [redacted]`,
+      ],
+      // An escaped tab is content: it ends no string.
+      [
+        "an escaped tab inside a value",
+        jsonOf({ o: `Cookie${GAP}: a\tsid=SEKRIT`, p: 1 }),
+        `{"o":"Cookie${GAP}: [redacted]","p":1}`,
+      ],
+      // A quote right after a comma opens an item, so the `]` inside it does not end the list.
+      [
+        "an item right after a comma",
+        `{"set-cookie"${GAP}:["a","b]c","SEKRIT"],"host":"h"}`,
+        `{"set-cookie"${GAP}:[redacted],"host":"h"}`,
+      ],
+      // Only spaces and tabs are skipped before the syntax that ends a quoted key's value.
+      [
+        "a form feed after a quoted key's value",
+        `{"cookie": "a"\f; sid=SEKRIT}`,
+        `{"cookie": [redacted]`,
+      ],
+      // Blanks after the value stay, so the marker reads back alone.
+      ["blanks after a value", `Cookie: a"  \nHost: h`, `Cookie: [redacted]  \nHost: h`],
+    ])("reads %s", (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toBe(expected);
+      expect(redacted).not.toContain("SEKRIT");
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
+    // The reader runs on what the regex pass left, so a header the regex ended early can no longer
+    // carry the next one away (the reader's frame ran from an escaped key to the next key's quote),
+    // and a second pass changes nothing.
+    it.each([
+      [
+        "a JSON string with a cookie key before a headers object",
+        String.raw`s = "{\"cookie\": 1}"; h = {"cookie": "sid=SEKRIT"}`,
+        String.raw`s = "{\"cookie\": [redacted]": "[redacted]"}`,
+      ],
+      [
+        "a null cookie key before a headers object",
+        String.raw`body = "{\"cookie\": null}"; headers = {"Cookie": "sid=SEKRIT"}`,
+        String.raw`body = "{\"cookie\": [redacted]": "[redacted]"}`,
+      ],
+      [
+        "two declarations",
+        String.raw`const a = "{\"cookie\": 1}"; const b = {"set-cookie": "sid=SEKRIT"};`,
+        String.raw`const a = "{\"cookie\": [redacted]": "[redacted]"};`,
+      ],
+      [
+        "a quoted name after a list",
+        "'Cookie: [a] Cookie': sid=SEKRIT",
+        "'Cookie: [redacted]': [redacted]",
+      ],
+      [
+        "an escaped key before a quoted name",
+        String.raw`{\"Cookie\": a "Set-Cookie": sid=SEKRIT`,
+        String.raw`{\"Cookie\": [redacted]": [redacted]`,
+      ],
+      [
+        "an escaped key with two quoted values",
+        String.raw`{\"cookie\": "a" "x": 1}`,
+        String.raw`{\"cookie\": [redacted]": 1}`,
+      ],
+      [
+        "an escaped key before a quoted cookie key",
+        String.raw`\"cookie\": "a" "Cookie": sid=SEKRIT`,
+        String.raw`\"cookie\": [redacted]": [redacted]`,
+      ],
+      // The regex leaves `"[redacted]` open; the reader takes the open quote with it.
+      ["an unclosed quoted key value", `{"cookie": "sid=SEKRIT`, '{"cookie": [redacted]'],
+    ])("redacts %s and reads the result back unchanged", (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toBe(expected);
+      expect(redacted).not.toContain("SEKRIT");
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
+    // As the regex pass does, an empty value is redacted, and the write guard refuses a note that
+    // quotes an empty header, as main's does.
+    it.each([
+      ["an empty header", "Cookie:\nHost: example.com", "Cookie:[redacted]\nHost: example.com"],
+      [
+        "an empty header with a gap",
+        "Cookie:   \nHost: example.com",
+        "Cookie:   [redacted]\nHost: example.com",
+      ],
+      ["an empty quoted value", '{"cookie": "", "a": 1}', '{"cookie": "[redacted]", "a": 1}'],
+    ])("redacts %s as the regex pass does", (_label, text, expected) => {
+      expect(redactSecretLike(text)).toBe(expected);
+      expect(redactSecretLike(expected)).toBe(expected);
+      expect(addsSecretLike("", text)).toBe(true);
+    });
+
+    // Five more layers of JSON escape a key's quote with 31 backslashes, the most a key may have.
+    it("redacts a quoted key five strings deep", () => {
+      let text = jsonOf({ cookie: `sid=${SESSION}`, host: "h" });
+      for (let layer = 0; layer < 5; layer++) text = jsonOf({ o: text });
+      expect(text).toContain(`${"\\".repeat(31)}"cookie${"\\".repeat(31)}"`);
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toContain("[redacted]");
+      expect(redacted).not.toContain(SESSION);
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
     // A marker inside quotes covers only what it replaced: a cookie pair after it in the same quoted
     // value is a credential an earlier pass missed (partially sanitized output).
     it.each([
@@ -466,23 +956,43 @@ describe("redactSecretLike", () => {
       [
         "a quoted command header",
         `curl -H 'Cookie: "[redacted]; b=2"' https://example.com`,
-        `curl -H 'Cookie: "[redacted]"' https://example.com`,
+        "curl -H 'Cookie: [redacted]' https://example.com",
       ],
     ])("redacts a cookie pair after the marker in %s", (_label, text, expected) => {
       expect(redactSecretLike(text)).toBe(expected);
+      expect(redactSecretLike(expected)).toBe(expected);
     });
 
-    // What this rule writes, read back (the model's own notes quote what it read), is not a new
-    // credential, as for the key/value rule: the write guard must accept it.
+    // What this rule writes, read back (the model's own notes quote what it read), stays as it is.
+    // The write guard still refuses it in a text that did not hold it, as main's guard does: the
+    // regex pass reports the marker it puts back.
     it.each([
       ["a header", "Cookie: [redacted]\nHost: example.com"],
       ["a quoted value", '{"cookie": "[redacted]", "a": 1}'],
       ["a list", '{"set-cookie": [redacted], "a": 1}'],
       ["Go's map print", "map[Accept:[*/*] Cookie:[redacted]"],
-      ["Go's map print closed after the marker", "map[Cookie:[redacted]]"],
+      ["a header with blanks after the marker", "Cookie: [redacted] \nHost: example.com"],
+      // At the end of the text or a line, a quoted key's marker value ends where it closes.
+      ["a quoted key's value at the end of the text", '"cookie": "[redacted]"'],
+      ["a quoted key's value at the end of a line", '"cookie": "[redacted]"\nHost: h'],
     ])("leaves %s that is already redacted as it is", (_label, text) => {
       expect(redactSecretLike(text)).toBe(text);
       expect(containsSecretLike(text)).toBe(false);
+      expect(addsSecretLike("", text)).toBe(true);
+      expect(addsSecretLike(text, text)).toBe(false);
+    });
+
+    it.each([
+      ["another key at the start of the text", "X: 1"],
+      ["a header name after a dash", "X-Cookie: docs"],
+      // Only the reader sees this header, and its marker value is no value to report.
+      ["a marker that only the reader reads", `Cookie${" ".repeat(49)}: [redacted]`],
+      ["a name inside a word at the start of the text", "xCookie: 1"],
+      ["a color code's letters without its escape", "Cookie x1b[0m: 1"],
+    ])("leaves %s as it is", (_label, text) => {
+      expect(redactSecretLike(text)).toBe(text);
+      expect(containsSecretLike(text)).toBe(false);
+      expect(addsSecretLike("", text)).toBe(false);
     });
   });
 
@@ -621,6 +1131,13 @@ describe("redactSecretLike", () => {
       `Cookie:${" ".repeat(40)}[redacted]\n`.repeat(2_500),
     ],
     ["cookie names behind quotes and commas", `,Cookie`.repeat(14_000)],
+    ["unclosed quoted cookie list items", 'Cookie:["'.repeat(14_000)],
+    ["quoted cookie keys each followed by a value", '"cookie":"a"'.repeat(10_000)],
+    [
+      "cookie names behind escaped breaks of long runs",
+      `\\n${"\\".repeat(31)}nCookie`.repeat(2_500),
+    ],
+    ["nested cookie list openers", `${"Cookie: [".repeat(10_000)}]`],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
     // Each scan gets the whole budget: `containsSecretLike` is a second pass of the same redaction,
@@ -644,6 +1161,80 @@ describe("containsSecretLike", () => {
 
 describe("addsSecretLike", () => {
   const KEY = "sk-ABCDEFGHIJKLMNO";
+
+  // The guard refuses at least what main's refuses: the regex passes report each value they take out
+  // as main's do, and a value the cookie reader takes out of the previous text excuses none of
+  // theirs. Expected values are main's, except where the reader adds a refusal.
+  it.each([
+    ["", "Cookie:", true],
+    ["", "cookie:", true],
+    ["'`", "cookie:", true],
+    ["", "Cookie: \nnext", true],
+    ["", "Cookie: [redacted]", true],
+    ["notes\n", '{"cookie": ""}', true],
+    ["Cookie: a\n", "Cookie: [redacted]\n", true],
+    ["Cookie:\n", "Cookie:", false],
+    ["Cookie: [redacted]\n", "Cookie: [redacted]", false],
+    ['{"cookie": "[redacted]"}', '{"cookie": "[redacted]"}', false],
+    // Main misses the pair after its marker; the reader takes it out, so the guard refuses it.
+    ["Cookie: [redacted]\n", "Cookie: [redacted]; sid=S\n", true],
+  ])("judges %j then %j as main's guard does: %p", (previous, updated, expected) => {
+    expect(addsSecretLike(previous, updated)).toBe(expected);
+    expect(addsSecretLike(updated, updated)).toBe(false);
+  });
+
+  // The same value taken out by the other source excuses nothing. Only the reader sees a name behind
+  // an escaped tab, and only the key/value regex sees `password:`; both take out `SEKRIT`.
+  describe("keeps the regex passes' values apart from the reader's", () => {
+    const byReader = String.raw`a\tCookie: SEKRIT`;
+    const byRegex = "password: SEKRIT";
+
+    it("refuses a value the regex takes out that the previous text held only by the reader", () => {
+      // Main's guard refuses this too: its regex never read the previous text's header.
+      expect(addsSecretLike(byReader, byRegex)).toBe(true);
+    });
+
+    it("refuses a value the reader takes out that the previous text held only by the regex", () => {
+      expect(addsSecretLike(byRegex, byReader)).toBe(true);
+    });
+
+    it("refuses a second regex copy that only a reader copy could cover", () => {
+      expect(addsSecretLike(`${byRegex}\n${byReader}`, `${byRegex}\n${byRegex}`)).toBe(true);
+    });
+
+    // Each regex pass reports as the regex: the cookie regex, a standalone pattern, the key/value
+    // pattern. Main's guard refuses each of these too.
+    it.each([
+      ["the cookie regex", `Cookie${" ".repeat(49)}: SEKRIT`, "Cookie: SEKRIT"],
+      ["a standalone pattern", byReader, "?sig=SEKRIT"],
+      ["the key/value pattern", byReader, "token: SEKRIT"],
+    ])(
+      "refuses a value %s takes out that the previous text held only by the reader",
+      (_label, previous, updated) => {
+        expect(addsSecretLike(previous, updated)).toBe(true);
+      }
+    );
+
+    it("refuses a second copy of a value only the reader takes out", () => {
+      expect(addsSecretLike(byReader, `${byReader}\n${byReader}`)).toBe(true);
+    });
+  });
+
+  // The guard counts each value as often as it occurs, and compares only what each pass takes out,
+  // not the name before it, as main's does.
+  describe("counts values as main's guard does", () => {
+    it("passes a text that holds the same value twice against itself", () => {
+      const twice = "password: SEKRIT\npassword: SEKRIT";
+      expect(addsSecretLike(twice, twice)).toBe(false);
+    });
+
+    it.each([
+      ["a cookie header renamed", "Cookie: SEKRIT", "Set-Cookie: SEKRIT"],
+      ["a secret key renamed", "password: SEKRIT", "token: SEKRIT"],
+    ])("passes %s that keeps its value", (_label, previous, updated) => {
+      expect(addsSecretLike(previous, updated)).toBe(false);
+    });
+  });
 
   it("flags an edit that swaps one credential for another, which keeps their count", () => {
     expect(addsSecretLike(`password: old-secret\nsk-\nABCDEFGHIJKLMNO\n`, `${KEY}\n`)).toBe(true);
