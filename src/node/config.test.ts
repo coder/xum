@@ -737,6 +737,98 @@ describe("Config", () => {
       }
     });
 
+    it("rejects the edit when config.json is rewritten in place right after the edit's read, keeping its stat", async () => {
+      // The check compares the bytes that the edit's read got. A rewrite right after that read
+      // (before the parse and the transform) must fail the save too: bytes taken any later
+      // would already be the outside writer's, and the save would replace them.
+      const configFile = path.join(tempDir, "config.json");
+      const mtime = new Date(Math.floor(Date.now() / 1000) * 1000);
+      fs.utimesSync(configFile, mtime, mtime);
+      const size = fs.statSync(configFile).size;
+      expect(Buffer.byteLength(outside)).toBeLessThan(size);
+      const sameSize = outside + " ".repeat(size - Buffer.byteLength(outside));
+      const statKey = () => {
+        const st = fs.statSync(configFile, { bigint: true });
+        return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
+      };
+      // Set before the load, so the snapshot stays valid and the edit's read is the next read.
+      config.loadConfigOrDefault();
+      const realRead = fs.readFileSync;
+      let armed = true;
+      let keptStat = false;
+      const readSpy = spyOn(fs, "readFileSync").mockImplementation(((
+        ...args: Parameters<typeof fs.readFileSync>
+      ) => {
+        const bytes = realRead(...args);
+        if (armed && String(args[0]) === configFile) {
+          armed = false;
+          const before = statKey();
+          fs.writeFileSync(configFile, sameSize);
+          fs.utimesSync(configFile, mtime, mtime);
+          keptStat = statKey() === before;
+        }
+        return bytes;
+      }) as typeof fs.readFileSync);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      let error: unknown;
+      try {
+        error = await config
+          .editConfig((value) => ({ ...value, updateChannel: "nightly" }))
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+      } finally {
+        readSpy.mockRestore();
+        errorSpy.mockRestore();
+      }
+      expect({ armed, keptStat }).toEqual({ armed: false, keptStat: true });
+      expect(String(error)).toContain("config.json changed on disk");
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(sameSize);
+    });
+
+    it("rejects the edit when the check's own read of config.json fails", async () => {
+      // The check stats config.json, then reads it to compare the bytes. A read that fails
+      // there (EIO on a flaky mount) leaves nothing to compare, so the save must not go ahead.
+      const configFile = path.join(tempDir, "config.json");
+      const before = fs.readFileSync(configFile, "utf-8");
+      config.loadConfigOrDefault();
+      const realRead = fs.readFileSync;
+      let failNextRead = false;
+      let failedReads = 0;
+      const readSpy = spyOn(fs, "readFileSync").mockImplementation(((
+        ...args: Parameters<typeof fs.readFileSync>
+      ) => {
+        if (failNextRead && String(args[0]) === configFile) {
+          failNextRead = false;
+          failedReads++;
+          throw Object.assign(new Error("EIO: injected read failure"), { code: "EIO" });
+        }
+        return realRead(...args);
+      }) as typeof fs.readFileSync);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      let error: unknown;
+      try {
+        error = await config
+          .editConfig((value) => {
+            // The transform runs after the edit's read: the next read of config.json is the
+            // check's, right before the rename.
+            failNextRead = true;
+            return { ...value, updateChannel: "nightly" };
+          })
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+      } finally {
+        readSpy.mockRestore();
+        errorSpy.mockRestore();
+      }
+      expect(failedReads).toBe(1);
+      expect(String(error)).toContain("config.json changed on disk");
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(before);
+    });
+
     it("a refused save records no own-write stamp: listeners still hear the outside write", async () => {
       // A watched config (a listener is subscribed). A refused save must not record the
       // outside bytes' stamp as its own write, or the watcher would treat their event as the
