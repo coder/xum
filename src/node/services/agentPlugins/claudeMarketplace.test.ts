@@ -563,13 +563,15 @@ describe("the Agent Plugins marketplace file", () => {
       kind: "remote",
       subpath: undefined,
     });
-    // Claude's url source has no path: the repository root, as before.
-    expect(resolveEntry({ source }, "claude")).toEqual({
-      kind: "remote",
-      url: "https://github.com/acme/mono.git",
-      ref: undefined,
-      subpath: undefined,
-    });
+    // Claude's and Cursor's url sources have no path: the repository root, as before.
+    for (const file of ["claude", "cursor"] as const) {
+      expect(resolveEntry({ source }, file)).toEqual({
+        kind: "remote",
+        url: "https://github.com/acme/mono.git",
+        ref: undefined,
+        subpath: undefined,
+      });
+    }
   });
 
   test("url and git-subdir sources name another repository, and npm is refused, as in Claude's", () => {
