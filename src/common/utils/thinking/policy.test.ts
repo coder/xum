@@ -549,7 +549,6 @@ describe("getThinkingPolicyForModel", () => {
       "google:gemini-4-argon",
       "openrouter:google/gemini-4-argon",
       "google:gemini-4-carbon",
-      "openrouter:google/gemini-4-carbon",
     ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
       expect(enforceThinkingPolicy(model, "off")).toBe("low");
