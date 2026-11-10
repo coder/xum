@@ -58,7 +58,8 @@ export function anthropicFastModeAvailable(
   // A config without this preference's write target must not expose Fast or
   // inject a hidden saved speed.
   if (providersConfig != null && providersConfig.anthropic == null) return false;
-  // Fast mode is a beta; ZDR setups disable Anthropic beta features entirely.
+  // Every Fast request carries the fast-mode beta header (see the module comment),
+  // and ZDR setups disable Anthropic beta features entirely.
   if (providersConfig?.anthropic?.disableBetaFeatures === true) return false;
 
   // A built-in provider pointed at a proxy/compatible endpoint (config or env
