@@ -15,6 +15,7 @@ import {
   type FakeAgentBrowser,
   type FakeAgentBrowserScript,
 } from "./fakeAgentBrowser.testHarness";
+import { LAYOUT_MEMORY_MAX_PATHS, startLayoutAudit } from "./layoutFingerprints";
 
 // Every audit spawns shells (a fake CLI run is about a dozen processes); a loaded CI host is slow.
 setDefaultTimeout(60_000);
@@ -255,6 +256,22 @@ describe("checkArtifactLayout", () => {
       releaseFirst();
       exec.mockRestore();
     }
+  });
+
+  test("a check in which no width completed changes no memory, so it pushes no other path out", async () => {
+    const remember = (relPath: string) =>
+      startLayoutAudit(sessionDir, relPath).finish(
+        () => ({ report: undefined, next: { phone: new Set([relPath]) } }),
+        true
+      );
+    for (let index = 0; index < LAYOUT_MEMORY_MAX_PATHS; index++) remember(`seed${index}.html`);
+    await install({ missing: true });
+    expect(await check({ relPath: "new.html" })).toMatchObject({ checked: false });
+    const oldest = startLayoutAudit(sessionDir, "seed0.html").finish(
+      (previous) => ({ report: previous, next: {} }),
+      false
+    );
+    expect(oldest).toEqual({ phone: new Set(["seed0.html"]) });
   });
 
   test("a name with a space and a # reaches the browser as the one file", async () => {

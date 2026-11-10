@@ -114,10 +114,13 @@ export async function checkArtifactLayout(
       Date.now() + (input.budgetMs ?? LAYOUT_AUDIT_BUDGET_MS)
     );
     // "Persistent" means the agent was shown the issue on an earlier publish. A cancelled
-    // call's report was probably never delivered, so it leaves the memory alone.
+    // call's report was probably never delivered, so it leaves the memory alone. So does a
+    // check in which no width completed: it learned nothing, and committing it would still
+    // push another path out of the bounded memory.
     return turn.finish(
       (previous) => buildLayoutReport(outcomes, previous),
-      input.abortSignal?.aborted !== true
+      input.abortSignal?.aborted !== true &&
+        outcomes.some((outcome) => outcome.status === "complete")
     );
   } catch (error) {
     log.debug("layout audit failed", { error });
