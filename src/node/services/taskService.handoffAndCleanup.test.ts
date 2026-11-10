@@ -65,6 +65,12 @@ import {
 } from "@/node/services/taskService.shared.testHarness";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
+/** The task ID that a failure row's body tells the parent to pass to task_await. */
+function awaitedTaskIds(errorMessage: string): string[] {
+  const call = /(\{"task_ids":[^}]*\})/.exec(errorMessage);
+  return (JSON.parse(call?.[1] ?? "{}") as { task_ids?: string[] }).task_ids ?? [];
+}
+
 describe("TaskService", () => {
   let rootDir: string;
   beforeEach(async () => {
@@ -2339,6 +2345,8 @@ describe("TaskService", () => {
       .filter((failure) => failure != null);
     expect(failureRows).toHaveLength(1);
     expect(failureRows[0]).toMatchObject({ taskId: childId, errorType: "authentication" });
+    // The row tells the parent to read the failed child by its own ID.
+    expect(awaitedTaskIds(failureRows[0]!.errorMessage)).toEqual([childId]);
 
     // The text is still there to read: task_await returns what this wait rejects with.
     const waitError = await taskService
@@ -2553,6 +2561,41 @@ describe("TaskService", () => {
       } finally {
         snapshot.mockRestore();
       }
+    });
+
+    test("marks the result delivered to its direct parent only when the read is allowed", async () => {
+      const { taskService, handleStore } = await setup();
+      const required = { directParentResultDeliveryRequiredAt: failedRecord.updatedAt };
+      // A record under a valid owner, and a record under an owner that cannot own a turn of the
+      // child (the read refuses it).
+      await handleStore.upsertWorkspaceTurn({ ...failedRecord, ...required });
+      await handleStore.upsertWorkspaceTurn({
+        ...failedRecord,
+        ...required,
+        handleId: "wst_misowned_turn",
+        ownerWorkspaceId: "mid-555",
+      });
+
+      const refused = await taskService.getDescendantTerminalWorkspaceTurnSnapshot(
+        parentId,
+        "wst_misowned_turn",
+        { consumingWorkspaceId: parentId }
+      );
+      const allowed = await taskService.getDescendantTerminalWorkspaceTurnSnapshot(
+        parentId,
+        handleId,
+        { consumingWorkspaceId: parentId }
+      );
+
+      expect(refused).toBeNull();
+      expect(
+        (await handleStore.getWorkspaceTurn("mid-555", "wst_misowned_turn"))
+          ?.directParentResultDeliveredAt
+      ).toBeUndefined();
+      expect(allowed?.record.status).toBe("error");
+      expect(
+        (await handleStore.getWorkspaceTurn(grandId, handleId))?.directParentResultDeliveredAt
+      ).toBeDefined();
     });
 
     test("cannot read an active turn", async () => {

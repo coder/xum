@@ -55,6 +55,12 @@ function busyThenFallback(
   });
 }
 
+/** The task ID that a failure row's body tells the parent to pass to task_await. */
+function awaitedTaskIds(errorMessage: string): string[] {
+  const call = /(\{"task_ids":[^}]*\})/.exec(errorMessage);
+  return (JSON.parse(call?.[1] ?? "{}") as { task_ids?: string[] }).task_ids ?? [];
+}
+
 describe("TaskService.drainTerminalAttention", () => {
   let rootDir: string;
   beforeEach(async () => {
@@ -367,5 +373,7 @@ describe("TaskService.drainTerminalAttention", () => {
       .filter((failure) => failure != null);
     expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({ taskId: childTaskId, errorType: "authentication" });
+    // The row tells the parent to read the failed child by its own ID.
+    expect(awaitedTaskIds(failures[0]!.errorMessage)).toEqual([childTaskId]);
   });
 });

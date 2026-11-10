@@ -2160,6 +2160,23 @@ describe("task_await tool", () => {
       });
     });
 
+    it("maps the unknown-task error to not_found for a non-blocking read", async () => {
+      using tempDir = new TestTempDir("test-task-await-unknown-task-timeout-zero");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      const taskServices = createFakeTaskServices({
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => null),
+        waitForAgentReport: mock(() => Promise.reject(new TaskNotFoundError())),
+      });
+      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+
+      const result: unknown = await Promise.resolve(
+        tool.execute!({ task_ids: ["missing"], timeout_secs: 0 }, mockToolCallOptions)
+      );
+
+      expect(result).toEqual({ results: [{ status: "not_found", taskId: "missing" }] });
+    });
+
     it("maps the unknown-task errors to not_found and invalid_scope", async () => {
       using tempDir = new TestTempDir("test-task-await-unknown-task");
       const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

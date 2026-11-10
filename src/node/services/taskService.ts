@@ -16533,14 +16533,13 @@ export class TaskService implements AgentTaskIntegration {
       handleId.length > 0,
       "getDescendantTerminalWorkspaceTurnSnapshot: handleId must be non-empty"
     );
-    if (!isWorkspaceTurnTaskId(handleId)) return null;
-
     const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
     const descendants = new Set(
       this.listDescendantAgentTaskIdsFromIndex(index, ancestorWorkspaceId)
     );
     const workspaceTurnManager = this.getWorkspaceTurnManager();
-    // The owner is an ancestor of some descendant, so probe each such ancestor once.
+    // The owner is an ancestor of some descendant, so probe each such ancestor once. A string
+    // that is not a handle ID finds no record under any owner (getWorkspaceTurnSnapshot refuses it).
     for (const ownerWorkspaceId of this.listAncestorsOfWorkspaces(index.parentById, descendants)) {
       // Probe without consuming: the record counts as read only once it is known to be a
       // descendant's.
@@ -16554,6 +16553,8 @@ export class TaskService implements AgentTaskIntegration {
           probe
         )
       ) {
+        // mutation-equivalent: a handle ID is stored under one owner, so this loop never has a
+        // second candidate to continue to.
         return null;
       }
       const record = await workspaceTurnManager.getWorkspaceTurnSnapshot(
