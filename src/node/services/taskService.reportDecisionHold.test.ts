@@ -1111,12 +1111,14 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
   // which takes seconds on a host with many skills. A send that arrives while a stream's decision
   // waits is refused as stale, so the decision must not wait for the probe where its answer
   // changes nothing: a stream with neither a final response nor a propose_plan result, and a
-  // reported row's final response (a reported row publishes no report, so its decision is
+  // reported row's final response (a reported row publishes no report, so the handler resolves
   // `nonreport` whatever the answer).
   async function endStreamWithPlanProbeBlocked(
     childId: string,
     options: {
       row?: Partial<WorkspaceConfigEntry>;
+      /** Turns the row into this status once the stream runs (a Stop landing before the stream end). */
+      statusAtEnd?: WorkspaceConfigEntry["taskStatus"];
       end: { finishReason?: string; proposePlan?: boolean };
       queueFollowUp: boolean;
     }
@@ -1130,7 +1132,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       return isPlanLike(entry);
     });
     try {
-      if (options.row?.taskStatus !== "reported") {
+      // A row without a status of its own starts interrupted: turn it running. A reported and an
+      // awaiting_report row keep their status through the stream.
+      if (options.row?.taskStatus == null) {
         expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
       }
       expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
@@ -1142,6 +1146,15 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           Ok(undefined)
         );
       }
+      if (options.statusAtEnd != null) {
+        await editChildRow(stack.config, childId, (row) => {
+          row.taskStatus = options.statusAtEnd;
+        });
+      }
+      // The row reads the status the case names when the stream ends (running by default).
+      expect(entryOf(stack.config, childId)?.taskStatus).toBe(
+        options.statusAtEnd ?? options.row?.taskStatus ?? "running"
+      );
       stack.endStream(0, options.end, true);
       if (!options.queueFollowUp) await until(() => !child.session.isBusy(), "session idle");
       return { stack, probe };
@@ -1220,16 +1233,31 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     {
       name: "a final response on a running row",
       row: undefined,
+      statusAtEnd: undefined,
+      end: {},
+    },
+    {
+      name: "a final response on an awaiting_report row",
+      row: { taskStatus: "awaiting_report" } as const,
+      statusAtEnd: undefined,
+      end: {},
+    },
+    {
+      name: "a final response on an interrupted row",
+      row: undefined,
+      statusAtEnd: "interrupted" as const,
       end: {},
     },
     {
       name: "a propose_plan result on a running row",
       row: undefined,
+      statusAtEnd: undefined,
       end: { finishReason: "tool-calls", proposePlan: true },
     },
     {
       name: "a propose_plan result on a reported row",
       row: REPORTED_ROW,
+      statusAtEnd: undefined,
       end: { finishReason: "tool-calls", proposePlan: true },
     },
   ])(
@@ -1237,6 +1265,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     async (c) => {
       const { stack, probe } = await endStreamWithPlanProbeBlocked("holdprobe003", {
         row: c.row,
+        statusAtEnd: c.statusAtEnd,
         end: c.end,
         queueFollowUp: true,
       });
@@ -1252,9 +1281,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     20_000
   );
 
-  // A reported task's decision is `nonreport` whatever the probe says, and it resolves before the
-  // cleanup of the reported task, so a direct send during that cleanup is admitted. A plan-like
-  // task's final response always resolved there.
+  // The handler resolves a reported task's decision `nonreport` whatever the probe says, and it
+  // does so before the cleanup of the reported task, so a direct send during that cleanup is
+  // admitted. A plan-like task's final response always resolved there.
   test.each([{ agentId: "plan" }, { agentId: "explore" }])(
     "a reported $agentId task accepts a direct send while its report cleanup waits",
     async (c) => {

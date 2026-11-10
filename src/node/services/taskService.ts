@@ -20335,8 +20335,10 @@ export class TaskService implements AgentTaskIntegration {
     // many skills, and a send that arrives while the stream's decision waits is refused as stale.
     // So the decision does not wait for it where its answer changes nothing: a stream with neither
     // a final response nor a propose_plan result, and a reported row's final response. A reported
-    // row publishes no report, so its decision is `nonreport` whatever the answer, and it resolves
-    // before the cleanup of the reported task, as a plan-like task's final response always did.
+    // row publishes no report, so the handler resolves its decision `nonreport` whatever the
+    // answer (the ledger can still turn that into `indeterminate`: see
+    // StreamEndLedger.resolveStreamEndDecision), and it does so before the cleanup of the
+    // reported task, as a plan-like task's final response always did.
     // The answer still matters to a propose_plan result (the plan hand-off) and to a final
     // response on any other row (a plan-like task's final response is no report).
     const probeDecidesReport =
