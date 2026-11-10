@@ -362,6 +362,7 @@ export function analyzerJobLockPath(rootDir: string, ownerId: string): string {
  * of waiting forever.
  */
 export function dreamLockWaitMs(runTimeoutMs: number | null): number {
+  // mutation-equivalent: a timeout is null or positive, and max() with the constant makes 0 and the constant agree, so ?? and || agree
   return Math.max(runTimeoutMs ?? MEMORY_CONSOLIDATION_TIMEOUT_MS, MEMORY_CONSOLIDATION_TIMEOUT_MS);
 }
 

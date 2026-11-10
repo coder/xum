@@ -149,6 +149,18 @@ describe("MemoryDreamRunTimeoutSetting", () => {
     }
   );
 
+  // A saved 0 is the timeout the run uses ("none"), not "no value": comparing with the default
+  // instead would write 0 again on every blur.
+  test("does not save no timeout again on a bare blur", async () => {
+    const { input, blur } = await renderSetting({ memory: { dreamRunTimeoutMinutes: 0 } });
+    expect(input.value).toBe("0");
+
+    input.focus();
+    await blur();
+
+    expect(writes).toEqual([]);
+  });
+
   test("does not save the timeout that is already saved", async () => {
     const { type, blur } = await renderSetting({ memory: { dreamRunTimeoutMinutes: 30 } });
 

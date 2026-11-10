@@ -4975,6 +4975,8 @@ describe("MemoryConsolidationService", () => {
     it("fails a run its timeout cut before any edit, and saves no record", async () => {
       const timeout = new AbortController();
       using fixture = await createFixture({ modelFactory: () => hangingModel(timeout, false) });
+      // Other preferences, but no memory group: the run still gets the default timeout.
+      await fixture.config.updateUserPreferences([{ appearance: { vimEnabled: true } }]);
       const timeouts: number[] = [];
       const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
         timeouts.push(ms);
