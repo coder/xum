@@ -788,6 +788,31 @@ describe("redactSecretLike", () => {
         `"cookie"\\tCookie:[redacted]`,
       ],
       ["a tab after the colon", "Cookie:\ta'b", "Cookie:\t[redacted]"],
+      // Blanks before the `,` after a quoted key's value still end it there.
+      [
+        "a quoted key's value before a blank and a comma",
+        `{"cookie": "a" , "host": "h"}`,
+        `{"cookie": "[redacted]" , "host": "h"}`,
+      ],
+      // A quote right after `[` opens an item: read as content, its `]` would end the list early.
+      [
+        "an item quote right after a nested list's bracket",
+        `{"set-cookie"${GAP}: [["a]b"], "SEKRIT"], "host": "h"}`,
+        `{"set-cookie"${GAP}: [redacted], "host": "h"}`,
+      ],
+      // An escaped comma starts no item, so the quote after it is content and its `]` ends the list.
+      [
+        "a quote after an escaped comma in a list",
+        `{"set-cookie"${GAP}:[a\\,"x]y","SEKRIT"]}`,
+        `{"set-cookie"${GAP}:[redacted]`,
+      ],
+      // A curl trace or a Markdown list between a string's quote and the name keeps the string.
+      ["a trace marker inside a string", `"> Cookie: a" keep`, `"> Cookie: [redacted]" keep`],
+      [
+        "list and emphasis markers inside a string",
+        `"1. **Cookie: a" keep`,
+        `"1. **Cookie: [redacted]" keep`,
+      ],
     ])("reads %s", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
 
@@ -893,6 +918,9 @@ describe("redactSecretLike", () => {
       ["a list", '{"set-cookie": [redacted], "a": 1}'],
       ["Go's map print", "map[Accept:[*/*] Cookie:[redacted]"],
       ["a header with blanks after the marker", "Cookie: [redacted] \nHost: example.com"],
+      // At the end of the text or a line, a quoted key's marker value ends where it closes.
+      ["a quoted key's value at the end of the text", '"cookie": "[redacted]"'],
+      ["a quoted key's value at the end of a line", '"cookie": "[redacted]"\nHost: h'],
     ])("leaves %s that is already redacted as it is", (_label, text) => {
       expect(redactSecretLike(text)).toBe(text);
       expect(containsSecretLike(text)).toBe(false);
@@ -903,6 +931,8 @@ describe("redactSecretLike", () => {
     it.each([
       ["another key at the start of the text", "X: 1"],
       ["a header name after a dash", "X-Cookie: docs"],
+      // Only the reader sees this header, and its marker value is no value to report.
+      ["a marker that only the reader reads", `Cookie${" ".repeat(49)}: [redacted]`],
       ["a name inside a word at the start of the text", "xCookie: 1"],
       ["a color code's letters without its escape", "Cookie x1b[0m: 1"],
     ])("leaves %s as it is", (_label, text) => {
@@ -1117,6 +1147,19 @@ describe("addsSecretLike", () => {
     it("refuses a second regex copy that only a reader copy could cover", () => {
       expect(addsSecretLike(`${byRegex}\n${byReader}`, `${byRegex}\n${byRegex}`)).toBe(true);
     });
+
+    // Each regex pass reports as the regex: the cookie regex, a standalone pattern, the key/value
+    // pattern. Main's guard refuses each of these too.
+    it.each([
+      ["the cookie regex", `Cookie${" ".repeat(49)}: SEKRIT`, "Cookie: SEKRIT"],
+      ["a standalone pattern", byReader, "?sig=SEKRIT"],
+      ["the key/value pattern", byReader, "token: SEKRIT"],
+    ])(
+      "refuses a value %s takes out that the previous text held only by the reader",
+      (_label, previous, updated) => {
+        expect(addsSecretLike(previous, updated)).toBe(true);
+      }
+    );
   });
 
   it("flags an edit that swaps one credential for another, which keeps their count", () => {
