@@ -374,6 +374,6 @@ describe("TaskService.drainTerminalAttention", () => {
     expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({ taskId: childTaskId, errorType: "authentication" });
     // The row tells the parent to read the failed child by its own ID.
-    expect(awaitedTaskIds(failures[0]!.errorMessage)).toEqual([childTaskId]);
+    expect(awaitedTaskIds(failures[0].errorMessage)).toEqual([childTaskId]);
   });
 });

@@ -2346,7 +2346,7 @@ describe("TaskService", () => {
     expect(failureRows).toHaveLength(1);
     expect(failureRows[0]).toMatchObject({ taskId: childId, errorType: "authentication" });
     // The row tells the parent to read the failed child by its own ID.
-    expect(awaitedTaskIds(failureRows[0]!.errorMessage)).toEqual([childId]);
+    expect(awaitedTaskIds(failureRows[0].errorMessage)).toEqual([childId]);
 
     // The text is still there to read: task_await returns what this wait rejects with.
     const waitError = await taskService
