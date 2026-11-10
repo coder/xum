@@ -137,45 +137,47 @@ describe("bash_output tool", () => {
 
     const tool = createBashOutputTool(config);
 
-    // Wait for the first output to reach the log
-    const outputPath = path.join(spawnResult.outputDir, "output.log");
-    await waitForCondition(
-      async () =>
-        (await fs.promises.readFile(outputPath, "utf-8").catch(() => "")).includes("line1"),
-      { timeoutMs: 20_000, intervalMs: 25 }
-    );
+    // The process waits for the gate, so a failure before the gate opens must still stop it.
+    try {
+      // Wait for the first output to reach the log
+      const outputPath = path.join(spawnResult.outputDir, "output.log");
+      await waitForCondition(
+        async () =>
+          (await fs.promises.readFile(outputPath, "utf-8").catch(() => "")).includes("line1"),
+        { timeoutMs: 20_000, intervalMs: 25 }
+      );
 
-    // First call - should get some output
-    const result1 = (await tool.execute!(
-      { process_id: spawnResult.processId, timeout_secs: 0 },
-      mockToolCallOptions
-    )) as BashOutputToolResult;
+      // First call - should get some output
+      const result1 = (await tool.execute!(
+        { process_id: spawnResult.processId, timeout_secs: 0 },
+        mockToolCallOptions
+      )) as BashOutputToolResult;
 
-    expect(result1.success).toBe(true);
-    if (result1.success) {
-      expect(result1.output).toContain("line1");
+      expect(result1.success).toBe(true);
+      if (result1.success) {
+        expect(result1.output).toContain("line1");
+      }
+
+      // Let the process print line2 and exit
+      await fs.promises.writeFile(gate, "");
+      expect(await readExitCodeWhenWritten(spawnResult.outputDir)).toBe("0");
+
+      // Second call - should ONLY get new output (incremental)
+      const result2 = (await tool.execute!(
+        { process_id: spawnResult.processId, timeout_secs: 0 },
+        mockToolCallOptions
+      )) as BashOutputToolResult;
+
+      expect(result2.success).toBe(true);
+      if (result2.success) {
+        // Should contain line2 but NOT line1 (already read)
+        expect(result2.output).toContain("line2");
+        expect(result2.output).not.toContain("line1");
+      }
+    } finally {
+      await manager.cleanup(TEST_WS);
+      tempDir[Symbol.dispose]();
     }
-
-    // Let the process print line2 and exit
-    await fs.promises.writeFile(gate, "");
-    expect(await readExitCodeWhenWritten(spawnResult.outputDir)).toBe("0");
-
-    // Second call - should ONLY get new output (incremental)
-    const result2 = (await tool.execute!(
-      { process_id: spawnResult.processId, timeout_secs: 0 },
-      mockToolCallOptions
-    )) as BashOutputToolResult;
-
-    expect(result2.success).toBe(true);
-    if (result2.success) {
-      // Should contain line2 but NOT line1 (already read)
-      expect(result2.output).toContain("line2");
-      expect(result2.output).not.toContain("line1");
-    }
-
-    // Cleanup
-    await manager.cleanup(TEST_WS);
-    tempDir[Symbol.dispose]();
   });
 
   it("should filter output with regex", async () => {
