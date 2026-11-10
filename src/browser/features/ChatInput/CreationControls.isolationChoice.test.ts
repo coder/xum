@@ -4,7 +4,8 @@ import {
   DEFAULT_RUNTIME_ENABLEMENT,
   type ParsedRuntime,
 } from "@/common/types/runtime";
-import { runtimeForIsolationChoice } from "./CreationControls";
+import { buildWorkspaceIsolationOptions, runtimeForIsolationChoice } from "./CreationControls";
+import type { RuntimeAvailabilityMap } from "./useCreationWorkspace";
 
 const coderConfigFallback = { existingWorkspace: false };
 
@@ -88,5 +89,39 @@ describe("runtimeForIsolationChoice", () => {
       host: CODER_RUNTIME_PLACEHOLDER,
       coder: coderConfigFallback,
     });
+  });
+});
+
+describe("buildWorkspaceIsolationOptions", () => {
+  // A non-git local project: SSH can't sync a worktree from it, but SSH x None needs no repo.
+  const availabilityMap = {
+    local: { available: true },
+    worktree: { available: false, reason: "Requires git repository" },
+    ssh: { available: false, reason: "Requires git repository" },
+    docker: { available: false, reason: "Requires git repository" },
+    devcontainer: { available: false, reason: "No devcontainer.json found" },
+  } satisfies RuntimeAvailabilityMap;
+
+  function disabledReasons(project: "local" | "ssh") {
+    const options = buildWorkspaceIsolationOptions({
+      current: { project, workspace: "none" },
+      availabilityMap,
+      runtimeAvailabilityState: { status: "loaded", data: availabilityMap },
+      runtimeEnablement: DEFAULT_RUNTIME_ENABLEMENT,
+      coderAvailability: { state: "available", shouldShowRuntimeButton: true },
+    });
+    return Object.fromEntries(options.map((option) => [option.value, option.disabledReason]));
+  }
+
+  test("SSH x None on a non-git project disables SSH x Worktree instead of moving to Local", () => {
+    const reasons = disabledReasons("ssh");
+    expect(reasons.none).toBeNull();
+    expect(reasons.worktree).toBe("Requires git repository");
+  });
+
+  test("local pairs report their own availability", () => {
+    const reasons = disabledReasons("local");
+    expect(reasons.none).toBeNull();
+    expect(reasons.worktree).toBe("Requires git repository");
   });
 });

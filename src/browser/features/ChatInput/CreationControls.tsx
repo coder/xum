@@ -352,11 +352,14 @@ export function buildWorkspaceIsolationOptions(
     return isCurrent || isWorkspaceIsolationEnabled(context.runtimeEnablement, workspace);
   }).map((workspace) => {
     const choice: IsolationChoice = { project: context.current.project, workspace };
-    // The project select already explains project-level unavailability (SSH, Coder CLI), so the
-    // workspace select only reports what is specific to the pair.
+    // The project select already explains Coder's unavailability (its CLI), so the workspace
+    // select only reports what is specific to the pair. SSH availability is pair-specific: it
+    // checks the local repo that SSH x Worktree syncs from, which SSH x None does not need, so a
+    // non-git project keeps SSH x None and must not offer a Worktree pick the correction effect
+    // would then move to Local.
     const disabledReason =
       getUnsupportedIsolationReason(choice) ??
-      (choice.project === "local" ? runtimeUnavailableReason(choice, context) : null);
+      (choice.project !== "coder" ? runtimeUnavailableReason(choice, context) : null);
     return { value: workspace, ui: WORKSPACE_ISOLATION_UI[workspace], disabledReason };
   });
 }
