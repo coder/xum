@@ -379,10 +379,11 @@ run_codex_comments_gate() {
 # only the gate reads every thread. So an approval stands only when the gate (run before it) counted
 # 0 unresolved review threads: every run that read the threads prints the count, and a gate that
 # could not read them (a malformed page, a crash) prints none, which is no proof that none is open.
-# Regular comments do not block an approval here: the gate counts every Codex regular comment that is
-# not an approval in its own format, and a Codex comment that is not a finding must not turn an
-# approval into exit 1. wait_pr_ready.sh runs the gate over them again (its step 6), and CI's Codex
-# Comments job runs on PR pushes, not in the merge queue.
+# Regular comments do not block an approval here: the gate counts every Codex regular comment except
+# the ones that codex_comment_is_informational (scripts/lib/codex_comments.jq) reads as clean, and a
+# Codex comment that is not a finding must not turn an approval into exit 1. wait_pr_ready.sh runs
+# the gate over them again (its step 6), and CI's Codex Comments job runs on PR pushes, not in the
+# merge queue.
 approval_stands() {
   if grep -Eq '^Found 0 unresolved review thread' <<<"$check_output"; then
     return 0

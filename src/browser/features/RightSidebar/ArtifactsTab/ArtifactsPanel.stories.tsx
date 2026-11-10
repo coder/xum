@@ -1555,3 +1555,80 @@ export const HostFreezeKeepsArtifactOpen: Story = {
     await expect(freezeStates).toEqual([{ saved: true }]);
   },
 };
+
+// An artifact that keeps the thread busy with chained tasks after a route change. WebKit runs the
+// frame on Xum's thread and fires a load for the change. The artifact answers the host's check two
+// of its tasks later, and its answer reaches the host one task after that. The deadline timer
+// fires at a task boundary, 100 ms after it is due, with the answer still on its way: not late
+// enough to show the block by itself. The heartbeat saw the blocks, so the check gets one more
+// deadline (frameDocumentChannel.ts). The tasks take 2.55 s, not 2.5 s: at 2.5 s the deadline
+// falls on the boundary itself, and which of the two runs first varies. Chromium fires no load
+// for a hash change, so only the WebKit run checks this story.
+const CHAINED_TASK_MS = 2550;
+const CHAINED_TASKS = 5;
+const CHAINED_TASKS_HTML = `<!doctype html><html><head><script>
+  function busy(ms) { var end = Date.now() + ms; while (Date.now() < end) {} }
+  window.addEventListener("message", function (event) {
+    var test = event.data && event.data.xumChainTest;
+    if (test === "save") window.xum.setState({ route: location.hash });
+    if (test !== "go") return;
+    window.addEventListener("hashchange", function () {
+      var left = ${CHAINED_TASKS};
+      (function task() {
+        busy(${CHAINED_TASK_MS});
+        if (--left > 0) setTimeout(task, 0);
+        else parent.postMessage({ xumChainTest: "done" }, "*");
+      })();
+    }, { once: true });
+    location.hash = "#/s/chain";
+  });
+  window.addEventListener("load", function () {
+    parent.postMessage({ xumChainTest: "ready" }, "*");
+  });
+</script></head><body><p>chained tasks</p></body></html>`;
+
+const chainEvents: string[] = [];
+const chainStates: unknown[] = [];
+export const ChainedTasksKeepArtifactOpen: Story = {
+  tags: ["webkit", "!test"],
+  parameters: { pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    chainEvents.length = 0;
+    chainStates.length = 0;
+    const handler = (event: MessageEvent) => {
+      const message = (event.data as { xumChainTest?: unknown } | null)?.xumChainTest;
+      if (typeof message === "string") chainEvents.push(message);
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  },
+  render: () =>
+    renderPanel(
+      "chain.html",
+      { "chain.html": ok("chain.html", CHAINED_TASKS_HTML) },
+      {
+        workspaceId: `${WORKSPACE_ID}-chain`,
+        onSetState: (input) => chainStates.push(input.state),
+      }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("artifact-frame");
+    if (!(frame instanceof HTMLIFrameElement)) throw new Error("Story bug: no artifact iframe");
+    await waitFor(() => expect(chainEvents).toContain("ready"));
+    frame.contentWindow?.postMessage({ xumChainTest: "go" }, "*");
+    const notice = () => canvas.queryByText(/This artifact navigated away/);
+    // The end of the chain, or the notice that closed the frame during it.
+    await waitFor(() => expect(chainEvents.includes("done") || notice() != null).toBe(true), {
+      timeout: 25000,
+    });
+    await expect(notice()).toBeNull();
+    frame.contentWindow?.postMessage({ xumChainTest: "save" }, "*");
+    await waitFor(() => expect(chainStates.length > 0 || notice() != null).toBe(true), {
+      timeout: 10000,
+    });
+    await expect(notice()).toBeNull();
+    await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
+    await expect(chainStates).toEqual([{ route: "#/s/chain" }]);
+  },
+};
