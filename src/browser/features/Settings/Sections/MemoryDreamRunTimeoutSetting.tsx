@@ -26,6 +26,17 @@ function parseTimeout(draft: string): ParsedTimeout {
 }
 
 /**
+ * What committing a draft saves: minutes, `null` to clear the saved value (an emptied field, which
+ * means the default), or `undefined` for nothing: an invalid draft, or the timeout the run already
+ * uses, so a blur on the shown default saves nothing.
+ */
+function timeoutPatch(parsed: ParsedTimeout, saved: number | undefined): number | null | undefined {
+  if ("error" in parsed) return undefined;
+  if ((parsed.minutes ?? DEFAULT_MINUTES) === (saved ?? DEFAULT_MINUTES)) return undefined;
+  return parsed.minutes ?? null;
+}
+
+/**
  * Run timeout of one organizer run, shown under the memory-consolidation experiment. The user asked
  * for a field instead of timeouts that grow with the edit limit: a run with many edits may need
  * more than the default, and the user picks how long.
@@ -43,12 +54,9 @@ export function MemoryDreamRunTimeoutSetting() {
 
   const commit = () => {
     setDraft(null);
-    // Compare the timeouts the run uses, so a blur on the shown default saves nothing.
-    if ("error" in parsed || (parsed.minutes ?? DEFAULT_MINUTES) === (saved ?? DEFAULT_MINUTES)) {
-      return;
-    }
+    const patch = timeoutPatch(parsed, saved);
     // A merge patch deletes a key set to null: an emptied field goes back to the default.
-    updateUserPreferences({ memory: { dreamRunTimeoutMinutes: parsed.minutes ?? null } });
+    if (patch !== undefined) updateUserPreferences({ memory: { dreamRunTimeoutMinutes: patch } });
   };
 
   return (
