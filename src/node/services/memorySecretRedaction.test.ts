@@ -1043,7 +1043,8 @@ describe("redactSecretLike", () => {
 
   // The harvest renderer and the guard run redaction over text that may hold the marker already, so
   // a second pass must change nothing: the value pattern started at the `[redacted` of an earlier
-  // pass and stopped before its `]`, which left `[redacted]]`.
+  // pass and stopped before its `]`, which left `[redacted]]`. A value that is only the marker (then
+  // a character that ends a value, or the end of the text) is left alone.
   it.each([
     ["a request line", "GET /x?a=1&sig=SEKRIT2 HTTP/1.1", "GET /x?a=1&sig=[redacted] HTTP/1.1"],
     [
@@ -1055,19 +1056,51 @@ describe("redactSecretLike", () => {
     ["an XML-escaped ampersand", "?a=1&amp;signature=SEKRIT", "?a=1&amp;signature=[redacted]"],
     ["a Google signature", "?X-Goog-Signature=SEKRIT", "?X-Goog-Signature=[redacted]"],
     ["a value that is the marker already", "?sig=[redacted]", "?sig=[redacted]"],
+    ["a marker after an XML-escaped ampersand", "?a=1&amp;sig=[redacted]", "?a=1&amp;sig=[redacted]"],
+    ["a marker in an AWS signature", "?X-Amz-Signature=[redacted]", "?X-Amz-Signature=[redacted]"],
     [
       "a marker in a request line",
       "GET /x?a=1&sig=[redacted] HTTP/1.1",
       "GET /x?a=1&sig=[redacted] HTTP/1.1",
     ],
-  ])(
-    "redacts a signed URL's signature once and leaves the marker alone: %s",
-    (_label, text, expected) => {
-      const redacted = redactSecretLike(text);
-      expect(redacted).toBe(expected);
-      expect(redactSecretLike(redacted)).toBe(redacted);
-    }
-  );
+    ["a marker in parentheses", "(see ?sig=[redacted])", "(see ?sig=[redacted])"],
+    ["a marker before the next parameter", "?sig=[redacted]&sp=r", "?sig=[redacted]&sp=r"],
+    ["a marker before a closing quote", '["?sig=[redacted]"]', '["?sig=[redacted]"]'],
+    ["an upper-case marker as the whole value", "?sig=[REDACTED]", "?sig=[REDACTED]"],
+  ])("redacts a signed URL's signature once and a second pass changes nothing: %s", (_label, text, expected) => {
+    const redacted = redactSecretLike(text);
+    expect(redacted).toBe(expected);
+    expect(redactSecretLike(redacted)).toBe(redacted);
+  });
+
+  // A value that goes on past the marker is not the marker: it is redacted exactly as before, so the
+  // output is main's, and the write guard refuses it. `]` is part of such a value, not its end. The
+  // tail that this pass leaves behind `]` is a known gap, pinned so this change does not move it.
+  it.each([
+    ["a value behind the marker", "?sig=[redacted]SEKRIT", "?sig=[redacted]]SEKRIT"],
+    ["a value behind an upper-case marker", "?sig=[REDACTED]x", "?sig=[redacted]]x"],
+    [
+      "a value behind the marker after an XML-escaped ampersand",
+      "&amp;X-Amz-Signature=[redacted]SEKRIT",
+      "&amp;X-Amz-Signature=[redacted]]SEKRIT",
+    ],
+    ["a value behind a marker and a bracket", "?sig=[redacted]]SEKRIT", "?sig=[redacted]]]SEKRIT"],
+    ["a dotted tail behind a marker and a bracket", "?sig=[redacted]].xyz", "?sig=[redacted]]].xyz"],
+    ["a bracket behind the marker", "?sig=[redacted]]", "?sig=[redacted]]]"],
+    [
+      "a key's marker with a tail, as the harvest renderer shows it",
+      "https://acct.blob.core.windows.net/c/b?sv=1&sig=sk-ABCDEFGHIJKL%2BSEKRITTAIL%3D",
+      "https://acct.blob.core.windows.net/c/b?sv=1&sig=[redacted]]%2BSEKRITTAIL%3D",
+    ],
+  ])("redacts a value that goes on past the marker as before: %s", (_label, text, expected) => {
+    const redacted = redactSecretLike(text);
+    expect(redacted).toBe(expected);
+    expect(containsSecretLike(text)).toBe(true);
+    expect(addsSecretLike("", text)).toBe(true);
+    // What the harvest renderer shows is what a model writes back: the guard must still refuse it.
+    expect(containsSecretLike(redacted)).toBe(true);
+    expect(addsSecretLike("", redacted)).toBe(true);
+  });
 
   // A half marker is not the marker: a value that merely starts like it is still a value.
   it("redacts a signature value that starts like the marker but is not it", () => {
@@ -1075,11 +1108,12 @@ describe("redactSecretLike", () => {
     expect(redactSecretLike("?sig=[redactedSEKRIT")).toBe("?sig=[redacted]");
   });
 
-  it("keeps the guard's verdict on a signature: a secret is flagged, the marker is not", () => {
+  it("keeps the guard's verdict on a signature: a secret is flagged, the marker alone is not", () => {
     expect(containsSecretLike("?sig=SEKRIT")).toBe(true);
     expect(containsSecretLike("?sig=[redacted]")).toBe(false);
     expect(addsSecretLike("", "?sig=SEKRIT")).toBe(true);
     expect(addsSecretLike("", "?sig=[redacted]")).toBe(false);
+    expect(addsSecretLike("?sig=[redacted]", "?sig=[redacted]&sp=r")).toBe(false);
   });
 
   // `signature` is not a secret name: the memory-write guard reuses this detector, and a note
