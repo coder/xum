@@ -252,9 +252,8 @@ describe("reasoning replay in built provider requests", () => {
     expect(await replayed("anthropic:claude-sonnet-5-5", "low")).toBe(1);
     expect(await replayed("anthropic:claude-haiku-5-5", "low")).toBe(1);
     expect(await replayed("anthropic:claude-sonnet-5", "off")).toBe(1);
-    // Mythos 5.1 does not run the prefix check (#5889), so "off" keeps its history thinking.
-    expect(await replayed("anthropic:claude-mythos-5-1", "off")).toBe(1);
-    // Mythos 5.2 runs it on every account, so "off" strips it like Fable.
+    // Mythos 5.1 and 5.2 run it on every account, so "off" strips it like Fable.
+    expect(await replayed("anthropic:claude-mythos-5-1", "off")).toBe(0);
     expect(await replayed("anthropic:claude-mythos-5-2", "off")).toBe(0);
   });
 
