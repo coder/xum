@@ -48,4 +48,16 @@ describe("createFileChangeNotificationMessage file names", () => {
     expect(text.match(/</g)).toHaveLength(2);
     expect(text.split(LINE_BREAK)).toHaveLength(plain.split(LINE_BREAK).length);
   });
+
+  // Only NEL, LS and PS are escaped. A wider range would turn real file names into escapes and
+  // hide them from the agent: Latin-1 text (U+00E9), CJK (U+65E5), an astral character (a
+  // surrogate pair) and U+2030, the first character after the escaped range that is not a break.
+  test("a name with printable non-ASCII text stays as it is", () => {
+    const name = "/repo/café-日本語-😀‰.ts";
+
+    const text = noticeFor(name);
+
+    expect(text).toContain(JSON.stringify(name));
+    expect(text).not.toContain("\\u");
+  });
 });
