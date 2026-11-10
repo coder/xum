@@ -1,9 +1,11 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, setDefaultTimeout } from "bun:test";
 import { createBashOutputTool } from "./bash_output";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import { shellQuote } from "@/node/runtime/backgroundCommands";
+import { waitForCondition } from "@/node/services/testDispatchHelpers";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { BashOutputToolResult } from "@/common/types/tools";
@@ -20,6 +22,11 @@ import type { ToolExecutionOptions } from "ai";
 // "test-workspace" let one file's cleanup delete another file's records, as #5591 fixed for
 // backgroundProcessManager.test.ts.
 const RUN_ID = randomUUID().slice(0, 12);
+
+// These tests spawn real shell processes, and every spawn, read and stop runs shell commands. They
+// take seconds on an idle machine, and CPU contention (a loaded CI runner or developer host)
+// stretches that past Bun's 5 s default for tests that are not broken.
+setDefaultTimeout(30_000);
 const TEST_WS = `test-workspace-${RUN_ID}`;
 const WS_A = `workspace-a-${RUN_ID}`;
 const WS_B = `workspace-b-${RUN_ID}`;
@@ -114,11 +121,13 @@ describe("bash_output tool", () => {
     config.runtimeTempDir = tempDir.path;
     config.backgroundProcessManager = manager;
 
-    // Spawn a process that outputs incrementally
+    // Spawn a process that outputs incrementally: line2 waits for a gate file, so no read can
+    // see it early or miss it because the host was slow.
+    const gate = path.join(tempDir.path, "line2-gate");
     const spawnResult = await manager.spawn(
       runtime,
       TEST_WS,
-      "echo 'line1'; sleep 0.5; echo 'line2'",
+      `echo 'line1'; while [ ! -e ${shellQuote(gate)} ]; do sleep 0.02; done; echo 'line2'`,
       { cwd: process.cwd(), displayName: "test" }
     );
 
@@ -128,40 +137,48 @@ describe("bash_output tool", () => {
 
     const tool = createBashOutputTool(config);
 
-    // Wait a bit for first output
-    await new Promise((r) => setTimeout(r, 200));
+    // The process waits for the gate, so a failure before the gate opens must still stop it.
+    try {
+      // Wait for the first output to reach the log
+      const outputPath = path.join(spawnResult.outputDir, "output.log");
+      await waitForCondition(
+        async () =>
+          (await fs.promises.readFile(outputPath, "utf-8").catch(() => "")).includes("line1"),
+        { timeoutMs: 20_000, intervalMs: 25 }
+      );
 
-    // First call - should get some output
-    const result1 = (await tool.execute!(
-      { process_id: spawnResult.processId, timeout_secs: 0 },
-      mockToolCallOptions
-    )) as BashOutputToolResult;
+      // First call - should get some output
+      const result1 = (await tool.execute!(
+        { process_id: spawnResult.processId, timeout_secs: 0 },
+        mockToolCallOptions
+      )) as BashOutputToolResult;
 
-    expect(result1.success).toBe(true);
-    if (result1.success) {
-      expect(result1.output).toContain("line1");
+      expect(result1.success).toBe(true);
+      if (result1.success) {
+        expect(result1.output).toContain("line1");
+      }
+
+      // Let the process print line2 and exit
+      await fs.promises.writeFile(gate, "");
+      expect(await readExitCodeWhenWritten(spawnResult.outputDir)).toBe("0");
+
+      // Second call - should ONLY get new output (incremental)
+      const result2 = (await tool.execute!(
+        { process_id: spawnResult.processId, timeout_secs: 0 },
+        mockToolCallOptions
+      )) as BashOutputToolResult;
+
+      expect(result2.success).toBe(true);
+      if (result2.success) {
+        // Should contain line2 but NOT line1 (already read)
+        expect(result2.output).toContain("line2");
+        expect(result2.output).not.toContain("line1");
+      }
+    } finally {
+      await manager.cleanup(TEST_WS);
+      tempDir[Symbol.dispose]();
     }
-
-    // Wait for more output
-    await new Promise((r) => setTimeout(r, 600));
-
-    // Second call - should ONLY get new output (incremental)
-    const result2 = (await tool.execute!(
-      { process_id: spawnResult.processId, timeout_secs: 0 },
-      mockToolCallOptions
-    )) as BashOutputToolResult;
-
-    expect(result2.success).toBe(true);
-    if (result2.success) {
-      // Should contain line2 but NOT line1 (already read)
-      expect(result2.output).toContain("line2");
-      expect(result2.output).not.toContain("line1");
-    }
-
-    // Cleanup
-    await manager.cleanup(TEST_WS);
-    tempDir[Symbol.dispose]();
-  });
+  }, 60_000);
 
   it("should filter output with regex", async () => {
     const tempDir = new TestTempDir("test-bash-output");
@@ -184,8 +201,8 @@ describe("bash_output tool", () => {
       throw new Error("Failed to spawn process");
     }
 
-    // Wait for output
-    await new Promise((r) => setTimeout(r, 200));
+    // The wrapper writes the exit code after the output: wait for it, not a fixed delay.
+    expect(await readExitCodeWhenWritten(spawnResult.outputDir)).toBe("0");
 
     const tool = createBashOutputTool(config);
     const result = (await tool.execute!(
@@ -317,7 +334,7 @@ describe("bash_output tool", () => {
     // Cleanup
     await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
-  }, 15_000);
+  });
 
   it("should block and wait for output when timeout_secs > 0", async () => {
     const tempDir = new TestTempDir("test-bash-output");
@@ -411,13 +428,15 @@ describe("bash_output tool", () => {
     if (result.success) {
       expect(result.output).toContain("quick exit");
       expect(result.status).toBe("exited");
-      expect(elapsed).toBeLessThan(500); // Should return quickly, not wait full 10s
+      // Must not wait out the 10 s timeout. An idle host returns in 100 to 200 ms, and a slow
+      // status probe on a busy host added about a second, so 500 ms failed there.
+      expect(elapsed).toBeLessThan(2_000);
     }
 
     // Cleanup
     await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
-  }, 15_000);
+  }, 60_000);
 
   it("should wait full timeout duration when no output and process running", async () => {
     const tempDir = new TestTempDir("test-bash-output");

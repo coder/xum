@@ -23,6 +23,7 @@ import {
 import { acquireGlobalMcpConfigLock } from "@/node/services/mcpConfigService";
 import { projectPathHashSuffix } from "@/node/services/memoryService";
 import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/constants/memory";
+import { percentDecodedForms } from "@/common/utils/agentPluginSource";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BackupCommandApproval, BackupProjectImport } from "@/common/orpc/schemas/backup";
@@ -107,6 +108,53 @@ const SECRET_PATTERNS = [
   /\bxoxb-[A-Za-z0-9-]{10,}\b/,
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
 ] as const;
+
+/** True when `text` matches a pattern the publish-time scan looks for. */
+function matchesSecretPattern(text: string): boolean {
+  return SECRET_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
+ * True when a text that carries percent escapes matches a secret pattern in any form a reader could
+ * decode it to (`percentDecodedForms`), or cannot be decoded. The publish-time scan reads a file as
+ * written, so `%20ghp_...` has no word boundary before the token and
+ * `-----BEGIN%20PRIVATE%20KEY-----` has no space in its header: the scan passes both, while whatever
+ * reads the text decoded sees the token. A malformed escape counts as a match: nothing says how a
+ * reader would decode that text. A `%` that starts no escape does not.
+ */
+export function hidesSecretBehindEscapes(text: string): boolean {
+  const forms = percentDecodedForms(text);
+  return forms === undefined || forms.some(matchesSecretPattern);
+}
+
+/**
+ * True when `text` carries a secret that the publish-time scan of the JSON text it is written as
+ * would not find. JSON writes a control character as an escape: `"\nghp_..."` has no word boundary
+ * before the token, so the scan passes it while a reader of the decoded string sees the token. The
+ * same goes for a percent escape (`hidesSecretBehindEscapes`). A token that the scan finds in the
+ * written text is not hidden: the scan holds that file for the user's review, the flow a push uses
+ * for any file that looks like a secret.
+ */
+function stringHidesSecret(text: string): boolean {
+  if (matchesSecretPattern(JSON.stringify(text))) return false;
+  return matchesSecretPattern(text) || hidesSecretBehindEscapes(text);
+}
+
+/**
+ * True when a string of a JSON value, a value or an object key at any depth, hides a secret from
+ * the publish-time scan of the JSON text (`stringHidesSecret`). Checking the strings themselves
+ * leaves nothing for a JSON escape to hide behind.
+ */
+export function jsonValueHidesSecret(value: unknown): boolean {
+  if (typeof value === "string") return stringHidesSecret(value);
+  if (Array.isArray(value)) return value.some(jsonValueHidesSecret);
+  if (value !== null && typeof value === "object") {
+    return Object.entries(value).some(
+      ([key, entry]) => jsonValueHidesSecret(key) || jsonValueHidesSecret(entry)
+    );
+  }
+  return false;
+}
 
 export interface BackupFile {
   path: string;
@@ -1733,7 +1781,7 @@ export function scanBackupFilesForSecrets(
   return files
     .filter((file) => {
       const content = file.content.toString("utf-8");
-      if (SECRET_PATTERNS.some((pattern) => pattern.test(content))) return true;
+      if (matchesSecretPattern(content)) return true;
       if (file.path === "mcp.jsonc" && mcpConfigRequiresPublishApproval(content, mcpOptions)) {
         return true;
       }
@@ -2075,12 +2123,14 @@ export class BackupInvalidPayloadError extends Error {
 }
 
 /**
- * An errno name (`ENOENT`, `EACCES`) or a Node `ERR_*` code. Our own errors carry a `code` too
- * (BackupInvalidPayloadError and BackupServiceError: `INVALID_BACKUP`, `IO_ERROR`, ...), so a bare
- * "has a string code" test would read a repository failure as a disk failure. None of those starts
- * with `E`; a test keeps it so (payload.test.ts).
+ * An errno name (`ENOENT`, `EACCES`), a Node `ERR_*` code, or `UNKNOWN`, the one libuv name that
+ * does not start with `E` (Node on Windows reports a failed fs call it cannot name that way). Our
+ * own errors carry a `code` too (BackupInvalidPayloadError and BackupServiceError:
+ * `INVALID_BACKUP`, `IO_ERROR`, ...), so a bare "has a string code" test would read a repository
+ * failure as a disk failure. None of those starts with `E` or is `UNKNOWN`; a test keeps it so
+ * (payload.test.ts).
  */
-const ERRNO_CODE = /^E[A-Z0-9_]+$/;
+const ERRNO_CODE = /^(?:E[A-Z0-9_]+|UNKNOWN)$/;
 
 /** An fs failure carries an errno code; a validation failure does not. */
 export function isFilesystemError(error: unknown): boolean {

@@ -827,7 +827,11 @@ const AddPluginPanel: React.FC<{
   // A backed-up plugin previews itself; its fields stay editable, so a preview that fails (a
   // repository that moved, a host that is down) can be fixed by hand.
   usePreviewOnMount(api, props.seed, {
-    onStart: () => setBusy(true),
+    onStart: () => {
+      setBusy(true);
+      // A reconnect previews again: the failure of the client that dropped no longer applies.
+      setError(null);
+    },
     onResult: showPreview,
     onError: setError,
     onEnd: () => setBusy(false),
@@ -1221,7 +1225,7 @@ const NotAppliedList: React.FC<{ items?: readonly AgentPluginNotApplied[]; class
   );
 };
 
-/** What a read-only agent loses: its edit tools, and its shell when a `disallowedTools` list removed it. */
+/** What a read-only agent loses: its edit tools, and its shell when its mapped tool list removed it. */
 const ReadonlyAgentNote: React.FC<{ preview: AgentPluginInstallPreview; agent: string }> = (
   props
 ) => {
@@ -2016,7 +2020,7 @@ export const PluginsSettingsSection: React.FC = () => {
           void checkForUpdates();
           break;
       }
-    });
+    }, initialIntent);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribe on API reconnect only; the listener reads the latest handlers via closure per subscription
   }, [api]);
 

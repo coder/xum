@@ -5630,7 +5630,7 @@ describe("Config", () => {
       });
     });
 
-    it("does not activate a fallback through a Coder-scoped tombstone", () => {
+    it("does not activate a fallback through a Coder-scoped tombstone", async () => {
       // Read-time sanitizing drops this empty, disabled entry, and a default-typed
       // Coder selection then resolves through the direct key. Seeding the direct
       // default here would turn on a fallback the user disabled.
@@ -5651,11 +5651,45 @@ describe("Config", () => {
       const loaded = config.loadConfigOrDefault();
       expect(loaded.modelFallbacks?.[FABLE]).toBeUndefined();
       expect(loaded.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
+      // After the migration write-back, the direct default must not reach disk either.
+      await flushConfigEdits();
       const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
-        modelFallbacks?: unknown;
+        modelFallbacks?: Record<string, unknown>;
+        migrations?: { defaultModelFallbacksSeededFable52?: unknown };
       };
-      expect(raw.modelFallbacks).toEqual({ [coderKey]: tombstone });
+      expect(raw.modelFallbacks?.[FABLE]).toBeUndefined();
+      expect(raw.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
     });
+
+    it.each<[string, string, unknown, { models: string[] } | undefined]>([
+      ["a Coder tombstone", " coder:anthropic", { enabled: false, models: [] }, undefined],
+      [
+        "an OpenRouter chain",
+        " openrouter:anthropic",
+        { models: ["openai:gpt-5.5"] },
+        { models: ["openai:gpt-5.5"] },
+      ],
+    ])(
+      "treats %s under a key with a leading space like the trimmed key",
+      (_label, prefix, entry, expectedDirect) => {
+        // Hand-edited keys can carry stray whitespace. The seed must read them the
+        // way persistence does (trimmed), or it seeds a default that either wins
+        // over the user's chain or activates a fallback the user disabled.
+        fs.writeFileSync(
+          configFilePath(),
+          JSON.stringify({
+            projects: [],
+            migrations: {
+              defaultModelFallbacksSeeded: true,
+              defaultModelFallbacksSeededFable51: true,
+            },
+            modelFallbacks: { [`${prefix}/${KNOWN_MODELS.FABLE.providerModelId}`]: entry },
+          })
+        );
+
+        expect(config.loadConfigOrDefault().modelFallbacks?.[FABLE]).toEqual(expectedDirect);
+      }
+    );
 
     it("respects a hand-edited tombstone whose chain sanitizes away", () => {
       fs.writeFileSync(
@@ -6672,6 +6706,70 @@ describe("Config", () => {
       const [metadata] = await config.getAllWorkspaceMetadata();
       expect(metadata).toMatchObject({ id: "legacy-tag", messagingTag: "research" });
     });
+
+    // A padded consent value is invalid (getValidUnrelatedWorkspaceConsent): it reads as off.
+    it.each([
+      ["a valid", "row-consent", "row-consent"],
+      ["an invalid", " row-consent ", undefined],
+    ] as const)(
+      "publishes the config row's consent (%s), dispatch mode and goal defaults for an id-less legacy workspace",
+      async (_kind, rowConsent, expectedConsent) => {
+        // No Xum build wrote these to metadata.json, and the current-format branch reads them from
+        // the row, validated. A stray file value must not reach the first build either: its consent
+        // would let unrelated workspaces message this one.
+        const projectPath = path.join(tempDir, "repo");
+        const rowGoalDefaults = {
+          defaultBudgetCents: 500,
+          defaultTurnCap: null,
+          alwaysRequireExplicitBudget: null,
+        };
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, {
+            workspaces: [
+              {
+                path: projectPath,
+                unrelatedWorkspaceConsent: rowConsent,
+                // Invalid: the row's value is validated, never served raw.
+                agentMessageDispatchMode: "bogus" as never,
+                goalDefaults: rowGoalDefaults,
+              },
+            ],
+          });
+          return cfg;
+        });
+        const sessionDir = path.join(config.sessionsDir, "repo");
+        fs.mkdirSync(sessionDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(sessionDir, "metadata.json"),
+          JSON.stringify({
+            id: "legacy-consent",
+            name: "legacy-consent",
+            unrelatedWorkspaceConsent: "file-consent",
+            agentMessageDispatchMode: "turn-end",
+            goalDefaults: {
+              defaultBudgetCents: 9,
+              defaultTurnCap: 9,
+              alwaysRequireExplicitBudget: true,
+            },
+          })
+        );
+        const fields = (metadata: WorkspaceMetadata | undefined) => ({
+          unrelatedWorkspaceConsent: metadata?.unrelatedWorkspaceConsent,
+          agentMessageDispatchMode: metadata?.agentMessageDispatchMode,
+          goalDefaults: metadata?.goalDefaults,
+        });
+        const first = fields((await config.getAllWorkspaceMetadata())[0]);
+        // The queued migration write lands before this no-op edit.
+        await config.editConfig((cfg) => cfg);
+        const restarted = fields((await new Config(tempDir).getAllWorkspaceMetadata())[0]);
+        const expected = {
+          unrelatedWorkspaceConsent: expectedConsent,
+          agentMessageDispatchMode: undefined,
+          goalDefaults: rowGoalDefaults,
+        };
+        expect([first, restarted]).toEqual([expected, expected]);
+      }
+    );
 
     it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {
       const projectPath = path.join(tempDir, "project");
