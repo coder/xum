@@ -365,7 +365,7 @@ export class AIService extends EventEmitter {
 
   /** The workspace's secrets, for agent definition reads outside a turn (ResolveAgentOptions). */
   async getWorkspaceSandboxEnv(metadata: WorkspaceMetadata): Promise<Record<string, string>> {
-    return secretsToRecord(workspaceSecrets(metadata, this.secretsStore));
+    return secretsToRecord(workspaceSecrets(metadata, this.secretsStore, this.config));
   }
 
   private emitEngineEvent(event: TurnEngineEvent): void | Promise<void> {

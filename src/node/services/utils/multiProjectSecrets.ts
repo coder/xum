@@ -1,7 +1,8 @@
 import type { Secret } from "@/common/types/secrets";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
-import type { SecretsStore } from "@/node/config";
+import type { Config, SecretsStore } from "@/node/config";
+import { secretsForWorkspace } from "@/node/utils/projectTrust";
 
 export function mergeMultiProjectSecrets(
   metadata: WorkspaceMetadata,
@@ -34,12 +35,16 @@ export function mergeMultiProjectSecrets(
   return merged;
 }
 
-/** The secrets a workspace's commands get: every project's for a multi-project workspace. */
+/**
+ * The secrets a workspace's commands get: every project's for a multi-project workspace, and
+ * none for an SSH+None workspace whose host directory is not trusted (`secretsForWorkspace`).
+ */
 export function workspaceSecrets(
   metadata: WorkspaceMetadata,
-  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">
+  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">,
+  config: Pick<Config, "loadConfigOrDefault">
 ): Secret[] {
   return isMultiProject(metadata)
     ? mergeMultiProjectSecrets(metadata, secretsStore)
-    : secretsStore.getEffectiveSecrets(metadata.projectPath);
+    : secretsForWorkspace(secretsStore, config, metadata.projectPath, metadata.runtimeConfig);
 }

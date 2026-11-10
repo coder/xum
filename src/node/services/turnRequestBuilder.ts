@@ -241,11 +241,7 @@ import {
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
-import {
-  isWorkspaceProjectTrusted,
-  isWorkspaceProjectTrustedIn,
-  secretsForWorkspace,
-} from "@/node/utils/projectTrust";
+import { isWorkspaceProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import {
   resolveTurnAnthropicCacheTtl,
   supportsAnthropicCache,
@@ -1390,14 +1386,11 @@ export class TurnRequestBuilder {
         clock: this.hostClock,
       })
       .catch(() => ({ overrides: undefined, authoritative: false }));
-    const projectSecrets = isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
-      : secretsForWorkspace(
-          this.dependencies.secretsStore,
-          this.dependencies.config,
-          metadata.projectPath,
-          metadata.runtimeConfig
-        );
+    const projectSecrets = workspaceSecrets(
+      metadata,
+      this.dependencies.secretsStore,
+      this.dependencies.config
+    );
     await mcpServerManager.getToolsForWorkspace(
       {
         workspaceId,
@@ -2296,7 +2289,11 @@ export class TurnRequestBuilder {
     // One cache per request: resolution, plan handoff, prompt body, and
     // sub-agent discovery share definition reads; the next turn starts fresh.
     const agentDefinitionCache = new AgentDefinitionRequestCache();
-    const projectSecrets = workspaceSecrets(metadata, this.dependencies.secretsStore);
+    const projectSecrets = workspaceSecrets(
+      metadata,
+      this.dependencies.secretsStore,
+      this.dependencies.config
+    );
     // Bash and the file tools get these too, so the agent definition and instruction reads
     // follow the same sandbox.
     const projectSecretsRecord = await secretsToRecord(projectSecrets);
