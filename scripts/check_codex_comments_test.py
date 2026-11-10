@@ -1561,6 +1561,27 @@ else:
                 result = self.assert_gate(expected, snapshot(comments, head=PR_HEAD), "wait_pr_codex.sh")
                 self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
 
+    def test_a_scanned_thumbs_up_needs_the_real_bot_and_a_fresh_time(self):
+        # With more than 100 thumbs-ups the script reads every page of them. The author and time
+        # rules hold there as in the newest 100: only the double's pages hold the reaction.
+        request = comment("@codex review", "maintainer", REQUEST)
+        for author, created_at, expected in (
+            (BOT, AFTER, 0),
+            (BOT + "[bot]", AFTER, 0),
+            ("human-reviewer", AFTER, 10),
+            (BOT + "-impostor[bot]", AFTER, 10),
+            (BOT, BEFORE, 10),
+            (BOT + "[bot]", BEFORE, 10),
+        ):
+            with self.subTest(author=author, created_at=created_at):
+                data = snapshot([request])
+                data["data"]["repository"]["pullRequest"]["reactions"]["pageInfo"]["hasPreviousPage"] = True
+                served = [{"user": {"login": author}, "createdAt": created_at}]
+                result = self.run_gate(
+                    data, "wait_pr_codex.sh", env_extra={"CODEX_GATE_REACTIONS_NODES": json.dumps(served)}
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
