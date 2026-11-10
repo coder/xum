@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -8,6 +8,7 @@ import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import assert from "@/common/utils/assert";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { BackgroundProcessManager } from "./backgroundProcessManager";
+import type { BashMonitorRegistryRecord } from "./bashMonitorRegistryStore";
 import {
   BASH_MONITOR_EARLIER_READ_NOTE,
   BashMonitorWakeReconciler,
@@ -27,17 +28,19 @@ describe("bash monitor wake and the shared read cursor", () => {
   let manager: BackgroundProcessManager;
   let reconciler: BashMonitorWakeReconciler;
   let dispatches: BashMonitorWakeDispatch[];
+  let rows: BashMonitorRegistryRecord[];
   const runtime = new LocalRuntime(process.cwd());
 
   beforeEach(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "bash-wake-cursor-"));
     manager = new BackgroundProcessManager(root);
     dispatches = [];
+    rows = [];
     reconciler = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: manager,
       registry: {
-        listAll: () => Promise.resolve([]),
+        listAll: () => Promise.resolve(rows),
         remove: () => undefined,
         recordTerminal: () => undefined,
       },
@@ -196,4 +199,65 @@ describe("bash monitor wake and the shared read cursor", () => {
     expect(Buffer.byteLength(firstPage, "utf8")).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
     expect(firstPage).not.toContain(marker);
   });
+
+  test("after a runtime monitor failure the wake gives no frozen unread count and still offers the read", async () => {
+    // A lost wake shows the script, so the shell builds the marker: the script never holds it.
+    const marker = `MARKER_LATE_${runId}`;
+    const gate = path.join(root, "gate-open");
+    const wrote = path.join(root, "late-written");
+    const processId = await spawnMonitored(
+      "cursor-runtime-failure",
+      `printf 'RESULT first\\n'; while [ ! -f '${gate}' ]; do sleep 0.05; done; printf 'MARKER_LATE_%s\\n' '${runId}'; touch '${wrote}'; sleep 30`
+    );
+    await waitForCondition(() => snapshotOf(processId)?.match != null, { timeoutMs: 5_000 });
+    // The cursor now sits at the end of the output the monitor scanned.
+    await read(processId, owner, "^zzz");
+
+    const proc = manager.peekProcess(processId);
+    assert(proc?.monitor != null, "process has a monitor");
+    const arm = proc.monitor.armMetadata;
+    // WorkspaceService writes this registry row on a failed monitor; this test has no service.
+    manager.on("monitor:stopped", (_workspaceId, payload) => {
+      if (payload.processId !== processId || payload.reason !== "failed") return;
+      rows = [
+        {
+          processId,
+          taskId: arm.taskId,
+          ownerWorkspaceId: owner,
+          filter: arm.filter,
+          filterExclude: arm.filterExclude,
+          script: arm.script,
+          createdAt: arm.createdAt,
+          lost: {
+            reason: "runtime-failure",
+            failedAt: new Date().toISOString(),
+            ...(payload.failedOperations != null
+              ? { failedOperations: payload.failedOperations }
+              : {}),
+          },
+        },
+      ];
+    });
+    spyOn(proc.handle, "getExitCodeForMonitor").mockResolvedValue({
+      success: false,
+      error: "exit probe down",
+    });
+    await waitForCondition(() => rows.length === 1, { timeoutMs: 10_000 });
+    // The stopped monitor no longer scans, but the process keeps writing.
+    await fs.writeFile(gate, "");
+    await waitForCondition(
+      () =>
+        fs.stat(wrote).then(
+          () => true,
+          () => false
+        ),
+      { timeoutMs: 5_000 }
+    );
+
+    const prompt = await wakePrompt();
+    expect(prompt).toContain("inspect current output");
+    expect(prompt).not.toContain("Unread output:");
+    expect(prompt).not.toContain(marker);
+    expect(await read(processId, owner)).toContain(marker);
+  }, 30_000);
 });

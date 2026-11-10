@@ -13,6 +13,7 @@ import type {
 } from "@/node/services/bashMonitorRegistryStore";
 import {
   BASH_MONITOR_EARLIER_READ_NOTE,
+  BASH_MONITOR_READ_RETURNS_OUTPUT,
   BashMonitorWakeReconciler,
   type BashMonitorProcessSnapshot,
   type BashMonitorWakeDeliveryState,
@@ -933,6 +934,7 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[0].prompt).not.toContain("transport failed");
     expect(dispatches[0].prompt).not.toContain("READY before failure");
     expect(dispatches[0].prompt).not.toContain("process was terminated");
+    expect(dispatches[0].prompt).toContain(BASH_MONITOR_READ_RETURNS_OUTPUT);
     expect(dispatches[0].prompt).toContain(BASH_MONITOR_EARLIER_READ_NOTE);
     await dispatches[0].onAccepted();
 
@@ -1017,6 +1019,7 @@ describe("BashMonitorWakeReconciler", () => {
       expect(prompt).toContain("Failed operations: readOutput");
       expect(prompt).not.toContain("Unread output:");
       expect(prompt).not.toContain("task_await({");
+      expect(prompt).not.toContain(BASH_MONITOR_READ_RETURNS_OUTPUT);
       expect(prompt).not.toContain(BASH_MONITOR_EARLIER_READ_NOTE);
       expect(classifyMachineTurnPromptKind(prompt)).toBe("turn.monitor_wake");
       expect(dispatches[0].muxMetadata.records[0]).toMatchObject({
@@ -1078,6 +1081,7 @@ describe("BashMonitorWakeReconciler", () => {
     // The settled process that only the registry still knows has no unread size to report.
     expect(prompt.match(/Unread output:/g)).toHaveLength(1);
     expect(prompt.split(BASH_MONITOR_EARLIER_READ_NOTE)).toHaveLength(2);
+    expect(prompt.split(BASH_MONITOR_READ_RETURNS_OUTPUT)).toHaveLength(2);
   });
 
   test.each([
@@ -1102,7 +1106,50 @@ describe("BashMonitorWakeReconciler", () => {
       expect(prompt).toContain(`Unread output: ${outputThroughOffset} bytes`);
       if (filteredCall == null) expect(prompt).not.toContain("filter:");
       else expect(prompt).toContain(filteredCall);
+      expect(prompt).toContain(BASH_MONITOR_READ_RETURNS_OUTPUT);
       expect(prompt).toContain(BASH_MONITOR_EARLIER_READ_NOTE);
+    }
+  );
+
+  test.each([
+    ["a monitor retired by max_events", false],
+    ["a monitor that failed at runtime", true],
+  ] as const)(
+    "%s stopped scanning, so the wake gives no unread count and still offers the read",
+    async (_label, failed) => {
+      // The stopped monitor's scanned end equals the read cursor, but the process still runs and
+      // can write more, so "0 bytes" would be wrong.
+      live = [liveSnapshot(failed ? { match: undefined, retired: true } : { retired: true })];
+      if (failed) {
+        rows = [
+          {
+            ...registryRecord(),
+            processId: "proc",
+            taskId: "bash:proc",
+            filter: "READY",
+            script: "run-ci",
+            lost: {
+              reason: "runtime-failure",
+              failedOperations: ["getExitCode"],
+              failedAt: "2026-08-31T12:06:00.000Z",
+            },
+          },
+        ];
+      }
+      deliveryState = {
+        status: "settled",
+        shownThroughOffset: 0,
+        terminalStatusShown: false,
+        readCursorOffset: 200,
+        outputThroughOffset: 200,
+      };
+
+      await reconciler.reconcile(OWNER);
+
+      expect(dispatches).toHaveLength(1);
+      const prompt = dispatches[0].prompt;
+      expect(prompt).not.toContain("Unread output:");
+      expect(prompt).toContain('task_await({ task_ids: ["bash:proc"], timeout_secs: 0 })');
     }
   );
 
@@ -1250,6 +1297,9 @@ describe("BashMonitorWakeReconciler", () => {
     });
     expect(dispatches[0].prompt).not.toContain("READY");
     expect(dispatches[0].muxMetadata.records[0]).not.toHaveProperty("terminal");
+    // The task is not awaitable, so the wake must not say that a read returns its output.
+    expect(dispatches[0].prompt).not.toContain(BASH_MONITOR_READ_RETURNS_OUTPUT);
+    expect(dispatches[0].prompt).not.toContain(BASH_MONITOR_EARLIER_READ_NOTE);
   });
 
   test("snapshot supplies pending kinds without dispatching and removes the legacy wake directory", async () => {

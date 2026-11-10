@@ -26,8 +26,10 @@ const RECONCILE_RETRY_MAX_MS = 2_000;
  * a user turn would give it the user's authority; the agent reads output with task_await, which
  * returns it as a tool result.
  */
-const BASH_MONITOR_OUTPUT_NOT_COPIED =
-  "Xum does not copy process output into this message. A task_await read returns it as a tool result.";
+const BASH_MONITOR_OUTPUT_NOT_COPIED = "Xum does not copy process output into this message.";
+
+/** Only for a wake that names a read: a lost or unreadable task has no output to return. */
+export const BASH_MONITOR_READ_RETURNS_OUTPUT = "A task_await read returns it as a tool result.";
 
 /**
  * Every read shares one cursor per process, filtered reads and reads from other workspaces
@@ -219,8 +221,14 @@ function latestMatchOffset(snapshot: BashMonitorProcessSnapshot): number | undef
 
 /** What the wake may say about the shared read cursor: a byte count, never output. */
 function unreadBytesFact(
+  snapshot: BashMonitorProcessSnapshot,
   readState: SettledDeliveryState | undefined
 ): Pick<DerivedSignal, "unreadBytes"> {
+  // The scanned end is the output end only while the monitor scans, or after its settlement scan.
+  // A monitor that stopped first froze it while the process can still write, so the count would
+  // be too low. That covers max_events and a runtime failure (every monitor-lost wake whose
+  // process is still in memory). The wake then gives no count and still offers the read.
+  if (snapshot.retired && snapshot.terminal == null) return {};
   const cursor = readState?.readCursorOffset;
   if (cursor == null || readState?.outputThroughOffset == null) return {};
   return { unreadBytes: Math.max(0, readState.outputThroughOffset - cursor) };
@@ -322,10 +330,7 @@ function buildPrompt(signals: readonly DerivedSignal[]): string {
           : restartLostSignals.length > 0
             ? BASH_MONITOR_WAKE_HEADINGS.mixed
             : BASH_MONITOR_WAKE_HEADINGS.mixedRuntimeFailure;
-  const closingParts = [
-    "This is a condition-driven wake-up. Continue from this event.",
-    BASH_MONITOR_OUTPUT_NOT_COPIED,
-  ];
+  const closingParts: string[] = [];
   let namesRead = false;
   // A read call for a live process with nothing unread would return nothing.
   const liveMatches = matchSignals.filter(
@@ -365,7 +370,12 @@ function buildPrompt(signals: readonly DerivedSignal[]): string {
       "Monitors lost after restart produce no further wakes and their task IDs are not awaitable. Relaunch the script with the bash tool only if the work is still needed."
     );
   }
-  return `${header}\n\n${sections.join("\n\n---\n\n")}\n\n${closingParts.join(" ")}`;
+  const leadParts = [
+    "This is a condition-driven wake-up. Continue from this event.",
+    BASH_MONITOR_OUTPUT_NOT_COPIED,
+    ...(namesRead ? [BASH_MONITOR_READ_RETURNS_OUTPUT] : []),
+  ];
+  return `${header}\n\n${sections.join("\n\n---\n\n")}\n\n${[...leadParts, ...closingParts].join(" ")}`;
 }
 
 function buildMetadata(
@@ -990,7 +1000,7 @@ export class BashMonitorWakeReconciler {
       createdAt: snapshot.createdAt,
       kind: "match",
       ...(matchOffset != null ? { matchOffset } : {}),
-      ...unreadBytesFact(readState),
+      ...unreadBytesFact(snapshot, readState),
       ...(snapshot.terminal?.wakeOnExit === true ? { terminal: snapshot.terminal } : {}),
       // Narrowed on purpose: the registry row can still hold failure text and matched lines.
       ...(snapshot.lost != null

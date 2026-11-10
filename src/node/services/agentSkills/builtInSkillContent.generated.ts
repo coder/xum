@@ -116,7 +116,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "- Leave a monitor running only when a later wake-up is still useful and intentional.",
       "- Terminate irrelevant monitors with `task_stop` using their `bash:<processId>` task IDs.",
-      "- Explicit termination is cancellation: pending coalesced matches and undelivered synthetic wakes for that monitor are discarded, and no settlement wake fires. Natural process exit and timeout instead settle the monitor: one combined wake delivers any pending matches together with the terminal status and a recent-output tail.",
+      "- Explicit termination is cancellation: pending coalesced matches and undelivered synthetic wakes for that monitor are discarded, and no settlement wake fires. Natural process exit and timeout instead settle the monitor: one combined wake reports any pending matches together with the terminal status. Like every wake, it carries none of the output.",
       "- Do not terminate unrelated long-running background processes merely because the current turn is ending; only clean up work whose future output no longer matters.",
       "",
       "## Heartbeat fallback",
