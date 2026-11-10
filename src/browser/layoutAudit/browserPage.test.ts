@@ -12,7 +12,7 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 /** An `observe` hook whose changes the test fires by hand. */
 function manualObserver() {
-  const state = { onChange: noop, stops: 0 };
+  const state: { onChange: () => void; stops: number } = { onChange: noop, stops: 0 };
   const observe = (onChange: () => void) => {
     state.onChange = onChange;
     return () => {
