@@ -397,7 +397,9 @@ function matchHeader(text: string, at: number, state: HintState): CookieHeader |
   if (nameEnd === null || !startsName(text, at)) return null;
   const keyRun = runLength(text, nameEnd);
   const keyQuote = text.charAt(nameEnd + keyRun);
-  const keyForm = QUOTE.test(keyQuote) && keyRun <= ESCAPE_RUN_MAX;
+  // Any run before the quote makes a key: the scan reads the run once, so it needs no bound, and a
+  // run that is no JSON depth gives a raw frame.
+  const keyForm = QUOTE.test(keyQuote);
   const colon = skipBlanks(text, keyForm ? nameEnd + keyRun + 1 : nameEnd);
   if (text.charAt(colon) !== ":") return null;
   const frame = keyForm ? keyFrame(keyQuote, keyRun) : state.frame;
@@ -498,10 +500,21 @@ function redactCookieHeaders(text: string, onRemoved: (removed: string) => void)
 }
 
 /**
+ * Which passes took a value out: main's regex passes, or the reader that runs on their output. The
+ * write guard compares each apart, so its verdict on the regex passes' values is main's own: a
+ * value the reader takes out of the previous text never excuses one the regex takes out of the new.
+ */
+type RemovalSource = "regex" | "reader";
+
+/**
  * The redaction passes, in order, each on the previous pass's output. `onRemoved` hears what each
  * replacement took out, so a caller can tell credentials apart instead of only counting them.
  */
-function runRedactionPasses(text: string, onRemoved: (removed: string) => void): string {
+function runRedactionPasses(
+  text: string,
+  onRemoved: (removed: string, source: RemovalSource) => void
+): string {
+  const fromRegex = (removed: string): void => onRemoved(removed, "regex");
   // First, while the value is still whole: a standalone pattern that redacts the head of a cookie
   // would end the value there and leave its tail readable.
   let redacted = text.replace(
@@ -509,26 +522,24 @@ function runRedactionPasses(text: string, onRemoved: (removed: string) => void):
     (match: string, prefix: string, opener: string | undefined) => {
       // mutation-equivalent: `opener` is undefined or a string, and "" or undefined both add nothing
       const kept = `${prefix}${opener ?? ""}`;
-      const removed = match.slice(kept.length);
-      // Taking out nothing, or a marker for itself, removes no credential the guard should count.
-      if (removed !== "" && removed !== REDACTED) onRemoved(removed);
+      fromRegex(match.slice(kept.length));
       return `${kept}${REDACTED}`;
     }
   );
   for (const pattern of STANDALONE_SECRET_PATTERNS) {
     redacted = redacted.replace(pattern, (match: string) => {
-      onRemoved(match);
+      fromRegex(match);
       return REDACTED;
     });
   }
   redacted = redacted.replace(SECRET_KEY_VALUE_PATTERN, (match: string, prefix: string) => {
-    onRemoved(match.slice(prefix.length));
+    fromRegex(match.slice(prefix.length));
     return `${prefix}${REDACTED}`;
   });
   // Last, on what the passes above left: the reader only replaces spans of their output with the
   // marker, so it never brings back a character they took out. It adds the rest of a value that
   // the regex ended early (at a quote, a `]` or a marker inside it), and never redacts less.
-  return redactCookieHeaders(redacted, onRemoved);
+  return redactCookieHeaders(redacted, (removed) => onRemoved(removed, "reader"));
 }
 
 /** Replaces common credential shapes with `[redacted]`. */
@@ -544,15 +555,17 @@ export function redactSecretLike(text: string): string {
  * key) makes a new value and is refused too, though it adds no secret.
  */
 export function addsSecretLike(previous: string, updated: string): boolean {
-  const held = new Map<string, number>();
-  // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
-  runRedactionPasses(previous, (removed) => held.set(removed, (held.get(removed) ?? 0) + 1));
+  const held: Record<RemovalSource, Map<string, number>> = { regex: new Map(), reader: new Map() };
+  runRedactionPasses(previous, (removed, source) => {
+    // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
+    held[source].set(removed, (held[source].get(removed) ?? 0) + 1);
+  });
   let added = false;
-  runRedactionPasses(updated, (removed) => {
+  runRedactionPasses(updated, (removed, source) => {
     // mutation-equivalent: a count of 0 and a missing one both read as 0
-    const left = held.get(removed) ?? 0;
+    const left = held[source].get(removed) ?? 0;
     if (left === 0) added = true;
-    else held.set(removed, left - 1);
+    else held[source].set(removed, left - 1);
   });
   return added;
 }

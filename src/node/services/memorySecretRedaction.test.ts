@@ -737,6 +737,65 @@ describe("redactSecretLike", () => {
       expect(redactSecretLike(redacted)).toBe(redacted);
     });
 
+    // Each row tells one of the reader's rules apart from a near miss: where a frame closes, what
+    // ends a quoted key's value, and what the reader remembers between headers.
+    it.each([
+      // A leading quote opens the value before the frame test: as the frame's close it would end it.
+      ["a quote that opens a value", `'Cookie${GAP}: ' sid=SEKRIT'`, `'Cookie${GAP}: [redacted]`],
+      // A new marker drops the value's quotes; kept, `"[redacted] "` would read back as less.
+      ["a quoted key's value that a blank closes", `cookie":""r "`, `cookie":[redacted]`],
+      ["a quoted key's list before a `)`", `"cookie":[])tail`, `"cookie":[redacted])tail`],
+      ["a close quote before a backtick", "'Cookie: a'`tail", "'Cookie: [redacted]'`tail"],
+      ["a close quote before an escaped tab", "'Cookie: a'\\ttail", "'Cookie: [redacted]'\\ttail"],
+      ["a close quote at the end of the text", "'Cookie:a=b'", "'Cookie:[redacted]'"],
+      [
+        "a quote that opens a tuple item",
+        `{"msg": "('Set-Cookie: a', 'keep=1')"}`,
+        `{"msg": "('Set-Cookie: [redacted]', 'keep=1')"}`,
+      ],
+      // After a marker, the quote that follows it closes nothing new: `]` opens no string.
+      [
+        "a quote after a marker",
+        '"Cookie:\'"{"`cOOkie:x"',
+        '"Cookie:[redacted]"`cOOkie:[redacted]',
+      ],
+      // Five backslashes are no JSON depth, so the key's frame is raw and `\\"` does not close it.
+      [
+        "a key behind a run that is no depth",
+        `"cookie${"\\".repeat(5)}"${GAP}: sid=SEKRIT\\\\" tail`,
+        `"cookie${"\\".repeat(5)}"${GAP}: [redacted]`,
+      ],
+      [
+        "a key quoted behind 63 backslashes",
+        `${"\\".repeat(63)}"cookie${"\\".repeat(63)}"${GAP}: sid=SEKRIT`,
+        `${"\\".repeat(63)}"cookie${"\\".repeat(63)}"${GAP}: [redacted]`,
+      ],
+      [
+        "an escaped bracket at a value's start",
+        `Cookie${GAP}: \\[a] sid=SEKRIT\nHost: h`,
+        `Cookie${GAP}: [redacted]\nHost: h`,
+      ],
+      // A header's end clears the frame read before it: `)` keeps a hint, not the key's quote.
+      [
+        "a header after a quoted key's value and a `)`",
+        `x 'cookie'${GAP}: 'a') Cookie: SEKRIT' keep`,
+        `x 'cookie'${GAP}: [redacted]) Cookie: [redacted]`,
+      ],
+      // The key's own quotes close the string they open, so no string is open at the escaped tab.
+      [
+        "a quoted key before an escaped tab",
+        `"cookie"\\tCookie:\\nsid=SEKRIT`,
+        `"cookie"\\tCookie:[redacted]`,
+      ],
+      ["a tab after the colon", "Cookie:\ta'b", "Cookie:\t[redacted]"],
+    ])("reads %s", (_label, text, expected) => {
+      const redacted = redactSecretLike(text);
+
+      expect(redacted).toBe(expected);
+      expect(redacted).not.toContain("SEKRIT");
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
     // The reader runs on what the regex pass left, so a header the regex ended early can no longer
     // carry the next one away (the reader's frame ran from an escaped key to the next key's quote),
     // and a second pass changes nothing.
@@ -786,8 +845,8 @@ describe("redactSecretLike", () => {
       expect(redactSecretLike(redacted)).toBe(redacted);
     });
 
-    // As the regex pass does, an empty value is redacted, but taking out nothing adds no credential
-    // the write guard should count, so a note that quotes an empty header stays writable.
+    // As the regex pass does, an empty value is redacted, and the write guard refuses a note that
+    // quotes an empty header, as main's does.
     it.each([
       ["an empty header", "Cookie:\nHost: example.com", "Cookie:[redacted]\nHost: example.com"],
       [
@@ -796,9 +855,9 @@ describe("redactSecretLike", () => {
         "Cookie:   [redacted]\nHost: example.com",
       ],
       ["an empty quoted value", '{"cookie": "", "a": 1}', '{"cookie": "[redacted]", "a": 1}'],
-    ])("redacts %s and counts nothing as added", (_label, text, expected) => {
+    ])("redacts %s as the regex pass does", (_label, text, expected) => {
       expect(redactSecretLike(text)).toBe(expected);
-      expect(addsSecretLike("", text)).toBe(false);
+      expect(addsSecretLike("", text)).toBe(true);
     });
 
     // Five more layers of JSON escape a key's quote with 31 backslashes, the most a key may have.
@@ -825,15 +884,25 @@ describe("redactSecretLike", () => {
       expect(redactSecretLike(text)).toBe(expected);
     });
 
-    // What this rule writes, read back (the model's own notes quote what it read), is not a new
-    // credential, as for the key/value rule: the write guard must accept it.
+    // What this rule writes, read back (the model's own notes quote what it read), stays as it is.
+    // The write guard still refuses it in a text that did not hold it, as main's guard does: the
+    // regex pass reports the marker it puts back.
     it.each([
       ["a header", "Cookie: [redacted]\nHost: example.com"],
       ["a quoted value", '{"cookie": "[redacted]", "a": 1}'],
       ["a list", '{"set-cookie": [redacted], "a": 1}'],
       ["Go's map print", "map[Accept:[*/*] Cookie:[redacted]"],
       ["a header with blanks after the marker", "Cookie: [redacted] \nHost: example.com"],
+    ])("leaves %s that is already redacted as it is", (_label, text) => {
+      expect(redactSecretLike(text)).toBe(text);
+      expect(containsSecretLike(text)).toBe(false);
+      expect(addsSecretLike("", text)).toBe(true);
+      expect(addsSecretLike(text, text)).toBe(false);
+    });
+
+    it.each([
       ["another key at the start of the text", "X: 1"],
+      ["a header name after a dash", "X-Cookie: docs"],
       ["a name inside a word at the start of the text", "xCookie: 1"],
       ["a color code's letters without its escape", "Cookie x1b[0m: 1"],
     ])("leaves %s as it is", (_label, text) => {
@@ -1008,6 +1077,27 @@ describe("containsSecretLike", () => {
 
 describe("addsSecretLike", () => {
   const KEY = "sk-ABCDEFGHIJKLMNO";
+
+  // The guard refuses at least what main's refuses: the regex passes report each value they take out
+  // as main's do, and a value the cookie reader takes out of the previous text excuses none of
+  // theirs. Expected values are main's, except where the reader adds a refusal.
+  it.each([
+    ["", "Cookie:", true],
+    ["", "cookie:", true],
+    ["'`", "cookie:", true],
+    ["", "Cookie: \nnext", true],
+    ["", "Cookie: [redacted]", true],
+    ["notes\n", '{"cookie": ""}', true],
+    ["Cookie: a\n", "Cookie: [redacted]\n", true],
+    ["Cookie:\n", "Cookie:", false],
+    ["Cookie: [redacted]\n", "Cookie: [redacted]", false],
+    ['{"cookie": "[redacted]"}', '{"cookie": "[redacted]"}', false],
+    // Main misses the pair after its marker; the reader takes it out, so the guard refuses it.
+    ["Cookie: [redacted]\n", "Cookie: [redacted]; sid=S\n", true],
+  ])("judges %j then %j as main's guard does: %p", (previous, updated, expected) => {
+    expect(addsSecretLike(previous, updated)).toBe(expected);
+    expect(addsSecretLike(updated, updated)).toBe(false);
+  });
 
   it("flags an edit that swaps one credential for another, which keeps their count", () => {
     expect(addsSecretLike(`password: old-secret\nsk-\nABCDEFGHIJKLMNO\n`, `${KEY}\n`)).toBe(true);
