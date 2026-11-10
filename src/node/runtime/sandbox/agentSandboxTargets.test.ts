@@ -315,6 +315,16 @@ describe("buildAgentSandboxPolicy", () => {
     expect(agentSandboxPolicyAllows(policy, path.join(shared, "config"), "write")).toBe(false);
   });
 
+  // Git outside the sandbox follows the link again, which a command could replace.
+  test("fails closed when commondir names a git folder through a link in a write root", async () => {
+    const shared = path.join(root, "shared-git");
+    await fs.mkdir(path.join(shared, "hooks"), { recursive: true });
+    await fs.symlink(shared, path.join(repo, "common-link"));
+    await fs.writeFile(path.join(commonDir, "commondir"), "../common-link\n");
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
+  });
+
   test("keeps a protected file that is a symlink read-only where it points", async () => {
     const actual = path.join(commonDir, "config.actual");
     await fs.rename(path.join(commonDir, "config"), actual);
@@ -1095,6 +1105,21 @@ describe("buildAgentSandboxPolicy", () => {
     using _tmpdir = homeOutsideWriteRoots();
 
     expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
+  });
+
+  // Any workspace can select a global agent, and its file holds the agent's instructions.
+  test("keeps the workspace file that a global agent definition links to read-only", async () => {
+    const xumHome = path.join(root, "xum-home");
+    await fs.mkdir(path.join(xumHome, "agents"), { recursive: true });
+    await fs.writeFile(path.join(repo, "reviewer.md"), "---\nname: Reviewer\n---\n");
+    await fs.symlink(path.join(repo, "reviewer.md"), path.join(xumHome, "agents", "reviewer.md"));
+    process.env.XUM_ROOT = xumHome;
+    using _tmpdir = homeOutsideWriteRoots();
+
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+    expect(agentSandboxPolicyAllows(policy, path.join(repo, "reviewer.md"), "write")).toBe(false);
+    expect(agentSandboxPolicyAllows(policy, path.join(repo, "notes.md"), "write")).toBe(true);
   });
 
   // Seatbelt hides and protects names, so a hard link in the workspace would write Xum's config.

@@ -281,6 +281,14 @@ export function buildAgentSandboxPolicy(
     [...workspaceRoots, ...extraWriteRoots],
     gitCommonDirs
   );
+  // Git outside the sandbox follows a `gitdir:` or `commondir` path as spelled, so a command could
+  // replace a link on the way with one to a git folder that it made (Codex review). A link in a
+  // `modules` folder stays: that folder is read-only.
+  const gitModules = repoGitDirs.map((gitDir) => path.join(gitDir, "modules"));
+  assertNoPathThroughLink(
+    repoGitDirs.filter((gitDir) => !isUnderAny(gitDir, gitModules)),
+    writeRoots
+  );
   const configIncludePaths = [
     ...gitConfigIncludes(repoGitDirs, gitGlobalConfigs),
     ...sshConfigIncludes(),
@@ -716,7 +724,7 @@ function homeLinkTargets(home: string, writeRoots: readonly string[]): string[] 
 }
 
 /**
- * Where the linked entries of the global skill and plugin folders lead. Xum loads a plugin linked
+ * Where the linked entries of the global skill, plugin and agent folders lead. Xum loads a plugin linked
  * to its checkout (`~/.agents/plugins/demo` to `~/src/demo`) from there and starts its MCP servers
  * outside the sandbox, so that checkout is automation too: read-only inside a write root, and a
  * write root at or inside it fails closed. Links deeper inside an entry are not followed.
