@@ -89,9 +89,9 @@ export interface ExecOptions {
    * submodule checkout when Xum creates a worktree, which needs the user's PATH (git-lfs), and
    * the removal of a patch dry-run worktree. "internal" is for fixed Xum-internal scripts that
    * never run agent or repo code (plan file moves, temp cleanup, skill path probes): while the
-   * sandbox applies they take bash and their tools from the system folders, because the
-   * inherited PATH can hold a folder that sandboxed commands write. Agent-reachable paths (bash,
-   * background bash, tool hooks, the init hook, web_fetch) never set it otherwise.
+   * sandbox is on for any project they take bash and their tools from the system folders,
+   * because the inherited PATH can hold a folder that sandboxed commands write. Agent-reachable
+   * paths (bash, background bash, tool hooks, the init hook, web_fetch) never set it otherwise.
    */
   sandbox?: "off" | "internal";
   /**

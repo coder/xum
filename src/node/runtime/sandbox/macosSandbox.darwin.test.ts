@@ -230,9 +230,8 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(await fs.readFile(path.join(commonDir, "config"), "utf8")).not.toContain("evil");
     });
 
-    // Xum's own checkout, like `git worktree add`: under the sandbox, `git submodule sync` and
-    // `update --init` could not write .git/config and .git/modules.
-    it("materializes the submodules of a new worktree while the sandbox is on", async () => {
+    /** `repo` with a submodule, and a new worktree of it whose submodule is not checked out. */
+    async function worktreeWithSubmodule(): Promise<{ repo: string; worktree: string }> {
       const sub = path.join(root, "sub");
       const repo = path.join(root, "repo");
       const worktree = path.join(root, "wt");
@@ -246,9 +245,11 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "vendor");
       git(repo, ...GIT_IDENTITY.split(" "), "commit", "-q", "-m", "add submodule");
       git(repo, "worktree", "add", "-q", "-b", "feature", worktree, "main");
-      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+      return { repo, worktree };
+    }
 
-      await syncLocalGitSubmodules({
+    function syncSubmodules(worktree: string, env: Record<string, string> = {}): Promise<void> {
+      return syncLocalGitSubmodules({
         workspacePath: worktree,
         initLogger: {
           logStep: () => undefined,
@@ -256,13 +257,44 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
           logStderr: () => undefined,
           logComplete: () => undefined,
         },
-        env: { GIT_ALLOW_PROTOCOL: "file" },
+        env: { GIT_ALLOW_PROTOCOL: "file", ...env },
         trusted: true,
       });
+    }
+
+    // Xum's own checkout, like `git worktree add`: under the sandbox, `git submodule sync` and
+    // `update --init` could not write .git/config and .git/modules.
+    it("materializes the submodules of a new worktree while the sandbox is on", async () => {
+      const { worktree } = await worktreeWithSubmodule();
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+
+      await syncSubmodules(worktree);
 
       expect(await fs.readFile(path.join(worktree, "vendor", "SKILL.md"), "utf8")).toBe(
         "payload\n"
       );
+    });
+
+    // A sandboxed command can change the file that BASH_ENV names. The checkout's runtime is keyed
+    // by the new worktree's path, which no project's setting names.
+    it("does not source BASH_ENV in the submodule checkout of a project with the sandbox on", async () => {
+      const { repo, worktree } = await worktreeWithSubmodule();
+      const marker = path.join(root, "sourced");
+      const startup = path.join(root, "startup.sh");
+      await fs.writeFile(startup, `echo sourced >> ${marker}\n`);
+      setAgentSandboxTargets({
+        fallback: { ...BASE_SETTINGS, enabled: false },
+        byProject: new Map([[repo, BASE_SETTINGS]]),
+      });
+
+      await syncSubmodules(worktree, { BASH_ENV: startup });
+
+      expect(await exists(path.join(worktree, "vendor", "SKILL.md"))).toBe(true);
+      expect(await exists(marker)).toBe(false);
+      // Without the sandbox the checkout keeps the user's BASH_ENV.
+      setAgentSandboxTargets(null);
+      await syncSubmodules(worktree, { BASH_ENV: startup });
+      expect(await exists(marker)).toBe(true);
     });
 
     it("keeps .git/hooks and .git/config of a repository in the workspace read-only", async () => {

@@ -46,6 +46,7 @@ import {
 import {
   agentSandboxApplies,
   agentSandboxSettingsFor,
+  anyAgentSandboxEnabled,
   buildAgentSandboxPolicy,
   type AgentSandboxPolicy,
   type AgentSandboxPolicyInput,
@@ -347,7 +348,9 @@ export abstract class LocalBaseRuntime implements Runtime {
    * and PATH are, and either can run a file that a sandboxed command wrote in the workspace (Codex
    * review), so no opt-out keeps them. Xum's fixed scripts also skip the inherited PATH, which can
    * hold a folder that sandboxed commands write (an activated <workspace>/.venv/bin), so a planted
-   * `rm` or `bash` never runs unsandboxed.
+   * `rm` or `bash` never runs unsandboxed. This holds while the sandbox is on for any project: a
+   * sandboxed command of one project can write those files for a call of another, and a runtime
+   * for a new worktree's path finds no project at all (Codex review).
    */
   private sandboxOptOut(
     cwd: string,
@@ -355,11 +358,12 @@ export abstract class LocalBaseRuntime implements Runtime {
   ): { bashPath: string; env: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv } {
     const inherited = { bashPath: getBashPath(), env: (env: NodeJS.ProcessEnv) => env };
     if (options.sandbox === undefined) return inherited;
-    const applies = agentSandboxApplies(this, {
-      cwd,
-      otherProjectPaths: options.sandboxProjectPaths,
-    });
-    if (!applies) return inherited;
+    if (
+      !this.sandboxOnAnywhere() &&
+      !agentSandboxApplies(this, { cwd, otherProjectPaths: options.sandboxProjectPaths })
+    ) {
+      return inherited;
+    }
     const withoutBashStartup = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({
       ...Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith("BASH_FUNC_"))),
       BASH_ENV: "",
@@ -369,6 +373,10 @@ export abstract class LocalBaseRuntime implements Runtime {
       bashPath: "/bin/bash",
       env: (env) => ({ ...withoutBashStartup(env), PATH: SYSTEM_PATH }),
     };
+  }
+
+  private sandboxOnAnywhere(): boolean {
+    return this.location === "local" && process.platform === "darwin" && anyAgentSandboxEnabled();
   }
 
   async exec(command: string, options: ExecOptions): Promise<ExecStream> {

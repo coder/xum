@@ -135,7 +135,7 @@ The request shows as a card with the command and the reason. Click **Run outside
 
 Each approval applies to one call. Xum never remembers it. Headless `xum run`, `xum workflow`, ACP clients, and sub-agents refuse such requests at once. A sub-agent cannot ask you anything, but the agent that started it can ask to run the command.
 
-An approved call starts without `BASH_ENV` and without the bash functions that Xum's environment exports (`BASH_FUNC_<name>%%`), as do MCP servers and the commands that Xum runs for itself while the sandbox is on, because a sandboxed command can change the file that `BASH_ENV` names, and bash runs an exported function in place of the program it names, which can run a file in the workspace. The scripts that Xum runs for itself also use `/bin/bash` and the folders that macOS protects (`/usr/bin`, `/bin`, `/usr/sbin` and `/sbin`) in place of your `PATH`, because a folder in your `PATH`, such as an activated `.venv/bin`, can be in the workspace.
+An approved call starts without `BASH_ENV` and without the bash functions that Xum's environment exports (`BASH_FUNC_<name>%%`), as do MCP servers and the commands that Xum runs for itself while the sandbox is on for any project, because a sandboxed command can change the file that `BASH_ENV` names, and bash runs an exported function in place of the program it names, which can run a file in the workspace. The scripts that Xum runs for itself also use `/bin/bash` and the folders that macOS protects (`/usr/bin`, `/bin`, `/usr/sbin` and `/sbin`) in place of your `PATH`, because a folder in your `PATH`, such as an activated `.venv/bin`, can be in the workspace.
 
 <Warning>
   An approved command runs with full access to your files, keys, and network. It could read the Xum
