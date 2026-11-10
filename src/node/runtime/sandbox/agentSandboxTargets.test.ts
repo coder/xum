@@ -86,6 +86,7 @@ const MOVED_CREDENTIAL_STORES = [
   { name: "NPM_CONFIG_PREFIX", value: "npm", file: "npm/etc/npmrc" },
   { name: "PREFIX", value: "npm", file: "npm/etc/npmrc" },
   { name: "PIP_CONFIG_FILE", value: "pip.conf", file: "pip.conf" },
+  { name: "GRADLE_USER_HOME", value: "gradle", file: "gradle/gradle.properties" },
 ];
 
 describe("buildAgentSandboxPolicy", () => {
@@ -938,7 +939,7 @@ describe("buildAgentSandboxPolicy", () => {
   });
 
   // Git and uv resolve a relative value from where they run, for Xum's own git the workspace.
-  test.each(["GIT_CONFIG_GLOBAL", "XDG_CACHE_HOME"])(
+  test.each(["GIT_CONFIG_GLOBAL", "XDG_CACHE_HOME", "GRADLE_USER_HOME"])(
     "fails closed when %s is a relative path",
     (name) => {
       const saved = process.env[name];

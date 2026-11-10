@@ -46,6 +46,10 @@ import {
   projectPluginContainerPaths,
 } from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
+import {
+  fileToolSandboxGate,
+  type FileToolSandboxGate,
+} from "@/node/services/agentSandbox/fileToolSandbox";
 
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
@@ -214,6 +218,47 @@ interface AgentDefinitionScanCandidate {
    * and plugin reads of a host-local root that do not go through `runtime` (phase 5).
    */
   hostFs: PluginFs;
+}
+
+/**
+ * Whether a project agent file loads: a sandboxed command can replace one with a link to a file
+ * its sandbox hides, and the definition goes into the prompt, so it loads only where a command
+ * in `workspacePath` could read it (Codex review). Plugin folders are read-only to commands, and
+ * the global folder is in Xum's home. Builds the policy on first use.
+ */
+function projectAgentFileGate(
+  runtime: Runtime,
+  workspacePath: string
+): (candidate: AgentDefinitionScanCandidate, filePath: string) => Promise<boolean> {
+  let gate: FileToolSandboxGate | undefined;
+  return async (candidate, filePath) => {
+    if (candidate.scope !== "project" || candidate.pluginRoot != null) return true;
+    try {
+      gate ??= fileToolSandboxGate(runtime, workspacePath);
+      await gate(filePath, "read");
+      return true;
+    } catch (error) {
+      log.warn(`Skipping agent definition ${filePath}: ${getErrorMessage(error)}`);
+      return false;
+    }
+  };
+}
+
+/** Whether discovery reads `filePath`: a plugin agent inside its plugin, others past the gate. */
+async function discoveryReadsFile(
+  scan: AgentDefinitionScanCandidate,
+  filePath: string,
+  agentId: AgentId,
+  projectFileLoads: ReturnType<typeof projectAgentFileGate>
+): Promise<boolean> {
+  if (scan.pluginRoot == null) return projectFileLoads(scan, filePath);
+  const containment = await pluginAgentContainment({
+    pluginRoot: scan.pluginRoot,
+    filePath,
+    agentId,
+    pluginFs: candidateFs(scan),
+  });
+  return containment === "contained";
 }
 
 /** #6426: scan candidates for the plugin agents of a trusted remote checkout's snapshot. */
@@ -809,6 +854,7 @@ export async function discoverAgentDefinitions(
 
   // Scan order encodes precedence: earlier roots win when ids collide.
   const scans = await buildScanCandidates(runtime, workspacePath, roots, options.runtimeFactory);
+  const projectFileLoads = projectAgentFileGate(runtime, workspacePath);
 
   for (const scan of scans) {
     let resolvedRoot: string;
@@ -838,15 +884,7 @@ export async function discoverAgentDefinitions(
 
       const filePath = scan.runtime.normalizePath(filename, resolvedRoot);
 
-      if (scan.pluginRoot != null) {
-        const containment = await pluginAgentContainment({
-          pluginRoot: scan.pluginRoot,
-          filePath,
-          agentId,
-          pluginFs: candidateFs(scan),
-        });
-        if (containment !== "contained") continue;
-      }
+      if (!(await discoveryReadsFile(scan, filePath, agentId, projectFileLoads))) continue;
 
       const descriptor = await readAgentDescriptorFromFile(
         scan.runtime,
@@ -1106,6 +1144,7 @@ async function loadAgentDefinition(
   // skipped, as discovery skips it: a lower scope's agent of that ID starts. Its refusal is the
   // spawn error only when no scope has the ID (A4).
   const refusals: PluginAgentRefusalError[] = [];
+  const projectFileLoads = projectAgentFileGate(runtime, workspacePath);
   for (const candidate of candidates) {
     abortSignal?.throwIfAborted();
     if (skipScopes.has(candidate.scope)) {
@@ -1130,6 +1169,7 @@ async function loadAgentDefinition(
         workspaceRuntime: runtime,
         refuseUnreachablePluginFolder: options.refuseUnreachablePluginFolder === true,
         abortSignal,
+        projectFileLoads,
       });
       if (pkg !== undefined) return pkg;
     } catch (error) {
@@ -1171,6 +1211,7 @@ async function readCandidateDefinition(args: {
   workspaceRuntime: Runtime;
   refuseUnreachablePluginFolder: boolean;
   abortSignal: AbortSignal | undefined;
+  projectFileLoads: ReturnType<typeof projectAgentFileGate>;
 }): Promise<AgentDefinitionPackage | undefined> {
   const { candidate, agentId, abortSignal } = args;
   let filePath = candidate.runtime.normalizePath(`${agentId}.md`, args.resolvedRoot);
@@ -1214,6 +1255,7 @@ async function readCandidateDefinition(args: {
     if (sizeValidation) {
       throw new Error(sizeValidation.error);
     }
+    if (!(await args.projectFileLoads(candidate, filePath))) return undefined;
 
     content = await readFileString(candidate.runtime, filePath, abortSignal);
     byteSize = stat.size;

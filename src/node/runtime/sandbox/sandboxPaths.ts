@@ -318,6 +318,9 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     ...fromEnv("PREFIX", "etc", "npmrc"),
     // pip runs without a config file that it cannot read (measured, pip 26.2).
     ...fromEnv("PIP_CONFIG_FILE"),
+    // Gradle reads repository credentials from gradle.properties in its user home, which the
+    // environment can move into an open folder (Codex review). Gradle skips a file it cannot see.
+    ...fromEnv("GRADLE_USER_HOME", "gradle.properties"),
     `${XUM_HOME_TOKEN}/server.lock`,
     `${XUM_HOME_TOKEN}/providers.jsonc`,
     `${XUM_HOME_TOKEN}/secrets.json`,

@@ -643,6 +643,43 @@ describe("agentDefinitionsService", () => {
     expect(pkg.frontmatter.name).toBe("Foo (project)");
   });
 
+  // A sandboxed command can replace a project agent file with a link to a file its sandbox hides,
+  // and the definition goes into the prompt.
+  test("skips a project agent that links to a file the agent sandbox hides", async () => {
+    using temp = new DisposableTempDir("agent-defs-sandbox");
+    const root = await fs.realpath(temp.path);
+    const workspace = path.join(root, "workspace");
+    const home = path.join(root, "home");
+    const projectAgentsRoot = path.join(workspace, ".xum", "agents");
+    const globalAgentsRoot = path.join(root, "global-agents");
+    await writeAgent(path.join(home, "notes"), "leak", "Hidden notes");
+    await writeAgent(globalAgentsRoot, "leak", "Leak (global)");
+    await writeAgent(projectAgentsRoot, "kept", "Kept (project)");
+    await fs.symlink(path.join(home, "notes", "leak.md"), path.join(projectAgentsRoot, "leak.md"));
+    const runtime = new LocalRuntime(workspace);
+    runtime.agentSandboxPolicy = () => ({
+      writeRoots: [workspace],
+      gitCommonDirs: [],
+      denyWrite: [],
+      denyRead: [home],
+      allowRead: [workspace],
+      network: "allowlist",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    });
+    const roots = { projectRoots: [projectAgentsRoot], globalRoot: globalAgentsRoot };
+
+    const agents = await discoverAgentDefinitions(runtime, workspace, { roots, runtimeFactory });
+    const leak = await readAgentDefinition(runtime, workspace, AgentIdSchema.parse("leak"), {
+      roots,
+      runtimeFactory,
+    });
+
+    expect(agents.find((a) => a.id === "leak")?.name).toBe("Leak (global)");
+    expect(agents.find((a) => a.id === "kept")?.scope).toBe("project");
+    expect(leak.frontmatter.name).toBe("Leak (global)");
+  });
+
   test("SSH workspaces discover host-global agents while keeping project overrides on the remote workspace", async () => {
     using project = new DisposableTempDir("agent-defs-ssh-project");
     using global = new DisposableTempDir("agent-defs-ssh-global");
