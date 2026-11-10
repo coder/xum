@@ -116,10 +116,9 @@ import {
   type PendingTaskWaiter,
 } from "@/node/services/taskWaiters";
 import {
-  isProjectTrusted,
+  isWorkspaceProjectTrusted,
   isWorkspaceProjectTrustedIn,
   secretsForWorkspace,
-  workspaceDirOutsideProjectTrust,
 } from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
@@ -5311,10 +5310,12 @@ export class TaskService implements AgentTaskIntegration {
       return false;
     }
     // #6426: one cached config load per call (not per candidate or per read).
-    // An SSH+None task runs in a host directory outside project trust.
-    const projectPluginsTrusted =
-      isProjectTrusted(this.config, entry.projectPath) &&
-      !workspaceDirOutsideProjectTrust(entry.workspace.runtimeConfig);
+    // An SSH+None task runs in a host directory that also needs its own trust.
+    const projectPluginsTrusted = isWorkspaceProjectTrusted(this.config, {
+      kind: undefined,
+      projectPath: entry.projectPath,
+      runtimeConfig: entry.workspace.runtimeConfig,
+    });
 
     const workspacePath = coerceNonEmptyString(entry.workspace.path);
     const workspaceName = coerceNonEmptyString(entry.workspace.name) ?? entry.workspace.id;
@@ -8753,7 +8754,12 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     const secrets = await secretsToRecord(
-      secretsForWorkspace(this.secretsStore, plan.parentMeta.projectPath, plan.taskRuntimeConfig)
+      secretsForWorkspace(
+        this.secretsStore,
+        this.config,
+        plan.parentMeta.projectPath,
+        plan.taskRuntimeConfig
+      )
     );
     // The sanitize and secrets awaits above leave a window in which the parent can cancel this
     // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
@@ -9824,7 +9830,12 @@ export class TaskService implements AgentTaskIntegration {
     // mutate the live parent workspace — skip it entirely.
     if (!plan.useSharedWorkspace) {
       const secrets = await secretsToRecord(
-        secretsForWorkspace(this.secretsStore, plan.parentMeta.projectPath, plan.taskRuntimeConfig)
+        secretsForWorkspace(
+          this.secretsStore,
+          this.config,
+          plan.parentMeta.projectPath,
+          plan.taskRuntimeConfig
+        )
       );
       this.registerTaskBackgroundInit(plan, checkout, secrets);
     }

@@ -161,7 +161,12 @@ async function resolveWorkspaceMcpRequestOptions(
   const projectSecrets = await secretsToRecord(
     isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, context.secretsStore)
-      : secretsForWorkspace(context.secretsStore, metadata.projectPath, metadata.runtimeConfig)
+      : secretsForWorkspace(
+          context.secretsStore,
+          context.config,
+          metadata.projectPath,
+          metadata.runtimeConfig
+        )
   );
   if (signal.aborted) return null;
   return {
@@ -170,6 +175,7 @@ async function resolveWorkspaceMcpRequestOptions(
     runtime,
     workspacePath,
     trusted: isWorkspaceProjectTrusted(context.config, metadata),
+    runtimeConfig: metadata.runtimeConfig,
     overrides,
     overridesAuthoritative: authoritative,
     // Like the send path: a non-authoritative read that exhausted its

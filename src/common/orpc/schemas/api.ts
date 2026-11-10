@@ -946,6 +946,18 @@ export const projects = {
     input: z.object({ projectPath: z.string(), trusted: z.boolean() }),
     output: z.void(),
   },
+  // Trust for one SSH+None directory of a project (ProjectConfig.trustedSshDirectories).
+  // Granting requires the project itself to be trusted. Returns the stored (resolved) projectDir.
+  setSshDirectoryTrust: {
+    input: z.object({
+      projectPath: z.string(),
+      host: z.string(),
+      port: z.number().int().nullish(),
+      projectDir: z.string(),
+      trusted: z.boolean(),
+    }),
+    output: ResultSchema(z.object({ projectDir: z.string() }), z.string()),
+  },
   setDisplayName: {
     input: z
       .object({

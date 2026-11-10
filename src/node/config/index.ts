@@ -146,6 +146,10 @@ import {
   withProjectRegistrationFileLock,
 } from "@/node/config/projectRegistrationLock";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  isSameSshDirectory,
+  normalizeTrustedSshDirectories,
+} from "@/common/utils/sshDirectoryTrust";
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig };
@@ -1082,6 +1086,7 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     customInstructions?: unknown;
     codeWorkspaceSyncPath?: unknown;
     icon?: unknown;
+    trustedSshDirectories?: unknown;
   };
   const runtimeEnablement = normalizeRuntimeEnablementOverrides(record.runtimeEnablement);
   const defaultIsolation = resolvePersistedDefaultIsolation(record);
@@ -1133,6 +1138,14 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
 
   // Hand-editable too: an out-of-range limit is dropped instead of failing projects.list.
   setProjectAgentResourceLimits(next, record.agentResourceLimits);
+
+  // Self-healing: malformed or duplicate SSH directory trust entries are dropped, never fatal.
+  const trustedSshDirectories = normalizeTrustedSshDirectories(record.trustedSshDirectories);
+  if (trustedSshDirectories) {
+    next.trustedSshDirectories = trustedSshDirectories;
+  } else {
+    delete next.trustedSshDirectories;
+  }
 
   // Legacy named workflow schedules are intentionally dropped while workflow
   // scheduling is disabled during the explicit script_path migration.
@@ -1199,6 +1212,17 @@ function mergeProjectAliases(group: StoredProjectEntry[]): {
     merged.trusted = true;
   } else if (group.some(({ config }) => config.trusted !== undefined)) {
     merged.trusted = false;
+  }
+  // Like project trust: an SSH directory stays trusted only when every alias trusted it.
+  const trustedSshDirectories = merged.trustedSshDirectories?.filter((directory) =>
+    group.every(({ config }) =>
+      (config.trustedSshDirectories ?? []).some((entry) => isSameSshDirectory(entry, directory))
+    )
+  );
+  if (trustedSshDirectories && trustedSshDirectories.length > 0) {
+    merged.trustedSshDirectories = trustedSshDirectories;
+  } else {
+    delete merged.trustedSshDirectories;
   }
   return { config: merged, conflictingIds: [...conflictingIds] };
 }

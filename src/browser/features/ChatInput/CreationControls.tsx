@@ -24,6 +24,7 @@ import {
 import { GitBranch, Loader2, Wand2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
 import { CreationProjectSelect } from "./CreationProjectSelect";
+import { SshDirectoryTrustNotice } from "./SshDirectoryTrustNotice";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
 import { usePerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
 import { cn } from "@/common/lib/utils";
@@ -856,6 +857,15 @@ function CreationControlsContent(props: CreationControlsProps) {
                 inputClassName={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[180px]")}
               />
             </div>
+          )}
+          {selectedRuntime.mode === "ssh" && isSshNoneSelected && (
+            <SshDirectoryTrustNotice
+              projectPath={props.projectPath}
+              userProjects={props.userProjects}
+              host={selectedRuntime.host}
+              projectDir={selectedRuntime.projectDir ?? ""}
+              disabled={props.disabled}
+            />
           )}
 
           {selectedRuntime.mode === "docker" && (

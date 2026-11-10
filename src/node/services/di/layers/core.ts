@@ -708,7 +708,7 @@ export const CoreWiringLive: Layer.Layer<
       const secrets =
         metadata && isMultiProject(metadata)
           ? mergeMultiProjectSecrets(metadata, secretsStore)
-          : secretsForWorkspace(secretsStore, projectPath, metadata?.runtimeConfig);
+          : secretsForWorkspace(secretsStore, config, projectPath, metadata?.runtimeConfig);
       return secretsToRecord(secrets);
     });
 

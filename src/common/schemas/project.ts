@@ -399,6 +399,16 @@ export const WorkspaceConfigSchema = z.object({
   }),
 });
 
+/**
+ * One SSH+None directory the user trusted for a project. Matched exactly against the workspace's
+ * persisted runtimeConfig (host string, port, absolute projectDir); see sshDirectoryTrust.ts.
+ */
+export const TrustedSshDirectorySchema = z.object({
+  host: z.string().meta({ description: "SSH host exactly as the workspace runtime stores it" }),
+  port: z.number().optional().meta({ description: "SSH port; absent matches only an absent port" }),
+  projectDir: z.string().meta({ description: "Absolute project directory on the host" }),
+});
+
 export const ProjectConfigSchema = z.object({
   displayName: z.string().nullish().meta({
     description: "Custom display name for the project",
@@ -450,6 +460,15 @@ export const ProjectConfigSchema = z.object({
   trusted: z.boolean().optional().meta({
     description:
       "Whether the user has confirmed trust for this project. Untrusted projects cannot run hooks or user scripts.",
+  }),
+  // An SSH+None workspace runs in an existing host directory that is not the local project, so
+  // project trust alone cannot vouch for its contents. Each such directory needs its own trust,
+  // scoped to this project (the trust owner), and it counts only while the project itself is
+  // trusted: revoking project trust keeps these entries but they stop applying. Sparse (omitted
+  // when empty); older builds ignore it.
+  trustedSshDirectories: z.array(TrustedSshDirectorySchema).optional().meta({
+    description:
+      "SSH+None directories the user trusted for this project; they apply only while the project itself is trusted",
   }),
   customInstructions: z.string().optional().meta({
     description:

@@ -1,6 +1,7 @@
 import type { Config, SecretsStore } from "@/node/config";
 import type { Secret } from "@/common/types/secrets";
-import type { ProjectsConfig } from "@/common/types/project";
+import type { ProjectConfig, ProjectsConfig } from "@/common/types/project";
+import { isWorkspaceDirTrustedBy } from "@/common/utils/sshDirectoryTrust";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { isSshSharedProjectDirRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
@@ -17,27 +18,45 @@ export type WorkspaceTrustSubject = Pick<WorkspaceMetadata, "kind" | "projectPat
 };
 
 /**
- * SSH+None runs in an existing host directory (projectDir) that collaborators may control.
- * Project trust is keyed to the local project path, and nothing binds it to that directory's
- * contents (changing projectDir prompts nothing), so trust never covers it: repo-controlled
- * automation from it (init hook, tool hooks, project agents/skills/plugins/MCP) stays off.
+ * Whether the directory a workspace runs in is covered by trust, on a config the caller already
+ * loaded. SSH+None runs in an existing host directory (projectDir) that is not the local project
+ * and that collaborators may control, so project trust alone cannot vouch for it: the user must
+ * also trust that exact directory for the project (trustedSshDirectories on the trust owner).
+ * Every other runtime runs in a checkout the project owns, so this is true for it. Workspace
+ * trust is project trust AND this.
  */
-export function workspaceDirOutsideProjectTrust(runtimeConfig: RuntimeConfig | undefined): boolean {
-  return isSshSharedProjectDirRuntime(runtimeConfig);
+export function isWorkspaceDirTrusted(
+  projects: ProjectsConfig["projects"],
+  projectPath: string | null | undefined,
+  runtimeConfig: RuntimeConfig | undefined
+): boolean {
+  if (!isSshSharedProjectDirRuntime(runtimeConfig)) return true;
+  if (!projectPath) return false;
+  return isWorkspaceDirTrustedBy(
+    trustOwnerConfig(projects, projectPath)?.trustedSshDirectories,
+    runtimeConfig
+  );
 }
 
 /**
  * The project secrets to put in a workspace's process env (bash tool, init, MCP servers).
  * Secrets were configured for the local project, but an SSH+None workspace runs commands in a
- * host directory outside project trust: a collaborator-controlled script there (a test runner,
- * a git hook) would read GH_TOKEN and the like. So that runtime gets no project secrets.
+ * host directory: until the user trusts that directory, a collaborator-controlled script there
+ * (a test runner, a git hook) must not read GH_TOKEN and the like, so it gets no project secrets.
+ * The config is loaded only for SSH+None.
  */
 export function secretsForWorkspace(
   secretsStore: Pick<SecretsStore, "getEffectiveSecrets">,
+  config: Pick<Config, "loadConfigOrDefault">,
   projectPath: string,
   runtimeConfig: RuntimeConfig | undefined
 ): Secret[] {
-  if (workspaceDirOutsideProjectTrust(runtimeConfig)) return [];
+  if (
+    isSshSharedProjectDirRuntime(runtimeConfig) &&
+    !isWorkspaceDirTrusted(config.loadConfigOrDefault().projects, projectPath, runtimeConfig)
+  ) {
+    return [];
+  }
   return secretsStore.getEffectiveSecrets(projectPath);
 }
 
@@ -51,13 +70,7 @@ export function isWorkspaceProjectTrusted(
   config: Config,
   metadata: WorkspaceTrustSubject
 ): boolean {
-  if (workspaceDirOutsideProjectTrust(metadata.runtimeConfig)) {
-    return false;
-  }
-  if (metadata.kind === "scratch") {
-    return true;
-  }
-  return isProjectTrusted(config, metadata.projectPath);
+  return isWorkspaceProjectTrustedIn(config.loadConfigOrDefault().projects, metadata);
 }
 
 /**
@@ -79,7 +92,7 @@ export function isWorkspaceProjectTrustedIn(
   projects: ProjectsConfig["projects"],
   metadata: WorkspaceTrustSubject
 ): boolean {
-  if (workspaceDirOutsideProjectTrust(metadata.runtimeConfig)) {
+  if (!isWorkspaceDirTrusted(projects, metadata.projectPath, metadata.runtimeConfig)) {
     return false;
   }
   return metadata.kind === "scratch" || isProjectTrustedIn(projects, metadata.projectPath);
@@ -93,10 +106,26 @@ export function isProjectTrustedIn(
   if (!projectPath) {
     return false;
   }
+  return trustOwnerConfig(projects, projectPath)?.trusted ?? false;
+}
+
+/** The trust owner's config: a sub-project's parent, else the project itself. */
+function trustOwnerConfig(
+  projects: ProjectsConfig["projects"],
+  projectPath: string
+): ProjectConfig | undefined {
   const normalizedProjectPath = stripTrailingSlashes(projectPath);
   const project = projects.get(normalizedProjectPath);
-  const trustOwnerPath = project?.parentProjectPath ?? normalizedProjectPath;
-  return projects.get(trustOwnerPath)?.trusted ?? false;
+  return projects.get(project?.parentProjectPath ?? normalizedProjectPath);
+}
+
+/** The path whose config holds trust for `projectPath`: a sub-project's parent, else itself. */
+export function trustOwnerPathIn(
+  projects: ProjectsConfig["projects"],
+  projectPath: string
+): string {
+  const normalizedProjectPath = stripTrailingSlashes(projectPath);
+  return projects.get(normalizedProjectPath)?.parentProjectPath ?? normalizedProjectPath;
 }
 
 /**

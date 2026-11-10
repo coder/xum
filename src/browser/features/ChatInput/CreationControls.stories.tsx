@@ -143,6 +143,8 @@ function IsolationPickerStory(props: {
   initialRuntime?: ParsedRuntime;
   /** Pins a phone-width container; the test-runner plays at desktop size (AGENTS.md). */
   phoneWidth?: boolean;
+  /** The story's project is trusted (SSH+None directory trust is offered only then). */
+  trustedProject?: boolean;
 }) {
   const [selectedRuntime, setSelectedRuntime] = useState<ParsedRuntime>(
     props.initialRuntime ?? { mode: RUNTIME_MODE.WORKTREE }
@@ -161,6 +163,16 @@ function IsolationPickerStory(props: {
             onSelectedRuntimeChange={setSelectedRuntime}
             runtimeAvailabilityState={props.runtimeAvailabilityState}
             coderInfo={props.coderInfo}
+            userProjects={
+              props.trustedProject
+                ? new Map([
+                    [
+                      DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS.projectPath,
+                      { workspaces: [], trusted: true },
+                    ],
+                  ])
+                : DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS.userProjects
+            }
           />
         </div>
       </div>
@@ -273,6 +285,7 @@ export const SshWithoutIsolation: Story = {
   parameters: { pixel: { matrix: { viewports: ["phone"] } } },
   args: {
     phoneWidth: true,
+    trustedProject: true,
     initialRuntime: {
       mode: "ssh",
       host: "devbox.internal",
@@ -287,6 +300,8 @@ export const SshWithoutIsolation: Story = {
     await expect(
       await canvas.findByLabelText("Project directory on host", {}, { timeout: 10000 })
     ).toHaveValue("~/src/my-app");
+    // The project is trusted but this host directory is not: its own trust is offered.
+    await expect(canvas.getByRole("button", { name: "Trust directory" })).toBeVisible();
 
     // Narrow-layout contract: every control stays inside the phone-width frame.
     const frame = canvas.getByTestId("isolation-picker-frame").getBoundingClientRect();
@@ -299,6 +314,8 @@ export const SshWithoutIsolation: Story = {
       const box = canvas.getByLabelText(label).getBoundingClientRect();
       await expect(box.right).toBeLessThanOrEqual(frame.right + 1);
     }
+    const trustButton = canvas.getByRole("button", { name: "Trust directory" });
+    await expect(trustButton.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right + 1);
 
     await openIsolationMenu(storyRoot, "Workspace isolation");
     const dockerOption = await within(document.body).findByRole("option", { name: /^Docker/i });

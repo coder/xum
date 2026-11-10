@@ -95,6 +95,11 @@ import type { TelemetryService } from "@/node/services/telemetryService";
 import { secretsToRecord } from "@/common/types/secrets";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import {
+  isWorkspaceDirTrustedBy,
+  type TrustedSshDirectory,
+} from "@/common/utils/sshDirectoryTrust";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import {
   parseBearerWwwAuthenticate,
@@ -1502,6 +1507,12 @@ export interface MCPWorkspaceRequestOptions {
   runtime: Runtime;
   workspacePath: string;
   trusted?: boolean;
+  /**
+   * The workspace's runtime config. Project trust published later (applyProjectTrust) is
+   * combined with it: an SSH+None workspace runs in a host directory that needs its own trust,
+   * so a project-wide trust grant must not enable its project-local servers by itself.
+   */
+  runtimeConfig?: RuntimeConfig;
   overrides?: WorkspaceMCPOverrides;
   /**
    * `false` when the caller could not establish `overrides` authoritatively
@@ -1523,6 +1534,30 @@ export interface MCPWorkspaceRequestOptions {
   overridesReadDeadlineAt?: number;
   projectSecrets?: Record<string, string>;
   agentPlugins?: AgentPluginsMcpContext | null;
+}
+
+/** A project trust change published to the manager (ProjectService.setTrust / setSshDirectoryTrust). */
+export interface MCPProjectTrustUpdate {
+  projectPath: string;
+  trusted: boolean;
+  /** The trust owner's trusted SSH+None directories; absent means none. */
+  trustedSshDirectories?: readonly TrustedSshDirectory[];
+}
+
+interface MCPProjectTrustState {
+  trusted: boolean;
+  trustedSshDirectories: readonly TrustedSshDirectory[];
+}
+
+/**
+ * A workspace's trust under its project's latest published trust: project trust AND, for an
+ * SSH+None workspace, the user's trust of its exact host directory (see isWorkspaceDirTrusted).
+ */
+function workspaceTrustUnder(
+  state: MCPProjectTrustState,
+  runtimeConfig: RuntimeConfig | undefined
+): boolean {
+  return state.trusted && isWorkspaceDirTrustedBy(state.trustedSshDirectories, runtimeConfig);
 }
 
 export type MCPWorkspaceSecretsResolver = (
@@ -1749,7 +1784,7 @@ export class MCPServerManager {
    * invocations wait for the pending repair before their call-time gate.
    */
   private readonly pendingEnablementRepairs = new Map<string, Promise<void>>();
-  private readonly latestProjectTrust = new Map<string, boolean>();
+  private readonly latestProjectTrust = new Map<string, MCPProjectTrustState>();
   private readonly workspaceRestartLocks = new MutexMap<string>();
   /** Instances whose prompts/list settled at least once; see awaitFirstPromptLists. */
   private readonly promptListSettledInstances = new WeakSet<MCPServerInstance>();
@@ -3455,11 +3490,15 @@ export class MCPServerManager {
     // Same cold-workspace gap for project trust: a revocation landing while a
     // stream's pre-await trusted snapshot is still in flight has no recorded
     // options to repair, so overlay the newest trust the manager has seen.
-    const latestTrust = this.latestProjectTrust.get(
+    // Per workspace, not project-wide: an SSH+None workspace also needs its directory trusted.
+    const latestTrustState = this.latestProjectTrust.get(
       stripTrailingSlashes(requestOptions.projectPath)
     );
-    if (latestTrust !== undefined && (options.trusted ?? false) !== latestTrust) {
-      options = { ...options, trusted: latestTrust };
+    if (latestTrustState !== undefined) {
+      const latestTrust = workspaceTrustUnder(latestTrustState, options.runtimeConfig);
+      if ((options.trusted ?? false) !== latestTrust) {
+        options = { ...options, trusted: latestTrust };
+      }
     }
     // The caller's read deadline is request-scoped (see
     // overridesReadDeadlineAt): the recorded options are re-used by later
@@ -4829,19 +4868,33 @@ export class MCPServerManager {
     this.latestProjectTrust.delete(stripTrailingSlashes(projectPath));
   }
 
-  /** Updates recorded options so prompt refreshes cannot reuse stale project trust. */
-  applyProjectTrust(updates: Array<{ projectPath: string; trusted: boolean }>): void {
-    const trustByPath = new Map(
-      updates.map((update) => [stripTrailingSlashes(update.projectPath), update.trusted])
+  /**
+   * Updates recorded options so prompt refreshes cannot reuse stale project trust. Each update
+   * carries the project's trust and its trusted SSH directories (absent: none); a workspace's
+   * trust is computed from both (workspaceTrustUnder), so trusting a project does not enable the
+   * project-local servers of an SSH+None workspace whose directory the user has not trusted.
+   * Also called when only a project's SSH directory trust changes.
+   */
+  applyProjectTrust(updates: MCPProjectTrustUpdate[]): void {
+    const trustByPath = new Map<string, MCPProjectTrustState>(
+      updates.map((update) => [
+        stripTrailingSlashes(update.projectPath),
+        {
+          trusted: update.trusted,
+          trustedSshDirectories: update.trustedSshDirectories ?? [],
+        },
+      ])
     );
     // Retained by project path so cold workspaces (no recorded options yet)
     // pick up the mutation when their first request reaches the manager.
-    for (const [path, trusted] of trustByPath) {
-      this.latestProjectTrust.set(path, trusted);
+    for (const [path, state] of trustByPath) {
+      this.latestProjectTrust.set(path, state);
     }
     for (const [workspaceId, options] of [...this.lastWorkspaceRequestOptions]) {
-      const trusted = trustByPath.get(stripTrailingSlashes(options.projectPath));
-      if (trusted === undefined || (options.trusted ?? false) === trusted) continue;
+      const state = trustByPath.get(stripTrailingSlashes(options.projectPath));
+      if (state === undefined) continue;
+      const trusted = workspaceTrustUnder(state, options.runtimeConfig);
+      if ((options.trusted ?? false) === trusted) continue;
       const published: MCPWorkspaceRequestOptions = { ...options, trusted };
       this.lastWorkspaceRequestOptions.set(workspaceId, published);
       this.bumpWorkspaceOptionsMutationCount(workspaceId);

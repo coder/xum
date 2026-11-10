@@ -1377,6 +1377,7 @@ export class TurnRequestBuilder {
       ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
       : secretsForWorkspace(
           this.dependencies.secretsStore,
+          this.dependencies.config,
           metadata.projectPath,
           metadata.runtimeConfig
         );
@@ -1387,6 +1388,7 @@ export class TurnRequestBuilder {
         runtime,
         workspacePath,
         trusted: isWorkspaceProjectTrusted(this.dependencies.config, metadata),
+        runtimeConfig: metadata.runtimeConfig,
         overrides: read.overrides,
         overridesAuthoritative: read.authoritative,
         ...(read.authoritative
@@ -2710,6 +2712,7 @@ export class TurnRequestBuilder {
       ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
       : secretsForWorkspace(
           this.dependencies.secretsStore,
+          this.dependencies.config,
           metadata.projectPath,
           metadata.runtimeConfig
         );
@@ -2734,6 +2737,7 @@ export class TurnRequestBuilder {
             runtime,
             workspacePath,
             trusted: projectTrusted,
+            runtimeConfig: metadata.runtimeConfig,
             overrides: mcpOverrides,
             overridesAuthoritative: mcpOverridesAuthoritative,
             // A non-authoritative read that exhausted its budget (unreachable
