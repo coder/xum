@@ -153,11 +153,11 @@ function kubeconfigPaths(env: NodeJS.ProcessEnv): string[] {
 /**
  * A variable that names a secret file by the common convention: AWS_WEB_IDENTITY_TOKEN_FILE,
  * CLOUDSDK_AUTH_ACCESS_TOKEN_FILE, CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE,
- * AZURE_FEDERATED_TOKEN_FILE, PGPASSFILE, SOPS_AGE_KEY_FILE, the `<NAME>_PASSWORD_FILE` of Docker
- * images. A list of CLIs always misses some (Codex review), so the name decides.
+ * AZURE_FEDERATED_TOKEN_FILE, GOOGLE_GHA_CREDS_PATH, PGPASSFILE, SOPS_AGE_KEY_FILE, the
+ * `<NAME>_PASSWORD_FILE` of Docker images. A list of CLIs always misses some (Codex review), so the name decides.
  */
 const SECRET_FILE_VARIABLE =
-  /(?:TOKEN|CREDENTIALS?|PASS(?:WORD)?|SECRETS?|KEY|AUTH)_?(?:FILE|PATH)(?:_OVERRIDE)?$/;
+  /(?:TOKEN|CRED(?:ENTIAL)?S?|PASS(?:WORD)?|SECRETS?|KEY|AUTH)_?(?:FILE|PATH)(?:_OVERRIDE)?$/;
 
 /**
  * The files that SECRET_FILE_VARIABLE variables name. Only an absolute or `~/` value: a tool that
@@ -381,6 +381,22 @@ export function nestedDenyReadPaths(env: NodeJS.ProcessEnv = process.env): strin
     ...kubeconfigPaths(env),
     // Python requests and Go's module fetches read logins from the .netrc that NETRC names.
     ...fromEnv("NETRC"),
+    // More tools keep tokens where these name (Codex review): Terraform's CLI config, Pulumi,
+    // rclone, gsutil, the OCI CLI, Databricks, Composer, glab, hub, Kaggle, Helm's registry logins
+    // and Docker's TLS key.
+    ...fromEnv("TF_CLI_CONFIG_FILE"),
+    ...fromEnv("TERRAFORM_CONFIG"),
+    ...fromEnv("PULUMI_HOME", "credentials.json"),
+    ...fromEnv("RCLONE_CONFIG"),
+    ...fromEnv("BOTO_CONFIG"),
+    ...fromEnv("OCI_CLI_CONFIG_FILE"),
+    ...fromEnv("DATABRICKS_CONFIG_FILE"),
+    ...fromEnv("COMPOSER_HOME", "auth.json"),
+    ...fromEnv("GLAB_CONFIG_DIR", "config.yml"),
+    ...fromEnv("HUB_CONFIG"),
+    ...fromEnv("KAGGLE_CONFIG_DIR", "kaggle.json"),
+    ...fromEnv("HELM_REGISTRY_CONFIG"),
+    ...fromEnv("DOCKER_CERT_PATH", "key.pem"),
     ...secretFileVariablePaths(env),
     `${XUM_HOME_TOKEN}/server.lock`,
     `${XUM_HOME_TOKEN}/providers.jsonc`,

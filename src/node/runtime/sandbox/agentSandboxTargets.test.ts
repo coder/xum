@@ -104,6 +104,20 @@ const MOVED_CREDENTIAL_STORES = [
   { name: "AZURE_FEDERATED_TOKEN_FILE", value: "azure-token", file: "azure-token" },
   { name: "PGPASSFILE", value: "pgpass", file: "pgpass" },
   { name: "POSTGRES_PASSWORD_FILE", value: "pg-password", file: "pg-password" },
+  { name: "GOOGLE_GHA_CREDS_PATH", value: "gha.json", file: "gha.json" },
+  { name: "TF_CLI_CONFIG_FILE", value: "terraform.tfrc", file: "terraform.tfrc" },
+  { name: "TERRAFORM_CONFIG", value: "terraform.tfrc", file: "terraform.tfrc" },
+  { name: "PULUMI_HOME", value: "pulumi", file: "pulumi/credentials.json" },
+  { name: "RCLONE_CONFIG", value: "rclone.conf", file: "rclone.conf" },
+  { name: "BOTO_CONFIG", value: "boto", file: "boto" },
+  { name: "OCI_CLI_CONFIG_FILE", value: "oci-config", file: "oci-config" },
+  { name: "DATABRICKS_CONFIG_FILE", value: "databrickscfg", file: "databrickscfg" },
+  { name: "COMPOSER_HOME", value: "composer", file: "composer/auth.json" },
+  { name: "GLAB_CONFIG_DIR", value: "glab", file: "glab/config.yml" },
+  { name: "HUB_CONFIG", value: "hub", file: "hub" },
+  { name: "KAGGLE_CONFIG_DIR", value: "kaggle", file: "kaggle/kaggle.json" },
+  { name: "HELM_REGISTRY_CONFIG", value: "helm.json", file: "helm.json" },
+  { name: "DOCKER_CERT_PATH", value: "docker-certs", file: "docker-certs/key.pem" },
 ];
 
 describe("buildAgentSandboxPolicy", () => {
