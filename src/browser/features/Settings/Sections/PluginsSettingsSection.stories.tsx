@@ -396,6 +396,22 @@ export const InstalledPhoneViewport: Story = {
         if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}px`);
       }
     }
+    // A path that fits a line moves to the next line whole, like a file name. The plugins folder
+    // of the intro and the locations of the rows are all shorter than a 320 px line.
+    const paths = [
+      await canvas.findByText("~/.mux/plugins"),
+      ...[MANAGED_ITEM, PINNED_ITEM, UNMANAGED_ITEM].map((item) => canvas.getByText(item.location)),
+    ];
+    for (let width = 320; width <= 390; width += 5) {
+      wrapper.style.width = `${width}px`;
+      for (const path of paths) {
+        const range = document.createRange();
+        range.selectNodeContents(path);
+        if (renderedLineTops(range).size !== 1) {
+          throw new Error(`${path.textContent} is split across lines at ${width}px`);
+        }
+      }
+    }
   },
 };
 
@@ -2114,6 +2130,9 @@ const COMPONENT_FILES = {
 /** A separator-free name longer than a phone line: it can only wrap inside its own box. */
 const LONG_FILE_NAME = "implementation_readiness_design_review_orchestrator_agent_v2.md";
 
+/** A valid slash command name with no separator and 63 of the 64 characters allowed. */
+const LONG_COMMAND_NAME = "implementationreadinessdesignrevieworchestratoragentsversiontwo";
+
 /** A configured plugins folder with one segment longer than a phone line. */
 const LONG_PLUGINS_DIRECTORY = `~/.mux/plugins/${"d".repeat(100)}`;
 
@@ -2127,6 +2146,10 @@ const COMPONENT_FILES_PREVIEW: AgentPluginInstallPreview = {
   mcpServers: [],
   agents: [...COMPONENT_FILES.agents, LONG_FILE_NAME],
   workflows: COMPONENT_FILES.workflows,
+  slashCommands: [
+    { name: "design-review-orchestrator", description: "Reviews a design." },
+    { name: LONG_COMMAND_NAME, description: "Runs the whole review." },
+  ],
   codexHooks: [
     {
       key: "hooks/hooks.json#PreToolUse[0][0]",
@@ -2145,10 +2168,10 @@ const COMPONENT_FILES_PREVIEW: AgentPluginInstallPreview = {
 };
 
 /**
- * File names of agents, workflows and reviewed components, the words of the hook list and the
- * plugins folder at phone width: each name moves to the next line whole instead of splitting at
- * the card's edge, a name longer than a line wraps inside its own box, and nothing sticks out of
- * the screen, down to 320 px. Play-only: the other phone stories of this file snapshot the same
+ * File names of agents, workflows and reviewed components, slash command names, the words of the
+ * hook list and the plugins folder at phone width: each name moves to the next line whole instead
+ * of splitting at the card's edge, a name longer than a line wraps inside its own box, and
+ * nothing sticks out of the screen, down to 320 px. Play-only: the other phone stories of this file snapshot the same
  * panel (Pixel budget).
  */
 export const AddPluginFileNamesPhoneViewport: Story = {
@@ -2188,6 +2211,7 @@ export const AddPluginFileNamesPhoneViewport: Story = {
       ...COMPONENT_FILES.agents,
       ...COMPONENT_FILES.workflows,
       "implementation_readiness_review.md",
+      "/design-review-orchestrator",
     ];
     for (const width of ["390px", "320px"]) {
       wrapper.style.width = width;
@@ -2207,6 +2231,10 @@ export const AddPluginFileNamesPhoneViewport: Story = {
         if (hook === undefined) throw new Error("The hook list item is missing");
         const split = splitProseWords(hook);
         if (split.length > 0) throw new Error(`${split.join(", ")} is split at ${width}`);
+        const command = canvas.getByText(`/${LONG_COMMAND_NAME}`);
+        if (command.getBoundingClientRect().right > wrapper.getBoundingClientRect().right + 1) {
+          throw new Error(`The long slash command sticks out of the screen at ${width}`);
+        }
         if (wrapper.scrollWidth > wrapper.clientWidth + 1) {
           throw new Error(`The plugins section is wider than the screen at ${width}`);
         }
