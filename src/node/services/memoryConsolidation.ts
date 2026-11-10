@@ -476,7 +476,8 @@ const fullJournals = new WeakSet<MemoryConsolidationOp[]>();
 /**
  * Journal a refusal while the journal has room. The refusal that reaches the last slot carries the
  * note that later ones are dropped, and so does the first one after rows of budgeted commands
- * filled the journal past it: those are pushed directly and always (the budget bounds them), so
+ * filled the journal past it: those are pushed directly and always (the run's budget bounds them,
+ * at most MEMORY_DREAM_EDIT_LIMIT_MAX for an organizer run), so
  * the note is recorded once whatever the order, and the journal holds at most one refusal past
  * the cap. The cap reads the journal itself, so it holds for every tool that shares one (the
  * analyzer's chunks of a run).

@@ -1917,7 +1917,7 @@ describe("runMemoryConsolidation", () => {
     async function run(
       fixture: Fixture,
       model: MockLanguageModelV3,
-      options: { editLimit?: number | null; ceilingUsd?: number } = {}
+      options: { editLimit?: number | null; ceilingUsd?: number; dryRun?: boolean } = {}
     ) {
       return runMemoryConsolidation({
         model,
@@ -1997,6 +1997,23 @@ describe("runMemoryConsolidation", () => {
         `You have ${MEMORY_DREAM_EDIT_LIMIT_MAX} mutating commands this run.`
       );
     });
+
+    // The journal saves every accepted command, so the cap is what keeps an unlimited run's journal
+    // bounded. Dry run: the commands are accepted and journaled like real ones without a cap's
+    // worth of file writes.
+    it("stops accepting edits at the safety cap when unlimited, so its journal stays bounded", async () => {
+      using fixture = await createFixture();
+      const scripted = creatingModel(MEMORY_DREAM_EDIT_LIMIT_MAX + 3);
+
+      const result = await run(fixture, scripted.model, { editLimit: null, dryRun: true });
+
+      const accepted = result.ops.filter((op) => op.note === "dry-run");
+      expect(accepted).toHaveLength(MEMORY_DREAM_EDIT_LIMIT_MAX);
+      expect(result.budgetExhausted).toBe(true);
+      expect(result.ops.length).toBeLessThanOrEqual(
+        MEMORY_DREAM_EDIT_LIMIT_MAX + MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES
+      );
+    }, 120_000);
 
     it("keeps the default budget for a caller that passes no limit", async () => {
       using fixture = await createFixture();

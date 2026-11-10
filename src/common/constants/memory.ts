@@ -94,10 +94,12 @@ export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
  * Rows of one run's journal that the guarded memory tool fills with refused commands (out of scope,
  * denied, credential-like, over budget). A refusal spends no budget, and one step can issue many
  * parallel calls, so without a bound a misbehaving model grows the journal, which is saved in the
- * run's sidecar record and returned over IPC. 32 is the organizer's step ceiling: a model that
- * has one command refused per step still gets every refusal journaled. Past it, the last row says
- * the rest are not recorded. Budgeted commands (applied, dry-run, failed) are at most the op budget
- * and are always journaled, so the cap never hides a change.
+ * run's sidecar record and returned over IPC. 32 is the default organizer's step ceiling: a model
+ * that has one command refused per step still gets every refusal journaled. Past it, the last row
+ * says the rest are not recorded. Budgeted commands (applied, dry-run, failed) are always
+ * journaled, so the cap never hides a change; they are at most the run's budget, which for an
+ * organizer run is the user's edit limit and never more than MEMORY_DREAM_EDIT_LIMIT_MAX. One
+ * run's journal therefore holds at most that cap plus these 32 rows (plus the one full note).
  */
 export const MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES = 32;
 /**

@@ -5,26 +5,12 @@ import {
   MEMORY_CONSOLIDATION_OP_BUDGET,
   MEMORY_DREAM_EDIT_LIMIT_MAX,
 } from "@/common/constants/memory";
-
-// Digits only: `Number()` alone would also take "0x10", "1e3", "+5" and "2.5".
-const WHOLE_NUMBER_PATTERN = /^\d+$/;
+import { parseWholeNumberDraft } from "./wholeNumberDraft";
 
 /** What unlimited means: the safety cap still bounds one run (see MEMORY_DREAM_EDIT_LIMIT_MAX). */
 const UNLIMITED_LABEL = `Unlimited (safety cap: ${MEMORY_DREAM_EDIT_LIMIT_MAX} edits per run)`;
 
 const INVALID_LIMIT_MESSAGE = `Enter a whole number of edits up to ${MEMORY_DREAM_EDIT_LIMIT_MAX}, or enter 0 or leave empty for unlimited.`;
-
-/** What a draft stands for: a limit (0 means unlimited), or why it is no limit. */
-type ParsedLimit = { limit: number } | { error: string };
-
-function parseLimit(draft: string): ParsedLimit {
-  const trimmed = draft.trim();
-  if (trimmed === "") return { limit: 0 };
-  const limit = Number(trimmed);
-  return WHOLE_NUMBER_PATTERN.test(trimmed) && limit <= MEMORY_DREAM_EDIT_LIMIT_MAX
-    ? { limit }
-    : { error: INVALID_LIMIT_MESSAGE };
-}
 
 /** The field's text for a saved limit: the default when none is saved, empty for unlimited (0). */
 function formatLimit(saved: number | undefined): string {
@@ -46,13 +32,18 @@ export function MemoryDreamEditLimitSetting() {
   // null means not editing: the field shows the saved limit.
   const [draft, setDraft] = useState<string | null>(null);
   const text = draft ?? formatLimit(saved);
-  const parsed = parseLimit(text);
+  // An empty field is 0: unlimited.
+  const parsed = parseWholeNumberDraft(text, {
+    max: MEMORY_DREAM_EDIT_LIMIT_MAX,
+    empty: 0,
+    error: INVALID_LIMIT_MESSAGE,
+  });
 
   const commit = () => {
     setDraft(null);
     // Compare with the limit the run uses, so a blur on the shown default saves nothing.
-    if ("error" in parsed || parsed.limit === (saved ?? MEMORY_CONSOLIDATION_OP_BUDGET)) return;
-    updateUserPreferences({ memory: { dreamEditLimit: parsed.limit } });
+    if ("error" in parsed || parsed.value === (saved ?? MEMORY_CONSOLIDATION_OP_BUDGET)) return;
+    updateUserPreferences({ memory: { dreamEditLimit: parsed.value } });
   };
 
   return (
