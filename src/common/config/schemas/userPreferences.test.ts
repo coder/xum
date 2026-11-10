@@ -173,12 +173,13 @@ describe("UserPreferencesSchema", () => {
         memory: { dreamEditLimit: MEMORY_DREAM_EDIT_LIMIT_MAX },
       });
     }
-    // A save over the cap is refused, so only the load repairs one.
-    expect(
-      UserPreferencesSchema.safeParse({
-        memory: { dreamEditLimit: MEMORY_DREAM_EDIT_LIMIT_MAX + 1 },
-      }).success
-    ).toBe(false);
+    // A save over the cap is refused, so only the load repairs one; a save of a negative or
+    // fractional limit is refused too (the load's repair would not catch a schema that took it).
+    for (const saved of [MEMORY_DREAM_EDIT_LIMIT_MAX + 1, -1, 2.5]) {
+      expect(UserPreferencesSchema.safeParse({ memory: { dreamEditLimit: saved } }).success).toBe(
+        false
+      );
+    }
     // A hand-edited value that is not a whole, non-negative number drops only itself, so the run
     // uses the default and the other preferences stay.
     for (const stored of [-1, 2.5, "8", null]) {

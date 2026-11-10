@@ -5,9 +5,8 @@ const WHOLE_NUMBER_PATTERN = /^\d+$/;
 export type ParsedWholeNumberDraft<Empty> = { value: number | Empty } | { error: string };
 
 /**
- * Reads the draft of a whole-number settings field (the dream edit limit and run timeout): an
- * empty field is `empty`, whole digits up to `max` are their number, and anything else is `error`.
- * The fields share this rule, so a change to what they accept reaches both.
+ * Reads the draft of a whole-number Settings field (the dream edit limit): an empty field is
+ * `empty`, whole digits up to `max` are their number, and anything else is `error`.
  */
 export function parseWholeNumberDraft<Empty>(
   draft: string,
