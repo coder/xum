@@ -4107,6 +4107,12 @@ describe("AgentPluginInstallService", () => {
       );
       // Still fail-closed.
       expect(await discovered()).toBe(0);
+      // That scan's gate started a sign-out pass in the background. A pass that reads the record
+      // while the swaps below leave it absent then deletes what replaced it, and the review
+      // reports "files changed" instead of the record's state. Let the pass end first.
+      await (
+        updater as unknown as { settledSignOutPasses: () => Promise<void> }
+      ).settledSignOutPasses();
       // A record that can be stat'ed but not read names its read error too.
       await fsPromises.rm(record);
       await fsPromises.mkdir(record);
