@@ -93,6 +93,12 @@ export interface MemoryConsolidationResult {
    * consolidated (no journal record, no debounce anchor).
    */
   streamError?: string;
+  /**
+   * The abort signal's reason when an abort, and nothing else, ended the stream; undefined after
+   * a provider error, even one that came as the signal fired. A caller that combined several
+   * signals compares it with each one's reason to know which fired (see organizerRunEnd).
+   */
+  abortReason?: unknown;
 }
 
 /** Scopes a consolidation run can be allowed to modify; the session scope is never one of them. */
@@ -786,7 +792,8 @@ export async function runMemoryConsolidation(args: {
   });
   // An abort ends the stream without an error part, so a pass cut short by its timeout or by
   // workspace removal would read as clean and be journaled as a success.
-  if (streamErrors.length === 0 && args.abortSignal?.aborted === true) {
+  const endedByAbort = streamErrors.length === 0 && args.abortSignal?.aborted === true;
+  if (endedByAbort) {
     streamErrors.push("memory consolidation was cut short by its timeout or by workspace removal");
   }
   // Set apart from `streamErrors`: only a stream that failed or was aborted has unreliable usage.
@@ -839,5 +846,6 @@ export async function runMemoryConsolidation(args: {
     spentUsd: meter.spentUsd(),
     note: meter.note(),
     streamError,
+    abortReason: endedByAbort ? args.abortSignal?.reason : undefined,
   };
 }

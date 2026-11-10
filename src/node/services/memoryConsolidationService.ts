@@ -413,16 +413,22 @@ export const RUN_TIMEOUT_NOTE = "stopped at its run timeout";
  * state: no record, so the debounce and the launch sweep retry later instead of reporting a
  * consolidation that never happened. One exception: a run that the user's run timeout cut after
  * it applied at least one edit changed memory, like a run the cost ceiling stopped, so it keeps
- * its record and the Memory tab and the debounce see it. An abort from workspace removal never
- * counts as the timeout.
+ * its record and the Memory tab and the debounce see it.
+ *
+ * "Cut by the run timeout" is what ended the stream, not the timeout's state afterwards: the
+ * stream's abort reason must be the timeout's own reason object (AbortSignal.any passes on the
+ * reason of the signal that fired first). A provider error, even one near the deadline, leaves no
+ * abort reason, and a removal's reason is not the timeout's, so both stay ordinary failures.
  */
 export function organizerRunEnd(
-  result: Pick<MemoryConsolidationResult, "streamError" | "ops" | "note">,
-  runTimeout: AbortSignal | undefined,
-  removalSignal: AbortSignal
+  result: Pick<MemoryConsolidationResult, "streamError" | "ops" | "note" | "abortReason">,
+  runTimeout: AbortSignal | undefined
 ): { kind: "record"; note: string | undefined } | { kind: "failed"; error: string } {
   if (result.streamError === undefined) return { kind: "record", note: result.note };
-  const cutByRunTimeout = runTimeout?.aborted === true && !removalSignal.aborted;
+  const cutByRunTimeout =
+    runTimeout?.aborted === true &&
+    result.abortReason !== undefined &&
+    result.abortReason === runTimeout.reason;
   if (cutByRunTimeout && result.ops.some((op) => op.applied)) {
     return { kind: "record", note: RUN_TIMEOUT_NOTE };
   }
@@ -440,11 +446,6 @@ function organizerRunSignals(
   if (runTimeoutMs === null) return { signal: removalSignal, runTimeout: undefined };
   const runTimeout = AbortSignal.timeout(runTimeoutMs);
   return { signal: AbortSignal.any([runTimeout, removalSignal]), runTimeout };
-}
-
-/** Why a stream did not start: another run kept the in-process turn past this run's wait. */
-function dreamTurnTimeoutMessage(waitMs: number): string {
-  return `Another memory run kept the turn for ${waitMs / 60_000} minutes, longer than this run waits.`;
 }
 
 /** The skip reason of a run the debounce window refused (callers match on "debounced"). */
@@ -487,28 +488,6 @@ function createDeferredUsageRecorder(label: string, workspaceId: string) {
       }
     },
   };
-}
-
-/** A promise and the function that settles it: one handoff of the in-process dream turn. */
-function createHandoff(): { settled: Promise<void>; settle: () => void } {
-  let settle!: () => void;
-  const settled = new Promise<void>((resolve) => {
-    settle = resolve;
-  });
-  return { settled, settle };
-}
-
-/**
- * Waits for the in-process dream turn like waitForTurnOrAbort, and also gives up when `deadline`
- * aborts: "deadline" then, "aborted" when `signal` (removal) did.
- */
-async function waitForDreamTurn(
-  turn: Promise<void>,
-  signal: AbortSignal,
-  deadline: AbortSignal
-): Promise<"turn" | "aborted" | "deadline"> {
-  if (await waitForTurnOrAbort(turn, AbortSignal.any([signal, deadline]))) return "turn";
-  return signal.aborted ? "aborted" : "deadline";
 }
 
 /** Resolves true once `turn` settles, or false if `signal` aborts first (a pre-aborted signal never waits). */
@@ -836,8 +815,6 @@ export class MemoryConsolidationService extends EventEmitter {
    * its wait was cancelled.
    */
   private dreamStreamTail: Promise<void> = Promise.resolve();
-  /** Settles each time a holder lets the in-process dream turn go (see waitForDreamTurnHandoffs). */
-  private dreamTurnHandoff = createHandoff();
 
   /**
    * Analyzer-job queue, keyed by the workspace-memory owner. `harvestInFlight` is per compaction
@@ -1579,22 +1556,12 @@ export class MemoryConsolidationService extends EventEmitter {
     // Linked before the first await so queue order is call order. A cancelled
     // waiter still releases its link, which lets successors pass it.
     this.dreamStreamTail = previous.then(() => turnDone);
-    const runTimeoutMs = resolveDreamRunTimeoutMs(this.config);
-    // Whether this run held the turn: only a holder's release hands it on (a cancelled waiter's
-    // release is no progress of the queue).
-    let held = false;
     try {
-      // Every waiter gives up when one holder keeps the turn longer than the wait of the lock
-      // below, whatever the holder's own setting: a holder that started with the run timeout off
-      // and hung holds this in-process turn until Xum restarts, even after the user sets a
-      // timeout again. The waiter then fails and its next trigger retries.
-      const waitMs = dreamLockWaitMs(runTimeoutMs);
-      const turn = await this.waitForDreamTurnHandoffs(previous, signal, waitMs);
-      if (turn === "aborted") return { outcome: "cancelled" };
-      if (turn === "deadline") {
-        return { outcome: "lock-failed", error: dreamTurnTimeoutMessage(waitMs) };
-      }
-      held = true;
+      // No deadline in this process, as before the run timeout setting: every holder here ends
+      // at its own timeout, and with the run timeout off a hung organizer run holds this turn,
+      // and every run queued behind it, until Xum restarts or the workspace is removed. The
+      // Settings field says so; the user chose "0 means no timeout" with that warning.
+      if (!(await waitForTurnOrAbort(previous, signal))) return { outcome: "cancelled" };
       let releaseLock: () => Promise<void>;
       try {
         releaseLock = await acquireCrossProcessLock({
@@ -1603,7 +1570,7 @@ export class MemoryConsolidationService extends EventEmitter {
           // the constant for an analyzer chunk), so this wait outlasts any healthy holder. A wedged
           // live holder is never taken over (fail closed): this run errors and the next trigger
           // retries. With the run timeout off, the wait keeps the constant as its floor.
-          acquireTimeoutMs: waitMs,
+          acquireTimeoutMs: dreamLockWaitMs(resolveDreamRunTimeoutMs(this.config)),
           staleMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
           timeoutMessage: "Another Xum process is running a memory consolidation.",
           signal,
@@ -1619,35 +1586,7 @@ export class MemoryConsolidationService extends EventEmitter {
       }
     } finally {
       release();
-      if (held) this.handOffDreamTurn();
     }
-  }
-
-  /**
-   * Waits for the in-process dream turn, giving up after `waitMs` without a handoff. The deadline
-   * restarts each time a holder lets the turn go, so it bounds one holder, not the whole queue: a
-   * waiter behind several healthy runs (each cut at its own timeout) keeps its place, as an
-   * analyzer retry behind a live job must, while one behind a hung holder gives up and retries.
-   */
-  private async waitForDreamTurnHandoffs(
-    previous: Promise<void>,
-    signal: AbortSignal,
-    waitMs: number
-  ): Promise<"turn" | "aborted" | "deadline"> {
-    for (;;) {
-      const handoff = this.dreamTurnHandoff.settled.then(() => "handoff" as const);
-      const outcome = await Promise.race([
-        waitForDreamTurn(previous, signal, AbortSignal.timeout(waitMs)),
-        handoff,
-      ]);
-      if (outcome !== "handoff") return outcome;
-    }
-  }
-
-  private handOffDreamTurn(): void {
-    const handoff = this.dreamTurnHandoff;
-    this.dreamTurnHandoff = createHandoff();
-    handoff.settle();
   }
 
   /**
@@ -1853,7 +1792,7 @@ export class MemoryConsolidationService extends EventEmitter {
           return Err(DEBOUNCED_SKIP_REASON);
         }
         const result = await consolidate();
-        const end = organizerRunEnd(result, runTimeout, removalSignal);
+        const end = organizerRunEnd(result, runTimeout);
         if (end.kind === "failed") return Err(end.error);
         // Removed while the model ran, in another backend: every memory read and write of the
         // pass was refused, so it covered nothing, and a success record would hold off the
