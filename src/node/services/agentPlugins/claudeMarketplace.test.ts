@@ -512,6 +512,22 @@ describe("the Agent Plugins marketplace file", () => {
     ).toEqual({ kind: "relative", subpath: "x" });
   });
 
+  test("an entry that names the root installs only from a Claude file", () => {
+    // A listing exists only when the root has no plugin manifest, so only an entry that is its
+    // own manifest (Claude) can install from the root.
+    const builds = listing({
+      cursor: marketplace([{ name: "demo", source: "./" }], undefined, "cursor"),
+      claude: marketplace([{ name: "demo", source: "./" }], undefined, "claude"),
+      agents: agents([{ name: "demo", source: { source: "local", path: "." } }]),
+    }).entries[0].builds;
+    expect(builds.map((build) => [build.file, build.installable])).toEqual([
+      ["cursor", false],
+      ["claude", true],
+      ["agents", false],
+    ]);
+    expect(builds[2].reason).toContain("names the repository root");
+  });
+
   test("a url source keeps its optional path folder, only in this file", () => {
     const source = { source: "url", url: "https://github.com/acme/mono.git", path: "./tools/x" };
     expect(resolveEntry({ source })).toEqual({

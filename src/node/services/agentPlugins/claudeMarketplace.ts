@@ -588,6 +588,17 @@ function describeMarketplaceBuild(
   } catch (error) {
     reason = getErrorMessage(error);
   }
+  // A listing exists only when the repository root has no plugin manifest of its own (a root
+  // with one previews as that plugin instead). So an entry that names the root installs only
+  // where the entry itself is the manifest (Claude); elsewhere its preview would always fail.
+  if (
+    resolved?.kind === "relative" &&
+    resolved.subpath === undefined &&
+    !MARKETPLACE_FILE_RULES[file].entryIsManifest
+  ) {
+    reason =
+      "The entry names the repository root, which has no plugin manifest, so Xum cannot install it.";
+  }
   return {
     file,
     sourceKind: entry.sourceKind,
