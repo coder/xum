@@ -51,7 +51,8 @@ describe("createFileChangeNotificationMessage file names", () => {
 
   // Only NEL, LS and PS are escaped. A wider range would turn real file names into escapes and
   // hide them from the agent: Latin-1 text (U+00E9), CJK (U+65E5), an astral character (a
-  // surrogate pair) and U+2030, the first character after the escaped range that is not a break.
+  // surrogate pair) and U+2030, the first printable character after U+2029 (past the bidi
+  // controls U+202A-U+202E and the narrow no-break space U+202F).
   test("a name with printable non-ASCII text stays as it is", () => {
     const name = "/repo/café-日本語-😀‰.ts";
 
