@@ -9,6 +9,8 @@ import type { Box, LayoutPage, PageMetrics, SettleSignals } from "./layoutPage";
  */
 export type BrowserWindow = Window & typeof globalThis;
 
+const noop = () => undefined;
+
 function readMetrics(win: BrowserWindow): PageMetrics {
   const root = win.document.documentElement;
   return {
@@ -80,7 +82,7 @@ export function observeUntilQuiet(
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const timers: { quiet?: ReturnType<typeof setTimeout>; max?: ReturnType<typeof setTimeout> } = {};
-    let stop = () => {};
+    let stop: () => void = noop;
     let done = false;
     const finish = (quiet: boolean) => {
       if (done) return;
@@ -103,7 +105,7 @@ export function observeUntilQuiet(
 // Upstream watches <html>, <body> and the first 800 elements. Observing fires once at the start,
 // which restarts the quiet timer: the page counts as quiet only after the first layout is read.
 function observeResizes(win: BrowserWindow, onChange: () => void): () => void {
-  if (typeof win.ResizeObserver === "undefined") return () => {};
+  if (typeof win.ResizeObserver === "undefined") return noop;
   const observer = new win.ResizeObserver(onChange);
   const doc = win.document;
   const watched = [doc.documentElement, doc.body, ...doc.body.querySelectorAll("*")];
@@ -125,7 +127,7 @@ function observeMutations(win: BrowserWindow, onChange: () => void): () => void 
 // A failed font load must not stall the audit: ready is awaited for its timing, not its outcome.
 function waitForFonts(win: BrowserWindow): Promise<void> {
   const ready = win.document.fonts?.ready;
-  return ready ? ready.then(() => {}, () => {}) : Promise.resolve();
+  return ready ? ready.then(noop, noop) : Promise.resolve();
 }
 
 function waitForFrames(win: BrowserWindow, count: number): Promise<void> {
@@ -148,7 +150,7 @@ async function waitForFiniteAnimations(win: BrowserWindow, maxMs: number): Promi
   const finite = runningAnimations(win).filter(isFiniteAnimation);
   if (finite.length === 0) return true;
   let settled = false;
-  const finished = Promise.all(finite.map((animation) => animation.finished.catch(() => {})));
+  const finished = Promise.all(finite.map((animation) => animation.finished.catch(noop)));
   await Promise.race([
     finished.then(() => {
       settled = true;

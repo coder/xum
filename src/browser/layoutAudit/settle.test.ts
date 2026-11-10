@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS } from "@/common/constants/artifactLayoutAudit";
+import type { LayoutAuditPageFinding } from "@/common/types/artifactLayoutAudit";
 import { createFakeLayoutPage } from "./fakeLayoutPage.testHarness";
 import type { SettleSignals } from "./layoutPage";
 import { runLayoutAudit } from "./settle";
 
 const PHONE = { viewport: { width: 390, height: 844 } };
 const OFF_LEFT = (id: string) => `<button id="${id}" data-box="-60 10 100 30">Menu</button>`;
-const FINDING = {
+const FINDING: LayoutAuditPageFinding = {
   rule: "viewport-unreachable-control",
   selector: "button#late",
   axis: "horizontal",

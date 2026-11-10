@@ -7,11 +7,12 @@ import {
 } from "./browserPage";
 import { createFakeBrowserWindow } from "./fakeLayoutPage.testHarness";
 
+const noop = () => undefined;
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** An `observe` hook whose changes the test fires by hand. */
 function manualObserver() {
-  const state = { onChange: () => {}, stops: 0 };
+  const state = { onChange: noop, stops: 0 };
   const observe = (onChange: () => void) => {
     state.onChange = onChange;
     return () => {
@@ -60,8 +61,10 @@ describe("observeUntilQuiet", () => {
   test("a change after the wait is over does not restart anything", async () => {
     const { observe, state } = manualObserver();
     await observeUntilQuiet(observe, 10, 1_000);
+    // A late change starts a quiet timer that must not stop the watcher a second time. Waiting
+    // out a longer quiet time of another watcher lets that timer fire first.
     state.onChange();
-    await delay(30);
+    await observeUntilQuiet(manualObserver().observe, 40, 1_000);
     expect(state.stops).toBe(1);
   });
 });
@@ -103,7 +106,7 @@ describe("createBrowserLayoutPage", () => {
       { left: 0, top: 0, right: 40, bottom: 0, width: 40, height: 0 },
     ];
     Object.assign(fake.win.document, {
-      createRange: () => ({ selectNodeContents: () => {}, getClientRects: () => rects }),
+      createRange: () => ({ selectNodeContents: noop, getClientRects: () => rects }),
     });
     const text = fake.win.document.querySelector("p")?.firstChild as Text;
     expect(createBrowserLayoutPage(fake.win).textLines(text)).toEqual([rects[0]]);
@@ -190,7 +193,7 @@ describe("createBrowserSettleSignals", () => {
     const infinite = {
       playState: "running",
       effect: { getComputedTiming: () => ({ endTime: Number.POSITIVE_INFINITY }) },
-      finished: new Promise<never>(() => {}),
+      finished: new Promise<never>(noop),
     };
 
     test("is settled at once when nothing finite is running, infinite loops included", async () => {
@@ -207,7 +210,7 @@ describe("createBrowserSettleSignals", () => {
 
     test("is not settled when a finite animation outlasts the wait", async () => {
       using fake = createFakeBrowserWindow();
-      stubAnimations(fake.win, [finite(new Promise<never>(() => {}))]);
+      stubAnimations(fake.win, [finite(new Promise<never>(noop))]);
       expect(await createBrowserSettleSignals(fake.win).finiteAnimationsSettled(30)).toBe(false);
     });
   });
