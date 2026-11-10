@@ -565,7 +565,8 @@ function urlSourceFolder(
   rules: MarketplaceFileRules,
   source: Record<string, unknown>
 ): string | undefined {
-  if (!rules.urlPath || source.path === undefined) return undefined;
+  // Codex reads a null `path` as absent.
+  if (!rules.urlPath || source.path == null) return undefined;
   const folder = typeof source.path === "string" ? marketplaceRelativePath(source.path) : "";
   if (folder === "") throw new Error("A 'url' source 'path' must name a folder.");
   return folder;

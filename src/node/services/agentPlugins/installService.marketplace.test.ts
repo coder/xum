@@ -1060,4 +1060,30 @@ describe("AgentPluginInstallService marketplaces", () => {
     );
     expect((await service.list()).map((item) => item.name)).toEqual([]);
   }, 20_000);
+
+  test("install never takes an Agent Plugins entry selector; an update follows the folder without the marketplace file", async () => {
+    await writeAgentsMarketplace({ only: true });
+    const preview = await previewAgentsEntry("e2e");
+    await expect(
+      service.install({
+        source: preview.source,
+        method: { kind: "agents-marketplace", entry: "e2e" },
+        expectedSha: preview.lockedSha,
+        expectedConsentDigest: preview.consentDigest,
+      })
+    ).rejects.toThrow("cannot be installed as Agent Plugins marketplace entry");
+    expect((await service.list()).map((item) => item.name)).toEqual([]);
+    await install(preview);
+    expect(await installedSkills("e2e")).toEqual(["write-tests"]);
+    await writeFiles(marketDir, { "plugins/e2e/skills/lint2/SKILL.md": skillMd("lint2") });
+    await git(marketDir, "rm", "-q", ".agents/plugins/marketplace.json");
+    await commit(marketDir, "drop the marketplace file, add a skill");
+    const head = (await git(marketDir, "rev-parse", "HEAD")).trim();
+    const review = await service.previewUpdate({ name: "e2e" });
+    expect(review.toSha).toBe(head);
+    await updateWithReview("e2e");
+    expect(await installedSkills("e2e")).toEqual(["lint2", "write-tests"]);
+    const updated = (await service.list()).find((item) => item.name === "e2e");
+    expect([updated?.lockedSha, updated?.source?.subpath]).toEqual([head, "plugins/e2e"]);
+  }, 60_000);
 });
