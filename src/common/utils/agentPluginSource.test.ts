@@ -299,6 +299,7 @@ describe("surelyOnThisMachine", () => {
     ],
     ["an ssh URL to a loopback IPv4 spelling", "ssh://127.1/srv/market.git"],
     ["an ssh URL to the IPv6 loopback", "ssh://[::1]/srv/market.git"],
+    ["an ssh URL to an IPv4-mapped loopback in capitals", "ssh://[::FFFF:7F00:1]/srv/market.git"],
     ["an https URL to a loopback address", "https://127.0.0.1/market.git"],
     ["an scp URL to a loopback address", "git@127.0.0.1:srv/market.git"],
     ["an scp URL to localhost with no user", "localhost:srv/market.git"],

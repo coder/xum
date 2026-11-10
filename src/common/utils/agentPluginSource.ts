@@ -80,7 +80,7 @@ export function pointsAtThisMachine(url: string): boolean {
  * `\h:org/repo` as ssh to `~h` or `\h`.
  */
 function gitReadsAsPath(url: string, platform: NodeJS.Platform): boolean {
-  if (/^file:\/\//i.test(url)) return true;
+  if (url.startsWith("file://")) return true;
   const colon = url.indexOf(":");
   const slash = url.indexOf("/");
   if (colon === -1 || (slash !== -1 && slash < colon)) return true;
