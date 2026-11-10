@@ -28,6 +28,11 @@ const MARKETPLACE_FILE: Record<
     build: "Claude build",
     marketplace: "Claude Code marketplace",
   },
+  agents: {
+    selector: "agents-marketplace",
+    build: "Agent Plugins build",
+    marketplace: "Agent Plugins marketplace",
+  },
 };
 
 function pickable(entry: AgentPluginMarketplaceEntry): boolean {

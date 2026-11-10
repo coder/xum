@@ -8,9 +8,9 @@
  *   review, so the consent preview, receipts and updates treat it like any plugin.
  * - `claude-marketplace`: one entry of a Claude Code marketplace whose folder has no manifest.
  *   Xum writes a plugin.json from the entry (the Claude rule: the entry is the manifest).
- * - `cursor-marketplace`: one entry of a Cursor marketplace, for a preview only. The entry
- *   installs through its folder's own manifest; Xum writes none for it and refuses an entry
- *   whose folder has none.
+ * - `cursor-marketplace`, `agents-marketplace`: one entry of a Cursor or an Agent Plugins
+ *   marketplace, for a preview only. The entry installs through its folder's own manifest; Xum
+ *   writes none for it and refuses an entry whose folder has none.
  *
  * Xum never overwrites or shadows a root or Codex manifest: `skills` fits only without them. A
  * Claude or Cursor manifest does not block `skills`: the generated root plugin.json wins by
@@ -45,6 +45,7 @@ import {
 } from "./discovery";
 import { normalizeClaudeManifest } from "./claudeManifest";
 import {
+  MARKETPLACE_FILE_RULES,
   MARKETPLACE_RELATIVE_PATHS,
   entryAsManifest,
   entryDeclaresComponents,
@@ -354,6 +355,7 @@ function sameInstallMethod(a: AgentPluginInstallMethod, b: AgentPluginInstallMet
       return b.kind === a.kind;
     case "claude-marketplace":
     case "cursor-marketplace":
+    case "agents-marketplace":
       return b.kind === a.kind && b.entry === a.entry;
   }
 }
@@ -516,8 +518,8 @@ export function isOwnManifestMethod(method: AgentPluginInstallMethod): boolean {
  * as the manifest, for a relative source only (an update must find the entry again in the same
  * repository); else Skills for a remote repository of SKILL.md files. A manifest plus entry
  * components is the Claude conflict for `strict: false`; with `strict` Xum uses only the
- * manifest and warns (Claude would merge them). A Cursor entry installs only through its own
- * manifest (Cursor plugin RFC, D23).
+ * manifest and warns (Claude would merge them). A Cursor or Agent Plugins entry installs only
+ * through its own manifest (Cursor plugin RFC, D23).
  */
 export function entryInstallMethods(
   detected: AgentPluginInstallMethod[],
@@ -525,9 +527,10 @@ export function entryInstallMethods(
 ): { methods: AgentPluginInstallMethod[]; warnings: string[] } {
   const name = ctx.entry.name;
   const own = detected.find(isOwnManifestMethod);
-  if (own === undefined && ctx.file === "cursor") {
+  const rules = MARKETPLACE_FILE_RULES[ctx.file];
+  if (own === undefined && !rules.entryIsManifest) {
     throw new Error(
-      `The Cursor marketplace entry '${name}' has no plugin manifest in its folder. Xum does not install it.`
+      `The ${AGENT_PLUGIN_INSTALL_METHOD_LABELS[rules.selector]} '${name}' has no plugin manifest in its folder. Xum does not install it.`
     );
   }
   if (own !== undefined) {

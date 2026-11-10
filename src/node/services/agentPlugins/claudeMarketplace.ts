@@ -1,7 +1,9 @@
 /**
  * Claude Code marketplace (`.claude-plugin/marketplace.json`) reader. The Cursor marketplace
- * (`.cursor-plugin/marketplace.json`) uses the same format, so this reader parses both, and a
- * repository with both files lists one merged list (mergeMarketplaces).
+ * (`.cursor-plugin/marketplace.json`) and the Agent Plugins (Codex) marketplace
+ * (`.agents/plugins/marketplace.json`) use the same format with a few differences
+ * (MARKETPLACE_FILE_RULES), so this reader parses all three, and a repository with several files
+ * lists one merged list (mergeMarketplaces).
  *
  * Source: https://code.claude.com/docs/en/plugin-marketplaces.md and the marketplace reference.
  * Xum lists the entries of a marketplace and installs ONE entry per install. Each entry source
@@ -36,13 +38,22 @@ import {
 
 export const CLAUDE_MARKETPLACE_RELATIVE_PATH = ".claude-plugin/marketplace.json";
 export const CURSOR_MARKETPLACE_RELATIVE_PATH = ".cursor-plugin/marketplace.json";
+export const AGENTS_MARKETPLACE_RELATIVE_PATH = ".agents/plugins/marketplace.json";
 
 export type MarketplaceFile = AgentPluginMarketplaceBuild["file"];
+
+/**
+ * The marketplace files in the order a listing merges them: Cursor first, so the rows of a
+ * repository that has only the Cursor and Claude files do not change when another file joins.
+ */
+export const MARKETPLACE_FILES: readonly MarketplaceFile[] =
+  AgentPluginMarketplaceBuildSchema.shape.file.options;
 
 /** The repository-relative path of each marketplace file ("/"-separated, as git names it). */
 export const MARKETPLACE_RELATIVE_PATHS: Record<MarketplaceFile, string> = {
   cursor: CURSOR_MARKETPLACE_RELATIVE_PATH,
   claude: CLAUDE_MARKETPLACE_RELATIVE_PATH,
+  agents: AGENTS_MARKETPLACE_RELATIVE_PATH,
 };
 
 /** One marketplace file's entry: what a preview, install or update reads again at a commit. */
@@ -59,7 +70,7 @@ export interface MarketplaceEntryRef {
 export const MAX_CLAUDE_MARKETPLACE_BYTES = 8 * 1024 * 1024;
 /**
  * Entries past this many are not listed (one warning names the count). Per file, so a merged
- * list has at most twice as many rows.
+ * list has at most as many times this many rows as there are marketplace files.
  */
 export const MAX_CLAUDE_MARKETPLACE_ENTRIES = 500;
 
@@ -140,8 +151,136 @@ const OBJECT_SOURCE_KINDS: readonly MarketplaceSourceKind[] = [
   "command",
 ];
 
-function sourceKindOf(source: unknown): MarketplaceSourceKind {
-  if (typeof source === "string") return "relative";
+/**
+ * What differs between the marketplace files. One row per file, so a new file cannot be added
+ * without deciding each of these (a `Record<MarketplaceFile, ...>`).
+ */
+interface MarketplaceFileRules {
+  /** The preview selector method for one entry of this file (never persisted or installed). */
+  selector: Extract<AgentPluginInstallMethod, { entry: string }>["kind"];
+  /**
+   * The Claude rule: an entry whose folder has no plugin manifest is the manifest, and Xum writes
+   * a plugin.json from it. In the other files an entry installs only through its folder's own
+   * manifest (Cursor plugin RFC, D23).
+   */
+  entryIsManifest: boolean;
+  /** An object `{source: "local", path}` names a folder of the marketplace, as a plain path does. */
+  localSource: boolean;
+  /** The folder a path source names (undefined: the marketplace root). Throws why it is refused. */
+  folderOf: (
+    source: string,
+    marketplace: Pick<ClaudeMarketplace, "pluginRoot" | "pluginRootProblem">
+  ) => string | undefined;
+  /** Why this entry cannot install whatever its source is. */
+  refusal?: (entry: ClaudeMarketplaceEntry) => string | undefined;
+  /** The marketplace title, for a file that has a field for it besides `name`. */
+  title?: (raw: Record<string, unknown>) => string | undefined;
+}
+
+function rootRelative(folder: string): string | undefined {
+  return folder === "" ? undefined : folder;
+}
+
+/**
+ * The Claude rule: ".", "./" and "./..." start at the marketplace root; only a bare folder name
+ * (no "/") starts at metadata.pluginRoot, and any other path needs the "./" prefix.
+ */
+function claudeFolder(
+  source: string,
+  marketplace: Pick<ClaudeMarketplace, "pluginRoot" | "pluginRootProblem">
+): string | undefined {
+  if (marketplace.pluginRootProblem !== undefined) throw new Error(marketplace.pluginRootProblem);
+  // Each part is checked on its own before the join, so `..` cannot cancel a pluginRoot folder.
+  const folder = marketplaceRelativePath(source);
+  const trimmed = source.trim();
+  const explicit = trimmed === "." || trimmed.startsWith("./");
+  if (!explicit && (folder === "" || folder.includes("/"))) {
+    throw new Error(
+      `The source '${source}' must start with './'. Only a single folder name resolves under metadata.pluginRoot.`
+    );
+  }
+  const joined = explicit
+    ? folder
+    : [marketplace.pluginRoot, folder].filter((part) => part !== "").join("/");
+  return rootRelative(joined);
+}
+
+/**
+ * The Cursor rule: a path starts at the marketplace root, with or without "./", and Cursor has no
+ * metadata.pluginRoot (cursor/plugins lists `third_party/attio`). The containment checks of
+ * marketplaceRelativePath still apply.
+ */
+function cursorFolder(source: string): string | undefined {
+  return rootRelative(marketplaceRelativePath(source));
+}
+
+/**
+ * The Agent Plugins rule (Codex "Marketplace metadata"): a path is relative to the marketplace
+ * root, not to `.agents/plugins/`, and must start with "./" ("./" is the root itself). There is
+ * no metadata.pluginRoot.
+ */
+function agentsFolder(source: string): string | undefined {
+  if (!source.trim().startsWith("./")) {
+    throw new Error(`The path '${source}' must start with './'.`);
+  }
+  return rootRelative(marketplaceRelativePath(source));
+}
+
+function agentsPolicyRefusal(entry: ClaudeMarketplaceEntry): string | undefined {
+  const policy = entry.raw.policy;
+  return isPlainObject(policy) && policy.installation === "NOT_AVAILABLE"
+    ? "The marketplace marks this plugin policy.installation NOT_AVAILABLE, so Xum does not install it."
+    : undefined;
+}
+
+function agentsTitle(raw: Record<string, unknown>): string | undefined {
+  return isPlainObject(raw.interface) ? optionalString(raw.interface.displayName) : undefined;
+}
+
+export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRules> = {
+  cursor: {
+    selector: "cursor-marketplace",
+    entryIsManifest: false,
+    localSource: false,
+    folderOf: cursorFolder,
+  },
+  claude: {
+    selector: "claude-marketplace",
+    entryIsManifest: true,
+    localSource: false,
+    folderOf: claudeFolder,
+  },
+  agents: {
+    selector: "agents-marketplace",
+    entryIsManifest: false,
+    localSource: true,
+    folderOf: agentsFolder,
+    refusal: agentsPolicyRefusal,
+    title: agentsTitle,
+  },
+};
+
+/** The marketplace entry that a preview selector (`{kind, entry}`) names, undefined for another method. */
+export function marketplaceEntryRefOf(
+  method: AgentPluginInstallMethod | null | undefined
+): MarketplaceEntryRef | undefined {
+  if (method == null || !("entry" in method)) return undefined;
+  const file = MARKETPLACE_FILES.find((candidate) => {
+    return MARKETPLACE_FILE_RULES[candidate].selector === method.kind;
+  });
+  return file === undefined ? undefined : { file, entry: method.entry };
+}
+
+/** An object source that names a folder of the marketplace (only where `localSource` is set). */
+function isLocalSource(
+  rules: MarketplaceFileRules,
+  source: unknown
+): source is Record<string, unknown> {
+  return rules.localSource && isPlainObject(source) && source.source === "local";
+}
+
+function sourceKindOf(rules: MarketplaceFileRules, source: unknown): MarketplaceSourceKind {
+  if (typeof source === "string" || isLocalSource(rules, source)) return "relative";
   if (!isPlainObject(source)) return "unknown";
   return OBJECT_SOURCE_KINDS.find((kind) => kind === source.source) ?? "unknown";
 }
@@ -154,7 +293,12 @@ function entrySkillCount(skills: unknown): number | undefined {
     : undefined;
 }
 
-function readEntry(value: unknown, index: number, seen: Set<string>): ClaudeMarketplaceEntry {
+function readEntry(
+  value: unknown,
+  index: number,
+  seen: Set<string>,
+  rules: MarketplaceFileRules
+): ClaudeMarketplaceEntry {
   const label = `(entry ${index + 1})`;
   if (!isPlainObject(value)) {
     return {
@@ -173,7 +317,7 @@ function readEntry(value: unknown, index: number, seen: Set<string>): ClaudeMark
     ...(description !== undefined ? { description } : {}),
     raw: value,
     strict: value.strict !== false,
-    sourceKind: sourceKindOf(value.source),
+    sourceKind: sourceKindOf(rules, value.source),
     ...(skillCount !== undefined ? { skillCount } : {}),
   };
   if (name === undefined) return { ...entry, problem: "The entry has no name." };
@@ -212,6 +356,7 @@ export function parseClaudeMarketplace(
   file: MarketplaceFile = "claude"
 ): ClaudeMarketplace {
   const relativePath = MARKETPLACE_RELATIVE_PATHS[file];
+  const rules = MARKETPLACE_FILE_RULES[file];
   let raw: unknown;
   try {
     raw = JSON.parse(content);
@@ -230,21 +375,25 @@ export function parseClaudeMarketplace(
   const seen = new Set<string>();
   const entries = raw.plugins
     .slice(0, MAX_CLAUDE_MARKETPLACE_ENTRIES)
-    .map((value, index) => readEntry(value, index, seen));
+    .map((value, index) => readEntry(value, index, seen, rules));
   return {
     file,
-    ...readMarketplaceHeader(raw, warnings, relativePath),
+    ...readMarketplaceHeader(raw, warnings, relativePath, rules),
     ...readPluginRoot(raw.metadata),
     entries,
     warnings,
   };
 }
 
-/** The display fields: `name` (warns when absent), the description and the owner's name. */
+/**
+ * The display fields: the title (the file's own title field, else `name`, which warns when
+ * absent), the description and the owner's name.
+ */
 function readMarketplaceHeader(
   raw: Record<string, unknown>,
   warnings: string[],
-  relativePath: string
+  relativePath: string,
+  rules: MarketplaceFileRules
 ): Pick<ClaudeMarketplace, "name" | "description" | "owner"> {
   const name = optionalString(raw.name);
   if (name === undefined) warnings.push(`${relativePath} has no 'name'.`);
@@ -252,7 +401,7 @@ function readMarketplaceHeader(
   const description = optionalString(raw.description) ?? optionalString(metadata.description);
   const owner = isPlainObject(raw.owner) ? optionalString(raw.owner.name) : undefined;
   return {
-    name: name ?? "marketplace",
+    name: rules.title?.(raw) ?? name ?? "marketplace",
     ...(description !== undefined ? { description } : {}),
     ...(owner !== undefined ? { owner } : {}),
   };
@@ -312,39 +461,10 @@ function entryGitUrl(raw: unknown, marketplaceUrl: string): string {
   return parsed.url;
 }
 
-function relativeEntrySource(
-  marketplace: Pick<ClaudeMarketplace, "file" | "pluginRoot" | "pluginRootProblem">,
-  source: string
-): ResolvedEntrySource {
-  // The Cursor rule: a path starts at the marketplace root, with or without "./", and Cursor has
-  // no metadata.pluginRoot (cursor/plugins lists `third_party/attio`). The containment checks of
-  // marketplaceRelativePath still apply.
-  if (marketplace.file === "cursor") {
-    const folder = marketplaceRelativePath(source);
-    return { kind: "relative", subpath: folder === "" ? undefined : folder };
-  }
-  if (marketplace.pluginRootProblem !== undefined) throw new Error(marketplace.pluginRootProblem);
-  // Each part is checked on its own before the join, so `..` cannot cancel a pluginRoot folder.
-  const folder = marketplaceRelativePath(source);
-  // The Claude rule: "." and "./..." start at the marketplace root; only a bare folder name (no
-  // "/") starts at metadata.pluginRoot, and any other path needs the "./" prefix.
-  const trimmed = source.trim();
-  const explicit = trimmed === "." || trimmed.startsWith("./");
-  if (!explicit && (folder === "" || folder.includes("/"))) {
-    throw new Error(
-      `The source '${source}' must start with './'. Only a single folder name resolves under metadata.pluginRoot.`
-    );
-  }
-  const joined = explicit
-    ? folder
-    : [marketplace.pluginRoot, folder].filter((part) => part !== "").join("/");
-  return { kind: "relative", subpath: joined === "" ? undefined : joined };
-}
-
 /**
- * Where an entry's plugin lives. A relative source is a folder of the marketplace repository
- * (relativeEntrySource); the others name a git repository. Throws a user-facing reason when the
- * entry cannot install.
+ * Where an entry's plugin lives. A path source is a folder of the marketplace repository (the
+ * file's `folderOf` rule); the others name a git repository. Throws a user-facing reason when
+ * the entry cannot install.
  */
 export function resolveEntrySource(
   marketplace: Pick<ClaudeMarketplace, "file" | "pluginRoot" | "pluginRootProblem">,
@@ -352,10 +472,17 @@ export function resolveEntrySource(
   entry: ClaudeMarketplaceEntry
 ): ResolvedEntrySource {
   if (entry.problem !== undefined) throw new Error(entry.problem);
+  const rules = MARKETPLACE_FILE_RULES[marketplace.file];
+  const withheld = rules.refusal?.(entry);
+  if (withheld !== undefined) throw new Error(withheld);
   const refused = REFUSED_SOURCE_REASONS[entry.sourceKind];
   if (refused !== undefined) throw new Error(refused);
   const source = entry.raw.source;
-  if (typeof source === "string") return relativeEntrySource(marketplace, source);
+  if (typeof source === "string" || isLocalSource(rules, source)) {
+    const folder = typeof source === "string" ? source : source.path;
+    if (typeof folder !== "string") throw new Error("A 'local' source needs 'path' as a folder.");
+    return { kind: "relative", subpath: rules.folderOf(folder, marketplace) };
+  }
   if (!isPlainObject(source)) throw new Error("The entry has no source.");
   return remoteEntrySource(source, marketplaceUrl);
 }
@@ -433,41 +560,38 @@ function describeMarketplaceBuild(
   };
 }
 
-/** One row of the merged list: a name and the entry of each file that lists it, Cursor first. */
+/** One row of the merged list: a name and the entry of each file that lists it, in MARKETPLACE_FILES order. */
 export interface MergedMarketplaceEntry {
   name: string;
   builds: Array<{ file: MarketplaceFile; entry: ClaudeMarketplaceEntry }>;
 }
 
-function entriesOf(marketplace: ClaudeMarketplace | null): ClaudeMarketplaceEntry[] {
-  return marketplace?.entries ?? [];
-}
-
 /**
- * One list from both marketplace files: the Cursor entries in file order, then each Claude entry
- * whose name the Cursor rows lack. A Claude entry joins the Cursor row of its name only when
- * neither entry has a problem, so an "(entry N)" label or a name listed twice never merges.
+ * One list from the marketplace files, taken in MARKETPLACE_FILES order: each file's entries in
+ * file order, a row per name. An entry joins the row that an earlier file made for its name only
+ * when neither entry has a problem, so an "(entry N)" label or a name listed twice never merges.
  */
 export function mergeMarketplaces(
-  cursor: ClaudeMarketplace | null,
-  claude: ClaudeMarketplace | null
+  files: Record<MarketplaceFile, ClaudeMarketplace | null>
 ): MergedMarketplaceEntry[] {
-  const rows: MergedMarketplaceEntry[] = entriesOf(cursor).map((entry) => ({
-    name: entry.name,
-    builds: [{ file: "cursor", entry }],
-  }));
+  const rows: MergedMarketplaceEntry[] = [];
   // A file lists a name without a problem at most once (readEntry), so each key is one row.
-  const mergeable = new Map(
-    rows.flatMap((row) => (row.builds[0].entry.problem === undefined ? [[row.name, row]] : []))
-  );
-  for (const entry of entriesOf(claude)) {
-    const row = entry.problem === undefined ? mergeable.get(entry.name) : undefined;
-    if (row === undefined) {
-      rows.push({ name: entry.name, builds: [{ file: "claude", entry }] });
-      continue;
+  const mergeable = new Map<string, MergedMarketplaceEntry>();
+  for (const file of MARKETPLACE_FILES) {
+    for (const entry of files[file]?.entries ?? []) {
+      const row = entry.problem === undefined ? mergeable.get(entry.name) : undefined;
+      if (row !== undefined) {
+        assert(
+          row.builds.every((build) => build.file !== file),
+          "mergeMarketplaces: a row takes one build per file"
+        );
+        row.builds.push({ file, entry });
+        continue;
+      }
+      const added: MergedMarketplaceEntry = { name: entry.name, builds: [{ file, entry }] };
+      rows.push(added);
+      if (entry.problem === undefined) mergeable.set(entry.name, added);
     }
-    assert(row.builds.length === 1, "mergeMarketplaces: a Cursor row takes one Claude build");
-    row.builds.push({ file: "claude", entry });
   }
   return rows;
 }
@@ -482,16 +606,16 @@ export interface ParsedMarketplaces {
 /**
  * Parse the marketplace files of a root (undefined: the commit has no such file; an Error: the
  * file could not be read; at least one exists). One file alone fails the listing when it does
- * not parse, as before Cursor files existed. With both, a broken file becomes a warning and the
- * other file still lists; only two broken files fail.
+ * not parse, as before Cursor files existed. With several, a broken file becomes a warning and
+ * the other files still list; only when every file is broken does the listing fail.
  */
 export function parseMarketplaces(
   contents: Record<MarketplaceFile, string | Error | undefined>
 ): ParsedMarketplaces {
-  const files: ParsedMarketplaces["files"] = { cursor: null, claude: null };
+  const files: ParsedMarketplaces["files"] = { cursor: null, claude: null, agents: null };
   const errors: string[] = [];
   let present = 0;
-  for (const file of AgentPluginMarketplaceBuildSchema.shape.file.options) {
+  for (const file of MARKETPLACE_FILES) {
     const content = contents[file];
     if (content === undefined) continue;
     present++;
@@ -595,7 +719,7 @@ export function entryAsManifest(entry: ClaudeMarketplaceEntry): {
 
 /**
  * The marketplace listing of a repository root (the preview result for a marketplace): one row
- * per merged entry. The header is the Cursor file's when it parsed, else the Claude file's.
+ * per merged entry. The header is the first file that parsed, in MARKETPLACE_FILES order.
  */
 export function marketplaceListing(args: {
   marketplaces: ParsedMarketplaces;
@@ -604,21 +728,25 @@ export function marketplaceListing(args: {
   /** The other methods that fit the root (Skills for a repository of SKILL.md files). */
   methods: AgentPluginInstallMethod[];
 }): AgentPluginMarketplaceListing {
-  const { cursor, claude } = args.marketplaces.files;
-  const header = cursor ?? claude;
-  assert(header !== null, "marketplaceListing: at least one marketplace file parsed");
-  const entries = mergeMarketplaces(cursor, claude).map((row): AgentPluginMarketplaceEntry => {
-    const description = row.builds[0].entry.description;
-    return {
-      name: row.name,
-      ...(description !== undefined ? { description } : {}),
-      builds: row.builds.map(({ file, entry }) => {
-        const marketplace = args.marketplaces.files[file];
-        assert(marketplace !== null, "marketplaceListing: a build's file parsed");
-        return describeMarketplaceBuild(marketplace, args.source.url, file, entry);
-      }),
-    };
-  });
+  const parsed = MARKETPLACE_FILES.flatMap((file) => args.marketplaces.files[file] ?? []);
+  const header = parsed[0];
+  assert(header !== undefined, "marketplaceListing: at least one marketplace file parsed");
+  const entries = mergeMarketplaces(args.marketplaces.files).map(
+    (row): AgentPluginMarketplaceEntry => {
+      // Agent Plugins entries have no description, so a row takes the first build that has one.
+      const description = row.builds.find((build) => build.entry.description !== undefined)?.entry
+        .description;
+      return {
+        name: row.name,
+        ...(description !== undefined ? { description } : {}),
+        builds: row.builds.map(({ file, entry }) => {
+          const marketplace = args.marketplaces.files[file];
+          assert(marketplace !== null, "marketplaceListing: a build's file parsed");
+          return describeMarketplaceBuild(marketplace, args.source.url, file, entry);
+        }),
+      };
+    }
+  );
   return {
     name: header.name,
     ...(header.description !== undefined ? { description: header.description } : {}),
@@ -628,8 +756,7 @@ export function marketplaceListing(args: {
     entries,
     methods: args.methods,
     warnings: [
-      ...(cursor?.warnings ?? []),
-      ...(claude?.warnings ?? []),
+      ...parsed.flatMap((marketplace) => marketplace.warnings),
       ...args.marketplaces.warnings,
     ],
   };

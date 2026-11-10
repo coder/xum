@@ -113,6 +113,7 @@ import {
   MARKETPLACE_RELATIVE_PATHS,
   MAX_CLAUDE_MARKETPLACE_BYTES,
   findMarketplaceEntry,
+  marketplaceEntryRefOf,
   marketplaceListing,
   parseClaudeMarketplace,
   parseMarketplaces,
@@ -1380,19 +1381,6 @@ function resolvePreviewRef(
     );
   }
   return parsedRef ?? (explicit.length > 0 ? explicit : undefined);
-}
-
-function marketplaceEntryOf(
-  method: AgentPluginInstallMethod | null | undefined
-): MarketplaceEntryRef | undefined {
-  switch (method?.kind) {
-    case "claude-marketplace":
-      return { file: "claude", entry: method.entry };
-    case "cursor-marketplace":
-      return { file: "cursor", entry: method.entry };
-    default:
-      return undefined;
-  }
 }
 
 /** The git source that preview returns and install persists. */
@@ -3821,11 +3809,12 @@ export class AgentPluginInstallService {
 
   /**
    * Preview a source: a plugin to review, or the entries of a marketplace. A root clone without
-   * a plugin manifest but with `.cursor-plugin/marketplace.json` or
-   * `.claude-plugin/marketplace.json` lists the marketplace, unless a method was asked for
-   * (Skills installs the whole repository). Xum never looks for a marketplace under a subpath.
-   * With a `claude-marketplace` or `cursor-marketplace` method, the preview resolves that
-   * entry's source and previews its plugin.
+   * a plugin manifest but with `.cursor-plugin/marketplace.json`,
+   * `.claude-plugin/marketplace.json` or `.agents/plugins/marketplace.json` lists the
+   * marketplace, unless a method was asked for (Skills installs the whole repository). Xum never
+   * looks for a marketplace under a subpath. With a `claude-marketplace`, `cursor-marketplace`
+   * or `agents-marketplace` method, the preview resolves that entry's source and previews its
+   * plugin.
    */
   async previewSource(args: {
     input: string;
@@ -3837,7 +3826,7 @@ export class AgentPluginInstallService {
     const parsed = parseAgentPluginSourceInput(args.input);
     const ref = resolvePreviewRef(parsed.ref, args.ref);
     const subpath = resolvePreviewSubpath(parsed.subpath, args.subpath);
-    const entryRef = marketplaceEntryOf(args.method);
+    const entryRef = marketplaceEntryRefOf(args.method);
     if (entryRef !== undefined && subpath !== undefined) {
       throw new Error("A marketplace entry is picked at the repository root. Remove the folder.");
     }
@@ -3874,7 +3863,7 @@ export class AgentPluginInstallService {
   /**
    * The listing when a root clone has a marketplace file and no plugin manifest. Xum looks only
    * at the root, and only when no method was asked for (Skills installs the whole repository).
-   * With both marketplace files, the rows are their merged entries (mergeMarketplaces).
+   * With several marketplace files, the rows are their merged entries (mergeMarketplaces).
    */
   private async marketplaceListingAt(
     staged: { dir: string; sha: string },
@@ -3888,8 +3877,12 @@ export class AgentPluginInstallService {
       this.readMarketplaceAtCommit(staged.dir, staged.sha, file).catch((error: unknown) =>
         error instanceof Error ? error : new Error(getErrorMessage(error))
       );
-    const contents = { cursor: await read("cursor"), claude: await read("claude") };
-    if (contents.cursor === undefined && contents.claude === undefined) return undefined;
+    const contents = {
+      cursor: await read("cursor"),
+      claude: await read("claude"),
+      agents: await read("agents"),
+    };
+    if (Object.values(contents).every((content) => content === undefined)) return undefined;
     const { methods } = await detectInstallMethods(staged.dir);
     if (methods.some(isOwnManifestMethod)) return undefined;
     const marketplaces = parseMarketplaces(contents);
@@ -4195,11 +4188,12 @@ export class AgentPluginInstallService {
     return this.runExclusive(async () => {
       // A marketplace entry without its own plugin.json is read again from the marketplace file
       // of the consented commit, so install writes the plugin.json that the preview showed. A
-      // `cursor-marketplace` method fails here: its entry installs through its own manifest.
+      // `cursor-marketplace` or `agents-marketplace` method fails here: its entry installs through
+      // its own manifest.
       const { stagedDir, marketplace } = await this.cloneWithEntry(
         args.source,
         args.expectedSha,
-        marketplaceEntryOf(args.method)
+        marketplaceEntryRefOf(args.method)
       );
       try {
         const { plugin } = await this.validateStagedClone(
