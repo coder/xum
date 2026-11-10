@@ -434,7 +434,7 @@ describe("the Agent Plugins marketplace file", () => {
     expect(resolveEntry({ source: { source: "local", path: "./plugins/x/" } })).toEqual(folder);
     // "." and "./" are the root itself, as in Codex.
     for (const path of ["./", "."]) {
-      const root = { kind: "relative", subpath: undefined };
+      const root = { kind: "relative" as const, subpath: undefined };
       expect(resolveEntry({ source: { source: "local", path } })).toEqual(root);
       expect(resolveEntry({ source: path })).toEqual(root);
     }
