@@ -6,13 +6,19 @@
  * base URL is dropped, or when the seed also runs next to real keys (CI), so these tests pin both.
  */
 
+import * as net from "net";
+
 import {
   AZURE_OPENAI_ENV_VARS,
   BEDROCK_AUTH_ENV_VARS,
   PROVIDER_ENV_VARS,
 } from "../../src/node/utils/providerRequirements";
 import { cleanupTestEnvironment, createTestEnvironment, type TestEnvironment } from "./setup";
-import { getProviderConfigOrDummy, shouldRunIntegrationTests } from "../testUtils";
+import {
+  DUMMY_PROVIDER_CONFIG,
+  getProviderConfigOrDummy,
+  shouldRunIntegrationTests,
+} from "../testUtils";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -97,5 +103,21 @@ describeIntegration("createTestEnvironment provider seeding", () => {
     const dummy = getProviderConfigOrDummy("ANTHROPIC_API_KEY");
     expect(LOOPBACK_HOSTS.has(new URL(dummy.baseUrl ?? "http://invalid").hostname)).toBe(true);
     expect(dummy.apiKey).not.toBe("");
+  });
+});
+
+describe("DUMMY_PROVIDER_CONFIG", () => {
+  // The loopback host alone is not enough: a dummy request that reached a listener on that host
+  // (the discard service on port 9, a dev server on another port) would deliver the dummy key and
+  // the request body to it. `fetch` refuses port 9 as a bad port before it opens a socket, and
+  // this test fails when the port or the runtime stops doing so.
+  test("a request to its base URL fails before a socket opens", async () => {
+    const connect = jest.spyOn(net.Socket.prototype, "connect");
+    try {
+      await expect(fetch(`${DUMMY_PROVIDER_CONFIG.baseUrl}/messages`)).rejects.toThrow();
+      expect(connect).not.toHaveBeenCalled();
+    } finally {
+      connect.mockRestore();
+    }
   });
 });
