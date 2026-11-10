@@ -38,6 +38,7 @@ import {
   FABLE_5_DEFAULT_MODEL_FALLBACKS,
   LEGACY_DEFAULT_MODEL_FALLBACKS,
   SEEDED_MODEL_FALLBACKS,
+  sanitizeFallbackModelString,
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
@@ -685,6 +686,25 @@ function migrateRaisedTaskSettingsDefaults(
 }
 
 /**
+ * Source-model keys under which one raw on-disk fallback entry counts as "already has
+ * a chain" for the seed. A `coder:` key keeps the persistence key form
+ * (sanitizeFallbackModelString): runtime lookup is raw-first, so a Coder-scoped chain
+ * serves only its own selection and must not stand in for the direct default (a
+ * cross-typed or shadowed Coder instance never shares the direct chain). Read-time
+ * sanitizing drops an entry whose chain sanitizes away, such as a hand-written
+ * `{enabled: false, models: []}`. A default-typed Coder selection then falls through to
+ * the direct key, so such an entry also covers its direct key, as it did before.
+ */
+function fallbackSeedGapKeys(key: string, entry: unknown): string[] {
+  const scopedKey = sanitizeFallbackModelString(key);
+  if (!scopedKey.startsWith("coder:")) return [scopedKey];
+  const keptAtRuntime = normalizeModelFallbacks({ [key]: entry }) !== undefined;
+  // scopedKey, not key: normalizeToCanonical does not trim, so a raw key with a
+  // leading space would keep its " coder" prefix and miss the direct key.
+  return keptAtRuntime ? [scopedKey] : [scopedKey, normalizeToCanonical(scopedKey)];
+}
+
+/**
  * One-time seed passes for the default refusal-fallback chains (e.g. Fable →
  * Opus), one per migration flag. Each fable alias move adds a pass: older
  * configs only have a chain for the old source key, and the new key is a new
@@ -724,8 +744,8 @@ function seedDefaultModelFallbacks(
   if (pendingPasses.length === 0) {
     return false;
   }
-  // Gap-check against the RAW on-disk map with canonicalized keys, not the
-  // sanitized map: a hand-edited entry whose chain sanitizes away (e.g.
+  // Gap-check against the RAW on-disk map (keys from fallbackSeedGapKeys), not
+  // the sanitized map: a hand-edited entry whose chain sanitizes away (e.g.
   // {enabled:false, models:[]}) is still user intent and must not be
   // overwritten. Merging into the raw map also keeps unrelated chains
   // byte-identical on disk (lenient-on-read preserved).
@@ -736,7 +756,7 @@ function seedDefaultModelFallbacks(
       ? (parsed.modelFallbacks as Record<string, unknown>)
       : {};
   const existingCanonicalKeys = new Set(
-    Object.keys(rawFallbacks).map((key) => normalizeToCanonical(key).trim())
+    Object.entries(rawFallbacks).flatMap(([key, entry]) => fallbackSeedGapKeys(key, entry))
   );
   const missingDefaults = Object.fromEntries(
     pendingPasses
