@@ -648,18 +648,23 @@ function pillLook(box: Element) {
 // control matches the sub-agents and background-bashes pills): same height, corner radius, border
 // and text color, and an icon the size of theirs. Read from the rendered boxes, not class names.
 async function assertStopDrawsLikeTheChips(line: HTMLElement) {
-  const stop = drawnBox(within(line).getByRole("button", { name: "Stop streaming" }));
-  if (stop === undefined) throw new Error("Stop draws no box beside the chips");
-  const pills = shownChips(line)
-    .map(drawnBox)
-    .filter((box) => box !== undefined);
-  await expect(pills.length).toBeGreaterThan(0);
-  const stopLook = pillLook(stop);
-  for (const pill of pills) {
-    const look = pillLook(pill);
+  const stopButton = within(line).getByRole("button", { name: "Stop streaming" });
+  // Stop takes the pill look only once a chip shows, and transition-colors fades its border and
+  // text into it, so a read right after the chips mount can land mid-fade.
+  await waitFor(() => {
+    const stop = drawnBox(stopButton);
+    if (stop === undefined) throw new Error("Stop draws no box beside the chips");
+    const pills = shownChips(line)
+      .map(drawnBox)
+      .filter((box) => box !== undefined);
+    if (pills.length === 0) throw new Error("No chip beside Stop draws a box");
+    const stopLook = pillLook(stop);
     // The "+N" chip is text only, so it has no icon to size Stop's against.
-    await expect(stopLook).toEqual({ ...look, icon: look.icon ?? stopLook.icon });
-  }
+    const looks = pills
+      .map(pillLook)
+      .map((look) => ({ ...look, icon: look.icon ?? stopLook.icon }));
+    return expect(looks).toEqual(looks.map(() => stopLook));
+  });
 }
 
 // The phone line draws each of its controls smaller than the touch box around it, so it reads as a
