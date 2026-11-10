@@ -1,5 +1,8 @@
 import * as path from "node:path";
-import { isProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceProjectTrustedIn,
+  workspaceDirOutsideProjectTrust,
+} from "@/node/utils/projectTrust";
 import assert from "node:assert/strict";
 
 import type { Config, ProjectsConfig } from "@/node/config";
@@ -412,10 +415,19 @@ export class GitPatchArtifactService {
       return;
     }
 
+    const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
     const discoveryContexts = [
       createAgentDiscoveryContext(childEntry),
-      createAgentDiscoveryContext(findWorkspaceEntry(cfg, parentWorkspaceId)),
+      createAgentDiscoveryContext(parentEntry),
     ].filter((context): context is WorkspaceRuntimeContext => context != null);
+    // #6426: from the config loaded above (no extra read). Both checkouts are read, so an SSH+None
+    // directory on either side (outside project trust) keeps project plugins off.
+    const projectPluginsTrusted =
+      isWorkspaceProjectTrustedIn(cfg.projects, {
+        kind: childEntry.workspace.kind,
+        projectPath: childEntry.projectPath,
+        runtimeConfig: childEntry.workspace.runtimeConfig,
+      }) && !workspaceDirOutsideProjectTrust(parentEntry?.workspace.runtimeConfig);
 
     let shouldGeneratePatch = false;
     for (const childAgentId of childAgentIds) {
@@ -423,8 +435,7 @@ export class GitPatchArtifactService {
         discoveryContexts,
         agentId: childAgentId,
         workspaceId: childWorkspaceId,
-        // #6426: from the config loaded above (no extra read).
-        projectPluginsTrusted: isProjectTrustedIn(cfg.projects, childEntry.projectPath),
+        projectPluginsTrusted,
       });
       if (editingCapability == null) {
         continue;

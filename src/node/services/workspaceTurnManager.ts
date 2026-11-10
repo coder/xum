@@ -1710,6 +1710,7 @@ export class WorkspaceTurnManager {
                 isWorkspaceProjectTrustedIn(cfg.projects, {
                   kind: targetEntry.workspace.kind,
                   projectPath: targetEntry.projectPath,
+                  runtimeConfig: targetEntry.workspace.runtimeConfig ?? parentMeta.runtimeConfig,
                 })
               )
             : ownerContext;

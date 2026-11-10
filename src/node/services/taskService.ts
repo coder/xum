@@ -115,7 +115,11 @@ import {
   type PendingTaskStartWaiter,
   type PendingTaskWaiter,
 } from "@/node/services/taskWaiters";
-import { isProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isProjectTrusted,
+  isWorkspaceProjectTrustedIn,
+  workspaceDirOutsideProjectTrust,
+} from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import {
@@ -5306,7 +5310,10 @@ export class TaskService implements AgentTaskIntegration {
       return false;
     }
     // #6426: one cached config load per call (not per candidate or per read).
-    const projectPluginsTrusted = isProjectTrusted(this.config, entry.projectPath);
+    // An SSH+None task runs in a host directory outside project trust.
+    const projectPluginsTrusted =
+      isProjectTrusted(this.config, entry.projectPath) &&
+      !workspaceDirOutsideProjectTrust(entry.workspace.runtimeConfig);
 
     const workspacePath = coerceNonEmptyString(entry.workspace.path);
     const workspaceName = coerceNonEmptyString(entry.workspace.name) ?? entry.workspace.id;
@@ -10824,6 +10831,7 @@ export class TaskService implements AgentTaskIntegration {
         isWorkspaceProjectTrustedIn(cfg.projects, {
           kind: workspace.kind,
           projectPath: entry.projectPath,
+          runtimeConfig: workspace.runtimeConfig,
         })
       );
     } catch (error) {
@@ -18770,6 +18778,7 @@ export class TaskService implements AgentTaskIntegration {
           projectPluginsTrusted: isWorkspaceProjectTrustedIn(context.config.projects, {
             kind: parentEntry.workspace.kind,
             projectPath: parentEntry.projectPath,
+            runtimeConfig: context.parentRuntimeConfig,
           }),
           runtimeFactory: nodeRuntimeFactory,
         }

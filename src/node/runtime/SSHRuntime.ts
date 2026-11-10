@@ -2660,26 +2660,19 @@ export class SSHRuntime extends RemoteRuntime {
   }
 
   async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
+    const sharedProjectDir = this.sharedProjectDir;
+    if (sharedProjectDir !== null) {
+      return this.initSharedProjectDirWorkspace(sharedProjectDir, params);
+    }
+
     // Disable git hooks for untrusted projects (prevents post-checkout execution)
     const nhp = gitNoHooksPrefix(params.trusted);
-    const sharedProjectDir = this.sharedProjectDir;
 
     const result = await runWorkspaceInitHook({
       params,
       runtimeType: "ssh",
       findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
-      beforeHook: async () => {
-        if (sharedProjectDir !== null) {
-          // SSH+None: no project sync, base repo, worktree or branch checkout. The directory
-          // must still exist (it may have gone since create); the init hook then runs in it.
-          const dirError = await this.checkSharedProjectDir(sharedProjectDir, params.abortSignal);
-          if (dirError !== null) {
-            throw new Error(dirError);
-          }
-          return;
-        }
-        await this.prepareWorkspaceCheckout(params, nhp);
-      },
+      beforeHook: () => this.prepareWorkspaceCheckout(params, nhp),
       runHook: async ({ hookRelativePath, xumEnv, initLogger, abortSignal }) => {
         // Expand tilde in hook path (quoted paths don't auto-expand on remote).
         const hookPath = expandTildeForSSH(`${params.workspacePath}/${hookRelativePath}`);
@@ -2693,11 +2686,34 @@ export class SSHRuntime extends RemoteRuntime {
         );
       },
     });
-    // The checkout now exists (or changed); see checkoutGenerations. SSH+None made no checkout.
-    if (sharedProjectDir === null) {
-      this.bumpCheckoutGeneration();
-    }
+    // The checkout now exists (or changed); see checkoutGenerations.
+    this.bumpCheckoutGeneration();
     return result;
+  }
+
+  /**
+   * SSH+None init: no project sync, base repo, worktree or branch checkout, and no git commands.
+   * The directory must still exist (it may have gone since create).
+   *
+   * SECURITY: project trust is keyed to the local project path, and nothing ties it to the
+   * contents of `projectDir` on the host, which collaborators may control. So the trusted
+   * checkout is never synced here and `.xum/init` never runs, even when params.trusted is true:
+   * running it would execute directory-controlled code with project secrets in its env.
+   */
+  private async initSharedProjectDirWorkspace(
+    sharedProjectDir: string,
+    params: WorkspaceInitParams
+  ): Promise<WorkspaceInitResult> {
+    const { initLogger } = params;
+    const dirError = await this.checkSharedProjectDir(sharedProjectDir, params.abortSignal);
+    if (dirError !== null) {
+      initLogger.logStderr(`Initialization failed: ${dirError}`);
+      initLogger.logComplete(-1);
+      return { success: false, error: dirError };
+    }
+    initLogger.logStep("Skipping .xum/init hook (SSH directory is not covered by project trust)");
+    initLogger.logComplete(0);
+    return { success: true };
   }
 
   /**

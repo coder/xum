@@ -169,16 +169,15 @@ describe("SSHRuntime with workspaceIsolation none", () => {
       trusted: true,
     };
 
-    it("does no sync or checkout and runs the init hook in projectDir", async () => {
+    // Project trust is keyed to the local path, not to projectDir's (possibly collaborator-
+    // controlled) contents, so a trusted project must still not run the directory's init hook.
+    it("does no sync or checkout and never runs the init hook, even when trusted", async () => {
       const runtime = new SharedDirTestSSHRuntime();
       runtime.initHookPresent = true;
       const result = await runtime.initWorkspace(params);
       expect(result.success).toBe(true);
       expect(runtime.commands.some(touchesCheckout)).toBe(false);
-      const hookCall = runtime.calls.find(
-        (call) => call.command.includes("/init") && !call.command.startsWith("test -x")
-      );
-      expect(hookCall?.cwd).toBe(PROJECT_DIR);
+      expect(runtime.commands.some((command) => command.includes("/init"))).toBe(false);
     });
 
     it("fails when the directory went missing after create", async () => {

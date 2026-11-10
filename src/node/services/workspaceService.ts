@@ -21,7 +21,10 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   WORKSPACE_NAME_GENERATION_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceProjectTrustedIn,
+  workspaceDirOutsideProjectTrust,
+} from "@/node/utils/projectTrust";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
 import { EventEmitter } from "events";
@@ -6568,7 +6571,10 @@ export class WorkspaceService
           initLogger,
           env: createEnv,
           abortSignal: initAbortController.signal,
-          trusted: projectConfig.trusted ?? false,
+          // SSH+None: the host directory is not covered by project trust (SSHRuntime also refuses).
+          trusted:
+            (projectConfig.trusted ?? false) &&
+            !workspaceDirOutsideProjectTrust(finalRuntimeConfig),
         };
         // The deferred checkout's settlement grants or clears the pending default from here on.
         pendingDefaultHandedOff = pendingMaterialization !== undefined;
@@ -13855,7 +13861,10 @@ export class WorkspaceService
           initLogger,
           env: secrets,
           abortSignal: initAbortController.signal,
-          trusted: projectConfig.trusted ?? false,
+          // SSH+None: the host directory is not covered by project trust (SSHRuntime also refuses).
+          trusted:
+            (projectConfig.trusted ?? false) &&
+            !workspaceDirOutsideProjectTrust(forkedRuntimeConfig),
         },
         newWorkspaceId,
         workspaceUseLeasesFor(this.config),

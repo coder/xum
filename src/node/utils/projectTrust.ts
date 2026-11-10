@@ -1,10 +1,29 @@
 import type { Config } from "@/node/config";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { isSshSharedProjectDirRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import type { Runtime } from "@/node/runtime/Runtime";
+
+/**
+ * The workspace fields that decide workspace-scoped trust. runtimeConfig is a required key
+ * (possibly undefined) so every caller that builds this shape must say which runtime it has.
+ */
+export type WorkspaceTrustSubject = Pick<WorkspaceMetadata, "kind" | "projectPath"> & {
+  runtimeConfig: RuntimeConfig | undefined;
+};
+
+/**
+ * SSH+None runs in an existing host directory (projectDir) that collaborators may control.
+ * Project trust is keyed to the local project path, and nothing binds it to that directory's
+ * contents (changing projectDir prompts nothing), so trust never covers it: repo-controlled
+ * automation from it (init hook, tool hooks, project agents/skills/plugins/MCP) stays off.
+ */
+export function workspaceDirOutsideProjectTrust(runtimeConfig: RuntimeConfig | undefined): boolean {
+  return isSshSharedProjectDirRuntime(runtimeConfig);
+}
 
 /**
  * Workspace-scoped trust. Scratch workspaces are app-owned (created trusted
@@ -14,8 +33,11 @@ import type { Runtime } from "@/node/runtime/Runtime";
  */
 export function isWorkspaceProjectTrusted(
   config: Config,
-  metadata: Pick<WorkspaceMetadata, "kind" | "projectPath">
+  metadata: WorkspaceTrustSubject
 ): boolean {
+  if (workspaceDirOutsideProjectTrust(metadata.runtimeConfig)) {
+    return false;
+  }
   if (metadata.kind === "scratch") {
     return true;
   }
@@ -39,8 +61,11 @@ export function isProjectTrusted(config: Config, projectPath?: string | null): b
  */
 export function isWorkspaceProjectTrustedIn(
   projects: ProjectsConfig["projects"],
-  metadata: Pick<WorkspaceMetadata, "kind" | "projectPath">
+  metadata: WorkspaceTrustSubject
 ): boolean {
+  if (workspaceDirOutsideProjectTrust(metadata.runtimeConfig)) {
+    return false;
+  }
   return metadata.kind === "scratch" || isProjectTrustedIn(projects, metadata.projectPath);
 }
 
