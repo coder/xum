@@ -1352,6 +1352,86 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     20_000
   );
 
+  // A queued follow-up leaves the session's queue before it publishes, so the cleanup's check for
+  // unsent user input must count a send that is still preparing. The row of a workflow-owned
+  // reported leaf stays `reported` through that window (the decision resolved `nonreport`), and
+  // removing it would dispose the session that holds the user's message.
+  test.each([{ agentId: "plan" }, { agentId: "explore" }])(
+    "the report cleanup keeps a workflow-owned reported $agentId leaf while its follow-up is being prepared",
+    async (c) => {
+      const childId = `holdcleanuprace${c.agentId}`;
+      const stack = await createStack(childId, {
+        ...REPORTED_ROW,
+        agentType: c.agentId,
+        agentId: c.agentId,
+        workflowTask: { runId: "wfr_hold_cleanup", stepId: "s1" },
+      });
+      const { taskService, workspaceService, child, completions, config } = stack;
+      const options = { ...stack.sendOptions, agentId: c.agentId };
+      // The cleanup waits at its entry until the follow-up is being prepared.
+      let cleanupEntered = false;
+      let cleanupDone = false;
+      let abandonCleanup = false;
+      const releaseCleanup = Promise.withResolvers<void>();
+      const internal = taskService as unknown as {
+        finalizeTerminationPhaseForReportedTask: (workspaceId: string) => Promise<void>;
+      };
+      const realCleanup = internal.finalizeTerminationPhaseForReportedTask.bind(taskService);
+      const cleanup = spyOn(internal, "finalizeTerminationPhaseForReportedTask").mockImplementation(
+        async (workspaceId) => {
+          cleanupEntered = true;
+          await releaseCleanup.promise;
+          // A failed run ends here, so its teardown never waits on a removal.
+          if (abandonCleanup) return;
+          await realCleanup(workspaceId);
+          cleanupDone = true;
+        }
+      );
+      const remove = spyOn(workspaceService, "remove");
+      // The follow-up's stream start waits: its message has left the queue and is preparing.
+      let followUpPreparing = false;
+      const releaseStart = Promise.withResolvers<void>();
+      const aiService = child.aiService as unknown as {
+        streamMessage: (opts: { workspaceId: string }) => Promise<unknown>;
+      };
+      const realStart = aiService.streamMessage;
+      aiService.streamMessage = async (opts) => {
+        if (opts.workspaceId === childId && completions.length === 1) {
+          followUpPreparing = true;
+          await releaseStart.promise;
+        }
+        return realStart(opts);
+      };
+      try {
+        expect(await workspaceService.sendMessage(childId, "work", options)).toEqual(Ok(undefined));
+        await until(() => completions.length === 1, "the continuation stream");
+        expect(await workspaceService.sendMessage(childId, "follow-up text", options)).toEqual(
+          Ok(undefined)
+        );
+        stack.endStream(0, { agentId: c.agentId }, true);
+        await until(() => cleanupEntered && followUpPreparing, "the follow-up preparing");
+        expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
+        releaseCleanup.resolve();
+        await until(() => cleanupDone || remove.mock.calls.length > 0, "the cleanup's decision");
+        const removalsStarted = remove.mock.calls.length;
+        // Settle the follow-up before asserting, so a failure leaves nothing waiting on teardown.
+        releaseStart.resolve();
+        await until(() => completions.length === 2, "the follow-up dispatched");
+        expect(removalsStarted).toBe(0);
+        expect(entryOf(config, childId)).toBeDefined();
+      } finally {
+        abandonCleanup = true;
+        releaseCleanup.resolve();
+        releaseStart.resolve();
+        aiService.streamMessage = realStart;
+        remove.mockRestore();
+        cleanup.mockRestore();
+        await stack.cleanup();
+      }
+    },
+    30_000
+  );
+
   test("a stream end that finds its attempt already reported by another writer refuses the held follow-up as indeterminate", async () => {
     const { stack, onCanceled } = await endStreamWithRowEditedInGap("holdlatehandler01", (row) => {
       row.taskStatus = "reported";
