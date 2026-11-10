@@ -11,6 +11,7 @@ describe("acceptsVolatileSystemTailRow", () => {
     ["anthropic:claude-fable-5-2", "coder", true],
     // OpenRouter converts the body on its side, so no row goes out there.
     ["anthropic:claude-mythos-5-1", "openrouter", false],
+    // Only the anthropic and coder routes count; an unknown route sends no row.
     ["anthropic:claude-mythos-5-1", undefined, false],
     // A model that does not bind thinking to the prefix keeps the tail in the system prompt.
     ["anthropic:claude-mythos-5", "anthropic", false],
