@@ -6,6 +6,7 @@ import {
   resolveSshDirectoryTrustNotice,
   applyResolvedProjectDir,
   saveSshDirectoryTrust,
+  sshDirectoryTrustRowCopy,
 } from "./sshDirectoryTrustState";
 
 const projectPath = "/repo/app";
@@ -128,6 +129,24 @@ describe("saveSshDirectoryTrust", () => {
       api: { setSshDirectoryTrust: () => Promise.reject(new Error("offline")) },
     };
     expect(await saveSshDirectoryTrust(failing, request)).toBe("offline");
+  });
+});
+
+describe("sshDirectoryTrustRowCopy", () => {
+  const base = { trusted: false, host: "devbox", projectDir: "~/app" } as const;
+
+  test("a trust that resolves the path on the host names the host while it runs", () => {
+    expect(sshDirectoryTrustRowCopy({ ...base, pending: "trust" }).action).toContain("devbox");
+    expect(
+      sshDirectoryTrustRowCopy({ ...base, projectDir: "/srv/app", pending: "trust" }).action
+    ).not.toContain("devbox");
+  });
+
+  test("idle and pending labels differ for each direction", () => {
+    const idleTrust = sshDirectoryTrustRowCopy({ ...base, pending: null }).action;
+    const idleUntrust = sshDirectoryTrustRowCopy({ ...base, trusted: true, pending: null }).action;
+    const untrusting = sshDirectoryTrustRowCopy({ ...base, trusted: true, pending: "untrust" });
+    expect(new Set([idleTrust, idleUntrust, untrusting.action]).size).toBe(3);
   });
 });
 

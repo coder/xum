@@ -47,6 +47,42 @@ export function resolveSshDirectoryTrustNotice(input: {
   };
 }
 
+/** The trust change a row is saving, if any. */
+export type PendingSshDirectoryTrust = "trust" | "untrust" | null;
+
+/**
+ * What the trust row says: its status and its button's label. While a trust saves, the label
+ * names the host when the host must resolve the path (~ or relative) over SSH, which can take
+ * seconds; otherwise the row would just sit there greyed out.
+ */
+export function sshDirectoryTrustRowCopy(input: {
+  trusted: boolean;
+  pending: PendingSshDirectoryTrust;
+  host: string;
+  projectDir: string;
+}): { title: string; detail: string; action: string } {
+  const status = input.trusted
+    ? { title: "Trusted directory", detail: "Hooks, MCP servers and project secrets run here." }
+    : {
+        title: "Untrusted directory",
+        detail: "Hooks, MCP servers and project secrets stay off until you trust it.",
+      };
+  const actions: Record<NonNullable<PendingSshDirectoryTrust> | "idle", string> = {
+    trust: input.projectDir.startsWith("/") ? "Trusting…" : `Checking ${input.host}…`,
+    untrust: "Untrusting…",
+    idle: input.trusted ? "Untrust" : "Trust directory",
+  };
+  return { ...status, action: actions[input.pending ?? "idle"] };
+}
+
+/** Identifies the directory a trust row is about, so its last error shows only for that one. */
+export function sshDirectoryTrustKey(
+  projectPath: string,
+  notice: Pick<SshDirectoryTrustNoticeState, "host" | "projectDir">
+): string {
+  return JSON.stringify([projectPath, notice.host, notice.projectDir]);
+}
+
 /** The SSH+None directory the creation form shows right now, and how to write a new path into it. */
 export interface SshDirectoryTrustSelection {
   projectPath: string;

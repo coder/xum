@@ -100,6 +100,11 @@ import {
 } from "@/common/config/schemas/userPreferences";
 import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import {
+  parseSshDirectoryTrustTarget,
+  TRUST_PROJECT_FIRST_ERROR,
+  withSshDirectoryTrust,
+} from "@/common/utils/sshDirectoryTrust";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 import {
   normalizeAutoModelRoutingConfig,
@@ -1900,6 +1905,32 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           project.trusted = input.trusted;
         }
         return Promise.resolve();
+      },
+      // As the backend: the trust owner (the parent of a sub-project) stores the directory as
+      // resolved on the host, where the mock's home is /home/mock.
+      setSshDirectoryTrust: (input: {
+        projectPath: string;
+        host: string;
+        port?: number | null;
+        projectDir: string;
+        trusted: boolean;
+      }) => {
+        const target = parseSshDirectoryTrustTarget(input);
+        if (!target.success) return Promise.resolve(target);
+        const ownerPath = projects.get(input.projectPath)?.parentProjectPath ?? input.projectPath;
+        const owner = projects.get(ownerPath);
+        if (input.trusted && owner?.trusted !== true) {
+          return Promise.resolve({ success: false as const, error: TRUST_PROJECT_FIRST_ERROR });
+        }
+        const projectDir = target.data.projectDir.replace(/^~(?=\/|$)/, "/home/mock");
+        if (owner) {
+          owner.trustedSshDirectories = withSshDirectoryTrust(
+            owner.trustedSshDirectories,
+            { ...target.data, projectDir },
+            input.trusted
+          );
+        }
+        return Promise.resolve({ success: true as const, data: { projectDir } });
       },
       setDisplayName: (input: { projectPath: string; displayName?: string | null }) => {
         const project = projects.get(input.projectPath);
