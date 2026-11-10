@@ -27,12 +27,15 @@ test("a read-only agent is flagged, and so is whether the mapped tools keep its 
       "cursor-readonly.md": "description: d\nreadonly: true",
       "no-shell.md": "description: d\ntools: [Read, Grep, Glob]\ndisallowedTools: [Bash]",
       "cursor-no-shell.md": "description: d\nreadonly: true\ndisallowedTools: [Bash]",
+      // An allowlist without a bash tool removes the shell too, with no `disallowedTools` entry.
+      "cursor-tools-no-shell.md": "description: d\nreadonly: true\ntools: [Read]",
       "writer.md": "description: d\ntools: [Read, Edit, Grep]",
       "reads-only.md": "description: d\ntools: [Read]",
     })
   ).toEqual({
     "cursor-no-shell.md": { readonly: true, keepsShell: false },
     "cursor-readonly.md": { readonly: true, keepsShell: true },
+    "cursor-tools-no-shell.md": { readonly: true, keepsShell: false },
     "no-shell.md": { readonly: true, keepsShell: false },
     "reads-only.md": { readonly: false, keepsShell: false },
     "searcher.md": { readonly: true, keepsShell: true },
