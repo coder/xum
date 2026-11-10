@@ -13,8 +13,10 @@ unset GH_DEBUG DEBUG
 # counts with the explicit read: ./scripts/check_codex_comments.sh <pr_number>
 #
 # Exits:
-#   0 - Codex approved, or reported a usage limit with no outstanding findings
-#   1 - Codex left comments to address OR failed to review for another reason
+#   0 - Codex approved and the Codex comments gate counted no open review thread, or Codex
+#       reported a usage limit with no outstanding findings
+#   1 - Codex left comments to address, approved while a review thread is open (or while the
+#       gate could not read the threads), OR failed to review for another reason
 #  10 - still waiting for Codex response (only in --once mode)
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -373,17 +375,22 @@ run_codex_comments_gate() {
   fi
 }
 
-# An approval comment or a thumbs-up says nothing about review threads that are still unresolved: only
-# the gate reads every thread. So an approval stands unless the gate (run before it) counted one.
-# Regular comments do not block here: an approval comment in the old format counts as one itself,
-# and the CI gate still reads them.
+# An approval comment or a thumbs-up says nothing about review threads that are still unresolved:
+# only the gate reads every thread. So an approval stands only when the gate (run before it) counted
+# 0 unresolved review threads: every run that read the threads prints the count, and a gate that
+# could not read them (a malformed page, a crash) prints none, which is no proof that none is open.
+# Regular comments do not block an approval here: the gate counts every Codex regular comment that is
+# not an approval in its own format, and a Codex comment that is not a finding must not turn an
+# approval into exit 1. wait_pr_ready.sh runs the gate over them again (its step 6), and CI's Codex
+# Comments job runs on PR pushes, not in the merge queue.
 approval_stands() {
-  if grep -Eq '^Found [1-9][0-9]* unresolved review thread' <<<"$check_output"; then
-    echo ""
-    echo "$check_output"
-    echo "❌ Codex approved PR #$PR_NUMBER, but unresolved Codex review threads remain."
-    return 1
+  if grep -Eq '^Found 0 unresolved review thread' <<<"$check_output"; then
+    return 0
   fi
+  echo ""
+  echo "$check_output"
+  echo "❌ Codex approved PR #$PR_NUMBER, but the Codex comments gate did not confirm that no review thread is open."
+  return 1
 }
 
 # A push-triggered Codex run posts no security receipt (coder/xum#7731), so the gate waits on one.
@@ -638,7 +645,7 @@ echo "⏳ Waiting for Codex review on PR #$PR_NUMBER..."
 echo ""
 echo "Tip: after you comment '@codex review', Codex will respond with either:"
 echo "  - review comments / threads to address (script exits 1)"
-echo "  - thumbs-up reaction on the PR description OR an explicit approval comment (script exits 0)"
+echo "  - thumbs-up reaction on the PR description OR an explicit approval comment (script exits 0, or 1 while a review thread is open)"
 echo ""
 
 while true; do

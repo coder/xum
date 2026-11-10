@@ -1357,20 +1357,23 @@ else:
         scanned = snapshot([request, comment("Codex is looking.")], [thread("[P1] Fix authorization")])
         scanned["data"]["repository"]["pullRequest"]["reactions"]["pageInfo"]["hasPreviousPage"] = True
         scan_env = {"CODEX_GATE_REACTIONS_NODES": json.dumps(thumbs_up)}
+        many = [thread("[P1] Fix authorization") for _ in range(10)]
+        # name: (reply, env of the double, number of open threads that the gate counts)
         blocked = {
-            "comment approval, open thread": (snapshot([request, receipt], [thread("[P1] Fix authorization")]), None),
-            "comment approval, thread from before the request": (snapshot([request, receipt], [thread("[P1] Fix authorization", created_at=BEFORE)]), None),
-            "reaction approval, open thread": (snapshot([request, comment("Codex is looking.")], [thread("[P1] Fix authorization")], reactions=thumbs_up), None),
-            "reaction scan approval, open thread": (scanned, scan_env),
+            "comment approval, open thread": (snapshot([request, receipt], [thread("[P1] Fix authorization")]), None, 1),
+            "comment approval, thread from before the request": (snapshot([request, receipt], [thread("[P1] Fix authorization", created_at=BEFORE)]), None, 1),
+            "comment approval, ten open threads": (snapshot([request, receipt], many), None, 10),
+            "reaction approval, open thread": (snapshot([request, comment("Codex is looking.")], [thread("[P1] Fix authorization")], reactions=thumbs_up), None, 1),
+            "reaction scan approval, open thread": (scanned, scan_env, 1),
         }
-        for name, (data, env) in blocked.items():
+        for name, (data, env, count) in blocked.items():
             with self.subTest(case=name):
                 result = self.run_gate(data, "wait_pr_codex.sh", env_extra=env)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertNotIn("✅ Codex approved", result.stdout)
-                self.assertIn("Found 1 unresolved review thread(s) from bot", result.stdout)
+                self.assertIn(f"Found {count} unresolved review thread(s) from bot", result.stdout)
                 self.assertIn("Read them with: ./scripts/check_codex_comments.sh 4145", result.stdout)
-                self.assertIn("unresolved Codex review threads remain", result.stdout)
+                self.assertIn("did not confirm that no review thread is open", result.stdout)
         # Threads that do not block, and regular comments (the CI gate reads those), leave the approval standing.
         standing = {
             "resolved thread": snapshot([request, receipt], [thread("[P1] Fixed", resolved=True)]),
@@ -1388,6 +1391,30 @@ else:
             result = self.run_gate(resolved_scan, "wait_pr_codex.sh", env_extra=scan_env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("✅ Codex approved PR #4145 via thumbs-up", result.stdout)
+
+    def test_an_approval_does_not_stand_when_the_gate_could_not_read_the_threads(self):
+        # A gate that fails on the thread pages prints no thread count. No count is no proof that no thread is open.
+        request = comment("@codex review", "maintainer", REQUEST)
+        receipt = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
+        thumbs_up = [{"user": {"login": BOT}, "createdAt": AFTER}]
+        # The double gives the gate's thread pages a page flag that the gate rejects, and the poller's own window no flag.
+        broken_pages = {"CODEX_GATE_NEXT_PAGE": HOSTILE, "CODEX_GATE_NEXT_PAGE_FIELD": "reviewThreads"}
+        cases = {
+            "approval comment": snapshot([request, receipt]),
+            "thumbs-up": snapshot([request, comment("Codex is looking.")], reactions=thumbs_up),
+        }
+        for name, data in cases.items():
+            with self.subTest(approval=name):
+                result = self.run_gate(data, "wait_pr_codex.sh", env_extra=broken_pages)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn("✅ Codex approved", result.stdout)
+                self.assertNotIn("unresolved review thread(s) from bot", result.stdout)
+                self.assertNotIn(HOSTILE_MARKER, result.stdout + result.stderr)
+                self.assertIn("did not confirm that no review thread is open", result.stdout)
+        # The same replies with readable pages approve, so the broken pages are what the cases above test.
+        for name, data in cases.items():
+            with self.subTest(readable=name):
+                self.assert_gate(0, data, "wait_pr_codex.sh")
 
     def test_an_approval_with_a_forged_time_is_not_printed_or_accepted(self):
         # A time that carries a line break and a forged line used to be echoed after "Approval comment
