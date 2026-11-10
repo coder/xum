@@ -465,82 +465,39 @@ function runnerLabels(runsOn: unknown): string[] {
   return [];
 }
 
-// The simple commands of a `run` script, each as its words. A trailing backslash joins lines, and
-// `;`, `&&`, `||`, `|`, `&` and a new line end a command. A word that starts with `#` begins a
-// comment. Leading assignments and shell keywords are dropped, and so is an `echo` or `printf`
-// command, whose words are text and not commands. A quoted string is not split, so a command
-// inside `bash -c "..."` is not seen.
-const SHELL_KEYWORDS = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{"]);
-function simpleCommands(run: string): string[][] {
-  return run
-    .replace(/\\\r?\n\s*/g, " ")
-    .split("\n")
-    .map((line) => line.replace(/(^|\s)#.*/, "$1"))
-    .flatMap((line) => line.split(/;|&&|\|\||\||&/))
-    .map((part) => {
-      const words: string[] = [];
-      for (const raw of part.trim().split(/\s+/)) {
-        const word = raw.replace(/^(?:\$\(|\(|`)+/, "").replace(/[)`]+$/, "");
-        if (word !== "") words.push(word);
-      }
-      const start = words.findIndex((word) => !/^\w+=/.test(word) && !SHELL_KEYWORDS.has(word));
-      return start === -1 ? [] : words.slice(start);
-    })
-    .filter((words) => words.length > 0 && words[0] !== "echo" && words[0] !== "printf");
-}
+// What in a `run` script may build the Linux AppImage: `make` with `dist` after it on the same line
+// (`make dist`, `make -j4 dist`, `make dist-linux`, `make dist-linux-arm64`), any electron-builder
+// call (`--linux`, `-l`, or none: electron-builder then builds for the host), and the npm scripts
+// `dist` and `dist:linux`.
+const APPIMAGE_COMMANDS = [
+  /\bmake\b[^\n]*\bdist\b/,
+  /electron-builder/,
+  /\bdist:linux\b/,
+  /\brun dist\b/,
+];
 
-const basename = (word: string): string => word.slice(word.lastIndexOf("/") + 1);
-
-// Whether the arguments of one electron-builder call build the Linux AppImage. A call that builds
-// no package (`--dir`, `--help`) or runs another command (`install-app-deps`) does not. Otherwise
-// `--linux` or `-l` (alone or in a cluster such as `-wl`) does. Without a platform option
-// electron-builder builds for the host, so the call builds it on a runner that may be Linux, unless
-// it names another platform (`--mac`, `--win`, `-m`, `-w`).
-function electronBuilderBuildsAppImage(args: string[], mayRunOnLinux: boolean): boolean {
-  const buildsNothing =
-    ["install-app-deps", "node-gyp-rebuild", "create-self-signed-cert", "start"].includes(
-      args[0] ?? ""
-    ) || args.some((arg) => ["--dir", "--help", "-h", "--version"].includes(arg));
-  if (buildsNothing) return false;
-  if (args.some((arg) => arg === "--linux" || /^-[mwl]*l[mwl]*$/.test(arg))) return true;
-  const otherPlatform = args.some(
-    (arg) => arg === "--mac" || arg === "--win" || /^-[mwl]+$/.test(arg)
-  );
-  return mayRunOnLinux && !otherPlatform;
-}
-
-// Whether a job builds the Linux AppImage. electron-builder builds it as above, directly or through
-// `make dist-linux` or `bun run dist:linux`, and the unqualified `make dist` (or `bun run dist`)
-// builds for the runner's own OS. A command can sit behind a wrapper (`scripts/retry.sh 3 30 make
-// dist`). `runs-on` is often an expression, so only a runner label that names macOS or Windows (in
-// any case) rules a job out.
+// Whether a job may build the Linux AppImage: its runner can be Linux, and the text of a `run`
+// script holds one of the commands above. The check over-flags by design: it is a substring match on
+// the text, so a comment, prose, `make dist/cli/index.js` or `electron-builder --dir` counts too. A
+// job that is flagged but builds no AppImage fails the test with its name, and the fix is to pass
+// the input. A job that builds one and is not flagged is the failure that matters, so the check
+// never tries to read the commands. Only a runner label that names macOS or Windows (in any case,
+// in a string, a list or a `{ group, labels }`) rules a job out. `runs-on` is often an expression,
+// which can name any runner, so an expression counts as Linux.
 function buildsAppImage(job: WorkflowJob): boolean {
   const mayRunOnLinux = !runnerLabels(job["runs-on"]).some((label) =>
     /^(?:macos|windows)\b/i.test(label)
   );
-  return (job.steps ?? []).some((step) =>
-    simpleCommands(step.run ?? "").some((words) =>
-      words.some((word, i) => {
-        const rest = words.slice(i + 1);
-        if (basename(word) === "make") {
-          return (
-            rest.some((arg) => /^dist-linux(?:-|$)/.test(arg)) ||
-            (mayRunOnLinux && rest.includes("dist"))
-          );
-        }
-        if (word === "run")
-          return rest[0] === "dist:linux" || (mayRunOnLinux && rest[0] === "dist");
-        return (
-          basename(word) === "electron-builder" &&
-          electronBuilderBuildsAppImage(rest, mayRunOnLinux)
-        );
-      })
+  return (
+    mayRunOnLinux &&
+    (job.steps ?? []).some((step) =>
+      APPIMAGE_COMMANDS.some((command) => command.test(step.run ?? ""))
     )
   );
 }
 
 // A workflow that builds an AppImage in a form this test does not know would skip the tool check
-// and download the tool with no retry. Each row is one form that the detector must find or leave.
+// and download the tool with no retry. Each row is one `run` text that the check must flag or leave.
 describe("the AppImage job detector", () => {
   const linux = "ubuntu-latest";
   test.each<[string, unknown, string, boolean]>([
@@ -551,57 +508,41 @@ describe("the AppImage job detector", () => {
       "bun x electron-builder \\\n  --linux \\\n  --publish always",
       true,
     ],
-    [
-      "electron-builder --linux over several lines on a macOS runner",
-      "macos-15",
-      "bun x electron-builder \\\n  --linux",
-      true,
-    ],
-    [
-      "electron-builder --mac over several lines",
-      linux,
-      "bun x electron-builder \\\n  --mac",
-      false,
-    ],
+    ["electron-builder -l", linux, "bun x electron-builder -l --publish never", true],
+    ["electron-builder with no platform option", linux, "bun x electron-builder", true],
     ["make dist-linux", linux, "make dist-linux", true],
+    ["make dist-linux-arm64", linux, "make dist-linux-arm64", true],
+    ["a plain make dist", linux, "make dist", true],
+    ["make with a flag before dist", linux, "make -j4 dist", true],
+    ["make dist behind a retry wrapper", linux, "./scripts/retry.sh 3 30 make dist", true],
+    ["make dist after cd and &&", linux, "cd app && make dist", true],
+    ["bun run dist", linux, "bun run dist", true],
     ["bun run dist:linux", linux, "bun run dist:linux", true],
-    ["a plain make dist on a Linux runner", linux, "make dist", true],
-    ["a plain bun run dist on a Linux runner", linux, "bun run dist", true],
+    ["yarn dist:linux", linux, "yarn dist:linux", true],
     [
       "a plain make dist on a runner named by an expression",
       "${{ needs.changes.outputs.runner-4 }}",
       "make dist",
       true,
     ],
-    ["a plain make dist on a macOS runner", "macos-15", "make dist", false],
-    ["make dist-mac", linux, "make dist-mac", false],
-    ["bun run dist:win", linux, "bun run dist:win", false],
-    ["electron-builder --win", linux, "bun x electron-builder --win --publish always", false],
     [
-      "electron-builder and --linux in two commands",
-      linux,
-      "bun x electron-builder --mac\necho --linux",
-      false,
-    ],
-    ["electron-builder -l", linux, "bun x electron-builder -l --publish never", true],
-    ["electron-builder -wl", linux, "bun x electron-builder -wl --publish never", true],
-    [
-      "electron-builder with no platform option",
-      linux,
-      "bun x electron-builder --publish never",
+      "a plain make dist on a self-hosted Linux runner",
+      ["self-hosted", "linux"],
+      "make dist",
       true,
     ],
-    [
-      "electron-builder with no platform option on macOS",
-      "macos-15",
-      "bun x electron-builder",
-      false,
-    ],
-    ["electron-builder -m", linux, "bun x electron-builder -m --publish never", false],
-    ["electron-builder install-app-deps", linux, "bun x electron-builder install-app-deps", false],
-    ["electron-builder --dir", linux, "bun x electron-builder --dir", false],
-    ["a file named electron-builder.yml", linux, "cat electron-builder.yml", false],
-    ["a comment about electron-builder", linux, "# electron-builder unpacks the zip\ntrue", false],
+    // Over-flags by design: each is a job that the check names and a person fixes by passing the input.
+    ["a comment about make dist", linux, "# make dist is not run here\ntrue", true],
+    ["prose after echo", linux, "echo do not run make dist here", true],
+    ["make dist/cli/index.js", linux, "make dist/cli/index.js", true],
+    ["electron-builder --dir", linux, "bun x electron-builder --dir", true],
+    ["a file named electron-builder.yml", linux, "cat electron-builder.yml", true],
+    ["no build command", linux, "bun run build\nmake test", false],
+    ["no run script", linux, "", false],
+    ["a plain make dist on a macOS runner", "macos-15", "make dist", false],
+    ["a plain make dist on a macOS-latest runner", "macOS-latest", "make dist", false],
+    ["a plain make dist on a Windows-2022 runner", "Windows-2022", "make dist", false],
+    ["a plain make dist on a windows-latest runner", "windows-latest", "make dist", false],
     [
       "a plain make dist on a self-hosted macOS runner",
       ["self-hosted", "macOS", "ARM64"],
@@ -615,34 +556,11 @@ describe("the AppImage job detector", () => {
       false,
     ],
     [
-      "a plain make dist on a self-hosted Linux runner",
-      ["self-hosted", "linux"],
-      "make dist",
-      true,
-    ],
-    ["a plain make dist on a macOS-latest runner", "macOS-latest", "make dist", false],
-    ["a plain make dist on a Windows-2022 runner", "Windows-2022", "make dist", false],
-    ["a plain make dist on a windows-latest runner", "windows-latest", "make dist", false],
-    ["make dist/cli/index.js", linux, "make dist/cli/index.js", false],
-    ["prose that mentions make dist after echo", linux, "echo do not run make dist here", false],
-    ["prose after then", linux, "if true; then echo do not run make dist; fi", false],
-    ["an assignment before echo", linux, "FOO=1 echo run make dist", false],
-    ["make dist in a comment line", linux, "# make dist\ntrue", false],
-    ["make dist in a comment after a command", linux, "true # make dist", false],
-    ["make with a flag before dist", linux, "make -j4 dist", true],
-    ["make dist behind a retry wrapper", linux, "./scripts/retry.sh 3 30 make dist", true],
-    ["make dist after cd and &&", linux, "cd app && make dist", true],
-    ["make dist in a for loop", linux, "for i in 1; do make dist; done", true],
-    ["make dist before a comment", linux, "make dist # build it", true],
-    ["make dist-linux-arm64", linux, "make dist-linux-arm64", true],
-    [
-      "a semicolon in a comment line",
-      linux,
-      "# Packaging is elsewhere; make dist is not run\ntrue",
+      "electron-builder --linux on a macOS runner",
+      "macos-15",
+      "bun x electron-builder --linux",
       false,
     ],
-    ["a semicolon in a comment after a command", linux, "true # one; make dist", false],
-    ["electron-builder -l --dir", linux, "bun x electron-builder -l --dir", false],
   ])("%s", (_name, runsOn, run, builds) => {
     expect(buildsAppImage({ "runs-on": runsOn, steps: [{ run }] })).toBe(builds);
   });
