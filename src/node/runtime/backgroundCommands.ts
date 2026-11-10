@@ -126,6 +126,8 @@ export interface SpawnCommandOptions {
   outputPath: string;
   /** Path to bash executable (defaults to "bash") */
   bashPath?: string;
+  /** Path to nohup (defaults to "nohup") */
+  nohupPath?: string;
   /** Function to quote paths for shell (default: shellQuote). Use expandTildeForSSH for SSH. */
   quotePath?: (path: string) => string;
 }
@@ -143,10 +145,11 @@ export interface SpawnCommandOptions {
  */
 export function buildSpawnCommand(options: SpawnCommandOptions): string {
   const bash = options.bashPath ?? "bash";
+  const nohup = options.nohupPath === undefined ? "nohup" : shellQuote(options.nohupPath);
   const quotePath = options.quotePath ?? shellQuote;
 
   return (
-    `(set -m; nohup ${shellQuote(bash)} -c ${shellQuote(options.wrapperScript)} ` +
+    `(set -m; ${nohup} ${shellQuote(bash)} -c ${shellQuote(options.wrapperScript)} ` +
     `${shellQuote(bash)} ${shellQuote(options.script)} ` +
     `> ${quotePath(options.outputPath)} 2>&1 ` +
     `< /dev/null & echo $!)`

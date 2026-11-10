@@ -270,7 +270,8 @@ export function buildAgentSandboxPolicy(
   const denyWrite = dedupe(
     [
       ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
-      ...gitCommonDirs.flatMap(protectedGitDirPaths),
+      // Also a git folder that a `.git` file names (`git init --separate-git-dir`) (Codex review).
+      ...repoGitDirs.flatMap(protectedGitDirPaths),
       // A credential file in a write root (~/.cache/huggingface/token) stays unwritable too, and
       // so do the npx, uv and Bun caches, a plugin or skill folder or a dotfile that links into
       // one, and the files that git and ssh config include from one.

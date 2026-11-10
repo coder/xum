@@ -126,6 +126,21 @@ export function toolSandboxGate(config: ToolConfiguration): FileToolSandboxGate 
 }
 
 /**
+ * For a tool that reads or writes a project file outside the file tools (AGENTS.md): a command
+ * can replace the file with a link to one that its sandbox hides or keeps read-only, such as
+ * `.xum/mcp.jsonc`, so the tool reaches it only where a sandboxed command could (Codex review).
+ * Global files are in Xum's home folder, which commands cannot write.
+ */
+export async function assertProjectFileReachable(
+  config: ToolConfiguration,
+  resolvedPath: string,
+  access: "read" | "write"
+): Promise<void> {
+  if (config.xumScope?.type !== "project") return;
+  await toolSandboxGate(config)(resolvedPath, access);
+}
+
+/**
  * Throws AgentSandboxPathError unless the runtime's sandbox policy lets a sandboxed command
  * reach `resolvedPath`, so file tools follow the same rules as the shell. No check when no
  * sandbox applies. Throws AgentSandboxStartError (fail closed) when the sandbox applies but has

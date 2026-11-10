@@ -6,6 +6,7 @@ import {
   type XumAgentsWriteToolResult,
 } from "@/common/types/tools";
 import {
+  assertProjectFileReachable,
   GLOBAL_WRITE_SANDBOX_ERROR,
   sandboxBlocksGlobalWrites,
 } from "@/node/services/agentSandbox/fileToolSandbox";
@@ -59,6 +60,7 @@ export const createXumAgentsWriteTool: ToolFactory = (config: ToolConfiguration)
           }
 
           const writePath = resolved.kind === "existing" ? resolved.realPath : runtimeAgentsPath;
+          await assertProjectFileReachable(config, writePath, "write");
           await writeFileString(config.runtime, writePath, args.newContent);
 
           const diff = generateDiff(writePath, originalContent, args.newContent);
@@ -98,6 +100,7 @@ export const createXumAgentsWriteTool: ToolFactory = (config: ToolConfiguration)
           writePath = resolved.writePath;
         }
 
+        await assertProjectFileReachable(config, writePath, "write");
         await nodeHostFiles.promises.writeFile(writePath, args.newContent, "utf-8");
 
         const diff = generateDiff(writePath, originalContent, args.newContent);

@@ -34,7 +34,9 @@ import {
   buildKillGroupCommand,
   buildPublishExitCodeCommand,
   shellQuote,
+  type SpawnCommandOptions,
 } from "@/node/runtime/backgroundCommands";
+import { getBashPath } from "@/node/utils/main/bashPath";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
 import {
   openRecordFile,
@@ -236,6 +238,18 @@ async function createEmptyOutputLog(
 }
 
 /**
+ * The launcher of a call that the user approved to run outside the agent sandbox. Its PATH is the
+ * user's, which can hold a folder that sandboxed commands write (an activated .venv/bin), and the
+ * approval card shows only the script, so `nohup` and `bash` do not come from that PATH (Codex
+ * review): the bash of an approved foreground call, and the nohup that macOS protects.
+ */
+function approvedLauncher(
+  sandbox: SpawnOptions["sandbox"]
+): Pick<SpawnCommandOptions, "bashPath" | "nohupPath"> {
+  return sandbox === "off" ? { bashPath: getBashPath(), nohupPath: "/usr/bin/nohup" } : {};
+}
+
+/**
  * Spawn a background process using runtime.exec (works for both local and SSH).
  *
  * All processes get the same infrastructure:
@@ -344,11 +358,15 @@ export async function spawnProcess(
     delete wrapperEnv[key];
   }
 
+  // The spawn shell's env carries BASH_ENV on to the script, and an opt-out of the agent sandbox
+  // clears it there: an export in the wrapper would bring it back for an approved call (Codex
+  // review).
+  const { BASH_ENV: _bashEnv, ...wrapperExports } = wrapperEnv;
   const wrapperScript = buildWrapperScript({
     exitCodePath,
     cwd: options.cwd,
     cwdEnvVar: BACKGROUND_CWD_ENV,
-    env: wrapperEnv,
+    env: wrapperExports,
   });
 
   const spawnCommand = buildSpawnCommand({
@@ -356,6 +374,7 @@ export async function spawnProcess(
     script,
     outputPath,
     quotePath,
+    ...approvedLauncher(options.sandbox),
   });
 
   // The spawn shell exits as soon as it has started the process, which keeps running and needs

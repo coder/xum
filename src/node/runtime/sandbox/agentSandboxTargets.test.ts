@@ -215,6 +215,22 @@ describe("buildAgentSandboxPolicy", () => {
     );
   });
 
+  // Git outside the sandbox, such as Xum's own `git worktree add`, runs the hooks and config of
+  // the git folder that a `.git` file names.
+  test("keeps the git folder of a separate-git-dir repository read-only", async () => {
+    const separate = path.join(root, "separate");
+    const gitDir = path.join(separate, "gitdir");
+    await fs.mkdir(separate);
+    git(separate, "init", "-q", `--separate-git-dir=${gitDir}`);
+
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: separate });
+
+    for (const name of ["hooks/post-checkout", "config", "modules/sub/config", "commondir"]) {
+      expect(agentSandboxPolicyAllows(policy, path.join(gitDir, name), "write")).toBe(false);
+    }
+    expect(agentSandboxPolicyAllows(policy, path.join(gitDir, "index"), "write")).toBe(true);
+  });
+
   test("keeps a protected file that is a symlink read-only where it points", async () => {
     const actual = path.join(commonDir, "config.actual");
     await fs.rename(path.join(commonDir, "config"), actual);

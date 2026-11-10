@@ -680,7 +680,8 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       const opened = await runSandboxed(policy, workspace, `/usr/bin/open -W -g -j '${planted}'`);
       expect(opened.exitCode).not.toBe(0);
       expect(await exists(marker)).toBe(false);
-    });
+      // LaunchServices registers each new app first, which took over 5 s on a CI runner.
+    }, 30_000);
 
     describe("network", () => {
       let server: http.Server;
@@ -881,6 +882,47 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
         const output = await fs.readFile(path.join(result.outputDir, "output.log"), "utf8");
         expect(output).not.toContain("hf_secret");
         expect(output).toContain("READ_DENIED");
+      } finally {
+        await result.handle.dispose();
+        await fs.rm(result.outputDir, { recursive: true, force: true });
+      }
+    });
+
+    // An approved background call runs outside the sandbox, and a sandboxed command can write the
+    // file that BASH_ENV names and a PATH folder in the workspace (an activated .venv/bin).
+    it("starts an approved background call without BASH_ENV or a launcher from the PATH", async () => {
+      const workspace = path.join(root, "ws");
+      const plantDir = path.join(workspace, ".venv", "bin");
+      const marker = path.join(root, "planted");
+      const startup = path.join(workspace, "startup.sh");
+      await fs.mkdir(plantDir, { recursive: true });
+      await fs.writeFile(startup, `echo BASH_ENV >> '${marker}'\n`);
+      for (const [name, real] of [
+        ["nohup", "/usr/bin/nohup"],
+        ["bash", "/bin/bash"],
+      ]) {
+        await fs.writeFile(
+          path.join(plantDir, name),
+          `#!/bin/sh\necho ${name} >> '${marker}'\nexec ${real} "$@"\n`,
+          { mode: 0o755 }
+        );
+      }
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+
+      const result = await spawnProcess(new LocalRuntime(workspace), "echo approved", {
+        cwd: workspace,
+        workspaceId: `sandbox-test-${path.basename(root)}`,
+        processId: "bg-approved",
+        env: { BASH_ENV: startup, PATH: `${plantDir}:${process.env.PATH ?? ""}` },
+        sandbox: "off",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      try {
+        await waitForExitCode(result.handle);
+        const output = await fs.readFile(path.join(result.outputDir, "output.log"), "utf8");
+        expect(output).toContain("approved");
+        expect((await exists(marker)) ? await fs.readFile(marker, "utf8") : "").toBe("");
       } finally {
         await result.handle.dispose();
         await fs.rm(result.outputDir, { recursive: true, force: true });
