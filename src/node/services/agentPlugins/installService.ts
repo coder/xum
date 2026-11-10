@@ -1389,6 +1389,32 @@ function resolvePreviewRef(
   return parsedRef ?? (explicit.length > 0 ? explicit : undefined);
 }
 
+/**
+ * The folder of a relative marketplace build, or why the listing does not offer it: the preview
+ * would fail on a missing or escaping folder, and on a Cursor or Agent Plugins folder without a
+ * plugin manifest of its own (entryInstallMethods). The reason names the folder, not the staging
+ * path.
+ */
+async function checkedEntryFolder(
+  stagedDir: string,
+  subpath: string | undefined,
+  file: MarketplaceFile
+): Promise<{ entryDir: string } | { reason: string }> {
+  let entryDir: string;
+  try {
+    entryDir = await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? ""));
+  } catch (error) {
+    const why = hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error);
+    return { reason: `Xum cannot install the entry's folder '${subpath ?? "."}': ${why}` };
+  }
+  if (!MARKETPLACE_FILE_RULES[file].entryIsManifest && !(await hasPluginManifest(entryDir))) {
+    return {
+      reason: `The entry's folder '${subpath ?? "."}' has no plugin manifest, so Xum cannot install it.`,
+    };
+  }
+  return { entryDir };
+}
+
 /** The git source that preview returns and install persists. */
 function resolvedGitSource(
   url: string,
@@ -3946,31 +3972,8 @@ export class AgentPluginInstallService {
     const entry = findMarketplaceEntry(marketplace, name);
     const resolved = resolveEntrySource(marketplace, source.url, entry);
     assert(resolved.kind === "relative", "withAcceptedSkillCount: a relative entry resolves here");
-    const folder = path.join(stagedDir, resolved.subpath ?? "");
-    let entryDir: string;
-    try {
-      entryDir = await ensurePluginPathContained(stagedDir, folder);
-    } catch (error) {
-      // A missing or escaping folder would fail the entry's preview, so the listing does not
-      // offer it. The reason names the folder, not the staging path.
-      const why = hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error);
-      return {
-        ...build,
-        installable: false,
-        reason: `Xum cannot install the entry's folder '${resolved.subpath ?? "."}': ${why}`,
-      };
-    }
-    if (
-      !MARKETPLACE_FILE_RULES[build.file].entryIsManifest &&
-      !(await hasPluginManifest(entryDir))
-    ) {
-      // The preview would refuse it (entryInstallMethods), so the listing does not offer it.
-      return {
-        ...build,
-        installable: false,
-        reason: `The entry's folder '${resolved.subpath ?? "."}' has no plugin manifest, so Xum cannot install it.`,
-      };
-    }
+    const folder = await checkedEntryFolder(stagedDir, resolved.subpath, build.file);
+    if ("reason" in folder) return { ...build, installable: false, reason: folder.reason };
     if (build.skillCount === undefined) return build;
     let manifest: Record<string, unknown>;
     try {
@@ -3984,8 +3987,19 @@ export class AgentPluginInstallService {
       // No plugin name fits the entry name: its own preview fails with the reason.
       return build;
     }
+    const scan = this.entrySkillScan(folder.entryDir, manifest, entry.name, scans);
+    return { ...build, skillCount: (await scan).size };
+  }
+
+  /** The accepted skills of an entry's folder under its manifest, one scan per shared key. */
+  private entrySkillScan(
+    entryDir: string,
+    manifest: Record<string, unknown>,
+    entryName: string,
+    scans: Map<string, Promise<Set<string>>>
+  ): Promise<Set<string>> {
     const declared = declaredSkills(manifest);
-    const pluginName = typeof manifest.name === "string" ? manifest.name : entry.name;
+    const pluginName = typeof manifest.name === "string" ? manifest.name : entryName;
     // The plugin name names only a skill at the plugin root itself (a declared "."), so
     // entries that share a folder and skills list share one scan otherwise.
     const namesRootSkill =
@@ -3997,7 +4011,7 @@ export class AgentPluginInstallService {
       scan = this.acceptedSkillNames(entryDir, { declared, pluginName });
       scans.set(key, scan);
     }
-    return { ...build, skillCount: (await scan).size };
+    return scan;
   }
 
   /**
