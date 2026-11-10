@@ -5,10 +5,17 @@ import { describe, expect, it } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import type { XumToolScope } from "@/common/types/toolScope";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createAgentSkillDeleteTool } from "@/node/services/tools/agent_skill_delete";
 import { createAgentSkillWriteTool } from "@/node/services/tools/agent_skill_write";
-import { TestTempDir, createTestToolConfig, writeSkill } from "@/node/services/tools/testHelpers";
+import {
+  TestTempDir,
+  createTestToolConfig,
+  stubSandboxHidingTokenPath,
+  writeProjectSkill,
+  writeSkill,
+} from "@/node/services/tools/testHelpers";
 import { createXumAgentsWriteTool } from "@/node/services/tools/xum_agents_write";
 
 const callOptions: ToolExecutionOptions<unknown> = {
@@ -80,5 +87,69 @@ describe("global skill and AGENTS.md writes from a sandboxed system workspace", 
 
     expect(result.error).toContain("agent sandbox");
     expect(await fs.stat(path.join(home.path, "AGENTS.md")).catch(() => null)).toBeNull();
+  });
+});
+
+// Codex review: a project secret such as GIT_CONFIG_GLOBAL can name a file in a skill folder,
+// which the sandbox then keeps read-only, and git runs what that config names outside it.
+describe("project skill writes and deletes from a sandboxed workspace", () => {
+  it("changes a skill file only where a sandboxed command could", async () => {
+    using tempDir = new TestTempDir("project-skill-sandbox");
+    const projectRoot = path.join(await fs.realpath(tempDir.path), "project");
+    await writeProjectSkill(projectRoot, "demo");
+    const gitConfig = path.join(projectRoot, ".xum", "skills", "demo", "gitconfig");
+    await fs.writeFile(gitConfig, "[user]\n");
+    const runtime = new LocalRuntime(projectRoot);
+    stubSandboxHidingTokenPath(runtime, projectRoot, [gitConfig]);
+    const xumScope: XumToolScope = {
+      type: "project",
+      xumHome: tempDir.path,
+      projectRoot,
+      projectStorageAuthority: "host-local",
+    };
+    const config = createTestToolConfig(projectRoot, { runtime, xumScope });
+    const write = (filePath: string) =>
+      createAgentSkillWriteTool(config).execute!(
+        { name: "demo", filePath, content: "[core]\n\tfsmonitor = evil\n" },
+        callOptions
+      ) as Promise<{ success: boolean; error?: string }>;
+
+    expect((await write("gitconfig")).error).toContain("agent sandbox");
+    const deleted = (await createAgentSkillDeleteTool(config).execute!(
+      { name: "demo", target: "file", filePath: "gitconfig", confirm: true },
+      callOptions
+    )) as { success: boolean; error?: string };
+    expect(deleted.error).toContain("agent sandbox");
+    expect(await fs.readFile(gitConfig, "utf-8")).toBe("[user]\n");
+
+    expect((await write("notes.md")).success).toBe(true);
+  });
+
+  it("keeps both manifests when the legacy one is read-only", async () => {
+    using tempDir = new TestTempDir("project-skill-sandbox-legacy");
+    const projectRoot = path.join(await fs.realpath(tempDir.path), "project");
+    await writeProjectSkill(projectRoot, "demo");
+    await writeSkill(path.join(projectRoot, ".mux", "skills"), "demo");
+    const legacyManifest = path.join(projectRoot, ".mux", "skills", "demo", "SKILL.md");
+    const runtime = new LocalRuntime(projectRoot);
+    stubSandboxHidingTokenPath(runtime, projectRoot, [legacyManifest]);
+    const xumScope: XumToolScope = {
+      type: "project",
+      xumHome: tempDir.path,
+      projectRoot,
+      projectStorageAuthority: "host-local",
+    };
+
+    const deleted = (await createAgentSkillDeleteTool(
+      createTestToolConfig(projectRoot, { runtime, xumScope })
+    ).execute!(
+      { name: "demo", target: "file", filePath: "SKILL.md", confirm: true },
+      callOptions
+    )) as { success: boolean; error?: string };
+
+    expect(deleted.error).toContain("agent sandbox");
+    expect(await fs.stat(legacyManifest).catch(() => null)).not.toBeNull();
+    const manifest = path.join(projectRoot, ".xum", "skills", "demo", "SKILL.md");
+    expect(await fs.stat(manifest).catch(() => null)).not.toBeNull();
   });
 });

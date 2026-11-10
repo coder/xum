@@ -35,6 +35,7 @@ import {
   resolveSkillFilePathForRuntime,
 } from "./runtimeSkillPathUtils";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
+import { assertProjectFileReachable } from "@/node/services/agentSandbox/fileToolSandbox";
 
 interface AgentSkillWriteToolArgs {
   name: string;
@@ -489,6 +490,9 @@ function makeAgentSkillWriteTool(
             normalizedRelativePath: SKILL_FILENAME,
           };
         }
+        // A project secret can name a file in the skill folder as a config that the sandbox keeps
+        // read-only, such as GIT_CONFIG_GLOBAL (Codex review). Legacy migration runs in the sandbox.
+        await assertProjectFileReachable(config, resolvedTarget.resolvedPath, "write");
 
         const writesSkillMarkdown = isSkillMarkdownRootFile(resolvedTarget.normalizedRelativePath);
         const contentToWrite = writesSkillMarkdown

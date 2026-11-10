@@ -39,6 +39,7 @@ import {
   validateLocalSkillDirectory,
 } from "./skillFileUtils";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
+import { assertProjectFileReachable } from "@/node/services/agentSandbox/fileToolSandbox";
 
 interface AgentSkillDeleteToolArgs {
   name: string;
@@ -639,6 +640,8 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
         } catch (error) {
           return deleteFailure(error);
         }
+        // As in agent_skill_write. Whole skill deletes run rm in the sandbox.
+        await assertProjectFileReachable(config, targetPath, "write");
 
         // Stat → capture → unlink → journal run under the per-root mutation
         // lock shared with the rollback engine (targetMutationLocks.ts), so a
@@ -747,6 +750,7 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
             // manifest so stale duplicates cannot shadow the delete (upstream
             // .xum-canonical migration semantics).
             if (legacyManifestPath != null) {
+              await assertProjectFileReachable(config, legacyManifestPath, "write");
               await nodeHostFiles.promises.rm(legacyManifestPath, { force: true });
             }
             await nodeHostFiles.promises.unlink(targetPath);
