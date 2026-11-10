@@ -706,6 +706,37 @@ describe("Config", () => {
       });
     }
 
+    it("rejects the edit and keeps the outside bytes after an in-place rewrite that keeps config.json's stat", async () => {
+      // An in-place rewrite of the same size keeps the inode and the size, and within one tick
+      // of a coarse filesystem clock the mtime too. utimes restores the mtime here, so the stat
+      // key cannot tell the rewrite apart and only the bytes differ.
+      const configFile = path.join(tempDir, "config.json");
+      const mtime = new Date(Math.floor(Date.now() / 1000) * 1000);
+      fs.utimesSync(configFile, mtime, mtime);
+      const size = fs.statSync(configFile).size;
+      expect(Buffer.byteLength(outside)).toBeLessThan(size);
+      const sameSize = outside + " ".repeat(size - Buffer.byteLength(outside));
+      const statKey = (file: string) => {
+        const st = fs.statSync(file, { bigint: true });
+        return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
+      };
+      let keptStat = false;
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const error = await editWithOutsideWrite((file) => {
+          const before = statKey(file);
+          fs.writeFileSync(file, sameSize);
+          fs.utimesSync(file, mtime, mtime);
+          keptStat = statKey(file) === before;
+        });
+        expect(keptStat).toBe(true);
+        expect(String(error)).toContain("config.json changed on disk");
+        expect(fs.readFileSync(configFile, "utf-8")).toBe(sameSize);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
     it("a refused save records no own-write stamp: listeners still hear the outside write", async () => {
       // A watched config (a listener is subscribed). A refused save must not record the
       // outside bytes' stamp as its own write, or the watcher would treat their event as the
@@ -4069,6 +4100,35 @@ describe("Config", () => {
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
       await expect(waiting).rejects.toThrow(/changed on disk/);
       expect(fs.readFileSync(configFile, "utf-8")).toBe(outside);
+    });
+
+    it("editConfigIfChanged fails when another writer rewrites config.json in place after its locked read and keeps its stat", async () => {
+      // A write's save would replace the rewritten bytes. An edit that changes nothing leaves
+      // them, so a rewrite that keeps the inode, the size and (within one tick of a coarse
+      // filesystem clock) the mtime must still fail it. utimes restores the mtime here.
+      await config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: 360_000 }));
+      const configFile = path.join(tempDir, "config.json");
+      const mtime = new Date(Math.floor(Date.now() / 1000) * 1000);
+      fs.utimesSync(configFile, mtime, mtime);
+      const statKey = () => {
+        const st = fs.statSync(configFile, { bigint: true });
+        return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
+      };
+      let keptStat = false;
+      // The transform runs after the edit's locked read: rewrite the file in place, same size.
+      const rewriteInPlace = (): typeof CONFIG_UNCHANGED => {
+        const before = statKey();
+        const text = fs.readFileSync(configFile, "utf-8");
+        expect(text).toContain("360000");
+        fs.writeFileSync(configFile, text.replace("360000", "420000"));
+        fs.utimesSync(configFile, mtime, mtime);
+        keptStat = statKey() === before;
+        return CONFIG_UNCHANGED;
+      };
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(config.editConfigIfChanged(rewriteInPlace)).rejects.toThrow(/changed on disk/);
+      expect(keptStat).toBe(true);
+      expect(new Config(tempDir).loadConfigOrDefault().heartbeatDefaultIntervalMs).toBe(420_000);
     });
 
     it("editConfigIfChanged fails before its transform runs when config.json does not exist", async () => {
