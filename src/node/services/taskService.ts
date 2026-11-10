@@ -193,6 +193,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   isDockerRuntime,
   isLocalProjectRuntime,
+  isSshSharedProjectDirRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
   type RuntimeConfig,
@@ -24345,10 +24346,14 @@ export class TaskService implements AgentTaskIntegration {
 
 /**
  * Removal deletes no checkout for isolation "none" children (they share the parent's) or for
- * project-dir local runtimes (deleteWorkspace is a no-op there), so it cannot lose their files.
+ * project-dir runtimes, local or SSH+None (deleteWorkspace is a no-op there), so it cannot lose
+ * their files.
  */
 function subagentRemovalPreservesCheckout(ws: WorkspaceConfigEntry): boolean {
+  const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
   return (
-    ws.taskIsolation === "none" || isLocalProjectRuntime(ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG)
+    ws.taskIsolation === "none" ||
+    isLocalProjectRuntime(runtimeConfig) ||
+    isSshSharedProjectDirRuntime(runtimeConfig)
   );
 }

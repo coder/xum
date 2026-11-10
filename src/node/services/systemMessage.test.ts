@@ -358,6 +358,38 @@ Use clear examples.
     }
   });
 
+  test("claims a git clone for SSH worktrees but not for SSH without isolation", async () => {
+    const environmentFor = async (runtimeConfig: WorkspaceMetadata["runtimeConfig"]) =>
+      extractTagContent(
+        await buildSystemMessage(
+          {
+            id: "test-workspace",
+            name: "test-workspace",
+            projectName: "test-project",
+            projectPath: projectDir,
+            runtimeConfig,
+          },
+          runtime,
+          workspaceDir
+        ),
+        "environment"
+      ) ?? "";
+    const ssh = { type: "ssh", host: "example.test", srcBaseDir: "/srv/src" } as const;
+
+    const worktree = await environmentFor(ssh);
+    const shared = await environmentFor({
+      ...ssh,
+      workspaceIsolation: "none",
+      projectDir: "/srv/app",
+    });
+    // The shared directory may not be git and is not isolated from other workspaces.
+    expect(worktree).toContain("This IS a git repository");
+    expect(shared).not.toContain("This IS a git repository");
+    expect(shared).not.toContain("isolated from the user and other agents");
+    // It is still remote: $XUM_PROJECT_PATH is the user's local path, not this one.
+    expect(shared).toContain("$XUM_PROJECT_PATH refers to the user's local machine");
+  });
+
   test("describes the agent interface status page only while that view is active", async () => {
     const metadata: WorkspaceMetadata = {
       id: "test-workspace",

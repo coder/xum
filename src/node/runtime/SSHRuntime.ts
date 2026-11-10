@@ -546,6 +546,11 @@ export class SSHRuntime extends RemoteRuntime {
     super();
     // Note: srcBaseDir may contain tildes - they will be resolved via resolvePath() before use
     // The WORKSPACE_CREATE IPC handler resolves paths before storing in config
+    if (config.workspaceIsolation === "none" && !config.projectDir?.trim()) {
+      throw new Error(
+        "SSH workspaces without isolation need the project directory on the host (projectDir)"
+      );
+    }
     this.config = config;
     this.transport = transport;
     this.ensureReadyProjectPath = options?.projectPath;
@@ -596,6 +601,59 @@ export class SSHRuntime extends RemoteRuntime {
   /** Get SSH configuration (for PTY terminal spawning). */
   public getConfig(): SSHRuntimeConfig {
     return this.config;
+  }
+
+  /**
+   * SSH+None (`workspaceIsolation: "none"`): the existing `projectDir` that every workspace uses
+   * directly; null for the default per-workspace worktree layout.
+   *
+   * This is the SSH analogue of LocalRuntime (project dir) vs WorktreeRuntime: the directory is
+   * the user's project, so Xum never syncs into it, checks out a branch, moves it or deletes it.
+   * Every method that would touch a per-workspace checkout (create, init, rename, delete, fork,
+   * the repo health check) branches on this first. It may still start with `~`: quoteForRemote()
+   * and expandTildeForSSH() expand it on the host, as for srcBaseDir.
+   */
+  private get sharedProjectDir(): string | null {
+    if (this.config.workspaceIsolation !== "none") return null;
+    // The constructor rejects a "none" config without a projectDir.
+    return this.config.projectDir ?? null;
+  }
+
+  private missingSharedProjectDirError(projectDir: string): string {
+    return `Directory ${projectDir} does not exist on host ${this.config.host}`;
+  }
+
+  /**
+   * Checks that the SSH+None project directory exists and is a directory on the host. Returns
+   * an actionable error (never throws) so create/fork/init can surface it as their failure.
+   */
+  private async checkSharedProjectDir(
+    projectDir: string,
+    abortSignal?: AbortSignal
+  ): Promise<string | null> {
+    const dirArg = this.quoteForRemote(projectDir);
+    let result: { exitCode: number; stderr: string };
+    try {
+      result = await execBuffered(
+        this,
+        `if [ -d ${dirArg} ]; then exit 0; elif [ -e ${dirArg} ]; then exit 11; else exit 10; fi`,
+        { cwd: "/tmp", timeout: 10, abortSignal }
+      );
+    } catch (error) {
+      return `Failed to reach SSH host ${this.config.host}: ${getErrorMessage(error)}`;
+    }
+    switch (result.exitCode) {
+      case 0:
+        return null;
+      case 10:
+        return this.missingSharedProjectDirError(projectDir);
+      case 11:
+        return `${projectDir} on host ${this.config.host} is not a directory`;
+      default:
+        return `Failed to check directory ${projectDir} on host ${this.config.host}: ${
+          result.stderr.trim() || `exit code ${result.exitCode}`
+        }`;
+    }
   }
 
   private getProjectLayout(projectPath: string): RemoteProjectLayout {
@@ -1130,7 +1188,9 @@ export class SSHRuntime extends RemoteRuntime {
   }
 
   protected getBasePath(): string {
-    return this.config.srcBaseDir;
+    // File commands cd here first. SSH+None never creates srcBaseDir on the host, so a cd into
+    // it would fail every file operation; the shared project directory always exists.
+    return this.sharedProjectDir ?? this.config.srcBaseDir;
   }
 
   protected quoteForRemote(filePath: string): string {
@@ -1249,6 +1309,12 @@ export class SSHRuntime extends RemoteRuntime {
   }
 
   getWorkspacePath(projectPath: string, workspaceName: string): string {
+    // SSH+None: like LocalRuntime, every workspace is the shared project directory.
+    const sharedProjectDir = this.sharedProjectDir;
+    if (sharedProjectDir !== null) {
+      return sharedProjectDir;
+    }
+
     if (
       this.currentWorkspacePath &&
       this.ensureReadyProjectPath === projectPath &&
@@ -1814,10 +1880,12 @@ export class SSHRuntime extends RemoteRuntime {
     }
 
     const statusSink = options?.statusSink;
+    const sharedProjectDir = this.sharedProjectDir;
     statusSink?.({
       phase: "checking",
       runtimeType: "ssh",
-      detail: "Checking repository...",
+      detail:
+        sharedProjectDir !== null ? "Checking project directory..." : "Checking repository...",
     });
 
     if (options?.signal?.aborted) {
@@ -1831,31 +1899,36 @@ export class SSHRuntime extends RemoteRuntime {
     const gitDir = path.posix.join(workspacePath, ".git");
     const gitDirProbe = this.quoteForRemote(gitDir);
     const workspacePathArg = this.quoteForRemote(workspacePath);
-    const verifyWorkspaceCommand = [
-      // .git is a file for worktrees; accept either file or directory so existing SSH/Coder
-      // worktree checkouts don't get flagged as setup failures. Keep this as one remote shell
-      // invocation because stream startup runs it before every first SSH use for a workspace.
-      `if ! (test -d ${gitDirProbe} || test -f ${gitDirProbe}); then`,
-      `  echo ${shescape.quote(`missing .git at ${gitDir}`)} >&2`,
-      "  exit 10",
-      "fi",
-      `git_dir_output=$(git -C ${workspacePathArg} rev-parse --git-dir 2>&1)`,
-      "git_dir_status=$?",
-      'if [ "$git_dir_status" -ne 0 ]; then',
-      '  printf "%s\\n" "$git_dir_output" >&2',
-      '  exit "$git_dir_status"',
-      "fi",
-      `inside_output=$(git -C ${workspacePathArg} rev-parse --is-inside-work-tree 2>&1)`,
-      "inside_status=$?",
-      'if [ "$inside_status" -ne 0 ]; then',
-      '  printf "%s\\n" "$inside_output" >&2',
-      '  exit "$inside_status"',
-      "fi",
-      'if [ "$inside_output" != "true" ]; then',
-      '  printf "not inside worktree: %s\\n" "$inside_output" >&2',
-      "  exit 11",
-      "fi",
-    ].join("\n");
+    // SSH+None: the shared project directory need not be a git repo (like project-dir local), so
+    // readiness only needs the directory itself; a missing one is reported by name below.
+    const verifyWorkspaceCommand =
+      sharedProjectDir !== null
+        ? `test -d ${workspacePathArg} || exit 10`
+        : [
+            // .git is a file for worktrees; accept either file or directory so existing SSH/Coder
+            // worktree checkouts don't get flagged as setup failures. Keep this as one remote shell
+            // invocation because stream startup runs it before every first SSH use for a workspace.
+            `if ! (test -d ${gitDirProbe} || test -f ${gitDirProbe}); then`,
+            `  echo ${shescape.quote(`missing .git at ${gitDir}`)} >&2`,
+            "  exit 10",
+            "fi",
+            `git_dir_output=$(git -C ${workspacePathArg} rev-parse --git-dir 2>&1)`,
+            "git_dir_status=$?",
+            'if [ "$git_dir_status" -ne 0 ]; then',
+            '  printf "%s\\n" "$git_dir_output" >&2',
+            '  exit "$git_dir_status"',
+            "fi",
+            `inside_output=$(git -C ${workspacePathArg} rev-parse --is-inside-work-tree 2>&1)`,
+            "inside_status=$?",
+            'if [ "$inside_status" -ne 0 ]; then',
+            '  printf "%s\\n" "$inside_output" >&2',
+            '  exit "$inside_status"',
+            "fi",
+            'if [ "$inside_output" != "true" ]; then',
+            '  printf "not inside worktree: %s\\n" "$inside_output" >&2',
+            "  exit 11",
+            "fi",
+          ].join("\n");
 
     let verifyResult: { exitCode: number; stderr: string; stdout: string };
     try {
@@ -1907,7 +1980,10 @@ export class SSHRuntime extends RemoteRuntime {
 
       return {
         ready: false,
-        error: WORKSPACE_REPO_MISSING_ERROR,
+        error:
+          sharedProjectDir !== null
+            ? this.missingSharedProjectDirError(sharedProjectDir)
+            : WORKSPACE_REPO_MISSING_ERROR,
         errorType: "runtime_not_ready",
       };
     }
@@ -2539,8 +2615,20 @@ export class SSHRuntime extends RemoteRuntime {
    * still do real I/O here) and so future runtime-specific provisioning can
    * be reintroduced without churning every call site.
    */
-  // eslint-disable-next-line @typescript-eslint/require-await
   async createWorkspace(params: WorkspaceCreationParams): Promise<WorkspaceCreationResult> {
+    const sharedProjectDir = this.sharedProjectDir;
+    if (sharedProjectDir !== null) {
+      // SSH+None mirrors LocalRuntime.createWorkspace: nothing is created, the existing
+      // directory is verified up front so a typo fails before the workspace is registered.
+      params.initLogger.logStep("Using project directory on the host directly (no isolation)");
+      const dirError = await this.checkSharedProjectDir(sharedProjectDir, params.abortSignal);
+      if (dirError !== null) {
+        return { success: false, error: dirError };
+      }
+      params.initLogger.logStep("Project directory verified");
+      return { success: true, workspacePath: sharedProjectDir };
+    }
+
     try {
       const { projectPath, directoryName } = params;
       const layout = this.getProjectLayout(projectPath);
@@ -2574,12 +2662,22 @@ export class SSHRuntime extends RemoteRuntime {
   async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
     // Disable git hooks for untrusted projects (prevents post-checkout execution)
     const nhp = gitNoHooksPrefix(params.trusted);
+    const sharedProjectDir = this.sharedProjectDir;
 
     const result = await runWorkspaceInitHook({
       params,
       runtimeType: "ssh",
       findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
       beforeHook: async () => {
+        if (sharedProjectDir !== null) {
+          // SSH+None: no project sync, base repo, worktree or branch checkout. The directory
+          // must still exist (it may have gone since create); the init hook then runs in it.
+          const dirError = await this.checkSharedProjectDir(sharedProjectDir, params.abortSignal);
+          if (dirError !== null) {
+            throw new Error(dirError);
+          }
+          return;
+        }
         await this.prepareWorkspaceCheckout(params, nhp);
       },
       runHook: async ({ hookRelativePath, xumEnv, initLogger, abortSignal }) => {
@@ -2595,8 +2693,10 @@ export class SSHRuntime extends RemoteRuntime {
         );
       },
     });
-    // The checkout now exists (or changed); see checkoutGenerations.
-    this.bumpCheckoutGeneration();
+    // The checkout now exists (or changed); see checkoutGenerations. SSH+None made no checkout.
+    if (sharedProjectDir === null) {
+      this.bumpCheckoutGeneration();
+    }
     return result;
   }
 
@@ -3182,6 +3282,11 @@ export class SSHRuntime extends RemoteRuntime {
     if (abortSignal?.aborted) {
       return { success: false, error: "Rename operation aborted" };
     }
+    const sharedProjectDir = this.sharedProjectDir;
+    if (sharedProjectDir !== null) {
+      // SSH+None, like LocalRuntime: the path is the shared project directory and never moves.
+      return { success: true, oldPath: sharedProjectDir, newPath: sharedProjectDir };
+    }
     const oldPath = this.getWorkspacePath(projectPath, oldName);
     const newPath = path.posix.join(path.posix.dirname(oldPath), newName);
 
@@ -3254,6 +3359,13 @@ export class SSHRuntime extends RemoteRuntime {
     // Check if already aborted
     if (abortSignal?.aborted) {
       return { success: false, error: "Delete operation aborted" };
+    }
+
+    const sharedProjectDir = this.sharedProjectDir;
+    if (sharedProjectDir !== null) {
+      // SSH+None, like LocalRuntime: the directory is the user's project, shared by every
+      // workspace. Never delete, clean or touch its branches; succeed so the entry can go.
+      return { success: true, deletedPath: sharedProjectDir };
     }
 
     // Disable git hooks for untrusted projects
@@ -3506,6 +3618,19 @@ export class SSHRuntime extends RemoteRuntime {
 
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {
     const { projectPath, sourceWorkspaceName, newWorkspaceName, initLogger, abortSignal } = params;
+
+    const sharedProjectDir = this.sharedProjectDir;
+    if (sharedProjectDir !== null) {
+      // SSH+None, like LocalRuntime.forkWorkspace: the fork is a new conversation in the same
+      // directory. No staging dir, worktree or branch; workspaceService copies the chat history.
+      initLogger.logStep("Creating conversation fork (no isolation)");
+      const dirError = await this.checkSharedProjectDir(sharedProjectDir, abortSignal);
+      if (dirError !== null) {
+        return { success: false, error: dirError };
+      }
+      initLogger.logStep("Project directory verified");
+      return { success: true, workspacePath: sharedProjectDir };
+    }
 
     // SAFETY (workspace-deletion regression): the new workspace path is
     // computed from the *canonical* project layout, never from the source

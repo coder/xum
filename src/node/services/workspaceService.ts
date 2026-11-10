@@ -354,6 +354,7 @@ import {
   hasSrcBaseDir,
   getSrcBaseDir,
   isSSHRuntime,
+  isSshSharedProjectDirRuntime,
   isDockerRuntime,
   isDevcontainerRuntime,
 } from "@/common/types/runtime";
@@ -6153,12 +6154,24 @@ export class WorkspaceService
       return Err(initialConflict);
     }
 
+    // SSH+None runs in an existing directory on the host, so it needs that directory's path.
+    if (
+      isSshSharedProjectDirRuntime(finalRuntimeConfig) &&
+      !finalRuntimeConfig.projectDir?.trim()
+    ) {
+      return Err(
+        "Enter the project directory on the SSH host: workspaces without isolation run in it directly"
+      );
+    }
+
     const workspaceId = this.config.generateStableId();
 
-    // Local runtime doesn't need a trunk branch; worktree/SSH runtimes require it
-    const isLocalRuntime = finalRuntimeConfig.type === "local";
+    // Project-dir runtimes (local, SSH+None) check out no branch, so they need no trunk branch;
+    // worktree/SSH runtimes require it.
+    const isProjectDirRuntime =
+      finalRuntimeConfig.type === "local" || isSshSharedProjectDirRuntime(finalRuntimeConfig);
     const normalizedTrunkBranch = trunkBranch?.trim() ?? "";
-    if (!isLocalRuntime && normalizedTrunkBranch.length === 0) {
+    if (!isProjectDirRuntime && normalizedTrunkBranch.length === 0) {
       return Err("Trunk branch is required for worktree and SSH runtimes");
     }
 
@@ -6176,6 +6189,22 @@ export class WorkspaceService
             ...finalRuntimeConfig,
             srcBaseDir: resolvedSrcBaseDir,
           };
+          runtime = createRuntime(finalRuntimeConfig, {
+            projectPath: owningProjectPath,
+            workspaceId,
+          });
+        }
+      }
+      // SSH+None: persist the project directory absolute (~ expanded on the host), like srcBaseDir.
+      if (
+        isSshSharedProjectDirRuntime(finalRuntimeConfig) &&
+        finalRuntimeConfig.projectDir != null &&
+        !runtime.createFlags?.deferredRuntimeAccess
+      ) {
+        const projectDir = finalRuntimeConfig.projectDir.trim();
+        const resolvedProjectDir = await runtime.resolvePath(projectDir);
+        if (resolvedProjectDir !== finalRuntimeConfig.projectDir) {
+          finalRuntimeConfig = { ...finalRuntimeConfig, projectDir: resolvedProjectDir };
           runtime = createRuntime(finalRuntimeConfig, {
             projectPath: owningProjectPath,
             workspaceId,
@@ -14141,7 +14170,9 @@ export class WorkspaceService
           rolledBack &&
           (isWorktreeRuntime(forkedRuntimeConfig) ||
             isDevcontainerRuntime(forkedRuntimeConfig) ||
-            isSSHRuntime(forkedRuntimeConfig) ||
+            // An SSH+None fork shares the source's directory, like a local project-dir fork.
+            (isSSHRuntime(forkedRuntimeConfig) &&
+              !isSshSharedProjectDirRuntime(forkedRuntimeConfig)) ||
             isDockerRuntime(forkedRuntimeConfig) ||
             targetRuntime instanceof MultiProjectRuntime)
         ) {
