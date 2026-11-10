@@ -8,14 +8,14 @@ unset GH_DEBUG DEBUG
 #
 # Usage: ./scripts/wait_pr_codex.sh <pr_number> [--once]
 #
-# Approval is, after the latest request, an approval comment or a thumbs-up reaction, and only
-# while check_codex_comments.sh (the gate) finds nothing that blocks the head. The gate binds the
-# head through Codex's summary board: it waits while the head's board is old or still running, so a
-# reaction or receipt left from an earlier head cannot approve a head that Codex has not finished.
-# A receipt that names another head never approves, since it outlasts a push. One exception: a PR
-# with no summary board at all has nothing to bind, so there a thumbs-up, or a receipt with no
-# `Reviewed commit`, counts when nothing blocks (as before this check existed). Codex creates the
-# board at its first review and edits it in place, so a PR that Codex reviewed always has one.
+# Approval is an approval comment or a thumbs-up reaction after the latest request, while the
+# Codex comments gate counts no open review thread. The only head this script binds is the one that
+# a receipt names: its `Reviewed commit` must start the PR head (at least 10 characters), because a
+# receipt for an earlier head outlasts a push. A thumbs-up, and a receipt with no `Reviewed commit`,
+# name no head. This script does not read the summary board for them, so one that outlasts a push
+# stays an approval here, and so does one on a PR that has no summary board at all. The board
+# (head, still running, findings) is the gate's: `wait_pr_ready.sh` and the CI `Codex Comments`
+# check run it after this script.
 #
 # Output carries fixed text, counts, timestamps and GitHub IDs only. Codex comment bodies quote
 # PR code, so an approval prints the comment's time instead of its body, and findings print
@@ -506,36 +506,16 @@ CHECK_CODEX_STATUS_ONCE() {
     return 10
   fi
 
-  # The gate is the single source of truth for what blocks, and it decides before any approval
-  # counts: it paginates every comment and thread, so an unresolved thread from before the
-  # request, a failed review or a board pushed out of this script's 100-comment window fails
-  # here, and a review of the head that still runs waits. Gate 10 means Codex is still reviewing
-  # the current head and nothing else blocks.
-  case "$check_rc" in
-    0) ;;
-    10)
-      return 10
-      ;;
-    *)
-      echo ""
-      echo "$check_output"
-      return 1
-      ;;
-  esac
-
-  # A fresh quota notice can pass, but only after the gate above found nothing that blocks.
+  # A fresh quota notice may pass the gate, but only after the full findings check below.
   rate_limit_comment=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '
     include "codex_comments";
     [.[] | select(.createdAt > $request_at and .isMinimized != true and codex_usage_limit($bot))]
     | sort_by(.createdAt) | last // empty | .body // empty')
 
-  # The gate above binds the head: it waits while the head's summary board is old or still running,
-  # and fails while a finding is open. The check here only rejects a receipt that names another
-  # head, because such a receipt outlasts a push: its `Reviewed commit` must be a short SHA of at
-  # least 10 hex characters (Codex prints 10) that starts the PR head. A receipt with no
-  # `Reviewed commit` line names no head and is left to the gate. Capture the SHA at any length:
-  # a short SHA must be rejected here, not mistaken for a receipt with no line.
-  # Only the time leaves this jq: the approval comment's body is Codex text.
+  # Only the time leaves this jq: the approval comment's body is Codex text. A receipt that names a
+  # commit approves the PR head only when that short SHA, read at any length, has at least 10 hex
+  # characters (Codex prints 10) and starts the head: a shorter one is rejected, not mistaken for a
+  # receipt with no line. A receipt with no `Reviewed commit` line names no head and stays as it was.
   approval_comment_at=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" --arg head "$pr_head" '
     [.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex)))
       | select(((.body | capture("[*][*]Reviewed commit:[*][*] `(?<sha>[0-9a-f]+)`")?) // {sha: null}).sha as $sha
@@ -625,7 +605,23 @@ CHECK_CODEX_STATUS_ONCE() {
     fi
   fi
 
-  # No approval yet, and the gate above found nothing that blocks.
+  # No approval yet. The gate is the single source of truth for what blocks: it
+  # paginates every comment and thread, so an unresolved thread from before the
+  # request or a board pushed out of this script's 100-comment window still fails
+  # fast here instead of after the review ends. Gate 10 means Codex is still
+  # reviewing the current head and nothing else blocks.
+  case "$check_rc" in
+    0) ;;
+    10)
+      return 10
+      ;;
+    *)
+      echo ""
+      echo "$check_output"
+      return 1
+      ;;
+  esac
+
   if [[ -n "$rate_limit_comment" && "$codex_response_count_comments" -eq 0 ]]; then
     echo ""
     echo "✅ Codex gate passed: review skipped because usage limits were reached; no outstanding findings."
@@ -638,7 +634,7 @@ CHECK_CODEX_STATUS_ONCE() {
 
   echo ""
   echo "❌ Codex responded, but no approval signal was found after the latest '@codex review'."
-  echo "   👉 Expected either a thumbs-up reaction on the PR description or an approval comment like 'Didn't find any major issues' (a receipt for another head does not count)."
+  echo "   👉 Expected either a thumbs-up reaction on the PR description or an approval comment like 'Didn't find any major issues'."
   echo "   👉 If you expected approval, re-comment '@codex review' and run this script again."
   return 1
 }

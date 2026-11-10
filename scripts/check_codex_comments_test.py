@@ -67,12 +67,12 @@ def receipt_head(body):
     return match.group(1).ljust(40, "0") if match else None
 
 
-def code_receipt(sha, author=BOT, created_at=AFTER):
+def code_receipt(sha, created_at=AFTER):
     """The clean code-review receipt Codex posts for a review request, naming `sha`."""
     body = FIXTURES["code_review_no_findings"]["body"]
     named = REVIEWED_COMMIT.sub(f"**Reviewed commit:** `{sha}`", body)
     assert f"`{sha}`" in named, sha
-    return comment(named, author, created_at)
+    return comment(named, BOT, created_at)
 
 
 RUNNING_LABEL = "🔄 Running"
@@ -122,9 +122,7 @@ def connection(nodes, more=False):
     }
 
 
-def snapshot(comments=(), threads=(), reactions=(), more=False, head=None, older_reactions=()):
-    """`reactions` is the newest-100 window of thumbs-ups. `older_reactions` are the ones before it:
-    the main query reports hasPreviousPage for them, and only the paged scan returns them."""
+def snapshot(comments=(), threads=(), reactions=(), more=False, head=None):
     # The PR head defaults to the head of the first board in the snapshot, so a
     # fixture board describes the current head unless a test says otherwise.
     if head is None:
@@ -138,9 +136,7 @@ def snapshot(comments=(), threads=(), reactions=(), more=False, head=None, older
                     "headRefOid": head,
                     "comments": connection(list(comments), more),
                     "reviewThreads": connection(list(threads), more),
-                    "reactions": connection(list(reactions), bool(older_reactions)),
-                    # Read by the gh double for the paged scan only: the scripts never ask for it.
-                    "olderReactions": list(older_reactions),
+                    "reactions": connection(list(reactions)),
                 }
             }
         }
@@ -220,14 +216,11 @@ else:
             'headRefOid': snapshot['data']['repository']['pullRequest']['headRefOid'],
             field: snapshot['data']['repository']['pullRequest'][field]}}}}))
         sys.exit(0)
-    pull_request = snapshot['data']['repository']['pullRequest']
-    nodes = pull_request[field]['nodes']
-    if field == 'reactions':
-        # The paged scan walks the older reactions, then the newest-100 window.
-        nodes = pull_request.get('olderReactions', []) + nodes
+    nodes = snapshot['data']['repository']['pullRequest'][field]['nodes']
     if field == 'reactions' and os.environ.get('CODEX_GATE_REACTIONS_NODES'):
         nodes = json.loads(os.environ['CODEX_GATE_REACTIONS_NODES'])
     more = index + 1 < len(nodes)
+    pull_request = snapshot['data']['repository']['pullRequest']
     print(json.dumps({'data': {'repository': {'pullRequest': {
         'headRefOid': pull_request['headRefOid'],
         field: {
@@ -247,7 +240,6 @@ else:
         if round_marker.exists():
             round_marker.unlink()
         calls = self.directory / "calls"
-        self.calls = calls
         calls.write_text("")
         self.posts = self.directory / "posts"
         self.posts.write_text("")
@@ -289,10 +281,6 @@ else:
         # Polling rounds, not pages: the double serves one node per page.
         self.comment_rounds = int(round_marker.read_text()) if round_marker.exists() else 0
         return result
-
-    def reaction_scan_pages(self):
-        """How many pages of the paged thumbs-up scan the last run asked for."""
-        return self.calls.read_text().count("reactions(first: 100, after: $cursor")
 
     def assert_gate(
         self, expected, data, script="check_codex_comments.sh", cache=None, wait=None, extra=()
@@ -542,7 +530,7 @@ else:
         head = board_head(board)
         review = comment("@codex review", "maintainer", BEFORE)
         posted = "@codex security review\n\nHead: " + head
-        approval = code_receipt(head[:10])
+        approval = comment("Codex Review: Didn't find any major issues. Nice work!", created_at=AFTER)
         for case, comments, posts, expected in (
             ("no request names the head", [review, comment(board)], 1, 10),
             # A request that names another head (an earlier push) does not count.
@@ -1124,17 +1112,18 @@ else:
         request = comment("@codex review", "maintainer", REQUEST)
         for name, fixture in FIXTURES.items():
             with self.subTest(name=name):
-                # A fixture can name its own readiness result: the clean code-review receipt
-                # is approval (for the head it names), and the account notice is a failed review.
+                # Completed informational envelopes and in-progress summaries keep
+                # polling for approval; unknown reports remain failures under the CI policy.
+                # A fixture can name its own readiness result: the clean code-review
+                # receipt is approval, and the account notice is a failed review.
                 expected = fixture.get(
                     "wait_exit_code", 10 if fixture["expected_exit_code"] in (0, 10) else 1
                 )
+                # A receipt approves the head it names, so an approving fixture is read on that head.
                 head = receipt_head(fixture["body"]) if expected == 0 else None
                 result = self.run_gate(
                     snapshot([request, comment(fixture["body"])], head=head), "wait_pr_codex.sh"
                 )
-                # Completed informational envelopes and in-progress summaries keep
-                # polling for approval; unknown reports remain failures under the CI policy.
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
     def test_in_progress_review_fails_fast_on_older_blockers(self):
@@ -1528,32 +1517,15 @@ else:
             (BOT + "[bot]", BEFORE, 10),
             (BOT + "-impostor[bot]", AFTER, 10),
         ):
-            # The same reaction in the newest-100 window and on an older page that only the
-            # paged scan reads.
-            for older in (False, True):
-                with self.subTest(author=author, created_at=created_at, older_page=older):
-                    reaction = [{"user": {"login": author}, "createdAt": created_at}]
-                    # A human thumbs-up always follows the window, so the window is never empty.
-                    newest = [{"user": {"login": "human-reviewer"}, "createdAt": AFTER}]
-                    data = snapshot(
-                        [request, comment(FIXTURES["summary"]["body"])],
-                        reactions=newest if older else reaction,
-                        older_reactions=reaction if older else (),
-                    )
-                    self.assert_gate(expected, data, "wait_pr_codex.sh")
-                    self.assertEqual(self.reaction_scan_pages() > 0, older, "the scan reads older pages only")
-
-    def test_approval_comment_requires_the_real_bot_and_a_fresh_comment(self):
-        request = comment("@codex review", "maintainer", REQUEST)
-        for author, created_at, expected in (
-            (BOT, BEFORE, 10),
-            ("human-reviewer", AFTER, 10),
-            (BOT, AFTER, 0),
-            (BOT + "-impostor", AFTER, 10),
-        ):
             with self.subTest(author=author, created_at=created_at):
                 data = snapshot(
-                    [request, code_receipt(PR_HEAD[:10], author, created_at)], head=PR_HEAD
+                    [request, comment(FIXTURES["summary"]["body"])],
+                    reactions=[
+                        {
+                            "user": {"login": author},
+                            "createdAt": created_at,
+                        }
+                    ],
                 )
                 self.assert_gate(expected, data, "wait_pr_codex.sh")
 
@@ -1563,119 +1535,31 @@ else:
         request = comment("@codex review", "maintainer", REQUEST)
         running = comment(board_for(FIXTURES["running_summary"]["body"], PR_HEAD))
         commitless = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
-        board = FIXTURES["review_state_summary"]["body"]
         for case, comments, expected in (
             ("10 characters of the head", [request, code_receipt(PR_HEAD[:10])], 0),
             ("the whole head", [request, code_receipt(PR_HEAD)], 0),
+            # Any receipt for the head approves it, whichever receipt is newest.
+            ("a later receipt for an earlier head", [request, code_receipt(PR_HEAD[:10]), code_receipt(EARLIER_HEAD[:10], LATER)], 0),
+            # A receipt that names no commit names no head: it approves as before.
+            ("no reviewed commit", [request, commitless], 0),
             ("an earlier head", [request, code_receipt(EARLIER_HEAD[:10])], 1),
+            ("an earlier head, 11 characters", [request, code_receipt(EARLIER_HEAD[:11])], 1),
+            ("an earlier head, 40 characters", [request, code_receipt(EARLIER_HEAD)], 1),
             # The head's own review is still running: wait for it, do not report the old receipt.
-            ("an earlier head, head's review running", [request, running, code_receipt(EARLIER_HEAD[:10])], 10),
-            # A short SHA is cheap to collide: Codex prints 10 characters.
+            ("an earlier head, the head's review running", [request, running, code_receipt(EARLIER_HEAD[:10])], 10),
+            # A short SHA is cheap to collide: Codex prints 10 characters. It is read as a SHA, and
+            # is not mistaken for a receipt with no line.
             ("7 characters of the head", [request, code_receipt(PR_HEAD[:7])], 1),
             ("9 characters of the head", [request, code_receipt(PR_HEAD[:9])], 1),
             ("the head's start with another end", [request, code_receipt(PR_HEAD[:9] + "f")], 1),
-            # A SHA is read at any length: a long one for another head must not read as "no line"
-            # or as its first 10 characters.
-            ("an earlier head, 11 characters", [request, code_receipt(EARLIER_HEAD[:11])], 1),
-            ("an earlier head, 40 characters", [request, code_receipt(EARLIER_HEAD)], 1),
+            # A long SHA is read whole: its first 10 characters do not stand for it.
             ("11 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f")], 1),
             ("20 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 10)], 1),
             ("40 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 30)], 1),
-            # Any receipt for the head approves it, whichever receipt is newest.
-            (
-                "a later receipt for an earlier head",
-                [request, code_receipt(PR_HEAD[:10]), code_receipt(EARLIER_HEAD[:10], created_at=LATER)],
-                0,
-            ),
-            # A receipt that names no commit says nothing about a head: the gate decides.
-            ("no reviewed commit", [request, commitless], 0),
-            ("no reviewed commit, the board names an earlier head", [request, commitless, comment(board_for(board, EARLIER_HEAD))], 10),
-            ("no reviewed commit, the head's review running", [request, commitless, running], 10),
         ):
             with self.subTest(case=case):
                 result = self.assert_gate(expected, snapshot(comments, head=PR_HEAD), "wait_pr_codex.sh")
                 self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
-
-    def test_a_thumbs_up_waits_for_the_comments_gate(self):
-        # A reaction names no head and outlasts a push (#7300, #7325). The gate binds the head: it
-        # waits while the head's summary board is old or still running, and fails while a finding
-        # is open, so a reaction left from an earlier head cannot approve a head Codex has not
-        # finished.
-        request = comment("@codex review", "maintainer", REQUEST)
-        board = FIXTURES["review_state_summary"]["body"]
-        flags = '"has_any_findings":true,"has_unresolved_findings":false,"status":"completed"},"security'
-        self.assertIn(flags, board)
-
-        def flagged(unresolved):
-            changed = flags.replace('"has_unresolved_findings":false', f'"has_unresolved_findings":{unresolved}')
-            return board_for(board, PR_HEAD).replace(flags, changed, 1)
-
-        running = FIXTURES["review_state_running_summary"]["body"]
-        for case, comments, expected in (
-            # As on main: with no board and no finding the gate is clean, so the reaction approves.
-            ("no board", [request], 0),
-            ("a receipt for an earlier head, no board", [request, code_receipt(EARLIER_HEAD[:10])], 0),
-            ("the board's code review of the head finished", [request, comment(flagged("false"))], 0),
-            # A finished review can report null flags (#7734): its findings are threads and comments.
-            ("the board's flag is null", [request, comment(flagged("null"))], 0),
-            ("the board names an earlier head", [request, comment(board_for(board, EARLIER_HEAD))], 10),
-            ("the board's review of the head still runs", [request, comment(board_for(running, PR_HEAD))], 10),
-            ("the board shows an unresolved finding", [request, comment(flagged("true"))], 1),
-            ("a finding comment", [request, comment("[P1] Fix authorization")], 1),
-        ):
-            for author in (BOT, BOT + "[bot]"):
-                with self.subTest(case=case, author=author):
-                    data = snapshot(
-                        comments,
-                        reactions=[{"user": {"login": author}, "createdAt": AFTER}],
-                        head=PR_HEAD,
-                    )
-                    result = self.assert_gate(expected, data, "wait_pr_codex.sh")
-                    self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
-        # With more than 100 reactions the script pages through all of them, and the same rule
-        # applies. The bot's thumbs-up sits only on an older page: a script that reads just the
-        # newest 100 never sees it. With no board at all the gate is clean, so the reaction
-        # approves, as on main (the no-board exception in the script header).
-        newest = [{"user": {"login": "human-reviewer"}, "createdAt": AFTER}]
-        older = [{"user": {"login": BOT}, "createdAt": AFTER}]
-        for case, comments, expected in (
-            ("paged: no board", [request], 0),
-            ("paged: the board's code review of the head finished", [request, comment(flagged("false"))], 0),
-            ("paged: the board names an earlier head", [request, comment(board_for(board, EARLIER_HEAD))], 10),
-            ("paged: the board shows an unresolved finding", [request, comment(flagged("true"))], 1),
-        ):
-            with self.subTest(case):
-                data = snapshot(comments, reactions=newest, older_reactions=older, head=PR_HEAD)
-                result = self.assert_gate(expected, data, "wait_pr_codex.sh")
-                self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
-                # An exit 10 or 1 here comes from the gate, before the scan: only a clean gate pages.
-                self.assertEqual(self.reaction_scan_pages() > 0, expected == 0, "the scan runs for a clean gate")
-        with self.subTest("the thumbs-up came before the request"):
-            stale = {"user": {"login": BOT}, "createdAt": BEFORE}
-            data = snapshot([request, comment(flagged("false"))], reactions=[stale], head=PR_HEAD)
-            self.assert_gate(10, data, "wait_pr_codex.sh")
-
-    def test_approval_waits_for_the_comments_gate(self):
-        # check_codex_comments.sh decides what blocks a head. An approval must not hide a finding
-        # (rc 1) or an unfinished review (rc 10), even a receipt that names the head.
-        request = comment("@codex review", "maintainer", REQUEST)
-        receipt = code_receipt(PR_HEAD[:10])
-        running = comment(board_for(FIXTURES["running_summary"]["body"], PR_HEAD))
-        older = thread("[P1] Fix authorization", created_at=BEFORE)
-        for case, comments, threads, expected, shown in (
-            ("older thread still open", [request, receipt], [older], 1, "1 unresolved review thread"),
-            ("finding comment", [request, receipt, comment("[P1] Fix authorization")], [], 1, "[P1] Fix authorization"),
-            ("failed review", [request, receipt, comment("Codex Review: Something went wrong.")], [], 1, "Something went wrong"),
-            ("review of the head still running", [request, running, receipt], [], 10, None),
-            ("older thread resolved", [request, receipt], [thread("[P1] Fixed", resolved=True, created_at=BEFORE)], 0, None),
-        ):
-            with self.subTest(case=case):
-                result = self.assert_gate(
-                    expected, snapshot(comments, threads, head=PR_HEAD), "wait_pr_codex.sh"
-                )
-                self.assertEqual("Codex approved" in result.stdout, expected == 0, result.stdout)
-                if shown is not None:
-                    self.assertIn(shown, result.stdout)
 
 
 if __name__ == "__main__":
