@@ -18,7 +18,7 @@ export function projectRuntimeEnablement(
   const hasOverrides =
     project.runtimeOverridesEnabled === true ||
     Boolean(project.runtimeEnablement) ||
-    project.defaultRuntime !== undefined;
+    project.defaultIsolation !== undefined;
   return hasOverrides ? normalizeRuntimeEnablement(project.runtimeEnablement) : global;
 }
 

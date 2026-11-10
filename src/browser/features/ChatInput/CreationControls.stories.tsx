@@ -21,11 +21,8 @@ import {
   type ParsedRuntime,
   type RuntimeAvailabilityStatus,
 } from "@/common/types/runtime";
-import {
-  CreationControls,
-  RuntimeButtonGroup,
-  type RuntimeButtonGroupProps,
-} from "./CreationControls";
+import type { CoderInfo } from "@/common/orpc/schemas/coder";
+import { CreationControls } from "./CreationControls";
 import type { RuntimeAvailabilityState } from "./useCreationWorkspace";
 import {
   SettingsSectionStory,
@@ -86,30 +83,6 @@ const DEVCONTAINER_MULTI_CONFIG = getLoadedRuntimeAvailability({
   ],
 });
 
-const BASE_ARGS = {
-  value: RUNTIME_MODE.WORKTREE,
-  defaultMode: RUNTIME_MODE.WORKTREE,
-  onChange: fn(),
-  runtimeAvailabilityState: getLoadedRuntimeAvailability({ available: true }),
-} satisfies RuntimeButtonGroupProps;
-
-const meta = {
-  ...lightweightMeta,
-  title: "App/Chat/Creation Controls",
-  component: RuntimeButtonGroup,
-  render: (args) => (
-    <div className="bg-background p-6">
-      <div className="w-full max-w-64">
-        <RuntimeButtonGroup {...args} />
-      </div>
-    </div>
-  ),
-} satisfies Meta<typeof RuntimeButtonGroup>;
-
-export default meta;
-
-type Story = StoryObj<typeof meta>;
-
 type CreationControlsProps = ComponentProps<typeof CreationControls>;
 
 const DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS: Omit<
@@ -122,7 +95,6 @@ const DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS: Omit<
   onTrunkBranchChange: fn(),
   coderConfigFallback: {},
   sshHostFallback: "devbox.internal",
-  defaultRuntimeMode: RUNTIME_MODE.WORKTREE,
   disabled: false,
   projectPath: "/home/user/projects/my-app",
   userProjects: new Map(),
@@ -164,22 +136,64 @@ function DevcontainerCreationControlsStory(props: {
   );
 }
 
-async function openWorkspaceTypeMenu(storyRoot: HTMLElement): Promise<void> {
+/** The project and workspace isolation selects, driven by a real selection state. */
+function IsolationPickerStory(props: {
+  runtimeAvailabilityState: RuntimeAvailabilityState;
+  coderInfo?: CoderInfo | null;
+  initialRuntime?: ParsedRuntime;
+}) {
+  const [selectedRuntime, setSelectedRuntime] = useState<ParsedRuntime>(
+    props.initialRuntime ?? { mode: RUNTIME_MODE.WORKTREE }
+  );
+
+  return (
+    <SettingsSectionStory setup={() => setupSettingsStory({})}>
+      <div className="bg-background p-6">
+        <div className="max-w-3xl">
+          <CreationControls
+            {...DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS}
+            selectedRuntime={selectedRuntime}
+            onSelectedRuntimeChange={setSelectedRuntime}
+            runtimeAvailabilityState={props.runtimeAvailabilityState}
+            coderInfo={props.coderInfo}
+          />
+        </div>
+      </div>
+    </SettingsSectionStory>
+  );
+}
+
+const meta = {
+  ...lightweightMeta,
+  title: "App/Chat/Creation Controls",
+  component: IsolationPickerStory,
+  args: {
+    runtimeAvailabilityState: getLoadedRuntimeAvailability({ available: true }),
+  },
+} satisfies Meta<typeof IsolationPickerStory>;
+
+export default meta;
+
+type Story = StoryObj<typeof meta>;
+
+async function openIsolationMenu(
+  storyRoot: HTMLElement,
+  axis: "Project isolation" | "Workspace isolation"
+): Promise<void> {
   const canvas = within(storyRoot);
-  const trigger = await canvas.findByLabelText("Workspace type", {}, { timeout: 10000 });
+  const trigger = await canvas.findByLabelText(axis, {}, { timeout: 10000 });
   await userEvent.click(trigger);
 }
 
 /** Coder option is visible and selectable when Coder CLI is available. */
 export const CoderAvailable: Story = {
   args: {
-    ...BASE_ARGS,
     coderInfo: mockCoderInfoAvailable,
   },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openWorkspaceTypeMenu(storyRoot);
+    await openIsolationMenu(storyRoot, "Project isolation");
     await within(document.body).findByRole("option", { name: /^Coder/i }, { timeout: 10000 });
     await userEvent.keyboard("{Escape}");
   },
@@ -188,13 +202,12 @@ export const CoderAvailable: Story = {
 /** Coder option is hidden when Coder CLI is missing. */
 export const CoderNotAvailable: Story = {
   args: {
-    ...BASE_ARGS,
     coderInfo: mockCoderInfoMissing,
   },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openWorkspaceTypeMenu(storyRoot);
+    await openIsolationMenu(storyRoot, "Project isolation");
     await within(document.body).findByRole("option", { name: /^SSH/i }, { timeout: 10000 });
     await expect(within(document.body).queryByRole("option", { name: /^Coder/i })).toBeNull();
     await userEvent.keyboard("{Escape}");
@@ -204,13 +217,12 @@ export const CoderNotAvailable: Story = {
 /** Coder option remains visible but disabled when CLI version is outdated. */
 export const CoderOutdated: Story = {
   args: {
-    ...BASE_ARGS,
     coderInfo: mockCoderInfoOutdated,
   },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openWorkspaceTypeMenu(storyRoot);
+    await openIsolationMenu(storyRoot, "Project isolation");
     const coderOption = await within(document.body).findByRole(
       "option",
       { name: /^Coder/i },
@@ -227,19 +239,47 @@ export const CoderOutdated: Story = {
 /** Dev container runtime unavailable (option remains visible but disabled). */
 export const DevcontainerUnavailable: Story = {
   args: {
-    ...BASE_ARGS,
     runtimeAvailabilityState: DEVCONTAINER_UNAVAILABLE,
   },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
 
-    await openWorkspaceTypeMenu(storyRoot);
+    await openIsolationMenu(storyRoot, "Workspace isolation");
 
     const devcontainerOption = await within(document.body).findByRole("option", {
       name: /^Dev container/i,
     });
 
     await expect(devcontainerOption).toHaveAttribute("aria-disabled", "true");
+    await userEvent.keyboard("{Escape}");
+  },
+};
+
+/**
+ * SSH with no workspace isolation runs in an existing directory on the host. The containers have no
+ * SSH backend yet, so they stay listed but disabled with the reason.
+ */
+export const SshWithoutIsolation: Story = {
+  args: {
+    initialRuntime: {
+      mode: "ssh",
+      host: "devbox.internal",
+      workspaceIsolation: "none",
+      projectDir: "~/src/my-app",
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const canvas = within(storyRoot);
+
+    await expect(
+      await canvas.findByLabelText("Project directory on host", {}, { timeout: 10000 })
+    ).toHaveValue("~/src/my-app");
+
+    await openIsolationMenu(storyRoot, "Workspace isolation");
+    const dockerOption = await within(document.body).findByRole("option", { name: /^Docker/i });
+    await expect(dockerOption).toHaveAttribute("aria-disabled", "true");
+    await expect(dockerOption).toHaveTextContent("Not yet supported on SSH projects");
     await userEvent.keyboard("{Escape}");
   },
 };
@@ -337,7 +377,6 @@ const CREATION_ERROR_BASE_CONTROLS_PROPS = {
   selectedRuntime: { mode: RUNTIME_MODE.WORKTREE },
   coderConfigFallback: {},
   sshHostFallback: "devbox",
-  defaultRuntimeMode: RUNTIME_MODE.WORKTREE,
   onSelectedRuntimeChange: fn(),
   disabled: false,
   projectPath: CREATION_PROJECT_PATH,
@@ -345,7 +384,7 @@ const CREATION_ERROR_BASE_CONTROLS_PROPS = {
   onSelectedProjectPathChange: fn(),
   projectSelectDisabled: false,
   projectName: "my-project",
-  runtimeAvailabilityState: BASE_ARGS.runtimeAvailabilityState,
+  runtimeAvailabilityState: getLoadedRuntimeAvailability({ available: true }),
   nameState: BASE_CREATION_NAME_STATE,
 } satisfies CreationControlsProps;
 

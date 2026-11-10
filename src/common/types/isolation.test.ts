@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
+  DEFAULT_ISOLATION,
   PROJECT_ISOLATIONS,
   WORKSPACE_ISOLATIONS,
   isIsolationSupported,
+  isolationFromRuntimeConfig,
   isolationFromRuntimeId,
   nearestSupportedIsolation,
   normalizeIsolationChoice,
@@ -18,18 +20,56 @@ describe("isolation ↔ runtime id mapping", () => {
     expect(runtimeIdFromIsolation(choice)).toBe(id);
   });
 
-  it("maps every supported pair to a distinct runtime id that maps back to the pair", () => {
+  it("maps every supported pair to a runtime id on the same project axis", () => {
     const seen = new Set<string>();
     for (const project of PROJECT_ISOLATIONS) {
       for (const workspace of WORKSPACE_ISOLATIONS) {
         const id = runtimeIdFromIsolation({ project, workspace });
         if (id === null) continue;
-        expect(seen.has(id)).toBe(false);
         seen.add(id);
-        expect(isolationFromRuntimeId(id)).toEqual({ project, workspace });
+        // SSH+None shares the "ssh" runtime id; the id maps back to the pre-split default.
+        expect(isolationFromRuntimeId(id).project).toBe(project);
       }
     }
     expect([...seen].sort()).toEqual([...RUNTIME_ENABLEMENT_IDS].sort());
+    expect(isolationFromRuntimeId("ssh")).toEqual({ project: "ssh", workspace: "worktree" });
+    expect(isIsolationSupported({ project: "ssh", workspace: "none" })).toBe(true);
+  });
+});
+
+describe("isolationFromRuntimeConfig", () => {
+  it("reads both axes from persisted runtime configs", () => {
+    expect(isolationFromRuntimeConfig(undefined)).toEqual(DEFAULT_ISOLATION);
+    expect(isolationFromRuntimeConfig({ type: "local" })).toEqual({
+      project: "local",
+      workspace: "none",
+    });
+    // Legacy worktree configs were written as "local" with a srcBaseDir.
+    expect(isolationFromRuntimeConfig({ type: "local", srcBaseDir: "~/.mux/src" })).toEqual({
+      project: "local",
+      workspace: "worktree",
+    });
+    expect(isolationFromRuntimeConfig({ type: "ssh", host: "h", srcBaseDir: "~/mux" })).toEqual({
+      project: "ssh",
+      workspace: "worktree",
+    });
+    expect(
+      isolationFromRuntimeConfig({
+        type: "ssh",
+        host: "h",
+        srcBaseDir: "~/mux",
+        workspaceIsolation: "none",
+        projectDir: "~/src/app",
+      })
+    ).toEqual({ project: "ssh", workspace: "none" });
+    expect(
+      isolationFromRuntimeConfig({
+        type: "ssh",
+        host: "coder://",
+        srcBaseDir: "~/mux",
+        coder: { existingWorkspace: false },
+      })
+    ).toEqual({ project: "coder", workspace: "worktree" });
   });
 });
 

@@ -37,7 +37,7 @@ import {
 } from "@/common/utils/drafts";
 
 import type { CoderWorkspaceConfig, ParsedRuntime } from "@/common/types/runtime";
-import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
+import { DEFAULT_ISOLATION, type IsolationChoice } from "@/common/types/isolation";
 import type {
   FrontendWorkspaceMetadata,
   WorkspaceActivitySnapshot,
@@ -2746,7 +2746,7 @@ function createDraftSettingsHarness(
     selectedRuntime: ParsedRuntime;
     trunkBranch: string;
     runtimeString?: string | undefined;
-    defaultRuntimeMode?: RuntimeChoice;
+    defaultIsolation?: IsolationChoice;
     agentId?: string;
     reasoningMode?: DraftWorkspaceSettings["reasoningMode"];
     coderConfigFallback?: CoderWorkspaceConfig;
@@ -2755,7 +2755,7 @@ function createDraftSettingsHarness(
 ) {
   const state = {
     selectedRuntime: initial?.selectedRuntime ?? { mode: "local" as const },
-    defaultRuntimeMode: initial?.defaultRuntimeMode ?? "worktree",
+    defaultIsolation: initial?.defaultIsolation ?? DEFAULT_ISOLATION,
     agentId: initial?.agentId ?? "exec",
     reasoningMode: initial?.reasoningMode ?? "standard",
     trunkBranch: initial?.trunkBranch ?? "main",
@@ -2764,7 +2764,7 @@ function createDraftSettingsHarness(
     sshHostFallback: initial?.sshHostFallback ?? "",
   } satisfies {
     selectedRuntime: ParsedRuntime;
-    defaultRuntimeMode: RuntimeChoice;
+    defaultIsolation: IsolationChoice;
     agentId: string;
     reasoningMode: DraftWorkspaceSettings["reasoningMode"];
     trunkBranch: string;
@@ -2809,7 +2809,7 @@ function createDraftSettingsHarness(
         reasoningMode: state.reasoningMode,
         agentId: state.agentId,
         selectedRuntime: state.selectedRuntime,
-        defaultRuntimeMode: state.defaultRuntimeMode,
+        defaultIsolation: state.defaultIsolation,
         trunkBranch: state.trunkBranch,
       };
       return {

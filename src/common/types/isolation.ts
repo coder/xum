@@ -163,6 +163,32 @@ export function isolationFromRuntimeConfig(config: RuntimeConfig | undefined): I
   }
 }
 
+/**
+ * The pair to use when Settings disable part of `choice`: keep it if both axes are enabled and
+ * supported, else keep the project and prefer worktree, else fall back to a Local pair. Null
+ * when nothing enabled is supported (Settings keep at least one workspace isolation enabled).
+ */
+export function resolveEnabledIsolation(
+  choice: IsolationChoice,
+  enablement: RuntimeEnablement
+): IsolationChoice | null {
+  const isUsable = (candidate: IsolationChoice) =>
+    isIsolationSupported(candidate) &&
+    isProjectIsolationEnabled(enablement, candidate.project) &&
+    isWorkspaceIsolationEnabled(enablement, candidate.workspace);
+  if (isUsable(choice)) {
+    return choice;
+  }
+  const workspaces = [choice.workspace, DEFAULT_ISOLATION.workspace, ...WORKSPACE_ISOLATIONS];
+  for (const project of [choice.project, "local" as const]) {
+    const workspace = workspaces.find((candidate) => isUsable({ project, workspace: candidate }));
+    if (workspace) {
+      return { project, workspace };
+    }
+  }
+  return null;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -3,6 +3,7 @@
  *
  * Creates a client that matches the AppRouter interface with configurable mock data.
  */
+import { isolationFromRuntimeId, type IsolationChoice } from "@/common/types/isolation";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
 import type { MCPSettingValue, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
@@ -216,6 +217,7 @@ export interface MockORPCClientOptions {
   /** Initial runtime enablement for config.getConfig */
   runtimeEnablement?: Record<string, boolean>;
   /** Initial default runtime for config.getConfig (global) */
+  /** Legacy flat default runtime, converted to the served defaultIsolation (stories stay terse). */
   defaultRuntime?: RuntimeEnablementId | null;
   /** Initial global heartbeat default prompt for config.getConfig */
   heartbeatDefaultPrompt?: string;
@@ -746,7 +748,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     devcontainer: true,
   };
 
-  let defaultRuntime: RuntimeEnablementId | null = initialDefaultRuntime ?? null;
+  let defaultIsolation: IsolationChoice | null =
+    initialDefaultRuntime != null ? isolationFromRuntimeId(initialDefaultRuntime) : null;
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
   let agentResourceLimitsState =
@@ -977,7 +980,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           coderWorkspaceArchiveBehavior,
           worktreeArchiveBehavior,
           runtimeEnablement,
-          defaultRuntime,
+          defaultIsolation,
           agentAiDefaults,
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
@@ -1133,11 +1136,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       updateRuntimeEnablement: (input: {
         projectPath?: string | null;
         runtimeEnablement?: Record<string, boolean> | null;
-        defaultRuntime?: RuntimeEnablementId | null;
+        defaultIsolation?: IsolationChoice | null;
         runtimeOverridesEnabled?: boolean | null;
       }) => {
         const shouldUpdateRuntimeEnablement = input.runtimeEnablement !== undefined;
-        const shouldUpdateDefaultRuntime = input.defaultRuntime !== undefined;
+        const shouldUpdateDefaultIsolation = input.defaultIsolation !== undefined;
         const shouldUpdateOverridesEnabled = input.runtimeOverridesEnabled !== undefined;
         const projectPath = input.projectPath?.trim();
 
@@ -1171,11 +1174,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               }
             }
 
-            if (shouldUpdateDefaultRuntime) {
-              if (input.defaultRuntime !== null && input.defaultRuntime !== undefined) {
-                nextProject.defaultRuntime = input.defaultRuntime;
+            if (shouldUpdateDefaultIsolation) {
+              if (input.defaultIsolation != null) {
+                nextProject.defaultIsolation = input.defaultIsolation;
               } else {
-                delete nextProject.defaultRuntime;
+                delete nextProject.defaultIsolation;
               }
             }
 
@@ -1201,8 +1204,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           }
         }
 
-        if (shouldUpdateDefaultRuntime) {
-          defaultRuntime = input.defaultRuntime ?? null;
+        if (shouldUpdateDefaultIsolation) {
+          defaultIsolation = input.defaultIsolation ?? null;
         }
 
         notifyConfigChanged();

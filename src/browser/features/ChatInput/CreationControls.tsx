@@ -463,13 +463,10 @@ function CreationControlsContent(props: CreationControlsProps) {
   usePerfRenderMarker("chat-input.creation-controls");
   const { nameState, runtimeAvailabilityState } = props;
 
-  // Extract mode from discriminated union for convenience
-  const runtimeMode = props.selectedRuntime.mode;
   const { selectedRuntime, onSelectedRuntimeChange } = props;
-  // Coder is surfaced as a separate runtime option while keeping SSH as the config mode.
+  // Coder is surfaced as its own project isolation while keeping SSH as the config mode.
   const isCoderSelected =
     selectedRuntime.mode === RUNTIME_MODE.SSH && selectedRuntime.coder != null;
-  const runtimeChoice: RuntimeChoice = isCoderSelected ? "coder" : runtimeMode;
   // The two-axis view of the selection; ParsedRuntime stays the source of truth.
   const currentIsolation = isolationFromRuntimeConfig(buildRuntimeConfig(selectedRuntime));
   const isSshNoneSelected =
