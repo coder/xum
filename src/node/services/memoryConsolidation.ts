@@ -653,13 +653,33 @@ export function createConsolidationMemoryTool(args: {
 }
 
 /**
- * The step ceiling of an organizer run: 4 steps for each edit (today's 32 steps for the default 8),
- * never below MEMORY_CONSOLIDATION_MAX_STEPS, so a raised limit can be spent. No edit limit means
- * no step ceiling: the run timeout and the cost ceiling end the run.
+ * What an organizer run's edit limit sets: the memory tool's budget, the line of the run prompt
+ * that states it (dream.md names no number, and a user's own dream definition may not either), and
+ * the step ceiling. Absent (the debug CLI) is the default limit; `null` is no limit.
+ *
+ * The step ceiling is 4 steps for each edit (today's 32 steps for the default 8), never below
+ * MEMORY_CONSOLIDATION_MAX_STEPS, so a raised limit can be spent. No limit is an endless budget
+ * and no step ceiling: the run timeout and the cost ceiling end the run. Infinity never reaches a
+ * record: tryConsume() never hits it, and the result keeps only `budgetExhausted`.
  */
-export function organizerStepCeiling(editLimit: number | null): Array<StopCondition<ToolSet>> {
-  if (editLimit === null) return [];
-  return [stepCountIs(Math.max(MEMORY_CONSOLIDATION_MAX_STEPS, 4 * editLimit))];
+export function organizerEditBudget(editLimit: number | null | undefined): {
+  budget: MutationBudget;
+  promptLine: string;
+  stepCeiling: Array<StopCondition<ToolSet>>;
+} {
+  const limit = editLimit === undefined ? MEMORY_CONSOLIDATION_OP_BUDGET : editLimit;
+  if (limit === null) {
+    return {
+      budget: createMutationBudget(Number.POSITIVE_INFINITY),
+      promptLine: "This run has no edit limit.",
+      stepCeiling: [],
+    };
+  }
+  return {
+    budget: createMutationBudget(limit),
+    promptLine: `You have ${limit} mutating commands this run.`,
+    stepCeiling: [stepCountIs(Math.max(MEMORY_CONSOLIDATION_MAX_STEPS, 4 * limit))],
+  };
 }
 
 /**
@@ -706,12 +726,10 @@ export async function runMemoryConsolidation(args: {
   editLimit?: number | null;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
-  const editLimit = args.editLimit === undefined ? MEMORY_CONSOLIDATION_OP_BUDGET : args.editLimit;
+  const editBudget = organizerEditBudget(args.editLimit);
   const journal: MemoryConsolidationOp[] = [];
   const { tool: memoryTool, isBudgetExhausted } = createConsolidationMemoryTool({
-    // No limit is an endless budget: tryConsume() never reaches Infinity, and the budget's
-    // limit is never persisted (the record keeps only `budgetExhausted`).
-    budget: createMutationBudget(editLimit ?? Number.POSITIVE_INFINITY),
+    budget: editBudget.budget,
     memoryService: args.memoryService,
     metaService: args.metaService,
     ctx: args.ctx,
@@ -739,22 +757,15 @@ export async function runMemoryConsolidation(args: {
         finalPassNoSecrets;
 
   const meter = createSpendMeter({ pricingModel: args.pricingModel, ceilingUsd: args.ceilingUsd });
-  // The prompt states the budget, so a raised limit reaches the model (dream.md names no number,
-  // and a user's own dream definition may not either).
-  const budgetPrompt =
-    editLimit === null
-      ? " This run has no edit limit."
-      : ` You have ${editLimit} mutating commands this run.`;
   const stream = streamText({
     model: args.model,
     system: args.agentBody,
     prompt:
-      "Run a memory-consolidation pass now." +
-      budgetPrompt +
+      `Run a memory-consolidation pass now. ${editBudget.promptLine}` +
       " Survey the memory directories, then apply the highest-value cleanups within budget." +
       finalPassPrompt,
     tools: { memory: memoryTool },
-    stopWhen: [...organizerStepCeiling(editLimit), meter.stopIfCeilingReached],
+    stopWhen: [...editBudget.stepCeiling, meter.stopIfCeilingReached],
     onStepEnd: meter.recordStep,
     maxOutputTokens: meter.maxOutputTokens,
     abortSignal: args.abortSignal,

@@ -20,6 +20,7 @@ import { Config } from "@/node/config";
 import {
   createConsolidationMemoryTool,
   createMutationBudget,
+  organizerEditBudget,
   runMemoryConsolidation,
   type MemoryConsolidationOp,
 } from "./memoryConsolidation";
@@ -1450,6 +1451,28 @@ describe("consolidation memory tool rails", () => {
     expect(fixture.journal).toHaveLength(1);
     expect(fixture.journal[0]?.applied).toBe(false);
     expect(fixture.journal[0]?.note).toBeDefined();
+  });
+});
+
+describe("organizerEditBudget", () => {
+  it.each([
+    [undefined, MEMORY_CONSOLIDATION_OP_BUDGET],
+    [24, 24],
+    [1, 1],
+  ])("gives a limit of %p a budget of %p and a prompt line that says so", (editLimit, limit) => {
+    const editBudget = organizerEditBudget(editLimit);
+
+    expect(editBudget.budget.limit).toBe(limit);
+    expect(editBudget.promptLine).toBe(`You have ${limit} mutating commands this run.`);
+    expect(editBudget.stepCeiling).toHaveLength(1);
+  });
+
+  it("gives no limit an endless budget and no step ceiling", () => {
+    const editBudget = organizerEditBudget(null);
+
+    for (let i = 0; i < 1000; i++) expect(editBudget.budget.tryConsume()).toBe(true);
+    expect(editBudget.promptLine).toBe("This run has no edit limit.");
+    expect(editBudget.stepCeiling).toEqual([]);
   });
 });
 
