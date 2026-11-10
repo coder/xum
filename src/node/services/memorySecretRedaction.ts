@@ -14,6 +14,9 @@
 /** What a redacted value becomes. */
 export const REDACTED = "[redacted]";
 
+/** The marker without its closing bracket: what a value pattern that stops before `]` reads of it. */
+const MARKER_HEAD = /^\[redacted$/i;
+
 /**
  * Callers cut text at a cap. They scan this much past it, so a secret that starts inside the kept
  * text is matched whole before the cut, and not left as a readable prefix of it.
@@ -48,17 +51,8 @@ const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // A signed URL's signature is the credential: Azure SAS `sig`, `signature`, AWS `X-Amz-Signature`,
   // Google `X-Goog-Signature`. Only the value goes, and only in query position (after `?` or `&`,
   // `&amp;` too, as in XML listings). `signature` stays out of SECRET_NAME: the memory-write guard
-  // reuses it, and prose such as `signature: foo(a, b)` must stay writable. A value that is only the
-  // marker (the marker, then a character that cannot belong to a query value, or the end of the
-  // text) is skipped, as the key/value rule skips it: the value stops before `]`, so a second pass
-  // would read `[redacted` as a value and write `[redacted]]`. `]` `;` `,` `)` and `}` do not count
-  // as that end: a URL parser keeps them in the value, so behind `[redacted]` they can open more of
-  // it (`[redacted];SEKRIT`). Every value that goes on past the marker is redacted as before, so the
-  // write guard still refuses it.
-  new RegExp(
-    String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)(?!\[redacted\](?:[\s"'\\<>&#]|$))[^\s"'\\<>&#,;)\]}]+`,
-    "gi"
-  ),
+  // reuses it, and prose such as `signature: foo(a, b)` must stay writable.
+  new RegExp(String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)[^\s"'\\<>&#,;)\]}]+`, "gi"),
   // Anchored to the start of a character run: `\b` also matches after `-`, so `eyJ-eyJ-eyJ-...`
   // would start a scan to the end of the run at every `eyJ`.
   /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
@@ -546,9 +540,15 @@ function runRedactionPasses(
     }
   );
   for (const pattern of STANDALONE_SECRET_PATTERNS) {
-    redacted = redacted.replace(pattern, (match: string) => {
+    redacted = redacted.replace(pattern, (match: string, offset: number, whole: string) => {
       fromRegex(match);
-      return REDACTED;
+      // Only the signed-URL pattern can match a bare `[redacted`: its value stops before `]`, so on
+      // the marker an earlier pass wrote it reads the head of the marker. That match is reported
+      // as it always was, so the write guard counts what it always counted, but the text keeps the
+      // marker: a second pass would write `[redacted]]`, and a third `[redacted]]]`.
+      return MARKER_HEAD.test(match) && whole.charAt(offset + match.length) === "]"
+        ? match
+        : REDACTED;
     });
   }
   redacted = redacted.replace(SECRET_KEY_VALUE_PATTERN, (match: string, prefix: string) => {
@@ -589,7 +589,16 @@ export function addsSecretLike(previous: string, updated: string): boolean {
   return added;
 }
 
-/** True when `text` holds a credential shape: redacting it would change it. */
+/**
+ * True when `text` holds a credential shape: redacting it would change it, or the signed-URL
+ * pattern read the head of a marker in it and wrote it back (see `runRedactionPasses`). That match
+ * changed the text on main, which wrote `[redacted]]`, so the verdict is main's. A marker that the
+ * cookie rule reads and puts back is no credential here: notes quote what the harvest showed.
+ */
 export function containsSecretLike(text: string): boolean {
-  return redactSecretLike(text) !== text;
+  let keptMarker = false;
+  const redacted = runRedactionPasses(text, (removed) => {
+    keptMarker ||= MARKER_HEAD.test(removed);
+  });
+  return redacted !== text || keptMarker;
 }
