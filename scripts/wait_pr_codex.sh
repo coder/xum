@@ -17,7 +17,8 @@ unset GH_DEBUG DEBUG
 #       comment, or Codex reported a usage limit with no outstanding findings
 #   1 - Codex left comments to address, approved while a review thread or a comment is open (or
 #       while the gate could not read them), OR failed to review for another reason
-#  10 - still waiting for Codex response (only in --once mode)
+#  10 - still waiting for Codex response, or Codex approved while its review board still runs
+#       (only in --once mode)
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
   echo "Usage: $0 <pr_number> [--once]"
@@ -366,7 +367,9 @@ record_full_reactions_scan() {
 run_codex_comments_gate() {
   # --counts-only: the gate prints counts and fixed lines, never a Codex comment body. That keeps
   # check_output (matched below and printed on failure) free of text that Codex or a PR author wrote.
-  if check_output=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" --counts-only 2>&1); then
+  # check_output is the gate's stdout only: the gate's stderr (gh's own messages) goes straight to ours,
+  # so a line there can never read as one of the gate's count lines.
+  if check_output=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" --counts-only); then
     check_rc=0
   else
     check_rc=$?
@@ -375,11 +378,19 @@ run_codex_comments_gate() {
 
 # An approval comment or a thumbs-up says nothing about the findings that are still open: only the
 # gate reads every thread and every regular comment. So an approval stands only when the gate (run
-# before it) counted 0 unresolved review threads and 0 unminimized regular comments. The gate skips
-# the comments that codex_comment_is_informational (scripts/lib/codex_comments.jq) reads as clean, so
-# an approval comment never blocks itself. A gate that could not read the threads or the comments
-# (a malformed page, a crash) printed no count, and that is no proof that none is open.
+# before it) counted 0 unresolved review threads and 0 unminimized regular comments. The gate does
+# not count the comments that codex_blocking_comments (scripts/lib/codex_comments.jq) lets through:
+# the informational ones (a completed board, a usage-limit notice, a clean receipt, the account
+# setup notice) and a failure notice that a completed board for the current head supersedes. So an
+# approval comment never blocks itself. A gate that could not read the threads or the comments (a
+# malformed page, a crash) printed no count, and that is no proof that none is open.
+# Gate 10 means the only open comment is a board that is still running (Codex often posts the code
+# receipt before its security review ends): the approval does not stand yet, so keep waiting
+# (return 10) and judge it once the board completes.
 approval_stands() {
+  if [ "$check_rc" -eq 10 ]; then
+    return 10
+  fi
   if grep -Eq '^Found 0 unresolved review thread' <<<"$check_output" \
     && grep -Eq '^Found 0 unminimized regular comment' <<<"$check_output"; then
     return 0
@@ -504,7 +515,7 @@ CHECK_CODEX_STATUS_ONCE() {
   approval_comment_at=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" 'include "codex_comments"; [.[] | select(.createdAt > $request_at and codex_approval_comment($bot)) | {createdAt}] | sort_by(.createdAt) | last // empty | .createdAt // empty')
 
   if [[ -n "$approval_comment_at" ]]; then
-    approval_stands || return 1
+    approval_stands || return $?
     echo ""
     echo "✅ Codex approved PR #$PR_NUMBER"
     echo ""
@@ -515,7 +526,7 @@ CHECK_CODEX_STATUS_ONCE() {
   approval_reaction_at=$(echo "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.data.repository.pullRequest.reactions.nodes[]? | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
   if [[ -n "$approval_reaction_at" ]]; then
-    approval_stands || return 1
+    approval_stands || return $?
     echo ""
     echo "✅ Codex approved PR #$PR_NUMBER via thumbs-up on the PR description"
     echo ""
@@ -577,7 +588,7 @@ CHECK_CODEX_STATUS_ONCE() {
     approval_reaction_at=$(echo "$all_thumbs_up_reactions" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.user.login == $bot or .user.login == ($bot + "[bot]")) and .createdAt > $request_at) | .createdAt] | sort | last // empty')
 
     if [[ -n "$approval_reaction_at" ]]; then
-      approval_stands || return 1
+      approval_stands || return $?
       echo ""
       echo "✅ Codex approved PR #$PR_NUMBER via thumbs-up on the PR description"
       echo ""

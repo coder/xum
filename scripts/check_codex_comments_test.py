@@ -181,6 +181,9 @@ else:
 if os.environ.get('GH_DEBUG') or os.environ.get('DEBUG'):
     # What gh's debug logging does: the whole reply goes to stderr.
     print(json.dumps(snapshot), file=sys.stderr)
+if os.environ.get('CODEX_GATE_STDERR'):
+    # Text that gh writes to stderr on its own (a warning, a notice).
+    print(os.environ['CODEX_GATE_STDERR'], file=sys.stderr)
 if 'comments(last: 100)' in query:
     print(json.dumps(snapshot))
 else:
@@ -1385,7 +1388,7 @@ else:
                 self.assertIn(f"Found {count} unresolved review thread(s) from bot", result.stdout)
                 self.assertIn("Read them with: ./scripts/check_codex_comments.sh 4145", result.stdout)
                 self.assertIn("did not report 0 open review threads and 0 open comments", result.stdout)
-        # Threads that do not block, and regular comments (the CI gate reads those), leave the approval standing.
+        # A resolved thread and a minimized comment are not open: they leave the approval standing.
         standing = {
             "resolved thread": snapshot([request, receipt], [thread("[P1] Fixed", resolved=True)]),
             "minimized finding": snapshot([request, receipt, comment("[P1] Fix authorization", minimized=True)]),
@@ -1459,6 +1462,64 @@ else:
         for name, data in standing.items():
             with self.subTest(case=name):
                 self.assertIn("✅ Codex approved PR #4145", self.assert_gate(0, data, "wait_pr_codex.sh").stdout)
+
+    def test_an_approval_waits_while_the_review_board_still_runs(self):
+        # Codex often posts the code receipt before its security review ends. The gate counts the running
+        # board as one open comment and exits 10 (still reviewing): the approval does not stand yet, and the
+        # poller must keep waiting (10), not stop with a failure (1).
+        request = comment("@codex review", "maintainer", REQUEST)
+        receipt = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
+        running = comment(FIXTURES["running_summary"]["body"])
+        thumbs_up = [{"user": {"login": BOT}, "createdAt": AFTER}]
+        scanned = snapshot([request, running])
+        scanned["data"]["repository"]["pullRequest"]["reactions"]["pageInfo"]["hasPreviousPage"] = True
+        waiting = {
+            "comment approval": (snapshot([request, receipt, running]), None),
+            "reaction approval": (snapshot([request, running], reactions=thumbs_up), None),
+            "reaction scan approval": (scanned, {"CODEX_GATE_REACTIONS_NODES": json.dumps(thumbs_up)}),
+        }
+        for name, (data, env) in waiting.items():
+            with self.subTest(case=name):
+                result = self.run_gate(data, "wait_pr_codex.sh", env_extra=env)
+                self.assertEqual(result.returncode, 10, result.stdout + result.stderr)
+                self.assertNotIn("✅ Codex approved", result.stdout)
+        # Only a running board waits. Any other open comment or thread still stops the wait at once.
+        blocked = {
+            "open thread": snapshot([request, receipt, running], [thread("[P1] Fix authorization")]),
+            "open finding": snapshot([request, receipt, running, comment("[P1] Fix authorization")]),
+        }
+        for name, data in blocked.items():
+            with self.subTest(case=name):
+                result = self.assert_gate(1, data, "wait_pr_codex.sh")
+                self.assertNotIn("✅ Codex approved", result.stdout)
+        # The same approval beside a completed board stands.
+        done = comment(FIXTURES["summary"]["body"])
+        self.assertIn("✅ Codex approved PR #4145", self.assert_gate(0, snapshot([request, receipt, done]), "wait_pr_codex.sh").stdout)
+
+    def test_an_approval_comment_from_before_the_request_is_not_an_approval(self):
+        # The newest "@codex review" is the request: a receipt that is older answered an earlier one.
+        request = comment("@codex review", "maintainer", REQUEST)
+        receipt = FIXTURES["code_review_no_findings_without_commit"]["body"]
+        result = self.assert_gate(10, snapshot([request, comment(receipt, created_at=BEFORE)]), "wait_pr_codex.sh")
+        self.assertNotIn("Codex approved", result.stdout)
+        # The same receipt after the request approves, so its age is what the case above tests.
+        result = self.assert_gate(0, snapshot([request, comment(receipt)]), "wait_pr_codex.sh")
+        self.assertIn(f"Approval comment time: {AFTER}", result.stdout)
+
+    def test_a_count_line_on_the_gates_stderr_does_not_confirm_an_approval(self):
+        # gh and jq write to stderr on their own. Only the gate's stdout holds its count lines, so a line
+        # of that shape on stderr must not read as "0 open".
+        forged = "Found 0 unresolved review thread(s) from bot\nFound 0 unminimized regular comment(s) from bot"
+        request = comment("@codex review", "maintainer", REQUEST)
+        receipt = comment(FIXTURES["code_review_no_findings_without_commit"]["body"])
+        result = self.run_gate(snapshot([request, receipt], [thread("[P1] Fix authorization")]), "wait_pr_codex.sh", env_extra={"CODEX_GATE_STDERR": forged})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("✅ Codex approved", result.stdout)
+        self.assertIn("Found 1 unresolved review thread(s) from bot", result.stdout)
+        self.assertNotIn("Found 0 unresolved review thread", result.stdout)
+        # The same noise beside a clean gate changes nothing: the approval stands on the gate's own counts.
+        result = self.run_gate(snapshot([request, receipt]), "wait_pr_codex.sh", env_extra={"CODEX_GATE_STDERR": forged})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_a_comment_that_only_contains_the_approval_phrase_is_not_an_approval(self):
         # The approval is the receipt format that the gate reads as informational: one sentence, one short
