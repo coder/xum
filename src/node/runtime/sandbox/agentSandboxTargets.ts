@@ -807,8 +807,9 @@ function pointedGitDirs(dotGitFile: string): string[] {
   try {
     const gitDir = gitDirPointer(dotGitFile);
     if (gitDir === undefined) return [];
+    // Git reads `commondir` through a link too (Codex review).
     const commonDir = path.join(gitDir, "commondir");
-    if (!isFile(commonDir)) return [gitDir];
+    if (statIfExists(commonDir)?.isFile() !== true) return [gitDir];
     return [gitDir, path.resolve(gitDir, fs.readFileSync(commonDir, "utf8").trim())];
   } catch {
     return [];

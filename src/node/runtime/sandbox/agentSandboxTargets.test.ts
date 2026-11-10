@@ -232,6 +232,23 @@ describe("buildAgentSandboxPolicy", () => {
     expect(agentSandboxPolicyAllows(policy, path.join(gitDir, "index"), "write")).toBe(true);
   });
 
+  test("keeps the folder that a linked commondir names read-only", async () => {
+    const separate = path.join(root, "separate");
+    const gitDir = path.join(separate, "gitdir");
+    const common = path.join(separate, "common");
+    await fs.mkdir(separate);
+    git(separate, "init", "-q", `--separate-git-dir=${gitDir}`);
+    await fs.mkdir(path.join(common, "hooks"), { recursive: true });
+    await fs.writeFile(path.join(separate, "commondir.txt"), `${common}\n`);
+    await fs.symlink(path.join(separate, "commondir.txt"), path.join(gitDir, "commondir"));
+
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: separate });
+
+    for (const name of ["hooks/post-checkout", "config"]) {
+      expect(agentSandboxPolicyAllows(policy, path.join(common, name), "write")).toBe(false);
+    }
+  });
+
   test("keeps a protected file that is a symlink read-only where it points", async () => {
     const actual = path.join(commonDir, "config.actual");
     await fs.rename(path.join(commonDir, "config"), actual);
