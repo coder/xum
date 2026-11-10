@@ -132,7 +132,7 @@ export function hidesSecretBehindEscapes(text: string): boolean {
  * in the JSON text it is written as. JSON writes a control character as an escape: `"\nghp_..."` has
  * no word boundary before the token, so that check passes it while a reader of the decoded string
  * sees the token. The same goes for a percent escape (`hidesSecretBehindEscapes`). The scan also
- * checks each decoded JSON string of a `.json` file (`jsonStringsMatchSecretPattern`), which holds
+ * checks each decoded JSON string of a file (`jsonStringsMatchSecretPattern`), which holds
  * the file for the first kind of escape and not for the second. The first kind still counts here:
  * a plugin row is left out of the list, so a push does not stop for review over a name the
  * installer took. A token that the raw-text check finds is not hidden: the scan holds that file
@@ -159,13 +159,15 @@ export function jsonValueHidesSecret(value: unknown): boolean {
   return false;
 }
 
-const JSON_FILE_PATH = /\.jsonc?$/i;
-
 /**
  * The patterns start with `\b`, but in a JSON string `\n`, `\t`, `\r` and `\uXXXX` end in a
  * word character, so a token written after one has no boundary in the raw text and the raw
  * check misses it. Checking each decoded string (keys and values, at any depth) sees what a
  * reader of the file sees.
+ *
+ * It runs on every file, whatever its name: a skill's `.md` or `.txt` file is published without
+ * review and can hold JSON text (a saved API response), and an extension is not what a reader
+ * of the text goes by. Text that is not JSON reads as it is, and only a quoted string can match.
  *
  * This reads tokens instead of parsing: `jsonc.parse` keeps only the last of a duplicate key
  * and drops `__proto__`, so a token in either would escape the check, and a file that does
@@ -179,13 +181,6 @@ function jsonStringsMatchSecretPattern(text: string): boolean {
     }
   }
   return false;
-}
-
-function fileContentMatchesSecretPattern(filePath: string, content: string): boolean {
-  return (
-    matchesSecretPattern(content) ||
-    (JSON_FILE_PATH.test(filePath) && jsonStringsMatchSecretPattern(content))
-  );
 }
 
 export interface BackupFile {
@@ -1813,7 +1808,7 @@ export function scanBackupFilesForSecrets(
   return files
     .filter((file) => {
       const content = file.content.toString("utf-8");
-      if (fileContentMatchesSecretPattern(file.path, content)) return true;
+      if (matchesSecretPattern(content) || jsonStringsMatchSecretPattern(content)) return true;
       if (file.path === "mcp.jsonc" && mcpConfigRequiresPublishApproval(content, mcpOptions)) {
         return true;
       }
