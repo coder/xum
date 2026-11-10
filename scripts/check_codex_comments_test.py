@@ -75,6 +75,13 @@ def unquoted_receipt(sha, created_at=AFTER):
     return comment(named, BOT, created_at)
 
 
+def two_line_receipt(first, second, created_at=AFTER):
+    """A code-review receipt with a second `Reviewed commit` line after the first."""
+    receipt = code_receipt(first, created_at)
+    receipt["body"] += f"\n\n**Reviewed commit:** `{second}`"
+    return receipt
+
+
 def code_receipt(sha, created_at=AFTER):
     """The clean code-review receipt Codex posts for a review request, naming `sha`."""
     body = FIXTURES["code_review_no_findings"]["body"]
@@ -1566,15 +1573,18 @@ else:
             ("40 characters that start like the head", [request, code_receipt(PR_HEAD[:10] + "f" * 30)], 1),
             # Longer than a head: the head cannot start it, and it must not read as a prefix of the head.
             ("41 characters, the head and one more", [request, code_receipt(PR_HEAD + "f")], 1),
-            # A SHA in upper case is a SHA: it names its head like the same SHA in lower case.
-            ("upper case, 12 characters of the head", [request, code_receipt(PR_HEAD[:12].upper())], 0),
-            ("upper case, the whole head", [request, code_receipt(PR_HEAD.upper())], 0),
+            # Codex prints lowercase hex, and the gate reads only that. A line in any other shape names
+            # no readable commit: it is rejected here, and it is not a receipt with no line.
+            ("upper case, 12 characters of the head", [request, code_receipt(PR_HEAD[:12].upper())], 1),
+            ("upper case, the whole head", [request, code_receipt(PR_HEAD.upper())], 1),
             ("upper case, an earlier head", [request, code_receipt(EARLIER_HEAD[:10].upper())], 1),
-            ("upper case, an earlier head, 40 characters", [request, code_receipt(EARLIER_HEAD.upper())], 1),
-            # A label that holds no hex SHA in backticks names no readable commit: not a receipt with no line.
             ("a reviewed commit that is not hex", [request, code_receipt("zzzzzzzzzz")], 1),
             ("an empty reviewed commit", [request, code_receipt("")], 1),
             ("a reviewed commit without backticks", [request, unquoted_receipt(PR_HEAD[:10])], 1),
+            # The first line decides: a later line cannot rescue an earlier one that fails.
+            ("two lines: 41 characters, then the head", [request, two_line_receipt(PR_HEAD + "f", PR_HEAD[:12])], 1),
+            ("two lines: no hex, then the head", [request, two_line_receipt("zzzzzzzzzz", PR_HEAD[:12])], 1),
+            ("two lines: the head, then no hex", [request, two_line_receipt(PR_HEAD[:12], "zzzzzzzzzz")], 0),
         ):
             with self.subTest(case=case):
                 result = self.assert_gate(expected, snapshot(comments, head=PR_HEAD), "wait_pr_codex.sh")
