@@ -146,8 +146,10 @@ done
 
 // The folder is removed whether or not the close worked. A busy daemon does not answer the close
 // (see the top of this file), so where `timeout` exists the wait is cut short and the folder is
-// removed under the daemon, which then exits on its own. Without `timeout` (stock macOS) this
-// exec is killed first, and the folder stays in /tmp with one small config file.
+// removed under the daemon, which then exits on its own. The removal is best effort: when this
+// exec is killed before it gets there (no `timeout` on stock macOS, or a host too loaded to
+// finish in the close reserve), or when Xum itself dies mid-audit, the folder stays in /tmp with
+// one small config file.
 const CLOSE_SCRIPT = String.raw`
 ${SHELL_COMMON}
 command -v timeout >/dev/null 2>&1 && ab_wrap="timeout ${CLOSE_WAIT_SECONDS}"
