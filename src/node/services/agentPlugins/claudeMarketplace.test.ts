@@ -562,6 +562,14 @@ describe("the Agent Plugins marketplace file", () => {
       resolveEntry({ source: { source: "url", url: "https://gitlab.com/acme/x.git", ref: "v2" } })
     ).toMatchObject({ kind: "remote", url: "https://gitlab.com/acme/x.git", ref: "v2" });
     expect(resolveEntry({ source: { source: "npm", package: "@acme/x" } })).toContain("npm");
+    // Claude's other source kinds are not part of this format (Codex skips them).
+    for (const kind of ["github", "archive", "command"]) {
+      const source = { source: kind, repo: "acme/x", url: "https://example.com/x.tgz" };
+      expect(resolveEntry({ source })).toBe(`Marketplace source '${kind}' is not supported.`);
+      expect(resolveEntry({ source }, "claude")).not.toBe(
+        `Marketplace source '${kind}' is not supported.`
+      );
+    }
   });
 
   test("keeps its first 500 entries and warns, as the other files do", () => {

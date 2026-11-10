@@ -141,7 +141,7 @@ export function marketplaceRelativePath(raw: string): string {
   return segments.length === 0 ? "" : normalizeAgentPluginSubpath(segments.join("/"));
 }
 
-/** The `source.source` values of a source object that Xum knows (installable or refused). */
+/** The `source.source` values of a Claude or Cursor source object (installable or refused). */
 const OBJECT_SOURCE_KINDS: readonly MarketplaceSourceKind[] = [
   "github",
   "git-subdir",
@@ -166,6 +166,8 @@ interface MarketplaceFileRules {
   entryIsManifest: boolean;
   /** An object `{source: "local", path}` names a folder of the marketplace, as a plain path does. */
   localSource: boolean;
+  /** The other `source.source` values the file defines; any other value is "unknown". */
+  objectSources: readonly MarketplaceSourceKind[];
   /** A `url` source may name a folder of its repository with `path`, as `git-subdir` does. */
   urlPath: boolean;
   /** The folder a path source names (undefined: the marketplace root). Throws why it is refused. */
@@ -233,7 +235,7 @@ function agentsFolder(source: string): string | undefined {
 /**
  * Codex's installability check (find_installable_marketplace_plugin): NOT_AVAILABLE refuses, and
  * a `policy.products` list allows only the products it names, so an empty list allows none. Xum
- * reads this file as the Codex host does, so it installs only what Codex would.
+ * reads this file as the Codex host does, so it refuses what Codex refuses.
  */
 function agentsPolicyRefusal(entry: ClaudeMarketplaceEntry): string | undefined {
   const policy = entry.raw.policy;
@@ -260,6 +262,7 @@ export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRule
     selector: "cursor-marketplace",
     entryIsManifest: false,
     localSource: false,
+    objectSources: OBJECT_SOURCE_KINDS,
     urlPath: false,
     folderOf: cursorFolder,
   },
@@ -267,6 +270,7 @@ export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRule
     selector: "claude-marketplace",
     entryIsManifest: true,
     localSource: false,
+    objectSources: OBJECT_SOURCE_KINDS,
     urlPath: false,
     folderOf: claudeFolder,
   },
@@ -274,6 +278,8 @@ export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRule
     selector: "agents-marketplace",
     entryIsManifest: false,
     localSource: true,
+    // Codex's reader (RawMarketplaceManifestPluginSourceObject) has no github, archive or command.
+    objectSources: ["url", "git-subdir", "npm"],
     urlPath: true,
     folderOf: agentsFolder,
     refusal: agentsPolicyRefusal,
@@ -303,7 +309,7 @@ function isLocalSource(
 function sourceKindOf(rules: MarketplaceFileRules, source: unknown): MarketplaceSourceKind {
   if (typeof source === "string" || isLocalSource(rules, source)) return "relative";
   if (!isPlainObject(source)) return "unknown";
-  return OBJECT_SOURCE_KINDS.find((kind) => kind === source.source) ?? "unknown";
+  return rules.objectSources.find((kind) => kind === source.source) ?? "unknown";
 }
 
 /** Number of `skills` paths an entry lists (a string is one path). */
@@ -505,6 +511,9 @@ export function resolveEntrySource(
     return { kind: "relative", subpath: rules.folderOf(folder, marketplace) };
   }
   if (!isPlainObject(source)) throw new Error("The entry has no source.");
+  if (!rules.objectSources.includes(entry.sourceKind)) {
+    throw new Error(`Marketplace source '${String(source.source)}' is not supported.`);
+  }
   return remoteEntrySource(source, marketplaceUrl, rules);
 }
 
