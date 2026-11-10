@@ -714,6 +714,56 @@ describe("consolidation memory tool rails", () => {
       expect(fixture.journal.at(-1)?.note).toBe(atCap);
     });
 
+    it("journals a dry run's long validation error cut to the note cap", async () => {
+      using fixture = await createFixture({ dryRun: true });
+      // Staging validation runs the real str_replace check, whose error lists every matching line.
+      const line = `x${"-".repeat(126)}\n`;
+      const lines = MEMORY_MAX_FILE_BYTES / line.length - 1;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "big.md"), line.repeat(lines));
+
+      const result = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/big.md",
+        old_str: "x",
+        new_str: "y",
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(result.error).toContain(`, ${lines})`);
+      const note = fixture.journal.at(-1)?.note ?? "";
+      expect(note).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      expect(result.error.startsWith(note.slice(0, 200))).toBe(true);
+    });
+
+    it("redacts a guarded run's error before it cuts the note, so no credential fragment is kept", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      // A made-up key that starts 13 characters before the cut: cut first, the kept fragment is too
+      // short for the redaction pattern to match, so it would stay in the journal.
+      const fakeKey = "sk-fakeFAKEfakeFAKE0123456789";
+      const keepsBeforeMarker = MEMORY_CONSOLIDATION_NOTE_MAX_CHARS - " [note cut]".length;
+      const error = `${"x".repeat(keepsBeforeMarker - 14)} ${fakeKey} ${"z".repeat(200)}`;
+      const strReplace = spyOn(fixture.memoryService, "strReplace").mockResolvedValue({
+        success: false,
+        error,
+      });
+      try {
+        const result = await execute(fixture.tool, {
+          command: "str_replace",
+          path: "/memories/global/a.md",
+          old_str: "x",
+          new_str: "y",
+        });
+        expect(result.success).toBe(false);
+      } finally {
+        strReplace.mockRestore();
+      }
+
+      const note = fixture.journal.at(-1)?.note ?? "";
+      expect(note).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      expect(note).not.toContain("sk-fake");
+    });
+
     it("journals a failed edit's error whole when it fits the note cap", async () => {
       using fixture = await createFixture();
       await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "small.md"), "x\nx\n");
