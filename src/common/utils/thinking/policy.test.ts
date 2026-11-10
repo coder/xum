@@ -283,7 +283,7 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
-    expect(getThinkingPolicyForModel("anthropic:claude-fable-5-5")).toEqual([
+    expect(getThinkingPolicyForModel("anthropic:claude-fable-5-2")).toEqual([
       "low",
       "medium",
       "high",
@@ -325,7 +325,8 @@ describe("getThinkingPolicyForModel", () => {
     // A stored/legacy "off" selection must not reach the wire as disabled thinking.
     expect(enforceThinkingPolicy("anthropic:claude-fable-5", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-fable-5-1", "off")).toBe("low");
-    expect(enforceThinkingPolicy("anthropic:claude-fable-5-5", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-fable-5-2", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-mythos-5-2", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5-1", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-opus-5-5", "off")).toBe("low");

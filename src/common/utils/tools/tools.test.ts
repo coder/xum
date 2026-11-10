@@ -84,7 +84,8 @@ describe("supportsAnthropicNativeWebFetch", () => {
     ["claude-mythos-5", true],
     // Two-segment IDs at/after the 4.6 cutoff.
     ["claude-fable-5-1", true],
-    ["claude-fable-5-5", true],
+    ["claude-fable-5-2", true],
+    ["claude-mythos-5-2", true],
     ["claude-mythos-5-1", true],
     ["claude-opus-5-5", true],
     ["claude-sonnet-5-5", true],

@@ -29,7 +29,7 @@ describe("searchModelCatalog", () => {
     // Bedrock/Vertex copies use non-Xum provider names and are not addable.
     // The retired Fable 5.1 id is in models-extra only, not in the LiteLLM
     // catalog, so it no longer appears once it stops being built in.
-    expect(fable).toEqual(["anthropic:claude-fable-5-5", "anthropic:claude-fable-5"]);
+    expect(fable).toEqual(["anthropic:claude-fable-5-2", "anthropic:claude-fable-5"]);
 
     // "Anthropic" matches the provider, "fable" the model: both are required.
     expect(searchModelCatalog({ query: "ANTHROPIC  fable" }).total).toBe(2);
@@ -75,7 +75,7 @@ describe("searchModelCatalog", () => {
   test("ranks exact model ids above prefix matches before preferring built-ins", () => {
     const ids = searchModelCatalog({ query: "claude-fable-5" }).models.map((model) => model.id);
     // The exact legacy id outranks the built-in successor that only prefix-matches.
-    expect(ids).toEqual(["anthropic:claude-fable-5", "anthropic:claude-fable-5-5"]);
+    expect(ids).toEqual(["anthropic:claude-fable-5", "anthropic:claude-fable-5-2"]);
   });
 
   test("lists newer versions first within a rank tier", () => {

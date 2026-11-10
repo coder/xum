@@ -50,16 +50,14 @@ interface KnownModel extends KnownModelDefinition {
 // Model definitions. Note we avoid listing legacy models here. These represent the focal models
 // of the community.
 const MODEL_DEFINITIONS = {
-  // Claude Fable 5.5 - Mythos-class model (a tier above Opus), successor to Fable 5.1
-  // (released September 1, 2026). PROVISIONAL: prepared ahead of an unannounced launch.
-  // The API id `claude-fable-5-5` follows the dash/dateless convention of
-  // `claude-opus-5-5` / `claude-sonnet-5-5`; pricing, limits and capabilities assume
-  // Fable 5.1's until confirmed against the official model page. Fable 5.1 and Fable 5
-  // stay usable as the custom model strings `anthropic:claude-fable-5-1` and
-  // `anthropic:claude-fable-5`.
+  // Claude Fable 5.2 - Mythos-class model (a tier above Opus), released November 9, 2026
+  // as the successor to Fable 5.1. $8/M input, $40/M output (down from $10/$50), cache
+  // reads 0.025x input. API id `claude-fable-5-2`; Fable 5.1 and Fable 5 stay usable as
+  // the custom model strings `anthropic:claude-fable-5-1` and `anthropic:claude-fable-5`.
+  // See https://platform.claude.com/docs/en/models/fable-5-2/overview
   FABLE: {
     provider: "anthropic",
-    providerModelId: "claude-fable-5-5",
+    providerModelId: "claude-fable-5-2",
     aliases: ["fable"],
     warm: true,
     // Fable/Mythos use the newer Opus 4.7+ tokenizer, which isn't published upstream;
@@ -68,17 +66,17 @@ const MODEL_DEFINITIONS = {
     // same text, so real usage can run ~1.0-1.3x higher than this estimate.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // Claude Mythos 5.1 - successor to Mythos 5 (released June 9, 2026 alongside Fable 5)
-  // as the restricted-access, safeguards-lifted twin of Fable 5.1, with identical specs
-  // and pricing ($10/M input, $50/M output, 0.025x-input cache reads) and unchanged
-  // availability (approved Project Glasswing customers only, no self-serve sign-up).
-  // API id `claude-mythos-5-1`; Mythos 5 stays usable as the custom model string
-  // `anthropic:claude-mythos-5`.
+  // Claude Mythos 5.2 - released November 9, 2026 alongside Fable 5.2 as its twin with
+  // some safeguards lifted, with identical specs and pricing ($8/M input, $40/M output,
+  // 0.025x-input cache reads). Only organizations in Anthropic's verification programs
+  // (such as the Cyber Verification Program) can use it. API id `claude-mythos-5-2`;
+  // Mythos 5.1 and Mythos 5 stay usable as the custom model strings
+  // `anthropic:claude-mythos-5-1` and `anthropic:claude-mythos-5`.
   // Not warmed: most users cannot access it, and its tokenizer override is already
   // warmed via FABLE.
   MYTHOS: {
     provider: "anthropic",
-    providerModelId: "claude-mythos-5-1",
+    providerModelId: "claude-mythos-5-2",
     aliases: ["mythos"],
     // Same tokenizer situation as Fable 5 (see FABLE above): reuse Opus 4.5 for
     // approximate counting; real usage can run ~1.0-1.3x higher.
@@ -299,6 +297,7 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-fable-5-1": "anthropic/claude-opus-4.5",
   "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-mythos-5-1": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
   "anthropic:claude-haiku-4-5": "anthropic/claude-3.5-haiku",

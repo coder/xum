@@ -86,6 +86,13 @@ describe("fast mode service tier", () => {
       getFastModeProvider("xai:grok-code-fast-1", { resolvedRouteProvider: "direct" })
     ).toBeNull();
     expect(getFastModeProvider("anthropic:claude-sonnet-4-5")).toBeNull();
+    // Fable 5.2 and Mythos 5.2 added Fast mode; Fable 5.1 never had it.
+    for (const model of ["anthropic:claude-fable-5-2", "anthropic:claude-mythos-5-2"]) {
+      expect(getFastModeProvider(model, { resolvedRouteProvider: "direct" })).toBe("anthropic");
+    }
+    expect(
+      getFastModeProvider("anthropic:claude-fable-5-1", { resolvedRouteProvider: "direct" })
+    ).toBeNull();
   });
 
   test("offers the shared OpenAI tier on explicit and preference-routed gateways", () => {

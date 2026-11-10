@@ -18,10 +18,13 @@ import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
  * Models Anthropic documents for Fast mode. Kept as an explicit list: Opus 4.7
  * rejects `speed: "fast"` and Opus 4.6 silently runs (and bills) at standard
  * speed, so a version-range matcher would expose a toggle that errors or lies.
- * Dated snapshots of the listed models are accepted.
+ * Dated snapshots of the listed models are accepted. Fable 5.2 and Mythos 5.2 support
+ * Fast mode on the Claude API without the beta header; requests that send it still work.
  */
 export function anthropicSupportsFastMode(modelString: string): boolean {
-  return /^claude-opus-(?:4-8|5|5-5)(?:-\d{8})?$/.test(stripModelProviderPrefixes(modelString));
+  return /^claude-(?:opus-(?:4-8|5|5-5)|fable-5-2|mythos-5-2)(?:-\d{8})?$/.test(
+    stripModelProviderPrefixes(modelString)
+  );
 }
 
 /** True when the base URL is the first-party Claude API host. */

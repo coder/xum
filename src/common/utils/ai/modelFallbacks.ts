@@ -22,7 +22,7 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
  * chain-target migration. Revisit once Opus 5.5 refusal behavior is known.
  *
  * Seeded into the config exactly once, guarded by
- * migrations.defaultModelFallbacksSeededFable55 (each earlier fable alias move
+ * migrations.defaultModelFallbacksSeededFable52 (each earlier fable alias move
  * has its own flag, see LEGACY_DEFAULT_MODEL_FALLBACKS) — on versions that know
  * the flag, user edits or deletions of these chains are never overridden by
  * updates. (Versions predating the flag strip it on save, so a downgrade→save→

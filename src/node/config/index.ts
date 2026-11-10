@@ -650,7 +650,7 @@ function readLegacyWorkspaceHeartbeatsExperiment(rootDir: string): boolean {
 const MODEL_FALLBACK_SEED_PASSES = [
   ["defaultModelFallbacksSeeded", FABLE_5_DEFAULT_MODEL_FALLBACKS],
   ["defaultModelFallbacksSeededFable51", FABLE_5_1_DEFAULT_MODEL_FALLBACKS],
-  ["defaultModelFallbacksSeededFable55", SEEDED_MODEL_FALLBACKS],
+  ["defaultModelFallbacksSeededFable52", SEEDED_MODEL_FALLBACKS],
 ] as const;
 
 /**
@@ -2759,7 +2759,7 @@ export class Config {
       migrations: {
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
-        defaultModelFallbacksSeededFable55: true,
+        defaultModelFallbacksSeededFable52: true,
         persistentSubagentsDefaulted: true,
         agentHeartbeatsSeeded: true,
         taskSettingsDefaultsRaised: true,

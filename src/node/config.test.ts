@@ -5094,7 +5094,7 @@ describe("Config", () => {
           migrations: {
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
-            defaultModelFallbacksSeededFable55: true,
+            defaultModelFallbacksSeededFable52: true,
           },
           modelFallbacks: {
             // Gateway-prefixed key + non-string chain entries + unknown trigger.
@@ -5171,7 +5171,7 @@ describe("Config", () => {
           migrations: {
             defaultModelFallbacksSeeded: true,
             defaultModelFallbacksSeededFable51: true,
-            defaultModelFallbacksSeededFable55: true,
+            defaultModelFallbacksSeededFable52: true,
           },
         })
       );
@@ -5179,7 +5179,7 @@ describe("Config", () => {
       expect(config.loadConfigOrDefault().modelFallbacks).toBeUndefined();
     });
 
-    it("seeds the Fable 5.1 and 5.5 chains once for configs seeded before the 5.1 promotion", async () => {
+    it("seeds the Fable 5.1 and 5.2 chains once for configs seeded before the 5.1 promotion", async () => {
       // Pre-5.1 configs carry a chain only for the old source key
       // (anthropic:claude-fable-5). Claiming the 5.1 flag must carry the 5.1
       // chain (a downgraded 5.1 build trusts that flag), and the promoted
@@ -5205,22 +5205,22 @@ describe("Config", () => {
       const loaded = config.loadConfigOrDefault();
       expect(loaded.modelFallbacks).toEqual(expected);
       expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
-      expect(loaded.migrations?.defaultModelFallbacksSeededFable55).toBe(true);
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
 
       await flushConfigEdits();
       const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
         modelFallbacks?: unknown;
         migrations?: {
           defaultModelFallbacksSeededFable51?: unknown;
-          defaultModelFallbacksSeededFable55?: unknown;
+          defaultModelFallbacksSeededFable52?: unknown;
         };
       };
       expect(raw.modelFallbacks).toEqual(expected);
       expect(raw.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
-      expect(raw.migrations?.defaultModelFallbacksSeededFable55).toBe(true);
+      expect(raw.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
     });
 
-    it("seeds only the Fable 5.5 chain for configs seeded before the 5.5 promotion", async () => {
+    it("seeds only the Fable 5.2 chain for configs seeded before the 5.2 promotion", async () => {
       // A 5.1-era config whose user deleted the 5.1 default: the 5.1 flag is
       // already claimed, so its chain stays deleted. Only the promoted FABLE
       // key is seeded.
@@ -5244,15 +5244,15 @@ describe("Config", () => {
       };
       const loaded = config.loadConfigOrDefault();
       expect(loaded.modelFallbacks).toEqual(expected);
-      expect(loaded.migrations?.defaultModelFallbacksSeededFable55).toBe(true);
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
 
       await flushConfigEdits();
       const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
         modelFallbacks?: unknown;
-        migrations?: { defaultModelFallbacksSeededFable55?: unknown };
+        migrations?: { defaultModelFallbacksSeededFable52?: unknown };
       };
       expect(raw.modelFallbacks).toEqual(expected);
-      expect(raw.migrations?.defaultModelFallbacksSeededFable55).toBe(true);
+      expect(raw.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
     });
 
     it.each([
@@ -5277,7 +5277,7 @@ describe("Config", () => {
         const loaded = config.loadConfigOrDefault();
         expect(loaded.modelFallbacks?.[sourceModel]).toEqual({ models: ["openai:gpt-5.5"] });
         expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
-        expect(loaded.migrations?.defaultModelFallbacksSeededFable55).toBe(true);
+        expect(loaded.migrations?.defaultModelFallbacksSeededFable52).toBe(true);
       }
     );
 
@@ -5468,11 +5468,11 @@ describe("Config", () => {
         {
           defaultModelFallbacksSeeded: true,
           defaultModelFallbacksSeededFable51: true,
-          defaultModelFallbacksSeededFable55: true,
+          defaultModelFallbacksSeededFable52: true,
         },
       ],
       [
-        "seeded before the Fable 5.5 promotion",
+        "seeded before the Fable 5.2 promotion",
         { defaultModelFallbacksSeeded: true, defaultModelFallbacksSeededFable51: true },
       ],
       ["seeded before the Fable 5.1 promotion", { defaultModelFallbacksSeeded: true }],
