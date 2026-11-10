@@ -196,14 +196,14 @@ describeIntegration("Docker runtime selection (UI)", () => {
         () => {
           const trigger = getIsolationTrigger(view.container, "Workspace isolation");
           if (!trigger) throw new Error("Workspace isolation trigger not found");
-          if (!trigger.textContent?.includes("Local")) {
-            throw new Error("Local runtime not selected for non-git repo");
+          if (!trigger.textContent?.includes("None")) {
+            throw new Error("No workspace isolation not selected for non-git repo");
           }
         },
         { timeout: 2_000 }
       );
 
-      const trigger = getWorkspaceTypeTrigger(view.container);
+      const trigger = getIsolationTrigger(view.container, "Workspace isolation");
       expect(trigger).toBeTruthy();
       fireEvent.click(trigger!);
 
