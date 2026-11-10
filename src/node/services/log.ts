@@ -150,22 +150,28 @@ function setDegradedState(error: unknown): void {
   };
 }
 
+/**
+ * Ends the stream and resolves once its file descriptor is closed. stream.end() only starts the
+ * close: its callback fires on 'finish', which precedes 'close', while the descriptor is still
+ * open. A rotation renames the log files and a clear truncates the file after this resolves, and
+ * Windows cannot rename or delete a file that a stream holds open.
+ */
 function waitForStreamClose(stream: fs.WriteStream): Promise<void> {
   return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) {
-        return;
-      }
-      done = true;
+    // A stream that is already closed never emits 'close' again.
+    if (stream.closed) {
       resolve();
-    };
+      return;
+    }
 
-    stream.once("close", finish);
-    stream.once("error", finish);
-    // .end() callback fires on 'finish', which precedes 'close'—
-    // but the callback guarantees flush completed.
-    stream.end(() => finish());
+    stream.once("close", () => resolve());
+    // A failed stream is destroyed, and 'close' follows its 'error' once the descriptor (if the open
+    // succeeded) is closed, so this waits for it too. Destroy a stream that nothing destroyed, so a
+    // stream that fails without a destroy cannot stall the transition.
+    stream.once("error", () => {
+      if (!stream.destroyed) stream.destroy();
+    });
+    stream.end();
   });
 }
 
@@ -371,19 +377,16 @@ export function __resetFileSinkForTests(): void {
 }
 
 /**
- * @internal Test seam: close the file sink and wait until it is done with its file. stream.end()
- * only starts the close, and a rotation or clear that is in flight already took its stream out of
- * the open state, so this also waits for every queued sink transition. The sink stays closed, so a
- * log line (or a transition that resumes) while the caller deletes the folder that holds the log
- * file cannot reopen it (Windows cannot delete a file that a stream holds open). Call
- * __resetFileSinkForTests afterwards to log to a file again.
+ * @internal Test seam: close the file sink and wait until every sink transition is done. Each one
+ * waits for its stream to close, including a rotation or clear that is in flight (it has already
+ * taken its stream out of the open state). The sink stays closed, so a log line (or a transition
+ * that resumes) while the caller deletes the folder that holds the log file cannot reopen it
+ * (Windows cannot delete a file that a stream holds open). Call __resetFileSinkForTests afterwards
+ * to log to a file again.
  */
 export async function __closeFileSinkForTests(): Promise<void> {
-  const openStream = fileSinkState.status === "open" ? fileSinkState.stream : null;
   closeSink();
   await sinkTransition;
-  if (openStream === null || openStream.closed) return;
-  await new Promise<void>((resolve) => openStream.once("close", resolve));
 }
 
 let currentLogLevel: LogLevel = getDefaultLogLevel();
