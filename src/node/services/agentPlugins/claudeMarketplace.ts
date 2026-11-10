@@ -24,10 +24,7 @@ import {
   type AgentPluginMarketplaceEntry,
   type AgentPluginMarketplaceListing,
 } from "@/common/orpc/schemas/agentPlugins";
-import {
-  isValidAgentPluginName,
-  isValidMarketplaceEntryName,
-} from "@/common/utils/agentPluginName";
+import { isValidMarketplaceEntryName } from "@/common/utils/agentPluginName";
 import { displayRepoUrl, pointsAtThisMachine } from "@/common/utils/agentPluginSource";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -171,8 +168,6 @@ interface MarketplaceFileRules {
   entryNamesPlugin: boolean;
   /** An object `{source: "local", path}` names a folder of the marketplace, as a plain path does. */
   localSource: boolean;
-  /** The entry-name grammar, and how a refusal describes it. */
-  entryName: { valid: (name: string) => boolean; grammar: string };
   /** The other `source.source` values the file defines; any other value is "unknown". */
   objectSources: readonly MarketplaceSourceKind[];
   /** A `url` source may name a folder of its repository with `path`, as `git-subdir` does. */
@@ -264,18 +259,12 @@ function agentsTitle(raw: Record<string, unknown>): string | undefined {
   return isPlainObject(raw.interface) ? optionalString(raw.interface.displayName) : undefined;
 }
 
-const MARKETPLACE_ENTRY_NAME: MarketplaceFileRules["entryName"] = {
-  valid: isValidMarketplaceEntryName,
-  grammar: "letters, digits, '.', '_' and '-'",
-};
-
 export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRules> = {
   cursor: {
     selector: "cursor-marketplace",
     entryIsManifest: false,
     entryNamesPlugin: false,
     localSource: false,
-    entryName: MARKETPLACE_ENTRY_NAME,
     objectSources: OBJECT_SOURCE_KINDS,
     urlPath: false,
     folderOf: cursorFolder,
@@ -285,7 +274,6 @@ export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRule
     entryIsManifest: true,
     entryNamesPlugin: false,
     localSource: false,
-    entryName: MARKETPLACE_ENTRY_NAME,
     objectSources: OBJECT_SOURCE_KINDS,
     urlPath: false,
     folderOf: claudeFolder,
@@ -295,11 +283,6 @@ export const MARKETPLACE_FILE_RULES: Record<MarketplaceFile, MarketplaceFileRule
     entryIsManifest: false,
     entryNamesPlugin: true,
     localSource: true,
-    // Codex checks an entry name with the plugin-name grammar (PluginId::new), not Claude's.
-    entryName: {
-      valid: isValidAgentPluginName,
-      grammar: "lowercase letters, digits, '.' and '-', at most 64 characters",
-    },
     // Codex's reader (RawMarketplaceManifestPluginSourceObject) has no github, archive or command.
     objectSources: ["url", "git-subdir", "npm"],
     urlPath: true,
@@ -370,10 +353,10 @@ function readEntry(
     ...(skillCount !== undefined ? { skillCount } : {}),
   };
   if (name === undefined) return { ...entry, problem: "The entry has no name." };
-  if (!rules.entryName.valid(name)) {
+  if (!isValidMarketplaceEntryName(name)) {
     return {
       ...entry,
-      problem: `'${name}' is not a valid plugin name (${rules.entryName.grammar}).`,
+      problem: `'${name}' is not a valid plugin name (letters, digits, '.', '_' and '-').`,
     };
   }
   if (seen.has(name)) return { ...entry, problem: `'${name}' is listed more than once.` };
