@@ -671,7 +671,9 @@ export function organizerEditBudget(editLimit: number | null | undefined): {
   stepCeiling: Array<StopCondition<ToolSet>>;
 } {
   const limit = Math.min(
-    editLimit === undefined ? MEMORY_CONSOLIDATION_OP_BUDGET : (editLimit ?? Number.POSITIVE_INFINITY),
+    editLimit === undefined
+      ? MEMORY_CONSOLIDATION_OP_BUDGET
+      : (editLimit ?? Number.POSITIVE_INFINITY),
     MEMORY_DREAM_EDIT_LIMIT_MAX
   );
   return {

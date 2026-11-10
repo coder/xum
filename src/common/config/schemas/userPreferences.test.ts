@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { MEMORY_DREAM_EDIT_LIMIT_MAX } from "@/common/constants/memory";
 import { DEFAULT_TERMINAL_BADGE_CONFIG } from "@/common/constants/storage";
 import {
   UserPreferencesSchema,
@@ -155,14 +156,32 @@ describe("UserPreferencesSchema", () => {
 
   test("keeps a whole dream edit limit, 0 included, and reads an invalid one as no limit saved", () => {
     // 0 is the user's "unlimited"; it must survive the load, or an emptied field reads as 8.
-    for (const stored of [0, 1, 24, Number.MAX_SAFE_INTEGER]) {
+    for (const stored of [0, 1, 24, MEMORY_DREAM_EDIT_LIMIT_MAX]) {
       expect(normalizeUserPreferences({ memory: { dreamEditLimit: stored } })).toEqual({
         memory: { dreamEditLimit: stored },
       });
     }
-    // A hand-edited value that is not a whole, non-negative, exact number drops only itself, so
-    // the run uses the default and the other preferences stay.
-    for (const stored of [-1, 2.5, 2 ** 60, "8", null]) {
+    // A whole limit over the safety cap (an older build saved it, or a hand edit) loads as the
+    // cap: dropping it would run at the default 8, far under what the user asked for.
+    for (const stored of [
+      MEMORY_DREAM_EDIT_LIMIT_MAX + 1,
+      1000,
+      Number.MAX_SAFE_INTEGER,
+      2 ** 60,
+    ]) {
+      expect(normalizeUserPreferences({ memory: { dreamEditLimit: stored } })).toEqual({
+        memory: { dreamEditLimit: MEMORY_DREAM_EDIT_LIMIT_MAX },
+      });
+    }
+    // A save over the cap is refused, so only the load repairs one.
+    expect(
+      UserPreferencesSchema.safeParse({
+        memory: { dreamEditLimit: MEMORY_DREAM_EDIT_LIMIT_MAX + 1 },
+      }).success
+    ).toBe(false);
+    // A hand-edited value that is not a whole, non-negative number drops only itself, so the run
+    // uses the default and the other preferences stay.
+    for (const stored of [-1, 2.5, "8", null]) {
       expect(
         normalizeUserPreferences({
           memory: { dreamEditLimit: stored, dreamCostCeilingUsd: 2 },

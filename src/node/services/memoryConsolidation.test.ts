@@ -10,6 +10,7 @@ import {
   MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES,
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_DREAM_EDIT_LIMIT_MAX,
   MEMORY_CONSOLIDATION_PATH_MAX_CHARS,
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
@@ -1459,6 +1460,11 @@ describe("organizerEditBudget", () => {
     [undefined, MEMORY_CONSOLIDATION_OP_BUDGET],
     [24, 24],
     [1, 1],
+    [MEMORY_DREAM_EDIT_LIMIT_MAX, MEMORY_DREAM_EDIT_LIMIT_MAX],
+    // Unlimited, and any limit over the safety cap, runs at the cap.
+    [null, MEMORY_DREAM_EDIT_LIMIT_MAX],
+    [MEMORY_DREAM_EDIT_LIMIT_MAX + 1, MEMORY_DREAM_EDIT_LIMIT_MAX],
+    [1_000_000, MEMORY_DREAM_EDIT_LIMIT_MAX],
   ])("gives a limit of %p a budget of %p and a prompt line that says so", (editLimit, limit) => {
     const editBudget = organizerEditBudget(editLimit);
 
@@ -1467,12 +1473,13 @@ describe("organizerEditBudget", () => {
     expect(editBudget.stepCeiling).toHaveLength(1);
   });
 
-  it("gives no limit an endless budget and no step ceiling", () => {
+  it("refuses the edit after the safety cap when unlimited", () => {
     const editBudget = organizerEditBudget(null);
 
-    for (let i = 0; i < 1000; i++) expect(editBudget.budget.tryConsume()).toBe(true);
-    expect(editBudget.promptLine).toBe("This run has no edit limit.");
-    expect(editBudget.stepCeiling).toEqual([]);
+    for (let i = 0; i < MEMORY_DREAM_EDIT_LIMIT_MAX; i++) {
+      expect(editBudget.budget.tryConsume()).toBe(true);
+    }
+    expect(editBudget.budget.tryConsume()).toBe(false);
   });
 });
 
@@ -1974,7 +1981,10 @@ describe("runMemoryConsolidation", () => {
       expect(scripted.prompts[0]).toContain("You have 3 mutating commands this run.");
     });
 
-    it("refuses no edit and says so in the prompt when there is no limit", async () => {
+    // Memory contents are untrusted model input: unlimited runs at the safety cap, so one run's
+    // accepted writes, and its journal rows, stay bounded (organizerEditBudget's tests refuse the
+    // edit after the cap; 256 parallel creates here would only slow the suite down).
+    it("states the safety cap as the budget of an unlimited run", async () => {
       using fixture = await createFixture();
       const scripted = creatingModel(MEMORY_CONSOLIDATION_OP_BUDGET + 4);
 
@@ -1983,8 +1993,9 @@ describe("runMemoryConsolidation", () => {
       expect(result.ops.filter((op) => op.applied)).toHaveLength(
         MEMORY_CONSOLIDATION_OP_BUDGET + 4
       );
-      expect(result.budgetExhausted).toBe(false);
-      expect(scripted.prompts[0]).toContain("This run has no edit limit.");
+      expect(scripted.prompts[0]).toContain(
+        `You have ${MEMORY_DREAM_EDIT_LIMIT_MAX} mutating commands this run.`
+      );
     });
 
     it("keeps the default budget for a caller that passes no limit", async () => {
@@ -2017,7 +2028,7 @@ describe("runMemoryConsolidation", () => {
       expect(scripted.calls).toHaveLength(MEMORY_CONSOLIDATION_MAX_STEPS);
     });
 
-    it("has no step ceiling without a limit, so only the cost ceiling ends this run", async () => {
+    it("lets an unlimited run take more than the default 32 steps", async () => {
       using fixture = await createFixture();
       const scripted = listingModel();
 
