@@ -486,8 +486,9 @@ export function anthropicSupportsBetweenToolsThinking(modelString: string): bool
  * relied on. The Fable 5.2 migration guide says Mythos 5.1 on Bedrock still accepts such a
  * request. `block_binding` goes out only on the direct Claude API and anthropic-typed Coder
  * instances, and a model that skips the check accepts it. The "off" history strip keys on the
- * anthropic wire instead, so on a Bedrock-typed Coder instance it also drops Mythos 5.1 history
- * thinking that Bedrock would accept: that costs reasoning context, never a failed request.
+ * anthropic wire instead, so on Bedrock, direct or through a Bedrock-typed Coder instance, it
+ * also drops Mythos 5.1 history thinking that Bedrock would accept: that costs reasoning
+ * context, never a failed request.
  * See https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
  */
 export function anthropicBindsThinkingToPrefix(modelString: string): boolean {
