@@ -201,6 +201,25 @@ describe("clipped-text", () => {
         'data-box="0 0 0 0" data-css="display: contents"'
       );
       expect(audit(contents)).toEqual([finding("clipped-text", "span#s", "horizontal", 340)]);
+      // Such a holder ignores opacity and content-visibility: its text still paints, and is cut.
+      for (const css of [
+        "display: contents; opacity: 0",
+        "display: contents; content-visibility: hidden",
+      ]) {
+        expect(
+          audit(contents.replace('data-css="display: contents"', `data-css="${css}"`))
+        ).toEqual([finding("clipped-text", "span#s", "horizontal", 340)]);
+      }
+      // Text under a transparent or content-visibility hidden wrapper does not paint.
+      for (const css of ["opacity: 0", "content-visibility: hidden"]) {
+        const wrapped = html
+          .replace(
+            '<span id="hidden" data-box="0 0 400 20" data-css="visibility: hidden"',
+            `<span id="wrap" data-box="0 0 400 20" data-css="${css}"><span id="hidden" data-box="0 0 400 20"`
+          )
+          .replace("A long line nobody sees</span>", "A long line nobody sees</span></span>");
+        expect(audit(wrapped)).toEqual([]);
+      }
     });
 
     test("is judged on the lines it holds, down to a clipper inside a clipper", () => {
