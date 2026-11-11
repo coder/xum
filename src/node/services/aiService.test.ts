@@ -916,7 +916,11 @@ describe("AIService layout turn-end nudge", () => {
     });
     const audit = spyOn(turnEndLayoutAudit, "workspaceHasNewLayoutIssueAtTurnEnd");
     const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    stubCommonStreamMessageDependencies({ ...harness, metadata });
+    stubCommonStreamMessageDependencies({
+      ...harness,
+      metadata,
+      allTools: { artifact: { inputSchema: jsonSchema({ type: "object" }) } },
+    });
     // A real turn start records whether the turn could publish (TurnRequestBuilder); the nudge
     // reads that record for the ended turn's message.
     const startTurn = async (agent: { planLike?: boolean; toolPolicy?: ToolPolicy } = {}) => {
@@ -1019,6 +1023,27 @@ describe("AIService layout turn-end nudge", () => {
       expect(await nudge()).toBeNull();
       expect(audit).not.toHaveBeenCalled();
     } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it("does not audit after a turn whose sent tools lost artifact in request assembly", async () => {
+    const { testHistory, audit, nudge, startTurn, workspaceId } = await setup();
+    const removeHook = eventSpine.useBefore("request.assemble", (ctx) => {
+      if (ctx.workspaceId !== workspaceId) return;
+      const { artifact: _dropped, ...rest } = ctx.tools;
+      ctx.tools = rest;
+    });
+    try {
+      audit.mockResolvedValue(true);
+      const turn = await startTurn();
+      expect(await nudge(undefined, turn)).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
+      removeHook();
+      // Without the hook the next turn sends the tool, and the page that stayed due is audited.
+      expect(await nudge(undefined, await startTurn())).toBe(LAYOUT_TURN_END_NUDGE);
+    } finally {
+      removeHook();
       await testHistory.cleanup();
     }
   });

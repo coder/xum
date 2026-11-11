@@ -1224,13 +1224,17 @@ export class TurnRequestBuilder {
   >();
 
   /**
-   * The assistant message of each workspace's latest prepared turn whose agent can call the
-   * artifact tool and is not plan-like, for the turn-end layout nudge (turnCanRepublishArtifacts).
-   * The nudge asks for a publish, and its continuation keeps the turn's agent and tool policy: a
-   * turn without the tool could not follow it. One entry per workspace: the next prepare replaces
-   * or drops it.
+   * Each workspace's latest prepared turn whose agent can call the artifact tool and is not
+   * plan-like, for the turn-end layout nudge (turnCanRepublishArtifacts). The nudge asks for a
+   * publish, and its continuation keeps the turn's agent, tool policy and request assembly: a turn
+   * without the tool could not follow it. `toolSent` is whether the tools of the turn's latest
+   * attempt still held `artifact` after assembly (followArtifactToolAfterAssembly). One entry per
+   * workspace: the next prepare replaces or drops it.
    */
-  private readonly artifactPublishTurns = new Map<string, string>();
+  private readonly artifactPublishTurns = new Map<
+    string,
+    { messageId: string; toolSent: boolean }
+  >();
 
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
 
@@ -1249,7 +1253,8 @@ export class TurnRequestBuilder {
 
   /** Whether the turn whose assistant message is `messageId` could publish an artifact. */
   turnCanRepublishArtifacts(workspaceId: string, messageId: string): boolean {
-    return this.artifactPublishTurns.get(workspaceId) === messageId;
+    const entry = this.artifactPublishTurns.get(workspaceId);
+    return entry?.messageId === messageId && entry.toolSent;
   }
 
   /**
@@ -1273,11 +1278,27 @@ export class TurnRequestBuilder {
   ): void {
     // A plan-like agent (a custom one included) may edit only its plan file, as for the status
     // page nudge (recordAgentInterfaceTurn).
+    // Not sent until an attempt's assembled tools hold the tool (followArtifactToolAfterAssembly).
     if (!agent.planLike && applyToolPolicyToNames(["artifact"], agent.toolPolicy).length > 0) {
-      this.artifactPublishTurns.set(workspaceId, messageId);
+      this.artifactPublishTurns.set(workspaceId, { messageId, toolSent: false });
     } else {
       this.artifactPublishTurns.delete(workspaceId);
     }
+  }
+
+  /**
+   * The policy allows the tool, but request.assemble middleware, XUM_DISABLE_AGENT_TOOLS or
+   * capability grants can still remove it from the request. Each attempt (a model fallback reruns
+   * assembly) sets the record from the tools it sends.
+   */
+  private followArtifactToolAfterAssembly(
+    workspaceId: string,
+    messageId: string,
+    tools: Record<string, Tool>
+  ): void {
+    const entry = this.artifactPublishTurns.get(workspaceId);
+    if (entry?.messageId !== messageId) return;
+    entry.toolSent = tools.artifact !== undefined;
   }
 
   private recordAgentInterfaceTurn(
@@ -3548,6 +3569,7 @@ export class TurnRequestBuilder {
             ? {}
             : applyCapabilityGrants(attemptTools, capabilityGrants);
         }
+        this.followArtifactToolAfterAssembly(workspaceId, assistantMessageId, attemptTools);
 
         // The window section goes last, resolved from the rows being sent, so start() can
         // re-render it without rerunning assembly middleware or tool construction.
