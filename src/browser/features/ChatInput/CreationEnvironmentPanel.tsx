@@ -16,6 +16,7 @@ import type {
 } from "@/common/types/isolation";
 import type { BranchLoadStatus } from "./branchListLoad";
 import type { EnvironmentSummary, RuntimeFieldError } from "./creationEnvironmentSummary";
+import { environmentArrowTarget, environmentOpenFocusTarget } from "./environmentPanelKeys";
 import { useCreationShortcut } from "./useCreationShortcut";
 
 /** One option on an isolation axis, with its UI and why it cannot be picked (if it cannot). */
@@ -50,51 +51,6 @@ interface CreationEnvironmentPanelProps {
   fieldError: RuntimeFieldError | null;
   /** Counts the sends refused for a required field; a new one reopens the panel. */
   fieldErrorAttempt: number;
-}
-
-const COLUMN_SELECTOR = "[data-environment-column]";
-const ROW_SELECTOR = '[role="radio"]:not(:disabled)';
-
-/** The row an Up/Down key moves to within a column; null from anything but a row. */
-function verticalTarget(target: HTMLElement, column: HTMLElement, key: string): HTMLElement | null {
-  // Inputs keep their own arrows (the branch filter moves its active row).
-  if (target.getAttribute("role") !== "radio") return null;
-  const rows = Array.from(column.querySelectorAll<HTMLElement>(ROW_SELECTOR));
-  const next = rows.indexOf(target) + (key === "ArrowDown" ? 1 : -1);
-  return rows[(next + rows.length) % rows.length] ?? null;
-}
-
-/** The control a Left/Right key moves to in the neighbouring column. */
-function horizontalTarget(
-  target: HTMLElement,
-  column: HTMLElement,
-  panel: HTMLElement,
-  key: string
-): HTMLElement | null {
-  // Left/Right move the caret while a field has text; they change column only from an empty one.
-  if (target instanceof HTMLInputElement && target.value !== "") return null;
-  const columns = Array.from(panel.querySelectorAll<HTMLElement>(COLUMN_SELECTOR));
-  const neighbor = columns[columns.indexOf(column) + (key === "ArrowRight" ? 1 : -1)];
-  if (!neighbor) return null;
-  return (
-    neighbor.querySelector<HTMLElement>('[role="radio"][aria-checked="true"]:not(:disabled)') ??
-    neighbor.querySelector<HTMLElement>(`${ROW_SELECTOR}, [role="combobox"]`)
-  );
-}
-
-/** Where an arrow key moves focus inside the panel, or null when the key is not the panel's. */
-export function environmentArrowTarget(
-  target: HTMLElement,
-  panel: HTMLElement,
-  key: string
-): HTMLElement | null {
-  const column = target.closest<HTMLElement>(COLUMN_SELECTOR);
-  if (!column) return null;
-  if (key === "ArrowUp" || key === "ArrowDown") return verticalTarget(target, column, key);
-  if (key === "ArrowLeft" || key === "ArrowRight") {
-    return horizontalTarget(target, column, panel, key);
-  }
-  return null;
 }
 
 const COLUMN_TITLE_CLASSES = "text-muted text-[11px] font-medium tracking-wide uppercase";
@@ -260,6 +216,14 @@ function ChipBranch(props: { branch: EnvironmentSummary["branch"] }) {
   );
 }
 
+/** The UI of the selected option on one axis, for the chip's icon and colour. */
+function selectedOptionUi<T extends string>(
+  options: Array<IsolationSelectOption<T>>,
+  value: T
+): IsolationOptionUi | undefined {
+  return options.find((option) => option.value === value)?.ui;
+}
+
 /** The closed state: the selection as one line, or the field Send is waiting for. */
 function ChipSummary(props: {
   summary: EnvironmentSummary;
@@ -367,15 +331,8 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
             >
               <ChipSummary
                 summary={props.summary}
-                projectUi={
-                  props.projectOptions.find((option) => option.value === props.isolation.project)
-                    ?.ui
-                }
-                workspaceUi={
-                  props.workspaceOptions.find(
-                    (option) => option.value === props.isolation.workspace
-                  )?.ui
-                }
+                projectUi={selectedOptionUi(props.projectOptions, props.isolation.project)}
+                workspaceUi={selectedOptionUi(props.workspaceOptions, props.isolation.workspace)}
               />
             </button>
           </PopoverTrigger>
@@ -394,12 +351,7 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
         // columns stack, scrolling inside the space the popover has.
         className="flex max-h-(--radix-popover-content-available-height) w-[min(54rem,calc(100vw-1rem))] flex-col overflow-y-auto p-0"
         onOpenAutoFocus={(event) => {
-          // Land on the field Send is waiting for, else on the selected "Run on" row.
-          const target =
-            contentRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]') ??
-            contentRef.current?.querySelector<HTMLElement>(
-              '[role="radio"][aria-checked="true"]:not(:disabled)'
-            );
+          const target = environmentOpenFocusTarget(contentRef.current);
           if (!target) return;
           event.preventDefault();
           target.focus();

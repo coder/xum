@@ -16,6 +16,73 @@ import {
  */
 const MAX_RENDERED_ROWS = 200;
 
+/** One row: a pointer target for the option; keyboard focus stays in the filter input. */
+function FilterListRow(props: {
+  id: string;
+  item: FilterListItem;
+  query: string;
+  selected: boolean;
+  active: boolean;
+  disabled: boolean | undefined;
+  mono: boolean | undefined;
+  leading: ReactNode;
+  onSelect: (value: string) => void;
+  onHover: (value: string) => void;
+}) {
+  const { item } = props;
+  const label = splitFilterMatch(item.label, props.query);
+  return (
+    <button
+      id={props.id}
+      type="button"
+      role="option"
+      aria-selected={props.selected}
+      tabIndex={-1}
+      disabled={props.disabled}
+      // A click must not take focus from the input, or typing and the arrows would stop
+      // filtering and moving while the list stays open (the branch picker does).
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={() => props.onSelect(item.value)}
+      onMouseMove={() => {
+        if (!props.active) props.onHover(item.value);
+      }}
+      className={cn(
+        "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs disabled:opacity-50",
+        props.active && "bg-hover"
+      )}
+    >
+      {props.leading}
+      <span
+        data-filter-list-label
+        className={cn(
+          "min-w-0 truncate",
+          props.mono && "font-mono",
+          // With a match, the rest of the label steps back so the match stands out.
+          label.match === "" ? "text-foreground" : "text-muted"
+        )}
+      >
+        {label.before}
+        {label.match !== "" && <span className="text-foreground font-semibold">{label.match}</span>}
+        {label.after}
+      </span>
+      {item.detail !== undefined && (
+        <span className="text-muted ml-auto min-w-0 shrink truncate pl-2 text-[11px]">
+          {item.detail}
+        </span>
+      )}
+      {props.selected && (
+        <Check
+          aria-hidden
+          className={cn(
+            "text-foreground size-3.5 shrink-0",
+            item.detail === undefined && "ml-auto"
+          )}
+        />
+      )}
+    </button>
+  );
+}
+
 /**
  * A filter input over a single-choice list: type to narrow, arrows to move, Enter to pick. The
  * creation page's project switcher and base-branch picker share it, so both filter and move the
@@ -111,64 +178,21 @@ export function FilterList(props: {
             {query.trim() === "" ? `No ${props.noun}` : `No ${props.noun} match "${query.trim()}"`}
           </div>
         )}
-        {rows.map((item, index) => {
-          const selected = item.value === props.selected;
-          const label = splitFilterMatch(item.label, query);
-          return (
-            <button
-              key={item.value}
-              id={optionId(index)}
-              type="button"
-              role="option"
-              aria-selected={selected}
-              // Focus stays in the input; the rows are pointer targets.
-              tabIndex={-1}
-              disabled={props.disabled}
-              // A click must not take focus from the input, or typing and the arrows would stop
-              // filtering and moving while the list stays open (the branch picker does).
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => props.onSelect(item.value)}
-              onMouseMove={() => {
-                if (activeValue !== item.value) setActiveValue(item.value);
-              }}
-              className={cn(
-                "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs disabled:opacity-50",
-                index === activeIndex && "bg-hover"
-              )}
-            >
-              {props.renderLeading?.(item)}
-              <span
-                data-filter-list-label
-                className={cn(
-                  "min-w-0 truncate",
-                  props.mono && "font-mono",
-                  // With a match, the rest of the label steps back so the match stands out.
-                  label.match === "" ? "text-foreground" : "text-muted"
-                )}
-              >
-                {label.before}
-                {label.match !== "" && (
-                  <span className="text-foreground font-semibold">{label.match}</span>
-                )}
-                {label.after}
-              </span>
-              {item.detail !== undefined && (
-                <span className="text-muted ml-auto min-w-0 shrink truncate pl-2 text-[11px]">
-                  {item.detail}
-                </span>
-              )}
-              {selected && (
-                <Check
-                  aria-hidden
-                  className={cn(
-                    "text-foreground size-3.5 shrink-0",
-                    item.detail === undefined && "ml-auto"
-                  )}
-                />
-              )}
-            </button>
-          );
-        })}
+        {rows.map((item, index) => (
+          <FilterListRow
+            key={item.value}
+            id={optionId(index)}
+            item={item}
+            query={query}
+            selected={item.value === props.selected}
+            active={index === activeIndex}
+            disabled={props.disabled}
+            mono={props.mono}
+            leading={props.renderLeading?.(item)}
+            onSelect={props.onSelect}
+            onHover={setActiveValue}
+          />
+        ))}
         {matches.length > rows.length && (
           <div className="text-muted px-2 py-1.5 text-[11px]" role="status">
             Showing {rows.length} of {matches.length}. Type to narrow the list.
