@@ -181,8 +181,10 @@ function shouldSkipOversizedCandidate(byteSize: number): boolean {
  * The one parse of a catalog SKILL.md. The fetch decides which file is the requested skill and the
  * read returns it, so they must accept the same files. A catalog skill is a discovered skill:
  * Claude Code and Codex load one whose description is over 1024 characters, so
- * `allowDisplayName` cuts it as discovery does. There is no `directoryName`, so the name stays
- * strict: a catalog directory can differ from the frontmatter name.
+ * `allowDisplayName` cuts it as discovery does. The model installs from the read result through
+ * `agent_skill_write`, which stays strict (1024 at most), so the cut text is what that writer
+ * accepts. There is no `directoryName`, so the name stays strict: a catalog directory can differ
+ * from the frontmatter name.
  */
 export function parseCatalogSkill(content: string, byteSize: number) {
   return parseSkillMarkdown({ content, byteSize, allowDisplayName: true });
