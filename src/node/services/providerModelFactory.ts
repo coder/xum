@@ -10,6 +10,7 @@ import assert from "node:assert";
 import { createHash, createPrivateKey } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { Effect } from "effect";
+import type { createOpenAI as CreateOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
   LanguageModelV4,
@@ -541,6 +542,51 @@ function wrapFetchWithChatToolCallIndexes(baseFetch: typeof fetch): typeof fetch
   };
 
   return Object.assign(indexedFetch, baseFetch) as typeof fetch;
+}
+
+/**
+ * Model for a Coder instance on an OpenAI wire other than google-typed ones.
+ * The gateway intercepts both /responses and /chat/completions: real OpenAI
+ * upstreams use Responses, compatible upstreams use Chat.
+ */
+function createCoderOpenAIWireModel(
+  createOpenAI: typeof CreateOpenAI,
+  options: {
+    wire: "openai-responses" | "openai-chat";
+    baseURL: string;
+    modelId: string;
+    fetch: typeof fetch;
+    serviceTierAvailable: boolean;
+    capabilityModel: string;
+  }
+): LanguageModelV4 {
+  const createCoderModel = (fetch: typeof globalThis.fetch) => {
+    const provider = createOpenAI({
+      apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
+      baseURL: options.baseURL,
+      fetch,
+    });
+    return options.wire === "openai-responses"
+      ? provider.responses(options.modelId)
+      : provider.chat(options.modelId);
+  };
+  if (options.wire === "openai-responses") {
+    return createOpenAIModelWithPreservedOptions(createCoderModel, options.fetch, {
+      serviceTierAvailable: options.serviceTierAvailable,
+      wireModelId: options.modelId,
+    });
+  }
+  // Chat upstreams include Gemini's OpenAI compatibility layer behind
+  // openai-compat instances.
+  const coderModel = createOpenAIModelWithPreservedOptions(
+    createCoderModel,
+    wrapFetchWithChatToolCallIndexes(options.fetch),
+    { serviceTierAvailable: options.serviceTierAvailable, wireModelId: options.modelId }
+  );
+  return clampGpt6ChatCompletionsToolReasoning(
+    reportChatCompletionsServiceTier(coderModel),
+    options.capabilityModel
+  );
 }
 
 /**
@@ -3154,36 +3200,18 @@ export class ProviderModelFactory {
           }
 
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
-          const createCoderModel = (fetch: typeof coderFetch) => {
-            const provider = createOpenAI({
-              apiKey: "coder", // placeholder; real auth injected by the fetch wrapper
-              baseURL: gatewayBaseUrl,
-              fetch,
-            });
-            // The gateway intercepts both /responses and /chat/completions. Real
-            // OpenAI upstreams use Responses; compatible upstreams use Chat.
-            return wire === "openai-responses"
-              ? provider.responses(originModelId)
-              : provider.chat(originModelId);
-          };
-          // Chat upstreams include Gemini's OpenAI compatibility layer behind
-          // openai-compat instances.
-          const openAIFetch =
-            wire === "openai-chat" ? wrapFetchWithChatToolCallIndexes(coderFetch) : coderFetch;
-          const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, openAIFetch, {
-            serviceTierAvailable,
-            wireModelId: originModelId,
-          });
-          // A Coder-scoped "Treat as" mapping (coder:compat/team-luna → openai:gpt-6-luna)
-          // is the only capability identity an openai-compat instance has; the raw
-          // originModelId would miss the clamp. Same resolution as buildProviderOptions.
           return Ok(
-            wire === "openai-responses"
-              ? coderModel
-              : clampGpt6ChatCompletionsToolReasoning(
-                  reportChatCompletionsServiceTier(coderModel),
-                  resolveModelForMetadata(`coder:${modelId}`, providersConfig)
-                )
+            createCoderOpenAIWireModel(createOpenAI, {
+              wire,
+              baseURL: gatewayBaseUrl,
+              modelId: originModelId,
+              fetch: coderFetch,
+              serviceTierAvailable,
+              // A Coder-scoped "Treat as" mapping (coder:compat/team-luna → openai:gpt-6-luna)
+              // is the only capability identity an openai-compat instance has; the raw
+              // originModelId would miss the clamp. Same resolution as buildProviderOptions.
+              capabilityModel: resolveModelForMetadata(`coder:${modelId}`, providersConfig),
+            })
           );
         }
 
