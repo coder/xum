@@ -126,7 +126,7 @@ interface GatedPattern {
 }
 
 // Credential shapes that are secret on their own, wherever they appear.
-const STANDALONE_SECRET_PATTERNS: (RegExp | GatedPattern)[] = [
+const STANDALONE_SECRET_PATTERNS: Array<RegExp | GatedPattern> = [
   // An unterminated block (a tool that cut its own output) redacts through to the end of the text.
   // A PGP armor header ends `PRIVATE KEY BLOCK-----`.
   /-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----|$)/g,
@@ -153,7 +153,7 @@ const STANDALONE_SECRET_PATTERNS: (RegExp | GatedPattern)[] = [
 
 // Each pass as a pattern and its gate (none for a plain pattern), so the loop below does not test
 // which kind a pass is.
-const STANDALONE_PASSES: { pattern: RegExp; accepts?: GatedPattern["accepts"] }[] =
+const STANDALONE_PASSES: Array<{ pattern: RegExp; accepts?: GatedPattern["accepts"] }> =
   STANDALONE_SECRET_PATTERNS.map((pass) => (pass instanceof RegExp ? { pattern: pass } : pass));
 
 // A quoted value reads through backslash escapes, so an escaped quote inside the string does not
