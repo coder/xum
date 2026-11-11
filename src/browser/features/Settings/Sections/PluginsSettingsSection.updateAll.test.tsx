@@ -151,6 +151,22 @@ test("capability-changing reviews open one after another, and cancelling one ope
   await waitFor(() => expect(openReviews(view)).toHaveLength(0));
 });
 
+test("the status of a run goes away once the user settles a review it left open", async () => {
+  const { api } = createApi({
+    names: ["alpha", "beta"],
+    pending: { alpha: neutral("alpha"), beta: capabilityChanging("beta") },
+  });
+  const view = mount(api);
+  const status = () => view.container.querySelector('[role="status"]');
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(status() !== null).toBe(true));
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+
+  fireEvent.click(buttonNamed(view, "Cancel")!);
+  await waitFor(() => expect(status() === null).toBe(true));
+});
+
 test("a failed update does not stop the others and the status names it", async () => {
   const { api, updates } = createApi({
     names: ["alpha", "beta", "gamma"],

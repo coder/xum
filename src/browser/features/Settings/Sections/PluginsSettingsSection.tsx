@@ -1882,7 +1882,9 @@ export const PluginsSettingsSection: React.FC = () => {
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
   /** Pending update whose capability changes await the user's confirmation. */
   const updateReviews = useUpdateReviewQueue(
-    initialIntent?.type === "review-updates" ? initialIntent.reviews : []
+    initialIntent?.type === "review-updates" ? initialIntent.reviews : [],
+    // Lazy: `updateAll` is declared below.
+    () => updateAll.dismissStatus()
   );
   const updateReview = updateReviews.open;
   /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */

@@ -23,7 +23,9 @@ const review = (name: string): AgentPluginUpdateReview => ({
 });
 
 test("the review queue opens its reviews in order and ends empty", () => {
-  const { result } = renderHook(() => useUpdateReviewQueue([review("a"), review("b")]));
+  const { result } = renderHook(() =>
+    useUpdateReviewQueue([review("a"), review("b")], () => undefined)
+  );
 
   expect(result.current.open?.name).toBe("a");
   act(() => result.current.next());
@@ -35,7 +37,9 @@ test("the review queue opens its reviews in order and ends empty", () => {
 });
 
 test("showing reviews replaces the open one and the queue behind it", () => {
-  const { result } = renderHook(() => useUpdateReviewQueue([review("a"), review("b")]));
+  const { result } = renderHook(() =>
+    useUpdateReviewQueue([review("a"), review("b")], () => undefined)
+  );
 
   act(() => result.current.show([review("c")]));
   expect(result.current.open?.name).toBe("c");
@@ -44,12 +48,26 @@ test("showing reviews replaces the open one and the queue behind it", () => {
 });
 
 test("clearing drops the open review and the queue behind it", () => {
-  const { result } = renderHook(() => useUpdateReviewQueue([review("a"), review("b")]));
+  const { result } = renderHook(() =>
+    useUpdateReviewQueue([review("a"), review("b")], () => undefined)
+  );
 
   act(() => result.current.clear());
   expect(result.current.open).toBeNull();
   act(() => result.current.next());
   expect(result.current.open).toBeNull();
+});
+
+test("confirming, cancelling or clearing a review settles it, and showing reviews does not", () => {
+  const onSettled = mock(() => undefined);
+  const { result } = renderHook(() => useUpdateReviewQueue([review("a"), review("b")], onSettled));
+
+  act(() => result.current.show([review("c"), review("d")]));
+  expect(onSettled).toHaveBeenCalledTimes(0);
+  act(() => result.current.next());
+  expect(onSettled).toHaveBeenCalledTimes(1);
+  act(() => result.current.clear());
+  expect(onSettled).toHaveBeenCalledTimes(2);
 });
 
 test("the button renders only while a plugin has an update waiting, and clicks run it", () => {

@@ -23,15 +23,25 @@ const queueOf = (reviews: Reviews): ReviewQueue => ({
   queued: reviews.slice(1),
 });
 
-export function useUpdateReviewQueue(initial: Reviews) {
+/**
+ * `onSettled` runs when the open review is dropped: confirmed, cancelled or cleared. The Update all
+ * status then no longer describes what is left, so the caller dismisses it.
+ */
+export function useUpdateReviewQueue(initial: Reviews, onSettled: () => void) {
   const [queue, setQueue] = useState(() => queueOf(initial));
   return {
     open: queue.open,
     /** Replaces the open review and everything queued behind it. */
     show: (reviews: Reviews) => setQueue(queueOf(reviews)),
     /** The open review was confirmed or cancelled: the next queued one opens. */
-    next: () => setQueue((current) => queueOf(current.queued)),
-    clear: () => setQueue(queueOf([])),
+    next: () => {
+      onSettled();
+      setQueue((current) => queueOf(current.queued));
+    },
+    clear: () => {
+      onSettled();
+      setQueue(queueOf([]));
+    },
   };
 }
 
@@ -81,7 +91,7 @@ export function useUpdateAll(deps: UpdateAllDeps) {
       setRunning(false);
     }
   };
-  return { count, running, status, run };
+  return { count, running, status, run, dismissStatus: () => setStatus(null) };
 }
 
 /** Shown only while a managed plugin has an update waiting. */
