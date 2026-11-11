@@ -1834,10 +1834,11 @@ describe("redactSecretLike", () => {
   // Past this, a scan fails whatever its growth: the slowest linear scan takes about a fifth of it,
   // and the regressions this guards cost seconds.
   const SCAN_CPU_CEILING_MS = 300;
-  // How much the cost per character grows when the text doubles: 1 for a linear scan (1.28 at most
-  // over 312 measurements each on Bun 1.3 and 1.4), 2 for a quadratic one.
+  // How much the cost per character grows when the text doubles: 1 for a linear scan (1.36 at most
+  // over 720 measurements each on Bun 1.3.14 and 1.4.3), 2 for a quadratic one.
   const SCAN_GROWTH_PER_DOUBLING_LIMIT = 1.6;
-  // A cut that costs less than this is mostly timer and allocation noise.
+  // A cut that costs less than this is mostly timer and allocation noise. Bun 1.4 measured growths
+  // up to 1.9 on linear scans with no floor, and up to 1.65 with a floor of 0.25.
   const SCAN_CPU_FLOOR_MS = 1;
 
   function cpuMilliseconds(run: () => void): number {
@@ -1850,8 +1851,8 @@ describe("redactSecretLike", () => {
   /**
    * The least CPU time of up to `runs` runs. One run can be slow for no fault of the scan: a 50 ms
    * scan once measured 350 ms (the process's CPU time counts all its threads). So the runs stop
-   * only when two in a row are past the ceiling, which a quadratic scan does every time, and a
-   * failing test does not repeat for long.
+   * early only when the first two are both past the ceiling, which a quadratic scan does every
+   * time, and a failing test does not repeat for long.
    */
   function bestCpuMilliseconds(run: () => void, runs: number): number {
     let best = Number.POSITIVE_INFINITY;
@@ -1903,6 +1904,7 @@ describe("redactSecretLike", () => {
     ["a PGP key header", "-----BEGIN PGP PRIVATE KEY BLOCK-----".repeat(3_000)],
     ["a quoted value of backslashes", `token:"${"\\".repeat(100_000)}`],
     ["a quoted value of escaped quotes", `token:"${'\\"'.repeat(50_000)}`],
+    ["a long backslash run and one letter", `${"\\".repeat(100_000)}x`],
     [
       "an escaped quoted value of backslash runs",
       String.raw`token:\"` + String.raw`\\\"`.repeat(25_000),
