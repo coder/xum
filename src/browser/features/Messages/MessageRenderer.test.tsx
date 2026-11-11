@@ -815,8 +815,9 @@ describe("MessageRenderer TODO nudge rows", () => {
     expect(row).not.toBeNull();
     const summary = view.getByText(/^Asked the agent to /).textContent ?? "";
     expect(summary).toContain("layout issues");
+    const named: readonly string[] = asks;
     for (const ask of ["TODO list", "status page"]) {
-      expect(summary.includes(ask)).toBe(asks.includes(ask));
+      expect(summary.includes(ask)).toBe(named.includes(ask));
     }
   });
 

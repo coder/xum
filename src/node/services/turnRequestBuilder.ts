@@ -1266,6 +1266,20 @@ export class TurnRequestBuilder {
     return entry.turn;
   }
 
+  private recordArtifactPublishTurn(
+    workspaceId: string,
+    messageId: string,
+    agent: { planLike: boolean; toolPolicy: ToolPolicy | undefined }
+  ): void {
+    // A plan-like agent (a custom one included) may edit only its plan file, as for the status
+    // page nudge (recordAgentInterfaceTurn).
+    if (!agent.planLike && applyToolPolicyToNames(["artifact"], agent.toolPolicy).length > 0) {
+      this.artifactPublishTurns.set(workspaceId, messageId);
+    } else {
+      this.artifactPublishTurns.delete(workspaceId);
+    }
+  }
+
   private recordAgentInterfaceTurn(
     workspaceId: string,
     messageId: string,
@@ -3094,13 +3108,10 @@ export class TurnRequestBuilder {
       // The same rule the prompt follows, so the nudge asks for what the prompt told the agent.
       statusPageAgent: statusUpdateUsable(statusPageAgentActive, effectiveToolPolicy),
     });
-    // A plan-like agent (a custom one included) may edit only its plan file, as for the status
-    // page nudge above.
-    if (!agentIsPlanLike && applyToolPolicyToNames(["artifact"], effectiveToolPolicy).length > 0) {
-      this.artifactPublishTurns.set(workspaceId, assistantMessageId);
-    } else {
-      this.artifactPublishTurns.delete(workspaceId);
-    }
+    this.recordArtifactPublishTurn(workspaceId, assistantMessageId, {
+      planLike: agentIsPlanLike,
+      toolPolicy: effectiveToolPolicy,
+    });
     // Bind ownership before cached MCP tools are captured by the PTC bridge.
     // A queued invocation must keep this turn's identity after a replacement starts.
     const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };

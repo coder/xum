@@ -937,7 +937,15 @@ describe("AIService layout turn-end nudge", () => {
     const turn = await startTurn();
     const nudge = (abortSignal = new AbortController().signal, messageId = turn) =>
       harness.service.layoutTurnEndNudge(workspaceId, { messageId, abortSignal });
-    return { testHistory, projectPath, workspaceId, audit, nudge, startTurn, config: harness.config };
+    return {
+      testHistory,
+      projectPath,
+      workspaceId,
+      audit,
+      nudge,
+      startTurn,
+      config: harness.config,
+    };
   }
 
   it("asks for the nudge when the audit finds a new issue, and gives it the turn's workspace", async () => {
