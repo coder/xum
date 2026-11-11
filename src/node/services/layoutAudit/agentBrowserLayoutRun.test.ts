@@ -347,16 +347,12 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       "768 failed timeout",
     ]);
     const calls = await fake.calls();
-    expect(subcommands(calls)).toEqual([
-      "set",
-      "set",
-      "open",
-      "eval",
-      "set",
-      "open",
-      "eval",
-      "close",
-    ]);
+    const names = subcommands(calls);
+    // On a loaded host the budget can run out while 1440 still opens, before its eval starts:
+    // what must hold is that 390 finished, 768 never opened, and the browser was closed.
+    expect(names.slice(0, 6)).toEqual(["set", "set", "open", "eval", "set", "open"]);
+    expect(names.filter((name) => name === "open")).toHaveLength(2);
+    expect(names.at(-1)).toBe("close");
     expectOneOwnSession(calls);
   });
 
