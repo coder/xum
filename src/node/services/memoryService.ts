@@ -4046,6 +4046,7 @@ function borderTable(needle: string): Int32Array {
  * otherwise the first ones and how many more matching lines there are. The cap counts lines, not
  * matches: the list is the part that grows, and many matches on a few lines still name them all.
  */
+// dry-duplicate-ok: error text for the model that tests pin, unlike the About dialog's UI copy
 function describeMatchingLines(lines: readonly number[]): string {
   const listed = lines.slice(0, MEMORY_STR_REPLACE_ERROR_MAX_LINES).join(", ");
   const unlisted = lines.length - MEMORY_STR_REPLACE_ERROR_MAX_LINES;
