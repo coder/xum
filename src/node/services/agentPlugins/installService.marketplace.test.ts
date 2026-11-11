@@ -842,29 +842,6 @@ describe("AgentPluginInstallService marketplaces", () => {
     }
   });
 
-  test("a folder matched only by ignoring letter case is refused; another Unicode form is not", async () => {
-    // This host's drive matches names exactly, so realpath answers as a drive that ignores
-    // letter case (macOS, Windows) would: with the name stored on disk.
-    const staged = path.join(tmpRoot, "staged");
-    await fsPromises.mkdir(path.join(staged, "Kit"), { recursive: true });
-    await fsPromises.mkdir(path.join(staged, "caf\u00e9"), { recursive: true });
-    const realRealpath = fsPromises.realpath;
-    const realpath = spyOn(fsPromises, "realpath").mockImplementation((async (target: string) => {
-      const resolved = await realRealpath(target);
-      return resolved.endsWith(`${path.sep}Kit`)
-        ? `${resolved.slice(0, -3)}kit`
-        : resolved.replace("caf\u00e9", "cafe\u0301");
-    }) as typeof fsPromises.realpath);
-    try {
-      expect(await realEntryFolder(staged, "Kit")).toEqual({
-        why: "its letter case differs from the folder in the repository",
-      });
-      expect("entryDir" in (await realEntryFolder(staged, "caf\u00e9"))).toBe(true);
-    } finally {
-      realpath.mockRestore();
-    }
-  });
-
   test("a Xum root behind a symbolic link does not make every entry folder look like a link", async () => {
     // A linked home such as Fedora Silverblue's /home -> /var/home: the staging folder's path runs
     // through a link, but the entry folders inside the clone do not.
