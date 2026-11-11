@@ -1263,15 +1263,23 @@ describe("redactSecretLike", () => {
   // its baseline. CPU time is the process's own, and it stayed within 7% when two runs shared one
   // CPU. A budget alone is not enough: the slowest linear scan takes about 65 ms, so a budget low
   // enough to catch a regression on the faster ones would fail it. Each row therefore also runs its
-  // text cut to an eighth: the cost per character must not grow with the length.
-  const SCAN_SIZE_DIVISOR = 8;
-  // Past this, a scan fails whatever its first eighth costs: the slowest linear scan takes about a
-  // fifth of it, and the regressions this guards cost seconds.
+  // text cut to a half, a quarter and an eighth, and checks how the cost per character grows from
+  // each size to the next.
+  //
+  // One ratio against the first eighth does not work. Bun 1.4 runs a regex about 70 times cheaper
+  // per character on a text shorter than some length (near 65,000 characters for the cookie rows,
+  // near 35,000 for the escaped runs), so the eighth of a long text looks cheap and the whole text
+  // 3 to 28 times costlier per character, with no quadratic scan involved: CI failed two rows on it
+  // at 3.6 and 3.2. That jump sits at one size, so it hits one of the three doublings. A quadratic
+  // scan hits all three, so the median of the three growths tells the two apart.
+  const SCAN_SIZE_DIVISORS = [8, 4, 2, 1];
+  // Past this, a scan fails whatever its growth: the slowest linear scan takes about a fifth of it,
+  // and the regressions this guards cost seconds.
   const SCAN_CPU_CEILING_MS = 300;
-  // How much more per character the full text may cost than its eighth: 1 for a linear scan (1.6
-  // measured at most), 8 for a quadratic one.
-  const SCAN_COST_PER_CHAR_LIMIT = 3;
-  // An eighth that costs less than this is mostly timer and allocation noise.
+  // How much the cost per character grows when the text doubles: 1 for a linear scan (1.28 at most
+  // over 312 measurements each on Bun 1.3 and 1.4), 2 for a quadratic one.
+  const SCAN_GROWTH_PER_DOUBLING_LIMIT = 1.6;
+  // A cut that costs less than this is mostly timer and allocation noise.
   const SCAN_CPU_FLOOR_MS = 1;
 
   function cpuMilliseconds(run: () => void): number {
@@ -1295,6 +1303,25 @@ describe("redactSecretLike", () => {
       if (attempt >= 1 && best >= SCAN_CPU_CEILING_MS) break;
     }
     return best;
+  }
+
+  /** The CPU time of the whole text, and the median growth of the cost per character per doubling. */
+  function measureScan(
+    scan: (text: string) => unknown,
+    text: string
+  ): { fullMs: number; growth: number } {
+    const timesMs = SCAN_SIZE_DIVISORS.map((divisor) => {
+      const part = text.slice(0, Math.floor(text.length / divisor));
+      scan(part);
+      return bestCpuMilliseconds(() => scan(part), divisor >= 4 ? 5 : 3);
+    });
+    // Each size is twice the one before, so the cost per character grew by `next / (2 * previous)`.
+    const growths = timesMs
+      .slice(1)
+      .map((next, i) => next / (2 * Math.max(timesMs[i], SCAN_CPU_FLOOR_MS)))
+      .sort((a, b) => a - b);
+    // Four sizes give three growths, so the middle one is the median.
+    return { fullMs: timesMs[timesMs.length - 1], growth: growths[Math.floor(growths.length / 2)] };
   }
 
   // The guard scans text a model supplied, so a hostile 100 KB write must not stall the process.
@@ -1376,20 +1403,12 @@ describe("redactSecretLike", () => {
     ["nested cookie list openers", `${"Cookie: [".repeat(10_000)}]`],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
-    const small = text.slice(0, Math.floor(text.length / SCAN_SIZE_DIVISOR));
     // Each scan gets its own checks: `containsSecretLike` is a second pass of the same redaction.
     for (const scan of [redactSecretLike, containsSecretLike]) {
-      scan(small);
-      const smallMs = bestCpuMilliseconds(() => scan(small), 5);
-      const fullMs = bestCpuMilliseconds(() => scan(text), 3);
+      const { fullMs, growth } = measureScan(scan, text);
 
-      // A scan that is not quadratic costs about the same per character on a text and on its
-      // first eighth (at most 1.6 times as much, measured: the engine slows down on long inputs),
-      // and a quadratic one costs eight times as much.
       expect(fullMs).toBeLessThan(SCAN_CPU_CEILING_MS);
-      expect(fullMs / SCAN_SIZE_DIVISOR).toBeLessThan(
-        SCAN_COST_PER_CHAR_LIMIT * Math.max(smallMs, SCAN_CPU_FLOOR_MS)
-      );
+      expect(growth).toBeLessThan(SCAN_GROWTH_PER_DOUBLING_LIMIT);
     }
   });
 });
