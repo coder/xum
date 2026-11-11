@@ -9,16 +9,17 @@ import {
   hasReachableVerticalScrollerAncestor,
   isExcludedElement,
   isInsideHorizontalScroller,
-  isIntentionalTruncation,
   isNearAnimation,
   isNestedInTextBoundary,
   isRequiredControl,
   isRootElement,
   isVisible,
+  nestedClippingBoundaries,
   paddingBox,
   rootVerticalScrollLocked,
   selectorFor,
   textFragments,
+  textTruncation,
   type ClippingBoundary,
 } from "./elementFacts";
 import {
@@ -29,6 +30,7 @@ import {
   isNearTotalOcclusion,
   materialViewportPx,
   strongest,
+  type TextTruncation,
 } from "./geometry";
 import type { Box, LayoutPage, PageMetrics } from "./layoutPage";
 
@@ -76,12 +78,14 @@ function isRootFailure(pass: AuditPass, el: Element): boolean {
 
 /**
  * Not a diagram, mask or screen-reader-only text, not a span that its paragraph judges, and not
- * near motion. The part of every text and control rule that does not depend on the rule.
+ * near motion. The part of every text and control rule that does not depend on the rule. A
+ * paragraph judges the text of what it holds, never a box: an element that is judged by its own
+ * box (`byOwnBox`) is not exempt for sitting inside one.
  */
-function isJudgeable(pass: AuditPass, el: Element): boolean {
+function isJudgeable(pass: AuditPass, el: Element, byOwnBox = false): boolean {
   return (
     !isExcludedElement(pass.page, el) &&
-    !isNestedInTextBoundary(pass.page, el) &&
+    (byOwnBox || !isNestedInTextBoundary(pass.page, el)) &&
     !isNearAnimation(pass.animated, el)
   );
 }
@@ -277,29 +281,44 @@ interface TextClip {
 const clippedOverflow = (boundary: ClippingBoundary, axis: "horizontal" | "vertical") =>
   boundary.axes.includes(axis) ? "hidden" : "auto";
 
-// The element's own box first, then each clipping ancestor: the strongest failure names the root
-// that is reported (an ancestor's clip wins only by overflowing more).
+function clipAtBoundary(
+  boundary: ClippingBoundary,
+  fragments: readonly Box[],
+  truncation: TextTruncation
+): TextClip | null {
+  const failure = classifySevereTextOverflow({
+    fragments,
+    box: boundary.box,
+    overflowX: clippedOverflow(boundary, "horizontal"),
+    overflowY: clippedOverflow(boundary, "vertical"),
+    truncation,
+  });
+  return failure && { root: boundary.el, ...failure };
+}
+
+// The element's own box first, then each clipping element inside it (a text boundary's narrower
+// span), then each clipping ancestor: the strongest failure names the root that is reported (a
+// later clip wins only by overflowing more).
 function strongestTextClip(pass: AuditPass, el: Element): TextClip | null {
   const style = pass.page.style(el);
   const fragments = textFragments(pass.page, el);
-  const isTruncated = isIntentionalTruncation(style);
+  const truncation = textTruncation(style);
   const own = classifySevereTextOverflow({
     fragments,
     box: paddingBox(pass.page, el),
     overflowX: style.overflowX,
     overflowY: style.overflowY,
-    isTruncated,
+    truncation,
   });
   let clip: TextClip | null = own && { root: el, ...own };
+  // A nested clipper's own ellipsis or line clamp is the author's cut of the text it holds, so it
+  // is read from that clipper (`<span class="truncate">` in a paragraph is common).
+  for (const nested of nestedClippingBoundaries(pass.page, el)) {
+    const nestedTruncation = textTruncation(pass.page.style(nested.boundary.el));
+    clip = strongest(clip, clipAtBoundary(nested.boundary, nested.fragments, nestedTruncation));
+  }
   for (const boundary of clippingBoundariesFor(pass.page, el)) {
-    const failure = classifySevereTextOverflow({
-      fragments,
-      box: boundary.box,
-      overflowX: clippedOverflow(boundary, "horizontal"),
-      overflowY: clippedOverflow(boundary, "vertical"),
-      isTruncated,
-    });
-    clip = strongest(clip, failure && { root: boundary.el, ...failure });
+    clip = strongest(clip, clipAtBoundary(boundary, fragments, truncation));
   }
   return clip;
 }
@@ -415,33 +434,98 @@ function isInsideViewport(point: Point, metrics: PageMetrics): boolean {
   );
 }
 
-function occlusionPoints(pass: AuditPass, el: Element): Point[] {
-  return textFragments(pass.page, el)
-    .filter((fragment) => fragment.width * fragment.height >= THRESHOLDS.minFragmentArea)
-    .flatMap(fragmentSamplePoints)
-    .filter((point) => isInsideViewport(point, pass.metrics));
+function isBelowViewport(point: Point, metrics: PageMetrics): boolean {
+  return point.x >= 0 && point.x <= metrics.viewportWidth && point.y > metrics.viewportHeight;
+}
+
+// A control with no text of its own (an <input value>, a <select>, an icon-only button): its face
+// is not a text node, so it is sampled by its box.
+function isFacelessControl(page: LayoutPage, el: Element): boolean {
+  return auditedText(page, el) === "" && isRequiredControl(el);
+}
+
+// The rectangles whose points are sampled: the text lines, or the box of a faceless control.
+function sampleRects(pass: AuditPass, el: Element): Box[] {
+  const rects = isFacelessControl(pass.page, el)
+    ? [pass.page.box(el)]
+    : textFragments(pass.page, el);
+  return rects.filter((rect) => rect.width * rect.height >= THRESHOLDS.minFragmentArea);
+}
+
+/** What the sample points of one candidate found so far. */
+interface OcclusionSamples {
+  el: Element;
+  /** The cover found at each sampled point, null where nothing covers it. */
+  covers: Array<Element | null>;
+  /** Points below the screen, in document coordinates: sampled after a scroll. */
+  below: Point[];
+}
+
+// Points inside the viewport are sampled where they are. Points below it wait for a scroll (every
+// rect is read here, before any scroll, so all of them are in the one coordinate frame).
+function sampleOnScreen(pass: AuditPass, el: Element): OcclusionSamples {
+  const samples: OcclusionSamples = { el, covers: [], below: [] };
+  for (const point of sampleRects(pass, el).flatMap(fragmentSamplePoints)) {
+    if (isInsideViewport(point, pass.metrics)) {
+      samples.covers.push(opaqueSiblingBlocker(pass, el, point));
+    } else if (isBelowViewport(point, pass.metrics)) {
+      samples.below.push({ x: point.x, y: point.y + pass.metrics.scrollY });
+    }
+  }
+  return samples;
+}
+
+/**
+ * Samples the points below the screen, which a user reaches by scrolling. The points are taken
+ * in page order. One that is not in the middle half of the viewport scrolls the window to put it
+ * in the middle (the scroll is instant, whatever the page's `scroll-behavior`), and the points
+ * that follow reuse that position. The scroll that was reached is read back: a point the page
+ * could not bring on screen is skipped, not sampled where it is not. A page that cannot scroll
+ * (its root clips vertically) shows a user none of this text. The scroll position is put back
+ * before this returns, so a later pass measures the same page.
+ */
+function sampleBelowScreen(pass: AuditPass, all: readonly OcclusionSamples[]): void {
+  const { page, metrics } = pass;
+  const pending = all.flatMap((samples) => samples.below.map((point) => ({ samples, point })));
+  if (pending.length === 0 || rootVerticalScrollLocked(page)) return;
+  pending.sort((a, b) => a.point.y - b.point.y);
+  const { viewportHeight } = metrics;
+  let top = metrics.scrollY;
+  try {
+    for (const { samples, point } of pending) {
+      const inMiddleHalf =
+        point.y - top >= viewportHeight / 4 && point.y - top <= (viewportHeight * 3) / 4;
+      if (!inMiddleHalf) top = page.scrollTo(point.y - viewportHeight / 2);
+      const clientPoint = { x: point.x, y: point.y - top };
+      if (!isInsideViewport(clientPoint, metrics)) continue;
+      samples.covers.push(opaqueSiblingBlocker(pass, samples.el, clientPoint));
+    }
+  } finally {
+    page.scrollTo(metrics.scrollY);
+  }
 }
 
 // How many sample points one blocker covers, of how many in all.
-function sampleOcclusion(pass: AuditPass, el: Element) {
-  const points = occlusionPoints(pass, el);
+function occlusionOf(samples: OcclusionSamples) {
   const coveredBy = new Map<Element, number>();
-  for (const point of points) {
-    const blocker = opaqueSiblingBlocker(pass, el, point);
-    if (blocker) coveredBy.set(blocker, (coveredBy.get(blocker) ?? 0) + 1);
+  for (const cover of samples.covers) {
+    if (cover) coveredBy.set(cover, (coveredBy.get(cover) ?? 0) + 1);
   }
-  return { occludedSamples: Math.max(0, ...coveredBy.values()), totalSamples: points.length };
+  return {
+    occludedSamples: Math.max(0, ...coveredBy.values()),
+    totalSamples: samples.covers.length,
+  };
 }
 
-// Long enough to read (any length for a control), static (positioned text overlaps on purpose),
-// and not shown by a paragraph around it.
+// Long enough to read (any length for a control, and none at all: it is sampled by its box),
+// static (positioned text overlaps on purpose), and not shown by a paragraph around it. A control
+// with no text is no text for a paragraph to show, so it is a candidate inside one too.
 function isOcclusionCandidate(pass: AuditPass, el: Element): boolean {
   const text = auditedText(pass.page, el);
-  const hasText =
-    text.length >= THRESHOLDS.occlusionMinTextChars || (text.length > 0 && isRequiredControl(el));
+  const sampled = text.length >= THRESHOLDS.occlusionMinTextChars || isRequiredControl(el);
   return (
-    hasText &&
-    isJudgeable(pass, el) &&
+    sampled &&
+    isJudgeable(pass, el, isFacelessControl(pass.page, el)) &&
     isVisible(pass.page, el) &&
     pass.page.style(el).position === "static"
   );
@@ -451,10 +535,13 @@ function occlusionCheck(pass: AuditPass, elements: readonly Element[]): void {
   const candidates = elements
     .filter((el) => isOcclusionCandidate(pass, el))
     .slice(0, THRESHOLDS.maxOcclusionCandidates);
+  const sampled = candidates.map((el) => sampleOnScreen(pass, el));
+  sampleBelowScreen(pass, sampled);
   const failedRoots: Element[] = [];
-  for (const el of candidates) {
+  for (const samples of sampled) {
+    const { el } = samples;
     if (failedRoots.some((root) => root.contains(el))) continue;
-    if (!isNearTotalOcclusion(sampleOcclusion(pass, el))) continue;
+    if (!isNearTotalOcclusion(occlusionOf(samples))) continue;
     failedRoots.push(el);
     report(pass, {
       rule: "overlapping-text",
@@ -478,7 +565,10 @@ function createPass(page: LayoutPage): AuditPass {
   };
 }
 
-/** One measurement of the page. Pure reads: it never changes the DOM. */
+/**
+ * One measurement of the page. It never changes the DOM. The overlap rule scrolls the window to
+ * sample text below the screen and puts it back before this returns.
+ */
 export function auditLayout(page: LayoutPage): LayoutAuditPageFinding[] {
   const pass = createPass(page);
   const { body } = page.document;

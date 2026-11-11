@@ -60,6 +60,13 @@ function readAnimatedElements(win: BrowserWindow): Element[] {
   return targets.filter((target) => target !== null);
 }
 
+// "instant" overrides a page's `scroll-behavior: smooth`, which would leave the scroll position
+// unmoved when it is read back. The position reached is the real one: the end of the page limits it.
+function scrollInstantly(win: BrowserWindow, top: number): number {
+  win.scrollTo({ top, behavior: "instant" });
+  return win.scrollY || 0;
+}
+
 export function createBrowserLayoutPage(win: BrowserWindow): LayoutPage {
   return {
     document: win.document,
@@ -69,6 +76,7 @@ export function createBrowserLayoutPage(win: BrowserWindow): LayoutPage {
     renderedText: (el) => readRenderedText(win, el),
     textLines: (node) => readTextLines(win, node),
     elementAt: (x, y) => win.document.elementFromPoint(x, y),
+    scrollTo: (top) => scrollInstantly(win, top),
     animatedElements: () => readAnimatedElements(win),
     escapeIdent: (value) => win.CSS.escape(value),
   };

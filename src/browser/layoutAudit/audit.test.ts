@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { LayoutAuditPageFinding } from "@/common/types/artifactLayoutAudit";
 import { auditLayout } from "./audit";
-import { createFakeLayoutPage, type FakeLayoutPageOptions } from "./fakeLayoutPage.testHarness";
+import {
+  createFakeLayoutPage,
+  type FakeLayoutPage,
+  type FakeLayoutPageOptions,
+} from "./fakeLayoutPage.testHarness";
+import type { LayoutPage } from "./layoutPage";
 
 type Rule = LayoutAuditPageFinding["rule"];
 type Axis = LayoutAuditPageFinding["axis"];
@@ -36,6 +41,22 @@ function auditBodyText(
   body.setAttribute("data-lines", attributes.lines);
   if (attributes.css !== undefined) body.setAttribute("data-css", attributes.css);
   return auditLayout(fake.page);
+}
+
+/**
+ * `audit` for a page 3000 px tall, with the scrolls the audit made. `prepare` changes the fake
+ * page before the audit (a locked root, say).
+ */
+function auditScrolling(
+  html: string,
+  options: FakeLayoutPageOptions = {},
+  prepare: (fake: FakeLayoutPage) => void = () => undefined
+) {
+  const viewport = { width: 390, height: 844, scrollHeight: 3000, ...options.viewport };
+  using fake = createFakeLayoutPage(html, { ...options, viewport });
+  prepare(fake);
+  const findings = auditLayout(fake.page);
+  return { findings, scrolls: fake.calls.filter((call) => call.startsWith("scrollTo")) };
 }
 
 describe("clipped-text", () => {
@@ -150,6 +171,119 @@ describe("clipped-text", () => {
     expect(audit(TEXT("").replace("<p ", "<p data-animated "))).toEqual([]);
     expect(audit(`<div data-animated>${TEXT("")}</div>`)).toEqual([]);
     expect(audit(TEXT("").replace(">Some", "><i data-animated></i>Some"))).toEqual([]);
+  });
+
+  describe("a clipper inside a paragraph", () => {
+    // The paragraph is wide; the span inside it is not.
+    const NESTED = (spanCss: string, spanBox = "0 0 60 20", paragraphCss = "") =>
+      `<p id="p" data-box="0 0 300 20" data-css="${paragraphCss}">Intro <span id="s" data-box="${spanBox}"
+        data-css="${spanCss}" data-lines="0 0 200 20">A long clipped text</span></p>`;
+    const CLIPPING = "overflow-x: hidden; white-space: nowrap";
+
+    test("is reported on the clipper: the paragraph's own box does not cut its text", () => {
+      expect(audit(NESTED(CLIPPING))).toEqual([
+        finding("clipped-text", "span#s", "horizontal", 140),
+      ]);
+    });
+
+    test("is judged on the lines it holds, down to a clipper inside a clipper", () => {
+      const html = `<p id="p" data-box="0 0 300 20"><span id="outer" data-box="0 0 60 20" data-css="overflow-x: hidden">
+        <span id="inner" data-box="0 0 300 20" data-css="overflow-x: hidden" data-lines="0 0 200 20">Clipped text</span></span></p>`;
+      expect(audit(html)).toEqual([finding("clipped-text", "span#outer", "horizontal", 140)]);
+    });
+
+    test("takes the blame from the paragraph's box and its clipping ancestors only by clipping more", () => {
+      const inCard = (cardWidth: number, spanWidth: number) =>
+        `<div id="card" data-box="0 0 ${cardWidth} 20" data-css="overflow-x: hidden">${NESTED(CLIPPING, `0 0 ${spanWidth} 20`)}</div>`;
+      // The line ends at 200: the span at 60 loses 140 px, the card at 150 loses 50.
+      expect(audit(inCard(150, 60))).toEqual([
+        finding("clipped-text", "span#s", "horizontal", 140),
+      ]);
+      expect(audit(inCard(150, 180))).toEqual([
+        finding("clipped-text", "div#card", "horizontal", 50),
+      ]);
+      // A paragraph that clips as much as the span keeps the blame: a tie keeps the first.
+      expect(
+        audit(
+          NESTED(CLIPPING, "0 0 100 20", "overflow-x: hidden").replace(
+            'data-box="0 0 300 20"',
+            'data-box="0 0 100 20"'
+          )
+        )
+      ).toEqual([finding("clipped-text", "p#p", "horizontal", 100)]);
+    });
+
+    test.each([
+      ["ellipsis", "; text-overflow: ellipsis"],
+      ["a line clamp", "; webkit-line-clamp: 2"],
+      ["a mask image", "; mask-image: linear-gradient(black, transparent)"],
+      ["rounded corners", "; border-top-left-radius: 8px"],
+      ["visibility hidden", "; visibility: hidden"],
+      ["display none", "; display: none"],
+      ["a running animation", ""],
+    ])("with %s is the author's cut, not a failure", (name, css) => {
+      const html = NESTED(CLIPPING + css);
+      expect(
+        audit(
+          name === "a running animation" ? html.replace("<span ", "<span data-animated ") : html
+        )
+      ).toEqual([]);
+    });
+
+    test("that clips only the other axis, or only scrolls, cuts nothing", () => {
+      expect(audit(NESTED("overflow-y: hidden"))).toEqual([]);
+      expect(audit(NESTED("overflow-x: auto"))).toEqual([]);
+    });
+
+    // The text of an element that no rule judges is no evidence of a cut, whichever box holds it.
+    test("that is itself screen-reader-only text is never reported", () => {
+      const hidden = "position: absolute; overflow-x: hidden; white-space: nowrap";
+      expect(audit(NESTED(hidden, "0 0 1 1"))).toEqual([]);
+    });
+
+    test("that holds screen-reader-only text is not reported for it", () => {
+      const html = `<p data-box="0 0 300 20"><span id="s" data-box="0 0 60 20" data-css="overflow-x: hidden">
+        <i data-box="0 0 1 1" data-css="position: absolute; overflow-x: hidden; white-space: nowrap"
+        data-lines="0 0 200 20">Hidden label</i></span></p>`;
+      expect(audit(html)).toEqual([]);
+    });
+
+    test("that holds a diagram's label is not reported for it", () => {
+      const diagram = `<p data-box="0 0 300 20"><span id="s" data-box="0 0 60 20" data-css="overflow-x: hidden"><svg>
+        <text data-box="0 0 200 20" data-lines="0 0 200 20">Diagram label</text></svg></span></p>`;
+      expect(audit(diagram)).toEqual([]);
+    });
+
+    test("is not judged for the text of an element that is no text boundary", () => {
+      // A div reads only its own text, so the span is its own element: still reported, once.
+      const html = `<div id="d" data-box="0 0 300 20"><span id="s" data-box="0 0 60 20" data-css="overflow-x: hidden"
+        data-lines="0 0 200 20">A long clipped text</span></div>`;
+      expect(audit(html)).toEqual([finding("clipped-text", "span#s", "horizontal", 140)]);
+    });
+  });
+
+  // An ellipsis marks where a line ends: it never authorizes lines lost below a short box.
+  test("an ellipsis excuses a line cut sideways, not lines lost below a short box", () => {
+    const TWO_LINES = (css: string) =>
+      `<p id="t" data-box="0 0 200 22" data-css="overflow-y: hidden; ${css}"
+        data-lines="0 0 180 20; 0 24 150 20">Two lines of text</p>`;
+    expect(audit(TWO_LINES("text-overflow: ellipsis"))).toEqual([
+      finding("clipped-text", "p#t", "vertical", 22),
+    ]);
+    expect(audit(TWO_LINES("webkit-line-clamp: 2"))).toEqual([]);
+  });
+
+  describe("visibility", () => {
+    const HIDDEN_BOX = (inner: string) =>
+      `<div data-box="0 0 200 20" data-css="visibility: hidden">${inner}</div>`;
+
+    test("a descendant that switches it back on is painted, so it is judged", () => {
+      expect(audit(HIDDEN_BOX(TEXT("; visibility: visible")))).toEqual(BASE);
+    });
+
+    test("a descendant that inherits it is hidden, so it is not", () => {
+      expect(audit(HIDDEN_BOX(TEXT("")))).toEqual([]);
+    });
   });
 });
 
@@ -516,6 +650,149 @@ describe("overlapping-text", () => {
       []
     );
     expect(audit(STAGE(COVER(), "Hello world text", "data-animated"))).toEqual([]);
+  });
+
+  describe("a control with no text of its own", () => {
+    const CONTROL = (control: string) => `<div id="stage">${control}${COVER()}</div>`;
+    const BOXED = 'data-box="10 10 200 30"';
+
+    test.each([
+      ["an input with a value", `<input id="f" value="Jane Doe" ${BOXED}>`, "input#f"],
+      ["a select", `<select id="f" ${BOXED}><option>One</option></select>`, "select#f"],
+      ["an icon-only button", `<button id="f" ${BOXED}><svg></svg></button>`, "button#f"],
+      ["a link around an image", `<a id="f" href="/x" ${BOXED}><img alt=""></a>`, "a#f"],
+    ])("%s is sampled by its box, so a cover over it is reported", (_name, control, selector) => {
+      expect(audit(CONTROL(control))).toEqual([
+        finding("overlapping-text", selector, "horizontal", 0),
+      ]);
+    });
+
+    test("a control that nothing covers, or that a cover leaves mostly free, is not reported", () => {
+      expect(audit(`<input id="f" value="Jane" ${BOXED}>`)).toEqual([]);
+      const partial = COVER().replace("0 0 300 60", "0 0 160 60");
+      expect(audit(`<div id="stage"><input id="f" value="Jane" ${BOXED}>${partial}</div>`)).toEqual(
+        []
+      );
+    });
+
+    test("the same filters apply as for text: static, shown, and at least 16 square px", () => {
+      const reported = (attributes: string) =>
+        audit(CONTROL(`<input id="f" value="x" ${attributes}>`)).length;
+      expect(reported(BOXED)).toBe(1);
+      expect(reported(`${BOXED} data-css="position: relative"`)).toBe(0);
+      expect(reported(`${BOXED} data-css="opacity: 0"`)).toBe(0);
+      expect(reported(`${BOXED} data-animated`)).toBe(0);
+      expect(reported('data-box="10 10 3 5"')).toBe(0);
+    });
+
+    // A paragraph, label or list item judges the text it holds, never a control's box.
+    test.each(["label", "p", "li"])(
+      "inside a %s it is sampled too: the text there is not its face",
+      (tag) => {
+        const html = `<div id="stage"><${tag} data-box="0 0 300 40">Name <input id="f" value="x" ${BOXED}></${tag}>${COVER()}</div>`;
+        expect(audit(html)).toEqual([finding("overlapping-text", "input#f", "horizontal", 0)]);
+      }
+    );
+
+    test("inside a label it is still left alone when excluded or near motion", () => {
+      const inLabel = (labelAttributes: string, inputAttributes = "") =>
+        `<div id="stage"><label ${labelAttributes} data-box="0 0 300 40">Name <input id="f" value="x" ${BOXED} ${inputAttributes}></label>${COVER()}</div>`;
+      expect(audit(inLabel(""))).toHaveLength(1);
+      expect(audit(inLabel("", "data-animated"))).toEqual([]);
+      expect(audit(inLabel("data-animated"))).toEqual([]);
+      expect(audit(inLabel('data-css="mask-image: linear-gradient(black, transparent)"'))).toEqual(
+        []
+      );
+      expect(audit(inLabel('class="mermaid"'))).toEqual([]);
+    });
+
+    test("a control that has text is still left to the paragraph around it", () => {
+      // Its text is in the item's lines, and a short one is no candidate there: only a control
+      // with no text at all is sampled by its box inside a paragraph.
+      const html = `<div id="stage"><li data-box="0 0 300 40"><textarea id="f" ${BOXED} data-lines="10 10 200 30">Go</textarea></li>${COVER()}</div>`;
+      expect(audit(html)).toEqual([]);
+    });
+
+    test("an element that is no control, and a hidden or disabled control, are not sampled", () => {
+      expect(audit(CONTROL(`<div id="f" ${BOXED}></div>`))).toEqual([]);
+      expect(audit(CONTROL(`<input type="hidden" id="f" ${BOXED}>`))).toEqual([]);
+      expect(audit(CONTROL(`<button id="f" disabled ${BOXED}></button>`))).toEqual([]);
+    });
+  });
+
+  describe("text below the screen", () => {
+    // A paragraph at `top` and an opaque sibling over it. The page is 3000 px tall.
+    const AT = (top: number, id = "t") =>
+      `<div id="stage-${id}"><p id="${id}" data-box="10 ${top} 200 20" data-lines="10 ${top} 200 20">Hello world text</p>
+        <div data-box="0 ${top - 10} 300 60" data-css="background-color: rgb(255, 255, 255)" data-z="1"></div></div>`;
+
+    test("covered text a user reaches by scrolling is reported", () => {
+      expect(auditScrolling(AT(1200)).findings).toEqual([
+        finding("overlapping-text", "p#t", "horizontal", 0),
+      ]);
+    });
+
+    test("is sampled where the point sits in the middle of the viewport, then the scroll is put back", () => {
+      // The first point is at 1204: 422 px (half the viewport) below the scroll position.
+      expect(auditScrolling(AT(1200)).scrolls).toEqual(["scrollTo 782", "scrollTo 0"]);
+    });
+
+    test("one scroll serves every point in the middle half of the viewport", () => {
+      const near = [1000, 1030, 1060, 1090, 1120].map((top) => AT(top, `p${top}`)).join("");
+      const { findings, scrolls } = auditScrolling(near);
+      expect(findings).toHaveLength(5);
+      expect(scrolls).toEqual(["scrollTo 582", "scrollTo 0"]);
+      // A paragraph farther down needs a scroll of its own.
+      expect(auditScrolling(near + AT(2000, "far")).scrolls).toEqual([
+        "scrollTo 582",
+        "scrollTo 1582",
+        "scrollTo 0",
+      ]);
+    });
+
+    test("text on the screen is sampled where it is, with no scroll", () => {
+      expect(auditScrolling(AT(100)).scrolls).toEqual([]);
+    });
+
+    test("the scroll position the page started at is the one it is put back to", () => {
+      // The boxes are client coordinates at scroll 500: text at 1200 is at 1700 in the document.
+      const { findings, scrolls } = auditScrolling(AT(1200), {
+        viewport: { width: 390, height: 844, scrollY: 500 },
+      });
+      expect(findings).toHaveLength(1);
+      expect(scrolls).toEqual(["scrollTo 1282", "scrollTo 500"]);
+    });
+
+    test("text at the end of the page, where the scroll stops short of the middle, is still sampled", () => {
+      expect(auditScrolling(AT(2900)).findings).toHaveLength(1);
+    });
+
+    test("a point the page cannot bring on screen is skipped, not sampled where it is not", () => {
+      // The page scrolls to 2156 at most: a point at 3104 would sit at 948, below the viewport.
+      expect(auditScrolling(AT(3100)).findings).toEqual([]);
+    });
+
+    test("a page whose root cannot scroll shows a user none of it, so it is not scrolled", () => {
+      const { findings, scrolls } = auditScrolling(AT(1200), {}, (fake) => {
+        fake.page.document.body.setAttribute("data-css", "overflow-y: hidden");
+      });
+      expect(findings).toEqual([]);
+      expect(scrolls).toEqual([]);
+    });
+
+    test("the scroll is put back when a sample throws", () => {
+      using fake = createFakeLayoutPage(AT(1200), {
+        viewport: { width: 390, height: 844, scrollHeight: 3000 },
+      });
+      const failing: LayoutPage = {
+        ...fake.page,
+        elementAt: () => {
+          throw new Error("boom");
+        },
+      };
+      expect(() => auditLayout(failing)).toThrow("boom");
+      expect(fake.calls.filter((call) => call.startsWith("scrollTo")).at(-1)).toBe("scrollTo 0");
+    });
   });
 });
 

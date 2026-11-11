@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { selectorFor } from "./elementFacts";
+import { selectorFor, textTruncation } from "./elementFacts";
 import { createFakeLayoutPage } from "./fakeLayoutPage.testHarness";
 
 /** The selectors of every element matching `query`, in document order. */
@@ -38,5 +38,22 @@ describe("selectorFor", () => {
 
   test("escapes an id the way CSS needs", () => {
     expect(selectors("<p id='a.b:c'>x</p>", "p")).toEqual(["p#a\\.b\\:c"]);
+  });
+});
+
+describe("textTruncation", () => {
+  function truncationOf(css: string) {
+    using fake = createFakeLayoutPage(`<p data-css="${css}">text</p>`);
+    const paragraph = fake.page.document.querySelector("p");
+    if (paragraph === null) throw new Error("no <p>");
+    return textTruncation(fake.page.style(paragraph));
+  }
+
+  test("names the cut the author asked for, and a line clamp wins over an ellipsis", () => {
+    expect(truncationOf("")).toBe("none");
+    expect(truncationOf("text-overflow: ellipsis")).toBe("ellipsis");
+    expect(truncationOf("webkit-line-clamp: 2")).toBe("line-clamp");
+    expect(truncationOf("text-overflow: ellipsis; webkit-line-clamp: 2")).toBe("line-clamp");
+    expect(truncationOf("webkit-line-clamp: none")).toBe("none");
   });
 });

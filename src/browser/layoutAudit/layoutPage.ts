@@ -65,6 +65,12 @@ export interface LayoutPage {
   /** The rendered line rectangles of one text node, empty ones dropped. */
   textLines(node: Text): Box[];
   elementAt(x: number, y: number): Element | null;
+  /**
+   * Scrolls the window to `top` at once, whatever the page's `scroll-behavior`, and returns the
+   * position it reached: the end of the page limits it. `elementAt`, `box` and `textLines` read
+   * the page at that position afterwards.
+   */
+  scrollTo(top: number): number;
   /** Targets of running or pending animations. */
   animatedElements(): Element[];
   escapeIdent(value: string): string;

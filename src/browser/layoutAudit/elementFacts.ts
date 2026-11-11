@@ -1,6 +1,7 @@
 // Adapted from lavish-axi (MIT). See lavish-axi-LICENSE.txt in this folder.
 import { LAYOUT_AUDIT_THRESHOLDS as THRESHOLDS } from "@/common/constants/artifactLayoutAudit";
 import type { LayoutAuditAxis } from "@/common/types/artifactLayoutAudit";
+import type { TextTruncation } from "./geometry";
 import type { Box, LayoutPage, LayoutStyle } from "./layoutPage";
 
 /**
@@ -101,20 +102,27 @@ export function isRequiredControl(el: Element): boolean {
   return CONTROL_ROLES.has((el.getAttribute("role") ?? "").toLowerCase());
 }
 
+// `visibility` is not here: it inherits and a descendant may switch it back on (see isVisible).
 function isHiddenStyle(style: LayoutStyle): boolean {
   const opacity = Number.parseFloat(style.opacity || "1");
   return (
     style.display === "none" ||
-    style.visibility === "hidden" ||
     style.contentVisibility === "hidden" ||
     (Number.isFinite(opacity) && opacity <= THRESHOLDS.hiddenOpacity)
   );
 }
 
-/** Has area, and neither it nor an ancestor is display none, hidden or transparent. */
+/**
+ * Has area, is not `visibility: hidden`, and neither it nor an ancestor is display none, hidden
+ * by content-visibility or transparent. Computed `visibility` inherits, so the element's own
+ * value is the effective one: a `visibility: visible` descendant of a hidden container is
+ * painted and reachable. Display, content-visibility and opacity cannot be switched back on by a
+ * descendant, so those walk the ancestors.
+ */
 export function isVisible(page: LayoutPage, el: Element): boolean {
   const rect = page.box(el);
   if (rect.width <= 0 || rect.height <= 0) return false;
+  if (page.style(el).visibility === "hidden") return false;
   return !selfAndAncestors(el).some((node) => isHiddenStyle(page.style(node)));
 }
 
@@ -187,9 +195,10 @@ export function textFragments(page: LayoutPage, el: Element): Box[] {
   return nodes.flatMap((node) => page.textLines(node));
 }
 
-/** Ellipsis or line-clamp: the author asked for the cut. */
-export function isIntentionalTruncation(style: LayoutStyle): boolean {
-  return style.textOverflow === "ellipsis" || Number.parseInt(style.webkitLineClamp || "0", 10) > 0;
+/** Which cut the author asked for; a line clamp wins over an ellipsis (it covers both axes). */
+export function textTruncation(style: LayoutStyle): TextTruncation {
+  if (Number.parseInt(style.webkitLineClamp || "0", 10) > 0) return "line-clamp";
+  return style.textOverflow === "ellipsis" ? "ellipsis" : "none";
 }
 
 function isSet(value: string): boolean {
@@ -262,17 +271,80 @@ function clippedAxes(style: LayoutStyle): LayoutAuditAxis[] {
   return axes;
 }
 
+// A box that cuts its contents on purpose (a mask, rounded corners with overflow hidden) is no
+// boundary: it cuts glyph ink at its edge by design.
+function clippingBoundaryOf(page: LayoutPage, node: Element): ClippingBoundary | null {
+  const style = page.style(node);
+  const axes = clippedAxes(style);
+  if (axes.length === 0 || hasVisualMask(style) || isRoundedOverflowMask(style)) return null;
+  return { el: node, box: paddingBox(page, node), axes };
+}
+
 /** Ancestors that cut their descendants (overflow hidden or clip), nearest first. */
 export function clippingBoundariesFor(page: LayoutPage, el: Element): ClippingBoundary[] {
-  const boundaries: ClippingBoundary[] = [];
-  for (const node of chainBelowRoot(page, el.parentElement)) {
-    const style = page.style(node);
-    const axes = clippedAxes(style);
-    if (axes.length > 0 && !hasVisualMask(style) && !isRoundedOverflowMask(style)) {
-      boundaries.push({ el: node, box: paddingBox(page, node), axes });
-    }
+  return chainBelowRoot(page, el.parentElement).flatMap(
+    (node) => clippingBoundaryOf(page, node) ?? []
+  );
+}
+
+/** A clipping element inside a text boundary, and the rendered lines of the text it holds. */
+export interface NestedClip {
+  boundary: ClippingBoundary;
+  fragments: Box[];
+}
+
+// A nested clipper is judged like a clipping ancestor, and only when it is shown. The text it
+// holds is filtered by the caller: text under a diagram, mask or screen-reader-only element
+// (the clipper itself included) is never evidence of a cut.
+function nestedClipFor(page: LayoutPage, node: Element): NestedClip | null {
+  const boundary = clippingBoundaryOf(page, node);
+  return boundary !== null && isVisible(page, node) ? { boundary, fragments: [] } : null;
+}
+
+// The nested clippers that hold `node`, nearest first: judged ones only, each looked up once.
+function clippersHolding(
+  page: LayoutPage,
+  node: Text,
+  boundary: Element,
+  clips: Map<Element, NestedClip | null>
+): NestedClip[] {
+  const found: NestedClip[] = [];
+  for (
+    let holder = node.parentElement;
+    holder && holder !== boundary;
+    holder = holder.parentElement
+  ) {
+    if (!clips.has(holder)) clips.set(holder, nestedClipFor(page, holder));
+    const clip = clips.get(holder);
+    if (clip) found.push(clip);
   }
-  return boundaries;
+  return found;
+}
+
+/**
+ * The clipping elements between a text boundary's text and the boundary (a paragraph's narrower
+ * `overflow: hidden` span), each with the lines it holds. The boundary measures its text against
+ * its own box and its clipping ancestors, so a clipper inside it would cut text that no box
+ * reaches. Text that no rule judges (a diagram label, screen-reader-only text) is no evidence of
+ * a cut. Another element reads only its own text, so it has none.
+ */
+export function nestedClippingBoundaries(page: LayoutPage, el: Element): NestedClip[] {
+  if (!isSemanticTextBoundary(el)) return [];
+  const nodes: Text[] = [];
+  collectTextNodes(el, true, nodes);
+  const clips = new Map<Element, NestedClip | null>();
+  for (const node of nodes) {
+    const clippers = clippersHolding(page, node, el, clips);
+    if (
+      clippers.length === 0 ||
+      (node.parentElement && isExcludedElement(page, node.parentElement))
+    ) {
+      continue;
+    }
+    const lines = page.textLines(node);
+    for (const clip of clippers) clip.fragments.push(...lines);
+  }
+  return Array.from(clips.values()).filter((clip) => clip !== null);
 }
 
 /** Near an animation target (itself, an ancestor or a descendant): motion makes geometry lie. */

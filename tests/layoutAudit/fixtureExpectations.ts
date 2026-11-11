@@ -13,7 +13,7 @@ const found = (rule: LayoutAuditRule, selector: string): ExpectedFinding => ({ r
 
 /**
  * What the shipped audit must report for each fixture page (tests/fixtures/layout-audit, byte
- * identical to lavish-axi's) at each width: its findings, one entry per finding, as the rule and
+ * identical to lavish-axi's except the pages marked as Xum's own below) at each width: its findings, one entry per finding, as the rule and
  * the selector. Pinning the selector too means a finding that moves to another element, or a
  * second element that starts to fail while the rule count stays the same, fails the run.
  *
@@ -59,6 +59,30 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
     found("viewport-unreachable-control", "html > body > button:nth-of-type(2)"),
     found("viewport-unreachable-control", "html > body > button:nth-of-type(3)")
   ),
+  // The pages below are Xum's own, each for a detector miss that upstream shares (found in review
+  // of the port). Their rows were measured, then checked against what the page does.
+  // A span narrower than its paragraph cuts its text. An ellipsis span and screen-reader-only
+  // text inside a paragraph are not findings.
+  "nested-clipper-in-paragraph": everyWidth(found("clipped-text", "span#cut-tag")),
+  // The cover sits below the first screen at every width: only a scroll reaches it.
+  "below-fold-covered": everyWidth(found("overlapping-text", "html > body > main > section > p")),
+  // The same page with `scroll-behavior: smooth`: the audit's scrolls must not animate.
+  "below-fold-covered-smooth-scroll": everyWidth(
+    found("overlapping-text", "html > body > main > section > p")
+  ),
+  // A long page with a sticky header and a fixed chip over scrolling text: no cover.
+  "below-fold-clean": CLEAN,
+  // An input, a select and an icon-only button have no text node, and neither has an input inside
+  // a label (the label's text is no face for it). The input at the end is free.
+  "faceless-controls-covered": everyWidth(
+    found("overlapping-text", "input#name"),
+    found("overlapping-text", "select#plan"),
+    found("overlapping-text", "button#close"),
+    found("overlapping-text", "input#in-label")
+  ),
+  // An ellipsis does not excuse lines lost below a short box. A one-line ellipsis and a line
+  // clamp are the author's cut.
+  "ellipsis-clipped-lines": everyWidth(found("clipped-text", "p#lost-lines")),
   "occlusion-exclusions-clean": CLEAN,
   "real-animated-entry": CLEAN,
   "real-carousel": CLEAN,

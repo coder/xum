@@ -8,6 +8,7 @@ import {
   isNearTotalOcclusion,
   materialViewportPx,
   strongest,
+  type TextTruncation,
 } from "./geometry";
 import type { Box } from "./layoutPage";
 
@@ -22,14 +23,14 @@ function textOverflow(
   boxEdges: { left: number; right: number; top: number; bottom: number },
   overflowX = "hidden",
   overflowY = "hidden",
-  isTruncated = false
+  truncation: TextTruncation = "none"
 ) {
   return classifySevereTextOverflow({
     fragments,
     box: boxEdges,
     overflowX,
     overflowY,
-    isTruncated,
+    truncation,
   });
 }
 
@@ -112,8 +113,27 @@ describe("classifySevereTextOverflow", () => {
   });
 
   test("text the author truncated, and a missing line list, are never failures", () => {
-    expect(textOverflow([box(0, 0, 400, 20)], BOX_300x20, "hidden", "hidden", true)).toBeNull();
+    const wide = [box(0, 0, 400, 20)];
+    expect(textOverflow(wide, BOX_300x20, "hidden", "hidden", "ellipsis")).toBeNull();
+    expect(textOverflow(wide, BOX_300x20, "hidden", "hidden", "line-clamp")).toBeNull();
     expect(textOverflow([], BOX_300x20)).toBeNull();
+  });
+
+  // An ellipsis marks where a line ends: it never authorizes lines lost below a short box.
+  test("an ellipsis exempts the sideways axis only; a line clamp exempts both", () => {
+    const frame = { left: 0, right: 300, top: 0, bottom: 22 };
+    const lost = [box(0, 0, 200, 20), box(0, 24, 200, 20)];
+    const sideways = [box(0, 0, 400, 20)];
+    expect(textOverflow(lost, frame, "hidden", "hidden", "ellipsis")).toEqual({
+      axis: "vertical",
+      overflowPx: 22,
+    });
+    expect(textOverflow(lost, frame, "hidden", "hidden", "line-clamp")).toBeNull();
+    expect(textOverflow(sideways, frame, "hidden", "hidden", "ellipsis")).toBeNull();
+    expect(textOverflow(sideways, frame, "hidden", "hidden", "none")).toEqual({
+      axis: "horizontal",
+      overflowPx: 100,
+    });
   });
 
   test("a line with no size, or with a non-finite edge, is ignored", () => {
