@@ -243,7 +243,7 @@ describe("Send dispatch modes (mock AI router)", () => {
       // Normal density folds the two settled reads into one summary row; open it to see both.
       const readsSummary = await waitFor(() => {
         const button = Array.from(app.view.container.querySelectorAll("button")).find((element) =>
-          element.textContent?.includes("2 reads")
+          element.textContent?.includes("Read 2 files")
         );
         if (!button) throw new Error("Expected the two reads to fold into one summary row");
         return button;
