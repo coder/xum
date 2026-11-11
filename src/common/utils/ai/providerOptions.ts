@@ -9,7 +9,7 @@
 import type { AnthropicProviderOptions } from "@ai-sdk/anthropic";
 import type { GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
 import type { OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
-import type { JSONValue } from "@ai-sdk/provider";
+import type { JSONObject, JSONValue } from "@ai-sdk/provider";
 import type { ZaiLanguageModelChatOptions } from "@ai-sdk/zai";
 import type {
   XaiProviderOptions,
@@ -75,6 +75,7 @@ import {
 } from "./models";
 import {
   bedrockOpenAIModelId,
+  CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE,
   resolveCoderWireCanonicalModel,
 } from "@/common/constants/coderOAuth";
 import {
@@ -132,15 +133,54 @@ function resolveOptionsCanonicalModel(
     const wireOrigin = customProviderWireOrigin(prefixEntry.providerType);
     return wireOrigin ? `${wireOrigin}:${modelString.slice(colonIndex + 1)}` : modelString;
   }
-  if (prefix !== "coder" && routeProvider !== "coder") {
-    return normalizeToCanonical(modelString);
+  const wire = resolveOptionsCoderWire(modelString, providersConfig, routeProvider);
+  return wire ? `${wire.origin}:${wire.modelId}` : normalizeToCanonical(modelString);
+}
+
+/** The Coder instance wire a non-custom model string speaks, or null off the Coder route. */
+function resolveOptionsCoderWire(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null,
+  routeProvider?: ProviderName
+): ReturnType<typeof resolveCoderWireCanonicalModel> {
+  if (!modelString.startsWith("coder:") && routeProvider !== "coder") {
+    return null;
   }
   const gatewayModelId = resolveCoderRouteGatewayModelId(modelString, providersConfig ?? null);
-  const wire =
-    gatewayModelId == null
-      ? null
-      : resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder);
-  return wire ? `${wire.origin}:${wire.modelId}` : normalizeToCanonical(modelString);
+  return gatewayModelId == null
+    ? null
+    : resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder);
+}
+
+/**
+ * Gemini thinking config for a Xum level, shared by the native Google payload
+ * and Gemini's OpenAI compatibility layer behind google-typed Coder instances.
+ */
+function geminiThinkingConfig(
+  capModelName: string,
+  effectiveThinking: ThinkingLevel
+): GoogleGenerativeAIProviderOptions["thinkingConfig"] {
+  const capBareModelName = capModelName.split("/").at(-1) ?? capModelName;
+  if (isGeminiFlashThinkingLevelModelName(capBareModelName) && effectiveThinking === "off") {
+    // Gemini Flash chat models default to medium and do not support true thinking-off;
+    // send minimal explicitly so Xum's "off" setting means lowest-effort behavior.
+    // Gemini 3.8 Flash rejects "minimal" with a 400 (policy already excludes "off");
+    // clamp to "low" here too so a caller bypassing policy cannot trigger the error.
+    return isGeminiFlashMinimalRejectingModelName(capBareModelName)
+      ? { includeThoughts: true, thinkingLevel: "low" }
+      : { thinkingLevel: "minimal" };
+  }
+  if (effectiveThinking === "off") {
+    return undefined;
+  }
+  if (/gemini-[34]/.test(capBareModelName)) {
+    // Policy enforcement should clamp to valid Google levels before this adapter runs.
+    // Avoid leaking xhigh/max to Google if a caller bypasses policy.
+    return { includeThoughts: true, thinkingLevel: GEMINI_THINKING_LEVELS[effectiveThinking] };
+  }
+  // Gemini 2.5 uses thinkingBudget
+  const budget = GEMINI_THINKING_BUDGETS[effectiveThinking];
+  return { includeThoughts: true, ...(budget > 0 && { thinkingBudget: budget }) };
 }
 
 /**
@@ -193,6 +233,7 @@ type ProviderOptions =
   | { xai: XaiBuiltProviderOptions }
   | { "github-copilot": OpenAICompatibleGatewayProviderOptions }
   | { bedrock: BedrockProviderOptions }
+  | { [CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE]: JSONObject }
   | Record<string, never>; // Empty object for unsupported providers
 
 // Simple direct providers have self-contained reasoning controls. Keep these
@@ -825,6 +866,35 @@ export function buildProviderOptions(
     return options;
   }
 
+  // A google-typed Coder instance fronts Gemini's OpenAI compatibility layer,
+  // which ignores reasoning_effort for thoughts (they need include_thoughts)
+  // and rejects it alongside thinking_config. The factory's compatible client
+  // copies this namespace's extra_body into the request verbatim.
+  if (
+    formatProvider === "openai" &&
+    !isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata]) &&
+    resolveOptionsCoderWire(modelString, providersConfig, routeProvider)?.providerType === "google"
+  ) {
+    const thinkingConfig = geminiThinkingConfig(capModelName, effectiveThinking);
+    const options = {
+      [CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE]: thinkingConfig
+        ? {
+            extra_body: {
+              google: {
+                thinking_config: {
+                  include_thoughts: thinkingConfig.includeThoughts,
+                  thinking_level: thinkingConfig.thinkingLevel,
+                  thinking_budget: thinkingConfig.thinkingBudget,
+                },
+              },
+            },
+          }
+        : {},
+    };
+    log.debug("buildProviderOptions: Coder Google options", options);
+    return options;
+  }
+
   // Build OpenAI-specific options
   if (formatProvider === "openai") {
     // Model-aware: native-max models (the GPT-6 tiers and the GPT-5.6 family, see
@@ -961,37 +1031,7 @@ export function buildProviderOptions(
 
   // Build Google-specific options (Gemini API and Vertex AI share the Gemini payload)
   if (isGoogleFamilyProvider(formatProvider)) {
-    const capBareModelName = capModelName.split("/").at(-1) ?? capModelName;
-    const usesGeminiThinkingLevelConfig = /gemini-[34]/.test(capBareModelName);
-    const isGeminiFlashThinkingModel = isGeminiFlashThinkingLevelModelName(capBareModelName);
-    let thinkingConfig: GoogleGenerativeAIProviderOptions["thinkingConfig"];
-
-    if (isGeminiFlashThinkingModel && effectiveThinking === "off") {
-      // Gemini Flash chat models default to medium and do not support true thinking-off;
-      // send minimal explicitly so Xum's "off" setting means lowest-effort behavior.
-      // Gemini 3.8 Flash rejects "minimal" with a 400 (policy already excludes "off");
-      // clamp to "low" here too so a caller bypassing policy cannot trigger the error.
-      thinkingConfig = isGeminiFlashMinimalRejectingModelName(capBareModelName)
-        ? { includeThoughts: true, thinkingLevel: "low" }
-        : { thinkingLevel: "minimal" };
-    } else if (effectiveThinking !== "off") {
-      thinkingConfig = {
-        includeThoughts: true,
-      };
-
-      if (usesGeminiThinkingLevelConfig) {
-        // Policy enforcement should clamp to valid Google levels before this adapter runs.
-        // Avoid leaking xhigh/max to Google if a caller bypasses policy.
-        thinkingConfig.thinkingLevel = GEMINI_THINKING_LEVELS[effectiveThinking];
-      } else {
-        // Gemini 2.5 uses thinkingBudget
-        const budget = GEMINI_THINKING_BUDGETS[effectiveThinking];
-        if (budget > 0) {
-          thinkingConfig.thinkingBudget = budget;
-        }
-      }
-    }
-
+    const thinkingConfig = geminiThinkingConfig(capModelName, effectiveThinking);
     const googleOptions = { thinkingConfig } satisfies GoogleGenerativeAIProviderOptions;
     const options =
       formatProvider === "google-vertex"

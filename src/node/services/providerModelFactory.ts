@@ -92,6 +92,7 @@ import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import {
+  CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE,
   coderAibridgeBaseUrl,
   coderGatewayWireProtocol,
   parseCoderGatewayProviders,
@@ -100,6 +101,10 @@ import {
 } from "@/common/constants/coderOAuth";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import type { DevToolsService } from "@/node/services/devToolsService";
+import {
+  mapEventStreamLines,
+  wrapFetchWithGeminiThoughts,
+} from "@/node/services/geminiThoughtsFetch";
 import {
   captureAndStripDevToolsHeader,
   recordPromptCacheWire,
@@ -532,37 +537,33 @@ function wrapFetchWithChatToolCallIndexes(baseFetch: typeof fetch): typeof fetch
       return changed ? `data: ${JSON.stringify(chunk)}` : line;
     };
 
-    const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
-    let pending = "";
-    const body = response.body.pipeThrough(
-      new TransformStream<Uint8Array, Uint8Array>({
-        transform(bytes, controller) {
-          pending += decoder.decode(bytes, { stream: true });
-          const lines = pending.split("\n");
-          pending = lines.pop() ?? "";
-          if (lines.length > 0) {
-            controller.enqueue(encoder.encode(`${lines.map(indexToolCalls).join("\n")}\n`));
-          }
-        },
-        flush(controller) {
-          pending += decoder.decode();
-          if (pending) {
-            controller.enqueue(encoder.encode(indexToolCalls(pending)));
-          }
-        },
-      })
-    );
-    const headers = new Headers(response.headers);
-    headers.delete("content-length");
-    return new Response(body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
-    });
+    return mapEventStreamLines(response, response.body, indexToolCalls);
   };
 
   return Object.assign(indexedFetch, baseFetch) as typeof fetch;
+}
+
+/**
+ * Request body for google-typed Coder instances. @ai-sdk/openai-compatible
+ * replays reasoning as reasoning_content on assistant messages; drop it, as
+ * @ai-sdk/openai (this route's previous client) did, because Gemini's
+ * compatibility layer takes thoughts back only as tool-call thought signatures,
+ * which stay.
+ */
+function toGeminiOpenAICompatBody(body: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(body.messages)) {
+    return body;
+  }
+  return {
+    ...body,
+    messages: body.messages.map((message: unknown) => {
+      if (!isPlainObject(message) || message.role !== "assistant") {
+        return message;
+      }
+      const { reasoning_content: _reasoning, ...rest } = message;
+      return rest;
+    }),
+  };
 }
 
 /** Set reasoning effort "none" on either OpenAI wire format's request body. */
@@ -3134,6 +3135,24 @@ export class ProviderModelFactory {
             return Ok(provider(originModelId));
           }
 
+          if (gatewayProvider.type === "google") {
+            // Gemini's OpenAI compatibility layer emits thoughts only for an
+            // extra_body thinking_config (see buildProviderOptions), inline in
+            // content. @ai-sdk/openai drops both the passthrough and reasoning;
+            // the compatible SDK forwards one and parses reasoning_content,
+            // which wrapFetchWithGeminiThoughts produces from the inline thoughts.
+            const provider = createOpenAICompatible({
+              name: CODER_GOOGLE_PROVIDER_OPTIONS_NAMESPACE,
+              baseURL: gatewayBaseUrl,
+              fetch: wrapFetchWithGeminiThoughts(wrapFetchWithChatToolCallIndexes(coderFetch)),
+              // Match @ai-sdk/openai's chat requests: streamed usage and json_schema outputs.
+              includeUsage: true,
+              supportsStructuredOutputs: true,
+              transformRequestBody: toGeminiOpenAICompatBody,
+            });
+            return Ok(provider(originModelId));
+          }
+
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
           const createCoderModel = (fetch: typeof coderFetch) => {
             const provider = createOpenAI({
@@ -3147,8 +3166,8 @@ export class ProviderModelFactory {
               ? provider.responses(originModelId)
               : provider.chat(originModelId);
           };
-          // Chat upstreams include Gemini's OpenAI compatibility layer (google-type
-          // instances, or openai-compat ones fronting it).
+          // Chat upstreams include Gemini's OpenAI compatibility layer behind
+          // openai-compat instances.
           const openAIFetch =
             wire === "openai-chat" ? wrapFetchWithChatToolCallIndexes(coderFetch) : coderFetch;
           const coderModel = createOpenAIModelWithPreservedOptions(createCoderModel, openAIFetch, {
