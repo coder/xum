@@ -413,6 +413,146 @@ test("plugin sign-out command reports a transport failure", async () => {
   });
 });
 
+describe("plugin update commands", () => {
+  const sha = (char: string) => char.repeat(40);
+  const check = (name: string) => ({
+    name,
+    status: "update-available" as const,
+    remoteSha: sha("b"),
+  });
+  const preview = (name: string, changes: Array<{ summary: string }>) => ({
+    success: true as const,
+    data: { name, fromSha: sha("a"), toSha: sha("b"), changes, warnings: [] },
+  });
+
+  const pluginApi = (
+    checks: Array<ReturnType<typeof check>>,
+    previews: Record<string, ReturnType<typeof preview>>
+  ) => {
+    const api = createMockORPCClient({ agentPlugins: { updateChecks: checks } });
+    api.agentPlugins.previewUpdate = ((input: { name: string }) =>
+      Promise.resolve(previews[input.name])) as unknown as typeof api.agentPlugins.previewUpdate;
+    const updated: string[] = [];
+    api.agentPlugins.update = ((input: { name: string }) => {
+      updated.push(input.name);
+      return Promise.resolve({ success: true });
+    }) as unknown as typeof api.agentPlugins.update;
+    return { api, updated };
+  };
+
+  const runCommand = async (
+    id: string,
+    api: ReturnType<typeof pluginApi>["api"]
+  ): Promise<{
+    intents: PluginsSectionIntent[];
+    toasts: ReturnType<typeof collectCommandEvents>["receivedToasts"];
+    openSettings: ReturnType<typeof mock>;
+  }> => {
+    const openSettings = mock(() => undefined);
+    const intents: PluginsSectionIntent[] = [];
+    const unsubscribe = subscribePluginsSectionIntents((intent) => intents.push(intent));
+    const events = collectCommandEvents();
+    try {
+      const action = getActions({ api, onOpenSettings: openSettings }).find((a) => a.id === id);
+      await action!.run();
+      return { intents, toasts: events.receivedToasts, openSettings };
+    } finally {
+      events.dispose();
+      unsubscribe();
+    }
+  };
+
+  test("Update All Plugins applies neutral updates and opens the capability-changing review in the section", async () => {
+    await withTestWindow(async () => {
+      const review = preview("beta", [{ summary: "adds skill 'review'" }]);
+      const { api, updated } = pluginApi([check("alpha"), check("beta")], {
+        alpha: preview("alpha", []),
+        beta: review,
+      });
+      const { intents, toasts, openSettings } = await runCommand(
+        CommandIds.pluginsUpdateAll(),
+        api
+      );
+
+      expect(updated).toEqual(["alpha"]);
+      expect(intents).toContainEqual({ type: "review-updates", reviews: [review.data] });
+      expect(openSettings).toHaveBeenCalledWith("plugins");
+      // A review waiting on the user is not a failure.
+      expect(toasts.map((toast) => toast.type)).toEqual(["success"]);
+    });
+  });
+
+  test("Update All Plugins keeps the reviews for a Settings that is not open yet", async () => {
+    await withTestWindow(async () => {
+      const review = preview("beta", [{ summary: "adds skill 'review'" }]);
+      const { api } = pluginApi([check("alpha"), check("beta")], {
+        alpha: preview("alpha", []),
+        beta: review,
+      });
+      consumePendingPluginsSectionIntent();
+      const action = getActions({ api, onOpenSettings: mock(() => undefined) }).find(
+        (a) => a.id === CommandIds.pluginsUpdateAll()
+      );
+
+      await action!.run();
+
+      // With no section mounted only the latest intent survives: it must be the reviews.
+      expect(consumePendingPluginsSectionIntent()).toEqual({
+        type: "review-updates",
+        reviews: [review.data],
+      });
+    });
+  });
+
+  test("Update All Plugins reports a transport failure", async () => {
+    await withTestWindow(async () => {
+      const { api } = pluginApi([], {});
+      api.agentPlugins.checkUpdates = () => Promise.reject(new Error("connection lost"));
+      const { toasts, openSettings } = await runCommand(CommandIds.pluginsUpdateAll(), api);
+
+      expect(toasts).toEqual([{ type: "error", message: "connection lost" }]);
+      expect(openSettings).not.toHaveBeenCalled();
+    });
+  });
+
+  test("Update All Plugins with nothing pending stays out of Settings", async () => {
+    await withTestWindow(async () => {
+      const { api, updated } = pluginApi([], {});
+      const { intents, toasts, openSettings } = await runCommand(
+        CommandIds.pluginsUpdateAll(),
+        api
+      );
+
+      expect(updated).toEqual([]);
+      expect(intents.map((intent) => intent.type)).toEqual(["refresh"]);
+      expect(toasts.map((toast) => toast.type)).toEqual(["success"]);
+      expect(openSettings).not.toHaveBeenCalled();
+    });
+  });
+
+  test("Update Agent Plugin opens the section review of a capability-changing update", async () => {
+    await withTestWindow(async () => {
+      const review = preview("beta", [{ summary: "adds skill 'review'" }]);
+      const { api, updated } = pluginApi([check("beta")], { beta: review });
+      const openSettings = mock(() => undefined);
+      const intents: PluginsSectionIntent[] = [];
+      const unsubscribe = subscribePluginsSectionIntents((intent) => intents.push(intent));
+      try {
+        const action = getActions({ api, onOpenSettings: openSettings }).find(
+          (a) => a.id === CommandIds.pluginsUpdateOne()
+        );
+        await action!.prompt!.onSubmit({ pluginName: "beta" });
+
+        expect(updated).toEqual([]);
+        expect(intents).toEqual([{ type: "review-updates", reviews: [review.data] }]);
+        expect(openSettings).toHaveBeenCalledWith("plugins");
+      } finally {
+        unsubscribe();
+      }
+    });
+  });
+});
+
 test("reset context command dispatches composer and toast outcomes", async () => {
   await withTestWindow(async () => {
     const cases = [
