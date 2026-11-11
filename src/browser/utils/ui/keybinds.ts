@@ -405,6 +405,12 @@ export const KEYBINDS = {
   /** Discard the oldest held (refused, unsent) message from an empty composer */
   DISCARD_HELD_INPUT: { key: "Backspace", ctrl: true, alt: true },
 
+  /**
+   * New-workspace page: make the shown isolation the project's default ("Set as default").
+   * Shift keeps Ctrl+Alt+D (AltGr+D on Windows layouts) free for typing in the composer.
+   */
+  SET_DEFAULT_ISOLATION: { key: "d", code: "KeyD", ctrl: true, alt: true, shift: true },
+
   /** Send message after current turn ends */
   SEND_MESSAGE_AFTER_TURN: { key: "Enter", ctrl: true },
 

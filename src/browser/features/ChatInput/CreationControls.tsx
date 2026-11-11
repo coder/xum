@@ -25,6 +25,7 @@ import {
 import { GitBranch, Loader2, Wand2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
 import { CreationProjectSelect } from "./CreationProjectSelect";
+import { SetDefaultIsolationButton } from "./SetDefaultIsolationButton";
 import { SshDirectoryTrustNotice } from "./SshDirectoryTrustNotice";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
 import { usePerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
@@ -512,53 +513,69 @@ export function runtimeForIsolationChoice(
   };
 }
 
-/**
- * SSH+None asks for the existing directory on the host that its workspaces run in, and offers
- * that directory's trust.
- */
-function SshNoneDirectoryControls(props: {
-  runtime: Extract<ParsedRuntime, { mode: "ssh" }>;
+/** The SSH+None selection with another directory on the host; the host and Coder stay. */
+function withSshNoneProjectDir(
+  runtime: Extract<ParsedRuntime, { mode: "ssh" }>,
+  projectDir: string
+): ParsedRuntime {
+  return {
+    mode: "ssh",
+    host: runtime.host,
+    coder: runtime.coder,
+    workspaceIsolation: "none",
+    projectDir,
+  };
+}
+
+/** The trust row for the SSH+None directory being configured; nothing for other selections. */
+function SshNoneDirectoryTrust(props: {
+  runtime: Extract<ParsedRuntime, { mode: "ssh" }> | null;
   projectPath: string;
   userProjects: Map<string, ProjectConfig>;
+  disabled: boolean;
+  onSelectedRuntimeChange: (runtime: ParsedRuntime) => void;
+}) {
+  const runtime = props.runtime;
+  if (runtime === null) return null;
+  return (
+    <SshDirectoryTrustNotice
+      projectPath={props.projectPath}
+      userProjects={props.userProjects}
+      host={runtime.host}
+      projectDir={runtime.projectDir ?? ""}
+      disabled={props.disabled}
+      onProjectDirResolved={(projectDir) =>
+        props.onSelectedRuntimeChange(withSshNoneProjectDir(runtime, projectDir))
+      }
+    />
+  );
+}
+
+/** SSH+None asks for the existing directory on the host that its workspaces run in. */
+function SshNoneDirectoryInput(props: {
+  runtime: Extract<ParsedRuntime, { mode: "ssh" }>;
   disabled: boolean;
   hasError: boolean;
   onSelectedRuntimeChange: (runtime: ParsedRuntime) => void;
 }) {
-  const projectDir = props.runtime.projectDir ?? "";
-  const selectProjectDir = (value: string) =>
-    props.onSelectedRuntimeChange({
-      mode: "ssh",
-      host: props.runtime.host,
-      coder: props.runtime.coder,
-      workspaceIsolation: "none",
-      projectDir: value,
-    });
   return (
-    <>
-      <div className={SENTENCE_CLAUSE_CLASSES}>
-        <span className="text-muted-foreground shrink-0">in</span>
-        <RuntimeConfigInput
-          id="ssh-project-dir"
-          fieldSpec={RUNTIME_OPTION_FIELDS.sshProjectDir}
-          value={projectDir}
-          onChange={selectProjectDir}
-          disabled={props.disabled}
-          hasError={props.hasError}
-          ariaLabel="Project directory on host"
-          className="min-w-0 flex-1 md:flex-initial"
-          labelClassName="sr-only"
-          inputClassName={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[180px]")}
-        />
-      </div>
-      <SshDirectoryTrustNotice
-        projectPath={props.projectPath}
-        userProjects={props.userProjects}
-        host={props.runtime.host}
-        projectDir={projectDir}
+    <div className={SENTENCE_CLAUSE_CLASSES}>
+      <span className="text-muted-foreground shrink-0">in</span>
+      <RuntimeConfigInput
+        id="ssh-project-dir"
+        fieldSpec={RUNTIME_OPTION_FIELDS.sshProjectDir}
+        value={props.runtime.projectDir ?? ""}
+        onChange={(value) =>
+          props.onSelectedRuntimeChange(withSshNoneProjectDir(props.runtime, value))
+        }
         disabled={props.disabled}
-        onProjectDirResolved={selectProjectDir}
+        hasError={props.hasError}
+        ariaLabel="Project directory on host"
+        className="min-w-0 flex-1 md:flex-initial"
+        labelClassName="sr-only"
+        inputClassName={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[180px]")}
       />
-    </>
+    </div>
   );
 }
 
@@ -913,10 +930,8 @@ function CreationControlsContent(props: CreationControlsProps) {
             )}
 
           {sshNoneRuntime && (
-            <SshNoneDirectoryControls
+            <SshNoneDirectoryInput
               runtime={sshNoneRuntime}
-              projectPath={props.projectPath}
-              userProjects={props.userProjects}
               disabled={props.disabled}
               hasError={props.runtimeFieldError === "sshProjectDir"}
               onSelectedRuntimeChange={onSelectedRuntimeChange}
@@ -966,7 +981,23 @@ function CreationControlsContent(props: CreationControlsProps) {
               />
             </div>
           </div>
+          <SetDefaultIsolationButton
+            projectPath={props.projectPath}
+            isolation={currentIsolation}
+            disabled={props.disabled}
+            rememberShownFields={() => onSelectedRuntimeChange(selectedRuntime)}
+          />
         </div>
+
+        {/* The directory's trust sits under the sentence, not inside it, so the sentence reads
+            straight through to the branch and the trust state stands out on its own row. */}
+        <SshNoneDirectoryTrust
+          runtime={sshNoneRuntime}
+          projectPath={props.projectPath}
+          userProjects={props.userProjects}
+          disabled={props.disabled}
+          onSelectedRuntimeChange={onSelectedRuntimeChange}
+        />
 
         {/* Dev container controls - config dropdown/input + credential sharing */}
         {selectedRuntime.mode === "devcontainer" && devcontainerSelection.uiMode !== "hidden" && (

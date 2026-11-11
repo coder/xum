@@ -314,8 +314,10 @@ export const SshWithoutIsolation: Story = {
       const box = canvas.getByLabelText(label).getBoundingClientRect();
       await expect(box.right).toBeLessThanOrEqual(frame.right + 1);
     }
-    const trustButton = canvas.getByRole("button", { name: "Trust directory" });
-    await expect(trustButton.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right + 1);
+    for (const name of ["Trust directory", "Set as default"]) {
+      const button = canvas.getByRole("button", { name });
+      await expect(button.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right + 1);
+    }
 
     await openIsolationMenu(storyRoot, "Workspace isolation");
     const dockerOption = await within(document.body).findByRole("option", { name: /^Docker/i });
