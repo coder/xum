@@ -71,6 +71,7 @@ export function claudeCommandSkillMarkdown(name: string, content: string): strin
       typeof description === "string" && description.trim().length > 0
         ? description
         : cutToCap(
+            // mutation-equivalent: firstNonEmptyLine returns undefined or a non-empty line, so ?? and || agree
             firstNonEmptyLine(parts.body) ?? `Command /${name}`,
             MAX_SKILL_DESCRIPTION_LENGTH
           ),

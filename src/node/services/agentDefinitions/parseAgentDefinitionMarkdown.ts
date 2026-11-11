@@ -115,6 +115,7 @@ export function parseAgentDefinitionMarkdown(input: {
   }
 
   const lines = content.split("\n");
+  // mutation-equivalent: split always returns a first line, so ?? and || agree
   if ((lines[0] ?? "").trim() !== "---") {
     throw new AgentDefinitionParseError(
       "Agent definition frontmatter start delimiter must be exactly '---'."
@@ -128,6 +129,7 @@ export function parseAgentDefinitionMarkdown(input: {
     );
   }
 
+  // mutation-equivalent: YAML reads a leading `---` line as its document start, so slice(0) parses alike
   const yamlText = lines.slice(1, endIndex).join("\n");
   const body = lines.slice(endIndex + 1).join("\n");
 

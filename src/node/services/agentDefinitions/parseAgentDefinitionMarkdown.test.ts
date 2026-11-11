@@ -82,6 +82,20 @@ Body
     expect(() => parse("  thinkingLevel: turbo")).toThrow(AgentDefinitionParseError);
   });
 
+  test("names both sizes when a file is over the size cap", () => {
+    const content = "---\nname: a\n---\nBody\n";
+    expect(() => parseAgentDefinitionMarkdown({ content, byteSize: MAX_FILE_SIZE * 2 })).toThrow(
+      "Agent definition is too large (2.00MB). Maximum supported size is 1.00MB."
+    );
+  });
+
+  test("throws when the closing delimiter is missing", () => {
+    const content = "---\nname: a\nBody\n";
+    expect(() =>
+      parseAgentDefinitionMarkdown({ content, byteSize: Buffer.byteLength(content, "utf-8") })
+    ).toThrow("missing the closing '---' delimiter");
+  });
+
   test("throws on missing frontmatter", () => {
     expect(() =>
       parseAgentDefinitionMarkdown({
