@@ -8,6 +8,7 @@ import type { ArtifactKind } from "@/common/utils/artifactKind";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { getWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
 import { Config } from "@/node/config";
+import * as artifactCapabilities from "@/node/services/artifactCapabilities";
 import * as artifactsOperations from "@/node/services/artifactsOperations";
 import { recordArtifactPublish } from "@/node/services/artifactRecordStore";
 import * as checkArtifactLayoutModule from "./checkArtifactLayout";
@@ -447,6 +448,17 @@ describe("workspaceHasNewLayoutIssueAtTurnEnd", () => {
     expect(await run()).toBe(true);
     expect(await run()).toBe(true);
     expect(audits).toHaveLength(2);
+  });
+
+  test("an earlier answer that agent-browser is missing does not stop the audit: it can be installed later", async () => {
+    // The tab caches its probe answer for the life of the process. The turn-end audit must not
+    // read that cache: the audit itself reports a missing agent-browser in a moment.
+    spyOn(artifactCapabilities, "getArtifactCapabilities").mockResolvedValue({
+      agentBrowserAvailable: false,
+    });
+    await publishedPage("report.html");
+    expect(await run()).toBe(true);
+    expect(audits).toHaveLength(1);
   });
 
   test("a side chat is not audited", async () => {
