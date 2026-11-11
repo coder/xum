@@ -1390,7 +1390,19 @@ function resolvePreviewRef(
 }
 
 /**
- * The real folder at `subpath`, or why the preview would not stage it (extractSubpath): missing,
+ * Why the containment check refused an entry folder. A filesystem error's own message names the
+ * staging path, which the list must not show: name the error code instead.
+ */
+function folderErrorReason(error: unknown): string {
+  if (hasErrorCode(error, "ENOENT")) return "it does not exist";
+  if (hasErrorCode(error, "ENOTDIR")) return "it runs through a file";
+  const code = error != null && typeof error === "object" && "code" in error ? error.code : null;
+  return typeof code === "string" ? `Xum cannot read it (${code})` : getErrorMessage(error);
+}
+
+/**
+ * The real folder at `subpath`, or why the preview would not stage it (narrowToSubpath, then
+ * extractSubpath): missing,
  * escaping the repository, a file, or a path through a symbolic link. A constant number of calls
  * per build: a marketplace lists up to 1,500 builds, and a per-segment walk of deep paths that
  * all name one folder made a hostile listing take over a minute. The realpath already resolved
@@ -1404,9 +1416,7 @@ async function realEntryFolder(
   try {
     entryDir = await ensurePluginPathContained(stagedDir, path.join(stagedDir, subpath ?? ""));
   } catch (error) {
-    // ENOTDIR's own message names the staging path: say what the preview says instead.
-    if (hasErrorCode(error, "ENOTDIR")) return { why: "it runs through a file" };
-    return { why: hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error) };
+    return { why: folderErrorReason(error) };
   }
   if (entryDir !== path.join(await fsPromises.realpath(stagedDir), subpath ?? "")) {
     return { why: "it is a symbolic link or runs through one" };
