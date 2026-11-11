@@ -537,6 +537,37 @@ test("uninstalling the plugin whose review is open opens the next queued review"
   expect(status).toContain("epsilon");
 });
 
+test("the next review opens only after the uninstall has settled", async () => {
+  const { api } = createApi({
+    names: ["beta", "epsilon"],
+    pending: { beta: capabilityChanging("beta"), epsilon: capabilityChanging("epsilon") },
+  });
+  const listed = api.agentPlugins.listForSettings;
+  const releaseList = Promise.withResolvers<void>();
+  let holdingList = false;
+  api.agentPlugins.listForSettings = (async () => {
+    if (holdingList) await releaseList.promise;
+    return listed();
+  }) as typeof listed;
+  const view = mount(api);
+  const shows = (text: string) => (view.container.textContent ?? "").includes(text);
+  const uninstalling = () =>
+    buttonsIn(view).some((button) => button.textContent === "Uninstalling…");
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(shows("adds skill 'beta'")).toBe(true));
+  holdingList = true;
+  await uninstallPlugin(view, "beta");
+  await waitFor(() => expect(uninstalling()).toBe(true));
+  await waitFor(() => expect(uninstalling()).toBe(false));
+
+  expect(shows("adds skill 'epsilon'")).toBe(false);
+
+  releaseList.resolve();
+  await waitFor(() => expect(shows("adds skill 'epsilon'")).toBe(true));
+  expect(openReviews(view)[0].disabled).toBe(false);
+});
+
 test("uninstalling a plugin whose review is still queued drops it from the queue", async () => {
   const { api } = createApi({
     names: ["beta", "epsilon", "delta"],
