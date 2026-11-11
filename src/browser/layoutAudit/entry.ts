@@ -13,10 +13,15 @@ import { runLayoutAudit } from "./settle";
  * crashed audit has not seen the page.
  */
 export async function auditWindow(win: BrowserWindow): Promise<LayoutAuditPagePass> {
+  const { href } = win.location;
   try {
-    return await runLayoutAudit(createBrowserLayoutPage(win), createBrowserSettleSignals(win));
+    const pass = await runLayoutAudit(
+      createBrowserLayoutPage(win),
+      createBrowserSettleSignals(win)
+    );
+    return { ...pass, href };
   } catch {
-    return { complete: false, viewportWidth: win.innerWidth || 0, findings: [] };
+    return { complete: false, viewportWidth: win.innerWidth || 0, href, findings: [] };
   }
 }
 

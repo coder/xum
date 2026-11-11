@@ -77,6 +77,22 @@ const SOCKET_DIR_PARENT = "/tmp";
  * idle timeout), and the run's own calls follow each other within milliseconds.
  */
 const IDLE_TIMEOUT = "10s";
+/**
+ * Chrome flags that send every connection of the whole browser to a dead end. `set offline on`
+ * covers only the tab it ran on: a window the page opens (window.open, a target=_blank form or
+ * link) is another tab with its own network. Nothing listens on port 9, loopback goes through
+ * the proxy too (`<-loopback>`), no host resolves, and WebRTC may not use UDP outside the proxy.
+ * They travel in agent-browser's own `--args`, comma separated (none of them holds a comma), and
+ * never in AGENT_BROWSER_ARGS, which the sweep clears. They apply when the browser launches, and
+ * every call carries them: a call whose launch settings differ from the running browser's can
+ * restart it, and a restarted browser has no emulation left.
+ */
+const BROWSER_NETWORK_OFF_ARGS = [
+  "--proxy-server=127.0.0.1:9",
+  "--proxy-bypass-list=<-loopback>",
+  "--host-resolver-rules=MAP * ~NOTFOUND",
+  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+].join(",");
 /** How long CLOSE waits for `close` before it removes the socket folder anyway. */
 const CLOSE_WAIT_SECONDS = 2;
 /**
@@ -119,7 +135,7 @@ const SHELL_COMMON = String.raw`
 for v in $(env | sed -n 's/^\(AGENT_BROWSER_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
 export AGENT_BROWSER_SOCKET_DIR="$XUM_LAYOUT_SOCKET_DIR"
 ab_wrap=
-ab() { $ab_wrap agent-browser --session "$XUM_LAYOUT_SESSION" --config "$XUM_LAYOUT_SOCKET_DIR/config.json" --idle-timeout ${IDLE_TIMEOUT} "$@"; }
+ab() { $ab_wrap agent-browser --session "$XUM_LAYOUT_SESSION" --config "$XUM_LAYOUT_SOCKET_DIR/config.json" --idle-timeout ${IDLE_TIMEOUT} --args "$XUM_LAYOUT_BROWSER_ARGS" "$@"; }
 cd / || exit ${EXIT_SETUP_FAILED}
 `;
 
@@ -127,11 +143,11 @@ cd / || exit ${EXIT_SETUP_FAILED}
 // stdin unread. The exec is told that this is fine (`stdinMayGoUnread`), so the exit code still
 // says why nothing ran.
 //
-// The page is agent-written and its scripts run in a normal browser, so the network goes off
-// before the first `open`: a page script, image or style sheet cannot reach a host, and what the
-// page holds cannot leave the machine through them. file:// pages and relative files still load.
-// A run that cannot turn it off stops (fail closed) and every width reads "not checked". It does
-// not cover a window the page opens itself: that is another target, with its own network.
+// The page is agent-written and its scripts run in a normal browser, so the network is off for
+// the whole browser from its launch (BROWSER_NETWORK_OFF_ARGS, on every `ab` call), and `set
+// offline on` turns it off for the tab as well, before the first `open`. A script, image, style
+// sheet, socket or window of the page cannot reach a host. file:// pages and relative files still
+// load. A run that cannot turn it off stops (fail closed) and every width reads "not checked".
 const RUN_SCRIPT = String.raw`
 command -v agent-browser >/dev/null 2>&1 || exit ${EXIT_NO_AGENT_BROWSER}
 page_script=$(cat) || exit ${EXIT_SETUP_FAILED}
@@ -251,12 +267,38 @@ function parsePagePass(envelope: string) {
   }
 }
 
-function outcomeOf(viewport: LayoutAuditViewport, record: RunRecord): ViewportOutcome {
+/**
+ * Whether the pass came from the artifact. A window the page opens takes over the browser's
+ * active tab, and the audit script then measures that tab: its address (an error page, say) is
+ * not the artifact's. The URL built here (over SSH, with encodeURIComponent) can escape more than
+ * the browser does, so the decoded paths are compared, not the strings, and a hash or a query
+ * that the page changed does not matter.
+ */
+function isArtifactPage(href: string, fileUrl: string): boolean {
+  try {
+    const page = new URL(href);
+    const artifact = new URL(fileUrl);
+    return (
+      page.protocol === artifact.protocol &&
+      decodeURIComponent(page.pathname) === decodeURIComponent(artifact.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function outcomeOf(
+  viewport: LayoutAuditViewport,
+  record: RunRecord,
+  fileUrl: string
+): ViewportOutcome {
   if (record.status !== 0 && record.envelope === "") {
     return { viewport, status: "failed", reason: "browser-failed" };
   }
   const pass = record.status === 0 ? parsePagePass(record.envelope) : undefined;
-  if (pass === undefined) return { viewport, status: "failed", reason: "script-failed" };
+  if (pass === undefined || !isArtifactPage(pass.href, fileUrl)) {
+    return { viewport, status: "failed", reason: "script-failed" };
+  }
   // A browser that ignored the viewport measured another layout: that is no result.
   if (pass.viewportWidth !== viewport.width) {
     return { viewport, status: "failed", reason: "wrong-viewport" };
@@ -267,7 +309,7 @@ function outcomeOf(viewport: LayoutAuditViewport, record: RunRecord): ViewportOu
 }
 
 /** One outcome per width, in run order. Every width without a record is "not checked". */
-function outcomesOf(run: ExecResult): ViewportOutcome[] {
+function outcomesOf(run: ExecResult, fileUrl: string): ViewportOutcome[] {
   const records = parseRecords(run.stdout);
   let lastFailure: FailedReason | undefined;
   return LAYOUT_AUDIT_VIEWPORTS.map((viewport) => {
@@ -279,7 +321,7 @@ function outcomesOf(run: ExecResult): ViewportOutcome[] {
             status: "failed",
             reason: EXIT_REASONS[run.exitCode] ?? lastFailure ?? "browser-failed",
           }
-        : outcomeOf(viewport, record);
+        : outcomeOf(viewport, record, fileUrl);
     if (outcome.status === "failed") lastFailure = outcome.reason;
     return outcome;
   });
@@ -308,6 +350,7 @@ export async function runLayoutPasses(input: LayoutRunInput): Promise<ViewportOu
   const sessionEnv = {
     XUM_LAYOUT_SESSION: session,
     XUM_LAYOUT_SOCKET_DIR: `${SOCKET_DIR_PARENT}/${session}`,
+    XUM_LAYOUT_BROWSER_ARGS: BROWSER_NETWORK_OFF_ARGS,
   };
   const { prelude, pathEnv } = toolEnvPrelude(input.toolEnvPath);
   const run = await execOrFail(input.runtime, prelude + inNewShell(RUN_SCRIPT), {
@@ -342,5 +385,5 @@ export async function runLayoutPasses(input: LayoutRunInput): Promise<ViewportOu
       });
     }
   }
-  return outcomesOf(run);
+  return outcomesOf(run, input.fileUrl);
 }

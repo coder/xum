@@ -24,11 +24,14 @@ export type LayoutAuditPageFinding = z.infer<typeof LayoutAuditPageFindingSchema
 /**
  * What the page script resolves to. `complete: false` means the pass could not vouch for the
  * page (it crashed, or the page never settled): its findings are not evidence, and an empty
- * list is not a clean result.
+ * list is not a clean result. `href` is the address of the page that was measured: a window that
+ * the page opens can take over the browser's active tab, and a pass from any other address is
+ * not a pass for the artifact.
  */
 export const LayoutAuditPagePassSchema = z.object({
   complete: z.boolean(),
   viewportWidth: z.number().finite(),
+  href: z.string(),
   findings: z.array(LayoutAuditPageFindingSchema).max(LAYOUT_AUDIT_MAX_FINDINGS_PER_PASS),
 });
 export type LayoutAuditPagePass = z.infer<typeof LayoutAuditPagePassSchema>;

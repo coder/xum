@@ -84,7 +84,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
   /** Subcommand of each call: the first argv field that is not a global flag or its value. */
   const subcommands = (calls: string[][]) =>
     calls.map((argv) => {
-      const flagsWithValue = ["--session", "--config", "--idle-timeout"];
+      const flagsWithValue = ["--session", "--config", "--idle-timeout", "--args"];
       for (let index = 0; index < argv.length; index++) {
         if (flagsWithValue.includes(argv[index] ?? "")) index += 1;
         else if (argv[index] !== "--json") return argv[index];
@@ -145,6 +145,57 @@ describe("runLayoutPasses through a fake agent-browser", () => {
     );
     expect(offline).toEqual([0]);
     expect(subcommands(calls).indexOf("open")).toBeGreaterThan(0);
+  });
+
+  // `set offline` covers one tab. A window the page opens is another tab, so the whole browser
+  // also launches with flags that send every connection to a dead end.
+  const NETWORK_OFF_FLAGS = [
+    "--proxy-server=127.0.0.1:9",
+    "--proxy-bypass-list=<-loopback>",
+    "--host-resolver-rules=MAP * ~NOTFOUND",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+  ];
+
+  test("launches the whole browser with the network-off flags, on every call, the close included", async () => {
+    const { fake } = await run({});
+    const calls = await fake.calls();
+    const values = calls.map((argv) => argv[argv.indexOf("--args") + 1]);
+    // The first call launches the browser; the others must not give it other launch settings.
+    expect(new Set(values).size).toBe(1);
+    expect(calls.every((argv) => argv.includes("--args"))).toBe(true);
+    expect(values[0]?.split(",")).toEqual(NETWORK_OFF_FLAGS);
+    expect(subcommands(calls).at(-1)).toBe("close");
+  });
+
+  // A window the page opens takes over the browser's active tab, and eval then runs there.
+  test.each([
+    ["a window that failed to load", "chrome-error://chromewebdata/"],
+    ["a window on another host", "http://127.0.0.1:9/window-open"],
+    ["another file", "file:///tmp/artifacts/other.html"],
+    ["a blank window", "about:blank"],
+    ["no address", ""],
+  ])("a pass from %s is not a clean result, and the other widths stand", async (_name, href) => {
+    const { outcomes } = await run({ eval: { 1440: { kind: "pass", href } } });
+    expect(summary(outcomes)).toEqual([
+      "390 complete",
+      "1440 failed script-failed",
+      "768 complete",
+    ]);
+  });
+
+  test("a pass from the artifact is accepted whatever the page did to its hash, query or escaping", async () => {
+    const fileUrl = "file:///tmp/artifacts/a%26b%5B1%5D.html";
+    const { outcomes } = await run(
+      {
+        eval: {
+          390: { kind: "pass", href: "file:///tmp/artifacts/a&b[1].html" },
+          1440: { kind: "pass", href: `${fileUrl}#section` },
+          768: { kind: "pass", href: `${fileUrl}?tab=2` },
+        },
+      },
+      { fileUrl }
+    );
+    expect(summary(outcomes)).toEqual(["390 complete", "1440 complete", "768 complete"]);
   });
 
   test("evaluates the page script, piped on stdin and never put on the command line", async () => {
@@ -404,6 +455,7 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       AGENT_BROWSER_CDP: "1",
       AGENT_BROWSER_PROFILE: "/nonexistent-profile",
       AGENT_BROWSER_FUTURE_FLAG: "1",
+      AGENT_BROWSER_ARGS: "--proxy-server=direct://",
     };
     Object.assign(process.env, inherited);
     try {
