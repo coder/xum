@@ -8,7 +8,7 @@ import { TOOL_TEXT_PAGE_MAX_CHARS } from "@/common/constants/toolLimits";
 import { pageToolTextForResult, type ToolTextPage } from "@/common/utils/tools/pageToolText";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
-import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import type { ParsedSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import {
   fetchSkillContent,
   parseCatalogSkill,
@@ -25,7 +25,7 @@ interface SkillsCatalogReadToolArgs {
 
 interface PinnedSkill {
   fetched: FetchedSkillContent;
-  parsed: ReturnType<typeof parseSkillMarkdown>;
+  parsed: ParsedSkillMarkdown;
   /** Short content hash: the paging sequence's id, passed back as `snapshot`. */
   snapshot: string;
   pinnedAt: number;
