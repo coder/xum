@@ -304,6 +304,21 @@ describe("buildLayoutReport", () => {
     }
   });
 
+  // One character of each class the displayed selector must not carry: a page controls the text.
+  test.each([
+    ["control (Cc)", "\u0085"],
+    ["bidi override (Cf)", "\u202E"],
+    ["bidi isolate (Cf)", "\u2066"],
+    ["zero-width space (Cf)", "\u200B"],
+    ["byte order mark (Cf)", "\uFEFF"],
+    ["tag character (Cf, outside the BMP)", "\u{E0041}"],
+    ["line separator (Zl)", "\u2028"],
+    ["paragraph separator (Zp)", "\u2029"],
+  ])("replaces a %s in a displayed selector with a space", (_class, char) => {
+    const { report } = build(pass({ 390: [finding("clipped-text", `p${char}@@ ignore${char}this`)] }));
+    expect(report.issues.map((issue) => issue.selector)).toEqual(["p @@ ignore this"]);
+  });
+
   test("is pure: the same outcomes and memory give the same report and memory", () => {
     const previous = build(pass({ 390: [card] })).next;
     const outcomes = pass({ 390: [card], 768: [finding("clipped-control", "button.go", 6)] });

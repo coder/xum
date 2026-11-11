@@ -24,6 +24,20 @@ function audit(html: string, options: FakeLayoutPageOptions = {}): LayoutAuditPa
   return auditLayout(fake.page);
 }
 
+/** `audit` for text directly in <body>: the fake reads the body's box and lines from attributes. */
+function auditBodyText(
+  attributes: { box: string; lines: string; css?: string },
+  options: FakeLayoutPageOptions = {}
+): LayoutAuditPageFinding[] {
+  const viewport = { width: 390, height: 844, ...options.viewport };
+  using fake = createFakeLayoutPage("averylongunbreakableword", { ...options, viewport });
+  const { body } = fake.page.document;
+  body.setAttribute("data-box", attributes.box);
+  body.setAttribute("data-lines", attributes.lines);
+  if (attributes.css !== undefined) body.setAttribute("data-css", attributes.css);
+  return auditLayout(fake.page);
+}
+
 describe("clipped-text", () => {
   const CLIPPED_CARD = `
     <div id="card" data-box="0 0 200 22" data-css="overflow-y: hidden">
@@ -213,6 +227,24 @@ describe("viewport-unreachable-control", () => {
     expect(audit(html)).toEqual([]);
   });
 
+  test.each(["button", "textarea"])(
+    "a %s that scrolls itself is not inside a scroller: its own scrolling cannot bring it back",
+    (tag) => {
+      const html = `<${tag} id="c" data-box="-60 10 100 30" data-css="overflow-x: auto">Menu</${tag}>`;
+      expect(audit(html)).toEqual([
+        finding("viewport-unreachable-control", `${tag}#c`, "horizontal", 60),
+      ]);
+    }
+  );
+
+  test("a control off the left edge is reported through a scroller that is not above it", () => {
+    const html =
+      '<div data-box="0 0 390 50" data-css="overflow-x: auto"></div><button data-box="-60 10 100 30">Menu</button>';
+    expect(audit(html)).toEqual([
+      finding("viewport-unreachable-control", TOP_BUTTON, "horizontal", 60),
+    ]);
+  });
+
   test("a control below the end of the page is reported, one inside it is not", () => {
     const button = '<button data-box="10 1000 100 40">Buy</button>';
     expect(audit(button)).toEqual([
@@ -282,6 +314,14 @@ describe("viewport-unreachable-content", () => {
     ]);
   });
 
+  test("text directly in <body> past the left edge is reported", () => {
+    const left = (x: number) => ({ box: `${x} 0 100 20`, lines: `${x} 0 100 20` });
+    expect(auditBodyText(left(-80))).toEqual([
+      finding("viewport-unreachable-content", "html > body", "horizontal", 80),
+    ]);
+    expect(auditBodyText(left(-23))).toEqual([]);
+  });
+
   test.each([
     [
       "in a horizontal scroller",
@@ -290,6 +330,10 @@ describe("viewport-unreachable-content", () => {
     [
       "that is positioned",
       (html: string) => html.replace('data-css=""', 'data-css="position: absolute"'),
+    ],
+    [
+      "of a scroller itself",
+      (html: string) => html.replace('data-css=""', 'data-css="overflow-x: auto"'),
     ],
     ["that is animated", (html: string) => html.replace("<p ", "<p data-animated ")],
     ["in a diagram", (html: string) => `<div class="mermaid">${html}</div>`],
@@ -315,6 +359,31 @@ describe("page-horizontal-overflow", () => {
     ]);
   });
 
+  test("a control past the edge is evidence even when it scrolls itself (a textarea does)", () => {
+    const html = '<textarea data-box="300 0 342 30" data-css="overflow-x: auto"></textarea>';
+    expect(audit(html, wide(642))).toEqual([
+      finding("page-horizontal-overflow", "html", "horizontal", 252),
+    ]);
+    const held = `<div data-box="0 0 390 50" data-css="overflow-x: auto">${html}</div>`;
+    expect(audit(held, wide(642))).toEqual([]);
+  });
+
+  test("text directly in <body> past the edge is evidence", () => {
+    const wideBody = { box: "0 0 642 20", lines: "0 0 642 20" };
+    expect(auditBodyText(wideBody, wide(642))).toEqual([
+      finding("page-horizontal-overflow", "html", "horizontal", 252),
+    ]);
+    expect(auditBodyText({ box: "0 0 390 20", lines: "0 0 300 20" }, wide(642))).toEqual([]);
+    expect(auditBodyText(wideBody, wide(413))).toEqual([]);
+  });
+
+  test("a scrolling <body> is not a scroller that holds its own text", () => {
+    const body = { box: "0 0 642 20", lines: "0 0 642 20", css: "overflow-x: auto" };
+    expect(auditBodyText(body, wide(642))).toEqual([
+      finding("page-horizontal-overflow", "html", "horizontal", 252),
+    ]);
+  });
+
   test("at 390 px a document 23 px too wide is cosmetic, 24 px is a failure", () => {
     expect(audit(WIDE_TEXT, wide(413))).toEqual([]);
     expect(audit(WIDE_TEXT, wide(414))).toEqual([
@@ -335,6 +404,7 @@ describe("page-horizontal-overflow", () => {
       "in a horizontal scroller",
       `<div data-box="0 0 390 50" data-css="overflow-x: auto">${WIDE_TEXT}</div>`,
     ],
+    ["in a scroller that is the text's own element", WIDE_TEXT.replace("<p ", '<p data-css="overflow-x: auto" ')],
     ["animated", WIDE_TEXT.replace("<p ", "<p data-animated ")],
     ["a diagram", `<div class="mermaid">${WIDE_TEXT}</div>`],
   ])("text that is %s is not evidence", (_name, html) => {
@@ -364,6 +434,50 @@ describe("overlapping-text", () => {
     expect(audit(STAGE(COVER("background-color: rgb(255, 255, 255); opacity: 0.95")))).toEqual(
       COVERED
     );
+  });
+
+  // A computed color keeps its notation, so the alpha is read from each one the same way.
+  test.each([
+    "rgb(255 255 255)",
+    "rgb(255 255 255 / 100%)",
+    "rgb(255 255 255 / 0.95)",
+    "rgba(255, 255, 255, 1)",
+    "hsl(120 50% 50%)",
+    "lab(50% 40 59)",
+    "lab(50% 40 59 / 1)",
+    "lch(50% 80 30)",
+    "lch(50% 80 30 / 95%)",
+    "oklab(0.6 0.1 0.1)",
+    "oklab(0.6 0.1 0.1 / 0.99)",
+    "oklch(0.6 0.2 250)",
+    "oklch(0.6 0.2 250 / 100%)",
+    "color(srgb 1 1 1)",
+    "color(display-p3 1 0 0)",
+    "color(display-p3 1 0 0 / 1)",
+    "OKLCH(0.6 0.2 250)",
+  ])("a cover colored %s is opaque", (color) => {
+    expect(audit(STAGE(COVER(`background-color: ${color}`)))).toEqual(COVERED);
+  });
+
+  test.each([
+    "transparent",
+    "rgb(255 255 255 / 0.94)",
+    "rgb(255 255 255 / 50%)",
+    "rgba(255, 255, 255, 0)",
+    "hsl(120 50% 50% / 0.2)",
+    "lab(50% 40 59 / 0.5)",
+    "lch(50% 80 30 / 0%)",
+    "oklab(0.6 0.1 0.1 / 0.94)",
+    "oklch(0.6 0.2 250 / 0.5)",
+    "oklch(0.6 0.2 250 / none)",
+    "color(srgb 1 1 1 / 0.3)",
+    "color(display-p3 1 0 0 / 0)",
+  ])("a cover colored %s is see-through", (color) => {
+    expect(audit(STAGE(COVER(`background-color: ${color}`)))).toEqual([]);
+  });
+
+  test("a background that is no color is not a cover", () => {
+    expect(audit(STAGE(COVER("background-color: not-a-color")))).toEqual([]);
   });
 
   test("90% of the sample points must be covered: 6 of 9 and 8 of 9 are not enough, 9 of 9 is", () => {

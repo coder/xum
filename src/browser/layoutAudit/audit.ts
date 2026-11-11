@@ -8,6 +8,7 @@ import {
   hasHorizontalScrollerAncestor,
   hasReachableVerticalScrollerAncestor,
   isExcludedElement,
+  isInsideHorizontalScroller,
   isIntentionalTruncation,
   isNearAnimation,
   isNestedInTextBoundary,
@@ -118,9 +119,13 @@ function textEscapesRightEdge(pass: AuditPass, el: Element): boolean {
 
 /** Real content, not a scroll dimension, past the right edge: the evidence for page overflow. */
 function elementEscapesRightEdge(pass: AuditPass, el: Element): boolean {
-  if (hasHorizontalScrollerAncestor(pass.page, el) || !isJudgeable(pass, el)) return false;
+  const control = isRequiredControl(el);
+  const scrolled = control
+    ? hasHorizontalScrollerAncestor(pass.page, el)
+    : isInsideHorizontalScroller(pass.page, el);
+  if (scrolled || !isJudgeable(pass, el)) return false;
   if (!isVisible(pass.page, el) || isPositionedNonControl(pass, el)) return false;
-  if (!isRequiredControl(el)) return textEscapesRightEdge(pass, el);
+  if (!control) return textEscapesRightEdge(pass, el);
   const rect = pass.page.box(el);
   return viewportEscape(pass, rect, THRESHOLDS.controlMinOutsidePx)?.side === "end";
 }
@@ -249,7 +254,7 @@ function leftmostTextEscape(pass: AuditPass, el: Element) {
 }
 
 function leftTextCheck(pass: AuditPass, el: Element): void {
-  if (hasHorizontalScrollerAncestor(pass.page, el) || !isVisibleText(pass, el)) return;
+  if (isInsideHorizontalScroller(pass.page, el) || !isVisibleText(pass, el)) return;
   if (isPositionedNonControl(pass, el)) return;
   const escape = leftmostTextEscape(pass, el);
   if (escape === null) return;
@@ -314,14 +319,32 @@ function textClipCheck(pass: AuditPass, el: Element): void {
 
 // ---- overlapping-text ------------------------------------------------------------------------
 
-// Opaque: opacity and background alpha both at least 0.95. Computed styles are rgb()/rgba().
+// A computed color keeps the notation it was written in (oklch() stays oklch(), color() stays
+// color()), so the alpha is read from the text, whatever the function.
+const COLOR_FUNCTION = /^(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\((.*)\)$/;
+
+function parseAlpha(text: string): number {
+  const value = text.trim();
+  return value.endsWith("%") ? Number(value.slice(0, -1)) / 100 : Number(value);
+}
+
+/** The alpha of a computed color, or null when it is not a color this knows. NaN: a bad alpha. */
+function colorAlpha(color: string): number | null {
+  const value = color.trim().toLowerCase();
+  if (value === "transparent") return 0;
+  const args = COLOR_FUNCTION.exec(value)?.[1];
+  if (args === undefined) return null;
+  // The alpha follows a slash ("r g b / a", every modern function) or is the fourth comma part
+  // (legacy "r, g, b, a"). Neither: the function has no alpha, so it is opaque.
+  const slash = args.lastIndexOf("/");
+  const alpha = slash >= 0 ? args.slice(slash + 1) : args.split(",")[3];
+  return alpha === undefined ? 1 : parseAlpha(alpha);
+}
+
+// Opaque: opacity and background alpha both at least 0.95.
 function isOpaqueColor(color: string): boolean {
-  const rgba = /^rgba?\(([^)]+)\)$/.exec(color.trim().toLowerCase());
-  if (rgba === null) return false;
-  const parts = rgba[1].split(/[\s,/]+/).filter(Boolean);
-  if (parts.length < 4) return true;
-  const alpha = Number(parts[3]);
-  return Number.isFinite(alpha) && alpha >= THRESHOLDS.opaqueMin;
+  const alpha = colorAlpha(color);
+  return alpha !== null && alpha >= THRESHOLDS.opaqueMin;
 }
 
 function isOpaqueSurface(page: LayoutPage, el: Element): boolean {
@@ -458,13 +481,16 @@ function createPass(page: LayoutPage): AuditPass {
 /** One measurement of the page. Pure reads: it never changes the DOM. */
 export function auditLayout(page: LayoutPage): LayoutAuditPageFinding[] {
   const pass = createPass(page);
-  const elements = Array.from(page.document.body.querySelectorAll("*")).slice(
-    0,
-    THRESHOLDS.maxAuditedElements
-  );
-  pageOverflowCheck(pass, elements);
+  const { body } = page.document;
+  const elements = Array.from(body.querySelectorAll("*")).slice(0, THRESHOLDS.maxAuditedElements);
+  // Text directly in <body> counts like an element's own text. Upstream walks only body's
+  // descendants, so a bare `<body>longword</body>` widened the page unseen. Body takes the two
+  // rules that read its text. It is no control. A root is never a clip (`textClipCheck` skips it),
+  // and a cover is never body's own descendant, which everything else is.
+  const textHolders = [body, ...elements];
+  pageOverflowCheck(pass, textHolders);
   for (const el of elements) controlChecks(pass, el);
-  for (const el of elements) leftTextCheck(pass, el);
+  for (const el of textHolders) leftTextCheck(pass, el);
   for (const el of elements) textClipCheck(pass, el);
   occlusionCheck(pass, elements);
   return pass.findings;

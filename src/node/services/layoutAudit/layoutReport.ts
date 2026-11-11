@@ -27,12 +27,18 @@ interface Candidate {
   viewportClass: LayoutAuditViewportClass;
 }
 
+// Control (Cc), line separator (Zl) and paragraph separator (Zp) characters can start a new line.
+// Format characters (Cf) reorder the text around them (bidi marks) or hide it (zero-width and tag
+// characters).
+const NON_DISPLAYABLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+
 /**
- * What the model sees of a selector: control characters become spaces (a page cannot start a
- * line in the model's context) and a long one is cut at the cap, never inside a surrogate pair.
+ * What the model sees of a selector: those characters become spaces (a page cannot start a line
+ * or reorder the text in the model's context) and a long one is cut at the cap, never inside a
+ * surrogate pair.
  */
 function displaySelector(selector: string): string {
-  const text = selector.replace(/\p{Cc}/gu, " ");
+  const text = selector.replace(NON_DISPLAYABLE, " ");
   if (text.length <= LAYOUT_AUDIT_MAX_SELECTOR_CHARS) return text;
   return `${text.slice(0, LAYOUT_AUDIT_MAX_SELECTOR_CHARS - 1).replace(/\p{Cs}$/u, "")}…`;
 }
