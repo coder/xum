@@ -194,7 +194,7 @@ function isSuccessfulToolCall(call: { state: string; output?: unknown }): boolea
   );
 }
 
-function madeSuccessfulToolCall(
+export function madeSuccessfulToolCall(
   parts: readonly CompletedMessagePart[],
   isWanted: (call: { toolName: string }) => boolean = () => true
 ): boolean {

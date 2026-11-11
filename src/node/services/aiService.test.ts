@@ -54,6 +54,7 @@ import { WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE } from "@/common/utils/workflow
 import type { InstructionSources } from "@/common/types/instructions";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { CompletedMessagePart } from "@/common/types/stream";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import type {
   ErrorEvent,
@@ -107,9 +108,11 @@ import { MemoryService, projectMemoryDirName } from "@/node/services/memoryServi
 import * as toolAssembly from "./toolAssembly";
 import * as agentInterfaceStatusPage from "./agentInterfaceStatusPage";
 import {
+  LAYOUT_TURN_END_NUDGE,
   STATUS_PAGE_AGENT_TURN_END_NUDGE,
   STATUS_PAGE_TURN_END_NUDGE,
 } from "@/common/utils/machineTurnPrompts";
+import * as turnEndLayoutAudit from "./layoutAudit/turnEndLayoutAudit";
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import type { WorkspaceHeartbeatToolService } from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -878,6 +881,123 @@ describe("AIService status page turn-end nudge", () => {
       expect(await nudge("another-turn")).toBeNull();
       expect(await nudge(messageId)).toBe(row.nudge);
       expect(await nudge(messageId)).toBeNull();
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+});
+
+describe("AIService layout turn-end nudge", () => {
+  afterEach(() => mock.restore());
+
+  const toolCall = (output: unknown): CompletedMessagePart => ({
+    type: "dynamic-tool",
+    toolCallId: "call-1",
+    toolName: "bash",
+    input: {},
+    state: "output-available",
+    output,
+  });
+  const succeeded = [toolCall({ success: true })];
+
+  async function setup(artifactsOn = true) {
+    const testHistory = await createTestHistoryService();
+    const projectPath = path.join(testHistory.tempDir, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "layout-nudge";
+    await testHistory.config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath,
+      // A project-dir local workspace runs in its project folder.
+      namedWorkspacePath: projectPath,
+      runtimeConfig: { type: "local" },
+    });
+    const experimentsService = await experimentsServiceWith(
+      testHistory.tempDir,
+      artifactsOn ? [EXPERIMENT_IDS.ARTIFACTS] : []
+    );
+    const harness = createBasicAIService(testHistory.tempDir, {
+      historyService: testHistory.historyService,
+      experimentsService,
+    });
+    const audit = spyOn(turnEndLayoutAudit, "workspaceHasNewLayoutIssueAtTurnEnd");
+    const nudge = (
+      parts: CompletedMessagePart[],
+      streamStartedAtMs: number | undefined,
+      abortSignal = new AbortController().signal
+    ) => harness.service.layoutTurnEndNudge(workspaceId, { parts, streamStartedAtMs, abortSignal });
+    return { testHistory, projectPath, workspaceId, audit, nudge, config: harness.config };
+  }
+
+  it("asks for the nudge when the audit finds a new issue, and gives it the turn's workspace", async () => {
+    const { testHistory, projectPath, workspaceId, audit, nudge } = await setup();
+    try {
+      audit.mockResolvedValue(true);
+      const stop = new AbortController();
+
+      expect(await nudge(succeeded, 1_234, stop.signal)).toBe(LAYOUT_TURN_END_NUDGE);
+      expect(audit).toHaveBeenCalledTimes(1);
+      const call = audit.mock.calls[0]?.[0];
+      expect(call).toMatchObject({
+        workspaceId,
+        streamStartedAtMs: 1_234,
+        abortSignal: stop.signal,
+        metadata: { id: workspaceId, projectPath },
+      });
+      expect(call?.cwd).toBeString();
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it("is silent when the audit finds nothing, and when the audit fails", async () => {
+    const { testHistory, audit, nudge } = await setup();
+    try {
+      audit.mockResolvedValueOnce(false);
+      expect(await nudge(succeeded, 1_000)).toBeNull();
+      audit.mockRejectedValueOnce(new Error("runtime unreachable"));
+      expect(await nudge(succeeded, 1_000)).toBeNull();
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it.each([
+    { name: "the experiment is off", artifactsOn: false, parts: succeeded },
+    { name: "the turn made no tool call", parts: [] },
+    { name: "every tool call failed", parts: [toolCall({ success: false, error: "no" })] },
+    { name: "the stream's start is unknown", parts: succeeded, streamStart: undefined },
+  ])("does not audit when $name", async (row) => {
+    const { testHistory, audit, nudge } = await setup(row.artifactsOn ?? true);
+    try {
+      audit.mockResolvedValue(true);
+      const start = "streamStart" in row ? row.streamStart : 1_000;
+      expect(await nudge(row.parts, start)).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it("does not audit a workspace that is not in the config", async () => {
+    const { testHistory, audit } = await setup();
+    try {
+      audit.mockResolvedValue(true);
+      const harness = createBasicAIService(testHistory.tempDir, {
+        experimentsService: await experimentsServiceWith(testHistory.tempDir, [
+          EXPERIMENT_IDS.ARTIFACTS,
+        ]),
+      });
+      expect(
+        await harness.service.layoutTurnEndNudge("unknown-workspace", {
+          parts: succeeded,
+          streamStartedAtMs: 1_000,
+          abortSignal: new AbortController().signal,
+        })
+      ).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
     } finally {
       await testHistory.cleanup();
     }

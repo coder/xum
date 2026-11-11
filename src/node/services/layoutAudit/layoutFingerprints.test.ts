@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   LAYOUT_MEMORY_MAX_PATHS,
+  layoutAuditLastStartedAtMs,
   layoutAuditPathsInFlight,
   layoutFingerprint,
   startLayoutAudit,
@@ -29,10 +30,15 @@ describe("layoutFingerprint", () => {
 
 /**
  * Ends an audit with `next` as its memory and returns what it read as `previous`. `remember`
- * false is an audit that leaves nothing behind (cancelled, or nothing completed).
+ * false is an audit that leaves no memory behind (nothing completed, or a turn-end audit), and
+ * `cancelled` one that never ran to its end.
  */
-const finish = (turn: LayoutAuditTurn, next: FingerprintSnapshot = {}, remember = true) =>
-  turn.finish((previous) => ({ report: previous, next }), remember);
+const finish = (
+  turn: LayoutAuditTurn,
+  next: FingerprintSnapshot = {},
+  remember = true,
+  cancelled = false
+) => turn.finish((previous) => ({ report: previous, next }), remember, cancelled);
 
 /** The memory of a path, read by an audit that leaves nothing behind. */
 const memoryOf = (dir: string, relPath: string) =>
@@ -149,6 +155,59 @@ describe("startLayoutAudit", () => {
     }
     finish(startLayoutAudit(dir, "newcomer.html"), remember("newcomer"), false);
     expect(memoryOf(dir, "p0.html")).toEqual(remember("p0"));
+  });
+});
+
+describe("layoutAuditLastStartedAtMs", () => {
+  test("is undefined for a path no audit has ended for", () => {
+    expect(layoutAuditLastStartedAtMs(freshDir(), "a.html")).toBeUndefined();
+    const dir = freshDir();
+    startLayoutAudit(dir, "a.html", 100);
+    expect(layoutAuditLastStartedAtMs(dir, "a.html")).toBeUndefined();
+  });
+
+  test("is the start of an audit that ran to its end, whether or not it remembered anything", () => {
+    const dir = freshDir();
+    finish(startLayoutAudit(dir, "kept.html", 100), remember("one"));
+    finish(startLayoutAudit(dir, "dropped.html", 200), remember("two"), false);
+    expect(layoutAuditLastStartedAtMs(dir, "kept.html")).toBe(100);
+    expect(layoutAuditLastStartedAtMs(dir, "dropped.html")).toBe(200);
+  });
+
+  test("a cancelled audit records nothing and leaves an earlier start as it was", () => {
+    const dir = freshDir();
+    finish(startLayoutAudit(dir, "a.html", 100), {}, true, true);
+    expect(layoutAuditLastStartedAtMs(dir, "a.html")).toBeUndefined();
+    finish(startLayoutAudit(dir, "a.html", 200));
+    finish(startLayoutAudit(dir, "a.html", 300), {}, false, true);
+    expect(layoutAuditLastStartedAtMs(dir, "a.html")).toBe(200);
+  });
+
+  test("the latest start wins, whichever audit ends last", () => {
+    const dir = freshDir();
+    const early = startLayoutAudit(dir, "a.html", 100);
+    const late = startLayoutAudit(dir, "a.html", 200);
+    finish(late);
+    finish(early);
+    expect(layoutAuditLastStartedAtMs(dir, "a.html")).toBe(200);
+  });
+
+  test("keeps paths and session dirs apart", () => {
+    const dir = freshDir();
+    finish(startLayoutAudit(dir, "a.html", 100));
+    expect(layoutAuditLastStartedAtMs(dir, "b.html")).toBeUndefined();
+    expect(layoutAuditLastStartedAtMs(freshDir(), "a.html")).toBeUndefined();
+  });
+
+  test("forgets the path audited longest ago once the bound is passed", () => {
+    const dir = freshDir();
+    for (let index = 0; index <= LAYOUT_MEMORY_MAX_PATHS; index++) {
+      finish(startLayoutAudit(dir, `p${index}.html`, 100 + index), {}, false);
+    }
+    expect(layoutAuditLastStartedAtMs(dir, "p0.html")).toBeUndefined();
+    expect(layoutAuditLastStartedAtMs(dir, `p${LAYOUT_MEMORY_MAX_PATHS}.html`)).toBe(
+      100 + LAYOUT_MEMORY_MAX_PATHS
+    );
   });
 });
 

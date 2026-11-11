@@ -36,6 +36,27 @@ export const LAYOUT_MEMORY_MAX_PATHS = 64;
 // remembered (`peek`) leaves the order alone.
 const remembered = new LRUCache<string, FingerprintSnapshot>({ max: LAYOUT_MEMORY_MAX_PATHS });
 
+// Per path, the start time (host clock, ms) of the latest audit that ran to its end, whatever it
+// found. The turn-end audit compares a page's modified time with it, so a page is never audited
+// twice for the same change. Bounded like the memory above. An evicted path reads as "never
+// audited": the next turn-end audit repeats one check at worst (the safe direction).
+const lastAuditStartedAt = new LRUCache<string, number>({ max: LAYOUT_MEMORY_MAX_PATHS });
+
+function pathKey(sessionDir: string, relPath: string): string {
+  return JSON.stringify([sessionDir, relPath]);
+}
+
+/**
+ * When the latest audit of the path that ran to its end started, in this process; undefined
+ * when it has none (never audited, evicted, or the backend restarted).
+ */
+export function layoutAuditLastStartedAtMs(
+  sessionDir: string,
+  relPath: string
+): number | undefined {
+  return lastAuditStartedAt.peek(pathKey(sessionDir, relPath));
+}
+
 /**
  * The ordering state of one path. It lives in its own map, not with the memory, and exists
  * exactly while an audit of the path is in flight: the first start creates it and the last
@@ -64,10 +85,15 @@ export interface LayoutAuditTurn {
    * keeps that memory when `remember` is true and no audit that started later has committed for
    * this path. An audit that loses that check still gets its own report back. The audit ends
    * whether or not `build` throws. Call it exactly once.
+   *
+   * An audit that ran to its end also records its start time for the path (the latest start
+   * wins: a slow early audit never moves it back), whether or not it remembers anything. A
+   * `cancelled` audit records nothing: it never looked at the page the way a finished one did.
    */
   finish<T>(
     build: (previous: FingerprintSnapshot) => { report: T; next: FingerprintSnapshot },
-    remember: boolean
+    remember: boolean,
+    cancelled?: boolean
   ): T;
 }
 
@@ -77,15 +103,19 @@ export interface LayoutAuditTurn {
  * the start order decides whose memory stands, so a slow early audit cannot overwrite what a
  * later one left. Call it before the audit's first await, and finish what it returns.
  */
-export function startLayoutAudit(sessionDir: string, relPath: string): LayoutAuditTurn {
-  const key = JSON.stringify([sessionDir, relPath]);
+export function startLayoutAudit(
+  sessionDir: string,
+  relPath: string,
+  startedAtMs: number = Date.now()
+): LayoutAuditTurn {
+  const key = pathKey(sessionDir, relPath);
   const path = auditsByPath.get(key) ?? { inFlight: 0, committedStart: 0 };
   auditsByPath.set(key, path);
   path.inFlight += 1;
   auditsStarted += 1;
   const startedAs = auditsStarted;
   return {
-    finish: (build, remember) => {
+    finish: (build, remember, cancelled = false) => {
       try {
         const { report, next } = build(remembered.peek(key) ?? {});
         if (remember && startedAs > path.committedStart) {
@@ -94,6 +124,9 @@ export function startLayoutAudit(sessionDir: string, relPath: string): LayoutAud
         }
         return report;
       } finally {
+        if (!cancelled) {
+          lastAuditStartedAt.set(key, Math.max(startedAtMs, lastAuditStartedAt.peek(key) ?? 0));
+        }
         path.inFlight -= 1;
         if (path.inFlight === 0) auditsByPath.delete(key);
       }

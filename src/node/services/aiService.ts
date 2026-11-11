@@ -103,9 +103,11 @@ import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
 import type { CompletedMessagePart } from "@/common/types/stream";
-import { needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
+import { madeSuccessfulToolCall, needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
+import { workspaceHasNewLayoutIssueAtTurnEnd } from "./layoutAudit/turnEndLayoutAudit";
 import { isStatusPageAgentEnabledInSettings } from "./statusPageAgentService";
 import {
+  LAYOUT_TURN_END_NUDGE,
   STATUS_PAGE_AGENT_TURN_END_NUDGE,
   STATUS_PAGE_TURN_END_NUDGE,
 } from "@/common/utils/machineTurnPrompts";
@@ -642,6 +644,51 @@ export class AIService extends EventEmitter {
     return turn?.statusPageAgent === true
       ? STATUS_PAGE_AGENT_TURN_END_NUDGE
       : STATUS_PAGE_TURN_END_NUDGE;
+  }
+
+  /**
+   * The turn-end layout nudge (see turnEndLayoutAudit.ts), or null: audits the published HTML
+   * artifacts that changed since their last audit, and asks for the nudge only when one has an
+   * issue no publish result has listed. A turn that made no successful tool call changed nothing,
+   * and `streamStartedAtMs` (absent when the ended stream's start is unknown) is the change bar
+   * for pages with no audit of their own. Fail-soft: a turn that ended must still end.
+   */
+  async layoutTurnEndNudge(
+    workspaceId: string,
+    input: {
+      parts: readonly CompletedMessagePart[];
+      streamStartedAtMs: number | undefined;
+      abortSignal: AbortSignal;
+    }
+  ): Promise<string | null> {
+    if (
+      input.streamStartedAtMs == null ||
+      !this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) ||
+      !madeSuccessfulToolCall(input.parts)
+    ) {
+      return null;
+    }
+    try {
+      const metadata = await this.getWorkspaceMetadata(workspaceId);
+      const workspace = this.config.findWorkspace(workspaceId);
+      if (!metadata.success || !workspace) return null;
+      const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+      if (!context.success) return null;
+      const found = await workspaceHasNewLayoutIssueAtTurnEnd({
+        workspaceId,
+        // As createWorkspaceRuntimeContext: the persisted workspace root, not a derived one.
+        metadata: { ...metadata.data, namedWorkspacePath: workspace.workspacePath },
+        config: this.config,
+        runtime: context.data.runtime,
+        cwd: context.data.workspacePath,
+        streamStartedAtMs: input.streamStartedAtMs,
+        abortSignal: input.abortSignal,
+      });
+      return found ? LAYOUT_TURN_END_NUDGE : null;
+    } catch (error) {
+      log.debug("Turn-end layout audit failed", { workspaceId, error: getErrorMessage(error) });
+      return null;
+    }
   }
 
   private isStatusPageAgentStillOn(): boolean {

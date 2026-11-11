@@ -12,6 +12,7 @@ import { AlertTriangle, LayoutDashboard, ListTodo, MessageSquare } from "lucide-
 import {
   classifyStatusPageTurnEndNudgePrompt,
   classifyTodoTurnEndNudgePrompt,
+  isLayoutTurnEndNudgePrompt,
 } from "@/common/utils/machineTurnPrompts";
 import {
   BackgroundWorkWakeMessage,
@@ -120,6 +121,8 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
           message.isSynthetic === true
             ? classifyStatusPageTurnEndNudgePrompt(message.content)
             : null;
+        const isLayoutNudge =
+          message.isSynthetic === true && isLayoutTurnEndNudgePrompt(message.content);
         renderedMessage =
           message.contextBudgetWarning != null ? (
             <CollapsibleMachineMessage
@@ -176,6 +179,16 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               }
               icon={<LayoutDashboard aria-hidden="true" className="size-3.5 shrink-0" />}
               marker="status-page-turn-end-nudge"
+              className={className}
+            />
+          ) : isLayoutNudge ? (
+            // The turn-end layout nudge, alone or after the TODO and status page nudges in one
+            // continuation: constant control text, so the same compact row.
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary="Asked the agent to re-publish HTML artifacts and fix layout issues"
+              icon={<LayoutDashboard aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="layout-turn-end-nudge"
               className={className}
             />
           ) : backgroundWorkWakeSummary != null ? (

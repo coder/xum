@@ -8,6 +8,7 @@ import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvel
 import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import {
   BACKGROUND_WORK_WAKE_OPENINGS,
+  LAYOUT_TURN_END_NUDGE,
   STATUS_PAGE_AGENT_TURN_END_NUDGE,
   STATUS_PAGE_TURN_END_NUDGE,
   TODO_TURN_END_NUDGE,
@@ -789,6 +790,31 @@ describe("MessageRenderer TODO nudge rows", () => {
       expect(typed.container.querySelector("[data-status-page-turn-end-nudge]")).toBeNull();
     }
   );
+
+  test.each([
+    { name: "alone", content: LAYOUT_TURN_END_NUDGE },
+    { name: "after the TODO nudge", content: `${TODO_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}` },
+    {
+      name: "after the status page nudge",
+      content: `${STATUS_PAGE_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+    },
+    {
+      name: "after both",
+      content: `${TODO_TURN_END_NUDGE}\n\n${STATUS_PAGE_AGENT_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+    },
+  ])("collapses a layout nudge $name", ({ content }) => {
+    const view = renderNudge(content, true);
+    expect(view.container.querySelector("[data-layout-turn-end-nudge]")).not.toBeNull();
+  });
+
+  test("keeps a full bubble for a typed layout nudge and one joined to a plugin's prompt", () => {
+    const typed = renderNudge(LAYOUT_TURN_END_NUDGE, false);
+    expect(typed.container.querySelector("[data-layout-turn-end-nudge]")).toBeNull();
+    cleanup();
+    const joined = renderNudge(`Run the failing tests again.\n\n${LAYOUT_TURN_END_NUDGE}`, true);
+    expect(joined.container.querySelector("[data-layout-turn-end-nudge]")).toBeNull();
+    expect(joined.getByText(/Run the failing tests again/)).toBeDefined();
+  });
 });
 
 describe("MessageRenderer bash monitor wake rows", () => {
