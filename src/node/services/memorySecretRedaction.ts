@@ -584,7 +584,7 @@ function redactMarkerTails(text: string, onRemoved: (removed: string) => void): 
 type RemovalSource = "regex" | "reader" | "tail" | "cut";
 
 /** The regex passes and the reader, in order, each on the previous pass's output. */
-function runPassesOnce(
+function runPassesBeforeTails(
   text: string,
   onRemoved: (removed: string, source: RemovalSource) => void
 ): string {
@@ -624,7 +624,7 @@ function runRedactionPasses(
   text: string,
   onRemoved: (removed: string, source: RemovalSource) => void
 ): string {
-  const redacted = runPassesOnce(text, onRemoved);
+  const redacted = runPassesBeforeTails(text, onRemoved);
   const tailed = redactMarkerTails(redacted, (removed) => onRemoved(removed, "tail"));
   if (tailed === redacted) return tailed;
   // The tail pass shortened the text, and the userinfo pattern bounds its user and its password: a
