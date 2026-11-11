@@ -1,5 +1,10 @@
 import { useEffect, useRef } from "react";
-import { isDialogOpen, matchesKeybind, type Keybind } from "@/browser/utils/ui/keybinds";
+import {
+  isAltGraphPressed,
+  isDialogOpen,
+  matchesKeybind,
+  type Keybind,
+} from "@/browser/utils/ui/keybinds";
 
 /**
  * Runs a creation-page action on its keybind while enabled, outside open dialogs. Shared by the
@@ -17,7 +22,9 @@ export function useCreationShortcut(
   useEffect(() => {
     if (!enabled) return;
     const handler = (event: KeyboardEvent) => {
-      if (!matchesKeybind(event, keybind) || isDialogOpen()) return;
+      // The page's shortcuts are Ctrl+Alt+Shift chords, and AltGr reports as Ctrl+Alt: Shift+AltGr
+      // types a character on some layouts, so that input stays text.
+      if (isAltGraphPressed(event) || !matchesKeybind(event, keybind) || isDialogOpen()) return;
       event.preventDefault();
       if (!event.repeat) void actionRef.current();
     };
