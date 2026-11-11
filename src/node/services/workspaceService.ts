@@ -21,7 +21,11 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   WORKSPACE_NAME_GENERATION_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import {
+  isWorkspaceProjectTrustedIn,
+  isInitHookTrusted,
+  secretsForWorkspace,
+} from "@/node/utils/projectTrust";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
 import { EventEmitter } from "events";
@@ -166,6 +170,10 @@ import {
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import {
+  creationRuntimeConfigError,
+  sshProjectDirConfigToResolve,
+} from "@/node/services/utils/workspaceCreationRuntime";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { getLegacyPlanFilePath, sharesPlanDirectory } from "@/common/utils/planStorage";
 import {
@@ -354,6 +362,7 @@ import {
   hasSrcBaseDir,
   getSrcBaseDir,
   isSSHRuntime,
+  isSshSharedProjectDirRuntime,
   isDockerRuntime,
   isDevcontainerRuntime,
 } from "@/common/types/runtime";
@@ -6153,14 +6162,16 @@ export class WorkspaceService
       return Err(initialConflict);
     }
 
-    const workspaceId = this.config.generateStableId();
-
-    // Local runtime doesn't need a trunk branch; worktree/SSH runtimes require it
-    const isLocalRuntime = finalRuntimeConfig.type === "local";
     const normalizedTrunkBranch = trunkBranch?.trim() ?? "";
-    if (!isLocalRuntime && normalizedTrunkBranch.length === 0) {
-      return Err("Trunk branch is required for worktree and SSH runtimes");
+    const runtimeConfigError = creationRuntimeConfigError(
+      finalRuntimeConfig,
+      normalizedTrunkBranch
+    );
+    if (runtimeConfigError) {
+      return Err(runtimeConfigError);
     }
+
+    const workspaceId = this.config.generateStableId();
 
     let runtime;
     try {
@@ -6176,6 +6187,18 @@ export class WorkspaceService
             ...finalRuntimeConfig,
             srcBaseDir: resolvedSrcBaseDir,
           };
+          runtime = createRuntime(finalRuntimeConfig, {
+            projectPath: owningProjectPath,
+            workspaceId,
+          });
+        }
+      }
+      // SSH+None: persist the project directory absolute (~ expanded on the host), like srcBaseDir.
+      const sshProjectDirConfig = sshProjectDirConfigToResolve(finalRuntimeConfig, runtime);
+      if (sshProjectDirConfig !== null) {
+        const resolvedProjectDir = await runtime.resolvePath(sshProjectDirConfig.projectDir.trim());
+        if (resolvedProjectDir !== sshProjectDirConfig.projectDir) {
+          finalRuntimeConfig = { ...sshProjectDirConfig, projectDir: resolvedProjectDir };
           runtime = createRuntime(finalRuntimeConfig, {
             projectPath: owningProjectPath,
             workspaceId,
@@ -6248,7 +6271,7 @@ export class WorkspaceService
       }
 
       const createEnv = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(owningProjectPath)
+        secretsForWorkspace(this.secretsStore, this.config, owningProjectPath, finalRuntimeConfig)
       );
       const maxCollisionRetries = hasSanitizedWorkspaceName
         ? 0
@@ -6539,7 +6562,13 @@ export class WorkspaceService
           initLogger,
           env: createEnv,
           abortSignal: initAbortController.signal,
-          trusted: projectConfig.trusted ?? false,
+          // SSH+None: the host directory is not the local project, so it needs its own trust too.
+          trusted: isInitHookTrusted(
+            this.config,
+            projectConfig.trusted,
+            owningProjectPath,
+            finalRuntimeConfig
+          ),
         };
         // The deferred checkout's settlement grants or clears the pending default from here on.
         pendingDefaultHandedOff = pendingMaterialization !== undefined;
@@ -13736,8 +13765,14 @@ export class WorkspaceService
           return cachedEnv;
         }
 
+        // An SSH+None fork shares the source's host directory, so the source runtime decides.
         const projectEnv = await secretsToRecord(
-          this.secretsStore.getEffectiveSecrets(normalizedRuntimeProjectPath)
+          secretsForWorkspace(
+            this.secretsStore,
+            this.config,
+            normalizedRuntimeProjectPath,
+            sourceRuntimeConfig
+          )
         );
         projectEnvCache.set(normalizedRuntimeProjectPath, projectEnv);
         return projectEnv;
@@ -13826,7 +13861,13 @@ export class WorkspaceService
           initLogger,
           env: secrets,
           abortSignal: initAbortController.signal,
-          trusted: projectConfig.trusted ?? false,
+          // SSH+None: the host directory is not the local project, so it needs its own trust too.
+          trusted: isInitHookTrusted(
+            this.config,
+            projectConfig.trusted,
+            foundProjectPath,
+            forkedRuntimeConfig
+          ),
         },
         newWorkspaceId,
         workspaceUseLeasesFor(this.config),
@@ -14141,7 +14182,9 @@ export class WorkspaceService
           rolledBack &&
           (isWorktreeRuntime(forkedRuntimeConfig) ||
             isDevcontainerRuntime(forkedRuntimeConfig) ||
-            isSSHRuntime(forkedRuntimeConfig) ||
+            // An SSH+None fork shares the source's directory, like a local project-dir fork.
+            (isSSHRuntime(forkedRuntimeConfig) &&
+              !isSshSharedProjectDirRuntime(forkedRuntimeConfig)) ||
             isDockerRuntime(forkedRuntimeConfig) ||
             targetRuntime instanceof MultiProjectRuntime)
         ) {
@@ -20371,7 +20414,12 @@ export class WorkspaceService
       // Multi-project bash shares one execution environment, so inject the union of repo secrets.
       const projectSecrets = isMultiProject(metadata)
         ? mergeMultiProjectSecrets(metadata, this.secretsStore)
-        : this.secretsStore.getEffectiveSecrets(metadata.projectPath);
+        : secretsForWorkspace(
+            this.secretsStore,
+            this.config,
+            metadata.projectPath,
+            metadata.runtimeConfig
+          );
 
       // Create scoped temp directory for this IPC call
       using tempDir = new DisposableTempDir("mux-ipc-bash");

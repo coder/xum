@@ -18,6 +18,7 @@ import {
 import { LocalRuntime } from "./LocalRuntime";
 import { WorktreeRuntime } from "./WorktreeRuntime";
 import { CoderSSHRuntime } from "./CoderSSHRuntime";
+import { SSHRuntime } from "./SSHRuntime";
 import type { CoderService } from "@/node/services/coderService";
 
 describe("isIncompatibleRuntimeConfig", () => {
@@ -170,6 +171,67 @@ describe("createRuntime - devcontainer scratch mount", () => {
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("createRuntime - SSH workspace isolation", () => {
+  const projectPath = "/Users/me/code/app";
+
+  it("passes workspaceIsolation none and projectDir through to the SSH runtime", () => {
+    const config: RuntimeConfig = {
+      type: "ssh",
+      host: "devbox",
+      srcBaseDir: "~/xum",
+      workspaceIsolation: "none",
+      projectDir: "/home/me/app",
+    };
+    const runtime = createRuntime(config, { projectPath, workspaceName: "feature-a" });
+    expect(runtime).toBeInstanceOf(SSHRuntime);
+    expect((runtime as SSHRuntime).getConfig()).toMatchObject({
+      workspaceIsolation: "none",
+      projectDir: "/home/me/app",
+    });
+    expect(runtime.getWorkspacePath(projectPath, "feature-a")).toBe("/home/me/app");
+  });
+
+  it("does not conflate a none runtime with a worktree runtime on the same host", () => {
+    const worktree = createRuntime({ type: "ssh", host: "devbox", srcBaseDir: "~/xum" });
+    const none = createRuntime({
+      type: "ssh",
+      host: "devbox",
+      srcBaseDir: "~/xum",
+      workspaceIsolation: "none",
+      projectDir: "/home/me/app",
+    });
+    expect(worktree.getWorkspacePath(projectPath, "feature-a")).not.toBe("/home/me/app");
+    expect(none.getWorkspacePath(projectPath, "feature-a")).toBe("/home/me/app");
+  });
+
+  it("rejects workspaceIsolation none without a projectDir", () => {
+    expect(() =>
+      createRuntime({
+        type: "ssh",
+        host: "devbox",
+        srcBaseDir: "~/xum",
+        workspaceIsolation: "none",
+      })
+    ).toThrow(/projectDir/);
+  });
+
+  it("passes the fields through to a Coder SSH runtime", () => {
+    const runtime = createRuntime(
+      {
+        type: "ssh",
+        host: "box.coder",
+        srcBaseDir: "~/xum",
+        workspaceIsolation: "none",
+        projectDir: "/home/coder/app",
+        coder: { existingWorkspace: true, workspaceName: "box", template: "t" },
+      },
+      { coderService: {} as unknown as CoderService }
+    );
+    expect(runtime).toBeInstanceOf(CoderSSHRuntime);
+    expect(runtime.getWorkspacePath(projectPath, "feature-a")).toBe("/home/coder/app");
   });
 });
 

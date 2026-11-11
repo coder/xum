@@ -1821,6 +1821,9 @@ const TruncatedInfoSchema = z.object({
   totalLines: z.number(),
 });
 
+/** What the macOS agent sandbox blocked, for example "write /Users/me/.zshrc". */
+const BashSandboxDenialsSchema = z.array(z.string()).optional();
+
 /**
  * Bash tool result - success, background spawn, or failure.
  */
@@ -1832,6 +1835,7 @@ const BashToolSuccessSchema = z
     wall_duration_ms: z.number(),
     note: z.string().optional(),
     truncated: TruncatedInfoSchema.optional(),
+    sandboxDenials: BashSandboxDenialsSchema,
   })
   .extend(ToolOutputUiOnlyFieldSchema);
 
@@ -1867,6 +1871,7 @@ const BashToolFailureSchema = z
     wall_duration_ms: z.number(),
     note: z.string().optional(),
     truncated: TruncatedInfoSchema.optional(),
+    sandboxDenials: BashSandboxDenialsSchema,
   })
   .extend(ToolOutputUiOnlyFieldSchema);
 
@@ -2349,6 +2354,12 @@ const BashToolArgsObjectSchema = z.object({
   monitor: BashMonitorSchema.nullish().describe(
     "Background only. Each complete output line matching filter wakes this workspace, even after your response; it also wakes once when the process settles (exit, kill, timeout) unless wake_on_exit is false, max_events retired it, or it was cancelled (task_stop). Terminate monitored tasks you no longer need before finishing."
   ),
+  outside_sandbox_reason: z
+    .string()
+    .nullish()
+    .describe(
+      "Only after the sandbox blocked this script: why it must run outside the sandbox. The user must approve it; a denial fails the call."
+    ),
   display_name: z.string().describe("Human-readable process name, e.g. 'Dev Server'"),
 });
 

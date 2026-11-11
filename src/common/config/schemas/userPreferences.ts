@@ -16,6 +16,8 @@ import {
 import {
   MEMORY_DREAM_COST_CEILING_MAX_USD,
   MEMORY_DREAM_COST_CEILING_MIN_USD,
+  MEMORY_DREAM_EDIT_LIMIT_MAX,
+  MEMORY_DREAM_RUN_TIMEOUT_MAX_MINUTES,
 } from "@/common/constants/memory";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import { REVIEW_FILE_TREE_VIEW_MODES, REVIEW_SORT_ORDERS } from "@/common/types/review";
@@ -54,6 +56,12 @@ const repairFontSize = (value: unknown) =>
   Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : undefined;
 // A fresh schema per field, since each one registers its own repair.
 const nonBlankString = () => z.string().refine((value) => value.trim().length > 0);
+// A whole limit over the safety cap (saved by an older build, or edited by hand) runs at the cap:
+// dropping it would read as the default 8, far under what the user asked for.
+const repairDreamEditLimit = (value: unknown) =>
+  typeof value === "number" && Number.isInteger(value) && value >= 0
+    ? Math.min(value, MEMORY_DREAM_EDIT_LIMIT_MAX)
+    : undefined;
 const BranchSchema = repairOnLoad(nonBlankString(), trimmedNonBlank);
 
 function repairModelString(value: unknown): string | undefined {
@@ -192,6 +200,25 @@ export const UserPreferencesSchema = z.object({
         .number()
         .min(MEMORY_DREAM_COST_CEILING_MIN_USD)
         .max(MEMORY_DREAM_COST_CEILING_MAX_USD)
+        .optional(),
+      /**
+       * Mutating memory commands one organizer run (background or manual) may make. 0 means
+       * unlimited, which runs at MEMORY_DREAM_EDIT_LIMIT_MAX, the safety cap; absent means
+       * MEMORY_CONSOLIDATION_OP_BUDGET. The analyzer keeps its own budget.
+       */
+      dreamEditLimit: repairOnLoad(
+        z.number().int().min(0).max(MEMORY_DREAM_EDIT_LIMIT_MAX),
+        repairDreamEditLimit
+      ).optional(),
+      /**
+       * Minutes one organizer run may stream before it is cut. 0 means no timeout; absent means
+       * MEMORY_CONSOLIDATION_TIMEOUT_MS. Analyzer chunks keep that constant.
+       */
+      dreamRunTimeoutMinutes: z
+        .number()
+        .int()
+        .min(0)
+        .max(MEMORY_DREAM_RUN_TIMEOUT_MAX_MINUTES)
         .optional(),
     })
     .optional(),

@@ -26,6 +26,8 @@ import { createConfigStores } from "@/node/config";
 import type { Config, ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
+import { AgentSandboxService } from "@/node/services/agentSandbox/agentSandboxService";
+import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
@@ -101,6 +103,7 @@ interface WorkflowContext {
   coderOauthService: CoderOauthService;
   realProviderService: ProviderService;
   agentResourceLimits: AgentResourceLimitsService;
+  agentSandbox: AgentSandboxService;
 }
 
 export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<unknown> {
@@ -234,6 +237,7 @@ async function disposeWorkflowResources(input: {
   coderOauthService?: CoderOauthService;
   realProviderService?: ProviderService;
   agentResourceLimits?: AgentResourceLimitsService;
+  agentSandbox: AgentSandboxService;
 }): Promise<void> {
   const services = input.services;
   // Same shape as `xum run`'s list: every step is contained, reported, and
@@ -268,6 +272,9 @@ async function disposeWorkflowResources(input: {
         name: "backgroundProcessManager.terminateAll",
         run: () => services?.backgroundProcessManager.terminateAll(),
       },
+      // After the agent fibers stop, as in `xum run`: a command that one starts after this
+      // would start srt's proxy and log monitor again (Codex review).
+      { name: "agentSandbox.dispose", run: () => input.agentSandbox.dispose() },
       // Last: release the Effect runtime that owns the core graph; never rejects.
       ...(services
         ? [{ name: "appRuntime.dispose", run: () => disposeAppRuntime(services.runtime.managed) }]
@@ -292,6 +299,7 @@ async function disposeWorkflowContext(ctx: WorkflowContext): Promise<void> {
     coderOauthService: ctx.coderOauthService,
     realProviderService: ctx.realProviderService,
     agentResourceLimits: ctx.agentResourceLimits,
+    agentSandbox: ctx.agentSandbox,
   });
 }
 
@@ -304,6 +312,11 @@ async function createWorkflowContext(options: {
   // the run config to stop its config.json watches.
   const runStores = createConfigStores(tempDir.path);
   const config = runStores.config;
+  const realStores = createConfigStores();
+  const realConfig = realStores.config;
+  // Constructed before the try, so the cleanup can always dispose it; a service that never
+  // started has nothing to stop.
+  const agentSandbox = new AgentSandboxService(realConfig, { privateConfigRoot: tempDir.path });
   let services: WorkflowServices | undefined;
   let session: AgentSession | undefined;
   let codexOauthService: CodexOauthService | undefined;
@@ -311,8 +324,6 @@ async function createWorkflowContext(options: {
   let realProviderService: ProviderService | undefined;
   let agentResourceLimits: AgentResourceLimitsService | undefined;
   try {
-    const realStores = createConfigStores();
-    const realConfig = realStores.config;
     await copyPersistentConfig(realStores, runStores);
 
     const realProvidersStore = realStores.providersConfigStore;
@@ -359,6 +370,8 @@ async function createWorkflowContext(options: {
     // Settings saved in the real config, as the server does.
     agentResourceLimits = new AgentResourceLimitsService(realConfig);
     await agentResourceLimits.start();
+    await agentSandbox.start();
+    sandboxApprovalManager.denyAllRequests();
 
     // Const capture: `services` is a `let`, so the deferred sanitize closure
     // below would lose TypeScript's definite-assignment narrowing.
@@ -414,6 +427,7 @@ async function createWorkflowContext(options: {
       coderOauthService,
       realProviderService,
       agentResourceLimits,
+      agentSandbox,
     };
   } catch (error) {
     await disposeWorkflowResources({
@@ -425,6 +439,7 @@ async function createWorkflowContext(options: {
       coderOauthService,
       realProviderService,
       agentResourceLimits,
+      agentSandbox,
     });
     throw error;
   }

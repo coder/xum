@@ -317,6 +317,7 @@ export async function runWithHook<T>(
       cwd: context.projectDir,
       env: hookEnv,
       pathEnv: getHookPathEnv(context.projectDir, hookPath),
+      sandboxReadPaths: payloadReadPaths(toolInputPath),
       abortSignal: abortController.signal,
     });
   } catch (err) {
@@ -633,6 +634,7 @@ export async function runPreHook(
       cwd: context.projectDir,
       env: hookEnv,
       pathEnv: getHookPathEnv(context.projectDir, hookPath),
+      sandboxReadPaths: payloadReadPaths(toolInputPath),
       timeout: Math.ceil(timeoutMs / 1000),
       abortSignal: context.abortSignal,
     });
@@ -747,6 +749,7 @@ export async function runPostHook(
       cwd: context.projectDir,
       env: hookEnv,
       pathEnv: getHookPathEnv(context.projectDir, hookPath),
+      sandboxReadPaths: payloadReadPaths(toolInputPath, resultPathForEnv),
       timeout: Math.ceil(timeoutMs / 1000),
       abortSignal: context.abortSignal,
     });
@@ -767,6 +770,14 @@ export async function runPostHook(
   } finally {
     await cleanup();
   }
+}
+
+/**
+ * The payload files a hook gets in XUM_TOOL_INPUT_PATH and XUM_TOOL_RESULT_PATH. They are in the
+ * stream's temp folder in the home folder, which the agent sandbox keeps closed.
+ */
+function payloadReadPaths(...paths: Array<string | undefined>): string[] {
+  return paths.filter((payload): payload is string => payload !== undefined);
 }
 
 function logHookFailure(

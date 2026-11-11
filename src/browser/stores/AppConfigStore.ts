@@ -6,6 +6,7 @@ import {
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
 import { applyMergePatch, type MergePatch } from "@/common/utils/applyMergePatch";
+import type { IsolationChoice } from "@/common/types/isolation";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ExperimentId } from "@/common/constants/experiments";
@@ -27,7 +28,7 @@ export interface AppConfigSnapshot {
   defaultModel?: string;
   hiddenModels?: string[];
   runtimeEnablement?: Record<string, boolean>;
-  defaultRuntime?: string | null;
+  defaultIsolation?: IsolationChoice | null;
   chatTranscriptFullWidth?: boolean;
   /** Read by the command palette to show the toggle's current state (#5791). */
   keepScreenAwake?: boolean;
@@ -205,7 +206,7 @@ export class AppConfigStore {
           defaultModel: config.defaultModel,
           hiddenModels: config.hiddenModels ?? [],
           runtimeEnablement: config.runtimeEnablement,
-          defaultRuntime: config.defaultRuntime ?? null,
+          defaultIsolation: config.defaultIsolation ?? null,
           chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
           keepScreenAwake: config.keepScreenAwake === true,
           heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs,

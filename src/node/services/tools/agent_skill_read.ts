@@ -14,6 +14,7 @@ import {
   type ResolvedAgentSkill,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import { toolSandboxGate } from "@/node/services/agentSandbox/fileToolSandbox";
 import {
   resolveSkillDirectory,
   substituteSkillDirectoryPlaceholders,
@@ -163,6 +164,7 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
           containment: skillCtx.containment,
           runtimeFactory: toolRuntimeFactory(config),
           includeClaudeSkills,
+          sandboxGate: toolSandboxGate(config),
         });
         // Judged against config.runtime: that is where the model's bash runs.
         // availableSkills is this turn's invocable list from the same skill

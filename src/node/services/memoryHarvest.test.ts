@@ -17,6 +17,7 @@ import {
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
+import { redactSecretLike } from "./memorySecretRedaction";
 import { MemoryService, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir } from "./tools/testHelpers";
 import {
@@ -1116,7 +1117,7 @@ describe("runMemoryHarvest", () => {
       expect(prompt).not.toContain("ghp_a1B2");
     });
 
-    it("keeps the count of cut characters of a part in which redaction shrank the text", () => {
+    it("counts the cut characters of a part in which redaction shrank the text in its own characters", () => {
       using fixture = createFixture();
       const text = `${githubToken} ${"y".repeat(TEXT_PART_LIMIT + 1_000)}`;
       fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
@@ -1125,10 +1126,49 @@ describe("runMemoryHarvest", () => {
         (chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>
       );
 
-      // Of the 1,041 characters past the cap, the 30 that redaction took out of the token now fit
-      // under it.
-      expect(rows.at(-1)?.text).toEndWith("[truncated 1011 more chars for memory harvest]");
+      // The cap is in the part's own characters, so the 30 that redaction took out of the token do
+      // not let 30 more fit under it: all 1,041 characters past the cap are cut.
+      expect(rows.at(-1)?.text).toEndWith("[truncated 1041 more chars for memory harvest]");
       expect(rows.map((row) => row.text).join("")).not.toContain(githubToken);
+    });
+
+    // The scan window is the cap and a lookahead past it. Its end can cut a key, and what is left is
+    // too short to match, so it shows as it is. Redaction shortens the text (a long value becomes one
+    // marker), so a cut of the redacted window at the cap reached that end.
+    describe("a window that redaction shortens past its lookahead", () => {
+      const KEY_CUT = "sk-QBNDZ8P3"; // 8 characters of a key that needs 12 to match: the window ends here
+      const KEY_REST = "R6V4H2J5 and the rest of the text";
+      const textOf = (prefix: string): string => {
+        const filler = TEXT_PART_LIMIT + 512 - prefix.length - 2 - KEY_CUT.length;
+        return `${prefix} ${"z".repeat(filler)} ${KEY_CUT}${KEY_REST}${" lorem".repeat(20_000)}`;
+      };
+      const shownOf = (text: string): string =>
+        buildHarvestChunks([createMuxMessage("t1", "user", text, { historySequence: 0 })])
+          .flatMap((chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>)
+          .map((row) => row.text)
+          .join("");
+
+      it.each([
+        ["a long redacted value", `password="${"A".repeat(600)}"`],
+        [
+          "ten long signed-URL values",
+          Array.from({ length: 10 }, () => `?sig=${"A".repeat(100)}`).join(" "),
+        ],
+        // Main writes a `]` behind each marker, which gives back 16 of the 512 characters that the
+        // value takes out. A redaction that does not write it takes this shape over the edge.
+        [
+          "a long value and signed-URL markers",
+          `password="${"A".repeat(520)}" ${"?sig=[redacted] ".repeat(16)}`,
+        ],
+      ])("shows no part of a key that the end of the window cut, behind %s", (_label, prefix) => {
+        const text = textOf(prefix);
+
+        const shown = shownOf(text);
+
+        expect(shown).not.toContain("sk-QBND");
+        // Only the first `TEXT_PART_LIMIT` characters of the part are shown, redacted.
+        expect(shown).toStartWith(redactSecretLike(text.slice(0, TEXT_PART_LIMIT)));
+      });
     });
   });
 
