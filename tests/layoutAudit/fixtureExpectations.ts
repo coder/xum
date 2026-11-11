@@ -72,11 +72,13 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
   ),
   // A long page with a sticky header and a fixed chip over scrolling text: no cover.
   "below-fold-clean": CLEAN,
-  // An input, a select and an icon-only button have no text node. The input below them is free.
+  // An input, a select and an icon-only button have no text node, and neither has an input inside
+  // a label (the label's text is no face for it). The input at the end is free.
   "faceless-controls-covered": everyWidth(
     found("overlapping-text", "input#name"),
     found("overlapping-text", "select#plan"),
-    found("overlapping-text", "button#close")
+    found("overlapping-text", "button#close"),
+    found("overlapping-text", "input#in-label")
   ),
   // An ellipsis does not excuse lines lost below a short box. A one-line ellipsis and a line
   // clamp are the author's cut.

@@ -78,12 +78,14 @@ function isRootFailure(pass: AuditPass, el: Element): boolean {
 
 /**
  * Not a diagram, mask or screen-reader-only text, not a span that its paragraph judges, and not
- * near motion. The part of every text and control rule that does not depend on the rule.
+ * near motion. The part of every text and control rule that does not depend on the rule. A
+ * paragraph judges the text of what it holds, never a box: an element that is judged by its own
+ * box (`byOwnBox`) is not exempt for sitting inside one.
  */
-function isJudgeable(pass: AuditPass, el: Element): boolean {
+function isJudgeable(pass: AuditPass, el: Element, byOwnBox = false): boolean {
   return (
     !isExcludedElement(pass.page, el) &&
-    !isNestedInTextBoundary(pass.page, el) &&
+    (byOwnBox || !isNestedInTextBoundary(pass.page, el)) &&
     !isNearAnimation(pass.animated, el)
   );
 }
@@ -436,11 +438,17 @@ function isBelowViewport(point: Point, metrics: PageMetrics): boolean {
   return point.x >= 0 && point.x <= metrics.viewportWidth && point.y > metrics.viewportHeight;
 }
 
-// The rectangles whose points are sampled: the text lines, or the box of a control with no text of
-// its own (an <input value>, a <select>, an icon-only button), whose face is not a text node.
+// A control with no text of its own (an <input value>, a <select>, an icon-only button): its face
+// is not a text node, so it is sampled by its box.
+function isFacelessControl(page: LayoutPage, el: Element): boolean {
+  return auditedText(page, el) === "" && isRequiredControl(el);
+}
+
+// The rectangles whose points are sampled: the text lines, or the box of a faceless control.
 function sampleRects(pass: AuditPass, el: Element): Box[] {
-  const faceless = auditedText(pass.page, el) === "" && isRequiredControl(el);
-  const rects = faceless ? [pass.page.box(el)] : textFragments(pass.page, el);
+  const rects = isFacelessControl(pass.page, el)
+    ? [pass.page.box(el)]
+    : textFragments(pass.page, el);
   return rects.filter((rect) => rect.width * rect.height >= THRESHOLDS.minFragmentArea);
 }
 
@@ -510,13 +518,14 @@ function occlusionOf(samples: OcclusionSamples) {
 }
 
 // Long enough to read (any length for a control, and none at all: it is sampled by its box),
-// static (positioned text overlaps on purpose), and not shown by a paragraph around it.
+// static (positioned text overlaps on purpose), and not shown by a paragraph around it. A control
+// with no text is no text for a paragraph to show, so it is a candidate inside one too.
 function isOcclusionCandidate(pass: AuditPass, el: Element): boolean {
   const text = auditedText(pass.page, el);
   const sampled = text.length >= THRESHOLDS.occlusionMinTextChars || isRequiredControl(el);
   return (
     sampled &&
-    isJudgeable(pass, el) &&
+    isJudgeable(pass, el, isFacelessControl(pass.page, el)) &&
     isVisible(pass.page, el) &&
     pass.page.style(el).position === "static"
   );

@@ -685,6 +685,34 @@ describe("overlapping-text", () => {
       expect(reported('data-box="10 10 3 5"')).toBe(0);
     });
 
+    // A paragraph, label or list item judges the text it holds, never a control's box.
+    test.each(["label", "p", "li"])(
+      "inside a %s it is sampled too: the text there is not its face",
+      (tag) => {
+        const html = `<div id="stage"><${tag} data-box="0 0 300 40">Name <input id="f" value="x" ${BOXED}></${tag}>${COVER()}</div>`;
+        expect(audit(html)).toEqual([finding("overlapping-text", "input#f", "horizontal", 0)]);
+      }
+    );
+
+    test("inside a label it is still left alone when excluded or near motion", () => {
+      const inLabel = (labelAttributes: string, inputAttributes = "") =>
+        `<div id="stage"><label ${labelAttributes} data-box="0 0 300 40">Name <input id="f" value="x" ${BOXED} ${inputAttributes}></label>${COVER()}</div>`;
+      expect(audit(inLabel(""))).toHaveLength(1);
+      expect(audit(inLabel("", "data-animated"))).toEqual([]);
+      expect(audit(inLabel("data-animated"))).toEqual([]);
+      expect(audit(inLabel('data-css="mask-image: linear-gradient(black, transparent)"'))).toEqual(
+        []
+      );
+      expect(audit(inLabel('class="mermaid"'))).toEqual([]);
+    });
+
+    test("a control that has text is still left to the paragraph around it", () => {
+      // Its text is in the item's lines, and a short one is no candidate there: only a control
+      // with no text at all is sampled by its box inside a paragraph.
+      const html = `<div id="stage"><li data-box="0 0 300 40"><textarea id="f" ${BOXED} data-lines="10 10 200 30">Go</textarea></li>${COVER()}</div>`;
+      expect(audit(html)).toEqual([]);
+    });
+
     test("an element that is no control, and a hidden or disabled control, are not sampled", () => {
       expect(audit(CONTROL(`<div id="f" ${BOXED}></div>`))).toEqual([]);
       expect(audit(CONTROL(`<input type="hidden" id="f" ${BOXED}>`))).toEqual([]);
