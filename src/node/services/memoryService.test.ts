@@ -132,7 +132,9 @@ function writeFillerNotes(
  * thread. At a load average of 40 a listing took 3 s and a test that lists three times took 13 s, and at
  * 60 that test took 40 s. A filler note has no description, so this answers its `open` with an empty file
  * and the listing is the same. Every other path reaches the filesystem, and the spy is gone when the
- * listing returns.
+ * listing returns. The adoption pass that a listing can run reads legacy notes through `open` too, so
+ * where the legacy store holds filler notes (the bounded-listing test), the spy answers those reads as
+ * well. That test asserts the content of `a.md` only, and `a.md` is no filler note.
  */
 async function listIndexEntriesOverFiller(
   service: MemoryService,
@@ -4529,7 +4531,7 @@ describe("MemoryService", () => {
         untyped.mockRestore();
       }
       // The legacy directory must hold more entries than the cap, and each is untyped. The first listing
-      // made about 4,000 lstat and 5,000 realpath calls, and nothing can skip them as the filler reads are
+      // made about 4,000 lstat and 6,000 realpath calls, and nothing can skip them as the filler reads are
       // skipped. The cap is a constant of the service, so the directory cannot be smaller. The test took
       // 8 s at a load average of 45 and 45 s at 75, so it keeps a wide allowance.
     }, 120_000);
@@ -5473,7 +5475,7 @@ describe("MemoryService", () => {
       expect(project[project.length - 1]?.relPath).toBe(
         `f${String(MEMORY_MAX_FILES_PER_SCOPE - 1).padStart(4, "0")}.md`
       );
-    });
+    }, 30_000);
 
     it("keeps global lexicographic order when the cap truncates nested trees", async () => {
       using fixture = await createFixture();
@@ -5492,7 +5494,7 @@ describe("MemoryService", () => {
       const project = entries.filter((e) => e.scope === "project");
       expect(project).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
       expect(project[0]?.relPath).toBe("a.md");
-    });
+    }, 30_000);
 
     it("reads only a bounded prefix per file when extracting descriptions", async () => {
       using fixture = await createFixture();
