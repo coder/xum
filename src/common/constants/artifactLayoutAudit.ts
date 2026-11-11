@@ -54,7 +54,10 @@ export const LAYOUT_AUDIT_NOT_CHECKED_REASONS = [
 ] as const;
 export type LayoutAuditNotCheckedReason = (typeof LAYOUT_AUDIT_NOT_CHECKED_REASONS)[number];
 
-/** The whole publish-time audit (run plus session close) must fit in this. */
+/**
+ * The whole publish-time audit (run plus session close) must fit in this. Only the removal of the
+ * run's folder after a failed close comes on top (agentBrowserLayoutRun.ts).
+ */
 export const LAYOUT_AUDIT_BUDGET_MS = 15_000;
 /** Held back from the run so closing the browser session always has time. */
 export const LAYOUT_AUDIT_CLOSE_RESERVE_MS = 3_000;

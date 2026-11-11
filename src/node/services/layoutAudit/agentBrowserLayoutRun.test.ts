@@ -344,7 +344,10 @@ describe("runLayoutPasses through a fake agent-browser", () => {
   });
 
   test("a run keeps its session files in a folder of its own and removes it after the close", async () => {
+    const exec = spyOn(runtime, "exec");
     const { fake } = await run({});
+    // The run and the close: a close that ended well needs no removal step after it.
+    expect(exec).toHaveBeenCalledTimes(2);
     const seen = await fake.socketDirs();
     const session = (await fake.calls())[0]?.[1];
     // Every call, the close included, saw the one folder, and it existed while they ran.
