@@ -191,8 +191,6 @@ function ChipBranch(props: { branch: EnvironmentSummary["branch"] }) {
     <>
       {SEPARATOR}
       <span
-        // The tutorial points at the base branch; it lives in the chip while the panel is closed.
-        data-tutorial="trunk-branch"
         data-component="BranchSelector"
         data-branch-load={branch.kind}
         className="flex min-w-0 items-center gap-1.5"
@@ -320,6 +318,10 @@ export function CreationEnvironmentPanel(props: CreationEnvironmentPanelProps) {
             <button
               type="button"
               data-testid="creation-environment"
+              // The tutorial's "Branch From" step points here. On the chip, not on its branch
+              // segment: the segment is hidden for runtimes with no base branch, and a step with
+              // no target shows only its backdrop.
+              data-tutorial="trunk-branch"
               aria-haspopup="dialog"
               aria-keyshortcuts={formatKeybindForAria(KEYBINDS.OPEN_CREATION_ENVIRONMENT)}
               disabled={props.disabled}
