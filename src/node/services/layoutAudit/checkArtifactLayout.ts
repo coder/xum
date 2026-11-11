@@ -107,8 +107,19 @@ async function outcomesOrFailed(input: ArtifactLayoutInput): Promise<ViewportOut
 }
 
 /**
+ * Whether a publish of `relPath` as `kind` is audited: shown as HTML, and named so that the
+ * browser parses it as HTML. The browser opens the file by its `file://` URL and picks the
+ * document type from the name, so a `page.txt` published as html would load as plain text and
+ * could read clean. Such a file is not audited (no `layout`), like any other kind.
+ */
+export function isAuditableHtml(kind: string, relPath: string): boolean {
+  return kind === "html" && getArtifactKind(relPath) === "html";
+}
+
+/**
  * Checks a just-published HTML artifact at 390, 768 and 1440 px in agent-browser and says what
- * is broken. Returns undefined for every other kind, so the caller needs no branch.
+ * is broken. Returns undefined for every other kind, and for a file isAuditableHtml rejects, so
+ * the caller needs no branch.
  *
  * Never throws and never fails the publish: whatever goes wrong becomes `checked: false`, which
  * the agent must not read as "clean". Findings of the same path are compared with the last
@@ -120,16 +131,6 @@ async function outcomesOrFailed(input: ArtifactLayoutInput): Promise<ViewportOut
  * audit that starts finishes exactly once, whatever happened to its work: the ordering state of
  * its path lives until then.
  */
-/**
- * Whether a publish of `relPath` as `kind` is audited: shown as HTML, and named so that the
- * browser parses it as HTML. The browser opens the file by its `file://` URL and picks the
- * document type from the name, so a `page.txt` published as html would load as plain text and
- * could read clean. Such a file is not audited (no `layout`), like any other kind.
- */
-export function isAuditableHtml(kind: string, relPath: string): boolean {
-  return kind === "html" && getArtifactKind(relPath) === "html";
-}
-
 export async function checkArtifactLayout(
   input: ArtifactLayoutInput
 ): Promise<LayoutAuditReport | undefined> {
