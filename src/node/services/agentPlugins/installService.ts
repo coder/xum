@@ -1402,11 +1402,12 @@ function folderErrorReason(error: unknown): string {
 
 /**
  * The real folder at `subpath`, or why the preview would not stage it (narrowToSubpath, then
- * extractSubpath): missing,
- * escaping the repository, a file, or a path through a symbolic link. A constant number of calls
- * per build: a marketplace lists up to 1,500 builds, and a per-segment walk of deep paths that
- * all name one folder made a hostile listing take over a minute. The realpath already resolved
- * every segment, so a link anywhere on the path shows as a realpath that differs from the path.
+ * extractSubpath): missing, escaping the repository, a file, or a path through a symbolic link.
+ * The realpath already resolved every segment, so a link anywhere on the path shows as a
+ * realpath that differs from the path. A marketplace lists up to 1,500 builds: a walk per
+ * segment, or a realpath of paths thousands of folders deep, made a hostile listing take over a
+ * minute, so this makes a few calls per build and marketplaceRelativePath caps the depth
+ * (MAX_MARKETPLACE_PATH_FOLDERS).
  */
 async function realEntryFolder(
   stagedDir: string,
