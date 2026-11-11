@@ -325,8 +325,8 @@ function clippersHolding(
  * The clipping elements between a text boundary's text and the boundary (a paragraph's narrower
  * `overflow: hidden` span), each with the lines it holds. The boundary measures its text against
  * its own box and its clipping ancestors, so a clipper inside it would cut text that no box
- * reaches. Text that no rule judges (a diagram label, screen-reader-only text) is no evidence of
- * a cut. Another element reads only its own text, so it has none.
+ * reaches. Text that no rule judges (a diagram label, screen-reader-only text) or that is not
+ * shown is no evidence of a cut. Another element reads only its own text, so it has none.
  */
 export function nestedClippingBoundaries(page: LayoutPage, el: Element): NestedClip[] {
   if (!isSemanticTextBoundary(el)) return [];
@@ -335,9 +335,14 @@ export function nestedClippingBoundaries(page: LayoutPage, el: Element): NestedC
   const clips = new Map<Element, NestedClip | null>();
   for (const node of nodes) {
     const clippers = clippersHolding(page, node, el, clips);
+    // Hidden text keeps its line boxes (a Range still measures `visibility: hidden` text), so
+    // only text the user can see is evidence that a clipper cuts something.
+    const holder = node.parentElement;
     if (
       clippers.length === 0 ||
-      (node.parentElement && isExcludedElement(page, node.parentElement))
+      !holder ||
+      isExcludedElement(page, holder) ||
+      !isVisible(page, holder)
     ) {
       continue;
     }

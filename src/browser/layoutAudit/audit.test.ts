@@ -186,6 +186,17 @@ describe("clipped-text", () => {
       ]);
     });
 
+    test("hidden text inside the clipper is no evidence of a cut", () => {
+      // A Range measures `visibility: hidden` text too: the long hidden line would read as cut.
+      const html = `<p id="p" data-box="0 0 300 20"><span id="s" data-box="0 0 60 20" data-css="overflow-x: hidden"><span id="shown" data-box="0 0 40 20" data-lines="0 0 40 20">Short</span>
+        <span id="hidden" data-box="0 0 400 20" data-css="visibility: hidden" data-lines="0 0 400 20">A long line nobody sees</span></span></p>`;
+      expect(audit(html)).toEqual([]);
+      // The same line shown is cut.
+      expect(audit(html.replace("visibility: hidden", "visibility: visible"))).toEqual([
+        finding("clipped-text", "span#s", "horizontal", 340),
+      ]);
+    });
+
     test("is judged on the lines it holds, down to a clipper inside a clipper", () => {
       const html = `<p id="p" data-box="0 0 300 20"><span id="outer" data-box="0 0 60 20" data-css="overflow-x: hidden">
         <span id="inner" data-box="0 0 300 20" data-css="overflow-x: hidden" data-lines="0 0 200 20">Clipped text</span></span></p>`;

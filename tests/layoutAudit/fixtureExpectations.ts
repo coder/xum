@@ -64,6 +64,8 @@ export const FIXTURE_EXPECTATIONS: Readonly<Record<string, WidthExpectations>> =
   // A span narrower than its paragraph cuts its text. An ellipsis span and screen-reader-only
   // text inside a paragraph are not findings.
   "nested-clipper-in-paragraph": everyWidth(found("clipped-text", "span#cut-tag")),
+  // The tag's visible text fits. Hidden text past its edge still has line boxes: no finding.
+  "nested-clipper-hidden-text": CLEAN,
   // The cover sits below the first screen at every width: only a scroll reaches it.
   "below-fold-covered": everyWidth(found("overlapping-text", "html > body > main > section > p")),
   // The same page with `scroll-behavior: smooth`: the audit's scrolls must not animate.
