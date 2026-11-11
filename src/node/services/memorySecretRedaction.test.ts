@@ -1257,6 +1257,40 @@ describe("redactSecretLike", () => {
     );
   });
 
+  // The rows below compare CPU time, not wall-clock time. Wall-clock time also counts the time other
+  // processes keep the CPU from this one, so a loaded host, or a second test run on the same CPU,
+  // stretched a 66 ms scan past its 100 ms budget, and the mutation gate dropped the whole file at
+  // its baseline. CPU time is the process's own, and it stayed within 7% when two runs shared one
+  // CPU. A budget alone is not enough: the slowest linear scan takes about 65 ms, so a budget low
+  // enough to catch a regression on the faster ones would fail it. Each row therefore also runs its
+  // text cut to an eighth: the cost per character must not grow with the length.
+  const SCAN_SIZE_DIVISOR = 8;
+  // Past this, a scan fails whatever its first eighth costs: the slowest linear scan takes about a
+  // fifth of it, and the regressions this guards cost seconds.
+  const SCAN_CPU_CEILING_MS = 300;
+  // How much more per character the full text may cost than its eighth: 1 for a linear scan (1.6
+  // measured at most), 8 for a quadratic one.
+  const SCAN_COST_PER_CHAR_LIMIT = 3;
+  // An eighth that costs less than this is mostly timer and allocation noise.
+  const SCAN_CPU_FLOOR_MS = 1;
+
+  function cpuMilliseconds(run: () => void): number {
+    const before = process.cpuUsage();
+    run();
+    const used = process.cpuUsage(before);
+    return (used.user + used.system) / 1000;
+  }
+
+  /** The least CPU time of up to `runs` runs, which stop at the first one past the ceiling. */
+  function bestCpuMilliseconds(run: () => void, runs: number): number {
+    let best = Number.POSITIVE_INFINITY;
+    for (let attempt = 0; attempt < runs; attempt++) {
+      best = Math.min(best, cpuMilliseconds(run));
+      if (best >= SCAN_CPU_CEILING_MS) break;
+    }
+    return best;
+  }
+
   // The guard scans text a model supplied, so a hostile 100 KB write must not stall the process.
   // Each shape repeats a keyword with nothing after it, which made the open-ended name suffix and
   // JWT segment rescan to the end of the text from every occurrence (seconds per input).
@@ -1336,12 +1370,20 @@ describe("redactSecretLike", () => {
     ["nested cookie list openers", `${"Cookie: [".repeat(10_000)}]`],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
-    // Each scan gets the whole budget: `containsSecretLike` is a second pass of the same redaction,
-    // and with the cookie rule a pass costs about half of it, so one budget for both flaked.
+    const small = text.slice(0, Math.floor(text.length / SCAN_SIZE_DIVISOR));
+    // Each scan gets its own checks: `containsSecretLike` is a second pass of the same redaction.
     for (const scan of [redactSecretLike, containsSecretLike]) {
-      const started = performance.now();
-      scan(text);
-      expect(performance.now() - started).toBeLessThan(100);
+      scan(small);
+      const smallMs = bestCpuMilliseconds(() => scan(small), 5);
+      const fullMs = bestCpuMilliseconds(() => scan(text), 3);
+
+      // A scan that is not quadratic costs about the same per character on a text and on its
+      // first eighth (at most 1.6 times as much, measured: the engine slows down on long inputs),
+      // and a quadratic one costs eight times as much.
+      expect(fullMs).toBeLessThan(SCAN_CPU_CEILING_MS);
+      expect(fullMs / SCAN_SIZE_DIVISOR).toBeLessThan(
+        SCAN_COST_PER_CHAR_LIMIT * Math.max(smallMs, SCAN_CPU_FLOOR_MS)
+      );
     }
   });
 });
