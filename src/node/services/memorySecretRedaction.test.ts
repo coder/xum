@@ -1177,6 +1177,28 @@ describe("redactWithinCap", () => {
     expect(redactWithinCap(text, CAP)).toBe(`${"x".repeat(CAP - 11)} [redacted]`);
   });
 
+  // A secret that starts at the first character past the cap is not in the kept text, so no marker
+  // for it is either: the first `cap` characters redacted alone are a prefix of the redacted whole,
+  // and a marker follows that prefix there.
+  it("shows no marker for a secret that starts right after the cap", () => {
+    const text = `${"x".repeat(CAP - 1)} ${KEY} tail`;
+    expect(text.indexOf(KEY)).toBe(CAP);
+    expect(redactWithinCap(text, CAP)).toBe(text.slice(0, CAP));
+  });
+
+  // Cut at the cap, a `Cookie:` header has no value, and redaction gives it a marker. In the whole
+  // text a blank and a line break follow it, and the marker stands after them. The two differ at the
+  // cap, and no marker stands there in the whole: what is shown ends there, with none of the blank
+  // or the marker that lie past the cap.
+  it("ends where the first characters and the whole text differ, when no marker stands there", () => {
+    const header = `${"x".repeat(CAP - 8)} Cookie:`;
+    expect(header).toHaveLength(CAP);
+    const text = `${header} \nnext line of text past the cap`;
+    expect(redactSecretLike(header)).toBe(`${header}[redacted]`);
+    expect(redactSecretLike(text)).toStartWith(`${header} [redacted]\nnext`);
+    expect(redactWithinCap(text, CAP)).toBe(header);
+  });
+
   // A value that redaction shortens must not let what lies past the cap into the output.
   it("shows no text from past the cap when redaction shortens the text before it", () => {
     expect(redactWithinCap(`password=${"z".repeat(300)} visible beyond the cap`, 50)).toBe(
