@@ -701,6 +701,36 @@ test("an open component review cannot be approved while another plugin is busy, 
   await waitFor(() => expect(approve()!.disabled).toBe(false));
 });
 
+test("an open uninstall confirmation cannot be confirmed while another plugin is busy, and can again when it settles", async () => {
+  const { api, updates } = createApi({
+    names: ["beta", "epsilon"],
+    pending: { beta: capabilityChanging("beta") },
+  });
+  const releaseUpdate = Promise.withResolvers<void>();
+  const applyUpdate = api.agentPlugins.update;
+  api.agentPlugins.update = (async (input: Parameters<typeof applyUpdate>[0]) => {
+    await releaseUpdate.promise;
+    return applyUpdate(input);
+  }) as typeof applyUpdate;
+  publishPluginsSectionIntent({ type: "review-updates", reviews: [capabilityChanging("beta")] });
+  const view = mount(api);
+  const confirmUninstall = () =>
+    buttonsIn(view).find(
+      (button) => button.textContent === "Uninstall" && !button.hasAttribute("aria-label")
+    );
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+  fireEvent.click(view.container.querySelector('button[aria-label="Uninstall epsilon"]')!);
+  await waitFor(() => expect(confirmUninstall()).toBeDefined());
+  expect(confirmUninstall()!.disabled).toBe(false);
+
+  fireEvent.click(openReviews(view)[0]);
+
+  await waitFor(() => expect(confirmUninstall()!.disabled).toBe(true));
+  releaseUpdate.resolve();
+  await waitFor(() => expect(updates.map((update) => update.name)).toEqual(["beta"]));
+  await waitFor(() => expect(confirmUninstall()!.disabled).toBe(false));
+});
+
 test("starting Update all closes the component review that is open", async () => {
   const { api } = createApi({
     names: ["alpha"],

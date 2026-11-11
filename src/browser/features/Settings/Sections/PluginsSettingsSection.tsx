@@ -1372,6 +1372,8 @@ const PreviewDisclosures: React.FC<{
 const UninstallConfirm: React.FC<{
   item: AgentPluginListItem;
   busy: boolean;
+  /** Another plugin's action is in flight: the section ignores a confirm until it settles. */
+  locked: boolean;
   onConfirm: (deletePluginData: boolean) => void;
   onCancel: () => void;
 }> = (props) => {
@@ -1396,7 +1398,7 @@ const UninstallConfirm: React.FC<{
           variant="destructive"
           size="sm"
           onClick={() => props.onConfirm(deletePluginData)}
-          disabled={props.busy}
+          disabled={props.busy || props.locked}
         >
           {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
           {props.busy ? "Uninstalling…" : "Uninstall"}
@@ -2439,6 +2441,7 @@ export const PluginsSettingsSection: React.FC = () => {
                     <UninstallConfirm
                       item={item}
                       busy={isBusy}
+                      locked={busyPlugin !== null}
                       onConfirm={(deletePluginData) =>
                         void handleUninstall(item.name, deletePluginData)
                       }
