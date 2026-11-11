@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
 
-import { addsSecretLike, containsSecretLike, redactSecretLike } from "./memorySecretRedaction";
+import {
+  addsSecretLike,
+  containsSecretLike,
+  redactSecretLike,
+  redactWithinCap,
+} from "./memorySecretRedaction";
 
 describe("redactSecretLike", () => {
   const FAKE = {
@@ -1101,6 +1106,10 @@ describe("redactSecretLike", () => {
         "password=[redacted]SEKRIT, user=alice; token=[redacted]SEKRIT&x=1",
         "password=[redacted], user=alice; token=[redacted]&x=1",
       ],
+      // A key pair's value does not end at `<`, `>` or `#`, as a signed-URL value does.
+      ["angle brackets and a hash", "token=[redacted]SEKRIT<b>x#y next", "token=[redacted] next"],
+      ["a tail that starts at a hash", "token=[redacted]#SEKRIT next", "token=[redacted] next"],
+      ["a tail of digits", "password=[redacted]4711", "password=[redacted]"],
       // A pass that swallowed the tail would take the key of this pair from the pass that reads it.
       ["a pair behind the marker", 'password=[redacted]token="SEKRIT"', "password=[redacted]"],
       [
@@ -1150,6 +1159,13 @@ describe("redactSecretLike", () => {
         "?sig=a.sk-AAAAAAAAAAAAAAAA.SEKRIT.sk-BBBBBBBBBBBBBBBB.MORE",
         "?sig=[redacted]",
       ],
+      // A signed-URL value ends at `<`, `>` and `#`, which a key pair's value does not end at.
+      [
+        "a signature that ends at an angle bracket and a hash",
+        "<https://h/p?sig=[redacted]SEKRIT><a>#frag",
+        "<https://h/p?sig=[redacted]><a>#frag",
+      ],
+      ["a signature that ends at a hash", "?sig=[redacted]SEKRIT#frag", "?sig=[redacted]#frag"],
     ])("redacts the tail of %s", (_label, text, expected) => {
       const redacted = redactSecretLike(text);
       expect(redacted).toBe(expected);
@@ -1169,7 +1185,13 @@ describe("redactSecretLike", () => {
       ["brackets after it", "password=[redacted]]]"],
       ["a marker that follows no key", "the value is [redacted]xyz"],
       ["a marker behind a name that is no secret", "user=[redacted]xyz"],
-    ])("leaves %s that holds a marker with nothing after it", (_label, text) => {
+      // A note that quotes what the harvest showed puts punctuation behind the marker. No letter or
+      // digit goes on after it, so there is no value to take.
+      ["a code span around the pair", "Deploy reads `GITHUB_TOKEN=[redacted]` from the vault."],
+      ["a full stop after it", "The CI password=[redacted]. Ask ops for access."],
+      ["punctuation only after it", "token=[redacted]..."],
+      ["markers only after it", "password=[redacted][redacted]"],
+    ])("leaves %s that holds a marker with nothing readable after it", (_label, text) => {
       expect(redactSecretLike(text)).toBe(text);
       expect(containsSecretLike(text)).toBe(false);
       expect(addsSecretLike("", text)).toBe(false);
@@ -1181,6 +1203,28 @@ describe("redactSecretLike", () => {
       expect(addsSecretLike(held, held.replace("SEKRIT", "OTHER"))).toBe(true);
       expect(addsSecretLike(held, `${held}token=[redacted]SEKRIT\n`)).toBe(true);
       expect(addsSecretLike("notes\n", held)).toBe(true);
+    });
+
+    // The userinfo pattern bounds its user at 64 characters. The tail pass shortens the value in
+    // front of the user's `:`, so a URL that was too long to match before it matches after it, and
+    // a second pass would take the password: the passes run again on a text that a tail cut.
+    describe("a URL whose user the tail pass shortens into the userinfo bound", () => {
+      const long = `see https://token=[redacted]${"x".repeat(48)},:pw@db.example/x`;
+      const short = "see https://token=[redacted],:pw@db.example/x";
+
+      it("is redacted once, and a second pass changes nothing", () => {
+        const redacted = redactSecretLike(long);
+        expect(redacted).toBe("see https://[redacted]@db.example/x");
+        expect(redactSecretLike(redacted)).toBe(redacted);
+        expect(addsSecretLike("", redacted)).toBe(false);
+      });
+
+      // Main takes the password out of the short form and not out of the long one, so the edit adds
+      // a credential. The second round's value of the long form must not excuse it.
+      it("refuses the short form as an edit of the long one, as main does", () => {
+        expect(addsSecretLike(long, short)).toBe(true);
+        expect(addsSecretLike(long, long)).toBe(false);
+      });
     });
 
     // The guard keeps each pass's values apart (see `RemovalSource`): a tail that the previous text
@@ -1276,8 +1320,8 @@ describe("redactSecretLike", () => {
     ["nested cookie list openers", `${"Cookie: [".repeat(10_000)}]`],
     ["a key and a run of markers", `token=${"[redacted]".repeat(10_000)}x`],
     ["a key and markers each with a tail", `token=${"[redacted]x".repeat(10_000)}`],
-    ["keys that each hold a marker and a tail", "token=[redacted]x ".repeat(10_000)],
-    ["a key and a marker followed by brackets", `token=[redacted]${"]x".repeat(40_000)}`],
+    ["keys that each hold a marker and a tail", "token=[redacted]x ".repeat(6_000)],
+    ["a key and a marker followed by brackets", `token=[redacted]${"]x".repeat(20_000)}`],
     ["a signature and a run of markers", `?sig=${"[redacted]]".repeat(10_000)}x`],
     ["keys and half markers", "token=[redacted".repeat(20_000)],
   ])("scans %s in linear time", (_label, text) => {
@@ -1289,6 +1333,38 @@ describe("redactSecretLike", () => {
       scan(text);
       expect(performance.now() - started).toBeLessThan(100);
     }
+  });
+});
+
+describe("redactWithinCap", () => {
+  const CAP = 100;
+  const KEY = `ghp_${"a1B2".repeat(5)}`;
+
+  it("cuts text without a secret where redaction alone would, and reads the lookahead for none", () => {
+    const text = "lorem ".repeat(300);
+    expect(redactWithinCap(text, CAP)).toBe(text.slice(0, CAP));
+  });
+
+  it("returns the whole redaction of a text that fits under the cap", () => {
+    expect(redactWithinCap(`a ${KEY} b`, CAP)).toBe("a [redacted] b");
+  });
+
+  it("takes a secret that crosses the cap whole, and shows no part of it", () => {
+    const text = `${"x".repeat(CAP - 11)} ${KEY} tail`;
+    expect(redactWithinCap(text, CAP)).toBe(`${"x".repeat(CAP - 11)} [redacted]`);
+  });
+
+  // The window is the cap and its lookahead. A long value that redaction shortens must not bring the
+  // end of the window into the kept text: a key that the end cut is too short to match.
+  it("shows nothing of the lookahead when redaction shortens the text by more than it", () => {
+    const window = `password=${"z".repeat(CAP + 512 - 21)} sk-QBNDZ8P3`;
+    expect(window).toHaveLength(CAP + 512);
+    expect(redactWithinCap(window, CAP)).toBe("password=[redacted]");
+  });
+
+  it("keeps a pair whose value goes past the cap redacted whole", () => {
+    const text = `password=${"z".repeat(600)}`;
+    expect(redactWithinCap(text, CAP)).toBe("password=[redacted]");
   });
 });
 

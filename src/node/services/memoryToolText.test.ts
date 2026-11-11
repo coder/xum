@@ -143,6 +143,19 @@ describe("renderToolValue", () => {
     }
   );
 
+  // Redaction shortens the text, so a cut of its output at the cap reached the lookahead's end, where
+  // a key that the end cut is too short to match shows as it is.
+  it("shows nothing of the lookahead when redaction shortens the text by more than it", () => {
+    const cap = 100;
+    const key = "sk-QBNDZ8P3"; // needs 12 characters after `sk-` to match, and the scan window ends here
+    const filler = "z".repeat(cap + 512 - "password= ".length - key.length);
+
+    const rendered = renderToolValue(`password=${filler} ${key}R6V4H2J5 and more text`, cap);
+
+    expect(rendered).not.toContain("sk-QBND");
+    expect(rendered).toStartWith("password=[redacted]");
+  });
+
   it("says how much was cut when the whole value fit, and at least how much when it did not", () => {
     expect(renderToolValue("x".repeat(2_100), 2_000)).toBe(
       `${"x".repeat(2_000)} [truncated 100 more chars for memory harvest]`

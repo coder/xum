@@ -105,15 +105,23 @@ const SECRET_KEY_VALUE_PATTERN = new RegExp(
 // the characters that would continue it without the marker, and through a `]` that a character of
 // the value follows (the marker's own bracket, which the pass that cut the value there leaves behind,
 // or a bracket inside the value: ending at it would leave `[redacted]]d]Z` for a second pass to cut
-// again). A marker with nothing after it is a redacted value, and stays as it is.
+// again). A marker with no letter or digit after it (punctuation, or more markers) is a redacted
+// value, and stays as it is: a note that quotes one puts a backtick or a full stop behind it.
 // This runs after every other pass, on what they left, and only puts the marker over a span of their
 // output, so it never redacts less than they do. Extending their patterns would take the tail in
 // their pass, and a later pass would no longer read what it holds (`token="SEKRIT"` or a
 // `Cookie:` header glued to the marker).
 // Linear: a marker, then characters of a class and markers with nothing after them.
 const MARKER_SOURCE = String.raw`\[redacted\]`;
+// A letter or digit outside the markers decides that a value goes on. Once it does, the punctuation
+// before and after that letter goes with it, as it does when no marker is there.
 function markerTail(valueEnd: string): string {
-  return String.raw`${MARKER_SOURCE}(?:${MARKER_SOURCE}|\](?=[^${valueEnd}])|[^${valueEnd}])+`;
+  const mark = String.raw`${MARKER_SOURCE}|\](?=[^${valueEnd}])`;
+  const alnum = "A-Za-z0-9";
+  return (
+    String.raw`${MARKER_SOURCE}(?=(?:${mark}|(?!${MARKER_SOURCE})[^${valueEnd}${alnum}])*[${alnum}])` +
+    String.raw`(?:[^${valueEnd}\[]+|${mark}|\[)+`
+  );
 }
 const KEY_MARKER_TAIL_PATTERN = new RegExp(
   `(${KEY_VALUE_PREFIX})` + markerTail(UNQUOTED_VALUE_END),
@@ -564,18 +572,16 @@ function redactMarkerTails(text: string, onRemoved: (removed: string) => void): 
 }
 
 /**
- * Which passes took a value out: main's regex passes, the reader that runs on their output, or the
- * marker tails after that. The write guard compares each apart, so its verdict on the regex passes'
- * values is main's own: a value the reader or a tail takes out of the previous text never excuses
- * one the regex takes out of the new.
+ * Which passes took a value out: main's regex passes, the reader that runs on their output, the
+ * marker tails after that, or any of them in a later round (`again`, see `runRedactionPasses`). The
+ * write guard compares each apart, so its verdict on the regex passes' values is main's own: a value
+ * that the reader, a tail or a later round takes out of the previous text never excuses one the
+ * regex takes out of the new.
  */
-type RemovalSource = "regex" | "reader" | "tail";
+type RemovalSource = "regex" | "reader" | "tail" | "again";
 
-/**
- * The redaction passes, in order, each on the previous pass's output. `onRemoved` hears what each
- * replacement took out, so a caller can tell credentials apart instead of only counting them.
- */
-function runRedactionPasses(
+/** The regex passes and the reader, in order, each on the previous pass's output. */
+function runPassesOnce(
   text: string,
   onRemoved: (removed: string, source: RemovalSource) => void
 ): string {
@@ -604,8 +610,47 @@ function runRedactionPasses(
   // Last, on what the passes above left: the reader only replaces spans of their output with the
   // marker, so it never brings back a character they took out. It adds the rest of a value that
   // the regex ended early (at a quote, a `]` or a marker inside it), and never redacts less.
-  redacted = redactCookieHeaders(redacted, (removed) => onRemoved(removed, "reader"));
-  return redactMarkerTails(redacted, (removed) => onRemoved(removed, "tail"));
+  return redactCookieHeaders(redacted, (removed) => onRemoved(removed, "reader"));
+}
+
+// A tail pass that shortens the text changes what the earlier passes read: the userinfo pattern
+// bounds its user and password, so a URL that was too long to match before the cut matches after it.
+// The passes run again on the shortened text, so one call leaves a text that a second call does not
+// change. A text can set off a chain of such cuts, so the rounds are bounded.
+const MAX_REDACTION_ROUNDS = 3;
+
+const ANY_MARKER = new RegExp(MARKER_SOURCE, "gi");
+
+/** How much of `text` a reader sees: its characters outside the markers. */
+function shownLength(text: string): number {
+  return text.replace(ANY_MARKER, "").length;
+}
+
+/**
+ * The redaction passes, in order, each on the previous pass's output, and again on a text that the
+ * tail pass cut. `onRemoved` hears what each replacement took out, so a caller can tell credentials
+ * apart instead of only counting them.
+ *
+ * A later round counts only when it hides more of the text. Run on a marker alone, the signed-URL
+ * pattern writes one more `]` (main's own doubled bracket): a round that did nothing else would put
+ * that bracket into a text that was done. What a later round takes out is reported as `again`, so
+ * a value that it finds never excuses one that the first round finds in the new text.
+ */
+function runRedactionPasses(
+  text: string,
+  onRemoved: (removed: string, source: RemovalSource) => void
+): string {
+  let current = text;
+  for (let round = 0; round < MAX_REDACTION_ROUNDS; round++) {
+    const removals: Array<[string, RemovalSource]> = [];
+    const redacted = runPassesOnce(current, (removed, source) => removals.push([removed, source]));
+    const tailed = redactMarkerTails(redacted, (removed) => removals.push([removed, "tail"]));
+    if (round > 0 && shownLength(tailed) >= shownLength(current)) return current;
+    for (const [removed, source] of removals) onRemoved(removed, round === 0 ? source : "again");
+    if (tailed === redacted) return tailed;
+    current = tailed;
+  }
+  return current;
 }
 
 /** Replaces common credential shapes with `[redacted]`. */
@@ -625,6 +670,7 @@ export function addsSecretLike(previous: string, updated: string): boolean {
     regex: new Map(),
     reader: new Map(),
     tail: new Map(),
+    again: new Map(),
   };
   runRedactionPasses(previous, (removed, source) => {
     // mutation-equivalent: a held count only grows here, so it is undefined or at least 1
@@ -638,6 +684,26 @@ export function addsSecretLike(previous: string, updated: string): boolean {
     else held[source].set(removed, left - 1);
   });
   return added;
+}
+
+/**
+ * `text` redacted, and cut at its first `cap` characters, with the rest of `text` as a lookahead: a
+ * secret that starts inside the cap is matched whole, and no character past the cap is shown.
+ * Redaction shortens text, so cutting its output at `cap` characters reaches the lookahead's end,
+ * where a key that the end cut is too short to match shows as it is. The cut is in the characters
+ * of `text` instead: redacting its first `cap` characters alone shows only those, except that it
+ * leaves the start of a secret that crosses the cap. Where the redacted whole differs from that,
+ * the whole has taken the secret, and its marker stands in for the start. Redaction can also
+ * lengthen text (a one-character value becomes a marker), so the result can be longer than `cap`.
+ */
+export function redactWithinCap(text: string, cap: number): string {
+  const whole = redactSecretLike(text);
+  if (text.length <= cap) return whole;
+  const head = redactSecretLike(text.slice(0, cap));
+  let same = 0;
+  while (same < head.length && head[same] === whole[same]) same++;
+  if (same === head.length) return head;
+  return whole.slice(0, whole.startsWith(REDACTED, same) ? same + REDACTED.length : same);
 }
 
 /** True when `text` holds a credential shape: redacting it would change it. */
