@@ -1971,6 +1971,19 @@ describe("redactSecretLike", () => {
       expect(redactSecretLike(text)).toBe(expected);
     });
 
+    // A reader's window cuts text at a cap and shows the redacted text of the first characters. The
+    // whole text takes the run, so no cap shows a part of it.
+    it.each([8, 20, 50, 70])(
+      "shows nothing of a run that a window of %i characters ends in",
+      (cap) => {
+        for (const cut of [false, true]) {
+          expect(redactWithinCap(`note ${RUN} tail words here`, cap, { cut })).toBe(
+            "note [redacted]"
+          );
+        }
+      }
+    );
+
     it("counts a run that holds no key as no run of its own", () => {
       // The JWT pattern takes the run in both texts: a regex value that the cookie pass held excuses it.
       expect(addsSecretLike(`Cookie: ${FAKE.jwt}`, FAKE.jwt)).toBe(false);
