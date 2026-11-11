@@ -81,7 +81,10 @@ import {
   type HarvestEpoch,
   type HarvestProgress,
 } from "@/node/services/memoryHarvest";
-import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
+import {
+  runMemoryConsolidation,
+  type MemoryConsolidationResult,
+} from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { KeyedTurnQueue } from "@/node/utils/concurrency/keyedTurnQueue";
@@ -212,6 +215,16 @@ export function resolveDreamModelString(config: Config, workspaceId: string): st
  */
 function resolveDreamCostCeilingUsd(config: Config): number | undefined {
   return config.loadConfigOrDefault().userPreferences?.memory?.dreamCostCeilingUsd;
+}
+
+/**
+ * The user's edit limit for one organizer run, read at each run like the ceiling. A stored 0 (an
+ * emptied Settings field) means unlimited, `null`, which runs at the safety cap. No stored value is `undefined`, which
+ * runMemoryConsolidation reads as the default, so existing configs keep 8 edits.
+ */
+function resolveDreamEditLimit(config: Config): number | null | undefined {
+  const saved = config.loadConfigOrDefault().userPreferences?.memory?.dreamEditLimit;
+  return saved === 0 ? null : saved;
 }
 
 export function resolveDreamAgentBody(muxRoot: string): Promise<string | null> {
@@ -358,12 +371,82 @@ export function analyzerJobLockPath(rootDir: string, ownerId: string): string {
 }
 
 /**
- * How long an analyzer job waits for another backend's job of the same owner. That job streams at
- * most MEMORY_HARVEST_MAX_CHUNKS chunks, each waiting up to one consolidation timeout for the dream
- * lock and streaming up to one more; one more timeout covers its reads and saves.
+ * How long a stream waits for the dream exclusion: for the longest healthy holder, an organizer
+ * run cut at the user's run timeout or an analyzer chunk cut at MEMORY_CONSOLIDATION_TIMEOUT_MS.
+ * With the run timeout off (`null`) a hung organizer stream holds the exclusion until Xum
+ * restarts, so another backend's waiters keep the constant as a floor: they give up, fail and
+ * retry later instead of waiting forever. Waiters in the holder's own process wait for its turn,
+ * which has no deadline (see runDreamStreamExclusively).
  */
-const ANALYZER_JOB_LOCK_TIMEOUT_MS =
-  (2 * MEMORY_HARVEST_MAX_CHUNKS + 1) * MEMORY_CONSOLIDATION_TIMEOUT_MS;
+export function dreamLockWaitMs(runTimeoutMs: number | null): number {
+  // mutation-equivalent: a timeout is null or positive, and max() with the constant makes 0 and the constant agree, so ?? and || agree
+  return Math.max(runTimeoutMs ?? MEMORY_CONSOLIDATION_TIMEOUT_MS, MEMORY_CONSOLIDATION_TIMEOUT_MS);
+}
+
+/**
+ * How long an analyzer job waits for another backend's job of the same owner. That job streams at
+ * most MEMORY_HARVEST_MAX_CHUNKS chunks, each waiting up to dreamLockWaitMs for the dream lock and
+ * streaming up to one consolidation timeout; one more timeout covers its reads and saves. With
+ * the default run timeout this is (2 × chunks + 1) consolidation timeouts, as before the setting.
+ */
+export function analyzerJobLockTimeoutMs(runTimeoutMs: number | null): number {
+  const chunkMs = dreamLockWaitMs(runTimeoutMs) + MEMORY_CONSOLIDATION_TIMEOUT_MS;
+  return MEMORY_HARVEST_MAX_CHUNKS * chunkMs + MEMORY_CONSOLIDATION_TIMEOUT_MS;
+}
+
+/**
+ * The user's organizer run timeout in ms, read at each run like the cost ceiling: absent is
+ * MEMORY_CONSOLIDATION_TIMEOUT_MS, and a stored 0 is no timeout (`null`).
+ */
+function resolveDreamRunTimeoutMs(config: Config): number | null {
+  const minutes = config.loadConfigOrDefault().userPreferences?.memory?.dreamRunTimeoutMinutes;
+  if (minutes === undefined) return MEMORY_CONSOLIDATION_TIMEOUT_MS;
+  return minutes === 0 ? null : minutes * 60_000;
+}
+
+/** The note of a run that its run timeout ended after it applied an edit (see organizerRunEnd). */
+export const RUN_TIMEOUT_NOTE = "stopped at its run timeout";
+
+/**
+ * How an organizer run ended: with a record (and its note), or as a failure that saves nothing.
+ *
+ * A stream failure (a provider error, or the run timeout) means the pass did NOT cover the memory
+ * state: no record, so the debounce and the launch sweep retry later instead of reporting a
+ * consolidation that never happened. One exception: a run that the user's run timeout cut after
+ * it applied at least one edit changed memory, like a run the cost ceiling stopped, so it keeps
+ * its record and the Memory tab and the debounce see it.
+ *
+ * "Cut by the run timeout" is what ended the stream, not the timeout's state afterwards: the
+ * stream's abort reason must be the timeout's own reason object (AbortSignal.any passes on the
+ * reason of the signal that fired first). A provider error, even one near the deadline, leaves no
+ * abort reason, and a removal's reason is not the timeout's, so both stay ordinary failures.
+ */
+export function organizerRunEnd(
+  result: Pick<MemoryConsolidationResult, "streamError" | "ops" | "note" | "abortReason">,
+  runTimeout: AbortSignal | undefined
+): { kind: "record"; note: string | undefined } | { kind: "failed"; error: string } {
+  if (result.streamError === undefined) return { kind: "record", note: result.note };
+  // An aborted signal's reason is never undefined (abort() with none stores an AbortError), so a
+  // stream with no abort reason never matches.
+  const cutByRunTimeout = runTimeout?.aborted === true && result.abortReason === runTimeout.reason;
+  if (cutByRunTimeout && result.ops.some((op) => op.applied)) {
+    return { kind: "record", note: RUN_TIMEOUT_NOTE };
+  }
+  return { kind: "failed", error: `consolidation stream failed: ${result.streamError}` };
+}
+
+/**
+ * The organizer stream's abort signal: workspace removal, plus the user's run timeout unless it is
+ * off. `runTimeout` is the timeout alone, so organizerRunEnd can tell it from a removal.
+ */
+function organizerRunSignals(
+  runTimeoutMs: number | null,
+  removalSignal: AbortSignal
+): { signal: AbortSignal; runTimeout: AbortSignal | undefined } {
+  if (runTimeoutMs === null) return { signal: removalSignal, runTimeout: undefined };
+  const runTimeout = AbortSignal.timeout(runTimeoutMs);
+  return { signal: AbortSignal.any([runTimeout, removalSignal]), runTimeout };
+}
 
 /** The skip reason of a run the debounce window refused (callers match on "debounced"). */
 const DEBOUNCED_SKIP_REASON =
@@ -1474,15 +1557,20 @@ export class MemoryConsolidationService extends EventEmitter {
     // waiter still releases its link, which lets successors pass it.
     this.dreamStreamTail = previous.then(() => turnDone);
     try {
+      // No deadline in this process, as before the run timeout setting: every holder here ends
+      // at its own timeout, and with the run timeout off a hung organizer run holds this turn,
+      // and every run queued behind it, until Xum restarts or the workspace is removed. The
+      // Settings field says so; the user chose "0 means no timeout" with that warning.
       if (!(await waitForTurnOrAbort(previous, signal))) return { outcome: "cancelled" };
       let releaseLock: () => Promise<void>;
       try {
         releaseLock = await acquireCrossProcessLock({
           lockPath: dreamStreamLockPath(this.config.rootDir),
-          // A holder's stream is cut at this timeout, so one full timeout outlasts any healthy
-          // holder. A wedged live holder is never taken over (fail closed): this run errors and
-          // the next trigger retries.
-          acquireTimeoutMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
+          // A holder's stream is cut at its timeout (the user's run timeout for an organizer run,
+          // the constant for an analyzer chunk), so this wait outlasts any healthy holder. A wedged
+          // live holder is never taken over (fail closed): this run errors and the next trigger
+          // retries. With the run timeout off, the wait keeps the constant as its floor.
+          acquireTimeoutMs: dreamLockWaitMs(resolveDreamRunTimeoutMs(this.config)),
           staleMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
           timeoutMessage: "Another Xum process is running a memory consolidation.",
           signal,
@@ -1553,7 +1641,7 @@ export class MemoryConsolidationService extends EventEmitter {
       try {
         release = await acquireCrossProcessLock({
           lockPath: analyzerJobLockPath(this.config.rootDir, ownerId),
-          acquireTimeoutMs: ANALYZER_JOB_LOCK_TIMEOUT_MS,
+          acquireTimeoutMs: analyzerJobLockTimeoutMs(resolveDreamRunTimeoutMs(this.config)),
           staleMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
           timeoutMessage: "Another Xum process is running this workspace's memory analyzer.",
           signal,
@@ -1637,29 +1725,32 @@ export class MemoryConsolidationService extends EventEmitter {
 
       // The stream's usage is recorded after its queue slot is released, not inside it.
       const usageRecorder = createDeferredUsageRecorder("MemoryConsolidation", workspaceId);
-      const consolidate = () =>
-        runMemoryConsolidation({
+      // The run timeout alone, set when the stream starts (see organizerRunEnd).
+      let runTimeout: AbortSignal | undefined;
+      const consolidate = () => {
+        const signals = organizerRunSignals(resolveDreamRunTimeoutMs(self.config), removalSignal);
+        runTimeout = signals.runTimeout;
+        return runMemoryConsolidation({
           model: modelResult.data.model,
           pricingModel: modelResult.data.metadataModel,
           ceilingUsd: resolveDreamCostCeilingUsd(self.config),
+          editLimit: resolveDreamEditLimit(self.config),
           agentBody,
           memoryService: self.memoryService,
           metaService: self.metaService,
           ctx,
           dryRun: false,
           finalPass: trigger === "archive",
-          // Hard timeout: a wedged provider stream must not hold the in-flight
-          // lock forever (and stall the sequential launch sweep behind it).
-          // Created when this run's turn in the queue arrives (the call happens
-          // inside runDreamStreamExclusively), so it bounds the stream and
-          // never the wait behind other workspaces.
+          // The user's run timeout (5 minutes unless set): a wedged provider stream must not
+          // hold the in-flight lock forever (and stall the sequential launch sweep behind it).
+          // A user who turned it off accepts that risk: runs queued behind a hung one wait
+          // until Xum restarts (see runDreamStreamExclusively). Created when this run's turn in
+          // the queue arrives (the call happens inside runDreamStreamExclusively), so it bounds
+          // the stream and never the wait behind other workspaces.
           // Combined with the removal controller (r60): workspace removal must
           // abort the stream AND flip the tool-level pre-commit checks so a
           // detached mutation cannot land after the session directory is gone.
-          abortSignal: AbortSignal.any([
-            AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
-            removalSignal,
-          ]),
+          abortSignal: signals.signal,
           recordUsage: (usage, providerMetadata) =>
             usageRecorder.defer(async () => {
               const recorded = await self.sessionUsageService?.recordHeadlessUsage(
@@ -1682,6 +1773,7 @@ export class MemoryConsolidationService extends EventEmitter {
               }
             }),
         });
+      };
 
       // Everything that must happen while this run holds the turn (the in-process tail and the
       // cross-process lock), and nothing slower: the next run reads the journal the moment the
@@ -1700,13 +1792,8 @@ export class MemoryConsolidationService extends EventEmitter {
           return Err(DEBOUNCED_SKIP_REASON);
         }
         const result = await consolidate();
-        // A stream failure (provider error or the run timeout) means the pass did
-        // NOT cover the memory state: skip the journal record so the debounce and
-        // launch sweep retry later instead of reporting a successful consolidation
-        // that never happened.
-        if (result.streamError !== undefined) {
-          return Err(`consolidation stream failed: ${result.streamError}`);
-        }
+        const end = organizerRunEnd(result, runTimeout);
+        if (end.kind === "failed") return Err(end.error);
         // Removed while the model ran, in another backend: every memory read and write of the
         // pass was refused, so it covered nothing, and a success record would hold off the
         // retries of the debounce and advance the launch sweep's global coverage.
@@ -1720,8 +1807,9 @@ export class MemoryConsolidationService extends EventEmitter {
           ops: result.ops,
           usage: result.usage,
           spentUsd: result.spentUsd,
-          // A run the cost ceiling ended is a normal end: it keeps its record, so the debounce holds.
-          note: result.note,
+          // A run the cost ceiling ended, or the run timeout after an edit, keeps its record, so
+          // the debounce holds.
+          note: end.note,
         };
         await Effect.runPromise(self.saveRecordEffect(workspaceId, projectPath, record));
         return Ok(record);

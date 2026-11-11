@@ -1129,6 +1129,8 @@ async function runServerTest(
             ...(server.env !== undefined ? { env: server.env } : {}),
             hostEnv: server.hostEnv,
             timeout: TEST_TIMEOUT_MS / 1000,
+            // MCP servers are user-configured and start outside the agent sandbox.
+            sandbox: "off",
           });
 
           const transport = new MCPStdioTransport(execStream);
@@ -8107,6 +8109,8 @@ export class MCPServerManager {
               hostEnv: launch.hostEnv,
               timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
               abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
+              // MCP servers are user-configured and start outside the agent sandbox.
+              sandbox: "off",
             }),
           signal,
           // A host-local exec resolves once the process exists; an SSH exec

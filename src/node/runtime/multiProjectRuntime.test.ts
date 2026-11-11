@@ -3,11 +3,22 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { ResolvedAgentSandboxSettings } from "@/common/config/schemas/agentSandbox";
 import type { Runtime, RuntimeStatusEvent } from "./Runtime";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { WorktreeRuntime } from "./WorktreeRuntime";
 import { MultiProjectRuntime } from "./multiProjectRuntime";
+import { setAgentSandboxTargets } from "./sandbox/agentSandboxTargets";
+import { resetAgentSandboxRuntime } from "./sandbox/macosSandbox";
+
+const SANDBOX_SETTINGS: ResolvedAgentSandboxSettings = {
+  enabled: true,
+  network: "loopback",
+  allowedHosts: [],
+  extraWritePaths: [],
+  extraReadPaths: [],
+};
 
 async function initGitRepo(projectPath: string): Promise<void> {
   await fs.mkdir(projectPath, { recursive: true });
@@ -332,5 +343,84 @@ describe("MultiProjectRuntime", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe(containerPath);
+  });
+
+  // The container is the cwd, a write root, so a sandboxed command can point a link anywhere.
+  it.skipIf(process.platform !== "darwin")(
+    "opens each project's checkout in the sandbox, not where the container links to it",
+    async () => {
+      const containerPath = await containerManager.createContainer(workspaceName, [
+        { projectName: "project-a", workspacePath: projectAWorkspacePath },
+        { projectName: "project-b", workspacePath: projectBWorkspacePath },
+      ]);
+      const elsewhere = path.join(rootDir, "elsewhere");
+      await fs.mkdir(elsewhere);
+      await fs.rm(path.join(containerPath, "project-a"));
+      await fs.symlink(elsewhere, path.join(containerPath, "project-a"));
+      setAgentSandboxTargets({ fallback: SANDBOX_SETTINGS, byProject: new Map() });
+      try {
+        const writeRoots = runtime.agentSandboxPolicy({ cwd: containerPath })?.writeRoots;
+
+        expect(writeRoots).toContain(projectAWorkspacePath);
+        expect(writeRoots).not.toContain(elsewhere);
+      } finally {
+        setAgentSandboxTargets(null);
+      }
+    }
+  );
+
+  // A command in the container can change the second project's checkout too.
+  it.skipIf(process.platform !== "darwin")(
+    "sandboxes commands when only a project after the first has the sandbox on",
+    async () => {
+      const containerPath = await containerManager.createContainer(workspaceName, [
+        { projectName: "project-a", workspacePath: projectAWorkspacePath },
+        { projectName: "project-b", workspacePath: projectBWorkspacePath },
+      ]);
+      const probe = path.join(await fs.realpath(os.homedir()), `.xum-multi-test-${process.pid}`);
+      setAgentSandboxTargets({
+        fallback: { ...SANDBOX_SETTINGS, enabled: false },
+        byProject: new Map([[projectBPath, SANDBOX_SETTINGS]]),
+      });
+      try {
+        const result = await execBuffered(runtime, `echo x > ${probe} || echo DENIED`, {
+          cwd: containerPath,
+          timeout: 10,
+        });
+
+        expect(result.stdout).toContain("DENIED");
+        expect(runtime.agentSandboxPolicy({ cwd: containerPath })).not.toBeNull();
+      } finally {
+        setAgentSandboxTargets(null);
+        await fs.rm(probe, { force: true });
+        await resetAgentSandboxRuntime();
+      }
+    }
+  );
+
+  it("asks the first project's runtime for the policy, with every checkout open like the workspace", () => {
+    const primary = new WorktreeRuntime(srcBaseDir, { projectPath: projectAPath, workspaceName });
+    const multiRuntime = new MultiProjectRuntime(
+      containerManager,
+      [
+        { projectPath: projectAPath, projectName: "project-a", runtime: primary },
+        {
+          projectPath: projectBPath,
+          projectName: "project-b",
+          runtime: new WorktreeRuntime(srcBaseDir, { projectPath: projectBPath, workspaceName }),
+        },
+      ],
+      workspaceName
+    );
+    const policyFor = vi.spyOn(primary, "agentSandboxPolicy").mockReturnValue(null);
+
+    expect(
+      multiRuntime.agentSandboxPolicy({ cwd: "/container", workspaceRoots: ["/extra"] })
+    ).toBeNull();
+    expect(policyFor).toHaveBeenCalledWith({
+      cwd: "/container",
+      workspaceRoots: ["/extra", projectAWorkspacePath, projectBWorkspacePath],
+      otherProjectPaths: [projectAPath, projectBPath],
+    });
   });
 });

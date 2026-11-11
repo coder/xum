@@ -59,6 +59,8 @@ import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
+import { lazyFileToolSandboxGate } from "@/node/services/agentSandbox/fileToolSandbox";
+import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import type { Config } from "@/node/config";
 import {
@@ -1064,6 +1066,8 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     options: StreamMessageOptions
   ): Promise<Result<PreparedStreamMessage, SendMessageError>>;
   getProvidersConfig(): ProvidersConfigMap | null;
+  /** AIService.getWorkspaceSandboxEnv. */
+  getWorkspaceSandboxEnv(metadata: WorkspaceMetadata): Promise<Record<string, string>>;
   isExperimentEnabled(experimentId: ExperimentId): boolean;
   buildMemorySessionContext?(
     workspaceId: string,
@@ -3857,6 +3861,16 @@ export class AgentSession {
     });
   }
 
+  /**
+   * A bash call waiting for a sandbox approval: its live event went out before this
+   * subscription, so without a replay the reloaded chat shows no card to answer.
+   */
+  private replayPendingSandboxApprovals(listener: (event: AgentSessionReplayEvent) => void): void {
+    for (const event of sandboxApprovalManager.pendingEvents(this.workspaceId)) {
+      listener({ workspaceId: this.workspaceId, message: event });
+    }
+  }
+
   private async emitHistoricalEvents(
     listener: (event: AgentSessionReplayEvent) => void,
     mode?: OnChatMode,
@@ -4424,6 +4438,8 @@ export class AgentSession {
       if (this.heldInputs.length > 0) {
         listener({ workspaceId: this.workspaceId, message: this.heldInputsChangedEvent() });
       }
+
+      this.replayPendingSandboxApprovals(listener);
 
       // Rehydrate auto-retry state on reconnect/reload so RetryBarrier keeps showing "Stop"
       // while a backend timer is armed, or the stop reason after auto-retry gave up.
@@ -11141,6 +11157,9 @@ export class AgentSession {
       this.markActiveStreamHadAnyOutput();
       this.emitChatEvent(payload);
     });
+    forward("bash-sandbox-approval", (payload) => {
+      this.emitChatEvent(payload);
+    });
     forward("task-created", (payload) => {
       this.emitChatEvent(payload);
     });
@@ -13914,6 +13933,12 @@ export class AgentSession {
     // When workspace agents are disabled, resolve skills from the project path instead of
     // the worktree so skill invocation uses the same precedence/discovery root as the UI.
     const skillDiscoveryPath = disableWorkspaceAgents ? metadata.projectPath : workspacePath;
+    // The snapshot reaches the model, so a project skill loads only where a sandboxed command could
+    // read its SKILL.md, as in the skills index: a command can link it to a file that a project
+    // secret names (Codex review).
+    const sandboxGate = lazyFileToolSandboxGate(runtime, workspacePath, {
+      env: await this.aiService.getWorkspaceSandboxEnv(metadata),
+    });
 
     // Dedupe per skill against recent persisted snapshots. A wider window keeps multi-skill
     // turns from reloading snapshots that were persisted together on the previous turn.
@@ -13987,6 +14012,7 @@ export class AgentSession {
             // #6426: the default roots (no storage context) add project plugins only when trusted.
             projectPluginsTrusted: isWorkspaceProjectTrusted(this.config, metadata),
             runtimeFactory: this.aiService.runtimeFactory,
+            sandboxGate,
           },
         };
         resolved = await readAgentSkill(

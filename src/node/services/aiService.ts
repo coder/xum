@@ -1,4 +1,6 @@
 import { createAssistantMessageId } from "@/node/services/utils/messageIds";
+import { workspaceSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { secretsToRecord } from "@/common/types/secrets";
 import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
 import { codexPluginHookService } from "./agentPlugins/codexHookService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
@@ -359,6 +361,11 @@ export class AIService extends EventEmitter {
 
   getProvidersConfig(): ProvidersConfigMap | null {
     return this.providerService.getConfig();
+  }
+
+  /** The workspace's secrets, for agent definition reads outside a turn (ResolveAgentOptions). */
+  async getWorkspaceSandboxEnv(metadata: WorkspaceMetadata): Promise<Record<string, string>> {
+    return secretsToRecord(workspaceSecrets(metadata, this.secretsStore, this.config));
   }
 
   private emitEngineEvent(event: TurnEngineEvent): void | Promise<void> {
