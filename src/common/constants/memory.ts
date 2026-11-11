@@ -132,12 +132,13 @@ export const MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES = 32;
  */
 export const MEMORY_CONSOLIDATION_PATH_MAX_CHARS = 512;
 /**
- * Longest note (characters) a journal row stores. A failed command's error can be long: a
- * str_replace whose old_str matches many lines of a large file lists every line number, and an
- * organizer run can journal up to MEMORY_DREAM_EDIT_LIMIT_MAX failed edits. A refusal note
- * quotes at most one path of MEMORY_CONSOLIDATION_PATH_MAX_CHARS, but a guarded run's redaction
- * can lengthen it past this cap (a path of `token=a&` segments), so every note over it is cut,
- * with a marker. The tool still returns the whole error to the model.
+ * Longest note (characters) a journal row stores. A failed command's error is not bounded by
+ * the journal: it quotes model-chosen text, and an organizer run can journal up to
+ * MEMORY_DREAM_EDIT_LIMIT_MAX failed edits. A str_replace error names at most
+ * MEMORY_STR_REPLACE_ERROR_MAX_LINES lines and one path today. A refusal note quotes at most one
+ * path of MEMORY_CONSOLIDATION_PATH_MAX_CHARS, but a guarded run's redaction can lengthen it past
+ * this cap (a path of `token=a&` segments), so every note over it is cut, with a marker. The tool
+ * still returns the whole error to the model.
  */
 export const MEMORY_CONSOLIDATION_NOTE_MAX_CHARS = 1024;
 /**

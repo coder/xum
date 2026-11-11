@@ -17,6 +17,7 @@ import {
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
   MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+  MEMORY_STR_REPLACE_ERROR_MAX_LINES,
 } from "@/common/constants/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { Config } from "@/node/config";
@@ -641,41 +642,47 @@ describe("consolidation memory tool rails", () => {
       expect(fixture.getMutationCount()).toBe(0);
     });
 
+    // A real failed edit's error cannot reach the note cap any more: a str_replace error names at
+    // most MEMORY_STR_REPLACE_ERROR_MAX_LINES lines and quotes one path of at most
+    // MEMORY_CONSOLIDATION_PATH_MAX_CHARS characters, so it stays near 700 characters. The tests
+    // below that guard the note cut therefore make the long error up, as the redaction test does.
+    const madeUpError = (length: number) =>
+      "0123456789".repeat(Math.ceil(length / 10)).slice(0, length);
+    const NOTE_CUT_MARKER = " [note cut]";
+    const cutNote = (error: string) =>
+      `${error.slice(0, MEMORY_CONSOLIDATION_NOTE_MAX_CHARS - NOTE_CUT_MARKER.length)}${NOTE_CUT_MARKER}`;
+
     it("bounds every row a run of failed edits journals, and returns each error whole", async () => {
       // The unlimited budget: each failed str_replace spends an edit and journals a row.
       using fixture = await createFixture({ guard: { budget: organizerEditBudget(null).budget } });
-      // A near-full-size file in which old_str starts every line: each failed str_replace's error
-      // lists every line number. (Few matches per line: findMatchingLines re-reads the file once
-      // per match.)
-      const line = `x${"-".repeat(126)}\n`;
-      const lines = MEMORY_MAX_FILE_BYTES / line.length - 1;
-      const created = await execute(fixture.tool, {
-        command: "create",
-        path: "/memories/global/big.md",
-        file_text: line.repeat(lines),
+      const error = madeUpError(4 * MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      const strReplace = spyOn(fixture.memoryService, "strReplace").mockResolvedValue({
+        success: false,
+        error,
       });
-      expect(created.success).toBe(true);
 
       const failures = 10;
-      for (let index = 0; index < failures; index++) {
-        const result = await execute(fixture.tool, {
-          command: "str_replace",
-          path: "/memories/global/big.md",
-          old_str: "x",
-          new_str: "y",
-        });
-        expect(result.success).toBe(false);
-        if (result.success) continue;
-        // The model still gets every line number to pick a unique old_str from.
-        expect(result.error).toContain(`matches ${lines} locations`);
-        expect(result.error).toContain(`, ${lines})`);
-        const row = fixture.journal.at(-1);
-        expect(row?.applied).toBe(false);
-        expect(row?.note).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
-        expect(result.error.startsWith(row?.note?.slice(0, 200) ?? "-")).toBe(true);
+      try {
+        for (let index = 0; index < failures; index++) {
+          const result = await execute(fixture.tool, {
+            command: "str_replace",
+            path: "/memories/global/big.md",
+            old_str: "x",
+            new_str: "y",
+          });
+          expect(result.success).toBe(false);
+          if (result.success) continue;
+          // The model still gets the whole error.
+          expect(result.error).toBe(error);
+          const row = fixture.journal.at(-1);
+          expect(row?.applied).toBe(false);
+          expect(row?.note).toBe(cutNote(error));
+        }
+      } finally {
+        strReplace.mockRestore();
       }
 
-      expect(fixture.journal).toHaveLength(failures + 1);
+      expect(fixture.journal).toHaveLength(failures);
       // Every row stays within what the caps allow (path, newPath and note, plus its JSON keys),
       // so the journal's size is bounded by its row count.
       const maxRowChars =
@@ -683,58 +690,87 @@ describe("consolidation memory tool rails", () => {
       for (const row of fixture.journal) {
         expect(JSON.stringify(row).length).toBeLessThanOrEqual(maxRowChars);
       }
-    }, 30_000);
+    });
 
-    it("journals a failed edit's error whole when it is exactly the note cap long", async () => {
+    it("journals a failed edit's error whole when it is exactly the note cap long, and cuts it one character over", async () => {
       using fixture = await createFixture();
-      // 130 matching lines make an error of about 700 characters; the path, which the error
-      // quotes once, then pads it to exactly the cap.
-      const content = "x\n".repeat(130);
-      const failedEdit = async (virtualPath: string) => {
-        await execute(fixture.tool, { command: "create", path: virtualPath, file_text: content });
-        const result = await execute(fixture.tool, {
-          command: "str_replace",
-          path: virtualPath,
-          old_str: "x",
-          new_str: "y",
-        });
-        expect(result.success).toBe(false);
-        return result.success ? "" : result.error;
-      };
-      const short = "/memories/global/a.md";
-      const shortError = await failedEdit(short);
-      // Directories of 100 characters keep each name under the filesystem's limit.
-      const dir = `/memories/global/${"d".repeat(100)}/${"e".repeat(100)}/`;
-      const name = "n".repeat(
-        short.length + MEMORY_CONSOLIDATION_NOTE_MAX_CHARS - shortError.length - dir.length - 3
-      );
-      const atCap = await failedEdit(`${dir}${name}.md`);
+      const exact = madeUpError(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      const over = madeUpError(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS + 1);
+      const strReplace = spyOn(fixture.memoryService, "strReplace")
+        .mockResolvedValueOnce({ success: false, error: exact })
+        .mockResolvedValueOnce({ success: false, error: over });
+      try {
+        for (const error of [exact, over]) {
+          const result = await execute(fixture.tool, {
+            command: "str_replace",
+            path: "/memories/global/a.md",
+            old_str: "x",
+            new_str: "y",
+          });
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error).toBe(error);
+        }
+      } finally {
+        strReplace.mockRestore();
+      }
 
-      expect(atCap).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
-      expect(fixture.journal.at(-1)?.note).toBe(atCap);
+      expect(fixture.journal.map((row) => row.note)).toEqual([exact, cutNote(over)]);
     });
 
     it("journals a dry run's long validation error cut to the note cap", async () => {
       using fixture = await createFixture({ dryRun: true });
-      // Staging validation runs the real str_replace check, whose error lists every matching line.
-      const line = `x${"-".repeat(126)}\n`;
-      const lines = MEMORY_MAX_FILE_BYTES / line.length - 1;
-      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "big.md"), line.repeat(lines));
-
-      const result = await execute(fixture.tool, {
-        command: "str_replace",
-        path: "/memories/global/big.md",
-        old_str: "x",
-        new_str: "y",
+      const error = madeUpError(4 * MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+      const validate = spyOn(fixture.memoryService, "validateMutation").mockResolvedValue({
+        ok: false,
+        error,
       });
+      try {
+        const result = await execute(fixture.tool, {
+          command: "str_replace",
+          path: "/memories/global/a.md",
+          old_str: "x",
+          new_str: "y",
+        });
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toBe(error);
+      } finally {
+        validate.mockRestore();
+      }
 
-      expect(result.success).toBe(false);
-      if (result.success) return;
-      expect(result.error).toContain(`, ${lines})`);
-      const note = fixture.journal.at(-1)?.note ?? "";
-      expect(note).toHaveLength(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
-      expect(result.error.startsWith(note.slice(0, 200))).toBe(true);
+      expect(fixture.journal.at(-1)?.note).toBe(cutNote(error));
     });
+
+    // The real chain: a str_replace that matches every line of a near-full file fails with a short
+    // error that names the first lines and counts the rest, so the journal keeps it whole.
+    it.each([
+      ["a live run", false],
+      ["a dry run", true],
+    ])(
+      "journals the capped line list of an ambiguous str_replace whole in %s",
+      async (_label, dryRun) => {
+        using fixture = await createFixture({ dryRun });
+        const line = `x${"-".repeat(126)}\n`;
+        const lines = MEMORY_MAX_FILE_BYTES / line.length - 1;
+        await fsPromises.writeFile(
+          path.join(fixture.globalMemoryDir, "big.md"),
+          line.repeat(lines)
+        );
+
+        const result = await execute(fixture.tool, {
+          command: "str_replace",
+          path: "/memories/global/big.md",
+          old_str: "x",
+          new_str: "y",
+        });
+
+        expect(result.success).toBe(false);
+        if (result.success) return;
+        expect(result.error).toContain(`matches ${lines} locations`);
+        expect(result.error).toContain(`, and ${lines - MEMORY_STR_REPLACE_ERROR_MAX_LINES} more)`);
+        expect(result.error.length).toBeLessThan(MEMORY_CONSOLIDATION_NOTE_MAX_CHARS);
+        expect(fixture.journal.at(-1)?.note).toBe(result.error);
+      }
+    );
 
     it("redacts a guarded run's error before it cuts the note, so no credential fragment is kept", async () => {
       using fixture = await createFixture({ guard: { rejectSecretLike: true } });
