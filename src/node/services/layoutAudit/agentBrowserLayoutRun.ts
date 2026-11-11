@@ -37,8 +37,8 @@ import { execBuffered, type ExecResult } from "@/node/utils/runtime/helpers";
  * agent-browser's JSON envelope stays inside this file.
  */
 
-// Run-script exit codes. Each one happens before any browser is launched, and before the run
-// owns a socket folder (so CLOSE, which removes that folder, is skipped for them).
+// Run-script exit codes. Those in NEVER_LAUNCHED_EXITS happen before any browser is launched, and
+// before the run owns a socket folder (so CLOSE, which removes that folder, is skipped for them).
 const EXIT_NO_AGENT_BROWSER = 127;
 const EXIT_SETUP_FAILED = 4;
 /**
