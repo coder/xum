@@ -62,8 +62,8 @@ const SCAN_SIZE_DIVISORS = [8, 4, 2, 1];
 // Past this, a scan fails whatever its growth: the slowest linear scan takes about a third of it,
 // and the regressions this guards cost seconds.
 const SCAN_CPU_CEILING_MS = 300;
-// How much the cost per character grows when the text doubles: 1 for a linear scan (1.36 at most
-// over 720 measurements each on Bun 1.3.14 and 1.4.3), 2 for a quadratic one.
+// How much the cost per character grows when the text doubles: 1 for a linear scan (1.40 at most
+// over 780 measurements on Bun 1.4.3, 1.36 over 720 on Bun 1.3.14), 2 for a quadratic one.
 const SCAN_GROWTH_PER_DOUBLING_LIMIT = 1.6;
 // A cut that costs less than this is mostly timer and allocation noise. Bun 1.4 measured growths
 // up to 1.9 on linear scans with no floor, and up to 1.65 with a floor of 0.25.
