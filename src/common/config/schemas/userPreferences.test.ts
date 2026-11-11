@@ -192,6 +192,23 @@ describe("UserPreferencesSchema", () => {
     }
   });
 
+  test("keeps whole run timeout minutes, 0 and 24 hours included, and drops anything else", () => {
+    // 0 is "no timeout"; it must survive the load, or an off timeout reads as 5 minutes.
+    for (const stored of [0, 1, 1440]) {
+      expect(normalizeUserPreferences({ memory: { dreamRunTimeoutMinutes: stored } })).toEqual({
+        memory: { dreamRunTimeoutMinutes: stored },
+      });
+    }
+    // Past 24 hours a timer would overflow and cut the run at once; the run then uses 5 minutes.
+    for (const stored of [-1, 2.5, 1441, "5", null]) {
+      expect(
+        normalizeUserPreferences({
+          memory: { dreamRunTimeoutMinutes: stored, dreamEditLimit: 24 },
+        })
+      ).toEqual({ memory: { dreamEditLimit: 24 } });
+    }
+  });
+
   test("prunes empty nested preference groups", () => {
     expect(
       pruneUserPreferences({

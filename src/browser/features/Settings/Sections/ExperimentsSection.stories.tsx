@@ -64,6 +64,8 @@ export const MemorySettingsEnabled: Story = {
     await expect(await canvas.findByLabelText("Dream cost ceiling")).toHaveValue("");
     // The edit limit shows the default 8 until the user saves another.
     await expect(await canvas.findByLabelText("Dream edit limit")).toHaveValue("8");
+    // The run timeout shows the default 5 minutes until the user saves another.
+    await expect(await canvas.findByLabelText("Dream run timeout")).toHaveValue("5");
   },
 };
 
