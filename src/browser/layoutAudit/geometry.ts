@@ -67,6 +67,13 @@ export interface TextOverflow {
   overflowPx: number;
 }
 
+/**
+ * The cut the author asked for. An ellipsis marks where a line ends, so it speaks for the
+ * horizontal axis only: it never authorizes lines lost below a short box. A line clamp drops
+ * whole lines on purpose, so it speaks for both.
+ */
+export type TextTruncation = "none" | "ellipsis" | "line-clamp";
+
 export interface TextOverflowInput {
   /** Rendered line rectangles of the element's text. */
   fragments: readonly Box[];
@@ -74,15 +81,16 @@ export interface TextOverflowInput {
   box: Edges;
   overflowX: string;
   overflowY: string;
-  /** Ellipsis or line-clamp: the author asked for the cut. */
-  isTruncated: boolean;
+  truncation: TextTruncation;
 }
 
 // A severe text failure needs rendered-fragment proof. Scroll dimensions include harmless font
 // ink, masks, transforms and offscreen carousel content, so they are never sufficient.
 function severeHorizontal(fragment: Box, input: TextOverflowInput): TextOverflow | null {
   const horizontal = axisOverflow(fragment, input.box, "horizontal");
-  if (horizontal === null || !isClipping(input.overflowX)) return null;
+  if (horizontal === null || !isClipping(input.overflowX) || input.truncation !== "none") {
+    return null;
+  }
   const severe =
     horizontal.overflowPx > THRESHOLDS.textEpsilonPx &&
     (horizontal.centerOutside || horizontal.outsideRatio >= THRESHOLDS.minOutsideRatio);
@@ -95,6 +103,7 @@ function severeVertical(fragment: Box, input: TextOverflowInput): TextOverflow |
   const vertical = axisOverflow(fragment, input.box, "vertical");
   if (vertical === null) return null;
   if (!isClipping(input.overflowY) && input.overflowY !== "visible") return null;
+  if (input.truncation === "line-clamp") return null;
   const severe = vertical.overflowPx > THRESHOLDS.textEpsilonPx && vertical.centerOutside;
   return severe ? { axis: "vertical", overflowPx: vertical.overflowPx } : null;
 }
@@ -105,7 +114,6 @@ function severeVertical(fragment: Box, input: TextOverflowInput): TextOverflow |
  * (every call site used the defaults, which now live in LAYOUT_AUDIT_THRESHOLDS).
  */
 export function classifySevereTextOverflow(input: TextOverflowInput): TextOverflow | null {
-  if (input.isTruncated) return null;
   let best: TextOverflow | null = null;
   for (const fragment of input.fragments) {
     best = strongest(best, severeHorizontal(fragment, input));

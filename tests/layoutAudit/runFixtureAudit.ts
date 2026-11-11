@@ -30,6 +30,8 @@ interface Row {
   width: LayoutAuditViewportWidth;
   pass: LayoutAuditPagePass;
   ms: number;
+  /** The window's scroll position after the pass: the audit must put back the one it found. */
+  scrollY: number;
 }
 
 async function auditFixture(
@@ -57,7 +59,14 @@ async function auditFixture(
       ),
     ]);
     const ms = performance.now() - started;
-    return { fixture, width: viewport.width, pass: LayoutAuditPagePassSchema.parse(raw), ms };
+    const scrollY = await page.evaluate(() => window.scrollY);
+    return {
+      fixture,
+      width: viewport.width,
+      pass: LayoutAuditPagePassSchema.parse(raw),
+      ms,
+      scrollY,
+    };
   } finally {
     await context.close();
   }
@@ -88,7 +97,7 @@ function formatRow(row: Row): string {
 const describeFinding = (finding: { rule: string; selector: string }) =>
   `${finding.rule} ${finding.selector}`;
 
-/** Mismatches between a row and its expectation: a settled pass, the width, the findings. */
+/** Mismatches between a row and its expectation: a settled pass, the width, the scroll, the findings. */
 function mismatches(row: Row): string[] {
   const expected = FIXTURE_EXPECTATIONS[row.fixture]?.[row.width] ?? [];
   const found = row.pass.findings.map(describeFinding).sort();
@@ -97,6 +106,9 @@ function mismatches(row: Row): string[] {
   if (row.pass.viewportWidth !== row.width) {
     problems.push(`the page reported width ${row.pass.viewportWidth}`);
   }
+  // A fresh page starts at the top, and the overlap rule scrolls the window to sample text below
+  // the screen: it must leave the window where it found it.
+  if (row.scrollY !== 0) problems.push(`the pass left the window scrolled to ${row.scrollY}`);
   if (JSON.stringify(found) !== JSON.stringify(expected.map(describeFinding).sort())) {
     problems.push(
       `findings [${found.join(" | ")}], expected [${expected.map(describeFinding).sort().join(" | ")}]`

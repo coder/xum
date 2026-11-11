@@ -12,6 +12,11 @@ import type { Box, LayoutPage, LayoutStyle, PageMetrics, SettleSignals } from ".
  *   data-css="overflow-x: hidden; opacity: 0.5"   computed style over browser-like defaults
  *   data-animated                 the element is the target of a running animation
  *   data-z="2"                    stacking for elementAt (default 0; a tie goes to the later element)
+ *
+ * Coordinates are client coordinates at the page's first scroll position (`viewport.scrollY`).
+ * `scrollTo` moves the fake window, and `elementAt` reads the markup at the scrolled position, as
+ * a browser's hit test does. `box` and `textLines` do not follow the scroll: the rules read them
+ * before any scroll, and a test that needs the page read after one uses a real browser.
  */
 
 const DEFAULT_STYLE: LayoutStyle = {
@@ -62,7 +67,10 @@ export interface FakeLayoutPageOptions {
 export interface FakeLayoutPage {
   readonly page: LayoutPage;
   readonly signals: SettleSignals;
-  /** Signal calls and measurements, in the order they happened ("measure" = one page.metrics()). */
+  /**
+   * Signal calls, measurements and scrolls, in the order they happened ("measure" = one
+   * page.metrics(), "scrollTo 1200" = one page.scrollTo(1200)).
+   */
   readonly calls: string[];
   byId(id: string): Element;
   [Symbol.dispose](): void;
@@ -102,7 +110,11 @@ function styleOf(el: Element): LayoutStyle {
     if (!isStyleKey(key)) throw new Error(`unknown style in data-css: ${name}`);
     overrides[key] = value.join(":").trim();
   }
-  return { ...DEFAULT_STYLE, ...overrides };
+  // Computed `visibility` inherits: an element has its parent's unless it sets its own.
+  const inherited = el.parentElement
+    ? styleOf(el.parentElement).visibility
+    : DEFAULT_STYLE.visibility;
+  return { ...DEFAULT_STYLE, visibility: inherited, ...overrides };
 }
 
 function firstTextNode(el: Element): Node | undefined {
@@ -164,21 +176,30 @@ export function createFakeLayoutPage(
   const document = window.document as unknown as Document;
   const calls: string[] = [];
   const viewport = options.viewport ?? { width: 1000, height: 800 };
+  const firstScrollY = viewport.scrollY ?? 0;
+  const scrollHeight = viewport.scrollHeight ?? viewport.height;
   const metrics: PageMetrics = {
     viewportWidth: viewport.width,
     viewportHeight: viewport.height,
-    scrollY: viewport.scrollY ?? 0,
+    scrollY: firstScrollY,
     scrollWidth: viewport.scrollWidth ?? viewport.width,
-    scrollHeight: viewport.scrollHeight ?? viewport.height,
+    scrollHeight,
   };
+  let scrollY = firstScrollY;
   const page: LayoutPage = {
     document,
-    metrics: () => (calls.push("measure"), metrics),
+    metrics: () => (calls.push("measure"), { ...metrics, scrollY }),
     box: boxOf,
     style: styleOf,
     renderedText: (el) => el.textContent ?? "",
     textLines: linesOfTextNode,
-    elementAt: (x, y) => topElementAt(document, x, y),
+    elementAt: (x, y) => topElementAt(document, x, y + (scrollY - firstScrollY)),
+    scrollTo(top) {
+      calls.push(`scrollTo ${top}`);
+      // The end of the page limits the scroll, as in a browser.
+      scrollY = Math.min(Math.max(0, top), Math.max(0, scrollHeight - viewport.height));
+      return scrollY;
+    },
     animatedElements: () => Array.from(document.querySelectorAll("[data-animated]")),
     escapeIdent: (value) => value.replace(/[^a-zA-Z0-9_-]/g, (char) => `\\${char}`),
   };

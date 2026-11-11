@@ -130,6 +130,28 @@ describe("createBrowserLayoutPage", () => {
     expect(createBrowserLayoutPage(fake.win).metrics().viewportWidth).toBe(375);
   });
 
+  test("scrolls the window instantly and reads back the position it reached", () => {
+    using fake = createFakeBrowserWindow({ width: 390, height: 844 });
+    const requests: ScrollToOptions[] = [];
+    let scrollY = 0;
+    Object.defineProperty(fake.win, "scrollY", { get: () => scrollY, configurable: true });
+    Object.assign(fake.win, {
+      // The page ends at 500: a scroll past it stops there.
+      scrollTo: (options: ScrollToOptions) => {
+        requests.push(options);
+        scrollY = Math.min(options.top ?? 0, 500);
+      },
+    });
+    const page = createBrowserLayoutPage(fake.win);
+    // "instant", not "auto": the page's own `scroll-behavior: smooth` would animate "auto".
+    expect(page.scrollTo(300)).toBe(300);
+    expect(page.scrollTo(900)).toBe(500);
+    expect(requests).toEqual([
+      { top: 300, behavior: "instant" },
+      { top: 900, behavior: "instant" },
+    ]);
+  });
+
   test("reads rendered text from innerText, and from textContent where an element has none", () => {
     using fake = createFakeBrowserWindow({
       bodyHtml: '<p id="p">visible <i>words</i></p><svg><text id="t">label</text></svg>',
