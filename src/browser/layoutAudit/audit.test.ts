@@ -235,9 +235,20 @@ describe("clipped-text", () => {
       expect(audit(NESTED("overflow-x: auto"))).toEqual([]);
     });
 
-    test("that is screen-reader-only text, or holds a diagram's label, is never reported", () => {
+    // The text of an element that no rule judges is no evidence of a cut, whichever box holds it.
+    test("that is itself screen-reader-only text is never reported", () => {
       const hidden = "position: absolute; overflow-x: hidden; white-space: nowrap";
       expect(audit(NESTED(hidden, "0 0 1 1"))).toEqual([]);
+    });
+
+    test("that holds screen-reader-only text is not reported for it", () => {
+      const html = `<p data-box="0 0 300 20"><span id="s" data-box="0 0 60 20" data-css="overflow-x: hidden">
+        <i data-box="0 0 1 1" data-css="position: absolute; overflow-x: hidden; white-space: nowrap"
+        data-lines="0 0 200 20">Hidden label</i></span></p>`;
+      expect(audit(html)).toEqual([]);
+    });
+
+    test("that holds a diagram's label is not reported for it", () => {
       const diagram = `<p data-box="0 0 300 20"><span id="s" data-box="0 0 60 20" data-css="overflow-x: hidden"><svg>
         <text data-box="0 0 200 20" data-lines="0 0 200 20">Diagram label</text></svg></span></p>`;
       expect(audit(diagram)).toEqual([]);

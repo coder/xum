@@ -293,12 +293,12 @@ export interface NestedClip {
   fragments: Box[];
 }
 
-// A nested clipper is judged like a clipping ancestor, and only when its text can be seen: not a
-// diagram, mask or screen-reader-only text, and not hidden or empty.
+// A nested clipper is judged like a clipping ancestor, and only when it is shown. The text it
+// holds is filtered by the caller: text under a diagram, mask or screen-reader-only element
+// (the clipper itself included) is never evidence of a cut.
 function nestedClipFor(page: LayoutPage, node: Element): NestedClip | null {
   const boundary = clippingBoundaryOf(page, node);
-  const judged = boundary !== null && !isExcludedElement(page, node) && isVisible(page, node);
-  return judged ? { boundary, fragments: [] } : null;
+  return boundary !== null && isVisible(page, node) ? { boundary, fragments: [] } : null;
 }
 
 // The nested clippers that hold `node`, nearest first: judged ones only, each looked up once.
