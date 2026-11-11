@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   COLLAPSED_NESTED_CALL_LIMIT,
   getCodePreviewLine,
-  getHiddenNestedCallCount,
   resolveCodeExecutionViewMode,
+  selectVisibleNestedCalls,
 } from "./codeExecutionViewMode";
 
 describe("getCodePreviewLine", () => {
@@ -18,11 +18,41 @@ describe("getCodePreviewLine", () => {
   });
 });
 
-describe("getHiddenNestedCallCount", () => {
-  test("hides only the calls beyond the limit, and none once the user shows all", () => {
-    expect(getHiddenNestedCallCount(COLLAPSED_NESTED_CALL_LIMIT, false)).toBe(0);
-    expect(getHiddenNestedCallCount(COLLAPSED_NESTED_CALL_LIMIT + 3, false)).toBe(3);
-    expect(getHiddenNestedCallCount(COLLAPSED_NESTED_CALL_LIMIT + 3, true)).toBe(0);
+describe("selectVisibleNestedCalls", () => {
+  const done = (id: string) => ({ id, state: "output-available" });
+  const running = (id: string) => ({ id, state: "input-available" });
+  const ids = (calls: ReadonlyArray<{ id: string }>) => calls.map((call) => call.id);
+
+  test("shows the latest calls, and all of them once the user asks", () => {
+    const calls = ["a", "b", "c", "d", "e", "f", "g"].map(done);
+    expect(calls.length).toBe(COLLAPSED_NESTED_CALL_LIMIT + 3);
+
+    const cut = selectVisibleNestedCalls(calls, false);
+    expect(ids(cut.visible)).toEqual(["d", "e", "f", "g"]);
+    expect(cut.hiddenCount).toBe(3);
+
+    expect(selectVisibleNestedCalls(calls, true)).toEqual({ visible: calls, hiddenCount: 0 });
+    expect(selectVisibleNestedCalls(calls.slice(0, COLLAPSED_NESTED_CALL_LIMIT), false)).toEqual({
+      visible: calls.slice(0, COLLAPSED_NESTED_CALL_LIMIT),
+      hiddenCount: 0,
+    });
+  });
+
+  // A call waiting for sandbox approval holds its approval card and shortcuts in its own row.
+  test("never cuts an earlier call that has not finished", () => {
+    const calls = [
+      done("a"),
+      running("approval"),
+      done("c"),
+      done("d"),
+      done("e"),
+      done("f"),
+      done("g"),
+    ];
+
+    const cut = selectVisibleNestedCalls(calls, false);
+    expect(ids(cut.visible)).toEqual(["approval", "d", "e", "f", "g"]);
+    expect(cut.hiddenCount).toBe(2);
   });
 });
 

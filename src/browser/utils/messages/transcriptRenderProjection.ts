@@ -4,6 +4,7 @@ import {
 } from "@/common/constants/ui";
 import type { DisplayedMessage } from "@/common/types/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
+import { shouldShowInterruptedBarrier } from "./messageUtils";
 
 export type OperationalBundleMemberMessage = DisplayedMessage & { type: "reasoning" | "tool" };
 
@@ -202,6 +203,20 @@ function isRunningWorkBundleRow(message: WorkBundleRow): boolean {
     return message.status === "pending" || message.status === "executing";
   }
   return message.isStreaming;
+}
+
+/**
+ * The one rule every fold in the transcript obeys (a work line, a run of routine calls, and the
+ * "show earlier calls" cut of a script, see selectVisibleNestedCalls): a row that still needs
+ * the user is never folded. That is a call that has not finished, which may be waiting for an
+ * approval whose card and shortcuts live in the row, and the row a stopped turn ended on, which
+ * carries the interrupted divider and its "continue" control.
+ */
+function needsUser(message: DisplayedMessage): boolean {
+  return (
+    (message.type === "tool" && (message.status === "pending" || message.status === "executing")) ||
+    shouldShowInterruptedBarrier(message)
+  );
 }
 
 function getMessageTimestamp(message: DisplayedMessage | undefined): number | undefined {
@@ -411,8 +426,9 @@ function assignWorkBundle(
       ...base,
       role: "work",
       visibleWhenFolded:
-        // A running call may need the user (an approval) or be the thing they are waiting on.
-        (message.type === "tool" && isRunningWorkBundleRow(message)) ||
+        // A running call (an approval, or the thing the user is waiting on), or the row an
+        // interrupted turn stopped on.
+        needsUser(message) ||
         // The latest step, unless the agent has since moved on to writing.
         (isLive && index === lastWorkIndex && index > lastTextIndex),
     };
@@ -580,7 +596,12 @@ export function computeOperationalBundleInfos(
       summary: summarizeOperationalBundle(messagesInBundle),
       state: getBundleState(frozenEntries),
       defaultExpanded:
-        hasTaskAwaitTerminalIssue(messagesInBundle) || (isLiveTail && !allTaskAwaits),
+        hasTaskAwaitTerminalIssue(messagesInBundle) ||
+        (isLiveTail && !allTaskAwaits) ||
+        // The run is no longer the tail (a parallel sibling such as an edit came after it), but
+        // one of its calls still needs the user. A run of task polls keeps its own quiet row:
+        // a poll that is waiting needs nobody.
+        (!allTaskAwaits && messagesInBundle.some(needsUser)),
     });
   }
 

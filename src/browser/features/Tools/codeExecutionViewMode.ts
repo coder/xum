@@ -12,9 +12,24 @@ interface ResolveCodeExecutionViewModeOptions {
  */
 export const COLLAPSED_NESTED_CALL_LIMIT = 4;
 
-/** Count of leading nested calls hidden behind "Show N earlier" (0 when all fit or are shown). */
-export function getHiddenNestedCallCount(totalCalls: number, showAll: boolean): number {
-  return showAll ? 0 : Math.max(0, totalCalls - COLLAPSED_NESTED_CALL_LIMIT);
+/**
+ * The nested calls a script shows: all of them once the user asks, else the latest few plus every
+ * earlier call that has not finished. An unfinished call may be waiting for the user (its row
+ * holds the approval card and its shortcuts), so the cut never hides one. `hiddenCount` is how
+ * many calls sit behind "Show N earlier".
+ */
+export function selectVisibleNestedCalls<T extends { state: string }>(
+  calls: T[],
+  showAll: boolean
+): { visible: T[]; hiddenCount: number } {
+  const firstRecent = Math.max(0, calls.length - COLLAPSED_NESTED_CALL_LIMIT);
+  if (showAll || firstRecent === 0) {
+    return { visible: calls, hiddenCount: 0 };
+  }
+  const visible = calls.filter(
+    (call, index) => index >= firstRecent || call.state === "input-available"
+  );
+  return { visible, hiddenCount: calls.length - visible.length };
 }
 
 /**

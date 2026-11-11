@@ -135,54 +135,75 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
   // A quiet line, not a box: reasoning is the least important row in a settled transcript, so
   // it gets the same muted one-line treatment as a folded summary row and no fill or accent
   // colour. Only a live trace (the shimmer) carries the thinking colour.
+  const headerClassName = cn(
+    "text-muted flex min-w-0 gap-2 px-1 select-none",
+    showsWrappedLine ? "items-start" : "items-center",
+    isExpanded && !isSingleLineTrace && "mb-1.5"
+  );
+  const headerBody = (
+    <>
+      {/* The chevron column is kept (as a spacer) when there is nothing to open, so every
+          folded row's icon and text start on the same edges. The 3px offset centres the
+          12px icons on the first 18px line when the text wraps. */}
+      {isCollapsible ? (
+        <ExpandIcon expanded={isExpanded} className={cn(showsWrappedLine && "mt-[3px]")} />
+      ) : (
+        <span className="w-3 shrink-0" aria-hidden="true" />
+      )}
+      <Lightbulb
+        aria-hidden="true"
+        className={cn(
+          "size-3 shrink-0",
+          showsWrappedLine && "mt-[3px]",
+          isStreaming && "animate-pulse"
+        )}
+      />
+      <span
+        className={cn("block min-w-0", !showsWrappedLine && "truncate", REASONING_FONT_CLASSES)}
+      >
+        {isStreaming ? (
+          <Shimmer className="thinking-shimmer" colorClass="var(--color-thinking-mode)">
+            Thinking…
+          </Shimmer>
+        ) : hasContent ? (
+          <span className={showsWrappedLine ? "break-words" : "whitespace-nowrap"}>
+            {parsedLeadingBoldSummary ? (
+              <>
+                <strong>{parsedLeadingBoldSummary.boldText}</strong>
+                {parsedLeadingBoldSummary.trailingText}
+              </>
+            ) : (
+              headerLine
+            )}
+          </span>
+        ) : (
+          "Thought"
+        )}
+      </span>
+    </>
+  );
+
   return (
     <div className={cn("relative my-1.5", className)}>
-      <div
-        className={cn(
-          "text-muted flex min-w-0 gap-2 px-1 select-none",
-          showsWrappedLine ? "items-start" : "items-center",
-          isCollapsible && "hover:text-foreground cursor-pointer transition-colors",
-          isExpanded && !isSingleLineTrace && "mb-1.5"
-        )}
-        onClick={isCollapsible ? toggleExpanded : undefined}
-      >
-        {/* The chevron column is kept (as a spacer) when there is nothing to open, so every
-            folded row's icon and text start on the same edges. The 3px offset centres the
-            12px icons on the first 18px line when the text wraps. */}
-        {isCollapsible ? (
-          <ExpandIcon expanded={isExpanded} className={cn(showsWrappedLine && "mt-[3px]")} />
-        ) : (
-          <span className="w-3 shrink-0" aria-hidden="true" />
-        )}
-        <Lightbulb
-          aria-hidden="true"
+      {/* A thought that can be opened is a real button, so the disclosure works from the
+          keyboard (Tab, then Enter or Space) and announces its state, like the work line and the
+          Script row. It is the only way to read a one-line thought the row truncates. */}
+      {isCollapsible ? (
+        <button
+          type="button"
           className={cn(
-            "size-3 shrink-0",
-            showsWrappedLine && "mt-[3px]",
-            isStreaming && "animate-pulse"
+            headerClassName,
+            "hover:text-foreground w-full cursor-pointer rounded-sm text-left transition-colors",
+            "focus-visible:outline-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
           )}
-        />
-        <div className={cn("min-w-0", !showsWrappedLine && "truncate", REASONING_FONT_CLASSES)}>
-          {isStreaming ? (
-            <Shimmer className="thinking-shimmer" colorClass="var(--color-thinking-mode)">
-              Thinking…
-            </Shimmer>
-          ) : hasContent ? (
-            <span className={showsWrappedLine ? "break-words" : "whitespace-nowrap"}>
-              {parsedLeadingBoldSummary ? (
-                <>
-                  <strong>{parsedLeadingBoldSummary.boldText}</strong>
-                  {parsedLeadingBoldSummary.trailingText}
-                </>
-              ) : (
-                headerLine
-              )}
-            </span>
-          ) : (
-            "Thought"
-          )}
-        </div>
-      </div>
+          aria-expanded={isExpanded}
+          onClick={toggleExpanded}
+        >
+          {headerBody}
+        </button>
+      ) : (
+        <div className={headerClassName}>{headerBody}</div>
+      )}
 
       {/* Always render the content container to prevent layout shifts. Keep an
           expanded streaming block's height uncontrolled so async markdown growth

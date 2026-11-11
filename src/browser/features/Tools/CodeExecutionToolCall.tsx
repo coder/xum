@@ -26,7 +26,7 @@ import { cn } from "@/common/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import {
   getCodePreviewLine,
-  getHiddenNestedCallCount,
+  selectVisibleNestedCalls,
   resolveCodeExecutionViewMode,
   type CodeExecutionViewMode,
 } from "./codeExecutionViewMode";
@@ -182,9 +182,11 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
   };
 
   // Long runs show only their latest calls by default; earlier ones are one click away.
-  const hiddenCallCount = getHiddenNestedCallCount(toolCalls.length, showAllCalls);
-  const visibleCalls = hiddenCallCount > 0 ? toolCalls.slice(hiddenCallCount) : toolCalls;
-  const canCollapseCalls = getHiddenNestedCallCount(toolCalls.length, false) > 0;
+  const { visible: visibleCalls, hiddenCount: hiddenCallCount } = selectVisibleNestedCalls(
+    toolCalls,
+    showAllCalls
+  );
+  const canCollapseCalls = selectVisibleNestedCalls(toolCalls, false).hiddenCount > 0;
 
   const pinViewToggles = hasFailed || isInterrupted || (expanded && viewMode !== "tools");
   const codePreview = hasToolCalls ? "" : getCodePreviewLine(args.code);

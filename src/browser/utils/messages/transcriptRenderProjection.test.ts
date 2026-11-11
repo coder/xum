@@ -402,6 +402,30 @@ describe("work bundles (compact density)", () => {
     expect(infos[2]).toMatchObject({ visibleWhenFolded: true });
   });
 
+  // The row a stopped turn ended on carries the interrupted divider and its "continue" control.
+  test("shows the row an interrupted turn stopped on through the fold", () => {
+    const stoppedOnCall = work([
+      user("prompt"),
+      tool({ id: "read", ...TURN }),
+      tool({
+        id: "tests",
+        toolName: "bash",
+        status: "interrupted",
+        isPartial: true,
+        isLastPartOfMessage: true,
+        ...TURN,
+      }),
+    ]);
+    expect(stoppedOnCall[1]).toMatchObject({ state: "settled", visibleWhenFolded: false });
+    expect(stoppedOnCall[2]).toMatchObject({ state: "settled", visibleWhenFolded: true });
+
+    const stoppedWhileThinking = work([
+      user("prompt"),
+      reasoning({ id: "think", isPartial: true, isLastPartOfMessage: true, ...TURN }),
+    ]);
+    expect(stoppedWhileThinking[1]).toMatchObject({ kind: "thought", visibleWhenFolded: true });
+  });
+
   test("times a stretch from the prompt to its latest timestamp, or not at all", () => {
     const prompt = user("prompt", 1_000);
     const timed = work([
@@ -575,6 +599,41 @@ describe("routine tool runs", () => {
         workBundleInfos: computeWorkBundleInfos(lone, { isTurnActive: false }),
       })
     ).toEqual([undefined, undefined, undefined]);
+  });
+
+  // A parallel step: a command waiting for sandbox approval, another routine call, then an
+  // edit. The edit makes the run no longer the tail, but the approval card lives in the
+  // command's row, so the run must stay open until that call finishes.
+  test("keeps a run open while one of its calls still needs the user", () => {
+    const waiting = tool({ id: "bash-approval", toolName: "bash", status: "executing" });
+    const read = tool({ id: "read-a" });
+    const edit = tool({ id: "edit", toolName: "file_edit_replace_string" });
+
+    expect(routine([waiting, read, edit], true)[0]).toMatchObject({
+      key: "routine:bash-approval",
+      defaultExpanded: true,
+    });
+    // Once the call finishes, the run folds: it is not the tail.
+    expect(
+      routine([{ ...waiting, status: "completed" }, read, edit], true)[0]?.defaultExpanded
+    ).toBe(false);
+
+    // The row a stopped turn ended on carries the interrupted divider: its run stays open too.
+    const stopped = tool({
+      id: "read-stopped",
+      status: "interrupted",
+      isPartial: true,
+      isLastPartOfMessage: true,
+    });
+    expect(routine([read, stopped])[0]?.defaultExpanded).toBe(true);
+
+    // A run of task polls keeps its own quiet row while a poll waits.
+    const poll = (id: string, status: "completed" | "executing") =>
+      tool({ id, toolName: "task_await", status });
+    expect(
+      routine([poll("poll-1", "completed"), poll("poll-2", "executing"), edit], true)[0]
+        ?.defaultExpanded
+    ).toBe(false);
   });
 
   test("folds routine calls with interleaved reasoning but leaves trailing reasoning out", () => {
