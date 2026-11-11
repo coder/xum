@@ -1246,6 +1246,26 @@ describe("redactWithinCap", () => {
       expect(redactWithinCap(windowOf(text), CAP)).toBe(`${before.trimEnd()}${glue}`);
     });
 
+    // The JWT pattern's characters include `-`, `_` and digits in every part: a cut that misses
+    // one of them leaves the JWT's start readable. Made up.
+    it("stops at the start of a JWT with `-`, `_` and digits in its header and payload", () => {
+      const body = (length: number): string =>
+        "Fq7_Hx-L2Mo9".repeat(Math.ceil(length / 12)).slice(0, length);
+      const text = `${before}${jwt(`eyJ${body(40)}`, `eyJ${body(1_200)}`)} tail`;
+
+      expect(redactWithinCap(windowOf(text), CAP)).toBe(before);
+    });
+
+    // Redaction before the JWT changes the text's length, so the JWT starts at another index in the
+    // redacted window than in the window itself. The cut is at its index in what is shown.
+    it("stops at the start of a JWT that a shortened secret comes before", () => {
+      const lead = `password=${"y".repeat(40)} `;
+      const filler = "z".repeat(CAP - 20 - lead.length);
+      const text = `${lead}${filler} ${jwt(HEADER, `eyJ${"W".repeat(1_200)}`)} tail`;
+
+      expect(redactWithinCap(windowOf(text), CAP)).toBe(`password=[redacted] ${filler} `);
+    });
+
     it("takes a JWT whose signature runs past the window whole, as a marker", () => {
       const text = `${before}${HEADER}.eyJ${"W".repeat(100)}.${"X".repeat(1_200)} tail`;
 
@@ -1281,6 +1301,18 @@ describe("redactWithinCap", () => {
         expect([length, shown === "" || shown === "[redacted]"]).toEqual([length, true]);
       }
     });
+  });
+
+  // A run of JWT starts that never reaches the window's end: the search tries only a start that no
+  // JWT character comes before, so it reads the run once. Tried at every start it is quadratic:
+  // about 5 seconds at this size, against well under 100 ms. The budget is generous because a
+  // loaded test host slows every row.
+  it("cuts a window of JWT starts that miss its end in linear time", () => {
+    const text = `${"eyJ".repeat(30_000)} `;
+    redactWithinCap("warm up eyJabc.def", 10); // keep a cold regex compile out of the timing
+    const started = performance.now();
+    redactWithinCap(text, text.length - REDACTION_LOOKAHEAD_CHARS);
+    expect(performance.now() - started).toBeLessThan(1_500);
   });
 
   // The cut reads the redacted window once more. Its cost must not grow faster than the window: a
