@@ -16,6 +16,17 @@ function isThought(value: Record<string, unknown>): boolean {
   return isPlainObject(extra) && isPlainObject(extra.google) && extra.google.thought === true;
 }
 
+/** The response with a rewritten body; the original length no longer applies. */
+function withBody(response: Response, body: BodyInit): Response {
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 /** Re-emit an SSE body line by line, preserving streaming latency across network reads. */
 export function mapEventStreamLines(
   response: Response,
@@ -43,13 +54,7 @@ export function mapEventStreamLines(
       },
     })
   );
-  const headers = new Headers(response.headers);
-  headers.delete("content-length");
-  return new Response(mapped, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
+  return withBody(response, mapped);
 }
 
 interface DataLine {
@@ -195,13 +200,10 @@ export function wrapFetchWithGeminiThoughts(baseFetch: typeof fetch): typeof fet
     } catch {
       completion = null;
     }
-    const headers = new Headers(response.headers);
-    headers.delete("content-length");
-    return new Response(rewriteThoughtCompletion(completion) ? JSON.stringify(completion) : text, {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
-    });
+    return withBody(
+      response,
+      rewriteThoughtCompletion(completion) ? JSON.stringify(completion) : text
+    );
   };
 
   return Object.assign(thoughtsFetch, baseFetch) as typeof fetch;
