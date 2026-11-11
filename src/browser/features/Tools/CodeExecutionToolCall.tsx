@@ -16,7 +16,7 @@ import {
   ToolHeader,
   ToolIcon,
 } from "./Shared/ToolPrimitives";
-import { isRoutineToolName } from "@/browser/utils/messages/transcriptRenderProjection";
+import { isRoutineToolCall } from "@/browser/utils/messages/transcriptRenderProjection";
 import { type ToolStatus } from "./Shared/toolUtils";
 import { HighlightedCode } from "./Shared/HighlightedCode";
 import { ConsoleOutputDisplay } from "./Shared/ConsoleOutput";
@@ -158,7 +158,9 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
   // under. It opens by default only when there is something to watch or review: it is still
   // running, it failed or was interrupted, it ran something the reader must see (an edit, a
   // question, a message), or it carries attachments.
-  const madeOnlyRoutineCalls = toolCalls.every((call) => isRoutineToolName(call.toolName));
+  const madeOnlyRoutineCalls = toolCalls.every((call) =>
+    isRoutineToolCall(call.toolName, call.input, call.output)
+  );
   const expandedByDefault =
     isRunning || hasFailed || isInterrupted || !madeOnlyRoutineCalls || hasAttachments;
   const expanded = userExpanded ?? expandedByDefault;
@@ -193,33 +195,42 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
       aria-label="Script"
       className="font-monospace [container-type:inline-size] my-2 text-[11px]"
     >
-      <ToolHeader
-        className="group/header min-w-0 px-1 py-1"
-        onClick={() => setUserExpanded(!expanded)}
-      >
-        <ExpandIcon expanded={expanded} />
-        <ToolIcon toolName="code_execution" />
-        <span className="text-foreground shrink-0">Script</span>
-        {hasToolCalls ? (
-          <span className="text-muted shrink-0 whitespace-nowrap">
-            {toolCalls.length.toLocaleString()} {toolCalls.length === 1 ? "call" : "calls"}
-          </span>
-        ) : (
-          codePreview && (
-            <span className="text-muted font-monospace min-w-0 truncate">{codePreview}</span>
-          )
-        )}
-        {isRunning && <LoadingDots aria-hidden="true" className="text-muted" />}
+      <ToolHeader className="group/header min-w-0 cursor-default px-1 py-1">
+        {/* The disclosure is a real button, so opening and closing a script works from the
+            keyboard (Tab, then Enter or Space) and announces its state. It is a sibling of the
+            view toggles, not their parent: buttons must not nest. */}
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={() => setUserExpanded(!expanded)}
+          className={cn(
+            "flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-sm text-left",
+            "focus-visible:outline-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
+          )}
+        >
+          <ExpandIcon expanded={expanded} />
+          <ToolIcon toolName="code_execution" />
+          <span className="text-foreground shrink-0">Script</span>
+          {hasToolCalls ? (
+            <span className="text-muted shrink-0 whitespace-nowrap">
+              {toolCalls.length.toLocaleString()} {toolCalls.length === 1 ? "call" : "calls"}
+            </span>
+          ) : (
+            codePreview && (
+              <span className="text-muted font-monospace min-w-0 truncate">{codePreview}</span>
+            )
+          )}
+          {isRunning && <LoadingDots aria-hidden="true" className="text-muted" />}
+        </button>
         {/* View toggles are drill-down chrome: hidden until hover or keyboard focus, pinned when
             they carry news (a failure or interruption) or a view is open. Touch screens have no
-            hover, so they always show there. Their clicks must not also toggle the row. */}
+            hover, so they always show there. */}
         <div
           className={cn(
             "ml-auto flex shrink-0 items-center gap-0.5 transition-opacity",
             !pinViewToggles &&
               "opacity-0 group-hover/header:opacity-100 focus-within:opacity-100 [@media(pointer:coarse)]:opacity-100"
           )}
-          onClick={(event) => event.stopPropagation()}
         >
           {!isRunning && (
             <ViewToggle

@@ -237,7 +237,11 @@ export const ConsecutiveRuns: AppStory = {
     await expect(runs[1]).toHaveTextContent("const counts = new Map();");
 
     const longRun = within(runs[2]);
-    await userEvent.click(longRun.getByText("Script"));
+    // The disclosure is a real button: it opens from the keyboard and reports its state.
+    const disclosure = longRun.getByRole("button", { name: /Script/, expanded: false });
+    disclosure.focus();
+    await userEvent.keyboard("{Enter}");
+    await expect(disclosure).toHaveAttribute("aria-expanded", "true");
     await expect(longRun.getByTestId("nested-tool-calls").children).toHaveLength(4);
     await userEvent.click(longRun.getByRole("button", { name: "Show 3 earlier calls" }));
     await expect(longRun.getByTestId("nested-tool-calls").children).toHaveLength(7);

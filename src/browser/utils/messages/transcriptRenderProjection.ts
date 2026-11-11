@@ -315,9 +315,26 @@ const ROUTINE_TOOL_NAMES = new Set<string>([
   "web_search",
 ]);
 
-/** Whether a call to this tool is routine enough to fold out of sight (see ROUTINE_TOOL_NAMES). */
-export function isRoutineToolName(toolName: string): boolean {
-  return ROUTINE_TOOL_NAMES.has(toolName);
+/**
+ * Whether a call (a transcript row, or a call nested under a script) is routine enough to fold out
+ * of sight. It depends on the payload as well as the tool name.
+ */
+export function isRoutineToolCall(toolName: string, args: unknown, result: unknown): boolean {
+  if (!ROUTINE_TOOL_NAMES.has(toolName)) {
+    return false;
+  }
+  // A bash call that left a process running is not routine: the process outlives the call, has
+  // its own controls (view output, terminate), and later task_await rows refer back to it.
+  // That is a spawn asked for up front (`run_in_background`) or a foreground command sent to
+  // the background while it ran, which only its result records (`backgroundProcessId`).
+  if (toolName === "bash") {
+    if (isPlainObject(args) && args.run_in_background === true) {
+      return false;
+    }
+    const unwrapped = unwrapJsonResult(result);
+    return !(isPlainObject(unwrapped) && typeof unwrapped.backgroundProcessId === "string");
+  }
+  return true;
 }
 
 /** Fewest routine tool calls that fold into a summary row; one call is already one row. */
@@ -326,21 +343,20 @@ const MIN_ROUTINE_RUN_TOOLS = 2;
 function isRoutineToolMessage(
   message: DisplayedMessage | undefined
 ): message is DisplayedMessage & { type: "tool" } {
-  if (message?.type !== "tool" || !ROUTINE_TOOL_NAMES.has(message.toolName)) {
+  if (
+    message?.type !== "tool" ||
+    !isRoutineToolCall(message.toolName, message.args, message.result)
+  ) {
     return false;
-  }
-  if (message.toolName === "bash") {
-    // A background spawn starts a process that outlives the call and has its own controls
-    // (view output, terminate), and later task_await rows refer back to it: keep it in view.
-    return !(isPlainObject(message.args) && message.args.run_in_background === true);
   }
   if (message.toolName !== "code_execution") {
     return true;
   }
-  // A code execution is only as routine as what it ran: one that edited a file or asked a
-  // question keeps its card visible. Attachments (screenshots, files) ride on its result.
+  // A code execution is only as routine as what it ran: one that edited a file, asked a
+  // question or left a process running keeps its card visible. The same payload-aware test
+  // applies to each nested call. Attachments (screenshots, files) ride on its result.
   const nestedCalls = Array.isArray(message.nestedCalls) ? message.nestedCalls : [];
-  if (nestedCalls.some((call) => !ROUTINE_TOOL_NAMES.has(call.toolName))) {
+  if (nestedCalls.some((call) => !isRoutineToolCall(call.toolName, call.input, call.output))) {
     return false;
   }
   const result = unwrapJsonResult(message.result);

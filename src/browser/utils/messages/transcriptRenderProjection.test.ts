@@ -658,6 +658,30 @@ describe("routine tool runs (normal density)", () => {
     // The spawn is not routine, so the single wait after it is not worth a summary row either.
     expect(routine([spawn, wait])).toEqual([undefined, undefined]);
 
+    // A foreground command sent to the background mid-run is only marked in its result.
+    const migrated = tool({
+      id: "migrated-c",
+      toolName: "bash",
+      result: { success: true, backgroundProcessId: "proc-1" },
+    });
+    const read = tool({ id: "read-c", toolName: "file_read" });
+    expect(routine([migrated, read])).toEqual([undefined, undefined]);
+
+    // A script that spawned a background process is not routine either.
+    const spawningScript = tool({
+      id: "code-spawn",
+      toolName: "code_execution",
+      nestedCalls: [
+        {
+          toolCallId: "n-spawn",
+          toolName: "bash",
+          input: { run_in_background: true },
+          state: "output-available",
+        },
+      ],
+    });
+    expect(routine([spawningScript, read])).toEqual([undefined, undefined]);
+
     // Consecutive bash_output polls keep their dedicated first/last collapse.
     const polls = ["poll-1", "poll-2", "poll-3"].map((id) => tool({ id, toolName: "bash_output" }));
     expect(routine(polls)).toEqual([undefined, undefined, undefined]);
