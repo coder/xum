@@ -19,6 +19,7 @@ import {
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
   MEMORY_CONSOLIDATION_TIMEOUT_MS,
+  MEMORY_DREAM_EDIT_LIMIT_MAX,
 } from "@/common/constants/memory";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
@@ -5487,6 +5488,28 @@ describe("MemoryConsolidationService", () => {
       expect(fixture.modelCalls).toHaveLength(1);
       expect(result.success).toBe(false);
       if (!result.success) expect(result.error).toContain("being removed");
+    });
+  });
+
+  describe("dream edit limit", () => {
+    // The organizer reads the user's limit at each run and states it in its prompt; the prompt's
+    // number is also the budget its memory tool enforces (see runMemoryConsolidation).
+    it.each([
+      [undefined, "You have 8 mutating commands this run."],
+      [24, "You have 24 mutating commands this run."],
+      // Unlimited runs at the safety cap.
+      [0, `You have ${MEMORY_DREAM_EDIT_LIMIT_MAX} mutating commands this run.`],
+    ])("runs an organizer pass for a saved limit of %p with its budget", async (limit, line) => {
+      using fixture = await createFixture();
+      // Other preferences, but no memory group unless a limit is saved: the run still reads it.
+      await fixture.config.updateUserPreferences([{ appearance: { vimEnabled: true } }]);
+      if (limit !== undefined) {
+        await fixture.config.updateUserPreferences([{ memory: { dreamEditLimit: limit } }]);
+      }
+
+      expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+
+      expect(fixture.modelPrompts.at(-1)).toContain(line);
     });
   });
 

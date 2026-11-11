@@ -77,16 +77,41 @@ export const MEMORY_VIEW_MAX_DEPTH = 2;
  * from a misbehaving model.
  */
 export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
+/**
+ * Safety cap on the user's dream edit limit: the most mutating commands one organizer run can
+ * make, also when the user chose unlimited (0 or an empty field). Memory contents are untrusted
+ * model input, so without a cap a misbehaving organizer could make any number of accepted writes
+ * in one run, and every accepted write is a journal row that is saved in memory-consolidation.json
+ * and returned over IPC (Codex review of #8096). The maintainer chose 1000: far more than one
+ * cleanup needs (about 200 oversized files split at roughly 5 edits each). One run's journal
+ * then holds at most 1032 rows (1000 accepted, 32 refused), each row's text at most two paths of
+ * MEMORY_CONSOLIDATION_PATH_MAX_CHARS and a note of MEMORY_CONSOLIDATION_NOTE_MAX_CHARS: about
+ * 2.2 MB for one record with ASCII text, at most about 12.8 MB if JSON escapes every character,
+ * and far less for real records. MEMORY_DREAM_MAX_STEPS bounds the run's steps separately.
+ */
+export const MEMORY_DREAM_EDIT_LIMIT_MAX = 1000;
 /** Generous step ceiling for the consolidation stream (reads + budgeted mutations). */
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
+/**
+ * Most steps one organizer run takes, whatever the user's edit limit: no setting raises it. The
+ * run's step ceiling is 4 steps for each edit of the limit, never below
+ * MEMORY_CONSOLIDATION_MAX_STEPS and never above this. Read-only calls spend no edit, so without
+ * it an unlimited run (or a limit of 1000) could take 4000 model requests, and the cost ceiling is
+ * optional (Codex review of #8096). The maintainer chose 400; one step can make several parallel
+ * edits, so a run can still spend a large limit within it.
+ */
+export const MEMORY_DREAM_MAX_STEPS = 400;
 /**
  * Rows of one run's journal that the guarded memory tool fills with refused commands (out of scope,
  * denied, credential-like, over budget). A refusal spends no budget, and one step can issue many
  * parallel calls, so without a bound a misbehaving model grows the journal, which is saved in the
- * run's sidecar record and returned over IPC. 32 is the organizer's step ceiling: a model that
- * has one command refused per step still gets every refusal journaled. Past it, the last row says
- * the rest are not recorded. Budgeted commands (applied, dry-run, failed) are at most the op budget
- * and are always journaled, so the cap never hides a change.
+ * run's sidecar record and returned over IPC. 32 is the default organizer's step ceiling: a model
+ * that has one command refused per step still gets every refusal journaled. Past it, the last row
+ * says the rest are not recorded. Budgeted commands (applied, dry-run, failed) are always
+ * journaled, so the cap never hides a change; they are at most the run's budget, which for an
+ * organizer run is the user's edit limit and never more than MEMORY_DREAM_EDIT_LIMIT_MAX. One
+ * run's journal therefore holds at most that cap plus these 32 rows; the row that says the rest
+ * are not recorded is one of the 32.
  */
 export const MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES = 32;
 /**
@@ -97,6 +122,15 @@ export const MEMORY_CONSOLIDATION_JOURNAL_MAX_ENTRIES = 32;
  * before it is parsed or journaled in full.
  */
 export const MEMORY_CONSOLIDATION_PATH_MAX_CHARS = 512;
+/**
+ * Longest note (characters) a journal row stores. A failed command's error can be long: a
+ * str_replace whose old_str matches many lines of a large file lists every line number, and an
+ * organizer run can journal up to MEMORY_DREAM_EDIT_LIMIT_MAX failed edits. A refusal note
+ * quotes at most one path of MEMORY_CONSOLIDATION_PATH_MAX_CHARS, but a guarded run's redaction
+ * can lengthen it past this cap (a path of `token=a&` segments), so every note over it is cut,
+ * with a marker. The tool still returns the whole error to the model.
+ */
+export const MEMORY_CONSOLIDATION_NOTE_MAX_CHARS = 1024;
 /**
  * Memory analyzer (the harvest of one closed or open compaction epoch): mutating memory
  * commands for the whole epoch. All of its transcript chunks, a retry of the epoch, and
