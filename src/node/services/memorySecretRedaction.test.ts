@@ -1486,6 +1486,7 @@ describe("redactSecretLike", () => {
       ["a combining mark after it", "password=[redacted]\u0301"],
       ["punctuation only after it", "token=[redacted]..."],
       ["markers only after it", "password=[redacted][redacted]"],
+      ["markers of any case only after it", "password=[REDACTED][Redacted][reDACTED]"],
       ["an ideographic space and letters after it", "password=[redacted]\u3000秘密"],
       ["a no-break space and letters after it", "password=[redacted]\u00a0秘密"],
     ])("leaves %s that holds a marker with nothing readable after it", (_label, text) => {
