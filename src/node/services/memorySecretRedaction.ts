@@ -119,11 +119,14 @@ const PROVIDER_KEY_PATTERN =
 // would start a scan to the end of the run at every `eyJ`.
 const JWT_PATTERN = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g;
 
-/** A standalone pattern. A gated one redacts only the matches its `accepts` takes. */
-type StandalonePass = RegExp | { pattern: RegExp; accepts: (match: string) => boolean };
+/** A standalone pattern that redacts only the matches its `accepts` takes. */
+interface GatedPattern {
+  pattern: RegExp;
+  accepts: (match: string) => boolean;
+}
 
 // Credential shapes that are secret on their own, wherever they appear.
-const STANDALONE_SECRET_PATTERNS: StandalonePass[] = [
+const STANDALONE_SECRET_PATTERNS: (RegExp | GatedPattern)[] = [
   // An unterminated block (a tool that cut its own output) redacts through to the end of the text.
   // A PGP armor header ends `PRIVATE KEY BLOCK-----`.
   /-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----|$)/g,
@@ -147,6 +150,10 @@ const STANDALONE_SECRET_PATTERNS: StandalonePass[] = [
   new RegExp(String.raw`(?<=[?&](?:amp;)?${SIGNED_URL_PARAM}=)[^\s"'\\<>&#,;)\]}]+`, "gi"),
   JWT_PATTERN,
 ];
+
+// Each pass as a pattern and its gate (none for a plain pattern), so the loop below branches on neither.
+const STANDALONE_PASSES: { pattern: RegExp; accepts?: GatedPattern["accepts"] }[] =
+  STANDALONE_SECRET_PATTERNS.map((pass) => (pass instanceof RegExp ? { pattern: pass } : pass));
 
 // A quoted value reads through backslash escapes, so an escaped quote inside the string does not
 // end it: `{"password":"abc\"DEF"}` (what `JSON.stringify` makes of `abc"DEF`) must lose `DEF` too.
@@ -617,6 +624,26 @@ function redactCookieHeaders(
  */
 type RemovalSource = "regex" | "reader" | "run";
 
+type Replacer = (match: string, offset: number, whole: string) => string;
+
+/**
+ * `replace` for a gated pass: a match that `accepts` does not take stays as it was, with nothing
+ * reported or tracked for it. With `fromRun` the guard is reading: a match it takes is reported
+ * and stays in the text.
+ */
+function gateReplacer(
+  accepts: GatedPattern["accepts"],
+  fromRun: ((removed: string) => void) | undefined,
+  replace: Replacer
+): Replacer {
+  return (match, offset, whole) => {
+    if (!accepts(match)) return match;
+    if (fromRun === undefined) return replace(match, offset, whole);
+    fromRun(match);
+    return match;
+  };
+}
+
 /**
  * The standalone patterns, in order, and where each `]` that the signed-URL pattern added ended up in
  * the result. The edits of a pass are logged only once a `]` is tracked: a text without one costs
@@ -633,17 +660,7 @@ function redactStandalone(
   let added: number[] | null = null;
   // mutation-equivalent: every pattern starts its own count at 0 below
   let shift = 0;
-  let accepts: ((match: string) => boolean) | undefined;
-  const replaceStandalone = (match: string, offset: number, whole: string): string => {
-    // A match that the gate does not take stays as it was: nothing is reported or tracked for it.
-    // With `fromRun` the guard is reading, and a match it takes is reported but stays in the text.
-    if (accepts !== undefined) {
-      if (!accepts(match)) return match;
-      if (fromRun !== undefined) {
-        fromRun(match);
-        return match;
-      }
-    }
+  const replaceStandalone: Replacer = (match, offset, whole) => {
     fromRegex(match);
     if (MARKER_HEAD.test(match) && whole.charAt(offset + match.length) === "]") {
       (added ??= []).push(offset + shift + REDACTED.length - 1);
@@ -652,12 +669,13 @@ function redactStandalone(
     shift += REDACTED.length - match.length;
     return REDACTED;
   };
-  for (const pass of STANDALONE_SECRET_PATTERNS) {
+  for (const { pattern, accepts } of STANDALONE_PASSES) {
     edits = artifacts.length === 0 ? null : [];
     added = null;
     shift = 0;
-    accepts = pass instanceof RegExp ? undefined : pass.accepts;
-    redacted = redacted.replace(pass instanceof RegExp ? pass : pass.pattern, replaceStandalone);
+    const replacer =
+      accepts === undefined ? replaceStandalone : gateReplacer(accepts, fromRun, replaceStandalone);
+    redacted = redacted.replace(pattern, replacer);
     if (edits !== null) artifacts = followPositions(artifacts, edits);
     // Only the signed-URL pattern adds, and no pattern before it tracked anything, so the two lists
     // are never both in play and the result stays ascending. `removeAt` asserts it.
