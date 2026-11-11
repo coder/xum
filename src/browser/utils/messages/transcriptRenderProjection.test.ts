@@ -8,9 +8,9 @@ import {
   summarizeOperationalBundle,
 } from "./transcriptRenderProjection";
 
-// ChatPane groups only routine tool runs (task_await polls included) outside hyper density.
+// Task polls are routine calls: a run of them folds like any other routine run.
 function computeTaskAwaitPollGroupInfos(messages: DisplayedMessage[]) {
-  return computeOperationalBundleInfos(messages, { isTurnActive: false, scope: "routine" });
+  return computeOperationalBundleInfos(messages, { isTurnActive: false });
 }
 
 let nextToolId = 0;
@@ -54,13 +54,14 @@ function reasoning(
   };
 }
 
-function user(id: string): DisplayedMessage {
+function user(id: string, timestamp?: number): DisplayedMessage {
   return {
     type: "user",
     id,
     historyId: `history-${id}`,
     content: "hello",
     historySequence: 1,
+    timestamp,
   };
 }
 
@@ -90,17 +91,6 @@ function streamError(id: string, historyId: string): DisplayedMessage & { type: 
     historyId,
     error: "Provider error",
     errorType: "api",
-    historySequence: 1,
-  };
-}
-
-function planDisplay(id: string, historyId: string): DisplayedMessage & { type: "plan-display" } {
-  return {
-    type: "plan-display",
-    id,
-    historyId,
-    content: "# Plan",
-    path: ".mux/plan.md",
     historySequence: 1,
   };
 }
@@ -148,354 +138,255 @@ describe("estimateTranscriptRowWeight", () => {
   });
 });
 
-describe("work bundle coalescing", () => {
-  test("collapses completed assistant work before the final row", () => {
-    const messages = [
-      user("u1"),
-      reasoning({ id: "think-1", historyId: "history-a1", timestamp: 1_000 }),
-      assistant("draft-1", {
-        historyId: "history-a1",
-        content: "I'll inspect first.",
-        timestamp: 61_000,
-      }),
-      tool({ id: "read-1", historyId: "history-a1", timestamp: 121_000 }),
-      assistant("final-1", {
-        historyId: "history-a1",
-        content: "Implemented the fix.",
-        timestamp: 181_000,
-      }),
-    ];
+describe("work bundles (compact density)", () => {
+  // One assistant message: its rows share a history id.
+  const TURN = { historyId: "history-turn" };
 
-    const infos = computeWorkBundleInfos(messages);
+  function work(messages: DisplayedMessage[], isTurnActive = false) {
+    return computeWorkBundleInfos(messages, { isTurnActive });
+  }
 
-    expect(infos[0]).toMatchObject({
-      key: "work:think-1",
-      position: "head",
-      headIndex: 0,
-      durationMs: 180_000,
-      defaultExpanded: false,
-      entries: [
-        { message: messages[1], originalIndex: 1 },
-        { message: messages[2], originalIndex: 2 },
-        { message: messages[3], originalIndex: 3 },
-        { message: messages[4], originalIndex: 4 },
-      ],
-    });
-    expect(infos[1]).toMatchObject({ key: "work:think-1", position: "member" });
-    expect(infos[2]).toMatchObject({ key: "work:think-1", position: "member" });
-    expect(infos[3]).toMatchObject({ key: "work:think-1", position: "member" });
-    expect(infos[4]).toMatchObject({ key: "work:think-1", position: "final" });
-  });
+  test("folds everything but the reply behind one line", () => {
+    const infos = work([
+      user("prompt"),
+      reasoning({ id: "think", ...TURN }),
+      assistant("narration", TURN),
+      tool({ id: "read", ...TURN }),
+      tool({ id: "edit", toolName: "file_edit_replace_string", ...TURN }),
+      assistant("reply", TURN),
+    ]);
 
-  test("omits work duration when timestamps are missing", () => {
-    const historyId = "history-a1";
-    const messages = [tool({ id: "read-1", historyId }), assistant("final-1", { historyId })];
-
-    const infos = computeWorkBundleInfos(messages);
-
-    expect(infos[0]).toMatchObject({ durationMs: undefined });
-  });
-
-  test("keeps operational bundle metadata aligned inside work bundles", () => {
-    const historyId = "history-a1";
-    const messages = [
-      reasoning({ id: "think-1", historyId }),
-      assistant("draft-1", { historyId }),
-      tool({ id: "read-1", historyId, toolName: "file_read" }),
-      tool({ id: "skill-1", historyId, toolName: "agent_skill_read" }),
-      assistant("final-1", { historyId }),
-    ];
-
-    const workInfos = computeWorkBundleInfos(messages);
-    const operationalInfos = computeOperationalBundleInfos(messages, { isTurnActive: false });
-
-    expect(workInfos[0]?.entries.map((entry) => entry.originalIndex)).toEqual([0, 1, 2, 3, 4]);
-    expect(operationalInfos[2]).toMatchObject({
-      position: "head",
-      headIndex: 2,
-      entries: [
-        { message: messages[0], originalIndex: 0 },
-        { message: messages[2], originalIndex: 2 },
-        { message: messages[3], originalIndex: 3 },
-      ],
+    expect(infos[0]).toBeUndefined();
+    for (const index of [1, 2, 3, 4]) {
+      expect(infos[index]).toMatchObject({
+        key: "work:think",
+        headIndex: 1,
+        role: "work",
+        visibleWhenFolded: false,
+        state: "settled",
+        kind: "work",
+      });
+    }
+    expect(infos[5]).toMatchObject({
+      key: "work:think",
+      role: "answer",
+      visibleWhenFolded: true,
     });
   });
 
-  test("spans steering user messages until the turn final assistant row", () => {
-    const messages = [
-      user("u1"),
+  test("keeps the reply in view when bookkeeping follows it", () => {
+    const infos = work([
+      tool({ id: "read", ...TURN }),
+      assistant("reply", TURN),
+      tool({ id: "todo", toolName: "todo_write", ...TURN }),
+    ]);
+
+    expect(infos[1]).toMatchObject({ role: "answer" });
+    expect(infos[2]).toMatchObject({
+      key: "work:read",
+      role: "work",
+      visibleWhenFolded: false,
+    });
+  });
+
+  test("does not pass off narration as the reply when the turn worked on after it", () => {
+    // Interrupted while running the tests: "Now running the tests." announced work, it did not
+    // report on it. The work after it gets its own line, below the narration.
+    const infos = work([
+      user("prompt"),
+      tool({ id: "read", ...TURN }),
+      assistant("now-running-the-tests", TURN),
+      tool({ id: "tests", toolName: "bash", status: "interrupted", ...TURN }),
+      tool({ id: "todo", toolName: "todo_write", ...TURN }),
+    ]);
+
+    expect(infos[1]).toMatchObject({ key: "work:read", role: "work" });
+    expect(infos[2]).toMatchObject({ key: "work:read", role: "answer" });
+    expect(infos[3]).toMatchObject({ key: "work:tests", headIndex: 3, role: "work" });
+    expect(infos[4]).toMatchObject({ key: "work:tests", role: "work", visibleWhenFolded: false });
+
+    // While the turn runs it is still one stretch, with the running call showing through.
+    const live = work(
+      [
+        user("prompt"),
+        tool({ id: "read", ...TURN }),
+        assistant("now-running-the-tests", TURN),
+        tool({ id: "tests", toolName: "bash", status: "executing", ...TURN }),
+      ],
+      true
+    );
+    expect(live[3]).toMatchObject({ key: "work:read", state: "live", visibleWhenFolded: true });
+  });
+
+  test("counts the files the folded work edited, once each and only when the edit landed", () => {
+    const edit = (id: string, path: string, overrides: Partial<ReturnType<typeof tool>> = {}) =>
+      tool({ id, toolName: "file_edit_replace_string", args: { path }, ...TURN, ...overrides });
+    const infos = work([
+      edit("edit-1", "src/a.ts"),
+      edit("edit-2", "src/a.ts"),
+      edit("edit-3", "src/b.ts", { toolName: "file_edit_insert" }),
+      edit("edit-failed", "src/c.ts", { status: "failed" }),
+      edit("edit-refused", "src/d.ts", { result: { success: false, error: "no match" } }),
+      // A script's edits count too.
       tool({
-        id: "read-1",
-        historyId: "history-a1",
-        isPartial: true,
-        status: "executing",
-        timestamp: 1_000,
+        id: "script",
+        toolName: "code_execution",
+        ...TURN,
+        nestedCalls: [
+          {
+            toolCallId: "nested-edit",
+            toolName: "file_edit_insert",
+            input: { path: "src/e.ts" },
+            output: { success: true },
+            state: "output-available",
+          },
+        ],
       }),
-      user("steer-1"),
-      tool({ id: "bash-1", historyId: "history-a1", toolName: "bash", timestamp: 31_000 }),
-      assistant("final-1", { historyId: "history-a1", timestamp: 61_000 }),
-    ];
+      tool({ id: "read", args: { path: "src/f.ts" }, ...TURN }),
+      assistant("reply", TURN),
+    ]);
 
-    const infos = computeWorkBundleInfos(messages);
-
-    expect(infos[0]).toMatchObject({
-      key: "work:read-1",
-      position: "head",
-      headIndex: 0,
-      durationMs: 60_000,
-      entries: [
-        { message: messages[1], originalIndex: 1 },
-        { message: messages[2], originalIndex: 2 },
-        { message: messages[3], originalIndex: 3 },
-        { message: messages[4], originalIndex: 4 },
-      ],
-    });
-    expect(infos[1]).toMatchObject({ key: "work:read-1", position: "member" });
-    expect(infos[2]).toMatchObject({ key: "work:read-1", position: "member" });
-    expect(infos[3]).toMatchObject({ key: "work:read-1", position: "member" });
-    expect(infos[4]).toMatchObject({ key: "work:read-1", position: "final" });
+    expect(infos[0]?.editedFileCount).toBe(3);
+    expect(
+      work([tool({ id: "read", ...TURN }), assistant("reply", TURN)])[0]?.editedFileCount
+    ).toBe(0);
   });
 
-  test("does not finalize work bundles before the first operation", () => {
-    const messages = [
-      user("u1"),
-      assistant("draft-1", { historyId: "history-a1", content: "I'll inspect first." }),
-      tool({ id: "read-1", historyId: "history-a1" }),
-    ];
+  test("gives a reply with no work behind it no line, and a turn that only reasoned its own name", () => {
+    expect(work([user("prompt"), assistant("reply", TURN)])).toEqual([undefined, undefined]);
 
-    const infos = computeWorkBundleInfos(messages);
+    const thought = work([reasoning({ id: "think", ...TURN }), assistant("reply", TURN)]);
+    expect(thought[0]).toMatchObject({ role: "work", kind: "thought" });
 
-    expect(infos.every((info) => info === undefined)).toBe(true);
+    // Narration that folds is work, not thought.
+    const narrated = work([
+      assistant("narration", TURN),
+      reasoning({ id: "think", ...TURN }),
+      assistant("reply", TURN),
+    ]);
+    expect(narrated[0]).toMatchObject({ role: "work", kind: "work" });
   });
 
-  test("does not merge completed partial tools into a tool-using next prompt", () => {
-    const messages = [
-      user("u1"),
-      tool({ id: "read-1", historyId: "history-a1", isPartial: true, status: "completed" }),
-      user("u2"),
-      tool({ id: "bash-1", historyId: "history-a2", toolName: "bash" }),
-      assistant("final-2", { historyId: "history-a2" }),
-    ];
+  test("never folds a question, a plan or an error, and starts a new stretch after one", () => {
+    const infos = work([
+      tool({ id: "read-a", ...TURN }),
+      tool({ id: "ask", toolName: "ask_user_question", ...TURN }),
+      tool({ id: "read-b", ...TURN }),
+      assistant("here-is-the-plan", TURN),
+      tool({ id: "plan", toolName: "propose_plan", ...TURN }),
+      streamError("error", TURN.historyId),
+    ]);
 
-    const infos = computeWorkBundleInfos(messages);
-
-    expect(infos[0]).toBeUndefined();
+    expect(infos[0]).toMatchObject({ key: "work:read-a", role: "work" });
     expect(infos[1]).toBeUndefined();
-    expect(infos[2]).toMatchObject({ key: "work:bash-1", position: "head", headIndex: 2 });
-    expect(infos[3]).toMatchObject({ key: "work:bash-1", position: "member" });
-    expect(infos[4]).toMatchObject({ key: "work:bash-1", position: "final" });
+    expect(infos[2]).toMatchObject({
+      key: "work:read-b",
+      headIndex: 2,
+      role: "work",
+    });
+    expect(infos[3]).toMatchObject({ key: "work:read-b", role: "answer" });
+    expect(infos[4]).toBeUndefined();
+    expect(infos[5]).toBeUndefined();
   });
 
-  test("does not merge interrupted partial tools into a text-only next prompt", () => {
-    const messages = [
-      user("u1"),
-      tool({ id: "read-1", historyId: "history-a1", isPartial: true }),
-      user("u2"),
-      assistant("answer-2", { historyId: "history-a2" }),
-    ];
+  test("gives a second message its own stretch and reply when no prompt separates them", () => {
+    const infos = work([
+      tool({ id: "read-a", historyId: "history-a" }),
+      assistant("reply-a", { historyId: "history-a" }),
+      tool({ id: "read-b", historyId: "history-b" }),
+      assistant("reply-b", { historyId: "history-b" }),
+    ]);
 
-    const infos = computeWorkBundleInfos(messages);
-
-    expect(infos.every((info) => info === undefined)).toBe(true);
+    expect(infos[1]).toMatchObject({ key: "work:read-a", role: "answer" });
+    expect(infos[3]).toMatchObject({ key: "work:read-b", role: "answer" });
   });
 
-  test("does not merge mixed partial tool and text interruptions across the next user prompt", () => {
-    const messages = [
-      user("u1"),
-      tool({ id: "read-1", historyId: "history-a1", isPartial: true }),
-      assistant("draft-1", { historyId: "history-a1", isPartial: true }),
-      user("u2"),
-      tool({ id: "bash-1", historyId: "history-a2", toolName: "bash" }),
-      assistant("final-2", { historyId: "history-a2" }),
-    ];
+  test("shows a live turn's latest step through the fold until the agent starts writing", () => {
+    const narration = assistant("narration", TURN);
+    const first = tool({ id: "read-1", ...TURN });
+    const latest = tool({ id: "read-2", ...TURN });
 
-    const infos = computeWorkBundleInfos(messages);
+    const working = work([user("prompt"), narration, first, latest], true);
+    expect(working[1]).toMatchObject({ state: "live", role: "answer" });
+    expect(working[2]).toMatchObject({
+      state: "live",
+      visibleWhenFolded: false,
+    });
+    expect(working[3]).toMatchObject({
+      state: "live",
+      visibleWhenFolded: true,
+    });
 
-    expect(infos[0]).toBeUndefined();
-    expect(infos[1]).toBeUndefined();
-    expect(infos[2]).toBeUndefined();
-    expect(infos[3]).toMatchObject({ key: "work:bash-1", position: "head", headIndex: 3 });
-    expect(infos[4]).toMatchObject({ key: "work:bash-1", position: "member" });
-    expect(infos[5]).toMatchObject({ key: "work:bash-1", position: "final" });
-  });
-
-  test("does not merge partial text-only interruptions across the next user prompt", () => {
-    const messages = [
-      user("u1"),
-      reasoning({ id: "think-1", historyId: "history-a1", isPartial: true }),
-      assistant("draft-1", { historyId: "history-a1", isPartial: true }),
-      user("u2"),
-      tool({ id: "bash-1", historyId: "history-a2", toolName: "bash" }),
-      assistant("final-2", { historyId: "history-a2" }),
-    ];
-
-    const infos = computeWorkBundleInfos(messages);
-
-    expect(infos[0]).toBeUndefined();
-    expect(infos[1]).toBeUndefined();
-    expect(infos[2]).toBeUndefined();
-    expect(infos[3]).toMatchObject({ key: "work:bash-1", position: "head", headIndex: 3 });
-    expect(infos[4]).toMatchObject({ key: "work:bash-1", position: "member" });
-    expect(infos[5]).toMatchObject({ key: "work:bash-1", position: "final" });
-  });
-
-  test("does not merge interrupted work across the next user prompt", () => {
-    const messages = [
-      user("u1"),
-      tool({ id: "interrupted-1", historyId: "history-a1", status: "interrupted" }),
-      user("u2"),
-      tool({ id: "bash-1", historyId: "history-a2", toolName: "bash" }),
-      assistant("final-2", { historyId: "history-a2" }),
-    ];
-
-    const infos = computeWorkBundleInfos(messages);
-
-    expect(infos[1]).toBeUndefined();
-    expect(infos[2]).toMatchObject({ key: "work:bash-1", position: "head", headIndex: 2 });
-    expect(infos[3]).toMatchObject({
-      key: "work:bash-1",
-      entries: [
-        { message: messages[3], originalIndex: 3 },
-        { message: messages[4], originalIndex: 4 },
+    // New narration is now the latest thing: the step before it folds, and so does the old narration.
+    const writing = work(
+      [
+        user("prompt"),
+        narration,
+        first,
+        latest,
+        assistant("reply", { ...TURN, isStreaming: true }),
       ],
+      true
+    );
+    expect(writing[1]).toMatchObject({
+      role: "work",
+      visibleWhenFolded: false,
     });
-    expect(infos[4]).toMatchObject({ key: "work:bash-1", position: "final" });
+    expect(writing[3]).toMatchObject({ visibleWhenFolded: false });
+    expect(writing[4]).toMatchObject({ state: "live", role: "answer" });
+
+    // The same rows are settled once the turn ends, and an earlier turn is never live.
+    expect(work([user("prompt"), narration, first, latest], false)[3]).toMatchObject({
+      state: "settled",
+      visibleWhenFolded: false,
+    });
+    expect(work([first, assistant("reply", TURN), user("next")], true)[0]).toMatchObject({
+      state: "settled",
+    });
   });
 
-  test("does not merge completed turns across the next user message", () => {
-    const messages = [
-      user("u1"),
-      tool({ id: "read-1", historyId: "history-a1" }),
-      assistant("final-1", { historyId: "history-a1" }),
-      user("u2"),
-      tool({ id: "bash-1", historyId: "history-a2", toolName: "bash" }),
-      assistant("final-2", { historyId: "history-a2" }),
-    ];
-
-    const infos = computeWorkBundleInfos(messages);
-
-    expect(infos[0]).toMatchObject({
-      key: "work:read-1",
-      position: "head",
-      entries: [
-        { message: messages[1], originalIndex: 1 },
-        { message: messages[2], originalIndex: 2 },
-      ],
-    });
-    expect(infos[2]).toMatchObject({ key: "work:read-1", position: "final" });
-    expect(infos[3]).toMatchObject({ key: "work:bash-1", position: "head" });
-    expect(infos[4]).toMatchObject({
-      key: "work:bash-1",
-      entries: [
-        { message: messages[4], originalIndex: 4 },
-        { message: messages[5], originalIndex: 5 },
-      ],
-    });
-    expect(infos[5]).toMatchObject({ key: "work:bash-1", position: "final" });
-  });
-
-  test("wraps active work in an expanded working bundle", () => {
-    const messages = [
-      user("u1"),
-      assistant("draft-1", { historyId: "history-a1" }),
-      tool({ id: "read-1", historyId: "history-a1", status: "executing" }),
-    ];
-
-    const infos = computeWorkBundleInfos(messages);
-
-    expect(infos[0]).toMatchObject({
-      key: "work:draft-1",
-      position: "head",
-      state: "active",
-      defaultExpanded: true,
-      entries: [
-        { message: messages[1], originalIndex: 1 },
-        { message: messages[2], originalIndex: 2 },
-      ],
-    });
-    expect(infos[1]).toMatchObject({ key: "work:draft-1", position: "member" });
-    expect(infos[2]).toMatchObject({ key: "work:draft-1", position: "member" });
-  });
-
-  test("collapses non-success tools before a final assistant row", () => {
-    const historyId = "history-a1";
-    const failedSearch = tool({
-      id: "search-1",
-      historyId,
-      toolName: "web_search",
-      status: "failed",
-      result: { error: "provider unavailable" },
-    });
-    const failedBash = tool({
-      id: "bash-1",
-      historyId,
+  test("shows every call that is still running, whether or not the host reports the turn", () => {
+    const waiting = tool({
+      id: "approval",
       toolName: "bash",
-      status: "failed",
-      result: { exitCode: 1, output: "type error" },
+      status: "pending",
+      ...TURN,
     });
-    const interruptedRead = tool({
-      id: "read-interrupted-1",
-      historyId,
-      toolName: "file_read",
-      status: "interrupted",
+    const done = tool({ id: "read", ...TURN });
+    const running = tool({
+      id: "tests",
+      toolName: "bash",
+      status: "executing",
+      ...TURN,
     });
-    const redactedRead = tool({
-      id: "read-redacted-1",
-      historyId,
-      toolName: "file_read",
-      status: "redacted",
-    });
-    const partialRead = tool({
-      id: "read-partial-1",
-      historyId,
-      toolName: "file_read",
-      isPartial: true,
-    });
-    const messages = [
-      failedSearch,
-      failedBash,
-      interruptedRead,
-      redactedRead,
-      partialRead,
-      assistant("final-1", { historyId }),
-    ];
 
-    const infos = computeWorkBundleInfos(messages);
+    const infos = work([waiting, done, running], false);
 
-    expect(infos[0]).toMatchObject({
-      key: "work:search-1",
-      position: "head",
-      entries: [
-        { message: failedSearch, originalIndex: 0 },
-        { message: failedBash, originalIndex: 1 },
-        { message: interruptedRead, originalIndex: 2 },
-        { message: redactedRead, originalIndex: 3 },
-        { message: partialRead, originalIndex: 4 },
-        { message: messages[5], originalIndex: 5 },
-      ],
-    });
-    expect(infos[1]).toMatchObject({ key: "work:search-1", position: "member" });
-    expect(infos[2]).toMatchObject({ key: "work:search-1", position: "member" });
-    expect(infos[3]).toMatchObject({ key: "work:search-1", position: "member" });
-    expect(infos[4]).toMatchObject({ key: "work:search-1", position: "member" });
-    expect(infos[5]).toMatchObject({ key: "work:search-1", position: "final" });
+    expect(infos[0]).toMatchObject({ state: "live", visibleWhenFolded: true });
+    expect(infos[1]).toMatchObject({ visibleWhenFolded: false });
+    expect(infos[2]).toMatchObject({ visibleWhenFolded: true });
   });
 
-  test("keeps stream errors and plan displays out of work bundles", () => {
-    const historyId = "history-a1";
-    const messages = [
-      reasoning({ id: "think-1", historyId }),
-      tool({ id: "read-1", historyId }),
-      streamError("error-1", historyId),
-      planDisplay("plan-1", historyId),
-    ];
+  test("times a stretch from the prompt to its latest timestamp, or not at all", () => {
+    const prompt = user("prompt", 1_000);
+    const timed = work([
+      prompt,
+      tool({ id: "read", timestamp: 5_000, ...TURN }),
+      assistant("reply", { ...TURN, timestamp: 135_000 }),
+      // A row without its own timestamp carries its message's start: it must not end the clock.
+      tool({ id: "todo", toolName: "todo_write", timestamp: 5_000, ...TURN }),
+    ]);
+    expect(timed[1]).toMatchObject({ startedAtMs: 1_000, durationMs: 134_000 });
 
-    const infos = computeWorkBundleInfos(messages);
+    const untimed = work([user("prompt"), tool({ id: "read", ...TURN }), assistant("reply", TURN)]);
+    expect(untimed[1]?.durationMs).toBeUndefined();
 
-    expect(infos.every((info) => info === undefined)).toBe(true);
+    // A live stretch has a start for the running clock and no duration yet.
+    const live = work([prompt, tool({ id: "read", timestamp: 5_000, ...TURN })], true);
+    expect(live[1]).toMatchObject({ startedAtMs: 1_000 });
+    expect(live[1]?.durationMs).toBeUndefined();
   });
 });
-
 describe("task_await poll grouping", () => {
   test("leaves standalone waits visible and collapses consecutive polls", () => {
     const first = tool({ id: "await-1", toolName: "task_await", status: "completed" });
@@ -606,9 +497,9 @@ describe("task_await poll grouping", () => {
   });
 });
 
-describe("routine tool runs (normal density)", () => {
+describe("routine tool runs", () => {
   function routine(messages: DisplayedMessage[], isTurnActive = false) {
-    return computeOperationalBundleInfos(messages, { isTurnActive, scope: "routine" });
+    return computeOperationalBundleInfos(messages, { isTurnActive });
   }
 
   test("folds routine calls with interleaved reasoning but leaves trailing reasoning out", () => {
@@ -746,238 +637,6 @@ describe("routine tool runs (normal density)", () => {
     expect(routine([first, second, thinking], false)[0]).toMatchObject({
       defaultExpanded: false,
     });
-  });
-});
-
-describe("operational bundle coalescing", () => {
-  test("groups consecutive reasoning and tool calls without mutating messages", () => {
-    const first = reasoning({ id: "think-1" });
-    const second = tool({ id: "read-1", toolName: "file_read" });
-    const third = tool({ id: "edit-1", toolName: "file_edit_replace_string" });
-    const messages = [user("u1"), first, assistant("a1"), second, third, assistant("a2")];
-    const before = JSON.stringify(messages);
-
-    const infos = computeOperationalBundleInfos(messages, { isTurnActive: false });
-
-    expect(JSON.stringify(messages)).toBe(before);
-    expect(infos[0]).toBeUndefined();
-    expect(infos[1]).toMatchObject({ key: "bundle:think-1", position: "member", headIndex: 3 });
-    expect(infos[2]).toBeUndefined();
-    expect(infos[3]).toMatchObject({
-      key: "bundle:think-1",
-      position: "head",
-      headIndex: 3,
-      state: "settled",
-      defaultExpanded: false,
-      entries: [
-        { message: first, originalIndex: 1 },
-        { message: second, originalIndex: 3 },
-        { message: third, originalIndex: 4 },
-      ],
-    });
-    expect(infos[4]).toMatchObject({ key: "bundle:think-1", position: "member" });
-    expect(infos[5]).toBeUndefined();
-  });
-
-  test("conversation rows break bundles", () => {
-    const messages = [
-      tool({ id: "read-1", toolName: "file_read" }),
-      assistant("a1"),
-      tool({ id: "edit", toolName: "file_edit_replace_string" }),
-      user("u1"),
-      tool({ id: "read-2", toolName: "agent_skill_read" }),
-    ];
-
-    const infos = computeOperationalBundleInfos(messages, { isTurnActive: false });
-
-    expect(infos[0]).toMatchObject({ position: "head" });
-    expect(infos[1]).toBeUndefined();
-    expect(infos[2]).toMatchObject({ position: "head" });
-    expect(infos[3]).toBeUndefined();
-    expect(infos[4]).toMatchObject({ position: "head" });
-  });
-
-  test("assistant rows split non-success operational bundles", () => {
-    const first = tool({ id: "bash-1", toolName: "bash", status: "failed" });
-    const middle = assistant("a1");
-    const second = tool({ id: "bash-2", toolName: "bash", status: "failed" });
-
-    const infos = computeOperationalBundleInfos([first, middle, second], {
-      isTurnActive: false,
-    });
-
-    expect(infos[0]).toMatchObject({
-      key: "bundle:bash-1",
-      position: "head",
-      entries: [{ message: first, originalIndex: 0 }],
-    });
-    expect(infos[1]).toBeUndefined();
-    expect(infos[2]).toMatchObject({
-      key: "bundle:bash-2",
-      position: "head",
-      entries: [{ message: second, originalIndex: 2 }],
-    });
-  });
-
-  test("leaves reasoning-only turns visible", () => {
-    const message = reasoning({ id: "think-only", isOnlyMessageContent: true });
-
-    const infos = computeOperationalBundleInfos([message], { isTurnActive: false });
-
-    expect(infos[0]).toBeUndefined();
-  });
-
-  test("does not duplicate leading reasoning when it is the bundle head", () => {
-    const first = reasoning({ id: "think-1" });
-    const second = tool({ id: "read-1", toolName: "file_read" });
-
-    const reasoningOnly = computeOperationalBundleInfos([first], { isTurnActive: false });
-    expect(reasoningOnly[0]?.entries).toEqual([{ message: first, originalIndex: 0 }]);
-    expect(reasoningOnly[0]?.summary.title).toBe("Thought");
-
-    const reasoningThenTool = computeOperationalBundleInfos([first, second], {
-      isTurnActive: false,
-    });
-    expect(reasoningThenTool[0]?.entries).toEqual([
-      { message: first, originalIndex: 0 },
-      { message: second, originalIndex: 1 },
-    ]);
-    expect(reasoningThenTool[0]?.summary.title).toBe("Read 1 file");
-  });
-
-  test("groups non-success tools into operational bundles", () => {
-    const failedSearch = tool({
-      id: "search-1",
-      toolName: "web_search",
-      status: "failed",
-      result: { error: "provider unavailable" },
-    });
-    const failedBash = tool({
-      id: "bash-1",
-      toolName: "bash",
-      status: "failed",
-      result: { exitCode: 1, output: "type error" },
-    });
-    const interruptedRead = tool({
-      id: "read-interrupted-1",
-      toolName: "file_read",
-      status: "interrupted",
-    });
-    const redactedRead = tool({
-      id: "read-redacted-1",
-      toolName: "file_read",
-      status: "redacted",
-    });
-    const partialRead = tool({
-      id: "read-partial-1",
-      toolName: "file_read",
-      isPartial: true,
-    });
-
-    const infos = computeOperationalBundleInfos(
-      [failedSearch, failedBash, interruptedRead, redactedRead, partialRead],
-      { isTurnActive: false }
-    );
-
-    expect(infos[0]).toMatchObject({
-      key: "bundle:search-1",
-      position: "head",
-      state: "settled",
-      defaultExpanded: false,
-      entries: [
-        { message: failedSearch, originalIndex: 0 },
-        { message: failedBash, originalIndex: 1 },
-        { message: interruptedRead, originalIndex: 2 },
-        { message: redactedRead, originalIndex: 3 },
-        { message: partialRead, originalIndex: 4 },
-      ],
-      summary: {
-        title: "Ran 1 search and 1 command, read 3 files",
-        details: "2 failed",
-      },
-    });
-    expect(infos[1]).toMatchObject({ key: "bundle:search-1", position: "member" });
-    expect(infos[2]).toMatchObject({ key: "bundle:search-1", position: "member" });
-    expect(infos[3]).toMatchObject({ key: "bundle:search-1", position: "member" });
-    expect(infos[4]).toMatchObject({ key: "bundle:search-1", position: "member" });
-  });
-
-  test("keeps active bundles expanded while completed bundles default collapsed", () => {
-    const active = computeOperationalBundleInfos(
-      [reasoning({ id: "think-1", isStreaming: true })],
-      {
-        isTurnActive: true,
-      }
-    );
-    expect(active[0]).toMatchObject({
-      position: "head",
-      state: "active",
-      defaultExpanded: true,
-    });
-
-    const justSettledTail = computeOperationalBundleInfos(
-      [tool({ id: "read-1", status: "completed" })],
-      { isTurnActive: true }
-    );
-    expect(justSettledTail[0]).toMatchObject({
-      position: "head",
-      state: "settled",
-      defaultExpanded: false,
-    });
-
-    const afterVisibleEvent = computeOperationalBundleInfos(
-      [tool({ id: "read-1", status: "completed" }), assistant("a1")],
-      { isTurnActive: true }
-    );
-    expect(afterVisibleEvent[0]).toMatchObject({
-      position: "head",
-      state: "settled",
-      defaultExpanded: false,
-    });
-  });
-
-  test("keeps task_await operational bundles quiet unless they need attention", () => {
-    const active = computeOperationalBundleInfos(
-      [
-        tool({
-          id: "await-active",
-          toolName: "task_await",
-          status: "executing",
-          result: { results: [{ status: "running", taskId: "task-1" }] },
-        }),
-      ],
-      { isTurnActive: true }
-    );
-    expect(active[0]).toMatchObject({ defaultExpanded: false });
-
-    const failed = computeOperationalBundleInfos(
-      [
-        tool({
-          id: "await-failed",
-          toolName: "task_await",
-          result: { results: [{ status: "not_found", taskId: "task-1" }] },
-        }),
-      ],
-      { isTurnActive: false }
-    );
-    expect(failed[0]).toMatchObject({
-      defaultExpanded: true,
-      summary: { title: "Task wait failed", tone: "danger" },
-    });
-  });
-
-  test("bundle key stays stable while an active bundle grows", () => {
-    const one = computeOperationalBundleInfos([tool({ id: "read-1", status: "executing" })], {
-      isTurnActive: true,
-    });
-    const two = computeOperationalBundleInfos(
-      [tool({ id: "read-1", status: "executing" }), tool({ id: "search-1" })],
-      { isTurnActive: true }
-    );
-
-    expect(one[0]?.key).toBe("bundle:read-1");
-    expect(two[0]?.key).toBe("bundle:read-1");
-    expect(two[1]).toMatchObject({ key: "bundle:read-1", position: "member" });
   });
 });
 

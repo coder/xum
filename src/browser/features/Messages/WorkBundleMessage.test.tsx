@@ -7,13 +7,14 @@ import { WorkBundleMessage } from "./WorkBundleMessage";
 
 const item: WorkBundleInfo = {
   key: "work:one",
-  position: "head",
   headIndex: 1,
-  entries: [],
+  role: "work",
+  visibleWhenFolded: false,
   startedAtMs: 0,
-  durationMs: 180_000,
+  durationMs: 134_000,
   state: "settled",
-  defaultExpanded: false,
+  kind: "work",
+  editedFileCount: 0,
 };
 
 describe("WorkBundleMessage", () => {
@@ -28,15 +29,14 @@ describe("WorkBundleMessage", () => {
     restoreDomGlobals();
   });
 
-  test("renders duration and toggles expansion", () => {
+  test("names the finished work with its duration and toggles expansion", () => {
     let expanded = false;
     const onToggle = () => {
       expanded = !expanded;
     };
     const view = render(<WorkBundleMessage item={item} expanded={expanded} onToggle={onToggle} />);
 
-    expect(view.getByRole("button", { expanded: false })).toBeDefined();
-    expect(view.getByText("Worked for 3m 0s")).toBeDefined();
+    expect(view.getByRole("button", { name: "Worked for 2m 14s", expanded: false })).toBeDefined();
 
     fireEvent.click(view.getByRole("button"));
     view.rerender(<WorkBundleMessage item={item} expanded={expanded} onToggle={onToggle} />);
@@ -44,25 +44,39 @@ describe("WorkBundleMessage", () => {
     expect(view.getByRole("button", { expanded: true })).toBeDefined();
   });
 
-  test("renders active working label with elapsed duration", () => {
+  test("says that the folded work changed files", () => {
     const view = render(
       <WorkBundleMessage
-        item={{
-          ...item,
-          state: "active",
-          startedAtMs: Date.now() - 35_000,
-          durationMs: undefined,
-          defaultExpanded: true,
-        }}
-        expanded
+        item={{ ...item, editedFileCount: 2 }}
+        expanded={false}
+        onToggle={() => undefined}
+      />
+    );
+    expect(view.getByRole("button", { name: "Worked for 2m 14s · edited 2 files" })).toBeDefined();
+
+    view.rerender(
+      <WorkBundleMessage
+        item={{ ...item, durationMs: undefined, editedFileCount: 1 }}
+        expanded={false}
+        onToggle={() => undefined}
+      />
+    );
+    expect(view.getByRole("button", { name: "Worked · edited 1 file" })).toBeDefined();
+  });
+
+  test("runs a clock while the turn is live", () => {
+    const view = render(
+      <WorkBundleMessage
+        item={{ ...item, state: "live", startedAtMs: Date.now() - 35_000, durationMs: undefined }}
+        expanded={false}
         onToggle={() => undefined}
       />
     );
 
-    expect(view.getByText(/Working for \d+s\.\.\./)).toBeDefined();
+    expect(view.getByText(/^Working for \d+s$/)).toBeDefined();
   });
 
-  test("renders fallback label without duration", () => {
+  test("drops a duration that is unknown or too short to read", () => {
     const view = render(
       <WorkBundleMessage
         item={{ ...item, durationMs: undefined }}
@@ -70,7 +84,15 @@ describe("WorkBundleMessage", () => {
         onToggle={() => undefined}
       />
     );
-
     expect(view.getByText("Worked")).toBeDefined();
+
+    view.rerender(
+      <WorkBundleMessage
+        item={{ ...item, kind: "thought", durationMs: 400 }}
+        expanded={false}
+        onToggle={() => undefined}
+      />
+    );
+    expect(view.getByText("Thought")).toBeDefined();
   });
 });

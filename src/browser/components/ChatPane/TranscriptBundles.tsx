@@ -11,20 +11,9 @@ import {
 import type { TranscriptDensity } from "@/common/constants/storage";
 import type { DisplayedMessage } from "@/common/types/message";
 
-// Work bundles (hyper density) and operational bundles (runs of routine tool calls),
-// shared by the desktop ChatPane and the VS Code webview (#4979) so both collapse the same rows.
-
-function findTailProposePlanToolId(messages: readonly DisplayedMessage[]): string | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message.type !== "tool") {
-      continue;
-    }
-    return message.toolName === "propose_plan" ? message.id : null;
-  }
-
-  return null;
-}
+// Work bundles (compact density: a turn's work behind one line) and operational bundles (runs of
+// routine tool calls), shared by the desktop ChatPane and the VS Code webview (#4979) so both
+// fold the same rows.
 
 const EMPTY_OVERRIDES: ReadonlyMap<string, boolean> = new Map();
 
@@ -35,14 +24,12 @@ interface BundleExpansionOverrides {
 }
 
 export interface TranscriptBundles {
-  /** Indexed like the full message array; undefined outside hyper density. */
+  /** Indexed like the full message array; undefined in detailed density. */
   workBundleInfos: Array<WorkBundleInfo | undefined> | undefined;
   /** Indexed like the full message array. */
   operationalBundleInfos: Array<OperationalBundleInfo | undefined>;
   workBundleExpansionOverrides: ReadonlyMap<string, boolean>;
   operationalBundleExpansionOverrides: ReadonlyMap<string, boolean>;
-  tailProposePlanWorkBundleKey: string | null;
-  tailProposePlanOperationalBundleKey: string | null;
   setWorkBundleExpanded: (key: string, expanded: boolean) => void;
   setOperationalBundleExpanded: (key: string, expanded: boolean) => void;
 }
@@ -75,36 +62,19 @@ export function useTranscriptBundles(params: {
     ? bundleExpansion.operational
     : EMPTY_OVERRIDES;
 
+  // The stored value "hyper" is the compact density (see TRANSCRIPT_DENSITIES).
   const workBundleInfos = useMemo(
-    () => (transcriptDensity === "hyper" ? computeWorkBundleInfos(messages) : undefined),
-    [messages, transcriptDensity]
-  );
-
-  const operationalBundleInfos = useMemo(
     () =>
-      computeOperationalBundleInfos(messages, {
-        isTurnActive,
-        // Normal density folds runs of routine tool calls (reads, searches, shell, code runs,
-        // task polls) into one summary row; hyper bundles every operational run.
-        scope: transcriptDensity === "hyper" ? "all" : "routine",
-      }),
+      transcriptDensity === "hyper"
+        ? computeWorkBundleInfos(messages, { isTurnActive })
+        : undefined,
     [isTurnActive, messages, transcriptDensity]
   );
 
-  // A tail propose_plan usually means the agent paused for user review; reveal only the
-  // containing hyper-density bundles by default so historical plans stay collapsed.
-  const tailProposePlanToolId =
-    transcriptDensity === "hyper" ? findTailProposePlanToolId(messages) : null;
-  const tailProposePlanIndex =
-    tailProposePlanToolId === null
-      ? -1
-      : messages.findIndex((message) => message.id === tailProposePlanToolId);
-  const tailProposePlanWorkBundleKey =
-    tailProposePlanIndex === -1 ? null : (workBundleInfos?.[tailProposePlanIndex]?.key ?? null);
-  const tailProposePlanOperationalBundleKey =
-    tailProposePlanIndex === -1
-      ? null
-      : (operationalBundleInfos?.[tailProposePlanIndex]?.key ?? null);
+  const operationalBundleInfos = useMemo(
+    () => computeOperationalBundleInfos(messages, { isTurnActive }),
+    [isTurnActive, messages]
+  );
 
   const updateBundleExpansion = (kind: "work" | "operational", key: string, expanded: boolean) => {
     setBundleExpansion((current) => {
@@ -130,8 +100,6 @@ export function useTranscriptBundles(params: {
     operationalBundleInfos,
     workBundleExpansionOverrides,
     operationalBundleExpansionOverrides,
-    tailProposePlanWorkBundleKey,
-    tailProposePlanOperationalBundleKey,
     setWorkBundleExpanded,
     setOperationalBundleExpanded,
   };
@@ -159,114 +127,74 @@ export function TranscriptBundleRows(props: {
     operationalBundleInfos,
     workBundleExpansionOverrides,
     operationalBundleExpansionOverrides,
-    tailProposePlanWorkBundleKey,
-    tailProposePlanOperationalBundleKey,
     setWorkBundleExpanded,
     setOperationalBundleExpanded,
   } = props.bundles;
   const workspaceId = props.workspaceId;
   const renderMessageAtIndex = props.renderMessageAtIndex;
 
-  const rows = props.messages.map((msg, revealOffset) => {
-    const index = props.indexOffset + revealOffset;
-    const workBundle = workBundleInfos?.[index];
-    const operationalBundle = workBundle ? undefined : operationalBundleInfos?.[index];
-    const workBundleOverride = workBundle
-      ? workBundleExpansionOverrides.get(workBundle.key)
-      : undefined;
-    const defaultRevealTailPlanWorkBundle =
-      tailProposePlanWorkBundleKey !== null && workBundle?.key === tailProposePlanWorkBundleKey;
-    const isWorkBundleExpanded = workBundle
-      ? (workBundleOverride ?? (defaultRevealTailPlanWorkBundle || workBundle.defaultExpanded))
-      : false;
+  // The steps of an opened work line hang off one rail, like the members of an opened run, so
+  // the eye can see where the turn's work ends and its reply begins. Consecutive steps share
+  // one container (not a rail segment each): their margins then collapse as they do outside
+  // it, and the rail is one unbroken line.
+  const rows: React.ReactNode[] = [];
+  let openSteps: { key: string; bundleKey: string; nodes: React.ReactNode[] } | undefined;
+  const closeSteps = () => {
+    if (openSteps !== undefined) {
+      rows.push(
+        <div key={openSteps.key} data-testid="work-bundle-steps" className={TOOL_RAIL_CLASS}>
+          {openSteps.nodes}
+        </div>
+      );
+      openSteps = undefined;
+    }
+  };
 
-    const keepCollapsedWorkBundleMemberVisible =
-      msg.type === "user" || (msg.type === "assistant" && workBundle?.position === "final");
-    if (
-      (workBundle?.position === "member" || workBundle?.position === "final") &&
-      (isWorkBundleExpanded || !keepCollapsedWorkBundleMemberVisible)
-    ) {
-      return null;
+  props.messages.forEach((msg, revealOffset) => {
+    const index = props.indexOffset + revealOffset;
+    const rowKey = `${workspaceId}:${msg.id}`;
+    const workBundle = workBundleInfos?.[index];
+    // A work line is closed until the user opens it. A live turn is not opened for them: it
+    // shows its latest step through the fold instead (see computeWorkBundleInfos).
+    const isWorkBundleExpanded =
+      workBundle !== undefined && (workBundleExpansionOverrides.get(workBundle.key) ?? false);
+    // The work line sits above the stretch's first row. ChatPane only cuts the tail-first reveal
+    // at such a row, so a mounted stretch always has its line.
+    if (workBundle?.headIndex === index) {
+      closeSteps();
+      rows.push(
+        <WorkBundleMessage
+          key={`${rowKey}:work-line`}
+          item={workBundle}
+          expanded={isWorkBundleExpanded}
+          onToggle={() => setWorkBundleExpanded(workBundle.key, !isWorkBundleExpanded)}
+        />
+      );
+    }
+    const showsThroughFold = workBundle !== undefined && !isWorkBundleExpanded;
+    if (showsThroughFold && !workBundle.visibleWhenFolded) {
+      return;
     }
 
-    const renderWorkBundle = workBundle?.position === "head";
-    const renderMessageBeforeWorkBundle = renderWorkBundle && msg.type === "user";
-    const renderMessageAfterWorkBundle = !renderWorkBundle;
+    // A work row that shows through a closed work line stands alone: the run of routine calls
+    // it belongs to is folded away with the rest of the work.
+    const operationalBundle =
+      showsThroughFold && workBundle.role === "work" ? undefined : operationalBundleInfos?.[index];
     const operationalBundleOverride = operationalBundle
       ? operationalBundleExpansionOverrides.get(operationalBundle.key)
       : undefined;
-    const defaultRevealTailPlanOperationalBundle =
-      tailProposePlanOperationalBundleKey !== null &&
-      operationalBundle?.key === tailProposePlanOperationalBundleKey;
     const isOperationalBundleExpanded = operationalBundle
       ? operationalBundle.summary.tone !== undefined ||
-        (operationalBundleOverride ??
-          (defaultRevealTailPlanOperationalBundle || operationalBundle.defaultExpanded))
+        (operationalBundleOverride ?? operationalBundle.defaultExpanded)
       : false;
 
     if (operationalBundle?.position === "member" && !isOperationalBundleExpanded) {
-      return null;
+      return;
     }
 
     const renderOperationalBundle = operationalBundle?.position === "head";
-    const renderMessageAfterOperationalBundle =
-      renderMessageAfterWorkBundle && (!renderOperationalBundle || isOperationalBundleExpanded);
-
-    return (
-      <React.Fragment key={`${workspaceId}:${msg.id}`}>
-        {renderMessageBeforeWorkBundle &&
-          renderMessageAtIndex(msg, index, {
-            key: `${workspaceId}:${msg.id}:message`,
-          })}
-        {renderWorkBundle && workBundle && (
-          <WorkBundleMessage
-            item={workBundle}
-            expanded={isWorkBundleExpanded}
-            onToggle={() => setWorkBundleExpanded(workBundle.key, !isWorkBundleExpanded)}
-          />
-        )}
-        {renderWorkBundle &&
-          workBundle &&
-          isWorkBundleExpanded &&
-          workBundle.entries.map((entry) => {
-            const nestedOperationalBundle = operationalBundleInfos?.[entry.originalIndex];
-            const nestedOverride = nestedOperationalBundle
-              ? operationalBundleExpansionOverrides.get(nestedOperationalBundle.key)
-              : undefined;
-            const defaultRevealTailPlanNestedBundle =
-              tailProposePlanOperationalBundleKey !== null &&
-              nestedOperationalBundle?.key === tailProposePlanOperationalBundleKey;
-            const isNestedExpanded = nestedOperationalBundle
-              ? nestedOperationalBundle.summary.tone !== undefined ||
-                (nestedOverride ??
-                  (defaultRevealTailPlanNestedBundle || nestedOperationalBundle.defaultExpanded))
-              : false;
-
-            if (nestedOperationalBundle?.position === "member" && !isNestedExpanded) {
-              return null;
-            }
-
-            const renderNestedBundle = nestedOperationalBundle?.position === "head";
-            const renderNestedMessage = !renderNestedBundle || isNestedExpanded;
-
-            return (
-              <React.Fragment key={`${workspaceId}:${workBundle.key}:${entry.message.id}`}>
-                {renderNestedBundle && nestedOperationalBundle && (
-                  <OperationalBundleMessage
-                    item={nestedOperationalBundle}
-                    expanded={isNestedExpanded}
-                    onToggle={() =>
-                      setOperationalBundleExpanded(nestedOperationalBundle.key, !isNestedExpanded)
-                    }
-                  />
-                )}
-                {renderNestedMessage &&
-                  renderMessageAtIndex(entry.message, entry.originalIndex, {
-                    key: `${workspaceId}:${workBundle.key}:${entry.message.id}:message`,
-                  })}
-              </React.Fragment>
-            );
-          })}
+    const row = (
+      <React.Fragment key={rowKey}>
         {renderOperationalBundle && operationalBundle && (
           <OperationalBundleMessage
             item={operationalBundle}
@@ -276,9 +204,9 @@ export function TranscriptBundleRows(props: {
             }
           />
         )}
-        {renderMessageAfterOperationalBundle &&
+        {(!renderOperationalBundle || isOperationalBundleExpanded) &&
           renderMessageAtIndex(msg, index, {
-            key: `${workspaceId}:${msg.id}:message`,
+            key: `${rowKey}:message`,
             // Open bundle members hang off the shared rail under the summary line's chevron,
             // like the calls under a script header.
             // `flow-root` keeps each row's 8px margins inside its rail segment, so the rail is
@@ -289,7 +217,20 @@ export function TranscriptBundleRows(props: {
           })}
       </React.Fragment>
     );
+
+    if (!isWorkBundleExpanded || workBundle?.role !== "work") {
+      closeSteps();
+      rows.push(row);
+      return;
+    }
+    if (openSteps?.bundleKey !== workBundle.key) {
+      closeSteps();
+      // Keyed by its first step, which holds while a live turn appends steps after it.
+      openSteps = { key: `${rowKey}:steps`, bundleKey: workBundle.key, nodes: [] };
+    }
+    openSteps.nodes.push(row);
   });
+  closeSteps();
 
   return <>{rows}</>;
 }

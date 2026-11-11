@@ -14,6 +14,7 @@ import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import type { StreamStartEvent } from "@/common/types/stream";
 
 import { createAppHarness, type AppHarness } from "../harness";
+import { showEveryTranscriptStep } from "../helpers";
 
 interface ServiceContainerPrivates {
   backgroundProcessManager: BackgroundProcessManager;
@@ -201,7 +202,10 @@ describe("Send dispatch modes (mock AI router)", () => {
   }, 60_000);
 
   test("send after step waits for every tool call emitted in the current step", async () => {
-    const app = await createAppHarness({ branchPrefix: "queued-parallel-tool-step" });
+    const app = await createAppHarness({
+      branchPrefix: "queued-parallel-tool-step",
+      beforeRenderEnvironment: showEveryTranscriptStep,
+    });
 
     try {
       // The send waits for workspace init, so the stream can start more than 1 s after the
@@ -240,7 +244,7 @@ describe("Send dispatch modes (mock AI router)", () => {
       await app.chat.expectTranscriptContains(`Mock response: ${queuedText}`);
       await app.chat.expectStreamComplete();
 
-      // Normal density folds the two settled reads into one summary row; open it to see both.
+      // Detailed density folds the two settled reads into one summary row; open it to see both.
       const readsSummary = await waitFor(() => {
         const button = Array.from(app.view.container.querySelectorAll("button")).find((element) =>
           element.textContent?.includes("Read 2 files")

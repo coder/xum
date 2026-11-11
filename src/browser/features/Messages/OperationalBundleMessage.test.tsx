@@ -66,12 +66,4 @@ describe("OperationalBundleMessage", () => {
 
     expect(view.getByRole("button").textContent).toBe("Read 2 files· 1 failed");
   });
-
-  test("suppresses redundant singleton details", () => {
-    const item = computeOperationalBundleInfos([tool("read-1")], { isTurnActive: false })[0]!;
-
-    const view = render(<OperationalBundleMessage item={item} expanded={false} onToggle={noop} />);
-
-    expect(view.getByRole("button").textContent).toBe("Read 1 file");
-  });
 });

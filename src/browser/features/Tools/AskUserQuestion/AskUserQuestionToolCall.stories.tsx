@@ -76,7 +76,7 @@ export const AskUserQuestionPending: AppStory = {
     const canvas = within(await findQuestionDock(storyRoot));
 
     // Wait for the tool card to appear (header is rendered even when collapsed).
-    const toolTitle = await canvas.findByText(/ask_user_question/, {}, { timeout: 8000 });
+    const toolTitle = await canvas.findByText("Question", {}, { timeout: 8000 });
 
     // Ensure tool is expanded (question text is inside ToolDetails).
     if (!canvas.queryByText("Summary")) {
@@ -309,7 +309,7 @@ export const AskUserQuestionTouchPhone: AppStory = {
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
     const canvas = within(await findQuestionDock(storyRoot));
-    const toolTitle = await canvas.findByText(/ask_user_question/, {}, { timeout: 8000 });
+    const toolTitle = await canvas.findByText("Question", {}, { timeout: 8000 });
     if (!canvas.queryByText("Summary")) {
       await userEvent.click(toolTitle);
     }

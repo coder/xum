@@ -694,7 +694,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     const bashOutputGroup = bashOutputGroupInfos[index];
     if (bashOutputGroup !== undefined && bashOutputGroup.position !== "first") return false;
     const workBundle = workBundleInfos?.[index];
-    if (workBundle !== undefined && workBundle.position !== "head") return false;
+    if (workBundle !== undefined && workBundle.headIndex !== index) return false;
     const operationalBundle = operationalBundleInfos?.[index];
     return operationalBundle === undefined || operationalBundle.position === "head";
   };

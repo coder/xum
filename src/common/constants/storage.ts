@@ -335,11 +335,16 @@ export function normalizeEditorConfig(value: unknown): EditorConfig {
   return { editor, customCommand };
 }
 
+// The stored names predate the redesign and are kept so settings survive an upgrade or a
+// downgrade: "hyper" is the compact transcript (each turn is the prompt, one line for the work,
+// and the reply) and "normal" is the detailed one (every step is a row).
 export const TRANSCRIPT_DENSITIES = ["normal", "hyper"] as const;
 
 export type TranscriptDensity = (typeof TRANSCRIPT_DENSITIES)[number];
 
-export const DEFAULT_TRANSCRIPT_DENSITY: TranscriptDensity = "normal";
+// Compact is the default: the transcript is a conversation first, and the steps are one click
+// away. A user who has never chosen a density gets it; a stored choice is kept.
+export const DEFAULT_TRANSCRIPT_DENSITY: TranscriptDensity = "hyper";
 
 export function isTranscriptDensity(value: unknown): value is TranscriptDensity {
   return typeof value === "string" && TRANSCRIPT_DENSITIES.includes(value as TranscriptDensity);

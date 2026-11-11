@@ -10,12 +10,17 @@ import {
   ToolContainer,
   ToolHeader,
   ExpandIcon,
+  FOLDED_ROW_TEXT_CLASS,
   ToolName,
   StatusIndicator,
   ToolDetails,
   ErrorBox,
 } from "./Shared/ToolPrimitives";
-import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
+import {
+  useAutoCollapsingToolExpansion,
+  getStatusDisplay,
+  type ToolStatus,
+} from "./Shared/toolUtils";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
 import { PlanAnnotationView } from "./PlanAnnotationView";
 import { extractPlanHeadings } from "./ProposePlan/extractPlanHeadings";
@@ -190,7 +195,18 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     path: directPath,
     className,
   } = props;
-  const { expanded, toggleExpanded } = useToolExpansion(true); // Expand by default
+  // An earlier plan was superseded or already acted on, so it folds to its title: the transcript
+  // keeps one plan open, the one the user is being asked about. Opening an earlier plan is a
+  // choice about that card alone, so it does not touch the sticky plan preference.
+  const isEarlierPlan = isLatest === false && isEphemeralPreview !== true;
+  const expansion = useAutoCollapsingToolExpansion(true, {
+    autoCollapsed: isEarlierPlan,
+    resetKey: undefined,
+  });
+  const expanded = expansion.expanded;
+  const toggleExpanded = isEarlierPlan
+    ? () => expansion.setLocalExpanded(!expanded)
+    : expansion.toggleExpanded;
   const [showRaw, setShowRaw] = useState(false);
   const [annotateMode, setAnnotateMode] = useState(false);
   const [isImplementing, setIsImplementing] = useState(false);
@@ -895,6 +911,12 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const showToc = !errorMessage && !annotateMode && !showRaw && hasPlanContentInChat;
   const tocEntries = showToc ? extractPlanHeadings(planContent) : [];
 
+  // Whether the plan's first line is the heading the title was taken from. Raw view shows that
+  // line as markup, so there the strip stays.
+  const firstPlanLine = planContent.trimStart().split("\n", 1)[0].trim();
+  const bodyOpensWithTitle =
+    !errorMessage && !showRaw && /^#\s+(.+)$/.exec(firstPlanLine)?.[1] === planTitle;
+
   // Shared plan UI content (used in both tool call and ephemeral preview modes)
   const planUI = (
     <div
@@ -904,19 +926,22 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         annotateMode && "ring-accent/30 ring-1"
       )}
     >
-      {/* Header: title only */}
-      <ToolChrome className="plan-divider mb-3 flex items-center gap-2 border-b pb-2">
-        <ClipboardList aria-hidden="true" className="h-4 w-4" />
-        <div className="text-plan-mode font-mono text-[13px] font-semibold">{planTitle}</div>
-        {annotateMode && (
-          <div className="bg-accent/10 text-accent-text rounded px-1.5 py-0.5 font-mono text-[10px] font-medium">
-            Annotating
-          </div>
-        )}
-        {isEphemeralPreview && (
-          <div className="text-muted font-mono text-[10px] italic">preview only</div>
-        )}
-      </ToolChrome>
+      {/* Header: title only. A plan whose body opens with that title as its heading already
+          shows it one line below, so the strip is kept only when it says something more. */}
+      {(!bodyOpensWithTitle || annotateMode || isEphemeralPreview === true) && (
+        <ToolChrome className="plan-divider mb-3 flex items-center gap-2 border-b pb-2">
+          <ClipboardList aria-hidden="true" className="h-4 w-4" />
+          <div className="text-plan-mode font-mono text-[13px] font-semibold">{planTitle}</div>
+          {annotateMode && (
+            <div className="bg-accent/10 text-accent-text rounded px-1.5 py-0.5 font-mono text-[10px] font-medium">
+              Annotating
+            </div>
+          )}
+          {isEphemeralPreview && (
+            <div className="text-muted font-mono text-[10px] italic">preview only</div>
+          )}
+        </ToolChrome>
+      )}
 
       {/* Content */}
       {planQuoteContent}
@@ -1044,7 +1069,14 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       <ToolContainer expanded={expanded}>
         <ToolHeader onClick={toggleExpanded}>
           <ExpandIcon expanded={expanded} />
-          <ToolName>propose_plan</ToolName>
+          {/* Set like the work lines around it (prose font): a plan is part of the conversation. */}
+          <ToolName className={FOLDED_ROW_TEXT_CLASS}>Plan</ToolName>
+          {/* A folded plan is its title: the card that carries the title is out of sight. */}
+          {!expanded && (
+            <span className={cn("text-text min-w-0 truncate", FOLDED_ROW_TEXT_CLASS)}>
+              {planTitle}
+            </span>
+          )}
           <StatusIndicator status={status}>{statusDisplay}</StatusIndicator>
         </ToolHeader>
 

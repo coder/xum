@@ -211,7 +211,7 @@ function setupSequenceStory() {
 }
 
 /**
- * A settled run of scripts folds into one summary row (normal density). Opening it shows each
+ * A settled run of scripts folds into one summary row (detailed density). Opening it shows each
  * script as one line; opening a script shows its calls, and a long script shows only its latest
  * calls until asked for the rest.
  */

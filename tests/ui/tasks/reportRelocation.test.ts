@@ -22,7 +22,7 @@ import { createMuxMessage } from "@/common/types/message";
 
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
-import { cleanupView, setupWorkspaceView } from "../helpers";
+import { cleanupView, setupWorkspaceView, showEveryTranscriptStep } from "../helpers";
 
 async function waitForWorkspaceChatToRender(container: HTMLElement): Promise<void> {
   await waitFor(
@@ -103,6 +103,7 @@ describe("Task report relocation UI", () => {
 
   test("renders completed task report under original task tool call", async () => {
     const env = await createTestEnvironment();
+    await showEveryTranscriptStep(env);
     const repoPath = await createTempGitRepo();
     await trustProject(env, repoPath);
     const cleanupDom = installDom();

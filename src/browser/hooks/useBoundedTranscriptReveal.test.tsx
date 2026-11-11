@@ -294,7 +294,7 @@ describe("useBoundedTranscriptReveal", () => {
       })
     );
     expect(result.current.fromIndex).toBe(160);
-    // normal → hyper density: a work bundle comes to span the anchor row (160) → its head.
+    // detailed → compact density: a work bundle comes to span the anchor row (160) → its head.
     bundles = [[140, 175]];
     rerender();
     expect(result.current.fromIndex).toBe(140);

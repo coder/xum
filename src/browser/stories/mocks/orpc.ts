@@ -731,9 +731,15 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   // Stories paint dark by default, so the theme preference shown in Settings matches.
   // Tutorials are off so their overlays cannot cover a story.
+  // Stories show the detailed transcript unless they ask for another density: most of them exist
+  // to show a tool card, which the compact default folds behind the turn's work line. The
+  // Transcript Density stories cover the default.
   let userPreferences = normalizeUserPreferences(
     applyMergePatch(
-      { appearance: { theme: "dark" }, ui: { tutorialState: { disabled: true } } },
+      {
+        appearance: { theme: "dark", transcriptDensity: "normal" },
+        ui: { tutorialState: { disabled: true } },
+      },
       initialUserPreferences ?? {}
     )
   );

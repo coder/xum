@@ -20,6 +20,23 @@ export interface ButtonConfig {
   component?: ReactNode;
 }
 
+/**
+ * A prompt's actions and time are there when the pointer or the keyboard is on the message, and
+ * gone otherwise: under every prompt they were the loudest thing left in a quiet transcript.
+ * With a pointer the row floats under the bubble and takes no room, so a prompt sits next to
+ * the work it started and not a row's height away from it. It starts flush with the bubble
+ * (padding, not margin), so the pointer can move onto it without leaving the message. Touch has
+ * no hover: there the row stays in the flow, always shown. A reply keeps its row (one per turn).
+ */
+const USER_META_ROW_CLASS = cn(
+  "opacity-0 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100",
+  "[@media(hover:hover)]:absolute [@media(hover:hover)]:top-full [@media(hover:hover)]:right-0",
+  "[@media(hover:hover)]:mt-0 [@media(hover:hover)]:w-max [@media(hover:hover)]:pt-1",
+  // Opaque, so in a narrow window it covers the end of the line under the prompt, not mixes with it.
+  "[@media(hover:hover)]:bg-surface-primary [@media(hover:hover)]:rounded [@media(hover:hover)]:pl-2",
+  "[@media(hover:none)]:opacity-100"
+);
+
 interface MessageWindowProps {
   label: ReactNode;
   variant?: "assistant" | "user";
@@ -65,8 +82,9 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
   return (
     <div
       className={cn(
-        "mt-4 mb-1 flex flex-col relative isolate",
-        variant === "user" && "ml-auto w-fit max-w-full",
+        "group/message mt-4 mb-1 flex flex-col relative isolate",
+        // The z-index keeps the floating action row above the row that follows the prompt.
+        variant === "user" && "ml-auto w-fit max-w-full hover:z-10 focus-within:z-10",
         variant === "assistant" && "w-full text-foreground",
         // Pair the extra bottom margin with the meta row so the surrounding transcript
         // space only changes at the same (settled) moment as the meta row appearing,
@@ -101,7 +119,8 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
         <div
           className={cn(
             "mt-2 flex flex-wrap items-center justify-between gap-3 text-[11px]",
-            variant === "user" ? "ml-auto text-muted" : "text-muted"
+            variant === "user" ? "ml-auto text-muted" : "text-muted",
+            variant === "user" && !isShowingJson && USER_META_ROW_CLASS
           )}
           data-message-meta
         >

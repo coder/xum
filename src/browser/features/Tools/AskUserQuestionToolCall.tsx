@@ -111,6 +111,24 @@ function isToolErrorResult(val: unknown): val is ToolErrorResult {
   return record.success === false && typeof record.error === "string";
 }
 
+/** The row's one-line reading: the first question (and how many more), and the answers given. */
+function summarizeQuestions(
+  questions: readonly AskUserQuestionQuestion[] | undefined,
+  answers: Record<string, string> | undefined
+): { question: string; answer: string | null } | undefined {
+  // History replays can carry args without a questions array, or with malformed entries.
+  const first = questions?.[0];
+  if (typeof first?.question !== "string") {
+    return undefined;
+  }
+  const more = questions != null && questions.length > 1 ? ` (+${questions.length - 1} more)` : "";
+  const given = answers == null ? [] : Object.values(answers).filter((answer) => answer !== "");
+  return {
+    question: `${first.question}${more}`,
+    answer: given.length > 0 ? given.join(" · ") : null,
+  };
+}
+
 /**
  * A finished question: the submitted answers, one row per question with the picked options'
  * descriptions, or a note when a non-blocking question closed unanswered.
@@ -206,7 +224,7 @@ function DockedQuestionStub(props: { status: ToolStatus }): JSX.Element {
       <ToolHeader className="cursor-default">
         <ToolIcon toolName="ask_user_question" />
         <div className="flex min-w-0 flex-1 flex-col">
-          <ToolName>ask_user_question</ToolName>
+          <ToolName>Question</ToolName>
           <div className="text-secondary text-[10px] leading-tight">
             Answer in the panel above the chat input.
           </div>
@@ -593,6 +611,7 @@ export function AskUserQuestionToolCall(
         onToggle={toggleExpanded}
         hint={isAnswering ? answeringHints.header : null}
         status={props.status}
+        title={summarizeQuestions(props.args.questions, successResult?.answers)}
       />
 
       {expanded && (

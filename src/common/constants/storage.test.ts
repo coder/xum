@@ -23,8 +23,10 @@ describe("storage workspace-scoped keys", () => {
 
   test("normalizeTranscriptDensity falls back for corrupt values", () => {
     expect(normalizeTranscriptDensity("hyper")).toBe("hyper");
-    expect(normalizeTranscriptDensity("compact")).toBe("normal");
-    expect(normalizeTranscriptDensity(null)).toBe("normal");
+    expect(normalizeTranscriptDensity("normal")).toBe("normal");
+    // Anything else, a never-set preference included, is the compact default (stored as "hyper").
+    expect(normalizeTranscriptDensity("compact")).toBe("hyper");
+    expect(normalizeTranscriptDensity(null)).toBe("hyper");
   });
 
   // A prefix that is a prefix of another would give keys the wrong kind, so quota eviction could

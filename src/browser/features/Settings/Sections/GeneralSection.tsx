@@ -28,7 +28,6 @@ import {
   DEFAULT_TERMINAL_FONT_CONFIG,
   TERMINAL_BADGE_POSITIONS,
   BASH_COLLAPSED_SUMMARY_MODES,
-  TRANSCRIPT_DENSITIES,
   normalizeBashCollapsedSummaryMode,
   normalizeEditorConfig,
   normalizeTerminalBadgeConfig,
@@ -132,10 +131,12 @@ const BASH_COLLAPSED_SUMMARY_MODE_OPTIONS = BASH_COLLAPSED_SUMMARY_MODES.map((va
   label: BASH_COLLAPSED_SUMMARY_MODE_LABELS[value],
 }));
 const TRANSCRIPT_DENSITY_LABELS: Record<TranscriptDensity, string> = {
-  normal: "Normal",
-  hyper: "Hyper",
+  hyper: "Compact",
+  normal: "Detailed",
 };
-const TRANSCRIPT_DENSITY_OPTIONS = TRANSCRIPT_DENSITIES.map((value) => ({
+// The default comes first, not the order the values are stored in.
+const TRANSCRIPT_DENSITY_ORDER: readonly TranscriptDensity[] = ["hyper", "normal"];
+const TRANSCRIPT_DENSITY_OPTIONS = TRANSCRIPT_DENSITY_ORDER.map((value) => ({
   value,
   label: TRANSCRIPT_DENSITY_LABELS[value],
 }));
@@ -861,8 +862,8 @@ export function GeneralSection() {
             <div className="flex-1">
               <div className="text-foreground text-sm">Transcript density</div>
               <div className="text-muted text-xs">
-                Control how much detail the transcript shows. Normal folds runs of routine tool
-                calls into expandable summaries; Hyper also collapses completed work.
+                Compact shows each turn as your prompt, one line for the work, and the reply. Open
+                the line to see the steps. Detailed lists every step.
               </div>
             </div>
             <Select

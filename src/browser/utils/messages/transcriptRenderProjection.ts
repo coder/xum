@@ -30,33 +30,34 @@ export interface OperationalBundleInfo {
   defaultExpanded: boolean;
 }
 
-export interface WorkBundleEntry {
-  message: DisplayedMessage;
-  originalIndex: number;
-}
-
+/**
+ * One stretch of agent work between two things the user reads: their prompt, a question or plan
+ * that stops for them, and the reply. Compact density shows the stretch as one line ("Worked for
+ * 2m 14s") above the reply, the way Codex folds a finished turn.
+ */
 export interface WorkBundleInfo {
+  /** Derived from the stretch's first row, so it holds while a live turn grows. */
   key: string;
-  position: "head" | "member" | "final";
-  /** Render slot where the work-bundle header is placed. */
+  /** First row of the stretch; the work line renders above it. */
   headIndex: number;
-  entries: readonly WorkBundleEntry[];
+  /** "work" rows fold behind the work line. "answer" rows are the reply and always show. */
+  role: "work" | "answer";
+  /** A work row that shows through the fold: a call still running, or a live turn's latest step. */
+  visibleWhenFolded: boolean;
+  state: "live" | "settled";
+  /** A stretch that only reasoned reads "Thought for 4s" rather than "Worked for 4s". */
+  kind: "work" | "thought";
+  /**
+   * Files the folded work changed with the edit tools. The line says so ("edited 2 files"),
+   * because a change to the user's files is the one thing a fold must not keep quiet about.
+   */
+  editedFileCount: number;
   startedAtMs?: number;
   durationMs?: number;
-  state: "active" | "settled";
-  defaultExpanded: boolean;
 }
 
 interface ComputeBundleInfosOptions {
   isTurnActive: boolean;
-  /**
-   * "all" (hyper density): every run of reasoning and tool rows becomes a bundle.
-   * "routine" (normal density): only runs of two or more routine tool calls (reads, searches,
-   * shell commands, code execution, task polls) collapse into one summary row, the way Claude
-   * Code, Codex and Cursor fold exploration into "Explored · 3 reads" lines. Rows the user must
-   * see (edits, questions, plans, todos, attachments) stay standalone.
-   */
-  scope?: "all" | "routine";
 }
 
 type OperationalBundleCategory =
@@ -159,133 +160,244 @@ export function estimateTranscriptRowWeight(message: DisplayedMessage): number {
   }
 }
 
+/**
+ * Tool rows that stop for the user: a question to answer, a plan to approve. They are part of
+ * the conversation, so no work line hides them and they end the stretch of work before them.
+ */
+const STOP_TOOL_NAMES = new Set<string>(["ask_user_question", "propose_plan"]);
+
+type WorkBundleRow = DisplayedMessage & {
+  type: "assistant" | "reasoning" | "tool";
+};
+
+function isWorkBundleRow(message: DisplayedMessage | undefined): message is WorkBundleRow {
+  switch (message?.type) {
+    case "reasoning":
+      return true;
+    case "tool":
+      return !STOP_TOOL_NAMES.has(message.toolName);
+    case "assistant":
+      // Compaction summaries and peer messages are not this turn's narration: they stay put.
+      return !message.isCompacted && message.agentPeerMessage === undefined;
+    default:
+      return false;
+  }
+}
+
+function isRunningWorkBundleRow(message: WorkBundleRow): boolean {
+  if (message.type === "tool") {
+    return message.status === "pending" || message.status === "executing";
+  }
+  return message.isStreaming;
+}
+
+function getMessageTimestamp(message: DisplayedMessage | undefined): number | undefined {
+  return message !== undefined && "timestamp" in message && typeof message.timestamp === "number"
+    ? message.timestamp
+    : undefined;
+}
+
+/**
+ * Calls that record progress and do no work. They often follow the reply (the agent ticks off
+ * its todo list last), and the narration before them is still the reply.
+ */
+const BOOKKEEPING_TOOL_NAMES = new Set<string>(["notify", "timeline_event", "todo_write"]);
+
+/** Whether a row after some narration means the agent went back to work after writing it. */
+function isWorkAfterNarration(message: DisplayedMessage): boolean {
+  return message.type === "tool" && !BOOKKEEPING_TOOL_NAMES.has(message.toolName);
+}
+
+/** Records the file a successful edit call changed. A call with no readable path counts alone. */
+function collectEditedFile(
+  editedFiles: Set<string>,
+  call: { id: string; toolName: string; args: unknown; result: unknown; failed: boolean }
+): void {
+  if (!FILE_EDIT_TOOL_NAMES.has(call.toolName) || call.failed) {
+    return;
+  }
+  const result = unwrapJsonResult(call.result);
+  if (isPlainObject(result) && result.success === false) {
+    return;
+  }
+  const path = isPlainObject(call.args) ? call.args.path : undefined;
+  editedFiles.add(typeof path === "string" ? path : `call:${call.id}`);
+}
+
+/** Records the files a work row edited: its own edit, or the edits of a script's nested calls. */
+function collectEditedFiles(editedFiles: Set<string>, message: WorkBundleRow): void {
+  if (message.type !== "tool") {
+    return;
+  }
+  collectEditedFile(editedFiles, {
+    id: message.id,
+    toolName: message.toolName,
+    args: message.args,
+    result: message.result,
+    failed: message.status !== "completed",
+  });
+  for (const call of Array.isArray(message.nestedCalls) ? message.nestedCalls : []) {
+    collectEditedFile(editedFiles, {
+      id: call.toolCallId,
+      toolName: call.toolName,
+      args: call.input,
+      result: call.output,
+      failed: call.failed === true || call.state !== "output-available",
+    });
+  }
+}
+
+/**
+ * Compact density. Each stretch of consecutive agent rows of one message (narration, reasoning,
+ * tool calls) becomes a work bundle: the last narration is the reply and stays in view, and every
+ * other row folds behind one line. Rows of another kind (a prompt, a question, a plan, an error)
+ * end the stretch and are never folded.
+ *
+ * A finished stretch that went back to work after its last narration (it was interrupted, or
+ * failed) has no reply: that narration announced work, it did not report on it. The work after
+ * it gets a line of its own below it, so the narration does not read as the turn's answer.
+ *
+ * A live stretch shows two more things through the fold so the user can see what the agent is
+ * doing without the whole log: calls that are still running, and its latest step.
+ */
 export function computeWorkBundleInfos(
-  messages: DisplayedMessage[]
+  messages: DisplayedMessage[],
+  options: ComputeBundleInfosOptions
 ): Array<WorkBundleInfo | undefined> {
   const infos = new Array<WorkBundleInfo | undefined>(messages.length);
   let index = 0;
 
   while (index < messages.length) {
-    const span = findWorkBundleSpan(messages, index);
-    if (span === undefined) {
+    const first = messages[index];
+    if (!isWorkBundleRow(first)) {
       index += 1;
       continue;
     }
 
-    const entries: WorkBundleEntry[] = [];
-    for (let entryIndex = span.firstEntryIndex; entryIndex <= span.finalIndex; entryIndex++) {
-      entries.push({ message: messages[entryIndex], originalIndex: entryIndex });
+    // One assistant message is one stream. A second message that follows with no prompt in
+    // between (a wake-up, a continuation) is its own stretch with its own reply.
+    const start = index;
+    while (index < messages.length) {
+      const candidate = messages[index];
+      if (!isWorkBundleRow(candidate) || candidate.historyId !== first.historyId) {
+        break;
+      }
+      index += 1;
     }
-
-    const finalMessage = messages[span.finalIndex];
-    if (span.state === "settled" && finalMessage?.type !== "assistant") {
-      index = span.finalIndex + 1;
-      continue;
-    }
-
-    const frozenEntries = Object.freeze(entries);
-    const firstAgentMessage = frozenEntries.find((entry) =>
-      isWorkBundleAgentMessage(entry.message)
-    );
-    if (firstAgentMessage === undefined) {
-      index = span.finalIndex + 1;
-      continue;
-    }
-
-    const info: WorkBundleInfo = {
-      key: `work:${firstAgentMessage.message.id}`,
-      position: "head",
-      headIndex: span.headIndex,
-      entries: frozenEntries,
-      startedAtMs: getMessageTimestamp(frozenEntries[0].message),
-      durationMs:
-        span.state === "active"
-          ? undefined
-          : computeWorkBundleDurationMs(frozenEntries, finalMessage),
-      state: span.state,
-      defaultExpanded: span.state === "active",
-    };
-
-    infos[span.headIndex] = info;
-    for (const entry of entries) {
-      infos[entry.originalIndex] = {
-        ...info,
-        position:
-          entry.originalIndex === span.headIndex
-            ? "head"
-            : span.state === "settled" && entry.originalIndex === span.finalIndex
-              ? "final"
-              : "member",
-      };
-    }
-    index = span.finalIndex + 1;
+    assignWorkBundle(infos, messages, start, index - 1, options.isTurnActive);
   }
 
   return infos;
 }
 
-export function computeOperationalBundleInfos(
+function assignWorkBundle(
+  infos: Array<WorkBundleInfo | undefined>,
   messages: DisplayedMessage[],
-  options: ComputeBundleInfosOptions
-): Array<OperationalBundleInfo | undefined> {
-  if (options.scope === "routine") {
-    return computeRoutineRunBundleInfos(messages, options);
-  }
-
-  const infos = new Array<OperationalBundleInfo | undefined>(messages.length);
-  let index = 0;
-
-  while (index < messages.length) {
-    const leadingReasoningStart = index;
-    const leadingReasoningEntries: OperationalBundleEntry[] = [];
-    while (true) {
-      const message = messages[index];
-      if (message?.type !== "reasoning") break;
-      leadingReasoningEntries.push({ message, originalIndex: index });
-      index += 1;
-    }
-
-    if (leadingReasoningEntries.length > 0 && messages[index]?.type === "assistant") {
-      index += 1;
-    } else if (leadingReasoningEntries.length > 0) {
-      leadingReasoningEntries.length = 0;
-      index = leadingReasoningStart;
-    }
-
-    const firstMessage = messages[index];
-    if (!isOperationalBundleMemberMessage(firstMessage)) {
-      index += 1;
+  start: number,
+  end: number,
+  isTurnActive: boolean
+): void {
+  let lastWorkIndex = -1;
+  let lastTextIndex = -1;
+  let hasRunningRow = false;
+  let startedAtMs =
+    messages[start - 1]?.type === "user" ? getMessageTimestamp(messages[start - 1]) : undefined;
+  let endedAtMs: number | undefined;
+  for (let index = start; index <= end; index++) {
+    const message = messages[index];
+    if (!isWorkBundleRow(message)) {
       continue;
     }
-
-    const headIndex = index;
-    const entries: OperationalBundleEntry[] = [...leadingReasoningEntries];
-    while (index < messages.length) {
-      const candidate = messages[index];
-      if (!isOperationalBundleMemberMessage(candidate)) {
-        break;
-      }
-      entries.push({ message: candidate, originalIndex: index });
-      index += 1;
+    if (message.type === "assistant") {
+      lastTextIndex = index;
+    } else {
+      lastWorkIndex = index;
     }
-
-    const frozenEntries = Object.freeze(entries);
-    const messagesInBundle = frozenEntries.map((entry) => entry.message);
-    const allTaskAwaits = messagesInBundle.every(isTaskAwaitMessage);
-    const state = getBundleState(frozenEntries);
-    const needsAttention = hasTaskAwaitTerminalIssue(messagesInBundle);
-    assignBundleInfo(infos, {
-      key: `bundle:${entries[0].message.id}`,
-      position: "head",
-      headIndex,
-      entries: frozenEntries,
-      summary: summarizeOperationalBundle(messagesInBundle),
-      state,
-      defaultExpanded: needsAttention || (state === "active" && !allTaskAwaits),
-    });
+    hasRunningRow ||= isRunningWorkBundleRow(message);
+    const timestamp = getMessageTimestamp(message);
+    startedAtMs ??= timestamp;
+    // The latest timestamp, not the last row's: a row without its own carries its message's start.
+    if (timestamp !== undefined && (endedAtMs === undefined || timestamp > endedAtMs)) {
+      endedAtMs = timestamp;
+    }
+  }
+  // A reply with no work behind it needs no work line.
+  if (lastWorkIndex === -1) {
+    return;
   }
 
-  return infos;
+  // Live means the agent is still in this stretch: it is the transcript's tail, and the turn is
+  // running. A row that is itself still running also counts, for hosts that do not report the
+  // turn (and so a stale partial call does not look finished).
+  const isLive = end === messages.length - 1 && (isTurnActive || hasRunningRow);
+
+  // A finished stretch that worked on after its last narration is two stretches: the one that
+  // narration closes, and the work after it. Each half is assigned on its own (the first now ends
+  // on its narration and the second has none, so neither splits again).
+  if (!isLive && lastTextIndex !== -1 && lastTextIndex < end) {
+    let workedOn = false;
+    for (let index = lastTextIndex + 1; index <= end && !workedOn; index++) {
+      workedOn = isWorkAfterNarration(messages[index]);
+    }
+    if (workedOn) {
+      assignWorkBundle(infos, messages, start, lastTextIndex, isTurnActive);
+      assignWorkBundle(infos, messages, lastTextIndex + 1, end, isTurnActive);
+      return;
+    }
+  }
+
+  // The reply is the last narration, with any narration directly before it. Bookkeeping that
+  // follows it (a todo update, a notification) folds like the rest, so it never hides a reply.
+  let answerStart = lastTextIndex;
+  while (answerStart > start && messages[answerStart - 1].type === "assistant") {
+    answerStart -= 1;
+  }
+  const isAnswer = (index: number) =>
+    lastTextIndex !== -1 && index >= answerStart && index <= lastTextIndex;
+
+  let onlyReasoned = true;
+  const editedFiles = new Set<string>();
+  for (let index = start; index <= end; index++) {
+    const message = messages[index];
+    if (isAnswer(index) || !isWorkBundleRow(message)) {
+      continue;
+    }
+    onlyReasoned &&= message.type === "reasoning";
+    collectEditedFiles(editedFiles, message);
+  }
+
+  const base = {
+    key: `work:${messages[start].id}`,
+    headIndex: start,
+    state: isLive ? "live" : "settled",
+    kind: onlyReasoned ? "thought" : "work",
+    editedFileCount: editedFiles.size,
+    startedAtMs,
+    durationMs:
+      !isLive && startedAtMs !== undefined && endedAtMs !== undefined && endedAtMs > startedAtMs
+        ? endedAtMs - startedAtMs
+        : undefined,
+  } satisfies Partial<WorkBundleInfo>;
+
+  for (let index = start; index <= end; index++) {
+    const message = messages[index];
+    if (!isWorkBundleRow(message)) {
+      continue;
+    }
+    if (isAnswer(index)) {
+      infos[index] = { ...base, role: "answer", visibleWhenFolded: true };
+      continue;
+    }
+    infos[index] = {
+      ...base,
+      role: "work",
+      visibleWhenFolded:
+        // A running call may need the user (an approval) or be the thing they are waiting on.
+        (message.type === "tool" && isRunningWorkBundleRow(message)) ||
+        // The latest step, unless the agent has since moved on to writing.
+        (isLive && index === lastWorkIndex && index > lastTextIndex),
+    };
+  }
 }
 
 /**
@@ -367,7 +479,13 @@ function isRoutineToolMessage(
   );
 }
 
-function computeRoutineRunBundleInfos(
+/**
+ * Runs of two or more routine tool calls (reads, searches, shell commands, code execution, task
+ * polls) collapse into one summary row, the way Claude Code, Codex and Cursor fold exploration
+ * into "Explored 3 files" lines. Rows the user must see (edits, questions, plans, todos,
+ * attachments) stay standalone. This is the grouping inside a turn at either density.
+ */
+export function computeOperationalBundleInfos(
   messages: DisplayedMessage[],
   options: ComputeBundleInfosOptions
 ): Array<OperationalBundleInfo | undefined> {
@@ -455,217 +573,6 @@ function assignBundleInfo(
       position: entry.originalIndex === info.headIndex ? "head" : "member",
     };
   }
-}
-
-interface WorkBundleSpan {
-  headIndex: number;
-  firstEntryIndex: number;
-  finalIndex: number;
-  state: "active" | "settled";
-}
-
-function findWorkBundleSpan(
-  messages: DisplayedMessage[],
-  index: number
-): WorkBundleSpan | undefined {
-  const message = messages[index];
-  const firstEntryIndex = message?.type === "user" ? index + 1 : index;
-  const firstEntry = messages[firstEntryIndex];
-  if (getWorkBundleAgentHistoryId(firstEntry) === undefined) {
-    return undefined;
-  }
-
-  const finalIndex = findWorkBundleFinalIndex(messages, firstEntryIndex);
-  if (finalIndex === undefined) {
-    return undefined;
-  }
-
-  return {
-    headIndex: message?.type === "user" ? index : firstEntryIndex,
-    firstEntryIndex,
-    ...finalIndex,
-  };
-}
-
-function findWorkBundleFinalIndex(
-  messages: DisplayedMessage[],
-  startIndex: number
-): Pick<WorkBundleSpan, "finalIndex" | "state"> | undefined {
-  const firstHistoryId = getWorkBundleAgentHistoryId(messages[startIndex]);
-  if (firstHistoryId === undefined) {
-    return undefined;
-  }
-
-  const historyIds = new Set<string>([firstHistoryId]);
-  let canCrossVisibleConversation = false;
-  let sawVisibleConversationSinceLastAgent = false;
-  let sawAnyOperationalMessage = false;
-  let sawOperationalMessage = false;
-  let sawActiveMessage = false;
-  let lastAgentIndex = startIndex;
-  let finalIndex: number | undefined;
-
-  for (let index = startIndex; index < messages.length; index++) {
-    const message = messages[index];
-    if (!isWorkBundleTimelineMessage(message)) {
-      break;
-    }
-
-    if (isWorkBundleVisibleConversationMessage(message)) {
-      if (finalIndex !== undefined) {
-        break;
-      }
-      if (!canCrossVisibleConversation) {
-        break;
-      }
-      if (!hasFutureWorkBundleAgentMessage(messages, index + 1)) {
-        break;
-      }
-      sawVisibleConversationSinceLastAgent = true;
-      sawOperationalMessage = false;
-      sawActiveMessage = false;
-      canCrossVisibleConversation = false;
-      continue;
-    }
-
-    const messageHistoryId = getWorkBundleAgentHistoryId(message);
-    if (messageHistoryId === undefined) {
-      break;
-    }
-    if (!historyIds.has(messageHistoryId)) {
-      if (!sawVisibleConversationSinceLastAgent) {
-        break;
-      }
-      historyIds.add(messageHistoryId);
-    }
-    sawVisibleConversationSinceLastAgent = false;
-    lastAgentIndex = index;
-    if (isActiveWorkBundleMessage(message)) {
-      sawActiveMessage = true;
-    }
-
-    if (isWorkBundleOperationalMessage(message)) {
-      sawAnyOperationalMessage = true;
-      sawOperationalMessage = true;
-    }
-    canCrossVisibleConversation = canContinueWorkBundleAcrossConversation(message);
-
-    if (message.type !== "assistant" || message.isPartial || !sawOperationalMessage) {
-      continue;
-    }
-
-    finalIndex = index;
-    canCrossVisibleConversation = false;
-  }
-
-  if (!sawAnyOperationalMessage) {
-    return undefined;
-  }
-  if (finalIndex !== undefined && finalIndex >= startIndex) {
-    return { finalIndex, state: "settled" };
-  }
-  if (sawActiveMessage && lastAgentIndex >= startIndex) {
-    return { finalIndex: lastAgentIndex, state: "active" };
-  }
-
-  return undefined;
-}
-
-function hasFutureWorkBundleAgentMessage(
-  messages: DisplayedMessage[],
-  startIndex: number
-): boolean {
-  for (let index = startIndex; index < messages.length; index++) {
-    const message = messages[index];
-    if (!isWorkBundleTimelineMessage(message)) {
-      return false;
-    }
-    if (isWorkBundleVisibleConversationMessage(message)) {
-      continue;
-    }
-
-    return getWorkBundleAgentHistoryId(message) !== undefined;
-  }
-
-  return false;
-}
-
-function canContinueWorkBundleAcrossConversation(message: DisplayedMessage): boolean {
-  // Only partial tool rows prove the agent was still doing operational work when
-  // the user spoke. Partial reasoning/text alone can also be an interrupted turn;
-  // do not anchor the next prompt under that old turn's work bundle.
-  return (
-    message.type === "tool" &&
-    message.isPartial === true &&
-    (message.status === "pending" ||
-      message.status === "executing" ||
-      message.toolName === "ask_user_question")
-  );
-}
-
-function getWorkBundleAgentHistoryId(message: DisplayedMessage | undefined): string | undefined {
-  if (!isWorkBundleAgentMessage(message) || isWorkBundleVisibleConversationMessage(message)) {
-    return undefined;
-  }
-  return message.historyId;
-}
-
-function isWorkBundleTimelineMessage(
-  message: DisplayedMessage | undefined
-): message is DisplayedMessage & { type: "assistant" | "reasoning" | "tool" | "user" } {
-  return (
-    message?.type === "assistant" ||
-    message?.type === "reasoning" ||
-    message?.type === "tool" ||
-    message?.type === "user"
-  );
-}
-
-function isWorkBundleAgentMessage(
-  message: DisplayedMessage | undefined
-): message is DisplayedMessage & { type: "assistant" | "reasoning" | "tool" } {
-  return message?.type === "assistant" || message?.type === "reasoning" || message?.type === "tool";
-}
-
-function isWorkBundleVisibleConversationMessage(message: DisplayedMessage | undefined): boolean {
-  return message?.type === "user";
-}
-
-function isWorkBundleOperationalMessage(message: DisplayedMessage | undefined): boolean {
-  return message?.type === "reasoning" || message?.type === "tool";
-}
-
-function isActiveWorkBundleMessage(message: DisplayedMessage): boolean {
-  if (message.type === "assistant" || message.type === "reasoning") {
-    return message.isStreaming;
-  }
-  return (
-    message.type === "tool" && (message.status === "pending" || message.status === "executing")
-  );
-}
-
-function getMessageTimestamp(message: DisplayedMessage): number | undefined {
-  return "timestamp" in message && typeof message.timestamp === "number"
-    ? message.timestamp
-    : undefined;
-}
-
-function computeWorkBundleDurationMs(
-  entries: readonly WorkBundleEntry[],
-  finalMessage: DisplayedMessage
-): number | undefined {
-  const startTimestamp = getMessageTimestamp(entries[0].message);
-  const endTimestamp =
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-    getMessageTimestamp(finalMessage) ?? getMessageTimestamp(entries.at(-1)!.message);
-  if (
-    startTimestamp === undefined ||
-    endTimestamp === undefined ||
-    endTimestamp <= startTimestamp
-  ) {
-    return undefined;
-  }
-  return endTimestamp - startTimestamp;
 }
 
 export function summarizeOperationalBundle(

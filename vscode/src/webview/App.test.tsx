@@ -162,6 +162,14 @@ async function emitBackgroundBashes(
   await settle();
 }
 
+// Compact density (the default) folds a finished turn's rows behind its work line. Tests about
+// the rows themselves ask for the detailed transcript, as a user who wants every step does.
+async function showEveryStep(bridge: TestBridge): Promise<void> {
+  await bridge.answer("config.getConfig", {
+    userPreferences: { appearance: { transcriptDensity: "normal" } },
+  });
+}
+
 async function selectWorkspace(
   bridge: TestBridge,
   history: unknown[] = [],
@@ -482,6 +490,7 @@ describe("vscode webview workspace selection", () => {
         },
       },
     ]);
+    await showEveryStep(bridge);
 
     expect(view.container.textContent).toContain("echo webview");
     expect(view.container.textContent).toContain("provider exploded");
@@ -601,6 +610,7 @@ describe("vscode webview workspace selection", () => {
         { success: true, output: "kept", exitCode: 0, wall_duration_ms: 3 }
       ),
     ]);
+    await showEveryStep(bridge);
     const textarea = () => view.container.querySelector("textarea");
     expect(view.container.textContent).toContain("echo kept");
     expect(textarea()?.disabled).toBe(false);
@@ -1106,6 +1116,8 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
         { success: true, output: "ok", exitCode: 0, wall_duration_ms: 5 }
       ),
     ]);
+    // The rows are behind the turn's work line at the default density, with or without config.
+    fireEvent.click(view.getByTestId("work-bundle"));
 
     // Default mode: the intent above the command.
     expect(view.getByText("List the repository files")).toBeDefined();
@@ -1130,7 +1142,7 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     expect(view.queryByText(script)).toBeNull();
   });
 
-  test("hyper transcript density collapses a finished turn's work into a work bundle (#4979)", async () => {
+  test("compact transcript density folds a finished turn's work behind a work line (#4979)", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, [
@@ -1180,11 +1192,11 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     });
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     expect(view.queryByText("I'll gather context first.")).not.toBeNull();
-    // Hyper density also groups the expanded bundle's tool rows, as on desktop.
+    // Opened, the turn groups its tool rows as on desktop.
     expect(view.getByTestId("operational-bundle").textContent).toContain("Ran 2 commands");
   });
 
-  test("consecutive task_await polls collapse into one operational bundle in the default density (#4979)", async () => {
+  test("consecutive task_await polls collapse into one operational bundle (#4979)", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(
@@ -1199,6 +1211,7 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
         )
       )
     );
+    await showEveryStep(bridge);
 
     const bundles = view.getAllByTestId("operational-bundle");
     expect(bundles).toHaveLength(1);
@@ -2316,6 +2329,7 @@ describe("vscode webview message rows", () => {
         )
       )
     );
+    await showEveryStep(bridge);
 
     // A boolean, so a failure does not print the whole row element.
     const middleRowRendered = () =>
@@ -2373,6 +2387,7 @@ describe("vscode webview message rows", () => {
         }
       ),
     ]);
+    await showEveryStep(bridge);
 
     expect(view.queryByText(/bash · Watching PR 27330 until it is ready/)).not.toBeNull();
   });
@@ -3122,6 +3137,7 @@ describe("vscode webview background processes strip (#5092)", () => {
       ],
       workspace
     );
+    await showEveryStep(bridge);
     await settle();
 
     await click(view.getByRole("button", { name: "View output" }));
