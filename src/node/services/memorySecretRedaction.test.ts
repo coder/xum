@@ -1139,7 +1139,9 @@ describe("redactSecretLike", () => {
 
   // The `]` that a signed-URL match adds is followed through every pass after it. Each shape puts the
   // edit of another pass in front of it, behind it, or right up to it. A position that a pass moved
-  // without reporting it would delete some other character, and `removeAt` would assert.
+  // without reporting it deletes some other character, which these exact outputs show. `removeAt`
+  // asserts only when that character is no `]` with a `]` behind it. The last shape ends in `]]`,
+  // so a stale position that lands there is deleted without an assertion: only the output tells.
   it.each([
     [
       "a key's value in front",
@@ -1187,11 +1189,30 @@ describe("redactSecretLike", () => {
       "?sig=sk-ABCDEFGHIJKLMNOP\n" + String.raw`a\tCookie: v1`,
       "?sig=[redacted]\n" + String.raw`a\tCookie: [redacted]`,
     ],
+    [
+      "a reader's header in front, and a `]]` at the end of the text",
+      String.raw`a\tCookie: XXXXXXXXXXXXX` + "\n?sig=[redacted]x]]",
+      String.raw`a\tCookie: [redacted]` + "\n?sig=[redacted]x]]",
+    ],
   ])("follows the added bracket past another pass: %s", (_label, text, expected) => {
     const redacted = redactSecretLike(text);
     expect(redacted).toBe(expected);
     expect(redactSecretLike(redacted)).toBe(redacted);
   });
+
+  // Only the marker's own head is read back as the marker. A value that merely starts or ends like it
+  // is a value: its `]` stays as on main, and no tracked bracket is taken out.
+  it.each([
+    ["a value that goes on after the head", "?sig=[redactedX]", "?sig=[redacted]]"],
+    ["a value that has the head at its end", "?sig=abc[redacted]", "?sig=[redacted]]"],
+    ["a value that has the head in the middle", "?sig=abc[redactedX]", "?sig=[redacted]]"],
+  ])(
+    "leaves the bracket of a value that is not the marker's head: %s",
+    (_label, text, expected) => {
+      expect(redactSecretLike(text)).toBe(expected);
+      expect(redactSecretLike(expected)).toBe(expected);
+    }
+  );
 
   // A half marker is not the marker: a value that merely starts like it is still a value.
   it("redacts a signature value that starts like the marker but is not it", () => {

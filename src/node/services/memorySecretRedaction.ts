@@ -66,10 +66,13 @@ function replaceMatches(
 }
 
 /**
- * `text` without the character at each position. Every position must hold a `]` with a `]` behind
- * it, so a deletion cannot break a marker. A position that a pass moved without reporting it (see
- * `followPositions`) would delete some other character: fail fast instead. The message names no
- * text, since the text can hold a credential.
+ * `text` without the character at each position. The assertion guarantees one thing: every position
+ * holds a `]` with a `]` behind it, so a deletion never takes a lone `]` out of a text and a marker
+ * keeps its closing bracket. It does not prove that a position is one the signed-URL pattern added:
+ * a position that a pass moved without reporting it (see `followPositions`) is caught only when it no
+ * longer lands on a `]` that a `]` follows. Where it lands on another such pair, that `]` is deleted
+ * silently. The tests that pin what each pass reports are the guard against that. The message names
+ * no text, since the text can hold a credential.
  */
 function removeAt(text: string, positions: number[]): string {
   if (positions.length === 0) return text;
