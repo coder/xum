@@ -35,6 +35,87 @@ console.log(JSON.stringify(calls.map(([name, ...args]) => guards[name](...args))
   return JSON.parse(child.stdout.toString());
 }
 
+// The timing rows in this file compare CPU time, not wall-clock time. Wall-clock time also counts the time other
+// processes keep the CPU from this one, so a loaded host, or a second test run on the same CPU,
+// stretched a 66 ms scan past its 100 ms budget, and the mutation gate dropped the whole file at
+// its baseline. CPU time is the process's own, and it stayed within 7% when two runs shared one
+// CPU. A budget alone is not enough: the slowest linear scan takes about 90 ms, so a budget low
+// enough to catch a regression on the faster ones would fail it. Each row therefore also runs its
+// text cut to a half, a quarter and an eighth, and checks how the cost per character grows from
+// each size to the next.
+//
+// One ratio against the first eighth does not work. Bun 1.4 runs a regex about 70 times cheaper
+// per character on a text shorter than some length (near 65,000 characters for the cookie rows,
+// near 35,000 for the escaped runs), so the eighth of a long text looks cheap and the whole text
+// 3 to 28 times costlier per character, with no quadratic scan involved: CI failed two rows on it
+// at 3.6 and 3.2. That jump sits at one size, so it hits one of the three doublings. A quadratic
+// scan hits all three, so the median of the three growths tells the two apart. The floor below
+// means a quadratic cost under about 13 ms at the full size passes unseen, and so does a cost that
+// grows at one doubling only, up to the ceiling.
+const SCAN_SIZE_DIVISORS = [8, 4, 2, 1];
+// Past this, a scan fails whatever its growth: the slowest linear scan takes about a third of it,
+// and the regressions this guards cost seconds.
+const SCAN_CPU_CEILING_MS = 300;
+// How much the cost per character grows when the text doubles: 1 for a linear scan (1.36 at most
+// over 720 measurements each on Bun 1.3.14 and 1.4.3), 2 for a quadratic one.
+const SCAN_GROWTH_PER_DOUBLING_LIMIT = 1.6;
+// A cut that costs less than this is mostly timer and allocation noise. Bun 1.4 measured growths
+// up to 1.9 on linear scans with no floor, and up to 1.65 with a floor of 0.25.
+const SCAN_CPU_FLOOR_MS = 1;
+// Bun's default per-test timeout is 5 s of wall-clock time, and a row times CPU, so it must not be
+// the limit: a loaded host stretched the slowest rows to 4.8 s with four copies of this file on
+// one CPU. The ceiling and the growth limit are what fail a row.
+const SCAN_TEST_TIMEOUT_MS = 30_000;
+
+function cpuMilliseconds(run: () => void): number {
+  const before = process.cpuUsage();
+  run();
+  const used = process.cpuUsage(before);
+  return (used.user + used.system) / 1000;
+}
+
+/**
+ * The least CPU time of up to `runs` runs. One run can be slow for no fault of the scan: a 50 ms
+ * scan once measured 350 ms (the process's CPU time counts all its threads). So the runs stop
+ * early only when the first two are both past the ceiling, which a quadratic scan does every
+ * time, and a failing test does not repeat for long.
+ */
+function bestCpuMilliseconds(run: () => void, runs: number): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (let attempt = 0; attempt < runs; attempt++) {
+    const cpuMs = cpuMilliseconds(run);
+    best = Math.min(best, cpuMs);
+    if (attempt >= 1 && best >= SCAN_CPU_CEILING_MS) break;
+  }
+  return best;
+}
+
+/** The CPU time of the whole text, and the median growth of the cost per character per doubling. */
+function measureScan(
+  scan: (text: string) => unknown,
+  text: string
+): { fullMs: number; growth: number } {
+  const timesMs = SCAN_SIZE_DIVISORS.map((divisor) => {
+    const part = text.slice(0, Math.floor(text.length / divisor));
+    scan(part);
+    return bestCpuMilliseconds(() => scan(part), divisor >= 4 ? 5 : 3);
+  });
+  // Each size is twice the one before, so the cost per character grew by `next / (2 * previous)`.
+  const growths = timesMs
+    .slice(1)
+    .map((next, i) => next / (2 * Math.max(timesMs[i], SCAN_CPU_FLOOR_MS)))
+    .sort((a, b) => a - b);
+  // Four sizes give three growths, so the middle one is the median.
+  return { fullMs: timesMs[timesMs.length - 1], growth: growths[Math.floor(growths.length / 2)] };
+}
+
+/** Fails when `scan` costs 300 ms or more on `text`, or more than linear time as `text` grows. */
+function expectLinearScan(scan: (text: string) => unknown, text: string): void {
+  const { fullMs, growth } = measureScan(scan, text);
+  expect(fullMs).toBeLessThan(SCAN_CPU_CEILING_MS);
+  expect(growth).toBeLessThan(SCAN_GROWTH_PER_DOUBLING_LIMIT);
+}
+
 describe("redactSecretLike", () => {
   const FAKE = {
     github: `gho_${"Q7w3".repeat(9)}`,
@@ -1816,75 +1897,6 @@ describe("redactSecretLike", () => {
     );
   });
 
-  // The rows below compare CPU time, not wall-clock time. Wall-clock time also counts the time other
-  // processes keep the CPU from this one, so a loaded host, or a second test run on the same CPU,
-  // stretched a 66 ms scan past its 100 ms budget, and the mutation gate dropped the whole file at
-  // its baseline. CPU time is the process's own, and it stayed within 7% when two runs shared one
-  // CPU. A budget alone is not enough: the slowest linear scan takes about 90 ms, so a budget low
-  // enough to catch a regression on the faster ones would fail it. Each row therefore also runs its
-  // text cut to a half, a quarter and an eighth, and checks how the cost per character grows from
-  // each size to the next.
-  //
-  // One ratio against the first eighth does not work. Bun 1.4 runs a regex about 70 times cheaper
-  // per character on a text shorter than some length (near 65,000 characters for the cookie rows,
-  // near 35,000 for the escaped runs), so the eighth of a long text looks cheap and the whole text
-  // 3 to 28 times costlier per character, with no quadratic scan involved: CI failed two rows on it
-  // at 3.6 and 3.2. That jump sits at one size, so it hits one of the three doublings. A quadratic
-  // scan hits all three, so the median of the three growths tells the two apart. The floor below
-  // means a quadratic cost under about 13 ms at the full size passes unseen.
-  const SCAN_SIZE_DIVISORS = [8, 4, 2, 1];
-  // Past this, a scan fails whatever its growth: the slowest linear scan takes about a third of it,
-  // and the regressions this guards cost seconds.
-  const SCAN_CPU_CEILING_MS = 300;
-  // How much the cost per character grows when the text doubles: 1 for a linear scan (1.36 at most
-  // over 720 measurements each on Bun 1.3.14 and 1.4.3), 2 for a quadratic one.
-  const SCAN_GROWTH_PER_DOUBLING_LIMIT = 1.6;
-  // A cut that costs less than this is mostly timer and allocation noise. Bun 1.4 measured growths
-  // up to 1.9 on linear scans with no floor, and up to 1.65 with a floor of 0.25.
-  const SCAN_CPU_FLOOR_MS = 1;
-
-  function cpuMilliseconds(run: () => void): number {
-    const before = process.cpuUsage();
-    run();
-    const used = process.cpuUsage(before);
-    return (used.user + used.system) / 1000;
-  }
-
-  /**
-   * The least CPU time of up to `runs` runs. One run can be slow for no fault of the scan: a 50 ms
-   * scan once measured 350 ms (the process's CPU time counts all its threads). So the runs stop
-   * early only when the first two are both past the ceiling, which a quadratic scan does every
-   * time, and a failing test does not repeat for long.
-   */
-  function bestCpuMilliseconds(run: () => void, runs: number): number {
-    let best = Number.POSITIVE_INFINITY;
-    for (let attempt = 0; attempt < runs; attempt++) {
-      const cpuMs = cpuMilliseconds(run);
-      best = Math.min(best, cpuMs);
-      if (attempt >= 1 && best >= SCAN_CPU_CEILING_MS) break;
-    }
-    return best;
-  }
-
-  /** The CPU time of the whole text, and the median growth of the cost per character per doubling. */
-  function measureScan(
-    scan: (text: string) => unknown,
-    text: string
-  ): { fullMs: number; growth: number } {
-    const timesMs = SCAN_SIZE_DIVISORS.map((divisor) => {
-      const part = text.slice(0, Math.floor(text.length / divisor));
-      scan(part);
-      return bestCpuMilliseconds(() => scan(part), divisor >= 4 ? 5 : 3);
-    });
-    // Each size is twice the one before, so the cost per character grew by `next / (2 * previous)`.
-    const growths = timesMs
-      .slice(1)
-      .map((next, i) => next / (2 * Math.max(timesMs[i], SCAN_CPU_FLOOR_MS)))
-      .sort((a, b) => a - b);
-    // Four sizes give three growths, so the middle one is the median.
-    return { fullMs: timesMs[timesMs.length - 1], growth: growths[Math.floor(growths.length / 2)] };
-  }
-
   // The guard scans text a model supplied, so a hostile 100 KB write must not stall the process.
   // Each shape repeats a keyword with nothing after it, which made the open-ended name suffix and
   // JWT segment rescan to the end of the text from every occurrence (seconds per input).
@@ -1966,7 +1978,7 @@ describe("redactSecretLike", () => {
     ["a key and a run of markers", `token=${"[redacted]".repeat(5_000)}x`],
     ["a key and markers each with a tail", `token=${"[redacted]x".repeat(5_000)}`],
     ["keys that each hold a marker and a tail", "token=[redacted]x ".repeat(4_000)],
-    ["a key and a marker followed by brackets", `token=[redacted]${"]x".repeat(10_000)}`],
+    ["a key and a marker followed by brackets", `token=[redacted]${"]x".repeat(50_000)}`],
     ["a signature and a run of markers", `?sig=${"[redacted]]".repeat(5_000)}x`],
     ["keys and half markers", "token=[redacted".repeat(10_000)],
     [
@@ -1974,21 +1986,24 @@ describe("redactSecretLike", () => {
       `token=[redacted]${"。".repeat(100 * 1024)}秘`,
     ],
     ["a marker and a tail of 50 Ki astral letters", `password=[redacted]${"𝒜".repeat(50 * 1024)}`],
-  ])("scans %s in linear time", (_label, text) => {
-    redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
-    // Each scan gets its own checks: `containsSecretLike` is a second pass of the same redaction.
-    for (const scan of [redactSecretLike, containsSecretLike]) {
-      const { fullMs, growth } = measureScan(scan, text);
-
-      expect(fullMs).toBeLessThan(SCAN_CPU_CEILING_MS);
-      expect(growth).toBeLessThan(SCAN_GROWTH_PER_DOUBLING_LIMIT);
-    }
-  });
+  ])(
+    "scans %s in linear time",
+    (_label, text) => {
+      redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
+      // Each scan gets its own checks: `containsSecretLike` is a second pass of the same redaction.
+      for (const scan of [redactSecretLike, containsSecretLike]) expectLinearScan(scan, text);
+    },
+    SCAN_TEST_TIMEOUT_MS
+  );
 });
 
 describe("redactWithinCap", () => {
   const CAP = 100;
   const KEY = `ghp_${"a1B2".repeat(5)}`;
+
+  /** A scan that cuts a window `tail` characters before its end. */
+  const cutBefore = (tail: number) => (window: string) =>
+    redactWithinCap(window, window.length - tail, { cut: true });
 
   it("cuts text without a secret where redaction alone would, and reads the lookahead for none", () => {
     const text = "lorem ".repeat(300);
@@ -2158,18 +2173,21 @@ describe("redactWithinCap", () => {
   // JWT character comes before, so it reads the run once. Tried at every start it is quadratic:
   // with no anchor, with a `\b` anchor (a dash before each start passes it), or with an anchor
   // class that lacks the character before each start. That takes several seconds at these sizes,
-  // against well under 100 ms. The budget is generous because a loaded test host slows every row.
+  // against a few milliseconds. A row fails at 300 ms of CPU or when the cost per character grows
+  // with the window (see `measureScan`), so a loaded test host does not fail it.
   it.each([
     ["JWT starts", `${"eyJ".repeat(30_000)} `],
     ["JWT starts with a dash after each", `${"eyJ-".repeat(32_000)} `],
     ["JWT starts with an underscore after each", `${"eyJ_".repeat(32_000)} `],
-  ])("cuts a window of %s that miss its end in linear time", (_label, text) => {
-    // Keep a cold regex compile out of the timing.
-    redactWithinCap("warm up eyJabc.def", 10, { cut: true });
-    const started = performance.now();
-    redactWithinCap(text, text.length - REDACTION_LOOKAHEAD_CHARS, { cut: true });
-    expect(performance.now() - started).toBeLessThan(1_500);
-  });
+  ])(
+    "cuts a window of %s that miss its end in linear time",
+    (_label, text) => {
+      // Keep a cold regex compile out of the timing.
+      redactWithinCap("warm up eyJabc.def", 10, { cut: true });
+      expectLinearScan(cutBefore(REDACTION_LOOKAHEAD_CHARS), text);
+    },
+    SCAN_TEST_TIMEOUT_MS
+  );
 
   // The cut reads the redacted window once more. Its cost must not grow faster than the window: a
   // quadratic scan of these shapes takes seconds at this size.
@@ -2178,12 +2196,16 @@ describe("redactWithinCap", () => {
     ["JWT starts with a dot after each", "eyJabc.".repeat(4_300)],
     ["one long header and one long payload", `eyJ${"a".repeat(15_000)}.${"b".repeat(15_000)} x`],
     ["many long parts", `eyJ${"a".repeat(1_000)}.`.repeat(30)],
-  ])("cuts the window of %s in linear time", (_label, text) => {
-    redactWithinCap("warm up eyJabc.def", 10, { cut: true }); // keep a cold regex compile out of the timing
-    const started = performance.now();
-    redactWithinCap(text, 29_000, { cut: true });
-    expect(performance.now() - started).toBeLessThan(100);
-  });
+  ])(
+    "cuts the window of %s in linear time",
+    (_label, text) => {
+      redactWithinCap("warm up eyJabc.def", 10, { cut: true }); // keep a cold regex compile out of the timing
+      // The cap is 29,000 characters of a window of about 30,000: it stays that far from the end when
+      // the window is cut for the growth check.
+      expectLinearScan(cutBefore(text.length - 29_000), text);
+    },
+    SCAN_TEST_TIMEOUT_MS
+  );
 });
 
 describe("containsSecretLike", () => {
