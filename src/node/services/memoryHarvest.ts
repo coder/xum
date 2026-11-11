@@ -253,6 +253,26 @@ function piecesOfPart(
   });
 }
 
+/** Whether a part gives a row text: a part its cut left empty does, as its piece carries the note. */
+function hasRowText(rowText: RowText): boolean {
+  return rowText.text !== "" || rowText.cutChars > 0;
+}
+
+/**
+ * Whether `piece` joins the row of `group`, whose text with the piece's would be `joinedChars` long.
+ * A segment's row stays its own: no piece fits behind a segment, as the group starts with it, and a
+ * segment never fits behind another piece. A first segment is usually a whole row's text, but the
+ * cut at a JWT can leave a short one, or only its note, and that note must not read as a cut of the
+ * parts before it.
+ */
+function fitsBehind(group: HarvestPiece[], piece: HarvestPiece, joinedChars: number): boolean {
+  return (
+    group[0].segment === undefined &&
+    piece.segment === undefined &&
+    joinedChars <= HARVEST_MAX_ROW_TEXT_CHARS
+  );
+}
+
 /**
  * Splits a message into evidence rows. Parts are packed in order: a row takes parts while their
  * text, joined by newlines, stays within the row's limit. A part is never split, except a text part
@@ -267,8 +287,7 @@ function formatMessageForHarvest(message: MuxMessage): HarvestEvidenceRow[] {
   };
   const texts = message.parts
     .map((part) => ({ part, rowText: rowTextOfPart(part) }))
-    // A part its cut left empty stays: its piece carries the cut's note.
-    .filter(({ rowText }) => rowText.text !== "" || rowText.cutChars > 0);
+    .filter(({ rowText }) => hasRowText(rowText));
   if (texts.length === 0) return [{ ...base, text: "", truncated: false }];
 
   const pieces = texts.flatMap(({ part, rowText }, index) =>
@@ -280,16 +299,7 @@ function formatMessageForHarvest(message: MuxMessage): HarvestEvidenceRow[] {
     const group = groups.at(-1);
     // The newline that joins the piece to the row's text counts too.
     const joinedChars = groupChars + 1 + piece.text.length;
-    // A segment's row stays its own: no piece fits behind a segment, as the group starts with it,
-    // and a segment never fits behind another piece. A first segment is usually a whole row's
-    // text, but the cut at a JWT can leave a short one, or only its note, and that note must not
-    // read as a cut of the parts before it.
-    const fits =
-      group !== undefined &&
-      group[0].segment === undefined &&
-      piece.segment === undefined &&
-      joinedChars <= HARVEST_MAX_ROW_TEXT_CHARS;
-    if (fits) {
+    if (group !== undefined && fitsBehind(group, piece, joinedChars)) {
       group.push(piece);
       groupChars = joinedChars;
     } else {
