@@ -104,10 +104,10 @@ test("the open review is the first waiting one whose plugin has a managed card, 
   const { result } = renderHook(() => useUpdateReviewQueue(queued, cards));
 
   expect(result.current.open).toBe(queued[1]);
-  act(() => result.current.settle(result.current.open ?? undefined));
+  act(() => result.current.settle(queued[1]));
   expect(result.current.open).toBe(queued[3]);
   expect(result.current.waiting).toEqual([queued[0], queued[2], queued[3]]);
-  act(() => result.current.settle(result.current.open ?? undefined));
+  act(() => result.current.settle(queued[3]));
   expect(result.current.open).toBeNull();
   expect(result.current.waiting).toEqual([queued[0], queued[2]]);
 });
