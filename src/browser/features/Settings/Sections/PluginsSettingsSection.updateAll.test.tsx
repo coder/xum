@@ -22,6 +22,8 @@ afterEach(() => {
   cleanupDom?.();
 });
 
+type Deferred = ReturnType<typeof Promise.withResolvers<void>>;
+
 const OLD_SHA = "a".repeat(40);
 /** The commit the list reports after an update; no review text carries it. */
 const UPDATED_SHA = "c".repeat(40);
@@ -74,8 +76,7 @@ function createApi(fixture: Fixture) {
       name,
       status: pending.has(name) ? "update-available" : "up-to-date",
     }));
-  let gate: { entered: PromiseWithResolvers<void>; released: PromiseWithResolvers<void> } | null =
-    null;
+  let gate: { entered: Deferred; released: Deferred } | null = null;
   api.agentPlugins.checkUpdates = (async () => {
     if (gate !== null) {
       gate.entered.resolve();
