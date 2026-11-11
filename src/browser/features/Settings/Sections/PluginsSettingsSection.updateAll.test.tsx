@@ -58,8 +58,30 @@ function createApi(fixture: Fixture) {
       name,
       status: pending.has(name) ? "update-available" : "up-to-date",
     }));
-  api.agentPlugins.checkUpdates = (() =>
-    Promise.resolve({ success: true, data: checks() })) as typeof api.agentPlugins.checkUpdates;
+  let gate: { entered: PromiseWithResolvers<void>; released: PromiseWithResolvers<void> } | null =
+    null;
+  api.agentPlugins.checkUpdates = (async () => {
+    if (gate !== null) {
+      gate.entered.resolve();
+      await gate.released.promise;
+    }
+    return { success: true, data: checks() };
+  }) as typeof api.agentPlugins.checkUpdates;
+  /** Holds the next update check: `entered` settles when it starts, `release` lets it finish. */
+  const holdChecks = () => {
+    const held = {
+      entered: Promise.withResolvers<void>(),
+      released: Promise.withResolvers<void>(),
+    };
+    gate = held;
+    return {
+      entered: held.entered.promise,
+      release: () => {
+        gate = null;
+        held.released.resolve();
+      },
+    };
+  };
   api.agentPlugins.previewUpdate = ((input: { name: string }) => {
     previews.push(input.name);
     const found = pending.get(input.name);
@@ -74,7 +96,7 @@ function createApi(fixture: Fixture) {
     pending.delete(input.name);
     return Promise.resolve({ success: true });
   }) as unknown as typeof api.agentPlugins.update;
-  return { api, updates, previews };
+  return { api, updates, previews, holdChecks };
 }
 
 function mount(api: ReturnType<typeof createApi>["api"]): RenderResult {
@@ -160,6 +182,50 @@ test("the status of a run goes away once the user settles a review it left open"
 
   fireEvent.click(buttonNamed(view, "Cancel")!);
   await waitFor(() => expect(status() === null).toBe(true));
+});
+
+test("reviews and the status appear only once the run has refreshed, with their controls enabled", async () => {
+  const { api, holdChecks } = createApi({
+    names: ["alpha", "beta"],
+    pending: { alpha: neutral("alpha"), beta: capabilityChanging("beta") },
+  });
+  const view = mount(api);
+  const status = () => view.container.querySelector('[role="status"]');
+  const button = await updateAllButton(view);
+
+  const hold = holdChecks();
+  fireEvent.click(button);
+  await hold.entered;
+  expect(openReviews(view)).toHaveLength(0);
+  expect(status() === null).toBe(true);
+
+  hold.release();
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+  expect(openReviews(view)[0].disabled).toBe(false);
+  expect(status() !== null).toBe(true);
+});
+
+test("the next queued review opens only after the confirmed update has settled", async () => {
+  const { api, updates, holdChecks } = createApi({
+    names: ["beta", "epsilon"],
+    pending: { beta: capabilityChanging("beta"), epsilon: capabilityChanging("epsilon") },
+  });
+  const view = mount(api);
+  const shows = (text: string) => (view.container.textContent ?? "").includes(text);
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+  expect(shows("adds skill 'beta'")).toBe(true);
+
+  const hold = holdChecks();
+  fireEvent.click(openReviews(view)[0]);
+  await hold.entered;
+  expect(updates.map((update) => update.name)).toEqual(["beta"]);
+  expect(shows("adds skill 'epsilon'")).toBe(false);
+
+  hold.release();
+  await waitFor(() => expect(shows("adds skill 'epsilon'")).toBe(true));
+  expect(openReviews(view)[0].disabled).toBe(false);
 });
 
 test("a failed update does not stop the others and the status names it", async () => {

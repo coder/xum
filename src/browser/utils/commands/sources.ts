@@ -660,6 +660,16 @@ async function updateAllPluginsFromPalette(
   api: BuildSourcesParams["api"],
   openPluginsSettings: () => void
 ): Promise<void> {
+  // The palette runs actions without a catch: a lost connection must still show an error.
+  await updateAllPluginsOrThrow(api, openPluginsSettings).catch((error: unknown) =>
+    showCommandFeedbackToast({ type: "error", message: getErrorMessage(error) })
+  );
+}
+
+async function updateAllPluginsOrThrow(
+  api: BuildSourcesParams["api"],
+  openPluginsSettings: () => void
+): Promise<void> {
   if (!api) return;
   const checks = await api.agentPlugins.checkUpdates();
   if (!checks.success) {

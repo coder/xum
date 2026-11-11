@@ -2105,7 +2105,6 @@ export const PluginsSettingsSection: React.FC = () => {
       // Mounted composers cache contributed slash-command/skill
       // descriptors; an update can change them without a remount.
       publishAgentPluginsMutated();
-      updateReviews.next();
     }
     // Refresh regardless of outcome (the swap may be partially visible),
     // but re-assert the mutation error AFTER the refresh: refresh's
@@ -2113,7 +2112,11 @@ export const PluginsSettingsSection: React.FC = () => {
     // the failure the user needs to see.
     await refresh();
     await checkForUpdates();
-    if (!result.success) {
+    if (result.success) {
+      // After the refresh, so the next queued review does not open while this update still holds
+      // `busyPlugin` (its own name is not the busy one, so its controls would look enabled).
+      updateReviews.next();
+    } else {
       setError(result.error);
     }
   };

@@ -482,6 +482,17 @@ describe("plugin update commands", () => {
     });
   });
 
+  test("Update All Plugins reports a transport failure", async () => {
+    await withTestWindow(async () => {
+      const { api } = pluginApi([], {});
+      api.agentPlugins.checkUpdates = () => Promise.reject(new Error("connection lost"));
+      const { toasts, openSettings } = await runCommand(CommandIds.pluginsUpdateAll(), api);
+
+      expect(toasts).toEqual([{ type: "error", message: "connection lost" }]);
+      expect(openSettings).not.toHaveBeenCalled();
+    });
+  });
+
   test("Update All Plugins with nothing pending stays out of Settings", async () => {
     await withTestWindow(async () => {
       const { api, updated } = pluginApi([], {});

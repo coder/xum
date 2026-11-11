@@ -72,9 +72,12 @@ export function useUpdateAll(deps: UpdateAllDeps) {
       if (result.updated.length > 0) {
         publishAgentPluginsMutated();
       }
-      deps.onReviews(result.reviews);
       await deps.refresh();
       await deps.checkForUpdates();
+      // Reviews and status appear together, in the render that also clears `busyPlugin`: a review
+      // shown earlier could be confirmed or cancelled while the run still holds the busy state, and
+      // the status written afterwards would describe a review that is already settled.
+      deps.onReviews(result.reviews);
       setStatus(summarizeUpdateAll(result));
     } finally {
       deps.setBusyPlugin(null);
