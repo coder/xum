@@ -306,7 +306,8 @@ describe("runLayoutPasses through a fake agent-browser", () => {
   test("a runtime that cannot exec reports browser-failed and never throws", async () => {
     const exec = spyOn(runtime, "exec").mockRejectedValue(new Error("connection reset"));
     const { outcomes } = await run({});
-    expect(exec).toHaveBeenCalledTimes(2);
+    // The run, the close, and the removal that follows a close that did not end well.
+    expect(exec).toHaveBeenCalledTimes(3);
     expect(new Set(summary(outcomes).map((line) => line.split(" ").slice(1).join(" ")))).toEqual(
       new Set(["failed browser-failed"])
     );
@@ -442,6 +443,20 @@ describe("runLayoutPasses through a fake agent-browser", () => {
       expect(Date.now() - started).toBeLessThan(15_000);
     }
   );
+
+  test("a close that is killed before it removes the folder still leaves no folder behind", async () => {
+    // A third of this budget is the close's time: less than the close waits for an answer, so
+    // the exec is killed while it waits, as on a host too loaded to finish in time.
+    const { fake } = await run({ closeHangs: true }, { budgetMs: 3_000 });
+    const seen = await fake.socketDirs();
+    expect(seen.at(-1)?.existed).toBe(true);
+    expect(
+      await fs.stat(seen[0]?.dir ?? "").then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
 
   test("a run never adopts a socket folder it did not create", async () => {
     // A name only this process uses, so parallel runs of this file on one host cannot collide.
