@@ -213,7 +213,9 @@ function boundedTextPart(raw: string): RowText {
   const window = takeWithoutMedia(raw, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
   // The cap is in the part's own characters: what redaction shortens does not bring the lookahead
   // into the kept text, where a key that the window's end cut would show as it is.
-  const prepared = neutralizeHarvestText(redactWithinCap(window.text, HARVEST_MAX_TEXT_PART_CHARS));
+  const prepared = neutralizeHarvestText(
+    redactWithinCap(window.text, HARVEST_MAX_TEXT_PART_CHARS, { cut: window.cut })
+  );
   const text = prepared.slice(0, HARVEST_MAX_TEXT_PART_CHARS);
   const pastCap = Math.max(0, window.text.length - HARVEST_MAX_TEXT_PART_CHARS);
   return { text, cutChars: raw.length - window.read + pastCap + prepared.length - text.length };

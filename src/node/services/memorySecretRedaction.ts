@@ -599,15 +599,18 @@ const OPEN_JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*)?$/;
  *
  * A secret that goes on past the lookahead cannot be matched whole, and its start inside the cap
  * would stay readable. The JWT is the only pattern that needs more than a minimum of its own
- * before it takes the rest of the window, so the output stops where a run that could be the start
- * of a JWT begins (`OPEN_JWT`). A pattern that is added with that need must be cut here too.
+ * before it takes the rest of the window, so when `cut` says that `text` is a window cut from a
+ * longer text, the output stops where a run that could be the start of a JWT begins (`OPEN_JWT`).
+ * A complete `text` has nothing past it, so a run that ends it is not cut. A pattern that is added
+ * with that need must be cut here too.
  */
-export function redactWithinCap(text: string, cap: number): string {
+export function redactWithinCap(text: string, cap: number, options: { cut: boolean }): string {
   const whole = redactSecretLike(text);
   // mutation-equivalent: at a length of exactly `cap` the head is the whole text, so either branch
   // returns the same text; this one skips the second redaction
   if (text.length <= cap) return whole;
   const shown = prefixWithinCap(text, cap, whole);
+  if (!options.cut) return shown;
   // What is shown is a prefix of `whole`, so an index in `whole` is an index in it.
   const open = whole.search(OPEN_JWT);
   return open < 0 ? shown : shown.slice(0, open);

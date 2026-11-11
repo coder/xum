@@ -216,6 +216,16 @@ describe("renderToolValue", () => {
     });
   });
 
+  // A value that fits the window is complete: a JWT-like run that ends it is no JWT, so what of it
+  // lies inside the cap is shown.
+  it("shows a JWT-like run that ends a complete value up to the cap", () => {
+    const text = `${"z".repeat(1_980)} eyJ${"A".repeat(30)}`;
+
+    expect(renderToolValue(text, 2_000)).toBe(
+      `${text.slice(0, 2_000)} [truncated ${text.length - 2_000} more chars for memory harvest]`
+    );
+  });
+
   it("says how much was cut when the whole value fit, and at least how much when it did not", () => {
     expect(renderToolValue("x".repeat(2_100), 2_000)).toBe(
       `${"x".repeat(2_000)} [truncated 100 more chars for memory harvest]`

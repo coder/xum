@@ -1226,6 +1226,22 @@ describe("runMemoryHarvest", () => {
       );
     });
 
+    // A part that fits the window is complete: a JWT-like run that ends it is no JWT, so what of it
+    // lies inside the cap is shown.
+    it("shows a JWT-like run that ends a complete part up to the cap", () => {
+      using fixture = createFixture();
+      const text = `${"z".repeat(TEXT_PART_LIMIT - 20)} eyJ${"A".repeat(30)}`;
+      fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
+
+      const rows = buildHarvestChunks(fixture.messages).flatMap(
+        (chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>
+      );
+
+      expect(rows.map((row) => row.text).join("")).toEndWith(
+        `${text.slice(TEXT_PART_LIMIT - 30, TEXT_PART_LIMIT)}\n[truncated ${text.length - TEXT_PART_LIMIT} more chars for memory harvest]`
+      );
+    });
+
     // A part that starts with such a run keeps nothing of it, and still says it was cut: its row
     // carries the note and the truncated flag, as a cut part with kept text does. As above, the note
     // counts the characters past the cap.
@@ -1241,8 +1257,9 @@ describe("runMemoryHarvest", () => {
             }>
         );
 
-      // One character past the cap is the least cut there is.
-      it.each([1, 600])(
+      // Only a window cut from a longer part is cut at a JWT-like run: 513 characters past the cap
+      // is one past the window (the cap and its 512-character lookahead), the least such cut.
+      it.each([513, 600])(
         "keeps its note when it is the message's only part, %d characters past the cap",
         (pastCap) => {
           const part = blob.slice(0, TEXT_PART_LIMIT + pastCap);

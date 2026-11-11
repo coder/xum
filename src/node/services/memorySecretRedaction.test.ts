@@ -1162,20 +1162,20 @@ describe("redactWithinCap", () => {
 
   it("cuts text without a secret where redaction alone would, and reads the lookahead for none", () => {
     const text = "lorem ".repeat(300);
-    expect(redactWithinCap(text, CAP)).toBe(text.slice(0, CAP));
+    expect(redactWithinCap(text, CAP, { cut: true })).toBe(text.slice(0, CAP));
   });
 
   it("returns the whole redaction of a text that fits under the cap", () => {
-    expect(redactWithinCap(`a ${KEY} b`, CAP)).toBe("a [redacted] b");
+    expect(redactWithinCap(`a ${KEY} b`, CAP, { cut: true })).toBe("a [redacted] b");
   });
 
   it("takes a secret that starts the text and crosses the cap whole", () => {
-    expect(redactWithinCap(`${KEY} tail`, 10)).toBe("[redacted]");
+    expect(redactWithinCap(`${KEY} tail`, 10, { cut: true })).toBe("[redacted]");
   });
 
   it("takes a secret that crosses the cap whole, and shows no part of it", () => {
     const text = `${"x".repeat(CAP - 11)} ${KEY} tail`;
-    expect(redactWithinCap(text, CAP)).toBe(`${"x".repeat(CAP - 11)} [redacted]`);
+    expect(redactWithinCap(text, CAP, { cut: true })).toBe(`${"x".repeat(CAP - 11)} [redacted]`);
   });
 
   // A secret that starts at the first character past the cap is not in the kept text, so no marker
@@ -1184,7 +1184,7 @@ describe("redactWithinCap", () => {
   it("shows no marker for a secret that starts right after the cap", () => {
     const text = `${"x".repeat(CAP - 1)} ${KEY} tail`;
     expect(text.indexOf(KEY)).toBe(CAP);
-    expect(redactWithinCap(text, CAP)).toBe(text.slice(0, CAP));
+    expect(redactWithinCap(text, CAP, { cut: true })).toBe(text.slice(0, CAP));
   });
 
   // Cut at the cap, a `Cookie:` header has no value, and redaction gives it a marker. In the whole
@@ -1197,14 +1197,14 @@ describe("redactWithinCap", () => {
     const text = `${header} \nnext line of text past the cap`;
     expect(redactSecretLike(header)).toBe(`${header}[redacted]`);
     expect(redactSecretLike(text)).toStartWith(`${header} [redacted]\nnext`);
-    expect(redactWithinCap(text, CAP)).toBe(header);
+    expect(redactWithinCap(text, CAP, { cut: true })).toBe(header);
   });
 
   // A value that redaction shortens must not let what lies past the cap into the output.
   it("shows no text from past the cap when redaction shortens the text before it", () => {
-    expect(redactWithinCap(`password=${"z".repeat(300)} visible beyond the cap`, 50)).toBe(
-      "password=[redacted]"
-    );
+    expect(
+      redactWithinCap(`password=${"z".repeat(300)} visible beyond the cap`, 50, { cut: true })
+    ).toBe("password=[redacted]");
   });
 
   // The window is the cap and its lookahead. Its end can cut a key: what is left is too short to
@@ -1213,12 +1213,12 @@ describe("redactWithinCap", () => {
   it("shows nothing of the lookahead's end when redaction shortens the text by more than it", () => {
     const window = `password=${"z".repeat(CAP + 512 - 21)} sk-QBNDZ8P3`;
     expect(window).toHaveLength(CAP + 512);
-    expect(redactWithinCap(window, CAP)).toBe("password=[redacted]");
+    expect(redactWithinCap(window, CAP, { cut: true })).toBe("password=[redacted]");
   });
 
   it("keeps a pair whose value goes past the cap redacted whole", () => {
     const text = `password=${"z".repeat(600)}`;
-    expect(redactWithinCap(text, CAP)).toBe("password=[redacted]");
+    expect(redactWithinCap(text, CAP, { cut: true })).toBe("password=[redacted]");
   });
 
   // The JWT pattern needs both dots. A JWT whose first parts run past the window is not matched, and
@@ -1243,7 +1243,9 @@ describe("redactWithinCap", () => {
     ])("stops at the start of %s", (_label, payload, header, glue) => {
       const text = `${before.trimEnd()}${glue}${jwt(header, payload)} tail`;
 
-      expect(redactWithinCap(windowOf(text), CAP)).toBe(`${before.trimEnd()}${glue}`);
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(
+        `${before.trimEnd()}${glue}`
+      );
     });
 
     // The JWT pattern's characters include `-`, `_` and digits in every part: a cut that misses
@@ -1253,7 +1255,7 @@ describe("redactWithinCap", () => {
         "Fq7_Hx-L2Mo9".repeat(Math.ceil(length / 12)).slice(0, length);
       const text = `${before}${jwt(`eyJ${body(40)}`, `eyJ${body(1_200)}`)} tail`;
 
-      expect(redactWithinCap(windowOf(text), CAP)).toBe(before);
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(before);
     });
 
     // Redaction before the JWT changes the text's length, so the JWT starts at another index in the
@@ -1263,19 +1265,21 @@ describe("redactWithinCap", () => {
       const filler = "z".repeat(CAP - 20 - lead.length);
       const text = `${lead}${filler} ${jwt(HEADER, `eyJ${"W".repeat(1_200)}`)} tail`;
 
-      expect(redactWithinCap(windowOf(text), CAP)).toBe(`password=[redacted] ${filler} `);
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(
+        `password=[redacted] ${filler} `
+      );
     });
 
     it("takes a JWT whose signature runs past the window whole, as a marker", () => {
       const text = `${before}${HEADER}.eyJ${"W".repeat(100)}.${"X".repeat(1_200)} tail`;
 
-      expect(redactWithinCap(windowOf(text), CAP)).toBe(`${before}[redacted]`);
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(`${before}[redacted]`);
     });
 
     it("takes a JWT that fits the window whole, and keeps what follows it up to the cap", () => {
       const text = `${before}${jwt(HEADER, `eyJ${"W".repeat(100)}`)} tail`;
 
-      expect(redactWithinCap(windowOf(text), CAP)).toBe(`${before}[redacted]`);
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(`${before}[redacted]`);
     });
 
     // Only a run that touches the window's end can be a JWT that goes on: a short one in the middle
@@ -1283,7 +1287,7 @@ describe("redactWithinCap", () => {
     it("keeps a JWT-like run that ends before the end of the window", () => {
       const text = `see eyJabc.def in ${"z".repeat(CAP + 600)}`;
 
-      expect(redactWithinCap(windowOf(text), CAP)).toBe(text.slice(0, CAP));
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(text.slice(0, CAP));
     });
 
     // A run with two dots is one the JWT pattern would take, if its parts were long enough. When it
@@ -1291,13 +1295,22 @@ describe("redactWithinCap", () => {
     it("keeps a run with two dots that ends the window and that the JWT pattern leaves alone", () => {
       const text = `${before}eyJab.cd.${"e".repeat(1_200)}`;
 
-      expect(redactWithinCap(windowOf(text), CAP)).toBe(text.slice(0, CAP));
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe(text.slice(0, CAP));
+    });
+
+    // A complete text has nothing past it: a run that ends it is not the start of a longer JWT, and
+    // the JWT pattern has already left it alone. Only a window cut from a longer text is cut there.
+    it("keeps a JWT-like run that ends a complete text, and cuts it in a cut window", () => {
+      const text = `${"x".repeat(80)} eyJ${"A".repeat(30)}`;
+
+      expect(redactWithinCap(text, CAP, { cut: false })).toBe(text.slice(0, CAP));
+      expect(redactWithinCap(text, CAP, { cut: true })).toBe(`${"x".repeat(80)} `);
     });
 
     it("leaves the output as it is for a JWT-like run that starts past the cap", () => {
       const text = `${"z".repeat(CAP + 5)} ${jwt(HEADER, `eyJ${"W".repeat(1_200)}`)}`;
 
-      expect(redactWithinCap(windowOf(text), CAP)).toBe("z".repeat(CAP));
+      expect(redactWithinCap(windowOf(text), CAP, { cut: true })).toBe("z".repeat(CAP));
     });
 
     // Every prefix of a JWT that is longer than the cap shows nothing of it: it is a marker once the
@@ -1305,24 +1318,26 @@ describe("redactWithinCap", () => {
     it("shows nothing of any prefix of a JWT", () => {
       const whole = jwt(`eyJ${"Q".repeat(10)}`, `eyJ${"W".repeat(20)}`);
       for (let length = 6; length <= whole.length; length++) {
-        const shown = redactWithinCap(whole.slice(0, length), 5);
+        const shown = redactWithinCap(whole.slice(0, length), 5, { cut: true });
         expect([length, shown === "" || shown === "[redacted]"]).toEqual([length, true]);
       }
     });
   });
 
   // A run of JWT starts that never reaches the window's end: the search tries only a start that no
-  // JWT character comes before, so it reads the run once. Tried at every start (no anchor, or a
-  // `\b` anchor, which a dash before each start passes) it is quadratic: several seconds at these
-  // sizes, against well under 100 ms. The budget is generous because a loaded test host slows
-  // every row.
+  // JWT character comes before, so it reads the run once. Tried at every start it is quadratic:
+  // with no anchor, with a `\b` anchor (a dash before each start passes it), or with an anchor
+  // class that lacks the character before each start. That takes several seconds at these sizes,
+  // against well under 100 ms. The budget is generous because a loaded test host slows every row.
   it.each([
     ["JWT starts", `${"eyJ".repeat(30_000)} `],
     ["JWT starts with a dash after each", `${"eyJ-".repeat(32_000)} `],
+    ["JWT starts with an underscore after each", `${"eyJ_".repeat(32_000)} `],
   ])("cuts a window of %s that miss its end in linear time", (_label, text) => {
-    redactWithinCap("warm up eyJabc.def", 10); // keep a cold regex compile out of the timing
+    // Keep a cold regex compile out of the timing.
+    redactWithinCap("warm up eyJabc.def", 10, { cut: true });
     const started = performance.now();
-    redactWithinCap(text, text.length - REDACTION_LOOKAHEAD_CHARS);
+    redactWithinCap(text, text.length - REDACTION_LOOKAHEAD_CHARS, { cut: true });
     expect(performance.now() - started).toBeLessThan(1_500);
   });
 
@@ -1334,9 +1349,9 @@ describe("redactWithinCap", () => {
     ["one long header and one long payload", `eyJ${"a".repeat(15_000)}.${"b".repeat(15_000)} x`],
     ["many long parts", `eyJ${"a".repeat(1_000)}.`.repeat(30)],
   ])("cuts the window of %s in linear time", (_label, text) => {
-    redactWithinCap("warm up eyJabc.def", 10); // keep a cold regex compile out of the timing
+    redactWithinCap("warm up eyJabc.def", 10, { cut: true }); // keep a cold regex compile out of the timing
     const started = performance.now();
-    redactWithinCap(text, 29_000);
+    redactWithinCap(text, 29_000, { cut: true });
     expect(performance.now() - started).toBeLessThan(100);
   });
 });
