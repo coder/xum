@@ -653,11 +653,18 @@ export function createConsolidationMemoryTool(args: {
         const invalid = await validateMutationForStaging(memoryService, ctx, input, {
           rejectSecretLike: args.rejectSecretLike,
         });
+        // Stored like every other row (persistedTarget, persistedNote): a redacting dry run (the
+        // debug CLI's --dry-run) must not keep a credential that names a file, and the refusal
+        // note quotes the path.
         if (invalid !== null) {
-          journal.push({ ...target, applied: false, note: clipJournalNote(invalid) });
+          journal.push({
+            ...persistedTarget(rails, target),
+            applied: false,
+            note: persistedNote(rails, invalid),
+          });
           return { success: false, error: invalid };
         }
-        journal.push({ ...target, applied: false, note: "dry-run" });
+        journal.push({ ...persistedTarget(rails, target), applied: false, note: "dry-run" });
         args.onStagedMutation?.(input, toolCallId);
         return { success: true, output: `[dry-run] recorded ${target.command} ${target.path}` };
       }
