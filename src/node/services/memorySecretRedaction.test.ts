@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { join } from "node:path";
 
 import {
   addsSecretLike,
@@ -6,6 +7,32 @@ import {
   redactSecretLike,
   redactWithinCap,
 } from "./memorySecretRedaction";
+
+const MODULE_PATH = join(import.meta.dir, "memorySecretRedaction");
+const CHILD_TIMEOUT_MS = 20_000;
+const CHILD_TEST_TIMEOUT_MS = 2 * CHILD_TIMEOUT_MS;
+
+type GuardCall = ["containsSecretLike", string] | ["addsSecretLike", string, string];
+
+/**
+ * The answers of the guards, asked in a child process that is killed after `CHILD_TIMEOUT_MS`. A
+ * guard that never returns would hang this run: bun cannot stop a synchronous loop at a test's time
+ * limit. The child dies instead, and the assertions here fail.
+ */
+function answersFromChild(calls: GuardCall[]): unknown {
+  const script = `import * as guards from ${JSON.stringify(MODULE_PATH)};
+const calls = ${JSON.stringify(calls)};
+console.log(JSON.stringify(calls.map(([name, ...args]) => guards[name](...args))));`;
+  const child = Bun.spawnSync([process.execPath, "-e", script], {
+    timeout: CHILD_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
+  expect({ timedOut: child.exitedDueToTimeout ?? false, exitCode: child.exitCode }).toEqual({
+    timedOut: false,
+    exitCode: 0,
+  });
+  return JSON.parse(child.stdout.toString());
+}
 
 describe("redactSecretLike", () => {
   const FAKE = {
@@ -1435,6 +1462,10 @@ describe("redactSecretLike", () => {
       // join the character before it or after it in a pair, so the `]` before a letter still goes on.
       ["a bracket, a lone low surrogate and a letter", "password=[redacted]]\udc00秘"],
       ["a lone high surrogate, a bracket and a letter", "password=[redacted]\ud800]x"],
+      // A lone low surrogate does not join a character that is no high surrogate either: the letter
+      // before it stays a letter. (Bun 1.3.14 answers false to `/[\p{L}\p{N}]/u` for a letter in
+      // U+F900 to U+FBFF and a lone low surrogate after it, so a reader that paired them would miss it.)
+      ["a letter from U+F900 and a lone low surrogate", "password=[redacted]\uf900\udc00"],
       ["punctuation before the letters", "token=[redacted]。秘密"],
       ["letters after a full-width bracket", "token=[redacted]」秘密"],
       ["a signature of CJK letters", "?sig=[redacted]秘密&x=1"],
@@ -1612,6 +1643,33 @@ describe("redactSecretLike", () => {
     ])("accepts an edit that adds a word behind a marker after %s", (_label, previous, updated) => {
       expect(addsSecretLike(previous, updated)).toBe(false);
       expect(containsSecretLike(updated)).toBe(false);
+    });
+
+    // The signed-URL start needs its marker. With the marker optional the start would match an empty
+    // string where a value ends, and the search, which resumes at the end of each tail, would stay
+    // there for good. A synchronous loop is out of reach of the test's time limit (bun waits for it),
+    // so these rows ask a child process that a time bound kills: the row fails instead of hanging the
+    // run. The text needs a marker somewhere else, since the scan starts only when a marker is in it.
+    it.each([
+      ["a signature name at the end of the text", "password=[redacted]x ?sig=", true],
+      ["a signature name before a delimiter", "note [redacted] https://h/p?sig=&a=1", false],
+      ["a signature name before a quote", 'note [redacted] "https://h/p?sig=" ok', false],
+    ])(
+      "ends in a child process on a signature with no value behind it: %s",
+      (_label, text, answer) => {
+        expect(answersFromChild([["containsSecretLike", text]])).toEqual([answer]);
+        expect(answersFromChild([["addsSecretLike", "", text]])).toEqual([answer]);
+      },
+      CHILD_TEST_TIMEOUT_MS
+    );
+
+    // Without a marker behind it a signature's value is main's to judge: the passes leave `]SEKRIT` as
+    // it is (a value stops at `]`), and a marker that stands elsewhere does not make it a tail.
+    it("reads no tail where a signature's value holds no marker", () => {
+      const text = "?sig=]SEKRIT password=[redacted]";
+      expect(containsSecretLike(text)).toBe(false);
+      expect(addsSecretLike("password=[redacted]", text)).toBe(false);
+      expect(addsSecretLike("", text)).toBe(false);
     });
 
     // The key's name, its quotes and the gaps around the separator are the key pattern's own.
