@@ -1819,7 +1819,7 @@ describe("redactSecretLike", () => {
   // processes keep the CPU from this one, so a loaded host, or a second test run on the same CPU,
   // stretched a 66 ms scan past its 100 ms budget, and the mutation gate dropped the whole file at
   // its baseline. CPU time is the process's own, and it stayed within 7% when two runs shared one
-  // CPU. A budget alone is not enough: the slowest linear scan takes about 65 ms, so a budget low
+  // CPU. A budget alone is not enough: the slowest linear scan takes about 90 ms, so a budget low
   // enough to catch a regression on the faster ones would fail it. Each row therefore also runs its
   // text cut to a half, a quarter and an eighth, and checks how the cost per character grows from
   // each size to the next.
@@ -1829,9 +1829,10 @@ describe("redactSecretLike", () => {
   // near 35,000 for the escaped runs), so the eighth of a long text looks cheap and the whole text
   // 3 to 28 times costlier per character, with no quadratic scan involved: CI failed two rows on it
   // at 3.6 and 3.2. That jump sits at one size, so it hits one of the three doublings. A quadratic
-  // scan hits all three, so the median of the three growths tells the two apart.
+  // scan hits all three, so the median of the three growths tells the two apart. The floor below
+  // means a quadratic cost under about 13 ms at the full size passes unseen.
   const SCAN_SIZE_DIVISORS = [8, 4, 2, 1];
-  // Past this, a scan fails whatever its growth: the slowest linear scan takes about a fifth of it,
+  // Past this, a scan fails whatever its growth: the slowest linear scan takes about a third of it,
   // and the regressions this guards cost seconds.
   const SCAN_CPU_CEILING_MS = 300;
   // How much the cost per character grows when the text doubles: 1 for a linear scan (1.36 at most
