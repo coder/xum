@@ -63,6 +63,12 @@ import {
 } from "./PluginInstallMethods";
 import { MarketplaceListing } from "./PluginMarketplaceListing";
 import {
+  UpdateAllButton,
+  UpdateAllStatus,
+  useUpdateAll,
+  useUpdateReviewQueue,
+} from "./PluginsUpdateAll";
+import {
   BackupQueueHeader,
   installSource,
   seededForm,
@@ -1875,9 +1881,11 @@ export const PluginsSettingsSection: React.FC = () => {
   /** Name of the plugin with an update/uninstall in flight. */
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
   /** Pending update whose capability changes await the user's confirmation. */
-  const [updateReview, setUpdateReview] = useState<AgentPluginUpdateReview | null>(
-    initialIntent?.type === "review-update" ? initialIntent.review : null
+  const updateReviews = useUpdateReviewQueue(
+    initialIntent?.type === "review-updates" ? initialIntent.reviews : [],
+    () => updateAll.dismissStatus()
   );
+  const updateReview = updateReviews.open;
   /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */
   const listGenerationRef = useRef(0);
   const checkGenerationRef = useRef(0);
@@ -2009,8 +2017,8 @@ export const PluginsSettingsSection: React.FC = () => {
         case "confirm-uninstall":
           setUninstallTarget(intent.name);
           break;
-        case "review-update":
-          setUpdateReview(intent.review);
+        case "review-updates":
+          updateReviews.show(intent.reviews);
           break;
         case "review-components":
           latestComponentReview.current.openFromIntent(intent);
@@ -2024,6 +2032,25 @@ export const PluginsSettingsSection: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resubscribe on API reconnect only; the listener reads the latest handlers via closure per subscription
   }, [api]);
 
+  const startUpdate = () => {
+    setError(null);
+    updateReviews.clear();
+    // The update moves lockedSha, so an open component review would confirm against a stale tree.
+    componentReview.close();
+  };
+
+  const updateAll = useUpdateAll({
+    api,
+    busyPlugin,
+    setBusyPlugin,
+    items,
+    updateChecks,
+    onStart: startUpdate,
+    onReviews: updateReviews.show,
+    refresh,
+    checkForUpdates,
+  });
+
   /**
    * Update click: review first. A capability-neutral update applies right
    * away; one that changes the capability surface opens the inline review,
@@ -2033,10 +2060,7 @@ export const PluginsSettingsSection: React.FC = () => {
   const handleUpdate = async (name: string) => {
     if (!api || busyPlugin !== null) return;
     setBusyPlugin(name);
-    setError(null);
-    setUpdateReview(null);
-    // The update moves lockedSha, so an open component review would confirm against a stale tree.
-    componentReview.close();
+    startUpdate();
     try {
       const preview = await api.agentPlugins.previewUpdate({ name });
       if (!preview.success) {
@@ -2044,7 +2068,7 @@ export const PluginsSettingsSection: React.FC = () => {
         return;
       }
       if (preview.data.changes.length > 0) {
-        setUpdateReview(preview.data);
+        updateReviews.show([preview.data]);
         return;
       }
       await applyUpdate(name, undefined);
@@ -2081,7 +2105,6 @@ export const PluginsSettingsSection: React.FC = () => {
       // Mounted composers cache contributed slash-command/skill
       // descriptors; an update can change them without a remount.
       publishAgentPluginsMutated();
-      setUpdateReview(null);
     }
     // Refresh regardless of outcome (the swap may be partially visible),
     // but re-assert the mutation error AFTER the refresh: refresh's
@@ -2089,7 +2112,11 @@ export const PluginsSettingsSection: React.FC = () => {
     // the failure the user needs to see.
     await refresh();
     await checkForUpdates();
-    if (!result.success) {
+    if (result.success) {
+      // After the refresh, so the next queued review does not open while this update still holds
+      // `busyPlugin` (its own name is not the busy one, so its controls would look enabled).
+      updateReviews.next();
+    } else {
       setError(result.error);
     }
   };
@@ -2138,7 +2165,13 @@ export const PluginsSettingsSection: React.FC = () => {
       <div>
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-foreground text-sm font-medium">Installed plugins</h3>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <UpdateAllButton
+              count={updateAll.count}
+              running={updateAll.running}
+              disabled={busyPlugin !== null}
+              onClick={() => void updateAll.run()}
+            />
             <Button
               variant="outline"
               size="sm"
@@ -2172,6 +2205,7 @@ export const PluginsSettingsSection: React.FC = () => {
           </div>
         )}
 
+        <UpdateAllStatus status={updateAll.status} />
         {installSucceeded && (
           <p role="status" className="text-accent-text mb-3 text-xs">
             Plugin installed.
@@ -2369,7 +2403,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       selective={item.importedComponents !== undefined}
                       busy={isBusy}
                       onConfirm={() => void handleConfirmUpdate(updateReview)}
-                      onCancel={() => setUpdateReview(null)}
+                      onCancel={updateReviews.next}
                     />
                   )}
                   <ComponentReviewRow
