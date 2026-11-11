@@ -151,7 +151,8 @@ const STANDALONE_SECRET_PATTERNS: (RegExp | GatedPattern)[] = [
   JWT_PATTERN,
 ];
 
-// Each pass as a pattern and its gate (none for a plain pattern), so the loop below branches on neither.
+// Each pass as a pattern and its gate (none for a plain pattern), so the loop below does not test
+// which kind a pass is.
 const STANDALONE_PASSES: { pattern: RegExp; accepts?: GatedPattern["accepts"] }[] =
   STANDALONE_SECRET_PATTERNS.map((pass) => (pass instanceof RegExp ? { pattern: pass } : pass));
 
@@ -755,7 +756,8 @@ export function redactSecretLike(text: string): string {
  * of `updated` are not all among (as a multiset) those it takes out of `previous`. Comparing values,
  * not a count, refuses an edit that drops one credential and assembles another. The accepted cost:
  * an edit inside a matched span (rewording the rest of a quoted value beside `password:`, trimming a
- * key) makes a new value and is refused too, though it adds no secret.
+ * key) makes a new value and is refused too, though it adds no secret. A JWT-like run that holds a
+ * provider key is one more value, so an edit that changes the run is refused too.
  */
 export function addsSecretLike(previous: string, updated: string): boolean {
   const held: Record<RemovalSource, Map<string, number>> = {
