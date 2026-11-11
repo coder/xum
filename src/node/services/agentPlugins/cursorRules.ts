@@ -13,6 +13,7 @@ import {
   rewrittenSkillMarkdown,
 } from "@/node/services/agentSkills/parseSkillMarkdown";
 import {
+  cutToCap,
   firstNonEmptyLine,
   normalizeNewlines,
   splitFrontmatter,
@@ -77,7 +78,7 @@ function globsSuffix(globs: readonly string[]): string {
     if (suffix.length >= MAX_SKILL_DESCRIPTION_LENGTH) break;
     suffix += `${index > 0 ? ", " : ""}${glob}`;
   }
-  return suffix.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
+  return cutToCap(suffix, MAX_SKILL_DESCRIPTION_LENGTH);
 }
 
 function ruleSkillDescription(args: {
@@ -89,7 +90,7 @@ function ruleSkillDescription(args: {
   const base = args.description ?? firstNonEmptyLine(args.body) ?? `Cursor rule ${args.name}`;
   const suffix = globsSuffix(args.globs);
   const room = Math.max(0, MAX_SKILL_DESCRIPTION_LENGTH - suffix.length);
-  return `${base.slice(0, room)}${suffix}`.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
+  return `${cutToCap(base, room)}${suffix}`.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
 }
 
 /**

@@ -166,6 +166,38 @@ describe("Cursor rule conversion", () => {
     expect(frontmatter.description).toStartWith("\n\nApplies to files matching: src/ggg");
   });
 
+  // The cap counts UTF-16 units: a cut must not leave the first half of a surrogate pair.
+  describe("a cut at the description cap", () => {
+    const GLOBS_PREFIX = "\n\nApplies to files matching: ";
+
+    test("drops a surrogate pair that the cut would split in a description", () => {
+      const { frontmatter } = ruleSkill(
+        "emoji",
+        `---\ndescription: ${"x".repeat(1023)}\u{1F600}tail\n---\nBody\n`
+      );
+      expect(frontmatter.description).toBe("x".repeat(1023));
+    });
+
+    test("drops a surrogate pair that the cut would split once the globs take their room", () => {
+      const suffix = `${GLOBS_PREFIX}**/*.ts`;
+      const room = SKILL_DESCRIPTION_CAP - suffix.length;
+      const { frontmatter } = ruleSkill(
+        "emoji-globs",
+        `---\ndescription: ${"x".repeat(room - 1)}\u{1F600}tail\nglobs: ["**/*.ts"]\n---\nBody\n`
+      );
+      expect(frontmatter.description).toBe(`${"x".repeat(room - 1)}${suffix}`);
+    });
+
+    test("drops a surrogate pair that the cut would split in the globs part", () => {
+      const glob = `${"g".repeat(SKILL_DESCRIPTION_CAP - GLOBS_PREFIX.length - 1)}\u{1F600}tail`;
+      const { frontmatter } = ruleSkill("emoji-glob", `---\nglobs: ["${glob}"]\n---\nBody\n`);
+      // One unit of room is left for the first body line, and the glob keeps all its text up to the pair.
+      expect(frontmatter.description).toBe(
+        `B${GLOBS_PREFIX}${"g".repeat(SKILL_DESCRIPTION_CAP - GLOBS_PREFIX.length - 1)}`
+      );
+    });
+  });
+
   test("cuts a long first body line to the skill description cap", () => {
     const { frontmatter } = ruleSkill("long", `${"w".repeat(3000)}\n`);
     expect(frontmatter.description.length).toBeLessThanOrEqual(SKILL_DESCRIPTION_CAP);
