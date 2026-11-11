@@ -254,11 +254,16 @@ describe("artifact tool", () => {
       expect(await fakeBrowser.calls()).toEqual([]);
     });
 
-    test("a kind override decides: html text is audited, an html file shown as markdown is not", async () => {
-      await fs.writeFile(path.join(scratchDir, "artifacts", "page.txt"), "<p>x</p>");
-      expect(await run({ path: "page.txt", kind: "html" })).toMatchObject({
+    test("a kind override decides only with an html name: page.htm is audited, page.txt and an html file shown as markdown are not", async () => {
+      await fs.writeFile(path.join(scratchDir, "artifacts", "page.htm"), "<p>x</p>");
+      expect(await run({ path: "page.htm", kind: "html" })).toMatchObject({
         layout: { checked: true },
       });
+      // The browser would load page.txt as plain text: no layout rather than a false clean.
+      await fs.writeFile(path.join(scratchDir, "artifacts", "page.txt"), "<p>x</p>");
+      const asText = await run({ path: "page.txt", kind: "html" });
+      expect(asText).toMatchObject({ success: true, kind: "html" });
+      expect(serialized(asText)).not.toHaveProperty("layout");
       await fs.writeFile(path.join(scratchDir, "artifacts", "doc.html"), "<p>x</p>");
       const asMarkdown = await run({ path: "doc.html", kind: "markdown" });
       expect(serialized(asMarkdown)).not.toHaveProperty("layout");
