@@ -1289,16 +1289,19 @@ export class TurnRequestBuilder {
   /**
    * The policy allows the tool, but request.assemble middleware, XUM_DISABLE_AGENT_TOOLS or
    * capability grants can still remove it from the request. Each attempt (a model fallback reruns
-   * assembly) sets the record from the tools it sends.
+   * assembly) sets the record from the tools it sends. With Programmatic Tool Calling the tool is
+   * bridged into code_execution (`xum.artifact`), built from the same policy-filtered tools that
+   * request hooks never see, so code_execution carries it.
    */
   private followArtifactToolAfterAssembly(
     workspaceId: string,
     messageId: string,
-    tools: Record<string, Tool>
+    attempt: { tools: Record<string, Tool>; ptcEnabled: boolean }
   ): void {
     const entry = this.artifactPublishTurns.get(workspaceId);
     if (entry?.messageId !== messageId) return;
-    entry.toolSent = tools.artifact !== undefined;
+    entry.toolSent =
+      attempt.tools.artifact !== undefined || ptcRanForTools(attempt.ptcEnabled, attempt.tools);
   }
 
   private recordAgentInterfaceTurn(
@@ -3569,7 +3572,10 @@ export class TurnRequestBuilder {
             ? {}
             : applyCapabilityGrants(attemptTools, capabilityGrants);
         }
-        this.followArtifactToolAfterAssembly(workspaceId, assistantMessageId, attemptTools);
+        this.followArtifactToolAfterAssembly(workspaceId, assistantMessageId, {
+          tools: attemptTools,
+          ptcEnabled,
+        });
 
         // The window section goes last, resolved from the rows being sent, so start() can
         // re-render it without rerunning assembly middleware or tool construction.

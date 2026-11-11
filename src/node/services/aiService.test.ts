@@ -892,7 +892,7 @@ const ARTIFACT_OFF: ToolPolicy = [{ regex_match: "artifact", action: "disable" }
 describe("AIService layout turn-end nudge", () => {
   afterEach(() => mock.restore());
 
-  async function setup(artifactsOn = true) {
+  async function setup(artifactsOn = true, ptc = false) {
     const testHistory = await createTestHistoryService();
     const projectPath = path.join(testHistory.tempDir, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -906,20 +906,29 @@ describe("AIService layout turn-end nudge", () => {
       namedWorkspacePath: projectPath,
       runtimeConfig: { type: "local" },
     });
-    const experimentsService = await experimentsServiceWith(
-      testHistory.tempDir,
-      artifactsOn ? [EXPERIMENT_IDS.ARTIFACTS] : []
-    );
+    const experimentsService = await experimentsServiceWith(testHistory.tempDir, [
+      ...(artifactsOn ? [EXPERIMENT_IDS.ARTIFACTS] : []),
+      ...(ptc ? [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING] : []),
+    ]);
     const harness = createBasicAIService(testHistory.tempDir, {
       historyService: testHistory.historyService,
       experimentsService,
     });
     const audit = spyOn(turnEndLayoutAudit, "workspaceHasNewLayoutIssueAtTurnEnd");
     const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const startStreamCalls: TurnExecutionOptions[] = [];
     stubCommonStreamMessageDependencies({
       ...harness,
       metadata,
-      allTools: { artifact: { inputSchema: jsonSchema({ type: "object" }) } },
+      startStreamCalls,
+      allTools: {
+        // An executable tool, as the real one: Programmatic Tool Calling can bridge it.
+        artifact: tool({
+          description: "publish",
+          inputSchema: jsonSchema({ type: "object" }),
+          execute: () => Promise.resolve({ success: true }),
+        }),
+      },
     });
     // A real turn start records whether the turn could publish (TurnRequestBuilder); the nudge
     // reads that record for the ended turn's message.
@@ -941,6 +950,7 @@ describe("AIService layout turn-end nudge", () => {
     const turn = await startTurn();
     const nudge = (abortSignal = new AbortController().signal, messageId = turn) =>
       harness.service.layoutTurnEndNudge(workspaceId, { messageId, abortSignal });
+    const sentToolNames = () => Object.keys(startStreamCalls.at(-1)?.tools ?? {});
     return {
       testHistory,
       projectPath,
@@ -948,6 +958,7 @@ describe("AIService layout turn-end nudge", () => {
       audit,
       nudge,
       startTurn,
+      sentToolNames,
       config: harness.config,
     };
   }
@@ -1044,6 +1055,18 @@ describe("AIService layout turn-end nudge", () => {
       expect(await nudge(undefined, await startTurn())).toBe(LAYOUT_TURN_END_NUDGE);
     } finally {
       removeHook();
+      await testHistory.cleanup();
+    }
+  });
+
+  it("audits after a turn that reaches artifact through Programmatic Tool Calling", async () => {
+    const { testHistory, audit, nudge, sentToolNames } = await setup(true, true);
+    try {
+      audit.mockResolvedValue(true);
+      // The request carries code_execution only: the agent publishes with xum.artifact(...).
+      expect(sentToolNames()).toEqual(["code_execution"]);
+      expect(await nudge()).toBe(LAYOUT_TURN_END_NUDGE);
+    } finally {
       await testHistory.cleanup();
     }
   });
