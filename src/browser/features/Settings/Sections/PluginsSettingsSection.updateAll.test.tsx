@@ -217,7 +217,8 @@ test("reviews and the status appear only once the run has refreshed, with their 
   await waitFor(() =>
     expect((view.container.textContent ?? "").includes(UPDATED_SHA.slice(0, 12))).toBe(true)
   );
-  expect(openReviews(view)).toHaveLength(0);
+  // A review shown while the run holds the busy state would still list its changes.
+  expect((view.container.textContent ?? "").includes("adds skill 'beta'")).toBe(false);
   expect(status() === null).toBe(true);
 
   hold.release();
