@@ -133,7 +133,9 @@ export function isVisible(page: LayoutPage, el: Element): boolean {
  * (`display: contents`) while its text paints.
  */
 export function paintsContent(page: LayoutPage, el: Element): boolean {
-  if (page.style(el).visibility === "hidden") return false;
+  // `collapse` hides like `hidden` outside table rows and columns, and text is never one.
+  const visibility = page.style(el).visibility;
+  if (visibility === "hidden" || visibility === "collapse") return false;
   return !selfAndAncestors(el).some((node) => isHiddenStyle(page.style(node)));
 }
 
