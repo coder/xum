@@ -642,9 +642,9 @@ describe("consolidation memory tool rails", () => {
       expect(fixture.getMutationCount()).toBe(0);
     });
 
-    // A real failed edit's error cannot reach the note cap any more: a str_replace error names at
-    // most MEMORY_STR_REPLACE_ERROR_MAX_LINES lines and quotes one path of at most
-    // MEMORY_CONSOLIDATION_PATH_MAX_CHARS characters, so it stays near 700 characters. The tests
+    // A failed str_replace's error cannot reach the note cap any more: it names at most
+    // MEMORY_STR_REPLACE_ERROR_MAX_LINES lines and quotes one path of at most
+    // MEMORY_CONSOLIDATION_PATH_MAX_CHARS characters, so it stays under 800 characters. The tests
     // below that guard the note cut therefore make the long error up, as the redaction test does.
     const madeUpError = (length: number) =>
       "0123456789".repeat(Math.ceil(length / 10)).slice(0, length);
