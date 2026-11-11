@@ -791,20 +791,33 @@ describe("MessageRenderer TODO nudge rows", () => {
     }
   );
 
+  // The summary is the only text of the collapsed row, so it names each joined nudge's ask.
   test.each([
-    { name: "alone", content: LAYOUT_TURN_END_NUDGE },
-    { name: "after the TODO nudge", content: `${TODO_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}` },
+    { name: "alone", content: LAYOUT_TURN_END_NUDGE, asks: [] },
+    {
+      name: "after the TODO nudge",
+      content: `${TODO_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+      asks: ["TODO list"],
+    },
     {
       name: "after the status page nudge",
       content: `${STATUS_PAGE_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+      asks: ["status page"],
     },
     {
       name: "after both",
       content: `${TODO_TURN_END_NUDGE}\n\n${STATUS_PAGE_AGENT_TURN_END_NUDGE}\n\n${LAYOUT_TURN_END_NUDGE}`,
+      asks: ["TODO list", "status page"],
     },
-  ])("collapses a layout nudge $name", ({ content }) => {
+  ])("collapses a layout nudge $name and names each ask", ({ content, asks }) => {
     const view = renderNudge(content, true);
-    expect(view.container.querySelector("[data-layout-turn-end-nudge]")).not.toBeNull();
+    const row = view.container.querySelector("[data-layout-turn-end-nudge]");
+    expect(row).not.toBeNull();
+    const summary = view.getByText(/^Asked the agent to /).textContent ?? "";
+    expect(summary).toContain("layout issues");
+    for (const ask of ["TODO list", "status page"]) {
+      expect(summary.includes(ask)).toBe(asks.includes(ask));
+    }
   });
 
   test("keeps a full bubble for a typed layout nudge and one joined to a plugin's prompt", () => {

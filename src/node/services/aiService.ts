@@ -665,9 +665,14 @@ export class AIService extends EventEmitter {
    */
   async layoutTurnEndNudge(
     workspaceId: string,
-    input: { abortSignal: AbortSignal }
+    input: { messageId: string; abortSignal: AbortSignal }
   ): Promise<string | null> {
     if (!this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)) return null;
+    // The nudge asks for a publish, and its continuation keeps the turn's agent and tools. A
+    // page stays due, so a later turn that can publish audits it.
+    if (!this.turnRequestBuilder.turnCanRepublishArtifacts(workspaceId, input.messageId)) {
+      return null;
+    }
     try {
       const target = await this.layoutAuditTarget(workspaceId);
       if (target == null) return null;

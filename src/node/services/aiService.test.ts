@@ -887,6 +887,8 @@ describe("AIService status page turn-end nudge", () => {
   });
 });
 
+const ARTIFACT_OFF: ToolPolicy = [{ regex_match: "artifact", action: "disable" }];
+
 describe("AIService layout turn-end nudge", () => {
   afterEach(() => mock.restore());
 
@@ -913,9 +915,29 @@ describe("AIService layout turn-end nudge", () => {
       experimentsService,
     });
     const audit = spyOn(turnEndLayoutAudit, "workspaceHasNewLayoutIssueAtTurnEnd");
-    const nudge = (abortSignal = new AbortController().signal) =>
-      harness.service.layoutTurnEndNudge(workspaceId, { abortSignal });
-    return { testHistory, projectPath, workspaceId, audit, nudge, config: harness.config };
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    stubCommonStreamMessageDependencies({ ...harness, metadata });
+    // A real turn start records whether the turn could publish (TurnRequestBuilder); the nudge
+    // reads that record for the ended turn's message.
+    const startTurn = async (agent: { planLike?: boolean; toolPolicy?: ToolPolicy } = {}) => {
+      const resolved = resolvedAgentResultFor(metadata);
+      if (!resolved.success) throw new Error("Expected resolved agent");
+      resolved.data.agentIsPlanLike = agent.planLike === true;
+      resolved.data.effectiveToolPolicy = agent.toolPolicy;
+      spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(resolved);
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "Fix the page")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+      if (!result.success) throw new Error(JSON.stringify(result.error));
+      return result.data.messageId;
+    };
+    const turn = await startTurn();
+    const nudge = (abortSignal = new AbortController().signal, messageId = turn) =>
+      harness.service.layoutTurnEndNudge(workspaceId, { messageId, abortSignal });
+    return { testHistory, projectPath, workspaceId, audit, nudge, startTurn, config: harness.config };
   }
 
   it("asks for the nudge when the audit finds a new issue, and gives it the turn's workspace", async () => {
@@ -963,20 +985,41 @@ describe("AIService layout turn-end nudge", () => {
     }
   });
 
-  it("does not audit a workspace that is not in the config", async () => {
-    const { testHistory, audit } = await setup();
+  // The nudge asks for a publish, and its continuation keeps the turn's agent and tool policy.
+  it.each([
+    { name: "a policy that disables the artifact tool", agent: { toolPolicy: ARTIFACT_OFF } },
+    { name: "a custom plan-like agent", agent: { planLike: true } },
+  ])("does not audit after a turn that cannot publish: $name", async ({ agent }) => {
+    const { testHistory, audit, nudge, startTurn } = await setup();
     try {
       audit.mockResolvedValue(true);
-      const harness = createBasicAIService(testHistory.tempDir, {
-        experimentsService: await experimentsServiceWith(testHistory.tempDir, [
-          EXPERIMENT_IDS.ARTIFACTS,
-        ]),
-      });
-      expect(
-        await harness.service.layoutTurnEndNudge("unknown-workspace", {
-          abortSignal: new AbortController().signal,
-        })
-      ).toBeNull();
+      const turn = await startTurn(agent);
+      expect(await nudge(undefined, turn)).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
+      // The next turn that can publish gets it: the page stayed due.
+      expect(await nudge(undefined, await startTurn())).toBe(LAYOUT_TURN_END_NUDGE);
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it("does not audit a workspace that is no longer in the config", async () => {
+    const { testHistory, audit, nudge, config } = await setup();
+    try {
+      audit.mockResolvedValue(true);
+      spyOn(config, "findWorkspace").mockReturnValue(null);
+      expect(await nudge()).toBeNull();
+      expect(audit).not.toHaveBeenCalled();
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+
+  it("does not audit for a message that is not the workspace's latest prepared turn", async () => {
+    const { testHistory, audit, nudge } = await setup();
+    try {
+      audit.mockResolvedValue(true);
+      expect(await nudge(undefined, "another-turn")).toBeNull();
       expect(audit).not.toHaveBeenCalled();
     } finally {
       await testHistory.cleanup();

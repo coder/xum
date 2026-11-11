@@ -1223,6 +1223,15 @@ export class TurnRequestBuilder {
     { messageId: string; turn: AgentInterfaceStatusPageTurn }
   >();
 
+  /**
+   * The assistant message of each workspace's latest prepared turn whose agent can call the
+   * artifact tool and is not plan-like, for the turn-end layout nudge (turnCanRepublishArtifacts).
+   * The nudge asks for a publish, and its continuation keeps the turn's agent and tool policy: a
+   * turn without the tool could not follow it. One entry per workspace: the next prepare replaces
+   * or drops it.
+   */
+  private readonly artifactPublishTurns = new Map<string, string>();
+
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
 
   /** Turn timings, record timestamps and retry delays share the stream's HostClock. */
@@ -1235,6 +1244,12 @@ export class TurnRequestBuilder {
   forgetWorkspace(workspaceId: string): void {
     this.toolCatalogOverviews.delete(workspaceId);
     this.agentInterfaceTurns.delete(workspaceId);
+    this.artifactPublishTurns.delete(workspaceId);
+  }
+
+  /** Whether the turn whose assistant message is `messageId` could publish an artifact. */
+  turnCanRepublishArtifacts(workspaceId: string, messageId: string): boolean {
+    return this.artifactPublishTurns.get(workspaceId) === messageId;
   }
 
   /**
@@ -3079,6 +3094,13 @@ export class TurnRequestBuilder {
       // The same rule the prompt follows, so the nudge asks for what the prompt told the agent.
       statusPageAgent: statusUpdateUsable(statusPageAgentActive, effectiveToolPolicy),
     });
+    // A plan-like agent (a custom one included) may edit only its plan file, as for the status
+    // page nudge above.
+    if (!agentIsPlanLike && applyToolPolicyToNames(["artifact"], effectiveToolPolicy).length > 0) {
+      this.artifactPublishTurns.set(workspaceId, assistantMessageId);
+    } else {
+      this.artifactPublishTurns.delete(workspaceId);
+    }
     // Bind ownership before cached MCP tools are captured by the PTC bridge.
     // A queued invocation must keep this turn's identity after a replacement starts.
     const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };

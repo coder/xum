@@ -1101,6 +1101,8 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   layoutTurnEndNudge?(
     workspaceId: string,
     input: {
+      /** The ended turn's assistant message: a turn that cannot publish gets no nudge. */
+      messageId: string;
       /** A user Stop (or a shutdown) ends the audit: no nudge is returned. */
       abortSignal: AbortSignal;
     }
@@ -11005,7 +11007,7 @@ export class AgentSession {
       parts: payload.parts,
     });
     if (statusPageNudge != null) nudges.push(statusPageNudge);
-    const layoutNudge = await this.readLayoutNudge(provenance, abortSignal);
+    const layoutNudge = await this.readLayoutNudge(provenance, payload.messageId, abortSignal);
     if (layoutNudge != null) nudges.push(layoutNudge);
     return nudges;
   }
@@ -11018,10 +11020,15 @@ export class AgentSession {
    */
   private async readLayoutNudge(
     provenance: StopContinuationProvenance,
+    messageId: string,
     abortSignal: AbortSignal
   ): Promise<string | null> {
     if (provenance.externallyOwnedTurn) return null;
-    return (await this.aiService.layoutTurnEndNudge?.(this.workspaceId, { abortSignal })) ?? null;
+    const nudge = await this.aiService.layoutTurnEndNudge?.(this.workspaceId, {
+      messageId,
+      abortSignal,
+    });
+    return nudge ?? null;
   }
 
   /** Records whether the sent message whose stream starts now began a user turn. */

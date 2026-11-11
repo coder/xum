@@ -128,20 +128,29 @@ export function classifyStatusPageTurnEndNudgePrompt(
     : null;
 }
 
+/** Which nudges a turn-end layout nudge row was joined after, in one continuation. */
+export interface LayoutTurnEndNudgeParts {
+  todo: boolean;
+  statusPage: boolean;
+}
+
 /**
  * Whether `text` is exactly the turn-end layout nudge, alone or after the TODO and/or status page
- * nudge in one continuation (the order they are joined in). Any other text, a plugin's prompt
- * included, is not one: that row keeps its full bubble.
+ * nudge in one continuation (the order they are joined in), and which of those it follows, so the
+ * collapsed row can name every action the hidden prompt asked for. Any other text, a plugin's
+ * prompt included, is null: that row keeps its full bubble.
  */
-export function isLayoutTurnEndNudgePrompt(text: string): boolean {
-  if (text === LAYOUT_TURN_END_NUDGE) return true;
+export function classifyLayoutTurnEndNudgePrompt(text: string): LayoutTurnEndNudgeParts | null {
+  if (text === LAYOUT_TURN_END_NUDGE) return { todo: false, statusPage: false };
   const suffix = `${TURN_END_NUDGE_SEPARATOR}${LAYOUT_TURN_END_NUDGE}`;
-  if (!text.endsWith(suffix)) return false;
+  if (!text.endsWith(suffix)) return null;
   const before = text.slice(0, -suffix.length);
-  return (
-    classifyTodoTurnEndNudgePrompt(before) === "current" ||
-    classifyStatusPageTurnEndNudgePrompt(before) != null
-  );
+  if (classifyTodoTurnEndNudgePrompt(before) === "current") {
+    return { todo: true, statusPage: false };
+  }
+  const statusPage = classifyStatusPageTurnEndNudgePrompt(before);
+  if (statusPage == null) return null;
+  return { todo: statusPage === "todo-and-status-page", statusPage: true };
 }
 
 const PROMPT_OPENINGS_BY_KIND: ReadonlyArray<{

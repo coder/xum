@@ -39,6 +39,18 @@ export interface TurnEndArtifactListing {
 }
 
 /**
+ * Whether a page modified at `modifiedMs` changed at or after `barMs`. A remote runtime lists
+ * modified times in whole seconds (artifactRuntimeStore), and the bar is a host time in
+ * milliseconds, so an edit in the same second as the bar would read as older than it. Such a
+ * time is compared with the bar cut to its second: the page is audited once more rather than
+ * skipped. A local time keeps its milliseconds: it has a whole-second value one time in 1000.
+ */
+function isModifiedSince(modifiedMs: number, barMs: number): boolean {
+  const precisionMs = modifiedMs % 1000 === 0 ? 1000 : 1;
+  return modifiedMs >= Math.floor(barMs / precisionMs) * precisionMs;
+}
+
+/**
  * The pages that are due for an audit, newest first: published, shown as HTML, and modified at
  * or after their bar. The bar is the start of the last audit that settled the page in this
  * process, else the time of its latest publish (each publish rewrites the record). A publish
@@ -47,10 +59,10 @@ export interface TurnEndArtifactListing {
  *
  * Due is derived, never marked: a page whose audit did not settle it keeps its bar, so the rule
  * alone keeps it due at later turn ends, after a restart and after an eviction from the start
- * times. That covers a page past the cap of one turn end, one that a Stop or a failure ended the
- * audit of, and one whose turn-end audit found a new issue: new input or a Stop can win over
- * the continuation that tells the agent, so the page is audited at each turn end until a
- * publish has shown the issue.
+ * times. That covers a page past the cap of one turn end, one whose audit a Stop ended before it
+ * settled, and one whose turn-end audit found a new issue: new input or a Stop can win over the
+ * continuation that tells the agent, so the page is audited at each turn end until a publish
+ * has shown the issue.
  */
 export function pagesDueForAudit(
   listing: TurnEndArtifactListing,
@@ -65,7 +77,7 @@ export function pagesDueForAudit(
       return (
         entry.kind === "html" &&
         publishedAt != null &&
-        entry.modifiedMs >= (lastAuditStartedAtMs(entry.path) ?? publishedAt)
+        isModifiedSince(entry.modifiedMs, lastAuditStartedAtMs(entry.path) ?? publishedAt)
       );
     })
     .sort((a, b) => b.modifiedMs - a.modifiedMs)

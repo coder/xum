@@ -1552,7 +1552,8 @@ describe("layout turn-end nudge", () => {
     // The nudged turn would earn it too: only the first stream of a user turn is audited.
     expect(await userTexts(h)).toEqual(["fix the bug", LAYOUT_TURN_END_NUDGE]);
     expect(streams()).toBe(2);
-    expect(calls).toHaveLength(1);
+    // The ended stream's message: AIService checks that this turn could publish.
+    expect(calls.map((call) => call.messageId)).toEqual(["a1"]);
   });
 
   test("a turn the audit finds nothing in is not nudged", async () => {

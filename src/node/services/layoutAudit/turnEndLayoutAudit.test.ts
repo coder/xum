@@ -118,6 +118,18 @@ describe("pagesDueForAudit", () => {
     expect(pagesDueForAudit(listing, () => PUBLISHED_AT + 100)).toEqual(["a.html"]);
   });
 
+  test("a whole-second time from a remote listing counts an edit in the bar's own second", () => {
+    // Remote listings drop the milliseconds: an edit 300 ms after the audit started lists as
+    // the start of that second, before the bar.
+    const second = 1_700_000_100_000;
+    const listing = listingOf([page("a.html", second)]);
+    expect(pagesDueForAudit(listing, () => second + 300)).toEqual(["a.html"]);
+    expect(pagesDueForAudit(listing, () => second + 1000)).toEqual([]);
+    // A time with milliseconds keeps them: 1 ms before the bar is older.
+    const local = listingOf([page("b.html", second + 299)]);
+    expect(pagesDueForAudit(local, () => second + 300)).toEqual([]);
+  });
+
   test("the last audit replaces the publish time as the bar, even when it is older than the publish", () => {
     // An edit, then a publish whose own audit a Stop cancelled: the page keeps the older audit's bar.
     const listing = listingOf([page("a.html", PUBLISHED_AT - 50)]);

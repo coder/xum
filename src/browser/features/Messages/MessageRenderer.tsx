@@ -11,8 +11,9 @@ import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
 import { AlertTriangle, LayoutDashboard, ListTodo, MessageSquare } from "lucide-react";
 import {
   classifyStatusPageTurnEndNudgePrompt,
+  classifyLayoutTurnEndNudgePrompt,
   classifyTodoTurnEndNudgePrompt,
-  isLayoutTurnEndNudgePrompt,
+  type LayoutTurnEndNudgeParts,
 } from "@/common/utils/machineTurnPrompts";
 import {
   BackgroundWorkWakeMessage,
@@ -55,6 +56,20 @@ interface MessageRendererProps {
   onCloseEphemeral?: (historyId: string) => void;
   /** "Load all" handler for history-hidden rows; same reason as onCloseEphemeral. */
   onShowAllHistory?: () => void;
+}
+
+// The layout nudge's collapsed row names every nudge joined into its continuation: the hidden
+// prompt asks for each of them, so a layout-only summary would hide the TODO or status page ask.
+const LAYOUT_NUDGE_SUMMARIES: Record<`${boolean}-${boolean}`, string> = {
+  "false-false": "Asked the agent to re-publish HTML artifacts and fix layout issues",
+  "true-false": "Asked the agent to update its TODO list and fix HTML artifact layout issues",
+  "false-true": "Asked the agent to update its status page and fix HTML artifact layout issues",
+  "true-true":
+    "Asked the agent to update its TODO list and status page, and fix HTML artifact layout issues",
+};
+
+function layoutNudgeSummary(parts: LayoutTurnEndNudgeParts): string {
+  return LAYOUT_NUDGE_SUMMARIES[`${parts.todo}-${parts.statusPage}`];
 }
 
 function getMessageHistoryId(message: DisplayedMessage): string | undefined {
@@ -121,8 +136,8 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
           message.isSynthetic === true
             ? classifyStatusPageTurnEndNudgePrompt(message.content)
             : null;
-        const isLayoutNudge =
-          message.isSynthetic === true && isLayoutTurnEndNudgePrompt(message.content);
+        const layoutNudgeParts =
+          message.isSynthetic === true ? classifyLayoutTurnEndNudgePrompt(message.content) : null;
         renderedMessage =
           message.contextBudgetWarning != null ? (
             <CollapsibleMachineMessage
@@ -181,12 +196,12 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               marker="status-page-turn-end-nudge"
               className={className}
             />
-          ) : isLayoutNudge ? (
+          ) : layoutNudgeParts != null ? (
             // The turn-end layout nudge, alone or after the TODO and status page nudges in one
             // continuation: constant control text, so the same compact row.
             <CollapsibleMachineMessage
               content={message.content}
-              summary="Asked the agent to re-publish HTML artifacts and fix layout issues"
+              summary={layoutNudgeSummary(layoutNudgeParts)}
               icon={<LayoutDashboard aria-hidden="true" className="size-3.5 shrink-0" />}
               marker="layout-turn-end-nudge"
               className={className}
