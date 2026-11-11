@@ -1257,6 +1257,120 @@ describe("redactSecretLike", () => {
     );
   });
 
+  // A JWT-like run that holds a provider key. The key pass used to replace the key alone, and its
+  // marker has no dots, so the JWT pattern no longer matched the run: the rest of it, the signature
+  // too, stayed readable. The `SEKRIT` words stand for the run's own characters: none may show.
+  describe("a JWT-like run that holds a provider key", () => {
+    const KEYS = [
+      ["an OpenAI-style key", FAKE.openai],
+      ["a GitHub personal token", `ghp_${"Q7w3".repeat(5)}`],
+      ["a GitHub OAuth token", FAKE.github],
+      ["a fine-grained GitHub token", FAKE.pat],
+      ["a Slack token", FAKE.slack],
+      ["an AWS access key id", FAKE.aws],
+      ["an AWS session key id", "ASIAABCDEFGHIJKLMNOP"],
+      ["a Stripe live key", FAKE.stripeLive],
+      ["a Stripe test key", FAKE.stripeTest],
+      ["a Stripe restricted key", FAKE.stripeRestricted],
+      ["a GitLab token", FAKE.gitlab],
+      ["a Google API key", FAKE.google],
+      ["an npm token", FAKE.npm],
+    ] as const;
+    const runWith = (key: string) =>
+      [
+        ["its header", `eyJSEKRITheadlead-${key}-SEKRITheadtail.eyJSEKRITpayload.SEKRITsig`],
+        ["its payload", `eyJSEKRITheader.eyJSEKRITpayloadlead-${key}-SEKRITpayloadtail.SEKRITsig`],
+        ["its signature", `eyJSEKRITheader.eyJSEKRITpayload.SEKRITsiglead-${key}-SEKRITsigtail`],
+        ["the start of its payload", `eyJSEKRITheader.${key}-SEKRITpayloadtail.SEKRITsig`],
+        ["the start of its signature", `eyJSEKRITheader.eyJSEKRITpayload.${key}-SEKRITsigtail`],
+      ] as const;
+    const RUN = runWith(FAKE.aws)[0][1];
+
+    it.each(
+      KEYS.flatMap(([label, key]) => runWith(key).map(([where, run]) => [label, where, run]))
+    )("redacts the whole run that holds %s in %s", (_label, _where, run) => {
+      const redacted = redactSecretLike(`see ${run} then`);
+      expect(redacted).toBe("see [redacted] then");
+      expect(redactSecretLike(redacted)).toBe(redacted);
+    });
+
+    // Each context is read by a pass of its own, and each used to leave part of the run behind.
+    it.each([
+      ["after a bearer scheme", `t Bearer ${RUN} done`, "t Bearer [redacted] done"],
+      ["as an assignment's value", `token=${RUN} x`, "token=[redacted] x"],
+      [
+        "as a query value",
+        `https://h.example.com/p?next=${RUN}&x=1`,
+        "https://h.example.com/p?next=[redacted]&x=1",
+      ],
+      [
+        "as a signed URL's signature",
+        `https://h.example.com/p?sig=${RUN}&x=1`,
+        "https://h.example.com/p?sig=[redacted]&x=1",
+      ],
+      ["behind a dot", `foo.${RUN} end`, "foo.[redacted] end"],
+      ["twice on a line", `${RUN} ${RUN}`, "[redacted] [redacted]"],
+      ["on its own line", `a\n${RUN}\nb`, "a\n[redacted]\nb"],
+      ["in a code span", `\`${RUN}\``, "`[redacted]`"],
+      ["among Unicode", `ünï ${RUN} ✓`, "ünï [redacted] ✓"],
+      [
+        "glued to a PEM block, which the PEM pattern reads first",
+        `${RUN}-----BEGIN PRIVATE KEY-----\nMIIEFAKE\n-----END PRIVATE KEY-----`,
+        "[redacted][redacted]",
+      ],
+    ])("redacts the whole run %s", (_label, text, expected) => {
+      expect(redactSecretLike(text)).toBe(expected);
+      expect(redactSecretLike(expected)).toBe(expected);
+    });
+
+    // The key pass still takes a key that no run holds, and the JWT pattern a run that holds none:
+    // a run without a key is read by the `Bearer` and `key=` passes as before.
+    it.each([
+      ["a bare key", `key ${FAKE.aws} end`, "key [redacted] end"],
+      ["a run without a key", `t ${FAKE.jwt} done`, "t [redacted] done"],
+      ["a run after a bearer scheme", `Bearer ${FAKE.jwt}`, "[redacted]"],
+      [
+        "a run in an authorization header",
+        `Authorization: Bearer ${FAKE.jwt}`,
+        "Authorization: [redacted]",
+      ],
+      ["a key in the fourth segment", `${FAKE.jwt}.x-${FAKE.aws}`, "[redacted].x-[redacted]"],
+    ])("reads %s as before", (_label, text, expected) => {
+      expect(redactSecretLike(text)).toBe(expected);
+    });
+
+    it("lets the guards see the run as one credential", () => {
+      const other = RUN.replace("SEKRITsig", "SEKRITother");
+      expect(containsSecretLike(RUN)).toBe(true);
+      expect(addsSecretLike("", RUN)).toBe(true);
+      expect(addsSecretLike(`note ${RUN}`, `note ${RUN}\nmore prose`)).toBe(false);
+      // The key is the same: only the run differs, and a run is a credential of its own.
+      expect(addsSecretLike(RUN, other)).toBe(true);
+    });
+
+    // The guard reads the later passes on the text as main did, so it refuses at least what main's
+    // refused: a context in front of a run that the previous text held makes a new value there.
+    it.each([
+      ["a bearer scheme", `Bearer ${RUN}`],
+      ["an assignment", `token=${RUN}`],
+      ["a signed URL", `https://h.example.com/p?sig=${RUN}`],
+    ])(
+      "refuses %s put in front of a run the file held, as main's guard does",
+      (_label, updated) => {
+        expect(addsSecretLike(RUN, updated)).toBe(true);
+        expect(addsSecretLike(updated, updated)).toBe(false);
+      }
+    );
+
+    // A run is one more value, apart from the regex passes' values: a cookie value that was the same
+    // text excuses nothing, and the key inside the run is held by the file either way.
+    it("keeps a run apart from a regex value of the same text", () => {
+      const key = FAKE.aws;
+      expect(addsSecretLike(`Cookie: ${RUN}\n${key}`, RUN)).toBe(true);
+      expect(addsSecretLike(`Cookie: ${RUN}\n${key}`, `Cookie: ${RUN}\n${key}`)).toBe(false);
+    });
+  });
+
   // The guard scans text a model supplied, so a hostile 100 KB write must not stall the process.
   // Each shape repeats a keyword with nothing after it, which made the open-ended name suffix and
   // JWT segment rescan to the end of the text from every occurrence (seconds per input).
@@ -1267,6 +1381,16 @@ describe("redactSecretLike", () => {
     ["credential_", "credential_".repeat(9_000)],
     ["api_key", "api_key".repeat(14_000)],
     ["a JWT header after a dash", "eyJ-".repeat(25_000)],
+    ["a long dotted chain of JWT headers", "eyJabcdefgh.".repeat(10_000)],
+    [
+      "JWT-like runs that each hold a key",
+      `eyJabcdefgh.abcdefgh-${FAKE.aws}.abcdefgh `.repeat(2_000),
+    ],
+    [
+      "one JWT-like run that holds many keys",
+      `eyJabcdefgh.abcdefgh.${`-${FAKE.aws}`.repeat(5_000)}`,
+    ],
+    ["JWT-like runs that hold key prefixes and no key", "eyJ.abcdefgh.sk-".repeat(7_000)],
     ["a bare bracket assignment", 'password"]'.repeat(10_000)],
     ["URL schemes with a short userinfo", "://a:".repeat(25_000)],
     ["a keyword followed by whitespace", `token${" ".repeat(100_000)}x`],
