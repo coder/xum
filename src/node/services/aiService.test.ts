@@ -943,9 +943,10 @@ describe("AIService layout turn-end nudge", () => {
       expect(call).toMatchObject({
         workspaceId,
         streamStartedAtMs: 1_234,
-        abortSignal: stop.signal,
         metadata: { id: workspaceId, projectPath },
       });
+      // Identity, not structure: two AbortSignals match each other structurally.
+      expect(call?.abortSignal).toBe(stop.signal);
       expect(call?.cwd).toBeString();
     } finally {
       await testHistory.cleanup();

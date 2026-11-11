@@ -147,7 +147,9 @@ describe("hasNewLayoutIssueAtTurnEnd", () => {
       })
     );
     expect(found).toBe(true);
-    expect(calls).toEqual([["a.html", controller.signal]]);
+    expect(calls.map(([relPath]) => relPath)).toEqual(["a.html"]);
+    // Identity, not structure: two AbortSignals match each other structurally.
+    expect(calls[0]?.[1]).toBe(controller.signal);
   });
 
   test.each([
@@ -335,7 +337,8 @@ describe("workspaceHasNewLayoutIssueAtTurnEnd", () => {
 
   test("audits a changed published page like a publish does, and leaves the fix-loop memory alone", async () => {
     await publishedPage("report.html");
-    expect(await run()).toBe(true);
+    const stop = new AbortController();
+    expect(await run({ abortSignal: stop.signal })).toBe(true);
     expect(audits).toHaveLength(1);
     expect(audits[0]).toMatchObject({
       kind: "html",
@@ -346,6 +349,8 @@ describe("workspaceHasNewLayoutIssueAtTurnEnd", () => {
       location: { kind: "host", dir: artifactsDir },
     });
     expect(audits[0]?.runtime).toBe(runtime);
+    // Identity, not structure: two AbortSignals match each other structurally.
+    expect(audits[0]?.abortSignal).toBe(stop.signal);
   });
 
   test("does not audit a page a publish audited after its last write", async () => {
