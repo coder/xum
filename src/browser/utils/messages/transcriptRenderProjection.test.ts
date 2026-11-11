@@ -289,6 +289,41 @@ describe("work bundles (compact density)", () => {
     expect(infos[5]).toBeUndefined();
   });
 
+  test("never folds a tool row that carries an MCP App view, its own or a nested call's", () => {
+    const appCall = {
+      connection: { key: "dice", transport: "stdio" as const },
+      identity: { name: "dice-mcp", version: "1.0.0" },
+      source: "connection" as const,
+      app: { resourceUri: "ui://dice/board.html" },
+    };
+    const infos = work([
+      tool({ id: "read-a", ...TURN }),
+      { ...tool({ id: "board", toolName: "mcp__dice__show_board", ...TURN }), mcpServer: appCall },
+      tool({ id: "read-b", ...TURN }),
+      tool({
+        id: "script",
+        toolName: "code_execution",
+        ...TURN,
+        nestedCalls: [
+          {
+            toolCallId: "nested-board",
+            toolName: "mcp__dice__show_board",
+            state: "output-available",
+            mcpServer: appCall,
+          },
+        ],
+      }),
+      assistant("reply", TURN),
+    ]);
+
+    expect(infos[0]).toMatchObject({ key: "work:read-a", role: "work" });
+    expect(infos[1]).toBeUndefined();
+    expect(infos[2]).toMatchObject({ key: "work:read-b", role: "work" });
+    expect(infos[3]).toBeUndefined();
+    // The reply after the last view has no work behind it, so it needs no line.
+    expect(infos[4]).toBeUndefined();
+  });
+
   test("gives a second message its own stretch and reply when no prompt separates them", () => {
     const infos = work([
       tool({ id: "read-a", historyId: "history-a" }),

@@ -11,7 +11,12 @@
  */
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import { disableTutorials, sendMessage, todoNudgeToolPolicies } from "../bugbash/repros/helpers";
+import {
+  disableTutorials,
+  sendMessage,
+  showEveryTranscriptStep,
+  todoNudgeToolPolicies,
+} from "../bugbash/repros/helpers";
 import { openPlayground } from "./helpers";
 
 const NUDGE_REPLY = "Verified the fix in README.md. The TODO list is complete.";
@@ -24,6 +29,8 @@ test(
     const transcript = browser.locator('[role="log"][aria-label="Conversation transcript"]');
 
     await disableTutorials(app);
+    // The story checks the nudged turn's file_read row, which compact density folds.
+    await showEveryTranscriptStep(app);
     await app.open();
     // exact step: Haiku 5.5 missed this step in 10 of 14 cold failures (Phase 5)
     await openPlayground(screen);

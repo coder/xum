@@ -166,6 +166,19 @@ export function estimateTranscriptRowWeight(message: DisplayedMessage): number {
  */
 const STOP_TOOL_NAMES = new Set<string>(["ask_user_question", "propose_plan"]);
 
+/**
+ * Whether a tool row carries an MCP App view (its own call, or a call nested under a script).
+ * A view is something the user works in, so like a question or a plan it stays in the
+ * conversation: no work line hides it.
+ */
+function showsAppView(message: DisplayedMessage & { type: "tool" }): boolean {
+  if (message.mcpServer?.app != null) {
+    return true;
+  }
+  const nestedCalls = Array.isArray(message.nestedCalls) ? message.nestedCalls : [];
+  return nestedCalls.some((call) => call.mcpServer?.app != null);
+}
+
 type WorkBundleRow = DisplayedMessage & {
   type: "assistant" | "reasoning" | "tool";
 };
@@ -175,7 +188,7 @@ function isWorkBundleRow(message: DisplayedMessage | undefined): message is Work
     case "reasoning":
       return true;
     case "tool":
-      return !STOP_TOOL_NAMES.has(message.toolName);
+      return !STOP_TOOL_NAMES.has(message.toolName) && !showsAppView(message);
     case "assistant":
       // Compaction summaries and peer messages are not this turn's narration: they stay put.
       return !message.isCompacted && message.agentPeerMessage === undefined;
@@ -250,8 +263,8 @@ function collectEditedFiles(editedFiles: Set<string>, message: WorkBundleRow): v
 /**
  * Compact density. Each stretch of consecutive agent rows of one message (narration, reasoning,
  * tool calls) becomes a work bundle: the last narration is the reply and stays in view, and every
- * other row folds behind one line. Rows of another kind (a prompt, a question, a plan, an error)
- * end the stretch and are never folded.
+ * other row folds behind one line. Rows of another kind (a prompt, a question, a plan, an app
+ * view, an error) end the stretch and are never folded.
  *
  * A finished stretch that went back to work after its last narration (it was interrupted, or
  * failed) has no reply: that narration announced work, it did not report on it. The work after
