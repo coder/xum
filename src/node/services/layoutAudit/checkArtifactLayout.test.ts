@@ -196,7 +196,8 @@ describe("checkArtifactLayout", () => {
     await install({
       eval: { 390: { kind: "pass", findings: [card] }, 1440: { kind: "hang" } },
     });
-    const report = await check({ budgetMs: 6_000 });
+    // Long enough for 390 to finish on a host at load 40 (6 s was not), short for a hang.
+    const report = await check({ budgetMs: 15_000 });
     expect(report).toMatchObject({
       checked: false,
       notChecked: [
