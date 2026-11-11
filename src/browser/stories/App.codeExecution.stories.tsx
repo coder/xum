@@ -1,7 +1,7 @@
 import { expect, userEvent, within } from "storybook/test";
 import { getAutoExpandPrefsKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { PhoneSubagentReportDecorator } from "./helpers/subagentReportStory";
 import { collapseLeftSidebar, collapseRightSidebar } from "./helpers/uiState";
@@ -91,7 +91,9 @@ export default {
 export const NestedTools: AppStory = {
   render: () => <AppWithMocks setup={setupNestedToolsStory} />,
   globals: { viewport: { value: "desktop", isRotated: false } },
-  parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
+  // Geometry regression only: ConsecutiveRuns carries the code execution Pixel snapshots, which
+  // keeps the repo under its snapshot budget.
+  parameters: { pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     const toggle = await canvas.findByRole("button", { name: "Message to Reviewer" });
@@ -133,9 +135,8 @@ export const NestedToolsPhone: AppStory = {
   globals: { viewport: { value: "mobile1", isRotated: false } },
   // Keep the narrow-container regression active in the desktop-sized test-runner too.
   decorators: [PhoneSubagentReportDecorator],
-  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+  parameters: { pixel: PIXEL_DISABLED },
   play: async (context) => {
-    await expect(context.parameters.pixel).toMatchObject({ matrix: { viewports: ["phone"] } });
     await NestedTools.play?.(context);
     const frame = within(context.canvasElement).getByRole("group", { name: "Code Execution" });
     await expect(frame.getBoundingClientRect().width).toBeLessThan(390);
