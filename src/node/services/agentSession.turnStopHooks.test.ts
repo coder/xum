@@ -1558,8 +1558,20 @@ describe("layout turn-end nudge", () => {
   test("the audit gets the turn's parts and the time the ended stream started", async () => {
     const calls: LayoutCall[] = [];
     const before = Date.now();
+    let streaming = 0;
     const parts: CompletedMessagePart[] = [{ type: "text", text: "edited the page" }];
-    const { h } = await setup({ layoutNudge: findsIssue(calls), parts: () => parts });
+    const { h } = await setup({
+      layoutNudge: findsIssue(calls),
+      parts: () => parts,
+      whileStreaming: (turn) => {
+        // The first stream takes a while, so its start and its end are different times: a page
+        // the turn wrote in between counts as changed only against the start. The nudged turn
+        // streams too, and must not move the mark.
+        if (turn !== 1) return;
+        streaming = Date.now();
+        Bun.sleepSync(25);
+      },
+    });
 
     await h.session.sendMessage("fix the bug", options);
     await settle(h);
@@ -1567,7 +1579,7 @@ describe("layout turn-end nudge", () => {
     // The stream's state is reset before the hooks run: the start time must be read ahead.
     expect(calls[0]?.parts).toEqual(parts);
     expect(calls[0]?.streamStartedAtMs).toBeGreaterThanOrEqual(before);
-    expect(calls[0]?.streamStartedAtMs).toBeLessThanOrEqual(Date.now());
+    expect(calls[0]?.streamStartedAtMs).toBeLessThanOrEqual(streaming);
   });
 
   test("a turn the audit finds nothing in is not nudged", async () => {
@@ -1714,6 +1726,30 @@ describe("layout turn-end nudge", () => {
     expect(abortedAfterStop).toBe(true);
     expect(await userTexts(h)).toEqual(["fix the bug"]);
     expect(streams()).toBe(1);
+  });
+
+  test("a shutdown while the audit runs aborts it", async () => {
+    const auditRunning = Promise.withResolvers<void>();
+    const auditEnded = Promise.withResolvers<boolean>();
+    const { h } = await setup({
+      layoutNudge: async (_workspace, input) => {
+        auditRunning.resolve();
+        // A browser run must not delay teardown (bounded, so a missing abort fails the
+        // assertion below instead of hanging the session).
+        await new Promise((resolve) => {
+          input.abortSignal.addEventListener("abort", resolve, { once: true });
+          setTimeout(resolve, 2_000);
+        });
+        auditEnded.resolve(input.abortSignal.aborted);
+        return null;
+      },
+    });
+
+    await h.session.sendMessage("fix the bug", options);
+    await auditRunning.promise;
+    h.session.beginShutdown();
+
+    expect(await auditEnded.promise).toBe(true);
   });
 
   test("a Stop that finished while the turn's last event arrived ends the turn without a nudge", async () => {

@@ -39,7 +39,9 @@ const remembered = new LRUCache<string, FingerprintSnapshot>({ max: LAYOUT_MEMOR
 // Per path, the start time (host clock, ms) of the latest audit that settled the page (see
 // LayoutAuditTurn.finish). The turn-end audit compares a page's modified time with it, so a page
 // is not audited twice for the same change. Bounded like the memory above. An evicted path reads
-// as "never audited": the next turn-end audit repeats one check at worst (the safe direction).
+// as "never audited": its bar is then the start of the stream that ends, as after a restart. So
+// an edit the page got in an earlier turn whose end ran no audit is not checked until the page
+// changes again.
 const lastAuditStartedAt = new LRUCache<string, number>({ max: LAYOUT_MEMORY_MAX_PATHS });
 
 // The paths a turn end picked for an audit that no audit has settled since. The modified-time
