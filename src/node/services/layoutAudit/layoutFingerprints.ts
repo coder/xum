@@ -41,7 +41,7 @@ const remembered = new LRUCache<string, FingerprintSnapshot>({ max: LAYOUT_MEMOR
 // is not audited twice for the same change. Bounded like the memory above. An evicted path reads
 // as "never audited": its bar is then the start of the stream that ends, as after a restart. So
 // an edit the page got in an earlier turn whose end ran no audit is not checked until the page
-// changes again.
+// changes again, unless the page is still marked due (below).
 const lastAuditStartedAt = new LRUCache<string, number>({ max: LAYOUT_MEMORY_MAX_PATHS });
 
 // The paths a turn end picked for an audit that no audit has settled since. The modified-time
