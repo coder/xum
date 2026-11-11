@@ -685,7 +685,7 @@ async function updateAllPluginsOrThrow(
   if (result.updated.length > 0) {
     publishAgentPluginsMutated();
   }
-  const summary = summarizeUpdateAll(result);
+  const summary = summarizeUpdateAll(result, true);
   showCommandFeedbackToast({ type: summary.tone, message: summary.message });
   if (result.reviews.length > 0) {
     publishPluginsSectionIntent({ type: "review-updates", reviews: result.reviews });

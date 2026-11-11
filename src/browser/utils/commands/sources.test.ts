@@ -482,6 +482,28 @@ describe("plugin update commands", () => {
     });
   });
 
+  test("Update All Plugins keeps the reviews for a Settings that is not open yet", async () => {
+    await withTestWindow(async () => {
+      const review = preview("beta", [{ summary: "adds skill 'review'" }]);
+      const { api } = pluginApi([check("alpha"), check("beta")], {
+        alpha: preview("alpha", []),
+        beta: review,
+      });
+      consumePendingPluginsSectionIntent();
+      const action = getActions({ api, onOpenSettings: mock(() => undefined) }).find(
+        (a) => a.id === CommandIds.pluginsUpdateAll()
+      );
+
+      await action!.run();
+
+      // With no section mounted only the latest intent survives: it must be the reviews.
+      expect(consumePendingPluginsSectionIntent()).toEqual({
+        type: "review-updates",
+        reviews: [review.data],
+      });
+    });
+  });
+
   test("Update All Plugins reports a transport failure", async () => {
     await withTestWindow(async () => {
       const { api } = pluginApi([], {});

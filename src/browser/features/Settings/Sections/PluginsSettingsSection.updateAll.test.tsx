@@ -58,6 +58,8 @@ interface Fixture {
   names: string[];
   pending: Record<string, AgentPluginUpdateReview>;
   failing?: Record<string, string>;
+  /** Unmanaged plugins in another container, listed after the managed ones (names may repeat). */
+  unmanaged?: string[];
 }
 
 function createApi(fixture: Fixture) {
@@ -66,7 +68,19 @@ function createApi(fixture: Fixture) {
   const locked = new Map(fixture.names.map((name) => [name, OLD_SHA]));
   api.agentPlugins.listForSettings = (() =>
     Promise.resolve({
-      list: { success: true, data: fixture.names.map((name) => row(name, locked.get(name)!)) },
+      list: {
+        success: true,
+        data: [
+          ...fixture.names.map((name) => row(name, locked.get(name)!)),
+          ...(fixture.unmanaged ?? []).map(
+            (name): AgentPluginListItem => ({
+              ...row(name, OLD_SHA),
+              managed: false,
+              location: `~/.agents/plugins/${name}`,
+            })
+          ),
+        ],
+      },
       pendingSignOuts: { kind: "none" },
     })) as typeof api.agentPlugins.listForSettings;
   const updates: Array<{ name: string; consent: unknown }> = [];
@@ -251,6 +265,70 @@ test("the next queued review opens only after the confirmed update has settled",
   hold.release();
   await waitFor(() => expect(shows("adds skill 'epsilon'")).toBe(true));
   expect(openReviews(view)[0].disabled).toBe(false);
+});
+
+test("an unmanaged plugin that shares a managed plugin's name is not counted twice", async () => {
+  const { api } = createApi({
+    names: ["alpha"],
+    pending: { alpha: neutral("alpha") },
+    unmanaged: ["alpha"],
+  });
+  const view = mount(api);
+
+  const button = await updateAllButton(view);
+
+  expect(button.textContent).toContain("(1)");
+});
+
+test("a single card Update click drops the queued reviews", async () => {
+  const { api, updates } = createApi({
+    names: ["beta", "epsilon", "delta"],
+    pending: {
+      beta: capabilityChanging("beta"),
+      epsilon: capabilityChanging("epsilon"),
+      delta: neutral("delta"),
+    },
+  });
+  publishPluginsSectionIntent({
+    type: "review-updates",
+    reviews: [capabilityChanging("beta"), capabilityChanging("epsilon")],
+  });
+  const view = mount(api);
+  const shows = (text: string) => (view.container.textContent ?? "").includes(text);
+  await waitFor(() => expect(shows("adds skill 'beta'")).toBe(true));
+
+  // The cards list beta, epsilon, delta: the last Update belongs to the neutral delta.
+  const cardUpdates = await waitFor(() => {
+    const found = buttonsIn(view).filter((candidate) => candidate.textContent === "Update");
+    if (found.length !== 3) throw new Error("The cards have not rendered their Update buttons");
+    return found;
+  });
+  fireEvent.click(cardUpdates[2]);
+
+  await waitFor(() => expect(updates.map((update) => update.name)).toEqual(["delta"]));
+  await waitFor(() => expect(shows("adds skill 'beta'")).toBe(false));
+  expect(shows("adds skill 'epsilon'")).toBe(false);
+});
+
+test("reviews a palette Update All finds while Settings is already open show up live", async () => {
+  const { api } = createApi({
+    names: ["beta", "epsilon"],
+    pending: { beta: capabilityChanging("beta"), epsilon: capabilityChanging("epsilon") },
+  });
+  const view = mount(api);
+  await updateAllButton(view);
+  expect(openReviews(view)).toHaveLength(0);
+
+  publishPluginsSectionIntent({
+    type: "review-updates",
+    reviews: [capabilityChanging("beta"), capabilityChanging("epsilon")],
+  });
+
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+  fireEvent.click(buttonNamed(view, "Cancel")!);
+  await waitFor(() =>
+    expect((view.container.textContent ?? "").includes("adds skill 'epsilon'")).toBe(true)
+  );
 });
 
 test("a failed update does not stop the others and the status names it", async () => {

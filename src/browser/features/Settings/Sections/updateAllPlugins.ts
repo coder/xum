@@ -82,7 +82,7 @@ export interface UpdateAllSummary {
   message: string;
 }
 
-function summaryParts(result: UpdateAllResult): string[] {
+function summaryParts(result: UpdateAllResult, pointToSettings: boolean): string[] {
   const parts: string[] = [];
   if (result.updated.length > 0) parts.push(`Updated ${result.updated.join(", ")}`);
   if (result.failures.length > 0) {
@@ -92,7 +92,8 @@ function summaryParts(result: UpdateAllResult): string[] {
     parts.push(`Review needed for ${result.reviews.map((review) => review.name).join(", ")}`);
   }
   if (result.tagMoved.length > 0) {
-    parts.push(`Tag moved for ${result.tagMoved.join(", ")} — review in Settings → Plugins`);
+    const where = pointToSettings ? " — review in Settings → Plugins" : "";
+    parts.push(`Tag moved for ${result.tagMoved.join(", ")}${where}`);
   }
   if (result.checkFailures.length > 0) {
     parts.push(`Update check failed for ${result.checkFailures.join(", ")}`);
@@ -103,8 +104,12 @@ function summaryParts(result: UpdateAllResult): string[] {
 const isUnexpected = (result: UpdateAllResult): boolean =>
   result.failures.length > 0 || result.checkFailures.length > 0 || result.tagMoved.length > 0;
 
-export function summarizeUpdateAll(result: UpdateAllResult): UpdateAllSummary {
-  const parts = summaryParts(result);
+/** `pointToSettings`: the reader is outside Settings → Plugins (the palette toast). */
+export function summarizeUpdateAll(
+  result: UpdateAllResult,
+  pointToSettings = false
+): UpdateAllSummary {
+  const parts = summaryParts(result, pointToSettings);
   if (parts.length === 0) return { tone: "success", message: "All plugins are up to date." };
   return { tone: isUnexpected(result) ? "error" : "success", message: parts.join(". ") };
 }

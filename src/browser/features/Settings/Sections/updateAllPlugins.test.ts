@@ -198,6 +198,14 @@ describe("summarizeUpdateAll", () => {
     expect(summary.message).toContain("clone failed");
   });
 
+  test("only the palette status sends the reader to Settings", () => {
+    const moved = { ...empty, tagMoved: ["moved"] };
+
+    expect(summarizeUpdateAll(moved, true).message).toContain("Settings");
+    expect(summarizeUpdateAll(moved).message).not.toContain("Settings");
+    expect(summarizeUpdateAll(moved).message).toContain("moved");
+  });
+
   test.each([
     ["a moved tag", { tagMoved: ["moved"] }],
     ["an unreachable remote", { checkFailures: ["offline"] }],
