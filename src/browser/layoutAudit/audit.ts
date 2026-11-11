@@ -5,6 +5,7 @@ import {
   auditedText,
   chainBelowRoot,
   clippingBoundariesFor,
+  clippingBoundaryOf,
   hasHorizontalScrollerAncestor,
   hasReachableVerticalScrollerAncestor,
   isExcludedElement,
@@ -444,11 +445,30 @@ function isFacelessControl(page: LayoutPage, el: Element): boolean {
   return auditedText(page, el) === "" && isRequiredControl(el);
 }
 
-// The rectangles whose points are sampled: the text lines, or the box of a faceless control.
+// A line that a clipping box cuts away keeps its line box (the lines past a line clamp, text past
+// an overflow-hidden edge), but the user never sees it, so nothing can cover it. Its center must
+// be inside every box that clips it on that axis: the element's own and its clipping ancestors'.
+function isShownLine(boxes: readonly ClippingBoundary[], line: Box): boolean {
+  const x = line.left + line.width / 2;
+  const y = line.top + line.height / 2;
+  return boxes.every(
+    ({ box, axes }) =>
+      (!axes.includes("horizontal") || (x >= box.left && x <= box.right)) &&
+      (!axes.includes("vertical") || (y >= box.top && y <= box.bottom))
+  );
+}
+
+// The rectangles whose points are sampled: the shown text lines, or the box of a faceless control.
 function sampleRects(pass: AuditPass, el: Element): Box[] {
-  const rects = isFacelessControl(pass.page, el)
-    ? [pass.page.box(el)]
-    : textFragments(pass.page, el);
+  const { page } = pass;
+  let rects: Box[];
+  if (isFacelessControl(page, el)) {
+    rects = [page.box(el)];
+  } else {
+    const own = clippingBoundaryOf(page, el);
+    const clips = [...(own ? [own] : []), ...clippingBoundariesFor(page, el)];
+    rects = textFragments(page, el).filter((line) => isShownLine(clips, line));
+  }
   return rects.filter((rect) => rect.width * rect.height >= THRESHOLDS.minFragmentArea);
 }
 
