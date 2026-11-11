@@ -370,6 +370,11 @@ function computeRoutineRunBundleInfos(
   options: ComputeBundleInfosOptions
 ): Array<OperationalBundleInfo | undefined> {
   const infos = new Array<OperationalBundleInfo | undefined>(messages.length);
+  // Found once per projection (not per run) so live-tail detection stays linear in the transcript.
+  let lastNonReasoningIndex = messages.length - 1;
+  while (lastNonReasoningIndex >= 0 && messages[lastNonReasoningIndex].type === "reasoning") {
+    lastNonReasoningIndex -= 1;
+  }
   let index = 0;
 
   while (index < messages.length) {
@@ -416,9 +421,7 @@ function computeRoutineRunBundleInfos(
     // The run the agent is still working in stays open so progress is visible, and it folds once
     // the agent moves on (writes text, makes an edit) or the turn ends. Keying this on the tail
     // rather than on per-row status keeps the run from collapsing and reopening between calls.
-    const isLiveTail =
-      options.isTurnActive &&
-      messages.slice(lastToolIndex + 1).every((message) => message.type === "reasoning");
+    const isLiveTail = options.isTurnActive && lastToolIndex === lastNonReasoningIndex;
     assignBundleInfo(infos, {
       key: `routine:${entries[0].message.id}`,
       position: "head",
