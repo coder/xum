@@ -122,6 +122,14 @@ function isHiddenStyle(style: LayoutStyle): boolean {
 export function isVisible(page: LayoutPage, el: Element): boolean {
   const rect = page.box(el);
   if (rect.width <= 0 || rect.height <= 0) return false;
+  return paintsContent(page, el);
+}
+
+/**
+ * isVisible without its area test, for an element that holds text: its own box can be empty
+ * (`display: contents`) while its text paints.
+ */
+export function paintsContent(page: LayoutPage, el: Element): boolean {
   if (page.style(el).visibility === "hidden") return false;
   return !selfAndAncestors(el).some((node) => isHiddenStyle(page.style(node)));
 }
@@ -342,7 +350,7 @@ export function nestedClippingBoundaries(page: LayoutPage, el: Element): NestedC
       clippers.length === 0 ||
       !holder ||
       isExcludedElement(page, holder) ||
-      !isVisible(page, holder)
+      !paintsContent(page, holder)
     ) {
       continue;
     }

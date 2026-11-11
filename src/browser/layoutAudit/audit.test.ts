@@ -195,6 +195,12 @@ describe("clipped-text", () => {
       expect(audit(html.replace("visibility: hidden", "visibility: visible"))).toEqual([
         finding("clipped-text", "span#s", "horizontal", 340),
       ]);
+      // A holder with no box of its own (`display: contents`) still paints its text.
+      const contents = html.replace(
+        'data-box="0 0 400 20" data-css="visibility: hidden"',
+        'data-box="0 0 0 0" data-css="display: contents"'
+      );
+      expect(audit(contents)).toEqual([finding("clipped-text", "span#s", "horizontal", 340)]);
     });
 
     test("is judged on the lines it holds, down to a clipper inside a clipper", () => {
@@ -749,6 +755,15 @@ describe("overlapping-text", () => {
       // The same lines shown, in a box that holds them all, are covered: 19 of 20.
       expect(auditScrolling(clamped("", 400)).findings).toEqual([
         finding("overlapping-text", "p#c", "horizontal", 0),
+      ]);
+    });
+
+    test("the shown part of an ellipsized line is sampled, however long the line", () => {
+      // The line runs to 1000, so its center is past the box: the 200 px that show are covered.
+      const html = `<div id="stage"><p id="e" data-box="10 1200 200 20" data-css="overflow-x: hidden; text-overflow: ellipsis" data-lines="10 1200 990 20">A heading that is far too long for its box</p>
+        <div data-box="0 1190 300 40" data-css="background-color: rgb(255, 255, 255)" data-z="1"></div></div>`;
+      expect(auditScrolling(html).findings).toEqual([
+        finding("overlapping-text", "p#e", "horizontal", 0),
       ]);
     });
 
