@@ -142,6 +142,67 @@ Body
     ).toThrow("must be a mapping");
   });
 
+  // Claude Code skips an agent file only for a missing name or description, a bad name or bad YAML,
+  // so an agent with a long description loads there and must load here (the cap is Xum's own).
+  describe("a description over the descriptor's cap", () => {
+    const longText = (length: number) =>
+      Array.from({ length }, (_, index) => String.fromCharCode(97 + (index % 26))).join("");
+
+    function parseWithDescription(description: string, plugin?: { agentId: string }) {
+      const content = `---\nname: Long\ndescription: ${description}\n---\nBody\n`;
+      return parseAgentDefinitionMarkdown({
+        content,
+        byteSize: Buffer.byteLength(content, "utf-8"),
+        ...(plugin != null ? { plugin } : {}),
+      });
+    }
+
+    test("is cut to a 1024-character prefix instead of failing the agent", () => {
+      const description = longText(1500);
+      const cut = parseWithDescription(description).frontmatter.description;
+      expect(cut).toHaveLength(1024);
+      expect(description.startsWith(cut ?? "")).toBe(true);
+    });
+
+    test("is kept whole at the cap and one under it", () => {
+      expect(parseWithDescription(longText(1024)).frontmatter.description).toBe(longText(1024));
+      expect(parseWithDescription(longText(1023)).frontmatter.description).toBe(longText(1023));
+    });
+
+    test("is not cut through a surrogate pair", () => {
+      // The pair's high half is the 1024th UTF-16 unit, so a plain slice would leave it alone.
+      const description = `${"a".repeat(1023)}😀tail`;
+      expect(parseWithDescription(description).frontmatter.description).toBe("a".repeat(1023));
+    });
+
+    test("is cut in a Claude Code plugin agent, which still maps to a hidden runnable agent", () => {
+      const { frontmatter } = parseWithDescription(longText(2000), { agentId: "file-id" });
+      expect(frontmatter.description).toHaveLength(1024);
+      expect(frontmatter.base).toBe("exec");
+      expect(frontmatter.subagent?.runnable).toBe(true);
+    });
+
+    test("is cut in a block scalar full of examples, the way Claude Code agents are written", () => {
+      const example =
+        "<example>\nuser: review this\nassistant: launching the reviewer\n</example>\n";
+      const block = example.repeat(30).replaceAll(/^/gm, "  ");
+      const content = `---\nname: Reviewer\ndescription: |\n${block}---\nBody\n`;
+      const { frontmatter } = parseAgentDefinitionMarkdown({
+        content,
+        byteSize: Buffer.byteLength(content, "utf-8"),
+      });
+      expect(frontmatter.description).toHaveLength(1024);
+      expect(frontmatter.description?.startsWith("<example>\nuser: review this")).toBe(true);
+    });
+
+    test("does not loosen another field: a name over its cap still fails the agent", () => {
+      const content = `---\nname: ${"n".repeat(129)}\ndescription: ${longText(1500)}\n---\nBody\n`;
+      expect(() =>
+        parseAgentDefinitionMarkdown({ content, byteSize: Buffer.byteLength(content, "utf-8") })
+      ).toThrow(AgentDefinitionParseError);
+    });
+  });
+
   describe("plugin source (Claude Code / Cursor format)", () => {
     function parse(frontmatter: string, source?: "plugin") {
       // The fixture file is agents/file-id.md.
