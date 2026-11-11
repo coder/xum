@@ -47,6 +47,11 @@ function pathKey(sessionDir: string, relPath: string): string {
   return JSON.stringify([sessionDir, relPath]);
 }
 
+/** An audit that started at `startedAtMs` settled the path: the latest start wins. */
+function settlePath(key: string, startedAtMs: number): void {
+  lastAuditStartedAt.set(key, Math.max(startedAtMs, lastAuditStartedAt.peek(key) ?? 0));
+}
+
 /**
  * When the latest audit that settled the path started, in this process; undefined when it has
  * none (never audited, still due, evicted, or the backend restarted).
@@ -128,9 +133,7 @@ export function startLayoutAudit(
         settled = staysDue?.(report) !== true;
         return report;
       } finally {
-        if (settled) {
-          lastAuditStartedAt.set(key, Math.max(startedAtMs, lastAuditStartedAt.peek(key) ?? 0));
-        }
+        if (settled) settlePath(key, startedAtMs);
         path.inFlight -= 1;
         if (path.inFlight === 0) auditsByPath.delete(key);
       }
