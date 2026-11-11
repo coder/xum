@@ -145,6 +145,7 @@ HistoryService is pure local disk I/O. **Always use a real instance** via `creat
 ## Agent Plugins
 
 - Plugin install-method choice is a Draft (`rfc/20261106_plugin-install-method-choice.md` at commit `4a1cf82e1da83bfabc04c340c8f080e2fc3eb7e4` of branch `plugin-install-method-choice-parked`). Before anyone builds it, its design must cover what every other Xum build does to a plugin whose saved manifest that build does not load: hook trust, OAuth sign-ins, the registry row and updates. Never repair state that another build changed: fail closed and let a reinstall review it.
+- Hostile repositories and slow `realpath` (plugin staging, the marketplace list): the fixed limits are the design. A marketplace path has at most 32 folders, a staged tree at most 64 levels, the list checks entry folders with `lstat` before `realpath`, and staging checks links only after the walk. Do not add a rule for each new way a hostile repository's paths or links can make `realpath` slow: a preview that the user started can be slow on a hostile repository.
 
 ## Command Palette & UI Access
 
