@@ -652,6 +652,17 @@ describe("routine tool runs (normal density)", () => {
     expect(infos[4]).toBeUndefined();
   });
 
+  test("leaves background spawns and output polls to their own rows", () => {
+    const spawn = tool({ id: "spawn-c", toolName: "bash", args: { run_in_background: true } });
+    const wait = tool({ id: "await-c", toolName: "task_await" });
+    // The spawn is not routine, so the single wait after it is not worth a summary row either.
+    expect(routine([spawn, wait])).toEqual([undefined, undefined]);
+
+    // Consecutive bash_output polls keep their dedicated first/last collapse.
+    const polls = ["poll-1", "poll-2", "poll-3"].map((id) => tool({ id, toolName: "bash_output" }));
+    expect(routine(polls)).toEqual([undefined, undefined, undefined]);
+  });
+
   test("treats code execution as routine only when everything it ran was routine", () => {
     const readOnlyRun = tool({
       id: "code-read",

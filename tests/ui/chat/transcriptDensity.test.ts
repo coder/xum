@@ -146,7 +146,7 @@ describe("Hyper transcript density", () => {
         return button;
       });
       expect(firstOperationalButton.textContent).toContain(
-        "Read 1 file and 1 skill, searched 1 query, asked 1 question"
+        "Read 1 file and 1 skill, ran 1 search, asked 1 question"
       );
       expect(firstOperationalButton.getAttribute("aria-expanded")).toBe("false");
       expect(view.container.textContent).toContain("Please validate with typecheck too");

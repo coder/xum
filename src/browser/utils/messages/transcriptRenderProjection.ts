@@ -299,7 +299,8 @@ const ROUTINE_TOOL_NAMES = new Set<string>([
   "agent_skill_read_file",
   "bash",
   "bash_background_list",
-  "bash_output",
+  // bash_output is deliberately absent: consecutive polls of one process have their own
+  // first/last collapse ("Show N more output checks"), which a generic fold would hide.
   "code_execution",
   "file_read",
   "get_goal",
@@ -327,6 +328,11 @@ function isRoutineToolMessage(
 ): message is DisplayedMessage & { type: "tool" } {
   if (message?.type !== "tool" || !ROUTINE_TOOL_NAMES.has(message.toolName)) {
     return false;
+  }
+  if (message.toolName === "bash") {
+    // A background spawn starts a process that outlives the call and has its own controls
+    // (view output, terminate), and later task_await rows refer back to it: keep it in view.
+    return !(isPlainObject(message.args) && message.args.run_in_background === true);
   }
   if (message.toolName !== "code_execution") {
     return true;
