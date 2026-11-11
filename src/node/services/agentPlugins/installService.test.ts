@@ -6757,7 +6757,7 @@ describe("AgentPluginInstallService", () => {
     // The relative-escape refusal must stand on its own: this link resolves,
     // lands outside both the staged root and the managed plugins directory,
     // so no other refusal in stagedLinkProblem catches it. Enough ".." reach
-    // the filesystem root from any staging depth (".." at "/" stays at "/").
+    // the filesystem root from any staging folder up to 64 levels deep (".." at "/" stays at "/").
     const outsideFile = path.join(await fsPromises.realpath(remoteDir), "outside.js");
     await fsPromises.writeFile(outsideFile, "// outside the plugin\n");
     const target = "../".repeat(64) + path.relative(path.parse(outsideFile).root, outsideFile);
