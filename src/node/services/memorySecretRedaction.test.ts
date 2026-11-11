@@ -1041,11 +1041,12 @@ describe("redactSecretLike", () => {
     ).toBe("https://h.example.com/p?sv=1&sig=[redacted]&sp=r#frag (see ?signature=[redacted])");
   });
 
-  // The harvest renderer and the guard run redaction over text that may hold the marker already, so
-  // a second pass must change nothing. The value pattern stops before `]`: on the marker an earlier
-  // pass wrote, it read `[redacted` and wrote `[redacted]]`, one more `]` on every pass. Such a match
-  // is still reported to the write guard, as before, so the guard refuses all of these: what stays
-  // readable behind the marker (`SEKRIT`) is a credential the redaction did not reach.
+  // The harvest renderer and the guard run redaction over text that may hold the marker already. The
+  // value pattern stops before `]`: on the marker an earlier pass wrote, it read `[redacted` and wrote
+  // `[redacted]]`, one more `]` on every pass. The output no longer grows that `]`, and every shape
+  // below is stable on a second pass. Such a match is still reported to the write guard, as on main,
+  // so the guard refuses all of these: what stays readable behind the marker (`SEKRIT`) is a credential
+  // the redaction did not reach. Other second-pass changes (a key next to a marker) are main's.
   it.each([
     // Every value goes once, and the output is stable.
     ["a request line", "GET /x?a=1&sig=SEKRIT2 HTTP/1.1", "GET /x?a=1&sig=[redacted] HTTP/1.1"],
@@ -1134,6 +1135,62 @@ describe("redactSecretLike", () => {
     ],
   ])("judges an edit as main's guard does: %j then %j", (previous, updated) => {
     expect(addsSecretLike(previous, updated)).toBe(true);
+  });
+
+  // The `]` that a signed-URL match adds is followed through every pass after it. Each shape puts the
+  // edit of another pass in front of it, behind it, or right up to it. A position that a pass moved
+  // without reporting it would delete some other character, and `removeAt` would assert.
+  it.each([
+    [
+      "a key's value in front",
+      "password=hunter2 &sig=sk-ABCDEFGHIJKLMNOP",
+      "password=[redacted] &sig=[redacted]",
+    ],
+    [
+      "a key's value behind",
+      "?sig=sk-ABCDEFGHIJKLMNOP password=hunter2",
+      "?sig=[redacted] password=[redacted]",
+    ],
+    ["a key's value that ends at it", "password=?sig=sk-ABCDEFGHIJKLMNOP", "password=[redacted]]"],
+    [
+      "a key's value that takes the first of two",
+      "token=?sig=sk-ABCDEFGHIJKLMNOP ?sig=sk-QRSTUVWXYZABCDEF",
+      "token=[redacted]] ?sig=[redacted]",
+    ],
+    [
+      "a JWT in front",
+      "eyJhbGciOiJI.eyJzdWIiOiIx.c2lnbmF0 &sig=sk-ABCDEFGHIJKLMNOP",
+      "[redacted] &sig=[redacted]",
+    ],
+    [
+      "a signature in front, from the same pattern",
+      "?sig=abcdefg &sig=sk-ABCDEFGHIJKLMNOP",
+      "?sig=[redacted] &sig=[redacted]",
+    ],
+    [
+      "a signature behind, from the same pattern",
+      "?sig=sk-ABCDEFGHIJKLMNOP &sig=abcdefg",
+      "?sig=[redacted] &sig=[redacted]",
+    ],
+    [
+      "two markers",
+      "?sig=sk-ABCDEFGHIJKLMNOP ?sig=sk-QRSTUVWXYZABCDEF",
+      "?sig=[redacted] ?sig=[redacted]",
+    ],
+    [
+      "a header in front that only the reader reads",
+      String.raw`a\tCookie: v1` + "\n?sig=sk-ABCDEFGHIJKLMNOP",
+      String.raw`a\tCookie: [redacted]` + "\n?sig=[redacted]",
+    ],
+    [
+      "a header behind that only the reader reads",
+      "?sig=sk-ABCDEFGHIJKLMNOP\n" + String.raw`a\tCookie: v1`,
+      "?sig=[redacted]\n" + String.raw`a\tCookie: [redacted]`,
+    ],
+  ])("follows the added bracket past another pass: %s", (_label, text, expected) => {
+    const redacted = redactSecretLike(text);
+    expect(redacted).toBe(expected);
+    expect(redactSecretLike(redacted)).toBe(redacted);
   });
 
   // A half marker is not the marker: a value that merely starts like it is still a value.

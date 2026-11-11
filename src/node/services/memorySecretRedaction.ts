@@ -11,6 +11,8 @@
  * leave the tail of a long credential readable.
  */
 
+import assert from "@/common/utils/assert";
+
 /** What a redacted value becomes. */
 export const REDACTED = "[redacted]";
 
@@ -50,8 +52,8 @@ function followPositions(positions: number[], edits: Edit[]): number[] {
 function replaceMatches(
   text: string,
   pattern: RegExp,
-  replacer: (match: RegExpMatchArray) => string,
-  marks: (match: RegExpMatchArray) => boolean
+  replacer: (match: RegExpExecArray) => string,
+  marks: (match: RegExpExecArray) => boolean
 ): { text: string; edits: Edit[]; marked: number[] } {
   const parts: string[] = [];
   const edits: Edit[] = [];
@@ -71,10 +73,20 @@ function replaceMatches(
   return { text: parts.join(""), edits, marked };
 }
 
+/**
+ * `text` without the character at each position. Every position must hold a `]` with a `]` behind
+ * it, so a deletion cannot break a marker. A position that a pass moved without reporting it (see
+ * `followPositions`) would delete some other character: fail fast instead. The message names no
+ * text, since the text can hold a credential.
+ */
 function removeAt(text: string, positions: number[]): string {
   const parts: string[] = [];
   let from = 0;
   for (const position of positions) {
+    assert(
+      position >= from && text.charAt(position) === "]" && text.charAt(position + 1) === "]",
+      "a tracked position is not a `]` that a `]` follows"
+    );
     parts.push(text.slice(from, position));
     from = position + 1;
   }
@@ -594,10 +606,12 @@ type RemovalSource = "regex" | "reader";
  * replacement took out, so a caller can tell credentials apart instead of only counting them.
  *
  * The signed-URL pattern's value stops before `]`, so on a marker that is already in the text it
- * matches `[redacted` and writes `[redacted]` in front of the `]` that was there: `[redacted]]`. The
- * passes keep doing that, because the write guard compares what they take out and the later passes
- * read what they leave. `artifacts` lists where such an added `]` ended up in the returned text, so
- * `redactSecretLike` can take it out and a second pass finds the text as the first left it.
+ * matches `[redacted` and writes `[redacted]` in front of the `]` that was there: `[redacted]]`, one
+ * more `]` on every pass. The passes keep doing that, because the write guard compares what they take
+ * out and the later passes read what they leave. `artifacts` lists where each `]` that such a match
+ * added ended up in the returned text, so `redactSecretLike` can take it out and the `]` stops
+ * growing. Each pass after the signed-URL pattern must report its edits to `followPositions`. Other
+ * second-pass changes (a key next to a marker) stay as they are on main.
  */
 function runRedactionPasses(
   text: string,
