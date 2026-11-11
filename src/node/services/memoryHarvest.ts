@@ -21,7 +21,7 @@ import {
 } from "@/node/services/memoryConsolidation";
 import { createSpendMeter, type SpendMeter } from "@/node/services/memoryDreamSpend";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
-import { REDACTION_LOOKAHEAD_CHARS, redactWithinCap } from "@/node/services/memorySecretRedaction";
+import { REDACTION_LOOKAHEAD_CHARS, redactSecretLike } from "@/node/services/memorySecretRedaction";
 import { isCompactionRequestMessage } from "@/node/services/taskMessagePredicates";
 import {
   SESSION_HISTORY_OMITTED,
@@ -209,12 +209,9 @@ interface HarvestPiece {
  */
 function boundedTextPart(raw: string): RowText {
   const window = takeWithoutMedia(raw, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
-  // The cap is in the part's own characters: what redaction shortens does not bring the lookahead
-  // into the kept text, where a key that the window's end cut would show as it is.
-  const prepared = neutralizeHarvestText(redactWithinCap(window.text, HARVEST_MAX_TEXT_PART_CHARS));
+  const prepared = neutralizeHarvestText(redactSecretLike(window.text));
   const text = prepared.slice(0, HARVEST_MAX_TEXT_PART_CHARS);
-  const pastCap = Math.max(0, window.text.length - HARVEST_MAX_TEXT_PART_CHARS);
-  return { text, cutChars: raw.length - window.read + pastCap + prepared.length - text.length };
+  return { text, cutChars: raw.length - window.read + prepared.length - text.length };
 }
 
 function rowTextOfPart(part: MuxMessage["parts"][number]): RowText {

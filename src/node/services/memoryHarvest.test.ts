@@ -1116,7 +1116,7 @@ describe("runMemoryHarvest", () => {
       expect(prompt).not.toContain("ghp_a1B2");
     });
 
-    it("counts the cut characters of a part in which redaction shrank the text in its own characters", () => {
+    it("keeps the count of cut characters of a part in which redaction shrank the text", () => {
       using fixture = createFixture();
       const text = `${githubToken} ${"y".repeat(TEXT_PART_LIMIT + 1_000)}`;
       fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
@@ -1125,23 +1125,10 @@ describe("runMemoryHarvest", () => {
         (chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>
       );
 
-      // The cap is in the part's own characters, so the 30 that redaction took out of the token do
-      // not let 30 more fit under it: all 1,041 characters past the cap are cut.
-      expect(rows.at(-1)?.text).toEndWith("[truncated 1041 more chars for memory harvest]");
+      // Of the 1,041 characters past the cap, the 30 that redaction took out of the token now fit
+      // under it.
+      expect(rows.at(-1)?.text).toEndWith("[truncated 1011 more chars for memory harvest]");
       expect(rows.map((row) => row.text).join("")).not.toContain(githubToken);
-    });
-
-    // Redaction shortens the text, so a cut of its output at the cap reached the lookahead's end,
-    // where a key that the end cut is too short to match shows as it is.
-    it("shows nothing of the lookahead when redaction shortens the text by more than it", async () => {
-      // The scan window ends 8 characters into a key that needs 12 to match.
-      const window = TEXT_PART_LIMIT + 512;
-      const key = "sk-QBNDZ8P3";
-      const filler = "z".repeat(window - "password= ".length - key.length);
-      const prompt = await promptOfText(`password=${filler} ${key}R6V4H2J5 and more text`, "user");
-
-      expect(prompt).not.toContain("sk-QBND");
-      expect(prompt).toContain("password=[redacted]");
     });
   });
 

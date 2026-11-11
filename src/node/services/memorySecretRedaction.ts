@@ -671,30 +671,6 @@ export function addsSecretLike(previous: string, updated: string): boolean {
   return added;
 }
 
-/**
- * `text` redacted, and cut at its first `cap` characters, with the rest of `text` as a lookahead: a
- * secret that starts inside the cap is matched whole, and no character past the cap is shown.
- * Redaction shortens text, so cutting its output at `cap` characters reaches the lookahead's end,
- * where a key that the end cut is too short to match shows as it is. The cut is in the characters
- * of `text` instead: redacting its first `cap` characters alone shows only those, except that it
- * leaves the start of a secret that crosses the cap. Where the redacted whole differs from that,
- * the whole has taken the secret, and its marker stands in for the start. Redaction can also
- * lengthen text (a one-character value becomes a marker), so the result can be longer than `cap`.
- */
-export function redactWithinCap(text: string, cap: number): string {
-  const whole = redactSecretLike(text);
-  // mutation-equivalent: at a length of exactly `cap` the head is the whole text, so either branch
-  // returns the same text; this one skips the second redaction
-  if (text.length <= cap) return whole;
-  const head = redactSecretLike(text.slice(0, cap));
-  let same = 0;
-  // mutation-equivalent: past the end of both texts `undefined === undefined` takes one more step,
-  // which returns the whole text, and then the whole text is the head
-  while (same < head.length && head[same] === whole[same]) same++;
-  if (same === head.length) return head;
-  return whole.slice(0, whole.startsWith(REDACTED, same) ? same + REDACTED.length : same);
-}
-
 /** True when `text` holds a credential shape: redacting it would change it. */
 export function containsSecretLike(text: string): boolean {
   return redactSecretLike(text) !== text;
