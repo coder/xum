@@ -849,12 +849,12 @@ describe("AgentPluginInstallService marketplaces", () => {
     await fsPromises.mkdir(path.join(staged, "Kit"), { recursive: true });
     await fsPromises.mkdir(path.join(staged, "caf\u00e9"), { recursive: true });
     const realRealpath = fsPromises.realpath;
-    const realpath = spyOn(fsPromises, "realpath").mockImplementation(async (target) => {
+    const realpath = spyOn(fsPromises, "realpath").mockImplementation((async (target: string) => {
       const resolved = await realRealpath(target);
       return resolved.endsWith(`${path.sep}Kit`)
         ? `${resolved.slice(0, -3)}kit`
         : resolved.replace("caf\u00e9", "cafe\u0301");
-    });
+    }) as typeof fsPromises.realpath);
     try {
       expect(await realEntryFolder(staged, "Kit")).toEqual({
         why: "its letter case differs from the folder in the repository",
