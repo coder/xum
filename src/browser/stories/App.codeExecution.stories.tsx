@@ -221,7 +221,7 @@ export const ConsecutiveRuns: AppStory = {
   parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    const bundle = await canvas.findByRole("button", { name: /Ran 3 operations/ });
+    const bundle = await canvas.findByRole("button", { name: /Ran 3 scripts/ });
     await expect(bundle).toHaveAttribute("aria-expanded", "false");
     await expect(canvas.queryAllByRole("group", { name: "Code Execution" })).toHaveLength(0);
 

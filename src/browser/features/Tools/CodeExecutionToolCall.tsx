@@ -7,7 +7,7 @@ import {
   AlertTriangleIcon,
   CirclePauseIcon,
 } from "lucide-react";
-import { DetailContent, ToolIcon } from "./Shared/ToolPrimitives";
+import { DetailContent, LoadingDots, ToolIcon } from "./Shared/ToolPrimitives";
 import { type ToolStatus } from "./Shared/toolUtils";
 import { HighlightedCode } from "./Shared/HighlightedCode";
 import { ConsoleOutputDisplay } from "./Shared/ConsoleOutput";
@@ -173,6 +173,8 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
           ? "success"
           : "error";
 
+  const isRunning = !isComplete && !isInterrupted && !isBackgrounded;
+  const pinViewToggles = hasFailed === true || isInterrupted || viewMode !== "tools";
   const showsBody =
     (effectiveViewMode === "tools" && hasToolCalls) ||
     effectiveViewMode === "code" ||
@@ -187,7 +189,7 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
       aria-label="Code Execution"
       className="[container-type:inline-size] my-2 font-mono text-[11px]"
     >
-      <div className="text-secondary flex min-w-0 items-center gap-2 px-3 py-1">
+      <div className="group/header text-secondary flex min-w-0 items-center gap-2 px-3 py-1">
         <ToolIcon toolName="code_execution" />
         <span className="text-foreground shrink-0 font-medium">Code execution</span>
         {hasToolCalls ? (
@@ -199,7 +201,17 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
             <span className="text-muted font-monospace min-w-0 truncate">{codePreview}</span>
           )
         )}
-        <div className="ml-auto flex shrink-0 items-center">
+        {isRunning && <LoadingDots aria-hidden="true" />}
+        {/* View toggles are drill-down chrome: hidden until hover or keyboard focus, like the
+            row actions in Cursor, but pinned when they carry news (a failure or interruption) or
+            the user has switched views. Touch screens have no hover, so they always show there. */}
+        <div
+          className={cn(
+            "ml-auto flex shrink-0 items-center transition-opacity",
+            !pinViewToggles &&
+              "opacity-0 group-hover/header:opacity-100 focus-within:opacity-100 [@media(pointer:coarse)]:opacity-100"
+          )}
+        >
           <div className="mr-0.5">
             <ViewToggle
               active={effectiveViewMode === "result"}

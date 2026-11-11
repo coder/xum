@@ -624,7 +624,7 @@ describe("routine tool runs (normal density)", () => {
       key: "routine:read-a",
       position: "head",
       defaultExpanded: false,
-      summary: { details: "1 read · 1 reasoning step · 1 shell command" },
+      summary: { title: "Read 1 file, ran 1 command", details: "" },
     });
     expect(infos[1]).toMatchObject({ key: "routine:read-a", position: "member" });
     expect(infos[2]).toMatchObject({ key: "routine:read-a", position: "member" });
@@ -686,7 +686,7 @@ describe("routine tool runs (normal density)", () => {
 
     expect(infos[0]).toMatchObject({
       key: "routine:code-read",
-      summary: { title: "Ran 2 operations", details: "2 code runs" },
+      summary: { title: "Ran 2 scripts" },
     });
     expect(infos[1]).toMatchObject({ position: "member" });
     expect(infos[2]).toBeUndefined();
@@ -798,7 +798,7 @@ describe("operational bundle coalescing", () => {
 
     const reasoningOnly = computeOperationalBundleInfos([first], { isTurnActive: false });
     expect(reasoningOnly[0]?.entries).toEqual([{ message: first, originalIndex: 0 }]);
-    expect(reasoningOnly[0]?.summary.title).toBe("Reasoned");
+    expect(reasoningOnly[0]?.summary.title).toBe("Thought");
 
     const reasoningThenTool = computeOperationalBundleInfos([first, second], {
       isTurnActive: false,
@@ -807,7 +807,7 @@ describe("operational bundle coalescing", () => {
       { message: first, originalIndex: 0 },
       { message: second, originalIndex: 1 },
     ]);
-    expect(reasoningThenTool[0]?.summary.title).toBe("Ran 2 operations");
+    expect(reasoningThenTool[0]?.summary.title).toBe("Read 1 file");
   });
 
   test("groups non-success tools into operational bundles", () => {
@@ -857,8 +857,8 @@ describe("operational bundle coalescing", () => {
         { message: partialRead, originalIndex: 4 },
       ],
       summary: {
-        title: "Ran 5 operations",
-        details: "1 search · 1 shell command · 3 reads · 2 failed",
+        title: "Searched 1 query, ran 1 command, read 3 files",
+        details: "2 failed",
       },
     });
     expect(infos[1]).toMatchObject({ key: "bundle:search-1", position: "member" });
@@ -961,27 +961,36 @@ describe("operational bundle summary", () => {
     });
   });
 
-  test("summarizes mixed tools and reasoning", () => {
+  test("phrases mixed runs as verb clauses, merging shared verbs and folding reasoning in", () => {
     const summary = summarizeOperationalBundle([
       reasoning({ id: "think-1" }),
-      tool({ id: "edit-1", toolName: "file_edit_replace_string" }),
       tool({ id: "test-1", toolName: "bash", args: { script: "make test" } }),
-      tool({ id: "question-1", toolName: "ask_user_question" }),
+      tool({ id: "read-1", toolName: "file_read" }),
+      tool({ id: "code-1", toolName: "code_execution" }),
+      tool({ id: "edit-1", toolName: "file_edit_replace_string" }),
     ]);
 
-    expect(summary.title).toBe("Ran 4 operations");
-    expect(summary.details).toBe("1 reasoning step · 1 edit · 1 shell command · 1 question");
+    expect(summary.title).toBe("Ran 1 command and 1 script, read 1 file, edited 1 file");
+    expect(summary.details).toBe("");
   });
 
-  test("pluralizes irregular detail labels", () => {
-    const summary = summarizeOperationalBundle([
+  test("calls a run of mixed read-only lookups exploration, but keeps one kind's own verb", () => {
+    const explored = summarizeOperationalBundle([
+      tool({ id: "read-1", toolName: "file_read" }),
+      tool({ id: "read-2", toolName: "file_read" }),
       tool({ id: "search-1", toolName: "web_search", result: [{ title: "one" }] }),
-      tool({ id: "search-2", toolName: "web_search", result: [{ title: "two" }] }),
-      tool({ id: "fetch-1", toolName: "web_fetch" }),
-      tool({ id: "fetch-2", toolName: "web_fetch" }),
     ]);
+    expect(explored.title).toBe("Explored 2 files, 1 query");
 
-    expect(summary.details).toBe("2 searches · 2 fetches");
+    const searches = summarizeOperationalBundle([
+      tool({ id: "search-2", toolName: "web_search", result: [{ title: "two" }] }),
+      tool({ id: "search-3", toolName: "web_search", result: [{ title: "three" }] }),
+    ]);
+    expect(searches.title).toBe("Searched 2 queries");
+  });
+
+  test("reads as a thought when the bundle only reasoned", () => {
+    expect(summarizeOperationalBundle([reasoning({ id: "think-only" })]).title).toBe("Thought");
   });
 
   test("categorizes Google native search grounding as a search", () => {
@@ -995,10 +1004,10 @@ describe("operational bundle summary", () => {
       tool({ id: "search-1", toolName: "web_search", result: [{ title: "one" }] }),
     ]);
 
-    expect(summary.details).toBe("2 searches");
+    expect(summary.title).toBe("Searched 2 queries");
   });
 
-  test("all-miss completed search bundle gets neutral copy", () => {
+  test("all-miss completed search bundle says it found nothing", () => {
     const allMiss = summarizeOperationalBundle([
       tool({ id: "search-1", toolName: "web_search", status: "completed", result: [] }),
       tool({
@@ -1008,10 +1017,10 @@ describe("operational bundle summary", () => {
         result: { type: "json", value: { sources: [] } },
       }),
     ]);
-    expect(allMiss.title).toBe("No results");
+    expect(allMiss.title).toBe("Searched 2 queries, no results");
   });
 
-  test("failed search summaries do not use no-results copy", () => {
+  test("failed searches report the failure, not missing results", () => {
     const failedSearch = summarizeOperationalBundle([
       tool({
         id: "search-1",
@@ -1021,5 +1030,6 @@ describe("operational bundle summary", () => {
       }),
     ]);
     expect(failedSearch.title).toBe("Searched 1 query");
+    expect(failedSearch.details).toBe("1 failed");
   });
 });

@@ -82,53 +82,25 @@ const FILE_EDIT_TOOL_NAMES = new Set<string>([
   "file_edit_insert",
 ]);
 
+/**
+ * Summary-row copy, phrased like Claude Code / Codex / Cursor ("Explored 3 files, 2 queries",
+ * "Ran 2 commands, read 1 file") rather than tallying "operations". `explores` marks read-only
+ * lookups: a run made only of those reads as "Explored ...".
+ */
 const OPERATIONAL_BUNDLE_CATEGORY_COPY: Record<
-  OperationalBundleCategory,
-  { singletonTitle: string; detailLabel: string; detailLabelPlural: string }
+  Exclude<OperationalBundleCategory, "reasoning">,
+  { verb: string; noun: string; nounPlural: string; explores: boolean }
 > = {
-  reasoning: {
-    singletonTitle: "Reasoned",
-    detailLabel: "reasoning step",
-    detailLabelPlural: "reasoning steps",
-  },
-  read: { singletonTitle: "Read 1 file", detailLabel: "read", detailLabelPlural: "reads" },
-  search: {
-    singletonTitle: "Searched 1 query",
-    detailLabel: "search",
-    detailLabelPlural: "searches",
-  },
-  fetch: { singletonTitle: "Fetched 1 page", detailLabel: "fetch", detailLabelPlural: "fetches" },
-  skill: {
-    singletonTitle: "Read 1 skill",
-    detailLabel: "skill read",
-    detailLabelPlural: "skill reads",
-  },
-  edit: { singletonTitle: "Edited 1 file", detailLabel: "edit", detailLabelPlural: "edits" },
-  shell: {
-    singletonTitle: "Ran 1 shell command",
-    detailLabel: "shell command",
-    detailLabelPlural: "shell commands",
-  },
-  question: {
-    singletonTitle: "Asked 1 question",
-    detailLabel: "question",
-    detailLabelPlural: "questions",
-  },
-  code: {
-    singletonTitle: "Ran code",
-    detailLabel: "code run",
-    detailLabelPlural: "code runs",
-  },
-  task: {
-    singletonTitle: "Ran 1 agent task",
-    detailLabel: "agent task",
-    detailLabelPlural: "agent tasks",
-  },
-  tool: {
-    singletonTitle: "Ran 1 operation",
-    detailLabel: "operation",
-    detailLabelPlural: "operations",
-  },
+  read: { verb: "Read", noun: "file", nounPlural: "files", explores: true },
+  search: { verb: "Searched", noun: "query", nounPlural: "queries", explores: true },
+  fetch: { verb: "Fetched", noun: "page", nounPlural: "pages", explores: true },
+  skill: { verb: "Read", noun: "skill", nounPlural: "skills", explores: true },
+  edit: { verb: "Edited", noun: "file", nounPlural: "files", explores: false },
+  shell: { verb: "Ran", noun: "command", nounPlural: "commands", explores: false },
+  code: { verb: "Ran", noun: "script", nounPlural: "scripts", explores: false },
+  question: { verb: "Asked", noun: "question", nounPlural: "questions", explores: false },
+  task: { verb: "Ran", noun: "agent task", nounPlural: "agent tasks", explores: false },
+  tool: { verb: "Used", noun: "tool", nounPlural: "tools", explores: false },
 };
 
 /** Nesting walked when charging a tool payload: provider/MCP results wrap content a few levels deep. */
@@ -699,21 +671,14 @@ export function summarizeOperationalBundle(
   const allSearchMisses = messages.every(isEmptyCompletedWebSearch);
   if (allSearchMisses) {
     return {
-      title: "No results",
-      details: formatDetails(messages),
-    };
-  }
-
-  if (messages.length === 1) {
-    return {
-      title: singletonTitle(messages[0]),
-      details: formatDetails(messages),
+      title: `${formatTitle(messages)}, no results`,
+      details: formatFailures(messages),
     };
   }
 
   return {
-    title: `Ran ${messages.length.toLocaleString()} operations`,
-    details: formatDetails(messages),
+    title: formatTitle(messages),
+    details: formatFailures(messages),
   };
 }
 
@@ -826,30 +791,54 @@ function isActiveOperationalMessage(message: OperationalBundleMemberMessage): bo
   return message.status === "pending" || message.status === "executing";
 }
 
-function singletonTitle(message: OperationalBundleMemberMessage): string {
-  return OPERATIONAL_BUNDLE_CATEGORY_COPY[getOperationalBundleCategory(message)].singletonTitle;
-}
-
-function formatDetails(messages: OperationalBundleMemberMessage[]): string {
-  const counts = new Map<OperationalBundleCategory, number>();
+/**
+ * One sentence for the whole run, in order of first appearance: "Explored 3 files, 2 queries" when
+ * every call was a read-only lookup of more than one kind, else verb clauses ("Ran 2 commands, read 1 file"). Reasoning
+ * rows are folded in silently; a reasoning-only bundle reads "Thought".
+ */
+function formatTitle(messages: OperationalBundleMemberMessage[]): string {
+  const counts = new Map<Exclude<OperationalBundleCategory, "reasoning">, number>();
   for (const message of messages) {
     const category = getOperationalBundleCategory(message);
+    if (category === "reasoning") continue;
     counts.set(category, (counts.get(category) ?? 0) + 1);
   }
+  if (counts.size === 0) {
+    return "Thought";
+  }
 
-  const parts = Array.from(counts.entries()).map(([category, count]) => {
+  const phrase = (category: Exclude<OperationalBundleCategory, "reasoning">, count: number) => {
     const copy = OPERATIONAL_BUNDLE_CATEGORY_COPY[category];
-    const label = count === 1 ? copy.detailLabel : copy.detailLabelPlural;
-    return `${count.toLocaleString()} ${label}`;
-  });
-  // A collapsed bundle hides each card's status, so surface failures in the summary itself.
+    return `${count.toLocaleString()} ${count === 1 ? copy.noun : copy.nounPlural}`;
+  };
+  const entries = Array.from(counts.entries());
+  if (
+    entries.length > 1 &&
+    entries.every(([category]) => OPERATIONAL_BUNDLE_CATEGORY_COPY[category].explores)
+  ) {
+    return `Explored ${entries.map(([category, count]) => phrase(category, count)).join(", ")}`;
+  }
+
+  // Merge categories that share a verb ("Ran 2 commands and 1 script") so the line stays short.
+  const clauses = new Map<string, string[]>();
+  for (const [category, count] of entries) {
+    const verb = OPERATIONAL_BUNDLE_CATEGORY_COPY[category].verb;
+    clauses.set(verb, [...(clauses.get(verb) ?? []), phrase(category, count)]);
+  }
+  return Array.from(clauses.entries())
+    .map(
+      ([verb, phrases], index) =>
+        `${index === 0 ? verb : verb.toLowerCase()} ${phrases.join(" and ")}`
+    )
+    .join(", ");
+}
+
+/** A collapsed bundle hides each card's status, so failures surface in the summary itself. */
+function formatFailures(messages: OperationalBundleMemberMessage[]): string {
   const failedCount = messages.filter(
     (message) => message.type === "tool" && message.status === "failed"
   ).length;
-  if (failedCount > 0) {
-    parts.push(`${failedCount.toLocaleString()} failed`);
-  }
-  return parts.join(" · ");
+  return failedCount > 0 ? `${failedCount.toLocaleString()} failed` : "";
 }
 
 function getOperationalBundleCategory(

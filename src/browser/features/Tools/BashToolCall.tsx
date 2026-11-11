@@ -254,8 +254,10 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             {args.display_name}
           </span>
         )}
-        {!isBackground && !showsDurationInCollapsedSummary && (
-          // Normal mode: show timeout and duration
+        {!isBackground && !showsDurationInCollapsedSummary && (!result || expanded) && (
+          // While running, show the budget and the clock. A finished command's timeout and
+          // duration are detail, not headline: the collapsed row keeps to the command itself
+          // (as Claude Code, Codex and Cursor do) and expanding the card brings them back.
           <span
             className={cn(
               "ml-2 text-[10px] tabular-nums whitespace-nowrap [@container(max-width:500px)]:hidden",
@@ -264,14 +266,15 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
           >
             timeout: {args.timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS}s
             {/* Kernel-mode nested reloads reconstruct partial results without
-                wall_duration_ms/exitCode; skip those fields instead of
-                rendering "took —" and an empty exit-code pill. */}
+                wall_duration_ms; skip it instead of rendering "took —". */}
             {typeof result?.wall_duration_ms === "number" &&
               ` • took ${formatDuration(result.wall_duration_ms)}`}
             {!result && <ElapsedTimeDisplay startedAt={startedAt} isActive={isPending} />}
           </span>
         )}
-        {!isBackground && typeof result?.exitCode === "number" && (
+        {/* A zero exit is the expected outcome; only a non-zero code earns a badge. Kernel-mode
+            nested reloads reconstruct partial results without exitCode, so check the type. */}
+        {!isBackground && typeof result?.exitCode === "number" && result.exitCode !== 0 && (
           <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />
         )}
         <SandboxDenialBadge summary={sandboxDenialSummary} />

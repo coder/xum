@@ -278,7 +278,11 @@ export function TranscriptBundleRows(props: {
         {renderMessageAfterOperationalBundle &&
           renderMessageAtIndex(msg, index, {
             key: `${workspaceId}:${msg.id}:message`,
-            className: operationalBundle ? "ml-4" : undefined,
+            // Open bundle members hang off a thin rail under the summary line, like the calls
+            // under a code execution header.
+            className: operationalBundle
+              ? "ml-[5px] border-l border-foreground/15 pl-2"
+              : undefined,
           })}
       </React.Fragment>
     );

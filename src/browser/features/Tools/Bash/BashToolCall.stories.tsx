@@ -190,16 +190,14 @@ export const NoIntentSummary: Story = {
     </ToolStoryShell>
   ),
   play: async ({ canvasElement }) => {
+    const command = await within(canvasElement).findByText("sleep 30 && tail -30 /tmp/develop.log");
+    // A finished command's collapsed row is just the command; timeout and duration are detail.
+    await expect(canvasElement.textContent).not.toContain("timeout: 120s");
+    await userEvent.click(command);
     await waitFor(() => {
       const textContent = canvasElement.textContent ?? "";
-      if (!textContent.includes("sleep 30 && tail -30 /tmp/develop.log")) {
-        throw new Error("Raw command should be visible when intent is absent");
-      }
-      if (!textContent.includes("timeout: 120s")) {
-        throw new Error("Command-only mode should keep timeout metadata visible");
-      }
-      if (!textContent.includes("took 30s")) {
-        throw new Error("Command-only mode should keep duration metadata visible");
+      if (!textContent.includes("timeout: 120s") || !textContent.includes("took 30s")) {
+        throw new Error("Expanding the card should bring back timeout and duration metadata");
       }
     });
   },

@@ -145,7 +145,9 @@ describe("Hyper transcript density", () => {
         }
         return button;
       });
-      expect(firstOperationalButton.textContent).toContain("Ran 5 operations");
+      expect(firstOperationalButton.textContent).toContain(
+        "Read 1 file and 1 skill, searched 1 query, asked 1 question"
+      );
       expect(firstOperationalButton.getAttribute("aria-expanded")).toBe("false");
       expect(view.container.textContent).toContain("Please validate with typecheck too");
       expect(view.container.textContent).not.toContain("src/auth.ts");
@@ -164,7 +166,7 @@ describe("Hyper transcript density", () => {
 
       const failedOperationalButton = await waitFor(() => {
         const button = queryButtons(view.container, "operational-bundle").find((candidate) =>
-          candidate.textContent?.includes("Ran 1 shell command")
+          candidate.textContent?.includes("Ran 1 command")
         );
         if (!button) {
           throw new Error("Failed operational bundle button not found");
