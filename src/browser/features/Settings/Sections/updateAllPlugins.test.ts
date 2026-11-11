@@ -6,7 +6,12 @@ import type {
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
-import { summarizeUpdateAll, updateAllPlugins, type UpdateAllResult } from "./updateAllPlugins";
+import {
+  summarizeRemaining,
+  summarizeUpdateAll,
+  updateAllPlugins,
+  type UpdateAllResult,
+} from "./updateAllPlugins";
 
 const available = (name: string): AgentPluginUpdateCheck => ({
   name,
@@ -214,5 +219,56 @@ describe("summarizeUpdateAll", () => {
 
     expect(summary.tone).toBe("error");
     expect(summary.message).toContain(Object.values(patch)[0][0]);
+  });
+});
+
+describe("summarizeRemaining", () => {
+  const empty: UpdateAllResult = {
+    updated: [],
+    reviews: [],
+    failures: [],
+    tagMoved: [],
+    checkFailures: [],
+  };
+  const bravo = review("bravo");
+  const echo = review("echo");
+
+  test("names only the reviews that still wait, and keeps everything else", () => {
+    const result: UpdateAllResult = {
+      updated: ["alpha"],
+      reviews: [bravo, echo],
+      failures: [{ name: "charlie", error: "clone failed" }],
+      tagMoved: ["moved"],
+      checkFailures: ["offline"],
+    };
+
+    const message = summarizeRemaining(result, [echo])!.message;
+
+    expect(message).not.toContain("bravo");
+    for (const kept of ["alpha", "echo", "charlie", "clone failed", "moved", "offline"]) {
+      expect(message).toContain(kept);
+    }
+    expect(message).not.toContain("Settings");
+  });
+
+  test("keeps the tone that the failures give the run", () => {
+    const result = { ...empty, reviews: [bravo], failures: [{ name: "charlie", error: "x" }] };
+
+    expect(summarizeRemaining(result, [])!.tone).toBe("error");
+    expect(summarizeRemaining({ ...empty, reviews: [bravo], updated: ["alpha"] }, [])!.tone).toBe(
+      "success"
+    );
+  });
+
+  test("says nothing once no review waits and nothing else was reported", () => {
+    expect(summarizeRemaining({ ...empty, reviews: [bravo] }, [])).toBeNull();
+  });
+
+  test("matches reviews by identity, so a later review of the same plugin is not this run's", () => {
+    const result = { ...empty, updated: ["alpha"], reviews: [bravo] };
+
+    const message = summarizeRemaining(result, [{ ...bravo }])!.message;
+
+    expect(message).not.toContain("bravo");
   });
 });

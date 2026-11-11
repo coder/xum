@@ -60,6 +60,8 @@ interface Fixture {
   failing?: Record<string, string>;
   /** Unmanaged plugins in another container, listed after the managed ones (names may repeat). */
   unmanaged?: string[];
+  /** Capability changes that a component review of the plugin lists. */
+  componentReviews?: Record<string, AgentPluginUpdateReview>;
 }
 
 function createApi(fixture: Fixture) {
@@ -128,7 +130,20 @@ function createApi(fixture: Fixture) {
     locked.set(input.name, UPDATED_SHA);
     return Promise.resolve({ success: true });
   }) as unknown as typeof api.agentPlugins.update;
-  return { api, updates, previews, holdChecks };
+  api.agentPlugins.previewComponentReview = ((input: { name: string }) => {
+    const found = fixture.componentReviews?.[input.name];
+    return Promise.resolve(
+      found ? { success: true, data: found } : { success: false, error: "nothing to review" }
+    );
+  }) as typeof api.agentPlugins.previewComponentReview;
+  const uninstalls: string[] = [];
+  api.agentPlugins.uninstall = ((input: { name: string }) => {
+    uninstalls.push(input.name);
+    fixture.names.splice(fixture.names.indexOf(input.name), 1);
+    pending.delete(input.name);
+    return Promise.resolve({ success: true });
+  }) as unknown as typeof api.agentPlugins.uninstall;
+  return { api, updates, previews, uninstalls, holdChecks };
 }
 
 function mount(api: ReturnType<typeof createApi>["api"]): RenderResult {
@@ -200,10 +215,39 @@ test("capability-changing reviews open one after another, and cancelling one ope
   await waitFor(() => expect(openReviews(view)).toHaveLength(0));
 });
 
-test("the status of a run goes away once the user settles a review it left open", async () => {
+test("settling a review takes only its name out of the status, and the failure text stays", async () => {
   const { api } = createApi({
-    names: ["alpha", "beta"],
-    pending: { alpha: neutral("alpha"), beta: capabilityChanging("beta") },
+    names: ["alpha", "beta", "gamma", "delta"],
+    pending: {
+      alpha: neutral("alpha"),
+      beta: capabilityChanging("beta"),
+      gamma: capabilityChanging("gamma"),
+      delta: neutral("delta"),
+    },
+    failing: { delta: "swap failed" },
+  });
+  const view = mount(api);
+  const status = () => view.container.querySelector('[role="status"]')?.textContent ?? "";
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+  expect(status()).toContain("beta");
+  expect(status()).toContain("gamma");
+
+  fireEvent.click(buttonNamed(view, "Cancel")!);
+  await waitFor(() => expect(status()).not.toContain("beta"));
+  expect(status()).toContain("gamma");
+  expect(status()).toContain("swap failed");
+
+  fireEvent.click(buttonNamed(view, "Cancel")!);
+  await waitFor(() => expect(status()).not.toContain("gamma"));
+  expect(status()).toContain("swap failed");
+});
+
+test("the status goes away once the last review it listed settles and nothing else is left to say", async () => {
+  const { api } = createApi({
+    names: ["beta"],
+    pending: { beta: capabilityChanging("beta") },
   });
   const view = mount(api);
   const status = () => view.container.querySelector('[role="status"]');
@@ -213,6 +257,42 @@ test("the status of a run goes away once the user settles a review it left open"
   await waitFor(() => expect(openReviews(view)).toHaveLength(1));
 
   fireEvent.click(buttonNamed(view, "Cancel")!);
+  await waitFor(() => expect(status() === null).toBe(true));
+});
+
+test("a settled review does not come back in the status when a later palette run queues the same plugin", async () => {
+  const { api } = createApi({
+    names: ["beta"],
+    pending: { beta: capabilityChanging("beta") },
+  });
+  const view = mount(api);
+  const status = () => view.container.querySelector('[role="status"]');
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+  fireEvent.click(buttonNamed(view, "Cancel")!);
+  await waitFor(() => expect(status() === null).toBe(true));
+
+  publishPluginsSectionIntent({ type: "review-updates", reviews: [capabilityChanging("beta")] });
+
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+  expect(status() === null).toBe(true);
+});
+
+test("a card Update click dismisses the status of the earlier run", async () => {
+  const { api } = createApi({
+    names: ["alpha", "beta"],
+    pending: { alpha: neutral("alpha"), beta: neutral("beta") },
+    failing: { alpha: "swap failed" },
+  });
+  const view = mount(api);
+  const status = () => view.container.querySelector('[role="status"]');
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(status()?.textContent).toContain("swap failed"));
+  await waitFor(() => expect(buttonsIn(view).some((b) => b.textContent === "Update")).toBe(true));
+
+  fireEvent.click(buttonsIn(view).find((b) => b.textContent === "Update")!);
   await waitFor(() => expect(status() === null).toBe(true));
 });
 
@@ -396,4 +476,165 @@ test("reviews a palette Update All found open in the section the same way", asyn
   await waitFor(() => expect(openReviews(view)).toHaveLength(1));
   fireEvent.click(openReviews(view)[0]);
   await waitFor(() => expect(updates.map((update) => update.name)).toEqual(["epsilon"]));
+});
+
+test("a confirm that fails keeps the queue where it is, with the same review open", async () => {
+  const { api, updates } = createApi({
+    names: ["beta", "epsilon"],
+    pending: { beta: capabilityChanging("beta"), epsilon: capabilityChanging("epsilon") },
+    failing: { beta: "swap failed" },
+  });
+  const view = mount(api);
+  const shows = (text: string) => (view.container.textContent ?? "").includes(text);
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(openReviews(view)).toHaveLength(1));
+  fireEvent.click(openReviews(view)[0]);
+
+  await waitFor(() => expect(updates.map((update) => update.name)).toEqual(["beta"]));
+  await waitFor(() => expect(shows("swap failed")).toBe(true));
+  expect(openReviews(view)).toHaveLength(1);
+  expect(shows("adds skill 'beta'")).toBe(true);
+  expect(shows("adds skill 'epsilon'")).toBe(false);
+  expect(openReviews(view)[0].disabled).toBe(false);
+
+  fireEvent.click(buttonNamed(view, "Cancel")!);
+  await waitFor(() => expect(shows("adds skill 'epsilon'")).toBe(true));
+});
+
+test("a confirm that settles after a palette run replaced the queue leaves the palette's reviews alone", async () => {
+  const { api, holdChecks } = createApi({
+    names: ["beta", "epsilon", "gamma", "delta"],
+    pending: { beta: capabilityChanging("beta"), epsilon: capabilityChanging("epsilon") },
+  });
+  const view = mount(api);
+  const shows = (text: string) => (view.container.textContent ?? "").includes(text);
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(shows("adds skill 'beta'")).toBe(true));
+  const hold = holdChecks();
+  fireEvent.click(openReviews(view)[0]);
+  await hold.entered;
+  publishPluginsSectionIntent({
+    type: "review-updates",
+    reviews: [capabilityChanging("gamma"), capabilityChanging("delta")],
+  });
+  await waitFor(() => expect(shows("adds skill 'gamma'")).toBe(true));
+
+  hold.release();
+
+  await waitFor(() => expect(buttonNamed(view, /Update all/)?.textContent).toContain("(1)"));
+  expect(shows("adds skill 'gamma'")).toBe(true);
+  expect(shows("adds skill 'delta'")).toBe(false);
+});
+
+async function uninstallPlugin(view: RenderResult, name: string) {
+  fireEvent.click(view.container.querySelector(`button[aria-label="Uninstall ${name}"]`)!);
+  const confirm = await waitFor(() => {
+    const found = buttonsIn(view).find(
+      (button) => button.textContent === "Uninstall" && !button.hasAttribute("aria-label")
+    );
+    if (found === undefined) throw new Error("The uninstall confirmation has not opened");
+    return found;
+  });
+  fireEvent.click(confirm);
+}
+
+test("uninstalling the plugin whose review is open opens the next queued review", async () => {
+  const { api, uninstalls } = createApi({
+    names: ["beta", "epsilon"],
+    pending: { beta: capabilityChanging("beta"), epsilon: capabilityChanging("epsilon") },
+  });
+  const view = mount(api);
+  const shows = (text: string) => (view.container.textContent ?? "").includes(text);
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(shows("adds skill 'beta'")).toBe(true));
+
+  await uninstallPlugin(view, "beta");
+
+  await waitFor(() => expect(uninstalls).toEqual(["beta"]));
+  await waitFor(() => expect(shows("adds skill 'epsilon'")).toBe(true));
+  expect(shows("adds skill 'beta'")).toBe(false);
+  expect(openReviews(view)).toHaveLength(1);
+  expect(openReviews(view)[0].disabled).toBe(false);
+  const status = view.container.querySelector('[role="status"]')?.textContent ?? "";
+  expect(status).not.toContain("beta");
+  expect(status).toContain("epsilon");
+});
+
+test("the next review opens only after the uninstall has settled", async () => {
+  const { api } = createApi({
+    names: ["beta", "epsilon"],
+    pending: { beta: capabilityChanging("beta"), epsilon: capabilityChanging("epsilon") },
+  });
+  const listed = api.agentPlugins.listForSettings;
+  const releaseList = Promise.withResolvers<void>();
+  let holdingList = false;
+  api.agentPlugins.listForSettings = (async () => {
+    if (holdingList) await releaseList.promise;
+    return listed();
+  }) as typeof listed;
+  const view = mount(api);
+  const shows = (text: string) => (view.container.textContent ?? "").includes(text);
+  const uninstalling = () =>
+    buttonsIn(view).some((button) => button.textContent === "Uninstalling…");
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(shows("adds skill 'beta'")).toBe(true));
+  holdingList = true;
+  await uninstallPlugin(view, "beta");
+  await waitFor(() => expect(uninstalling()).toBe(true));
+  await waitFor(() => expect(uninstalling()).toBe(false));
+
+  expect(shows("adds skill 'epsilon'")).toBe(false);
+
+  releaseList.resolve();
+  await waitFor(() => expect(shows("adds skill 'epsilon'")).toBe(true));
+  expect(openReviews(view)[0].disabled).toBe(false);
+});
+
+test("uninstalling a plugin whose review is still queued drops it from the queue", async () => {
+  const { api } = createApi({
+    names: ["beta", "epsilon", "delta"],
+    pending: {
+      beta: capabilityChanging("beta"),
+      epsilon: capabilityChanging("epsilon"),
+      delta: capabilityChanging("delta"),
+    },
+  });
+  const view = mount(api);
+  const shows = (text: string) => (view.container.textContent ?? "").includes(text);
+
+  fireEvent.click(await updateAllButton(view));
+  await waitFor(() => expect(shows("adds skill 'beta'")).toBe(true));
+
+  await uninstallPlugin(view, "epsilon");
+  await waitFor(() =>
+    expect(view.container.querySelector('button[aria-label="Uninstall epsilon"]') === null).toBe(
+      true
+    )
+  );
+  fireEvent.click(buttonNamed(view, "Cancel")!);
+
+  await waitFor(() => expect(shows("adds skill 'delta'")).toBe(true));
+  expect(shows("adds skill 'beta'")).toBe(false);
+});
+
+test("starting Update all closes the component review that is open", async () => {
+  const { api } = createApi({
+    names: ["alpha"],
+    pending: { alpha: neutral("alpha") },
+    componentReviews: { alpha: review("alpha", [{ summary: "adds the hook 'audit'" }]) },
+  });
+  const view = mount(api);
+  const shows = (text: string) => (view.container.textContent ?? "").includes(text);
+  const button = await updateAllButton(view);
+
+  publishPluginsSectionIntent({ type: "review-components", name: "alpha" });
+  await waitFor(() => expect(shows("adds the hook 'audit'")).toBe(true));
+
+  fireEvent.click(button);
+
+  await waitFor(() => expect(shows("adds the hook 'audit'")).toBe(false));
 });
