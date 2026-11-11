@@ -907,6 +907,24 @@ describe("runMemoryHarvest", () => {
     expect(prompt.length).toBeLessThan(200_000);
   });
 
+  // A summary whose cut keeps nothing (it starts with a JWT that the window ends inside) is its
+  // note alone, with no blank line before it.
+  it("shows only the note of a compaction summary that its cut left empty", async () => {
+    using fixture = createFixture();
+    const blob = `eyJ${"Q".repeat(128_597)}`; // made up, no dot: not a match
+    fixture.summary = createMuxMessage("summary-1", "assistant", blob, {
+      historySequence: 2,
+      compactionBoundary: true,
+    });
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    expect(userPromptText(calls[0])).toContain(
+      "Compaction summary (summary-1):\n[truncated 600 more chars for memory harvest]\n"
+    );
+  });
+
   it.each([
     ["at the cap", 128_000, false],
     ["one character over the cap", 128_001, true],
@@ -1211,7 +1229,7 @@ describe("runMemoryHarvest", () => {
     // A part that starts with such a run keeps nothing of it, and still says it was cut: its row
     // carries the note and the truncated flag, as a cut part with kept text does. As above, the note
     // counts the characters past the cap.
-    describe("a part that the cut at a JWT leaves empty", () => {
+    describe("a cut part whose row is short", () => {
       const blob = `eyJ${"Q".repeat(TEXT_PART_LIMIT + 597)}`; // made up, no dot: not a match
       const rowsOf = (message: MuxMessage) =>
         buildHarvestChunks([message]).flatMap(
@@ -1237,6 +1255,24 @@ describe("runMemoryHarvest", () => {
           });
         }
       );
+
+      // Only an empty part's note keeps a row of its own. A cut part that redaction shortened to a
+      // marker still packs behind the part before it.
+      it("packs a short cut part behind the part before it", () => {
+        const message = createMuxMessage("t1", "user", "here is the config", {
+          historySequence: 0,
+        });
+        message.parts.push({ type: "text", text: `sk-${"Lq".repeat(65_000)}` }); // made up
+
+        const rows = rowsOf(message);
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0].parts).toBeUndefined();
+        expect(rows[0].truncated).toBe(true);
+        expect(rows[0].text).toMatch(
+          /^here is the config\n\[redacted\]\n\[truncated \d+ more chars for memory harvest\]$/
+        );
+      });
 
       it("keeps its place among the message's parts after a prose part", () => {
         const message = createMuxMessage("t1", "user", "see the attached state blob", {

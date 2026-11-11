@@ -196,6 +196,8 @@ interface HarvestPiece {
   part: number;
   /** Set on a segment of a long text part, as in `HarvestEvidenceRow.segment`. */
   segment?: string;
+  /** Set on the piece of a text part that its cut left empty: the piece is the cut's note alone. */
+  noteOnly?: true;
 }
 
 /**
@@ -227,6 +229,11 @@ function truncationNote(cutChars: number): string {
   return `[truncated ${cutChars} more chars for memory harvest]`;
 }
 
+/** `text` and the note of its cut on a line of its own, or the note alone when nothing is left. */
+function withTruncationNote(text: string, cutChars: number): string {
+  return text === "" ? truncationNote(cutChars) : `${text}\n${truncationNote(cutChars)}`;
+}
+
 function piecesOfPart(
   part: MuxMessage["parts"][number],
   position: number,
@@ -245,10 +252,11 @@ function piecesOfPart(
     );
     const isCutEnd = cutChars > 0 && index === count - 1;
     return {
-      text: isCutEnd ? [segment, truncationNote(cutChars)].filter(Boolean).join("\n") : segment,
+      text: isCutEnd ? withTruncationNote(segment, cutChars) : segment,
       truncated: isCutEnd,
       part: position,
       segment: `${index + 1} of ${count}`,
+      ...(text === "" && { noteOnly: true }),
     };
   });
 }
@@ -260,15 +268,15 @@ function hasRowText(rowText: RowText): boolean {
 
 /**
  * Whether `piece` joins the row of `group`, whose text with the piece's would be `joinedChars` long.
- * A segment's row stays its own: no piece fits behind a segment, as the group starts with it, and a
- * segment never fits behind another piece. A first segment is usually a whole row's text, but the
- * cut at a JWT can leave a short one, or only its note, and that note must not read as a cut of the
- * parts before it.
+ * No piece fits behind a segment, as the group starts with it. A short segment fits behind other
+ * pieces (a cut part whose secret redaction shortened to a marker). The note of a part
+ * that its cut left empty keeps a row of its own: behind another part it would read as a cut of
+ * that part.
  */
 function fitsBehind(group: HarvestPiece[], piece: HarvestPiece, joinedChars: number): boolean {
   return (
     group[0].segment === undefined &&
-    piece.segment === undefined &&
+    piece.noteOnly !== true &&
     joinedChars <= HARVEST_MAX_ROW_TEXT_CHARS
   );
 }
@@ -569,7 +577,7 @@ const ANALYZER_TOOL_DESCRIPTION =
  */
 function summaryText(summary: MuxMessage): string {
   const { text, cutChars } = boundedTextPart(summary.parts.map(partToText).join("\n"));
-  return cutChars > 0 ? `${text}\n${truncationNote(cutChars)}` : text;
+  return cutChars > 0 ? withTruncationNote(text, cutChars) : text;
 }
 
 function buildChunkPrompt(args: {
